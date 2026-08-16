@@ -3,10 +3,10 @@
 //! 包含 Kiro API 请求相关的类型定义
 
 pub mod conversation;
-pub mod kiro;
 pub mod tool;
+pub mod upstream;
 
 #[allow(unused_imports)]
 pub use conversation::{ConversationState, CurrentMessage, UserInputMessage};
 #[allow(unused_imports)]
-pub use kiro::KiroRequest;
+pub use upstream::KiroRequest;

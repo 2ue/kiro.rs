@@ -1,6 +1,6 @@
 use std::time::Duration as StdDuration;
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
 
 use super::concurrency::InFlightLeaseGuard;
 

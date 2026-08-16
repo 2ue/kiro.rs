@@ -6,149 +6,172 @@
 
 pub(crate) mod call_trace {
     #[cfg(test)]
-    pub(crate) use crate::kiro::call_trace::SelectionFailureSummary;
-    pub(crate) use crate::kiro::call_trace::summarize_attempts as summarize_local_upstream_attempts;
-    pub(crate) use crate::kiro::call_trace::{AccountRejectReason, SelectionFailureStage};
+    pub(crate) use crate::local_upstream_impl::call_trace::SelectionFailureSummary;
+    pub(crate) use crate::local_upstream_impl::call_trace::summarize_attempts as summarize_local_upstream_attempts;
+    pub(crate) use crate::local_upstream_impl::call_trace::{
+        AccountRejectReason, SelectionFailureStage,
+    };
     #[cfg(test)]
-    pub(crate) type LocalUpstreamCallError = crate::kiro::call_trace::KiroCallError;
-    pub(crate) type LocalUpstreamCallFailureKind = crate::kiro::call_trace::KiroCallFailureKind;
-    pub(crate) type LocalUpstreamCredentialAttempt = crate::kiro::call_trace::KiroCredentialAttempt;
+    pub(crate) type LocalUpstreamCallError = crate::local_upstream_impl::call_trace::KiroCallError;
+    pub(crate) type LocalUpstreamCallFailureKind =
+        crate::local_upstream_impl::call_trace::KiroCallFailureKind;
+    pub(crate) type LocalUpstreamCredentialAttempt =
+        crate::local_upstream_impl::call_trace::KiroCredentialAttempt;
     pub(crate) type LocalAuxiliaryMcpAttributionSink =
-        crate::kiro::call_trace::McpCallAttributionSink;
+        crate::local_upstream_impl::call_trace::McpCallAttributionSink;
 }
 
 pub(crate) mod credentials {
-    pub(crate) use crate::kiro::model::credentials::profile_arn_region as local_upstream_profile_region;
-    pub(crate) use crate::kiro::model::credentials::split_kiro_api_key_and_region as split_local_upstream_api_key_and_region;
-    pub(crate) type LocalUpstreamCredentials = crate::kiro::model::credentials::KiroCredentials;
+    pub(crate) use crate::local_upstream_impl::model::credentials::profile_arn_region as local_upstream_profile_region;
+    pub(crate) use crate::local_upstream_impl::model::credentials::split_kiro_api_key_and_region as split_local_upstream_api_key_and_region;
+    pub(crate) type LocalUpstreamCredentials =
+        crate::local_upstream_impl::model::credentials::KiroCredentials;
     pub(crate) type LocalUpstreamCredentialsConfig =
-        crate::kiro::model::credentials::CredentialsConfig;
+        crate::local_upstream_impl::model::credentials::CredentialsConfig;
 }
 
 pub(crate) mod dispatch {
-    pub(crate) type LocalUpstreamAcquireMode = crate::kiro::token_manager::AcquireMode;
-    pub(crate) type LocalUpstreamRouteState = crate::kiro::token_manager::LocalPoolRouteState;
+    pub(crate) type LocalUpstreamAcquireMode =
+        crate::local_upstream_impl::token_manager::AcquireMode;
+    pub(crate) type LocalUpstreamRouteState =
+        crate::local_upstream_impl::token_manager::LocalPoolRouteState;
     pub(crate) type LocalUpstreamRouteStateKind =
-        crate::kiro::token_manager::LocalPoolRouteStateKind;
+        crate::local_upstream_impl::token_manager::LocalPoolRouteStateKind;
 }
 
 pub(crate) mod endpoint {
-    pub(crate) use crate::kiro::endpoint::IdeEndpoint as LocalUpstreamIdeEndpoint;
-    pub(crate) use crate::kiro::endpoint::KiroEndpoint as LocalUpstreamEndpointTrait;
-    pub(crate) use crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
-    pub(crate) type LocalUpstreamCliEndpoint = crate::kiro::endpoint::CliEndpoint;
+    pub(crate) use crate::local_upstream_impl::endpoint::IdeEndpoint as LocalUpstreamIdeEndpoint;
+    pub(crate) use crate::local_upstream_impl::endpoint::KiroEndpoint as LocalUpstreamEndpointTrait;
+    pub(crate) use crate::local_upstream_impl::endpoint::ide::IDE_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
+    pub(crate) type LocalUpstreamCliEndpoint = crate::local_upstream_impl::endpoint::CliEndpoint;
     pub(crate) type LocalUpstreamEndpoint = dyn LocalUpstreamEndpointTrait;
 }
 
 pub(crate) mod provider {
-    pub(crate) type LocalAuxiliaryMcpAttribution = crate::kiro::provider::McpCallAttribution;
-    pub(crate) type LocalAuxiliaryMcpFailureKind = crate::kiro::provider::McpCallFailureKind;
-    pub(crate) type LocalUpstreamApiResponse = crate::kiro::provider::KiroApiResponse;
-    pub(crate) type LocalUpstreamProvider = crate::kiro::provider::KiroProvider;
-    pub(crate) type LocalUpstreamStreamCompletion = crate::kiro::provider::KiroStreamCompletion;
-    pub(crate) type LocalUpstreamStreamResponse = crate::kiro::provider::KiroStreamResponse;
+    pub(crate) type LocalAuxiliaryMcpAttribution =
+        crate::local_upstream_impl::provider::McpCallAttribution;
+    pub(crate) type LocalAuxiliaryMcpFailureKind =
+        crate::local_upstream_impl::provider::McpCallFailureKind;
+    pub(crate) type LocalUpstreamApiResponse =
+        crate::local_upstream_impl::provider::KiroApiResponse;
+    pub(crate) type LocalUpstreamProvider = crate::local_upstream_impl::provider::KiroProvider;
+    pub(crate) type LocalUpstreamStreamCompletion =
+        crate::local_upstream_impl::provider::KiroStreamCompletion;
+    pub(crate) type LocalUpstreamStreamResponse =
+        crate::local_upstream_impl::provider::KiroStreamResponse;
 }
 
 pub(crate) mod event {
     #[cfg(test)]
     pub(crate) type LocalUpstreamAssistantResponseEvent =
-        crate::kiro::model::events::AssistantResponseEvent;
+        crate::local_upstream_impl::model::events::AssistantResponseEvent;
     #[cfg(test)]
-    pub(crate) type LocalUpstreamCodeEvent = crate::kiro::model::events::CodeEvent;
+    pub(crate) type LocalUpstreamCodeEvent = crate::local_upstream_impl::model::events::CodeEvent;
     #[cfg(test)]
-    pub(crate) type LocalUpstreamContextUsageEvent = crate::kiro::model::events::ContextUsageEvent;
-    pub(crate) type LocalUpstreamEvent = crate::kiro::model::events::Event;
+    pub(crate) type LocalUpstreamContextUsageEvent =
+        crate::local_upstream_impl::model::events::ContextUsageEvent;
+    pub(crate) type LocalUpstreamEvent = crate::local_upstream_impl::model::events::Event;
     #[cfg(test)]
-    pub(crate) type LocalUpstreamInvalidStateEvent = crate::kiro::model::events::InvalidStateEvent;
+    pub(crate) type LocalUpstreamInvalidStateEvent =
+        crate::local_upstream_impl::model::events::InvalidStateEvent;
     #[cfg(test)]
     pub(crate) type LocalUpstreamMessageMetadataEvent =
-        crate::kiro::model::events::MessageMetadataEvent;
+        crate::local_upstream_impl::model::events::MessageMetadataEvent;
     #[cfg(test)]
-    pub(crate) type LocalUpstreamMetadataEvent = crate::kiro::model::events::MetadataEvent;
+    pub(crate) type LocalUpstreamMetadataEvent =
+        crate::local_upstream_impl::model::events::MetadataEvent;
     pub(crate) type LocalUpstreamMetadataTokenUsage =
-        crate::kiro::model::events::MetadataTokenUsage;
+        crate::local_upstream_impl::model::events::MetadataTokenUsage;
     #[cfg(test)]
-    pub(crate) type LocalUpstreamMeteringEvent = crate::kiro::model::events::MeteringEvent;
+    pub(crate) type LocalUpstreamMeteringEvent =
+        crate::local_upstream_impl::model::events::MeteringEvent;
     pub(crate) type LocalUpstreamReasoningContentEvent =
-        crate::kiro::model::events::ReasoningContentEvent;
-    pub(crate) type LocalUpstreamToolUseEvent = crate::kiro::model::events::ToolUseEvent;
+        crate::local_upstream_impl::model::events::ReasoningContentEvent;
+    pub(crate) type LocalUpstreamToolUseEvent =
+        crate::local_upstream_impl::model::events::ToolUseEvent;
 }
 
 pub(crate) mod model_catalog {
     pub(crate) type LocalUpstreamAvailableModel =
-        crate::kiro::model::available_models::KiroAvailableModel;
+        crate::local_upstream_impl::model::available_models::KiroAvailableModel;
     pub(crate) type LocalUpstreamAvailableModelCatalog =
-        crate::kiro::model::available_models::KiroAvailableModelCatalog;
+        crate::local_upstream_impl::model::available_models::KiroAvailableModelCatalog;
     pub(crate) type LocalUpstreamModelCapabilityCohortKey =
-        crate::kiro::model::available_models::KiroModelCapabilityCohortKey;
+        crate::local_upstream_impl::model::available_models::KiroModelCapabilityCohortKey;
     #[cfg(test)]
     pub(crate) type LocalUpstreamModelTokenLimits =
-        crate::kiro::model::available_models::KiroModelTokenLimits;
+        crate::local_upstream_impl::model::available_models::KiroModelTokenLimits;
 }
 
 pub(crate) mod manager {
     pub(crate) type LocalUpstreamCredentialAuthUpdate =
-        crate::kiro::token_manager::CredentialAuthUpdate;
+        crate::local_upstream_impl::token_manager::CredentialAuthUpdate;
     pub(crate) type LocalUpstreamCredentialBaseSnapshot =
-        crate::kiro::token_manager::CredentialBaseSnapshot;
+        crate::local_upstream_impl::token_manager::CredentialBaseSnapshot;
     pub(crate) type LocalUpstreamCredentialEntrySnapshot =
-        crate::kiro::token_manager::CredentialEntrySnapshot;
-    pub(crate) type LocalUpstreamCredentialManager = crate::kiro::token_manager::MultiTokenManager;
+        crate::local_upstream_impl::token_manager::CredentialEntrySnapshot;
+    pub(crate) type LocalUpstreamCredentialManager =
+        crate::local_upstream_impl::token_manager::MultiTokenManager;
 }
 
 pub(crate) mod usage_limits {
     pub(crate) type LocalUpstreamUsageLimitsResponse =
-        crate::kiro::model::usage_limits::UsageLimitsResponse;
+        crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
 }
 
 pub(crate) mod request {
     pub(crate) type LocalUpstreamAdditionalModelRequestFields =
-        crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
+        crate::local_upstream_impl::model::requests::upstream::AdditionalModelRequestFields;
     pub(crate) type LocalUpstreamAssistantMessage =
-        crate::kiro::model::requests::conversation::AssistantMessage;
+        crate::local_upstream_impl::model::requests::conversation::AssistantMessage;
     pub(crate) type LocalUpstreamConversationMessage =
-        crate::kiro::model::requests::conversation::Message;
+        crate::local_upstream_impl::model::requests::conversation::Message;
     pub(crate) type LocalUpstreamConversationState =
-        crate::kiro::model::requests::conversation::ConversationState;
+        crate::local_upstream_impl::model::requests::conversation::ConversationState;
     pub(crate) type LocalUpstreamCurrentMessage =
-        crate::kiro::model::requests::conversation::CurrentMessage;
+        crate::local_upstream_impl::model::requests::conversation::CurrentMessage;
     pub(crate) type LocalUpstreamHistoryAssistantMessage =
-        crate::kiro::model::requests::conversation::HistoryAssistantMessage;
+        crate::local_upstream_impl::model::requests::conversation::HistoryAssistantMessage;
     pub(crate) type LocalUpstreamHistoryUserMessage =
-        crate::kiro::model::requests::conversation::HistoryUserMessage;
-    pub(crate) type LocalUpstreamImage = crate::kiro::model::requests::conversation::KiroImage;
-    pub(crate) type LocalUpstreamInputSchema = crate::kiro::model::requests::tool::InputSchema;
+        crate::local_upstream_impl::model::requests::conversation::HistoryUserMessage;
+    pub(crate) type LocalUpstreamImage =
+        crate::local_upstream_impl::model::requests::conversation::KiroImage;
+    pub(crate) type LocalUpstreamInputSchema =
+        crate::local_upstream_impl::model::requests::tool::InputSchema;
     pub(crate) type LocalUpstreamOutputConfig =
-        crate::kiro::model::requests::kiro::KiroOutputConfig;
+        crate::local_upstream_impl::model::requests::upstream::KiroOutputConfig;
     pub(crate) type LocalUpstreamReasoningConfig =
-        crate::kiro::model::requests::kiro::KiroReasoningConfig;
+        crate::local_upstream_impl::model::requests::upstream::KiroReasoningConfig;
     pub(crate) type LocalUpstreamReasoningContent =
-        crate::kiro::model::requests::conversation::ReasoningContent;
-    pub(crate) type LocalUpstreamRequest = crate::kiro::model::requests::kiro::KiroRequest;
+        crate::local_upstream_impl::model::requests::conversation::ReasoningContent;
+    pub(crate) type LocalUpstreamRequest =
+        crate::local_upstream_impl::model::requests::upstream::KiroRequest;
     pub(crate) type LocalUpstreamThinkingConfig =
-        crate::kiro::model::requests::kiro::KiroThinkingConfig;
-    pub(crate) type LocalUpstreamTool = crate::kiro::model::requests::tool::Tool;
-    pub(crate) type LocalUpstreamToolResult = crate::kiro::model::requests::tool::ToolResult;
+        crate::local_upstream_impl::model::requests::upstream::KiroThinkingConfig;
+    pub(crate) type LocalUpstreamTool = crate::local_upstream_impl::model::requests::tool::Tool;
+    pub(crate) type LocalUpstreamToolResult =
+        crate::local_upstream_impl::model::requests::tool::ToolResult;
     pub(crate) type LocalUpstreamToolSpecification =
-        crate::kiro::model::requests::tool::ToolSpecification;
-    pub(crate) type LocalUpstreamToolUseEntry = crate::kiro::model::requests::tool::ToolUseEntry;
+        crate::local_upstream_impl::model::requests::tool::ToolSpecification;
+    pub(crate) type LocalUpstreamToolUseEntry =
+        crate::local_upstream_impl::model::requests::tool::ToolUseEntry;
     pub(crate) type LocalUpstreamUserInputMessageContext =
-        crate::kiro::model::requests::conversation::UserInputMessageContext;
+        crate::local_upstream_impl::model::requests::conversation::UserInputMessageContext;
     pub(crate) type LocalUpstreamUserInputMessage =
-        crate::kiro::model::requests::conversation::UserInputMessage;
+        crate::local_upstream_impl::model::requests::conversation::UserInputMessage;
     pub(crate) type LocalUpstreamUserMessage =
-        crate::kiro::model::requests::conversation::UserMessage;
+        crate::local_upstream_impl::model::requests::conversation::UserMessage;
 }
 
 pub(crate) mod stream {
     #[cfg(test)]
-    pub(crate) use crate::kiro::parser::crc::crc32 as local_upstream_eventstream_crc32;
+    pub(crate) use crate::local_upstream_impl::parser::crc::crc32 as local_upstream_eventstream_crc32;
     pub(crate) type LocalUpstreamEventStreamDecoder =
-        crate::kiro::parser::decoder::EventStreamDecoder;
+        crate::local_upstream_impl::parser::decoder::EventStreamDecoder;
 }
 
 pub(crate) mod storage_task {
-    pub(crate) use crate::kiro::token_manager::storage_task::{
+    pub(crate) use crate::local_upstream_impl::token_manager::storage_task::{
         best_effort_storage_task_stats as local_upstream_storage_task_stats,
         drain_best_effort_storage_tasks as drain_local_upstream_storage_tasks,
         shutdown_best_effort_storage_tasks as shutdown_local_upstream_storage_tasks,

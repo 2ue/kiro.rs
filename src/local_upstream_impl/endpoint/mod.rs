@@ -8,7 +8,7 @@
 
 use reqwest::{Method, RequestBuilder};
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod cli;

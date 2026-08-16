@@ -69,7 +69,7 @@ pub enum DecoderState {
 /// # Example
 ///
 /// ```rust,ignore
-/// use kiro_rs::kiro::parser::EventStreamDecoder;
+/// use kiro_rs::local_upstream_impl::parser::EventStreamDecoder;
 ///
 /// let mut decoder = EventStreamDecoder::new();
 ///

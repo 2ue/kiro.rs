@@ -13,7 +13,7 @@ use super::{
     KiroEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
     normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
 };
-use crate::kiro::protocol::{
+use crate::local_upstream_impl::protocol::{
     is_external_idp_credentials, resolve_agent_mode, resolve_profile_arn,
     resolve_streaming_profile_arn,
 };
@@ -234,9 +234,11 @@ fn set_profile_arn(json: &mut serde_json::Value, profile_arn: &Option<String>) -
 mod tests {
     use super::{IdeEndpoint, inject_profile_arn, transform_ide_api_body};
     use crate::http_client::allocation_probe;
-    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-    use crate::kiro::model::credentials::KiroCredentials;
-    use crate::kiro::protocol::{KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN};
+    use crate::local_upstream_impl::endpoint::{KiroEndpoint, RequestContext};
+    use crate::local_upstream_impl::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::protocol::{
+        KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN,
+    };
     use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
     use reqwest::Client;
     use serde_json::Value;

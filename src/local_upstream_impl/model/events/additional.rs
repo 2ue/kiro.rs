@@ -7,8 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::kiro::parser::error::ParseResult;
-use crate::kiro::parser::frame::Frame;
+use crate::local_upstream_impl::parser::error::ParseResult;
+use crate::local_upstream_impl::parser::frame::Frame;
 
 use super::base::EventPayload;
 

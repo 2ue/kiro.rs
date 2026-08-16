@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
 
 use super::account_state::{CredentialEntry, ProxyResourceAvailability, ProxyResourceRuntime};
 use super::cooldown::entry_cooldown_remaining;

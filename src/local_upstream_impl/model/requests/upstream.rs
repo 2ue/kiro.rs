@@ -13,7 +13,7 @@ use super::conversation::ConversationState;
 /// # 示例
 ///
 /// ```rust
-/// use kiro_rs::kiro::model::requests::{
+/// use kiro_rs::local_upstream_impl::model::requests::{
 ///     KiroRequest, ConversationState, CurrentMessage, UserInputMessage, Tool
 /// };
 ///

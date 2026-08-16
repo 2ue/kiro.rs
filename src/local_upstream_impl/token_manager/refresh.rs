@@ -13,15 +13,15 @@ use crate::http_client::{
     HttpSendError, ProxyConfig, build_client, execute_with_response_header_timeout,
     response_bytes_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
-use crate::kiro::endpoint::configured_upstream_url;
-use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::model::token_refresh::{
+use crate::local_upstream_impl::endpoint::configured_upstream_url;
+use crate::local_upstream_impl::machine_id;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
 };
-use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::protocol::{is_external_idp_credentials, resolve_profile_arn};
+use crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
+use crate::local_upstream_impl::protocol::{is_external_idp_credentials, resolve_profile_arn};
 use crate::model::config::Config;
 
 use super::auxiliary::{
@@ -1117,12 +1117,12 @@ mod tests {
         RefreshFailureStage, get_usage_limits, refresh_failure_from_token_refresh_admission,
         refresh_token,
     };
-    use crate::kiro::model::credentials::KiroCredentials;
-    use crate::kiro::token_manager::auxiliary::{
+    use crate::local_upstream_impl::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::token_manager::auxiliary::{
         TokenRefreshAdmissionAuthority, TokenRefreshAdmissionRejected,
         TokenRefreshAdmissionRejectionKind,
     };
-    use crate::kiro::token_manager::{
+    use crate::local_upstream_impl::token_manager::{
         AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind, MultiTokenManager,
     };
     use crate::model::config::{Config, TlsBackend};
@@ -1669,7 +1669,7 @@ mod tests {
 
     async fn acquire_from_fake_refresh_manager(
         manager: &MultiTokenManager,
-    ) -> anyhow::Result<crate::kiro::token_manager::CallContext> {
+    ) -> anyhow::Result<crate::local_upstream_impl::token_manager::CallContext> {
         let auxiliary_budget = Arc::new(AuxiliaryAttemptBudget::new(2));
         manager
             .acquire_context_for_session_with_mode_and_auxiliary_budget(
@@ -1869,7 +1869,7 @@ mod tests {
         manager: &MultiTokenManager,
         max_attempts: u32,
     ) -> (
-        anyhow::Result<crate::kiro::token_manager::CallContext>,
+        anyhow::Result<crate::local_upstream_impl::token_manager::CallContext>,
         Arc<AuxiliaryAttemptBudget>,
     ) {
         let budget = Arc::new(AuxiliaryAttemptBudget::new(max_attempts));
@@ -2075,7 +2075,7 @@ mod tests {
                     Err(error) => error,
                 };
                 if error
-                    .downcast_ref::<crate::kiro::token_manager::AuxiliaryConcurrencySaturated>()
+                    .downcast_ref::<crate::local_upstream_impl::token_manager::AuxiliaryConcurrencySaturated>()
                     .is_some()
                 {
                     saturated += 1;
@@ -2243,7 +2243,7 @@ mod tests {
                     Err(error) => error,
                 };
                 if error
-                    .downcast_ref::<crate::kiro::token_manager::AuxiliaryConcurrencySaturated>()
+                    .downcast_ref::<crate::local_upstream_impl::token_manager::AuxiliaryConcurrencySaturated>()
                     .is_some()
                 {
                     saturated += 1;

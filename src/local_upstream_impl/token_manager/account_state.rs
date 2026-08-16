@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
 use crate::storage::postgres::ProxyResourceRow;
 use crate::storage::redis_cache::SchedulerHealthState;
 

@@ -2,8 +2,8 @@
 //!
 //! 定义事件类型枚举、trait 和统一事件结构
 
-use crate::kiro::parser::error::{ParseError, ParseResult};
-use crate::kiro::parser::frame::Frame;
+use crate::local_upstream_impl::parser::error::{ParseError, ParseResult};
+use crate::local_upstream_impl::parser::frame::Frame;
 
 /// 事件类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

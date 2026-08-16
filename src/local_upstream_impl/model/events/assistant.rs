@@ -4,8 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::kiro::parser::error::ParseResult;
-use crate::kiro::parser::frame::Frame;
+use crate::local_upstream_impl::parser::error::ParseResult;
+use crate::local_upstream_impl::parser::frame::Frame;
 
 use super::base::EventPayload;
 
@@ -21,7 +21,7 @@ use super::base::EventPayload;
 /// # 示例
 ///
 /// ```rust
-/// use kiro_rs::kiro::model::events::AssistantResponseEvent;
+/// use kiro_rs::local_upstream_impl::model::events::AssistantResponseEvent;
 ///
 /// let json = r#"{"content":"Hello, world!"}"#;
 /// let event: AssistantResponseEvent = serde_json::from_str(json).unwrap();

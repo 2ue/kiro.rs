@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
 use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
 
 pub const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =

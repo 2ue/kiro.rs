@@ -1,6 +1,6 @@
 use super::*;
 use crate::anthropic::usage::sampled_request_rejection_usage_record;
-use crate::kiro::token_manager::refresh::{is_token_expiring_soon, refresh_token};
+use crate::local_upstream_impl::token_manager::refresh::{is_token_expiring_soon, refresh_token};
 use crate::storage::postgres::CredentialAccountInfoRow;
 use std::sync::Arc;
 
@@ -608,7 +608,10 @@ where
     };
     let cleanup_store = stores[0].clone();
     let outcome = AssertUnwindSafe(body(stores)).catch_unwind().await;
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(5),
+    )
+    .await;
     let cleanup = cleanup_store
         .delete_pattern_bounded("*", None)
         .await
@@ -639,7 +642,10 @@ where
         clear_test_redis_latency_toxic().await;
         set_test_redis_proxy_enabled(true).await;
     }
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(5),
+    )
+    .await;
     let cleanup = store.delete_pattern_bounded("*", None).await.unwrap();
     assert!(
         !cleanup.cancelled,
@@ -795,7 +801,10 @@ async fn recover_capacity_breaker_five_times(
             .unwrap_or_else(|| panic!("{scenario}: recovery {recovery}/5 had no capacity"));
         drop(lease);
     }
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(5),
+    )
+    .await;
     assert!(
         !manager.scheduler_redis_breaker.is_degraded(),
         "{scenario}: breaker must close after healthy recovery probe"
@@ -2856,7 +2865,10 @@ async fn force_refresh_holds_redis_lock_until_postgres_commit() {
     );
 
     server.abort();
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(1),
+    )
+    .await;
     store.drop_test_schema().await.unwrap();
 }
 
@@ -4666,7 +4678,10 @@ async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
     assert_eq!(states[&1].failure_count, 1);
     assert_eq!(states[&1].revision, 3);
 
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(1),
+    )
+    .await;
     store.drop_test_schema().await.unwrap();
 }
 
@@ -4753,7 +4768,7 @@ async fn postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine
             );
         }
 
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
     })
     .await;
 }
@@ -4830,7 +4845,7 @@ async fn terminal_deferred_success_does_not_wait_for_pgsql_pool_pressure_for_fiv
             }
         }
 
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
     })
     .await;
 }
@@ -5102,7 +5117,10 @@ async fn postgres_reset_generation_fences_pending_failure_and_disable_replay() {
     assert_eq!(current.failure_count, 1);
     assert!(current.disabled_reason.is_none());
 
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(1),
+    )
+    .await;
     store.drop_test_schema().await.unwrap();
 }
 
@@ -8992,7 +9010,7 @@ async fn redis_two_instance_connections_preserve_lease_queue_and_rpm_authority_f
                 tokio::time::sleep(StdDuration::from_millis(250)).await;
                 lease_b.touch();
             }
-            crate::kiro::token_manager::drain_best_effort_storage_tasks(
+            crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
                 StdDuration::from_secs(2),
             )
             .await;
@@ -9585,7 +9603,10 @@ async fn finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_in
 
     drop(first);
     drop(manager);
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(1)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(1),
+    )
+    .await;
     let cleanup = redis_store.delete_pattern_bounded("*", None).await.unwrap();
     assert!(!cleanup.cancelled);
     assert!(!cleanup.pass_limit_reached);
@@ -9959,7 +9980,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                     LocalPoolRouteStateKind::AllDisabled,
                     "{scenario}: Redis latency must never impersonate credential disablement"
                 );
-                crate::kiro::token_manager::drain_best_effort_storage_tasks(
+                crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
                     StdDuration::from_secs(3),
                 )
                 .await;
@@ -10141,7 +10162,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                 .unwrap()
                 .unwrap();
             drop(healthy);
-            crate::kiro::token_manager::drain_best_effort_storage_tasks(
+            crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
                 StdDuration::from_secs(2),
             )
             .await;
@@ -10226,7 +10247,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
 
         clear_test_redis_latency_toxic().await;
         set_test_redis_proxy_enabled(true).await;
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
         let rss_end = process_rss_kib_for_test();
         let fd_end = open_fd_count_for_test();
         if let (Some(start), Some(end)) = (rss_start, rss_end) {
@@ -10327,7 +10348,7 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
                 .unwrap()
                 .expect("business Redis warm-up must have capacity");
             drop(warm);
-            crate::kiro::token_manager::drain_best_effort_storage_tasks(
+            crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
                 StdDuration::from_secs(2),
             )
             .await;
@@ -10490,7 +10511,10 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
     })
     .catch_unwind()
     .await;
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(5),
+    )
+    .await;
     business_store
         .delete_pattern_bounded("*", None)
         .await
@@ -10635,8 +10659,10 @@ async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
             .expect("healthy Redis acquire")
             .expect("healthy credential capacity");
         drop(healthy);
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
-            .await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+            StdDuration::from_secs(2),
+        )
+        .await;
 
         set_test_redis_proxy_enabled(false).await;
         let started_at = Instant::now();
@@ -10690,8 +10716,10 @@ async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
             .expect("same manager should reconnect after Redis proxy recovery")
             .expect("credential capacity should recover");
         drop(recovered);
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
-            .await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+            StdDuration::from_secs(2),
+        )
+        .await;
         assert!(!manager.scheduler_redis_breaker.is_degraded());
         tokio::time::timeout(StdDuration::from_secs(2), async {
             loop {
@@ -10787,8 +10815,10 @@ async fn redis_capacity_backend_restart_recovers_same_manager() {
             .expect("same manager should reconnect after Redis backend restart")
             .expect("credential capacity should recover after backend restart");
         drop(recovered);
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
-            .await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+            StdDuration::from_secs(2),
+        )
+        .await;
         assert!(!manager.scheduler_redis_breaker.is_degraded());
 
         tokio::time::timeout(StdDuration::from_secs(2), async {
@@ -11056,7 +11086,10 @@ async fn redis_backed_temporary_sticky_capacity_fallback_rebounds_without_full_s
         "Redis authority must permit immediate rebound despite stale local remote capacity"
     );
     rebound.release_in_flight();
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(2),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11130,8 +11163,10 @@ async fn redis_backed_sticky_release_grace_keeps_binding_between_managers() {
     let release = tokio::spawn(async move {
         tokio::time::sleep(StdDuration::from_millis(10)).await;
         initial.release_in_flight();
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
-            .await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+            StdDuration::from_secs(2),
+        )
+        .await;
     });
 
     let mut rebound = manager_b
@@ -11152,7 +11187,10 @@ async fn redis_backed_sticky_release_grace_keeps_binding_between_managers() {
     assert!(!rebound.fallback_from_sticky);
     rebound.release_in_flight();
     release.await.unwrap();
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(2),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11238,7 +11276,10 @@ async fn redis_backed_sticky_holder_still_falls_back_after_release_grace() {
     );
     fallback.release_in_flight();
     drop(holder);
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(2),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11386,8 +11427,10 @@ async fn provisional_local_reservation_spreads_concurrent_redis_acquires() {
                 .await,
             "round with concurrency={contenders}: Redis release dispatcher must drain"
         );
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2))
-            .await;
+        crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+            StdDuration::from_secs(2),
+        )
+        .await;
         assert!(
             redis_store
                 .scheduler_state_for_credentials(&(1..=ACCOUNT_COUNT as u64).collect::<Vec<_>>())
@@ -11456,7 +11499,10 @@ async fn redis_rejected_provisional_acquire_rolls_back_without_remote_release() 
         "a definitive Redis rejection must not delete the holder lease"
     );
     drop(holder);
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(2)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(2),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11499,9 +11545,10 @@ async fn cancelled_provisional_redis_acquire_rolls_back_local_and_tombstones_rem
     assert!(manager.entries.lock()[0].in_flight_leases.is_empty());
 
     clear_test_redis_latency_toxic().await;
-    let drained =
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
-            .await;
+    let drained = crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(5),
+    )
+    .await;
     assert!(drained.drained, "cancel cleanup should drain: {drained:?}");
     tokio::time::timeout(StdDuration::from_secs(2), async {
         loop {
@@ -11558,9 +11605,10 @@ async fn redis_commit_unknown_provisional_acquire_leaves_no_lease() {
     assert!(manager.entries.lock()[0].in_flight_leases.is_empty());
 
     clear_test_redis_latency_toxic().await;
-    let drained =
-        crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5))
-            .await;
+    let drained = crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(5),
+    )
+    .await;
     assert!(drained.drained, "timeout cleanup should drain: {drained:?}");
     tokio::time::timeout(StdDuration::from_secs(2), async {
         loop {

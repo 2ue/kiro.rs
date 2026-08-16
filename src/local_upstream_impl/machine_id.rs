@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 /// 兜底 machineId 缓存（按凭据 id 分桶，进程生命周期内稳定）

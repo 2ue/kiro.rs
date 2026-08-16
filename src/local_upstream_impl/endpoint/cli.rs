@@ -15,7 +15,7 @@ use super::{
     configured_upstream_url, contains_json_object_key,
     normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
 };
-use crate::kiro::protocol::{
+use crate::local_upstream_impl::protocol::{
     is_external_idp_credentials, resolve_profile_arn, resolve_streaming_profile_arn,
 };
 
@@ -321,7 +321,7 @@ fn rewrite_origin(json: &mut serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::http_client::allocation_probe;
-    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::model::credentials::KiroCredentials;
     use crate::model::config::Config;
     use std::time::Instant;
 

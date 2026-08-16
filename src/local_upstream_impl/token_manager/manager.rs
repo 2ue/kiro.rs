@@ -26,15 +26,15 @@ use crate::anthropic::inference_attempt_budget::{
 };
 use crate::common::capacity_signal::{CapacitySignal, CapacityWaiter};
 use crate::http_client::ProxyConfig;
-use crate::kiro::call_trace::{
+use crate::local_upstream_impl::call_trace::{
     AccountRejectReason, RejectedAccountSample, SelectionFailureStage, SelectionFailureSummary,
 };
-use crate::kiro::machine_id;
-use crate::kiro::model::available_models::{
+use crate::local_upstream_impl::machine_id;
+use crate::local_upstream_impl::model::available_models::{
     KiroModelCapabilityCohort, KiroModelCapabilityCohortKey,
 };
-use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
-use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::local_upstream_impl::model::credentials::{KiroCredentials, profile_arn_region};
+use crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
     Config, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
     MIN_TOKEN_REFRESH_MAX_RPM,

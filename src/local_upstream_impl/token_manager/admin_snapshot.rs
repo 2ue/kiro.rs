@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::ProxyConfig;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 use super::account_state::{CredentialEntry, ProxyResourceRuntime};

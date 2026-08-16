@@ -211,6 +211,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
 - Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Kiro-specific header name.
 - Admin, storage and Anthropic handler-test boundaries now import upstream-account storage/status/eligibility/manager aliases through `account_runtime` instead of direct legacy external-pool modules. Unused legacy Rust enable/test DTOs were removed after compatibility routes moved to account DTOs.
+- The legacy local upstream implementation directory moved from `src/kiro` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::kiro` module paths were removed, and the concrete request submodule moved from `model::requests::kiro` to `model::requests::upstream`.
 
 Last verified on 2026-08-16:
 
@@ -751,3 +752,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-runtime-boundary-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-boundary-tests1 -- bash -lc 'cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture && cargo test run_account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh account-runtime-boundary-tests2 -- bash -lc 'cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture && cargo test postgres_external_pool_list_and_get_preserve_body_modes -- --nocapture'`
+- `rg -n "crate::kiro|\\bmod kiro\\b|model::requests::kiro" src --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-impl-module-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-impl-module-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-impl-module-test1 -- cargo test no_available_credentials_error_uses_public_account_message -- --nocapture`

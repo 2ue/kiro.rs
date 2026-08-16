@@ -157,7 +157,10 @@ where
     let outcome = AssertUnwindSafe(body(postgres_stores, redis_stores))
         .catch_unwind()
         .await;
-    crate::kiro::token_manager::drain_best_effort_storage_tasks(StdDuration::from_secs(5)).await;
+    crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
+        StdDuration::from_secs(5),
+    )
+    .await;
     let cleanup = cleanup_redis
         .delete_pattern_bounded("*", None)
         .await
@@ -703,7 +706,7 @@ async fn token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_w
             tokio::time::sleep(StdDuration::from_millis(100)).await;
             leader.abort();
             let _ = leader.await;
-            let drain = crate::kiro::token_manager::drain_best_effort_storage_tasks(
+            let drain = crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
                 StdDuration::from_secs(10),
             )
             .await;

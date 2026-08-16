@@ -31,20 +31,20 @@ use crate::http_client::{
     response_bytes_with_limit_and_body_timeout, response_text_with_limit_and_body_timeout,
     send_with_response_header_timeout,
 };
-use crate::kiro::call_trace::{
+use crate::local_upstream_impl::call_trace::{
     KiroCallError, KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink,
     SelectionFailureSummary, summarize_attempts,
 };
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext, configured_upstream_url};
-use crate::kiro::machine_id;
-use crate::kiro::model::available_models::{
+use crate::local_upstream_impl::endpoint::{KiroEndpoint, RequestContext, configured_upstream_url};
+use crate::local_upstream_impl::machine_id;
+use crate::local_upstream_impl::model::available_models::{
     KiroAvailableModel, KiroAvailableModelCatalog, KiroAvailableModelsResponse,
 };
-use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::protocol::{
+use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::protocol::{
     extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
 };
-use crate::kiro::token_manager::{
+use crate::local_upstream_impl::token_manager::{
     AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind,
     AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason,
     EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind, InFlightLeaseGuard, LocalPoolRouteState,
@@ -1028,12 +1028,14 @@ mod tests {
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, InferenceAttemptBudget, InferenceAttemptKind,
     };
     use crate::http_client::ProxyConfig;
-    use crate::kiro::call_trace::{
+    use crate::local_upstream_impl::call_trace::{
         AccountRejectReason, KiroCallFailureKind, SelectionFailureStage,
     };
-    use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
-    use crate::kiro::model::credentials::KiroCredentials;
-    use crate::kiro::token_manager::{AcquireMode, AuxiliaryConcurrencyKind, MultiTokenManager};
+    use crate::local_upstream_impl::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
+    use crate::local_upstream_impl::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::token_manager::{
+        AcquireMode, AuxiliaryConcurrencyKind, MultiTokenManager,
+    };
     use crate::model::config::Config;
 
     #[derive(Clone, Default)]
@@ -2498,7 +2500,7 @@ mod tests {
         use crate::anthropic::types::{
             Message as AnthropicMessage, MessagesRequest, OutputConfig, Thinking,
         };
-        use crate::kiro::model::requests::kiro::KiroRequest;
+        use crate::local_upstream_impl::model::requests::upstream::KiroRequest;
 
         let server = FakeProviderBodyCaptureServer::start().await;
         let request = MessagesRequest {
@@ -3725,7 +3727,10 @@ mod tests {
         pool_size: usize,
         round: usize,
         prompt_logic_retry_enabled: bool,
-    ) -> (usize, Vec<crate::kiro::call_trace::KiroCredentialAttempt>) {
+    ) -> (
+        usize,
+        Vec<crate::local_upstream_impl::call_trace::KiroCredentialAttempt>,
+    ) {
         let hits_before = server.state.scenario_hits(scenario);
         let total_hits_before = server.state.total_hits.load(Ordering::Relaxed);
         let mut config = Config::default();
@@ -3881,7 +3886,10 @@ mod tests {
         preserve_external_attempt: bool,
         max_sends: Option<usize>,
         retry_body_builder: F,
-    ) -> anyhow::Result<(u64, Vec<crate::kiro::call_trace::KiroCredentialAttempt>)>
+    ) -> anyhow::Result<(
+        u64,
+        Vec<crate::local_upstream_impl::call_trace::KiroCredentialAttempt>,
+    )>
     where
         F: FnOnce() -> anyhow::Result<String> + Send,
     {
@@ -3944,7 +3952,7 @@ mod tests {
     struct ProviderFailureOutcome {
         marker: String,
         error_text: String,
-        attempts: Vec<crate::kiro::call_trace::KiroCredentialAttempt>,
+        attempts: Vec<crate::local_upstream_impl::call_trace::KiroCredentialAttempt>,
         consumed_sends: usize,
         scheduler_snapshot: String,
         cooldown_kinds: Vec<Option<String>>,
@@ -6234,11 +6242,11 @@ mod tests {
         assert_eq!(selection_failure.request_id, "mcp");
         assert_eq!(
             selection_failure.stage,
-            crate::kiro::call_trace::SelectionFailureStage::AccountEligibility
+            crate::local_upstream_impl::call_trace::SelectionFailureStage::AccountEligibility
         );
         assert_eq!(
             selection_failure.primary_reason,
-            crate::kiro::call_trace::AccountRejectReason::Disabled
+            crate::local_upstream_impl::call_trace::AccountRejectReason::Disabled
         );
     }
 
@@ -8633,7 +8641,8 @@ impl KiroProvider {
 
     pub(crate) fn model_capability_cohort_keys(
         &self,
-    ) -> Arc<Vec<crate::kiro::model::available_models::KiroModelCapabilityCohortKey>> {
+    ) -> Arc<Vec<crate::local_upstream_impl::model::available_models::KiroModelCapabilityCohortKey>>
+    {
         self.token_manager.local_model_capability_cohort_keys()
     }
 
