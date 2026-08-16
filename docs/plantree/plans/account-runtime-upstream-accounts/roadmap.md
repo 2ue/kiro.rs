@@ -6,7 +6,7 @@ Status: In Progress
 
 Authority: Tracks readiness and execution order for the current-repository target only
 
-As of: 2026-08-15
+As of: 2026-08-16
 
 Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md)
 
@@ -163,6 +163,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
 - Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
 - Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
+- Anthropic handler prompt-cache strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream naming instead of Kiro-scoped route/content variables.
 
 ## In Progress
 

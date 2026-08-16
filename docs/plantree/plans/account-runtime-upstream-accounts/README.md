@@ -6,7 +6,7 @@ Status: In Progress; implementation branch created
 
 Authority: Defines the target boundary for the current-repository refactor requested after `feature/usage-correction-cost-floor`
 
-As of: 2026-08-15
+As of: 2026-08-16
 
 Related: [Plan Tree](../../README.md), [current module map](../../baseline/module-map.md), [protocol contracts](../../baseline/protocol-and-api-contracts.md), [runtime flows](../../baseline/runtime-flows.md), [target architecture](topics/final-target-plan.md)
 
@@ -201,9 +201,13 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
 - Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
 - Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
+- Anthropic handler prompt-cache route strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream test naming instead of Kiro-scoped route/content variables.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro" src/anthropic/handlers/tests.rs`
+- `feature/tests/run-cargo-scoped.sh handler-fixture-neutral-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh handler-fixture-neutral-names-test1 -- bash -lc 'cargo test path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_stream -- --nocapture && cargo test claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage -- --nocapture && cargo test claude_code_tool_route_strategy_misses_first_then_reads_after_success -- --nocapture && cargo test claude_code_tool_route_strategy_commits_without_credential_id -- --nocapture && cargo test normalized_external_direct_policy_skips_raw_preparse_without_raw_pool -- --nocapture'`
 - `rg -n "kiro-|conversation-kiro-strategy" src/anthropic/prompt_cache.rs src/anthropic/handlers/tests.rs`
 - `feature/tests/run-cargo-scoped.sh prompt-cache-fixture-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh prompt-cache-fixture-names-test1 -- bash -lc 'cargo test claude_code_tool_first_miss_then_success_commit_hits -- --nocapture && cargo test claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage -- --nocapture'`

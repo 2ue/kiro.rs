@@ -1555,7 +1555,7 @@ fn native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds()
 }
 
 async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_pool() {
-    let kiro_upstream = WebSearchHandlerUpstream::start().await;
+    let local_auxiliary_upstream = WebSearchHandlerUpstream::start().await;
     let external_upstream = ExternalMessagesUpstream::start().await;
     let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
         &external_upstream.base_url,
@@ -1566,7 +1566,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         return;
     };
     let (router, usage_recorder) = websearch_handler_test_router_with_external_options(
-        &kiro_upstream.base_url,
+        &local_auxiliary_upstream.base_url,
         external_pool_manager,
         Vec::new(),
         false,
@@ -1647,7 +1647,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         assert_eq!(outbound["model"], "claude-opus-4.6");
     }
     assert_eq!(
-        kiro_upstream.state.normal_hits(),
+        local_auxiliary_upstream.state.normal_hits(),
         0,
         "direct account policy must not call local upstream for stream or non-stream"
     );
@@ -4803,7 +4803,7 @@ fn count_tool_use_blocks_counts_assistant_tool_uses_without_text_hashing() {
     let content = json!([
         {"type": "text", "text": "I will call a tool."},
         {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "README.md"}},
-        {"type": "tool_use", "id": "toolu_2", "name": "Grep", "input": {"pattern": "kiro"}}
+        {"type": "tool_use", "id": "toolu_2", "name": "Grep", "input": {"pattern": "account-runtime"}}
     ]);
 
     assert_eq!(count_tool_use_blocks(&content), 2);
@@ -6706,7 +6706,7 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
     let usage_recorder = Arc::new(UsageRecorder::new(10));
     let mut cache_policy = CachePolicyConfig::default();
     cache_policy.path_overrides.insert(
-        "/kiro/v1/messages".to_string(),
+        "/cc/v1/messages".to_string(),
         CacheRoutePolicyPatch {
             cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
             reported_usage: Some(ReportedUsagePathPolicy {
@@ -6730,7 +6730,7 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
     .with_cache_policy(cache_policy);
 
     let route =
-        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
+        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/cc/v1/messages");
     assert_eq!(
         route.policy.cache_type,
         PromptCacheStrategyType::ClaudeCodeTool
@@ -7308,9 +7308,9 @@ fn claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_report
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
-        request_id: "req_kiro_strategy_reported_usage".to_string(),
-        error_id: "req_01kiro_strategy_reported_usage".to_string(),
-        endpoint: "/kiro/v1/messages".to_string(),
+        request_id: "req_claude_code_tool_strategy_reported_usage".to_string(),
+        error_id: "req_01claude_code_tool_strategy_reported_usage".to_string(),
+        endpoint: "/cc/v1/messages".to_string(),
         stream: false,
         model: "claude-sonnet-4-6".to_string(),
         upstream_model: None,
@@ -7327,7 +7327,7 @@ fn claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_report
         context_window_tokens: 200_000,
         prompt_cache_profile: None,
         claude_code_tool_prompt_cache_plan: None,
-        prompt_cache_route_namespace: Some("/kiro".to_string()),
+        prompt_cache_route_namespace: Some("/cc".to_string()),
         prompt_cache_strategy_type: PromptCacheStrategyType::ClaudeCodeTool,
         simulation_mode: PromptCacheSimulationMode::Disabled,
         prompt_cache_target_read_ratio: 0.5,
@@ -9022,7 +9022,7 @@ fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
     let usage_recorder = Arc::new(UsageRecorder::new(10));
     let mut cache_policy = CachePolicyConfig::default();
     cache_policy.path_overrides.insert(
-        "/kiro/v1/messages".to_string(),
+        "/cc/v1/messages".to_string(),
         CacheRoutePolicyPatch {
             cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
             ..CacheRoutePolicyPatch::default()
@@ -9046,11 +9046,11 @@ fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
         max_tokens: 16,
         messages: vec![Message {
             role: "user".to_string(),
-            content: json!("start kiro strategy session"),
+            content: json!("start claude code tool strategy session"),
         }],
         stream: false,
         system: Some(vec![SystemMessage {
-            text: "stable kiro strategy system prompt ".repeat(700),
+            text: "stable claude code tool strategy system prompt ".repeat(700),
             cache_control: Some(json!({"type": "ephemeral"})),
         }]),
         tools: None,
@@ -9062,7 +9062,7 @@ fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
         }),
     };
     let cache_route =
-        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
+        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/cc/v1/messages");
     assert_eq!(
         cache_route.policy.cache_type,
         PromptCacheStrategyType::ClaudeCodeTool
@@ -9070,7 +9070,7 @@ fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
     let first_context = prepare_usage_context(
         &state,
         cache_route,
-        "/kiro/v1/messages",
+        "/cc/v1/messages",
         false,
         &first_payload,
         None,
@@ -9094,7 +9094,7 @@ fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
     assert!(first_context.claude_code_tool_prompt_cache_plan.is_some());
     let first_simulation = first_context
         .simulated_usage
-        .expect("first kiro request should project cache creation");
+        .expect("first Claude Code Tool request should project cache creation");
     assert!(first_simulation.cache_creation_input_tokens > 0);
     assert_eq!(first_simulation.cache_read_input_tokens, 0);
     let first_usage = first_context.attach_credential(Some(1), None, false, false, Vec::new());
@@ -9119,13 +9119,13 @@ fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
         },
         Message {
             role: "user".to_string(),
-            content: json!("continue the same kiro strategy session"),
+            content: json!("continue the same claude code tool strategy session"),
         },
     ]);
     let second_context = prepare_usage_context(
         &state,
-        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages"),
-        "/kiro/v1/messages",
+        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/cc/v1/messages"),
+        "/cc/v1/messages",
         false,
         &first_payload,
         None,
@@ -9140,7 +9140,7 @@ fn claude_code_tool_route_strategy_misses_first_then_reads_after_success() {
     assert!(second_context.claude_code_tool_prompt_cache_plan.is_some());
     let second_simulation = second_context
         .simulated_usage
-        .expect("second kiro request should project a cache read");
+        .expect("second Claude Code Tool request should project a cache read");
     assert!(second_simulation.cache_read_input_tokens > 0);
     let second_usage =
         cache::build_usage_with_simulation_policy(None, 8192, 1, Some(second_simulation), true);
@@ -9161,7 +9161,7 @@ fn claude_code_tool_route_strategy_commits_without_credential_id() {
     let usage_recorder = Arc::new(UsageRecorder::new(10));
     let mut cache_policy = CachePolicyConfig::default();
     cache_policy.path_overrides.insert(
-        "/kiro/v1/messages".to_string(),
+        "/cc/v1/messages".to_string(),
         CacheRoutePolicyPatch {
             cache_type: Some(PromptCacheStrategyType::ClaudeCodeTool),
             ..CacheRoutePolicyPatch::default()
@@ -9185,11 +9185,11 @@ fn claude_code_tool_route_strategy_commits_without_credential_id() {
         max_tokens: 16,
         messages: vec![Message {
             role: "user".to_string(),
-            content: json!("start kiro no credential session"),
+            content: json!("start upstream no credential session"),
         }],
         stream: false,
         system: Some(vec![SystemMessage {
-            text: "stable kiro no credential system prompt ".repeat(700),
+            text: "stable upstream no credential system prompt ".repeat(700),
             cache_control: Some(json!({"type": "ephemeral"})),
         }]),
         tools: None,
@@ -9203,8 +9203,8 @@ fn claude_code_tool_route_strategy_commits_without_credential_id() {
 
     let first_context = prepare_usage_context(
         &state,
-        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages"),
-        "/kiro/v1/messages",
+        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/cc/v1/messages"),
+        "/cc/v1/messages",
         false,
         &payload,
         None,
@@ -9240,8 +9240,8 @@ fn claude_code_tool_route_strategy_commits_without_credential_id() {
     ]);
     let second_context = prepare_usage_context(
         &state,
-        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages"),
-        "/kiro/v1/messages",
+        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/cc/v1/messages"),
+        "/cc/v1/messages",
         false,
         &payload,
         None,
@@ -9255,7 +9255,7 @@ fn claude_code_tool_route_strategy_commits_without_credential_id() {
     );
     let second_simulation = second_context
         .simulated_usage
-        .expect("second kiro request should read cache without credential id");
+        .expect("second Claude Code Tool request should read cache without credential id");
     assert!(second_simulation.cache_read_input_tokens > 0);
     let second_usage =
         cache::build_usage_with_simulation_policy(None, 8192, 1, Some(second_simulation), true);
