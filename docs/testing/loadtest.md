@@ -1,6 +1,6 @@
-# Kiro Loadtest 使用说明
+# Account Runtime Loadtest 使用说明
 
-`kiro_loadtest` 是独立压测和异常复现工具，不会随主服务启动。它用于验证本地代理、fake Kiro server、streaming、thinking、tool-use、高缓存路由、错误归一化、延迟和资源占用。
+`kiro_loadtest` 仍是当前 Cargo 兼容二进制名；工具本身面向 account runtime / upstream account 压测和异常复现，不会随主服务启动。它用于验证本地代理、fake upstream server、streaming、thinking、tool-use、高缓存路由、错误归一化、延迟和资源占用。
 
 ## 编译环境注意
 
@@ -13,8 +13,8 @@ error: unknown command '.../symbols.o'
 使用系统编译器，并通过 scoped runner 构建仓库外冻结二进制。不要使用 `cargo run`：它会把运行和构建生命周期重新绑定到 Cargo target。
 
 ```bash
-candidate_root="$(mktemp -d "${TMPDIR:-/tmp}/kiro-loadtest-bin.XXXXXX")"
-artifact_root="$(mktemp -d "${TMPDIR:-/tmp}/kiro-loadtest-artifacts.XXXXXX")"
+candidate_root="$(mktemp -d "${TMPDIR:-/tmp}/account-runtime-loadtest-bin.XXXXXX")"
+artifact_root="$(mktemp -d "${TMPDIR:-/tmp}/account-runtime-loadtest-artifacts.XXXXXX")"
 cleanup_loadtest() {
   rc=$?
   trap - EXIT INT TERM HUP
@@ -24,14 +24,16 @@ cleanup_loadtest() {
 trap cleanup_loadtest EXIT INT TERM HUP
 mkdir -p "$artifact_root/reports"
 
-KIRO_FROZEN_LOADTEST="$candidate_root/kiro_loadtest" \
+ACCOUNT_RUNTIME_FROZEN_LOADTEST="$candidate_root/kiro_loadtest" \
 CC=/usr/bin/cc \
 CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
   feature/tests/run-cargo-scoped.sh loadtest-binary -- \
-  bash -lc 'cargo +1.92.0 build --release --bin kiro_loadtest && install -m 755 "$CARGO_TARGET_DIR/release/kiro_loadtest" "$KIRO_FROZEN_LOADTEST"'
-export KIRO_LOADTEST_BINARY="$candidate_root/kiro_loadtest"
-export KIRO_VALIDATION_ARTIFACT_DIR="$artifact_root"
-shasum -a 256 "$KIRO_LOADTEST_BINARY"
+  bash -lc 'cargo +1.92.0 build --release --bin kiro_loadtest && install -m 755 "$CARGO_TARGET_DIR/release/kiro_loadtest" "$ACCOUNT_RUNTIME_FROZEN_LOADTEST"'
+export ACCOUNT_RUNTIME_LOADTEST_BINARY="$candidate_root/kiro_loadtest"
+export KIRO_LOADTEST_BINARY="$ACCOUNT_RUNTIME_LOADTEST_BINARY"
+export ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR="$artifact_root"
+export KIRO_VALIDATION_ARTIFACT_DIR="$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR"
+shasum -a 256 "$ACCOUNT_RUNTIME_LOADTEST_BINARY"
 ```
 
 ## 基础 smoke test
@@ -39,14 +41,14 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 启动内置 fake server，并直接对 fake server 发 5 个流式请求：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --base-url http://127.0.0.1:19080 \
   --route /v1/messages \
   --requests 5 \
   --concurrency 2 \
   --scenario normal-stream \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/smoke.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/smoke.json"
 ```
 
 ## 测本地代理
@@ -54,7 +56,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 只使用隔离测试代理，例如 `19022`。`9022` 是受保护的现有服务端口，验证脚本和本说明均禁止将负载发送到该端口。
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
@@ -62,13 +64,13 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --concurrency 10 \
   --scenario normal-stream \
   --auth-key admin123 \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/local-cc.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/local-cc.json"
 ```
 
 ## thinking 测试
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
@@ -77,7 +79,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --scenario normal-stream \
   --thinking true \
   --auth-key admin123 \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/thinking.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/thinking.json"
 ```
 
 验收重点：
@@ -89,7 +91,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 ## tool-use 测试
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
@@ -98,7 +100,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --scenario normal-stream \
   --tool-use true \
   --auth-key admin123 \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/tool-use.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/tool-use.json"
 ```
 
 ## `/dfcache/*` 测试
@@ -106,27 +108,27 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 已配置路由：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --dfcache-route /dfcache/cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
   --scenario normal-stream \
   --auth-key admin123 \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/dfcache-configured.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/dfcache-configured.json"
 ```
 
 未配置路由应返回错误，并且报告中应出现非 2xx 状态：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --dfcache-route /dfcache/not-configured/v1/messages \
   --requests 5 \
   --concurrency 1 \
   --scenario normal-stream \
   --auth-key admin123 \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/dfcache-missing.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/dfcache-missing.json"
 ```
 
 ## 异常场景 fake server
@@ -134,7 +136,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 只启动 fake server：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario slow-thinking-then-text
@@ -165,7 +167,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 `mixed-chaos` 用于极端组合：同一轮请求中混合 429、500、3/10/22 秒分层慢首字、长流式占用、随机慢首字和正常响应，适合验证错误冷却、恢复、连接释放、资源回落和高并发下的排队行为。
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario long-stream \
@@ -177,7 +179,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 随机慢首字：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario random-slow-first-byte \
@@ -187,7 +189,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 密集慢首字：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario dense-slow-first-byte \
@@ -197,7 +199,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 分层慢首字，固定覆盖 3 秒、10 秒、22 秒：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario tiered-slow-first-byte
@@ -206,7 +208,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 混合异常：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
   --scenario mixed-chaos \
@@ -232,7 +234,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 长文本 history：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -243,13 +245,13 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --long-context-chars 600000 \
   --long-context-messages 30 \
   --target-pid <proxy-pid> \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-text-history.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/payload-text-history.json"
 ```
 
 大 tool_result，并叠加高首字延迟：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -262,13 +264,13 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --tool-result-chars 200000 \
   --tool-result-count 6 \
   --target-pid <proxy-pid> \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-large-tool-results-slow-ttfb.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/payload-large-tool-results-slow-ttfb.json"
 ```
 
 深层 tool input：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -278,13 +280,13 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --payload-case deep-tool-input \
   --tool-input-depth 80 \
   --target-pid <proxy-pid> \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-deep-tool-input.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/payload-deep-tool-input.json"
 ```
 
 多工具 schema：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -296,13 +298,13 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --tool-input-depth 10 \
   --cache-control true \
   --target-pid <proxy-pid> \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-many-tools.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/payload-many-tools.json"
 ```
 
 混合最坏形状，并叠加长流式占用：
 
 ```bash
-"$KIRO_LOADTEST_BINARY" \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --auth-key admin123 \
@@ -324,7 +326,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --tool-input-depth 64 \
   --tool-count 120 \
   --target-pid <proxy-pid> \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/payload-mixed-long-stream.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/payload-mixed-long-stream.json"
 ```
 
 报告的 `requestProfile` 会记录实际生效的请求形状参数。对比 payload guard 开/关时，优先看 `cpuPercent.peak/end`、`memory.peak/end`、`fileDescriptors.peak/end`、`ttfbMs.p95/p99` 和 `totalLatencyMs.p95/p99`。
@@ -334,15 +336,15 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 如果要明确进行真实上游压测，必须同时加参数和环境变量：
 
 ```bash
-KIRO_LOADTEST_ALLOW_REAL_UPSTREAM=1 \
-"$KIRO_LOADTEST_BINARY" \
+ACCOUNT_RUNTIME_LOADTEST_ALLOW_REAL_UPSTREAM=1 \
+"$ACCOUNT_RUNTIME_LOADTEST_BINARY" \
   --real-upstream true \
   --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
   --auth-key admin123 \
-  --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/real-upstream.json"
+  --report "$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/reports/real-upstream.json"
 ```
 
 不要在没有明确目的时增加并发。真实上游测试优先从低并发开始。

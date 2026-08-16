@@ -4,10 +4,13 @@ import http from "node:http";
 import { URL } from "node:url";
 import { createHash } from "node:crypto";
 
-const DEFAULT_PORT = Number.parseInt(process.env.PORT || process.env.KIRO_MOCK_PORT || "39090", 10);
+const DEFAULT_PORT = Number.parseInt(
+  process.env.PORT || process.env.ACCOUNT_RUNTIME_MOCK_PORT || process.env.KIRO_MOCK_PORT || "39090",
+  10
+);
 const DEFAULT_HOST = process.env.HOST || "127.0.0.1";
-const DEFAULT_SCENARIO = process.env.KIRO_MOCK_SCENARIO || "success";
-const LOG_REQUESTS = process.env.KIRO_MOCK_LOG_REQUESTS === "1";
+const DEFAULT_SCENARIO = process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || process.env.KIRO_MOCK_SCENARIO || "success";
+const LOG_REQUESTS = process.env.ACCOUNT_RUNTIME_MOCK_LOG_REQUESTS === "1" || process.env.KIRO_MOCK_LOG_REQUESTS === "1";
 
 const models = [
   { id: "sonnet", displayName: "Sonnet", maxInputTokens: 200000 },
@@ -20,7 +23,7 @@ function nowIso() {
 }
 
 function pickScenario(url) {
-  return url.searchParams.get("scenario") || process.env.KIRO_MOCK_SCENARIO || DEFAULT_SCENARIO;
+  return url.searchParams.get("scenario") || process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || process.env.KIRO_MOCK_SCENARIO || DEFAULT_SCENARIO;
 }
 
 function json(res, status, body, headers = {}) {
@@ -135,7 +138,7 @@ function longAssistantText(body) {
   const pieces = [
     "Mock assistant response.",
     `Scenario seed: ${seed}.`,
-    "This payload comes from the local Kiro upstream mock.",
+    "This payload comes from the local upstream mock.",
   ];
   return pieces.join(" ");
 }
@@ -188,7 +191,7 @@ function toolFlowEvent(scenario) {
         toolUseId: "toolu_mock_task_1",
         input: JSON.stringify({
           description: "Inspect token manager hot path",
-          prompt: "Search src/kiro/token_manager.rs for pending_stats_deltas and summarize what it does. Do not modify files.",
+          prompt: "Search the local upstream token manager implementation for pending_stats_deltas and summarize what it does. Do not modify files.",
           subagent_type: "Explore",
         }),
         stop: true,
@@ -201,8 +204,8 @@ function toolFlowEvent(scenario) {
       name: "Bash",
       toolUseId: "toolu_mock_bash_1",
       input: JSON.stringify({
-        command: "rg -n \"pending_stats_deltas|kiro_upstream_base_url|profileArn\" src/kiro src/model/config.rs | head -40",
-        description: "Search Kiro protocol and scheduler hot paths",
+        command: "rg -n \"pending_stats_deltas|local_upstream_base_url|profileArn\" src/kiro src/model/config.rs | head -40",
+        description: "Search local upstream protocol and scheduler hot paths",
       }),
       stop: true,
     }
@@ -344,7 +347,7 @@ const server = http.createServer(async (req, res) => {
   const scenario = pickScenario(url);
 
   res.setHeader("x-mock-scenario", scenario);
-  res.setHeader("x-mock-upstream", "kiro-loadtest");
+  res.setHeader("x-mock-upstream", "account-runtime-loadtest");
 
   try {
     if (req.method === "GET" && url.pathname === "/ListAvailableModels") {
@@ -401,6 +404,6 @@ server.on("clientError", (error, socket) => {
 });
 
 server.listen(DEFAULT_PORT, DEFAULT_HOST, () => {
-  console.log(`kiro mock upstream listening on http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
+  console.log(`account runtime mock upstream listening on http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
   console.log(`default scenario: ${DEFAULT_SCENARIO}`);
 });

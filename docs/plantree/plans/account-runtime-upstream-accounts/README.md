@@ -193,9 +193,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving the generic tier parsing behavior.
 - The load/chaos helper now presents account-runtime/upstream wording for its command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and test names. New flags use `--fake-upstream-usage` and `--fake-local-upstream-eventstream`; old Kiro-named flags, env and error-header inputs remain only as compatibility aliases/fallbacks.
 - Anthropic handler and external-pool test helpers now construct local upstream credentials, endpoints, managers, provider fixtures and EventStream CRC frames through the `local_upstream` facade instead of importing legacy local-provider modules directly.
+- Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording. New mock/doc variables use `ACCOUNT_RUNTIME_*` names while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
 
 Last verified on 2026-08-16:
 
+- `rg -n "Kiro|kiro|KIRO" docs/testing/loadtest.md scripts/loadtest/kiro-mock-upstream.mjs admin-ui/index.html`
+- `node --check scripts/loadtest/kiro-mock-upstream.mjs`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "crate::kiro|kiro::|KiroCredentials|KiroProvider|MultiTokenManager|KiroEndpoint|IdeEndpoint|AcquireMode" src/anthropic/handlers/tests.rs src/external_pool/tests.rs`
 - `feature/tests/run-cargo-scoped.sh facade-test-imports-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh facade-test-imports-check1 -- cargo check`
