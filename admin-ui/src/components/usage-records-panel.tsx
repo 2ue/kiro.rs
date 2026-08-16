@@ -64,8 +64,8 @@ function billingDeltaTone(delta: number): BillingDeltaTone {
 }
 
 function billingDeltaTextClass(tone: BillingDeltaTone): string {
-  if (tone === 'loss') return 'text-kiro-error'
-  if (tone === 'profit') return 'text-kiro-warning'
+  if (tone === 'loss') return 'text-runtime-error'
+  if (tone === 'profit') return 'text-runtime-warning'
   return 'text-muted-foreground'
 }
 
@@ -660,7 +660,7 @@ function UsageMetric({
 }) {
   const toneClass =
     tone === 'success'
-      ? 'text-kiro-success'
+      ? 'text-runtime-success'
       : tone === 'info'
         ? 'text-primary'
         : tone === 'warning'
@@ -965,7 +965,7 @@ export function UsageRecordsPanel() {
             <CardTitle className="text-sm font-medium text-muted-foreground">高缓存请求</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold text-kiro-success">{formatNumber(summaryData?.highCacheRequests || 0)}</div>
+            <div className="text-2xl font-bold text-runtime-success">{formatNumber(summaryData?.highCacheRequests || 0)}</div>
           </CardContent>
         </Card>
         <Card>
@@ -1916,7 +1916,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             </Button>
           </div>
 
-          <div className="rounded-md border border-kiro-warning-soft bg-kiro-warning-soft p-3 text-kiro-warning">
+          <div className="rounded-md border border-runtime-warning-soft bg-runtime-warning-soft p-3 text-runtime-warning">
             这是手动任务，不会定时执行。系统会自动分批清理；每次执行最多 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批，达到上限后暂停并等待管理员显式恢复。软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删的记录。
           </div>
 

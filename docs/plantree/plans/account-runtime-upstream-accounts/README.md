@@ -202,9 +202,12 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
 - Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
 - Anthropic handler prompt-cache route strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream test naming instead of Kiro-scoped route/content variables.
+- Admin UI internal status color utility classes now use `runtime` prefixes instead of Kiro-branded class names while preserving the existing color values and component behavior.
 
 Last verified on 2026-08-16:
 
+- `rg -n "(text|bg|border)-kiro|kiro-(success|warning|error|info)" admin-ui ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "kiro" src/anthropic/handlers/tests.rs`
 - `feature/tests/run-cargo-scoped.sh handler-fixture-neutral-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh handler-fixture-neutral-names-test1 -- bash -lc 'cargo test path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_stream -- --nocapture && cargo test claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage -- --nocapture && cargo test claude_code_tool_route_strategy_misses_first_then_reads_after_success -- --nocapture && cargo test claude_code_tool_route_strategy_commits_without_credential_id -- --nocapture && cargo test normalized_external_direct_policy_skips_raw_preparse_without_raw_pool -- --nocapture'`

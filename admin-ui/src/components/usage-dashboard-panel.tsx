@@ -116,24 +116,24 @@ function billingDeltaTone(delta: number): BillingDeltaTone {
 }
 
 function billingDeltaTextClass(tone: BillingDeltaTone): string {
-  if (tone === 'loss') return 'text-kiro-error'
-  if (tone === 'profit') return 'text-kiro-warning'
+  if (tone === 'loss') return 'text-runtime-error'
+  if (tone === 'profit') return 'text-runtime-warning'
   return 'text-muted-foreground'
 }
 
 function toneText(tone: DashboardTone): string {
-  if (tone === 'success') return 'text-kiro-success'
-  if (tone === 'warning') return 'text-kiro-warning'
-  if (tone === 'error') return 'text-kiro-error'
-  if (tone === 'info') return 'text-kiro-info'
+  if (tone === 'success') return 'text-runtime-success'
+  if (tone === 'warning') return 'text-runtime-warning'
+  if (tone === 'error') return 'text-runtime-error'
+  if (tone === 'info') return 'text-runtime-info'
   return 'text-foreground'
 }
 
 function toneBar(tone: DashboardTone): string {
-  if (tone === 'success') return 'bg-kiro-success'
-  if (tone === 'warning') return 'bg-kiro-warning'
-  if (tone === 'error') return 'bg-kiro-error'
-  if (tone === 'info') return 'bg-kiro-info'
+  if (tone === 'success') return 'bg-runtime-success'
+  if (tone === 'warning') return 'bg-runtime-warning'
+  if (tone === 'error') return 'bg-runtime-error'
+  if (tone === 'info') return 'bg-runtime-info'
   return 'bg-primary'
 }
 
@@ -294,7 +294,7 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
                     style={{ height }}
                     title={`${point.label}: ${formatNumber(point.requests)} 请求 / ${formatNumber(point.errorRequests)} 错误 / 估算 ${formatUsd(point.totalEstimatedCostUsd)} / 原始 ${formatUsd(point.totalOriginalCostUsd)} / 上游计量 ${formatNumber(totalUpstreamMetering(point))}`}
                   >
-                    {errorHeight > 0 && <div className="absolute inset-x-0 bottom-0 bg-kiro-error" style={{ height: errorHeight }} />}
+                    {errorHeight > 0 && <div className="absolute inset-x-0 bottom-0 bg-runtime-error" style={{ height: errorHeight }} />}
                   </div>
                   <span className="w-full truncate text-center text-[10px] text-muted-foreground">{point.label}</span>
                 </div>
@@ -384,16 +384,16 @@ function ErrorFocusPanel({
     >
       <div className="space-y-3">
         {visibleItems.length === 0 ? (
-          <div className="flex items-center gap-2 rounded-md border border-kiro-success-soft bg-kiro-success-soft p-3 text-sm text-kiro-success">
+          <div className="flex items-center gap-2 rounded-md border border-runtime-success-soft bg-runtime-success-soft p-3 text-sm text-runtime-success">
             <CheckCircle2 className="h-4 w-4 shrink-0" />
             当前窗口没有错误聚合。
           </div>
         ) : (
           visibleItems.map((item, index) => (
-            <div key={`${item.key}-${index}`} className="rounded-md border border-kiro-error-soft bg-kiro-error-soft p-3">
+            <div key={`${item.key}-${index}`} className="rounded-md border border-runtime-error-soft bg-runtime-error-soft p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-kiro-error" title={item.label || item.key}>
+                  <div className="truncate text-sm font-semibold text-runtime-error" title={item.label || item.key}>
                     {item.label || item.key}
                   </div>
                   {item.label && <div className="truncate font-mono text-[11px] text-muted-foreground">{item.key}</div>}
@@ -749,7 +749,7 @@ export function UsageDashboardPanel() {
 
       {partialErrors.length > 0 && (
         <Card>
-          <CardContent className="p-3 text-xs text-kiro-warning">
+          <CardContent className="p-3 text-xs text-runtime-warning">
             部分数据加载失败：{partialErrors.join('；')}
           </CardContent>
         </Card>
@@ -803,14 +803,14 @@ export function UsageDashboardPanel() {
           <span>{autoRefresh.enabled ? `页面数据每 ${autoRefresh.intervalSeconds} 秒自动刷新。` : '自动刷新已关闭。'}</span>
           {summary.errorRequests > 0 && (
             <>
-              <AlertTriangle className="h-4 w-4 text-kiro-error" />
-              <span className="text-kiro-error">当前窗口存在错误请求，优先查看异常摘要和用量详情。</span>
+              <AlertTriangle className="h-4 w-4 text-runtime-error" />
+              <span className="text-runtime-error">当前窗口存在错误请求，优先查看异常摘要和用量详情。</span>
             </>
           )}
           {summary.fallbackFromStickyRequests > 0 && (
             <>
-              <Zap className="h-4 w-4 text-kiro-warning" />
-              <span className="text-kiro-warning">检测到 Sticky 回退，说明粘度命中的账号不可用或并发不可用。</span>
+              <Zap className="h-4 w-4 text-runtime-warning" />
+              <span className="text-runtime-warning">检测到 Sticky 回退，说明粘度命中的账号不可用或并发不可用。</span>
             </>
           )}
         </div>

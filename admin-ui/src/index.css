@@ -78,67 +78,67 @@
 }
 
 @layer utilities {
-  .text-kiro-success {
+  .text-runtime-success {
     color: hsl(var(--success));
   }
 
-  .text-kiro-warning {
+  .text-runtime-warning {
     color: hsl(var(--warning));
   }
 
-  .text-kiro-error {
+  .text-runtime-error {
     color: hsl(var(--destructive));
   }
 
-  .text-kiro-info {
+  .text-runtime-info {
     color: hsl(var(--info));
   }
 
-  .bg-kiro-success {
+  .bg-runtime-success {
     background-color: hsl(var(--success));
   }
 
-  .bg-kiro-warning {
+  .bg-runtime-warning {
     background-color: hsl(var(--warning));
   }
 
-  .bg-kiro-error {
+  .bg-runtime-error {
     background-color: hsl(var(--destructive));
   }
 
-  .bg-kiro-info {
+  .bg-runtime-info {
     background-color: hsl(var(--info));
   }
 
-  .bg-kiro-success-soft {
+  .bg-runtime-success-soft {
     background-color: hsl(var(--success-soft) / 0.72);
   }
 
-  .bg-kiro-warning-soft {
+  .bg-runtime-warning-soft {
     background-color: hsl(var(--warning-soft) / 0.72);
   }
 
-  .bg-kiro-error-soft {
+  .bg-runtime-error-soft {
     background-color: hsl(var(--destructive) / 0.08);
   }
 
-  .bg-kiro-info-soft {
+  .bg-runtime-info-soft {
     background-color: hsl(var(--info-soft) / 0.72);
   }
 
-  .border-kiro-success-soft {
+  .border-runtime-success-soft {
     border-color: hsl(var(--success) / 0.28);
   }
 
-  .border-kiro-warning-soft {
+  .border-runtime-warning-soft {
     border-color: hsl(var(--warning) / 0.34);
   }
 
-  .border-kiro-error-soft {
+  .border-runtime-error-soft {
     border-color: hsl(var(--destructive) / 0.24);
   }
 
-  .border-kiro-info-soft {
+  .border-runtime-info-soft {
     border-color: hsl(var(--info) / 0.3);
   }
 }
