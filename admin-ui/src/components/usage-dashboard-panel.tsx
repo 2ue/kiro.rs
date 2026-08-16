@@ -40,7 +40,7 @@ import type {
 } from '@/types/api'
 
 const DASHBOARD_TIMEZONE = 'Asia/Shanghai'
-const DASHBOARD_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:dashboard'
+const DASHBOARD_AUTO_REFRESH_KEY = 'account-runtime-admin:auto-refresh:dashboard'
 
 type DashboardTone = 'default' | 'success' | 'warning' | 'error' | 'info'
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'

@@ -30,7 +30,7 @@ import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
 import type { AccountAttempt, ExternalPoolAttempt, ExternalPoolUsageSnapshot, InferenceAttemptSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 import { RequestApiKeyIdDisplay } from '@/components/request-api-key-id'
 
-const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
+const USAGE_AUTO_REFRESH_KEY = 'account-runtime-admin:auto-refresh:usage'
 const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
 const EXPORT_LIMIT = 10_000
 const SLOW_FIRST_TOKEN_MS = 10_000

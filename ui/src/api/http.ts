@@ -22,7 +22,7 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (isAdminAuthFailure(error?.response?.status) && typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('kiro-admin-auth-failed'))
+      window.dispatchEvent(new CustomEvent('account-runtime-admin-auth-failed'))
     }
     return Promise.reject(error)
   }

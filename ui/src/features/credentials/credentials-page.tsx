@@ -846,7 +846,7 @@ export function CredentialsPage() {
               <Input
                 value={endpointQuery}
                 onChange={(e) => setEndpointQuery(e.target.value)}
-                placeholder="ide / kiro"
+                placeholder="ide / cli"
                 className="h-8 text-xs"
               />
             </CredentialFilterField>

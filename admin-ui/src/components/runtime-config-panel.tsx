@@ -925,7 +925,7 @@ function AccessKeysPanel() {
     try {
       const response = await updateAdminApiKey({ adminApiKey })
       storage.setApiKey(response.adminApiKey)
-      window.dispatchEvent(new CustomEvent('kiro-admin-key-updated'))
+      window.dispatchEvent(new CustomEvent('account-runtime-admin-key-updated'))
       setKeysAndResetDrafts(response)
       setNextAdminApiKey('')
       toast.success('登录 Key 已更新，后续后台请求会使用新 Key')

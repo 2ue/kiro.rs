@@ -64,8 +64,8 @@ function App() {
       setIsLoggedIn(false)
     }
 
-    window.addEventListener('kiro-admin-auth-failed', handleAuthFailed)
-    return () => window.removeEventListener('kiro-admin-auth-failed', handleAuthFailed)
+    window.addEventListener('account-runtime-admin-auth-failed', handleAuthFailed)
+    return () => window.removeEventListener('account-runtime-admin-auth-failed', handleAuthFailed)
   }, [queryClient])
 
   return (

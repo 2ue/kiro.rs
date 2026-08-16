@@ -87,7 +87,7 @@ import { RequestApiKeyIdDisplay } from './request-api-key-id'
 
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
-const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
+const AUTO_REFRESH_KEY = 'account-runtime-admin:auto-refresh:usage'
 const PAGE_SIZE = 20
 const EXPORT_LIMIT = 10_000
 const ROUTE_OPTION_LIMIT = 50
@@ -723,7 +723,7 @@ function RecordsView({
       }
       const csv = usageRecordsToCsv(result.records)
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-      downloadTextFile(csv, `kiro-usage-records-${stamp}.csv`, 'text/csv;charset=utf-8')
+      downloadTextFile(csv, `account-runtime-usage-records-${stamp}.csv`, 'text/csv;charset=utf-8')
       const suffix = result.total > result.records.length
         ? `（最多导出 ${result.records.length}/${result.total} 条）`
         : ''

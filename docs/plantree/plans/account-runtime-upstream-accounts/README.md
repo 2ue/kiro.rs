@@ -197,9 +197,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The maintained UI HTML document title now uses Account Runtime Console wording; the Admin HTML title already uses Account Runtime Admin.
 - Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Kiro-named semantic test names while preserving the existing compatibility fields.
 - The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Kiro-named path remains only as a compatibility wrapper that imports the new entrypoint.
+- Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Kiro-branded names.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro-admin-auth-failed|kiro-admin-key-updated|kiro-console:theme|kiro-admin:auto-refresh|kiro-usage-records|placeholder=\"ide / kiro\"" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `git diff --check`
 - `rg -n "kiro-mock-upstream|account-runtime-mock-upstream" . --glob '!target/**' --glob '!**/node_modules/**'`
 - `node --check scripts/loadtest/account-runtime-mock-upstream.mjs`
 - `node --check scripts/loadtest/kiro-mock-upstream.mjs`

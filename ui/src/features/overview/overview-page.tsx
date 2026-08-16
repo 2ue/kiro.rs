@@ -73,7 +73,7 @@ import {
 // ─── 常量 ─────────────────────────────────────────────────────────────────────
 
 const OVERVIEW_TIMEZONE = 'Asia/Shanghai'
-const OVERVIEW_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:overview'
+const OVERVIEW_AUTO_REFRESH_KEY = 'account-runtime-admin:auto-refresh:overview'
 
 const EMPTY_ACCOUNT_BILLING: UsageAccountBillingSummary = {
   requests: 0,

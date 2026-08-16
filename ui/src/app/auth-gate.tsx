@@ -49,8 +49,8 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       setAuthError('登录已失效，请重新输入管理后台 Key')
       setState('guest')
     }
-    window.addEventListener('kiro-admin-auth-failed', handleAuthFailed)
-    return () => window.removeEventListener('kiro-admin-auth-failed', handleAuthFailed)
+    window.addEventListener('account-runtime-admin-auth-failed', handleAuthFailed)
+    return () => window.removeEventListener('account-runtime-admin-auth-failed', handleAuthFailed)
   }, [queryClient])
 
   const logout = React.useCallback(() => {

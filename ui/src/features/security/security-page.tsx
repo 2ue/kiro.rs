@@ -341,7 +341,7 @@ export function SecurityPage() {
     try {
       const response = await updateAdminApiKey({ adminApiKey })
       storage.setApiKey(response.adminApiKey)
-      window.dispatchEvent(new CustomEvent('kiro-admin-key-updated'))
+      window.dispatchEvent(new CustomEvent('account-runtime-admin-key-updated'))
       setKeysAndReset(response)
       setNextAdminKey('')
       toast.success('登录 Key 已更新，当前会话已自动切换')

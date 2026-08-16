@@ -2,7 +2,7 @@ import * as React from 'react'
 
 type Theme = 'light' | 'dark'
 
-const STORAGE_KEY = 'kiro-console:theme'
+const STORAGE_KEY = 'account-runtime-console:theme'
 
 interface ThemeContextValue {
   theme: Theme
