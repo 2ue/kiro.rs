@@ -672,12 +672,6 @@ where
     Option::<ExternalPoolStreamResponseMode>::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetExternalPoolEnabledRequest {
-    pub enabled: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolStatus {
@@ -696,18 +690,6 @@ pub struct ExternalPoolStatus {
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolsStatusResponse {
     pub pools: Vec<ExternalPoolStatus>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalPoolTestResponse {
-    pub ok: bool,
-    pub status: Option<u16>,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
 }
 
 #[derive(Default)]

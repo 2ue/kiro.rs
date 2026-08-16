@@ -17,25 +17,21 @@ use super::{
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateAccountRequest,
         CreateProxyResourceRequest, CreateRequestApiKeyRequest,
         DiscoverAccountSupportedModelsRequest, DiscoverExternalPoolSupportedModelsRequest,
-        ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
-        RefreshCredentialInfoRequest, SetAccountEnabledRequest, SetCredentialConcurrencyRequest,
-        SetCredentialOverageRequest, SetCredentialProxyRequest,
-        SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
-        SetCredentialRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
-        SystemVersionResponse, TestCredentialRequest, UpdateAccountRequest,
-        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-        UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        ExportCredentialsQuery, ProxyResourceTestRequest, RefreshCredentialInfoRequest,
+        SetAccountEnabledRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
+        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+        SetCredentialRegionsRequest, SetCredentialRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
+        SetWarmupRequest, SuccessResponse, SystemVersionResponse, TestCredentialRequest,
+        UpdateAccountRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{
     UsageExternalPoolRiskQuery, UsageRecordQuery, UsageRecordStatus, UsageRouteKind, UsageSource,
     usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
-};
-use crate::external_pool::{
-    CreateExternalPoolRequest, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
 };
 
 #[derive(Debug, Deserialize)]
@@ -1207,9 +1203,9 @@ pub async fn get_accounts(State(state): State<AdminState>) -> impl IntoResponse 
 
 pub async fn create_external_pool(
     State(state): State<AdminState>,
-    Json(payload): Json<CreateExternalPoolRequest>,
+    Json(payload): Json<CreateAccountRequest>,
 ) -> impl IntoResponse {
-    match state.service.create_external_pool(payload) {
+    match state.service.create_external_pool(payload.into()) {
         Ok(pool) => Json(pool).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
@@ -1228,9 +1224,9 @@ pub async fn create_account(
 pub async fn update_external_pool(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<UpdateExternalPoolRequest>,
+    Json(payload): Json<UpdateAccountRequest>,
 ) -> impl IntoResponse {
-    match state.service.update_external_pool(id, payload) {
+    match state.service.update_external_pool(id, payload.into()) {
         Ok(pool) => Json(pool).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }
@@ -1270,7 +1266,7 @@ pub async fn delete_account(
 pub async fn set_external_pool_enabled(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    Json(payload): Json<SetExternalPoolEnabledRequest>,
+    Json(payload): Json<SetAccountEnabledRequest>,
 ) -> impl IntoResponse {
     match state.service.set_external_pool_enabled(id, payload) {
         Ok(pool) => Json(pool).into_response(),
@@ -1346,7 +1342,7 @@ pub async fn get_account_status(State(state): State<AdminState>) -> impl IntoRes
 pub async fn test_external_pool(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
-    payload: Option<Json<ExternalPoolTestRequest>>,
+    payload: Option<Json<AccountTestRequest>>,
 ) -> impl IntoResponse {
     match state
         .service

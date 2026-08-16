@@ -30,7 +30,7 @@ use super::types::{
     CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
     CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
     DiscoverAccountSupportedModelsRequest, DiscoverExternalPoolSupportedModelsRequest,
-    ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
+    LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
     ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
     RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
     SetAccountEnabledRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
@@ -46,9 +46,10 @@ use super::types::{
 };
 use crate::account_runtime::{
     AccountAuthType, AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
-    UpstreamAccountStatusRecord, UpstreamAccountStorageRecord, clear_upstream_account_cooldowns,
-    load_upstream_account_status_records, upstream_account_messages_url,
-    upstream_account_models_url,
+    AccountRuntimeStatusCompatibilityResponse, CreateUpstreamAccountStorageRequest,
+    UpdateUpstreamAccountStorageRequest, UpstreamAccountStatusRecord, UpstreamAccountStorageRecord,
+    clear_upstream_account_cooldowns, load_upstream_account_status_records,
+    upstream_account_messages_url, upstream_account_models_url,
 };
 use crate::anthropic::{
     inference_attempt_budget::{
@@ -70,11 +71,6 @@ use crate::anthropic::{
     },
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
-use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolTestResponse,
-    ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
-    external_pool_messages_url, external_pool_models_url,
-};
 use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
     response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
@@ -809,7 +805,7 @@ impl AdminService {
     fn invalidate_external_pool_admin_cache_with_pool(
         &self,
         reason: &'static str,
-        pool: &ExternalPool,
+        pool: &UpstreamAccountStorageRecord,
     ) {
         self.account_runtime_manager
             .notify_account_runtime_data_changed_with_local_account(reason, pool);
@@ -971,9 +967,12 @@ impl AdminService {
         Ok(self.get_access_keys(admin_api_key))
     }
 
-    pub fn list_external_pools(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
+    pub fn list_external_pools(
+        &self,
+    ) -> Result<Vec<UpstreamAccountStorageRecord>, AdminServiceError> {
         let cache_key = admin_external_pool_list_cache_key();
-        if let Some(cached) = self.read_admin_cache::<Vec<ExternalPool>>(cache_key) {
+        if let Some(cached) = self.read_admin_cache::<Vec<UpstreamAccountStorageRecord>>(cache_key)
+        {
             return Ok(cached);
         }
 
@@ -1019,8 +1018,8 @@ impl AdminService {
 
     pub fn create_external_pool(
         &self,
-        request: CreateExternalPoolRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+        request: CreateUpstreamAccountStorageRequest,
+    ) -> Result<UpstreamAccountStorageRecord, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool =
             block_on_admin_store(async move { store.create_external_pool_unmasked(request).await })
@@ -1063,8 +1062,8 @@ impl AdminService {
     pub fn update_external_pool(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+        request: UpdateUpstreamAccountStorageRequest,
+    ) -> Result<UpstreamAccountStorageRecord, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool =
             block_on_admin_store(
@@ -1301,8 +1300,8 @@ impl AdminService {
         let auth_type = request
             .auth_type
             .or_else(|| saved_pool.as_ref().map(|pool| pool.auth_type))
-            .unwrap_or(ExternalPoolAuthType::Bearer);
-        let url = external_pool_models_url(&base_url).map_err(|err| {
+            .unwrap_or(AccountAuthType::Bearer);
+        let url = upstream_account_models_url(&base_url).map_err(|err| {
             AdminServiceError::InvalidCredential(format!("外部池模型列表 URL 无效: {err}"))
         })?;
         let config = self.token_manager.runtime_config();
@@ -1316,10 +1315,10 @@ impl AdminService {
             .header("accept", "application/json")
             .header("anthropic-version", "2023-06-01");
         match auth_type {
-            ExternalPoolAuthType::Bearer => {
+            AccountAuthType::Bearer => {
                 request_builder = request_builder.bearer_auth(api_key);
             }
-            ExternalPoolAuthType::XApiKey => {
+            AccountAuthType::XApiKey => {
                 request_builder = request_builder.header("x-api-key", api_key);
             }
         }
@@ -1494,8 +1493,8 @@ impl AdminService {
     pub fn set_external_pool_enabled(
         &self,
         id: u64,
-        request: SetExternalPoolEnabledRequest,
-    ) -> Result<ExternalPool, AdminServiceError> {
+        request: SetAccountEnabledRequest,
+    ) -> Result<UpstreamAccountStorageRecord, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
@@ -1544,7 +1543,7 @@ impl AdminService {
     pub fn clear_external_pool_auto_disabled(
         &self,
         id: u64,
-    ) -> Result<ExternalPool, AdminServiceError> {
+    ) -> Result<UpstreamAccountStorageRecord, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store.clear_external_pool_auto_disabled_unmasked(id).await
@@ -1584,7 +1583,10 @@ impl AdminService {
         Ok(pool.masked_for_admin_response().into())
     }
 
-    pub fn clear_external_pool_cooldown(&self, id: u64) -> Result<ExternalPool, AdminServiceError> {
+    pub fn clear_external_pool_cooldown(
+        &self,
+        id: u64,
+    ) -> Result<UpstreamAccountStorageRecord, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move { store.get_external_pool(id, true).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
@@ -1630,9 +1632,11 @@ impl AdminService {
 
     pub fn get_external_pool_status(
         &self,
-    ) -> Result<ExternalPoolsStatusResponse, AdminServiceError> {
+    ) -> Result<AccountRuntimeStatusCompatibilityResponse, AdminServiceError> {
         let cache_key = admin_external_pool_status_cache_key();
-        if let Some(cached) = self.read_admin_cache::<ExternalPoolsStatusResponse>(cache_key) {
+        if let Some(cached) =
+            self.read_admin_cache::<AccountRuntimeStatusCompatibilityResponse>(cache_key)
+        {
             return Ok(cached);
         }
 
@@ -1644,7 +1648,7 @@ impl AdminService {
             .clone();
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-        let response = ExternalPoolsStatusResponse { pools };
+        let response = AccountRuntimeStatusCompatibilityResponse { pools };
         self.write_admin_cache(
             cache_key.to_string(),
             response.clone(),
@@ -1657,7 +1661,9 @@ impl AdminService {
         &self,
     ) -> Result<Vec<UpstreamAccountStatusRecord>, AdminServiceError> {
         let cache_key = admin_external_pool_status_cache_key();
-        if let Some(cached) = self.read_admin_cache::<ExternalPoolsStatusResponse>(cache_key) {
+        if let Some(cached) =
+            self.read_admin_cache::<AccountRuntimeStatusCompatibilityResponse>(cache_key)
+        {
             return Ok(cached.pools);
         }
 
@@ -1673,7 +1679,7 @@ impl AdminService {
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.write_admin_cache(
             cache_key.to_string(),
-            ExternalPoolsStatusResponse {
+            AccountRuntimeStatusCompatibilityResponse {
                 pools: accounts.clone(),
             },
             ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
@@ -1694,8 +1700,8 @@ impl AdminService {
     pub fn test_external_pool(
         &self,
         id: u64,
-        req: Option<ExternalPoolTestRequest>,
-    ) -> Result<ExternalPoolTestResponse, AdminServiceError> {
+        req: Option<AccountTestRequest>,
+    ) -> Result<AccountTestResponse, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move { store.get_external_pool(id, false).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
@@ -1706,9 +1712,9 @@ impl AdminService {
                 .map(|req| req.model.trim().to_string())
                 .filter(|model| !model.is_empty());
             let url = if model.is_some() {
-                external_pool_messages_url(&pool.base_url)?
+                upstream_account_messages_url(&pool.base_url)?
             } else {
-                external_pool_models_url(&pool.base_url)?
+                upstream_account_models_url(&pool.base_url)?
             };
             let client = reqwest::Client::builder()
                 .timeout(StdDuration::from_secs(15))
@@ -1732,15 +1738,15 @@ impl AdminService {
                 client.get(url)
             };
             match pool.auth_type {
-                crate::external_pool::ExternalPoolAuthType::Bearer => {
+                AccountAuthType::Bearer => {
                     request = request.bearer_auth(pool.api_key.unwrap_or_default());
                 }
-                crate::external_pool::ExternalPoolAuthType::XApiKey => {
+                AccountAuthType::XApiKey => {
                     request = request.header("x-api-key", pool.api_key.unwrap_or_default());
                 }
             }
             let result = request.send().await;
-            Ok::<ExternalPoolTestResponse, anyhow::Error>(match result {
+            Ok::<AccountTestResponse, anyhow::Error>(match result {
                 Ok(response) => {
                     let status = response.status();
                     let body = match response_text_with_limit_and_body_timeout(
@@ -1752,7 +1758,7 @@ impl AdminService {
                     {
                         Ok(body) => body,
                         Err(error) => {
-                            return Ok(ExternalPoolTestResponse {
+                            return Ok(AccountTestResponse {
                                 ok: false,
                                 status: Some(status.as_u16()),
                                 message: format!("读取外部池测试响应失败: {error}"),
@@ -1766,7 +1772,7 @@ impl AdminService {
                     } else {
                         None
                     };
-                    ExternalPoolTestResponse {
+                    AccountTestResponse {
                         ok: status.is_success(),
                         status: Some(status.as_u16()),
                         message: if status.is_success() {
@@ -1787,7 +1793,7 @@ impl AdminService {
                         response: response_text,
                     }
                 }
-                Err(err) => ExternalPoolTestResponse {
+                Err(err) => AccountTestResponse {
                     ok: false,
                     status: None,
                     message: err.to_string(),

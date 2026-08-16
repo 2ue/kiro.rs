@@ -23,6 +23,9 @@ pub type UpstreamAccountStorageRecord = crate::external_pool::ExternalPool;
 
 pub type UpstreamAccountStatusRecord = crate::external_pool::ExternalPoolStatus;
 
+pub(crate) type AccountRuntimeStatusCompatibilityResponse =
+    crate::external_pool::ExternalPoolsStatusResponse;
+
 pub type AccountRouteRequest = crate::external_pool::ExternalRouteRequest;
 
 pub(crate) type AccountRouteRequestPreparationCache =
@@ -45,6 +48,18 @@ pub type AccountModelMappingMode = crate::external_pool::ExternalPoolModelMappin
 pub type AccountRouteMode = crate::model::config::ExternalPoolRouteMode;
 
 pub type AccountLatencyTraceState = crate::external_pool::ExternalLatencyTraceState;
+
+pub(crate) type UpstreamAccountEligibility = crate::external_pool::ExternalPoolEligibility;
+
+pub(crate) fn mask_upstream_account_key(value: &str) -> String {
+    crate::external_pool::mask_external_pool_key(value)
+}
+
+pub(crate) fn normalize_upstream_account_model_mapping_rules(
+    rules: Vec<crate::model::config::ModelMappingRule>,
+) -> Vec<crate::model::config::ModelMappingRule> {
+    crate::external_pool::normalize_external_pool_model_mapping_rules(rules)
+}
 
 pub async fn load_upstream_account_status_records(
     manager: &AccountRuntimeManager,

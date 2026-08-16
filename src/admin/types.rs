@@ -5,13 +5,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::account_runtime::{
     AccountAuthType, AccountAutoDisablePolicy, AccountModelMappingMode, AccountRawModelMode,
     AccountRequestBodyMode, AccountRouteMode, AccountRuntimeConfig, AccountStreamResponseMode,
-    AccountStreamRetryMode, AccountUsageProjectionMode,
+    AccountStreamRetryMode, AccountUsageProjectionMode, CreateUpstreamAccountStorageRequest,
+    UpdateUpstreamAccountStorageRequest, UpstreamAccountStatusRecord, UpstreamAccountStorageRecord,
 };
 use crate::anthropic::pricing::ModelPricing;
-use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolStatus, ExternalPoolTestResponse,
-    UpdateExternalPoolRequest,
-};
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
     ImageProcessingConfig, LocalUpstreamAgentModeStrategy, MissingMaxTokensConfig,
@@ -585,7 +582,7 @@ pub struct DiscoverExternalPoolSupportedModelsRequest {
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
-    pub auth_type: Option<crate::external_pool::ExternalPoolAuthType>,
+    pub auth_type: Option<AccountAuthType>,
 }
 
 /// 使用上游账号兼容 /v1/models 接口发现支持模型。创建态需要传 baseUrl/apiKey；
@@ -1167,27 +1164,10 @@ pub struct BatchUpdateCredentialsResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalPoolTestRequest {
-    pub model: String,
-    #[serde(default)]
-    pub prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AccountTestRequest {
     pub model: String,
     #[serde(default)]
     pub prompt: Option<String>,
-}
-
-impl From<AccountTestRequest> for ExternalPoolTestRequest {
-    fn from(request: AccountTestRequest) -> Self {
-        Self {
-            model: request.model,
-            prompt: request.prompt,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1236,7 +1216,7 @@ pub struct CreateAccountRequest {
     pub notes: Option<String>,
 }
 
-impl From<CreateAccountRequest> for CreateExternalPoolRequest {
+impl From<CreateAccountRequest> for CreateUpstreamAccountStorageRequest {
     fn from(request: CreateAccountRequest) -> Self {
         Self {
             name: request.name,
@@ -1317,7 +1297,7 @@ pub struct UpdateAccountRequest {
     pub notes: Option<String>,
 }
 
-impl From<UpdateAccountRequest> for UpdateExternalPoolRequest {
+impl From<UpdateAccountRequest> for UpdateUpstreamAccountStorageRequest {
     fn from(request: UpdateAccountRequest) -> Self {
         Self {
             name: request.name,
@@ -1359,14 +1339,6 @@ where
 #[serde(rename_all = "camelCase")]
 pub struct SetAccountEnabledRequest {
     pub enabled: bool,
-}
-
-impl From<SetAccountEnabledRequest> for crate::external_pool::SetExternalPoolEnabledRequest {
-    fn from(request: SetAccountEnabledRequest) -> Self {
-        Self {
-            enabled: request.enabled,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1423,8 +1395,8 @@ pub struct Account {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<ExternalPool> for Account {
-    fn from(pool: ExternalPool) -> Self {
+impl From<UpstreamAccountStorageRecord> for Account {
+    fn from(pool: UpstreamAccountStorageRecord) -> Self {
         Self {
             id: pool.id,
             name: pool.name,
@@ -1471,18 +1443,6 @@ pub struct AccountTestResponse {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<String>,
-}
-
-impl From<ExternalPoolTestResponse> for AccountTestResponse {
-    fn from(response: ExternalPoolTestResponse) -> Self {
-        Self {
-            ok: response.ok,
-            status: response.status,
-            message: response.message,
-            model: response.model,
-            response: response.response,
-        }
-    }
 }
 
 fn default_proxy_resource_enabled() -> bool {
@@ -2128,8 +2088,8 @@ pub struct AccountStatus {
     pub skipped_reason: Option<String>,
 }
 
-impl From<ExternalPoolStatus> for AccountStatus {
-    fn from(status: ExternalPoolStatus) -> Self {
+impl From<UpstreamAccountStatusRecord> for AccountStatus {
+    fn from(status: UpstreamAccountStatusRecord) -> Self {
         Self {
             account: status.pool.into(),
             in_flight: status.in_flight,
@@ -2563,7 +2523,7 @@ mod tests {
             "routeRules": ["/cc"]
         }))
         .unwrap();
-        let storage_create: CreateExternalPoolRequest = create.into();
+        let storage_create: CreateUpstreamAccountStorageRequest = create.into();
         assert_eq!(storage_create.name, "primary");
         assert_eq!(storage_create.base_url, "https://upstream.example.test");
         assert_eq!(storage_create.api_key, "sk-test");
@@ -2582,7 +2542,7 @@ mod tests {
             "enabled": false
         }))
         .unwrap();
-        let storage_update: UpdateExternalPoolRequest = update.into();
+        let storage_update: UpdateUpstreamAccountStorageRequest = update.into();
         assert_eq!(storage_update.stream_response_mode, Some(None));
         assert_eq!(storage_update.enabled, Some(false));
 

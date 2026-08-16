@@ -10,6 +10,13 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+use crate::account_runtime::{
+    AccountAuthType, AccountAutoDisablePolicy, AccountModelMappingMode, AccountRawModelMode,
+    AccountRequestBodyMode, AccountRouteMode, AccountStreamResponseMode, AccountStreamRetryMode,
+    AccountUsageProjectionMode, CreateUpstreamAccountStorageRequest,
+    UpdateUpstreamAccountStorageRequest, UpstreamAccountEligibility, UpstreamAccountStorageRecord,
+    mask_upstream_account_key, normalize_upstream_account_model_mapping_rules,
+};
 #[cfg(test)]
 use crate::anthropic::model_capabilities::UpstreamReasoningFieldPath;
 use crate::anthropic::model_capabilities::{
@@ -32,20 +39,11 @@ use crate::anthropic::usage::{
     usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
     usage_dashboard_windows,
 };
-use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
-    ExternalPoolEligibility, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
-    ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
-    UpdateExternalPoolRequest, mask_external_pool_key, normalize_external_pool_model_mapping_rules,
-};
 use crate::local_upstream::credentials::{
     LocalUpstreamCredentials, split_local_upstream_api_key_and_region,
 };
 use crate::local_upstream::model_catalog::LocalUpstreamModelCapabilityCohortKey;
-use crate::model::config::{
-    Config, ExternalPoolRouteMode, ExternalPoolStreamResponseMode, ModelMappingRule,
-    normalize_route_rules,
-};
+use crate::model::config::{Config, ModelMappingRule, normalize_route_rules};
 use crate::model::model_support::normalize_supported_models;
 
 const ACTIVE_CREDENTIALS_SELECT_SQL: &str = r#"
@@ -1209,7 +1207,7 @@ impl PostgresStore {
     pub async fn list_external_pools(
         &self,
         mask_secrets: bool,
-    ) -> anyhow::Result<Vec<ExternalPool>> {
+    ) -> anyhow::Result<Vec<UpstreamAccountStorageRecord>> {
         let rows = sqlx::query(EXTERNAL_POOL_SELECT_SQL)
             .fetch_all(&self.pool)
             .await?;
@@ -1220,7 +1218,9 @@ impl PostgresStore {
 
     /// Loads only rows that can be decoded without compatibility defaults.
     /// A malformed pool is isolated from healthy pools and cannot authorize dispatch.
-    pub async fn list_dispatchable_external_pools(&self) -> anyhow::Result<Vec<ExternalPool>> {
+    pub async fn list_dispatchable_external_pools(
+        &self,
+    ) -> anyhow::Result<Vec<UpstreamAccountStorageRecord>> {
         let rows = sqlx::query(EXTERNAL_POOL_SELECT_SQL)
             .fetch_all(&self.pool)
             .await?;
@@ -1249,9 +1249,9 @@ impl PostgresStore {
         Ok(pools)
     }
 
-    pub async fn list_external_pool_eligibility(
+    pub(crate) async fn list_external_pool_eligibility(
         &self,
-    ) -> anyhow::Result<Vec<ExternalPoolEligibility>> {
+    ) -> anyhow::Result<Vec<UpstreamAccountEligibility>> {
         let rows = sqlx::query(
             r#"
             SELECT id, revision, enabled, base_url,
@@ -1303,7 +1303,7 @@ impl PostgresStore {
         &self,
         id: u64,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         let row = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
@@ -1363,32 +1363,32 @@ impl PostgresStore {
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn create_external_pool(
         &self,
-        request: CreateExternalPoolRequest,
-    ) -> anyhow::Result<ExternalPool> {
+        request: CreateUpstreamAccountStorageRequest,
+    ) -> anyhow::Result<UpstreamAccountStorageRecord> {
         self.create_external_pool_with_secret_policy(request, true)
             .await
     }
 
     pub(crate) async fn create_external_pool_unmasked(
         &self,
-        request: CreateExternalPoolRequest,
-    ) -> anyhow::Result<ExternalPool> {
+        request: CreateUpstreamAccountStorageRequest,
+    ) -> anyhow::Result<UpstreamAccountStorageRecord> {
         self.create_external_pool_with_secret_policy(request, false)
             .await
     }
 
     async fn create_external_pool_with_secret_policy(
         &self,
-        request: CreateExternalPoolRequest,
+        request: CreateUpstreamAccountStorageRequest,
         mask_secrets: bool,
-    ) -> anyhow::Result<ExternalPool> {
+    ) -> anyhow::Result<UpstreamAccountStorageRecord> {
         validate_external_pool_input(
             &request.name,
             &request.base_url,
             request.max_concurrent_requests,
         )?;
         let model_mapping_rules =
-            normalize_external_pool_model_mapping_rules(request.model_mapping_rules);
+            normalize_upstream_account_model_mapping_rules(request.model_mapping_rules);
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let supported_models = normalize_supported_models(request.supported_models);
         let supported_models_value = serde_json::to_value(&supported_models)?;
@@ -1448,8 +1448,8 @@ impl PostgresStore {
     pub async fn update_external_pool(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+        request: UpdateUpstreamAccountStorageRequest,
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.update_external_pool_with_secret_policy(id, request, true)
             .await
     }
@@ -1457,8 +1457,8 @@ impl PostgresStore {
     pub(crate) async fn update_external_pool_unmasked(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+        request: UpdateUpstreamAccountStorageRequest,
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.update_external_pool_with_secret_policy(id, request, false)
             .await
     }
@@ -1466,9 +1466,9 @@ impl PostgresStore {
     async fn update_external_pool_with_secret_policy(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
+        request: UpdateUpstreamAccountStorageRequest,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         let Some(current) = self.get_external_pool(id, false).await? else {
             return Ok(None);
         };
@@ -1518,7 +1518,7 @@ impl PostgresStore {
             .unwrap_or(current.model_mapping_require_match);
         let model_mapping_rules = request
             .model_mapping_rules
-            .map(normalize_external_pool_model_mapping_rules)
+            .map(normalize_upstream_account_model_mapping_rules)
             .unwrap_or(current.model_mapping_rules);
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let supported_models = request
@@ -1610,7 +1610,7 @@ impl PostgresStore {
         &self,
         id: u64,
         enabled: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.set_external_pool_enabled_with_secret_policy(id, enabled, true)
             .await
     }
@@ -1619,7 +1619,7 @@ impl PostgresStore {
         &self,
         id: u64,
         enabled: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.set_external_pool_enabled_with_secret_policy(id, enabled, false)
             .await
     }
@@ -1629,7 +1629,7 @@ impl PostgresStore {
         id: u64,
         enabled: bool,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         let row = sqlx::query(
             r#"
             UPDATE external_upstream_pools
@@ -1661,7 +1661,7 @@ impl PostgresStore {
         &self,
         id: u64,
         supported_models: Vec<String>,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.set_external_pool_supported_models_with_secret_policy(id, supported_models, true)
             .await
     }
@@ -1670,7 +1670,7 @@ impl PostgresStore {
         &self,
         id: u64,
         supported_models: Vec<String>,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.set_external_pool_supported_models_with_secret_policy(id, supported_models, false)
             .await
     }
@@ -1680,7 +1680,7 @@ impl PostgresStore {
         id: u64,
         supported_models: Vec<String>,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         let supported_models = normalize_supported_models(supported_models);
         let supported_models_value = serde_json::to_value(&supported_models)?;
         let row = sqlx::query(
@@ -1723,7 +1723,7 @@ impl PostgresStore {
     pub async fn clear_external_pool_auto_disabled(
         &self,
         id: u64,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.clear_external_pool_auto_disabled_with_secret_policy(id, true)
             .await
     }
@@ -1731,7 +1731,7 @@ impl PostgresStore {
     pub(crate) async fn clear_external_pool_auto_disabled_unmasked(
         &self,
         id: u64,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         self.clear_external_pool_auto_disabled_with_secret_policy(id, false)
             .await
     }
@@ -1740,7 +1740,7 @@ impl PostgresStore {
         &self,
         id: u64,
         mask_secrets: bool,
-    ) -> anyhow::Result<Option<ExternalPool>> {
+    ) -> anyhow::Result<Option<UpstreamAccountStorageRecord>> {
         let row = sqlx::query(
             r#"
             UPDATE external_upstream_pools
@@ -10352,7 +10352,7 @@ fn runtime_state_from_row(row: &PgRow) -> anyhow::Result<CredentialRuntimeStateR
     })
 }
 
-fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoolEligibility> {
+fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<UpstreamAccountEligibility> {
     let revision: i64 = row.try_get("revision")?;
     if revision <= 0 {
         anyhow::bail!("revision 必须为正数");
@@ -10370,45 +10370,44 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
         anyhow::bail!("api_key 不能为空");
     }
     let auth_type: String = row.try_get("auth_type")?;
-    ExternalPoolAuthType::parse_known(&auth_type)
-        .ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?;
+    AccountAuthType::parse_known(&auth_type).ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?;
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
     if max_concurrent_requests <= 0 {
         anyhow::bail!("max_concurrent_requests 必须为正数");
     }
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
-    ExternalPoolUsageProjectionMode::parse_known(&usage_projection_mode)
+    AccountUsageProjectionMode::parse_known(&usage_projection_mode)
         .ok_or_else(|| anyhow::anyhow!("usage_projection_mode 值无效"))?;
     let stream_response_mode: Option<String> = row.try_get("stream_response_mode")?;
     if stream_response_mode
         .as_deref()
-        .is_some_and(|value| ExternalPoolStreamResponseMode::parse_known(value).is_none())
+        .is_some_and(|value| AccountStreamResponseMode::parse_known(value).is_none())
     {
         anyhow::bail!("stream_response_mode 值无效");
     }
     let request_body_mode: String = row
         .try_get("request_body_mode")
         .map_err(|_| anyhow::anyhow!("request_body_mode 字段类型无效"))?;
-    let request_body_mode = ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
+    let request_body_mode = AccountRequestBodyMode::parse_known(&request_body_mode)
         .ok_or_else(|| anyhow::anyhow!("request_body_mode 值无效"))?;
     let raw_model_mode: String = row.try_get("raw_model_mode")?;
-    ExternalPoolRawModelMode::parse_known(&raw_model_mode)
+    AccountRawModelMode::parse_known(&raw_model_mode)
         .ok_or_else(|| anyhow::anyhow!("raw_model_mode 值无效"))?;
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
-    ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
+    AccountAutoDisablePolicy::parse_known(&auto_disable_policy)
         .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?;
     let pre_output_stream_retry_mode: String = row.try_get("pre_output_stream_retry_mode")?;
-    ExternalPoolStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
+    AccountStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
         .ok_or_else(|| anyhow::anyhow!("pre_output_stream_retry_mode 值无效"))?;
     let route_mode: String = row.try_get("route_mode")?;
-    let route_mode = ExternalPoolRouteMode::parse_known(&route_mode)
+    let route_mode = AccountRouteMode::parse_known(&route_mode)
         .ok_or_else(|| anyhow::anyhow!("route_mode 值无效"))?;
     let route_rules_value: serde_json::Value = row
         .try_get("route_rules")
         .map_err(|_| anyhow::anyhow!("route_rules 字段类型无效"))?;
     let route_rules = decode_external_pool_route_rules(route_rules_value, true)?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
-    ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
+    AccountModelMappingMode::parse_known(&model_mapping_mode)
         .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?;
     row.try_get::<bool, _>("model_mapping_require_match")?;
     let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
@@ -10429,7 +10428,7 @@ fn external_pool_eligibility_from_row(row: &PgRow) -> anyhow::Result<ExternalPoo
     if supported_models.iter().any(|model| model.trim().is_empty()) {
         anyhow::bail!("supported_models 不能包含空模型名");
     }
-    Ok(ExternalPoolEligibility {
+    Ok(UpstreamAccountEligibility {
         id: row.try_get::<i64, _>("id")?.max(0) as u64,
         enabled: row.try_get("enabled")?,
         auto_disabled: row.try_get("auto_disabled")?,
@@ -10469,7 +10468,10 @@ fn validate_external_pool_route_rules(rules: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<ExternalPool> {
+fn external_pool_from_row(
+    row: PgRow,
+    mask_secrets: bool,
+) -> anyhow::Result<UpstreamAccountStorageRecord> {
     external_pool_from_row_with_policy(row, mask_secrets, false)
 }
 
@@ -10477,7 +10479,7 @@ fn external_pool_from_row_with_policy(
     row: PgRow,
     mask_secrets: bool,
     strict_dispatch: bool,
-) -> anyhow::Result<ExternalPool> {
+) -> anyhow::Result<UpstreamAccountStorageRecord> {
     let id: i64 = row.try_get("id")?;
     let revision: i64 = row.try_get("revision")?;
     let api_key: String = row.try_get("api_key")?;
@@ -10555,60 +10557,60 @@ fn external_pool_from_row_with_policy(
     });
 
     let auth_type = if strict_dispatch {
-        ExternalPoolAuthType::parse_known(&auth_type)
+        AccountAuthType::parse_known(&auth_type)
             .ok_or_else(|| anyhow::anyhow!("auth_type 值无效"))?
     } else {
-        ExternalPoolAuthType::parse(&auth_type)
+        AccountAuthType::parse(&auth_type)
     };
     let usage_projection_mode = if strict_dispatch {
-        ExternalPoolUsageProjectionMode::parse_known(&usage_projection_mode)
+        AccountUsageProjectionMode::parse_known(&usage_projection_mode)
             .ok_or_else(|| anyhow::anyhow!("usage_projection_mode 值无效"))?
     } else {
-        ExternalPoolUsageProjectionMode::parse(&usage_projection_mode)
+        AccountUsageProjectionMode::parse(&usage_projection_mode)
     };
     let stream_response_mode = match stream_response_mode.as_deref() {
         Some(value) if strict_dispatch => Some(
-            ExternalPoolStreamResponseMode::parse_known(value)
+            AccountStreamResponseMode::parse_known(value)
                 .ok_or_else(|| anyhow::anyhow!("stream_response_mode 值无效"))?,
         ),
-        Some(value) => Some(ExternalPoolStreamResponseMode::parse(value)),
+        Some(value) => Some(AccountStreamResponseMode::parse(value)),
         None => None,
     };
     let request_body_mode = if strict_dispatch {
-        ExternalPoolRequestBodyMode::parse_known(&request_body_mode)
+        AccountRequestBodyMode::parse_known(&request_body_mode)
             .ok_or_else(|| anyhow::anyhow!("request_body_mode 值无效"))?
     } else {
-        ExternalPoolRequestBodyMode::parse(&request_body_mode)
+        AccountRequestBodyMode::parse(&request_body_mode)
     };
     let raw_model_mode = if strict_dispatch {
-        ExternalPoolRawModelMode::parse_known(&raw_model_mode)
+        AccountRawModelMode::parse_known(&raw_model_mode)
             .ok_or_else(|| anyhow::anyhow!("raw_model_mode 值无效"))?
     } else {
-        ExternalPoolRawModelMode::parse(&raw_model_mode)
+        AccountRawModelMode::parse(&raw_model_mode)
     };
     let auto_disable_policy = if strict_dispatch {
-        ExternalPoolAutoDisablePolicy::parse_known(&auto_disable_policy)
+        AccountAutoDisablePolicy::parse_known(&auto_disable_policy)
             .ok_or_else(|| anyhow::anyhow!("auto_disable_policy 值无效"))?
     } else {
-        ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy)
+        AccountAutoDisablePolicy::parse(&auto_disable_policy)
     };
     let pre_output_stream_retry_mode = if strict_dispatch {
-        ExternalPoolStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
+        AccountStreamRetryMode::parse_known(&pre_output_stream_retry_mode)
             .ok_or_else(|| anyhow::anyhow!("pre_output_stream_retry_mode 值无效"))?
     } else {
-        ExternalPoolStreamRetryMode::parse(&pre_output_stream_retry_mode)
+        AccountStreamRetryMode::parse(&pre_output_stream_retry_mode)
     };
     let route_mode = if strict_dispatch {
-        ExternalPoolRouteMode::parse_known(&route_mode)
+        AccountRouteMode::parse_known(&route_mode)
             .ok_or_else(|| anyhow::anyhow!("route_mode 值无效"))?
     } else {
-        ExternalPoolRouteMode::parse(&route_mode)
+        AccountRouteMode::parse(&route_mode)
     };
     let model_mapping_mode = if strict_dispatch {
-        ExternalPoolModelMappingMode::parse_known(&model_mapping_mode)
+        AccountModelMappingMode::parse_known(&model_mapping_mode)
             .ok_or_else(|| anyhow::anyhow!("model_mapping_mode 值无效"))?
     } else {
-        ExternalPoolModelMappingMode::parse(&model_mapping_mode)
+        AccountModelMappingMode::parse(&model_mapping_mode)
     };
     let model_mapping_require_match = if strict_dispatch {
         row.try_get("model_mapping_require_match")?
@@ -10638,13 +10640,13 @@ fn external_pool_from_row_with_policy(
             anyhow::bail!("base_url 必须包含 host");
         }
     }
-    Ok(ExternalPool {
+    Ok(UpstreamAccountStorageRecord {
         id: id.max(0) as u64,
         revision: revision.max(1) as u64,
         name: row.try_get("name")?,
         base_url: row.try_get("base_url")?,
         api_key: (!mask_secrets).then_some(api_key.clone()),
-        masked_api_key: Some(mask_external_pool_key(&api_key)),
+        masked_api_key: Some(mask_upstream_account_key(&api_key)),
         auth_type,
         enabled: row.try_get("enabled")?,
         priority: row.try_get("priority")?,
@@ -10664,7 +10666,7 @@ fn external_pool_from_row_with_policy(
         normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
         model_mapping_mode,
         model_mapping_require_match,
-        model_mapping_rules: normalize_external_pool_model_mapping_rules(model_mapping_rules),
+        model_mapping_rules: normalize_upstream_account_model_mapping_rules(model_mapping_rules),
         supported_models,
         route_mode,
         route_rules,
@@ -18642,23 +18644,23 @@ mod tests {
         clean(&store).await;
 
         let created = store
-            .create_external_pool(CreateExternalPoolRequest {
+            .create_external_pool(CreateUpstreamAccountStorageRequest {
                 name: "raw-pool".to_string(),
                 base_url: "https://example.com".to_string(),
                 api_key: "sk-test".to_string(),
-                auth_type: ExternalPoolAuthType::Bearer,
+                auth_type: AccountAuthType::Bearer,
                 enabled: true,
                 priority: 1,
                 max_concurrent_requests: 2,
-                usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
-                stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
-                request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
-                raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
-                auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
-                pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Enabled,
+                usage_projection_mode: AccountUsageProjectionMode::PassThrough,
+                stream_response_mode: Some(AccountStreamResponseMode::EventPassthrough),
+                request_body_mode: AccountRequestBodyMode::RawPassthrough,
+                raw_model_mode: AccountRawModelMode::RewriteTopLevel,
+                auto_disable_policy: AccountAutoDisablePolicy::Inherit,
+                pre_output_stream_retry_mode: AccountStreamRetryMode::Enabled,
                 preserve_path: true,
                 normalize_model_version_dots: false,
-                model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
+                model_mapping_mode: AccountModelMappingMode::PassthroughMapping,
                 model_mapping_require_match: false,
                 model_mapping_rules: vec![ModelMappingRule {
                     enabled: true,
@@ -18668,7 +18670,7 @@ mod tests {
                     note: None,
                 }],
                 supported_models: Vec::new(),
-                route_mode: ExternalPoolRouteMode::AllowList,
+                route_mode: AccountRouteMode::AllowList,
                 route_rules: vec!["/CC".to_string(), "/ha".to_string()],
                 notes: None,
             })
@@ -18677,21 +18679,18 @@ mod tests {
 
         assert_eq!(
             created.request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
+            AccountRequestBodyMode::RawPassthrough
         );
-        assert_eq!(
-            created.raw_model_mode,
-            ExternalPoolRawModelMode::RewriteTopLevel
-        );
+        assert_eq!(created.raw_model_mode, AccountRawModelMode::RewriteTopLevel);
         assert_eq!(
             created.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(AccountStreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             created.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Enabled
+            AccountStreamRetryMode::Enabled
         );
-        assert_eq!(created.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(created.route_mode, AccountRouteMode::AllowList);
         assert_eq!(
             created.route_rules,
             vec!["/cc".to_string(), "/ha".to_string()]
@@ -18701,19 +18700,19 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(
             listed[0].request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
+            AccountRequestBodyMode::RawPassthrough
         );
         assert_eq!(
             listed[0].raw_model_mode,
-            ExternalPoolRawModelMode::RewriteTopLevel
+            AccountRawModelMode::RewriteTopLevel
         );
         assert_eq!(
             listed[0].stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(AccountStreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             listed[0].pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Enabled
+            AccountStreamRetryMode::Enabled
         );
 
         let loaded = store
@@ -18723,21 +18722,18 @@ mod tests {
             .expect("pool should exist");
         assert_eq!(
             loaded.request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
+            AccountRequestBodyMode::RawPassthrough
         );
-        assert_eq!(
-            loaded.raw_model_mode,
-            ExternalPoolRawModelMode::RewriteTopLevel
-        );
+        assert_eq!(loaded.raw_model_mode, AccountRawModelMode::RewriteTopLevel);
         assert_eq!(
             loaded.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(AccountStreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             loaded.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Enabled
+            AccountStreamRetryMode::Enabled
         );
-        assert_eq!(loaded.route_mode, ExternalPoolRouteMode::AllowList);
+        assert_eq!(loaded.route_mode, AccountRouteMode::AllowList);
         assert_eq!(
             loaded.route_rules,
             vec!["/cc".to_string(), "/ha".to_string()]
@@ -18746,16 +18742,14 @@ mod tests {
         let updated = store
             .update_external_pool(
                 created.id,
-                UpdateExternalPoolRequest {
-                    stream_response_mode: Some(Some(
-                        ExternalPoolStreamResponseMode::EventPassthrough,
-                    )),
-                    request_body_mode: Some(ExternalPoolRequestBodyMode::RawPassthrough),
-                    raw_model_mode: Some(ExternalPoolRawModelMode::None),
-                    pre_output_stream_retry_mode: Some(ExternalPoolStreamRetryMode::Disabled),
-                    route_mode: Some(ExternalPoolRouteMode::DenyList),
+                UpdateUpstreamAccountStorageRequest {
+                    stream_response_mode: Some(Some(AccountStreamResponseMode::EventPassthrough)),
+                    request_body_mode: Some(AccountRequestBodyMode::RawPassthrough),
+                    raw_model_mode: Some(AccountRawModelMode::None),
+                    pre_output_stream_retry_mode: Some(AccountStreamRetryMode::Disabled),
+                    route_mode: Some(AccountRouteMode::DenyList),
                     route_rules: Some(vec!["/V1".to_string()]),
-                    ..UpdateExternalPoolRequest::default()
+                    ..UpdateUpstreamAccountStorageRequest::default()
                 },
             )
             .await
@@ -18763,26 +18757,26 @@ mod tests {
             .expect("pool should update");
         assert_eq!(
             updated.request_body_mode,
-            ExternalPoolRequestBodyMode::RawPassthrough
+            AccountRequestBodyMode::RawPassthrough
         );
-        assert_eq!(updated.raw_model_mode, ExternalPoolRawModelMode::None);
+        assert_eq!(updated.raw_model_mode, AccountRawModelMode::None);
         assert_eq!(
             updated.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthrough)
+            Some(AccountStreamResponseMode::EventPassthrough)
         );
         assert_eq!(
             updated.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Disabled
+            AccountStreamRetryMode::Disabled
         );
-        assert_eq!(updated.route_mode, ExternalPoolRouteMode::DenyList);
+        assert_eq!(updated.route_mode, AccountRouteMode::DenyList);
         assert_eq!(updated.route_rules, vec!["/v1".to_string()]);
 
         let inherited = store
             .update_external_pool(
                 created.id,
-                UpdateExternalPoolRequest {
+                UpdateUpstreamAccountStorageRequest {
                     stream_response_mode: Some(None),
-                    ..UpdateExternalPoolRequest::default()
+                    ..UpdateUpstreamAccountStorageRequest::default()
                 },
             )
             .await
@@ -18791,9 +18785,9 @@ mod tests {
         assert_eq!(inherited.stream_response_mode, None);
         assert_eq!(
             inherited.pre_output_stream_retry_mode,
-            ExternalPoolStreamRetryMode::Disabled
+            AccountStreamRetryMode::Disabled
         );
-        assert_eq!(inherited.route_mode, ExternalPoolRouteMode::DenyList);
+        assert_eq!(inherited.route_mode, AccountRouteMode::DenyList);
         assert_eq!(inherited.route_rules, vec!["/v1".to_string()]);
 
         store.drop_test_schema().await.unwrap();

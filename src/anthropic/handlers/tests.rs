@@ -1,4 +1,9 @@
 use super::*;
+use crate::account_runtime::{
+    AccountAuthType, AccountAutoDisablePolicy, AccountModelMappingMode, AccountRawModelMode,
+    AccountRequestBodyMode, AccountRouteMode, AccountRuntimeManager, AccountStreamRetryMode,
+    AccountUsageProjectionMode, CreateUpstreamAccountStorageRequest,
+};
 use crate::anthropic::cache::{self, CacheUsage};
 use crate::anthropic::model_capabilities::ModelCapabilitiesCatalog;
 use crate::anthropic::pricing::PricingCatalog;
@@ -13,11 +18,6 @@ use crate::anthropic::usage::{
     UsageRecord, UsageRecordQuery, UsageRecorder, UsageRouteKind, UsageRouteSubtype,
 };
 use crate::common::auth::RequestApiKeyStore;
-use crate::external_pool::{
-    CreateExternalPoolRequest, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
-    ExternalPoolManager, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
-    ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
-};
 use crate::local_upstream::call_trace::{
     AccountRejectReason, LocalUpstreamCallError, SelectionFailureStage, SelectionFailureSummary,
 };
@@ -909,8 +909,8 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
 
 async fn test_external_pool_manager_for_handlers(
     base_url: &str,
-    body_mode: ExternalPoolRequestBodyMode,
-) -> Option<Arc<ExternalPoolManager>> {
+    body_mode: AccountRequestBodyMode,
+) -> Option<Arc<AccountRuntimeManager>> {
     let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
     else {
         eprintln!("跳过 WebSearch account fallback 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -942,29 +942,29 @@ async fn test_external_pool_manager_for_handlers(
             .expect("connect handler account fallback test Redis"),
     );
 
-    let manager = Arc::new(ExternalPoolManager::new(postgres.clone(), redis));
+    let manager = Arc::new(AccountRuntimeManager::new(postgres.clone(), redis));
     postgres
-        .create_external_pool(CreateExternalPoolRequest {
+        .create_external_pool(CreateUpstreamAccountStorageRequest {
             name: format!("handler-websearch-{body_mode:?}"),
             base_url: base_url.to_string(),
             api_key: "sk-handler-external-test".to_string(),
-            auth_type: ExternalPoolAuthType::XApiKey,
+            auth_type: AccountAuthType::XApiKey,
             enabled: true,
             priority: 1,
             max_concurrent_requests: 10,
-            usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            usage_projection_mode: AccountUsageProjectionMode::PassThrough,
             stream_response_mode: None,
             request_body_mode: body_mode,
-            raw_model_mode: ExternalPoolRawModelMode::None,
-            auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
-            pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
+            raw_model_mode: AccountRawModelMode::None,
+            auto_disable_policy: AccountAutoDisablePolicy::Inherit,
+            pre_output_stream_retry_mode: AccountStreamRetryMode::Inherit,
             preserve_path: true,
             normalize_model_version_dots: false,
-            model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+            model_mapping_mode: AccountModelMappingMode::ProcessedMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
             supported_models: Vec::new(),
-            route_mode: crate::model::config::ExternalPoolRouteMode::AllowAll,
+            route_mode: AccountRouteMode::AllowAll,
             route_rules: Vec::new(),
             notes: None,
         })
@@ -976,7 +976,7 @@ async fn test_external_pool_manager_for_handlers(
 
 fn websearch_handler_test_router_with_external(
     local_upstream_base_url: &str,
-    external_pool_manager: Arc<ExternalPoolManager>,
+    external_pool_manager: Arc<AccountRuntimeManager>,
 ) -> (Router, Arc<UsageRecorder>) {
     websearch_handler_test_router_with_external_options(
         local_upstream_base_url,
@@ -989,7 +989,7 @@ fn websearch_handler_test_router_with_external(
 
 fn websearch_handler_test_router_with_external_options(
     local_upstream_base_url: &str,
-    external_pool_manager: Arc<ExternalPoolManager>,
+    external_pool_manager: Arc<AccountRuntimeManager>,
     credentials: Vec<LocalUpstreamCredentials>,
     local_pool_preflight_enabled: bool,
     external_direct_policy_enabled: bool,
@@ -1048,7 +1048,7 @@ fn websearch_handler_test_router_with_external_options(
 }
 
 fn account_only_handler_test_router(
-    external_pool_manager: Arc<ExternalPoolManager>,
+    external_pool_manager: Arc<AccountRuntimeManager>,
 ) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
     {
@@ -1456,7 +1456,7 @@ async fn run_native_websearch_normalized_external_preflight_precedes_mcp_for_fiv
     let external_upstream = ExternalMessagesUpstream::start().await;
     let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
         &external_upstream.base_url,
-        ExternalPoolRequestBodyMode::Normalized,
+        AccountRequestBodyMode::Normalized,
     )
     .await
     else {
@@ -1561,7 +1561,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
     let external_upstream = ExternalMessagesUpstream::start().await;
     let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
         &external_upstream.base_url,
-        ExternalPoolRequestBodyMode::Normalized,
+        AccountRequestBodyMode::Normalized,
     )
     .await
     else {
@@ -1666,7 +1666,7 @@ async fn run_account_only_routes_normalized_requests_without_local_upstream_prov
     let external_upstream = ExternalMessagesUpstream::start().await;
     let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
         &external_upstream.base_url,
-        ExternalPoolRequestBodyMode::Normalized,
+        AccountRequestBodyMode::Normalized,
     )
     .await
     else {
@@ -1747,7 +1747,7 @@ async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp
     let external_upstream = ExternalMessagesUpstream::start().await;
     let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
         &external_upstream.base_url,
-        ExternalPoolRequestBodyMode::Normalized,
+        AccountRequestBodyMode::Normalized,
     )
     .await
     else {
@@ -5270,7 +5270,7 @@ fn raw_account_route_request_is_preparse_raw_only() {
     assert!(route.payload.is_none());
     assert_eq!(
         route.body_mode_filter,
-        Some(ExternalPoolRequestBodyMode::RawPassthrough)
+        Some(AccountRequestBodyMode::RawPassthrough)
     );
     assert_eq!(route.model_hint.as_deref(), Some("client-model"));
     assert_eq!(route.stream_hint, Some(true));
@@ -5292,7 +5292,7 @@ fn contaminated_fallback_requires_normalized_pool_for_five_rounds() {
         assert_eq!(account_route_body_mode_filter(false), None);
         assert_eq!(
             account_route_body_mode_filter(true),
-            Some(ExternalPoolRequestBodyMode::Normalized)
+            Some(AccountRequestBodyMode::Normalized)
         );
     }
 }
@@ -10807,7 +10807,7 @@ fn account_runtime_endpoint_gate_applies_global_enable_and_route_policy() {
         "/cc/v1/messages"
     ));
 
-    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::DenyList;
+    config.external_pool_route_mode = AccountRouteMode::DenyList;
     config.external_pool_route_rules = vec!["/cc".to_string()];
     assert!(!account_runtime_enabled_for_endpoint(
         &config,
@@ -10818,7 +10818,7 @@ fn account_runtime_endpoint_gate_applies_global_enable_and_route_policy() {
         "/v1/messages"
     ));
 
-    config.external_pool_route_mode = crate::model::config::ExternalPoolRouteMode::AllowList;
+    config.external_pool_route_mode = AccountRouteMode::AllowList;
     config.external_pool_route_rules = vec!["/dfcache/team-a".to_string()];
     assert!(!account_runtime_enabled_for_endpoint(
         &config,

@@ -26,7 +26,6 @@ pub use attempt::{
     AccountAttemptAction, AccountAttemptTrace, DeliveryEvidence, UpstreamErrorClass,
 };
 pub use migration::upstream_account_from_external_pool;
-pub(crate) use runtime::AccountRouteRequestPreparationCache;
 pub use runtime::{
     AccountAuthType, AccountAutoDisablePolicy, AccountFinalError, AccountForwardOutcome,
     AccountLatencyTraceState, AccountModelMappingMode, AccountRawModelMode, AccountRequestBodyMode,
@@ -43,6 +42,11 @@ pub use runtime::{
     immediately_available_account_for_route_body_mode_and_model,
     load_upstream_account_status_records, upstream_account_messages_url,
     upstream_account_models_url,
+};
+pub(crate) use runtime::{
+    AccountRouteRequestPreparationCache, AccountRuntimeStatusCompatibilityResponse,
+    UpstreamAccountEligibility, mask_upstream_account_key,
+    normalize_upstream_account_model_mapping_rules,
 };
 pub use scheduler::{AccountDispatchCandidate, AccountDispatchDecision, select_account_candidate};
 pub use store::{CreateUpstreamAccountStorageRequest, UpdateUpstreamAccountStorageRequest};

@@ -210,6 +210,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
 - New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
 - Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Kiro-specific header name.
+- Admin, storage and Anthropic handler-test boundaries now import upstream-account storage/status/eligibility/manager aliases through `account_runtime` instead of direct legacy external-pool modules. Unused legacy Rust enable/test DTOs were removed after compatibility routes moved to account DTOs.
 
 Last verified on 2026-08-16:
 
@@ -745,3 +746,8 @@ Earlier verified on 2026-08-15:
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
+- `rg -n "crate::external_pool|external_pool::" src --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh account-runtime-boundary-fmt2 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-runtime-boundary-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-boundary-tests1 -- bash -lc 'cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture && cargo test run_account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh account-runtime-boundary-tests2 -- bash -lc 'cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture && cargo test postgres_external_pool_list_and_get_preserve_body_modes -- --nocapture'`
