@@ -1323,7 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn recorder_writes_sampled_jsonl_and_rate_limits_same_fingerprint() {
         let dir = std::env::temp_dir().join(format!(
-            "kiro-tool-format-debug-test-{}-{}",
+            "account-runtime-tool-format-debug-test-{}-{}",
             std::process::id(),
             fastrand::u64(..)
         ));
@@ -1360,7 +1360,7 @@ mod tests {
     #[tokio::test]
     async fn recorder_captures_attempted_body_only_within_body_limit() {
         let dir = std::env::temp_dir().join(format!(
-            "kiro-tool-format-debug-body-test-{}-{}",
+            "account-runtime-tool-format-debug-body-test-{}-{}",
             std::process::id(),
             fastrand::u64(..)
         ));
@@ -1428,7 +1428,7 @@ mod tests {
     #[tokio::test]
     async fn writer_state_rolls_when_file_size_budget_would_be_exceeded() {
         let dir = std::env::temp_dir().join(format!(
-            "kiro-tool-format-debug-roll-test-{}-{}",
+            "account-runtime-tool-format-debug-roll-test-{}-{}",
             std::process::id(),
             fastrand::u64(..)
         ));

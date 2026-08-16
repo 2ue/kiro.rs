@@ -206,9 +206,13 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming; the old theme key remains a read fallback only.
 - New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
 - Startup env handling now prefers `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, reads the old Kiro-named env vars only as compatibility fallbacks, and healthz now reports `account-runtime` as the service name.
+- Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming; stable hash domains remain unchanged to avoid behavior drift.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro-tool-format-debug|kiro-rs-file-limit-boundary|kiro\\.rs:anthropic:conversation-id|kiro\\.rs:tool-schema-key" src/anthropic src/model src/admin src/storage --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh fixture-artifact-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh fixture-artifact-names-test1 -- bash -lc 'cargo test recorder_writes_sampled_jsonl_and_rate_limits_same_fingerprint -- --nocapture && cargo test recorder_captures_attempted_body_only_within_body_limit -- --nocapture && cargo test writer_state_rolls_when_file_size_budget_would_be_exceeded -- --nocapture && cargo test file_upload_route_accepts_exact_file_limit_and_rejects_one_byte_over_for_five_rounds -- --nocapture'`
 - `rg -n "KIRO_API_KEY|KIRO_RS_HOST|KIRO_RS_PORT|\"service\": \"kiro-rs\"|service.*kiro-rs" src README.md docker-compose.deploy.yml docs/ai-docker-compose-deployment.md scripts/loadtest --glob '!target/**' --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh startup-env-health-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh startup-env-health-test1 -- bash -lc 'cargo test account_runtime_env_helpers_prefer_neutral_names_and_fallback_to_legacy -- --nocapture && cargo test healthz_uses_account_runtime_service_name -- --nocapture && cargo check'`

@@ -684,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn file_upload_route_accepts_exact_file_limit_and_rejects_one_byte_over_for_five_rounds()
     {
-        const BOUNDARY: &str = "kiro-rs-file-limit-boundary";
+        const BOUNDARY: &str = "account-runtime-file-limit-boundary";
         let config = Config::default();
         let app = create_router_with_provider(
             AnthropicRouterDependencies {
