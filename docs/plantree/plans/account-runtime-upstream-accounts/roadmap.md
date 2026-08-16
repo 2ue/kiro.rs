@@ -167,6 +167,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Admin UI internal status color utilities now use `runtime` class prefixes instead of Kiro-branded class names while preserving the existing visual behavior.
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming, with the old theme key retained only as a compatibility fallback.
 - New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
+- Startup env handling now prefers `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, keeps old Kiro-named env vars only as compatibility fallbacks, and healthz reports `account-runtime`.
 
 ## In Progress
 

@@ -106,7 +106,7 @@ services:
       KIRO_RS_POSTGRES_MIGRATE_ON_START: ${KIRO_RS_POSTGRES_MIGRATE_ON_START:-true}
       KIRO_RS_REDIS_URL: redis://kiro-rs-redis:6379/0
     ports:
-      - "${KIRO_RS_PORT:-8990}:8990"
+      - "${ACCOUNT_RUNTIME_PORT:-8990}:8990"
     volumes:
       - ./config:/app/config
     extra_hosts:
@@ -130,7 +130,7 @@ PostgreSQL 18 官方镜像默认使用版本化的数据目录，compose 中挂�
 | --- | --- | --- |
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | 控制使用哪个镜像仓库。一般不需要改。 |
 | `KIRO_RS_VERSION` | `latest` | 控制镜像版本。生产建议固定为具体版本，例如 `0.0.19`。 |
-| `KIRO_RS_PORT` | `8990` | 控制宿主机暴露端口。容器内端口固定是 `8990`。 |
+| `ACCOUNT_RUNTIME_PORT` | `8990` | 控制宿主机暴露端口。容器内端口固定是 `8990`。旧 `KIRO_RS_PORT` 仍可被运行时作为兼容 fallback 读取，但当前 compose 文件使用 `ACCOUNT_RUNTIME_PORT`。 |
 | `KIRO_RS_POSTGRES_DB` | `kiro_rs` | 控制 PgSQL 数据库名。 |
 | `KIRO_RS_POSTGRES_USER` | `kiro_rs` | 控制 PgSQL 用户名。 |
 | `KIRO_RS_POSTGRES_PASSWORD` | `change-me` | 控制 PgSQL 密码，生产必须改成强密码。 |
@@ -146,7 +146,7 @@ KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker com
 如果宿主机想用 `9022` 端口：
 
 ```bash
-KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
+ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
 ```
 
 ## 5. config.json

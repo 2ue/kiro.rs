@@ -2036,9 +2036,9 @@ impl PostgresStore {
         api_key: &str,
     ) -> anyhow::Result<LocalUpstreamCredentials> {
         let (api_key, region) = split_local_upstream_api_key_and_region(api_key)
-            .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 为空"))?;
+            .ok_or_else(|| anyhow::anyhow!("本地上游 API Key 为空"))?;
         if api_key.trim().is_empty() {
-            anyhow::bail!("KIRO_API_KEY 为空");
+            anyhow::bail!("本地上游 API Key 为空");
         }
         if let Some(existing) = self.find_existing_api_key_credential(&api_key).await? {
             return Ok(existing);
@@ -2059,7 +2059,7 @@ impl PostgresStore {
             Err(err) if err.to_string().contains("kiroApiKey 重复") => self
                 .find_existing_api_key_credential(&api_key)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 已存在但重新查询失败")),
+                .ok_or_else(|| anyhow::anyhow!("本地上游 API Key 已存在但重新查询失败")),
             Err(err) => Err(err),
         }
     }

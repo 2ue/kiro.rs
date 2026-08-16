@@ -241,14 +241,7 @@ async fn main() {
         });
     let start_legacy_credential_provider = legacy_credential_provider_required(&config);
     let env_local_upstream_api_key = if start_legacy_credential_provider {
-        match std::env::var("KIRO_API_KEY") {
-            Ok(value) if value.trim().is_empty() => {
-                tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
-                None
-            }
-            Ok(value) => Some(value.trim().to_string()),
-            Err(_) => None,
-        }
+        read_trimmed_env_var_with_legacy("LOCAL_UPSTREAM_API_KEY", "KIRO_API_KEY")
     } else {
         None
     };
@@ -269,7 +262,7 @@ async fn main() {
             }
             Err(err) if env_local_upstream_api_key.is_some() => {
                 tracing::warn!(
-                    "首次导入凭据文件不可用，将仅使用 KIRO_API_KEY 自动导入: {}",
+                    "首次导入凭据文件不可用，将仅使用环境中的本地上游 API Key 自动导入: {}",
                     err
                 );
             }
@@ -280,18 +273,23 @@ async fn main() {
         }
     }
 
-    if let Some(local_upstream_api_key) = &env_local_upstream_api_key {
+    if let Some((local_upstream_api_key, env_var_name)) = &env_local_upstream_api_key {
         postgres_store
             .ensure_api_key_credential(local_upstream_api_key)
             .await
             .map(|credential| {
                 tracing::info!(
                     credential_id = credential.id.unwrap_or_default(),
-                    "KIRO_API_KEY 已作为 API Key 凭据存在或完成一次性导入"
+                    env_var = env_var_name,
+                    "环境中的本地上游 API Key 已作为 API Key 凭据存在或完成一次性导入"
                 );
             })
             .unwrap_or_else(|e| {
-                tracing::error!("导入 KIRO_API_KEY 到 PgSQL 失败: {}", e);
+                tracing::error!(
+                    env_var = env_var_name,
+                    "导入本地上游 API Key 到 PgSQL 失败: {}",
+                    e
+                );
                 std::process::exit(1);
             });
     }
@@ -1216,27 +1214,41 @@ fn startup_retry_delay(attempt: u32) -> StdDuration {
 }
 
 fn apply_service_bind_env_overrides(config: &mut Config) {
-    if let Ok(host) = std::env::var("KIRO_RS_HOST") {
-        let host = host.trim();
-        if !host.is_empty() {
-            config.host = host.to_string();
-        }
+    if let Some((host, _env_var_name)) =
+        read_trimmed_env_var_with_legacy("ACCOUNT_RUNTIME_HOST", "KIRO_RS_HOST")
+    {
+        config.host = host;
     }
 
-    if let Ok(port) = std::env::var("KIRO_RS_PORT") {
-        let port = port.trim();
-        if port.is_empty() {
-            return;
-        }
+    if let Some((port, env_var_name)) =
+        read_trimmed_env_var_with_legacy("ACCOUNT_RUNTIME_PORT", "KIRO_RS_PORT")
+    {
         match port.parse::<u16>() {
             Ok(port) => config.port = port,
             Err(err) => tracing::warn!(
-                value = port,
+                env_var = env_var_name,
+                value = %port,
                 error = %err,
-                "忽略无效的 KIRO_RS_PORT 环境变量"
+                "忽略无效的服务监听端口环境变量"
             ),
         }
     }
+}
+
+fn read_trimmed_env_var_with_legacy(primary: &str, legacy: &str) -> Option<(String, String)> {
+    for name in [primary, legacy] {
+        match std::env::var(name) {
+            Ok(value) if value.trim().is_empty() => {
+                tracing::warn!(env_var = name, "环境变量已设置但为空，视为未配置");
+            }
+            Ok(value) => return Some((value.trim().to_string(), name.to_string())),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(err) => {
+                tracing::warn!(env_var = name, error = %err, "读取环境变量失败，视为未配置");
+            }
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -1283,7 +1295,7 @@ fn create_health_router(state: Arc<AppHealthState>) -> Router {
 async fn healthz() -> Json<Value> {
     Json(json!({
         "status": "ok",
-        "service": "kiro-rs"
+        "service": "account-runtime"
     }))
 }
 
@@ -1568,7 +1580,26 @@ fn handle_credentials_command(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn set_test_env(name: &str, value: &str) {
+        // SAFETY: Tests that mutate process env hold ENV_LOCK, so this module does not race itself.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+
+    fn remove_test_env(name: &str) {
+        // SAFETY: Tests that mutate process env hold ENV_LOCK, so this module does not race itself.
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
 
     #[test]
     fn remaining_shutdown_budget_caps_each_stage_and_expires() {
@@ -1598,6 +1629,60 @@ mod lifecycle_tests {
         let checksum_error =
             anyhow::anyhow!("schema migration credential-storage-revision-v1 checksum mismatch");
         assert!(!postgres_startup_error_is_retryable(&checksum_error));
+    }
+
+    #[test]
+    fn account_runtime_env_helpers_prefer_neutral_names_and_fallback_to_legacy() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        remove_test_env("LOCAL_UPSTREAM_API_KEY");
+        remove_test_env("KIRO_API_KEY");
+        remove_test_env("ACCOUNT_RUNTIME_HOST");
+        remove_test_env("KIRO_RS_HOST");
+        remove_test_env("ACCOUNT_RUNTIME_PORT");
+        remove_test_env("KIRO_RS_PORT");
+
+        set_test_env("KIRO_API_KEY", " legacy-key ");
+        assert_eq!(
+            read_trimmed_env_var_with_legacy("LOCAL_UPSTREAM_API_KEY", "KIRO_API_KEY"),
+            Some(("legacy-key".to_string(), "KIRO_API_KEY".to_string()))
+        );
+
+        set_test_env("LOCAL_UPSTREAM_API_KEY", " primary-key ");
+        assert_eq!(
+            read_trimmed_env_var_with_legacy("LOCAL_UPSTREAM_API_KEY", "KIRO_API_KEY"),
+            Some((
+                "primary-key".to_string(),
+                "LOCAL_UPSTREAM_API_KEY".to_string()
+            ))
+        );
+
+        let mut config = Config::default();
+        set_test_env("KIRO_RS_HOST", "127.0.0.2");
+        set_test_env("KIRO_RS_PORT", "19090");
+        apply_service_bind_env_overrides(&mut config);
+        assert_eq!(config.host, "127.0.0.2");
+        assert_eq!(config.port, 19090);
+
+        set_test_env("ACCOUNT_RUNTIME_HOST", "127.0.0.3");
+        set_test_env("ACCOUNT_RUNTIME_PORT", "19091");
+        apply_service_bind_env_overrides(&mut config);
+        assert_eq!(config.host, "127.0.0.3");
+        assert_eq!(config.port, 19091);
+
+        remove_test_env("LOCAL_UPSTREAM_API_KEY");
+        remove_test_env("KIRO_API_KEY");
+        remove_test_env("ACCOUNT_RUNTIME_HOST");
+        remove_test_env("KIRO_RS_HOST");
+        remove_test_env("ACCOUNT_RUNTIME_PORT");
+        remove_test_env("KIRO_RS_PORT");
+    }
+
+    #[tokio::test]
+    async fn healthz_uses_account_runtime_service_name() {
+        let Json(body) = healthz().await;
+
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["service"], "account-runtime");
     }
 
     #[test]

@@ -205,9 +205,13 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin UI internal status color utility classes now use `runtime` prefixes instead of Kiro-branded class names while preserving the existing color values and component behavior.
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming; the old theme key remains a read fallback only.
 - New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
+- Startup env handling now prefers `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, reads the old Kiro-named env vars only as compatibility fallbacks, and healthz now reports `account-runtime` as the service name.
 
 Last verified on 2026-08-16:
 
+- `rg -n "KIRO_API_KEY|KIRO_RS_HOST|KIRO_RS_PORT|\"service\": \"kiro-rs\"|service.*kiro-rs" src README.md docker-compose.deploy.yml docs/ai-docker-compose-deployment.md scripts/loadtest --glob '!target/**' --glob '!**/node_modules/**'`
+- `feature/tests/run-cargo-scoped.sh startup-env-health-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh startup-env-health-test1 -- bash -lc 'cargo test account_runtime_env_helpers_prefer_neutral_names_and_fallback_to_legacy -- --nocapture && cargo test healthz_uses_account_runtime_service_name -- --nocapture && cargo check'`
 - `rg -n "sk-kiro-rs|kiro-credentials|kiro-rs-credentials-backup|kiro-rs-proxy-test" src ui admin-ui scripts docs --glob '!target/**' --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh api-key-artifacts-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh api-key-artifacts-check1 -- bash -lc 'cargo check && cargo test admin::service_tests -- --nocapture'`
