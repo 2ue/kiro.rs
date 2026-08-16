@@ -156,6 +156,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - The load/chaos helper now presents account-runtime/upstream wording for command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and tests while keeping old Kiro-named CLI/env/header inputs only as compatibility aliases/fallbacks.
 - Anthropic handler and external-pool test helpers now construct local upstream credential, endpoint, manager, provider and EventStream CRC fixtures through the `local_upstream` facade instead of importing legacy local-provider modules directly.
 - Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
+- The maintained UI HTML document title now uses Account Runtime Console wording.
 
 ## In Progress
 

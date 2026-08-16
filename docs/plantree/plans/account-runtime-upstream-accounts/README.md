@@ -194,9 +194,13 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The load/chaos helper now presents account-runtime/upstream wording for its command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and test names. New flags use `--fake-upstream-usage` and `--fake-local-upstream-eventstream`; old Kiro-named flags, env and error-header inputs remain only as compatibility aliases/fallbacks.
 - Anthropic handler and external-pool test helpers now construct local upstream credentials, endpoints, managers, provider fixtures and EventStream CRC frames through the `local_upstream` facade instead of importing legacy local-provider modules directly.
 - Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording. New mock/doc variables use `ACCOUNT_RUNTIME_*` names while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
+- The maintained UI HTML document title now uses Account Runtime Console wording; the Admin HTML title already uses Account Runtime Admin.
 
 Last verified on 2026-08-16:
 
+- `rg -n "<title>|Kiro Console|Kiro Admin|Kiro 控制台" ui/index.html admin-ui/index.html ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `pnpm --dir ui check`
+- `git diff --check`
 - `rg -n "Kiro|kiro|KIRO" docs/testing/loadtest.md scripts/loadtest/kiro-mock-upstream.mjs admin-ui/index.html`
 - `node --check scripts/loadtest/kiro-mock-upstream.mjs`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
