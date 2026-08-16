@@ -208,9 +208,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Startup env handling now prefers `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, reads the old Kiro-named env vars only as compatibility fallbacks, and healthz now reports `account-runtime` as the service name.
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming; stable hash domains remain unchanged to avoid behavior drift.
 - Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
+- New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
 
 Last verified on 2026-08-16:
 
+- `rg -n "/tmp/kiro-rs/external-pool-usage-debug|kiro_rs:local|kiro_rs:observability|sk-kiro-rs-qaz" src ui admin-ui README.md docs/ai-docker-compose-deployment.md --glob '!target/**' --glob '!**/node_modules/**'`
+- `feature/tests/run-cargo-scoped.sh config-default-artifacts-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh config-default-artifacts-test1 -- bash -lc 'cargo test model::config -- --nocapture && cargo check'`
+- `pnpm --dir ui check`
 - `rg -n "__kiro_rs_invalid_redis_type__|kiro_rs:test|kiro-usage-store" src/anthropic src/storage src/external_pool src/admin --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh redis-prefix-artifacts-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh redis-prefix-artifacts-test1 -- bash -lc 'cargo test dashboard_windows_uses_redis_observability_without_postgres_for_three_rounds -- --nocapture && cargo test persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds -- --nocapture && cargo test production_postgres_only_usage_never_materializes_redis_for_five_rounds -- --nocapture && cargo test redis_cache -- --nocapture'`

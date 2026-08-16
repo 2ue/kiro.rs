@@ -4591,7 +4591,7 @@ fn default_external_pool_usage_projection_cost_floor_margin_percent() -> u32 {
 }
 
 fn default_external_pool_usage_debug_dir() -> String {
-    "/tmp/kiro-rs/external-pool-usage-debug".to_string()
+    "/tmp/account-runtime/upstream-account-usage-debug".to_string()
 }
 
 fn default_external_pool_usage_debug_max_body_bytes() -> u32 {
@@ -4611,11 +4611,11 @@ fn default_postgres_usage_max_connections() -> u32 {
 }
 
 fn default_redis_key_prefix() -> String {
-    "kiro_rs:local".to_string()
+    "account-runtime:local".to_string()
 }
 
 fn default_observability_redis_key_prefix() -> String {
-    "kiro_rs:observability".to_string()
+    "account-runtime:observability".to_string()
 }
 
 fn default_reported_usage_normal_max_multiplier() -> f64 {
@@ -5313,7 +5313,7 @@ mod tests {
         assert!(config.observability_redis.url.is_none());
         assert_eq!(
             config.observability_redis.key_prefix,
-            "kiro_rs:observability"
+            "account-runtime:observability"
         );
         assert!(config.validate_redis_fault_domains().is_ok());
     }
@@ -5466,7 +5466,7 @@ mod tests {
         assert_eq!(config.postgres.usage_max_connections, 4);
         assert!(config.postgres.migrate_on_start);
         assert!(!config.postgres.compress_usage_rollups_on_start);
-        assert_eq!(config.redis.key_prefix, "kiro_rs:local");
+        assert_eq!(config.redis.key_prefix, "account-runtime:local");
         assert_eq!(config.credential_rpm, Some(100));
         assert_eq!(config.credential_max_concurrent_requests, 30);
         assert_eq!(config.credential_transient_cooldown_secs, 10);

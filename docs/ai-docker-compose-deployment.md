@@ -251,7 +251,7 @@ ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替�
 | `postgres.migrateOnStart` | `true` | 控制启动时是否自动创建或升级数据库表。生产升级必须保持开启，或使用 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true` 覆盖挂载配置；当前二进制会在启动时校验所需 schema，旧/半迁移 schema 会拒绝启动。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
 | `postgres.compressUsageRollupsOnStart` | `false` | 控制启动时是否执行历史 usage rollup 小桶压缩。生产默认关闭，避免升级启动阶段长时间占用 PgSQL；需要整理历史数据时再低峰期显式开启一次。普通升级保持 `false`。 |
 | `redis.url` | Compose 自动注入 | 控制 Redis 连接地址。服务必须能连接 Redis 才能启动；会话绑定、临时冷却、限流、并发占用、刷新锁和余额缓存都写入 Redis。 |
-| `redis.keyPrefix` | `kiro_rs:prod` | 控制 Redis key 前缀，用于和同一个 Redis 中的其他业务隔离。 |
+| `redis.keyPrefix` | `account-runtime:prod` | 控制 Redis key 前缀，用于和同一个 Redis 中的其他业务隔离。 |
 
 #### Usage 历史数据维护
 

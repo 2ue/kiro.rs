@@ -115,11 +115,11 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
    },
    "observabilityRedis": {
       "url": null,
-      "keyPrefix": "kiro_rs:observability"
+      "keyPrefix": "account-runtime:observability"
    },
    "host": "127.0.0.1",
    "port": 8990,
-   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+   "apiKey": "sk-account-runtime-qazWSXedcRFV123456",
    "apiKeys": [],
    "region": "us-east-1"
 }
@@ -191,7 +191,7 @@ IdC 认证：
 ```bash
 curl http://127.0.0.1:8990/v1/messages \
   -H "Content-Type: application/json" \
-  -H "x-api-key: sk-kiro-rs-qazWSXedcRFV123456" \
+  -H "x-api-key: sk-account-runtime-qazWSXedcRFV123456" \
   -d '{
     "model": "claude-sonnet-4-20250514",
     "max_tokens": 1024,
@@ -258,7 +258,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表；生产升级必须保持开启或通过 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true` 覆盖配置，否则旧/半迁移 schema 会在启动兼容校验中被拒绝 |
 | `postgres.compressUsageRollupsOnStart` | boolean | `false` | 已废弃的兼容字段；设置为 `true` 会在连接数据库前拒绝启动。请先停止并排空所有网关实例，再运行 `maintenance usage-rollup-compression` |
 | `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
-| `redis.keyPrefix` | string | `kiro_rs:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
+| `redis.keyPrefix` | string | `account-runtime:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `credentialRpm` | number/null | `null` | 单凭据本地 RPM 限速；`null` 或 `0` 表示关闭。开启后会优先分流到其他可用凭据 |
 | `credentialMaxConcurrentRequests` | number | `0` | 单凭据最大并发请求数；`0` 表示不限制。开启后同一凭据达到并发上限时，新请求会优先换其他可用凭据 |
@@ -332,7 +332,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    },
    "host": "127.0.0.1",
    "port": 8990,
-   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+   "apiKey": "sk-account-runtime-qazWSXedcRFV123456",
    "apiKeys": [],
    "adminApiKey": "sk-admin-your-secret-key",
    "payloadGuardEnabled": true,

@@ -871,7 +871,7 @@ export function RuntimePage() {
                       <Input
                         className="font-mono text-xs"
                         value={draft.externalPools.externalPoolUsageDebugDir}
-                        placeholder="/tmp/kiro-rs/external-pool-usage-debug"
+                        placeholder="/tmp/account-runtime/upstream-account-usage-debug"
                         onChange={(event) => setExternalPools('externalPoolUsageDebugDir')(event.target.value)}
                       />
                       <span className="block text-xs leading-4 text-muted-foreground">
