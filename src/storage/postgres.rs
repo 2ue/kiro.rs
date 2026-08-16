@@ -15308,7 +15308,7 @@ mod tests {
             .save_credential_account_info(
                 7,
                 &CredentialAccountInfoRow {
-                    subscription_title: Some("Upstream Pro".to_string()),
+                    subscription_title: Some("Plan Alpha".to_string()),
                     current_usage: 90.0,
                     usage_limit: 1000.0,
                     remaining: 910.0,
@@ -15332,7 +15332,7 @@ mod tests {
         let account_info = account_info.get(&7).unwrap();
         assert_eq!(
             account_info.subscription_title.as_deref(),
-            Some("Upstream Pro")
+            Some("Plan Alpha")
         );
         assert_eq!(account_info.current_usage, 90.0);
         assert_eq!(account_info.usage_limit, 1000.0);
@@ -15670,7 +15670,7 @@ mod tests {
                 provider: "builderid".to_string(),
                 effective_auth_region: "us-east-1".to_string(),
                 effective_api_region: "us-east-1".to_string(),
-                subscription_class: "kiro pro".to_string(),
+                subscription_class: "account class alpha".to_string(),
                 supported_models: Vec::new(),
             }],
             reasoning_capability_cohort_complete: true,

@@ -389,7 +389,7 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
-    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    /// 上游返回的订阅/计划标签，仅用于展示和过滤。
     pub subscription_title: Option<String>,
     /// 上次查询到的账号信息快照。
     #[serde(skip_serializing_if = "Option::is_none")]

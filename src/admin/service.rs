@@ -268,15 +268,6 @@ struct CachedBalance {
     data: BalanceResponse,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialCreditTier {
-    Free,
-    Pro,
-    ProPlus,
-    Power,
-    ProMax,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct CredentialCreditSnapshot {
     limit: f64,
@@ -285,42 +276,18 @@ struct CredentialCreditSnapshot {
     bonus: f64,
 }
 
-fn credit_snapshot_for_subscription(
-    subscription_title: Option<&str>,
+fn credit_snapshot_for_account_usage(
     current_usage: f64,
     usage_limit: f64,
     active_bonus_limit: f64,
 ) -> CredentialCreditSnapshot {
-    let Some(tier) = credential_credit_tier(subscription_title) else {
-        return CredentialCreditSnapshot {
-            limit: usage_limit,
-            remaining: (usage_limit - current_usage).max(0.0),
-            base: 0.0,
-            bonus: 0.0,
-        };
-    };
-
-    if tier == CredentialCreditTier::Free {
-        let limit = if usage_limit > 0.0 {
-            usage_limit
-        } else {
-            credential_credit_base(tier)
-        };
-        return CredentialCreditSnapshot {
-            limit,
-            remaining: (limit - current_usage).max(0.0),
-            base: limit,
-            bonus: 0.0,
-        };
-    }
-
-    let base = credential_credit_base(tier);
-    let bonus = if tier != CredentialCreditTier::Free && active_bonus_limit > 0.0 {
-        10_000.0
+    let limit = usage_limit.max(0.0);
+    let bonus = active_bonus_limit.clamp(0.0, limit);
+    let base = if limit > 0.0 {
+        (limit - bonus).max(0.0)
     } else {
         0.0
     };
-    let limit = base + bonus;
 
     CredentialCreditSnapshot {
         limit,
@@ -331,7 +298,6 @@ fn credit_snapshot_for_subscription(
 }
 
 fn credit_snapshot_from_persisted_fields(
-    subscription_title: Option<&str>,
     current_usage: f64,
     usage_limit: f64,
     credit_limit: f64,
@@ -340,16 +306,7 @@ fn credit_snapshot_from_persisted_fields(
     credit_bonus: f64,
 ) -> CredentialCreditSnapshot {
     if usage_limit > 0.0 {
-        let inferred_bonus_limit = credential_credit_tier(subscription_title)
-            .filter(|tier| has_overage_credit_from_usage_limit(*tier, usage_limit))
-            .map(|_| 10_000.0)
-            .unwrap_or(0.0);
-        return credit_snapshot_for_subscription(
-            subscription_title,
-            current_usage,
-            usage_limit,
-            inferred_bonus_limit,
-        );
+        return credit_snapshot_for_account_usage(current_usage, usage_limit, credit_bonus);
     }
     if credit_limit > 0.0 || credit_remaining > 0.0 || credit_base > 0.0 || credit_bonus > 0.0 {
         return CredentialCreditSnapshot {
@@ -359,49 +316,7 @@ fn credit_snapshot_from_persisted_fields(
             bonus: credit_bonus,
         };
     }
-    credit_snapshot_for_subscription(subscription_title, current_usage, 0.0, 0.0)
-}
-
-fn credential_credit_base(tier: CredentialCreditTier) -> f64 {
-    match tier {
-        CredentialCreditTier::Free => 50.0,
-        CredentialCreditTier::Pro => 1_000.0,
-        CredentialCreditTier::ProPlus => 2_000.0,
-        CredentialCreditTier::Power => 10_000.0,
-        CredentialCreditTier::ProMax => 5_000.0,
-    }
-}
-
-fn has_overage_credit_from_usage_limit(tier: CredentialCreditTier, usage_limit: f64) -> bool {
-    tier != CredentialCreditTier::Free
-        && usage_limit >= credential_credit_base(tier) + 10_000.0 - f64::EPSILON
-}
-
-fn credential_credit_tier(subscription_title: Option<&str>) -> Option<CredentialCreditTier> {
-    let title = subscription_title?.trim().to_ascii_lowercase();
-    if title.is_empty() {
-        return None;
-    }
-    let compact: String = title
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect();
-    if title.contains("free") {
-        return Some(CredentialCreditTier::Free);
-    }
-    if title.contains("power") {
-        return Some(CredentialCreditTier::Power);
-    }
-    if compact.contains("promax") {
-        return Some(CredentialCreditTier::ProMax);
-    }
-    if title.contains("pro+") || compact.contains("proplus") {
-        return Some(CredentialCreditTier::ProPlus);
-    }
-    if compact.contains("pro") {
-        return Some(CredentialCreditTier::Pro);
-    }
-    None
+    credit_snapshot_for_account_usage(current_usage, 0.0, 0.0)
 }
 
 fn balance_cache_key(id: u64) -> String {
@@ -3516,9 +3431,9 @@ impl AdminService {
             }
         }
 
-        // 主动获取订阅等级并保存账号信息快照，避免首次请求时 Free 账号绕过 Opus 模型过滤。
+        // 主动获取上游账号信息快照，后续列表和用量展示直接读取缓存元数据。
         if let Err(e) = self.get_balance(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+            tracing::warn!("添加凭据后获取账号信息失败（不影响凭据添加）: {}", e);
         }
         self.audit(
             "add_credential",
@@ -6535,7 +6450,6 @@ fn extract_upstream_account_test_response_text(body: &str) -> Option<String> {
 
 fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInfo {
     let credit = credit_snapshot_from_persisted_fields(
-        row.subscription_title.as_deref(),
         row.current_usage,
         row.usage_limit,
         row.credit_limit,
@@ -6778,12 +6692,8 @@ fn balance_response_from_usage(
     } else {
         0.0
     };
-    let credit = credit_snapshot_for_subscription(
-        usage.subscription_title(),
-        current_usage,
-        usage_limit,
-        usage.active_bonus_limit(),
-    );
+    let credit =
+        credit_snapshot_for_account_usage(current_usage, usage_limit, usage.active_bonus_limit());
     BalanceResponse {
         id,
         checked_at: Utc::now().to_rfc3339(),
@@ -6807,7 +6717,6 @@ fn balance_response_from_usage(
 
 fn normalize_balance_credit_snapshot(balance: &BalanceResponse) -> BalanceResponse {
     let credit = credit_snapshot_from_persisted_fields(
-        balance.subscription_title.as_deref(),
         balance.current_usage,
         balance.usage_limit,
         balance.credit_limit,
@@ -7512,17 +7421,10 @@ fn compare_subscription_change(
     let Some(current) = current else {
         return "unknown".to_string();
     };
-    let previous_rank = subscription_rank(previous.subscription_title.as_deref());
-    let current_rank = subscription_rank(current.subscription_title.as_deref());
-    if previous_rank == 0 || current_rank == 0 {
-        return "unknown".to_string();
-    }
-    if current_rank < previous_rank {
-        "downgraded".to_string()
-    } else if current_rank > previous_rank {
-        "upgraded".to_string()
-    } else {
+    if previous.subscription_title == current.subscription_title {
         "unchanged".to_string()
+    } else {
+        "changed".to_string()
     }
 }
 
@@ -7530,48 +7432,35 @@ fn subscription_key(title: Option<&str>) -> String {
     let Some(title) = title else {
         return "unknown".to_string();
     };
-    let lower = title.trim().to_lowercase();
-    let compact: String = lower
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect();
-    if compact.contains("power") {
-        "power".to_string()
-    } else if compact.contains("promax") {
-        "pro_max".to_string()
-    } else if lower.contains("pro+")
-        || lower.contains("pro plus")
-        || lower.contains("pro_plus")
-        || lower.contains("pro-plus")
-        || compact.contains("proplus")
-    {
-        "pro_plus".to_string()
-    } else if lower.contains("trial") || lower.contains("试用") {
-        "trial".to_string()
-    } else if lower.contains("free") || lower.contains("免费") {
-        "free".to_string()
-    } else if lower.contains("pro") {
-        "pro".to_string()
-    } else {
-        "unknown".to_string()
+    let normalized = title.trim().to_lowercase();
+    if normalized.is_empty() {
+        return "unknown".to_string();
     }
-}
-
-fn subscription_rank(title: Option<&str>) -> u8 {
-    match subscription_key(title).as_str() {
-        "free" => 1,
-        "trial" => 2,
-        "pro" => 3,
-        "pro_plus" => 4,
-        "pro_max" => 5,
-        "power" => 6,
-        _ => 0,
+    let mut slug_source = String::new();
+    for ch in normalized.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug_source.push(ch);
+        } else if ch == '+' {
+            slug_source.push_str("_plus_");
+        } else {
+            slug_source.push('_');
+        }
+    }
+    let slug = slug_source
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() {
+        "unknown".to_string()
+    } else {
+        format!("subscription_label_{slug}")
     }
 }
 
 fn validation_group_key(item: &CredentialValidationItem) -> String {
     match item.change_kind.as_str() {
-        "failed" | "downgraded" | "upgraded" => item.change_kind.clone(),
+        "failed" | "changed" => item.change_kind.clone(),
         _ => item.subscription_key.clone(),
     }
 }
@@ -7579,14 +7468,12 @@ fn validation_group_key(item: &CredentialValidationItem) -> String {
 fn validation_group_title(key: &str) -> String {
     match key {
         "failed" => "查询失败".to_string(),
-        "downgraded" => "疑似订阅掉级".to_string(),
-        "upgraded" => "订阅升级".to_string(),
-        "pro_plus" => "Pro+".to_string(),
-        "pro" => "Pro".to_string(),
-        "trial" => "试用".to_string(),
-        "free" => "Free".to_string(),
+        "changed" => "订阅变更".to_string(),
         "unknown" => "未知订阅".to_string(),
         "external" => "外部校验".to_string(),
+        key if key.starts_with("subscription_label_") => key
+            .trim_start_matches("subscription_label_")
+            .replace('_', " "),
         other => other.to_string(),
     }
 }
@@ -7614,17 +7501,7 @@ fn build_validation_response(items: Vec<CredentialValidationItem>) -> Credential
             .or_default()
             .push(item);
     }
-    let preferred = [
-        "downgraded",
-        "failed",
-        "upgraded",
-        "pro_plus",
-        "pro",
-        "trial",
-        "free",
-        "external",
-        "unknown",
-    ];
+    let preferred = ["failed", "changed", "external", "unknown"];
     let mut groups = Vec::new();
     for key in preferred {
         if let Some(items) = grouped.remove(key) {

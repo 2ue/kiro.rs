@@ -53,9 +53,8 @@ import { pageMeta } from '@/types/ui'
 // ---------------------------------------------------------------------------
 
 function changeTone(kind: string): 'default' | 'success' | 'warning' | 'error' {
-  if (kind === 'downgraded' || kind === 'failed') return 'error'
-  if (kind === 'upgraded') return 'success'
-  if (kind === 'unknown') return 'warning'
+  if (kind === 'failed') return 'error'
+  if (kind === 'changed' || kind === 'unknown') return 'warning'
   return 'default'
 }
 
@@ -232,6 +231,7 @@ function ValidationResults({ result }: { result: CredentialValidationResponse | 
       />
     )
   }
+  const changed = result.groups.find((group) => group.key === 'changed')?.count ?? 0
 
   return (
     <div className="space-y-4">
@@ -245,16 +245,10 @@ function ValidationResults({ result }: { result: CredentialValidationResponse | 
           tone={result.failed > 0 ? 'error' : 'default'}
         />
         <StatCard
-          title="升级"
-          value={formatCompact(result.upgraded)}
-          valueTitle={formatNumber(result.upgraded)}
-          tone={result.upgraded > 0 ? 'success' : 'default'}
-        />
-        <StatCard
-          title="疑似掉级"
-          value={formatCompact(result.downgraded)}
-          valueTitle={formatNumber(result.downgraded)}
-          tone={result.downgraded > 0 ? 'warning' : 'default'}
+          title="变更"
+          value={formatCompact(changed)}
+          valueTitle={formatNumber(changed)}
+          tone={changed > 0 ? 'warning' : 'default'}
         />
         <StatCard title="无变化" value={formatCompact(result.unchanged)} valueTitle={formatNumber(result.unchanged)} />
       </StatGrid>
@@ -337,7 +331,7 @@ function ExistingValidationSection({
         <Callout tone="warning">
           <div className="flex items-start gap-2">
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>掉级判断基于上次保存的信息和本次强制查询结果；首次查询没有历史快照时会标记为未知。existing 接口仅支持订阅与用量对比，不支持模型验活。</span>
+            <span>变更判断基于上次保存的信息和本次强制查询结果；首次查询没有历史快照时会标记为未知。existing 接口仅支持订阅与用量对比，不支持模型验活。</span>
           </div>
         </Callout>
       </div>

@@ -50,7 +50,8 @@ Current-state facts and target-state decisions answer different questions and mu
 - 2026-08-16: The same plan also renamed the concrete local-upstream provider, endpoint trait, API response and stream completion types to `LocalUpstream*` names; provider diagnostics now use local-upstream wording while preserving transport behavior.
 - 2026-08-16: The local-upstream call-trace attempt/error/failure-kind types now use `LocalUpstream*` names while keeping the existing attempt JSON shape and MCP attribution behavior unchanged.
 - 2026-08-16: Local-upstream available-model catalog, cohort-key and token-limit types now use `LocalUpstream*` names while preserving the ListAvailableModels wire shape and reasoning cohort checks.
-- 2026-08-16: Local-upstream credential type/helper names now use `LocalUpstream*` wording, and scheduler model eligibility no longer derives Opus support from Pro/Free subscription labels. Explicit `supported_models` data now owns model capability filtering; legacy subscription labels are metadata only.
+- 2026-08-16: Local-upstream credential type/helper names now use `LocalUpstream*` wording, and scheduler model eligibility no longer derives Opus support from legacy subscription labels. Explicit `supported_models` data now owns model capability filtering; legacy subscription labels are metadata only.
+- 2026-08-16: Admin account-info credit snapshots and validation grouping no longer use built-in subscription tier tables or rank ordering. Usage/credit fields drive credit values, and subscription titles are treated as unordered labels.
 
 ## Baseline
 

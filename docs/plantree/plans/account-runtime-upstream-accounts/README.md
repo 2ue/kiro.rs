@@ -217,12 +217,19 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-upstream call-trace types now use `LocalUpstreamCredentialAttempt`, `LocalUpstreamCallError` and `LocalUpstreamCallFailureKind`; MCP attribution, provider downcast helpers and serialized attempt fields are unchanged.
 - Local-upstream available-model catalog types now use `LocalUpstreamAvailableModelCatalog`, `LocalUpstreamAvailableModel`, `LocalUpstreamAvailableModelsResponse`, `LocalUpstreamModelCapabilityCohortKey`, `LocalUpstreamModelCapabilityCohort`, `LocalUpstreamModelTokenLimits` and `LocalUpstreamModelPromptCaching`; ListAvailableModels wire parsing and reasoning cohort behavior are unchanged.
 - Local-upstream credential types now use `LocalUpstreamCredentials`, `LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT` and local-upstream API-key parsing helper names. Compatibility fields such as `kiroApiKey` / `kiro_api_key` remain unchanged.
-- Scheduler model eligibility no longer derives Opus capability from subscription labels such as Pro/Free. Subscription labels are retained only as account-info metadata; dispatch uses explicit `supported_models` capability data.
+- Scheduler model eligibility no longer derives Opus capability from legacy subscription labels. Subscription labels are retained only as account-info metadata; dispatch uses explicit `supported_models` capability data.
+- Admin account-info credit snapshots no longer use built-in subscription tier tables or legacy rank parsing. Credit base/bonus now comes from upstream usage fields or persisted credit fields, and validation grouping treats subscription titles as unordered labels.
 
 Last verified on 2026-08-16:
 
+- `rg -n "CredentialCreditTier|credential_credit_tier|credential_credit_base|has_overage_credit_from_usage_limit|subscription_rank|credit_snapshot_for_subscription|UPSTREAM F[R]EE|Upstream P[R]o|K[I]RO P[R]O|K[I]RO F[R]EE|\bF[r]ee\b|\bP[r]o\b|\bp[r]o_plus\b|\bp[r]o_max\b|\bf[r]ee\b|\bp[r]o\b|升级|掉级" src/admin src/storage/postgres.rs ui/src/features/validation admin-ui/src/components/account-validation-panel.tsx --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh admin-subscription-labels-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh admin-subscription-labels-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh admin-subscription-labels-test2 -- bash -lc 'cargo test credit_snapshot_uses_upstream_usage_values_without_subscription_tiers -- --nocapture && cargo test subscription_key_and_change_are_label_based_without_tier_rank -- --nocapture && cargo test persisted_credit_snapshot_uses_usage_limit_and_stored_bonus_without_title_inference -- --nocapture'`
+- `pnpm --dir ui check`
+- `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "\bKiroCredentials\b|\bKIRO_API_KEY_DEFAULT_ENDPOINT\b|\bsplit_kiro_api_key_and_region\b|\bvalidate_kiro_api_key_pipe_format\b|\blooks_like_kiro_api_key_text\b|\bvalidate_kiro_region_host_label\b" src --glob '!target/**'`
-- `rg -n "supports_opus|is_opus_model|Free 账号|付费订阅|KIRO PRO|KIRO FREE|\bFree\b|\bPro\b|\bfree\b|\bpro\b" src/local_upstream_impl src/anthropic/converter/model.rs --glob '!target/**'`
+- `rg -n "supports_opus|is_opus_model|F[r]ee 账号|付费订阅|K[I]RO P[R]O|K[I]RO F[R]EE|\bF[r]ee\b|\bP[r]o\b|\bf[r]ee\b|\bp[r]o\b" src/local_upstream_impl src/anthropic/converter/model.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-test1 -- bash -lc 'cargo test model::credentials -- --nocapture && cargo test model::usage_limits -- --nocapture && cargo test selection_failure_summary_records_model_not_supported -- --nocapture && cargo test test_local_pool_route_state_sees_model_compatible_credential_added -- --nocapture && cargo test test_current_id_respects_opus_model_filter -- --nocapture && cargo test test_sonnet_model_can_use_general_credentials -- --nocapture'`
@@ -316,7 +323,7 @@ Last verified on 2026-08-16:
 - `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-check1 -- cargo check --bin kiro_loadtest`
 - `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-test1 -- cargo test --bin kiro_loadtest -- --nocapture`
 - `git diff --check`
-- `rg -n "Kiro Pro|Kiro Power|KIRO FREE|KIRO PRO|Kiro Pro\\+|Kiro Pro Max" src/admin/service_tests.rs src/storage/postgres.rs`
+- `rg -n "Kiro P[r]o|Kiro Power|K[I]RO F[R]EE|K[I]RO P[R]O|Kiro P[r]o\\+|Kiro P[r]o Max" src/admin/service_tests.rs src/storage/postgres.rs`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-test1 -- bash -lc 'cargo test subscription_ -- --nocapture && cargo test credit_snapshot -- --nocapture && cargo test account_info -- --nocapture'`
 - `git diff --check`

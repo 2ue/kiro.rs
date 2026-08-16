@@ -232,129 +232,84 @@ fn credential_admin_list_options_include_account_info_snapshot() {
 }
 
 #[test]
-fn credit_snapshot_uses_overage_bonus_for_all_paid_tiers() {
-    let free_without_overage =
-        credit_snapshot_for_subscription(Some("UPSTREAM FREE"), 34.52, 50.0, 0.0);
-    assert_eq!(free_without_overage.limit, 50.0);
-    assert!((free_without_overage.remaining - 15.48).abs() < 1e-9);
-    assert_eq!(free_without_overage.base, 50.0);
-    assert_eq!(free_without_overage.bonus, 0.0);
+fn credit_snapshot_uses_upstream_usage_values_without_subscription_tiers() {
+    let without_bonus = credit_snapshot_for_account_usage(34.52, 50.0, 0.0);
+    assert_eq!(without_bonus.limit, 50.0);
+    assert!((without_bonus.remaining - 15.48).abs() < 1e-9);
+    assert_eq!(without_bonus.base, 50.0);
+    assert_eq!(without_bonus.bonus, 0.0);
 
-    let pro_without_overage =
-        credit_snapshot_for_subscription(Some("Upstream Pro"), 125.25, 1_000.0, 0.0);
-    assert_eq!(pro_without_overage.limit, 1_000.0);
-    assert_eq!(pro_without_overage.remaining, 874.75);
-    assert_eq!(pro_without_overage.base, 1_000.0);
-    assert_eq!(pro_without_overage.bonus, 0.0);
+    let with_bonus = credit_snapshot_for_account_usage(125.25, 1_500.0, 500.0);
+    assert_eq!(with_bonus.limit, 1_500.0);
+    assert_eq!(with_bonus.remaining, 1_374.75);
+    assert_eq!(with_bonus.base, 1_000.0);
+    assert_eq!(with_bonus.bonus, 500.0);
 
-    let pro_with_overage =
-        credit_snapshot_for_subscription(Some("Upstream Pro"), 125.25, 11_000.0, 10_000.0);
-    assert_eq!(pro_with_overage.limit, 11_000.0);
-    assert_eq!(pro_with_overage.remaining, 10_874.75);
-    assert_eq!(pro_with_overage.base, 1_000.0);
-    assert_eq!(pro_with_overage.bonus, 10_000.0);
-
-    let pro_plus_with_overage =
-        credit_snapshot_for_subscription(Some("Upstream Pro+"), 125.25, 12_000.0, 10_000.0);
-    assert_eq!(pro_plus_with_overage.limit, 12_000.0);
-    assert_eq!(pro_plus_with_overage.remaining, 11_874.75);
-    assert_eq!(pro_plus_with_overage.base, 2_000.0);
-    assert_eq!(pro_plus_with_overage.bonus, 10_000.0);
-
-    let pro_max_with_overage =
-        credit_snapshot_for_subscription(Some("Upstream Pro Max"), 125.25, 15_000.0, 10_000.0);
-    assert_eq!(pro_max_with_overage.limit, 15_000.0);
-    assert_eq!(pro_max_with_overage.remaining, 14_874.75);
-    assert_eq!(pro_max_with_overage.base, 5_000.0);
-    assert_eq!(pro_max_with_overage.bonus, 10_000.0);
-
-    let power_without_overage =
-        credit_snapshot_for_subscription(Some("Upstream Power"), 125.25, 10_000.0, 0.0);
-    assert_eq!(power_without_overage.limit, 10_000.0);
-    assert_eq!(power_without_overage.remaining, 9_874.75);
-    assert_eq!(power_without_overage.base, 10_000.0);
-    assert_eq!(power_without_overage.bonus, 0.0);
-
-    let power_with_overage =
-        credit_snapshot_for_subscription(Some("Upstream Power"), 125.25, 20_000.0, 10_000.0);
-    assert_eq!(power_with_overage.limit, 20_000.0);
-    assert_eq!(power_with_overage.remaining, 19_874.75);
-    assert_eq!(power_with_overage.base, 10_000.0);
-    assert_eq!(power_with_overage.bonus, 10_000.0);
+    let clamped_bonus = credit_snapshot_for_account_usage(25.0, 100.0, 250.0);
+    assert_eq!(clamped_bonus.limit, 100.0);
+    assert_eq!(clamped_bonus.remaining, 75.0);
+    assert_eq!(clamped_bonus.base, 0.0);
+    assert_eq!(clamped_bonus.bonus, 100.0);
 }
 
 #[test]
-fn subscription_key_and_rank_distinguish_pro_max_from_pro() {
-    for title in ["Upstream Pro Max", "UPSTREAM PRO_MAX", "pro-max", "promax"] {
-        assert_eq!(subscription_key(Some(title)), "pro_max", "title={title}");
-        assert_eq!(subscription_rank(Some(title)), 5, "title={title}");
-    }
-    assert_eq!(subscription_key(Some("Upstream Pro")), "pro");
-    assert_eq!(subscription_rank(Some("Upstream Pro")), 3);
-    assert_eq!(subscription_key(Some("Upstream Pro+")), "pro_plus");
-    assert_eq!(subscription_rank(Some("Upstream Pro+")), 4);
-    assert_eq!(subscription_key(Some("Upstream Power")), "power");
-    assert_eq!(subscription_rank(Some("Upstream Power")), 6);
-}
-
-#[test]
-fn live_credit_snapshot_does_not_infer_bonus_from_usage_limit() {
-    let pro_without_active_bonus =
-        credit_snapshot_for_subscription(Some("Upstream Pro"), 125.25, 11_000.0, 0.0);
-
-    assert_eq!(pro_without_active_bonus.limit, 1_000.0);
-    assert_eq!(pro_without_active_bonus.remaining, 874.75);
-    assert_eq!(pro_without_active_bonus.base, 1_000.0);
-    assert_eq!(pro_without_active_bonus.bonus, 0.0);
-}
-
-#[test]
-fn persisted_credit_snapshot_recomputes_from_usage_limit() {
-    let old_wrong_power = credit_snapshot_from_persisted_fields(
-        Some("Upstream Power"),
-        250.0,
-        20_000.0,
-        10_000.0,
-        10_000.0,
-        9_750.0,
-        10_000.0,
+fn subscription_key_and_change_are_label_based_without_tier_rank() {
+    assert_eq!(
+        subscription_key(Some("Plan Alpha")),
+        "subscription_label_plan_alpha"
     );
-    assert_eq!(old_wrong_power.limit, 20_000.0);
-    assert_eq!(old_wrong_power.remaining, 19_750.0);
-    assert_eq!(old_wrong_power.base, 10_000.0);
-    assert_eq!(old_wrong_power.bonus, 10_000.0);
-
-    let old_wrong_pro_without_overage = credit_snapshot_from_persisted_fields(
-        Some("Upstream Pro"),
-        250.0,
-        1_000.0,
-        11_000.0,
-        10_750.0,
-        1_000.0,
-        10_000.0,
+    assert_eq!(
+        subscription_key(Some("Plan Alpha+")),
+        "subscription_label_plan_alpha_plus"
     );
-    assert_eq!(old_wrong_pro_without_overage.limit, 1_000.0);
-    assert_eq!(old_wrong_pro_without_overage.remaining, 750.0);
-    assert_eq!(old_wrong_pro_without_overage.base, 1_000.0);
-    assert_eq!(old_wrong_pro_without_overage.bonus, 0.0);
+    assert_eq!(
+        subscription_key(Some("Plan Beta Max")),
+        "subscription_label_plan_beta_max"
+    );
+    assert_eq!(subscription_key(Some(" ")), "unknown");
+
+    let previous = CredentialValidationInfo {
+        subscription_title: Some("Plan Alpha".to_string()),
+        current_usage: 10.0,
+        usage_limit: 100.0,
+        usage_percentage: 10.0,
+        checked_at: "2026-08-16T00:00:00Z".to_string(),
+    };
+    let same = CredentialValidationInfo {
+        subscription_title: Some("Plan Alpha".to_string()),
+        ..previous.clone()
+    };
+    let changed = CredentialValidationInfo {
+        subscription_title: Some("Plan Beta".to_string()),
+        ..previous.clone()
+    };
+
+    assert_eq!(
+        compare_subscription_change(Some(&previous), Some(&same)),
+        "unchanged"
+    );
+    assert_eq!(
+        compare_subscription_change(Some(&previous), Some(&changed)),
+        "changed"
+    );
 }
 
 #[test]
-fn persisted_credit_snapshot_only_infers_fixed_overage_bonus() {
-    let trial_like_extra_limit = credit_snapshot_from_persisted_fields(
-        Some("Upstream Pro"),
-        125.0,
-        1_500.0,
-        11_000.0,
-        10_875.0,
-        1_000.0,
-        10_000.0,
+fn persisted_credit_snapshot_uses_usage_limit_and_stored_bonus_without_title_inference() {
+    let recomputed = credit_snapshot_from_persisted_fields(
+        250.0, 20_000.0, 10_000.0, 10_000.0, 9_750.0, 10_000.0,
     );
+    assert_eq!(recomputed.limit, 20_000.0);
+    assert_eq!(recomputed.remaining, 19_750.0);
+    assert_eq!(recomputed.base, 10_000.0);
+    assert_eq!(recomputed.bonus, 10_000.0);
 
-    assert_eq!(trial_like_extra_limit.limit, 1_000.0);
-    assert_eq!(trial_like_extra_limit.remaining, 875.0);
-    assert_eq!(trial_like_extra_limit.base, 1_000.0);
-    assert_eq!(trial_like_extra_limit.bonus, 0.0);
+    let zero_usage_limit_uses_stored_fields =
+        credit_snapshot_from_persisted_fields(250.0, 0.0, 11_000.0, 10_750.0, 1_000.0, 10_000.0);
+    assert_eq!(zero_usage_limit_uses_stored_fields.limit, 11_000.0);
+    assert_eq!(zero_usage_limit_uses_stored_fields.remaining, 10_750.0);
+    assert_eq!(zero_usage_limit_uses_stored_fields.base, 1_000.0);
+    assert_eq!(zero_usage_limit_uses_stored_fields.bonus, 10_000.0);
 }
 
 fn credential_item(
@@ -388,7 +343,7 @@ fn credential_item(
         email: Some(format!("user{}@example.com", id)),
         subscription_title: None,
         account_info: usage_percentage.map(|usage_percentage| CredentialAccountInfo {
-            subscription_title: Some("Upstream Pro".to_string()),
+            subscription_title: Some("Plan Alpha".to_string()),
             current_usage: usage_percentage,
             usage_limit: 100.0,
             remaining: 100.0 - usage_percentage,

@@ -29,8 +29,8 @@ function formatDate(value?: string | null): string {
 }
 
 function badgeVariant(key: string): 'default' | 'secondary' | 'destructive' | 'outline' {
-  if (key === 'downgraded' || key === 'failed') return 'destructive'
-  if (key === 'upgraded' || key === 'pro' || key === 'pro_plus') return 'default'
+  if (key === 'failed') return 'destructive'
+  if (key === 'changed') return 'default'
   return 'secondary'
 }
 
@@ -122,14 +122,14 @@ function Results({ result }: { result: CredentialValidationResponse | null }) {
   if (!result) {
     return <Card><CardContent className="py-8 text-center text-muted-foreground">暂无校验结果</CardContent></Card>
   }
+  const changed = result.groups.find((group) => group.key === 'changed')?.count ?? 0
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-6">
+      <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-5">
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">总数</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{formatNumber(result.total)}</div></CardContent></Card>
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">成功</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-green-600">{formatNumber(result.success)}</div></CardContent></Card>
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">失败</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-amber-600">{formatNumber(result.failed)}</div></CardContent></Card>
-        <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">升级</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-emerald-600">{formatNumber(result.upgraded)}</div></CardContent></Card>
-        <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">疑似掉级</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-red-600">{formatNumber(result.downgraded)}</div></CardContent></Card>
+        <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">变更</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-amber-600">{formatNumber(changed)}</div></CardContent></Card>
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">无变化</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-muted-foreground">{formatNumber(result.unchanged)}</div></CardContent></Card>
       </div>
       {result.groups.length === 0 ? <Card><CardContent className="py-8 text-center text-muted-foreground">暂无分组结果</CardContent></Card> : result.groups.map(group => <ResultGroup key={group.key} group={group} />)}
@@ -282,7 +282,7 @@ export function AccountValidationPanel() {
         <CardContent>
           <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <div>掉级判断基于上次保存的信息和本次强制查询结果；首次查询没有历史快照时会标记为未知。</div>
+            <div>变更判断基于上次保存的信息和本次强制查询结果；首次查询没有历史快照时会标记为未知。</div>
           </div>
         </CardContent>
       </Card>
