@@ -180,9 +180,14 @@ pub struct LocalUpstreamCredentials {
     /// Local-upstream API key for headless mode.
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken。
-    /// 字段名暂时保留旧 `kiroApiKey`/`kiro_api_key` 兼容形状。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kiro_api_key: Option<String>,
+    /// 新写出字段为 `apiKey`；旧字段名只作为兼容读取。
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "kiroApiKey",
+        alias = "kiro_api_key",
+        alias = "api_key"
+    )]
+    pub api_key: Option<String>,
 
     /// 端点名称（可选）
     ///
@@ -233,7 +238,7 @@ impl fmt::Debug for LocalUpstreamCredentials {
             .field("proxy_password_present", &self.proxy_password.is_some())
             .field("proxy_resource_id", &self.proxy_resource_id)
             .field("disabled", &self.disabled)
-            .field("kiro_api_key_present", &self.kiro_api_key.is_some())
+            .field("api_key_present", &self.api_key.is_some())
             .field("endpoint_present", &self.endpoint.is_some())
             .finish()
     }
@@ -341,7 +346,7 @@ fn api_key_credential_from_text(raw: &str, priority: u32) -> Option<LocalUpstrea
 
     let mut credential = LocalUpstreamCredentials {
         auth_method: Some("api_key".to_string()),
-        kiro_api_key: Some(api_key),
+        api_key: Some(api_key),
         priority,
         region: region.clone(),
         auth_region: region.clone(),
@@ -574,7 +579,7 @@ impl LocalUpstreamCredentials {
             && self.proxy_password == other.proxy_password
             && self.proxy_resource_id == other.proxy_resource_id
             && self.disabled == other.disabled
-            && self.kiro_api_key == other.kiro_api_key
+            && self.api_key == other.api_key
             && self.endpoint == other.endpoint
     }
 
@@ -641,7 +646,7 @@ impl LocalUpstreamCredentials {
         if !self.is_api_key_credential() {
             return Ok(());
         }
-        if let Some(api_key) = self.kiro_api_key.as_deref() {
+        if let Some(api_key) = self.api_key.as_deref() {
             validate_local_upstream_api_key_pipe_format(api_key)?;
         }
         for region in [
@@ -659,7 +664,7 @@ impl LocalUpstreamCredentials {
 
     /// 规范化本地上游 API-key/headless 凭据。
     ///
-    /// 支持把 `kiroApiKey: "ksk_xxx|eu-central-1"` 拆成真实 key 和区域；
+    /// 支持把 `apiKey: "ksk_xxx|eu-central-1"` 拆成真实 key 和区域；
     /// API Key 凭据默认走 `cli` endpoint；如果只给了 `region`，同步补齐
     /// `authRegion/apiRegion`，避免 API 请求仍回退到全局区域。
     pub fn normalize_api_key_defaults(&mut self) {
@@ -668,7 +673,7 @@ impl LocalUpstreamCredentials {
             return;
         }
 
-        let Some(raw_key) = self.kiro_api_key.clone() else {
+        let Some(raw_key) = self.api_key.clone() else {
             return;
         };
         if raw_key.trim().is_empty() {
@@ -677,7 +682,7 @@ impl LocalUpstreamCredentials {
 
         match split_local_upstream_api_key_and_region(&raw_key) {
             Some((api_key, parsed_region)) => {
-                self.kiro_api_key = Some(api_key);
+                self.api_key = Some(api_key);
                 if let Some(region) = parsed_region {
                     if self.region.as_deref().is_none_or(str::is_empty) {
                         self.region = Some(region.clone());
@@ -690,7 +695,7 @@ impl LocalUpstreamCredentials {
                     }
                 }
             }
-            None => self.kiro_api_key = None,
+            None => self.api_key = None,
         }
 
         self.auth_method = Some("api_key".to_string());
@@ -715,7 +720,7 @@ impl LocalUpstreamCredentials {
             self.endpoint = Some(LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT.to_string());
         }
 
-        self.kiro_api_key = normalized_optional(self.kiro_api_key.take());
+        self.api_key = normalized_optional(self.api_key.take());
         self.region = normalized_optional(self.region.take());
         self.auth_region = normalized_optional(self.auth_region.take());
         self.api_region = normalized_optional(self.api_region.take());
@@ -771,9 +776,9 @@ impl LocalUpstreamCredentials {
 
     /// 检查是否为 API Key 凭据
     ///
-    /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
+    /// API Key 凭据直接使用 api_key 作为 Bearer Token，无需 refreshToken
     pub fn is_api_key_credential(&self) -> bool {
-        self.kiro_api_key.is_some()
+        self.api_key.is_some()
             || self
                 .auth_method
                 .as_deref()
@@ -875,7 +880,7 @@ mod tests {
             proxy_password: Some("proxy-password-sensitive-value".to_string()),
             proxy_resource_id: Some(6),
             disabled: true,
-            kiro_api_key: Some("kiro-api-key-sensitive-value".to_string()),
+            api_key: Some("api-key-sensitive-value".to_string()),
             endpoint: Some("endpoint-sensitive-value".to_string()),
         };
 
@@ -904,7 +909,7 @@ mod tests {
             credentials.proxy_url.as_deref().unwrap(),
             credentials.proxy_username.as_deref().unwrap(),
             credentials.proxy_password.as_deref().unwrap(),
-            credentials.kiro_api_key.as_deref().unwrap(),
+            credentials.api_key.as_deref().unwrap(),
             credentials.endpoint.as_deref().unwrap(),
         ] {
             assert!(
@@ -1245,7 +1250,7 @@ mod tests {
     fn test_api_key_auth_method_canonicalization_does_not_trip_oidc_refresh() {
         let mut creds = LocalUpstreamCredentials {
             auth_method: Some("API KEY".to_string()),
-            kiro_api_key: Some("ksk_test_key".to_string()),
+            api_key: Some("ksk_test_key".to_string()),
             provider: Some("Enterprise".to_string()),
             profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/STALE".to_string()),
             ..Default::default()
@@ -1261,7 +1266,7 @@ mod tests {
     fn test_api_key_pipe_region_normalizes_to_cli_endpoint_and_regions() {
         let mut creds = LocalUpstreamCredentials {
             auth_method: Some("API KEY".to_string()),
-            kiro_api_key: Some("ksk_test_key|eu-central-1".to_string()),
+            api_key: Some("ksk_test_key|eu-central-1".to_string()),
             endpoint: None,
             ..Default::default()
         };
@@ -1269,7 +1274,7 @@ mod tests {
         creds.normalize_api_key_defaults();
 
         assert_eq!(creds.auth_method.as_deref(), Some("api_key"));
-        assert_eq!(creds.kiro_api_key.as_deref(), Some("ksk_test_key"));
+        assert_eq!(creds.api_key.as_deref(), Some("ksk_test_key"));
         assert_eq!(creds.region.as_deref(), Some("eu-central-1"));
         assert_eq!(creds.auth_region.as_deref(), Some("eu-central-1"));
         assert_eq!(creds.api_region.as_deref(), Some("eu-central-1"));
@@ -1280,6 +1285,33 @@ mod tests {
         assert!(creds.refresh_token.is_none());
         assert!(creds.profile_arn.is_none());
         assert!(creds.client_id.is_none());
+    }
+
+    #[test]
+    fn api_key_field_serializes_primary_name_and_accepts_legacy_aliases() {
+        let credentials = LocalUpstreamCredentials {
+            auth_method: Some("api_key".to_string()),
+            api_key: Some("ksk_primary".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&credentials).unwrap();
+        assert_eq!(value["apiKey"], "ksk_primary");
+        assert!(value.get("kiroApiKey").is_none());
+        assert!(value.get("kiro_api_key").is_none());
+
+        for legacy_field in ["kiroApiKey", "kiro_api_key", "api_key"] {
+            let mut object = serde_json::Map::new();
+            object.insert("authMethod".to_string(), serde_json::json!("api_key"));
+            object.insert(legacy_field.to_string(), serde_json::json!("ksk_legacy"));
+            let parsed: LocalUpstreamCredentials =
+                serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+            assert_eq!(
+                parsed.api_key.as_deref(),
+                Some("ksk_legacy"),
+                "legacy_field={legacy_field}"
+            );
+        }
     }
 
     #[test]
@@ -1339,12 +1371,12 @@ mod tests {
         for round in 0..3 {
             for (index, value) in malformed.iter().enumerate() {
                 let path = std::env::temp_dir().join(format!(
-                    "kiro-rs-invalid-api-key-pipe-{round}-{index}-{}.json",
+                    "account-runtime-invalid-api-key-pipe-{round}-{index}-{}.json",
                     uuid::Uuid::new_v4()
                 ));
                 let body = serde_json::json!([{
                     "authMethod": "api_key",
-                    "kiroApiKey": value
+                    "apiKey": value
                 }]);
                 std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
                 let error = CredentialsConfig::load(&path).unwrap_err().to_string();
@@ -1362,12 +1394,12 @@ mod tests {
             .enumerate()
             {
                 let path = std::env::temp_dir().join(format!(
-                    "kiro-rs-invalid-explicit-region-{round}-{index}-{}.json",
+                    "account-runtime-invalid-explicit-region-{round}-{index}-{}.json",
                     uuid::Uuid::new_v4()
                 ));
                 let mut credential = serde_json::Map::new();
                 credential.insert("authMethod".to_string(), serde_json::json!("api_key"));
-                credential.insert("kiroApiKey".to_string(), serde_json::json!("ksk_fake"));
+                credential.insert("apiKey".to_string(), serde_json::json!("ksk_fake"));
                 credential.insert(field.to_string(), serde_json::json!(value));
                 std::fs::write(
                     &path,
@@ -1396,7 +1428,7 @@ mod tests {
             .enumerate()
             {
                 let path = std::env::temp_dir().join(format!(
-                    "kiro-rs-invalid-plain-api-key-{round}-{index}-{}.txt",
+                    "account-runtime-invalid-plain-api-key-{round}-{index}-{}.txt",
                     uuid::Uuid::new_v4()
                 ));
                 std::fs::write(&path, format!("{value}\n")).unwrap();
@@ -1417,7 +1449,7 @@ mod tests {
             ] {
                 let mut credential = LocalUpstreamCredentials {
                     auth_method: Some("api_key".to_string()),
-                    kiro_api_key: Some("future_key_format".to_string()),
+                    api_key: Some("future_key_format".to_string()),
                     ..Default::default()
                 };
                 match field {
@@ -1431,7 +1463,7 @@ mod tests {
 
             let compatible = LocalUpstreamCredentials {
                 auth_method: Some("api_key".to_string()),
-                kiro_api_key: Some("future_key_format".to_string()),
+                api_key: Some("future_key_format".to_string()),
                 region: Some("future-safe-region-9".to_string()),
                 auth_region: Some("future-auth-9".to_string()),
                 api_region: Some("future-api-9".to_string()),
@@ -1445,7 +1477,7 @@ mod tests {
     fn test_api_key_normalization_preserves_explicit_endpoint_and_api_region() {
         let mut creds = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
-            kiro_api_key: Some("ksk_test_key|eu-central-1".to_string()),
+            api_key: Some("ksk_test_key|eu-central-1".to_string()),
             region: Some("us-east-1".to_string()),
             api_region: Some("us-west-2".to_string()),
             endpoint: Some("ide".to_string()),
@@ -1463,7 +1495,7 @@ mod tests {
     #[test]
     fn test_credentials_config_plain_text_api_key_with_region() {
         let path = std::env::temp_dir().join(format!(
-            "kiro-rs-credentials-api-key-{}.txt",
+            "account-runtime-credentials-api-key-{}.txt",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(
@@ -1477,10 +1509,10 @@ mod tests {
 
         assert_eq!(credentials.len(), 2);
         assert_eq!(credentials[0].auth_method.as_deref(), Some("api_key"));
-        assert_eq!(credentials[0].kiro_api_key.as_deref(), Some("ksk_first"));
+        assert_eq!(credentials[0].api_key.as_deref(), Some("ksk_first"));
         assert_eq!(credentials[0].api_region.as_deref(), Some("eu-central-1"));
         assert_eq!(credentials[0].endpoint.as_deref(), Some("cli"));
-        assert_eq!(credentials[1].kiro_api_key.as_deref(), Some("ksk_second"));
+        assert_eq!(credentials[1].api_key.as_deref(), Some("ksk_second"));
         assert_eq!(credentials[1].api_region.as_deref(), Some("us-east-1"));
 
         let _ = std::fs::remove_file(path);

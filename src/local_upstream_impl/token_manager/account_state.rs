@@ -134,7 +134,7 @@ pub(super) enum DisabledReason {
     QuotaExceeded,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
-    /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
+    /// 凭据配置无效（如 authMethod=api_key 但缺少 API key）
     InvalidConfig,
     /// 上游明确返回临时风控/暂停
     TemporarilySuspended,

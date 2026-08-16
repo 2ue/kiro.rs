@@ -353,7 +353,7 @@ mod tests {
     fn api_key_credentials_do_not_invent_builder_id_profile_arn() {
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
-            kiro_api_key: Some("ksk_test".to_string()),
+            api_key: Some("ksk_test".to_string()),
             provider: Some("Enterprise".to_string()),
             profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/STALE".to_string()),
             ..Default::default()
@@ -387,7 +387,7 @@ mod tests {
         };
         let api_key = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
-            kiro_api_key: Some("ksk_test".to_string()),
+            api_key: Some("ksk_test".to_string()),
             ..Default::default()
         };
 

@@ -280,7 +280,7 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
 pub struct RequestContext<'a> {
     /// 当前凭据
     pub credentials: &'a LocalUpstreamCredentials,
-    /// 有效的 access token（API Key 凭据下即 kiroApiKey）
+    /// 有效的 access token（API Key 凭据下即 API key）
     pub token: &'a str,
     /// 当前凭据对应的 machineId
     pub machine_id: &'a str,

@@ -72,7 +72,7 @@ pub fn generate_from_credentials(
     // 按凭据类型派生（API Key 与 refreshToken 两条路径互斥，不回落）
     if credentials.is_api_key_credential() {
         // API Key 凭据：基于兼容 API-key 字段派生
-        if let Some(ref api_key) = credentials.kiro_api_key {
+        if let Some(ref api_key) = credentials.api_key {
             if !api_key.is_empty() {
                 return sha256_hex(&format!("KiroAPIKey/{}", api_key));
             }
@@ -179,7 +179,7 @@ mod tests {
     #[test]
     fn test_generate_with_api_key() {
         let mut credentials = LocalUpstreamCredentials::default();
-        credentials.kiro_api_key = Some("ksk_test_api_key".to_string());
+        credentials.api_key = Some("ksk_test_api_key".to_string());
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
@@ -192,7 +192,7 @@ mod tests {
     fn test_api_key_and_refresh_token_are_mutually_exclusive() {
         // 同时存在 API key 和 refreshToken 时，应走 API Key 分支
         let mut credentials = LocalUpstreamCredentials::default();
-        credentials.kiro_api_key = Some("ksk_test".to_string());
+        credentials.api_key = Some("ksk_test".to_string());
         credentials.refresh_token = Some("should_not_be_used".to_string());
         let config = Config::default();
 
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_api_key_auth_method_empty_uses_fallback_not_refresh_token() {
-        // auth_method=api_key 但 kiro_api_key 为空：不回落到 refreshToken，走兜底分支
+        // auth_method=api_key 但 api_key 为空：不回落到 refreshToken，走兜底分支
         let mut credentials = LocalUpstreamCredentials::default();
         credentials.id = Some(u64::MAX - 1);
         credentials.auth_method = Some("api_key".to_string());

@@ -2331,7 +2331,7 @@ mod tests {
             LocalUpstreamCredentials {
                 id: Some(1),
                 auth_method: Some("api_key".to_string()),
-                kiro_api_key: Some("ksk_fake_body_capture".to_string()),
+                api_key: Some("ksk_fake_body_capture".to_string()),
                 endpoint: Some(endpoint_name.to_string()),
                 ..Default::default()
             }
@@ -7442,11 +7442,11 @@ impl LocalUpstreamProvider {
             ("refresh_token", refresh_token)
         } else if let Some(api_key) = ctx
             .credentials
-            .kiro_api_key
+            .api_key
             .as_deref()
             .filter(|value| !value.is_empty())
         {
-            ("kiro_api_key", api_key)
+            ("api_key", api_key)
         } else {
             ("access_token", ctx.token.as_str())
         };

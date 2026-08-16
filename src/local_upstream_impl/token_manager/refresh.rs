@@ -1758,7 +1758,7 @@ mod tests {
 
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
-            kiro_api_key: Some("ksk_fake_balance".to_string()),
+            api_key: Some("ksk_fake_balance".to_string()),
             api_region: Some("ap-south-2".to_string()),
             ..Default::default()
         };
@@ -1768,7 +1768,7 @@ mod tests {
         let usage = get_usage_limits(
             &credentials,
             &config,
-            credentials.kiro_api_key.as_deref().unwrap(),
+            credentials.api_key.as_deref().unwrap(),
             None,
         )
         .await

@@ -1523,13 +1523,14 @@ fn handle_credentials_command(
                     "#{id} priority={} disabled={} auth={} label={}",
                     credential.priority,
                     credential.disabled,
-                    credential.auth_method.as_deref().unwrap_or(
-                        if credential.kiro_api_key.is_some() {
+                    credential
+                        .auth_method
+                        .as_deref()
+                        .unwrap_or(if credential.api_key.is_some() {
                             "api_key"
                         } else {
                             "oauth"
-                        }
-                    ),
+                        }),
                     label
                 );
             }
@@ -1559,7 +1560,7 @@ fn handle_credentials_command(
                 if !ids.insert(id) {
                     println!("error: duplicate credential id #{id}");
                 }
-                if credential.is_api_key_credential() && credential.kiro_api_key.is_none() {
+                if credential.is_api_key_credential() && credential.api_key.is_none() {
                     println!("error: credential #{id} authMethod=api_key but missing apiKey");
                 }
                 if !credential.is_api_key_credential() && credential.refresh_token.is_none() {

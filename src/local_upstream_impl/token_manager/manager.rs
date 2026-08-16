@@ -213,8 +213,8 @@ fn apply_credential_auth_update(
     let explicit_access_token = update.access_token;
     let explicit_expires_at = update.expires_at;
 
-    if let Some(api_key) = update.kiro_api_key {
-        credential.kiro_api_key = trimmed_optional(api_key);
+    if let Some(api_key) = update.api_key {
+        credential.api_key = trimmed_optional(api_key);
         credential.refresh_token = None;
         credential.provider = None;
         credential.client_id = None;
@@ -228,7 +228,7 @@ fn apply_credential_auth_update(
 
     if let Some(refresh_token) = update.refresh_token {
         credential.refresh_token = trimmed_optional(refresh_token);
-        credential.kiro_api_key = None;
+        credential.api_key = None;
         if credential
             .auth_method
             .as_deref()
@@ -2208,11 +2208,11 @@ impl MultiTokenManager {
             })
             .collect();
 
-        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
+        // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 API key
         let mut entries = entries;
         let mut invalid_config_credential_ids = Vec::new();
         for entry in &mut entries {
-            if entry.credentials.kiro_api_key.is_none()
+            if entry.credentials.api_key.is_none()
                 && entry
                     .credentials
                     .auth_method
@@ -2221,7 +2221,7 @@ impl MultiTokenManager {
                     .unwrap_or(false)
             {
                 tracing::warn!(
-                    "凭据 #{} 配置了 authMethod=api_key 但缺少 kiroApiKey 字段，已自动禁用",
+                    "凭据 #{} 配置了 authMethod=api_key 但缺少 API key 字段，已自动禁用",
                     entry.id
                 );
                 entry.disabled = true;
@@ -2374,7 +2374,7 @@ impl MultiTokenManager {
                 "startup_invalid_config",
                 "凭据配置无效，启动时已自动禁用",
                 serde_json::json!({
-                    "configError": "api_key_auth_without_kiro_api_key",
+                    "configError": "api_key_auth_without_api_key",
                 }),
             );
         }
@@ -2529,7 +2529,7 @@ impl MultiTokenManager {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string)
-                    .or_else(|| entry.credentials.kiro_api_key.as_deref().map(mask_api_key))
+                    .or_else(|| entry.credentials.api_key.as_deref().map(mask_api_key))
                     .or_else(|| {
                         entry
                             .credentials
@@ -2570,7 +2570,7 @@ impl MultiTokenManager {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .or_else(|| entry.credentials.kiro_api_key.as_deref().map(mask_api_key))
+            .or_else(|| entry.credentials.api_key.as_deref().map(mask_api_key))
             .or_else(|| entry.credentials.endpoint.clone());
 
         match label {
@@ -6893,13 +6893,13 @@ impl MultiTokenManager {
         budgets: TokenRefreshBudgets,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     ) -> anyhow::Result<CallContext> {
-        // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
+        // API Key 凭据直接使用 api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
             let credentials = self.resolve_proxy_for_credential(credentials.clone())?;
             let token = credentials
-                .kiro_api_key
+                .api_key
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 API key"))?;
             return Ok(CallContext {
                 id,
                 credentials,
@@ -11571,7 +11571,7 @@ impl MultiTokenManager {
         }
     }
 
-    /// 导出完整凭据快照（包含 refreshToken / kiroApiKey 等敏感字段）。
+    /// 导出完整凭据快照（包含 refreshToken / API key 等敏感字段）。
     ///
     /// 仅供 Admin API 显式导出使用；不改变调度状态，也不触发持久化。
     pub fn export_credentials(&self) -> Vec<LocalUpstreamCredentials> {
@@ -11803,11 +11803,11 @@ impl MultiTokenManager {
         credential.normalize_external_idp_defaults();
         if credential.is_api_key_credential() {
             let api_key = credential
-                .kiro_api_key
+                .api_key
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 API key"))?;
             if api_key.trim().is_empty() {
-                anyhow::bail!("kiroApiKey 为空");
+                anyhow::bail!("API key 为空");
             }
         } else {
             validate_refresh_token(&credential)?;
@@ -11816,20 +11816,20 @@ impl MultiTokenManager {
         {
             let entries = self.entries.lock();
             if credential.is_api_key_credential() {
-                let new_hash = credential.kiro_api_key.as_deref().map(sha256_hex);
+                let new_hash = credential.api_key.as_deref().map(sha256_hex);
                 if let Some(new_hash) = new_hash.as_deref() {
                     let duplicate = entries.iter().any(|entry| {
                         entry.id != id
                             && entry
                                 .credentials
-                                .kiro_api_key
+                                .api_key
                                 .as_deref()
                                 .map(sha256_hex)
                                 .as_deref()
                                 == Some(new_hash)
                     });
                     if duplicate {
-                        anyhow::bail!("凭据已存在（kiroApiKey 重复）");
+                        anyhow::bail!("凭据已存在（API key 重复）");
                     }
                 }
             } else {
@@ -12079,9 +12079,9 @@ impl MultiTokenManager {
         if credentials.is_api_key_credential() {
             let credentials = self.resolve_proxy_for_credential(credentials)?;
             let token = credentials
-                .kiro_api_key
+                .api_key
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 API key"))?;
             return Ok(CallContext {
                 id: EXTERNAL_CREDENTIAL_CONTEXT_ID,
                 credentials,
@@ -12141,8 +12141,8 @@ impl MultiTokenManager {
     /// 添加新凭据（Admin API）
     ///
     /// # 流程
-    /// 1. 验证凭据基本字段（API Key: kiroApiKey 不为空; OAuth: refreshToken 不为空）
-    /// 2. 基于 kiroApiKey 或 refreshToken 的 SHA-256 哈希检测重复
+    /// 1. 验证凭据基本字段（API Key: API key 不为空; OAuth: refreshToken 不为空）
+    /// 2. 基于 API key 或 refreshToken 的 SHA-256 哈希检测重复
     /// 3. OAuth: 尝试刷新 Token 验证凭据有效性; API Key: 跳过
     /// 4. 分配新 ID（PgSQL 模式由数据库序列生成；测试无 PgSQL 时回退内存 max + 1）
     /// 5. 添加到 entries 列表
@@ -12167,11 +12167,11 @@ impl MultiTokenManager {
 
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
-                .kiro_api_key
+                .api_key
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 API key"))?;
             if api_key.trim().is_empty() {
-                anyhow::bail!("kiroApiKey 为空");
+                anyhow::bail!("API key 为空");
             }
         } else {
             validate_refresh_token(&new_cred)?;
@@ -12180,16 +12180,16 @@ impl MultiTokenManager {
         // 2. 基于哈希检测重复
         if new_cred.is_api_key_credential() {
             let new_api_key = new_cred
-                .kiro_api_key
+                .api_key
                 .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("缺少 kiroApiKey"))?;
+                .ok_or_else(|| anyhow::anyhow!("缺少 API key"))?;
             let new_api_key_hash = sha256_hex(new_api_key);
             let duplicate_exists = {
                 let entries = self.entries.lock();
                 entries.iter().any(|entry| {
                     entry
                         .credentials
-                        .kiro_api_key
+                        .api_key
                         .as_deref()
                         .map(sha256_hex)
                         .as_deref()
@@ -12197,7 +12197,7 @@ impl MultiTokenManager {
                 })
             };
             if duplicate_exists {
-                anyhow::bail!("凭据已存在（kiroApiKey 重复）");
+                anyhow::bail!("凭据已存在（API key 重复）");
             }
         } else {
             let new_refresh_token = new_cred
@@ -12266,7 +12266,7 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.proxy_resource_id = new_cred.proxy_resource_id;
-        validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.api_key = new_cred.api_key;
         validated_cred.endpoint = new_cred.endpoint;
         validated_cred.normalize_api_key_defaults();
         validated_cred.normalize_external_idp_defaults();

@@ -308,7 +308,7 @@ async fn api_key_token_path_does_not_allocate_oauth_refresh_state() {
     let credentials = LocalUpstreamCredentials {
         id: Some(1),
         auth_method: Some("api_key".to_string()),
-        kiro_api_key: Some("ksk_test_api_key_identity".to_string()),
+        api_key: Some("ksk_test_api_key_identity".to_string()),
         ..Default::default()
     };
     let manager = MultiTokenManager::new(
@@ -1125,7 +1125,7 @@ fn force_refresh_test_credential(token_endpoint: String) -> LocalUpstreamCredent
 
 fn api_key_credential(token: &str) -> LocalUpstreamCredentials {
     LocalUpstreamCredentials {
-        kiro_api_key: Some(token.to_string()),
+        api_key: Some(token.to_string()),
         auth_method: Some("api_key".to_string()),
         ..Default::default()
     }
@@ -4037,7 +4037,7 @@ fn usage_limits_user_agents_match_kiro_rest_shape() {
 async fn test_refresh_token_rejects_api_key_credential() {
     let config = Config::default();
     let mut credentials = LocalUpstreamCredentials::default();
-    credentials.kiro_api_key = Some("ksk_test_key_123".to_string());
+    credentials.api_key = Some("ksk_test_key_123".to_string());
     credentials.auth_method = Some("api_key".to_string());
 
     let result = refresh_token(&credentials, &config, None).await;
@@ -4077,7 +4077,7 @@ async fn test_add_credential_api_key_success() {
     let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
 
     let mut api_key_cred = LocalUpstreamCredentials::default();
-    api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
+    api_key_cred.api_key = Some("ksk_test_key_123".to_string());
     api_key_cred.auth_method = Some("api_key".to_string());
 
     let result = manager.add_credential(api_key_cred).await;
@@ -4113,7 +4113,7 @@ async fn postgres_row_level_update_does_not_delete_credentials_added_by_other_in
 
     let second = store
         .insert_credential(&LocalUpstreamCredentials {
-            kiro_api_key: Some("ksk_second_other_instance".to_string()),
+            api_key: Some("ksk_second_other_instance".to_string()),
             auth_method: Some("api_key".to_string()),
             priority: 2,
             ..Default::default()
@@ -5287,24 +5287,18 @@ async fn test_add_credential_reject_duplicate_api_key() {
     let config = Config::default();
 
     let mut existing = LocalUpstreamCredentials::default();
-    existing.kiro_api_key = Some("ksk_existing_key".to_string());
+    existing.api_key = Some("ksk_existing_key".to_string());
     existing.auth_method = Some("api_key".to_string());
 
     let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
 
     let mut duplicate = LocalUpstreamCredentials::default();
-    duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
+    duplicate.api_key = Some("ksk_existing_key".to_string());
     duplicate.auth_method = Some("api_key".to_string());
 
     let result = manager.add_credential(duplicate).await;
     assert!(result.is_err());
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复")
-    );
+    assert!(result.err().unwrap().to_string().contains("API key 重复"));
 }
 
 #[tokio::test]
@@ -5313,18 +5307,12 @@ async fn test_add_credential_api_key_empty_rejected() {
     let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
 
     let mut cred = LocalUpstreamCredentials::default();
-    cred.kiro_api_key = Some(String::new());
+    cred.api_key = Some(String::new());
     cred.auth_method = Some("api_key".to_string());
 
     let result = manager.add_credential(cred).await;
     assert!(result.is_err());
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空")
-    );
+    assert!(result.err().unwrap().to_string().contains("API key 为空"));
 }
 
 #[tokio::test]
@@ -5334,17 +5322,11 @@ async fn test_add_credential_api_key_missing_key_rejected() {
 
     let mut cred = LocalUpstreamCredentials::default();
     cred.auth_method = Some("api_key".to_string());
-    // kiro_api_key is None
+    // api_key is None
 
     let result = manager.add_credential(cred).await;
     assert!(result.is_err());
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey")
-    );
+    assert!(result.err().unwrap().to_string().contains("缺少 API key"));
 }
 
 #[tokio::test]
@@ -5357,7 +5339,7 @@ async fn test_add_credential_api_key_and_oauth_coexist() {
     let manager = MultiTokenManager::new(config, vec![oauth_cred], None, None, false).unwrap();
 
     let mut api_key_cred = LocalUpstreamCredentials::default();
-    api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
+    api_key_cred.api_key = Some("ksk_new_key".to_string());
     api_key_cred.auth_method = Some("api_key".to_string());
 
     let result = manager.add_credential(api_key_cred).await;
@@ -5411,13 +5393,13 @@ fn test_multi_token_manager_duplicate_ids() {
 }
 
 #[test]
-fn test_multi_token_manager_api_key_missing_kiro_api_key_auto_disabled() {
+fn test_multi_token_manager_api_key_missing_api_key_auto_disabled() {
     let config = Config::default();
 
-    // auth_method=api_key 但缺少 kiro_api_key → 应被自动禁用
+    // auth_method=api_key 但缺少 api_key → 应被自动禁用
     let mut bad_cred = LocalUpstreamCredentials::default();
     bad_cred.auth_method = Some("api_key".to_string());
-    // kiro_api_key 保持 None
+    // api_key 保持 None
 
     let mut good_cred = LocalUpstreamCredentials::default();
     good_cred.refresh_token = Some("valid_token".to_string());
@@ -5429,13 +5411,13 @@ fn test_multi_token_manager_api_key_missing_kiro_api_key_auto_disabled() {
 }
 
 #[test]
-fn test_multi_token_manager_api_key_with_kiro_api_key_not_disabled() {
+fn test_multi_token_manager_api_key_with_api_key_not_disabled() {
     let config = Config::default();
 
-    // auth_method=api_key 且有 kiro_api_key → 不应被禁用
+    // auth_method=api_key 且有 api_key → 不应被禁用
     let mut cred = LocalUpstreamCredentials::default();
     cred.auth_method = Some("api_key".to_string());
-    cred.kiro_api_key = Some("ksk_test123".to_string());
+    cred.api_key = Some("ksk_test123".to_string());
 
     let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
     assert_eq!(manager.total_count(), 1);
@@ -8773,7 +8755,7 @@ async fn test_added_credential_warmup_does_not_fake_success_count() {
     let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
 
     let mut new_cred = LocalUpstreamCredentials::default();
-    new_cred.kiro_api_key = Some("ksk_new_key".to_string());
+    new_cred.api_key = Some("ksk_new_key".to_string());
     new_cred.auth_method = Some("api_key".to_string());
     let new_id = manager.add_credential(new_cred).await.unwrap();
 
@@ -12974,7 +12956,7 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
     let (credential, runtime) = store
         .insert_credential_with_runtime_patch(
             &LocalUpstreamCredentials {
-                kiro_api_key: Some("manager-auth-reset-old".to_string()),
+                api_key: Some("manager-auth-reset-old".to_string()),
                 auth_method: Some("api_key".to_string()),
                 disabled: true,
                 ..Default::default()
@@ -13043,7 +13025,7 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
     .await
     .unwrap();
     let update = CredentialAuthUpdate {
-        kiro_api_key: Some("manager-auth-reset-new".to_string()),
+        api_key: Some("manager-auth-reset-new".to_string()),
         auth_method: Some("api_key".to_string()),
         ..Default::default()
     };
@@ -13062,7 +13044,7 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
         .unwrap();
     assert_eq!(after_failure.storage_revision, baseline.storage_revision);
     assert_eq!(
-        after_failure.kiro_api_key.as_deref(),
+        after_failure.api_key.as_deref(),
         Some("manager-auth-reset-old")
     );
     assert!(after_failure.disabled);
@@ -13095,10 +13077,7 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
         persisted.storage_revision,
         baseline.storage_revision.saturating_add(1)
     );
-    assert_eq!(
-        persisted.kiro_api_key.as_deref(),
-        Some("manager-auth-reset-new")
-    );
+    assert_eq!(persisted.api_key.as_deref(), Some("manager-auth-reset-new"));
     assert!(!persisted.disabled);
     let runtime = store
         .load_credential_runtime_state()
@@ -13119,7 +13098,7 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
             baseline.storage_revision.saturating_add(1)
         );
         assert_eq!(
-            local.credentials.kiro_api_key.as_deref(),
+            local.credentials.api_key.as_deref(),
             Some("manager-auth-reset-new")
         );
         assert_eq!(local.failure_count, 0);

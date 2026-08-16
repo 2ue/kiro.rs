@@ -52,9 +52,9 @@ pub struct CredentialEntrySnapshot {
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
-    /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
+    /// API key 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
     pub api_key_hash: Option<String>,
-    /// kiroApiKey 的脱敏展示（仅 API Key 凭据，用于前端显示）
+    /// API key 的脱敏展示（仅 API Key 凭据，用于前端显示）
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
@@ -366,12 +366,12 @@ pub(super) fn base_snapshot_from_entry(
             entry.credentials.refresh_token.as_deref().map(hash_secret)
         },
         api_key_hash: if entry.credentials.is_api_key_credential() {
-            entry.credentials.kiro_api_key.as_deref().map(hash_secret)
+            entry.credentials.api_key.as_deref().map(hash_secret)
         } else {
             None
         },
         masked_api_key: if entry.credentials.is_api_key_credential() {
-            entry.credentials.kiro_api_key.as_deref().map(mask_secret)
+            entry.credentials.api_key.as_deref().map(mask_secret)
         } else {
             None
         },
@@ -461,12 +461,12 @@ pub(super) fn runtime_snapshot_from_entry(
             entry.credentials.refresh_token.as_deref().map(hash_secret)
         },
         api_key_hash: if entry.credentials.is_api_key_credential() {
-            entry.credentials.kiro_api_key.as_deref().map(hash_secret)
+            entry.credentials.api_key.as_deref().map(hash_secret)
         } else {
             None
         },
         masked_api_key: if entry.credentials.is_api_key_credential() {
-            entry.credentials.kiro_api_key.as_deref().map(mask_secret)
+            entry.credentials.api_key.as_deref().map(mask_secret)
         } else {
             None
         },

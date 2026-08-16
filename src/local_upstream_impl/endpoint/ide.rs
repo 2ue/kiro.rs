@@ -692,7 +692,7 @@ mod tests {
         let endpoint = IdeEndpoint::new();
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("api key".to_string()),
-            kiro_api_key: Some("ksk_test".to_string()),
+            api_key: Some("ksk_test".to_string()),
             provider: Some("Enterprise".to_string()),
             profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/STALE".to_string()),
             ..Default::default()
@@ -746,7 +746,7 @@ mod tests {
         let endpoint = IdeEndpoint::new();
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("api key".to_string()),
-            kiro_api_key: Some("ksk_test".to_string()),
+            api_key: Some("ksk_test".to_string()),
             ..Default::default()
         };
         let config = Config::default();

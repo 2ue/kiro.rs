@@ -1953,7 +1953,7 @@ impl AdminService {
             proxy_password: req.proxy_password,
             proxy_resource_id: req.proxy_resource_id,
             disabled,
-            kiro_api_key: req.api_key,
+            api_key: req.api_key,
             endpoint: req.endpoint,
         };
         credentials
@@ -1996,7 +1996,7 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         let (candidate_hash, duplicate_label, api_key) = if credential.is_api_key_credential() {
             let Some(value) = credential
-                .kiro_api_key
+                .api_key
                 .as_deref()
                 .filter(|value| !value.is_empty())
             else {
@@ -3482,7 +3482,7 @@ impl AdminService {
             token_endpoint: req.token_endpoint,
             issuer_url: req.issuer_url,
             scopes: req.scopes,
-            kiro_api_key: req.api_key,
+            api_key: req.api_key,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -5825,7 +5825,7 @@ impl AdminService {
         if msg.contains("凭据已存在")
             || msg.contains("refreshToken 重复")
             || msg.contains("apiKey 重复")
-            || msg.contains("kiroApiKey 重复")
+            || msg.contains("API key 重复")
         {
             return AdminServiceError::Conflict(msg);
         }
@@ -5836,8 +5836,8 @@ impl AdminService {
             || msg.contains("refreshToken 已被截断")
             || msg.contains("缺少 apiKey")
             || msg.contains("apiKey 为空")
-            || msg.contains("缺少 kiroApiKey")
-            || msg.contains("kiroApiKey 为空")
+            || msg.contains("缺少 API key")
+            || msg.contains("API key 为空")
             || msg.contains("代理资源不存在")
             || msg.contains("代理资源不存在或已禁用")
             || msg.contains("refreshToken 已失效")
@@ -6418,7 +6418,7 @@ fn is_duplicate_credential_error(err: &AdminServiceError) -> bool {
     let message = err.to_string();
     message.contains("凭据已存在")
         || message.contains("apiKey 重复")
-        || message.contains("kiroApiKey 重复")
+        || message.contains("API key 重复")
         || message.contains("refreshToken 重复")
 }
 

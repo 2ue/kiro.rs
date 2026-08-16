@@ -44,7 +44,7 @@ pub struct CredentialAuthUpdate {
     pub token_endpoint: Option<String>,
     pub issuer_url: Option<String>,
     pub scopes: Option<String>,
-    pub kiro_api_key: Option<String>,
+    pub api_key: Option<String>,
     pub region: Option<String>,
     pub auth_region: Option<String>,
     pub api_region: Option<String>,

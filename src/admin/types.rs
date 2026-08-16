@@ -663,7 +663,12 @@ pub struct UpdateCredentialAuthRequest {
     pub issuer_url: Option<String>,
     #[serde(default, alias = "scope")]
     pub scopes: Option<String>,
-    #[serde(default, alias = "kiroApiKey", alias = "kiro_api_key")]
+    #[serde(
+        default,
+        alias = "kiroApiKey",
+        alias = "kiro_api_key",
+        alias = "api_key"
+    )]
     pub api_key: Option<String>,
     #[serde(default)]
     pub region: Option<String>,
@@ -923,7 +928,12 @@ pub struct AddCredentialRequest {
 
     /// 上游 API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
-    #[serde(default, alias = "kiroApiKey", alias = "kiro_api_key")]
+    #[serde(
+        default,
+        alias = "kiroApiKey",
+        alias = "kiro_api_key",
+        alias = "api_key"
+    )]
     pub api_key: Option<String>,
 
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
@@ -2389,7 +2399,7 @@ mod tests {
         assert_eq!(add_req.auto_discover_supported_models, Some(true));
 
         let batch_req: BatchCredentialImportRequest = serde_json::from_value(serde_json::json!({
-            "credentials": [{ "kiroApiKey": "ksk_fake" }]
+            "credentials": [{ "apiKey": "ksk_fake" }]
         }))
         .unwrap();
         assert_eq!(
@@ -2604,7 +2614,7 @@ mod tests {
     fn validate_external_credentials_defaults_liveness_on_but_accepts_override() {
         let default_req: ValidateExternalCredentialsRequest =
             serde_json::from_value(serde_json::json!({
-                "credentials": [{ "kiroApiKey": "ksk_fake" }]
+                "credentials": [{ "apiKey": "ksk_fake" }]
             }))
             .unwrap();
         assert!(default_req.query_subscription);
@@ -2614,7 +2624,7 @@ mod tests {
         let override_req: ValidateExternalCredentialsRequest =
             serde_json::from_value(serde_json::json!({
                 "checkLiveness": false,
-                "credentials": [{ "kiroApiKey": "ksk_fake" }]
+                "credentials": [{ "apiKey": "ksk_fake" }]
             }))
             .unwrap();
         assert!(!override_req.check_liveness);

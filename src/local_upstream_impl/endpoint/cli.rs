@@ -383,7 +383,7 @@ mod tests {
             Some(" http://127.0.0.1:39091/aws-lifecycle/ ".to_string());
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
-            kiro_api_key: Some("ksk_fake_lifecycle".to_string()),
+            api_key: Some("ksk_fake_lifecycle".to_string()),
             api_region: Some("eu-west-3".to_string()),
             ..Default::default()
         };
@@ -815,7 +815,7 @@ mod tests {
         let config = Config::default();
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("api key".to_string()),
-            kiro_api_key: Some("ksk_test".to_string()),
+            api_key: Some("ksk_test".to_string()),
             ..Default::default()
         };
         let request = endpoint

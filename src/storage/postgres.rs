@@ -508,7 +508,7 @@ fn credential_hash_columns(
             .to_ascii_lowercase()
     };
     let api_key_hash = is_api_key
-        .then(|| credential.kiro_api_key.as_deref())
+        .then(|| credential.api_key.as_deref())
         .flatten()
         .filter(|value| !value.is_empty())
         .map(sha256_hex);
@@ -525,7 +525,7 @@ fn duplicate_credential_message(err: sqlx::Error) -> anyhow::Error {
         sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
             let constraint = db_err.constraint().unwrap_or_default();
             if constraint.contains("api_key") {
-                return anyhow::anyhow!("凭据已存在（kiroApiKey 重复）");
+                return anyhow::anyhow!("凭据已存在（API key 重复）");
             }
             if constraint.contains("refresh_token") {
                 return anyhow::anyhow!("凭据已存在（refreshToken 重复）");
@@ -2045,7 +2045,7 @@ impl PostgresStore {
         }
 
         let mut credential = LocalUpstreamCredentials {
-            kiro_api_key: Some(api_key.to_string()),
+            api_key: Some(api_key.to_string()),
             auth_method: Some("api_key".to_string()),
             priority: 0,
             region: region.clone(),
@@ -2056,7 +2056,7 @@ impl PostgresStore {
         credential.normalize_api_key_defaults();
         match self.insert_credential(&credential).await {
             Ok(inserted) => Ok(inserted),
-            Err(err) if err.to_string().contains("kiroApiKey 重复") => self
+            Err(err) if err.to_string().contains("API key 重复") => self
                 .find_existing_api_key_credential(&api_key)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("本地上游 API Key 已存在但重新查询失败")),
@@ -4986,7 +4986,7 @@ async fn repair_active_credential_hashes_in_tx(
           AND (
               (
                   api_key_hash IS NULL
-                  AND COALESCE(data->>'kiroApiKey', data->>'kiro_api_key') IS NOT NULL
+                  AND COALESCE(data->>'apiKey', data->>'kiroApiKey', data->>'kiro_api_key', data->>'api_key') IS NOT NULL
               )
               OR (
                   refresh_token_hash IS NULL
@@ -5032,7 +5032,7 @@ async fn repair_active_credential_hashes_in_tx(
             .await?;
             if let Some(conflicting_id) = conflicting_id {
                 anyhow::bail!(
-                    "凭据 #{} 与 #{} 的 kiroApiKey 重复，无法回填 hash",
+                    "凭据 #{} 与 #{} 的 API key 重复，无法回填 hash",
                     credential_id,
                     conflicting_id
                 );
@@ -14106,7 +14106,7 @@ mod tests {
         .unwrap();
         store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_migration_atomicity_fixture".to_string()),
+                api_key: Some("ksk_migration_atomicity_fixture".to_string()),
                 auth_method: Some("api_key".to_string()),
                 priority: 23,
                 email: Some("migration-atomicity@example.test".to_string()),
@@ -15340,7 +15340,7 @@ mod tests {
         let inserted = store
             .insert_credential(&LocalUpstreamCredentials {
                 email: Some("beta@example.com".to_string()),
-                kiro_api_key: Some("ksk_beta_key".to_string()),
+                api_key: Some("ksk_beta_key".to_string()),
                 auth_method: Some("api_key".to_string()),
                 priority: 1,
                 ..Default::default()
@@ -15364,7 +15364,7 @@ mod tests {
         store
             .save_credentials(&[LocalUpstreamCredentials {
                 email: Some("gamma@example.com".to_string()),
-                kiro_api_key: Some("ksk_gamma_key".to_string()),
+                api_key: Some("ksk_gamma_key".to_string()),
                 auth_method: Some("api_key".to_string()),
                 priority: 2,
                 ..Default::default()
@@ -16009,7 +16009,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_credential_revision_migration".to_string()),
+                api_key: Some("ksk_credential_revision_migration".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -16707,7 +16707,7 @@ mod tests {
         clean(&store).await;
         let first_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_stats_exactly_once_first".to_string()),
+                api_key: Some("ksk_stats_exactly_once_first".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -16717,7 +16717,7 @@ mod tests {
             .unwrap();
         let second_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_stats_exactly_once_second".to_string()),
+                api_key: Some("ksk_stats_exactly_once_second".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -16846,7 +16846,7 @@ mod tests {
                    NULL,
                    NULL,
                    jsonb_build_object(
-                       'kiroApiKey', 'ksk_stats_chunk_' || id::text,
+                       'apiKey', 'ksk_stats_chunk_' || id::text,
                        'authMethod', 'api_key'
                    )
             FROM generate_series(1, 1001) AS id
@@ -16938,7 +16938,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_stats_soft_delete_race".to_string()),
+                api_key: Some("ksk_stats_soft_delete_race".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17030,7 +17030,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_last_used_rfc3339_order".to_string()),
+                api_key: Some("ksk_last_used_rfc3339_order".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17137,7 +17137,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_mutation_revision".to_string()),
+                api_key: Some("ksk_runtime_mutation_revision".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17226,7 +17226,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_generation_fence".to_string()),
+                api_key: Some("ksk_runtime_generation_fence".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17448,7 +17448,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_disable_mutation_idempotency".to_string()),
+                api_key: Some("ksk_disable_mutation_idempotency".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17605,7 +17605,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_patch_idempotency".to_string()),
+                api_key: Some("ksk_runtime_patch_idempotency".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17786,7 +17786,7 @@ mod tests {
         clean(&store).await;
         let mutation_credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_patch_soft_delete".to_string()),
+                api_key: Some("ksk_runtime_patch_soft_delete".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17830,7 +17830,7 @@ mod tests {
 
         let snapshot_credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_soft_delete".to_string()),
+                api_key: Some("ksk_runtime_snapshot_soft_delete".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17906,7 +17906,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_stale".to_string()),
+                api_key: Some("ksk_runtime_snapshot_stale".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -17985,7 +17985,7 @@ mod tests {
 
         let missing_state_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_missing".to_string()),
+                api_key: Some("ksk_runtime_snapshot_missing".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -18029,7 +18029,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_snapshot_concurrent".to_string()),
+                api_key: Some("ksk_runtime_snapshot_concurrent".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -18128,7 +18128,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_mutation_cleanup".to_string()),
+                api_key: Some("ksk_runtime_mutation_cleanup".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -18221,7 +18221,7 @@ mod tests {
         let first_id = store
             .insert_credential(&LocalUpstreamCredentials {
                 email: Some("consistent-first@example.com".to_string()),
-                kiro_api_key: Some("ksk_consistent_first".to_string()),
+                api_key: Some("ksk_consistent_first".to_string()),
                 auth_method: Some("api_key".to_string()),
                 priority: 2,
                 disabled: true,
@@ -18234,7 +18234,7 @@ mod tests {
         store
             .insert_credential(&LocalUpstreamCredentials {
                 email: Some("consistent-second@example.com".to_string()),
-                kiro_api_key: Some("ksk_consistent_second".to_string()),
+                api_key: Some("ksk_consistent_second".to_string()),
                 auth_method: Some("api_key".to_string()),
                 priority: 1,
                 ..Default::default()
@@ -18306,7 +18306,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_revision_migration".to_string()),
+                api_key: Some("ksk_runtime_revision_migration".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -18377,7 +18377,7 @@ mod tests {
         clean(&store).await;
         let credential_id = store
             .insert_credential(&LocalUpstreamCredentials {
-                kiro_api_key: Some("ksk_runtime_generation_migration".to_string()),
+                api_key: Some("ksk_runtime_generation_migration".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -18449,7 +18449,7 @@ mod tests {
                 store
                     .insert_credential(&LocalUpstreamCredentials {
                         email: Some(format!("concurrent-{}@example.com", index)),
-                        kiro_api_key: Some(format!("ksk_concurrent_{}", index)),
+                        api_key: Some(format!("ksk_concurrent_{}", index)),
                         auth_method: Some("api_key".to_string()),
                         priority: index,
                         ..Default::default()
@@ -18482,13 +18482,13 @@ mod tests {
         let duplicate = store
             .insert_credential(&LocalUpstreamCredentials {
                 email: Some("duplicate@example.com".to_string()),
-                kiro_api_key: Some("ksk_concurrent_0".to_string()),
+                api_key: Some("ksk_concurrent_0".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
             .await
             .unwrap_err();
-        assert!(duplicate.to_string().contains("kiroApiKey 重复"));
+        assert!(duplicate.to_string().contains("API key 重复"));
 
         store.drop_test_schema().await.unwrap();
     }
@@ -18507,7 +18507,7 @@ mod tests {
             .save_credentials(&[LocalUpstreamCredentials {
                 id: Some(7),
                 email: Some("explicit-seven@example.com".to_string()),
-                kiro_api_key: Some("ksk_explicit_seven".to_string()),
+                api_key: Some("ksk_explicit_seven".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             }])
@@ -18516,7 +18516,7 @@ mod tests {
         let after_explicit = store
             .insert_credential(&LocalUpstreamCredentials {
                 email: Some("after-explicit@example.com".to_string()),
-                kiro_api_key: Some("ksk_after_explicit".to_string()),
+                api_key: Some("ksk_after_explicit".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -18533,7 +18533,7 @@ mod tests {
             .save_credentials(&[LocalUpstreamCredentials {
                 id: Some(50),
                 email: Some("explicit-fifty@example.com".to_string()),
-                kiro_api_key: Some("ksk_explicit_fifty".to_string()),
+                api_key: Some("ksk_explicit_fifty".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             }])
@@ -18542,7 +18542,7 @@ mod tests {
         let after_higher_sequence = store
             .insert_credential(&LocalUpstreamCredentials {
                 email: Some("after-higher-sequence@example.com".to_string()),
-                kiro_api_key: Some("ksk_after_higher_sequence".to_string()),
+                api_key: Some("ksk_after_higher_sequence".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
@@ -18579,7 +18579,7 @@ mod tests {
                     .save_credentials(&[LocalUpstreamCredentials {
                         id: Some(id),
                         email: Some(format!("explicit-concurrent-{index}@example.com")),
-                        kiro_api_key: Some(format!("ksk_explicit_concurrent_{index}")),
+                        api_key: Some(format!("ksk_explicit_concurrent_{index}")),
                         auth_method: Some("api_key".to_string()),
                         ..Default::default()
                     }])
@@ -18596,7 +18596,7 @@ mod tests {
                 store
                     .insert_credential(&LocalUpstreamCredentials {
                         email: Some(format!("automatic-concurrent-{index}@example.com")),
-                        kiro_api_key: Some(format!("ksk_automatic_concurrent_{index}")),
+                        api_key: Some(format!("ksk_automatic_concurrent_{index}")),
                         auth_method: Some("api_key".to_string()),
                         ..Default::default()
                     })
@@ -18622,7 +18622,7 @@ mod tests {
         let after_concurrent_inserts = store
             .insert_credential(&LocalUpstreamCredentials {
                 email: Some("after-concurrent-allocation@example.com".to_string()),
-                kiro_api_key: Some("ksk_after_concurrent_allocation".to_string()),
+                api_key: Some("ksk_after_concurrent_allocation".to_string()),
                 auth_method: Some("api_key".to_string()),
                 ..Default::default()
             })
