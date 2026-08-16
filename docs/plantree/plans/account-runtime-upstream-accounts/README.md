@@ -203,9 +203,12 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
 - Anthropic handler prompt-cache route strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream test naming instead of Kiro-scoped route/content variables.
 - Admin UI internal status color utility classes now use `runtime` prefixes instead of Kiro-branded class names while preserving the existing color values and component behavior.
+- Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming; the old theme key remains a read fallback only.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro-admin-ui|kiro-ui|kiro-credentials|kiro-usage|kiro-console:theme" ui admin-ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
+- `pnpm --dir ui check && pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "(text|bg|border)-kiro|kiro-(success|warning|error|info)" admin-ui ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "kiro" src/anthropic/handlers/tests.rs`

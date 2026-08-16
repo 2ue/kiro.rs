@@ -9,7 +9,9 @@
       // 在 React 挂载前应用主题,避免亮/暗闪烁
       (function () {
         try {
-          var saved = localStorage.getItem('kiro-console:theme')
+          var saved =
+            localStorage.getItem('account-runtime-console:theme') ||
+            localStorage.getItem('kiro-console:theme')
           var dark =
             saved === 'dark' ||
             (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)

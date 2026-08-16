@@ -862,7 +862,7 @@ export function UsageRecordsPanel() {
       }
       downloadTextFile(
         usageRecordsToCsv(result.records),
-        `kiro-usage-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`,
+        `account-runtime-usage-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`,
         'text/csv;charset=utf-8'
       )
       const suffix = result.total > result.records.length

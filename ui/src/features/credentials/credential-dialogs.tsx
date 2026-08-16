@@ -289,7 +289,7 @@ async function rollbackCredential(id: number): Promise<{ success: boolean; error
 
 function exportFilename(format: CredentialExportFormat): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-  return `kiro-credentials-${stamp}.${format === 'jsonl' ? 'jsonl' : 'json'}`
+  return `account-runtime-credentials-${stamp}.${format === 'jsonl' ? 'jsonl' : 'json'}`
 }
 
 function downloadBlob(blob: Blob, filename: string) {

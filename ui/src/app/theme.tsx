@@ -3,6 +3,7 @@ import * as React from 'react'
 type Theme = 'light' | 'dark'
 
 const STORAGE_KEY = 'account-runtime-console:theme'
+const LEGACY_STORAGE_KEY = 'kiro-console:theme'
 
 interface ThemeContextValue {
   theme: Theme
@@ -14,7 +15,9 @@ const ThemeContext = React.createContext<ThemeContextValue | null>(null)
 
 function getInitialTheme(): Theme {
   if (typeof window === 'undefined') return 'light'
-  const saved = window.localStorage.getItem(STORAGE_KEY)
+  const saved =
+    window.localStorage.getItem(STORAGE_KEY) ??
+    window.localStorage.getItem(LEGACY_STORAGE_KEY)
   if (saved === 'light' || saved === 'dark') return saved
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
