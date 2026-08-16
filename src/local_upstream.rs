@@ -41,7 +41,7 @@ pub(crate) mod dispatch {
 
 pub(crate) mod endpoint {
     pub(crate) use crate::local_upstream_impl::endpoint::IdeEndpoint as LocalUpstreamIdeEndpoint;
-    pub(crate) use crate::local_upstream_impl::endpoint::KiroEndpoint as LocalUpstreamEndpointTrait;
+    pub(crate) use crate::local_upstream_impl::endpoint::LocalUpstreamEndpoint as LocalUpstreamEndpointTrait;
     pub(crate) use crate::local_upstream_impl::endpoint::ide::IDE_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
     pub(crate) type LocalUpstreamCliEndpoint = crate::local_upstream_impl::endpoint::CliEndpoint;
     pub(crate) type LocalUpstreamEndpoint = dyn LocalUpstreamEndpointTrait;
@@ -53,12 +53,13 @@ pub(crate) mod provider {
     pub(crate) type LocalAuxiliaryMcpFailureKind =
         crate::local_upstream_impl::provider::McpCallFailureKind;
     pub(crate) type LocalUpstreamApiResponse =
-        crate::local_upstream_impl::provider::KiroApiResponse;
-    pub(crate) type LocalUpstreamProvider = crate::local_upstream_impl::provider::KiroProvider;
+        crate::local_upstream_impl::provider::LocalUpstreamApiResponse;
+    pub(crate) type LocalUpstreamProvider =
+        crate::local_upstream_impl::provider::LocalUpstreamProvider;
     pub(crate) type LocalUpstreamStreamCompletion =
-        crate::local_upstream_impl::provider::KiroStreamCompletion;
+        crate::local_upstream_impl::provider::LocalUpstreamStreamCompletion;
     pub(crate) type LocalUpstreamStreamResponse =
-        crate::local_upstream_impl::provider::KiroStreamResponse;
+        crate::local_upstream_impl::provider::LocalUpstreamStreamResponse;
 }
 
 pub(crate) mod event {

@@ -10,7 +10,7 @@ use reqwest::RequestBuilder;
 use uuid::Uuid;
 
 use super::{
-    KiroEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
+    LocalUpstreamEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
     normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
 };
 use crate::local_upstream_impl::protocol::{
@@ -71,7 +71,7 @@ impl Default for IdeEndpoint {
     }
 }
 
-impl KiroEndpoint for IdeEndpoint {
+impl LocalUpstreamEndpoint for IdeEndpoint {
     fn name(&self) -> &'static str {
         IDE_ENDPOINT_NAME
     }
@@ -234,7 +234,7 @@ fn set_profile_arn(json: &mut serde_json::Value, profile_arn: &Option<String>) -
 mod tests {
     use super::{IdeEndpoint, inject_profile_arn, transform_ide_api_body};
     use crate::http_client::allocation_probe;
-    use crate::local_upstream_impl::endpoint::{KiroEndpoint, RequestContext};
+    use crate::local_upstream_impl::endpoint::{LocalUpstreamEndpoint, RequestContext};
     use crate::local_upstream_impl::model::credentials::KiroCredentials;
     use crate::local_upstream_impl::protocol::{
         KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN,

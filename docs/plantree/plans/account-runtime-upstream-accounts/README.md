@@ -213,9 +213,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin, storage and Anthropic handler-test boundaries now import upstream-account storage/status/eligibility/manager aliases through `account_runtime` instead of direct legacy external-pool modules. Unused legacy Rust enable/test DTOs were removed after compatibility routes moved to account DTOs.
 - The legacy local upstream implementation directory moved from `src/kiro` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::kiro` module paths were removed, and the concrete request submodule moved from `model::requests::kiro` to `model::requests::upstream`.
 - Concrete local-upstream request payload structs now use `LocalUpstreamRequest`, `LocalUpstreamAdditionalModelRequestFields`, `LocalUpstreamThinkingConfig`, `LocalUpstreamOutputConfig` and `LocalUpstreamReasoningConfig`; `model/requests` comments now use local-upstream wording while compatibility wire fields and payload behavior remain unchanged.
+- Concrete local-upstream provider and endpoint types now use `LocalUpstreamProvider`, `LocalUpstreamEndpoint`, `LocalUpstreamApiResponse`, `LocalUpstreamApiCompletion`, `LocalUpstreamStreamResponse` and `LocalUpstreamStreamCompletion`; provider diagnostics and endpoint comments now use local-upstream wording while existing transport, retry and completion behavior stays unchanged.
 
 Last verified on 2026-08-16:
 
+- `rg -n "\bKiroProvider\b|\bKiroEndpoint\b|\bKiroApiResponse\b|\bKiroApiCompletion\b|\bKiroStreamResponse\b|\bKiroStreamCompletion\b" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint src/local_upstream.rs --glob '!target/**'`
+- `rg -n "Kiro API Provider|Kiro API|Kiro model discovery|Kiro model capability|Kiro 端点|不同 Kiro|AWS/Kiro host|Kiro CLI management" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint/mod.rs src/local_upstream_impl/mod.rs --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-provider-types-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-provider-types-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-provider-types-test1 -- bash -lc 'cargo test provider_sends_endpoint_and_compression_bytes_exactly_for_five_rounds -- --nocapture && cargo test provider_sends_converter_max_effort_with_native_adaptive_thinking_for_five_rounds -- --nocapture && cargo test stream_completion -- --nocapture && cargo test api_completion -- --nocapture'`
 - `rg -n "KiroRequest|KiroThinkingConfig|KiroOutputConfig|KiroReasoningConfig|pub use upstream::Kiro|Kiro 请求|Kiro API 请求|Kiro-native|Kiro native|Kiro accepts|Kiro 的 tools|Kiro cachePoint|Kiro API" src/local_upstream_impl/model/requests src/local_upstream_impl/model/mod.rs src/local_upstream.rs src/local_upstream_impl/provider.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-types-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-types-check1 -- cargo check`

@@ -1,4 +1,4 @@
-//! Kiro API 客户端模块
+//! 本地上游客户端模块
 
 pub mod call_trace;
 pub mod endpoint;

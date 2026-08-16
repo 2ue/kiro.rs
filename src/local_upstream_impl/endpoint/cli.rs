@@ -11,7 +11,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    KiroEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
+    LocalUpstreamEndpoint, RequestContext, body_may_need_output_config_thinking_normalization,
     configured_upstream_url, contains_json_object_key,
     normalize_output_config_thinking_compatibility_json, serialize_json_with_capacity,
 };
@@ -87,7 +87,7 @@ impl Default for CliEndpoint {
     }
 }
 
-impl KiroEndpoint for CliEndpoint {
+impl LocalUpstreamEndpoint for CliEndpoint {
     fn name(&self) -> &'static str {
         CLI_ENDPOINT_NAME
     }

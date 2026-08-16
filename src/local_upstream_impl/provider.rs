@@ -1,9 +1,9 @@
-//! Kiro API Provider
+//! Local upstream provider
 //!
-//! 核心组件，负责与 Kiro API 通信
+//! 核心组件，负责与本地上游通信
 //! 支持流式和非流式请求
 //! 支持多凭据故障转移和重试
-//! 支持按凭据级 endpoint 切换不同 Kiro API 端点
+//! 支持按凭据级 endpoint 切换不同本地上游端点
 
 use chrono::Utc;
 use once_cell::sync::OnceCell;
@@ -35,7 +35,9 @@ use crate::local_upstream_impl::call_trace::{
     KiroCallError, KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink,
     SelectionFailureSummary, summarize_attempts,
 };
-use crate::local_upstream_impl::endpoint::{KiroEndpoint, RequestContext, configured_upstream_url};
+use crate::local_upstream_impl::endpoint::{
+    LocalUpstreamEndpoint, RequestContext, configured_upstream_url,
+};
 use crate::local_upstream_impl::machine_id;
 use crate::local_upstream_impl::model::available_models::{
     KiroAvailableModel, KiroAvailableModelCatalog, KiroAvailableModelsResponse,
@@ -480,12 +482,12 @@ impl ProfileArnDiscoveryMetrics {
     }
 }
 
-/// Kiro API Provider
+/// Local upstream provider
 ///
-/// 核心组件，负责与 Kiro API 通信
+/// 核心组件，负责与本地上游通信
 /// 支持多凭据故障转移和重试机制
-/// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
-pub struct KiroProvider {
+/// 按凭据 `endpoint` 字段选择 [`LocalUpstreamEndpoint`] 实现
+pub struct LocalUpstreamProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
@@ -496,7 +498,7 @@ pub struct KiroProvider {
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
-    endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
+    endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>>,
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
     /// Prevent startup and Admin model discovery from scanning the account pool concurrently.
@@ -529,7 +531,9 @@ struct ModelDiscoveryRunGuard<'a> {
 impl<'a> ModelDiscoveryRunGuard<'a> {
     fn acquire(flag: &'a AtomicBool) -> anyhow::Result<Self> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| anyhow::anyhow!("Kiro model discovery is already in progress"))?;
+            .map_err(|_| {
+                anyhow::anyhow!("Local upstream model discovery is already in progress")
+            })?;
         Ok(Self { flag })
     }
 }
@@ -540,9 +544,9 @@ impl Drop for ModelDiscoveryRunGuard<'_> {
     }
 }
 
-pub struct KiroApiResponse {
+pub struct LocalUpstreamApiResponse {
     response: reqwest::Response,
-    completion: KiroApiCompletion,
+    completion: LocalUpstreamApiCompletion,
 }
 
 pub struct McpCallResponse {
@@ -630,7 +634,7 @@ impl McpCallCompletion {
         }
         let attempts = {
             let mut attempts = self.attempts.lock();
-            KiroProvider::push_attempt(
+            LocalUpstreamProvider::push_attempt(
                 &mut attempts,
                 self.attempt,
                 self.credential_id,
@@ -664,7 +668,7 @@ impl McpCallCompletion {
         }
         let attempts = {
             let mut attempts = self.attempts.lock();
-            KiroProvider::push_attempt(
+            LocalUpstreamProvider::push_attempt(
                 &mut attempts,
                 self.attempt,
                 self.credential_id,
@@ -746,7 +750,7 @@ enum CredentialAuthFailureDecision {
 ///
 /// 非流式响应头返回后，body 读取和事件解析仍可能失败或被取消。
 /// 这个 guard 用 Drop 兜底释放并发槽，避免调用链中途退出导致凭据长期不可调度。
-pub struct KiroApiCompletion {
+pub struct LocalUpstreamApiCompletion {
     token_manager: Arc<MultiTokenManager>,
     credential_id: u64,
     in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
@@ -759,7 +763,7 @@ pub struct KiroApiCompletion {
     started_at: Instant,
 }
 
-impl KiroApiCompletion {
+impl LocalUpstreamApiCompletion {
     fn new(
         token_manager: Arc<MultiTokenManager>,
         credential_id: u64,
@@ -824,7 +828,7 @@ impl KiroApiCompletion {
     }
 }
 
-impl Drop for KiroApiCompletion {
+impl Drop for LocalUpstreamApiCompletion {
     fn drop(&mut self) {
         if self.reported.load(Ordering::Acquire) {
             return;
@@ -833,7 +837,7 @@ impl Drop for KiroApiCompletion {
     }
 }
 
-impl KiroApiResponse {
+impl LocalUpstreamApiResponse {
     pub fn credential_id(&self) -> u64 {
         self.completion.credential_id()
     }
@@ -850,7 +854,7 @@ impl KiroApiResponse {
         self.completion.attempts()
     }
 
-    pub fn into_parts(self) -> (reqwest::Response, KiroApiCompletion) {
+    pub fn into_parts(self) -> (reqwest::Response, LocalUpstreamApiCompletion) {
         (self.response, self.completion)
     }
 }
@@ -859,7 +863,7 @@ impl KiroApiResponse {
 ///
 /// Provider 只能确认上游返回了成功响应头；流式 body 是否完整消费需要
 /// SSE 处理链路在 EOF、读错误或 idle timeout 时回报。
-pub struct KiroStreamCompletion {
+pub struct LocalUpstreamStreamCompletion {
     token_manager: Arc<MultiTokenManager>,
     credential_id: u64,
     in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
@@ -872,7 +876,7 @@ pub struct KiroStreamCompletion {
     started_at: Instant,
 }
 
-impl KiroStreamCompletion {
+impl LocalUpstreamStreamCompletion {
     fn new(
         token_manager: Arc<MultiTokenManager>,
         credential_id: u64,
@@ -976,7 +980,7 @@ impl KiroStreamCompletion {
     }
 }
 
-impl Drop for KiroStreamCompletion {
+impl Drop for LocalUpstreamStreamCompletion {
     fn drop(&mut self) {
         if self.reported.load(Ordering::Acquire) {
             return;
@@ -985,13 +989,13 @@ impl Drop for KiroStreamCompletion {
     }
 }
 
-pub struct KiroStreamResponse {
+pub struct LocalUpstreamStreamResponse {
     response: reqwest::Response,
-    completion: KiroStreamCompletion,
+    completion: LocalUpstreamStreamCompletion,
 }
 
-impl KiroStreamResponse {
-    pub fn into_parts(self) -> (reqwest::Response, KiroStreamCompletion) {
+impl LocalUpstreamStreamResponse {
+    pub fn into_parts(self) -> (reqwest::Response, LocalUpstreamStreamCompletion) {
         (self.response, self.completion)
     }
 }
@@ -1019,10 +1023,10 @@ mod tests {
 
     use super::{
         AuxiliaryConcurrencySaturated, CredentialAuthFailureDecision, CredentialRiskControlReason,
-        KIRO_CLIENT_CACHE_MAX_ENTRIES, KiroAvailableModel, KiroProvider, KiroStreamCompletion,
-        MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS, MODEL_DISCOVERY_MAX_HTTP_SENDS, McpCallCompletion,
-        McpCallFailureKind, PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES, ProfileArnDiscoveryPolicy,
-        ProviderClientCacheEntry,
+        KIRO_CLIENT_CACHE_MAX_ENTRIES, KiroAvailableModel, LocalUpstreamProvider,
+        LocalUpstreamStreamCompletion, MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS,
+        MODEL_DISCOVERY_MAX_HTTP_SENDS, McpCallCompletion, McpCallFailureKind,
+        PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES, ProfileArnDiscoveryPolicy, ProviderClientCacheEntry,
     };
     use crate::anthropic::inference_attempt_budget::{
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, InferenceAttemptBudget, InferenceAttemptKind,
@@ -1031,7 +1035,7 @@ mod tests {
     use crate::local_upstream_impl::call_trace::{
         AccountRejectReason, KiroCallFailureKind, SelectionFailureStage,
     };
-    use crate::local_upstream_impl::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
+    use crate::local_upstream_impl::endpoint::{CliEndpoint, IdeEndpoint, LocalUpstreamEndpoint};
     use crate::local_upstream_impl::model::credentials::KiroCredentials;
     use crate::local_upstream_impl::token_manager::{
         AcquireMode, AuxiliaryConcurrencyKind, MultiTokenManager,
@@ -2048,7 +2052,7 @@ mod tests {
         }
     }
 
-    fn fake_final_attempt_provider(base_url: &str, token: &str) -> KiroProvider {
+    fn fake_final_attempt_provider(base_url: &str, token: &str) -> LocalUpstreamProvider {
         let mut credential = fake_external_idp_credential(1, token);
         credential.profile_arn =
             Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FINAL_ATTEMPT".to_string());
@@ -2062,9 +2066,9 @@ mod tests {
             MultiTokenManager::new(config, vec![credential], None, None, false)
                 .expect("final-attempt fixture token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string())
+        LocalUpstreamProvider::with_proxy(manager, None, endpoints, "ide".to_string())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2234,7 +2238,7 @@ mod tests {
         base_url: &str,
         credentials: Vec<KiroCredentials>,
         policy: Option<ProfileArnDiscoveryPolicy>,
-    ) -> (Arc<KiroProvider>, Arc<MultiTokenManager>) {
+    ) -> (Arc<LocalUpstreamProvider>, Arc<MultiTokenManager>) {
         fake_profile_provider_with_auxiliary_limit(base_url, credentials, policy, None)
     }
 
@@ -2243,7 +2247,7 @@ mod tests {
         credentials: Vec<KiroCredentials>,
         policy: Option<ProfileArnDiscoveryPolicy>,
         auxiliary_limit: Option<u32>,
-    ) -> (Arc<KiroProvider>, Arc<MultiTokenManager>) {
+    ) -> (Arc<LocalUpstreamProvider>, Arc<MultiTokenManager>) {
         let mut config = Config::default();
         config.local_upstream_base_url = Some(base_url.to_string());
         config.local_upstream_response_timeout_secs = 2;
@@ -2254,10 +2258,10 @@ mod tests {
             MultiTokenManager::new(config, credentials, None, None, false)
                 .expect("fake profile discovery token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let mut provider =
-            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+            LocalUpstreamProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
         if let Some(policy) = policy {
             provider.profile_arn_discovery_policy = policy;
         }
@@ -2267,7 +2271,7 @@ mod tests {
     fn fake_model_discovery_provider(
         base_url: &str,
         tokens: impl IntoIterator<Item = String>,
-    ) -> Arc<KiroProvider> {
+    ) -> Arc<LocalUpstreamProvider> {
         let credentials = tokens
             .into_iter()
             .enumerate()
@@ -2289,9 +2293,9 @@ mod tests {
             MultiTokenManager::new(config, credentials, None, None, false)
                 .expect("fake model discovery token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        Arc::new(KiroProvider::with_proxy(
+        Arc::new(LocalUpstreamProvider::with_proxy(
             manager,
             None,
             endpoints,
@@ -2304,7 +2308,7 @@ mod tests {
         endpoint_name: &str,
         profile_arn: Option<&str>,
         compression_enabled: bool,
-    ) -> KiroProvider {
+    ) -> LocalUpstreamProvider {
         let mut config = Config::default();
         config.local_upstream_base_url = Some(base_url.to_string());
         config.local_upstream_response_timeout_secs = 5;
@@ -2334,13 +2338,17 @@ mod tests {
             MultiTokenManager::new(config, vec![credentials], None, None, false)
                 .expect("fake body capture token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         endpoints.insert("cli".to_string(), Arc::new(CliEndpoint::new()));
-        KiroProvider::with_proxy(manager, None, endpoints, endpoint_name.to_string())
+        LocalUpstreamProvider::with_proxy(manager, None, endpoints, endpoint_name.to_string())
     }
 
-    async fn call_body_capture_provider(provider: &KiroProvider, body: &str, is_stream: bool) {
+    async fn call_body_capture_provider(
+        provider: &LocalUpstreamProvider,
+        body: &str,
+        is_stream: bool,
+    ) {
         if is_stream {
             let response = provider
                 .call_api_stream(body)
@@ -2601,7 +2609,7 @@ mod tests {
     }
 
     async fn ensure_profile_for_credential(
-        provider: &KiroProvider,
+        provider: &LocalUpstreamProvider,
         manager: &MultiTokenManager,
         id: u64,
     ) -> Option<String> {
@@ -2626,7 +2634,7 @@ mod tests {
     }
 
     async fn concurrently_ensure_profiles(
-        provider: Arc<KiroProvider>,
+        provider: Arc<LocalUpstreamProvider>,
         manager: Arc<MultiTokenManager>,
         credential_ids: &[u64],
         copies_per_credential: usize,
@@ -2875,7 +2883,8 @@ mod tests {
             .acquire_context_for_credential(1)
             .await
             .expect("acquire deleted credential simulation");
-        let old_key = KiroProvider::profile_arn_discovery_key(&old_ctx, &config, "fake-machine");
+        let old_key =
+            LocalUpstreamProvider::profile_arn_discovery_key(&old_ctx, &config, "fake-machine");
         provider
             .ensure_profile_arn_for_context(&mut old_ctx, &config, "fake-machine", None)
             .await;
@@ -2897,8 +2906,11 @@ mod tests {
             old_ctx.id, replacement_ctx.id,
             "both credentials reuse ID 1"
         );
-        let replacement_key =
-            KiroProvider::profile_arn_discovery_key(&replacement_ctx, &config, "fake-machine");
+        let replacement_key = LocalUpstreamProvider::profile_arn_discovery_key(
+            &replacement_ctx,
+            &config,
+            "fake-machine",
+        );
         assert_ne!(
             old_key, replacement_key,
             "replacement authentication identity must not inherit deleted credential state"
@@ -2950,7 +2962,7 @@ mod tests {
                 .await
                 .expect("acquire cross-region context");
             let missing_profile_key =
-                KiroProvider::profile_arn_discovery_key(&ctx, &config, "fake-machine");
+                LocalUpstreamProvider::profile_arn_discovery_key(&ctx, &config, "fake-machine");
             provider
                 .ensure_profile_arn_for_context(&mut ctx, &config, "fake-machine", None)
                 .await;
@@ -2962,7 +2974,7 @@ mod tests {
                 "round {round}: fake discovery should shift away from the configured region"
             );
             let discovered_profile_key =
-                KiroProvider::profile_arn_discovery_key(&ctx, &config, "fake-machine");
+                LocalUpstreamProvider::profile_arn_discovery_key(&ctx, &config, "fake-machine");
             assert_eq!(
                 missing_profile_key, discovered_profile_key,
                 "round {round}: discovered ARN region must not change the invalidation identity"
@@ -3370,9 +3382,9 @@ mod tests {
             MultiTokenManager::new(config, credentials, None, None, false)
                 .expect("fake model discovery token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider = Arc::new(KiroProvider::with_proxy(
+        let provider = Arc::new(LocalUpstreamProvider::with_proxy(
             manager,
             None,
             endpoints,
@@ -3749,9 +3761,10 @@ mod tests {
             )
             .expect("fake provider token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let provider =
+            LocalUpstreamProvider::with_proxy(manager, None, endpoints, "ide".to_string());
         let request_body = serde_json::json!({
             "testScenario": scenario,
             "conversationState": {
@@ -3792,13 +3805,13 @@ mod tests {
         assert_eq!(snapshot.consumed as usize, hits);
         assert_eq!(snapshot.local_attempts as usize, hits);
         assert_eq!(snapshot.account_attempts, 0);
-        (hits, KiroProvider::attempts_from_error(&error))
+        (hits, LocalUpstreamProvider::attempts_from_error(&error))
     }
 
     fn fake_thinking_signature_provider(
         base_url: &str,
         pool_size: usize,
-    ) -> (KiroProvider, Arc<MultiTokenManager>) {
+    ) -> (LocalUpstreamProvider, Arc<MultiTokenManager>) {
         let mut config = Config::default();
         config.local_upstream_base_url = Some(base_url.to_string());
         config.local_upstream_response_timeout_secs = 2;
@@ -3818,10 +3831,10 @@ mod tests {
             )
             .expect("thinking signature retry token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         (
-            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string()),
+            LocalUpstreamProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string()),
             manager,
         )
     }
@@ -3879,7 +3892,7 @@ mod tests {
     }
 
     async fn call_thinking_signature_retry<F>(
-        provider: &KiroProvider,
+        provider: &LocalUpstreamProvider,
         request_body: &str,
         is_stream: bool,
         budget: Arc<InferenceAttemptBudget>,
@@ -3995,10 +4008,10 @@ mod tests {
             )
             .expect("provider failure token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider =
-            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+            LocalUpstreamProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
         let request_body = serde_json::json!({
             "testScenario": scenario,
             "secretMarker": marker,
@@ -4051,7 +4064,7 @@ mod tests {
                 )
             })
             .expect_err("controlled provider upstream must fail");
-        let attempts = KiroProvider::attempts_from_error(&error);
+        let attempts = LocalUpstreamProvider::attempts_from_error(&error);
         let budget_snapshot = budget.snapshot();
         let snapshot = manager.snapshot();
         let scheduler_snapshot =
@@ -4098,11 +4111,11 @@ mod tests {
         }"#;
 
         assert_eq!(
-            KiroProvider::test_extract_conversation_id_from_request(body).as_deref(),
+            LocalUpstreamProvider::test_extract_conversation_id_from_request(body).as_deref(),
             Some("session-123")
         );
         assert_eq!(
-            KiroProvider::test_extract_model_from_request(body).as_deref(),
+            LocalUpstreamProvider::test_extract_model_from_request(body).as_deref(),
             Some("claude-opus-4")
         );
     }
@@ -4112,20 +4125,26 @@ mod tests {
         let body = r#"{"conversationState":{"conversationId":"  "}}"#;
 
         assert_eq!(
-            KiroProvider::test_extract_conversation_id_from_request(body),
+            LocalUpstreamProvider::test_extract_conversation_id_from_request(body),
             None
         );
     }
 
     #[test]
     fn credential_log_label_always_includes_id() {
-        assert_eq!(KiroProvider::format_credential_log_label(6, None), "#6");
         assert_eq!(
-            KiroProvider::format_credential_log_label(6, Some("prevotrj@gmail.com".to_string())),
+            LocalUpstreamProvider::format_credential_log_label(6, None),
+            "#6"
+        );
+        assert_eq!(
+            LocalUpstreamProvider::format_credential_log_label(
+                6,
+                Some("prevotrj@gmail.com".to_string())
+            ),
             "#6 prevotrj@gmail.com"
         );
         assert_eq!(
-            KiroProvider::format_credential_log_label(6, Some("#6 custom".to_string())),
+            LocalUpstreamProvider::format_credential_log_label(6, Some("#6 custom".to_string())),
             "#6 custom"
         );
     }
@@ -4133,56 +4152,56 @@ mod tests {
     #[test]
     fn detects_risk_controlled_upstream_errors() {
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
                 r#"{"reason":"TEMPORARILY_SUSPENDED","message":"User ID is temporarily suspended"}"#
             ),
             Some(CredentialRiskControlReason::TemporarilySuspended)
         );
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
                 r#"{"message":"Your User ID temporarily is suspended. We've locked your account as a security precaution.","reason":null}"#
             ),
             Some(CredentialRiskControlReason::TemporarilySuspended)
         );
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 r#"{"message":"Due to suspicious activity, we are imposing temporary limits on your account."}"#
             ),
             Some(CredentialRiskControlReason::TemporarilySuspended)
         );
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
                 r#"{"__type":"AccountSuspendedException","message":"Account suspended"}"#
             ),
             Some(CredentialRiskControlReason::AccountSuspended)
         );
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::LOCKED,
                 r#"{"message":"Locked"}"#
             ),
             Some(CredentialRiskControlReason::AccountLocked)
         );
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
                 r#"{"message":"We've locked your account as a security precaution."}"#
             ),
             Some(CredentialRiskControlReason::AccountLocked)
         );
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
                 r#"{"message":"The bearer token included in the request is invalid"}"#
             ),
             None
         );
         assert_eq!(
-            KiroProvider::detect_risk_control_error(
+            LocalUpstreamProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
                 r#"{"message":"User is not authorized to make this call.","reason":null}"#
             ),
@@ -4198,31 +4217,41 @@ mod tests {
         };
         let default_credential = KiroCredentials::default();
 
-        assert!(KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            CredentialRiskControlReason::TemporarilySuspended,
-            &opted_out
-        ));
-        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            CredentialRiskControlReason::TemporarilySuspended,
-            &default_credential
-        ));
-        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
-            reqwest::StatusCode::FORBIDDEN,
-            CredentialRiskControlReason::TemporarilySuspended,
-            &opted_out
-        ));
-        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            CredentialRiskControlReason::AccountSuspended,
-            &opted_out
-        ));
-        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            CredentialRiskControlReason::AccountLocked,
-            &opted_out
-        ));
+        assert!(
+            LocalUpstreamProvider::should_downgrade_rate_limit_risk_to_cooldown(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                CredentialRiskControlReason::TemporarilySuspended,
+                &opted_out
+            )
+        );
+        assert!(
+            !LocalUpstreamProvider::should_downgrade_rate_limit_risk_to_cooldown(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                CredentialRiskControlReason::TemporarilySuspended,
+                &default_credential
+            )
+        );
+        assert!(
+            !LocalUpstreamProvider::should_downgrade_rate_limit_risk_to_cooldown(
+                reqwest::StatusCode::FORBIDDEN,
+                CredentialRiskControlReason::TemporarilySuspended,
+                &opted_out
+            )
+        );
+        assert!(
+            !LocalUpstreamProvider::should_downgrade_rate_limit_risk_to_cooldown(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                CredentialRiskControlReason::AccountSuspended,
+                &opted_out
+            )
+        );
+        assert!(
+            !LocalUpstreamProvider::should_downgrade_rate_limit_risk_to_cooldown(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                CredentialRiskControlReason::AccountLocked,
+                &opted_out
+            )
+        );
     }
 
     #[test]
@@ -4326,7 +4355,7 @@ mod tests {
         for round in 0..5 {
             for (body, expected) in cases {
                 assert_eq!(
-                    KiroProvider::classify_bad_request_reason(body),
+                    LocalUpstreamProvider::classify_bad_request_reason(body),
                     expected,
                     "classification mismatch in round {round} for body {body}"
                 );
@@ -4336,22 +4365,30 @@ mod tests {
 
     #[test]
     fn model_unavailable_retry_requires_reason_and_model() {
-        assert!(KiroProvider::should_retry_model_unavailable_bad_request(
-            "model_unavailable_bad_request",
-            Some("claude-opus-4-8"),
-        ));
-        assert!(!KiroProvider::should_retry_model_unavailable_bad_request(
-            "bad_request",
-            Some("claude-opus-4-8"),
-        ));
-        assert!(!KiroProvider::should_retry_model_unavailable_bad_request(
-            "model_unavailable_bad_request",
-            None,
-        ));
-        assert!(!KiroProvider::should_retry_model_unavailable_bad_request(
-            "model_unavailable_bad_request",
-            Some("  "),
-        ));
+        assert!(
+            LocalUpstreamProvider::should_retry_model_unavailable_bad_request(
+                "model_unavailable_bad_request",
+                Some("claude-opus-4-8"),
+            )
+        );
+        assert!(
+            !LocalUpstreamProvider::should_retry_model_unavailable_bad_request(
+                "bad_request",
+                Some("claude-opus-4-8"),
+            )
+        );
+        assert!(
+            !LocalUpstreamProvider::should_retry_model_unavailable_bad_request(
+                "model_unavailable_bad_request",
+                None,
+            )
+        );
+        assert!(
+            !LocalUpstreamProvider::should_retry_model_unavailable_bad_request(
+                "model_unavailable_bad_request",
+                Some("  "),
+            )
+        );
     }
 
     #[test]
@@ -4377,14 +4414,14 @@ mod tests {
         for round in 1..=5 {
             for body in positives {
                 assert!(
-                    KiroProvider::is_thinking_signature_invalid_response(
+                    LocalUpstreamProvider::is_thinking_signature_invalid_response(
                         reqwest::StatusCode::BAD_REQUEST,
                         body,
                     ),
                     "round {round}: exact structured reason must match: {body}"
                 );
                 assert!(
-                    !KiroProvider::is_thinking_signature_invalid_response(
+                    !LocalUpstreamProvider::is_thinking_signature_invalid_response(
                         reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                         body,
                     ),
@@ -4393,7 +4430,7 @@ mod tests {
             }
             for body in negatives {
                 assert!(
-                    !KiroProvider::is_thinking_signature_invalid_response(
+                    !LocalUpstreamProvider::is_thinking_signature_invalid_response(
                         reqwest::StatusCode::BAD_REQUEST,
                         body,
                     ),
@@ -4596,9 +4633,9 @@ mod tests {
                     assert_eq!(server.state.scenario_hits(scenario) - hits_before, 1);
                     assert_eq!(builder_calls.load(Ordering::SeqCst), 0);
                     assert_eq!(budget.snapshot().consumed, 1);
-                    assert_eq!(KiroProvider::attempts_from_error(&error).len(), 1);
+                    assert_eq!(LocalUpstreamProvider::attempts_from_error(&error).len(), 1);
                     assert!(!matches!(
-                        KiroProvider::call_failure_kind_from_error(&error),
+                        LocalUpstreamProvider::call_failure_kind_from_error(&error),
                         Some(
                             KiroCallFailureKind::ThinkingSignatureInvalid
                                 | KiroCallFailureKind::ThinkingSignatureRetryFailed
@@ -4657,9 +4694,9 @@ mod tests {
                     .expect_err("exact reason without eligible history must not retry");
                 assert_eq!(server.state.scenario_hits(scenario) - hits_before, 1);
                 assert_eq!(budget.snapshot().consumed, 1);
-                assert_eq!(KiroProvider::attempts_from_error(&error).len(), 1);
+                assert_eq!(LocalUpstreamProvider::attempts_from_error(&error).len(), 1);
                 assert!(!matches!(
-                    KiroProvider::call_failure_kind_from_error(&error),
+                    LocalUpstreamProvider::call_failure_kind_from_error(&error),
                     Some(
                         KiroCallFailureKind::ThinkingSignatureInvalid
                             | KiroCallFailureKind::ThinkingSignatureRetryFailed
@@ -4716,11 +4753,11 @@ mod tests {
 
                     assert_eq!(server.state.scenario_hits(scenario) - hits_before, 2);
                     assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
-                    let attempts = KiroProvider::attempts_from_error(&error);
+                    let attempts = LocalUpstreamProvider::attempts_from_error(&error);
                     assert_eq!(attempts.len(), 2);
                     assert_eq!(attempts[0].credential_id, attempts[1].credential_id);
                     assert_eq!(
-                        KiroProvider::call_failure_kind_from_error(&error),
+                        LocalUpstreamProvider::call_failure_kind_from_error(&error),
                         Some(expected_kind)
                     );
                     let snapshot = budget.snapshot();
@@ -4800,8 +4837,11 @@ mod tests {
                         "{scenario} stream={is_stream} round={round}: {}",
                         error
                     );
-                    assert_eq!(KiroProvider::call_failure_kind_from_error(&error), None);
-                    let attempts = KiroProvider::attempts_from_error(&error);
+                    assert_eq!(
+                        LocalUpstreamProvider::call_failure_kind_from_error(&error),
+                        None
+                    );
+                    let attempts = LocalUpstreamProvider::attempts_from_error(&error);
                     assert_eq!(attempts.len(), 2);
                     assert_eq!(
                         attempts[0].error_type.as_deref(),
@@ -4897,10 +4937,10 @@ mod tests {
                     );
                     assert_eq!(budget.snapshot().consumed, 1);
                     assert_eq!(
-                        KiroProvider::call_failure_kind_from_error(&error),
+                        LocalUpstreamProvider::call_failure_kind_from_error(&error),
                         Some(KiroCallFailureKind::ThinkingSignatureRetryFailed)
                     );
-                    assert_eq!(KiroProvider::attempts_from_error(&error).len(), 1);
+                    assert_eq!(LocalUpstreamProvider::attempts_from_error(&error).len(), 1);
                     assert!(!error.to_string().contains(&private_builder_marker));
                     assert_signature_retry_did_not_cool_down(
                         &manager,
@@ -4942,10 +4982,10 @@ mod tests {
 
                 assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
                 assert_eq!(
-                    KiroProvider::call_failure_kind_from_error(&error),
+                    LocalUpstreamProvider::call_failure_kind_from_error(&error),
                     Some(KiroCallFailureKind::ThinkingSignatureRetryFailed)
                 );
-                let attempts = KiroProvider::attempts_from_error(&error);
+                let attempts = LocalUpstreamProvider::attempts_from_error(&error);
                 assert_eq!(attempts.len(), 2);
                 assert_eq!(attempts[0].credential_id, attempts[1].credential_id);
                 let snapshot = budget.snapshot();
@@ -5436,10 +5476,14 @@ mod tests {
                     )
                     .expect("provider recovery token manager"),
                 );
-                let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+                let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-                let provider =
-                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+                let provider = LocalUpstreamProvider::with_proxy(
+                    manager.clone(),
+                    None,
+                    endpoints,
+                    "ide".to_string(),
+                );
                 let failed_body = serde_json::json!({
                     "testScenario": "provider_status_500",
                     "secretMarker": format!("RECOVERY_PRIVATE_MARKER_{is_stream}_{round}"),
@@ -5579,10 +5623,14 @@ mod tests {
                     )
                     .expect("eventstream JSON sniff token manager"),
                 );
-                let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+                let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-                let provider =
-                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+                let provider = LocalUpstreamProvider::with_proxy(
+                    manager.clone(),
+                    None,
+                    endpoints,
+                    "ide".to_string(),
+                );
                 let marker = format!("EVENTSTREAM_JSON_PRIVATE_MARKER_{is_stream}_{round}");
                 let request_body = serde_json::json!({
                     "testScenario": "provider_eventstream_json_exception",
@@ -5683,10 +5731,14 @@ mod tests {
                     )
                     .expect("JSON content-type sniff token manager"),
                 );
-                let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+                let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-                let provider =
-                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+                let provider = LocalUpstreamProvider::with_proxy(
+                    manager.clone(),
+                    None,
+                    endpoints,
+                    "ide".to_string(),
+                );
                 let request_body = serde_json::json!({
                     "testScenario": "provider_json_headers",
                     "conversationState": {
@@ -5843,7 +5895,7 @@ mod tests {
             auth_method: Some("external_idp".to_string()),
             ..Default::default()
         };
-        let headers = KiroProvider::list_available_profiles_headers(
+        let headers = LocalUpstreamProvider::list_available_profiles_headers(
             &credentials,
             "token",
             &Config::default(),
@@ -5882,7 +5934,7 @@ mod tests {
             auth_method: Some("social".to_string()),
             ..Default::default()
         };
-        let headers = KiroProvider::list_available_profiles_headers(
+        let headers = LocalUpstreamProvider::list_available_profiles_headers(
             &credentials,
             "token",
             &Config::default(),
@@ -5902,7 +5954,7 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion = KiroStreamCompletion::new(
+        let completion = LocalUpstreamStreamCompletion::new(
             manager.clone(),
             1,
             None,
@@ -5929,7 +5981,7 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion = KiroStreamCompletion::new(
+        let completion = LocalUpstreamStreamCompletion::new(
             manager.clone(),
             1,
             None,
@@ -5956,7 +6008,7 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion = KiroStreamCompletion::new(
+        let completion = LocalUpstreamStreamCompletion::new(
             manager.clone(),
             1,
             None,
@@ -5988,7 +6040,7 @@ mod tests {
         let lease = manager.acquire_in_flight_lease_for_test(1);
 
         {
-            let _completion = super::KiroApiCompletion::new(
+            let _completion = super::LocalUpstreamApiCompletion::new(
                 manager.clone(),
                 1,
                 lease,
@@ -6016,7 +6068,7 @@ mod tests {
         );
         let lease = manager.acquire_in_flight_lease_for_test(1);
 
-        let completion = super::KiroApiCompletion::new(
+        let completion = super::LocalUpstreamApiCompletion::new(
             manager.clone(),
             1,
             lease,
@@ -6172,26 +6224,40 @@ mod tests {
 
     #[test]
     fn accepts_only_binary_event_stream_content_types() {
-        assert!(KiroProvider::is_event_stream_content_type(
+        assert!(LocalUpstreamProvider::is_event_stream_content_type(
             "application/vnd.amazon.eventstream"
         ));
-        assert!(KiroProvider::is_event_stream_content_type(
+        assert!(LocalUpstreamProvider::is_event_stream_content_type(
             "application/octet-stream; charset=utf-8"
         ));
-        assert!(!KiroProvider::is_event_stream_content_type(
+        assert!(!LocalUpstreamProvider::is_event_stream_content_type(
             "application/json"
         ));
-        assert!(!KiroProvider::is_event_stream_content_type("text/plain"));
+        assert!(!LocalUpstreamProvider::is_event_stream_content_type(
+            "text/plain"
+        ));
     }
 
     #[test]
     fn auto_retry_attempts_are_bounded_independently_of_credential_pool_size() {
         let config = Config::default();
 
-        assert_eq!(KiroProvider::test_max_retry_attempts(1, &config), 3);
-        assert_eq!(KiroProvider::test_max_retry_attempts(3, &config), 3);
-        assert_eq!(KiroProvider::test_max_retry_attempts(25, &config), 3);
-        assert_eq!(KiroProvider::test_max_retry_attempts(10_000, &config), 3);
+        assert_eq!(
+            LocalUpstreamProvider::test_max_retry_attempts(1, &config),
+            3
+        );
+        assert_eq!(
+            LocalUpstreamProvider::test_max_retry_attempts(3, &config),
+            3
+        );
+        assert_eq!(
+            LocalUpstreamProvider::test_max_retry_attempts(25, &config),
+            3
+        );
+        assert_eq!(
+            LocalUpstreamProvider::test_max_retry_attempts(10_000, &config),
+            3
+        );
     }
 
     #[test]
@@ -6199,9 +6265,18 @@ mod tests {
         let mut config = Config::default();
         config.credential_retry_max_attempts = 12;
 
-        assert_eq!(KiroProvider::test_max_retry_attempts(1, &config), 12);
-        assert_eq!(KiroProvider::test_max_retry_attempts(25, &config), 12);
-        assert_eq!(KiroProvider::test_max_retry_attempts(10_000, &config), 12);
+        assert_eq!(
+            LocalUpstreamProvider::test_max_retry_attempts(1, &config),
+            12
+        );
+        assert_eq!(
+            LocalUpstreamProvider::test_max_retry_attempts(25, &config),
+            12
+        );
+        assert_eq!(
+            LocalUpstreamProvider::test_max_retry_attempts(10_000, &config),
+            12
+        );
     }
 
     #[tokio::test]
@@ -6213,9 +6288,10 @@ mod tests {
         disabled.disabled = true;
         let manager =
             Arc::new(MultiTokenManager::new(config, vec![disabled], None, None, false).unwrap());
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let provider =
+            LocalUpstreamProvider::with_proxy(manager, None, endpoints, "ide".to_string());
 
         let err = tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -6232,10 +6308,10 @@ mod tests {
             err
         );
         assert_eq!(
-            KiroProvider::mcp_failure_kind_from_error(&err),
+            LocalUpstreamProvider::mcp_failure_kind_from_error(&err),
             Some(McpCallFailureKind::Scheduler)
         );
-        let attribution = KiroProvider::mcp_attribution_from_error(&err);
+        let attribution = LocalUpstreamProvider::mcp_attribution_from_error(&err);
         let selection_failure = attribution
             .selection_failure
             .expect("MCP acquire failure must carry selectionFailure");
@@ -6261,10 +6337,10 @@ mod tests {
             MultiTokenManager::new(config, fake_bad_request_credentials(1), None, None, false)
                 .expect("MCP completion token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
         let provider =
-            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+            LocalUpstreamProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
 
         for round in 1..=5 {
             let response = provider
@@ -6330,10 +6406,14 @@ mod tests {
                     )
                     .expect("fake MCP token manager"),
                 );
-                let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+                let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-                let provider =
-                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+                let provider = LocalUpstreamProvider::with_proxy(
+                    manager.clone(),
+                    None,
+                    endpoints,
+                    "ide".to_string(),
+                );
                 let budget = Arc::new(InferenceAttemptBudget::new(4));
                 let hits_before = server.state.mcp_hits.load(Ordering::Relaxed);
 
@@ -6357,7 +6437,7 @@ mod tests {
                     snapshot.local_attempts + snapshot.account_attempts + snapshot.mcp_attempts,
                     snapshot.consumed
                 );
-                let attribution = KiroProvider::mcp_attribution_from_error(&error);
+                let attribution = LocalUpstreamProvider::mcp_attribution_from_error(&error);
                 assert_eq!(
                     attribution.attempts.len(),
                     expected_sends,
@@ -6416,10 +6496,14 @@ mod tests {
                     )
                     .expect("bounded MCP error token manager"),
                 );
-                let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+                let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
                 endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-                let provider =
-                    KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+                let provider = LocalUpstreamProvider::with_proxy(
+                    manager.clone(),
+                    None,
+                    endpoints,
+                    "ide".to_string(),
+                );
                 let budget = Arc::new(InferenceAttemptBudget::new(4));
                 let started = Instant::now();
                 let error = provider
@@ -6435,14 +6519,14 @@ mod tests {
                     "{scenario} round {round}: bounded read must not wait for pending EOF"
                 );
                 assert_eq!(
-                    KiroProvider::mcp_failure_kind_from_error(&error),
+                    LocalUpstreamProvider::mcp_failure_kind_from_error(&error),
                     Some(expected_kind),
                     "{scenario} round {round}: body text cannot spoof status classification: {error:?}"
                 );
                 assert_eq!(budget.snapshot().consumed, 1);
                 assert!(error.to_string().len() < 1024);
                 assert!(!error.to_string().contains("misleading private body"));
-                let attribution = KiroProvider::mcp_attribution_from_error(&error);
+                let attribution = LocalUpstreamProvider::mcp_attribution_from_error(&error);
                 assert_eq!(attribution.credential_id, Some(1));
                 assert_eq!(attribution.attempts.len(), 1);
                 assert_eq!(attribution.attempts[0].credential_id, 1);
@@ -6480,9 +6564,10 @@ mod tests {
             MultiTokenManager::new(config, fake_bad_request_credentials(20), None, None, false)
                 .expect("fake rescue token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let provider =
+            LocalUpstreamProvider::with_proxy(manager, None, endpoints, "ide".to_string());
 
         for round in 1..=5 {
             let request_body = serde_json::json!({
@@ -6571,9 +6656,10 @@ mod tests {
         disabled.access_token = Some("secret-token-should-not-leak".to_string());
         let manager =
             Arc::new(MultiTokenManager::new(config, vec![disabled], None, None, false).unwrap());
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let mut endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let provider =
+            LocalUpstreamProvider::with_proxy(manager, None, endpoints, "ide".to_string());
         let body = r#"{
             "conversationState": {
                 "currentMessage": {
@@ -6593,7 +6679,7 @@ mod tests {
         .err()
         .unwrap();
 
-        let summary = KiroProvider::selection_failure_from_error(&err)
+        let summary = LocalUpstreamProvider::selection_failure_from_error(&err)
             .expect("API 调度失败应携带结构化选择失败摘要");
         assert_eq!(summary.request_id, "req-selection-1");
         assert_eq!(summary.route, "local_account");
@@ -6611,8 +6697,8 @@ mod tests {
     }
 }
 
-impl KiroProvider {
-    /// 创建带代理配置和端点注册表的 KiroProvider 实例
+impl LocalUpstreamProvider {
+    /// 创建带代理配置和端点注册表的 LocalUpstreamProvider 实例
     ///
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
@@ -6622,7 +6708,7 @@ impl KiroProvider {
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,
-        endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
+        endpoints: HashMap<String, Arc<dyn LocalUpstreamEndpoint>>,
         default_endpoint: String,
     ) -> Self {
         assert!(
@@ -7290,19 +7376,22 @@ impl KiroProvider {
                 api_type,
                 outcome,
                 credential_chain = %chain,
-                "Kiro API 凭据调用链路"
+                "本地上游凭据调用链路"
             ),
             None => tracing::info!(
                 api_type,
                 outcome,
                 credential_chain = %chain,
-                "Kiro API 凭据调用链路"
+                "本地上游凭据调用链路"
             ),
         }
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<Arc<dyn LocalUpstreamEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -7918,7 +8007,7 @@ impl KiroProvider {
         body: &str,
         recorded_detail: &str,
         ctx: &CallContext,
-        endpoint: &dyn KiroEndpoint,
+        endpoint: &dyn LocalUpstreamEndpoint,
         credential_label: &str,
         model: Option<&str>,
         session_id: Option<&str>,
@@ -8082,7 +8171,7 @@ impl KiroProvider {
     pub async fn call_api_with_context(
         &self,
         request_body: &str,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id(request_body, None)
             .await
     }
@@ -8091,7 +8180,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         request_id: Option<&str>,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id_and_capacity_weight(request_body, request_id, 1)
             .await
     }
@@ -8101,7 +8190,7 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
         capacity_weight_units: u32,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8117,7 +8206,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         request_id: Option<&str>,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8134,7 +8223,7 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
         capacity_weight_units: u32,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8151,7 +8240,7 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
         max_wait: Duration,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8169,7 +8258,7 @@ impl KiroProvider {
         request_id: Option<&str>,
         max_wait: Duration,
         capacity_weight_units: u32,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8187,7 +8276,7 @@ impl KiroProvider {
         acquire_mode: AcquireMode,
         capacity_weight_units: u32,
         dispatch_model_filter: Option<&str>,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         let result = self
             .call_api_with_retry(
                 request_body,
@@ -8202,9 +8291,9 @@ impl KiroProvider {
                 None,
             )
             .await?;
-        Ok(KiroApiResponse {
+        Ok(LocalUpstreamApiResponse {
             response: result.response,
-            completion: KiroApiCompletion::new(
+            completion: LocalUpstreamApiCompletion::new(
                 self.token_manager.clone(),
                 result.credential_id,
                 result.in_flight_lease,
@@ -8227,7 +8316,7 @@ impl KiroProvider {
         dispatch_model_filter: Option<&str>,
         inference_attempt_budget: Arc<InferenceAttemptBudget>,
         preserve_external_attempt: bool,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         self.call_api_with_context_with_request_id_and_attempt_budget_max_sends(
             request_body,
             request_id,
@@ -8252,7 +8341,7 @@ impl KiroProvider {
         preserve_external_attempt: bool,
         max_sends: Option<usize>,
         retry_body_builder: F,
-    ) -> anyhow::Result<KiroApiResponse>
+    ) -> anyhow::Result<LocalUpstreamApiResponse>
     where
         F: FnOnce() -> anyhow::Result<String> + Send,
     {
@@ -8270,9 +8359,9 @@ impl KiroProvider {
                 Some(Box::new(retry_body_builder)),
             )
             .await?;
-        Ok(KiroApiResponse {
+        Ok(LocalUpstreamApiResponse {
             response: result.response,
-            completion: KiroApiCompletion::new(
+            completion: LocalUpstreamApiCompletion::new(
                 self.token_manager.clone(),
                 result.credential_id,
                 result.in_flight_lease,
@@ -8296,7 +8385,7 @@ impl KiroProvider {
         inference_attempt_budget: Arc<InferenceAttemptBudget>,
         preserve_external_attempt: bool,
         max_sends: Option<usize>,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         let result = self
             .call_api_with_retry(
                 request_body,
@@ -8311,9 +8400,9 @@ impl KiroProvider {
                 None,
             )
             .await?;
-        Ok(KiroApiResponse {
+        Ok(LocalUpstreamApiResponse {
             response: result.response,
-            completion: KiroApiCompletion::new(
+            completion: LocalUpstreamApiCompletion::new(
                 self.token_manager.clone(),
                 result.credential_id,
                 result.in_flight_lease,
@@ -8335,7 +8424,7 @@ impl KiroProvider {
         &self,
         credential_id: u64,
         request_body: &str,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         let ctx = self
             .token_manager
             .acquire_context_for_credential(credential_id)
@@ -8353,7 +8442,7 @@ impl KiroProvider {
         &self,
         credentials: KiroCredentials,
         request_body: &str,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         let ctx = self
             .token_manager
             .acquire_context_for_external_credentials(credentials)
@@ -8388,7 +8477,7 @@ impl KiroProvider {
         request_body: &str,
         credential_label: String,
         credential_context: String,
-    ) -> anyhow::Result<KiroApiResponse> {
+    ) -> anyhow::Result<LocalUpstreamApiResponse> {
         ctx.mark_in_flight_kind(InFlightKind::Test);
         let started_at = Instant::now();
 
@@ -8462,9 +8551,9 @@ impl KiroProvider {
                 })?;
         let status = response.status();
         if status.is_success() {
-            return Ok(KiroApiResponse {
+            return Ok(LocalUpstreamApiResponse {
                 response,
-                completion: KiroApiCompletion::new(
+                completion: LocalUpstreamApiCompletion::new(
                     self.token_manager.clone(),
                     ctx.id,
                     ctx.take_in_flight_lease(),
@@ -8613,7 +8702,7 @@ impl KiroProvider {
                     successful_cohort_count,
                     cohort_count,
                     attempt_limit,
-                    "Kiro model capability cohorts were only partially observed; native reasoning will fail closed"
+                    "Local upstream model capability cohorts were only partially observed; native reasoning will fail closed"
                 );
             }
             return Ok(KiroAvailableModelCatalog {
@@ -8632,10 +8721,10 @@ impl KiroProvider {
             attempted,
             cohort_count,
             attempt_limit,
-            "Kiro model discovery exhausted its bounded auxiliary credential attempts"
+            "Local upstream model discovery exhausted its bounded auxiliary credential attempts"
         );
         Err(anyhow::anyhow!(
-            "Kiro model discovery failed after {attempted}/{cohort_count} capability cohorts (limit {attempt_limit}): {last_error}"
+            "Local upstream model discovery failed after {attempted}/{cohort_count} capability cohorts (limit {attempt_limit}): {last_error}"
         ))
     }
 
@@ -8772,7 +8861,10 @@ impl KiroProvider {
 
     /// 发送流式 API 请求
     #[allow(dead_code)]
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id(request_body, None)
             .await
     }
@@ -8781,7 +8873,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         request_id: Option<&str>,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id_and_capacity_weight(request_body, request_id, 1)
             .await
     }
@@ -8791,7 +8883,7 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
         capacity_weight_units: u32,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8807,7 +8899,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         request_id: Option<&str>,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8824,7 +8916,7 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
         capacity_weight_units: u32,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8841,7 +8933,7 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
         max_wait: Duration,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8859,7 +8951,7 @@ impl KiroProvider {
         request_id: Option<&str>,
         max_wait: Duration,
         capacity_weight_units: u32,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id_and_mode(
             request_body,
             request_id,
@@ -8877,7 +8969,7 @@ impl KiroProvider {
         acquire_mode: AcquireMode,
         capacity_weight_units: u32,
         dispatch_model_filter: Option<&str>,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         let result = self
             .call_api_with_retry(
                 request_body,
@@ -8892,9 +8984,9 @@ impl KiroProvider {
                 None,
             )
             .await?;
-        Ok(KiroStreamResponse {
+        Ok(LocalUpstreamStreamResponse {
             response: result.response,
-            completion: KiroStreamCompletion::new(
+            completion: LocalUpstreamStreamCompletion::new(
                 self.token_manager.clone(),
                 result.credential_id,
                 result.in_flight_lease,
@@ -8917,7 +9009,7 @@ impl KiroProvider {
         dispatch_model_filter: Option<&str>,
         inference_attempt_budget: Arc<InferenceAttemptBudget>,
         preserve_external_attempt: bool,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         self.call_api_stream_with_request_id_and_attempt_budget_max_sends(
             request_body,
             request_id,
@@ -8942,7 +9034,7 @@ impl KiroProvider {
         preserve_external_attempt: bool,
         max_sends: Option<usize>,
         retry_body_builder: F,
-    ) -> anyhow::Result<KiroStreamResponse>
+    ) -> anyhow::Result<LocalUpstreamStreamResponse>
     where
         F: FnOnce() -> anyhow::Result<String> + Send,
     {
@@ -8960,9 +9052,9 @@ impl KiroProvider {
                 Some(Box::new(retry_body_builder)),
             )
             .await?;
-        Ok(KiroStreamResponse {
+        Ok(LocalUpstreamStreamResponse {
             response: result.response,
-            completion: KiroStreamCompletion::new(
+            completion: LocalUpstreamStreamCompletion::new(
                 self.token_manager.clone(),
                 result.credential_id,
                 result.in_flight_lease,
@@ -8986,7 +9078,7 @@ impl KiroProvider {
         inference_attempt_budget: Arc<InferenceAttemptBudget>,
         preserve_external_attempt: bool,
         max_sends: Option<usize>,
-    ) -> anyhow::Result<KiroStreamResponse> {
+    ) -> anyhow::Result<LocalUpstreamStreamResponse> {
         let result = self
             .call_api_with_retry(
                 request_body,
@@ -9001,9 +9093,9 @@ impl KiroProvider {
                 None,
             )
             .await?;
-        Ok(KiroStreamResponse {
+        Ok(LocalUpstreamStreamResponse {
             response: result.response,
-            completion: KiroStreamCompletion::new(
+            completion: LocalUpstreamStreamCompletion::new(
                 self.token_manager.clone(),
                 result.credential_id,
                 result.in_flight_lease,
@@ -10371,7 +10463,7 @@ impl KiroProvider {
                         failure_class = failure_kind.as_error_type(),
                         attempt = attempt + 1,
                         max_retries,
-                        "Kiro API upstream send failed"
+                        "Local upstream send failed"
                     );
                     // 网络错误通常是上游/链路瞬态问题，不禁用凭据；若本机内存态存在备选，
                     // 仅在当前请求内临时排除失败账号，避免重试链反复命中同一账号。
@@ -10517,7 +10609,7 @@ impl KiroProvider {
                         body_bytes = ?read_failure.body_bytes,
                         attempt = attempt + 1,
                         max_retries,
-                        "Kiro API upstream response body could not be validated"
+                        "Local upstream response body could not be validated"
                     );
                     let mut can_retry =
                         read_failure.kind.is_retryable() && attempt + 1 < max_retries;
@@ -10624,7 +10716,7 @@ impl KiroProvider {
                     content_type = content_kind.as_str(),
                     attempt = attempt + 1,
                     max_retries,
-                    "Kiro API returned a non-eventstream success response"
+                    "Local upstream returned a non-eventstream success response"
                 );
                 Self::push_attempt(
                     &mut attempts,
@@ -10717,7 +10809,7 @@ impl KiroProvider {
                         body_bytes,
                         attempt = attempt + 1,
                         max_retries,
-                        "Kiro API rate-limit risk control entered credential cooldown"
+                        "Local upstream rate-limit risk control entered credential cooldown"
                     );
                     Self::push_attempt(
                         &mut attempts,
@@ -10797,7 +10889,7 @@ impl KiroProvider {
                     body_bytes,
                     attempt = attempt + 1,
                     max_retries,
-                    "Kiro API credential entered a terminal risk-control state"
+                    "Local upstream credential entered a terminal risk-control state"
                 );
                 let risk_outcome = self.token_manager.report_risk_controlled_outcome_deferred(
                     ctx.id,
@@ -10894,7 +10986,7 @@ impl KiroProvider {
                     body_bytes,
                     attempt = attempt + 1,
                     max_retries,
-                    "Kiro API credential quota is exhausted"
+                    "Local upstream credential quota is exhausted"
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
@@ -11356,7 +11448,7 @@ impl KiroProvider {
                         body_bytes = retry_upstream_body.bytes,
                         attempt = attempt + 2,
                         max_retries,
-                        "Kiro API thinking-signature retry returned a retryable upstream status"
+                        "Local upstream thinking-signature retry returned a retryable upstream status"
                     );
                     Self::push_attempt(
                         &mut attempts,
@@ -11549,7 +11641,7 @@ impl KiroProvider {
                         body_bytes,
                         attempt = attempt + 1,
                         max_retries,
-                        "Kiro API model is unavailable for the selected credential"
+                        "Local upstream model is unavailable for the selected credential"
                     );
                     Self::push_attempt(
                         &mut attempts,
@@ -11605,7 +11697,7 @@ impl KiroProvider {
                         body_bytes,
                         attempt = attempt + 1,
                         max_retries,
-                        "Kiro API rejected the persisted profile ARN"
+                        "Local upstream rejected the persisted profile ARN"
                     );
                     Self::push_attempt(
                         &mut attempts,
@@ -11704,7 +11796,7 @@ impl KiroProvider {
                     body_bytes,
                     attempt = attempt + 1,
                     max_retries,
-                    "Kiro API credential authentication failed"
+                    "Local upstream credential authentication failed"
                 );
                 let decision = match self
                     .handle_credential_auth_failure(
@@ -11851,7 +11943,7 @@ impl KiroProvider {
                     body_bytes,
                     attempt = attempt + 1,
                     max_retries,
-                    "Kiro API returned a retryable upstream status"
+                    "Local upstream returned a retryable upstream status"
                 );
                 let mut can_retry = attempt + 1 < max_retries;
                 Self::push_attempt(
@@ -11961,7 +12053,7 @@ impl KiroProvider {
                 body_bytes,
                 attempt = attempt + 1,
                 max_retries,
-                "Kiro API returned an unclassified upstream status"
+                "Local upstream returned an unclassified upstream status"
             );
             Self::push_attempt(
                 &mut attempts,

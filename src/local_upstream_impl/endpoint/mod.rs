@@ -1,9 +1,9 @@
-//! Kiro 端点抽象
+//! 本地上游端点抽象
 //!
-//! 不同 Kiro 端点（如 `ide` / `cli`）在 URL、请求头、请求体上存在差异，
+//! 不同本地上游端点（如 `ide` / `cli`）在 URL、请求头、请求体上存在差异，
 //! 但共享凭据池、Token 刷新、重试逻辑和 AWS event-stream 响应解码。
 //!
-//! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
+//! [`LocalUpstreamEndpoint`] 抽象了请求侧的差异点；`LocalUpstreamProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
 use reqwest::{Method, RequestBuilder};
@@ -20,7 +20,7 @@ pub use ide::IdeEndpoint;
 /// Resolve a local/staging upstream override while preserving endpoint-specific Host headers.
 ///
 /// The override changes only the transport destination. Callers must still decorate the request
-/// with the logical AWS/Kiro host derived from the credential region.
+/// with the logical logical upstream host derived from the credential region.
 pub(crate) fn configured_upstream_url(config: &Config, suffix: &str) -> Option<String> {
     let base = config
         .local_upstream_base_url
@@ -203,10 +203,10 @@ fn decode_json_hex4(hex: &[u8]) -> Option<u16> {
     })
 }
 
-/// Kiro 端点
+/// 本地上游端点
 ///
-/// 同一个 `KiroProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
-pub trait KiroEndpoint: Send + Sync {
+/// 同一个 `LocalUpstreamProvider` 可持有多个 endpoint 实现，按凭据级字段切换。
+pub trait LocalUpstreamEndpoint: Send + Sync {
     /// 端点名称（对应 credentials.endpoint / config.defaultEndpoint 的取值）
     fn name(&self) -> &'static str;
 
@@ -228,7 +228,7 @@ pub trait KiroEndpoint: Send + Sync {
 
     /// ListAvailableModels HTTP method.
     ///
-    /// IDE-compatible endpoints use the legacy GET form. The Kiro CLI management
+    /// IDE-compatible endpoints use the legacy GET form. The CLI management
     /// endpoint uses AWS JSON 1.0 POST with a JSON body.
     fn models_method(&self, _ctx: &RequestContext<'_>) -> Method {
         Method::GET
