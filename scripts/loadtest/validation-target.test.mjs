@@ -22,6 +22,24 @@ test('accepts explicit loopback and explicit remote targets for five rounds', ()
   }
 })
 
+test('accepts account-runtime env names and legacy env fallbacks for five rounds', () => {
+  for (let round = 0; round < 5; round += 1) {
+    const primary = resolveLoadTarget({}, {
+      ACCOUNT_RUNTIME_BASE_URL: `http://127.0.0.1:${19100 + round}`,
+      ACCOUNT_RUNTIME_API_KEY: 'primary-fixture',
+    })
+    assert.equal(primary.baseUrl.port, String(19100 + round))
+    assert.equal(primary.apiKey, 'primary-fixture')
+
+    const legacy = resolveLoadTarget({}, {
+      KIRO_BASE_URL: `http://127.0.0.1:${19200 + round}`,
+      KIRO_API_KEY: 'legacy-fixture',
+    })
+    assert.equal(legacy.baseUrl.port, String(19200 + round))
+    assert.equal(legacy.apiKey, 'legacy-fixture')
+  }
+})
+
 test('rejects missing, malformed, unsafe protocol, implicit remote, and missing key for five rounds', () => {
   const cases = [
     [{ apiKey: 'fixture' }, {}, /explicit --base-url/],
@@ -71,5 +89,5 @@ test('loadtest documentation uses frozen binaries and external report roots', ()
   assert.doesNotMatch(source, /--report target\//)
   assert.doesNotMatch(source, /--base-url http:\/\/(?:127\.0\.0\.1|localhost):9022/)
   assert.match(source, /feature\/tests\/run-cargo-scoped\.sh/)
-  assert.match(source, /KIRO_VALIDATION_ARTIFACT_DIR/)
+  assert.match(source, /ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR/)
 })

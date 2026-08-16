@@ -10,12 +10,12 @@ import { resolveLoadTarget } from "./validation-target.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const { baseUrl, apiKey } = resolveLoadTarget(args);
-const path = args.path || process.env.KIRO_MESSAGES_PATH || "/cc/v1/messages";
+const path = args.path || process.env.ACCOUNT_RUNTIME_MESSAGES_PATH || process.env.KIRO_MESSAGES_PATH || "/cc/v1/messages";
 const durationMs = parseDuration(args.duration || process.env.DURATION || "30s");
 const concurrency = Number.parseInt(args.concurrency || process.env.CONCURRENCY || "20", 10);
 const targetRpm = Number.parseInt(args.rpm || process.env.RPM || "2000", 10);
 const streamMode = parseBool(args.stream ?? process.env.STREAM ?? "true");
-const scenario = args.scenario || process.env.KIRO_MOCK_SCENARIO || "success";
+const scenario = args.scenario || process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || process.env.KIRO_MOCK_SCENARIO || "success";
 const noSummary = parseBool(args.noSummary ?? process.env.NO_SUMMARY ?? "false");
 const conversationMode = args.conversationMode || process.env.CONVERSATION_MODE || "derived";
 
@@ -102,7 +102,7 @@ function requestBodyForSequence(sequence) {
   if (conversationMode === "unique") {
     body.metadata = {
       user_id: JSON.stringify({
-        device_id: "kiro-loadtest",
+        device_id: "account-runtime-loadtest",
         account_uuid: "loadtest",
         session_id: randomUUID(),
         request_sequence: sequence,
@@ -122,7 +122,7 @@ function makeRequest(method, pathname, body) {
     "content-type": "application/json",
     accept: "application/vnd.amazon.eventstream, application/json",
     "x-api-key": apiKey,
-    "user-agent": "kiro-loadtest/1.0",
+    "user-agent": "account-runtime-loadtest/1.0",
   };
   if (payload) headers["content-length"] = String(payload.length);
   return { url, headers, payload };

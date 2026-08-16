@@ -198,9 +198,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Kiro-named semantic test names while preserving the existing compatibility fields.
 - The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Kiro-named path remains only as a compatibility wrapper that imports the new entrypoint.
 - Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Kiro-branded names.
+- Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
 
 Last verified on 2026-08-16:
 
+- `rg -n "KIRO_BASE_URL|KIRO_LOAD_ALLOW_REMOTE|KIRO_API_KEY|KIRO_MESSAGES_PATH|KIRO_MOCK_SCENARIO|kiro-loadtest|kiro-conversation-loadtest|kiro-sustained|kiro-load-runner|kiro-conversation-load-runner|KIRO_VALIDATION_ARTIFACT_DIR" scripts/loadtest docs/testing/loadtest.md`
+- `node --check scripts/loadtest/validation-target.mjs && node --check scripts/loadtest/kiro-load-runner.mjs && node --check scripts/loadtest/kiro-conversation-load-runner.mjs`
+- `node --test scripts/loadtest/validation-target.test.mjs`
+- `git diff --check`
 - `rg -n "kiro-admin-auth-failed|kiro-admin-key-updated|kiro-console:theme|kiro-admin:auto-refresh|kiro-usage-records|placeholder=\"ide / kiro\"" ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
