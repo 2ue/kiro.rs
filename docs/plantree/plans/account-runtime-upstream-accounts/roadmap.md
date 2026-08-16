@@ -182,6 +182,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Opus/model dispatch no longer derives account capability from legacy subscription labels. Subscription labels remain account-info metadata only; scheduler tests now use explicit `supported_models` capability fixtures.
 - Admin account-info credit snapshots no longer derive base/bonus or validation ordering from built-in subscription labels. Subscription titles are now unordered labels for display/filtering, while credit values come from usage or persisted fields.
 - Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. They display upstream subscription titles as unordered metadata, and model-capability cohort tests now use neutral account cohort fixtures.
+- Local-upstream image request payload types now use `LocalUpstreamImage` and `LocalUpstreamImageSource` as real Rust types, with image JSON shape and payload-guard byte accounting preserved.
 
 ## In Progress
 

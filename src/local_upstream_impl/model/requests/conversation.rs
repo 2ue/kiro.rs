@@ -129,7 +129,7 @@ pub struct UserInputMessage {
     pub model_id: String,
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<KiroImage>,
+    pub images: Vec<LocalUpstreamImage>,
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -154,7 +154,7 @@ impl UserInputMessage {
     }
 
     /// 添加图片
-    pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
+    pub fn with_images(mut self, images: Vec<LocalUpstreamImage>) -> Self {
         self.images = images;
         self
     }
@@ -199,37 +199,37 @@ impl UserInputMessageContext {
     }
 }
 
-/// Kiro 图片
+/// Local-upstream 图片
 ///
 /// API 中使用的图片格式
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroImage {
+pub struct LocalUpstreamImage {
     /// 图片格式（"jpeg", "png", "gif", "webp"）
     pub format: String,
     /// 图片数据源
-    pub source: KiroImageSource,
+    pub source: LocalUpstreamImageSource,
 }
 
-impl KiroImage {
+impl LocalUpstreamImage {
     /// 从 base64 数据创建图片
     pub fn from_base64(format: impl Into<String>, data: impl Into<String>) -> Self {
         Self {
             format: format.into(),
-            source: KiroImageSource::from_bytes(data),
+            source: LocalUpstreamImageSource::from_bytes(data),
         }
     }
 }
 
-/// Kiro 图片数据源
+/// Local-upstream 图片数据源
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KiroImageSource {
+pub struct LocalUpstreamImageSource {
     /// base64 编码的图片数据
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<String>,
 }
 
-impl KiroImageSource {
+impl LocalUpstreamImageSource {
     pub fn from_bytes(data: impl Into<String>) -> Self {
         Self {
             bytes: Some(data.into()),
@@ -279,7 +279,7 @@ pub struct UserMessage {
     pub origin: Option<String>,
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<KiroImage>,
+    pub images: Vec<LocalUpstreamImage>,
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
@@ -302,7 +302,7 @@ impl UserMessage {
     }
 
     /// 设置图片
-    pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
+    pub fn with_images(mut self, images: Vec<LocalUpstreamImage>) -> Self {
         self.images = images;
         self
     }
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn test_image_source_serialize() {
         let msg = UserInputMessage::new("Analyze attachments", "claude-opus-4.7")
-            .with_images(vec![KiroImage::from_base64("png", "aW1hZ2U=")]);
+            .with_images(vec![LocalUpstreamImage::from_base64("png", "aW1hZ2U=")]);
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"images\""));
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_reasoning_content_serializes_as_exact_kiro_union() {
+    fn assistant_reasoning_content_serializes_as_exact_local_upstream_union() {
         let signed = AssistantMessage::new("answer")
             .with_reasoning_content(ReasoningContent::reasoning_text("thought", "sig"));
         assert_eq!(

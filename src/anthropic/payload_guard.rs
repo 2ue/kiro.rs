@@ -7814,9 +7814,9 @@ mod tests {
                     "round {round}"
                 );
 
-                let kiro = LocalUpstreamImage::from_base64("png", encoded);
+                let local_upstream = LocalUpstreamImage::from_base64("png", encoded);
                 assert_eq!(
-                    local_upstream_image_source_bytes(&kiro),
+                    local_upstream_image_source_bytes(&local_upstream),
                     decoded_bytes,
                     "round {round}"
                 );

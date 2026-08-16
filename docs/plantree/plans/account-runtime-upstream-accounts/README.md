@@ -220,9 +220,16 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Scheduler model eligibility no longer derives Opus capability from legacy subscription labels. Subscription labels are retained only as account-info metadata; dispatch uses explicit `supported_models` capability data.
 - Admin account-info credit snapshots no longer use built-in subscription label tables or legacy rank parsing. Credit base/bonus now comes from upstream usage fields or persisted credit fields, and validation grouping treats subscription titles as unordered labels.
 - Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. Subscription title display now uses the upstream title directly as unordered metadata, and model-capability cohort tests use neutral account cohort fixtures.
+- Local-upstream image request payload types now use `LocalUpstreamImage` and `LocalUpstreamImageSource` as real Rust types. The facade points at those concrete types, image JSON shape is unchanged, and payload-guard image byte accounting uses local-upstream naming.
 
 Last verified on 2026-08-16:
 
+- `rg -n "\bKiroImage\b|\bKiroImageSource\b|Kiro 图片|assistant_reasoning_content_serializes_as_exact_kiro_union|let kiro\b" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs src/anthropic/payload_guard.rs src/anthropic/converter/content.rs --glob '!target/**'`
+- `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-image-types-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-image-types-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-image-types-test1 -- bash -lc 'cargo test test_image_source_serialize -- --nocapture && cargo test assistant_reasoning_content_serializes_as_exact_local_upstream_union -- --nocapture && cargo test image_source_size_uses_decoded_base64_bytes_for_five_rounds -- --nocapture && cargo test image_history_bytes_are_counted -- --nocapture'`
+- `git diff --check`
 - Residual scan for old built-in subscription label names in maintained credential UI, model-capability tests and active plan files returned no target-scope matches.
 - `rg -n "credential_credit_tier|credential_credit_base|has_overage_credit_from_usage_limit|subscription_rank|credit_snapshot_for_subscription|升级|掉级" src/admin src/storage/postgres.rs ui/src/features/validation admin-ui/src/components/account-validation-panel.tsx --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh account-labels-no-builtins-fmt1 -- cargo fmt`

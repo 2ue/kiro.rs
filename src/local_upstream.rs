@@ -137,7 +137,7 @@ pub(crate) mod request {
     pub(crate) type LocalUpstreamHistoryUserMessage =
         crate::local_upstream_impl::model::requests::conversation::HistoryUserMessage;
     pub(crate) type LocalUpstreamImage =
-        crate::local_upstream_impl::model::requests::conversation::KiroImage;
+        crate::local_upstream_impl::model::requests::conversation::LocalUpstreamImage;
     pub(crate) type LocalUpstreamInputSchema =
         crate::local_upstream_impl::model::requests::tool::InputSchema;
     pub(crate) type LocalUpstreamOutputConfig =
