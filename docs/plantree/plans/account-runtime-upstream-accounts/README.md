@@ -200,9 +200,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Kiro-branded names.
 - Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
 - Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
+- Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro-|conversation-kiro-strategy" src/anthropic/prompt_cache.rs src/anthropic/handlers/tests.rs`
+- `feature/tests/run-cargo-scoped.sh prompt-cache-fixture-names-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh prompt-cache-fixture-names-test1 -- bash -lc 'cargo test claude_code_tool_first_miss_then_success_commit_hits -- --nocapture && cargo test claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage -- --nocapture'`
+- `git diff --check`
 - `rg -n "kiro-load-runner|kiro-conversation-load-runner|account-runtime-load-runner|account-runtime-conversation-load-runner" . --glob '!target/**' --glob '!**/node_modules/**'`
 - `node --check scripts/loadtest/account-runtime-load-runner.mjs && node --check scripts/loadtest/account-runtime-conversation-load-runner.mjs && node --check scripts/loadtest/kiro-load-runner.mjs && node --check scripts/loadtest/kiro-conversation-load-runner.mjs`
 - `node --test scripts/loadtest/validation-target.test.mjs`

@@ -162,6 +162,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Kiro-branded names.
 - Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
 - Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
+- Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
 
 ## In Progress
 

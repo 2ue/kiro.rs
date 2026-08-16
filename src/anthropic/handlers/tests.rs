@@ -7318,9 +7318,11 @@ fn claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_report
         model_resolution_note: None,
         requested_max_tokens: 0,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
-        conversation_id: Some("conversation-kiro-strategy".to_string()),
+        conversation_id: Some("conversation-claude-code-tool-strategy".to_string()),
         request_api_key_id: None,
-        prompt_cache_scope_conversation_id: Some("conversation-kiro-strategy".to_string()),
+        prompt_cache_scope_conversation_id: Some(
+            "conversation-claude-code-tool-strategy".to_string(),
+        ),
         input_tokens: 100_000,
         context_window_tokens: 200_000,
         prompt_cache_profile: None,

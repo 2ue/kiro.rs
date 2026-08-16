@@ -1808,7 +1808,7 @@ mod tests {
     #[test]
     fn claude_code_tool_first_miss_then_success_commit_hits() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-session");
+        let scope = test_scope("claude-code-tool-session");
         let mut first_req = request("stable system prompt ".repeat(300));
         first_req.messages = vec![
             Message {
@@ -1857,7 +1857,7 @@ mod tests {
     #[test]
     fn claude_code_tool_failed_request_does_not_commit_segments() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-failed-session");
+        let scope = test_scope("claude-code-tool-failed-session");
         let mut req = request("stable system prompt ".repeat(300));
         req.messages = vec![
             Message {
@@ -1900,7 +1900,7 @@ mod tests {
     #[test]
     fn claude_code_tool_skips_dynamic_system_before_first_cache_control() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-dynamic-system");
+        let scope = test_scope("claude-code-tool-dynamic-system");
         let make_req = |dynamic: &str| MessagesRequest {
             model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
@@ -1986,7 +1986,7 @@ mod tests {
         };
 
         let plan = tracker.compute_claude_code_tool_with_bounds(
-            Some(test_scope("kiro-single-message")),
+            Some(test_scope("claude-code-tool-single-message")),
             &req,
             1_000,
             &req.model,
@@ -2003,7 +2003,7 @@ mod tests {
         let tracker = PromptCacheTracker::default();
         let bounds = PromptCacheBounds::from_config(10, 2, 3600, 0);
         for idx in 0..5 {
-            let scope = test_scope(&format!("kiro-bounds-{idx}"));
+            let scope = test_scope(&format!("claude-code-tool-bounds-{idx}"));
             let mut req = request(format!("stable system prompt {idx} ").repeat(300));
             req.messages = vec![
                 Message {
@@ -2036,7 +2036,7 @@ mod tests {
     #[test]
     fn claude_code_tool_coverage_ratio_caps_committed_reads() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-coverage-ratio");
+        let scope = test_scope("claude-code-tool-coverage-ratio");
         let mut req = request("stable system prompt ".repeat(300));
         req.messages = vec![
             Message {
@@ -2089,7 +2089,7 @@ mod tests {
     #[test]
     fn claude_code_tool_creation_cap_commits_only_created_tokens() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-creation-cap");
+        let scope = test_scope("claude-code-tool-creation-cap");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
         req.messages = vec![
             Message {
@@ -2141,7 +2141,7 @@ mod tests {
     #[test]
     fn claude_code_tool_can_disable_incremental_creation_after_read() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-no-incremental-create");
+        let scope = test_scope("claude-code-tool-no-incremental-create");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
         req.messages = vec![
             Message {
@@ -2195,7 +2195,7 @@ mod tests {
     #[test]
     fn claude_code_tool_max_coverage_tokens_caps_default_creation() {
         let tracker = PromptCacheTracker::default();
-        let scope = test_scope("kiro-max-coverage");
+        let scope = test_scope("claude-code-tool-max-coverage");
         let mut req = request("stable system prompt with enough tokens ".repeat(2000));
         req.messages = vec![
             Message {
@@ -2263,7 +2263,7 @@ mod tests {
         };
 
         let default_plan = tracker.compute_claude_code_tool_with_bounds(
-            Some(test_scope("kiro-current-user-default")),
+            Some(test_scope("claude-code-tool-current-user-default")),
             &req,
             10_000,
             &req.model,
@@ -2278,7 +2278,7 @@ mod tests {
             current_user_stable_prefix_max_tokens: 1_500,
             ..ClaudeCodeToolCachePolicy::default()
         };
-        let scope = test_scope("kiro-current-user-opt-in");
+        let scope = test_scope("claude-code-tool-current-user-opt-in");
         let first = tracker.compute_claude_code_tool_with_bounds(
             Some(scope.clone()),
             &req,
