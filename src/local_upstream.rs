@@ -121,7 +121,7 @@ pub(crate) mod usage_limits {
 
 pub(crate) mod request {
     pub(crate) type LocalUpstreamAdditionalModelRequestFields =
-        crate::local_upstream_impl::model::requests::upstream::AdditionalModelRequestFields;
+        crate::local_upstream_impl::model::requests::upstream::LocalUpstreamAdditionalModelRequestFields;
     pub(crate) type LocalUpstreamAssistantMessage =
         crate::local_upstream_impl::model::requests::conversation::AssistantMessage;
     pub(crate) type LocalUpstreamConversationMessage =
@@ -139,15 +139,15 @@ pub(crate) mod request {
     pub(crate) type LocalUpstreamInputSchema =
         crate::local_upstream_impl::model::requests::tool::InputSchema;
     pub(crate) type LocalUpstreamOutputConfig =
-        crate::local_upstream_impl::model::requests::upstream::KiroOutputConfig;
+        crate::local_upstream_impl::model::requests::upstream::LocalUpstreamOutputConfig;
     pub(crate) type LocalUpstreamReasoningConfig =
-        crate::local_upstream_impl::model::requests::upstream::KiroReasoningConfig;
+        crate::local_upstream_impl::model::requests::upstream::LocalUpstreamReasoningConfig;
     pub(crate) type LocalUpstreamReasoningContent =
         crate::local_upstream_impl::model::requests::conversation::ReasoningContent;
     pub(crate) type LocalUpstreamRequest =
-        crate::local_upstream_impl::model::requests::upstream::KiroRequest;
+        crate::local_upstream_impl::model::requests::upstream::LocalUpstreamRequest;
     pub(crate) type LocalUpstreamThinkingConfig =
-        crate::local_upstream_impl::model::requests::upstream::KiroThinkingConfig;
+        crate::local_upstream_impl::model::requests::upstream::LocalUpstreamThinkingConfig;
     pub(crate) type LocalUpstreamTool = crate::local_upstream_impl::model::requests::tool::Tool;
     pub(crate) type LocalUpstreamToolResult =
         crate::local_upstream_impl::model::requests::tool::ToolResult;

@@ -1,6 +1,6 @@
 //! 工具类型定义
 //!
-//! 定义 Kiro API 中工具相关的类型
+//! 定义本地上游请求中工具相关的类型
 
 use serde::{Deserialize, Serialize};
 

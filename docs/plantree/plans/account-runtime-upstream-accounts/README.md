@@ -212,9 +212,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Kiro-specific header name.
 - Admin, storage and Anthropic handler-test boundaries now import upstream-account storage/status/eligibility/manager aliases through `account_runtime` instead of direct legacy external-pool modules. Unused legacy Rust enable/test DTOs were removed after compatibility routes moved to account DTOs.
 - The legacy local upstream implementation directory moved from `src/kiro` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::kiro` module paths were removed, and the concrete request submodule moved from `model::requests::kiro` to `model::requests::upstream`.
+- Concrete local-upstream request payload structs now use `LocalUpstreamRequest`, `LocalUpstreamAdditionalModelRequestFields`, `LocalUpstreamThinkingConfig`, `LocalUpstreamOutputConfig` and `LocalUpstreamReasoningConfig`; `model/requests` comments now use local-upstream wording while compatibility wire fields and payload behavior remain unchanged.
 
 Last verified on 2026-08-16:
 
+- `rg -n "KiroRequest|KiroThinkingConfig|KiroOutputConfig|KiroReasoningConfig|pub use upstream::Kiro|Kiro 请求|Kiro API 请求|Kiro-native|Kiro native|Kiro accepts|Kiro 的 tools|Kiro cachePoint|Kiro API" src/local_upstream_impl/model/requests src/local_upstream_impl/model/mod.rs src/local_upstream.rs src/local_upstream_impl/provider.rs --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-request-types-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-request-types-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-request-types-test1 -- bash -lc 'cargo test test_additional_model_request_fields_wire_format -- --nocapture && cargo test output_config_thinking_compatibility_normalizer_drops_non_adaptive_thinking_for_five_rounds -- --nocapture && cargo test local_upstream_request_deserializes -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-request-types-test2 -- cargo test provider_sends_converter_max_effort_with_native_adaptive_thinking_for_five_rounds -- --nocapture`
 - `rg -n "x-amzn-kiro|旧 IDE|Kiro API|Kiro 上游|Kiro 账号|Kiro credits|Kiro Console|Kiro Admin" ui/src admin-ui/src --glob '!**/dist/**' --glob '!**/node_modules/**'`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "/tmp/kiro-rs/external-pool-usage-debug|kiro_rs:local|kiro_rs:observability|sk-kiro-rs-qaz" src ui admin-ui README.md docs/ai-docker-compose-deployment.md --glob '!target/**' --glob '!**/node_modules/**'`

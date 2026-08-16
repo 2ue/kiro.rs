@@ -44,6 +44,10 @@ Current-state facts and target-state decisions answer different questions and mu
 | [Request body capability modularization](plans/request-body-capability-modularization/README.md) | Implemented And Validated | Maintenance | 2026-07-06: capability plans, converter split, configuration, UI, and fake-upstream regression landed | No active implementation; preserve behavior as an oracle and route future target-system work through the Greenfield AI Gateway plan |
 | [Admin observability, routing model support, and config IA](plans/admin-observability-routing-config/README.md) | Implemented And Locally Verified | Maintenance | 2026-07-07: exact usage search, supported-model routing, bounded prompt retry, and UI grouping landed | Optional low-volume real-upstream smoke only when explicitly requested |
 
+## Current Implementation Notes
+
+- 2026-08-16: In [Account Runtime Upstream Accounts](plans/account-runtime-upstream-accounts/README.md), concrete local-upstream request payload structs now use `LocalUpstream*` names and `model/requests` comments use local-upstream wording. The compatibility wire fields are intentionally unchanged.
+
 ## Baseline
 
 - [Baseline index](baseline/README.md)

@@ -2500,7 +2500,7 @@ mod tests {
         use crate::anthropic::types::{
             Message as AnthropicMessage, MessagesRequest, OutputConfig, Thinking,
         };
-        use crate::local_upstream_impl::model::requests::upstream::KiroRequest;
+        use crate::local_upstream_impl::model::requests::upstream::LocalUpstreamRequest;
 
         let server = FakeProviderBodyCaptureServer::start().await;
         let request = MessagesRequest {
@@ -2551,7 +2551,7 @@ mod tests {
                         .unwrap_or_else(|error| {
                             panic!("{endpoint} stream={is_stream} round={round}: {error}")
                         });
-                    let converted = KiroRequest {
+                    let converted = LocalUpstreamRequest {
                         conversation_state: converted.conversation_state,
                         profile_arn: None,
                         additional_model_request_fields: converted.additional_model_request_fields,

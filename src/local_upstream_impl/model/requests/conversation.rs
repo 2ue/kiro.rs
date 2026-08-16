@@ -1,6 +1,6 @@
 //! 对话类型定义
 //!
-//! 定义 Kiro API 中对话相关的类型，包括消息、历史记录等
+//! 定义本地上游请求中对话相关的类型，包括消息、历史记录等
 
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +8,7 @@ use super::tool::{Tool, ToolResult, ToolUseEntry};
 
 /// 对话状态
 ///
-/// Kiro API 请求中的核心结构，包含当前消息和历史记录
+/// 本地上游请求中的核心结构，包含当前消息和历史记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationState {
@@ -73,7 +73,7 @@ impl ConversationState {
         self
     }
 
-    /// Whether any assistant history entry carries Kiro-native reasoning.
+    /// Whether any assistant history entry carries local-upstream native reasoning.
     pub fn has_history_reasoning_content(&self) -> bool {
         self.history.iter().any(|message| {
             matches!(
@@ -84,7 +84,7 @@ impl ConversationState {
         })
     }
 
-    /// Remove all Kiro-native reasoning blocks from assistant history.
+    /// Remove all local-upstream native reasoning blocks from assistant history.
     ///
     /// This is intentionally narrower than removing an assistant entry: visible
     /// content and tool uses remain byte-for-byte equivalent after serialization.
@@ -340,7 +340,7 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
-    /// Kiro-native signed or redacted reasoning history.
+    /// Local-upstream native signed or redacted reasoning history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<ReasoningContent>,
 }
@@ -361,14 +361,14 @@ impl AssistantMessage {
         self
     }
 
-    /// Set a single Kiro-native reasoning union value.
+    /// Set a single local-upstream native reasoning union value.
     pub fn with_reasoning_content(mut self, reasoning_content: ReasoningContent) -> Self {
         self.reasoning_content = Some(reasoning_content);
         self
     }
 }
 
-/// Kiro assistant history accepts exactly one native reasoning union member.
+/// Local-upstream assistant history accepts exactly one native reasoning union member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReasoningContent {
