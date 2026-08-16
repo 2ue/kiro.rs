@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::model::config::Config;
 
 /// 兜底 machineId 缓存（按凭据 id 分桶，进程生命周期内稳定）
@@ -47,11 +47,14 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
 /// 优先级：
 /// 1. 凭据级 `machineId`（若配置且格式合法）
 /// 2. 全局 `config.machineId`（若配置且格式合法）
-/// 3. 根据凭据类型派生（互斥，由 [`KiroCredentials::is_api_key_credential`] 分流）：
+/// 3. 根据凭据类型派生（互斥，由 [`LocalUpstreamCredentials::is_api_key_credential`] 分流）：
 ///    - API Key 凭据：基于 `kiroApiKey` 派生
 ///    - OAuth 凭据：基于 `refreshToken` 派生
 /// 4. 兜底：基于随机种子派生，按 `credentials.id` 在进程内缓存（首次触发 warn 日志）
-pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> String {
+pub fn generate_from_credentials(
+    credentials: &LocalUpstreamCredentials,
+    config: &Config,
+) -> String {
     // 如果配置了凭据级 machineId，优先使用
     if let Some(ref machine_id) = credentials.machine_id {
         if let Some(normalized) = normalize_machine_id(machine_id) {
@@ -91,7 +94,7 @@ pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config)
 /// - 按 `credentials.id` 在进程内缓存；同一凭据多次调用返回同一值
 /// - 进程重启会重新随机；不持久化
 /// - 每个凭据首次生成时 warn 一次
-fn fallback_machine_id(credentials: &KiroCredentials) -> String {
+fn fallback_machine_id(credentials: &LocalUpstreamCredentials) -> String {
     let cache = FALLBACK_MACHINE_IDS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = cache.lock();
     if let Some(existing) = map.get(&credentials.id) {
@@ -132,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_custom_machine_id() {
-        let credentials = KiroCredentials::default();
+        let credentials = LocalUpstreamCredentials::default();
         let mut config = Config::default();
         config.machine_id = Some("a".repeat(64));
 
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_credential_machine_id_overrides_config() {
-        let mut credentials = KiroCredentials::default();
+        let mut credentials = LocalUpstreamCredentials::default();
         credentials.machine_id = Some("b".repeat(64));
 
         let mut config = Config::default();
@@ -154,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_refresh_token() {
-        let mut credentials = KiroCredentials::default();
+        let mut credentials = LocalUpstreamCredentials::default();
         credentials.refresh_token = Some("test_refresh_token".to_string());
         let config = Config::default();
 
@@ -165,7 +168,7 @@ mod tests {
     #[test]
     fn test_generate_without_credentials_uses_fallback() {
         // 完全空凭据会走兜底分支，返回派生后的随机 machineId
-        let credentials = KiroCredentials::default();
+        let credentials = LocalUpstreamCredentials::default();
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
@@ -175,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_api_key() {
-        let mut credentials = KiroCredentials::default();
+        let mut credentials = LocalUpstreamCredentials::default();
         credentials.kiro_api_key = Some("ksk_test_api_key".to_string());
         let config = Config::default();
 
@@ -188,7 +191,7 @@ mod tests {
     #[test]
     fn test_api_key_and_refresh_token_are_mutually_exclusive() {
         // 同时存在 kiroApiKey 和 refreshToken 时，应走 API Key 分支
-        let mut credentials = KiroCredentials::default();
+        let mut credentials = LocalUpstreamCredentials::default();
         credentials.kiro_api_key = Some("ksk_test".to_string());
         credentials.refresh_token = Some("should_not_be_used".to_string());
         let config = Config::default();
@@ -200,7 +203,7 @@ mod tests {
     #[test]
     fn test_api_key_auth_method_empty_uses_fallback_not_refresh_token() {
         // auth_method=api_key 但 kiro_api_key 为空：不回落到 refreshToken，走兜底分支
-        let mut credentials = KiroCredentials::default();
+        let mut credentials = LocalUpstreamCredentials::default();
         credentials.id = Some(u64::MAX - 1);
         credentials.auth_method = Some("api_key".to_string());
         credentials.refresh_token = Some("should_not_be_used".to_string());
@@ -215,7 +218,7 @@ mod tests {
     #[test]
     fn test_fallback_is_stable_per_credential() {
         // 同一凭据（按 id 区分）多次调用兜底应返回同一值
-        let mut credentials = KiroCredentials::default();
+        let mut credentials = LocalUpstreamCredentials::default();
         credentials.id = Some(u64::MAX - 10);
         let config = Config::default();
 
@@ -227,9 +230,9 @@ mod tests {
     #[test]
     fn test_fallback_differs_across_credentials() {
         // 不同凭据（不同 id）的兜底值应互不相同
-        let mut cred_a = KiroCredentials::default();
+        let mut cred_a = LocalUpstreamCredentials::default();
         cred_a.id = Some(u64::MAX - 20);
-        let mut cred_b = KiroCredentials::default();
+        let mut cred_b = LocalUpstreamCredentials::default();
         cred_b.id = Some(u64::MAX - 21);
         let config = Config::default();
 
@@ -271,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_generate_with_uuid_machine_id() {
-        let mut credentials = KiroCredentials::default();
+        let mut credentials = LocalUpstreamCredentials::default();
         credentials.machine_id = Some("2582956e-cc88-4669-b546-07adbffcb894".to_string());
 
         let config = Config::default();

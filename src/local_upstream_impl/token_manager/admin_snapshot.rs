@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::ProxyConfig;
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::model::config::Config;
 
 use super::account_state::{CredentialEntry, ProxyResourceRuntime};
@@ -58,7 +58,7 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
-    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    /// 旧上游订阅标签，仅作为账号信息元数据展示。
     pub subscription_title: Option<String>,
     /// 凭据支持的模型列表。空列表表示不限制模型调度。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -279,12 +279,12 @@ pub struct ManagerSnapshot {
 }
 
 fn effective_proxy_display_with_resources(
-    creds: &KiroCredentials,
+    creds: &LocalUpstreamCredentials,
     resources: &HashMap<u64, ProxyResourceRuntime>,
     global_proxy: Option<&ProxyConfig>,
 ) -> (Option<String>, String) {
     match creds.proxy_url.as_deref() {
-        Some(url) if url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) => {
+        Some(url) if url.eq_ignore_ascii_case(LocalUpstreamCredentials::PROXY_DIRECT) => {
             (None, "direct".to_string())
         }
         Some(url) => (Some(url.to_string()), "credential".to_string()),
@@ -316,7 +316,7 @@ fn proxy_resource_name_from_resources(
         .map(|resource| resource.name.clone())
 }
 
-fn normalized_auth_method(credentials: &KiroCredentials) -> Option<String> {
+fn normalized_auth_method(credentials: &LocalUpstreamCredentials) -> Option<String> {
     if credentials.is_api_key_credential() {
         return Some("api_key".to_string());
     }

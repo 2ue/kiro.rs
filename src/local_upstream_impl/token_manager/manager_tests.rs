@@ -10,7 +10,7 @@ const SONNET_MODEL: &str = "claude-sonnet-4.5";
 fn automatic_recovery_revision_fence_accepts_metadata_only_advance_and_rejects_regression() {
     for round in 1..=5 {
         let rejected = format!("rejected-access-{round}");
-        let mut credentials = KiroCredentials {
+        let mut credentials = LocalUpstreamCredentials {
             access_token: Some(rejected.clone()),
             storage_revision: 8,
             ..Default::default()
@@ -70,7 +70,7 @@ fn token_refresh_admission_config_is_fail_fast_at_startup_and_runtime_update() {
 
 #[test]
 fn refresh_negative_result_is_typed_versioned_bounded_and_expires_for_five_rounds() {
-    let mut credentials = KiroCredentials {
+    let mut credentials = LocalUpstreamCredentials {
         id: Some(1),
         storage_revision: 7,
         refresh_token: Some(format!("refresh-{}", "x".repeat(192))),
@@ -305,7 +305,7 @@ fn refresh_negative_result_is_typed_versioned_bounded_and_expires_for_five_round
 
 #[tokio::test]
 async fn api_key_token_path_does_not_allocate_oauth_refresh_state() {
-    let credentials = KiroCredentials {
+    let credentials = LocalUpstreamCredentials {
         id: Some(1),
         auth_method: Some("api_key".to_string()),
         kiro_api_key: Some("ksk_test_api_key_identity".to_string()),
@@ -332,7 +332,10 @@ async fn api_key_token_path_does_not_allocate_oauth_refresh_state() {
 fn runtime_state_apply_rejects_stale_and_equal_revisions() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![test_access_token_credential("runtime-revision", "Pro")],
+        vec![test_access_token_credential(
+            "runtime-revision",
+            "account-class-a",
+        )],
         None,
         None,
         false,
@@ -377,7 +380,7 @@ fn admin_deferred_runtime_patch_advances_generation_and_ignores_older_replay() {
         Config::default(),
         vec![test_access_token_credential(
             "admin-deferred-runtime",
-            "Pro",
+            "account-class-a",
         )],
         None,
         None,
@@ -451,7 +454,7 @@ fn admin_deferred_runtime_patch_advances_generation_and_ignores_older_replay() {
 
 #[test]
 fn atomic_credential_runtime_reconcile_requires_the_complete_patch() {
-    let base = KiroCredentials {
+    let base = LocalUpstreamCredentials {
         id: Some(7),
         email: Some("old@example.com".to_string()),
         disabled: true,
@@ -1106,8 +1109,8 @@ async fn spawn_pending_refresh_token_endpoint() -> (
     (format!("http://{address}/token"), request_received, server)
 }
 
-fn force_refresh_test_credential(token_endpoint: String) -> KiroCredentials {
-    KiroCredentials {
+fn force_refresh_test_credential(token_endpoint: String) -> LocalUpstreamCredentials {
+    LocalUpstreamCredentials {
         id: Some(1),
         auth_method: Some("external_idp".to_string()),
         access_token: Some("old-access-token".to_string()),
@@ -1120,8 +1123,8 @@ fn force_refresh_test_credential(token_endpoint: String) -> KiroCredentials {
     }
 }
 
-fn api_key_credential(token: &str) -> KiroCredentials {
-    KiroCredentials {
+fn api_key_credential(token: &str) -> LocalUpstreamCredentials {
+    LocalUpstreamCredentials {
         kiro_api_key: Some(token.to_string()),
         auth_method: Some("api_key".to_string()),
         ..Default::default()
@@ -1842,7 +1845,7 @@ fn startup_quota_guard_skips_fresh_exhausted_api_key_and_keeps_runtime_enabled()
 fn quota_guard_ignores_stale_missing_non_disabled_and_oauth_account_snapshots() {
     let mut api_key = api_key_credential("quota-guard-matrix");
     api_key.id = Some(1);
-    let oauth = KiroCredentials {
+    let oauth = LocalUpstreamCredentials {
         id: Some(2),
         auth_method: Some("social".to_string()),
         refresh_token: Some("refresh".to_string()),
@@ -3014,8 +3017,8 @@ fn test_partial_scheduler_state_apply_preserves_unrequested_entries() {
     let manager = MultiTokenManager::new(
         Config::default(),
         vec![
-            test_access_token_credential("token-1", "Pro"),
-            test_access_token_credential("token-2", "Pro"),
+            test_access_token_credential("token-1", "account-class-a"),
+            test_access_token_credential("token-2", "account-class-a"),
         ],
         None,
         None,
@@ -3068,7 +3071,7 @@ fn test_partial_scheduler_state_apply_preserves_unrequested_entries() {
 fn test_scheduler_state_apply_preserves_local_in_flight_leases() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![test_access_token_credential("token-1", "Pro")],
+        vec![test_access_token_credential("token-1", "account-class-a")],
         None,
         None,
         false,
@@ -3107,7 +3110,7 @@ fn test_scheduler_state_apply_filters_expired_redis_in_flight_leases() {
     config.credential_in_flight_lease_max_secs = 1;
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("token-1", "Pro")],
+        vec![test_access_token_credential("token-1", "account-class-a")],
         None,
         None,
         false,
@@ -3172,7 +3175,7 @@ fn test_scheduler_state_apply_filters_expired_redis_in_flight_leases() {
 fn test_scheduler_state_apply_ignores_recently_released_redis_in_flight_lease() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![test_access_token_credential("token-1", "Pro")],
+        vec![test_access_token_credential("token-1", "account-class-a")],
         None,
         None,
         false,
@@ -3229,7 +3232,7 @@ fn test_scheduler_state_apply_ignores_recently_released_redis_in_flight_lease() 
 fn test_scheduler_state_apply_drops_remote_lease_missing_from_next_snapshot() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![test_access_token_credential("token-1", "Pro")],
+        vec![test_access_token_credential("token-1", "account-class-a")],
         None,
         None,
         false,
@@ -3270,7 +3273,7 @@ fn test_scheduler_state_apply_drops_remote_lease_missing_from_next_snapshot() {
 async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![test_access_token_credential("token-1", "Pro")],
+        vec![test_access_token_credential("token-1", "account-class-a")],
         None,
         None,
         false,
@@ -3307,7 +3310,7 @@ fn dispatch_wakeup_filters_self_and_routes_remote_scope_for_five_rounds() {
     for round in 0..5u64 {
         let manager = MultiTokenManager::new(
             Config::default(),
-            vec![test_access_token_credential("token-1", "Pro")],
+            vec![test_access_token_credential("token-1", "account-class-a")],
             None,
             None,
             false,
@@ -3450,7 +3453,7 @@ async fn remote_scheduler_events_arriving_during_snapshot_are_chased_for_five_ro
 async fn test_scheduler_affinity_timeout_does_not_degrade_capacity_coordination() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![test_access_token_credential("token-1", "Pro")],
+        vec![test_access_token_credential("token-1", "account-class-a")],
         None,
         None,
         false,
@@ -3917,8 +3920,8 @@ async fn half_open_route_state_stays_degraded_until_the_single_probe_recovers() 
     assert!(!breaker.is_degraded());
 }
 
-fn test_access_token_credential(token: &str, subscription_title: &str) -> KiroCredentials {
-    let mut credential = KiroCredentials::default();
+fn test_access_token_credential(token: &str, subscription_title: &str) -> LocalUpstreamCredentials {
+    let mut credential = LocalUpstreamCredentials::default();
     credential.subscription_title = Some(subscription_title.to_string());
     credential.access_token = Some(token.to_string());
     credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
@@ -3927,14 +3930,14 @@ fn test_access_token_credential(token: &str, subscription_title: &str) -> KiroCr
 
 #[test]
 fn test_is_token_expired_with_expired_token() {
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
     assert!(is_token_expired(&credentials));
 }
 
 #[test]
 fn test_is_token_expired_with_valid_token() {
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     let future = Utc::now() + Duration::hours(1);
     credentials.expires_at = Some(future.to_rfc3339());
     assert!(!is_token_expired(&credentials));
@@ -3942,7 +3945,7 @@ fn test_is_token_expired_with_valid_token() {
 
 #[test]
 fn test_is_token_expired_within_5_minutes() {
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     let expires = Utc::now() + Duration::minutes(3);
     credentials.expires_at = Some(expires.to_rfc3339());
     assert!(is_token_expired(&credentials));
@@ -3950,13 +3953,13 @@ fn test_is_token_expired_within_5_minutes() {
 
 #[test]
 fn test_is_token_expired_no_expires_at() {
-    let credentials = KiroCredentials::default();
+    let credentials = LocalUpstreamCredentials::default();
     assert!(is_token_expired(&credentials));
 }
 
 #[test]
 fn test_is_token_expiring_soon_within_10_minutes() {
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     let expires = Utc::now() + Duration::minutes(8);
     credentials.expires_at = Some(expires.to_rfc3339());
     assert!(is_token_expiring_soon(&credentials));
@@ -3964,7 +3967,7 @@ fn test_is_token_expiring_soon_within_10_minutes() {
 
 #[test]
 fn test_is_token_expiring_soon_beyond_10_minutes() {
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     let expires = Utc::now() + Duration::minutes(15);
     credentials.expires_at = Some(expires.to_rfc3339());
     assert!(!is_token_expiring_soon(&credentials));
@@ -3972,14 +3975,14 @@ fn test_is_token_expiring_soon_beyond_10_minutes() {
 
 #[test]
 fn test_validate_refresh_token_missing() {
-    let credentials = KiroCredentials::default();
+    let credentials = LocalUpstreamCredentials::default();
     let result = validate_refresh_token(&credentials);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_validate_refresh_token_valid() {
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.refresh_token = Some("a".repeat(150));
     let result = validate_refresh_token(&credentials);
     assert!(result.is_ok());
@@ -4033,7 +4036,7 @@ fn usage_limits_user_agents_match_kiro_rest_shape() {
 #[tokio::test]
 async fn test_refresh_token_rejects_api_key_credential() {
     let config = Config::default();
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.kiro_api_key = Some("ksk_test_key_123".to_string());
     credentials.auth_method = Some("api_key".to_string());
 
@@ -4055,12 +4058,12 @@ async fn test_refresh_token_rejects_api_key_credential() {
 async fn test_add_credential_reject_duplicate_refresh_token() {
     let config = Config::default();
 
-    let mut existing = KiroCredentials::default();
+    let mut existing = LocalUpstreamCredentials::default();
     existing.refresh_token = Some("a".repeat(150));
 
     let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
 
-    let mut duplicate = KiroCredentials::default();
+    let mut duplicate = LocalUpstreamCredentials::default();
     duplicate.refresh_token = Some("a".repeat(150));
 
     let result = manager.add_credential(duplicate).await;
@@ -4073,7 +4076,7 @@ async fn test_add_credential_api_key_success() {
     let config = Config::default();
     let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
 
-    let mut api_key_cred = KiroCredentials::default();
+    let mut api_key_cred = LocalUpstreamCredentials::default();
     api_key_cred.kiro_api_key = Some("ksk_test_key_123".to_string());
     api_key_cred.auth_method = Some("api_key".to_string());
 
@@ -4109,7 +4112,7 @@ async fn postgres_row_level_update_does_not_delete_credentials_added_by_other_in
     .unwrap();
 
     let second = store
-        .insert_credential(&KiroCredentials {
+        .insert_credential(&LocalUpstreamCredentials {
             kiro_api_key: Some("ksk_second_other_instance".to_string()),
             auth_method: Some("api_key".to_string()),
             priority: 2,
@@ -5283,13 +5286,13 @@ async fn postgres_admin_reset_enable_defers_runtime_patch_during_recovery() {
 async fn test_add_credential_reject_duplicate_api_key() {
     let config = Config::default();
 
-    let mut existing = KiroCredentials::default();
+    let mut existing = LocalUpstreamCredentials::default();
     existing.kiro_api_key = Some("ksk_existing_key".to_string());
     existing.auth_method = Some("api_key".to_string());
 
     let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
 
-    let mut duplicate = KiroCredentials::default();
+    let mut duplicate = LocalUpstreamCredentials::default();
     duplicate.kiro_api_key = Some("ksk_existing_key".to_string());
     duplicate.auth_method = Some("api_key".to_string());
 
@@ -5309,7 +5312,7 @@ async fn test_add_credential_api_key_empty_rejected() {
     let config = Config::default();
     let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.kiro_api_key = Some(String::new());
     cred.auth_method = Some("api_key".to_string());
 
@@ -5329,7 +5332,7 @@ async fn test_add_credential_api_key_missing_key_rejected() {
     let config = Config::default();
     let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.auth_method = Some("api_key".to_string());
     // kiro_api_key is None
 
@@ -5348,12 +5351,12 @@ async fn test_add_credential_api_key_missing_key_rejected() {
 async fn test_add_credential_api_key_and_oauth_coexist() {
     let config = Config::default();
 
-    let mut oauth_cred = KiroCredentials::default();
+    let mut oauth_cred = LocalUpstreamCredentials::default();
     oauth_cred.refresh_token = Some("a".repeat(150));
 
     let manager = MultiTokenManager::new(config, vec![oauth_cred], None, None, false).unwrap();
 
-    let mut api_key_cred = KiroCredentials::default();
+    let mut api_key_cred = LocalUpstreamCredentials::default();
     api_key_cred.kiro_api_key = Some("ksk_new_key".to_string());
     api_key_cred.auth_method = Some("api_key".to_string());
 
@@ -5368,9 +5371,9 @@ async fn test_add_credential_api_key_and_oauth_coexist() {
 #[test]
 fn test_multi_token_manager_new() {
     let config = Config::default();
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.priority = 0;
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.priority = 1;
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
@@ -5392,9 +5395,9 @@ fn test_multi_token_manager_empty_credentials() {
 #[test]
 fn test_multi_token_manager_duplicate_ids() {
     let config = Config::default();
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.id = Some(1);
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.id = Some(1); // 重复 ID
 
     let result = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false);
@@ -5412,11 +5415,11 @@ fn test_multi_token_manager_api_key_missing_kiro_api_key_auto_disabled() {
     let config = Config::default();
 
     // auth_method=api_key 但缺少 kiro_api_key → 应被自动禁用
-    let mut bad_cred = KiroCredentials::default();
+    let mut bad_cred = LocalUpstreamCredentials::default();
     bad_cred.auth_method = Some("api_key".to_string());
     // kiro_api_key 保持 None
 
-    let mut good_cred = KiroCredentials::default();
+    let mut good_cred = LocalUpstreamCredentials::default();
     good_cred.refresh_token = Some("valid_token".to_string());
 
     let manager =
@@ -5430,7 +5433,7 @@ fn test_multi_token_manager_api_key_with_kiro_api_key_not_disabled() {
     let config = Config::default();
 
     // auth_method=api_key 且有 kiro_api_key → 不应被禁用
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.auth_method = Some("api_key".to_string());
     cred.kiro_api_key = Some("ksk_test123".to_string());
 
@@ -5442,8 +5445,8 @@ fn test_multi_token_manager_api_key_with_kiro_api_key_not_disabled() {
 #[test]
 fn test_multi_token_manager_report_failure() {
     let config = Config::default();
-    let cred1 = KiroCredentials::default();
-    let cred2 = KiroCredentials::default();
+    let cred1 = LocalUpstreamCredentials::default();
+    let cred2 = LocalUpstreamCredentials::default();
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -5468,7 +5471,10 @@ fn test_multi_token_manager_report_failure() {
 fn report_failure_deferred_matches_local_scheduler_semantics() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![KiroCredentials::default(), KiroCredentials::default()],
+        vec![
+            LocalUpstreamCredentials::default(),
+            LocalUpstreamCredentials::default(),
+        ],
         None,
         None,
         false,
@@ -5502,9 +5508,9 @@ fn deferred_terminal_disable_variants_update_local_state_without_store() {
     let manager = MultiTokenManager::new(
         Config::default(),
         vec![
-            KiroCredentials::default(),
-            KiroCredentials::default(),
-            KiroCredentials::default(),
+            LocalUpstreamCredentials::default(),
+            LocalUpstreamCredentials::default(),
+            LocalUpstreamCredentials::default(),
         ],
         None,
         None,
@@ -5565,7 +5571,7 @@ fn deferred_terminal_disable_variants_update_local_state_without_store() {
 fn profile_arn_deferred_updates_local_state_without_store() {
     let manager = MultiTokenManager::new(
         Config::default(),
-        vec![KiroCredentials::default()],
+        vec![LocalUpstreamCredentials::default()],
         None,
         None,
         false,
@@ -5605,7 +5611,7 @@ fn profile_arn_deferred_updates_local_state_without_store() {
 #[test]
 fn test_multi_token_manager_report_success() {
     let config = Config::default();
-    let cred = KiroCredentials::default();
+    let cred = LocalUpstreamCredentials::default();
 
     let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
 
@@ -5625,9 +5631,9 @@ fn test_multi_token_manager_report_success() {
 #[test]
 fn test_multi_token_manager_switch_to_next() {
     let config = Config::default();
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.refresh_token = Some("token1".to_string());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.refresh_token = Some("token2".to_string());
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
@@ -5642,9 +5648,14 @@ fn test_multi_token_manager_switch_to_next() {
 #[test]
 fn test_set_load_balancing_mode_updates_runtime_memory_without_store() {
     let config = Config::default();
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        config,
+        vec![LocalUpstreamCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .set_load_balancing_mode("balanced".to_string())
@@ -5661,9 +5672,14 @@ fn test_update_runtime_config_updates_runtime_memory_without_store() {
     };
 
     let config = Config::default();
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        config,
+        vec![LocalUpstreamCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .update_runtime_config(|config| {
@@ -5725,8 +5741,8 @@ fn finite_dispatch_queue_lease_covers_actual_wait_and_unlimited_wait_renews() {
 #[tokio::test]
 async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
     let config = Config::default();
-    let cred1 = test_access_token_credential("t1", "Pro");
-    let cred2 = test_access_token_credential("t2", "Pro");
+    let cred1 = test_access_token_credential("t1", "account-class-a");
+    let cred2 = test_access_token_credential("t2", "account-class-a");
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -5752,11 +5768,11 @@ async fn test_multi_token_manager_acquire_context_balanced_request_excludes_bad_
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut bad_cred = KiroCredentials::default();
+    let mut bad_cred = LocalUpstreamCredentials::default();
     bad_cred.priority = 0;
     bad_cred.refresh_token = Some("bad".to_string());
 
-    let mut good_cred = KiroCredentials::default();
+    let mut good_cred = LocalUpstreamCredentials::default();
     good_cred.priority = 1;
     good_cred.access_token = Some("good-token".to_string());
     good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
@@ -5782,9 +5798,9 @@ async fn test_all_invalid_refresh_configurations_are_request_bounded_and_health_
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
-        let mut first = KiroCredentials::default();
+        let mut first = LocalUpstreamCredentials::default();
         first.refresh_token = Some("bad".to_string());
-        let mut second = KiroCredentials::default();
+        let mut second = LocalUpstreamCredentials::default();
         second.refresh_token = Some("also-bad".to_string());
 
         let manager =
@@ -5862,10 +5878,10 @@ async fn test_acquire_context_sticks_same_session_to_same_credential_in_balanced
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -5891,10 +5907,10 @@ async fn test_model_specific_cooldown_only_blocks_same_model() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -5935,7 +5951,7 @@ async fn test_supported_model_exact_match_allows_local_scheduler_selection() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.supported_models = vec!["claude-sonnet-4".to_string()];
@@ -5955,7 +5971,7 @@ async fn test_supported_model_filter_does_not_alias_local_scheduler_selection() 
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
@@ -5976,11 +5992,11 @@ async fn test_empty_supported_models_allows_future_model_when_restricted_credent
     let mut config = Config::default();
     config.load_balancing_mode = "priority".to_string();
 
-    let mut restricted = test_access_token_credential("restricted", "Pro");
+    let mut restricted = test_access_token_credential("restricted", "account-class-a");
     restricted.priority = 0;
     restricted.supported_models = vec!["claude-sonnet-4.6".to_string()];
 
-    let mut unrestricted = test_access_token_credential("unrestricted", "Pro");
+    let mut unrestricted = test_access_token_credential("unrestricted", "account-class-a");
     unrestricted.priority = 1;
     unrestricted.supported_models = Vec::new();
 
@@ -6000,7 +6016,7 @@ async fn test_supported_model_alias_does_not_cross_family_in_local_scheduler() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.supported_models = vec!["claude-opus-4.8".to_string()];
@@ -6036,8 +6052,19 @@ async fn test_model_scoped_429_high_concurrency_disabled_and_model_filters() {
 
     let mut credentials = (1..=CREDENTIAL_COUNT)
         .map(|idx| {
-            let subscription = if idx % 2 == 0 { "Pro" } else { "Free" };
-            test_access_token_credential(&format!("token-{idx}"), subscription)
+            let account_class = if idx % 2 == 0 {
+                "account-class-a"
+            } else {
+                "account-class-b"
+            };
+            let mut credential =
+                test_access_token_credential(&format!("token-{idx}"), account_class);
+            credential.supported_models = if idx % 2 == 0 {
+                vec![SONNET_MODEL.to_string(), OPUS_MODEL.to_string()]
+            } else {
+                vec![SONNET_MODEL.to_string()]
+            };
+            credential
         })
         .collect::<Vec<_>>();
     credentials[10].disabled = true;
@@ -6102,7 +6129,7 @@ async fn test_model_scoped_429_high_concurrency_disabled_and_model_filters() {
             let mut ctx = manager.acquire_context(Some(OPUS_MODEL)).await.unwrap();
             assert!(
                 matches!(ctx.id, 8 | 10),
-                "opus 只能调度未冷却且支持 opus 的 Pro 凭据，实际 #{}",
+                "opus 只能调度未冷却且显式支持 opus 的账号，实际 #{}",
                 ctx.id
             );
             tokio::time::sleep(StdDuration::from_millis(2 + (idx % 5) as u64)).await;
@@ -6132,7 +6159,7 @@ async fn test_model_scoped_429_high_concurrency_disabled_and_model_filters() {
     );
     assert!(
         opus_ids.iter().all(|id| matches!(*id, 8 | 10)),
-        "opus 不应使用 Free、禁用或 opus 冷却凭据，实际分布: {:?}",
+        "opus 不应使用模型不匹配、禁用或 opus 冷却账号，实际分布: {:?}",
         opus_ids
     );
 
@@ -6168,10 +6195,10 @@ async fn test_acquire_context_excluded_bound_session_can_fallback() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -6205,10 +6232,10 @@ async fn test_bound_session_falls_back_when_bound_credential_is_full() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_max_concurrent_requests = 1;
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -6263,10 +6290,10 @@ async fn test_transient_failure_cools_down_without_disabling_credential() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_transient_cooldown_secs = 60;
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -6296,10 +6323,10 @@ async fn test_transient_failure_does_not_shorten_existing_cooldown() {
     let mut config = Config::default();
     config.credential_transient_cooldown_secs = 60;
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -6323,10 +6350,10 @@ fn test_success_does_not_clear_active_transient_cooldown() {
     let mut config = Config::default();
     config.credential_transient_cooldown_secs = 60;
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -6350,9 +6377,14 @@ fn test_structured_transient_failure_updates_health_and_backoff() {
     config.credential_max_cooldown_secs = 10;
     config.credential_cooldown_backoff_multiplier = 2.0;
     config.credential_cooldown_jitter_percent = 0;
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        config,
+        vec![LocalUpstreamCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 
     manager
         .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
@@ -6387,7 +6419,7 @@ fn test_transient_failure_coalesces_same_burst_without_backoff_amplification() {
     config.credential_cooldown_jitter_percent = 0;
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("token", "Pro")],
+        vec![test_access_token_credential("token", "account-class-a")],
         None,
         None,
         false,
@@ -6460,7 +6492,7 @@ fn test_error_specific_cooldown_parameters_are_effective() {
 
         let manager = MultiTokenManager::new(
             config,
-            vec![test_access_token_credential("token", "Pro")],
+            vec![test_access_token_credential("token", "account-class-a")],
             None,
             None,
             false,
@@ -6490,7 +6522,7 @@ fn test_scheduler_error_ewma_alpha_changes_error_rate_update() {
         config.credential_cooldown_jitter_percent = 0;
         MultiTokenManager::new(
             config,
-            vec![test_access_token_credential("token", "Pro")],
+            vec![test_access_token_credential("token", "account-class-a")],
             None,
             None,
             false,
@@ -6521,7 +6553,7 @@ fn test_scheduler_error_ewma_alpha_changes_error_rate_update() {
 fn test_health_balanced_score_parameters_are_effective() {
     let mut worse = CredentialEntry {
         id: 1,
-        credentials: KiroCredentials {
+        credentials: LocalUpstreamCredentials {
             priority: 10,
             max_concurrent_requests: Some(2),
             ..Default::default()
@@ -6557,7 +6589,7 @@ fn test_health_balanced_score_parameters_are_effective() {
 
     let better = CredentialEntry {
         id: 2,
-        credentials: KiroCredentials::default(),
+        credentials: LocalUpstreamCredentials::default(),
         failure_count: 0,
         refresh_failure_count: 0,
         runtime_revision: 0,
@@ -6622,9 +6654,14 @@ fn test_health_balanced_score_parameters_are_effective() {
 fn test_success_updates_health_latency_without_clearing_cooldown() {
     let mut config = Config::default();
     config.credential_stream_error_cooldown_secs = 10;
-    let manager =
-        MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-            .unwrap();
+    let manager = MultiTokenManager::new(
+        config,
+        vec![LocalUpstreamCredentials::default()],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     manager
         .report_transient_failure_kind(
             1,
@@ -6647,10 +6684,10 @@ async fn test_health_balanced_mode_prefers_best_scored_candidate() {
     let mut config = Config::default();
     config.load_balancing_mode = "health_balanced".to_string();
     config.scheduler_top_k = 1;
-    let mut first = KiroCredentials::default();
+    let mut first = LocalUpstreamCredentials::default();
     first.access_token = Some("first".to_string());
     first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut second = KiroCredentials::default();
+    let mut second = LocalUpstreamCredentials::default();
     second.access_token = Some("second".to_string());
     second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
@@ -6681,8 +6718,8 @@ async fn test_weighted_least_inflight_mode_prefers_lower_load_candidate() {
     let manager = MultiTokenManager::new(
         config,
         vec![
-            test_access_token_credential("busy-token", "Pro"),
-            test_access_token_credential("idle-token", "Pro"),
+            test_access_token_credential("busy-token", "account-class-a"),
+            test_access_token_credential("idle-token", "account-class-a"),
         ],
         None,
         None,
@@ -6708,10 +6745,10 @@ async fn test_health_balanced_mode_penalizes_recent_selection_pressure() {
     config.load_balancing_mode = "health_balanced".to_string();
     config.scheduler_top_k = 1;
     config.scheduler_selection_pressure_weight = 100.0;
-    let mut first = KiroCredentials::default();
+    let mut first = LocalUpstreamCredentials::default();
     first.access_token = Some("first".to_string());
     first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut second = KiroCredentials::default();
+    let mut second = LocalUpstreamCredentials::default();
     second.access_token = Some("second".to_string());
     second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
@@ -6729,13 +6766,13 @@ async fn test_health_balanced_mode_penalizes_recent_selection_pressure() {
 async fn test_balanced_mode_rotates_all_warming_credentials_by_recent_selection() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
-    let mut first = KiroCredentials::default();
+    let mut first = LocalUpstreamCredentials::default();
     first.access_token = Some("first".to_string());
     first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut second = KiroCredentials::default();
+    let mut second = LocalUpstreamCredentials::default();
     second.access_token = Some("second".to_string());
     second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut third = KiroCredentials::default();
+    let mut third = LocalUpstreamCredentials::default();
     third.access_token = Some("third".to_string());
     third.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     let manager =
@@ -6769,13 +6806,13 @@ async fn test_balanced_mode_gives_warming_group_scaled_target_share() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_warmup_selection_percent = 5;
     config.credential_warmup_max_selection_percent = 50;
-    let mut ready = KiroCredentials::default();
+    let mut ready = LocalUpstreamCredentials::default();
     ready.access_token = Some("ready".to_string());
     ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut warming_a = KiroCredentials::default();
+    let mut warming_a = LocalUpstreamCredentials::default();
     warming_a.access_token = Some("warming-a".to_string());
     warming_a.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut warming_b = KiroCredentials::default();
+    let mut warming_b = LocalUpstreamCredentials::default();
     warming_b.access_token = Some("warming-b".to_string());
     warming_b.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     let manager =
@@ -6985,9 +7022,9 @@ async fn test_transient_failure_cools_down_only_usable_credential() {
     config.credential_transient_cooldown_secs = 1;
     config.credential_max_cooldown_secs = 1;
 
-    let mut disabled = KiroCredentials::default();
+    let mut disabled = LocalUpstreamCredentials::default();
     disabled.disabled = true;
-    let mut active = KiroCredentials::default();
+    let mut active = LocalUpstreamCredentials::default();
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -7037,10 +7074,10 @@ async fn test_rate_limiter_prefers_other_dispatchable_credential() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_rpm = Some(1);
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -7068,7 +7105,7 @@ async fn test_rate_limiter_blocks_after_window_capacity_is_full() {
     let mut config = Config::default();
     config.credential_rpm = Some(1);
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -7091,7 +7128,7 @@ async fn test_rate_limiter_allows_idle_burst_up_to_rpm_capacity() {
 
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("t1", "Pro")],
+        vec![test_access_token_credential("t1", "account-class-a")],
         None,
         None,
         false,
@@ -7119,7 +7156,7 @@ async fn test_runtime_config_disabling_credential_rpm_clears_rate_limit_state() 
 
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("t1", "Pro")],
+        vec![test_access_token_credential("t1", "account-class-a")],
         None,
         None,
         false,
@@ -7150,7 +7187,7 @@ async fn test_credential_rpm_override_limits_when_global_unlimited() {
     let mut config = Config::default();
     config.credential_rpm = None;
 
-    let mut cred = test_access_token_credential("t1", "Pro");
+    let mut cred = test_access_token_credential("t1", "account-class-a");
     cred.rpm = Some(1);
 
     let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
@@ -7168,7 +7205,7 @@ async fn test_credential_rpm_override_zero_bypasses_global_limit() {
     let mut config = Config::default();
     config.credential_rpm = Some(60);
 
-    let mut cred = test_access_token_credential("t1", "Pro");
+    let mut cred = test_access_token_credential("t1", "account-class-a");
     cred.rpm = Some(0);
 
     let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
@@ -7188,9 +7225,9 @@ async fn priority_mode_respects_warmup_candidate_share() {
     config.credential_warmup_selection_percent = 0;
     config.credential_warmup_max_selection_percent = 0;
 
-    let mut ready = test_access_token_credential("ready", "Pro");
+    let mut ready = test_access_token_credential("ready", "account-class-a");
     ready.priority = 10;
-    let mut warming = test_access_token_credential("warming", "Pro");
+    let mut warming = test_access_token_credential("warming", "account-class-a");
     warming.priority = 0;
 
     let manager = MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
@@ -7215,7 +7252,7 @@ fn credential_capacity_updates_reset_warmup_remaining() {
     config.credential_warmup_requests = 7;
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("capacity", "Pro")],
+        vec![test_access_token_credential("capacity", "account-class-a")],
         None,
         None,
         false,
@@ -7240,10 +7277,10 @@ async fn test_all_transient_cooldown_fails_fast() {
     config.credential_transient_cooldown_secs = 1;
     config.credential_max_cooldown_secs = 1;
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -7291,10 +7328,10 @@ async fn test_concurrency_limiter_prefers_other_dispatchable_credential() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_max_concurrent_requests = 1;
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -7329,10 +7366,10 @@ async fn test_concurrency_limiter_prefers_other_dispatchable_credential() {
 async fn test_priority_mode_prefers_lower_in_flight_with_same_priority() {
     let config = Config::default();
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -7352,10 +7389,10 @@ async fn test_global_capacity_limits_dispatch_and_bounds_wait_queue() {
     let mut config = Config::default();
     config.dispatch_global_max_concurrent_requests = 1;
     config.dispatch_max_queued_requests = 1;
-    let mut first_cred = KiroCredentials::default();
+    let mut first_cred = LocalUpstreamCredentials::default();
     first_cred.access_token = Some("first".to_string());
     first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut second_cred = KiroCredentials::default();
+    let mut second_cred = LocalUpstreamCredentials::default();
     second_cred.access_token = Some("second".to_string());
     second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     let manager = Arc::new(
@@ -7603,8 +7640,8 @@ async fn test_fail_fast_global_capacity_full_returns_without_queueing_for_five_r
         config.dispatch_global_max_concurrent_requests = 1;
         config.dispatch_max_queued_requests = 10;
 
-        let first_cred = test_access_token_credential("first", "Pro");
-        let second_cred = test_access_token_credential("second", "Pro");
+        let first_cred = test_access_token_credential("first", "account-class-a");
+        let second_cred = test_access_token_credential("second", "account-class-a");
         let manager =
             MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
                 .unwrap();
@@ -7646,7 +7683,7 @@ async fn test_weighted_local_capacity_consumes_single_credential_slots() {
 
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("weighted", "Pro")],
+        vec![test_access_token_credential("weighted", "account-class-a")],
         None,
         None,
         false,
@@ -7700,8 +7737,8 @@ async fn test_weighted_local_capacity_consumes_global_slots() {
     let manager = MultiTokenManager::new(
         config,
         vec![
-            test_access_token_credential("weighted-a", "Pro"),
-            test_access_token_credential("weighted-b", "Pro"),
+            test_access_token_credential("weighted-a", "account-class-a"),
+            test_access_token_credential("weighted-b", "account-class-a"),
         ],
         None,
         None,
@@ -7750,7 +7787,10 @@ async fn test_weighted_selection_pressure_counts_capacity_units_not_total_reques
 
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("weighted-selection", "Pro")],
+        vec![test_access_token_credential(
+            "weighted-selection",
+            "account-class-a",
+        )],
         None,
         None,
         false,
@@ -7784,7 +7824,10 @@ async fn test_weighted_rpm_consumes_capacity_units() {
 
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("weighted-rpm", "Pro")],
+        vec![test_access_token_credential(
+            "weighted-rpm",
+            "account-class-a",
+        )],
         None,
         None,
         false,
@@ -7817,7 +7860,7 @@ fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
     assert_eq!(empty_state.total, 0);
     assert_eq!(empty_state.available, 0);
 
-    let mut disabled = test_access_token_credential("disabled", "Pro");
+    let mut disabled = test_access_token_credential("disabled", "account-class-a");
     disabled.disabled = true;
     let disabled_manager =
         MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
@@ -7835,7 +7878,7 @@ async fn test_local_pool_route_state_reports_capacity_full_without_queueing_for_
         config.dispatch_max_queued_requests = 10;
         let manager = MultiTokenManager::new(
             config,
-            vec![test_access_token_credential("first", "Pro")],
+            vec![test_access_token_credential("first", "account-class-a")],
             None,
             None,
             false,
@@ -7874,7 +7917,7 @@ async fn selection_failure_summary_records_concurrency_full_accounts() {
     config.credential_max_concurrent_requests = 1;
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("first", "Pro")],
+        vec![test_access_token_credential("first", "account-class-a")],
         None,
         None,
         false,
@@ -7915,7 +7958,7 @@ async fn selection_failure_summary_records_rpm_limited_accounts() {
     config.credential_rpm = Some(60);
     let manager = MultiTokenManager::new(
         config,
-        vec![test_access_token_credential("first", "Pro")],
+        vec![test_access_token_credential("first", "account-class-a")],
         None,
         None,
         false,
@@ -7945,9 +7988,11 @@ async fn selection_failure_summary_records_rpm_limited_accounts() {
 
 #[tokio::test]
 async fn selection_failure_summary_records_model_not_supported() {
-    let mut free = api_key_credential("ksk_selection_free");
-    free.subscription_title = Some("Free".to_string());
-    let manager = MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
+    let mut limited = api_key_credential("ksk_selection_model_limited");
+    limited.subscription_title = Some("account-class-b".to_string());
+    limited.supported_models = vec![SONNET_MODEL.to_string()];
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![limited], None, None, false).unwrap();
 
     let summary = manager.selection_failure_summary(
         "req_model",
@@ -8065,16 +8110,19 @@ fn test_local_pool_route_state_sees_manual_enable_after_all_disabled() {
 
 #[tokio::test]
 async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
-    let mut free = api_key_credential("ksk_model_free");
-    free.subscription_title = Some("Free".to_string());
-    let manager = MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
+    let mut limited = api_key_credential("ksk_model_limited");
+    limited.subscription_title = Some("account-class-b".to_string());
+    limited.supported_models = vec![SONNET_MODEL.to_string()];
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![limited], None, None, false).unwrap();
 
     let unsupported = manager.local_pool_route_state(Some("claude-opus-4-8"));
     assert_eq!(unsupported.kind, LocalPoolRouteStateKind::NoModelCompatible);
 
-    let mut pro = api_key_credential("ksk_model_pro");
-    pro.subscription_title = Some("Pro".to_string());
-    manager.add_credential(pro).await.unwrap();
+    let mut capable = api_key_credential("ksk_model_capable");
+    capable.subscription_title = Some("account-class-a".to_string());
+    capable.supported_models = vec!["claude-opus-4-8".to_string()];
+    manager.add_credential(capable).await.unwrap();
 
     let ready = manager.local_pool_route_state(Some("claude-opus-4-8"));
     assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
@@ -8151,11 +8199,11 @@ async fn test_concurrency_limiter_skips_disabled_credentials_and_queues_on_only_
     config.load_balancing_mode = "balanced".to_string();
     config.credential_max_concurrent_requests = 1;
 
-    let mut disabled1 = KiroCredentials::default();
+    let mut disabled1 = LocalUpstreamCredentials::default();
     disabled1.disabled = true;
-    let mut disabled2 = KiroCredentials::default();
+    let mut disabled2 = LocalUpstreamCredentials::default();
     disabled2.disabled = true;
-    let mut active = KiroCredentials::default();
+    let mut active = LocalUpstreamCredentials::default();
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8208,7 +8256,7 @@ async fn test_concurrency_limiter_multiple_waiters_are_served_serially_on_one_cr
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8303,9 +8351,9 @@ async fn test_acquire_context_all_manually_disabled_fails_without_queueing() {
     config.credential_max_concurrent_requests = 1;
     config.credential_dispatch_max_wait_secs = 1;
 
-    let mut disabled1 = KiroCredentials::default();
+    let mut disabled1 = LocalUpstreamCredentials::default();
     disabled1.disabled = true;
-    let mut disabled2 = KiroCredentials::default();
+    let mut disabled2 = LocalUpstreamCredentials::default();
     disabled2.disabled = true;
 
     let manager =
@@ -8337,8 +8385,8 @@ async fn test_all_model_incompatible_credentials_fail_fast_without_queueing() {
     config.credential_max_concurrent_requests = 1;
     config.credential_dispatch_max_wait_secs = 1;
 
-    let free_a = test_access_token_credential("free-a", "Free");
-    let free_b = test_access_token_credential("free-b", "Free");
+    let free_a = test_access_token_credential("account-a", "account-class-b");
+    let free_b = test_access_token_credential("account-b", "account-class-b");
     let manager = MultiTokenManager::new(config, vec![free_a, free_b], None, None, false).unwrap();
 
     let started = Instant::now();
@@ -8366,7 +8414,7 @@ async fn test_concurrency_limiter_waits_until_slot_released() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8398,12 +8446,12 @@ async fn test_fail_fast_slot_race_reselects_other_available_credential_for_five_
         let mut config = Config::default();
         config.credential_max_concurrent_requests = 1;
 
-        let mut first_cred = KiroCredentials::default();
+        let mut first_cred = LocalUpstreamCredentials::default();
         first_cred.access_token = Some("t1".to_string());
         first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         first_cred.priority = 0;
 
-        let mut second_cred = KiroCredentials::default();
+        let mut second_cred = LocalUpstreamCredentials::default();
         second_cred.access_token = Some("t2".to_string());
         second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         second_cred.priority = 0;
@@ -8450,7 +8498,7 @@ async fn test_credential_concurrency_override_limits_when_global_unlimited() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 0;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.max_concurrent_requests = Some(1);
@@ -8486,7 +8534,7 @@ async fn test_credential_concurrency_override_zero_bypasses_global_limit() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.max_concurrent_requests = Some(0);
@@ -8510,7 +8558,7 @@ async fn test_credential_concurrency_override_exceeds_global_default() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 5;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     cred.max_concurrent_requests = Some(200);
@@ -8548,7 +8596,7 @@ async fn test_concurrency_limiter_times_out_after_dispatch_wait_limit() {
     config.credential_dispatch_max_wait_secs = 1;
     config.credential_in_flight_lease_max_secs = 0;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8586,7 +8634,7 @@ async fn test_in_flight_lease_guard_drop_releases_slot() {
     let mut config = Config::default();
     config.credential_max_concurrent_requests = 1;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8608,7 +8656,7 @@ async fn test_expired_leaked_in_flight_lease_wakes_waiting_request() {
     config.credential_max_concurrent_requests = 1;
     config.credential_in_flight_lease_max_secs = 1;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8638,7 +8686,7 @@ async fn test_manual_clear_in_flight_leases_wakes_waiting_request() {
     config.credential_max_concurrent_requests = 1;
     config.credential_in_flight_lease_max_secs = 0;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8676,7 +8724,7 @@ async fn test_expired_in_flight_lease_is_cleaned_and_dispatch_recovers() {
     config.credential_max_concurrent_requests = 1;
     config.credential_in_flight_lease_max_secs = 1;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8697,7 +8745,7 @@ async fn test_summary_snapshot_cleans_expired_in_flight_lease() {
     config.credential_max_concurrent_requests = 1;
     config.credential_in_flight_lease_max_secs = 1;
 
-    let mut cred = KiroCredentials::default();
+    let mut cred = LocalUpstreamCredentials::default();
     cred.access_token = Some("t1".to_string());
     cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -8718,13 +8766,13 @@ async fn test_added_credential_warmup_does_not_fake_success_count() {
     config.credential_warmup_requests = 2;
     config.credential_warmup_selection_percent = 0;
 
-    let mut existing = KiroCredentials::default();
+    let mut existing = LocalUpstreamCredentials::default();
     existing.access_token = Some("existing".to_string());
     existing.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
     let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
 
-    let mut new_cred = KiroCredentials::default();
+    let mut new_cred = LocalUpstreamCredentials::default();
     new_cred.kiro_api_key = Some("ksk_new_key".to_string());
     new_cred.auth_method = Some("api_key".to_string());
     let new_id = manager.add_credential(new_cred).await.unwrap();
@@ -8766,10 +8814,10 @@ async fn test_warmup_selection_percent_allows_real_request_sampling() {
     config.credential_warmup_requests = 2;
     config.credential_warmup_selection_percent = 100;
 
-    let mut ready = KiroCredentials::default();
+    let mut ready = LocalUpstreamCredentials::default();
     ready.access_token = Some("ready".to_string());
     ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut warming = KiroCredentials::default();
+    let mut warming = LocalUpstreamCredentials::default();
     warming.access_token = Some("warming".to_string());
     warming.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -11634,11 +11682,11 @@ async fn test_only_available_credential_is_not_an_alternate_after_soft_failure()
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut disabled1 = KiroCredentials::default();
+    let mut disabled1 = LocalUpstreamCredentials::default();
     disabled1.disabled = true;
-    let mut disabled2 = KiroCredentials::default();
+    let mut disabled2 = LocalUpstreamCredentials::default();
     disabled2.disabled = true;
-    let mut active = KiroCredentials::default();
+    let mut active = LocalUpstreamCredentials::default();
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -11668,10 +11716,10 @@ async fn test_deferred_session_soft_failure_and_unbind_use_local_state() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -11718,8 +11766,8 @@ fn test_cached_alternate_usable_credential_uses_current_memory_state() {
     let manager = MultiTokenManager::new(
         config,
         vec![
-            test_access_token_credential("t1", "Pro"),
-            test_access_token_credential("t2", "Pro"),
+            test_access_token_credential("t1", "account-class-a"),
+            test_access_token_credential("t2", "account-class-a"),
         ],
         None,
         None,
@@ -11748,13 +11796,13 @@ fn test_cached_alternate_usable_credential_uses_current_memory_state() {
 
 #[test]
 fn test_cached_alternate_usable_credential_is_false_for_single_active_credential() {
-    let mut disabled = KiroCredentials::default();
+    let mut disabled = LocalUpstreamCredentials::default();
     disabled.disabled = true;
     let manager = MultiTokenManager::new(
         Config::default(),
         vec![
             disabled,
-            test_access_token_credential("active-token", "Pro"),
+            test_access_token_credential("active-token", "account-class-a"),
         ],
         None,
         None,
@@ -11771,9 +11819,9 @@ async fn test_excluding_only_available_credential_reports_temporary_exclusion() 
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut disabled = KiroCredentials::default();
+    let mut disabled = LocalUpstreamCredentials::default();
     disabled.disabled = true;
-    let mut active = KiroCredentials::default();
+    let mut active = LocalUpstreamCredentials::default();
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -11806,12 +11854,12 @@ async fn test_bound_disabled_proxy_resource_is_not_dispatchable() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut blocked = KiroCredentials::default();
+    let mut blocked = LocalUpstreamCredentials::default();
     blocked.access_token = Some("blocked-token".to_string());
     blocked.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     blocked.proxy_resource_id = Some(7);
 
-    let mut active = KiroCredentials::default();
+    let mut active = LocalUpstreamCredentials::default();
     active.access_token = Some("active-token".to_string());
     active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -11843,9 +11891,9 @@ async fn test_all_proxy_blocked_credentials_fail_fast_with_proxy_error() {
     config.proxy_url = Some("http://global-proxy:8080".to_string());
     config.credential_dispatch_max_wait_secs = 1;
 
-    let mut missing_proxy = test_access_token_credential("missing-proxy", "Pro");
+    let mut missing_proxy = test_access_token_credential("missing-proxy", "account-class-a");
     missing_proxy.proxy_resource_id = Some(404);
-    let mut disabled_proxy = test_access_token_credential("disabled-proxy", "Pro");
+    let mut disabled_proxy = test_access_token_credential("disabled-proxy", "account-class-a");
     disabled_proxy.proxy_resource_id = Some(7);
 
     let manager = MultiTokenManager::new(
@@ -11898,7 +11946,7 @@ async fn test_bound_missing_proxy_resource_does_not_fallback_to_global_proxy() {
     let mut config = Config::default();
     config.proxy_url = Some("http://global-proxy:8080".to_string());
 
-    let mut credential = KiroCredentials::default();
+    let mut credential = LocalUpstreamCredentials::default();
     credential.access_token = Some("token".to_string());
     credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
     credential.proxy_resource_id = Some(404);
@@ -11946,9 +11994,9 @@ fn test_external_import_refresh_preserves_bound_proxy_resource() {
         },
     );
 
-    let mut source = KiroCredentials::default();
+    let mut source = LocalUpstreamCredentials::default();
     source.proxy_resource_id = Some(7);
-    let mut refreshed = KiroCredentials::default();
+    let mut refreshed = LocalUpstreamCredentials::default();
     refreshed.access_token = Some("refreshed-token".to_string());
     refreshed.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -11976,10 +12024,10 @@ async fn test_unbind_session_if_bound_to_does_not_clear_original_binding() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -12010,49 +12058,55 @@ async fn test_unbind_session_if_bound_to_does_not_clear_original_binding() {
 
 #[tokio::test]
 async fn test_current_id_respects_opus_model_filter() {
-    let mut free = KiroCredentials::default();
-    free.priority = 0;
-    free.subscription_title = Some("Free".to_string());
-    free.access_token = Some("free-token".to_string());
-    free.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+    let mut general = LocalUpstreamCredentials::default();
+    general.priority = 0;
+    general.subscription_title = Some("account-class-b".to_string());
+    general.supported_models = vec![SONNET_MODEL.to_string()];
+    general.access_token = Some("general-token".to_string());
+    general.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let mut pro = KiroCredentials::default();
-    pro.priority = 1;
-    pro.subscription_title = Some("Pro".to_string());
-    pro.access_token = Some("pro-token".to_string());
-    pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+    let mut capable = LocalUpstreamCredentials::default();
+    capable.priority = 1;
+    capable.subscription_title = Some("account-class-a".to_string());
+    capable.supported_models = vec!["claude-opus-4".to_string()];
+    capable.access_token = Some("capable-token".to_string());
+    capable.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
     let manager =
-        MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
+        MultiTokenManager::new(Config::default(), vec![general, capable], None, None, false)
+            .unwrap();
 
     let ctx = manager
         .acquire_context(Some("claude-opus-4"))
         .await
         .unwrap();
     assert_eq!(ctx.id, 2);
-    assert_eq!(ctx.token, "pro-token");
+    assert_eq!(ctx.token, "capable-token");
 }
 
 #[tokio::test]
-async fn test_sonnet_model_can_use_free_credentials() {
-    let mut free = KiroCredentials::default();
-    free.priority = 0;
-    free.subscription_title = Some("Free".to_string());
-    free.access_token = Some("free-token".to_string());
-    free.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+async fn test_sonnet_model_can_use_general_credentials() {
+    let mut general = LocalUpstreamCredentials::default();
+    general.priority = 0;
+    general.subscription_title = Some("account-class-b".to_string());
+    general.supported_models = vec![SONNET_MODEL.to_string()];
+    general.access_token = Some("general-token".to_string());
+    general.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-    let mut pro = KiroCredentials::default();
-    pro.priority = 1;
-    pro.subscription_title = Some("Pro".to_string());
-    pro.access_token = Some("pro-token".to_string());
-    pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+    let mut capable = LocalUpstreamCredentials::default();
+    capable.priority = 1;
+    capable.subscription_title = Some("account-class-a".to_string());
+    capable.supported_models = vec![SONNET_MODEL.to_string(), "claude-opus-4".to_string()];
+    capable.access_token = Some("capable-token".to_string());
+    capable.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
     let manager =
-        MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
+        MultiTokenManager::new(Config::default(), vec![general, capable], None, None, false)
+            .unwrap();
 
     let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
     assert_eq!(ctx.id, 1);
-    assert_eq!(ctx.token, "free-token");
+    assert_eq!(ctx.token, "general-token");
     ctx.release_in_flight();
 }
 
@@ -12062,12 +12116,12 @@ async fn test_sonnet_bound_session_falls_back_when_bound_credential_is_full() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_max_concurrent_requests = 1;
 
-    let mut cred1 = KiroCredentials::default();
-    cred1.subscription_title = Some("Free".to_string());
+    let mut cred1 = LocalUpstreamCredentials::default();
+    cred1.subscription_title = Some("account-class-b".to_string());
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
-    cred2.subscription_title = Some("Free".to_string());
+    let mut cred2 = LocalUpstreamCredentials::default();
+    cred2.subscription_title = Some("account-class-b".to_string());
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -12106,12 +12160,12 @@ async fn test_sonnet_rate_limiter_prefers_other_dispatchable_credential() {
     config.load_balancing_mode = "balanced".to_string();
     config.credential_rpm = Some(1);
 
-    let mut cred1 = KiroCredentials::default();
-    cred1.subscription_title = Some("Free".to_string());
+    let mut cred1 = LocalUpstreamCredentials::default();
+    cred1.subscription_title = Some("account-class-b".to_string());
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
-    cred2.subscription_title = Some("Free".to_string());
+    let mut cred2 = LocalUpstreamCredentials::default();
+    cred2.subscription_title = Some("account-class-b".to_string());
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -12133,12 +12187,12 @@ async fn test_sonnet_rate_limit_cooldown_skips_limited_credential() {
     config.credential_max_cooldown_secs = 60;
     config.credential_cooldown_jitter_percent = 0;
 
-    let mut cred1 = KiroCredentials::default();
-    cred1.subscription_title = Some("Free".to_string());
+    let mut cred1 = LocalUpstreamCredentials::default();
+    cred1.subscription_title = Some("account-class-b".to_string());
     cred1.access_token = Some("t1".to_string());
     cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
-    let mut cred2 = KiroCredentials::default();
-    cred2.subscription_title = Some("Free".to_string());
+    let mut cred2 = LocalUpstreamCredentials::default();
+    cred2.subscription_title = Some("account-class-b".to_string());
     cred2.access_token = Some("t2".to_string());
     cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -12172,8 +12226,8 @@ async fn test_sonnet_pool_uses_available_credentials_when_one_is_cooldown_and_st
 
     let credentials = (1..=4)
         .map(|idx| {
-            let mut cred = KiroCredentials::default();
-            cred.subscription_title = Some("Free".to_string());
+            let mut cred = LocalUpstreamCredentials::default();
+            cred.subscription_title = Some("account-class-b".to_string());
             cred.access_token = Some(format!("t{idx}"));
             cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
             cred
@@ -12243,9 +12297,9 @@ async fn test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load(
 
     let credentials = (1..=CREDENTIAL_COUNT)
         .map(|idx| {
-            let mut cred = KiroCredentials::default();
-            cred.subscription_title = Some("Free".to_string());
-            cred.email = Some(format!("sonnet-free-{idx}@example.test"));
+            let mut cred = LocalUpstreamCredentials::default();
+            cred.subscription_title = Some("account-class-b".to_string());
+            cred.email = Some(format!("sonnet-account-{idx}@example.test"));
             cred.access_token = Some(format!("t{idx}"));
             cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
             cred
@@ -12389,8 +12443,8 @@ async fn test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load(
 #[test]
 fn test_multi_token_manager_report_refresh_failure() {
     let config = Config::default();
-    let cred1 = KiroCredentials::default();
-    let cred2 = KiroCredentials::default();
+    let cred1 = LocalUpstreamCredentials::default();
+    let cred2 = LocalUpstreamCredentials::default();
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -12413,8 +12467,8 @@ fn test_multi_token_manager_report_refresh_failure() {
 #[tokio::test]
 async fn test_multi_token_manager_refresh_failure_disabled_is_not_auto_recovered() {
     let config = Config::default();
-    let cred1 = KiroCredentials::default();
-    let cred2 = KiroCredentials::default();
+    let cred1 = LocalUpstreamCredentials::default();
+    let cred2 = LocalUpstreamCredentials::default();
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -12440,8 +12494,8 @@ async fn test_multi_token_manager_refresh_failure_disabled_is_not_auto_recovered
 #[test]
 fn test_multi_token_manager_report_quota_exhausted() {
     let config = Config::default();
-    let cred1 = KiroCredentials::default();
-    let cred2 = KiroCredentials::default();
+    let cred1 = LocalUpstreamCredentials::default();
+    let cred2 = LocalUpstreamCredentials::default();
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -12458,8 +12512,8 @@ fn test_multi_token_manager_report_quota_exhausted() {
 #[test]
 fn test_report_risk_controlled_disables_with_specific_reason() {
     let config = Config::default();
-    let cred1 = KiroCredentials::default();
-    let cred2 = KiroCredentials::default();
+    let cred1 = LocalUpstreamCredentials::default();
+    let cred2 = LocalUpstreamCredentials::default();
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -12498,9 +12552,9 @@ async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
     let manager = MultiTokenManager::new(
         config,
         vec![
-            test_access_token_credential("risk-1", "Pro"),
-            test_access_token_credential("risk-2", "Pro"),
-            test_access_token_credential("risk-3", "Pro"),
+            test_access_token_credential("risk-1", "account-class-a"),
+            test_access_token_credential("risk-2", "account-class-a"),
+            test_access_token_credential("risk-3", "account-class-a"),
         ],
         None,
         None,
@@ -12565,8 +12619,8 @@ fn runtime_capacity_updates_reset_active_credential_warmup() {
     let manager = MultiTokenManager::new(
         config,
         vec![
-            test_access_token_credential("warmup-global-1", "Pro"),
-            test_access_token_credential("warmup-global-2", "Pro"),
+            test_access_token_credential("warmup-global-1", "account-class-a"),
+            test_access_token_credential("warmup-global-2", "account-class-a"),
         ],
         None,
         None,
@@ -12598,8 +12652,8 @@ fn runtime_capacity_updates_reset_active_credential_warmup() {
 #[tokio::test]
 async fn test_multi_token_manager_quota_disabled_is_not_auto_recovered() {
     let config = Config::default();
-    let cred1 = KiroCredentials::default();
-    let cred2 = KiroCredentials::default();
+    let cred1 = LocalUpstreamCredentials::default();
+    let cred2 = LocalUpstreamCredentials::default();
 
     let manager = MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
@@ -12629,7 +12683,7 @@ fn test_credential_region_priority_uses_credential_auth_region() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.auth_region = Some("eu-west-1".to_string());
 
     let region = credentials.effective_auth_region(&config);
@@ -12642,7 +12696,7 @@ fn test_credential_region_priority_fallback_to_credential_region() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.region = Some("eu-central-1".to_string());
 
     let region = credentials.effective_auth_region(&config);
@@ -12655,7 +12709,7 @@ fn test_credential_region_priority_fallback_to_config() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let credentials = KiroCredentials::default();
+    let credentials = LocalUpstreamCredentials::default();
     assert!(credentials.auth_region.is_none());
     assert!(credentials.region.is_none());
 
@@ -12669,13 +12723,13 @@ fn test_multiple_credentials_use_respective_regions() {
     let mut config = Config::default();
     config.region = "ap-northeast-1".to_string();
 
-    let mut cred1 = KiroCredentials::default();
+    let mut cred1 = LocalUpstreamCredentials::default();
     cred1.auth_region = Some("us-east-1".to_string());
 
-    let mut cred2 = KiroCredentials::default();
+    let mut cred2 = LocalUpstreamCredentials::default();
     cred2.region = Some("eu-west-1".to_string());
 
-    let cred3 = KiroCredentials::default(); // 无 region，使用 config
+    let cred3 = LocalUpstreamCredentials::default(); // 无 region，使用 config
 
     assert_eq!(cred1.effective_auth_region(&config), "us-east-1");
     assert_eq!(cred2.effective_auth_region(&config), "eu-west-1");
@@ -12688,7 +12742,7 @@ fn test_idc_oidc_endpoint_uses_credential_auth_region() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.auth_region = Some("eu-central-1".to_string());
 
     let region = credentials.effective_auth_region(&config);
@@ -12703,7 +12757,7 @@ fn test_social_refresh_endpoint_uses_credential_auth_region() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.auth_region = Some("ap-southeast-1".to_string());
 
     let region = credentials.effective_auth_region(&config);
@@ -12721,7 +12775,7 @@ fn test_api_call_uses_effective_api_region() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.region = Some("eu-west-1".to_string());
 
     // 凭据.region 不参与 api_region 回退链
@@ -12737,7 +12791,7 @@ fn test_api_call_uses_credential_api_region() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.api_region = Some("eu-central-1".to_string());
 
     let api_region = credentials.effective_api_region(&config);
@@ -12748,7 +12802,7 @@ fn test_api_call_uses_credential_api_region() {
 
 #[test]
 fn test_region_update_preserves_matching_profile_arn() {
-    let mut credential = KiroCredentials {
+    let mut credential = LocalUpstreamCredentials {
         auth_method: Some("idc".to_string()),
         access_token: Some("access".to_string()),
         expires_at: Some("2099-01-01T00:00:00Z".to_string()),
@@ -12779,7 +12833,7 @@ fn test_region_update_preserves_matching_profile_arn() {
 
 #[test]
 fn test_region_update_clears_conflicting_profile_arn() {
-    let mut credential = KiroCredentials {
+    let mut credential = LocalUpstreamCredentials {
         auth_method: Some("idc".to_string()),
         profile_arn: Some(
             "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL".to_string(),
@@ -12811,7 +12865,7 @@ fn test_credential_region_empty_string_treated_as_set() {
     let mut config = Config::default();
     config.region = "us-west-2".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.auth_region = Some("".to_string());
 
     let region = credentials.effective_auth_region(&config);
@@ -12825,7 +12879,7 @@ fn test_auth_and_api_region_independent() {
     let mut config = Config::default();
     config.region = "default".to_string();
 
-    let mut credentials = KiroCredentials::default();
+    let mut credentials = LocalUpstreamCredentials::default();
     credentials.auth_region = Some("auth-only".to_string());
     credentials.api_region = Some("api-only".to_string());
 
@@ -12919,7 +12973,7 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
     };
     let (credential, runtime) = store
         .insert_credential_with_runtime_patch(
-            &KiroCredentials {
+            &LocalUpstreamCredentials {
                 kiro_api_key: Some("manager-auth-reset-old".to_string()),
                 auth_method: Some("api_key".to_string()),
                 disabled: true,

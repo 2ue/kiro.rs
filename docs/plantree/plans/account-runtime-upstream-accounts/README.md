@@ -216,9 +216,17 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Concrete local-upstream provider and endpoint types now use `LocalUpstreamProvider`, `LocalUpstreamEndpoint`, `LocalUpstreamApiResponse`, `LocalUpstreamApiCompletion`, `LocalUpstreamStreamResponse` and `LocalUpstreamStreamCompletion`; provider diagnostics and endpoint comments now use local-upstream wording while existing transport, retry and completion behavior stays unchanged.
 - Local-upstream call-trace types now use `LocalUpstreamCredentialAttempt`, `LocalUpstreamCallError` and `LocalUpstreamCallFailureKind`; MCP attribution, provider downcast helpers and serialized attempt fields are unchanged.
 - Local-upstream available-model catalog types now use `LocalUpstreamAvailableModelCatalog`, `LocalUpstreamAvailableModel`, `LocalUpstreamAvailableModelsResponse`, `LocalUpstreamModelCapabilityCohortKey`, `LocalUpstreamModelCapabilityCohort`, `LocalUpstreamModelTokenLimits` and `LocalUpstreamModelPromptCaching`; ListAvailableModels wire parsing and reasoning cohort behavior are unchanged.
+- Local-upstream credential types now use `LocalUpstreamCredentials`, `LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT` and local-upstream API-key parsing helper names. Compatibility fields such as `kiroApiKey` / `kiro_api_key` remain unchanged.
+- Scheduler model eligibility no longer derives Opus capability from subscription labels such as Pro/Free. Subscription labels are retained only as account-info metadata; dispatch uses explicit `supported_models` capability data.
 
 Last verified on 2026-08-16:
 
+- `rg -n "\bKiroCredentials\b|\bKIRO_API_KEY_DEFAULT_ENDPOINT\b|\bsplit_kiro_api_key_and_region\b|\bvalidate_kiro_api_key_pipe_format\b|\blooks_like_kiro_api_key_text\b|\bvalidate_kiro_region_host_label\b" src --glob '!target/**'`
+- `rg -n "supports_opus|is_opus_model|Free 账号|付费订阅|KIRO PRO|KIRO FREE|\bFree\b|\bPro\b|\bfree\b|\bpro\b" src/local_upstream_impl src/anthropic/converter/model.rs --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-test1 -- bash -lc 'cargo test model::credentials -- --nocapture && cargo test model::usage_limits -- --nocapture && cargo test selection_failure_summary_records_model_not_supported -- --nocapture && cargo test test_local_pool_route_state_sees_model_compatible_credential_added -- --nocapture && cargo test test_current_id_respects_opus_model_filter -- --nocapture && cargo test test_sonnet_model_can_use_general_credentials -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-test2 -- cargo test test_model_scoped_429_high_concurrency_disabled_and_model_filters -- --nocapture`
 - `rg -n "\bKiroAvailableModelCatalog\b|\bKiroAvailableModelsResponse\b|\bKiroAvailableModel\b|\bKiroModelCapabilityCohortKey\b|\bKiroModelCapabilityCohort\b|\bKiroModelTokenLimits\b|\bKiroModelPromptCaching\b" src --glob '!target/**'`
 - `rg -n "Kiro ListAvailableModels|serialized to Kiro|Kiro model-capability|Kiro model|Kiro 模型|Kiro 上游|Kiro available" src/local_upstream_impl/model/available_models.rs src/local_upstream_impl/provider.rs src/local_upstream_impl/token_manager/manager.rs src/storage/postgres.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-model-catalog-types-fmt1 -- cargo fmt`

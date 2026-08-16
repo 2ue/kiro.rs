@@ -178,6 +178,8 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Concrete local-upstream provider, endpoint trait, API response and stream completion types now use `LocalUpstream*` names. Provider diagnostics and endpoint comments use local-upstream wording while existing transport, retry, completion and body-send behavior stays unchanged.
 - Local-upstream call-trace attempt, call-error and failure-kind types now use `LocalUpstream*` names while preserving serialized attempt fields, provider downcast helpers and MCP attribution behavior.
 - Local-upstream available-model catalog, available-model item, model-capability cohort and token-limit/prompt-cache helper types now use `LocalUpstream*` names while preserving ListAvailableModels parsing and reasoning cohort checks.
+- Local-upstream credential type, API-key endpoint constant and API-key parsing helpers now use local-upstream names while preserving legacy credential wire/storage field compatibility.
+- Opus/model dispatch no longer derives account capability from Pro/Free subscription labels. Subscription labels remain account-info metadata only; scheduler tests now use explicit `supported_models` capability fixtures.
 
 ## In Progress
 
@@ -186,7 +188,8 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 
 ## Next
 
-- Rename concrete local-upstream credential and event model types so Kiro-specific runtime names shrink toward explicit compatibility-only fields.
+- Rename concrete local-upstream event model types so Kiro-specific runtime names shrink toward explicit compatibility-only fields.
+- Remove remaining Admin subscription credit-tier heuristics from account capability behavior; keep usage/account-info labels only where compatibility requires them.
 - Split scheduler primitives from legacy credential/provider dependencies before deleting local Kiro auth, endpoint and EventStream paths.
 - Convert body and protocol paths to canonical/upstream-account logic with no legacy Kiro envelope or Kiro event dependency.
 

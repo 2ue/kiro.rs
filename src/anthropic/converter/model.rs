@@ -90,7 +90,7 @@ fn is_native_claude_family_model(model: &str, family: &str) -> bool {
 ///
 /// 这是仅在上游 `ListAvailableModels` 能力目录缺失时使用的保守兜底。
 /// 真实请求应优先使用上游目录中的 `maxInputTokens`；同名/同族模型在不同
-/// 账号池中可能是 200K 或 1M，不能仅凭普通别名把 free Sonnet 误抬成 1M。
+/// 账号池中可能是 200K 或 1M，不能仅凭普通别名把标准 Sonnet 误抬成 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     let model_lower = model.to_lowercase();
     let explicit_one_m = model_lower.ends_with("[1m]");

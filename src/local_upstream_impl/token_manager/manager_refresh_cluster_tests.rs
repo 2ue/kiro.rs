@@ -181,8 +181,8 @@ where
     }
 }
 
-fn expired_cluster_credential(endpoint: String, marker: &str) -> KiroCredentials {
-    KiroCredentials {
+fn expired_cluster_credential(endpoint: String, marker: &str) -> LocalUpstreamCredentials {
+    LocalUpstreamCredentials {
         auth_method: Some("external_idp".to_string()),
         access_token: Some(format!("old-access-{marker}")),
         refresh_token: Some(format!("refresh-{marker}-{}", "r".repeat(150))),
@@ -196,7 +196,7 @@ fn expired_cluster_credential(endpoint: String, marker: &str) -> KiroCredentials
 }
 
 fn cluster_managers(
-    credential: &KiroCredentials,
+    credential: &LocalUpstreamCredentials,
     postgres: &[Arc<PostgresStore>],
     redis: &[Arc<RedisStore>],
 ) -> [Arc<MultiTokenManager>; 2] {
@@ -252,7 +252,7 @@ fn refresh_identity_for_manager(manager: &MultiTokenManager, id: u64) -> Refresh
 
 fn assert_cluster_refresh_identity_stable(
     managers: &[Arc<MultiTokenManager>; 2],
-    credential: &KiroCredentials,
+    credential: &LocalUpstreamCredentials,
     marker: &str,
 ) {
     let id = credential.id.unwrap();
@@ -266,7 +266,7 @@ fn assert_cluster_refresh_identity_stable(
 
 async fn concurrent_cluster_refresh(
     managers: &[Arc<MultiTokenManager>; 2],
-    credential: &KiroCredentials,
+    credential: &LocalUpstreamCredentials,
     update_health: bool,
 ) -> Vec<anyhow::Result<CallContext>> {
     let id = credential.id.unwrap();
@@ -300,7 +300,7 @@ async fn concurrent_cluster_refresh(
 
 async fn wait_for_cluster_refresh_recovery(
     managers: &[Arc<MultiTokenManager>; 2],
-    credential: &KiroCredentials,
+    credential: &LocalUpstreamCredentials,
     endpoint: &ClusterRefreshEndpoint,
     expected_hits: usize,
     marker: &str,
@@ -317,7 +317,7 @@ async fn wait_for_cluster_refresh_recovery(
 
 async fn wait_for_cluster_refresh_success_contexts(
     managers: &[Arc<MultiTokenManager>; 2],
-    credential: &KiroCredentials,
+    credential: &LocalUpstreamCredentials,
     endpoint: &ClusterRefreshEndpoint,
     expected_hits: usize,
     marker: &str,
@@ -385,7 +385,7 @@ fn refresh_failure_is_pre_send_setup_failure(failure: &RefreshFailure) -> bool {
 
 async fn wait_for_shared_upstream_failure_wave(
     managers: &[Arc<MultiTokenManager>; 2],
-    credential: &KiroCredentials,
+    credential: &LocalUpstreamCredentials,
     endpoint: &ClusterRefreshEndpoint,
     marker: &str,
 ) {

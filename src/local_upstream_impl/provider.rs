@@ -43,7 +43,7 @@ use crate::local_upstream_impl::model::available_models::{
     LocalUpstreamAvailableModel, LocalUpstreamAvailableModelCatalog,
     LocalUpstreamAvailableModelsResponse,
 };
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::local_upstream_impl::protocol::{
     extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
 };
@@ -1037,7 +1037,7 @@ mod tests {
         AccountRejectReason, LocalUpstreamCallFailureKind, SelectionFailureStage,
     };
     use crate::local_upstream_impl::endpoint::{CliEndpoint, IdeEndpoint, LocalUpstreamEndpoint};
-    use crate::local_upstream_impl::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
     use crate::local_upstream_impl::token_manager::{
         AcquireMode, AuxiliaryConcurrencyKind, MultiTokenManager,
     };
@@ -2028,9 +2028,9 @@ mod tests {
         )
     }
 
-    fn fake_bad_request_credentials(pool_size: usize) -> Vec<KiroCredentials> {
+    fn fake_bad_request_credentials(pool_size: usize) -> Vec<LocalUpstreamCredentials> {
         (1..=pool_size)
-            .map(|id| KiroCredentials {
+            .map(|id| LocalUpstreamCredentials {
                 id: Some(id as u64),
                 access_token: Some(format!("fake-token-{id}")),
                 expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
@@ -2040,8 +2040,8 @@ mod tests {
             .collect()
     }
 
-    fn fake_external_idp_credential(id: u64, token: &str) -> KiroCredentials {
-        KiroCredentials {
+    fn fake_external_idp_credential(id: u64, token: &str) -> LocalUpstreamCredentials {
+        LocalUpstreamCredentials {
             id: Some(id),
             access_token: Some(token.to_string()),
             refresh_token: Some(format!("refresh-{token}-{}", "x".repeat(256))),
@@ -2237,7 +2237,7 @@ mod tests {
 
     fn fake_profile_provider(
         base_url: &str,
-        credentials: Vec<KiroCredentials>,
+        credentials: Vec<LocalUpstreamCredentials>,
         policy: Option<ProfileArnDiscoveryPolicy>,
     ) -> (Arc<LocalUpstreamProvider>, Arc<MultiTokenManager>) {
         fake_profile_provider_with_auxiliary_limit(base_url, credentials, policy, None)
@@ -2245,7 +2245,7 @@ mod tests {
 
     fn fake_profile_provider_with_auxiliary_limit(
         base_url: &str,
-        credentials: Vec<KiroCredentials>,
+        credentials: Vec<LocalUpstreamCredentials>,
         policy: Option<ProfileArnDiscoveryPolicy>,
         auxiliary_limit: Option<u32>,
     ) -> (Arc<LocalUpstreamProvider>, Arc<MultiTokenManager>) {
@@ -2276,7 +2276,7 @@ mod tests {
         let credentials = tokens
             .into_iter()
             .enumerate()
-            .map(|(index, token)| KiroCredentials {
+            .map(|(index, token)| LocalUpstreamCredentials {
                 id: Some(index as u64 + 1),
                 access_token: Some(token),
                 expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
@@ -2317,7 +2317,7 @@ mod tests {
         config.compression.whitespace_compression = true;
 
         let credentials = if let Some(profile_arn) = profile_arn {
-            KiroCredentials {
+            LocalUpstreamCredentials {
                 id: Some(1),
                 access_token: Some("fake-body-capture-access-token".to_string()),
                 expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
@@ -2327,7 +2327,7 @@ mod tests {
                 ..Default::default()
             }
         } else {
-            KiroCredentials {
+            LocalUpstreamCredentials {
                 id: Some(1),
                 auth_method: Some("api_key".to_string()),
                 kiro_api_key: Some("ksk_fake_body_capture".to_string()),
@@ -3635,7 +3635,7 @@ mod tests {
                 match mutate {
                     0 => credentials[1].endpoint = Some("cli".to_string()),
                     1 => credentials[1].api_region = Some("eu-west-1".to_string()),
-                    2 => credentials[1].subscription_title = Some("KIRO FREE".to_string()),
+                    2 => credentials[1].subscription_title = Some("capability-class-b".to_string()),
                     _ => credentials[1].supported_models = vec!["claude-haiku-4.5".to_string()],
                 }
                 let manager =
@@ -3644,7 +3644,7 @@ mod tests {
                 assert_eq!(
                     manager.local_model_capability_cohorts().len(),
                     2,
-                    "round {round}: endpoint/region/subscription/model support class {mutate}"
+                    "round {round}: endpoint/region/account metadata/model support class {mutate}"
                 );
             }
         }
@@ -4212,11 +4212,11 @@ mod tests {
 
     #[test]
     fn downgrades_only_429_temporary_risk_when_credential_opted_out() {
-        let opted_out = KiroCredentials {
+        let opted_out = LocalUpstreamCredentials {
             rate_limit_auto_disable_enabled: Some(false),
             ..Default::default()
         };
-        let default_credential = KiroCredentials::default();
+        let default_credential = LocalUpstreamCredentials::default();
 
         assert!(
             LocalUpstreamProvider::should_downgrade_rate_limit_risk_to_cooldown(
@@ -5892,7 +5892,7 @@ mod tests {
 
     #[test]
     fn list_available_profiles_headers_attach_external_idp_token_type() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             ..Default::default()
         };
@@ -5931,7 +5931,7 @@ mod tests {
 
     #[test]
     fn list_available_profiles_headers_do_not_attach_token_type_for_social() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("social".to_string()),
             ..Default::default()
         };
@@ -5949,7 +5949,7 @@ mod tests {
 
     #[test]
     fn stream_completion_reports_success_once() {
-        let mut cred = KiroCredentials::default();
+        let mut cred = LocalUpstreamCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         let manager = Arc::new(
@@ -5976,7 +5976,7 @@ mod tests {
 
     #[test]
     fn stream_completion_soft_failure_does_not_count_success() {
-        let mut cred = KiroCredentials::default();
+        let mut cred = LocalUpstreamCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         let manager = Arc::new(
@@ -6003,7 +6003,7 @@ mod tests {
 
     #[test]
     fn stream_completion_upstream_failure_cools_down_credential() {
-        let mut cred = KiroCredentials::default();
+        let mut cred = LocalUpstreamCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         let manager = Arc::new(
@@ -6032,7 +6032,7 @@ mod tests {
 
     #[test]
     fn api_completion_drop_releases_in_flight_without_counting_success() {
-        let mut cred = KiroCredentials::default();
+        let mut cred = LocalUpstreamCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         let manager = Arc::new(
@@ -6061,7 +6061,7 @@ mod tests {
 
     #[test]
     fn api_completion_report_success_once() {
-        let mut cred = KiroCredentials::default();
+        let mut cred = LocalUpstreamCredentials::default();
         cred.access_token = Some("token".to_string());
         cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         let manager = Arc::new(
@@ -6092,7 +6092,7 @@ mod tests {
     #[test]
     fn mcp_completion_holds_lease_until_validated_success_for_five_rounds() {
         for _ in 0..5 {
-            let mut credential = KiroCredentials::default();
+            let mut credential = LocalUpstreamCredentials::default();
             credential.access_token = Some("mcp-success-token".to_string());
             credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
             let manager = Arc::new(
@@ -6149,7 +6149,7 @@ mod tests {
             for _ in 0..5 {
                 let mut config = Config::default();
                 config.credential_transient_cooldown_secs = 60;
-                let mut credential = KiroCredentials::default();
+                let mut credential = LocalUpstreamCredentials::default();
                 credential.access_token = Some("mcp-failure-token".to_string());
                 credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
                 let manager = Arc::new(
@@ -6195,7 +6195,7 @@ mod tests {
     #[test]
     fn mcp_completion_drop_releases_pending_lease_without_false_success_for_five_rounds() {
         for _ in 0..5 {
-            let mut credential = KiroCredentials::default();
+            let mut credential = LocalUpstreamCredentials::default();
             credential.access_token = Some("mcp-cancelled-token".to_string());
             credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
             let manager = Arc::new(
@@ -6285,7 +6285,7 @@ mod tests {
         let mut config = Config::default();
         config.credential_retry_max_attempts = 100_000;
 
-        let mut disabled = KiroCredentials::default();
+        let mut disabled = LocalUpstreamCredentials::default();
         disabled.disabled = true;
         let manager =
             Arc::new(MultiTokenManager::new(config, vec![disabled], None, None, false).unwrap());
@@ -6652,7 +6652,7 @@ mod tests {
         let mut config = Config::default();
         config.credential_retry_max_attempts = 100_000;
 
-        let mut disabled = KiroCredentials::default();
+        let mut disabled = LocalUpstreamCredentials::default();
         disabled.disabled = true;
         disabled.access_token = Some("secret-token-should-not-leak".to_string());
         let manager =
@@ -6756,7 +6756,7 @@ impl LocalUpstreamProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+    fn client_for(&self, credentials: &LocalUpstreamCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let cell = {
             let mut cache = self.client_cache.lock();
@@ -7393,7 +7393,7 @@ impl LocalUpstreamProvider {
     /// 根据凭据选择 endpoint 实现
     fn endpoint_for(
         &self,
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
     ) -> anyhow::Result<Arc<dyn LocalUpstreamEndpoint>> {
         let name = credentials
             .endpoint
@@ -7602,7 +7602,7 @@ impl LocalUpstreamProvider {
     }
 
     fn list_available_profiles_headers(
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         token: &str,
         config: &Config,
         machine_id: &str,
@@ -8443,7 +8443,7 @@ impl LocalUpstreamProvider {
     /// 仅用于 Admin 外部 JSON 验活：不加入凭据池、不参与负载均衡、不累计调度状态。
     pub async fn call_api_with_external_credentials(
         &self,
-        credentials: KiroCredentials,
+        credentials: LocalUpstreamCredentials,
         request_body: &str,
     ) -> anyhow::Result<LocalUpstreamApiResponse> {
         let ctx = self
@@ -8465,7 +8465,7 @@ impl LocalUpstreamProvider {
     /// 然后再把发现结果写回 supportedModels。
     pub async fn list_available_models_for_external_credentials(
         &self,
-        credentials: KiroCredentials,
+        credentials: LocalUpstreamCredentials,
     ) -> anyhow::Result<Vec<LocalUpstreamAvailableModel>> {
         let ctx = self
             .token_manager
@@ -12189,7 +12189,7 @@ impl LocalUpstreamProvider {
     fn should_downgrade_rate_limit_risk_to_cooldown(
         status: reqwest::StatusCode,
         reason: CredentialRiskControlReason,
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
     ) -> bool {
         status == reqwest::StatusCode::TOO_MANY_REQUESTS
             && reason == CredentialRiskControlReason::TemporarilySuspended

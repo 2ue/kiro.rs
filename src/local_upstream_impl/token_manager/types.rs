@@ -1,6 +1,6 @@
 use std::time::Duration as StdDuration;
 
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 
 use super::concurrency::InFlightLeaseGuard;
 
@@ -86,7 +86,7 @@ pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
     /// 凭据信息（用于构建请求头）
-    pub credentials: KiroCredentials,
+    pub credentials: LocalUpstreamCredentials,
     /// 访问 Token
     pub token: String,
     /// 本次请求是否实际命中了已有会话绑定。

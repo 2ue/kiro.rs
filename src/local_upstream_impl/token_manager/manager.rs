@@ -33,7 +33,9 @@ use crate::local_upstream_impl::machine_id;
 use crate::local_upstream_impl::model::available_models::{
     LocalUpstreamModelCapabilityCohort, LocalUpstreamModelCapabilityCohortKey,
 };
-use crate::local_upstream_impl::model::credentials::{KiroCredentials, profile_arn_region};
+use crate::local_upstream_impl::model::credentials::{
+    LocalUpstreamCredentials, profile_arn_region,
+};
 use crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
     Config, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
@@ -71,8 +73,7 @@ use super::capacity::{
     credential_is_temporarily_available, credential_is_usable_for_model,
     credential_proxy_availability, credential_proxy_is_dispatchable,
     effective_max_concurrent_requests, effective_weight_for_limit, entry_has_concurrency_capacity,
-    global_has_concurrency_capacity, is_opus_model, normalize_capacity_weight_units,
-    proxy_unavailable_error,
+    global_has_concurrency_capacity, normalize_capacity_weight_units, proxy_unavailable_error,
 };
 #[cfg(test)]
 use super::concurrency::record_released_in_flight_lease_tombstone;
@@ -183,7 +184,7 @@ fn apply_optional_string(target: &mut Option<String>, value: Option<String>) {
     }
 }
 
-fn api_region_conflicts_with_profile_arn(credential: &KiroCredentials) -> bool {
+fn api_region_conflicts_with_profile_arn(credential: &LocalUpstreamCredentials) -> bool {
     let Some(profile_region) = credential
         .profile_arn
         .as_deref()
@@ -204,7 +205,10 @@ fn api_region_conflicts_with_profile_arn(credential: &KiroCredentials) -> bool {
     !api_region.eq_ignore_ascii_case(profile_region)
 }
 
-fn apply_credential_auth_update(credential: &mut KiroCredentials, update: CredentialAuthUpdate) {
+fn apply_credential_auth_update(
+    credential: &mut LocalUpstreamCredentials,
+    update: CredentialAuthUpdate,
+) {
     let mut clear_access_token = false;
     let explicit_access_token = update.access_token;
     let explicit_expires_at = update.expires_at;
@@ -461,7 +465,7 @@ impl std::fmt::Debug for RefreshAttemptIdentity {
 }
 
 impl RefreshAttemptIdentity {
-    fn from_credentials(credentials: &KiroCredentials) -> Self {
+    fn from_credentials(credentials: &LocalUpstreamCredentials) -> Self {
         fn update_optional(hasher: &mut Sha256, value: Option<&str>) {
             match value {
                 Some(value) => {
@@ -493,7 +497,7 @@ impl RefreshAttemptIdentity {
     }
 
     fn from_refresh_request(
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         config: &Config,
         effective_proxy: Option<&ProxyConfig>,
     ) -> Self {
@@ -527,7 +531,7 @@ impl RefreshAttemptIdentity {
     }
 
     fn from_automatic_recovery_request(
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         rejected_access_token: &str,
         config: &Config,
         effective_proxy: Option<&ProxyConfig>,
@@ -1612,13 +1616,13 @@ async fn run_refresh_step_until<T>(
 }
 
 async fn refresh_token_until(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     client: Arc<reqwest::Client>,
     admission: Option<RefreshSendAdmission>,
     deadline: tokio::time::Instant,
     operation: &'static str,
-) -> anyhow::Result<KiroCredentials> {
+) -> anyhow::Result<LocalUpstreamCredentials> {
     let credentials = credentials.clone();
     let config = config.clone();
     run_refresh_step_until(operation, deadline, async move {
@@ -2046,7 +2050,7 @@ impl MultiTokenManager {
     #[cfg(test)]
     pub fn new(
         config: Config,
-        credentials: Vec<KiroCredentials>,
+        credentials: Vec<LocalUpstreamCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
@@ -2058,7 +2062,7 @@ impl MultiTokenManager {
     #[cfg(test)]
     pub fn new_with_postgres_store(
         config: Config,
-        credentials: Vec<KiroCredentials>,
+        credentials: Vec<LocalUpstreamCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
@@ -2078,7 +2082,7 @@ impl MultiTokenManager {
     #[cfg(test)]
     pub fn new_with_stores(
         config: Config,
-        credentials: Vec<KiroCredentials>,
+        credentials: Vec<LocalUpstreamCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
@@ -2099,7 +2103,7 @@ impl MultiTokenManager {
     #[cfg(test)]
     pub(crate) fn new_with_stores_and_runtime_state(
         config: Config,
-        credentials: Vec<KiroCredentials>,
+        credentials: Vec<LocalUpstreamCredentials>,
         proxy: Option<ProxyConfig>,
         postgres_store: Option<Arc<PostgresStore>>,
         redis_store: Option<Arc<RedisStore>>,
@@ -2118,7 +2122,7 @@ impl MultiTokenManager {
 
     pub(crate) fn new_with_stores_and_runtime_state_and_account_info(
         config: Config,
-        mut credentials: Vec<KiroCredentials>,
+        mut credentials: Vec<LocalUpstreamCredentials>,
         proxy: Option<ProxyConfig>,
         postgres_store: Option<Arc<PostgresStore>>,
         redis_store: Option<Arc<RedisStore>>,
@@ -2951,9 +2955,7 @@ impl MultiTokenManager {
         for entry in entries.iter() {
             let (reason, cooldown_remaining) = if entry.disabled {
                 (AccountRejectReason::Disabled, None)
-            } else if !entry.credentials.supports_model(&[model])
-                || (is_opus_model(model) && !entry.credentials.supports_opus())
-            {
+            } else if !entry.credentials.supports_model(&[model]) {
                 (AccountRejectReason::ModelNotSupported, None)
             } else if !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
                 (AccountRejectReason::ProxyUnavailable, None)
@@ -5171,7 +5173,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
         request_weight_units: u32,
-    ) -> Option<(u64, KiroCredentials)> {
+    ) -> Option<(u64, LocalUpstreamCredentials)> {
         if let Err(err) = self.refresh_scheduler_state_from_redis() {
             tracing::warn!("选择凭据前同步 Redis 调度状态失败: {}", err);
             return None;
@@ -5283,7 +5285,7 @@ impl MultiTokenManager {
         bound_id: u64,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
-    ) -> Option<(u64, KiroCredentials)> {
+    ) -> Option<(u64, LocalUpstreamCredentials)> {
         if excluded_ids.contains(&bound_id) {
             return None;
         }
@@ -5635,7 +5637,7 @@ impl MultiTokenManager {
     /// 冷却，传输、上游、解析及内部协调失败只在当前请求中排除，不改变凭据健康。
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤显式支持该模型的凭据
     #[cfg(test)]
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         self.acquire_context_for_session(model, None, &HashSet::new())
@@ -5720,7 +5722,7 @@ impl MultiTokenManager {
             RpmLimited,
         }
         enum AcquireDecision {
-            Selected(u64, KiroCredentials, bool, bool),
+            Selected(u64, LocalUpstreamCredentials, bool, bool),
             WaitForDispatch {
                 reason: DispatchWaitReason,
                 available: usize,
@@ -6763,7 +6765,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
         deadline: tokio::time::Instant,
-    ) -> anyhow::Result<KiroCredentials> {
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         let Some(store) = self.postgres_store.as_ref() else {
             let entries = self.entries.lock();
             return entries
@@ -6835,7 +6837,7 @@ impl MultiTokenManager {
     async fn try_ensure_token(
         &self,
         id: u64,
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         update_refresh_health: bool,
     ) -> anyhow::Result<CallContext> {
         self.try_ensure_token_with_budgets_and_auxiliary_budget(
@@ -6851,7 +6853,7 @@ impl MultiTokenManager {
     async fn try_ensure_token_with_auxiliary_budget(
         &self,
         id: u64,
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         update_refresh_health: bool,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     ) -> anyhow::Result<CallContext> {
@@ -6869,7 +6871,7 @@ impl MultiTokenManager {
     async fn try_ensure_token_with_budgets(
         &self,
         id: u64,
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         update_refresh_health: bool,
         budgets: TokenRefreshBudgets,
     ) -> anyhow::Result<CallContext> {
@@ -6886,7 +6888,7 @@ impl MultiTokenManager {
     async fn try_ensure_token_with_budgets_and_auxiliary_budget(
         &self,
         id: u64,
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         update_refresh_health: bool,
         budgets: TokenRefreshBudgets,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
@@ -7193,7 +7195,7 @@ impl MultiTokenManager {
                             })?;
                         persisted_storage_revision
                             .store(new_creds.storage_revision, Ordering::Release);
-                        Ok::<KiroCredentials, anyhow::Error>(new_creds)
+                        Ok::<LocalUpstreamCredentials, anyhow::Error>(new_creds)
                     }
                     .await;
                     if redis_refresh_lease.is_some() {
@@ -7330,7 +7332,7 @@ impl MultiTokenManager {
     async fn token_context_from_credentials_until(
         &self,
         id: u64,
-        creds: KiroCredentials,
+        creds: LocalUpstreamCredentials,
         update_refresh_health: bool,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<CallContext> {
@@ -7378,8 +7380,8 @@ impl MultiTokenManager {
 
     fn resolve_proxy_for_credential(
         &self,
-        mut creds: KiroCredentials,
-    ) -> anyhow::Result<KiroCredentials> {
+        mut creds: LocalUpstreamCredentials,
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         if creds.proxy_url.is_some() {
             return Ok(creds);
         }
@@ -7403,9 +7405,9 @@ impl MultiTokenManager {
     }
 
     fn preserve_proxy_fields(
-        mut credentials: KiroCredentials,
-        source: &KiroCredentials,
-    ) -> KiroCredentials {
+        mut credentials: LocalUpstreamCredentials,
+        source: &LocalUpstreamCredentials,
+    ) -> LocalUpstreamCredentials {
         credentials.proxy_url = source.proxy_url.clone();
         credentials.proxy_username = source.proxy_username.clone();
         credentials.proxy_password = source.proxy_password.clone();
@@ -7413,7 +7415,7 @@ impl MultiTokenManager {
         credentials
     }
 
-    fn credential_from_entry(entry: &CredentialEntry) -> KiroCredentials {
+    fn credential_from_entry(entry: &CredentialEntry) -> LocalUpstreamCredentials {
         let mut cred = entry.credentials.clone();
         cred.id = Some(entry.id);
         cred.disabled = if entry.runtime_persistence_degraded {
@@ -7428,7 +7430,10 @@ impl MultiTokenManager {
         cred
     }
 
-    fn merge_refresh_fields(target: &mut KiroCredentials, source: &KiroCredentials) {
+    fn merge_refresh_fields(
+        target: &mut LocalUpstreamCredentials,
+        source: &LocalUpstreamCredentials,
+    ) {
         target.access_token = source.access_token.clone();
         target.refresh_token = source.refresh_token.clone();
         target.profile_arn = source.profile_arn.clone();
@@ -7440,10 +7445,10 @@ impl MultiTokenManager {
     }
 
     fn merge_credential_update(
-        base: &KiroCredentials,
-        requested: &KiroCredentials,
-        current: &KiroCredentials,
-    ) -> anyhow::Result<KiroCredentials> {
+        base: &LocalUpstreamCredentials,
+        requested: &LocalUpstreamCredentials,
+        current: &LocalUpstreamCredentials,
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         if base.id != requested.id || base.id != current.id {
             anyhow::bail!("凭据 CAS 三方合并的 id 不一致");
         }
@@ -7478,7 +7483,7 @@ impl MultiTokenManager {
             }
         }
 
-        let mut merged: KiroCredentials = serde_json::from_value(merged_value)?;
+        let mut merged: LocalUpstreamCredentials = serde_json::from_value(merged_value)?;
         merged.id = current.id;
         merged.created_at = current.created_at.clone();
         merged.updated_at = current.updated_at.clone();
@@ -7491,9 +7496,9 @@ impl MultiTokenManager {
     }
 
     fn credential_update_is_applied(
-        base: &KiroCredentials,
-        requested: &KiroCredentials,
-        current: &KiroCredentials,
+        base: &LocalUpstreamCredentials,
+        requested: &LocalUpstreamCredentials,
+        current: &LocalUpstreamCredentials,
     ) -> anyhow::Result<bool> {
         let base_value = serde_json::to_value(base)?;
         let requested_value = serde_json::to_value(requested)?;
@@ -7515,9 +7520,9 @@ impl MultiTokenManager {
     }
 
     fn credential_runtime_patch_is_applied(
-        base: &KiroCredentials,
-        requested: &KiroCredentials,
-        current: &KiroCredentials,
+        base: &LocalUpstreamCredentials,
+        requested: &LocalUpstreamCredentials,
+        current: &LocalUpstreamCredentials,
         runtime: Option<&CredentialRuntimeStateRow>,
         patch: &CredentialRuntimeStatePatch,
     ) -> anyhow::Result<bool> {
@@ -7562,7 +7567,7 @@ impl MultiTokenManager {
     }
 
     fn refresh_fields_match(
-        current: &KiroCredentials,
+        current: &LocalUpstreamCredentials,
         requested: &CredentialRefreshFieldsPatch,
     ) -> bool {
         requested
@@ -7590,13 +7595,13 @@ impl MultiTokenManager {
     async fn persist_refreshed_credential_fields(
         &self,
         id: u64,
-        expected_credentials: &KiroCredentials,
-        refreshed_credentials: KiroCredentials,
+        expected_credentials: &LocalUpstreamCredentials,
+        refreshed_credentials: LocalUpstreamCredentials,
         accept_fresh_conflict: bool,
         rejected_access_token: Option<&str>,
         work_deadline: tokio::time::Instant,
         reconciliation_deadline: tokio::time::Instant,
-    ) -> anyhow::Result<KiroCredentials> {
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         let Some(store) = &self.postgres_store else {
             return Ok(refreshed_credentials);
         };
@@ -7787,7 +7792,7 @@ impl MultiTokenManager {
     /// 该方法只用于旧数据补全、环境变量凭据导入等 bootstrap 场景。底层
     /// `save_credentials` 不再删除未出现在当前内存快照里的数据库凭据。
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        let credentials: Vec<KiroCredentials> = {
+        let credentials: Vec<LocalUpstreamCredentials> = {
             let entries = self.entries.lock();
             entries.iter().map(Self::credential_from_entry).collect()
         };
@@ -7799,7 +7804,7 @@ impl MultiTokenManager {
         let saved = block_on_credential_pgsql("保存凭据到 PgSQL", async move {
             store.save_credentials(&credentials).await
         })?;
-        let saved_by_id: HashMap<u64, KiroCredentials> = saved
+        let saved_by_id: HashMap<u64, LocalUpstreamCredentials> = saved
             .into_iter()
             .filter_map(|credential| credential.id.map(|id| (id, credential)))
             .collect();
@@ -7819,9 +7824,9 @@ impl MultiTokenManager {
 
     fn persist_credential_update(
         &self,
-        base: &KiroCredentials,
-        requested: &KiroCredentials,
-    ) -> anyhow::Result<KiroCredentials> {
+        base: &LocalUpstreamCredentials,
+        requested: &LocalUpstreamCredentials,
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         let id = base
             .id
             .filter(|id| requested.id == Some(*id))
@@ -7904,8 +7909,8 @@ impl MultiTokenManager {
     fn persist_credential_update_best_effort(
         &self,
         operation: &'static str,
-        base: KiroCredentials,
-        requested: KiroCredentials,
+        base: LocalUpstreamCredentials,
+        requested: LocalUpstreamCredentials,
     ) {
         let Some(store) = &self.postgres_store else {
             return;
@@ -7965,10 +7970,10 @@ impl MultiTokenManager {
 
     fn persist_credential_update_with_runtime_patch(
         &self,
-        base: &KiroCredentials,
-        requested: &KiroCredentials,
+        base: &LocalUpstreamCredentials,
+        requested: &LocalUpstreamCredentials,
         mut patch: CredentialRuntimeStatePatch,
-    ) -> anyhow::Result<KiroCredentials> {
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         let id = base
             .id
             .filter(|id| requested.id == Some(*id))
@@ -8153,8 +8158,8 @@ impl MultiTokenManager {
     fn persist_credential_mutation(
         &self,
         id: u64,
-        mutate: impl FnOnce(&mut KiroCredentials) -> anyhow::Result<()>,
-    ) -> anyhow::Result<KiroCredentials> {
+        mutate: impl FnOnce(&mut LocalUpstreamCredentials) -> anyhow::Result<()>,
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         let base = {
             let entries = self.entries.lock();
             entries
@@ -8175,8 +8180,8 @@ impl MultiTokenManager {
     fn persist_credential_capacity_mutation(
         &self,
         id: u64,
-        mutate: impl FnOnce(&mut KiroCredentials) -> anyhow::Result<bool>,
-    ) -> anyhow::Result<KiroCredentials> {
+        mutate: impl FnOnce(&mut LocalUpstreamCredentials) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<LocalUpstreamCredentials> {
         let base = {
             let entries = self.entries.lock();
             entries
@@ -8223,7 +8228,7 @@ impl MultiTokenManager {
                 )
                 .await
             })?;
-        let by_id: HashMap<u64, KiroCredentials> = credentials
+        let by_id: HashMap<u64, LocalUpstreamCredentials> = credentials
             .into_iter()
             .filter_map(|credential| credential.id.map(|id| (id, credential)))
             .collect();
@@ -11569,8 +11574,8 @@ impl MultiTokenManager {
     /// 导出完整凭据快照（包含 refreshToken / kiroApiKey 等敏感字段）。
     ///
     /// 仅供 Admin API 显式导出使用；不改变调度状态，也不触发持久化。
-    pub fn export_credentials(&self) -> Vec<KiroCredentials> {
-        let mut credentials: Vec<KiroCredentials> = {
+    pub fn export_credentials(&self) -> Vec<LocalUpstreamCredentials> {
+        let mut credentials: Vec<LocalUpstreamCredentials> = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -12065,7 +12070,7 @@ impl MultiTokenManager {
     /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
     pub async fn acquire_context_for_external_credentials(
         &self,
-        mut credentials: KiroCredentials,
+        mut credentials: LocalUpstreamCredentials,
     ) -> anyhow::Result<CallContext> {
         credentials.canonicalize_auth_method();
         credentials.normalize_api_key_defaults();
@@ -12117,7 +12122,7 @@ impl MultiTokenManager {
     /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
     pub async fn probe_usage_limits_for_credentials(
         &self,
-        credentials: KiroCredentials,
+        credentials: LocalUpstreamCredentials,
     ) -> anyhow::Result<UsageLimitsResponse> {
         let ctx = self
             .acquire_context_for_external_credentials(credentials)
@@ -12146,7 +12151,7 @@ impl MultiTokenManager {
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
-    pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+    pub async fn add_credential(&self, new_cred: LocalUpstreamCredentials) -> anyhow::Result<u64> {
         let mut new_cred = new_cred;
         new_cred.canonicalize_auth_method();
         new_cred.normalize_api_key_defaults();
@@ -12509,7 +12514,7 @@ impl MultiTokenManager {
     }
 
     fn automatic_recovery_context_is_current(
-        credentials: &KiroCredentials,
+        credentials: &LocalUpstreamCredentials,
         expected_access_token: &str,
         expected_storage_revision: u64,
     ) -> anyhow::Result<bool> {

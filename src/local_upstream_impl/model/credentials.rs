@@ -1,7 +1,6 @@
-//! Kiro OAuth 凭证数据模型
+//! Local-upstream credential data model.
 //!
-//! 支持从 Kiro IDE 的凭证文件加载，使用 Social 认证方式
-//! 支持单凭据和多凭据配置格式
+//! 支持单凭据和多凭据配置格式。当前实现仍保留旧凭据文件和 wire 字段的兼容读取。
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -16,17 +15,17 @@ use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 use crate::model::model_support::{model_is_supported_by_list, normalize_supported_models};
 
-/// Kiro API Key/headless 凭据默认应走 CLI runtime 协议。
+/// Local-upstream API-key/headless credentials default to the CLI runtime protocol.
 ///
 /// `Config.defaultEndpoint` 默认为 `ide`，OAuth/IDE 登录账号继续使用该默认值；
-/// 但 `ksk_...` API Key 是 Kiro CLI/headless 认证形态，默认走 `cli` 可以避免
+/// 但 `ksk_...` API Key 是 CLI/headless 认证形态，默认走 `cli` 可以避免
 /// 误带 IDE/profile 语义。
-pub const KIRO_API_KEY_DEFAULT_ENDPOINT: &str = "cli";
+pub const LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT: &str = "cli";
 
-/// Kiro OAuth 凭证
+/// Local-upstream credential record.
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroCredentials {
+pub struct LocalUpstreamCredentials {
     /// 凭据唯一标识符（自增 ID）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
@@ -141,7 +140,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
-    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    /// Legacy upstream subscription label retained as account-info metadata.
+    ///
+    /// Scheduler capability must come from explicit account capability fields such as
+    /// `supported_models`, not from this display label.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub subscription_title: Option<String>,
@@ -175,24 +177,25 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
-    /// Kiro API Key（headless 模式）
+    /// Local-upstream API key for headless mode.
     /// 格式: ksk_xxxxxxxx
-    /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
+    /// 设置后直接作为 Bearer Token 使用，无需 refreshToken。
+    /// 字段名暂时保留旧 `kiroApiKey`/`kiro_api_key` 兼容形状。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
     /// 端点名称（可选）
     ///
-    /// 决定该凭据走哪套 Kiro API。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
+    /// 决定该凭据走哪套本地上游端点。未配置时回退到 `config.defaultEndpoint`（默认 "ide"）。
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 }
 
-impl fmt::Debug for KiroCredentials {
+impl fmt::Debug for LocalUpstreamCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("KiroCredentials")
+            .debug_struct("LocalUpstreamCredentials")
             .field("id", &self.id)
             .field("created_at_present", &self.created_at.is_some())
             .field("updated_at_present", &self.updated_at.is_some())
@@ -255,12 +258,12 @@ fn normalized_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// 解析 Kiro API Key 便捷格式：`ksk_xxx|region`。
+/// 解析本地上游 API key 便捷格式：`ksk_xxx|region`。
 ///
 /// 返回 `(api_key, region)`。没有 `|region` 时只返回 key。
 /// 该函数不打印、不记录原始 key，调用方负责继续按敏感字段处理。
-pub fn split_kiro_api_key_and_region(raw: &str) -> Option<(String, Option<String>)> {
-    validate_kiro_api_key_pipe_format(raw).ok()?;
+pub fn split_local_upstream_api_key_and_region(raw: &str) -> Option<(String, Option<String>)> {
+    validate_local_upstream_api_key_pipe_format(raw).ok()?;
     let trimmed = raw.trim();
 
     let Some((key, region)) = trimmed.split_once('|') else {
@@ -277,10 +280,10 @@ pub fn split_kiro_api_key_and_region(raw: &str) -> Option<(String, Option<String
 
 /// Validate only the `key|region` convenience envelope.
 ///
-/// The API key itself is intentionally not restricted to a fixed prefix so future Kiro key
+/// The API key itself is intentionally not restricted to a fixed prefix so future upstream key
 /// formats remain compatible. A supplied region becomes part of an HTTP Host label, so it must
 /// not contain whitespace, controls, separators, or other host-unsafe characters.
-pub(crate) fn validate_kiro_api_key_pipe_format(raw: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_local_upstream_api_key_pipe_format(raw: &str) -> Result<(), &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("key is empty");
@@ -299,10 +302,10 @@ pub(crate) fn validate_kiro_api_key_pipe_format(raw: &str) -> Result<(), &'stati
     let Some(region) = region else {
         return Ok(());
     };
-    validate_kiro_region_host_label(region)
+    validate_local_upstream_region_host_label(region)
 }
 
-fn validate_kiro_region_host_label(region: &str) -> Result<(), &'static str> {
+fn validate_local_upstream_region_host_label(region: &str) -> Result<(), &'static str> {
     if region.is_empty() {
         return Ok(());
     }
@@ -320,7 +323,7 @@ fn validate_kiro_region_host_label(region: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn looks_like_kiro_api_key_text(value: &str) -> bool {
+fn looks_like_local_upstream_api_key_text(value: &str) -> bool {
     let key = value
         .trim()
         .split_once('|')
@@ -330,27 +333,27 @@ fn looks_like_kiro_api_key_text(value: &str) -> bool {
     key.starts_with("ksk_")
 }
 
-fn api_key_credential_from_text(raw: &str, priority: u32) -> Option<KiroCredentials> {
-    let (api_key, region) = split_kiro_api_key_and_region(raw)?;
-    if !looks_like_kiro_api_key_text(&api_key) {
+fn api_key_credential_from_text(raw: &str, priority: u32) -> Option<LocalUpstreamCredentials> {
+    let (api_key, region) = split_local_upstream_api_key_and_region(raw)?;
+    if !looks_like_local_upstream_api_key_text(&api_key) {
         return None;
     }
 
-    let mut credential = KiroCredentials {
+    let mut credential = LocalUpstreamCredentials {
         auth_method: Some("api_key".to_string()),
         kiro_api_key: Some(api_key),
         priority,
         region: region.clone(),
         auth_region: region.clone(),
         api_region: region,
-        endpoint: Some(KIRO_API_KEY_DEFAULT_ENDPOINT.to_string()),
+        endpoint: Some(LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT.to_string()),
         ..Default::default()
     };
     credential.normalize_api_key_defaults();
     Some(credential)
 }
 
-fn api_key_credentials_from_plain_text(content: &str) -> Option<Vec<KiroCredentials>> {
+fn api_key_credentials_from_plain_text(content: &str) -> Option<Vec<LocalUpstreamCredentials>> {
     let mut credentials = Vec::new();
 
     for line in content.lines() {
@@ -446,9 +449,9 @@ pub(crate) fn profile_arn_region(profile_arn: &str) -> Option<&str> {
 #[serde(untagged)]
 pub enum CredentialsConfig {
     /// 单个凭据（旧格式）
-    Single(KiroCredentials),
+    Single(LocalUpstreamCredentials),
     /// 多凭据数组（新格式）
-    Multiple(Vec<KiroCredentials>),
+    Multiple(Vec<LocalUpstreamCredentials>),
 }
 
 impl CredentialsConfig {
@@ -489,7 +492,7 @@ impl CredentialsConfig {
     }
 
     fn validate_api_key_pipe_formats(&self) -> anyhow::Result<()> {
-        let credentials: &[KiroCredentials] = match self {
+        let credentials: &[LocalUpstreamCredentials] = match self {
             Self::Single(credential) => std::slice::from_ref(credential),
             Self::Multiple(credentials) => credentials,
         };
@@ -508,7 +511,7 @@ impl CredentialsConfig {
     }
 
     /// 转换为按优先级排序的凭据列表
-    pub fn into_sorted_credentials(self) -> Vec<KiroCredentials> {
+    pub fn into_sorted_credentials(self) -> Vec<LocalUpstreamCredentials> {
         match self {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
@@ -537,7 +540,7 @@ impl CredentialsConfig {
     }
 }
 
-impl KiroCredentials {
+impl LocalUpstreamCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
 
@@ -639,7 +642,7 @@ impl KiroCredentials {
             return Ok(());
         }
         if let Some(api_key) = self.kiro_api_key.as_deref() {
-            validate_kiro_api_key_pipe_format(api_key)?;
+            validate_local_upstream_api_key_pipe_format(api_key)?;
         }
         for region in [
             self.region.as_deref(),
@@ -649,12 +652,12 @@ impl KiroCredentials {
         .into_iter()
         .flatten()
         {
-            validate_kiro_region_host_label(region)?;
+            validate_local_upstream_region_host_label(region)?;
         }
         Ok(())
     }
 
-    /// 规范化 Kiro API Key/headless 凭据。
+    /// 规范化本地上游 API-key/headless 凭据。
     ///
     /// 支持把 `kiroApiKey: "ksk_xxx|eu-central-1"` 拆成真实 key 和区域；
     /// API Key 凭据默认走 `cli` endpoint；如果只给了 `region`，同步补齐
@@ -672,7 +675,7 @@ impl KiroCredentials {
             return;
         }
 
-        match split_kiro_api_key_and_region(&raw_key) {
+        match split_local_upstream_api_key_and_region(&raw_key) {
             Some((api_key, parsed_region)) => {
                 self.kiro_api_key = Some(api_key);
                 if let Some(region) = parsed_region {
@@ -709,7 +712,7 @@ impl KiroCredentials {
             self.api_region = self.region.clone();
         }
         if self.endpoint.as_deref().is_none_or(str::is_empty) {
-            self.endpoint = Some(KIRO_API_KEY_DEFAULT_ENDPOINT.to_string());
+            self.endpoint = Some(LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT.to_string());
         }
 
         self.kiro_api_key = normalized_optional(self.kiro_api_key.take());
@@ -724,7 +727,7 @@ impl KiroCredentials {
     /// 企业 SSO 导出格式经常没有 AWS SSO device-flow 的 clientSecret。Microsoft
     /// Entra ID 这类 public-client refresh token 只需要 clientId、refreshToken
     /// 和 token endpoint；当导入 JSON 只带 issuerUrl 或 accessToken 时，可以安全
-    /// 推导 token endpoint。缺 scopes 时按 Kiro 官方 CodeWhisperer scope 补齐。
+    /// 推导 token endpoint。缺 scopes 时按当前上游 CodeWhisperer scope 补齐。
     pub fn normalize_external_idp_defaults(&mut self) {
         self.canonicalize_auth_method();
         if !self.is_external_idp_refresh_credential() {
@@ -757,21 +760,6 @@ impl KiroCredentials {
         }
     }
 
-    /// 检查凭据是否支持 Opus 模型
-    ///
-    /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
-    pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
-            Some(title) => {
-                let title_upper = title.to_uppercase();
-                // 如果包含 FREE，则不支持 Opus
-                !title_upper.contains("FREE")
-            }
-            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
-        }
-    }
-
     pub fn normalize_supported_models(&mut self) {
         self.supported_models =
             normalize_supported_models(std::mem::take(&mut self.supported_models));
@@ -795,7 +783,7 @@ impl KiroCredentials {
 
     /// 检查是否应使用 AWS SSO OIDC refresh token 协议刷新。
     ///
-    /// Enterprise / external IdP 与 Builder ID 一样走 OIDC 刷新，但请求 Kiro API
+    /// Enterprise / external IdP 与 Builder ID 一样走 OIDC 刷新，但请求本地上游
     /// 时仍保留 external_idp 语义以附加 TokenType。
     pub fn is_idc_refresh_credential(&self) -> bool {
         if self.is_api_key_credential() {
@@ -838,7 +826,7 @@ impl KiroCredentials {
 }
 
 #[cfg(test)]
-impl KiroCredentials {
+impl LocalUpstreamCredentials {
     fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json_string)
     }
@@ -855,7 +843,7 @@ mod tests {
 
     #[test]
     fn debug_output_redacts_all_credential_strings() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             id: Some(42),
             created_at: Some("created-at-sensitive-value".to_string()),
             updated_at: Some("updated-at-sensitive-value".to_string()),
@@ -939,7 +927,7 @@ mod tests {
             "authMethod": "social"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.access_token, Some("test_token".to_string()));
         assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
         assert_eq!(creds.profile_arn, Some("arn:aws:test".to_string()));
@@ -967,7 +955,7 @@ mod tests {
             "machine_id": "fake-machine-id"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
 
         assert_eq!(creds.access_token.as_deref(), Some("test_access"));
         assert_eq!(creds.refresh_token.as_deref(), Some("test_refresh"));
@@ -1008,13 +996,13 @@ mod tests {
             "unknownField": "should be ignored"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.access_token, Some("test_token".to_string()));
     }
 
     #[test]
     fn supported_models_empty_allows_any_and_nonempty_filters_candidates() {
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         assert!(creds.supports_model(&[Some("claude-sonnet-4")]));
 
         creds.supported_models = vec![
@@ -1039,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_to_json() {
-        let creds = KiroCredentials {
+        let creds = LocalUpstreamCredentials {
             id: None,
             access_token: Some("token".to_string()),
             auth_method: Some("social".to_string()),
@@ -1059,7 +1047,7 @@ mod tests {
     #[test]
     fn test_default_credentials_path() {
         assert_eq!(
-            KiroCredentials::default_credentials_path(),
+            LocalUpstreamCredentials::default_credentials_path(),
             "credentials.json"
         );
     }
@@ -1067,30 +1055,31 @@ mod tests {
     #[test]
     fn test_priority_default() {
         let json = r#"{"refreshToken": "test"}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 0);
     }
 
     #[test]
     fn test_priority_explicit() {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 5);
     }
 
     #[test]
     fn rate_limit_auto_disable_defaults_to_enabled() {
-        let creds = KiroCredentials::default();
+        let creds = LocalUpstreamCredentials::default();
         assert!(creds.rate_limit_auto_disable_enabled());
 
-        let parsed = KiroCredentials::from_json("{}").unwrap();
+        let parsed = LocalUpstreamCredentials::from_json("{}").unwrap();
         assert!(parsed.rate_limit_auto_disable_enabled());
     }
 
     #[test]
     fn rate_limit_auto_disable_can_be_disabled() {
         let parsed =
-            KiroCredentials::from_json(r#"{"rateLimitAutoDisableEnabled":false}"#).unwrap();
+            LocalUpstreamCredentials::from_json(r#"{"rateLimitAutoDisableEnabled":false}"#)
+                .unwrap();
         assert!(!parsed.rate_limit_auto_disable_enabled());
 
         let serialized = serde_json::to_value(&parsed).unwrap();
@@ -1106,7 +1095,7 @@ mod tests {
             "clientSecret": "secret456",
             "provider": "Enterprise"
         }"#;
-        let mut creds = KiroCredentials::from_json(json).unwrap();
+        let mut creds = LocalUpstreamCredentials::from_json(json).unwrap();
         creds.canonicalize_auth_method();
         assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
         assert_eq!(creds.provider.as_deref(), Some("Enterprise"));
@@ -1126,7 +1115,7 @@ mod tests {
             "AWS_IDC",
             "Internal",
         ] {
-            let mut creds = KiroCredentials {
+            let mut creds = LocalUpstreamCredentials {
                 auth_method: Some(auth_method.to_string()),
                 refresh_token: Some("test_refresh".to_string()),
                 client_id: Some("client123".to_string()),
@@ -1155,7 +1144,7 @@ mod tests {
             "scopes": "api://client123/codewhisperer:conversations offline_access"
         }"#;
 
-        let mut creds = KiroCredentials::from_json(json).unwrap();
+        let mut creds = LocalUpstreamCredentials::from_json(json).unwrap();
         creds.canonicalize_auth_method();
 
         assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
@@ -1174,7 +1163,7 @@ mod tests {
 
     #[test]
     fn test_external_idp_defaults_are_derived_from_issuer_url_without_client_secret() {
-        let mut creds = KiroCredentials {
+        let mut creds = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             refresh_token: Some("1.example-refresh-token".to_string()),
             client_id: Some("client-123".to_string()),
@@ -1205,7 +1194,7 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD
             .encode(br#"{"iss":"https://login.microsoftonline.com/tenant-from-token/v2.0"}"#);
-        let mut creds = KiroCredentials {
+        let mut creds = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             access_token: Some(format!("{header}.{payload}.")),
             refresh_token: Some("1.example-refresh-token".to_string()),
@@ -1230,7 +1219,7 @@ mod tests {
 
     #[test]
     fn test_external_idp_defaults_fall_back_to_microsoft_common_for_msal_refresh_token() {
-        let mut creds = KiroCredentials {
+        let mut creds = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             refresh_token: Some("1.msal-refresh-token-without-issuer".to_string()),
             client_id: Some("client-789".to_string()),
@@ -1254,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_api_key_auth_method_canonicalization_does_not_trip_oidc_refresh() {
-        let mut creds = KiroCredentials {
+        let mut creds = LocalUpstreamCredentials {
             auth_method: Some("API KEY".to_string()),
             kiro_api_key: Some("ksk_test_key".to_string()),
             provider: Some("Enterprise".to_string()),
@@ -1270,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_api_key_pipe_region_normalizes_to_cli_endpoint_and_regions() {
-        let mut creds = KiroCredentials {
+        let mut creds = LocalUpstreamCredentials {
             auth_method: Some("API KEY".to_string()),
             kiro_api_key: Some("ksk_test_key|eu-central-1".to_string()),
             endpoint: None,
@@ -1286,7 +1275,7 @@ mod tests {
         assert_eq!(creds.api_region.as_deref(), Some("eu-central-1"));
         assert_eq!(
             creds.endpoint.as_deref(),
-            Some(KIRO_API_KEY_DEFAULT_ENDPOINT)
+            Some(LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT)
         );
         assert!(creds.refresh_token.is_none());
         assert!(creds.profile_arn.is_none());
@@ -1306,10 +1295,10 @@ mod tests {
                 "ksk_fake|us-east-1-",
             ] {
                 assert!(
-                    validate_kiro_api_key_pipe_format(malformed).is_err(),
+                    validate_local_upstream_api_key_pipe_format(malformed).is_err(),
                     "malformed={malformed:?}"
                 );
-                assert_eq!(split_kiro_api_key_and_region(malformed), None);
+                assert_eq!(split_local_upstream_api_key_and_region(malformed), None);
             }
         }
     }
@@ -1331,7 +1320,7 @@ mod tests {
                     ("ksk_fake", Some("future-safe-region-9")),
                 ),
             ] {
-                let actual = split_kiro_api_key_and_region(input).unwrap();
+                let actual = split_local_upstream_api_key_and_region(input).unwrap();
                 assert_eq!(actual.0, expected.0);
                 assert_eq!(actual.1.as_deref(), expected.1);
             }
@@ -1426,7 +1415,7 @@ mod tests {
                 ("authRegion", "us-east-1\nextra"),
                 ("apiRegion", "us-east-1.example"),
             ] {
-                let mut credential = KiroCredentials {
+                let mut credential = LocalUpstreamCredentials {
                     auth_method: Some("api_key".to_string()),
                     kiro_api_key: Some("future_key_format".to_string()),
                     ..Default::default()
@@ -1440,7 +1429,7 @@ mod tests {
                 assert!(credential.validate_api_key_import_fields().is_err());
             }
 
-            let compatible = KiroCredentials {
+            let compatible = LocalUpstreamCredentials {
                 auth_method: Some("api_key".to_string()),
                 kiro_api_key: Some("future_key_format".to_string()),
                 region: Some("future-safe-region-9".to_string()),
@@ -1454,7 +1443,7 @@ mod tests {
 
     #[test]
     fn test_api_key_normalization_preserves_explicit_endpoint_and_api_region() {
-        let mut creds = KiroCredentials {
+        let mut creds = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
             kiro_api_key: Some("ksk_test_key|eu-central-1".to_string()),
             region: Some("us-east-1".to_string()),
@@ -1541,7 +1530,7 @@ mod tests {
             "region": "us-east-1"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
         assert_eq!(creds.region, Some("us-east-1".to_string()));
     }
@@ -1554,14 +1543,14 @@ mod tests {
             "authMethod": "social"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
         assert_eq!(creds.region, None);
     }
 
     #[test]
     fn test_region_field_serialization() {
-        let creds = KiroCredentials {
+        let creds = LocalUpstreamCredentials {
             id: None,
             refresh_token: Some("test".to_string()),
             region: Some("eu-west-1".to_string()),
@@ -1575,7 +1564,7 @@ mod tests {
 
     #[test]
     fn test_region_field_none_not_serialized() {
-        let creds = KiroCredentials {
+        let creds = LocalUpstreamCredentials {
             id: None,
             refresh_token: Some("test".to_string()),
             ..Default::default()
@@ -1597,14 +1586,14 @@ mod tests {
             }}"#
         );
 
-        let creds = KiroCredentials::from_json(&json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(&json).unwrap();
         assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
         assert_eq!(creds.machine_id, Some(machine_id));
     }
 
     #[test]
     fn test_machine_id_field_serialization() {
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.refresh_token = Some("test".to_string());
         creds.machine_id = Some("b".repeat(64));
 
@@ -1614,7 +1603,7 @@ mod tests {
 
     #[test]
     fn test_machine_id_field_none_not_serialized() {
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.refresh_token = Some("test".to_string());
         creds.machine_id = None;
 
@@ -1655,7 +1644,7 @@ mod tests {
             "region": "ap-northeast-1"
         }"#;
 
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.id, Some(1));
         assert_eq!(creds.access_token, Some("access".to_string()));
         assert_eq!(creds.refresh_token, Some("refresh".to_string()));
@@ -1671,7 +1660,7 @@ mod tests {
     #[test]
     fn test_region_roundtrip() {
         // 测试序列化和反序列化的往返一致性
-        let original = KiroCredentials {
+        let original = LocalUpstreamCredentials {
             id: Some(42),
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
@@ -1683,7 +1672,7 @@ mod tests {
         };
 
         let json = original.to_pretty_json().unwrap();
-        let parsed = KiroCredentials::from_json(&json).unwrap();
+        let parsed = LocalUpstreamCredentials::from_json(&json).unwrap();
 
         assert_eq!(parsed.id, original.id);
         assert_eq!(parsed.access_token, original.access_token);
@@ -1701,7 +1690,7 @@ mod tests {
             "refreshToken": "test_refresh",
             "authRegion": "eu-central-1"
         }"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.auth_region, Some("eu-central-1".to_string()));
         assert_eq!(creds.api_region, None);
     }
@@ -1712,14 +1701,14 @@ mod tests {
             "refreshToken": "test_refresh",
             "apiRegion": "ap-southeast-1"
         }"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.api_region, Some("ap-southeast-1".to_string()));
         assert_eq!(creds.auth_region, None);
     }
 
     #[test]
     fn test_auth_api_region_serialization() {
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.refresh_token = Some("test".to_string());
         creds.auth_region = Some("eu-west-1".to_string());
         creds.api_region = Some("us-west-2".to_string());
@@ -1733,7 +1722,7 @@ mod tests {
 
     #[test]
     fn test_auth_api_region_none_not_serialized() {
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.refresh_token = Some("test".to_string());
         creds.auth_region = None;
         creds.api_region = None;
@@ -1745,14 +1734,14 @@ mod tests {
 
     #[test]
     fn test_auth_api_region_roundtrip() {
-        let mut original = KiroCredentials::default();
+        let mut original = LocalUpstreamCredentials::default();
         original.refresh_token = Some("refresh".to_string());
         original.region = Some("us-east-1".to_string());
         original.auth_region = Some("eu-west-1".to_string());
         original.api_region = Some("ap-northeast-1".to_string());
 
         let json = original.to_pretty_json().unwrap();
-        let parsed = KiroCredentials::from_json(&json).unwrap();
+        let parsed = LocalUpstreamCredentials::from_json(&json).unwrap();
 
         assert_eq!(parsed.region, original.region);
         assert_eq!(parsed.auth_region, original.auth_region);
@@ -1766,7 +1755,7 @@ mod tests {
             "refreshToken": "test_refresh",
             "region": "us-east-1"
         }"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
+        let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.region, Some("us-east-1".to_string()));
         assert_eq!(creds.auth_region, None);
         assert_eq!(creds.api_region, None);
@@ -1781,7 +1770,7 @@ mod tests {
         config.region = "config-region".to_string();
         config.auth_region = Some("config-auth-region".to_string());
 
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.region = Some("cred-region".to_string());
         creds.auth_region = Some("cred-auth-region".to_string());
 
@@ -1794,7 +1783,7 @@ mod tests {
         config.region = "config-region".to_string();
         config.auth_region = Some("config-auth-region".to_string());
 
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.region = Some("cred-region".to_string());
         // auth_region 未设置
 
@@ -1807,7 +1796,7 @@ mod tests {
         config.region = "config-region".to_string();
         config.auth_region = Some("config-auth-region".to_string());
 
-        let creds = KiroCredentials::default();
+        let creds = LocalUpstreamCredentials::default();
         // auth_region 和 region 均未设置
 
         assert_eq!(creds.effective_auth_region(&config), "config-auth-region");
@@ -1819,7 +1808,7 @@ mod tests {
         config.region = "config-region".to_string();
         // config.auth_region 未设置
 
-        let creds = KiroCredentials::default();
+        let creds = LocalUpstreamCredentials::default();
 
         assert_eq!(creds.effective_auth_region(&config), "config-region");
     }
@@ -1831,7 +1820,7 @@ mod tests {
         config.region = "config-region".to_string();
         config.api_region = Some("config-api-region".to_string());
 
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.api_region = Some("cred-api-region".to_string());
         creds.profile_arn =
             Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/FAKE".to_string());
@@ -1845,7 +1834,7 @@ mod tests {
         config.region = "config-region".to_string();
         config.api_region = Some("config-api-region".to_string());
 
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.profile_arn =
             Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/FAKE".to_string());
 
@@ -1858,7 +1847,7 @@ mod tests {
         config.region = "config-region".to_string();
         config.api_region = Some("config-api-region".to_string());
 
-        let creds = KiroCredentials::default();
+        let creds = LocalUpstreamCredentials::default();
 
         assert_eq!(creds.effective_api_region(&config), "config-api-region");
     }
@@ -1868,7 +1857,7 @@ mod tests {
         let mut config = Config::default();
         config.region = "config-region".to_string();
 
-        let creds = KiroCredentials::default();
+        let creds = LocalUpstreamCredentials::default();
 
         assert_eq!(creds.effective_api_region(&config), "config-region");
     }
@@ -1879,7 +1868,7 @@ mod tests {
         let mut config = Config::default();
         config.region = "config-region".to_string();
 
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.region = Some("cred-region".to_string());
 
         assert_eq!(creds.effective_api_region(&config), "config-region");
@@ -1891,7 +1880,7 @@ mod tests {
         let mut config = Config::default();
         config.region = "default".to_string();
 
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.auth_region = Some("auth-only".to_string());
         creds.api_region = Some("api-only".to_string());
 
@@ -1904,7 +1893,7 @@ mod tests {
     #[test]
     fn test_effective_proxy_credential_overrides_global() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.proxy_url = Some("socks5://cred:1080".to_string());
 
         let result = creds.effective_proxy(Some(&global));
@@ -1914,7 +1903,7 @@ mod tests {
     #[test]
     fn test_effective_proxy_credential_with_auth() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.proxy_url = Some("http://proxy:3128".to_string());
         creds.proxy_username = Some("user".to_string());
         creds.proxy_password = Some("pass".to_string());
@@ -1927,7 +1916,7 @@ mod tests {
     #[test]
     fn test_effective_proxy_direct_bypasses_global() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.proxy_url = Some("direct".to_string());
 
         let result = creds.effective_proxy(Some(&global));
@@ -1937,7 +1926,7 @@ mod tests {
     #[test]
     fn test_effective_proxy_direct_case_insensitive() {
         let global = ProxyConfig::new("http://global:8080");
-        let mut creds = KiroCredentials::default();
+        let mut creds = LocalUpstreamCredentials::default();
         creds.proxy_url = Some("DIRECT".to_string());
 
         let result = creds.effective_proxy(Some(&global));
@@ -1947,7 +1936,7 @@ mod tests {
     #[test]
     fn test_effective_proxy_fallback_to_global() {
         let global = ProxyConfig::new("http://global:8080");
-        let creds = KiroCredentials::default();
+        let creds = LocalUpstreamCredentials::default();
 
         let result = creds.effective_proxy(Some(&global));
         assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
@@ -1955,7 +1944,7 @@ mod tests {
 
     #[test]
     fn test_effective_proxy_none_when_no_proxy() {
-        let creds = KiroCredentials::default();
+        let creds = LocalUpstreamCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
     }

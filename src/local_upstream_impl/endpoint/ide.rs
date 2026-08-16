@@ -235,7 +235,7 @@ mod tests {
     use super::{IdeEndpoint, inject_profile_arn, transform_ide_api_body};
     use crate::http_client::allocation_probe;
     use crate::local_upstream_impl::endpoint::{LocalUpstreamEndpoint, RequestContext};
-    use crate::local_upstream_impl::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
     use crate::local_upstream_impl::protocol::{
         KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN,
     };
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn test_models_url_skips_builder_id_placeholder_for_idc_credentials() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("builder-id".to_string()),
             client_id: Some("client".to_string()),
             client_secret: Some("secret".to_string()),
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn test_models_url_uses_social_profile_for_social_credentials() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("social".to_string()),
             provider: Some("Github".to_string()),
             ..Default::default()
@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn test_models_url_skips_enterprise_fallback_for_external_idp_credentials() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             provider: Some("Enterprise".to_string()),
             api_region: Some("eu-west-1".to_string()),
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn test_streaming_body_keeps_builder_id_placeholder() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("builder-id".to_string()),
             client_id: Some("client".to_string()),
             client_secret: Some("secret".to_string()),
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn test_streaming_body_uses_enterprise_fallback_without_model_header_leak() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             provider: Some("Enterprise".to_string()),
             api_region: Some("eu-west-1".to_string()),
@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn test_decorate_api_applies_agent_mode_and_token_type_headers() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("External IDP".to_string()),
             provider: Some("Enterprise".to_string()),
             api_region: Some("us-east-1".to_string()),
@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn test_decorate_models_and_mcp_do_not_attach_profile_arn_for_api_key() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("api key".to_string()),
             kiro_api_key: Some("ksk_test".to_string()),
             provider: Some("Enterprise".to_string()),
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn test_api_key_noop_transform_is_byte_identical_for_five_rounds() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("api key".to_string()),
             kiro_api_key: Some("ksk_test".to_string()),
             ..Default::default()
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn test_local_upstream_base_url_override_only_changes_target_url() {
         let endpoint = IdeEndpoint::new();
-        let credentials = KiroCredentials::default();
+        let credentials = LocalUpstreamCredentials::default();
         let mut config = Config::default();
         config.local_upstream_base_url = Some("http://127.0.0.1:39090/mock/".to_string());
         let ctx = RequestContext {

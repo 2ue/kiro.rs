@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::storage::postgres::ProxyResourceRow;
 use crate::storage::redis_cache::SchedulerHealthState;
 
@@ -43,7 +43,7 @@ pub(super) struct CredentialEntry {
     /// 凭据唯一 ID
     pub(super) id: u64,
     /// 凭据信息
-    pub(super) credentials: KiroCredentials,
+    pub(super) credentials: LocalUpstreamCredentials,
     /// API 调用连续失败次数
     pub(super) failure_count: u32,
     /// Token 刷新连续失败次数

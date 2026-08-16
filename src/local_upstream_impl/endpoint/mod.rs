@@ -8,7 +8,7 @@
 
 use reqwest::{Method, RequestBuilder};
 
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::model::config::Config;
 
 pub mod cli;
@@ -279,7 +279,7 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
 /// 包含单次调用已确定的所有运行时信息。引用形式避免无谓 clone。
 pub struct RequestContext<'a> {
     /// 当前凭据
-    pub credentials: &'a KiroCredentials,
+    pub credentials: &'a LocalUpstreamCredentials,
     /// 有效的 access token（API Key 凭据下即 kiroApiKey）
     pub token: &'a str,
     /// 当前凭据对应的 machineId

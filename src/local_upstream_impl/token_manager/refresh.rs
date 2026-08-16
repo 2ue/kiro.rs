@@ -15,7 +15,7 @@ use crate::http_client::{
 };
 use crate::local_upstream_impl::endpoint::configured_upstream_url;
 use crate::local_upstream_impl::machine_id;
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::local_upstream_impl::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -268,7 +268,7 @@ async fn reserve_refresh_send(
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     minutes: i64,
 ) -> Option<bool> {
     credentials
@@ -283,18 +283,18 @@ pub(crate) fn is_token_expiring_within(
 /// 刷新 singleflight、跨实例 peer 接受和刷新 CAS 都必须使用这个边界。上游可能合法
 /// 签发不足 10 分钟的短期 Token；若请求热路径改用更宽的预警窗口，刚刷新的 Token 会
 /// 立即再次刷新并在突发流量下放大 OAuth RPM。
-pub(crate) fn is_token_expired(credentials: &KiroCredentials) -> bool {
+pub(crate) fn is_token_expired(credentials: &LocalUpstreamCredentials) -> bool {
     is_token_expiring_within(credentials, 5).unwrap_or(true)
 }
 
 /// 10 分钟预警窗口，只用于状态展示或主动后台维护，不驱动请求热路径刷新。
 #[cfg(test)]
-pub(crate) fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
+pub(crate) fn is_token_expiring_soon(credentials: &LocalUpstreamCredentials) -> bool {
     is_token_expiring_within(credentials, 10).unwrap_or(false)
 }
 
 /// 验证 refreshToken 的基本有效性
-pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
+pub(crate) fn validate_refresh_token(credentials: &LocalUpstreamCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials.refresh_token.as_ref().ok_or_else(|| {
         RefreshFailure::new(
             RefreshFailureStage::RequestSend,
@@ -610,10 +610,10 @@ fn decode_token_refresh_response<T: DeserializeOwned>(
 /// 刷新 Token
 #[cfg(test)]
 pub(crate) async fn refresh_token(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     proxy: Option<&ProxyConfig>,
-) -> anyhow::Result<KiroCredentials> {
+) -> anyhow::Result<LocalUpstreamCredentials> {
     let client = Arc::new(build_client(proxy, 60, config.tls_backend).map_err(|_| {
         RefreshFailure::new(
             RefreshFailureStage::Internal,
@@ -627,11 +627,11 @@ pub(crate) async fn refresh_token(
 }
 
 pub(crate) async fn refresh_token_with_client(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     client: Arc<reqwest::Client>,
     admission: Option<RefreshSendAdmission>,
-) -> anyhow::Result<KiroCredentials> {
+) -> anyhow::Result<LocalUpstreamCredentials> {
     let mut normalized_credentials = credentials.clone();
     normalized_credentials.canonicalize_auth_method();
     normalized_credentials.normalize_external_idp_defaults();
@@ -676,11 +676,11 @@ pub(crate) async fn refresh_token_with_client(
 
 /// 刷新 Social Token
 async fn refresh_social_token(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     client: &reqwest::Client,
     admission: Option<&RefreshSendAdmission>,
-) -> anyhow::Result<KiroCredentials> {
+) -> anyhow::Result<LocalUpstreamCredentials> {
     tracing::info!("正在刷新 Social Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
@@ -739,11 +739,11 @@ async fn refresh_social_token(
 
 /// 刷新外部 IdP Token（Microsoft Entra ID 等 OAuth v2 token endpoint）
 async fn refresh_external_idp_token(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     client: &reqwest::Client,
     admission: Option<&RefreshSendAdmission>,
-) -> anyhow::Result<KiroCredentials> {
+) -> anyhow::Result<LocalUpstreamCredentials> {
     tracing::info!("正在刷新 External IdP Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
@@ -826,11 +826,11 @@ async fn refresh_external_idp_token(
 
 /// 刷新 IdC Token (AWS SSO OIDC)
 async fn refresh_idc_token(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     client: &reqwest::Client,
     admission: Option<&RefreshSendAdmission>,
-) -> anyhow::Result<KiroCredentials> {
+) -> anyhow::Result<LocalUpstreamCredentials> {
     tracing::info!("正在刷新 IdC Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
@@ -914,7 +914,7 @@ async fn refresh_idc_token(
 
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     token: &str,
     proxy: Option<&ProxyConfig>,
@@ -1004,7 +1004,7 @@ pub(crate) async fn get_usage_limits(
 
 /// 设置 Kiro/AWS Q Overages 开关。
 pub(crate) async fn set_overage_status(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
     token: &str,
     proxy: Option<&ProxyConfig>,
@@ -1117,7 +1117,7 @@ mod tests {
         RefreshFailureStage, get_usage_limits, refresh_failure_from_token_refresh_admission,
         refresh_token,
     };
-    use crate::local_upstream_impl::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
     use crate::local_upstream_impl::token_manager::auxiliary::{
         TokenRefreshAdmissionAuthority, TokenRefreshAdmissionRejected,
         TokenRefreshAdmissionRejectionKind,
@@ -1542,9 +1542,9 @@ mod tests {
         pool_size: usize,
         request_namespace: usize,
         token_endpoint: &str,
-    ) -> Vec<KiroCredentials> {
+    ) -> Vec<LocalUpstreamCredentials> {
         (1..=pool_size)
-            .map(|id| KiroCredentials {
+            .map(|id| LocalUpstreamCredentials {
                 id: Some(id as u64),
                 access_token: Some(format!("expired-access-{request_namespace}-{id}")),
                 refresh_token: Some(format!(
@@ -1732,7 +1732,7 @@ mod tests {
         *state.captured.lock().unwrap() = Some(captured);
         Json(json!({
             "subscriptionInfo": {
-                "subscriptionTitle": "KIRO TEST",
+                "subscriptionTitle": "UPSTREAM TEST",
                 "overageCapability": "OVERAGE_CAPABLE"
             },
             "usageBreakdownList": [{
@@ -1756,7 +1756,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
             kiro_api_key: Some("ksk_fake_balance".to_string()),
             api_region: Some("ap-south-2".to_string()),
@@ -1775,7 +1775,7 @@ mod tests {
         .unwrap();
         server.abort();
 
-        assert_eq!(usage.subscription_title(), Some("KIRO TEST"));
+        assert_eq!(usage.subscription_title(), Some("UPSTREAM TEST"));
         let (host, authorization, token_type, uri) = captured.lock().unwrap().clone().unwrap();
         assert_eq!(host, "q.ap-south-2.amazonaws.com");
         assert_eq!(authorization, "Bearer ksk_fake_balance");
@@ -1801,7 +1801,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             refresh_token: Some("r".repeat(150)),
             client_id: Some("client-123".to_string()),
@@ -1848,7 +1848,7 @@ mod tests {
     }
 
     fn fake_refresh_manager_from_credentials(
-        credentials: Vec<KiroCredentials>,
+        credentials: Vec<LocalUpstreamCredentials>,
         auxiliary_max_concurrent_requests: u32,
     ) -> Arc<MultiTokenManager> {
         let mut config = Config::default();
@@ -3360,7 +3360,7 @@ mod tests {
             return;
         };
         let raw = fs::read_to_string(&path).expect("read real external_idp credential file");
-        let mut credentials: KiroCredentials =
+        let mut credentials: LocalUpstreamCredentials =
             serde_json::from_str(&raw).expect("parse real external_idp credential file");
         credentials.canonicalize_auth_method();
 

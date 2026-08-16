@@ -1,26 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 
 use super::account_state::{CredentialEntry, ProxyResourceAvailability, ProxyResourceRuntime};
 use super::cooldown::entry_cooldown_remaining;
 use super::rpm::entry_rate_limit_remaining;
-
-pub(super) fn is_opus_model(model: Option<&str>) -> bool {
-    model
-        .map(|m| m.to_lowercase().contains("opus"))
-        .unwrap_or(false)
-}
 
 pub(super) fn credential_is_usable_for_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
     if entry.disabled || entry.account_quota_blocked {
         return false;
     }
     if !entry.credentials.supports_model(&[model]) {
-        return false;
-    }
-    if is_opus_model(model) && !entry.credentials.supports_opus() {
         return false;
     }
     true
@@ -67,7 +58,7 @@ pub(super) fn credential_is_dispatch_candidate(
 }
 
 pub(super) fn credential_proxy_availability(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
 ) -> Option<ProxyResourceAvailability> {
     if credentials.proxy_url.is_some() {
@@ -84,7 +75,7 @@ pub(super) fn credential_proxy_availability(
 }
 
 pub(super) fn credential_proxy_is_dispatchable(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
 ) -> bool {
     match credential_proxy_availability(credentials, proxy_resources) {

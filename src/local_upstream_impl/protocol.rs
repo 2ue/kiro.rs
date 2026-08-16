@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::local_upstream_impl::model::credentials::KiroCredentials;
+use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
 
 pub const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
@@ -46,7 +46,7 @@ pub fn enterprise_fallback_profile_arn(region: &str) -> String {
     )
 }
 
-pub fn is_external_idp_credentials(credentials: &KiroCredentials) -> bool {
+pub fn is_external_idp_credentials(credentials: &LocalUpstreamCredentials) -> bool {
     if credentials.is_api_key_credential() {
         return false;
     }
@@ -75,7 +75,7 @@ pub fn is_external_idp_provider(value: &str) -> bool {
     )
 }
 
-pub fn is_social_credentials(credentials: &KiroCredentials) -> bool {
+pub fn is_social_credentials(credentials: &LocalUpstreamCredentials) -> bool {
     if credentials.is_api_key_credential() {
         return false;
     }
@@ -94,7 +94,10 @@ pub fn is_social_credentials(credentials: &KiroCredentials) -> bool {
 /// Header/query endpoints such as MCP, ListAvailableModels, and usage APIs must not
 /// receive BuilderId placeholders or Enterprise fallback ARNs. Those values are not
 /// caller-owned real profiles and can make otherwise valid accounts fail with 400/403.
-pub fn resolve_profile_arn(credentials: &KiroCredentials, _config: &Config) -> Option<String> {
+pub fn resolve_profile_arn(
+    credentials: &LocalUpstreamCredentials,
+    _config: &Config,
+) -> Option<String> {
     if credentials.is_api_key_credential() {
         return None;
     }
@@ -117,12 +120,12 @@ pub fn resolve_profile_arn(credentials: &KiroCredentials, _config: &Config) -> O
 
 /// Resolve the profile ARN for streaming assistant request bodies.
 ///
-/// Streaming calls are stricter than header/query APIs: BuilderId/free OAuth flows
+/// Streaming calls are stricter than header/query APIs: BuilderId/public OAuth flows
 /// still need a body-level `profileArn`, while API-key credentials have no profile
 /// concept. Enterprise/IdC should self-heal to a real ARN first; the region-aware
 /// fallback here is request-body-only and must not be persisted as a real profile.
 pub fn resolve_streaming_profile_arn(
-    credentials: &KiroCredentials,
+    credentials: &LocalUpstreamCredentials,
     config: &Config,
 ) -> Option<String> {
     if credentials.is_api_key_credential() {
@@ -160,7 +163,7 @@ pub fn resolve_streaming_profile_arn(
     None
 }
 
-pub fn resolve_agent_mode(credentials: &KiroCredentials, config: &Config) -> &'static str {
+pub fn resolve_agent_mode(credentials: &LocalUpstreamCredentials, config: &Config) -> &'static str {
     match config.local_upstream_agent_mode_strategy {
         LocalUpstreamAgentModeStrategy::Vibe => "vibe",
         LocalUpstreamAgentModeStrategy::Spec => "spec",
@@ -206,7 +209,7 @@ mod tests {
 
     #[test]
     fn header_profile_skips_external_idp_fallback() {
-        let mut credentials = KiroCredentials {
+        let mut credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             api_region: Some("eu-west-1".to_string()),
             ..Default::default()
@@ -219,7 +222,7 @@ mod tests {
 
     #[test]
     fn real_profile_arn_wins_over_fallbacks() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string()),
             ..Default::default()
@@ -243,7 +246,7 @@ mod tests {
             "AWS_IDC",
             "Internal",
         ] {
-            let credentials = KiroCredentials {
+            let credentials = LocalUpstreamCredentials {
                 auth_method: Some("idc".to_string()),
                 provider: Some(provider.to_string()),
                 api_region: Some("eu-west-1".to_string()),
@@ -276,7 +279,7 @@ mod tests {
             "AWS_IDC",
             "Internal",
         ] {
-            let credentials = KiroCredentials {
+            let credentials = LocalUpstreamCredentials {
                 auth_method: Some(auth_method.to_string()),
                 client_id: Some("client".to_string()),
                 client_secret: Some("secret".to_string()),
@@ -292,7 +295,7 @@ mod tests {
 
     #[test]
     fn header_profile_skips_builder_id_placeholder_for_idc_credentials() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("idc".to_string()),
             client_id: Some("client".to_string()),
             client_secret: Some("secret".to_string()),
@@ -303,7 +306,7 @@ mod tests {
 
     #[test]
     fn streaming_profile_keeps_builder_id_placeholder_for_idc_credentials() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("idc".to_string()),
             client_id: Some("client".to_string()),
             client_secret: Some("secret".to_string()),
@@ -317,7 +320,7 @@ mod tests {
 
     #[test]
     fn streaming_profile_uses_enterprise_fallback_without_persisting_it() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             api_region: Some("eu-west-1".to_string()),
             ..Default::default()
@@ -331,7 +334,7 @@ mod tests {
     #[test]
     fn persisted_enterprise_fallback_is_not_treated_as_real_header_profile() {
         let fallback = enterprise_fallback_profile_arn("us-east-1");
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
             provider: Some("Enterprise".to_string()),
             profile_arn: Some(fallback.clone()),
@@ -348,7 +351,7 @@ mod tests {
 
     #[test]
     fn api_key_credentials_do_not_invent_builder_id_profile_arn() {
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
             kiro_api_key: Some("ksk_test".to_string()),
             provider: Some("Enterprise".to_string()),
@@ -372,17 +375,17 @@ mod tests {
     #[test]
     fn resolves_agent_mode_strategy() {
         let mut config = Config::default();
-        let social = KiroCredentials {
+        let social = LocalUpstreamCredentials {
             auth_method: Some("social".to_string()),
             ..Default::default()
         };
-        let idc = KiroCredentials {
+        let idc = LocalUpstreamCredentials {
             auth_method: Some("idc".to_string()),
             client_id: Some("client".to_string()),
             client_secret: Some("secret".to_string()),
             ..Default::default()
         };
-        let api_key = KiroCredentials {
+        let api_key = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
             kiro_api_key: Some("ksk_test".to_string()),
             ..Default::default()

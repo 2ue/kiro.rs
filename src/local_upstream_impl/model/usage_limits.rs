@@ -29,7 +29,7 @@ pub struct UsageLimitsResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionInfo {
-    /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
+    /// Legacy upstream subscription label.
     #[serde(default)]
     pub subscription_title: Option<String>,
 
@@ -236,7 +236,7 @@ impl UsageLimitsResponse {
 
         let mut total = breakdown.usage_limit_with_precision;
 
-        // 累加激活的 free trial 额度
+        // 累加激活的试用额度
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
                 total += trial.usage_limit_with_precision;
@@ -277,7 +277,7 @@ impl UsageLimitsResponse {
 
         let mut total = breakdown.current_usage_with_precision;
 
-        // 累加激活的 free trial 使用量
+        // 累加激活的试用使用量
         if let Some(trial) = &breakdown.free_trial_info {
             if trial.is_active() {
                 total += trial.current_usage_with_precision;
@@ -304,7 +304,7 @@ mod tests {
         let raw = r#"{
             "overageConfiguration": {"overageStatus": "ENABLED"},
             "subscriptionInfo": {
-                "subscriptionTitle": "KIRO PRO",
+                "subscriptionTitle": "UPSTREAM PLAN",
                 "overageCapability": "OVERAGE_CAPABLE"
             },
             "usageBreakdownList": [{
@@ -318,7 +318,7 @@ mod tests {
 
         let parsed: UsageLimitsResponse = serde_json::from_str(raw).unwrap();
 
-        assert_eq!(parsed.subscription_title(), Some("KIRO PRO"));
+        assert_eq!(parsed.subscription_title(), Some("UPSTREAM PLAN"));
         assert_eq!(parsed.overage_capability(), Some("OVERAGE_CAPABLE"));
         assert_eq!(parsed.overage_status().as_deref(), Some("ENABLED"));
         assert_eq!(parsed.overage_cap(), 10.0);

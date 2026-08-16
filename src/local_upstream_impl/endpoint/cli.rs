@@ -321,7 +321,7 @@ fn rewrite_origin(json: &mut serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::http_client::allocation_probe;
-    use crate::local_upstream_impl::model::credentials::KiroCredentials;
+    use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
     use crate::model::config::Config;
     use std::time::Instant;
 
@@ -349,7 +349,7 @@ mod tests {
     }
 
     fn ctx<'a>(
-        credentials: &'a KiroCredentials,
+        credentials: &'a LocalUpstreamCredentials,
         config: &'a Config,
         token: &'a str,
     ) -> RequestContext<'a> {
@@ -365,7 +365,7 @@ mod tests {
     fn cli_api_url_uses_runtime_kiro_dev() {
         let endpoint = CliEndpoint::new();
         let config = Config::default();
-        let credentials = KiroCredentials::default();
+        let credentials = LocalUpstreamCredentials::default();
 
         assert_eq!(
             endpoint.api_url(&ctx(&credentials, &config, "token")),
@@ -380,7 +380,7 @@ mod tests {
         let mut config = Config::default();
         config.local_upstream_base_url =
             Some(" http://127.0.0.1:39091/aws-lifecycle/ ".to_string());
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
             kiro_api_key: Some("ksk_fake_lifecycle".to_string()),
             api_region: Some("eu-west-3".to_string()),
@@ -451,7 +451,7 @@ mod tests {
     fn cli_models_request_uses_management_post_protocol() {
         let endpoint = CliEndpoint::new();
         let config = Config::default();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string()),
             ..Default::default()
         };
@@ -807,7 +807,7 @@ mod tests {
     fn cli_decorate_api_uses_runtime_headers() {
         let endpoint = CliEndpoint::new();
         let config = Config::default();
-        let credentials = KiroCredentials {
+        let credentials = LocalUpstreamCredentials {
             auth_method: Some("api key".to_string()),
             kiro_api_key: Some("ksk_test".to_string()),
             ..Default::default()
