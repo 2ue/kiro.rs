@@ -4876,7 +4876,7 @@ impl RedisStore {
                 for _ = 1, cooldown_count do
                     local cooldown_value = redis.pcall('GET', KEYS[key_index])
                     if type(cooldown_value) == 'table' and cooldown_value.err then
-                        table.insert(result, '__kiro_rs_invalid_redis_type__')
+                        table.insert(result, '__account_runtime_invalid_redis_type__')
                     else
                         table.insert(result, cooldown_value or '')
                     end
@@ -4885,7 +4885,7 @@ impl RedisStore {
                 end
                 local transient_value = redis.pcall('GET', KEYS[key_index])
                 if type(transient_value) == 'table' and transient_value.err then
-                    table.insert(result, '__kiro_rs_invalid_redis_type__')
+                    table.insert(result, '__account_runtime_invalid_redis_type__')
                 else
                     table.insert(result, transient_value or '')
                 end
@@ -7366,7 +7366,7 @@ mod tests {
         let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
         let mut config = Config::default();
         config.redis.url = Some(url);
-        config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+        config.redis.key_prefix = format!("account-runtime:test:{}", uuid::Uuid::new_v4());
         Some(config)
     }
 

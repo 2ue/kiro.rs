@@ -207,9 +207,13 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
 - Startup env handling now prefers `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, reads the old Kiro-named env vars only as compatibility fallbacks, and healthz now reports `account-runtime` as the service name.
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming; stable hash domains remain unchanged to avoid behavior drift.
+- Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
 
 Last verified on 2026-08-16:
 
+- `rg -n "__kiro_rs_invalid_redis_type__|kiro_rs:test|kiro-usage-store" src/anthropic src/storage src/external_pool src/admin --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh redis-prefix-artifacts-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh redis-prefix-artifacts-test1 -- bash -lc 'cargo test dashboard_windows_uses_redis_observability_without_postgres_for_three_rounds -- --nocapture && cargo test persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds -- --nocapture && cargo test production_postgres_only_usage_never_materializes_redis_for_five_rounds -- --nocapture && cargo test redis_cache -- --nocapture'`
 - `rg -n "kiro-tool-format-debug|kiro-rs-file-limit-boundary|kiro\\.rs:anthropic:conversation-id|kiro\\.rs:tool-schema-key" src/anthropic src/model src/admin src/storage --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh fixture-artifact-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh fixture-artifact-names-test1 -- bash -lc 'cargo test recorder_writes_sampled_jsonl_and_rate_limits_same_fingerprint -- --nocapture && cargo test recorder_captures_attempted_body_only_within_body_limit -- --nocapture && cargo test writer_state_rolls_when_file_size_budget_would_be_exceeded -- --nocapture && cargo test file_upload_route_accepts_exact_file_limit_and_rejects_one_byte_over_for_five_rounds -- --nocapture'`

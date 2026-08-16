@@ -932,8 +932,10 @@ async fn test_external_pool_manager_for_handlers(
 
     let mut redis_config = Config::default();
     redis_config.redis.url = Some(redis_url);
-    redis_config.redis.key_prefix =
-        format!("kiro_rs:test:handlers:websearch:{}", uuid::Uuid::new_v4());
+    redis_config.redis.key_prefix = format!(
+        "account-runtime:test:handlers:websearch:{}",
+        uuid::Uuid::new_v4()
+    );
     let redis = Arc::new(
         RedisStore::connect(&redis_config)
             .await

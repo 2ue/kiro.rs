@@ -3899,7 +3899,7 @@ fn usage_fallback_runtime() -> &'static Runtime {
     FALLBACK_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("kiro-usage-store")
+            .thread_name("account-runtime-usage-store")
             .enable_all()
             .build()
             .expect("创建 usage 存储 runtime 失败")
@@ -4969,7 +4969,7 @@ mod tests {
         let mut config = crate::model::config::Config::default();
         config.redis.url = Some(redis_url);
         config.redis.key_prefix = format!(
-            "kiro_rs:test:recorder-dashboard-redis-first:{}",
+            "account-runtime:test:recorder-dashboard-redis-first:{}",
             uuid::Uuid::new_v4()
         );
         let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
@@ -5080,7 +5080,10 @@ mod tests {
         config.postgres.url = Some(postgres_url);
         config.postgres.max_connections = 2;
         config.redis.url = Some(redis_url);
-        config.redis.key_prefix = format!("kiro_rs:test:usage-cleanup:{}", uuid::Uuid::new_v4());
+        config.redis.key_prefix = format!(
+            "account-runtime:test:usage-cleanup:{}",
+            uuid::Uuid::new_v4()
+        );
         let postgres = Arc::new(
             crate::storage::postgres::PostgresStore::connect_test(&config)
                 .await
@@ -5218,8 +5221,10 @@ mod tests {
         config.postgres.url = Some(postgres_url);
         config.postgres.max_connections = 2;
         config.redis.url = Some(redis_url);
-        config.redis.key_prefix =
-            format!("kiro_rs:test:usage-postgres-only:{}", uuid::Uuid::new_v4());
+        config.redis.key_prefix = format!(
+            "account-runtime:test:usage-postgres-only:{}",
+            uuid::Uuid::new_v4()
+        );
         let postgres = Arc::new(
             crate::storage::postgres::PostgresStore::connect_test(&config)
                 .await

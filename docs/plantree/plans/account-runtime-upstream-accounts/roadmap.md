@@ -169,6 +169,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
 - Startup env handling now prefers `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, keeps old Kiro-named env vars only as compatibility fallbacks, and healthz reports `account-runtime`.
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming while stable hash domains remain unchanged.
+- Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
 
 ## In Progress
 

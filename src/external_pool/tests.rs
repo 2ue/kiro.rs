@@ -186,7 +186,10 @@ fn test_redis_config() -> Option<Config> {
     let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
     let mut config = Config::default();
     config.redis.url = Some(url);
-    config.redis.key_prefix = format!("kiro_rs:test:external_pool:{}", uuid::Uuid::new_v4());
+    config.redis.key_prefix = format!(
+        "account-runtime:test:external_pool:{}",
+        uuid::Uuid::new_v4()
+    );
     Some(config)
 }
 
@@ -2542,7 +2545,7 @@ async fn real_redis_external_poison_does_not_block_or_emit_false_capacity_for_fi
     for round in 0..5u64 {
         let mut config = Config::default();
         config.redis.url = Some(url.clone());
-        config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+        config.redis.key_prefix = format!("account-runtime:test:{}", uuid::Uuid::new_v4());
         let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
         let poison_pool = 20_000 + round;
         redis
@@ -6310,7 +6313,7 @@ async fn external_pool_redis_rtt_and_concurrency_matrix_five_outer_rounds() {
     let route = Arc::new(test_route("claude-sonnet-4-6"));
     let mut managers = Vec::with_capacity(5);
     let mut direct_stores = Vec::with_capacity(5);
-    let key_prefix = format!("kiro_rs:test:external_rtt:{}", uuid::Uuid::new_v4());
+    let key_prefix = format!("account-runtime:test:external_rtt:{}", uuid::Uuid::new_v4());
     for _ in 0..5 {
         let mut proxy_config = Config::default();
         proxy_config.redis.url = Some(proxy_redis_url.clone());
