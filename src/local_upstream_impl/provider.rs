@@ -154,10 +154,10 @@ const PROFILE_ARN_DISCOVERY_SUCCESS_HANDOFF_TTL: Duration = Duration::from_secs(
 /// from malformed imports or repeated credential replacement.
 const PROFILE_ARN_DISCOVERY_MAX_ENTRIES: usize = 2_048;
 
-/// Kiro provider 不设置 reqwest 整请求总超时：流式正文由 Anthropic SSE idle timeout 管控，
+/// Local-upstream provider 不设置 reqwest 整请求总超时：流式正文由 Anthropic SSE idle timeout 管控，
 /// 请求头和非流式 body 分别由专门的 timeout helper 管控。
-const KIRO_CLIENT_TOTAL_TIMEOUT_SECS: u64 = 0;
-const KIRO_CLIENT_CACHE_MAX_ENTRIES: usize = 256;
+const LOCAL_UPSTREAM_CLIENT_TOTAL_TIMEOUT_SECS: u64 = 0;
+const LOCAL_UPSTREAM_CLIENT_CACHE_MAX_ENTRIES: usize = 256;
 const PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES: usize = 1024 * 1024;
 const PROVIDER_AUXILIARY_BODY_MAX_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1024,10 +1024,11 @@ mod tests {
 
     use super::{
         AuxiliaryConcurrencySaturated, CredentialAuthFailureDecision, CredentialRiskControlReason,
-        KIRO_CLIENT_CACHE_MAX_ENTRIES, LocalUpstreamAvailableModel, LocalUpstreamProvider,
-        LocalUpstreamStreamCompletion, MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS,
-        MODEL_DISCOVERY_MAX_HTTP_SENDS, McpCallCompletion, McpCallFailureKind,
-        PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES, ProfileArnDiscoveryPolicy, ProviderClientCacheEntry,
+        LOCAL_UPSTREAM_CLIENT_CACHE_MAX_ENTRIES, LocalUpstreamAvailableModel,
+        LocalUpstreamProvider, LocalUpstreamStreamCompletion,
+        MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS, MODEL_DISCOVERY_MAX_HTTP_SENDS, McpCallCompletion,
+        McpCallFailureKind, PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES, ProfileArnDiscoveryPolicy,
+        ProviderClientCacheEntry,
     };
     use crate::anthropic::inference_attempt_budget::{
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, InferenceAttemptBudget, InferenceAttemptKind,
@@ -2596,7 +2597,7 @@ mod tests {
                         wire["additionalModelRequestFields"]["thinking"]
                             .get("budget_tokens")
                             .is_none(),
-                        "{endpoint} stream={is_stream} round={round}: native Kiro adaptive thinking must not carry Anthropic budget_tokens"
+                        "{endpoint} stream={is_stream} round={round}: native local-upstream adaptive thinking must not carry Anthropic budget_tokens"
                     );
                     assert_eq!(
                         wire["conversationState"]["currentMessage"]["userInputMessage"]["origin"],
@@ -3251,7 +3252,7 @@ mod tests {
                 .expect("dummy cached client");
             {
                 let mut cache = provider.client_cache.lock();
-                let missing_entries = KIRO_CLIENT_CACHE_MAX_ENTRIES - cache.entries.len();
+                let missing_entries = LOCAL_UPSTREAM_CLIENT_CACHE_MAX_ENTRIES - cache.entries.len();
                 for index in 0..missing_entries {
                     let proxy_url = format!("http://127.0.0.1:{}", 33_000 + round * 1_000 + index);
                     let key = Some(ProxyConfig::new(proxy_url));
@@ -3268,7 +3269,7 @@ mod tests {
                         },
                     );
                 }
-                assert_eq!(cache.entries.len(), KIRO_CLIENT_CACHE_MAX_ENTRIES);
+                assert_eq!(cache.entries.len(), LOCAL_UPSTREAM_CLIENT_CACHE_MAX_ENTRIES);
             }
 
             let mut last_credential = fake_bad_request_credentials(1).remove(0);
@@ -3276,7 +3277,7 @@ mod tests {
             provider.client_for(&last_credential).unwrap();
             assert_eq!(
                 provider.client_cache.lock().entries.len(),
-                KIRO_CLIENT_CACHE_MAX_ENTRIES
+                LOCAL_UPSTREAM_CLIENT_CACHE_MAX_ENTRIES
             );
             assert_eq!(provider.client_cache_builds.load(Ordering::Acquire), 2);
 
@@ -4099,7 +4100,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_model_and_conversation_id_from_kiro_request() {
+    fn extracts_model_and_conversation_id_from_local_upstream_request() {
         let body = r#"{
             "conversationState": {
                 "conversationId": "session-123",
@@ -6719,13 +6720,16 @@ impl LocalUpstreamProvider {
         );
         let tls_backend = token_manager.runtime_config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client =
-            build_client(proxy.as_ref(), KIRO_CLIENT_TOTAL_TIMEOUT_SECS, tls_backend)
-                .expect("创建 HTTP 客户端失败");
+        let initial_client = build_client(
+            proxy.as_ref(),
+            LOCAL_UPSTREAM_CLIENT_TOTAL_TIMEOUT_SECS,
+            tls_backend,
+        )
+        .expect("创建 HTTP 客户端失败");
         let initial_cell = Arc::new(OnceCell::new());
         initial_cell
             .set(initial_client)
-            .expect("initial Kiro client cache cell must be empty");
+            .expect("initial local-upstream client cache cell must be empty");
         let mut cache = HashMap::new();
         cache.insert(
             proxy.clone(),
@@ -6766,7 +6770,7 @@ impl LocalUpstreamProvider {
                 entry.last_used = now;
                 entry.client.clone()
             } else {
-                if cache.entries.len() >= KIRO_CLIENT_CACHE_MAX_ENTRIES {
+                if cache.entries.len() >= LOCAL_UPSTREAM_CLIENT_CACHE_MAX_ENTRIES {
                     let evicted = cache
                         .entries
                         .iter()
@@ -6775,7 +6779,7 @@ impl LocalUpstreamProvider {
                         .map(|(key, _)| key.clone())
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "Kiro HTTP client cache is temporarily saturated with active lookups"
+                                "local-upstream HTTP client cache is temporarily saturated with active lookups"
                             )
                         })?;
                     cache.entries.remove(&evicted);
@@ -6796,7 +6800,7 @@ impl LocalUpstreamProvider {
             self.client_cache_builds.fetch_add(1, Ordering::Relaxed);
             build_client(
                 effective.as_ref(),
-                KIRO_CLIENT_TOTAL_TIMEOUT_SECS,
+                LOCAL_UPSTREAM_CLIENT_TOTAL_TIMEOUT_SECS,
                 self.tls_backend,
             )
         });
@@ -8517,7 +8521,7 @@ impl LocalUpstreamProvider {
                 pre_endpoint_body_bytes = request_body.len(),
                 compression_enabled = config.compression.enabled
                     && config.compression.whitespace_compression,
-                "Kiro upstream request body size"
+                "local-upstream request body size"
             );
         } else {
             tracing::debug!(
@@ -8528,7 +8532,7 @@ impl LocalUpstreamProvider {
                 pre_endpoint_body_bytes = request_body.len(),
                 compression_enabled = config.compression.enabled
                     && config.compression.whitespace_compression,
-                "Kiro upstream request body size"
+                "local-upstream request body size"
             );
         }
         let base = self
@@ -10383,7 +10387,7 @@ impl LocalUpstreamProvider {
                     pre_endpoint_body_bytes = request_body.len(),
                     compression_enabled = config.compression.enabled
                         && config.compression.whitespace_compression,
-                    "Kiro upstream request body size"
+                    "local-upstream request body size"
                 );
             } else {
                 tracing::debug!(
@@ -10400,7 +10404,7 @@ impl LocalUpstreamProvider {
                     pre_endpoint_body_bytes = request_body.len(),
                     compression_enabled = config.compression.enabled
                         && config.compression.whitespace_compression,
-                    "Kiro upstream request body size"
+                    "local-upstream request body size"
                 );
             }
 
@@ -10542,7 +10546,7 @@ impl LocalUpstreamProvider {
             // terminal success decision, so the provider records only a pending header outcome.
             //
             // The legacy IDE endpoint can return a binary AWS EventStream while labeling the
-            // response as `application/json`. This is valid Kiro behavior observed in production
+            // response as `application/json`. This valid upstream behavior was observed in production
             // for social accounts: the body starts with an EventStream prelude and contains
             // assistantResponseEvent/contextUsageEvent/meteringEvent frames. Let the downstream
             // stream/non-stream handlers sniff the body bytes: binary frames pass through to the
@@ -11199,7 +11203,7 @@ impl LocalUpstreamProvider {
                             request_id,
                             credential_id = ctx.id,
                             credential_label = %credential_label,
-                            "failed to build Kiro request without historical reasoningContent"
+                            "failed to build local-upstream request without historical reasoningContent"
                         );
                         if let Some(last) = attempts.last_mut() {
                             last.action = "thinking_signature_retry_build_failed".to_string();
@@ -11311,7 +11315,7 @@ impl LocalUpstreamProvider {
                 let retry_after = Self::retry_after_duration(retry_response.headers());
                 let retry_content_kind = Self::upstream_content_kind(&retry_response);
                 // Keep the signature-retry success gate aligned with the normal provider
-                // success gate above. The legacy Kiro IDE endpoint can return a binary
+                // success gate above. The legacy IDE endpoint can return a binary
                 // AWS EventStream while labeling the response as application/json; handlers
                 // sniff the body and still reject real JSON error envelopes before committing
                 // downstream success.
@@ -12110,7 +12114,7 @@ impl LocalUpstreamProvider {
             .map(|s| s.to_string())
     }
 
-    /// 从请求体中提取 Kiro conversationId，用于账号粘性调度。
+    /// 从请求体中提取 local-upstream conversationId，用于账号粘性调度。
     fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
         use serde_json::Value;
 
