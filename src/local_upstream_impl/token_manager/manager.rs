@@ -31,7 +31,7 @@ use crate::local_upstream_impl::call_trace::{
 };
 use crate::local_upstream_impl::machine_id;
 use crate::local_upstream_impl::model::available_models::{
-    KiroModelCapabilityCohort, KiroModelCapabilityCohortKey,
+    LocalUpstreamModelCapabilityCohort, LocalUpstreamModelCapabilityCohortKey,
 };
 use crate::local_upstream_impl::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
@@ -433,8 +433,8 @@ struct LocalPoolRiskCircuitSnapshot {
 #[derive(Debug)]
 struct ModelCapabilityCohortCache {
     generation: u64,
-    cohorts: Arc<Vec<KiroModelCapabilityCohort>>,
-    keys: Arc<Vec<KiroModelCapabilityCohortKey>>,
+    cohorts: Arc<Vec<LocalUpstreamModelCapabilityCohort>>,
+    keys: Arc<Vec<LocalUpstreamModelCapabilityCohortKey>>,
     #[cfg(test)]
     rebuilds: u64,
 }
@@ -11222,7 +11222,9 @@ impl MultiTokenManager {
     /// model-capability contract. It does not refresh tokens, synchronize Redis/PgSQL state, hash
     /// credentials, or inspect transient cooldown/RPM/concurrency state. Transient availability
     /// must not make an upstream schema appear and disappear between retries.
-    pub(crate) fn local_model_capability_cohorts(&self) -> Arc<Vec<KiroModelCapabilityCohort>> {
+    pub(crate) fn local_model_capability_cohorts(
+        &self,
+    ) -> Arc<Vec<LocalUpstreamModelCapabilityCohort>> {
         let generation = self
             .model_capability_cohort_generation
             .load(Ordering::Acquire);
@@ -11233,7 +11235,7 @@ impl MultiTokenManager {
         let config = self.config.lock().clone();
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
-        let mut cohorts = BTreeMap::<KiroModelCapabilityCohortKey, Vec<u64>>::new();
+        let mut cohorts = BTreeMap::<LocalUpstreamModelCapabilityCohortKey, Vec<u64>>::new();
         for entry in entries.iter().filter(|entry| {
             !entry.disabled
                 && credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
@@ -11254,7 +11256,7 @@ impl MultiTokenManager {
                 .collect::<Vec<_>>();
             supported_models.sort_unstable();
             supported_models.dedup();
-            let key = KiroModelCapabilityCohortKey {
+            let key = LocalUpstreamModelCapabilityCohortKey {
                 endpoint_family: normalize(
                     credentials.endpoint.as_deref(),
                     &config.default_endpoint,
@@ -11282,7 +11284,7 @@ impl MultiTokenManager {
             .into_iter()
             .map(|(key, mut credential_ids)| {
                 credential_ids.sort_unstable();
-                KiroModelCapabilityCohort {
+                LocalUpstreamModelCapabilityCohort {
                     key,
                     credential_ids,
                 }
@@ -11306,7 +11308,7 @@ impl MultiTokenManager {
 
     pub(crate) fn local_model_capability_cohort_keys(
         &self,
-    ) -> Arc<Vec<KiroModelCapabilityCohortKey>> {
+    ) -> Arc<Vec<LocalUpstreamModelCapabilityCohortKey>> {
         let generation = self
             .model_capability_cohort_generation
             .load(Ordering::Acquire);

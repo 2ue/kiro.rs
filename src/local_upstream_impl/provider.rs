@@ -40,7 +40,8 @@ use crate::local_upstream_impl::endpoint::{
 };
 use crate::local_upstream_impl::machine_id;
 use crate::local_upstream_impl::model::available_models::{
-    KiroAvailableModel, KiroAvailableModelCatalog, KiroAvailableModelsResponse,
+    LocalUpstreamAvailableModel, LocalUpstreamAvailableModelCatalog,
+    LocalUpstreamAvailableModelsResponse,
 };
 use crate::local_upstream_impl::model::credentials::KiroCredentials;
 use crate::local_upstream_impl::protocol::{
@@ -87,13 +88,13 @@ impl ModelDiscoverySendBudget {
 }
 
 fn merge_model_discovery_catalogs(
-    catalogs: Vec<Vec<KiroAvailableModel>>,
+    catalogs: Vec<Vec<LocalUpstreamAvailableModel>>,
     cohort_complete: bool,
-) -> Vec<KiroAvailableModel> {
+) -> Vec<LocalUpstreamAvailableModel> {
     let mut per_credential = Vec::with_capacity(catalogs.len());
-    let mut merged = BTreeMap::<String, KiroAvailableModel>::new();
+    let mut merged = BTreeMap::<String, LocalUpstreamAvailableModel>::new();
     for catalog in catalogs {
-        let mut by_model = BTreeMap::<String, KiroAvailableModel>::new();
+        let mut by_model = BTreeMap::<String, LocalUpstreamAvailableModel>::new();
         for mut model in catalog {
             let model_id = model.model_id.trim().to_string();
             if model_id.is_empty() {
@@ -1023,7 +1024,7 @@ mod tests {
 
     use super::{
         AuxiliaryConcurrencySaturated, CredentialAuthFailureDecision, CredentialRiskControlReason,
-        KIRO_CLIENT_CACHE_MAX_ENTRIES, KiroAvailableModel, LocalUpstreamProvider,
+        KIRO_CLIENT_CACHE_MAX_ENTRIES, LocalUpstreamAvailableModel, LocalUpstreamProvider,
         LocalUpstreamStreamCompletion, MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS,
         MODEL_DISCOVERY_MAX_HTTP_SENDS, McpCallCompletion, McpCallFailureKind,
         PROVIDER_DIAGNOSTIC_BODY_MAX_BYTES, ProfileArnDiscoveryPolicy, ProviderClientCacheEntry,
@@ -3447,8 +3448,8 @@ mod tests {
                 }
             })
         }
-        fn model(schema: Option<serde_json::Value>) -> KiroAvailableModel {
-            KiroAvailableModel {
+        fn model(schema: Option<serde_json::Value>) -> LocalUpstreamAvailableModel {
+            LocalUpstreamAvailableModel {
                 model_id: "claude-cohort-test".to_string(),
                 additional_model_request_fields_schema: schema,
                 ..Default::default()
@@ -3522,7 +3523,7 @@ mod tests {
                         &["high"],
                         Some("high"),
                     )))],
-                    vec![KiroAvailableModel {
+                    vec![LocalUpstreamAvailableModel {
                         model_id: "other-model".to_string(),
                         ..Default::default()
                     }],
@@ -8465,7 +8466,7 @@ impl LocalUpstreamProvider {
     pub async fn list_available_models_for_external_credentials(
         &self,
         credentials: KiroCredentials,
-    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+    ) -> anyhow::Result<Vec<LocalUpstreamAvailableModel>> {
         let ctx = self
             .token_manager
             .acquire_context_for_external_credentials(credentials)
@@ -8598,12 +8599,14 @@ impl LocalUpstreamProvider {
         anyhow::bail!("non_stream credential test failed: {}", message);
     }
 
-    /// 从 Kiro 上游同步可用模型列表。
+    /// 从本地上游同步可用模型列表。
     ///
     /// 该方法只用于后台模型能力同步：失败会返回给调用方记录状态，不会写入调度失败、
-    /// 不会禁用凭据，也不会占用请求并发槽。由于同步会真实调用 Kiro 上游，
+    /// 不会禁用凭据，也不会占用请求并发槽。由于同步会真实调用本地上游，
     /// 这里只自动使用未禁用凭据，避免后台任务绕过用户手动禁用。
-    pub async fn list_available_models(&self) -> anyhow::Result<KiroAvailableModelCatalog> {
+    pub async fn list_available_models(
+        &self,
+    ) -> anyhow::Result<LocalUpstreamAvailableModelCatalog> {
         let _run_guard = ModelDiscoveryRunGuard::acquire(&self.model_discovery_in_progress)?;
         let mut send_budget = ModelDiscoverySendBudget::new();
         let cohorts = self.token_manager.local_model_capability_cohorts();
@@ -8686,7 +8689,7 @@ impl LocalUpstreamProvider {
                     tracing::warn!(
                         credential_id = ctx_id,
                         credential_label = %label,
-                        "同步 Kiro 模型能力失败: {}",
+                        "同步本地上游模型能力失败: {}",
                         err
                     );
                     last_error = Some(err);
@@ -8707,7 +8710,7 @@ impl LocalUpstreamProvider {
                     "Local upstream model capability cohorts were only partially observed; native reasoning will fail closed"
                 );
             }
-            return Ok(KiroAvailableModelCatalog {
+            return Ok(LocalUpstreamAvailableModelCatalog {
                 models: merge_model_discovery_catalogs(successful_catalogs, complete),
                 capability_cohort_keys: cohorts.iter().map(|cohort| cohort.key.clone()).collect(),
                 successful_cohort_count,
@@ -8732,18 +8735,18 @@ impl LocalUpstreamProvider {
 
     pub(crate) fn model_capability_cohort_keys(
         &self,
-    ) -> Arc<Vec<crate::local_upstream_impl::model::available_models::KiroModelCapabilityCohortKey>>
+    ) -> Arc<Vec<crate::local_upstream_impl::model::available_models::LocalUpstreamModelCapabilityCohortKey>>
     {
         self.token_manager.local_model_capability_cohort_keys()
     }
 
-    /// 使用指定凭据同步 Kiro 可用模型列表。
+    /// 使用指定凭据同步本地上游可用模型列表。
     ///
     /// 该方法会真实调用上游模型列表接口，但不占用普通请求并发槽。
     pub async fn list_available_models_for_credential(
         &self,
         id: u64,
-    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+    ) -> anyhow::Result<Vec<LocalUpstreamAvailableModel>> {
         let ctx = self
             .token_manager
             .acquire_context_for_credential(id)
@@ -8755,7 +8758,7 @@ impl LocalUpstreamProvider {
     async fn list_available_models_for_context(
         &self,
         ctx: CallContext,
-    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+    ) -> anyhow::Result<Vec<LocalUpstreamAvailableModel>> {
         let mut send_budget = ModelDiscoverySendBudget::new();
         self.list_available_models_for_context_with_budget(ctx, &mut send_budget)
             .await
@@ -8765,7 +8768,7 @@ impl LocalUpstreamProvider {
         &self,
         mut ctx: CallContext,
         send_budget: &mut ModelDiscoverySendBudget,
-    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+    ) -> anyhow::Result<Vec<LocalUpstreamAvailableModel>> {
         let config = self.token_manager.runtime_config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
         self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id, None)
@@ -8838,7 +8841,7 @@ impl LocalUpstreamProvider {
                     )
                 );
             }
-            let parsed: KiroAvailableModelsResponse = serde_json::from_str(&body.text)
+            let parsed: LocalUpstreamAvailableModelsResponse = serde_json::from_str(&body.text)
                 .map_err(|_| anyhow::anyhow!("ListAvailableModels protocol_error"))?;
             all_models.extend(
                 parsed

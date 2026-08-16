@@ -215,9 +215,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Concrete local-upstream request payload structs now use `LocalUpstreamRequest`, `LocalUpstreamAdditionalModelRequestFields`, `LocalUpstreamThinkingConfig`, `LocalUpstreamOutputConfig` and `LocalUpstreamReasoningConfig`; `model/requests` comments now use local-upstream wording while compatibility wire fields and payload behavior remain unchanged.
 - Concrete local-upstream provider and endpoint types now use `LocalUpstreamProvider`, `LocalUpstreamEndpoint`, `LocalUpstreamApiResponse`, `LocalUpstreamApiCompletion`, `LocalUpstreamStreamResponse` and `LocalUpstreamStreamCompletion`; provider diagnostics and endpoint comments now use local-upstream wording while existing transport, retry and completion behavior stays unchanged.
 - Local-upstream call-trace types now use `LocalUpstreamCredentialAttempt`, `LocalUpstreamCallError` and `LocalUpstreamCallFailureKind`; MCP attribution, provider downcast helpers and serialized attempt fields are unchanged.
+- Local-upstream available-model catalog types now use `LocalUpstreamAvailableModelCatalog`, `LocalUpstreamAvailableModel`, `LocalUpstreamAvailableModelsResponse`, `LocalUpstreamModelCapabilityCohortKey`, `LocalUpstreamModelCapabilityCohort`, `LocalUpstreamModelTokenLimits` and `LocalUpstreamModelPromptCaching`; ListAvailableModels wire parsing and reasoning cohort behavior are unchanged.
 
 Last verified on 2026-08-16:
 
+- `rg -n "\bKiroAvailableModelCatalog\b|\bKiroAvailableModelsResponse\b|\bKiroAvailableModel\b|\bKiroModelCapabilityCohortKey\b|\bKiroModelCapabilityCohort\b|\bKiroModelTokenLimits\b|\bKiroModelPromptCaching\b" src --glob '!target/**'`
+- `rg -n "Kiro ListAvailableModels|serialized to Kiro|Kiro model-capability|Kiro model|Kiro 模型|Kiro 上游|Kiro available" src/local_upstream_impl/model/available_models.rs src/local_upstream_impl/provider.rs src/local_upstream_impl/token_manager/manager.rs src/storage/postgres.rs --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-model-catalog-types-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh local-upstream-model-catalog-types-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh local-upstream-model-catalog-types-test1 -- bash -lc 'cargo test deserializes_cli_management_model_catalog_fields -- --nocapture && cargo test catalog_reasoning_state_is_authoritative_and_cohort_fenced_for_five_rounds -- --nocapture && cargo test model_discovery_reasoning_contract_intersects_or_rejects_heterogeneous_cohorts_five_rounds -- --nocapture'`
 - `rg -n "\bKiroCredentialAttempt\b|\bKiroCallFailureKind\b|\bKiroCallError\b|Kiro provider 内部" src --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-check1 -- cargo check`

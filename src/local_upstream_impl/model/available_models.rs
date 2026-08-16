@@ -1,4 +1,4 @@
-//! Kiro ListAvailableModels response models.
+//! Local-upstream ListAvailableModels response models.
 
 use std::collections::BTreeMap;
 
@@ -7,31 +7,31 @@ use serde::{Deserialize, Serialize};
 /// One bounded, pool-aware model discovery result.
 ///
 /// Cohort keys are process-internal correctness metadata. They contain no credential secret and
-/// are never serialized to Kiro or exposed through the Admin model payload. Consumers may publish
+/// are never serialized to upstream or exposed through the Admin model payload. Consumers may publish
 /// native reasoning fields only while the current local cohort keys exactly match this snapshot.
 #[derive(Debug, Clone, Default)]
-pub struct KiroAvailableModelCatalog {
-    pub models: Vec<KiroAvailableModel>,
-    pub capability_cohort_keys: Vec<KiroModelCapabilityCohortKey>,
+pub struct LocalUpstreamAvailableModelCatalog {
+    pub models: Vec<LocalUpstreamAvailableModel>,
+    pub capability_cohort_keys: Vec<LocalUpstreamModelCapabilityCohortKey>,
     pub successful_cohort_count: usize,
     pub cohort_count: usize,
     pub complete: bool,
 }
 
-impl std::ops::Deref for KiroAvailableModelCatalog {
-    type Target = [KiroAvailableModel];
+impl std::ops::Deref for LocalUpstreamAvailableModelCatalog {
+    type Target = [LocalUpstreamAvailableModel];
 
     fn deref(&self) -> &Self::Target {
         &self.models
     }
 }
 
-/// Static, secret-free attributes expected to determine one Kiro model-capability catalog.
+/// Static, secret-free attributes expected to determine one local-upstream model-capability catalog.
 /// Transient cooldown, RPM, concurrency, token expiry, proxy identity, and credential ID are
 /// intentionally excluded so ordinary failover and same-cohort account additions stay valid.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroModelCapabilityCohortKey {
+pub struct LocalUpstreamModelCapabilityCohortKey {
     pub endpoint_family: String,
     pub auth_method: String,
     pub provider: String,
@@ -42,25 +42,25 @@ pub struct KiroModelCapabilityCohortKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KiroModelCapabilityCohort {
-    pub key: KiroModelCapabilityCohortKey,
+pub(crate) struct LocalUpstreamModelCapabilityCohort {
+    pub key: LocalUpstreamModelCapabilityCohortKey,
     pub credential_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroAvailableModelsResponse {
+pub struct LocalUpstreamAvailableModelsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_model: Option<KiroAvailableModel>,
+    pub default_model: Option<LocalUpstreamAvailableModel>,
     #[serde(default)]
-    pub models: Vec<KiroAvailableModel>,
+    pub models: Vec<LocalUpstreamAvailableModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroAvailableModel {
+pub struct LocalUpstreamAvailableModel {
     #[serde(default, alias = "id")]
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,9 +70,9 @@ pub struct KiroAvailableModel {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_input_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_limits: Option<KiroModelTokenLimits>,
+    pub token_limits: Option<LocalUpstreamModelTokenLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_caching: Option<KiroModelPromptCaching>,
+    pub prompt_caching: Option<LocalUpstreamModelPromptCaching>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_model_request_fields_schema: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,7 +85,7 @@ pub struct KiroAvailableModel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroModelTokenLimits {
+pub struct LocalUpstreamModelTokenLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,7 +94,7 @@ pub struct KiroModelTokenLimits {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct KiroModelPromptCaching {
+pub struct LocalUpstreamModelPromptCaching {
     #[serde(default)]
     pub supports_prompt_caching: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,7 +136,7 @@ mod tests {
             }]
         }"#;
 
-        let parsed: KiroAvailableModelsResponse = serde_json::from_str(body).unwrap();
+        let parsed: LocalUpstreamAvailableModelsResponse = serde_json::from_str(body).unwrap();
         assert_eq!(
             parsed
                 .default_model

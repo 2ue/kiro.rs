@@ -95,14 +95,14 @@ pub(crate) mod event {
 
 pub(crate) mod model_catalog {
     pub(crate) type LocalUpstreamAvailableModel =
-        crate::local_upstream_impl::model::available_models::KiroAvailableModel;
+        crate::local_upstream_impl::model::available_models::LocalUpstreamAvailableModel;
     pub(crate) type LocalUpstreamAvailableModelCatalog =
-        crate::local_upstream_impl::model::available_models::KiroAvailableModelCatalog;
+        crate::local_upstream_impl::model::available_models::LocalUpstreamAvailableModelCatalog;
     pub(crate) type LocalUpstreamModelCapabilityCohortKey =
-        crate::local_upstream_impl::model::available_models::KiroModelCapabilityCohortKey;
+        crate::local_upstream_impl::model::available_models::LocalUpstreamModelCapabilityCohortKey;
     #[cfg(test)]
     pub(crate) type LocalUpstreamModelTokenLimits =
-        crate::local_upstream_impl::model::available_models::KiroModelTokenLimits;
+        crate::local_upstream_impl::model::available_models::LocalUpstreamModelTokenLimits;
 }
 
 pub(crate) mod manager {
