@@ -5117,7 +5117,7 @@ mod tests {
 
         for content_bytes in SIZES {
             for mode in ["clean_anthropic", "dirty_anthropic", "clean_local_upstream"] {
-                let (anthropic_template, raw, kiro_template) = match mode {
+                let (anthropic_template, raw, local_upstream_template) = match mode {
                     "clean_anthropic" => {
                         let request = anthropic_request(vec![anthropic_message(
                             "user",
@@ -5149,7 +5149,7 @@ mod tests {
                     .as_ref()
                     .map(Bytes::len)
                     .or_else(|| {
-                        kiro_template
+                        local_upstream_template
                             .as_ref()
                             .map(|request| serialize_local_upstream_request(request).unwrap().len())
                     })
@@ -5181,7 +5181,7 @@ mod tests {
                         }
                         report
                     } else {
-                        let mut request = kiro_template.as_ref().unwrap().clone();
+                        let mut request = local_upstream_template.as_ref().unwrap().clone();
                         let (body, report) = guard_local_upstream_request(
                             &mut request,
                             guard_config(input_bytes.saturating_add(1)),
@@ -7366,21 +7366,21 @@ mod tests {
         let encoded = "A".repeat(512 * 1_024);
 
         for round in 0..5 {
-            let mut kiro_template = request_with_history(Vec::new());
-            kiro_template
+            let mut local_upstream_template = request_with_history(Vec::new());
+            local_upstream_template
                 .conversation_state
                 .current_message
                 .user_input_message
                 .images = (0..4)
                 .map(|_| LocalUpstreamImage::from_base64("png", encoded.clone()))
                 .collect();
-            let mut one_kiro_image = request_with_history(Vec::new());
-            one_kiro_image
+            let mut one_local_upstream_image = request_with_history(Vec::new());
+            one_local_upstream_image
                 .conversation_state
                 .current_message
                 .user_input_message
                 .images = vec![LocalUpstreamImage::from_base64("png", encoded.clone())];
-            let kiro_target = serialize_local_upstream_request(&one_kiro_image)
+            let local_upstream_target = serialize_local_upstream_request(&one_local_upstream_image)
                 .unwrap()
                 .len()
                 .saturating_add(4 * 1_024);
@@ -7397,16 +7397,25 @@ mod tests {
                 ..PayloadShapingConfig::default()
             };
 
-            let (kiro_body, kiro_report) = guard_local_upstream_request(
-                &mut kiro_template,
-                guard_config_with_shaping(kiro_target, false, shaping),
+            let (local_upstream_body, local_upstream_report) = guard_local_upstream_request(
+                &mut local_upstream_template,
+                guard_config_with_shaping(local_upstream_target, false, shaping),
             )
             .expect("batched local upstream current image fit");
-            assert!(kiro_body.len() <= kiro_target, "round {round}");
-            assert_eq!(kiro_report.dropped_current_images, 3, "round {round}");
-            assert_eq!(kiro_report.guard_serializations, 3, "round {round}");
+            assert!(
+                local_upstream_body.len() <= local_upstream_target,
+                "round {round}"
+            );
             assert_eq!(
-                kiro_template
+                local_upstream_report.dropped_current_images, 3,
+                "round {round}"
+            );
+            assert_eq!(
+                local_upstream_report.guard_serializations, 3,
+                "round {round}"
+            );
+            assert_eq!(
+                local_upstream_template
                     .conversation_state
                     .current_message
                     .user_input_message
@@ -7416,7 +7425,7 @@ mod tests {
                 "round {round}"
             );
             assert_eq!(
-                kiro_template
+                local_upstream_template
                     .conversation_state
                     .current_message
                     .user_input_message
@@ -7852,19 +7861,22 @@ mod tests {
             );
             assert!(body.contains(r#""type":"image""#));
 
-            let mut kiro = request_with_history(Vec::new());
-            kiro.conversation_state
+            let mut local_upstream = request_with_history(Vec::new());
+            local_upstream
+                .conversation_state
                 .current_message
                 .user_input_message
                 .images = vec![LocalUpstreamImage::from_base64(
                 "png",
                 base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
             )];
-            let (_body, report) = guard_local_upstream_request(&mut kiro, guard_config(usize::MAX))
-                .expect("exact-limit local upstream image");
+            let (_body, report) =
+                guard_local_upstream_request(&mut local_upstream, guard_config(usize::MAX))
+                    .expect("exact-limit local upstream image");
             assert_eq!(report.dropped_current_images, 0);
             assert_eq!(
-                kiro.conversation_state
+                local_upstream
+                    .conversation_state
                     .current_message
                     .user_input_message
                     .images

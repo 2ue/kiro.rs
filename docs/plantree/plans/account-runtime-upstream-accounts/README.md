@@ -222,9 +222,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. Subscription title display now uses the upstream title directly as unordered metadata, and model-capability cohort tests use neutral account cohort fixtures.
 - Local-upstream image request payload types now use `LocalUpstreamImage` and `LocalUpstreamImageSource` as real Rust types. The facade points at those concrete types, image JSON shape is unchanged, and payload-guard image byte accounting uses local-upstream naming.
 - Local-upstream event model comments and examples now use local-upstream/upstream wording. Event names, parser behavior and typed DTOs are unchanged.
+- Payload-guard local-upstream image tests now use local-upstream variable names while preserving current image-budget shaping and exact-limit behavior.
 
 Last verified on 2026-08-16:
 
+- `rg -n "\bkiro_(template|target|body|report)|one_kiro_image|let mut kiro\b|\bkiro\b" src/anthropic/payload_guard.rs --glob '!target/**'`
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-vars-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-vars-test1 -- bash -lc 'cargo test current_fit_batches_image_drops_and_counts_serializations_for_five_rounds -- --nocapture && cargo test exact_five_mib_decoded_images_are_not_dropped_for_five_rounds -- --nocapture'`
+- `git diff --check`
 - `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/model/events --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-check1 -- cargo check`

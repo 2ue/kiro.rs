@@ -184,6 +184,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. They display upstream subscription titles as unordered metadata, and model-capability cohort tests now use neutral account cohort fixtures.
 - Local-upstream image request payload types now use `LocalUpstreamImage` and `LocalUpstreamImageSource` as real Rust types, with image JSON shape and payload-guard byte accounting preserved.
 - Local-upstream event model comments and examples now use local-upstream/upstream wording while preserving event names, parser behavior and typed DTOs.
+- Payload-guard local-upstream image tests now use local-upstream variable names while preserving image-budget shaping and exact-limit behavior.
 
 ## In Progress
 

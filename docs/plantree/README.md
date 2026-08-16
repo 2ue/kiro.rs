@@ -55,6 +55,7 @@ Current-state facts and target-state decisions answer different questions and mu
 - 2026-08-16: Maintained credential UIs no longer hard-code subscription label badges or filter values. They display upstream subscription titles as unordered metadata, and model-capability cohort tests use neutral account cohort fixtures.
 - 2026-08-16: Local-upstream image request payload types now use `LocalUpstreamImage` / `LocalUpstreamImageSource` as real Rust types while preserving image JSON shape and payload-guard behavior.
 - 2026-08-16: Local-upstream event model comments and examples now use local-upstream/upstream wording; event names, parser behavior and typed DTOs are unchanged.
+- 2026-08-16: Payload-guard local-upstream image tests now use local-upstream variable names while preserving current image-budget shaping and exact-limit behavior.
 
 ## Baseline
 
