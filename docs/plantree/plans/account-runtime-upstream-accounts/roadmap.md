@@ -186,6 +186,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream event model comments and examples now use local-upstream/upstream wording while preserving event names, parser behavior and typed DTOs.
 - Payload-guard local-upstream image tests now use local-upstream variable names while preserving image-budget shaping and exact-limit behavior.
 - Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording; remaining provider Kiro strings are compatibility fields or upstream wire literals.
+- Local-upstream protocol profile ARN constants and machineId diagnostics/comments now use generic local-upstream and compatibility wording while preserving stable hash domains and upstream wire/header literals.
 
 ## In Progress
 

@@ -237,7 +237,7 @@ mod tests {
     use crate::local_upstream_impl::endpoint::{LocalUpstreamEndpoint, RequestContext};
     use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
     use crate::local_upstream_impl::protocol::{
-        KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN,
+        BUILDER_ID_PLACEHOLDER_PROFILE_ARN, SOCIAL_PROFILE_ARN,
     };
     use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
     use reqwest::Client;
@@ -549,7 +549,7 @@ mod tests {
         };
 
         let url = endpoint.models_url(&ctx, None);
-        assert!(url.contains(&urlencoding::encode(KIRO_SOCIAL_PROFILE_ARN).to_string()));
+        assert!(url.contains(&urlencoding::encode(SOCIAL_PROFILE_ARN).to_string()));
     }
 
     #[test]
@@ -592,7 +592,7 @@ mod tests {
 
         let body = endpoint.transform_api_body(r#"{"conversationState":{}}"#, &ctx);
         let json: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["profileArn"], KIRO_BUILDER_ID_PLACEHOLDER_ARN);
+        assert_eq!(json["profileArn"], BUILDER_ID_PLACEHOLDER_PROFILE_ARN);
     }
 
     #[test]

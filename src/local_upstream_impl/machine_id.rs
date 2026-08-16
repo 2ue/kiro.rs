@@ -48,7 +48,7 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
 /// 1. 凭据级 `machineId`（若配置且格式合法）
 /// 2. 全局 `config.machineId`（若配置且格式合法）
 /// 3. 根据凭据类型派生（互斥，由 [`LocalUpstreamCredentials::is_api_key_credential`] 分流）：
-///    - API Key 凭据：基于 `kiroApiKey` 派生
+///    - API Key 凭据：基于兼容 API-key 字段派生
 ///    - OAuth 凭据：基于 `refreshToken` 派生
 /// 4. 兜底：基于随机种子派生，按 `credentials.id` 在进程内缓存（首次触发 warn 日志）
 pub fn generate_from_credentials(
@@ -71,7 +71,7 @@ pub fn generate_from_credentials(
 
     // 按凭据类型派生（API Key 与 refreshToken 两条路径互斥，不回落）
     if credentials.is_api_key_credential() {
-        // API Key 凭据：基于 kiroApiKey 派生
+        // API Key 凭据：基于兼容 API-key 字段派生
         if let Some(ref api_key) = credentials.kiro_api_key {
             if !api_key.is_empty() {
                 return sha256_hex(&format!("KiroAPIKey/{}", api_key));
@@ -90,7 +90,7 @@ pub fn generate_from_credentials(
 
 /// 为缺失派生材料的凭据生成兜底 machineId
 ///
-/// - 仍经 `sha256("KiroFallback/<uuid>")` 派生，输出格式与正常路径一致（64 字符十六进制）
+/// - 仍经既有兼容 hash domain 派生，输出格式与正常路径一致（64 字符十六进制）
 /// - 按 `credentials.id` 在进程内缓存；同一凭据多次调用返回同一值
 /// - 进程重启会重新随机；不持久化
 /// - 每个凭据首次生成时 warn 一次
@@ -105,7 +105,7 @@ fn fallback_machine_id(credentials: &LocalUpstreamCredentials) -> String {
     let derived = sha256_hex(&format!("KiroFallback/{}", seed));
     tracing::warn!(
         credential_id = ?credentials.id,
-        "凭据缺少派生材料（kiroApiKey/refreshToken 均不可用），使用随机兜底 machineId（进程内稳定）"
+        "凭据缺少派生材料（API key/refreshToken 均不可用），使用随机兜底 machineId（进程内稳定）"
     );
     map.insert(credentials.id, derived.clone());
     derived
@@ -184,13 +184,13 @@ mod tests {
 
         let result = generate_from_credentials(&credentials, &config);
         assert_eq!(result.len(), 64);
-        // 应与 KiroAPIKey/<api_key> 的哈希一致
+        // 应与既有兼容 API-key hash domain 的哈希一致
         assert_eq!(result, sha256_hex("KiroAPIKey/ksk_test_api_key"));
     }
 
     #[test]
     fn test_api_key_and_refresh_token_are_mutually_exclusive() {
-        // 同时存在 kiroApiKey 和 refreshToken 时，应走 API Key 分支
+        // 同时存在 API key 和 refreshToken 时，应走 API Key 分支
         let mut credentials = LocalUpstreamCredentials::default();
         credentials.kiro_api_key = Some("ksk_test".to_string());
         credentials.refresh_token = Some("should_not_be_used".to_string());

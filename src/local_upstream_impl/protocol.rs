@@ -1,13 +1,13 @@
-//! Shared Kiro upstream protocol helpers.
+//! Shared local-upstream protocol helpers.
 
 use serde_json::Value;
 
 use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
 
-pub const KIRO_BUILDER_ID_PLACEHOLDER_ARN: &str =
+pub const BUILDER_ID_PLACEHOLDER_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
-pub const KIRO_SOCIAL_PROFILE_ARN: &str =
+pub const SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 
 const ENTERPRISE_FALLBACK_PROFILE_ID: &str = "VNECVYCYYAWN";
@@ -22,7 +22,7 @@ fn compact_protocol_value(value: &str) -> String {
 }
 
 pub fn is_placeholder_profile_arn(arn: &str) -> bool {
-    arn == KIRO_BUILDER_ID_PLACEHOLDER_ARN
+    arn == BUILDER_ID_PLACEHOLDER_PROFILE_ARN
 }
 
 pub fn is_enterprise_fallback_profile_arn(arn: &str) -> bool {
@@ -112,7 +112,7 @@ pub fn resolve_profile_arn(
     }
 
     if is_social_credentials(credentials) {
-        return Some(KIRO_SOCIAL_PROFILE_ARN.to_string());
+        return Some(SOCIAL_PROFILE_ARN.to_string());
     }
 
     None
@@ -148,7 +148,7 @@ pub fn resolve_streaming_profile_arn(
     }
 
     if is_social_credentials(credentials) {
-        return Some(KIRO_SOCIAL_PROFILE_ARN.to_string());
+        return Some(SOCIAL_PROFILE_ARN.to_string());
     }
 
     if credentials.is_idc_refresh_credential()
@@ -157,7 +157,7 @@ pub fn resolve_streaming_profile_arn(
             .as_deref()
             .is_some_and(|value| compact_protocol_value(value) == "builderid")
     {
-        return Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN.to_string());
+        return Some(BUILDER_ID_PLACEHOLDER_PROFILE_ARN.to_string());
     }
 
     None
@@ -314,7 +314,7 @@ mod tests {
         };
         assert_eq!(
             resolve_streaming_profile_arn(&credentials, &Config::default()).as_deref(),
-            Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+            Some(BUILDER_ID_PLACEHOLDER_PROFILE_ARN)
         );
     }
 
