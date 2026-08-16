@@ -204,9 +204,17 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Anthropic handler prompt-cache route strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream test naming instead of Kiro-scoped route/content variables.
 - Admin UI internal status color utility classes now use `runtime` prefixes instead of Kiro-branded class names while preserving the existing color values and component behavior.
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming; the old theme key remains a read fallback only.
+- New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
 
 Last verified on 2026-08-16:
 
+- `rg -n "sk-kiro-rs|kiro-credentials|kiro-rs-credentials-backup|kiro-rs-proxy-test" src ui admin-ui scripts docs --glob '!target/**' --glob '!**/node_modules/**'`
+- `feature/tests/run-cargo-scoped.sh api-key-artifacts-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh api-key-artifacts-check1 -- bash -lc 'cargo check && cargo test admin::service_tests -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh api-key-artifacts-service-test1 -- cargo test export_credentials_filter_keeps_selected_ids_and_rejects_missing_ids -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh api-key-prefix-test-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh api-key-prefix-test1 -- cargo test generated_request_api_key_uses_account_runtime_prefix -- --nocapture`
+- `pnpm --dir ui check && pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "kiro-admin-ui|kiro-ui|kiro-credentials|kiro-usage|kiro-console:theme" ui admin-ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
 - `pnpm --dir ui check && pnpm --dir admin-ui exec tsc -b --pretty false`
 - `rg -n "(text|bg|border)-kiro|kiro-(success|warning|error|info)" admin-ui ui --glob '!**/dist/**' --glob '!**/node_modules/**'`

@@ -40,7 +40,7 @@ import type { AccessKeysResponse, RequestApiKeyItem } from '@/types/api'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
 
-const REQUEST_API_KEY_PREFIX = 'sk-kiro-rs-'
+const REQUEST_API_KEY_PREFIX = 'sk-account-runtime-'
 
 function generateLocalRequestApiKey(): string {
   const bytes = new Uint8Array(32)

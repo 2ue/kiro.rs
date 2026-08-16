@@ -166,6 +166,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Anthropic handler prompt-cache strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream naming instead of Kiro-scoped route/content variables.
 - Admin UI internal status color utilities now use `runtime` class prefixes instead of Kiro-branded class names while preserving the existing visual behavior.
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming, with the old theme key retained only as a compatibility fallback.
+- New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
 
 ## In Progress
 

@@ -505,7 +505,7 @@ fn generate_request_api_key() -> String {
     let mut bytes = [0u8; 32];
     bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    format!("sk-kiro-rs-{}", URL_SAFE_NO_PAD.encode(bytes))
+    format!("sk-account-runtime-{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn remove_request_api_key_by_id(
@@ -3816,7 +3816,7 @@ impl AdminService {
         let response = match send_with_response_header_timeout(
             client
                 .get(&test_url)
-                .header("user-agent", "kiro-rs-proxy-test/1.0"),
+                .header("user-agent", "account-runtime-proxy-test/1.0"),
             PROXY_TEST_TIMEOUT_SECS,
         )
         .await
@@ -4590,18 +4590,18 @@ impl AdminService {
                 let body = serde_json::to_string_pretty(&credentials).map_err(|e| {
                     AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                 })?;
-                Ok((body, "kiro-credentials.json".to_string()))
+                Ok((body, "account-runtime-credentials.json".to_string()))
             }
             "backup-json" | "wrapped-json" => {
                 let export = CredentialsBackupExport {
-                    format: "kiro-rs-credentials-backup",
+                    format: "account-runtime-credentials-backup",
                     exported_at: Utc::now().to_rfc3339(),
                     credentials,
                 };
                 let body = serde_json::to_string_pretty(&export).map_err(|e| {
                     AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                 })?;
-                Ok((body, "kiro-credentials-backup.json".to_string()))
+                Ok((body, "account-runtime-credentials-backup.json".to_string()))
             }
             "jsonl" => {
                 let mut lines = Vec::with_capacity(credentials.len());
@@ -4610,7 +4610,10 @@ impl AdminService {
                         AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                     })?);
                 }
-                Ok((lines.join("\n"), "kiro-credentials.jsonl".to_string()))
+                Ok((
+                    lines.join("\n"),
+                    "account-runtime-credentials.jsonl".to_string(),
+                ))
             }
             _ => Err(AdminServiceError::InvalidCredential(format!(
                 "不支持的导出格式: {}，可选 json、backup-json、jsonl",

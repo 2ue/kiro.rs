@@ -163,7 +163,7 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
   },
   "host": "0.0.0.0",
   "port": 8990,
-  "apiKey": "sk-kiro-rs-change-me",
+  "apiKey": "sk-account-runtime-change-me",
   "apiKeys": [],
   "adminApiKey": "sk-admin-change-me",
   "payloadGuardEnabled": true,
@@ -408,7 +408,7 @@ docker compose logs -f kiro-rs
 
 ```bash
 curl http://127.0.0.1:8990/v1/models \
-  -H 'x-api-key: sk-kiro-rs-change-me'
+  -H 'x-api-key: sk-account-runtime-change-me'
 ```
 
 验证消息接口：
@@ -416,7 +416,7 @@ curl http://127.0.0.1:8990/v1/models \
 ```bash
 curl http://127.0.0.1:8990/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: sk-kiro-rs-change-me' \
+  -H 'x-api-key: sk-account-runtime-change-me' \
   -d '{
     "model": "claude-sonnet-4-5",
     "max_tokens": 128,

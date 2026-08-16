@@ -14,6 +14,16 @@ fn cleanup_request() -> UsageCleanupRequest {
 }
 
 #[test]
+fn generated_request_api_key_uses_account_runtime_prefix() {
+    let first = generate_request_api_key();
+    let second = generate_request_api_key();
+
+    assert!(first.starts_with("sk-account-runtime-"));
+    assert!(second.starts_with("sk-account-runtime-"));
+    assert_ne!(first, second);
+}
+
+#[test]
 fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
     let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
         "refreshToken": "fake-refresh-token",
