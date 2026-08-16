@@ -199,9 +199,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Kiro-named path remains only as a compatibility wrapper that imports the new entrypoint.
 - Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Kiro-branded names.
 - Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
+- Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro-load-runner|kiro-conversation-load-runner|account-runtime-load-runner|account-runtime-conversation-load-runner" . --glob '!target/**' --glob '!**/node_modules/**'`
+- `node --check scripts/loadtest/account-runtime-load-runner.mjs && node --check scripts/loadtest/account-runtime-conversation-load-runner.mjs && node --check scripts/loadtest/kiro-load-runner.mjs && node --check scripts/loadtest/kiro-conversation-load-runner.mjs`
+- `node --test scripts/loadtest/validation-target.test.mjs`
+- `git diff --check`
 - `rg -n "KIRO_BASE_URL|KIRO_LOAD_ALLOW_REMOTE|KIRO_API_KEY|KIRO_MESSAGES_PATH|KIRO_MOCK_SCENARIO|kiro-loadtest|kiro-conversation-loadtest|kiro-sustained|kiro-load-runner|kiro-conversation-load-runner|KIRO_VALIDATION_ARTIFACT_DIR" scripts/loadtest docs/testing/loadtest.md`
 - `node --check scripts/loadtest/validation-target.mjs && node --check scripts/loadtest/kiro-load-runner.mjs && node --check scripts/loadtest/kiro-conversation-load-runner.mjs`
 - `node --test scripts/loadtest/validation-target.test.mjs`

@@ -5,7 +5,7 @@ import test from 'node:test'
 
 import { resolveLoadTarget } from './validation-target.mjs'
 
-const RUNNERS = ['kiro-load-runner.mjs', 'kiro-conversation-load-runner.mjs']
+const RUNNERS = ['account-runtime-load-runner.mjs', 'account-runtime-conversation-load-runner.mjs']
 
 test('accepts explicit loopback and explicit remote targets for five rounds', () => {
   for (let round = 0; round < 5; round += 1) {
