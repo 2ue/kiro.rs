@@ -158,6 +158,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
 - The maintained UI HTML document title now uses Account Runtime Console wording.
 - Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Kiro-named semantic test names while preserving existing compatibility fields.
+- The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Kiro-named path remains only as a compatibility wrapper.
 
 ## In Progress
 

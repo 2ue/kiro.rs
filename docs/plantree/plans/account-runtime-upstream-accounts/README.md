@@ -196,9 +196,14 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording. New mock/doc variables use `ACCOUNT_RUNTIME_*` names while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
 - The maintained UI HTML document title now uses Account Runtime Console wording; the Admin HTML title already uses Account Runtime Admin.
 - Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Kiro-named semantic test names while preserving the existing compatibility fields.
+- The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Kiro-named path remains only as a compatibility wrapper that imports the new entrypoint.
 
 Last verified on 2026-08-16:
 
+- `rg -n "kiro-mock-upstream|account-runtime-mock-upstream" . --glob '!target/**' --glob '!**/node_modules/**'`
+- `node --check scripts/loadtest/account-runtime-mock-upstream.mjs`
+- `node --check scripts/loadtest/kiro-mock-upstream.mjs`
+- `git diff --check`
 - `rg -n "fn .*kiro|includes_kiro|aggregates_kiro|with_kiro_compatibility|kiro compatible|Kiro compatible" src/admin/service_tests.rs src/anthropic/usage.rs`
 - `feature/tests/run-cargo-scoped.sh upstream-test-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh upstream-test-names-test1 -- bash -lc 'cargo test extracts_model_ids_from_upstream_model_catalog_response -- --nocapture && cargo test usage_metering_fields_serialize_upstream_with_legacy_compatibility -- --nocapture && cargo test credential_cost_summary_includes_upstream_metering_units -- --nocapture && cargo test credential_cost_summary_aggregates_upstream_metering_units -- --nocapture'`
