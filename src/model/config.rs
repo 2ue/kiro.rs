@@ -5245,44 +5245,45 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(url) = std::env::var("KIRO_RS_POSTGRES_URL") {
+        if let Ok(url) = std::env::var("ACCOUNT_RUNTIME_POSTGRES_URL") {
             if !url.trim().is_empty() {
                 self.postgres.url = Some(url);
             }
         }
-        if let Some(parsed) = std::env::var("KIRO_RS_POSTGRES_MAX_CONNECTIONS")
+        if let Some(parsed) = std::env::var("ACCOUNT_RUNTIME_POSTGRES_MAX_CONNECTIONS")
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
         {
             self.postgres.max_connections = parsed.max(1);
         }
-        if let Some(parsed) = std::env::var("KIRO_RS_POSTGRES_USAGE_MAX_CONNECTIONS")
+        if let Some(parsed) = std::env::var("ACCOUNT_RUNTIME_POSTGRES_USAGE_MAX_CONNECTIONS")
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
         {
             self.postgres.usage_max_connections = parsed.max(1);
         }
-        if let Ok(value) = std::env::var("KIRO_RS_POSTGRES_MIGRATE_ON_START") {
+        if let Ok(value) = std::env::var("ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START") {
             if let Some(parsed) = parse_env_bool(&value) {
                 self.postgres.migrate_on_start = parsed;
             }
         }
-        if let Ok(value) = std::env::var("KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START") {
+        if let Ok(value) = std::env::var("ACCOUNT_RUNTIME_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START")
+        {
             if let Some(parsed) = parse_env_bool(&value) {
                 self.postgres.compress_usage_rollups_on_start = parsed;
             }
         }
-        if let Ok(url) = std::env::var("KIRO_RS_REDIS_URL") {
+        if let Ok(url) = std::env::var("ACCOUNT_RUNTIME_REDIS_URL") {
             if !url.trim().is_empty() {
                 self.redis.url = Some(url);
             }
         }
-        if let Ok(url) = std::env::var("KIRO_RS_OBSERVABILITY_REDIS_URL") {
+        if let Ok(url) = std::env::var("ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_URL") {
             if !url.trim().is_empty() {
                 self.observability_redis.url = Some(url);
             }
         }
-        if let Ok(prefix) = std::env::var("KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX") {
+        if let Ok(prefix) = std::env::var("ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_KEY_PREFIX") {
             if !prefix.trim().is_empty() {
                 self.observability_redis.key_prefix = prefix;
             }

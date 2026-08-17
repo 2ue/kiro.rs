@@ -127,7 +127,7 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
 > PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
 > PgSQL 和业务 Redis 为必需依赖。首次启动时会把 `config.json` 和 `credentials.json` 导入 PgSQL；之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用、external fencing 和跨实例 Token 刷新锁只使用业务 `redis`。
 >
-> `observabilityRedis` 是可选的独立观测故障域，用于 usage 派生 materialization、Admin/余额缓存和 usage cleanup 的 Redis 阶段。未配置时这些能力使用 PostgreSQL/进程内状态，绝不会回落到业务 Redis。配置后必须使用不同的 Redis 网络 authority；只改 logical DB 或 `keyPrefix` 仍共享同一个 Redis 单线程，启动会拒绝这种伪隔离。也可以通过 `KIRO_RS_OBSERVABILITY_REDIS_URL` 和 `KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX` 设置。
+> `observabilityRedis` 是可选的独立观测故障域，用于 usage 派生 materialization、Admin/余额缓存和 usage cleanup 的 Redis 阶段。未配置时这些能力使用 PostgreSQL/进程内状态，绝不会回落到业务 Redis。配置后必须使用不同的 Redis 网络 authority；只改 logical DB 或 `keyPrefix` 仍共享同一个 Redis 单线程，启动会拒绝这种伪隔离。也可以通过 `ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_URL` 和 `ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_KEY_PREFIX` 设置。
 
 创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
 > PS: 可以前往 Web 管理面板配置跳过本步骤
@@ -255,7 +255,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `postgres.url` | string | 必填 | PgSQL 连接地址。服务启动必须能连接；首次启动可从配置文件导入运行配置和凭据 |
 | `postgres.maxConnections` | number | `10` | PgSQL 连接池最大连接数 |
-| `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表；生产升级必须保持开启或通过 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true` 覆盖配置，否则旧/半迁移 schema 会在启动兼容校验中被拒绝 |
+| `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表；生产升级必须保持开启或通过 `ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=true` 覆盖配置，否则旧/半迁移 schema 会在启动兼容校验中被拒绝 |
 | `postgres.compressUsageRollupsOnStart` | boolean | `false` | 已废弃的兼容字段；设置为 `true` 会在连接数据库前拒绝启动。请先停止并排空所有网关实例，再运行 `maintenance usage-rollup-compression` |
 | `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
 | `redis.keyPrefix` | string | `account-runtime:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
