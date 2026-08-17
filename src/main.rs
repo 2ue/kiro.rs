@@ -241,7 +241,7 @@ async fn main() {
         });
     let start_legacy_credential_provider = legacy_credential_provider_required(&config);
     let env_local_upstream_api_key = if start_legacy_credential_provider {
-        read_trimmed_env_var_with_legacy("LOCAL_UPSTREAM_API_KEY", "KIRO_API_KEY")
+        read_trimmed_env_var("LOCAL_UPSTREAM_API_KEY")
     } else {
         None
     };
@@ -1214,15 +1214,11 @@ fn startup_retry_delay(attempt: u32) -> StdDuration {
 }
 
 fn apply_service_bind_env_overrides(config: &mut Config) {
-    if let Some((host, _env_var_name)) =
-        read_trimmed_env_var_with_legacy("ACCOUNT_RUNTIME_HOST", "KIRO_RS_HOST")
-    {
+    if let Some((host, _env_var_name)) = read_trimmed_env_var("ACCOUNT_RUNTIME_HOST") {
         config.host = host;
     }
 
-    if let Some((port, env_var_name)) =
-        read_trimmed_env_var_with_legacy("ACCOUNT_RUNTIME_PORT", "KIRO_RS_PORT")
-    {
+    if let Some((port, env_var_name)) = read_trimmed_env_var("ACCOUNT_RUNTIME_PORT") {
         match port.parse::<u16>() {
             Ok(port) => config.port = port,
             Err(err) => tracing::warn!(
@@ -1235,17 +1231,15 @@ fn apply_service_bind_env_overrides(config: &mut Config) {
     }
 }
 
-fn read_trimmed_env_var_with_legacy(primary: &str, legacy: &str) -> Option<(String, String)> {
-    for name in [primary, legacy] {
-        match std::env::var(name) {
-            Ok(value) if value.trim().is_empty() => {
-                tracing::warn!(env_var = name, "环境变量已设置但为空，视为未配置");
-            }
-            Ok(value) => return Some((value.trim().to_string(), name.to_string())),
-            Err(std::env::VarError::NotPresent) => {}
-            Err(err) => {
-                tracing::warn!(env_var = name, error = %err, "读取环境变量失败，视为未配置");
-            }
+fn read_trimmed_env_var(name: &str) -> Option<(String, String)> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => {
+            tracing::warn!(env_var = name, "环境变量已设置但为空，视为未配置");
+        }
+        Ok(value) => return Some((value.trim().to_string(), name.to_string())),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(err) => {
+            tracing::warn!(env_var = name, error = %err, "读取环境变量失败，视为未配置");
         }
     }
     None
@@ -1633,24 +1627,17 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn account_runtime_env_helpers_prefer_neutral_names_and_fallback_to_legacy() {
+    fn account_runtime_env_helpers_use_account_runtime_names_only() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         remove_test_env("LOCAL_UPSTREAM_API_KEY");
-        remove_test_env("KIRO_API_KEY");
         remove_test_env("ACCOUNT_RUNTIME_HOST");
-        remove_test_env("KIRO_RS_HOST");
         remove_test_env("ACCOUNT_RUNTIME_PORT");
-        remove_test_env("KIRO_RS_PORT");
 
-        set_test_env("KIRO_API_KEY", " legacy-key ");
-        assert_eq!(
-            read_trimmed_env_var_with_legacy("LOCAL_UPSTREAM_API_KEY", "KIRO_API_KEY"),
-            Some(("legacy-key".to_string(), "KIRO_API_KEY".to_string()))
-        );
+        assert_eq!(read_trimmed_env_var("LOCAL_UPSTREAM_API_KEY"), None);
 
         set_test_env("LOCAL_UPSTREAM_API_KEY", " primary-key ");
         assert_eq!(
-            read_trimmed_env_var_with_legacy("LOCAL_UPSTREAM_API_KEY", "KIRO_API_KEY"),
+            read_trimmed_env_var("LOCAL_UPSTREAM_API_KEY"),
             Some((
                 "primary-key".to_string(),
                 "LOCAL_UPSTREAM_API_KEY".to_string()
@@ -1658,12 +1645,6 @@ mod lifecycle_tests {
         );
 
         let mut config = Config::default();
-        set_test_env("KIRO_RS_HOST", "127.0.0.2");
-        set_test_env("KIRO_RS_PORT", "19090");
-        apply_service_bind_env_overrides(&mut config);
-        assert_eq!(config.host, "127.0.0.2");
-        assert_eq!(config.port, 19090);
-
         set_test_env("ACCOUNT_RUNTIME_HOST", "127.0.0.3");
         set_test_env("ACCOUNT_RUNTIME_PORT", "19091");
         apply_service_bind_env_overrides(&mut config);
@@ -1671,11 +1652,8 @@ mod lifecycle_tests {
         assert_eq!(config.port, 19091);
 
         remove_test_env("LOCAL_UPSTREAM_API_KEY");
-        remove_test_env("KIRO_API_KEY");
         remove_test_env("ACCOUNT_RUNTIME_HOST");
-        remove_test_env("KIRO_RS_HOST");
         remove_test_env("ACCOUNT_RUNTIME_PORT");
-        remove_test_env("KIRO_RS_PORT");
     }
 
     #[tokio::test]

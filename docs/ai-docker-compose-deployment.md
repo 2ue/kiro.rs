@@ -102,9 +102,9 @@ services:
       kiro-rs-redis:
         condition: service_healthy
     environment:
-      KIRO_RS_POSTGRES_URL: postgres://${KIRO_RS_POSTGRES_USER:-kiro_rs}:${KIRO_RS_POSTGRES_PASSWORD:-change-me}@kiro-rs-postgres:5432/${KIRO_RS_POSTGRES_DB:-kiro_rs}
-      KIRO_RS_POSTGRES_MIGRATE_ON_START: ${KIRO_RS_POSTGRES_MIGRATE_ON_START:-true}
-      KIRO_RS_REDIS_URL: redis://kiro-rs-redis:6379/0
+      ACCOUNT_RUNTIME_POSTGRES_URL: postgres://${KIRO_RS_POSTGRES_USER:-kiro_rs}:${KIRO_RS_POSTGRES_PASSWORD:-change-me}@kiro-rs-postgres:5432/${KIRO_RS_POSTGRES_DB:-kiro_rs}
+      ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START: ${ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START:-true}
+      ACCOUNT_RUNTIME_REDIS_URL: redis://kiro-rs-redis:6379/0
     ports:
       - "${ACCOUNT_RUNTIME_PORT:-8990}:8990"
     volumes:
@@ -130,12 +130,12 @@ PostgreSQL 18 官方镜像默认使用版本化的数据目录，compose 中挂�
 | --- | --- | --- |
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | 控制使用哪个镜像仓库。一般不需要改。 |
 | `KIRO_RS_VERSION` | `latest` | 控制镜像版本。生产建议固定为具体版本，例如 `0.0.19`。 |
-| `ACCOUNT_RUNTIME_PORT` | `8990` | 控制宿主机暴露端口。容器内端口固定是 `8990`。旧 `KIRO_RS_PORT` 仍可被运行时作为兼容 fallback 读取，但当前 compose 文件使用 `ACCOUNT_RUNTIME_PORT`。 |
+| `ACCOUNT_RUNTIME_PORT` | `8990` | 控制宿主机暴露端口。容器内端口固定是 `8990`。 |
 | `KIRO_RS_POSTGRES_DB` | `kiro_rs` | 控制 PgSQL 数据库名。 |
 | `KIRO_RS_POSTGRES_USER` | `kiro_rs` | 控制 PgSQL 用户名。 |
 | `KIRO_RS_POSTGRES_PASSWORD` | `change-me` | 控制 PgSQL 密码，生产必须改成强密码。 |
-| `KIRO_RS_POSTGRES_MIGRATE_ON_START` | `true` | 覆盖 `postgres.migrateOnStart`；生产升级必须保持 `true`，除非已经通过其它维护流程完成当前镜像要求的 schema 迁移。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
-| `KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START` | 配置文件默认值 | 覆盖 `postgres.compressUsageRollupsOnStart`；历史 usage rollup 压缩只在低峰维护窗口设为 `true`。普通升级保持 `false`。 |
+| `ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START` | `true` | 覆盖 `postgres.migrateOnStart`；生产升级必须保持 `true`，除非已经通过其它维护流程完成当前镜像要求的 schema 迁移。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
+| `ACCOUNT_RUNTIME_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START` | 配置文件默认值 | 覆盖 `postgres.compressUsageRollupsOnStart`；历史 usage rollup 压缩只在低峰维护窗口设为 `true`。普通升级保持 `false`。 |
 
 固定版本启动示例：
 
@@ -194,7 +194,7 @@ ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替�
 关键说明：
 
 - Docker 部署时 `host` 必须是 `0.0.0.0`，否则宿主机端口映射后可能访问不到服务。
-- Compose 会通过 `KIRO_RS_POSTGRES_URL` 和 `KIRO_RS_REDIS_URL` 注入数据库连接地址；文件里的 `postgres.url` 和 `redis.url` 也可以保留，主要用于本地或非 Compose 场景。
+- Compose 会通过 `ACCOUNT_RUNTIME_POSTGRES_URL` 和 `ACCOUNT_RUNTIME_REDIS_URL` 注入数据库连接地址；文件里的 `postgres.url` 和 `redis.url` 也可以保留，主要用于本地或非 Compose 场景。
 - 未写出的配置会使用内置默认值。首次启动导入 PgSQL 后，可以在后台配置页热更新调度、payload 防护、高缓存模拟和路径级 usage 上报策略。
 - 首次启动时，如果 PgSQL 没有运行配置或凭据，服务会从 `config.json` 和 `credentials.json` 导入。
 - 导入后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、调度统计、usage 记录、模型价格都以 PgSQL 为准。
@@ -248,7 +248,7 @@ ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替�
 | --- | --- | --- |
 | `postgres.url` | Compose 自动注入 | 控制 PgSQL 连接地址。服务必须能连接 PgSQL 才能启动。 |
 | `postgres.maxConnections` | `10` | 控制 PgSQL 连接池最大连接数。 |
-| `postgres.migrateOnStart` | `true` | 控制启动时是否自动创建或升级数据库表。生产升级必须保持开启，或使用 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true` 覆盖挂载配置；当前二进制会在启动时校验所需 schema，旧/半迁移 schema 会拒绝启动。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
+| `postgres.migrateOnStart` | `true` | 控制启动时是否自动创建或升级数据库表。生产升级必须保持开启，或使用 `ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=true` 覆盖挂载配置；当前二进制会在启动时校验所需 schema，旧/半迁移 schema 会拒绝启动。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
 | `postgres.compressUsageRollupsOnStart` | `false` | 控制启动时是否执行历史 usage rollup 小桶压缩。生产默认关闭，避免升级启动阶段长时间占用 PgSQL；需要整理历史数据时再低峰期显式开启一次。普通升级保持 `false`。 |
 | `redis.url` | Compose 自动注入 | 控制 Redis 连接地址。服务必须能连接 Redis 才能启动；会话绑定、临时冷却、限流、并发占用、刷新锁和余额缓存都写入 Redis。 |
 | `redis.keyPrefix` | `account-runtime:prod` | 控制 Redis key 前缀，用于和同一个 Redis 中的其他业务隔离。 |

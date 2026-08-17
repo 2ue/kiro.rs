@@ -538,11 +538,11 @@ RUST_LOG=debug ./target/release/kiro-rs
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
-| `LOCAL_UPSTREAM_API_KEY` | - | 自动导入一个最高优先级的本地上游 API Key 凭据并写入 PgSQL，可用于不准备 `credentials.json` 的场景；支持 `ksk_xxx|region`；旧 `KIRO_API_KEY` 仍作为兼容 fallback 读取 |
+| `LOCAL_UPSTREAM_API_KEY` | - | 自动导入一个最高优先级的本地上游 API Key 凭据并写入 PgSQL，可用于不准备 `credentials.json` 的场景；支持 `ksk_xxx|region` |
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
-| `ACCOUNT_RUNTIME_HOST` | 配置文件值 | 服务监听地址；旧 `KIRO_RS_HOST` 仍作为兼容 fallback 读取 |
-| `ACCOUNT_RUNTIME_PORT` | `8990` | Docker 部署时映射到宿主机的端口，也是服务监听端口覆盖值；旧 `KIRO_RS_PORT` 仍作为运行时兼容 fallback 读取 |
+| `ACCOUNT_RUNTIME_HOST` | 配置文件值 | 服务监听地址 |
+| `ACCOUNT_RUNTIME_PORT` | `8990` | Docker 部署时映射到宿主机的端口，也是服务监听端口覆盖值 |
 | `KIRO_ADMIN_UI_MODE` | debug: `redirect`; release: `embedded` | 旧版 `/admin` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
 | `KIRO_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
 | `KIRO_ADMIN_UI_DEV_SERVER` | debug: `http://127.0.0.1:9025/admin` | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |

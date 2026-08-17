@@ -205,7 +205,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Admin UI internal status color utility classes now use `runtime` prefixes instead of Kiro-branded class names while preserving the existing color values and component behavior.
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming; the old theme key remains a read fallback only.
 - New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
-- Startup env handling now prefers `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, reads the old Kiro-named env vars only as compatibility fallbacks, and healthz now reports `account-runtime` as the service name.
+- Startup env handling now reads only `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, and healthz now reports `account-runtime` as the service name.
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming; stable hash domains remain unchanged to avoid behavior drift.
 - Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
 - New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
@@ -224,9 +224,17 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-upstream event model comments and examples now use local-upstream/upstream wording. Event names, parser behavior and typed DTOs are unchanged.
 - Payload-guard local-upstream image tests now use local-upstream variable names while preserving current image-budget shaping and exact-limit behavior.
 - Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording. Remaining provider Kiro strings are compatibility fields or upstream wire literals.
+- Runtime storage overrides now read `ACCOUNT_RUNTIME_*` names only, and README, Docker Compose and maintained deployment docs inject the account-runtime storage/port variables.
+- Startup local-upstream API-key bootstrap and service bind overrides now read only `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; the old Kiro-named runtime fallback env vars were removed from main startup helpers and tests.
 
-Last verified on 2026-08-16:
+Last verified on 2026-08-17:
 
+- `feature/tests/run-cargo-scoped.sh account-runtime-storage-env-fmt -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-runtime-storage-env-check -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-env-fallback-cut-fmt -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-runtime-env-fallback-cut-check -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-env-fallback-cut-test -- bash -lc 'cargo test account_runtime_env_helpers_use_account_runtime_names_only -- --nocapture && cargo test healthz_uses_account_runtime_service_name -- --nocapture'`
+- `git diff --check`
 - `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/provider.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh provider-local-upstream-wording-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh provider-local-upstream-wording-check1 -- cargo check`
