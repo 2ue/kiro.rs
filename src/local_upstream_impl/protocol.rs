@@ -3,7 +3,9 @@
 use serde_json::Value;
 
 use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
-use crate::model::config::{Config, LocalUpstreamAgentModeStrategy};
+use crate::model::config::Config;
+#[cfg(test)]
+use crate::model::config::LocalUpstreamAgentModeStrategy;
 
 pub const BUILDER_ID_PLACEHOLDER_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
@@ -124,6 +126,7 @@ pub fn resolve_profile_arn(
 /// still need a body-level `profileArn`, while API-key credentials have no profile
 /// concept. Enterprise/IdC should self-heal to a real ARN first; the region-aware
 /// fallback here is request-body-only and must not be persisted as a real profile.
+#[cfg(test)]
 pub fn resolve_streaming_profile_arn(
     credentials: &LocalUpstreamCredentials,
     config: &Config,
@@ -163,6 +166,7 @@ pub fn resolve_streaming_profile_arn(
     None
 }
 
+#[cfg(test)]
 pub fn resolve_agent_mode(credentials: &LocalUpstreamCredentials, config: &Config) -> &'static str {
     match config.local_upstream_agent_mode_strategy {
         LocalUpstreamAgentModeStrategy::Vibe => "vibe",

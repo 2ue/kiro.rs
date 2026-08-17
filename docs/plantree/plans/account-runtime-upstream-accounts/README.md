@@ -226,6 +226,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording. Remaining provider Kiro strings are compatibility fields or upstream wire literals.
 - Runtime storage overrides now read `ACCOUNT_RUNTIME_*` names only, and README, Docker Compose and maintained deployment docs inject the account-runtime storage/port variables.
 - Runtime startup no longer installs the legacy local-upstream provider, no longer bootstraps `credentials.json`, and no longer imports `LOCAL_UPSTREAM_API_KEY`. Claude/Anthropic request routing now receives no local provider from `main`; account-only routing remains the runtime path.
+- Legacy local-upstream `ide`/`cli` concrete endpoint implementations and provider construction are now test-only; production keeps only the remaining compatibility type boundary until handler/Admin direct-provider paths are removed.
 - Service bind overrides now read only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; the old Kiro-named runtime fallback env vars and local-upstream API-key bootstrap were removed from main startup helpers and tests.
 - Active validation runners that spawn the service now use `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures still use `LOCAL_UPSTREAM_API_KEY` only as a must-not-inherit sentinel.
 - Active storage, integration and chaos validation runner/test inputs now use account-runtime environment names. Old maintained `KIRO_RS_TEST_*`, `KIRO_RS_REQUIRE_STORAGE_TESTS`, `KIRO_RS_RUN_*`, `KIRO_REDIS_FAULT_DOMAIN_*`, `KIRO_SCHEDULER_CHAOS_*`, `KIRO_CLAUDE_TRANSCRIPT_*`, `KIRO_RS_REAL_*`, `KIRO_MULTI_INSTANCE_*` and `KIRO_TOKEN_REFRESH_CLUSTER_*` inputs were removed from active harnesses. Active runner exact Rust test paths now target `local_upstream_impl::token_manager`.
@@ -235,6 +236,9 @@ Last verified on 2026-08-17:
 - `feature/tests/run-cargo-scoped.sh account-runtime-no-provider-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-runtime-no-provider-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-no-provider-test -- bash -lc 'cargo test legacy_provider_is_never_required_at_runtime -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh account-runtime-provider-prune-fmt1 -- cargo fmt`
+- `feature/tests/run-cargo-scoped.sh account-runtime-provider-prune-check2 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh account-runtime-provider-prune-test1 -- bash -lc 'cargo test local_upstream_impl::endpoint -- --nocapture && cargo test local_upstream_impl::protocol -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh account-runtime-test-env-fmt -- cargo fmt`
 - `bash -n feature/tests/run-external-dispatch-storage-validation.sh feature/tests/run-runtime-quarantine-storage-validation.sh feature/tests/run-redis-usage-writer-validation.sh feature/tests/run-token-refresh-redis-validation.sh`
 - `node --test feature/tests/runtime-validation-paths.test.mjs feature/tests/run-scheduler-redis-chaos-validation.contract.test.mjs feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs feature/tests/run-multi-instance-redis-coordination-validation.contract.test.mjs feature/tests/run-token-refresh-cluster-validation.contract.test.mjs`

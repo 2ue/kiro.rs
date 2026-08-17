@@ -6707,6 +6707,7 @@ impl LocalUpstreamProvider {
     /// * `proxy` - 全局代理配置
     /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
     /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
+    #[cfg(test)]
     pub fn with_proxy(
         token_manager: Arc<MultiTokenManager>,
         proxy: Option<ProxyConfig>,

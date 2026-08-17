@@ -41,9 +41,12 @@ pub(crate) mod dispatch {
 }
 
 pub(crate) mod endpoint {
+    pub(crate) use crate::local_upstream_impl::endpoint::DEFAULT_LOCAL_UPSTREAM_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
+    #[cfg(test)]
     pub(crate) use crate::local_upstream_impl::endpoint::IdeEndpoint as LocalUpstreamIdeEndpoint;
+    #[cfg(test)]
     pub(crate) use crate::local_upstream_impl::endpoint::LocalUpstreamEndpoint as LocalUpstreamEndpointTrait;
-    pub(crate) use crate::local_upstream_impl::endpoint::ide::IDE_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
+    #[cfg(test)]
     pub(crate) type LocalUpstreamEndpoint = dyn LocalUpstreamEndpointTrait;
 }
 

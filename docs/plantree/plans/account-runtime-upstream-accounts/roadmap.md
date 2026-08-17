@@ -191,6 +191,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream credentials now use `api_key` internally and serialize API-key credentials as `apiKey`; old API-key JSON field names remain read aliases and Postgres hash repair still accepts existing old rows.
 - Runtime storage overrides now read `ACCOUNT_RUNTIME_*` names, with README and maintained deployment docs updated to match.
 - Runtime startup no longer installs the legacy local-upstream provider, no longer bootstraps `credentials.json`, and no longer imports `LOCAL_UPSTREAM_API_KEY`; Claude/Anthropic request routing now receives no local provider from `main`.
+- Legacy local-upstream `ide`/`cli` concrete endpoint implementations and provider construction are now test-only; production keeps only the remaining compatibility type boundary until handler/Admin direct-provider paths are removed.
 - Service bind overrides now read only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; Kiro-named runtime fallback env vars and local-upstream API-key bootstrap were removed from code, tests and maintained deployment docs.
 - Active validation runners that spawn the service now use `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures still use `LOCAL_UPSTREAM_API_KEY` only as a must-not-inherit sentinel.
 - Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Kiro-named loadtest env fallbacks were removed.

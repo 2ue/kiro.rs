@@ -11,11 +11,18 @@ use reqwest::{Method, RequestBuilder};
 use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::model::config::Config;
 
+#[cfg(test)]
 pub mod cli;
+#[cfg(test)]
 pub mod ide;
 
+#[cfg(test)]
 pub use cli::CliEndpoint;
+#[cfg(test)]
 pub use ide::IdeEndpoint;
+
+/// Legacy default endpoint name retained for config compatibility.
+pub const DEFAULT_LOCAL_UPSTREAM_ENDPOINT_NAME: &str = "ide";
 
 /// Resolve a local/staging upstream override while preserving endpoint-specific Host headers.
 ///
@@ -42,6 +49,7 @@ pub(crate) fn configured_upstream_url(config: &Config, suffix: &str) -> Option<S
 /// body contains a backslash, so escaped keys such as `"orig\u0069n"` cannot bypass a
 /// required transform. Invalid JSON may produce a conservative marker hit, but the
 /// subsequent real parse still fails closed and returns the original body unchanged.
+#[cfg(test)]
 pub(super) fn contains_json_object_key(body: &str, targets: &[&str]) -> bool {
     debug_assert!(targets.iter().all(|target| target.is_ascii()));
     let bytes = body.as_bytes();
@@ -73,6 +81,7 @@ pub(super) fn contains_json_object_key(body: &str, targets: &[&str]) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(super) fn serialize_json_with_capacity(
     value: &serde_json::Value,
     minimum_capacity: usize,
@@ -82,6 +91,7 @@ pub(super) fn serialize_json_with_capacity(
     String::from_utf8(output).ok()
 }
 
+#[cfg(test)]
 pub(super) fn body_may_need_output_config_thinking_normalization(body: &str) -> bool {
     let plain_markers = body.contains("\"additionalModelRequestFields\"")
         && body.contains("\"output_config\"")
@@ -94,6 +104,7 @@ pub(super) fn body_may_need_output_config_thinking_normalization(body: &str) -> 
             ))
 }
 
+#[cfg(test)]
 pub(super) fn normalize_output_config_thinking_compatibility_json(
     json: &mut serde_json::Value,
 ) -> bool {
@@ -124,6 +135,7 @@ pub(super) fn normalize_output_config_thinking_compatibility_json(
     false
 }
 
+#[cfg(test)]
 fn json_string_end(bytes: &[u8], mut index: usize) -> Option<usize> {
     while index < bytes.len() {
         match bytes[index] {
@@ -137,6 +149,7 @@ fn json_string_end(bytes: &[u8], mut index: usize) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 fn json_string_matches_ascii(encoded: &[u8], target: &[u8]) -> bool {
     let mut input_index = 0;
     let mut target_index = 0;
@@ -188,6 +201,7 @@ fn json_string_matches_ascii(encoded: &[u8], target: &[u8]) -> bool {
     target_index == target.len()
 }
 
+#[cfg(test)]
 fn decode_json_hex4(hex: &[u8]) -> Option<u16> {
     if hex.len() != 4 {
         return None;
@@ -277,6 +291,8 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
 /// 装饰请求时可用的上下文
 ///
 /// 包含单次调用已确定的所有运行时信息。引用形式避免无谓 clone。
+/// 生产构建当前只保留剩余 direct-provider 兼容方法的类型边界；具体 endpoint 实现已收进测试域。
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct RequestContext<'a> {
     /// 当前凭据
     pub credentials: &'a LocalUpstreamCredentials,
