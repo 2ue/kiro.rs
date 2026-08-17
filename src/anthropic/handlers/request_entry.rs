@@ -11,20 +11,12 @@ pub(super) async fn handle_messages_endpoint(
     request_api_key_id: Option<String>,
     attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
-    let runtime_config = state
-        .local_upstream_provider
-        .as_ref()
-        .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
+    let runtime_config = request_runtime_config_for_state(&state);
     let inference_attempt_budget = Arc::new(InferenceAttemptBudget::with_auxiliary_max_attempts(
         runtime_config.inference_upstream_max_attempts,
         runtime_config.auxiliary_upstream_max_attempts,
     ));
-    let local_dispatch_max_wait_secs = state
-        .local_upstream_provider
-        .as_ref()
-        .map(|provider| provider.runtime_config().credential_dispatch_max_wait_secs)
-        .unwrap_or(5);
+    let local_dispatch_max_wait_secs = local_dispatch_max_wait_secs_for_state(&state);
     let shared_dispatch_max_wait_secs = local_dispatch_max_wait_secs
         .max(
             runtime_config
@@ -194,11 +186,7 @@ async fn continue_messages_endpoint_after_raw_account_routes(
     attribution: Option<RequestRejectionAttribution>,
     raw_preflight_failure: Option<RawAccountPreflightFailure>,
 ) -> Response {
-    let runtime_config = state
-        .local_upstream_provider
-        .as_ref()
-        .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
+    let runtime_config = request_runtime_config_for_state(&state);
     if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
         &state,
         &runtime_config,
@@ -245,56 +233,66 @@ fn maybe_local_pool_unavailable_fast_fail_response(
     attribution: Option<&RequestRejectionAttribution>,
     raw_probe: &RawMessagesBodyProbe,
 ) -> Option<Response> {
-    let provider = state.local_upstream_provider.as_ref()?;
-    let model = raw_probe
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())?;
-
-    // If the account runtime is enabled and wired, the normalized account route may still be
-    // eligible after typed parsing. Do not preempt it with a local-only response.
-    if runtime_config.account_runtime.account_runtime_enabled()
-        && state.account_runtime_manager.is_some()
+    #[cfg(not(test))]
     {
+        let _ = (state, runtime_config, endpoint, attribution, raw_probe);
         return None;
     }
 
-    let local_state = provider.local_pool_route_state_cached(Some(model));
-    let (status, error_type, message, reason, retry_after_secs) =
-        local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)?;
+    #[cfg(test)]
+    {
+        let provider = state.local_upstream_provider.as_ref()?;
+        let model = raw_probe
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())?;
 
-    if let (Some(attribution), Some(retry_after_secs)) = (attribution, retry_after_secs) {
-        attribution.apply_local_temporary_backoff(retry_after_secs);
+        // If the account runtime is enabled and wired, the normalized account route may still be
+        // eligible after typed parsing. Do not preempt it with a local-only response.
+        if runtime_config.account_runtime.account_runtime_enabled()
+            && state.account_runtime_manager.is_some()
+        {
+            return None;
+        }
+
+        let local_state = provider.local_pool_route_state_cached(Some(model));
+        let (status, error_type, message, reason, retry_after_secs) =
+            local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)?;
+
+        if let (Some(attribution), Some(retry_after_secs)) = (attribution, retry_after_secs) {
+            attribution.apply_local_temporary_backoff(retry_after_secs);
+        }
+
+        let request_id = envelope::request_id();
+        tracing::warn!(
+            request_id,
+            endpoint,
+            model,
+            local_state = ?local_state.kind,
+            local_total = local_state.total,
+            local_available = local_state.available,
+            local_dispatchable = local_state.dispatchable,
+            local_usable = local_state.usable,
+            retry_after_secs = ?retry_after_secs,
+            "local credential pool is unavailable and no upstream account takeover is available; rejecting before full body processing"
+        );
+        let response = match retry_after_secs {
+            Some(retry_after_secs) => envelope::error_response_with_id_and_headers(
+                status,
+                error_type,
+                message,
+                &request_id,
+                [("retry-after", retry_after_secs.to_string())],
+            ),
+            None => envelope::error_response_with_id(status, error_type, message, &request_id),
+        };
+        record_pre_usage_rejection(attribution, reason, endpoint, &response);
+        Some(response)
     }
-
-    let request_id = envelope::request_id();
-    tracing::warn!(
-        request_id,
-        endpoint,
-        model,
-        local_state = ?local_state.kind,
-        local_total = local_state.total,
-        local_available = local_state.available,
-        local_dispatchable = local_state.dispatchable,
-        local_usable = local_state.usable,
-        retry_after_secs = ?retry_after_secs,
-        "local credential pool is unavailable and no upstream account takeover is available; rejecting before full body processing"
-    );
-    let response = match retry_after_secs {
-        Some(retry_after_secs) => envelope::error_response_with_id_and_headers(
-            status,
-            error_type,
-            message,
-            &request_id,
-            [("retry-after", retry_after_secs.to_string())],
-        ),
-        None => envelope::error_response_with_id(status, error_type, message, &request_id),
-    };
-    record_pre_usage_rejection(attribution, reason, endpoint, &response);
-    Some(response)
 }
 
+#[cfg(test)]
 fn local_pool_fast_fail_response_parts(
     kind: LocalUpstreamRouteStateKind,
     retry_after_secs: Option<u64>,

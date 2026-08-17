@@ -6855,6 +6855,7 @@ impl LocalUpstreamProvider {
         self.token_manager.local_pool_route_state_fresh(model)
     }
 
+    #[cfg(test)]
     pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
         self.token_manager.local_pool_route_state_cached(model)
     }

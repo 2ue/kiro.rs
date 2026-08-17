@@ -136,7 +136,9 @@ pub(crate) enum RequestRejectionReason {
     ModelUnsupported,
     WebSearchUnsupported,
     LocalBodyPrepare,
+    #[cfg_attr(not(test), allow(dead_code))]
     LocalPoolUnavailable,
+    #[cfg_attr(not(test), allow(dead_code))]
     LocalPoolTemporaryUnavailable,
     AdmissionLocalTemporaryBackoff,
 }

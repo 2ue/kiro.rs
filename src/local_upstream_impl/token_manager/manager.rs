@@ -2768,6 +2768,7 @@ impl MultiTokenManager {
     /// path. It still preserves the existing TooManyFailures auto-heal behavior so entry-level
     /// fast-fail does not strand a self-healable local pool. The authoritative scheduler state is
     /// still refreshed by normal dispatch/preflight paths before a local upstream call is made.
+    #[cfg(test)]
     pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
         let mut state = self.compute_local_pool_route_state(model, false);
         if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {

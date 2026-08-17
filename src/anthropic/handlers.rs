@@ -13,13 +13,15 @@ use std::{
 use crate::common::upstream_error::RawUpstreamError;
 use crate::model::config::{
     BodyConversionConfig, CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
-    CacheSimulationPolicy, ClaudeCodeToolCachePolicy, CompatProfile, Config, ImageProcessingConfig,
+    CacheSimulationPolicy, ClaudeCodeToolCachePolicy, CompatProfile, ImageProcessingConfig,
     MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
     PromptCacheSimulationMode, PromptCacheStrategyType, PromptSteeringConfig, ReportedUsageConfig,
     ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, ThinkingTriggerMode,
-    normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
+    normalize_defined_cache_route, resolve_cache_policy_for_path,
 };
+#[cfg(test)]
+use crate::model::config::{Config, normalize_defined_cache_routes};
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -96,11 +98,13 @@ use crate::account_runtime::{
     AccountRuntimeConfigExt, AccountRuntimeManager, account_direct_policy_reason,
     cached_eligible_account_for_route_and_model,
     cached_eligible_account_for_route_body_mode_and_model,
-    cached_immediately_available_account_for_route_and_model,
+    cached_immediately_available_account_for_route_and_model, eligible_account_for_route_and_model,
+    eligible_account_for_route_body_mode_and_model, forward_account_with_failover,
+    forward_account_with_failover_result, immediately_available_account_for_route_and_model,
+};
+#[cfg(test)]
+use crate::account_runtime::{
     cached_immediately_available_account_for_route_body_mode_and_model,
-    eligible_account_for_route_and_model, eligible_account_for_route_body_mode_and_model,
-    forward_account_with_failover, forward_account_with_failover_result,
-    immediately_available_account_for_route_and_model,
     immediately_available_account_for_route_body_mode_and_model,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
@@ -813,6 +817,7 @@ struct RawAccountPreflightFailure {
     error: AccountFinalError,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 enum RawAccountPreflightDecision {
     Response(Response),
     ContinueWithLocalRescue(RawAccountPreflightFailure),
@@ -927,6 +932,7 @@ impl RequestRuntimeConfig {
         }
     }
 
+    #[cfg(test)]
     fn from_config_with_fallback(config: &Config, fallback: Self) -> Self {
         Self {
             extract_thinking: config.extract_thinking,
@@ -1254,6 +1260,7 @@ impl CachePointRetryRequest {
     }
 }
 
+#[cfg(test)]
 fn request_runtime_config(
     state: &AppState,
     provider: &LocalUpstreamProvider,
@@ -1264,12 +1271,36 @@ fn request_runtime_config(
     )
 }
 
-fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
+#[cfg(test)]
+fn request_runtime_config_for_state(state: &AppState) -> RequestRuntimeConfig {
     state
         .local_upstream_provider
         .as_ref()
-        .map(|provider| request_runtime_config(state, provider).image_processing)
-        .unwrap_or_else(|| state.image_processing.normalized())
+        .map(|provider| request_runtime_config(state, provider))
+        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(state))
+}
+
+#[cfg(not(test))]
+fn request_runtime_config_for_state(state: &AppState) -> RequestRuntimeConfig {
+    RequestRuntimeConfig::from_app_state(state)
+}
+
+#[cfg(test)]
+fn local_dispatch_max_wait_secs_for_state(state: &AppState) -> u64 {
+    state
+        .local_upstream_provider
+        .as_ref()
+        .map(|provider| provider.runtime_config().credential_dispatch_max_wait_secs)
+        .unwrap_or(5)
+}
+
+#[cfg(not(test))]
+fn local_dispatch_max_wait_secs_for_state(_state: &AppState) -> u64 {
+    5
+}
+
+fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
+    request_runtime_config_for_state(state).image_processing
 }
 
 fn account_runtime_enabled_for_endpoint(config: &AccountRuntimeConfig, endpoint: &str) -> bool {
@@ -1293,11 +1324,7 @@ async fn maybe_raw_account_direct_response(
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<Response> {
     let manager = state.account_runtime_manager.clone()?;
-    let runtime_config = state
-        .local_upstream_provider
-        .as_ref()
-        .map(|provider| request_runtime_config(state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(state));
+    let runtime_config = request_runtime_config_for_state(state);
     let cache_route = runtime_config.cache_policy_for_path(endpoint);
     let config = runtime_config.account_runtime.clone();
     if !account_runtime_enabled_for_endpoint(&config, endpoint) {
@@ -1314,9 +1341,8 @@ async fn maybe_raw_account_direct_response(
         return None;
     }
 
-    let reason = if state.local_upstream_provider.is_none() {
-        "account_route".to_string()
-    } else {
+    #[cfg(test)]
+    let reason = if state.local_upstream_provider.is_some() {
         account_direct_policy_reason(
             &manager,
             &config,
@@ -1324,7 +1350,11 @@ async fn maybe_raw_account_direct_response(
             raw_probe.model.as_deref().unwrap_or(""),
         )
         .await?
+    } else {
+        "account_route".to_string()
     };
+    #[cfg(not(test))]
+    let reason = "account_route".to_string();
     let request_id = envelope::request_id();
     let direct_model_resolution = raw_probe
         .model
@@ -1372,107 +1402,126 @@ async fn maybe_raw_account_preflight_response(
     request_api_key_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<RawAccountPreflightDecision> {
-    let provider = state.local_upstream_provider.as_ref()?.clone();
-    let manager = state.account_runtime_manager.clone()?;
-    let runtime_config = request_runtime_config(state, &provider);
-    let cache_route = runtime_config.cache_policy_for_path(endpoint);
-    let config = runtime_config.account_runtime.clone();
-    if !config.local_pool_preflight_enabled
-        || !account_runtime_enabled_for_endpoint(&config, endpoint)
+    #[cfg(not(test))]
     {
+        let _ = (
+            state,
+            headers,
+            raw_body,
+            endpoint,
+            inference_attempt_budget,
+            request_api_key_id,
+            raw_probe,
+        );
         return None;
     }
 
-    let (reason, local_state) = local_pool_preflight_reason_after_capacity_grace(
-        provider.as_ref(),
-        &config,
-        raw_probe.model.as_deref(),
-        bounded_preflight_capacity_wait(&config, inference_attempt_budget.as_ref()),
-        "raw_before_parse",
-        None,
-    )
-    .await?;
-    if !raw_upstream_account_ready_for_route_reason(
-        &manager,
-        &config,
-        reason.as_str(),
-        endpoint,
-        raw_probe.model.as_deref(),
-    )
-    .await
+    #[cfg(test)]
     {
-        return None;
-    }
-
-    let request_id = envelope::request_id();
-    tracing::warn!(
-        request_id,
-        reason = %reason,
-        local_total = local_state.total,
-        local_available = local_state.available,
-        local_dispatchable = local_state.dispatchable,
-        local_usable = local_state.usable,
-        retry_after_secs = ?local_state.retry_after_secs,
-        "local credential pool is not immediately schedulable; routing raw request directly to upstream account before parsing body"
-    );
-    let route = raw_account_route_request_with_hints(
-        state,
-        &runtime_config,
-        &cache_route,
-        headers,
-        raw_body,
-        endpoint,
-        request_id.clone(),
-        UsageRouteSubtype::AccountFallbackPreflight,
-        Some(reason.clone()),
-        None,
-        Some(json!({
-            "reason": reason,
-            "state": local_state,
-            "preflightStage": "before_parse",
-            "requiredBodyMode": AccountRequestBodyMode::RawPassthrough.as_str(),
-        })),
-        inference_attempt_budget.clone(),
-        request_api_key_id,
-        raw_probe.clone(),
-    );
-
-    let outcome = forward_account_with_failover_result(&manager, config.clone(), route).await;
-    Some(match outcome {
-        AccountForwardOutcome::Response(response) => {
-            RawAccountPreflightDecision::Response(response)
+        let provider = state.local_upstream_provider.as_ref()?.clone();
+        let manager = state.account_runtime_manager.clone()?;
+        let runtime_config = request_runtime_config(state, &provider);
+        let cache_route = runtime_config.cache_policy_for_path(endpoint);
+        let config = runtime_config.account_runtime.clone();
+        if !config.local_pool_preflight_enabled
+            || !account_runtime_enabled_for_endpoint(&config, endpoint)
+        {
+            return None;
         }
-        AccountForwardOutcome::FinalError(err) => {
-            let current_local_dispatchable = provider
-                .local_pool_route_state_fresh(raw_probe.model.as_deref())
-                .dispatchable;
-            if let Some(rescue_reason) = budgeted_local_rescue_reason_after_account_route_error(
-                UsageRouteSubtype::AccountFallbackPreflight,
-                &config,
-                &err,
-                Some(reason.as_str()),
-                Some(current_local_dispatchable),
-                inference_attempt_budget.as_ref(),
-            ) {
-                tracing::warn!(
-                    request_id,
-                    reason = rescue_reason,
-                    local_fallback_reason = %reason,
-                    max_wait_secs = config.account_local_rescue_max_wait_secs(),
-                    account_status = err.status.as_u16(),
-                    account_error_type = %err.route_error_type,
-                    account_attempt_count = err.attempts.len(),
-                    "raw account preflight failed with a rescuable error; continuing into parsed local rescue path"
-                );
-                RawAccountPreflightDecision::ContinueWithLocalRescue(RawAccountPreflightFailure {
-                    local_reason: reason,
-                    error: err,
-                })
-            } else {
-                RawAccountPreflightDecision::Response(err.into_response(&request_id))
+
+        let (reason, local_state) = local_pool_preflight_reason_after_capacity_grace(
+            provider.as_ref(),
+            &config,
+            raw_probe.model.as_deref(),
+            bounded_preflight_capacity_wait(&config, inference_attempt_budget.as_ref()),
+            "raw_before_parse",
+            None,
+        )
+        .await?;
+        if !raw_upstream_account_ready_for_route_reason(
+            &manager,
+            &config,
+            reason.as_str(),
+            endpoint,
+            raw_probe.model.as_deref(),
+        )
+        .await
+        {
+            return None;
+        }
+
+        let request_id = envelope::request_id();
+        tracing::warn!(
+            request_id,
+            reason = %reason,
+            local_total = local_state.total,
+            local_available = local_state.available,
+            local_dispatchable = local_state.dispatchable,
+            local_usable = local_state.usable,
+            retry_after_secs = ?local_state.retry_after_secs,
+            "local credential pool is not immediately schedulable; routing raw request directly to upstream account before parsing body"
+        );
+        let route = raw_account_route_request_with_hints(
+            state,
+            &runtime_config,
+            &cache_route,
+            headers,
+            raw_body,
+            endpoint,
+            request_id.clone(),
+            UsageRouteSubtype::AccountFallbackPreflight,
+            Some(reason.clone()),
+            None,
+            Some(json!({
+                "reason": reason,
+                "state": local_state,
+                "preflightStage": "before_parse",
+                "requiredBodyMode": AccountRequestBodyMode::RawPassthrough.as_str(),
+            })),
+            inference_attempt_budget.clone(),
+            request_api_key_id,
+            raw_probe.clone(),
+        );
+
+        let outcome = forward_account_with_failover_result(&manager, config.clone(), route).await;
+        Some(match outcome {
+            AccountForwardOutcome::Response(response) => {
+                RawAccountPreflightDecision::Response(response)
             }
-        }
-    })
+            AccountForwardOutcome::FinalError(err) => {
+                let current_local_dispatchable = provider
+                    .local_pool_route_state_fresh(raw_probe.model.as_deref())
+                    .dispatchable;
+                if let Some(rescue_reason) = budgeted_local_rescue_reason_after_account_route_error(
+                    UsageRouteSubtype::AccountFallbackPreflight,
+                    &config,
+                    &err,
+                    Some(reason.as_str()),
+                    Some(current_local_dispatchable),
+                    inference_attempt_budget.as_ref(),
+                ) {
+                    tracing::warn!(
+                        request_id,
+                        reason = rescue_reason,
+                        local_fallback_reason = %reason,
+                        max_wait_secs = config.account_local_rescue_max_wait_secs(),
+                        account_status = err.status.as_u16(),
+                        account_error_type = %err.route_error_type,
+                        account_attempt_count = err.attempts.len(),
+                        "raw account preflight failed with a rescuable error; continuing into parsed local rescue path"
+                    );
+                    RawAccountPreflightDecision::ContinueWithLocalRescue(
+                        RawAccountPreflightFailure {
+                            local_reason: reason,
+                            error: err,
+                        },
+                    )
+                } else {
+                    RawAccountPreflightDecision::Response(err.into_response(&request_id))
+                }
+            }
+        })
+    }
 }
 
 async fn raw_upstream_account_has_eligible_account(
@@ -1500,6 +1549,7 @@ async fn raw_upstream_account_has_eligible_account(
     .await
 }
 
+#[cfg(test)]
 async fn raw_upstream_account_ready_for_route_reason(
     manager: &AccountRuntimeManager,
     config: &AccountRuntimeConfig,
@@ -1662,10 +1712,14 @@ fn build_account_fallback_context(
     if !account_runtime_enabled_for_endpoint(&config, endpoint) {
         return None;
     }
+    #[cfg(test)]
+    let provider = state.local_upstream_provider.clone();
+    #[cfg(not(test))]
+    let provider = None;
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
     let policy = &effective_cache_route.policy;
     Some(AccountFallbackContext {
-        provider: state.local_upstream_provider.clone(),
+        provider,
         manager,
         config,
         effective_raw_body,
@@ -5851,6 +5905,7 @@ fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, 
             format!("dfcache route is invalid: {candidate}"),
         ));
     };
+    #[cfg(test)]
     let defined_cache_routes = state
         .local_upstream_provider
         .as_ref()
@@ -5858,6 +5913,8 @@ fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, 
             normalize_defined_cache_routes(&provider.runtime_config().defined_cache_routes)
         })
         .unwrap_or_else(|| state.defined_cache_routes.clone());
+    #[cfg(not(test))]
+    let defined_cache_routes = state.defined_cache_routes.clone();
     if !defined_cache_routes.iter().any(|item| item == &prefix) {
         return Err(envelope::error_response(
             StatusCode::NOT_FOUND,
@@ -6047,11 +6104,11 @@ async fn post_messages_inner(
         "Received POST messages request"
     );
     log_anthropic_request_summary(&endpoint, &payload);
+    #[cfg(test)]
     let provider = state.local_upstream_provider.clone();
-    let runtime_config = provider
-        .as_ref()
-        .map(|provider| request_runtime_config(&state, provider))
-        .unwrap_or_else(|| RequestRuntimeConfig::from_app_state(&state));
+    #[cfg(not(test))]
+    let provider = None;
+    let runtime_config = request_runtime_config_for_state(&state);
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let mut account_fallback = build_account_fallback_context(
         &state,

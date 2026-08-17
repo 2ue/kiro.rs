@@ -193,6 +193,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Runtime startup no longer installs the legacy local-upstream provider, no longer bootstraps `credentials.json`, and no longer imports `LOCAL_UPSTREAM_API_KEY`; Claude/Anthropic request routing now receives no local provider from `main`.
 - Legacy local-upstream `ide`/`cli` concrete endpoint implementations and provider construction are now test-only; production keeps only the remaining compatibility type boundary until handler/Admin direct-provider paths are removed.
 - Production startup, Anthropic router dependencies and Admin service dependencies no longer carry a local-upstream provider. The old startup/Admin model-discovery worker and legacy Admin credential liveness/model-discovery calls were removed from runtime; old model catalog network DTOs remain test-only.
+- Production Anthropic `AppState`, request-entry and handler runtime-config resolution no longer expose or read a local-upstream provider. Account-only request routing uses account-runtime state/config directly; raw local-pool preflight, cached local-pool fast-fail and provider-derived route-config overrides are now test-only compatibility paths.
 - Service bind overrides now read only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; Kiro-named runtime fallback env vars and local-upstream API-key bootstrap were removed from code, tests and maintained deployment docs.
 - Active validation runners that spawn the service now use `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures still use `LOCAL_UPSTREAM_API_KEY` only as a must-not-inherit sentinel.
 - Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Kiro-named loadtest env fallbacks were removed.
@@ -206,9 +207,9 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 
 ## Next
 
-- Rename concrete local-upstream event model types so Kiro-specific runtime names shrink toward explicit compatibility-only fields.
-- Split scheduler primitives from legacy credential/provider dependencies before deleting local Kiro auth, endpoint and EventStream paths.
-- Convert body and protocol paths to canonical/upstream-account logic with no legacy Kiro envelope or Kiro event dependency.
+- Remove production compilation of the legacy local-upstream provider execution tail from Anthropic handlers and WebSearch, leaving only account-runtime forwarding for live request execution.
+- Split remaining scheduler primitives from legacy credential/provider dependencies before deleting local Kiro auth, endpoint and EventStream paths.
+- Convert remaining body and protocol paths to canonical/upstream-account logic with no legacy Kiro envelope or Kiro event dependency.
 
 ## Deferred
 
