@@ -46,6 +46,7 @@ Current-state facts and target-state decisions answer different questions and mu
 
 ## Current Implementation Notes
 
+- 2026-08-17: Loadtest target resolution and mock upstream scripts now accept only account-runtime environment names for base URL, API key, route path and mock scenario configuration. Old Kiro-named loadtest env fallbacks were removed, and mock tool commands now reference `src/local_upstream_impl`.
 - 2026-08-17: Local-upstream credentials now use `api_key` as the Rust field and serialize API-key credentials as `apiKey`. Legacy `kiroApiKey` / `kiro_api_key` remain read aliases and Postgres hash repair still reads old JSON rows; user-facing duplicate/missing/empty API-key errors no longer use Kiro field wording.
 - 2026-08-17: Local-upstream endpoint comments and ignored body-performance probe inputs now use local-upstream wording and `LOCAL_UPSTREAM_*` environment variables. The CLI origin is isolated behind one wire-value constant; existing upstream host/header/User-Agent literals are unchanged.
 - 2026-08-17: Local-upstream protocol profile ARN constants now use generic profile naming, and machineId comments/warnings describe compatibility API-key/hash-domain behavior without Kiro product wording. Stable hash domains and upstream wire/header literals are intentionally unchanged.

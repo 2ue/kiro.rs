@@ -10,7 +10,7 @@ import { resolveLoadTarget } from "./validation-target.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const { baseUrl, apiKey } = resolveLoadTarget(args);
-const path = args.path || process.env.ACCOUNT_RUNTIME_MESSAGES_PATH || process.env.KIRO_MESSAGES_PATH || "/cc/v1/messages";
+const path = args.path || process.env.ACCOUNT_RUNTIME_MESSAGES_PATH || "/cc/v1/messages";
 const durationMs = parseDuration(args.duration || process.env.DURATION || "5m");
 const concurrency = Number.parseInt(args.concurrency || process.env.CONCURRENCY || "16", 10);
 const targetRpm = Number.parseInt(args.rpm || process.env.RPM || "120", 10);
@@ -22,7 +22,7 @@ const currentUserChars = Number.parseInt(args.currentUserChars || process.env.CU
 const systemChars = Number.parseInt(args.systemChars || process.env.SYSTEM_CHARS || "24000", 10);
 const toolDescriptionChars = Number.parseInt(args.toolDescriptionChars || process.env.TOOL_DESCRIPTION_CHARS || "12000", 10);
 const streamMode = parseBool(args.stream ?? process.env.STREAM ?? "true");
-const scenario = args.scenario || process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || process.env.KIRO_MOCK_SCENARIO || "success";
+const scenario = args.scenario || process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || "success";
 const noSummary = parseBool(args.noSummary ?? process.env.NO_SUMMARY ?? "false");
 
 const agent =

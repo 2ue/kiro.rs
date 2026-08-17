@@ -189,6 +189,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream protocol profile ARN constants and machineId diagnostics/comments now use generic local-upstream and compatibility wording while preserving stable hash domains and upstream wire/header literals.
 - Local-upstream endpoint comments and ignored body-performance probes now use local-upstream wording and `LOCAL_UPSTREAM_*` environment variables, and the CLI origin literal is isolated as a wire-value constant.
 - Local-upstream credentials now use `api_key` internally and serialize API-key credentials as `apiKey`; old API-key JSON field names remain read aliases and Postgres hash repair still accepts existing old rows.
+- Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Kiro-named loadtest env fallbacks were removed.
 
 ## In Progress
 

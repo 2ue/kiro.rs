@@ -5,12 +5,12 @@ import { URL } from "node:url";
 import { createHash } from "node:crypto";
 
 const DEFAULT_PORT = Number.parseInt(
-  process.env.PORT || process.env.ACCOUNT_RUNTIME_MOCK_PORT || process.env.KIRO_MOCK_PORT || "39090",
+  process.env.PORT || process.env.ACCOUNT_RUNTIME_MOCK_PORT || "39090",
   10
 );
 const DEFAULT_HOST = process.env.HOST || "127.0.0.1";
-const DEFAULT_SCENARIO = process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || process.env.KIRO_MOCK_SCENARIO || "success";
-const LOG_REQUESTS = process.env.ACCOUNT_RUNTIME_MOCK_LOG_REQUESTS === "1" || process.env.KIRO_MOCK_LOG_REQUESTS === "1";
+const DEFAULT_SCENARIO = process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || "success";
+const LOG_REQUESTS = process.env.ACCOUNT_RUNTIME_MOCK_LOG_REQUESTS === "1";
 
 const models = [
   { id: "sonnet", displayName: "Sonnet", maxInputTokens: 200000 },
@@ -23,7 +23,7 @@ function nowIso() {
 }
 
 function pickScenario(url) {
-  return url.searchParams.get("scenario") || process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || process.env.KIRO_MOCK_SCENARIO || DEFAULT_SCENARIO;
+  return url.searchParams.get("scenario") || process.env.ACCOUNT_RUNTIME_MOCK_SCENARIO || DEFAULT_SCENARIO;
 }
 
 function json(res, status, body, headers = {}) {
@@ -204,7 +204,7 @@ function toolFlowEvent(scenario) {
       name: "Bash",
       toolUseId: "toolu_mock_bash_1",
       input: JSON.stringify({
-        command: "rg -n \"pending_stats_deltas|local_upstream_base_url|profileArn\" src/kiro src/model/config.rs | head -40",
+        command: "rg -n \"pending_stats_deltas|local_upstream_base_url|profileArn\" src/local_upstream_impl src/model/config.rs | head -40",
         description: "Search local upstream protocol and scheduler hot paths",
       }),
       stop: true,
