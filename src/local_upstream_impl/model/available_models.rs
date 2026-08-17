@@ -40,7 +40,6 @@ pub struct LocalUpstreamModelCapabilityCohortKey {
     pub provider: String,
     pub effective_auth_region: String,
     pub effective_api_region: String,
-    pub subscription_class: String,
     pub supported_models: Vec<String>,
 }
 

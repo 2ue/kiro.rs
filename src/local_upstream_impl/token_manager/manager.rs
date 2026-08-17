@@ -11281,7 +11281,6 @@ impl MultiTokenManager {
                     .effective_api_region(&config)
                     .trim()
                     .to_ascii_lowercase(),
-                subscription_class: normalize(credentials.subscription_title.as_deref(), "unknown"),
                 supported_models,
             };
             cohorts.entry(key).or_default().push(entry.id);

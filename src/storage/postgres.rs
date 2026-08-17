@@ -15670,7 +15670,6 @@ mod tests {
                 provider: "builderid".to_string(),
                 effective_auth_region: "us-east-1".to_string(),
                 effective_api_region: "us-east-1".to_string(),
-                subscription_class: "account class alpha".to_string(),
                 supported_models: Vec::new(),
             }],
             reasoning_capability_cohort_complete: true,

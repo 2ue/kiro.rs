@@ -67,9 +67,9 @@ pub struct UsageBreakdown {
     #[serde(default)]
     pub bonuses: Vec<Bonus>,
 
-    /// 免费试用信息
-    #[serde(default)]
-    pub free_trial_info: Option<FreeTrialInfo>,
+    /// Trial credit details from legacy usage-limit payloads.
+    #[serde(default, alias = "freeTrialInfo")]
+    pub trial_credit_info: Option<TrialCreditInfo>,
 
     /// 下次重置日期 (Unix 时间戳)
     #[serde(default)]
@@ -123,11 +123,11 @@ impl Bonus {
     }
 }
 
-/// 免费试用信息
+/// Trial credit details from legacy usage-limit payloads.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
-pub struct FreeTrialInfo {
+pub struct TrialCreditInfo {
     /// 当前使用量
     #[serde(default)]
     pub current_usage: i64,
@@ -136,13 +136,13 @@ pub struct FreeTrialInfo {
     #[serde(default)]
     pub current_usage_with_precision: f64,
 
-    /// 免费试用过期时间 (Unix 时间戳)
-    #[serde(default)]
-    pub free_trial_expiry: Option<f64>,
+    /// 过期时间 (Unix 时间戳)
+    #[serde(default, alias = "freeTrialExpiry")]
+    pub trial_expiry: Option<f64>,
 
-    /// 免费试用状态 (ACTIVE / EXPIRED)
-    #[serde(default)]
-    pub free_trial_status: Option<String>,
+    /// 状态 (ACTIVE / EXPIRED)
+    #[serde(default, alias = "freeTrialStatus")]
+    pub trial_status: Option<String>,
 
     /// 使用限额
     #[serde(default)]
@@ -155,10 +155,10 @@ pub struct FreeTrialInfo {
 
 // ============ 便捷方法实现 ============
 
-impl FreeTrialInfo {
-    /// 检查免费试用是否处于激活状态
+impl TrialCreditInfo {
+    /// 检查试用额度是否处于激活状态
     pub fn is_active(&self) -> bool {
-        self.free_trial_status
+        self.trial_status
             .as_deref()
             .map(|s| s == "ACTIVE")
             .unwrap_or(false)
@@ -228,7 +228,7 @@ impl UsageLimitsResponse {
 
     /// 获取总使用限额（精确值）
     ///
-    /// 累加基础额度、激活的免费试用额度和激活的奖励额度
+    /// 累加基础额度、激活的试用额度和激活的奖励额度
     pub fn usage_limit(&self) -> f64 {
         let Some(breakdown) = self.primary_breakdown() else {
             return 0.0;
@@ -237,7 +237,7 @@ impl UsageLimitsResponse {
         let mut total = breakdown.usage_limit_with_precision;
 
         // 累加激活的试用额度
-        if let Some(trial) = &breakdown.free_trial_info {
+        if let Some(trial) = &breakdown.trial_credit_info {
             if trial.is_active() {
                 total += trial.usage_limit_with_precision;
             }
@@ -269,7 +269,7 @@ impl UsageLimitsResponse {
 
     /// 获取总当前使用量（精确值）
     ///
-    /// 累加基础使用量、激活的免费试用使用量和激活的奖励使用量
+    /// 累加基础使用量、激活的试用使用量和激活的奖励使用量
     pub fn current_usage(&self) -> f64 {
         let Some(breakdown) = self.primary_breakdown() else {
             return 0.0;
@@ -278,7 +278,7 @@ impl UsageLimitsResponse {
         let mut total = breakdown.current_usage_with_precision;
 
         // 累加激活的试用使用量
-        if let Some(trial) = &breakdown.free_trial_info {
+        if let Some(trial) = &breakdown.trial_credit_info {
             if trial.is_active() {
                 total += trial.current_usage_with_precision;
             }
@@ -332,5 +332,25 @@ mod tests {
         let parsed: UsageLimitsResponse = serde_json::from_str(raw).unwrap();
 
         assert_eq!(parsed.overage_status().as_deref(), Some("DISABLED"));
+    }
+
+    #[test]
+    fn legacy_trial_credit_fields_are_read_as_neutral_usage_credit() {
+        let raw = r#"{
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 10.0,
+                "usageLimitWithPrecision": 100.0,
+                "freeTrialInfo": {
+                    "currentUsageWithPrecision": 2.5,
+                    "usageLimitWithPrecision": 25.0,
+                    "freeTrialStatus": "ACTIVE"
+                }
+            }]
+        }"#;
+
+        let parsed: UsageLimitsResponse = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.current_usage(), 12.5);
+        assert_eq!(parsed.usage_limit(), 125.0);
     }
 }

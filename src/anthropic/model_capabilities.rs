@@ -1940,14 +1940,13 @@ mod tests {
         }
     }
 
-    fn capability_cohort_key(class: &str) -> LocalUpstreamModelCapabilityCohortKey {
+    fn capability_cohort_key(provider: &str) -> LocalUpstreamModelCapabilityCohortKey {
         LocalUpstreamModelCapabilityCohortKey {
             endpoint_family: "ide".to_string(),
             auth_method: "social".to_string(),
-            provider: "builderid".to_string(),
+            provider: provider.to_string(),
             effective_auth_region: "us-east-1".to_string(),
             effective_api_region: "us-east-1".to_string(),
-            subscription_class: class.to_string(),
             supported_models: Vec::new(),
         }
     }
