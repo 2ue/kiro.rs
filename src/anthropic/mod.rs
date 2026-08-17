@@ -26,7 +26,7 @@
 //!
 //! # 使用示例
 //! ```rust,ignore
-//! use kiro_rs::anthropic;
+//! use crate::anthropic;
 //!
 //! let app = anthropic::create_router("your-api-key");
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;

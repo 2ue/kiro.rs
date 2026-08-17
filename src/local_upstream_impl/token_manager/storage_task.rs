@@ -652,7 +652,7 @@ fn storage_fallback_runtime() -> &'static Runtime {
     FALLBACK_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("kiro-storage-task")
+            .thread_name("account-runtime-storage-task")
             .enable_all()
             .build()
             .expect("创建 best-effort 存储 runtime 失败")

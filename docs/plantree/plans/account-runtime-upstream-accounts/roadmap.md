@@ -190,6 +190,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream endpoint comments and ignored body-performance probes now use local-upstream wording and `LOCAL_UPSTREAM_*` environment variables, and the CLI origin literal is isolated as a wire-value constant.
 - Local-upstream credentials now use `api_key` internally and serialize API-key credentials as `apiKey`; old API-key JSON field names remain read aliases and Postgres hash repair still accepts existing old rows.
 - Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Kiro-named loadtest env fallbacks were removed.
+- Internal local-upstream examples, storage-task thread names and Redis test prefixes now use account-runtime identifiers instead of Kiro-branded crate/test names.
 
 ## In Progress
 

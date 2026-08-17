@@ -1219,7 +1219,7 @@ mod tests {
         for round in 0..5u64 {
             let mut config = crate::model::config::Config::default();
             config.redis.url = Some(url.clone());
-            config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+            config.redis.key_prefix = format!("account_runtime:test:{}", uuid::Uuid::new_v4());
             let redis = Arc::new(RedisStore::connect(&config).await.unwrap());
             let poison_id = 10_000 + round;
             redis

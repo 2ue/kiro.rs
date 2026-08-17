@@ -584,7 +584,7 @@ async fn test_redis_store() -> Option<Arc<RedisStore>> {
     let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
     let mut config = Config::default();
     config.redis.url = Some(url);
-    config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+    config.redis.key_prefix = format!("account_runtime:test:{}", uuid::Uuid::new_v4());
     Some(Arc::new(RedisStore::connect(&config).await.unwrap()))
 }
 
@@ -592,7 +592,7 @@ async fn test_redis_stores_with_shared_namespace(count: usize) -> Option<Vec<Arc
     let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
     let mut config = Config::default();
     config.redis.url = Some(url);
-    config.redis.key_prefix = format!("kiro_rs:test:{}", uuid::Uuid::new_v4());
+    config.redis.key_prefix = format!("account_runtime:test:{}", uuid::Uuid::new_v4());
     let mut stores = Vec::with_capacity(count);
     for _ in 0..count {
         stores.push(Arc::new(RedisStore::connect(&config).await.unwrap()));
@@ -10327,7 +10327,7 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
     let mut business_config = Config::default();
     business_config.redis.url = Some(business_url);
     business_config.redis.key_prefix = format!(
-        "kiro_rs:test:business-fault-domain:{}",
+        "account_runtime:test:business-fault-domain:{}",
         uuid::Uuid::new_v4()
     );
     let business_store = Arc::new(RedisStore::connect(&business_config).await.unwrap());
@@ -10335,7 +10335,7 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
     let observability_config = crate::model::config::RedisConfig {
         url: Some(observability_url),
         key_prefix: format!(
-            "kiro_rs:test:observability-fault-domain:{}",
+            "account_runtime:test:observability-fault-domain:{}",
             uuid::Uuid::new_v4()
         ),
     };
@@ -10779,7 +10779,7 @@ async fn redis_capacity_backend_restart_recovers_same_manager() {
         return;
     };
     assert!(
-        container.starts_with("kiro-rs-validation-redis-"),
+        container.starts_with("account-runtime-validation-redis-"),
         "只允许重启本任务创建的 Redis validation 容器"
     );
     if test_redis_toxiproxy().is_none() {

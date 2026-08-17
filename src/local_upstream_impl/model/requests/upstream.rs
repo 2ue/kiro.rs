@@ -16,7 +16,7 @@ use super::conversation::ConversationState;
 /// # 示例
 ///
 /// ```rust
-/// use kiro_rs::local_upstream_impl::model::requests::{
+/// use crate::local_upstream_impl::model::requests::{
 ///     LocalUpstreamRequest, ConversationState, CurrentMessage, UserInputMessage, Tool
 /// };
 ///
