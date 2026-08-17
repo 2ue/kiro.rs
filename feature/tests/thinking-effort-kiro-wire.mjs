@@ -1840,9 +1840,9 @@ function isolatedCredential(endpoint) {
 
 function isolatedServiceEnvironment(endpoint, servicePort) {
   return minimalEnvironment({
-    KIRO_API_KEY: '',
-    KIRO_RS_HOST: '127.0.0.1',
-    KIRO_RS_PORT: String(servicePort),
+    LOCAL_UPSTREAM_API_KEY: '',
+    ACCOUNT_RUNTIME_HOST: '127.0.0.1',
+    ACCOUNT_RUNTIME_PORT: String(servicePort),
     KIRO_RS_POSTGRES_URL: POSTGRES_URLS[endpoint],
     KIRO_RS_REDIS_URL: REDIS_URL,
     KIRO_RS_POSTGRES_MIGRATE_ON_START: 'true',
@@ -3041,7 +3041,7 @@ function runContractFixture() {
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_AUTH_TOKEN',
     'CLAUDE_CODE_OAUTH_TOKEN',
-    'KIRO_API_KEY',
+    'LOCAL_UPSTREAM_API_KEY',
     'KIRO_RS_POSTGRES_URL',
     'KIRO_RS_REDIS_URL',
     'DATABASE_URL',

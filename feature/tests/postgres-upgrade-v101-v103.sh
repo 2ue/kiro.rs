@@ -107,11 +107,11 @@ start_ready() {
   local binary=$1 log_file=$2 service_port=$3
   local started finished response=""
   started=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
-  env -u KIRO_API_KEY \
+  env -u LOCAL_UPSTREAM_API_KEY \
     KIRO_RS_POSTGRES_URL="$POSTGRES_URL" \
     KIRO_RS_REDIS_URL="$REDIS_URL" \
-    KIRO_RS_HOST=127.0.0.1 \
-    KIRO_RS_PORT="$service_port" \
+    ACCOUNT_RUNTIME_HOST=127.0.0.1 \
+    ACCOUNT_RUNTIME_PORT="$service_port" \
     KIRO_RS_POSTGRES_MIGRATE_ON_START=true \
     KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
     RUST_LOG=info \
@@ -150,11 +150,11 @@ start_expected_checksum_failure() {
   local log_file=$1 service_port=$2
   local started finished rc
   started=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
-  env -u KIRO_API_KEY \
+  env -u LOCAL_UPSTREAM_API_KEY \
     KIRO_RS_POSTGRES_URL="$POSTGRES_URL" \
     KIRO_RS_REDIS_URL="$REDIS_URL" \
-    KIRO_RS_HOST=127.0.0.1 \
-    KIRO_RS_PORT="$service_port" \
+    ACCOUNT_RUNTIME_HOST=127.0.0.1 \
+    ACCOUNT_RUNTIME_PORT="$service_port" \
     KIRO_RS_POSTGRES_MIGRATE_ON_START=true \
     KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
     RUST_LOG=info \

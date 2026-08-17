@@ -612,7 +612,7 @@ async function startService(configPath, credentialsPath, logPath, port) {
   const child = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
     cwd: ROOT,
     env: validationChildEnvironment({
-      KIRO_API_KEY: '', KIRO_RS_HOST: '127.0.0.1', KIRO_RS_PORT: String(port),
+      LOCAL_UPSTREAM_API_KEY: '', ACCOUNT_RUNTIME_HOST: '127.0.0.1', ACCOUNT_RUNTIME_PORT: String(port),
       RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs::anthropic::handlers=info,kiro_rs=info',
     }),
     stdio: ['ignore', logFd, logFd], detached: true,

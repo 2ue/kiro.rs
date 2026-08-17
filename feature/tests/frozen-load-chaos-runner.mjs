@@ -592,8 +592,8 @@ async function startProxy(ctx, fakePort, options = {}) {
     {
       env: minimalEnvironment({
         RUST_LOG: "info",
-        KIRO_RS_HOST: "127.0.0.1",
-        KIRO_RS_PORT: String(proxyPort),
+        ACCOUNT_RUNTIME_HOST: "127.0.0.1",
+        ACCOUNT_RUNTIME_PORT: String(proxyPort),
       }),
     },
   );
@@ -619,8 +619,8 @@ async function restartProxy(ctx, proxy, fakePort) {
     {
       env: minimalEnvironment({
         RUST_LOG: "info",
-        KIRO_RS_HOST: "127.0.0.1",
-        KIRO_RS_PORT: String(proxy.port),
+        ACCOUNT_RUNTIME_HOST: "127.0.0.1",
+        ACCOUNT_RUNTIME_PORT: String(proxy.port),
       }),
     },
   );

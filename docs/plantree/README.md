@@ -47,6 +47,7 @@ Current-state facts and target-state decisions answer different questions and mu
 ## Current Implementation Notes
 
 - 2026-08-17: Runtime storage overrides, local-upstream API-key bootstrap, and service bind overrides now use account-runtime/local-upstream environment names without Kiro-named runtime fallbacks. Docker Compose and maintained deployment docs now inject `ACCOUNT_RUNTIME_*` storage and port variables.
+- 2026-08-17: Active validation runners that start the service now pass `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-environment leak fixtures now use account-runtime/local-upstream variable names.
 - 2026-08-17: Internal local-upstream examples, storage-task thread naming and Redis test prefixes now use account-runtime names instead of Kiro-branded crate/test identifiers. The Redis backend restart safety prefix now expects `account-runtime-validation-redis-`.
 - 2026-08-17: Loadtest target resolution and mock upstream scripts now accept only account-runtime environment names for base URL, API key, route path and mock scenario configuration. Old Kiro-named loadtest env fallbacks were removed, and mock tool commands now reference `src/local_upstream_impl`.
 - 2026-08-17: Local-upstream credentials now use `api_key` as the Rust field and serialize API-key credentials as `apiKey`. Legacy `kiroApiKey` / `kiro_api_key` remain read aliases and Postgres hash repair still reads old JSON rows; user-facing duplicate/missing/empty API-key errors no longer use Kiro field wording.

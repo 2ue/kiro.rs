@@ -237,13 +237,13 @@ test('validation child environment is allowlisted and does not inherit credentia
       ANTHROPIC_API_KEY: 'sk-ant-secret',
       ANTHROPIC_AUTH_TOKEN: 'anthropic-token-secret',
       OPENAI_API_KEY: 'sk-openai-secret',
-      KIRO_API_KEY: 'ksk_secret',
-      KIRO_RS_TEST_REDIS_URL: 'redis://127.0.0.1:6379/9',
-      KIRO_VALIDATION_SHOULD_NOT_LEAK: 'present',
+      LOCAL_UPSTREAM_API_KEY: 'ksk_secret',
+      ACCOUNT_RUNTIME_TEST_REDIS_URL: 'redis://127.0.0.1:6379/9',
+      ACCOUNT_RUNTIME_VALIDATION_SHOULD_NOT_LEAK: 'present',
       PATH: process.env.PATH || '/usr/bin:/bin',
-    }, () => validationChildEnvironment({ KIRO_RS_PORT: '19022' }))
+    }, () => validationChildEnvironment({ ACCOUNT_RUNTIME_PORT: '19022' }))
 
-    assert.equal(environment.KIRO_RS_PORT, '19022')
+    assert.equal(environment.ACCOUNT_RUNTIME_PORT, '19022')
     assert.equal(typeof environment.PATH, 'string')
     for (const forbidden of [
       'DATABASE_URL',
@@ -251,9 +251,9 @@ test('validation child environment is allowlisted and does not inherit credentia
       'ANTHROPIC_API_KEY',
       'ANTHROPIC_AUTH_TOKEN',
       'OPENAI_API_KEY',
-      'KIRO_API_KEY',
-      'KIRO_RS_TEST_REDIS_URL',
-      'KIRO_VALIDATION_SHOULD_NOT_LEAK',
+      'LOCAL_UPSTREAM_API_KEY',
+      'ACCOUNT_RUNTIME_TEST_REDIS_URL',
+      'ACCOUNT_RUNTIME_VALIDATION_SHOULD_NOT_LEAK',
     ]) {
       assert.equal(environment[forbidden], undefined, `${forbidden} leaked in round ${round}`)
     }

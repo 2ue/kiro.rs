@@ -466,9 +466,9 @@ function startService({ configPath, credentialsPath, logPath, port }) {
     cwd: ROOT,
     env: minimalEnvironment({
       RUST_LOG: 'info',
-      KIRO_API_KEY: '',
-      KIRO_RS_HOST: '127.0.0.1',
-      KIRO_RS_PORT: String(port),
+      LOCAL_UPSTREAM_API_KEY: '',
+      ACCOUNT_RUNTIME_HOST: '127.0.0.1',
+      ACCOUNT_RUNTIME_PORT: String(port),
     }),
     stdio: ['ignore', log, log],
   })

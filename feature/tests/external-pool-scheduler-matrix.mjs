@@ -1268,7 +1268,7 @@ function spawnService(configPath, credentialsPath, logPath) {
     cwd: TEMP_ROOT,
     env: validationChildEnvironment({
       RUST_LOG: 'kiro_rs::external_pool=debug,kiro_rs::anthropic=info,kiro_rs=info',
-      KIRO_API_KEY: '',
+      LOCAL_UPSTREAM_API_KEY: '',
     }),
     stdio: ['ignore', fd, fd],
     detached: true,

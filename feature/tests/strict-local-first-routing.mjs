@@ -585,7 +585,7 @@ async function stopService(handle) {
 function startService(configPath, credentialsPath, logPath) {
   const log = fs.openSync(logPath, 'a')
   const handle = startChild(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
-    env: { RUST_LOG: 'info', KIRO_API_KEY: '' },
+    env: { RUST_LOG: 'info', LOCAL_UPSTREAM_API_KEY: '' },
     stdio: ['ignore', log, log],
   })
   handle.once('exit', () => {

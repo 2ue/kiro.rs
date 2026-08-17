@@ -191,6 +191,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream credentials now use `api_key` internally and serialize API-key credentials as `apiKey`; old API-key JSON field names remain read aliases and Postgres hash repair still accepts existing old rows.
 - Runtime storage overrides now read `ACCOUNT_RUNTIME_*` names, with README and maintained deployment docs updated to match.
 - Startup local-upstream API-key bootstrap and service bind overrides now read only `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; Kiro-named runtime fallback env vars were removed from code, tests and maintained deployment docs.
+- Active validation runners that spawn the service now set `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures now use account-runtime/local-upstream variable names.
 - Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Kiro-named loadtest env fallbacks were removed.
 - Internal local-upstream examples, storage-task thread names and Redis test prefixes now use account-runtime identifiers instead of Kiro-branded crate/test names.
 

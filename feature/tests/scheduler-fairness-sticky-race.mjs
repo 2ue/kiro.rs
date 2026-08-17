@@ -748,9 +748,9 @@ function startService(configPath, credentialsPath, logPath, servicePort) {
   const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
     cwd: ROOT,
     env: validationChildEnvironment({
-      KIRO_API_KEY: '',
-      KIRO_RS_HOST: '127.0.0.1',
-      KIRO_RS_PORT: String(servicePort),
+      LOCAL_UPSTREAM_API_KEY: '',
+      ACCOUNT_RUNTIME_HOST: '127.0.0.1',
+      ACCOUNT_RUNTIME_PORT: String(servicePort),
       RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs=info',
     }),
     stdio: ['ignore', log, log],

@@ -512,9 +512,9 @@ function startService({ configPath, credentialsPath, logPath, port }) {
   const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
     cwd: ROOT,
     env: minimalEnvironment({
-      KIRO_API_KEY: '',
-      KIRO_RS_HOST: '127.0.0.1',
-      KIRO_RS_PORT: String(port),
+      LOCAL_UPSTREAM_API_KEY: '',
+      ACCOUNT_RUNTIME_HOST: '127.0.0.1',
+      ACCOUNT_RUNTIME_PORT: String(port),
       RUST_LOG: 'kiro_rs::anthropic::request_admission=debug,kiro_rs=info',
     }),
     stdio: ['ignore', log, log],
