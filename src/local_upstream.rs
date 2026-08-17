@@ -53,6 +53,7 @@ pub(crate) mod endpoint {
 pub(crate) mod provider {
     pub(crate) type LocalAuxiliaryMcpAttribution =
         crate::local_upstream_impl::provider::McpCallAttribution;
+    #[cfg(test)]
     pub(crate) type LocalAuxiliaryMcpFailureKind =
         crate::local_upstream_impl::provider::McpCallFailureKind;
     pub(crate) type LocalUpstreamApiResponse =

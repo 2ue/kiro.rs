@@ -59,6 +59,7 @@ pub(crate) mod tool_schema_keys;
 pub(crate) mod transcript_sanitizer;
 pub mod types;
 pub(crate) mod usage;
+#[cfg(test)]
 mod websearch;
 
 pub use router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider};

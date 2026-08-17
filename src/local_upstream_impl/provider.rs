@@ -3395,7 +3395,7 @@ mod tests {
         config.local_upstream_response_timeout_secs = 2;
         let mut credentials = fake_bad_request_credentials(60);
         for (index, credential) in credentials.iter_mut().enumerate() {
-            credential.subscription_title = Some(format!("capability-class-{index}"));
+            credential.supported_models = vec![format!("capability-cohort-model-{index}")];
         }
         let manager = Arc::new(
             MultiTokenManager::new(config, credentials, None, None, false)
@@ -3589,10 +3589,10 @@ mod tests {
     }
 
     #[test]
-    fn model_capability_cohort_keys_scale_by_class_not_account_count_five_rounds() {
+    fn model_capability_cohort_keys_scale_by_static_capability_not_account_count_five_rounds() {
         let mut credentials = fake_bad_request_credentials(4_096);
         for (index, credential) in credentials.iter_mut().enumerate() {
-            credential.subscription_title = Some(format!("class-{}", index % 3));
+            credential.supported_models = vec![format!("capability-cohort-model-{}", index % 3)];
         }
         let manager = MultiTokenManager::new(Config::default(), credentials, None, None, false)
             .expect("large capability cohort fixture");
@@ -3653,7 +3653,7 @@ mod tests {
                 match mutate {
                     0 => credentials[1].endpoint = Some("cli".to_string()),
                     1 => credentials[1].api_region = Some("eu-west-1".to_string()),
-                    2 => credentials[1].subscription_title = Some("capability-class-b".to_string()),
+                    2 => credentials[1].provider = Some("provider-b".to_string()),
                     _ => credentials[1].supported_models = vec!["claude-haiku-4.5".to_string()],
                 }
                 let manager =
@@ -3662,7 +3662,7 @@ mod tests {
                 assert_eq!(
                     manager.local_model_capability_cohorts().len(),
                     2,
-                    "round {round}: endpoint/region/account metadata/model support class {mutate}"
+                    "round {round}: endpoint/region/provider/model support cohort {mutate}"
                 );
             }
         }

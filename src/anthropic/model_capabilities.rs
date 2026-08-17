@@ -65,6 +65,7 @@ pub enum UpstreamReasoningCapabilityState {
 /// effort enum is already the intersection across every old cohort. The reverse is unsafe because
 /// a newly introduced cohort was never represented in that intersection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum UpstreamReasoningCohortContractMatch {
     None,
     Exact,
@@ -83,6 +84,7 @@ impl UpstreamReasoningCapabilityState {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn reasoning_cohort_contract_match(
     verified_cohort_keys: Option<&[LocalUpstreamModelCapabilityCohortKey]>,
     current_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
@@ -591,6 +593,7 @@ impl ModelCapabilitiesCatalog {
         self.inner.read().reasoning_fields.get(&model).cloned()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reasoning_capability_state_for(
         &self,
         model: &str,

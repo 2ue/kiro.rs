@@ -133,8 +133,11 @@ pub(crate) enum RequestRejectionReason {
     DfcacheRouteInvalid,
     ProviderNotReady,
     MultimodalInvalid,
+    #[cfg_attr(not(test), allow(dead_code))]
     ModelUnsupported,
+    #[cfg_attr(not(test), allow(dead_code))]
     WebSearchUnsupported,
+    #[cfg_attr(not(test), allow(dead_code))]
     LocalBodyPrepare,
     #[cfg_attr(not(test), allow(dead_code))]
     LocalPoolUnavailable,

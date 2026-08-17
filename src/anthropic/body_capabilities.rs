@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use crate::model::config::{BodyConversionConfig, ImageProcessingConfig, ToolSchemaKeyMappingMode};
 
 use super::payload_guard::PayloadGuardConfig;

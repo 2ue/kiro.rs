@@ -1,5 +1,7 @@
 //! Anthropic API Handler 函数
 
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -91,6 +93,7 @@ use super::usage::{
     UsagePublicError, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
     UsageSource, account_attempts_from_external,
 };
+#[cfg(test)]
 use super::websearch;
 use crate::account_runtime::{
     AccountFinalError, AccountForwardOutcome, AccountLatencyTraceState, AccountRequestBodyMode,
@@ -124,6 +127,7 @@ use crate::local_upstream::request::LocalUpstreamRequest;
 use crate::local_upstream::stream::LocalUpstreamEventStreamDecoder;
 
 #[path = "handlers/local_body_pipeline.rs"]
+#[cfg(test)]
 mod local_body_pipeline;
 #[path = "handlers/parsed_body_pipeline.rs"]
 mod parsed_body_pipeline;
@@ -6106,8 +6110,6 @@ async fn post_messages_inner(
     log_anthropic_request_summary(&endpoint, &payload);
     #[cfg(test)]
     let provider = state.local_upstream_provider.clone();
-    #[cfg(not(test))]
-    let provider = None;
     let runtime_config = request_runtime_config_for_state(&state);
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let mut account_fallback = build_account_fallback_context(
@@ -6192,7 +6194,8 @@ async fn post_messages_inner(
         }
     }
 
-    let Some(provider) = provider else {
+    #[cfg(not(test))]
+    {
         let response = envelope::error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
@@ -6205,56 +6208,58 @@ async fn post_messages_inner(
             &response,
         );
         return response;
-    };
+    }
 
-    let model_resolution = match resolve_request_model(&state, &runtime_config, &endpoint, &payload)
+    #[cfg(test)]
     {
-        Ok(resolution) => resolution,
-        Err(response) => {
-            if let Some(external_response) = maybe_forward_account_after_local_error(
-                account_fallback.as_ref(),
-                &envelope::request_id(),
-                &format!("模型不支持: {}", payload.model),
-                Vec::new(),
-            )
-            .await
-            {
-                return external_response;
-            }
+        let Some(provider) = provider else {
+            let response = envelope::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
+            );
             record_pre_usage_rejection(
                 attribution.as_ref(),
-                RequestRejectionReason::ModelUnsupported,
+                RequestRejectionReason::ProviderNotReady,
                 &endpoint,
                 &response,
             );
             return response;
-        }
-    };
-    if let Some(external) = account_fallback.as_mut() {
-        external.model_resolution = Some(account_route_model_resolution(model_resolution.clone()));
-    }
+        };
 
-    if websearch::has_misnamed_native_web_search_tool(&payload) {
-        let response = envelope::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "The native web_search tool must be named web_search.",
-        );
-        record_pre_usage_rejection(
-            attribution.as_ref(),
-            RequestRejectionReason::WebSearchUnsupported,
-            &endpoint,
-            &response,
-        );
-        return response;
-    }
-    // 检查是否声明了 Anthropic 原生 WebSearch 工具。
-    if websearch::has_native_web_search_tool(&payload) {
-        if !websearch_supported_for_profile(runtime_config.compat_profile) {
+        let model_resolution =
+            match resolve_request_model(&state, &runtime_config, &endpoint, &payload) {
+                Ok(resolution) => resolution,
+                Err(response) => {
+                    if let Some(external_response) = maybe_forward_account_after_local_error(
+                        account_fallback.as_ref(),
+                        &envelope::request_id(),
+                        &format!("模型不支持: {}", payload.model),
+                        Vec::new(),
+                    )
+                    .await
+                    {
+                        return external_response;
+                    }
+                    record_pre_usage_rejection(
+                        attribution.as_ref(),
+                        RequestRejectionReason::ModelUnsupported,
+                        &endpoint,
+                        &response,
+                    );
+                    return response;
+                }
+            };
+        if let Some(external) = account_fallback.as_mut() {
+            external.model_resolution =
+                Some(account_route_model_resolution(model_resolution.clone()));
+        }
+
+        if websearch::has_misnamed_native_web_search_tool(&payload) {
             let response = envelope::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "The web_search tool is not supported for this request.",
+                "The native web_search tool must be named web_search.",
             );
             record_pre_usage_rejection(
                 attribution.as_ref(),
@@ -6264,283 +6269,303 @@ async fn post_messages_inner(
             );
             return response;
         }
-        tracing::info!(
-            native_websearch_tool_count = payload.tools.as_ref().map_or(0, Vec::len),
-            native_websearch_pure_tool = websearch::has_web_search_tool(&payload),
-            native_websearch_mixed_tools = websearch::has_mixed_native_web_search_tool(&payload),
-            native_websearch_unlisted_version =
-                websearch::has_unlisted_native_web_search_tool_type(&payload),
-            "detected native WebSearch tool request"
-        );
-
-        if let Some(external) = account_fallback.as_ref() {
-            let request_id = envelope::request_id();
-            let preflight_model = model_resolution
-                .upstream_model
-                .as_deref()
-                .unwrap_or(payload.model.as_str());
-            if let Some(response) = maybe_local_pool_preflight_account_response(
-                Some(external),
-                &request_id,
-                Some(preflight_model),
-            )
-            .await
-            {
-                tracing::warn!(
-                    request_id,
-                    model = %payload.model,
-                    upstream_model = %preflight_model,
-                    "native WebSearch MCP skipped because local pool preflight routed request to upstream account"
+        // 检查是否声明了 Anthropic 原生 WebSearch 工具。
+        if websearch::has_native_web_search_tool(&payload) {
+            if !websearch_supported_for_profile(runtime_config.compat_profile) {
+                let response = envelope::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "The web_search tool is not supported for this request.",
+                );
+                record_pre_usage_rejection(
+                    attribution.as_ref(),
+                    RequestRejectionReason::WebSearchUnsupported,
+                    &endpoint,
+                    &response,
                 );
                 return response;
             }
+            tracing::info!(
+                native_websearch_tool_count = payload.tools.as_ref().map_or(0, Vec::len),
+                native_websearch_pure_tool = websearch::has_web_search_tool(&payload),
+                native_websearch_mixed_tools =
+                    websearch::has_mixed_native_web_search_tool(&payload),
+                native_websearch_unlisted_version =
+                    websearch::has_unlisted_native_web_search_tool_type(&payload),
+                "detected native WebSearch tool request"
+            );
+
+            if let Some(external) = account_fallback.as_ref() {
+                let request_id = envelope::request_id();
+                let preflight_model = model_resolution
+                    .upstream_model
+                    .as_deref()
+                    .unwrap_or(payload.model.as_str());
+                if let Some(response) = maybe_local_pool_preflight_account_response(
+                    Some(external),
+                    &request_id,
+                    Some(preflight_model),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        request_id,
+                        model = %payload.model,
+                        upstream_model = %preflight_model,
+                        "native WebSearch MCP skipped because local pool preflight routed request to upstream account"
+                    );
+                    return response;
+                }
+            }
+
+            // 估算输入 tokens
+            let input_tokens = token::count_all_tokens(
+                &payload.model,
+                payload.system.as_deref(),
+                &payload.messages,
+                payload.tools.as_deref(),
+            ) as i32;
+
+            let websearch_cache_route =
+                cache_route_for_request_stream(cache_route.clone(), payload.stream);
+            let usage_context = prepare_usage_context_with_inference_attempt_budget(
+                &state,
+                websearch_cache_route,
+                &endpoint,
+                payload.stream,
+                &payload,
+                Some(model_resolution.clone()),
+                None,
+                None,
+                input_tokens,
+                inference_attempt_budget.clone(),
+                request_api_key_id.clone(),
+            );
+            let request_id = usage_context.request_id.clone();
+            let error_id = usage_context.error_id.clone();
+            let attribution_sink = Arc::new(LocalAuxiliaryMcpAttributionSink::default());
+            let mut usage_guard =
+                WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
+            let outcome = websearch::handle_websearch_request(
+                provider,
+                &payload,
+                input_tokens,
+                inference_attempt_budget,
+                attribution_sink,
+                &request_id,
+                &error_id,
+            )
+            .await;
+            let usage_context = usage_guard.take();
+            return match outcome {
+                websearch::WebSearchOutcome::Success {
+                    response,
+                    output_tokens,
+                    attribution,
+                } => {
+                    let usage_context = usage_context.attach_credential(
+                        attribution.credential_id,
+                        attribution.credential_label,
+                        false,
+                        false,
+                        attribution.attempts,
+                    );
+                    let usage = super::cache::CacheUsage {
+                        total_input_tokens: input_tokens.max(0),
+                        input_tokens: input_tokens.max(0),
+                        output_tokens: output_tokens.max(0),
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                        cache_creation_5m_input_tokens: 0,
+                        cache_creation_1h_input_tokens: 0,
+                    };
+                    if payload.stream {
+                        wrap_websearch_stream_usage_record(response, usage_context, usage)
+                    } else {
+                        usage_context.request.set_downstream_stop_reason("end_turn");
+                        usage_context
+                            .request
+                            .latency
+                            .inference_attempt_budget
+                            .mark_downstream_committed();
+                        usage_context.record_success_reported_with_metering(
+                            usage,
+                            UsageSource::RequestEstimate,
+                            Some(usage),
+                            None,
+                        );
+                        response
+                    }
+                }
+                websearch::WebSearchOutcome::Failure {
+                    response,
+                    error_type,
+                    internal_reason,
+                    attribution,
+                } => {
+                    if let Some(external_response) =
+                        maybe_account_fallback_after_websearch_mcp_failure(
+                            account_fallback.as_ref(),
+                            &request_id,
+                            internal_reason,
+                            &attribution,
+                        )
+                        .await
+                    {
+                        return external_response;
+                    }
+                    let error_metadata = websearch_error_metadata(&attribution, internal_reason);
+                    let usage_context = usage_context.attach_credential(
+                        attribution.credential_id,
+                        attribution.credential_label,
+                        false,
+                        false,
+                        attribution.attempts,
+                    );
+                    usage_context
+                        .with_error_metadata(error_metadata)
+                        .record_websearch_failure(response.status(), error_type, internal_reason);
+                    response
+                }
+            };
         }
 
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
+        let local_cache_route = cache_route_for_request_stream(cache_route, payload.stream);
+        let request_simulation_mode =
+            prompt_cache_simulation_mode_for_policy(&local_cache_route.policy);
+        let cache_type = local_cache_route.policy.cache_type;
+        let native_reasoning_capability = model_resolution
+            .upstream_model
+            .as_deref()
+            .map(|model| {
+                let capability_cohort_keys = provider.model_capability_cohort_keys();
+                state
+                    .model_capabilities
+                    .reasoning_capability_state_for(model, &capability_cohort_keys)
+            })
+            .unwrap_or(UpstreamReasoningCapabilityState::Unknown);
+        let prepared_local = match local_body_pipeline::prepare(
+            &endpoint,
+            &payload,
+            &runtime_config,
+            &local_cache_route,
+            &model_resolution,
+            native_reasoning_capability,
+        ) {
+            Ok(prepared) => prepared,
+            Err(response) => {
+                record_pre_usage_rejection(
+                    attribution.as_ref(),
+                    RequestRejectionReason::LocalBodyPrepare,
+                    &endpoint,
+                    &response,
+                );
+                return response;
+            }
+        };
+        let local_body_pipeline::PreparedLocalUpstreamBody {
+            request_body,
+            local_upstream_request,
+            conversation_id,
+            input_tokens,
+            payload_breakdown,
+            payload_guard_report,
+            payload_guard_elapsed,
+            thinking_enabled,
+            tool_name_map,
+            tool_schema_key_map,
+            known_tool_names,
+            warnings_header,
+            extract_xml_thinking,
+            too_long_retry,
+            cache_point_retry,
+        } = prepared_local;
 
-        let websearch_cache_route =
-            cache_route_for_request_stream(cache_route.clone(), payload.stream);
-        let usage_context = prepare_usage_context_with_inference_attempt_budget(
+        let mut usage_context = prepare_usage_context_with_inference_attempt_budget(
             &state,
-            websearch_cache_route,
+            local_cache_route,
             &endpoint,
             payload.stream,
             &payload,
             Some(model_resolution.clone()),
-            None,
-            None,
+            Some(conversation_id.clone()),
+            prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
             input_tokens,
             inference_attempt_budget.clone(),
-            request_api_key_id.clone(),
+            request_api_key_id,
         );
-        let request_id = usage_context.request_id.clone();
-        let error_id = usage_context.error_id.clone();
-        let attribution_sink = Arc::new(LocalAuxiliaryMcpAttributionSink::default());
-        let mut usage_guard =
-            WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
-        let outcome = websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            inference_attempt_budget,
-            attribution_sink,
-            &request_id,
-            &error_id,
-        )
-        .await;
-        let usage_context = usage_guard.take();
-        return match outcome {
-            websearch::WebSearchOutcome::Success {
-                response,
-                output_tokens,
-                attribution,
-            } => {
-                let usage_context = usage_context.attach_credential(
-                    attribution.credential_id,
-                    attribution.credential_label,
-                    false,
-                    false,
-                    attribution.attempts,
-                );
-                let usage = super::cache::CacheUsage {
-                    total_input_tokens: input_tokens.max(0),
-                    input_tokens: input_tokens.max(0),
-                    output_tokens: output_tokens.max(0),
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_creation_5m_input_tokens: 0,
-                    cache_creation_1h_input_tokens: 0,
-                };
-                if payload.stream {
-                    wrap_websearch_stream_usage_record(response, usage_context, usage)
-                } else {
-                    usage_context.request.set_downstream_stop_reason("end_turn");
-                    usage_context
-                        .request
-                        .latency
-                        .inference_attempt_budget
-                        .mark_downstream_committed();
-                    usage_context.record_success_reported_with_metering(
-                        usage,
-                        UsageSource::RequestEstimate,
-                        Some(usage),
-                        None,
-                    );
-                    response
-                }
-            }
-            websearch::WebSearchOutcome::Failure {
-                response,
-                error_type,
-                internal_reason,
-                attribution,
-            } => {
-                if let Some(external_response) = maybe_account_fallback_after_websearch_mcp_failure(
-                    account_fallback.as_ref(),
-                    &request_id,
-                    internal_reason,
-                    &attribution,
-                )
-                .await
-                {
-                    return external_response;
-                }
-                let error_metadata = websearch_error_metadata(&attribution, internal_reason);
-                let usage_context = usage_context.attach_credential(
-                    attribution.credential_id,
-                    attribution.credential_label,
-                    false,
-                    false,
-                    attribution.attempts,
-                );
-                usage_context
-                    .with_error_metadata(error_metadata)
-                    .record_websearch_failure(response.status(), error_type, internal_reason);
-                response
-            }
-        };
-    }
-
-    let local_cache_route = cache_route_for_request_stream(cache_route, payload.stream);
-    let request_simulation_mode =
-        prompt_cache_simulation_mode_for_policy(&local_cache_route.policy);
-    let cache_type = local_cache_route.policy.cache_type;
-    let native_reasoning_capability = model_resolution
-        .upstream_model
-        .as_deref()
-        .map(|model| {
-            let capability_cohort_keys = provider.model_capability_cohort_keys();
-            state
-                .model_capabilities
-                .reasoning_capability_state_for(model, &capability_cohort_keys)
-        })
-        .unwrap_or(UpstreamReasoningCapabilityState::Unknown);
-    let prepared_local = match local_body_pipeline::prepare(
-        &endpoint,
-        &payload,
-        &runtime_config,
-        &local_cache_route,
-        &model_resolution,
-        native_reasoning_capability,
-    ) {
-        Ok(prepared) => prepared,
-        Err(response) => {
-            record_pre_usage_rejection(
-                attribution.as_ref(),
-                RequestRejectionReason::LocalBodyPrepare,
-                &endpoint,
-                &response,
-            );
-            return response;
+        if let Some(report) = payload_guard_report.clone() {
+            usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
         }
-    };
-    let local_body_pipeline::PreparedLocalUpstreamBody {
-        request_body,
-        local_upstream_request,
-        conversation_id,
-        input_tokens,
-        payload_breakdown,
-        payload_guard_report,
-        payload_guard_elapsed,
-        thinking_enabled,
-        tool_name_map,
-        tool_schema_key_map,
-        known_tool_names,
-        warnings_header,
-        extract_xml_thinking,
-        too_long_retry,
-        cache_point_retry,
-    } = prepared_local;
+        if let Some(elapsed) = payload_guard_elapsed {
+            usage_context.mark_payload_guard_latency(elapsed);
+        }
+        let capacity_weight_units =
+            capacity_weight_units_for_local_request(provider.as_ref(), input_tokens);
+        usage_context.set_capacity_weight_units(capacity_weight_units);
 
-    let mut usage_context = prepare_usage_context_with_inference_attempt_budget(
-        &state,
-        local_cache_route,
-        &endpoint,
-        payload.stream,
-        &payload,
-        Some(model_resolution.clone()),
-        Some(conversation_id.clone()),
-        prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
-        input_tokens,
-        inference_attempt_budget.clone(),
-        request_api_key_id,
-    );
-    if let Some(report) = payload_guard_report.clone() {
-        usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
-    }
-    if let Some(elapsed) = payload_guard_elapsed {
-        usage_context.mark_payload_guard_latency(elapsed);
-    }
-    let capacity_weight_units =
-        capacity_weight_units_for_local_request(provider.as_ref(), input_tokens);
-    usage_context.set_capacity_weight_units(capacity_weight_units);
-
-    if payload.stream {
-        let claude_code_noop_delta_keepalive =
-            should_use_claude_code_noop_delta_keepalive(request_user_agent(&headers));
-        // 流式响应
-        handle_stream_request(
-            provider,
-            &request_body,
-            local_upstream_request,
-            &payload.model,
-            model_resolution
-                .upstream_model
-                .as_deref()
-                .unwrap_or(&payload.model),
-            payload.max_tokens,
-            input_tokens,
-            usage_context.context_window_tokens,
-            thinking_enabled,
-            extract_xml_thinking,
-            tool_name_map,
-            tool_schema_key_map,
-            known_tool_names,
-            usage_context,
-            attribution,
-            warnings_header,
-            too_long_retry,
-            cache_point_retry,
-            account_fallback,
-            runtime_config.local_upstream_stream_idle_timeout_secs,
-            LocalStreamRetryConfig::from_runtime_config(&runtime_config),
-            capacity_weight_units,
-            claude_code_noop_delta_keepalive,
-        )
-        .await
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = should_extract_unsigned_thinking(&runtime_config, thinking_enabled);
-        handle_non_stream_request(
-            provider,
-            &request_body,
-            &local_upstream_request,
-            &payload.model,
-            model_resolution
-                .upstream_model
-                .as_deref()
-                .unwrap_or(&payload.model),
-            input_tokens,
-            thinking_enabled,
-            extract_thinking,
-            tool_name_map,
-            tool_schema_key_map,
-            known_tool_names,
-            usage_context,
-            attribution,
-            warnings_header,
-            too_long_retry,
-            cache_point_retry,
-            account_fallback,
-            capacity_weight_units,
-        )
-        .await
+        if payload.stream {
+            let claude_code_noop_delta_keepalive =
+                should_use_claude_code_noop_delta_keepalive(request_user_agent(&headers));
+            // 流式响应
+            handle_stream_request(
+                provider,
+                &request_body,
+                local_upstream_request,
+                &payload.model,
+                model_resolution
+                    .upstream_model
+                    .as_deref()
+                    .unwrap_or(&payload.model),
+                payload.max_tokens,
+                input_tokens,
+                usage_context.context_window_tokens,
+                thinking_enabled,
+                extract_xml_thinking,
+                tool_name_map,
+                tool_schema_key_map,
+                known_tool_names,
+                usage_context,
+                attribution,
+                warnings_header,
+                too_long_retry,
+                cache_point_retry,
+                account_fallback,
+                runtime_config.local_upstream_stream_idle_timeout_secs,
+                LocalStreamRetryConfig::from_runtime_config(&runtime_config),
+                capacity_weight_units,
+                claude_code_noop_delta_keepalive,
+            )
+            .await
+        } else {
+            // 非流式响应：仅在配置开启时提取 thinking 块
+            let extract_thinking =
+                should_extract_unsigned_thinking(&runtime_config, thinking_enabled);
+            handle_non_stream_request(
+                provider,
+                &request_body,
+                &local_upstream_request,
+                &payload.model,
+                model_resolution
+                    .upstream_model
+                    .as_deref()
+                    .unwrap_or(&payload.model),
+                input_tokens,
+                thinking_enabled,
+                extract_thinking,
+                tool_name_map,
+                tool_schema_key_map,
+                known_tool_names,
+                usage_context,
+                attribution,
+                warnings_header,
+                too_long_retry,
+                cache_point_retry,
+                account_fallback,
+                capacity_weight_units,
+            )
+            .await
+        }
     }
 }
 

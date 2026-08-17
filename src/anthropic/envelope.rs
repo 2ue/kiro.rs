@@ -1,5 +1,7 @@
 //! Anthropic-compatible response envelope helpers.
 
+#![cfg_attr(not(test), allow(dead_code))]
+
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json, Response},

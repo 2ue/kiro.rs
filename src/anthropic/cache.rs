@@ -1,6 +1,9 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use serde_json::json;
 
 use crate::anthropic::prompt_cache::PromptCacheUsage;
+
 use crate::local_upstream::event::LocalUpstreamMetadataTokenUsage;
 use crate::model::config::{
     ReportedUsageFieldMode, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,

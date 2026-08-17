@@ -2,6 +2,8 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为本地上游请求格式
 
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::HashMap;
 
 #[cfg(test)]

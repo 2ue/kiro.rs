@@ -14,6 +14,7 @@ use crate::{
     local_upstream::request::LocalUpstreamRequest,
 };
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PreparedLocalUpstreamRequestBody {
     pub body: String,
     pub report: Option<PayloadGuardReport>,
