@@ -196,13 +196,13 @@ ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替�
 - Docker 部署时 `host` 必须是 `0.0.0.0`，否则宿主机端口映射后可能访问不到服务。
 - Compose 会通过 `ACCOUNT_RUNTIME_POSTGRES_URL` 和 `ACCOUNT_RUNTIME_REDIS_URL` 注入数据库连接地址；文件里的 `postgres.url` 和 `redis.url` 也可以保留，主要用于本地或非 Compose 场景。
 - 未写出的配置会使用内置默认值。首次启动导入 PgSQL 后，可以在后台配置页热更新调度、payload 防护、高缓存模拟和路径级 usage 上报策略。
-- 首次启动时，如果 PgSQL 没有运行配置或凭据，服务会从 `config.json` 和 `credentials.json` 导入。
-- 导入后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、调度统计、usage 记录、模型价格都以 PgSQL 为准。
+- 首次启动时，如果 PgSQL 没有运行配置，服务可从 `config.json` 初始化运行配置；服务启动不再从 `credentials.json` 自动导入旧本地上游凭据。
+- 导入后运行配置、上游账号状态、调度统计、usage 记录、模型价格都以 PgSQL 为准。
 - 会话粘性绑定、同会话软失败计数、上游瞬态错误冷却、本地 RPM 限流、单凭据并发 lease 和跨实例 Token 刷新锁都以 Redis 为准。
 
-## 6. credentials.json
+## 6. 旧 credentials.json 兼容说明
 
-首次启动前，在 `/opt/kiro-rs/config/credentials.json` 写入凭据。可以是单个对象，也可以是数组。
+当前账号运行时启动不再读取 `/opt/kiro-rs/config/credentials.json` 自动导入凭据。下面格式只保留给离线诊断、旧数据迁移或兼容说明；新上游账号请通过 Admin 账号接口配置。
 
 单个 OAuth 凭据示例：
 
@@ -238,7 +238,7 @@ ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替�
 ]
 ```
 
-数据库已有凭据后，服务启动不依赖 `credentials.json`。之后建议通过管理后台新增、禁用、删除或导出凭据。
+服务启动不依赖 `credentials.json`。上游账号的新增、禁用、删除或导出应通过管理后台账号功能完成。
 
 ## 7. 配置项中文说明
 
@@ -441,16 +441,16 @@ http://服务器地址:8990/ui
 | 位置 | 控制什么 |
 | --- | --- |
 | PgSQL `runtime_config` | 运行配置。首次可从 `config.json` 导入，之后后台修改写入这里。 |
-| PgSQL `credentials` | 凭据列表、禁用状态、刷新后的 Token、优先级等。首次可从 `credentials.json` 导入。 |
+| PgSQL `credentials` | 旧本地上游凭据兼容数据；账号运行时请求不再通过启动导入的旧凭据执行。 |
 | PgSQL `credential_runtime_state` | 凭据失败计数、刷新失败计数、禁用原因、预热剩余次数。 |
 | PgSQL `credential_stats` | 凭据成功次数、最后使用时间等调度统计。 |
 | PgSQL `usage_records` | 请求级 usage 记录、错误详情、模型计价结果。 |
 | PgSQL `model_pricing` | 模型价格同步结果。 |
 | Redis | 会话粘性绑定、同会话软失败计数、临时冷却、本地限流、并发 lease、Token 刷新锁、余额查询缓存。 |
 | `config/config.json` | 首次导入和数据库连接配置。 |
-| `config/credentials.json` | 首次导入凭据文件；数据库已有凭据后服务启动不依赖它。 |
+| `config/credentials.json` | 旧本地上游凭据兼容文件；服务启动不再自动读取它。 |
 
-备份时至少备份 PgSQL 数据卷。如果还依赖文件做首次导入，也备份：
+备份时至少备份 PgSQL 数据卷。如果还保留旧兼容文件，也备份：
 
 ```text
 config/config.json
@@ -502,4 +502,4 @@ docker compose logs kiro-rs
 
 ### 修改 credentials.json 后为什么不生效
 
-首次导入后，凭据以 PgSQL `credentials` 为准。后续请在管理后台新增、删除、禁用或导出凭据；如果要重新从文件导入，需要清空数据库中的凭据，谨慎操作。
+当前运行时不会在启动时重新读取 `credentials.json`。请通过管理后台账号功能维护上游账号；旧本地上游凭据文件只作为兼容或迁移材料保留。

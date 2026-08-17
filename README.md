@@ -125,12 +125,12 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
 }
 ```
 > PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
-> PgSQL 和业务 Redis 为必需依赖。首次启动时会把 `config.json` 和 `credentials.json` 导入 PgSQL；之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用、external fencing 和跨实例 Token 刷新锁只使用业务 `redis`。
+> PgSQL 和业务 Redis 为必需依赖。首次启动时运行配置可从 `config.json` 初始化到 PgSQL；上游账号请通过 Admin 的账号接口或账号运行时存储配置，不再从 `credentials.json` 或环境变量自动导入旧本地上游凭据。之后运行配置、账号状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、限流、并发占用、account fencing 和跨实例刷新锁只使用业务 `redis`。
 >
 > `observabilityRedis` 是可选的独立观测故障域，用于 usage 派生 materialization、Admin/余额缓存和 usage cleanup 的 Redis 阶段。未配置时这些能力使用 PostgreSQL/进程内状态，绝不会回落到业务 Redis。配置后必须使用不同的 Redis 网络 authority；只改 logical DB 或 `keyPrefix` 仍共享同一个 Redis 单线程，启动会拒绝这种伪隔离。也可以通过 `ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_URL` 和 `ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_KEY_PREFIX` 设置。
 
-创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
-> PS: 可以前往 Web 管理面板配置跳过本步骤
+旧 `credentials.json` 兼容说明：
+> PS: 该文件不再是服务启动时的上游账号入口，只保留给离线诊断或旧数据迁移说明。新上游账号应通过 Admin 的账号接口配置。
 > 如果你对凭据地域有疑惑, 请查看 [Region 配置](#region-配置)
 
 Social 认证：
@@ -538,7 +538,6 @@ RUST_LOG=debug ./target/release/kiro-rs
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
-| `LOCAL_UPSTREAM_API_KEY` | - | 自动导入一个最高优先级的本地上游 API Key 凭据并写入 PgSQL，可用于不准备 `credentials.json` 的场景；支持 `ksk_xxx|region` |
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `ACCOUNT_RUNTIME_HOST` | 配置文件值 | 服务监听地址 |

@@ -12,7 +12,6 @@ mod storage;
 pub mod token;
 
 use std::{
-    collections::HashMap,
     future::{Future, IntoFuture},
     sync::{
         Arc,
@@ -42,10 +41,6 @@ use common::auth::RequestApiKeyStore;
 use futures::StreamExt;
 use local_upstream::{
     credentials::{LocalUpstreamCredentials, LocalUpstreamCredentialsConfig},
-    endpoint::{
-        LocalUpstreamCliEndpoint, LocalUpstreamEndpoint, LocalUpstreamEndpointTrait,
-        LocalUpstreamIdeEndpoint,
-    },
     manager::LocalUpstreamCredentialManager,
     provider::LocalUpstreamProvider,
 };
@@ -124,8 +119,10 @@ fn model_capability_retry_delay(consecutive_failures: u32) -> StdDuration {
     StdDuration::from_secs(seconds)
 }
 
+#[cfg(test)]
 fn legacy_credential_provider_required(config: &Config) -> bool {
-    !config.account_runtime_config().external_pools_enabled
+    let _ = config;
+    false
 }
 
 #[tokio::main]
@@ -231,68 +228,6 @@ async fn main() {
         });
     config.set_config_path_for_runtime(None);
     apply_service_bind_env_overrides(&mut config);
-
-    let credentials_exist = postgres_store
-        .credentials_exist()
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("检查 PgSQL 凭据是否存在失败: {}", e);
-            std::process::exit(1);
-        });
-    let start_legacy_credential_provider = legacy_credential_provider_required(&config);
-    let env_local_upstream_api_key = if start_legacy_credential_provider {
-        read_trimmed_env_var("LOCAL_UPSTREAM_API_KEY")
-    } else {
-        None
-    };
-    if !credentials_exist && start_legacy_credential_provider {
-        let credentials_path = args
-            .credentials
-            .unwrap_or_else(|| LocalUpstreamCredentials::default_credentials_path().to_string());
-        match LocalUpstreamCredentialsConfig::load(&credentials_path) {
-            Ok(file_credentials) => {
-                let file_credentials_list = file_credentials.into_sorted_credentials();
-                postgres_store
-                    .bootstrap_credentials_from_file(&file_credentials_list)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!("从凭据文件 bootstrap 凭据到 PgSQL 失败: {}", e);
-                        std::process::exit(1);
-                    });
-            }
-            Err(err) if env_local_upstream_api_key.is_some() => {
-                tracing::warn!(
-                    "首次导入凭据文件不可用，将仅使用环境中的本地上游 API Key 自动导入: {}",
-                    err
-                );
-            }
-            Err(err) => {
-                tracing::error!("加载首次导入凭据文件失败: {}", err);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    if let Some((local_upstream_api_key, env_var_name)) = &env_local_upstream_api_key {
-        postgres_store
-            .ensure_api_key_credential(local_upstream_api_key)
-            .await
-            .map(|credential| {
-                tracing::info!(
-                    credential_id = credential.id.unwrap_or_default(),
-                    env_var = env_var_name,
-                    "环境中的本地上游 API Key 已作为 API Key 凭据存在或完成一次性导入"
-                );
-            })
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    env_var = env_var_name,
-                    "导入本地上游 API Key 到 PgSQL 失败: {}",
-                    e
-                );
-                std::process::exit(1);
-            });
-    }
 
     let observability_redis_store = if config
         .observability_redis
@@ -432,41 +367,8 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理");
     }
 
-    // 构建端点注册表
-    let mut endpoints: HashMap<String, Arc<LocalUpstreamEndpoint>> = HashMap::new();
-    {
-        let ide = LocalUpstreamIdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = LocalUpstreamCliEndpoint::new();
-        endpoints.insert(cli.name().to_string(), Arc::new(cli));
-    }
-
-    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
-    if start_legacy_credential_provider {
-        // 校验默认端点存在
-        if !endpoints.contains_key(&config.default_endpoint) {
-            tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
-            std::process::exit(1);
-        }
-
-        // 校验所有凭据声明的端点都已注册
-        for cred in &credentials_list {
-            let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
-            if !endpoints.contains_key(name) {
-                tracing::error!(
-                    "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
-                    cred.id,
-                    name,
-                    endpoints.keys().collect::<Vec<_>>()
-                );
-                std::process::exit(1);
-            }
-        }
-    } else {
-        tracing::info!(
-            "上游账号运行时已启用；跳过旧凭据端点校验并不安装 legacy local-upstream executor"
-        );
-    }
+    let endpoint_names: Vec<String> = Vec::new();
+    tracing::info!("账号运行时不安装 legacy local-upstream executor");
     let usage_recorder = Arc::new(
         anthropic::usage::UsageRecorder::with_postgres_and_observability_redis(
             config.usage_record_limit,
@@ -567,17 +469,7 @@ async fn main() {
         request_admission.clone(),
         runtime_event_health.clone(),
     );
-    let local_upstream_provider = if start_legacy_credential_provider {
-        let provider = LocalUpstreamProvider::with_proxy(
-            token_manager.clone(),
-            proxy_config.clone(),
-            endpoints,
-            config.default_endpoint.clone(),
-        );
-        Some(Arc::new(provider))
-    } else {
-        None
-    };
+    let local_upstream_provider: Option<Arc<LocalUpstreamProvider>> = None;
     let model_capability_recovery_task = if let Some(local_upstream_provider) =
         local_upstream_provider.as_ref()
     {
@@ -1627,22 +1519,10 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn account_runtime_env_helpers_use_account_runtime_names_only() {
+    fn account_runtime_env_helpers_use_account_runtime_bind_names_only() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        remove_test_env("LOCAL_UPSTREAM_API_KEY");
         remove_test_env("ACCOUNT_RUNTIME_HOST");
         remove_test_env("ACCOUNT_RUNTIME_PORT");
-
-        assert_eq!(read_trimmed_env_var("LOCAL_UPSTREAM_API_KEY"), None);
-
-        set_test_env("LOCAL_UPSTREAM_API_KEY", " primary-key ");
-        assert_eq!(
-            read_trimmed_env_var("LOCAL_UPSTREAM_API_KEY"),
-            Some((
-                "primary-key".to_string(),
-                "LOCAL_UPSTREAM_API_KEY".to_string()
-            ))
-        );
 
         let mut config = Config::default();
         set_test_env("ACCOUNT_RUNTIME_HOST", "127.0.0.3");
@@ -1651,7 +1531,6 @@ mod lifecycle_tests {
         assert_eq!(config.host, "127.0.0.3");
         assert_eq!(config.port, 19091);
 
-        remove_test_env("LOCAL_UPSTREAM_API_KEY");
         remove_test_env("ACCOUNT_RUNTIME_HOST");
         remove_test_env("ACCOUNT_RUNTIME_PORT");
     }
@@ -1732,7 +1611,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn legacy_provider_is_not_required_when_upstream_accounts_are_enabled() {
+    fn legacy_provider_is_never_required_at_runtime() {
         let mut config = Config::default();
 
         config.external_pools.external_pools_enabled = true;
@@ -1743,8 +1622,8 @@ mod lifecycle_tests {
 
         config.external_pools.external_pools_enabled = false;
         assert!(
-            legacy_credential_provider_required(&config),
-            "legacy provider remains the compatibility path until account runtime is enabled"
+            !legacy_credential_provider_required(&config),
+            "disabled account routing must fail closed instead of installing the legacy provider"
         );
     }
 
