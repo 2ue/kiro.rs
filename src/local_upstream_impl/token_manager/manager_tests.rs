@@ -581,7 +581,7 @@ async fn stats_flush_worker_shutdown_flushes_and_releases_manager() {
 }
 
 async fn test_redis_store() -> Option<Arc<RedisStore>> {
-    let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
+    let url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")?;
     let mut config = Config::default();
     config.redis.url = Some(url);
     config.redis.key_prefix = format!("account_runtime:test:{}", uuid::Uuid::new_v4());
@@ -589,7 +589,7 @@ async fn test_redis_store() -> Option<Arc<RedisStore>> {
 }
 
 async fn test_redis_stores_with_shared_namespace(count: usize) -> Option<Vec<Arc<RedisStore>>> {
-    let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
+    let url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")?;
     let mut config = Config::default();
     config.redis.url = Some(url);
     config.redis.key_prefix = format!("account_runtime:test:{}", uuid::Uuid::new_v4());
@@ -606,7 +606,7 @@ where
     Fut: Future<Output = ()>,
 {
     let Some(stores) = test_redis_stores_with_shared_namespace(count).await else {
-        eprintln!("跳过 Redis 多实例集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis 多实例集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let cleanup_store = stores[0].clone();
@@ -637,7 +637,7 @@ where
     Fut: Future<Output = ()>,
 {
     let Some(store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let outcome = AssertUnwindSafe(body(store.clone())).catch_unwind().await;
@@ -831,8 +831,8 @@ async fn recover_capacity_breaker_five_times(
 }
 
 fn test_redis_toxiproxy() -> Option<(String, String)> {
-    let api = std::env::var("KIRO_RS_TEST_TOXIPROXY_API").ok()?;
-    let proxy = std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").ok()?;
+    let api = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API").ok()?;
+    let proxy = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME").ok()?;
     Some((api.trim_end_matches('/').to_string(), proxy))
 }
 
@@ -903,8 +903,8 @@ async fn set_test_redis_proxy_enabled(enabled: bool) -> bool {
 
 fn test_fault_domain_toxiproxy(domain: &str) -> Option<(String, String)> {
     let domain = domain.to_ascii_uppercase();
-    let api = std::env::var(format!("KIRO_RS_TEST_{domain}_TOXIPROXY_API")).ok()?;
-    let proxy = std::env::var(format!("KIRO_RS_TEST_{domain}_TOXIPROXY_NAME")).ok()?;
+    let api = std::env::var(format!("ACCOUNT_RUNTIME_TEST_{domain}_TOXIPROXY_API")).ok()?;
+    let proxy = std::env::var(format!("ACCOUNT_RUNTIME_TEST_{domain}_TOXIPROXY_NAME")).ok()?;
     Some((api.trim_end_matches('/').to_string(), proxy))
 }
 
@@ -1020,7 +1020,7 @@ async fn acquire_test_refresh_lock_until(
 }
 
 async fn test_postgres_store() -> Option<Arc<PostgresStore>> {
-    let url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")?;
+    let url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")?;
     let mut config = Config::default();
     config.postgres.url = Some(url);
     config.postgres.max_connections = 2;
@@ -1035,7 +1035,7 @@ where
     Fut: Future<Output = ()>,
 {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let outcome = AssertUnwindSafe(body(store.clone())).catch_unwind().await;
@@ -1134,7 +1134,7 @@ fn api_key_credential(token: &str) -> LocalUpstreamCredentials {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_stats_reload_preserves_pending_deltas_and_monotonic_local_values() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut credential = api_key_credential("stats-reload-monotonic");
@@ -1210,7 +1210,7 @@ async fn postgres_stats_reload_preserves_pending_deltas_and_monotonic_local_valu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steady_success_queues_stats_without_rewriting_unchanged_runtime_state() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL steady-success 测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL steady-success 测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut credential = api_key_credential("steady-success");
@@ -1284,7 +1284,7 @@ async fn steady_success_queues_stats_without_rewriting_unchanged_runtime_state()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_failed_stats_batch_retry_keeps_frozen_payload_and_new_accumulator_separate() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut credential = api_key_credential("stats-frozen-batch");
@@ -1373,7 +1373,7 @@ async fn postgres_failed_stats_batch_retry_keeps_frozen_payload_and_new_accumula
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut credential = api_key_credential("stats-shutdown-drain");
@@ -1485,7 +1485,7 @@ async fn stats_shutdown_drains_frozen_and_new_stats_with_multiple_runtime_rounds
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let credentials: Vec<_> = (1..=3)
@@ -1576,7 +1576,7 @@ async fn postgres_runtime_flush_round_robins_past_one_failed_credential() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_admin_runtime_patches_advance_revision_once_and_ignore_old_results() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut credential = api_key_credential("admin-runtime-patches");
@@ -1923,7 +1923,7 @@ fn quota_guard_ignores_stale_missing_non_disabled_and_oauth_account_snapshots() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reload_remote_delete_clears_pending_persistence_for_removed_id() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut first = api_key_credential("reload-remote-delete-first");
@@ -2100,7 +2100,7 @@ async fn runtime_mutation_cleanup_loop_drains_full_batches_and_honors_limits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_mutation_history_cleanup_drains_both_ledgers_and_is_minute_throttled() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -2224,7 +2224,7 @@ async fn runtime_mutation_history_cleanup_drains_both_ledgers_and_is_minute_thro
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_admin_updates_merge_unrelated_credential_fields() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut credential = api_key_credential("credential-admin-cas-merge");
@@ -2280,7 +2280,7 @@ async fn stale_admin_updates_merge_unrelated_credential_fields() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_mutation_flush_respects_global_wall_clock_budget() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let credentials: Vec<_> = (1..=RUNTIME_MUTATION_FLUSH_LIMIT as u64)
@@ -2500,7 +2500,7 @@ async fn ordinary_refresh_peer_wait_respects_coordination_deadline() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_force_refresh_respects_total_deadline_and_releases_redis_lock() {
     let Some(redis) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let (token_endpoint, request_received, server) = spawn_pending_refresh_token_endpoint().await;
@@ -2557,7 +2557,7 @@ async fn pending_force_refresh_respects_total_deadline_and_releases_redis_lock()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborting_force_refresh_submits_critical_redis_lock_cleanup() {
     let Some(redis) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let (token_endpoint, request_received, server) = spawn_pending_refresh_token_endpoint().await;
@@ -2617,7 +2617,7 @@ async fn aborting_force_refresh_submits_critical_redis_lock_cleanup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborting_ordinary_refresh_submits_critical_redis_lock_cleanup() {
     let Some(redis) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let (token_endpoint, request_received, server) = spawn_pending_refresh_token_endpoint().await;
@@ -2685,7 +2685,7 @@ async fn aborting_ordinary_refresh_submits_critical_redis_lock_cleanup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_refresh_with_redis_without_postgres_uses_local_authority_and_releases_lock() {
     let Some(redis) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let (token_endpoint, _request_received, server) = spawn_force_refresh_token_endpoint().await;
@@ -2733,7 +2733,7 @@ async fn ordinary_refresh_with_redis_without_postgres_uses_local_authority_and_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn force_refresh_runtime_reset_cannot_overrun_total_deadline() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let (token_endpoint, _request_received, server) = spawn_force_refresh_token_endpoint().await;
@@ -2949,7 +2949,7 @@ async fn ordinary_refresh_postgres_failure_is_typed_and_credential_health_neutra
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_cas_treats_already_committed_fields_as_success() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let credential =
@@ -3375,7 +3375,7 @@ fn dispatch_wakeup_filters_self_and_routes_remote_scope_for_five_rounds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_scheduler_events_arriving_during_snapshot_are_chased_for_five_rounds() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis remote generation 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis remote generation 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     redis_store.set_scheduler_state_delay_millis(100);
@@ -4091,7 +4091,7 @@ async fn test_add_credential_api_key_success() {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_row_level_update_does_not_delete_credentials_added_by_other_instance() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4140,7 +4140,7 @@ async fn postgres_row_level_update_does_not_delete_credentials_added_by_other_in
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_failure_counts_are_atomic_across_managers() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4197,7 +4197,7 @@ async fn postgres_failure_counts_are_atomic_across_managers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_failure_deferred_queues_before_runtime_flush() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4244,7 +4244,7 @@ async fn postgres_failure_deferred_queues_before_runtime_flush() {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_quota_deferred_persists_disable_on_runtime_flush() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4309,7 +4309,7 @@ async fn postgres_quota_deferred_persists_disable_on_runtime_flush() {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_success_reset_is_ordered_before_next_cross_manager_failure() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4369,7 +4369,7 @@ async fn postgres_success_reset_is_ordered_before_next_cross_manager_failure() {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_clean_success_reconciliation_is_rate_limited_per_credential() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4489,7 +4489,7 @@ fn pending_success_runtime_mutations_coalesce_at_queue_tail() {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_refresh_failure_counts_are_atomic_across_managers() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4543,7 +4543,7 @@ async fn postgres_refresh_failure_counts_are_atomic_across_managers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_auto_heal_reenables_credential_for_every_manager() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -4600,7 +4600,7 @@ async fn postgres_auto_heal_reenables_credential_for_every_manager() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_pending_runtime_mutations_replay_in_order_and_unquarantine() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -5035,7 +5035,7 @@ fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_reset_generation_fences_pending_failure_and_disable_replay() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -5130,7 +5130,7 @@ async fn postgres_reset_generation_fences_pending_failure_and_disable_replay() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_admin_capacity_update_defers_runtime_patch_during_recovery() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -5205,7 +5205,7 @@ async fn postgres_admin_capacity_update_defers_runtime_patch_during_recovery() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_admin_reset_enable_defers_runtime_patch_during_recovery() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
 
@@ -8820,7 +8820,7 @@ async fn test_warmup_selection_percent_allows_real_request_sampling() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_backed_in_flight_limit_is_shared_between_managers() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -8874,7 +8874,7 @@ async fn redis_backed_in_flight_limit_is_shared_between_managers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_backed_in_flight_limit_does_not_fail_open_under_concurrency() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -9240,7 +9240,7 @@ mod refresh_cluster_tests;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -9382,7 +9382,7 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -9462,7 +9462,7 @@ async fn redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -9534,7 +9534,7 @@ async fn redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_interval() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -9650,7 +9650,7 @@ async fn redis_affinity_latency_does_not_degrade_capacity_coordination() {
     }
     clear_test_redis_latency_toxic().await;
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis affinity latency 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis affinity latency 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
@@ -9701,7 +9701,7 @@ async fn redis_affinity_latency_does_not_degrade_capacity_coordination() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_affinity_breaker_open_does_not_block_selection_admission() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis affinity/selection 隔离测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis affinity/selection 隔离测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let mut config = Config::default();
@@ -9759,7 +9759,9 @@ async fn redis_capacity_latency_boundary_and_recovery_matrix() {
         for round in 1..=3 {
             clear_test_redis_latency_toxic().await;
             let Some(redis_store) = test_redis_store().await else {
-                eprintln!("跳过 Redis capacity latency 矩阵：未设置 KIRO_RS_TEST_REDIS_URL");
+                eprintln!(
+                    "跳过 Redis capacity latency 矩阵：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL"
+                );
                 return;
             };
             let manager = MultiTokenManager::new_with_stores(
@@ -9847,7 +9849,9 @@ async fn redis_capacity_consecutive_timeouts_open_breaker_without_all_disabled()
     }
     clear_test_redis_latency_toxic().await;
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis capacity timeout breaker 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!(
+            "跳过 Redis capacity timeout breaker 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL"
+        );
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
@@ -10301,18 +10305,18 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn redis_business_and_observability_fault_domains_are_independent_for_three_rounds() {
-    let Some(business_url) = std::env::var("KIRO_RS_TEST_BUSINESS_REDIS_URL")
+    let Some(business_url) = std::env::var("ACCOUNT_RUNTIME_TEST_BUSINESS_REDIS_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
-        eprintln!("跳过双 Redis 故障域测试：未设置 KIRO_RS_TEST_BUSINESS_REDIS_URL");
+        eprintln!("跳过双 Redis 故障域测试：未设置 ACCOUNT_RUNTIME_TEST_BUSINESS_REDIS_URL");
         return;
     };
-    let Some(observability_url) = std::env::var("KIRO_RS_TEST_OBSERVABILITY_REDIS_URL")
+    let Some(observability_url) = std::env::var("ACCOUNT_RUNTIME_TEST_OBSERVABILITY_REDIS_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
     else {
-        eprintln!("跳过双 Redis 故障域测试：未设置 KIRO_RS_TEST_OBSERVABILITY_REDIS_URL");
+        eprintln!("跳过双 Redis 故障域测试：未设置 ACCOUNT_RUNTIME_TEST_OBSERVABILITY_REDIS_URL");
         return;
     };
     let Some(_) = test_fault_domain_toxiproxy("business") else {
@@ -10566,7 +10570,7 @@ async fn redis_lease_release_is_non_blocking_under_latency_and_burst() {
     }
     clear_test_redis_latency_toxic().await;
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis lease release latency 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis lease release latency 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let mut test_config = Config::default();
@@ -10670,7 +10674,7 @@ async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
 
     for round in 1..=3 {
         let Some(redis_store) = test_redis_store().await else {
-            eprintln!("跳过 Redis reconnect 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis reconnect 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
         let manager = MultiTokenManager::new_with_stores(
@@ -10774,7 +10778,7 @@ async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_capacity_backend_restart_recovers_same_manager() {
-    let Ok(container) = std::env::var("KIRO_RS_TEST_REDIS_RESTART_CONTAINER") else {
+    let Ok(container) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_RESTART_CONTAINER") else {
         eprintln!("跳过 Redis backend restart 测试：未设置专用测试容器");
         return;
     };
@@ -10789,7 +10793,7 @@ async fn redis_capacity_backend_restart_recovers_same_manager() {
     clear_test_redis_latency_toxic().await;
     set_test_redis_proxy_enabled(true).await;
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis backend restart 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis backend restart 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
@@ -10875,7 +10879,7 @@ async fn redis_capacity_backend_restart_recovers_same_manager() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis TokenManager 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -10946,7 +10950,7 @@ async fn redis_backed_session_binding_and_cooldown_are_shared_between_managers()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_backed_temporary_sticky_capacity_fallback_rebounds_without_full_sync() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis sticky stale-state 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis sticky stale-state 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -11125,7 +11129,7 @@ async fn redis_backed_temporary_sticky_capacity_fallback_rebounds_without_full_s
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_backed_sticky_release_grace_keeps_binding_between_managers() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis sticky release grace 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis sticky release grace 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -11226,7 +11230,9 @@ async fn redis_backed_sticky_release_grace_keeps_binding_between_managers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_backed_sticky_holder_still_falls_back_after_release_grace() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis sticky holder fallback grace 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!(
+            "跳过 Redis sticky holder fallback grace 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL"
+        );
         return;
     };
 
@@ -11315,7 +11321,7 @@ async fn redis_backed_sticky_holder_still_falls_back_after_release_grace() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn redis_dispatch_waiters_share_one_scheduler_state_scan_for_five_rounds() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis waiter singleflight 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis waiter singleflight 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -11377,7 +11383,7 @@ async fn redis_dispatch_waiters_share_one_scheduler_state_scan_for_five_rounds()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provisional_local_reservation_spreads_concurrent_redis_acquires() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis provisional spread 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis provisional spread 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -11475,7 +11481,7 @@ async fn provisional_local_reservation_spreads_concurrent_redis_acquires() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_rejected_provisional_acquire_rolls_back_without_remote_release() {
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis provisional rejection 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis provisional rejection 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let mut config = Config::default();
@@ -11543,7 +11549,7 @@ async fn cancelled_provisional_redis_acquire_rolls_back_local_and_tombstones_rem
     }
     clear_test_redis_latency_toxic().await;
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis provisional cancel 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis provisional cancel 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let manager = Arc::new(
@@ -11607,7 +11613,7 @@ async fn redis_commit_unknown_provisional_acquire_leaves_no_lease() {
     }
     clear_test_redis_latency_toxic().await;
     let Some(redis_store) = test_redis_store().await else {
-        eprintln!("跳过 Redis provisional timeout 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 Redis provisional timeout 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let manager = MultiTokenManager::new_with_stores(
@@ -12872,7 +12878,7 @@ fn test_auth_and_api_region_independent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_add_credential_is_atomic_with_initial_runtime_state() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     sqlx::query(
@@ -12950,7 +12956,7 @@ async fn postgres_add_credential_is_atomic_with_initial_runtime_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
     let Some(store) = test_postgres_store().await else {
-        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let (credential, runtime) = store

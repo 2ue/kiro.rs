@@ -10,10 +10,10 @@ const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const RUNNER = path.join(ROOT, 'feature/tests/run-scheduler-redis-chaos-validation.mjs')
 const STATIC_DIRECT_REDIS_URL = 'redis://127.0.0.1:1/15'
 const LIVE_EMPTY_REDIS_URL = String(
-  process.env.KIRO_SCHEDULER_CHAOS_CONTRACT_EMPTY_REDIS_URL || '',
+  process.env.ACCOUNT_RUNTIME_SCHEDULER_CHAOS_CONTRACT_EMPTY_REDIS_URL || '',
 ).trim()
 const LIVE_NONEMPTY_REDIS_URL = String(
-  process.env.KIRO_SCHEDULER_CHAOS_CONTRACT_NONEMPTY_REDIS_URL || '',
+  process.env.ACCOUNT_RUNTIME_SCHEDULER_CHAOS_CONTRACT_NONEMPTY_REDIS_URL || '',
 ).trim()
 const EARLY_ROUNDS = 3
 const SIGNAL_ROUNDS = 3
@@ -41,17 +41,17 @@ const NONEMPTY_DATABASE = databaseNumber(LIVE_NONEMPTY_REDIS_URL)
 function runnerEnvironment(overrides = {}) {
   const env = { ...process.env }
   for (const name of [
-    'KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL',
-    'KIRO_RS_TEST_REDIS_ISOLATED',
-    'KIRO_SCHEDULER_CHAOS_SCOPE',
-    'KIRO_SCHEDULER_CHAOS_OUTER_ROUNDS',
-    'KIRO_SCHEDULER_CHAOS_TEST_READY_FILE',
+    'ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL',
+    'ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED',
+    'ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE',
+    'ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS',
+    'ACCOUNT_RUNTIME_SCHEDULER_CHAOS_TEST_READY_FILE',
   ]) delete env[name]
   Object.assign(env, {
     PATH: process.env.PATH || '/usr/bin:/bin',
     TMPDIR: process.env.TMPDIR || os.tmpdir(),
-    KIRO_RS_TEST_REDIS_ISOLATED: '1',
-    KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL: STATIC_DIRECT_REDIS_URL,
+    ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED: '1',
+    ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL: STATIC_DIRECT_REDIS_URL,
   }, overrides)
   return env
 }
@@ -210,30 +210,30 @@ test('scheduler chaos runner keeps the protected port numeric-only and never pro
 const earlyCases = [
   {
     name: 'missing direct Redis URL',
-    env: { KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL: undefined },
-    error: /KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL is required/,
+    env: { ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL: undefined },
+    error: /ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL is required/,
   },
   {
     name: 'isolation marker is zero',
-    env: { KIRO_RS_TEST_REDIS_ISOLATED: '0' },
-    error: /KIRO_RS_TEST_REDIS_ISOLATED=1 is required/,
+    env: { ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED: '0' },
+    error: /ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required/,
   },
   {
     name: 'isolation marker is textual true rather than one',
-    env: { KIRO_RS_TEST_REDIS_ISOLATED: 'true' },
-    error: /KIRO_RS_TEST_REDIS_ISOLATED=1 is required/,
+    env: { ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED: 'true' },
+    error: /ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required/,
   },
   {
     name: 'database zero',
     env: {
-      KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL: 'redis://127.0.0.1:1/0',
+      ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL: 'redis://127.0.0.1:1/0',
     },
     error: /isolated nonzero database in 1\.\.15/,
   },
   {
     name: 'protected port 9022',
     env: {
-      KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL: 'redis://127.0.0.1:9022/15',
+      ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL: 'redis://127.0.0.1:9022/15',
     },
     error: /port 9022 is protected/,
   },
@@ -258,9 +258,9 @@ for (let round = 1; round <= EARLY_ROUNDS; round += 1) {
     const before = await redisDbSize(directUrl)
     assert.ok(before > 0, `database ${NONEMPTY_DATABASE} must be pre-populated for this contract: ${before}`)
     const result = runRunner({
-      KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL: directUrl,
-      KIRO_SCHEDULER_CHAOS_SCOPE: `contract-nonempty-${process.pid}-${round}`,
-      KIRO_SCHEDULER_CHAOS_OUTER_ROUNDS: '1',
+      ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL: directUrl,
+      ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE: `contract-nonempty-${process.pid}-${round}`,
+      ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS: '1',
     }, { timeout: 10_000 })
     const after = await redisDbSize(directUrl)
     assert.notEqual(result.status, 0, result.stdout)
@@ -281,10 +281,10 @@ for (const [signal, expectedCode] of [['SIGHUP', 129], ['SIGINT', 130], ['SIGTER
         cwd: ROOT,
         env: runnerEnvironment({
           TMPDIR: fixtureRoot,
-          KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL: LIVE_EMPTY_REDIS_URL,
-          KIRO_SCHEDULER_CHAOS_SCOPE: `contract-signal-${signal.toLowerCase()}-${process.pid}-${round}`,
-          KIRO_SCHEDULER_CHAOS_TEST_READY_FILE: readyFile,
-          KIRO_SCHEDULER_CHAOS_OUTER_ROUNDS: '1',
+          ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL: LIVE_EMPTY_REDIS_URL,
+          ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE: `contract-signal-${signal.toLowerCase()}-${process.pid}-${round}`,
+          ACCOUNT_RUNTIME_SCHEDULER_CHAOS_TEST_READY_FILE: readyFile,
+          ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS: '1',
         }),
         stdio: ['ignore', 'pipe', 'pipe'],
       })

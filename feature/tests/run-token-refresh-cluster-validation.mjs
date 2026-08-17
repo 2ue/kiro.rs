@@ -8,12 +8,12 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
-const REDIS_URL = requiredEnvironment('KIRO_TOKEN_REFRESH_CLUSTER_REDIS_URL')
-const POSTGRES_URL = requiredEnvironment('KIRO_TOKEN_REFRESH_CLUSTER_POSTGRES_URL')
-const REDIS_ISOLATED = process.env.KIRO_RS_TEST_REDIS_ISOLATED === '1'
-const POSTGRES_ISOLATED = process.env.KIRO_RS_TEST_POSTGRES_ISOLATED === '1'
-const OUTER_ROUNDS = boundedInteger('KIRO_TOKEN_REFRESH_CLUSTER_OUTER_ROUNDS', 3, 1, 10)
-const SCOPE = process.env.KIRO_TOKEN_REFRESH_CLUSTER_SCOPE || 'token-refresh-cluster'
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_REDIS_URL')
+const POSTGRES_URL = requiredEnvironment('ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_POSTGRES_URL')
+const REDIS_ISOLATED = process.env.ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED === '1'
+const POSTGRES_ISOLATED = process.env.ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED === '1'
+const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_OUTER_ROUNDS', 3, 1, 10)
+const SCOPE = process.env.ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_SCOPE || 'token-refresh-cluster'
 const ACTIVE_CHILDREN = new Set()
 let redisTarget
 let postgresTarget
@@ -42,10 +42,10 @@ function loopback(hostname) {
 }
 
 function validateInputs() {
-  if (!REDIS_ISOLATED) throw new Error('KIRO_RS_TEST_REDIS_ISOLATED=1 is required')
-  if (!POSTGRES_ISOLATED) throw new Error('KIRO_RS_TEST_POSTGRES_ISOLATED=1 is required')
+  if (!REDIS_ISOLATED) throw new Error('ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required')
+  if (!POSTGRES_ISOLATED) throw new Error('ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED=1 is required')
   if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(SCOPE)) {
-    throw new Error('KIRO_TOKEN_REFRESH_CLUSTER_SCOPE has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_SCOPE has an invalid format')
   }
 
   const redis = new URL(REDIS_URL)
@@ -214,17 +214,17 @@ async function main() {
   const targets = validateInputs()
   redisTarget = targets.redis
   postgresTarget = targets.postgres
-  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-token-refresh-cluster-${process.pid}-`))
+  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `account-runtime-token-refresh-cluster-${process.pid}-`))
   const before = await redisCommand(redisTarget, ['DBSIZE'])
   if (before !== 0) throw new Error(`isolated Redis database ${redisTarget.database} is not empty (${before} keys)`)
   redisWasEmpty = true
   await probeTcp(postgresTarget.postgres.hostname, postgresTarget.port, 'PostgreSQL')
 
   const tests = [
-    'kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_rotating_and_non_rotating_share_one_send_and_pg_authority_for_five_rounds',
-    'kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_pg_cas_fences_stale_rotating_and_non_rotating_results_for_five_rounds',
-    'kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds',
-    'kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_five_rounds',
+    'local_upstream_impl::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_rotating_and_non_rotating_share_one_send_and_pg_authority_for_five_rounds',
+    'local_upstream_impl::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_pg_cas_fences_stale_rotating_and_non_rotating_results_for_five_rounds',
+    'local_upstream_impl::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds',
+    'local_upstream_impl::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_five_rounds',
     'storage::postgres::tests::postgres_refresh_field_cas_fences_non_rotating_refresh_by_access_token_for_five_rounds',
     'storage::redis_cache::tests::token_refresh_redis_stale_leader_cannot_overwrite_success_for_five_rounds',
     'storage::redis_cache::tests::token_refresh_redis_failure_replay_health_claim_and_identity_are_fenced_for_five_rounds',
@@ -241,9 +241,9 @@ async function main() {
   const child = spawn(path.join(ROOT, 'feature/tests/run-cargo-scoped.sh'), [
     SCOPE, '--', 'env',
     'RUSTUP_TOOLCHAIN=1.92.0',
-    `KIRO_RS_TEST_REDIS_URL=${REDIS_URL}`,
-    `KIRO_RS_TEST_POSTGRES_URL=${POSTGRES_URL}`,
-    'KIRO_RS_REQUIRE_STORAGE_TESTS=1',
+    `ACCOUNT_RUNTIME_TEST_REDIS_URL=${REDIS_URL}`,
+    `ACCOUNT_RUNTIME_TEST_POSTGRES_URL=${POSTGRES_URL}`,
+    'ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1',
     'bash', '-lc', commandScript,
   ], {
     cwd: ROOT,
@@ -251,9 +251,9 @@ async function main() {
       PATH: process.env.PATH || '/usr/bin:/bin',
       HOME: process.env.HOME || os.homedir(),
       TMPDIR: tempRoot,
-      KIRO_RS_TEST_REDIS_URL: REDIS_URL,
-      KIRO_RS_TEST_POSTGRES_URL: POSTGRES_URL,
-      KIRO_RS_REQUIRE_STORAGE_TESTS: '1',
+      ACCOUNT_RUNTIME_TEST_REDIS_URL: REDIS_URL,
+      ACCOUNT_RUNTIME_TEST_POSTGRES_URL: POSTGRES_URL,
+      ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS: '1',
     },
     detached: true,
     stdio: 'inherit',

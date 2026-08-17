@@ -194,6 +194,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Active validation runners that spawn the service now set `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures now use account-runtime/local-upstream variable names.
 - Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Kiro-named loadtest env fallbacks were removed.
 - Internal local-upstream examples, storage-task thread names and Redis test prefixes now use account-runtime identifiers instead of Kiro-branded crate/test names.
+- Active storage, integration and chaos validation runner/test inputs now use account-runtime environment names; old maintained `KIRO_RS_TEST_*`, `KIRO_RS_REQUIRE_STORAGE_TESTS`, `KIRO_RS_RUN_*`, `KIRO_REDIS_FAULT_DOMAIN_*`, `KIRO_SCHEDULER_CHAOS_*`, `KIRO_CLAUDE_TRANSCRIPT_*`, `KIRO_RS_REAL_*`, `KIRO_MULTI_INSTANCE_*` and `KIRO_TOKEN_REFRESH_CLUSTER_*` inputs were removed from active harnesses. Active runner exact Rust test paths now target `local_upstream_impl::token_manager`.
 
 ## In Progress
 

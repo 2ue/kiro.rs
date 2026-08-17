@@ -175,7 +175,7 @@ fn finite_external_queue_lease_covers_wait_without_periodic_renewal() {
 }
 
 fn test_postgres_config() -> Option<Config> {
-    let url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")?;
+    let url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")?;
     let mut config = Config::default();
     config.postgres.url = Some(url);
     config.postgres.max_connections = 2;
@@ -183,7 +183,7 @@ fn test_postgres_config() -> Option<Config> {
 }
 
 fn test_redis_config() -> Option<Config> {
-    let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
+    let url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")?;
     let mut config = Config::default();
     config.redis.url = Some(url);
     config.redis.key_prefix = format!(
@@ -195,11 +195,11 @@ fn test_redis_config() -> Option<Config> {
 
 async fn test_external_pool_manager() -> Option<(ExternalPoolManager, Arc<PostgresStore>)> {
     let Some(postgres_config) = test_postgres_config() else {
-        eprintln!("跳过上游账号集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过上游账号集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return None;
     };
     let Some(redis_config) = test_redis_config() else {
-        eprintln!("跳过上游账号集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过上游账号集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return None;
     };
     let postgres = Arc::new(PostgresStore::connect_test(&postgres_config).await.unwrap());
@@ -2537,8 +2537,8 @@ fn external_release_transport_backoff_retains_but_does_not_send_new_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_redis_external_poison_does_not_block_or_emit_false_capacity_for_five_rounds() {
-    let Some(url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-        eprintln!("跳过 Redis external release poison 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+    let Some(url) = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL") else {
+        eprintln!("跳过 Redis external release poison 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
 
@@ -2686,16 +2686,16 @@ async fn external_pool_release_fallback_storm_is_bounded_for_five_rounds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_release_dispatcher_drains_10k_real_leases_after_commit_unknown_for_five_rounds()
  {
-    let Ok(direct_redis_url) = std::env::var("KIRO_RS_TEST_REDIS_DIRECT_URL") else {
-        eprintln!("跳过 10k external release 测试：未设置 KIRO_RS_TEST_REDIS_DIRECT_URL");
+    let Ok(direct_redis_url) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_DIRECT_URL") else {
+        eprintln!("跳过 10k external release 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_DIRECT_URL");
         return;
     };
-    let Ok(toxiproxy_api) = std::env::var("KIRO_RS_TEST_TOXIPROXY_API") else {
-        eprintln!("跳过 10k external release 测试：未设置 KIRO_RS_TEST_TOXIPROXY_API");
+    let Ok(toxiproxy_api) = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 10k external release 测试：未设置 ACCOUNT_RUNTIME_TEST_TOXIPROXY_API");
         return;
     };
-    let proxy_name =
-        std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let proxy_name = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME")
+        .unwrap_or_else(|_| "redis".to_string());
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -6273,28 +6273,30 @@ async fn external_pool_redis_hot_path_is_repeatable_across_selection_and_acquire
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn external_pool_redis_rtt_and_concurrency_matrix_five_outer_rounds() {
     if !matches!(
-        std::env::var("KIRO_RS_RUN_EXTERNAL_REDIS_RTT_MATRIX"),
+        std::env::var("ACCOUNT_RUNTIME_RUN_EXTERNAL_REDIS_RTT_MATRIX"),
         Ok(value) if value == "1"
     ) {
-        eprintln!("跳过 external Redis RTT 矩阵：未设置 KIRO_RS_RUN_EXTERNAL_REDIS_RTT_MATRIX=1");
+        eprintln!(
+            "跳过 external Redis RTT 矩阵：未设置 ACCOUNT_RUNTIME_RUN_EXTERNAL_REDIS_RTT_MATRIX=1"
+        );
         return;
     }
-    let Ok(proxy_redis_url) = std::env::var("KIRO_RS_TEST_REDIS_URL") else {
-        eprintln!("跳过 external Redis RTT 矩阵：未设置 KIRO_RS_TEST_REDIS_URL");
+    let Ok(proxy_redis_url) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_URL") else {
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
-    let Ok(direct_redis_url) = std::env::var("KIRO_RS_TEST_REDIS_DIRECT_URL") else {
-        eprintln!("跳过 external Redis RTT 矩阵：未设置 KIRO_RS_TEST_REDIS_DIRECT_URL");
+    let Ok(direct_redis_url) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_DIRECT_URL") else {
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 ACCOUNT_RUNTIME_TEST_REDIS_DIRECT_URL");
         return;
     };
-    let Ok(toxiproxy_api) = std::env::var("KIRO_RS_TEST_TOXIPROXY_API") else {
-        eprintln!("跳过 external Redis RTT 矩阵：未设置 KIRO_RS_TEST_TOXIPROXY_API");
+    let Ok(toxiproxy_api) = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 ACCOUNT_RUNTIME_TEST_TOXIPROXY_API");
         return;
     };
-    let proxy_name =
-        std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let proxy_name = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME")
+        .unwrap_or_else(|_| "redis".to_string());
     let Some(mut postgres_config) = test_postgres_config() else {
-        eprintln!("跳过 external Redis RTT 矩阵：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 external Redis RTT 矩阵：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     postgres_config.postgres.max_connections = 64;
@@ -8507,7 +8509,7 @@ async fn external_pool_one_malformed_runtime_isolated_from_fifty_nine_healthy_fo
     }
     let malformed_pool_id = pool_ids[0];
     let route = test_route("claude-sonnet-4-6");
-    let redis_url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL").unwrap();
+    let redis_url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL").unwrap();
     let redis_client = redis::Client::open(redis_url).unwrap();
     let mut raw_redis = redis_client
         .get_multiplexed_async_connection()
@@ -8624,16 +8626,16 @@ async fn external_pool_one_malformed_runtime_isolated_from_fifty_nine_healthy_fo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_heartbeat_redis_faults_fail_closed_before_prune_and_recover_five_of_five() {
-    let Ok(toxiproxy_api) = std::env::var("KIRO_RS_TEST_TOXIPROXY_API") else {
-        eprintln!("跳过 heartbeat Redis 故障测试：未设置 KIRO_RS_TEST_TOXIPROXY_API");
+    let Ok(toxiproxy_api) = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 heartbeat Redis 故障测试：未设置 ACCOUNT_RUNTIME_TEST_TOXIPROXY_API");
         return;
     };
-    let Ok(direct_redis_url) = std::env::var("KIRO_RS_TEST_REDIS_DIRECT_URL") else {
-        eprintln!("跳过 heartbeat Redis 故障测试：未设置 KIRO_RS_TEST_REDIS_DIRECT_URL");
+    let Ok(direct_redis_url) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_DIRECT_URL") else {
+        eprintln!("跳过 heartbeat Redis 故障测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_DIRECT_URL");
         return;
     };
-    let proxy_name =
-        std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let proxy_name = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME")
+        .unwrap_or_else(|_| "redis".to_string());
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -8768,12 +8770,12 @@ async fn external_pool_heartbeat_redis_faults_fail_closed_before_prune_and_recov
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_coordinator_breaker_bounds_10k_failures_and_single_recovery_probe_for_five_rounds()
  {
-    let Ok(toxiproxy_api) = std::env::var("KIRO_RS_TEST_TOXIPROXY_API") else {
-        eprintln!("跳过 coordinator breaker 压力测试：未设置 KIRO_RS_TEST_TOXIPROXY_API");
+    let Ok(toxiproxy_api) = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 coordinator breaker 压力测试：未设置 ACCOUNT_RUNTIME_TEST_TOXIPROXY_API");
         return;
     };
-    let proxy_name =
-        std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let proxy_name = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME")
+        .unwrap_or_else(|_| "redis".to_string());
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -8964,12 +8966,12 @@ async fn external_pool_selection_runtime_snapshot_coalesces_128_waiters_for_five
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_coordinator_admission_bounds_10k_simultaneous_first_timeout_wave_for_five_rounds()
  {
-    let Ok(toxiproxy_api) = std::env::var("KIRO_RS_TEST_TOXIPROXY_API") else {
-        eprintln!("跳过 coordinator 首波压力测试：未设置 KIRO_RS_TEST_TOXIPROXY_API");
+    let Ok(toxiproxy_api) = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 coordinator 首波压力测试：未设置 ACCOUNT_RUNTIME_TEST_TOXIPROXY_API");
         return;
     };
-    let proxy_name =
-        std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let proxy_name = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME")
+        .unwrap_or_else(|_| "redis".to_string());
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -9147,12 +9149,12 @@ async fn external_pool_coordinator_clean_startup_has_no_recovery_barrier_for_fiv
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_redis_disconnect_fails_closed_and_recovers() {
-    let Ok(toxiproxy_api) = std::env::var("KIRO_RS_TEST_TOXIPROXY_API") else {
-        eprintln!("跳过 Redis 断连集成测试：未设置 KIRO_RS_TEST_TOXIPROXY_API");
+    let Ok(toxiproxy_api) = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 Redis 断连集成测试：未设置 ACCOUNT_RUNTIME_TEST_TOXIPROXY_API");
         return;
     };
-    let proxy_name =
-        std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let proxy_name = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME")
+        .unwrap_or_else(|_| "redis".to_string());
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -9316,8 +9318,10 @@ async fn external_pool_redis_disconnect_fails_closed_and_recovers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_redis_restart_fails_closed_and_recovers_five_of_five() {
-    let Ok(container) = std::env::var("KIRO_RS_TEST_REDIS_RESTART_CONTAINER") else {
-        eprintln!("跳过 Redis restart 集成测试：未设置 KIRO_RS_TEST_REDIS_RESTART_CONTAINER");
+    let Ok(container) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_RESTART_CONTAINER") else {
+        eprintln!(
+            "跳过 Redis restart 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_RESTART_CONTAINER"
+        );
         return;
     };
     let Some((manager, postgres)) = test_external_pool_manager().await else {
@@ -9423,9 +9427,9 @@ async fn external_pool_redis_restart_fails_closed_and_recovers_five_of_five() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_redis_data_loss_fences_active_confirmed_lease_before_reacquire() {
-    let Ok(container) = std::env::var("KIRO_RS_TEST_REDIS_RESTART_CONTAINER") else {
+    let Ok(container) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_RESTART_CONTAINER") else {
         eprintln!(
-            "跳过 active lease Redis restart 测试：未设置 KIRO_RS_TEST_REDIS_RESTART_CONTAINER"
+            "跳过 active lease Redis restart 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_RESTART_CONTAINER"
         );
         return;
     };
@@ -9512,7 +9516,7 @@ async fn external_pool_redis_data_loss_fences_active_confirmed_lease_before_reac
 
         let mut fresh_redis_config = Config::default();
         fresh_redis_config.redis.url =
-            Some(crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL").unwrap());
+            Some(crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL").unwrap());
         fresh_redis_config.redis.key_prefix = manager.redis.key_prefix_for_test();
         let fresh_manager = ExternalPoolManager::new(
             postgres.clone(),
@@ -9600,7 +9604,7 @@ async fn external_pool_redis_data_loss_fences_active_confirmed_lease_before_reac
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_redis_restart_fences_multiple_active_leases_across_managers_for_five_rounds()
 {
-    let Ok(container) = std::env::var("KIRO_RS_TEST_REDIS_RESTART_CONTAINER") else {
+    let Ok(container) = std::env::var("ACCOUNT_RUNTIME_TEST_REDIS_RESTART_CONTAINER") else {
         eprintln!("跳过多 active lease Redis restart 测试：未设置 restart container");
         return;
     };
@@ -9611,7 +9615,7 @@ async fn external_pool_redis_restart_fences_multiple_active_leases_across_manage
     let mut manager = manager.with_coordinator_recovery_grace(recovery_grace);
     let mut peer_redis_config = Config::default();
     peer_redis_config.redis.url =
-        Some(crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL").unwrap());
+        Some(crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL").unwrap());
     peer_redis_config.redis.key_prefix = manager.redis.key_prefix_for_test();
     let peer = ExternalPoolManager::new(
         postgres.clone(),
@@ -9774,12 +9778,12 @@ async fn external_pool_redis_restart_fences_multiple_active_leases_across_manage
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_redis_acquire_timeout_reclaims_commit_unknown_and_recovers() {
-    let Ok(toxiproxy_api) = std::env::var("KIRO_RS_TEST_TOXIPROXY_API") else {
-        eprintln!("跳过 Redis commit-unknown 集成测试：未设置 KIRO_RS_TEST_TOXIPROXY_API");
+    let Ok(toxiproxy_api) = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_API") else {
+        eprintln!("跳过 Redis commit-unknown 集成测试：未设置 ACCOUNT_RUNTIME_TEST_TOXIPROXY_API");
         return;
     };
-    let proxy_name =
-        std::env::var("KIRO_RS_TEST_TOXIPROXY_NAME").unwrap_or_else(|_| "redis".to_string());
+    let proxy_name = std::env::var("ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME")
+        .unwrap_or_else(|_| "redis".to_string());
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };

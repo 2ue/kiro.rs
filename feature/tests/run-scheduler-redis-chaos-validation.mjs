@@ -8,10 +8,10 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
-const DIRECT_REDIS_URL = requiredEnvironment('KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL')
-const ISOLATED = process.env.KIRO_RS_TEST_REDIS_ISOLATED === '1'
-const OUTER_ROUNDS = boundedInteger('KIRO_SCHEDULER_CHAOS_OUTER_ROUNDS', 3, 1, 5)
-const SCOPE = process.env.KIRO_SCHEDULER_CHAOS_SCOPE || 'scheduler-redis-chaos-real'
+const DIRECT_REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL')
+const ISOLATED = process.env.ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED === '1'
+const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS', 3, 1, 5)
+const SCOPE = process.env.ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE || 'scheduler-redis-chaos-real'
 const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-scheduler-chaos-${process.pid}-`))
 let testReadyFile = null
 const ACTIVE_CHILDREN = new Set()
@@ -36,31 +36,31 @@ function boundedInteger(name, fallback, minimum, maximum) {
 }
 
 function optionalTestReadyFile() {
-  const raw = String(process.env.KIRO_SCHEDULER_CHAOS_TEST_READY_FILE || '').trim()
+  const raw = String(process.env.ACCOUNT_RUNTIME_SCHEDULER_CHAOS_TEST_READY_FILE || '').trim()
   if (!raw) return null
   if (!path.isAbsolute(raw)) {
-    throw new Error('KIRO_SCHEDULER_CHAOS_TEST_READY_FILE must be an absolute path')
+    throw new Error('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_TEST_READY_FILE must be an absolute path')
   }
   const parent = path.dirname(raw)
   if (!fs.existsSync(parent)) {
-    throw new Error('KIRO_SCHEDULER_CHAOS_TEST_READY_FILE parent must exist')
+    throw new Error('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_TEST_READY_FILE parent must exist')
   }
   const parentReal = fs.realpathSync(parent)
   if (parentReal === ROOT || parentReal.startsWith(`${ROOT}${path.sep}`)) {
-    throw new Error('KIRO_SCHEDULER_CHAOS_TEST_READY_FILE must be outside the repository')
+    throw new Error('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_TEST_READY_FILE must be outside the repository')
   }
   if (fs.existsSync(raw)) {
-    throw new Error('KIRO_SCHEDULER_CHAOS_TEST_READY_FILE must not already exist')
+    throw new Error('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_TEST_READY_FILE must not already exist')
   }
   return raw
 }
 
 function validateInputs() {
   if (!ISOLATED) {
-    throw new Error('KIRO_RS_TEST_REDIS_ISOLATED=1 is required')
+    throw new Error('ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required')
   }
   if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(SCOPE)) {
-    throw new Error('KIRO_SCHEDULER_CHAOS_SCOPE has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE has an invalid format')
   }
   const redis = new URL(DIRECT_REDIS_URL)
   if (redis.protocol !== 'redis:') throw new Error('direct Redis URL must use redis://')
@@ -284,14 +284,14 @@ async function main() {
   proxyRedis.hostname = '127.0.0.1'
   proxyRedis.port = String(proxyInfo.proxyPort)
   const testNames = [
-    'kiro::token_manager::manager::tests::redis_affinity_latency_does_not_degrade_capacity_coordination',
-    'kiro::token_manager::manager::tests::redis_capacity_latency_boundary_and_recovery_matrix',
-    'kiro::token_manager::manager::tests::redis_capacity_consecutive_timeouts_open_breaker_without_all_disabled',
-    'kiro::token_manager::manager::tests::redis_lease_release_is_non_blocking_under_latency_and_burst',
-    'kiro::token_manager::manager::tests::redis_capacity_disconnect_reconnect_recovers_same_manager',
-    'kiro::token_manager::manager::tests::redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_spin_or_false_disable',
-    'kiro::token_manager::manager::tests::cancelled_provisional_redis_acquire_rolls_back_local_and_tombstones_remote',
-    'kiro::token_manager::manager::tests::redis_commit_unknown_provisional_acquire_leaves_no_lease',
+    'local_upstream_impl::token_manager::manager::tests::redis_affinity_latency_does_not_degrade_capacity_coordination',
+    'local_upstream_impl::token_manager::manager::tests::redis_capacity_latency_boundary_and_recovery_matrix',
+    'local_upstream_impl::token_manager::manager::tests::redis_capacity_consecutive_timeouts_open_breaker_without_all_disabled',
+    'local_upstream_impl::token_manager::manager::tests::redis_lease_release_is_non_blocking_under_latency_and_burst',
+    'local_upstream_impl::token_manager::manager::tests::redis_capacity_disconnect_reconnect_recovers_same_manager',
+    'local_upstream_impl::token_manager::manager::tests::redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_spin_or_false_disable',
+    'local_upstream_impl::token_manager::manager::tests::cancelled_provisional_redis_acquire_rolls_back_local_and_tombstones_remote',
+    'local_upstream_impl::token_manager::manager::tests::redis_commit_unknown_provisional_acquire_leaves_no_lease',
   ]
   const testCommands = testNames.map((name) => (
     `cargo test ${name} -- --exact --nocapture --test-threads=1`
@@ -308,10 +308,10 @@ done
   const command = spawn(path.join(ROOT, 'feature/tests/run-cargo-scoped.sh'), [
     SCOPE, '--', 'env',
     'RUSTUP_TOOLCHAIN=1.92.0',
-    `KIRO_RS_TEST_REDIS_URL=${proxyRedis.toString()}`,
-    'KIRO_RS_REQUIRE_STORAGE_TESTS=1',
-    `KIRO_RS_TEST_TOXIPROXY_API=http://127.0.0.1:${proxyInfo.apiPort}`,
-    'KIRO_RS_TEST_TOXIPROXY_NAME=redis',
+    `ACCOUNT_RUNTIME_TEST_REDIS_URL=${proxyRedis.toString()}`,
+    'ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1',
+    `ACCOUNT_RUNTIME_TEST_TOXIPROXY_API=http://127.0.0.1:${proxyInfo.apiPort}`,
+    'ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME=redis',
     'bash', '-lc', script,
   ], {
     cwd: ROOT,
@@ -319,10 +319,10 @@ done
       PATH: process.env.PATH || '/usr/bin:/bin',
       HOME: process.env.HOME || os.homedir(),
       TMPDIR: process.env.TMPDIR || os.tmpdir(),
-      KIRO_RS_TEST_REDIS_URL: proxyRedis.toString(),
-      KIRO_RS_REQUIRE_STORAGE_TESTS: '1',
-      KIRO_RS_TEST_TOXIPROXY_API: `http://127.0.0.1:${proxyInfo.apiPort}`,
-      KIRO_RS_TEST_TOXIPROXY_NAME: 'redis',
+      ACCOUNT_RUNTIME_TEST_REDIS_URL: proxyRedis.toString(),
+      ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS: '1',
+      ACCOUNT_RUNTIME_TEST_TOXIPROXY_API: `http://127.0.0.1:${proxyInfo.apiPort}`,
+      ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME: 'redis',
     },
     detached: true,
     stdio: 'inherit',

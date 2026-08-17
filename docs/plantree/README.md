@@ -46,6 +46,7 @@ Current-state facts and target-state decisions answer different questions and mu
 
 ## Current Implementation Notes
 
+- 2026-08-17: Active storage, integration and chaos validation environment names now use `ACCOUNT_RUNTIME_*` prefixes. Old active `KIRO_RS_TEST_*`, `KIRO_RS_REQUIRE_STORAGE_TESTS`, `KIRO_RS_RUN_*`, `KIRO_REDIS_FAULT_DOMAIN_*`, `KIRO_SCHEDULER_CHAOS_*`, `KIRO_CLAUDE_TRANSCRIPT_*`, `KIRO_RS_REAL_*`, `KIRO_MULTI_INSTANCE_*` and `KIRO_TOKEN_REFRESH_CLUSTER_*` runner inputs were removed from maintained tests and validation scripts. Active runner exact Rust test paths now use `local_upstream_impl::token_manager` instead of the old module path.
 - 2026-08-17: Runtime storage overrides, local-upstream API-key bootstrap, and service bind overrides now use account-runtime/local-upstream environment names without Kiro-named runtime fallbacks. Docker Compose and maintained deployment docs now inject `ACCOUNT_RUNTIME_*` storage and port variables.
 - 2026-08-17: Active validation runners that start the service now pass `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-environment leak fixtures now use account-runtime/local-upstream variable names.
 - 2026-08-17: Internal local-upstream examples, storage-task thread naming and Redis test prefixes now use account-runtime names instead of Kiro-branded crate/test identifiers. The Redis backend restart safety prefix now expects `account-runtime-validation-redis-`.

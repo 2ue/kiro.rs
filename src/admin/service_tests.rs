@@ -629,8 +629,9 @@ fn usage_cleanup_lock_contention_backoff_is_bounded() {
 
 #[tokio::test]
 async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_rounds() {
-    let Some(url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL") else {
-        eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+    let Some(url) = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")
+    else {
+        eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut config = crate::model::config::Config::default();

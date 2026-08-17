@@ -8,10 +8,10 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
-const REDIS_URL = requiredEnvironment('KIRO_MULTI_INSTANCE_REDIS_URL')
-const ISOLATED = process.env.KIRO_RS_TEST_REDIS_ISOLATED === '1'
-const OUTER_ROUNDS = boundedInteger('KIRO_MULTI_INSTANCE_REDIS_OUTER_ROUNDS', 3, 1, 10)
-const SCOPE = process.env.KIRO_MULTI_INSTANCE_REDIS_SCOPE || 'multi-instance-redis-coordination'
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_URL')
+const ISOLATED = process.env.ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED === '1'
+const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_OUTER_ROUNDS', 3, 1, 10)
+const SCOPE = process.env.ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_SCOPE || 'multi-instance-redis-coordination'
 const ACTIVE_CHILDREN = new Set()
 let redisTarget
 let tempRoot
@@ -35,9 +35,9 @@ function boundedInteger(name, fallback, minimum, maximum) {
 }
 
 function validateInputs() {
-  if (!ISOLATED) throw new Error('KIRO_RS_TEST_REDIS_ISOLATED=1 is required')
+  if (!ISOLATED) throw new Error('ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required')
   if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(SCOPE)) {
-    throw new Error('KIRO_MULTI_INSTANCE_REDIS_SCOPE has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_SCOPE has an invalid format')
   }
   const redis = new URL(REDIS_URL)
   if (redis.protocol !== 'redis:') throw new Error('Redis URL must use redis://')
@@ -204,14 +204,14 @@ for (const [signal, exitCode] of [['SIGHUP', 129], ['SIGINT', 130], ['SIGTERM', 
 
 async function main() {
   redisTarget = validateInputs()
-  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-multi-instance-redis-${process.pid}-`))
+  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `account-runtime-multi-instance-redis-${process.pid}-`))
   const before = await redisCommands(redisTarget, ['DBSIZE'])
   if (before !== 0) {
     throw new Error(`isolated Redis database ${redisTarget.database} is not empty (${before} keys)`)
   }
   initialDatabaseEmpty = true
 
-  const testName = 'kiro::token_manager::manager::tests::redis_two_instance_connections_preserve_lease_queue_and_rpm_authority_for_five_rounds'
+  const testName = 'local_upstream_impl::token_manager::manager::tests::redis_two_instance_connections_preserve_lease_queue_and_rpm_authority_for_five_rounds'
   const script = `
 set -euo pipefail
 cargo fmt --all -- --check
@@ -224,8 +224,8 @@ done
   const child = spawn(path.join(ROOT, 'feature/tests/run-cargo-scoped.sh'), [
     SCOPE, '--', 'env',
     'RUSTUP_TOOLCHAIN=1.92.0',
-    `KIRO_RS_TEST_REDIS_URL=${REDIS_URL}`,
-    'KIRO_RS_REQUIRE_STORAGE_TESTS=1',
+    `ACCOUNT_RUNTIME_TEST_REDIS_URL=${REDIS_URL}`,
+    'ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1',
     'bash', '-lc', script,
   ], {
     cwd: ROOT,
@@ -233,8 +233,8 @@ done
       PATH: process.env.PATH || '/usr/bin:/bin',
       HOME: process.env.HOME || os.homedir(),
       TMPDIR: tempRoot,
-      KIRO_RS_TEST_REDIS_URL: REDIS_URL,
-      KIRO_RS_REQUIRE_STORAGE_TESTS: '1',
+      ACCOUNT_RUNTIME_TEST_REDIS_URL: REDIS_URL,
+      ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS: '1',
     },
     detached: true,
     stdio: 'inherit',

@@ -8,28 +8,28 @@ repo_root="$(git rev-parse --show-toplevel)"
   exit 64
 }
 
-postgres_url="${KIRO_RS_TEST_POSTGRES_URL:-}"
-redis_url="${KIRO_RS_TEST_REDIS_URL:-}"
-postgres_isolated="${KIRO_RS_TEST_POSTGRES_ISOLATED:-0}"
-redis_isolated="${KIRO_RS_TEST_REDIS_ISOLATED:-0}"
+postgres_url="${ACCOUNT_RUNTIME_TEST_POSTGRES_URL:-}"
+redis_url="${ACCOUNT_RUNTIME_TEST_REDIS_URL:-}"
+postgres_isolated="${ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED:-0}"
+redis_isolated="${ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED:-0}"
 allow_non_loopback="${KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
 outer_rounds="${KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS:-3}"
 scope="${KIRO_RUNTIME_QUARANTINE_STORAGE_SCOPE:-runtime-quarantine-storage-real}"
 
 [[ -n "$postgres_url" ]] || {
-  printf 'KIRO_RS_TEST_POSTGRES_URL is required; no storage test was run\n' >&2
+  printf 'ACCOUNT_RUNTIME_TEST_POSTGRES_URL is required; no storage test was run\n' >&2
   exit 64
 }
 [[ -n "$redis_url" ]] || {
-  printf 'KIRO_RS_TEST_REDIS_URL is required; no storage test was run\n' >&2
+  printf 'ACCOUNT_RUNTIME_TEST_REDIS_URL is required; no storage test was run\n' >&2
   exit 64
 }
 [[ "$postgres_isolated" == "1" ]] || {
-  printf 'KIRO_RS_TEST_POSTGRES_ISOLATED=1 is required\n' >&2
+  printf 'ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED=1 is required\n' >&2
   exit 64
 }
 [[ "$redis_isolated" == "1" ]] || {
-  printf 'KIRO_RS_TEST_REDIS_ISOLATED=1 is required\n' >&2
+  printf 'ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required\n' >&2
   exit 64
 }
 [[ "$outer_rounds" =~ ^[1-9][0-9]*$ ]] && (( outer_rounds <= 5 )) || {
@@ -41,22 +41,22 @@ scope="${KIRO_RUNTIME_QUARANTINE_STORAGE_SCOPE:-runtime-quarantine-storage-real}
   exit 64
 }
 
-KIRO_RS_TEST_POSTGRES_URL="$postgres_url" \
-KIRO_RS_TEST_REDIS_URL="$redis_url" \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
+ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
 KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
 node <<'NODE'
 const net = require('node:net');
 
 const targets = [
   {
-    name: 'KIRO_RS_TEST_POSTGRES_URL',
-    raw: process.env.KIRO_RS_TEST_POSTGRES_URL,
+    name: 'ACCOUNT_RUNTIME_TEST_POSTGRES_URL',
+    raw: process.env.ACCOUNT_RUNTIME_TEST_POSTGRES_URL,
     protocols: new Set(['postgres:', 'postgresql:']),
     defaultPort: 5432,
   },
   {
-    name: 'KIRO_RS_TEST_REDIS_URL',
-    raw: process.env.KIRO_RS_TEST_REDIS_URL,
+    name: 'ACCOUNT_RUNTIME_TEST_REDIS_URL',
+    raw: process.env.ACCOUNT_RUNTIME_TEST_REDIS_URL,
     protocols: new Set(['redis:', 'rediss:']),
     defaultPort: 6379,
   },
@@ -124,15 +124,15 @@ function probe(target) {
 })();
 NODE
 
-KIRO_RS_TEST_POSTGRES_URL="$postgres_url" \
-KIRO_RS_TEST_REDIS_URL="$redis_url" \
-KIRO_RS_REQUIRE_STORAGE_TESTS=1 \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
+ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
 KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS="$outer_rounds" \
 feature/tests/run-cargo-scoped.sh "$scope" -- \
   env RUSTUP_TOOLCHAIN=1.92.0 \
-  KIRO_RS_TEST_POSTGRES_URL="$postgres_url" \
-  KIRO_RS_TEST_REDIS_URL="$redis_url" \
-  KIRO_RS_REQUIRE_STORAGE_TESTS=1 \
+  ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
+  ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
+  ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
   KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS="$outer_rounds" \
   bash -lc '
     set -euo pipefail
@@ -140,11 +140,11 @@ feature/tests/run-cargo-scoped.sh "$scope" -- \
     git diff --check
     for ((round = 1; round <= KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS; round += 1)); do
       printf "runtime-quarantine-storage outer_round=%s\n" "$round"
-      cargo test kiro::token_manager::manager::tests::postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds -- --exact --nocapture --test-threads=1
-      cargo test kiro::token_manager::manager::tests::postgres_pending_runtime_mutations_replay_in_order_and_unquarantine -- --exact --nocapture --test-threads=1
-      cargo test kiro::token_manager::manager::tests::postgres_reset_generation_fences_pending_failure_and_disable_replay -- --exact --nocapture --test-threads=1
-      cargo test kiro::token_manager::manager::tests::finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_interval -- --exact --nocapture --test-threads=1
-      cargo test kiro::token_manager::manager::tests::redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades -- --exact --nocapture --test-threads=1
-      cargo test kiro::token_manager::manager::tests::redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease -- --exact --nocapture --test-threads=1
+      cargo test local_upstream_impl::token_manager::manager::tests::postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds -- --exact --nocapture --test-threads=1
+      cargo test local_upstream_impl::token_manager::manager::tests::postgres_pending_runtime_mutations_replay_in_order_and_unquarantine -- --exact --nocapture --test-threads=1
+      cargo test local_upstream_impl::token_manager::manager::tests::postgres_reset_generation_fences_pending_failure_and_disable_replay -- --exact --nocapture --test-threads=1
+      cargo test local_upstream_impl::token_manager::manager::tests::finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_interval -- --exact --nocapture --test-threads=1
+      cargo test local_upstream_impl::token_manager::manager::tests::redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades -- --exact --nocapture --test-threads=1
+      cargo test local_upstream_impl::token_manager::manager::tests::redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease -- --exact --nocapture --test-threads=1
     done
   '

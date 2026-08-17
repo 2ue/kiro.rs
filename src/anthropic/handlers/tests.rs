@@ -911,13 +911,19 @@ async fn test_external_pool_manager_for_handlers(
     base_url: &str,
     body_mode: AccountRequestBodyMode,
 ) -> Option<Arc<AccountRuntimeManager>> {
-    let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+    let Some(postgres_url) =
+        crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")
     else {
-        eprintln!("跳过 WebSearch account fallback 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!(
+            "跳过 WebSearch account fallback 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL"
+        );
         return None;
     };
-    let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-        eprintln!("跳过 WebSearch account fallback 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+    let Some(redis_url) = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")
+    else {
+        eprintln!(
+            "跳过 WebSearch account fallback 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL"
+        );
         return None;
     };
 

@@ -94,8 +94,8 @@ PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `admin-
 本地执行存储集成测试时必须显式提供测试实例；测试会在 PgSQL 中创建临时 schema，并在 Redis 中使用随机 key prefix：
 
 ```bash
-export KIRO_RS_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/kiro_rs_test'
-export KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:6379/0'
+export ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/kiro_rs_test'
+export ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:6379/0'
 cargo +1.92.0 test --locked --all-targets --no-default-features
 ```
 

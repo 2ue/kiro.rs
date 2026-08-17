@@ -4962,8 +4962,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dashboard_windows_uses_redis_observability_without_postgres_for_three_rounds() {
-        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        let Some(redis_url) =
+            crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")
+        else {
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
         let mut config = crate::model::config::Config::default();
@@ -5067,13 +5069,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds()
     {
-        let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+        let Some(postgres_url) =
+            crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")
         else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
-        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        let Some(redis_url) =
+            crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")
+        else {
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
         let mut config = crate::model::config::Config::default();
@@ -5208,13 +5213,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn production_postgres_only_usage_never_materializes_redis_for_five_rounds() {
-        let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+        let Some(postgres_url) =
+            crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")
         else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
-        let Some(redis_url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        let Some(redis_url) =
+            crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")
+        else {
+            eprintln!("跳过 PgSQL+Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
         let mut config = crate::model::config::Config::default();

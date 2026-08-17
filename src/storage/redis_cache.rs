@@ -1434,11 +1434,12 @@ impl RedisStore {
             RedisStoreRole::Observability => (manager.clone(), manager.clone()),
         };
         #[cfg(test)]
-        let usage_summary_write_permits = std::env::var("KIRO_RS_TEST_USAGE_SUMMARY_WRITE_PERMITS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(|value| value.clamp(1, 4))
-            .unwrap_or(DEFAULT_USAGE_SUMMARY_WRITE_PERMITS);
+        let usage_summary_write_permits =
+            std::env::var("ACCOUNT_RUNTIME_TEST_USAGE_SUMMARY_WRITE_PERMITS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|value| value.clamp(1, 4))
+                .unwrap_or(DEFAULT_USAGE_SUMMARY_WRITE_PERMITS);
         #[cfg(not(test))]
         let usage_summary_write_permits = DEFAULT_USAGE_SUMMARY_WRITE_PERMITS;
         Ok(Self {
@@ -7363,7 +7364,7 @@ mod tests {
     }
 
     fn test_config() -> Option<Config> {
-        let url = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL")?;
+        let url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")?;
         let mut config = Config::default();
         config.redis.url = Some(url);
         config.redis.key_prefix = format!("account-runtime:test:{}", uuid::Uuid::new_v4());
@@ -7538,7 +7539,7 @@ mod tests {
         Fut: Future<Output = ()>,
     {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -8041,7 +8042,7 @@ mod tests {
     #[tokio::test]
     async fn redis_pattern_delete_is_bounded_and_cancellable() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -8111,7 +8112,7 @@ mod tests {
     #[tokio::test]
     async fn redis_json_round_trip_and_delete() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -8133,7 +8134,7 @@ mod tests {
     #[tokio::test]
     async fn redis_usage_summary_and_dashboard_are_materialized() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -8372,7 +8373,7 @@ mod tests {
     #[tokio::test]
     async fn redis_cleanup_watermark_rejects_old_and_accepts_new_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
         let store = RedisStore::connect(&config).await.unwrap();
@@ -8443,7 +8444,7 @@ mod tests {
     #[tokio::test]
     async fn redis_cleanup_watermark_is_shared_across_two_instances_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
         let store_a = RedisStore::connect(&config).await.unwrap();
@@ -8489,7 +8490,7 @@ mod tests {
     #[tokio::test]
     async fn redis_guarded_summary_commit_closes_midflight_cleanup_race_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
         let store = RedisStore::connect(&config).await.unwrap();
@@ -8882,7 +8883,7 @@ mod tests {
     #[tokio::test]
     async fn redis_usage_record_snapshot_trims_orphan_items_with_index() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -8955,7 +8956,7 @@ mod tests {
     #[tokio::test]
     async fn redis_usage_summary_reads_existing_hash_data_without_index_rebuild() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9002,7 +9003,7 @@ mod tests {
     #[tokio::test]
     async fn redis_usage_summary_and_dashboard_skip_high_cardinality_cache_read_buckets() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9041,7 +9042,7 @@ mod tests {
     #[tokio::test]
     async fn redis_usage_dashboard_stale_summary_without_window_buckets_returns_none() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9071,7 +9072,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_session_binding_round_trip_and_soft_failure() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9160,7 +9161,7 @@ mod tests {
     #[tokio::test]
     async fn redis_runtime_event_pubsub_round_trip() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9188,7 +9189,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_cooldown_and_rate_limit_round_trip() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9392,7 +9393,7 @@ mod tests {
     #[tokio::test]
     async fn redis_local_pool_circuit_uses_sliding_window_and_distinct_credentials() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9464,7 +9465,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_in_flight_acquire_release_and_cleanup() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9536,7 +9537,7 @@ mod tests {
     #[tokio::test]
     async fn redis_dispatch_queue_leases_enforce_cross_manager_limit_and_idempotence() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9613,7 +9614,7 @@ mod tests {
     #[tokio::test]
     async fn redis_dispatch_queue_prunes_stale_leases_before_admission_and_counting() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9652,7 +9653,7 @@ mod tests {
     #[tokio::test]
     async fn redis_dispatch_queue_commit_unknown_cleanup_only_removes_its_lease() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9686,7 +9687,7 @@ mod tests {
     #[tokio::test]
     async fn redis_dispatch_queue_admission_and_renewal_only_update_their_own_lease() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -9761,7 +9762,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_snapshot_and_acquire_are_atomic_across_managers() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10046,7 +10047,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_commit_unknown_cleanup_tombstone_blocks_late_acquire() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10124,7 +10125,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn redis_external_pool_atomic_acquire_never_oversells_across_managers() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10193,7 +10194,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn redis_external_pool_two_managers_sixty_pools_never_oversell_across_10k_competitions() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10330,7 +10331,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_confirmed_release_keeps_tombstones_empty_for_10k_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10386,7 +10387,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_pending_tombstone_expiry_never_shortens_newer_score() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10436,7 +10437,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_queue_leases_enforce_cross_manager_limit_and_idempotence() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10495,7 +10496,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_queue_prunes_stale_leases_before_admission() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10536,7 +10537,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_queue_commit_unknown_cleanup_only_removes_its_waiter() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10580,7 +10581,7 @@ mod tests {
     #[tokio::test]
     async fn redis_external_pool_queue_admission_and_renewal_only_update_their_own_lease() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10666,7 +10667,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_weighted_in_flight_acquire_release_and_cleanup() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10766,7 +10767,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_clearing_one_weighted_credential_keeps_other_global_count() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10844,7 +10845,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_late_touch_after_release_does_not_reoccupy_capacity() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10912,7 +10913,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_tombstone_blocks_late_acquire_after_release() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 
@@ -10981,7 +10982,7 @@ mod tests {
     #[tokio::test]
     async fn redis_scheduler_refresh_lock_is_exclusive() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            eprintln!("跳过 Redis 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
             return;
         };
 

@@ -8,18 +8,18 @@ repo_root="$(git rev-parse --show-toplevel)"
   exit 64
 }
 
-redis_url="${KIRO_RS_TEST_REDIS_URL:-}"
-isolated="${KIRO_RS_TEST_REDIS_ISOLATED:-0}"
+redis_url="${ACCOUNT_RUNTIME_TEST_REDIS_URL:-}"
+isolated="${ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED:-0}"
 allow_non_loopback="${KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
 outer_rounds="${KIRO_REDIS_USAGE_OUTER_ROUNDS:-3}"
 scope="${KIRO_REDIS_USAGE_SCOPE:-redis-usage-writer-real}"
 
 [[ -n "$redis_url" ]] || {
-  printf 'KIRO_RS_TEST_REDIS_URL is required; no Redis test was run\n' >&2
+  printf 'ACCOUNT_RUNTIME_TEST_REDIS_URL is required; no Redis test was run\n' >&2
   exit 64
 }
 [[ "$isolated" == "1" ]] || {
-  printf 'KIRO_RS_TEST_REDIS_ISOLATED=1 is required; refusing an unconfirmed Redis target\n' >&2
+  printf 'ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required; refusing an unconfirmed Redis target\n' >&2
   exit 64
 }
 [[ "$outer_rounds" =~ ^[1-9][0-9]*$ ]] && (( outer_rounds <= 10 )) || {
@@ -32,18 +32,18 @@ scope="${KIRO_REDIS_USAGE_SCOPE:-redis-usage-writer-real}"
 }
 
 KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
-KIRO_RS_TEST_REDIS_URL="$redis_url" \
+ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
 node <<'NODE'
-const raw = process.env.KIRO_RS_TEST_REDIS_URL;
+const raw = process.env.ACCOUNT_RUNTIME_TEST_REDIS_URL;
 let parsed;
 try {
   parsed = new URL(raw);
 } catch {
-  process.stderr.write('KIRO_RS_TEST_REDIS_URL is not a valid URL\n');
+  process.stderr.write('ACCOUNT_RUNTIME_TEST_REDIS_URL is not a valid URL\n');
   process.exit(64);
 }
 if (!['redis:', 'rediss:'].includes(parsed.protocol)) {
-  process.stderr.write('KIRO_RS_TEST_REDIS_URL must use redis:// or rediss://\n');
+  process.stderr.write('ACCOUNT_RUNTIME_TEST_REDIS_URL must use redis:// or rediss://\n');
   process.exit(64);
 }
 const hostname = parsed.hostname.toLowerCase();
@@ -63,13 +63,13 @@ if (parsed.port === '9022') {
 }
 NODE
 
-KIRO_RS_TEST_REDIS_URL="$redis_url" \
-KIRO_RS_REQUIRE_STORAGE_TESTS=1 \
+ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
 KIRO_REDIS_USAGE_OUTER_ROUNDS="$outer_rounds" \
 feature/tests/run-cargo-scoped.sh "$scope" -- \
   env RUSTUP_TOOLCHAIN=1.92.0 \
-  KIRO_RS_TEST_REDIS_URL="$redis_url" \
-  KIRO_RS_REQUIRE_STORAGE_TESTS=1 \
+  ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
+  ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
   KIRO_REDIS_USAGE_OUTER_ROUNDS="$outer_rounds" \
   bash -lc '
     set -euo pipefail

@@ -12058,7 +12058,7 @@ mod tests {
     use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
 
     fn test_config() -> Option<Config> {
-        let url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")?;
+        let url = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")?;
         let mut config = Config::default();
         config.postgres.url = Some(url);
         config.postgres.max_connections = 2;
@@ -12144,7 +12144,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_schema_compatibility_check_rejects_missing_upgrade_column() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -12169,7 +12169,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_pool_isolated_from_exhausted_main_pool_for_three_rounds() {
         let Some(mut config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         config.postgres.max_connections = 1;
@@ -12210,7 +12210,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_startup_migration_repairs_usage_dashboard_upgrade_columns() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -12266,7 +12266,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_startup_migration_expands_usage_cleanup_batch_size_constraint() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -12479,7 +12479,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_job_is_persistent_exclusive_and_recoverable() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12638,7 +12638,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_supervisor_only_sees_claimable_jobs_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12706,7 +12706,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_cancel_resume_and_expired_recovery_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12804,7 +12804,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_batches_are_bounded_idempotent_and_skip_locked() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12873,7 +12873,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_locked_rows_remain_visible_until_release_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -12950,7 +12950,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_cleanup_advisory_guards_are_test_schema_scoped() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store_a = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13054,7 +13054,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_rollup_update_subtracts_legacy_cost_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13157,7 +13157,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_external_pool_usage_risk_reports_cache_and_cost_risks() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13232,7 +13232,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_soft_cleanup_removes_rollups_and_costs_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13266,7 +13266,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_recomputes_global_duration_max_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13353,7 +13353,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_hard_cleanup_removes_legacy_rollups_once_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13392,7 +13392,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_rejects_late_replay_but_accepts_newer_records_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13464,7 +13464,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_is_consistent_with_concurrent_old_writes_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13525,7 +13525,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_cleanup_watermark_waits_for_inflight_usage_commit_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13595,7 +13595,7 @@ mod tests {
     async fn postgres_usage_cleanup_batches_return_contention_signal_while_writer_guard_is_held_for_three_rounds()
      {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13667,7 +13667,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_cleanup_watermark_lock_wait_is_bounded_and_recovers() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13711,7 +13711,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_cleanup_prunes_high_cardinality_zero_rollups_for_three_rounds() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -13944,7 +13944,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_lifecycle_fence_requires_offline_maintenance() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -14089,7 +14089,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_startup_migration_checksum_failure_rolls_back_entire_default_chain() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -14172,7 +14172,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_repeated_startup_migration_preserves_unchanged_inline_marker_time() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -14249,7 +14249,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_rollup_writes_hour_buckets() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -14302,7 +14302,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_usage_concurrent_writers_keep_rollup_lock_order_stable() {
         let Some(mut config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         config.postgres.max_connections = 4;
@@ -14420,7 +14420,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_duration_p95_uses_weighted_histogram_and_negative_deltas() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -14504,7 +14504,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_read_transaction_is_bounded_and_read_only() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = PostgresStore::connect_test(&config).await.unwrap();
@@ -14541,7 +14541,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_uses_exact_utc_boundary_population_for_every_window_metric() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -14783,7 +14783,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_dashboard_applies_legacy_cost_fallback_after_utc_hour_regrouping() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -14868,7 +14868,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_duration_write_and_dashboard_histogram_saturate_without_signed_wrap() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
@@ -14905,7 +14905,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_migration_compresses_second_rollup_buckets_to_hours() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -15262,7 +15262,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_persists_runtime_config_credentials_stats_usage_and_pricing() {
         let Some(mut config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -15810,7 +15810,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_credential_upsert_rejects_soft_deleted_rows() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -15863,7 +15863,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_credential_revision_cas_preserves_concurrent_field_updates() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16001,7 +16001,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_credential_revision_migration_upgrades_legacy_rows() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16050,7 +16050,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_atomic_credential_insert_rolls_back_when_runtime_patch_fails() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16142,7 +16142,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_atomic_credential_update_rolls_back_with_runtime_patch() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16311,7 +16311,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_refresh_field_cas_preserves_admin_changes_and_rejects_stale_hashes() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16483,7 +16483,7 @@ mod tests {
     async fn postgres_refresh_field_cas_fences_non_rotating_refresh_by_access_token_for_five_rounds()
      {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16578,7 +16578,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_credential_hash_repair_backfills_legacy_rows_and_detects_collisions() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16699,7 +16699,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_stats_delta_batches_are_exactly_once_and_payload_bound() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16827,7 +16827,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_stats_delta_batch_rolls_back_all_chunks() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -16930,7 +16930,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_stats_delta_batch_filters_soft_delete_races() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -17022,7 +17022,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_last_used_at_compares_rfc3339_instants() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -17129,7 +17129,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_mutations_are_idempotent_and_revisioned() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -17218,7 +17218,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_generation_fences_pre_reset_mutations() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -17440,7 +17440,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_disable_mutations_are_idempotent_and_preserve_unspecified_counts() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -17597,7 +17597,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_patches_are_field_level_and_idempotent() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -17778,7 +17778,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_mutations_and_snapshots_reject_soft_delete_races() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -17898,7 +17898,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_snapshot_cas_rejects_stale_revision_without_writing() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18021,7 +18021,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_snapshot_cas_allows_one_concurrent_writer() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18120,7 +18120,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_mutation_cleanup_is_expiry_aware_and_bounded() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18212,7 +18212,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_consistent_credential_runtime_load_matches_individual_loads() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18298,7 +18298,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_revision_migration_upgrades_existing_rows() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18369,7 +18369,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_runtime_generation_migration_upgrades_existing_rows() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18435,7 +18435,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_generates_unique_ids_for_concurrent_credential_inserts() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18496,7 +18496,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_explicit_credential_ids_advance_sequence_without_regression() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18556,7 +18556,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn postgres_serializes_explicit_and_automatic_credential_id_allocation() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18636,7 +18636,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_external_pool_list_and_get_preserve_body_modes() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 
@@ -18796,7 +18796,7 @@ mod tests {
     #[tokio::test]
     async fn postgres_rolls_up_external_pool_billing_for_large_samples_and_removes_after_cleanup() {
         let Some(config) = test_config() else {
-            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            eprintln!("跳过 PgSQL 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
             return;
         };
 

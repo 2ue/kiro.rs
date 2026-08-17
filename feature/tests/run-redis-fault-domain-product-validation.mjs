@@ -11,11 +11,11 @@ import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const CHAOS_PROXY = path.join(ROOT, 'feature/tests/redis-chaos-proxy.mjs')
-const BUSINESS_URL = requiredEnvironment('KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL')
-const OBSERVABILITY_URL = requiredEnvironment('KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL')
-const ISOLATED = process.env.KIRO_RS_TEST_REDIS_ISOLATED === '1'
-const OUTER_ROUNDS = boundedInteger('KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS', 3, 1, 5)
-const SCOPE = String(process.env.KIRO_REDIS_FAULT_DOMAIN_SCOPE || 'redis-fault-domain-product')
+const BUSINESS_URL = requiredEnvironment('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL')
+const OBSERVABILITY_URL = requiredEnvironment('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL')
+const ISOLATED = process.env.ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED === '1'
+const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS', 3, 1, 5)
+const SCOPE = String(process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE || 'redis-fault-domain-product')
 const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-redis-fault-domain-product-${process.pid}-`))
 
 const ACTIVE_CHILDREN = new Set()
@@ -86,14 +86,14 @@ function parseRedisTarget(name, raw) {
 
 function validateInputs() {
   if (!ISOLATED) {
-    throw new Error('KIRO_RS_TEST_REDIS_ISOLATED=1 is required')
+    throw new Error('ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required')
   }
   if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(SCOPE)) {
-    throw new Error('KIRO_REDIS_FAULT_DOMAIN_SCOPE has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE has an invalid format')
   }
-  const business = parseRedisTarget('KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL', BUSINESS_URL)
+  const business = parseRedisTarget('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL', BUSINESS_URL)
   const observability = parseRedisTarget(
-    'KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL',
+    'ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL',
     OBSERVABILITY_URL,
   )
   if (business.authority === observability.authority) {
@@ -103,21 +103,21 @@ function validateInputs() {
 }
 
 function optionalTestReadyFile() {
-  const raw = String(process.env.KIRO_REDIS_FAULT_DOMAIN_TEST_READY_FILE || '').trim()
+  const raw = String(process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_TEST_READY_FILE || '').trim()
   if (!raw) return null
   if (!path.isAbsolute(raw)) {
-    throw new Error('KIRO_REDIS_FAULT_DOMAIN_TEST_READY_FILE must be an absolute path')
+    throw new Error('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_TEST_READY_FILE must be an absolute path')
   }
   const parent = path.dirname(raw)
   if (!fs.existsSync(parent)) {
-    throw new Error('KIRO_REDIS_FAULT_DOMAIN_TEST_READY_FILE parent must exist')
+    throw new Error('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_TEST_READY_FILE parent must exist')
   }
   const parentReal = fs.realpathSync(parent)
   if (parentReal === ROOT || parentReal.startsWith(`${ROOT}${path.sep}`)) {
-    throw new Error('KIRO_REDIS_FAULT_DOMAIN_TEST_READY_FILE must be outside the repository')
+    throw new Error('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_TEST_READY_FILE must be outside the repository')
   }
   if (fs.existsSync(raw)) {
-    throw new Error('KIRO_REDIS_FAULT_DOMAIN_TEST_READY_FILE must not already exist')
+    throw new Error('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_TEST_READY_FILE must not already exist')
   }
   return raw
 }
@@ -347,9 +347,9 @@ function scopedCargoScript() {
 set -euo pipefail
 cargo fmt --all -- --check
 git diff --check
-for round in $(seq 1 "$KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS"); do
+for round in $(seq 1 "$ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS"); do
   echo "redis-fault-domain-product outer_round=$round"
-  cargo test kiro::token_manager::manager::tests::redis_business_and_observability_fault_domains_are_independent_for_three_rounds -- --exact --nocapture --test-threads=1
+  cargo test local_upstream_impl::token_manager::manager::tests::redis_business_and_observability_fault_domains_are_independent_for_three_rounds -- --exact --nocapture --test-threads=1
 done
 `
 }
@@ -357,14 +357,14 @@ done
 async function runScopedCargo(businessProxy, observabilityProxy) {
   const env = validationChildEnvironment({
     RUSTUP_TOOLCHAIN: '1.92.0',
-    KIRO_RS_TEST_BUSINESS_REDIS_URL: businessProxy.redisUrl,
-    KIRO_RS_TEST_OBSERVABILITY_REDIS_URL: observabilityProxy.redisUrl,
-    KIRO_RS_REQUIRE_STORAGE_TESTS: '1',
-    KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS: String(OUTER_ROUNDS),
-    KIRO_RS_TEST_BUSINESS_TOXIPROXY_API: businessProxy.api,
-    KIRO_RS_TEST_BUSINESS_TOXIPROXY_NAME: businessProxy.name,
-    KIRO_RS_TEST_OBSERVABILITY_TOXIPROXY_API: observabilityProxy.api,
-    KIRO_RS_TEST_OBSERVABILITY_TOXIPROXY_NAME: observabilityProxy.name,
+    ACCOUNT_RUNTIME_TEST_BUSINESS_REDIS_URL: businessProxy.redisUrl,
+    ACCOUNT_RUNTIME_TEST_OBSERVABILITY_REDIS_URL: observabilityProxy.redisUrl,
+    ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS: '1',
+    ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS: String(OUTER_ROUNDS),
+    ACCOUNT_RUNTIME_TEST_BUSINESS_TOXIPROXY_API: businessProxy.api,
+    ACCOUNT_RUNTIME_TEST_BUSINESS_TOXIPROXY_NAME: businessProxy.name,
+    ACCOUNT_RUNTIME_TEST_OBSERVABILITY_TOXIPROXY_API: observabilityProxy.api,
+    ACCOUNT_RUNTIME_TEST_OBSERVABILITY_TOXIPROXY_NAME: observabilityProxy.name,
   })
   const command = spawn(path.join(ROOT, 'feature/tests/run-cargo-scoped.sh'), [
     SCOPE,

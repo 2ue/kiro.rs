@@ -1907,7 +1907,7 @@ mod tests {
 
     #[test]
     fn optional_local_claude_jsonl_replay_suppresses_every_polluted_record() {
-        let Ok(path) = std::env::var("KIRO_CLAUDE_TRANSCRIPT_FIXTURE") else {
+        let Ok(path) = std::env::var("ACCOUNT_RUNTIME_CLAUDE_TRANSCRIPT_FIXTURE") else {
             return;
         };
         let file = std::fs::read_to_string(path).expect("read Claude JSONL fixture");
@@ -1965,7 +1965,7 @@ mod tests {
             }
         }
 
-        let minimum_records = std::env::var("KIRO_CLAUDE_TRANSCRIPT_MIN_RECORDS")
+        let minimum_records = std::env::var("ACCOUNT_RUNTIME_CLAUDE_TRANSCRIPT_MIN_RECORDS")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(1);

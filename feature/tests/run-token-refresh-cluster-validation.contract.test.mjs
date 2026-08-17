@@ -8,10 +8,10 @@ const RUNNER = path.join(ROOT, 'feature/tests/run-token-refresh-cluster-validati
 const source = fs.readFileSync(RUNNER, 'utf8')
 
 test('refresh cluster runner is explicit about both isolated stores', () => {
-  assert.match(source, /KIRO_TOKEN_REFRESH_CLUSTER_REDIS_URL/)
-  assert.match(source, /KIRO_TOKEN_REFRESH_CLUSTER_POSTGRES_URL/)
-  assert.match(source, /KIRO_RS_TEST_REDIS_ISOLATED=1/)
-  assert.match(source, /KIRO_RS_TEST_POSTGRES_ISOLATED=1/)
+  assert.match(source, /ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_REDIS_URL/)
+  assert.match(source, /ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_POSTGRES_URL/)
+  assert.match(source, /ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1/)
+  assert.match(source, /ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED=1/)
   assert.match(source, /nonzero database in 1\.\.15/)
   assert.match(source, /PostgreSQL URL must target loopback/)
 })

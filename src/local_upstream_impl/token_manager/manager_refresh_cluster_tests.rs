@@ -129,9 +129,10 @@ where
     F: FnOnce(Vec<Arc<PostgresStore>>, Vec<Arc<RedisStore>>) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
+    let Some(postgres_url) =
+        crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_POSTGRES_URL")
     else {
-        eprintln!("跳过 refresh cluster 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        eprintln!("跳过 refresh cluster 集成测试：未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL");
         return;
     };
     let mut owner_config = Config::default();
@@ -148,7 +149,7 @@ where
     );
     let Some(redis_stores) = test_redis_stores_with_shared_namespace(2).await else {
         postgres_owner.drop_test_schema().await.unwrap();
-        eprintln!("跳过 refresh cluster 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        eprintln!("跳过 refresh cluster 集成测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL");
         return;
     };
     let cleanup_redis = redis_stores[0].clone();

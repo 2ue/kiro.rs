@@ -1211,8 +1211,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_redis_wrongtype_poison_does_not_block_new_local_release_for_five_rounds() {
-        let Some(url) = crate::storage::integration_test_url("KIRO_RS_TEST_REDIS_URL") else {
-            eprintln!("跳过 Redis local release poison 测试：未设置 KIRO_RS_TEST_REDIS_URL");
+        let Some(url) = crate::storage::integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")
+        else {
+            eprintln!(
+                "跳过 Redis local release poison 测试：未设置 ACCOUNT_RUNTIME_TEST_REDIS_URL"
+            );
             return;
         };
 

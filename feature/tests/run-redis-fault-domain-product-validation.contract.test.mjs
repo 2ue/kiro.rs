@@ -9,27 +9,27 @@ const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const RUNNER = path.join(ROOT, 'feature/tests/run-redis-fault-domain-product-validation.mjs')
 const STATIC_BUSINESS_URL = 'redis://127.0.0.1:1/15'
 const STATIC_OBSERVABILITY_URL = 'redis://127.0.0.1:2/15'
-const LIVE_BUSINESS_URL = String(process.env.KIRO_REDIS_FAULT_DOMAIN_CONTRACT_BUSINESS_URL || '').trim()
+const LIVE_BUSINESS_URL = String(process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_CONTRACT_BUSINESS_URL || '').trim()
 const LIVE_OBSERVABILITY_URL = String(
-  process.env.KIRO_REDIS_FAULT_DOMAIN_CONTRACT_OBSERVABILITY_URL || '',
+  process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_CONTRACT_OBSERVABILITY_URL || '',
 ).trim()
 
 function runnerEnvironment(overrides = {}) {
   const env = { ...process.env }
   for (const name of [
-    'KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL',
-    'KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL',
-    'KIRO_RS_TEST_REDIS_ISOLATED',
-    'KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS',
-    'KIRO_REDIS_FAULT_DOMAIN_SCOPE',
-    'KIRO_REDIS_FAULT_DOMAIN_TEST_READY_FILE',
+    'ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL',
+    'ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL',
+    'ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED',
+    'ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS',
+    'ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE',
+    'ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_TEST_READY_FILE',
   ]) delete env[name]
   Object.assign(env, {
     PATH: process.env.PATH || '/usr/bin:/bin',
     TMPDIR: process.env.TMPDIR || os.tmpdir(),
-    KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL: STATIC_BUSINESS_URL,
-    KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: STATIC_OBSERVABILITY_URL,
-    KIRO_RS_TEST_REDIS_ISOLATED: '1',
+    ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL: STATIC_BUSINESS_URL,
+    ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: STATIC_OBSERVABILITY_URL,
+    ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED: '1',
   })
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) delete env[key]
@@ -124,13 +124,17 @@ test('production startup injects only observability Redis into usage and Admin s
 
 test('production scheduler, external pool, runtime event, and health paths keep business Redis only', () => {
   const source = sourceFile('src/main.rs')
-  const managerBlock = sourceWindow(source, 'MultiTokenManager::new_with_stores_and_runtime_state', 1_200)
+  const managerBlock = sourceWindow(
+    source,
+    'LocalUpstreamCredentialManager::new_with_stores_and_runtime_state_and_account_info',
+    1_200,
+  )
   assert.match(managerBlock, /Some\(redis_store\.clone\(\)\)/)
   assert.doesNotMatch(managerBlock, /observability_redis_store/)
 
-  const externalBlock = sourceWindow(source, 'ExternalPoolManager::new', 500)
-  assert.match(externalBlock, /postgres_store\.clone\(\),\s*redis_store\.clone\(\)/s)
-  assert.doesNotMatch(externalBlock, /observability_redis_store/)
+  const accountRuntimeBlock = sourceWindow(source, 'AccountRuntimeManager::new', 500)
+  assert.match(accountRuntimeBlock, /postgres_store\.clone\(\),\s*redis_store\.clone\(\)/s)
+  assert.doesNotMatch(accountRuntimeBlock, /observability_redis_store/)
 
   const eventsBlock = sourceWindow(source, 'spawn_redis_runtime_event_listener(', 900)
   assert.match(eventsBlock, /redis_store\.clone\(\)/)
@@ -247,58 +251,58 @@ test('configuration rejects DB or prefix only Redis separation and supports obse
   assert.match(validator, /changing DB or keyPrefix is not sufficient/)
   assert.match(validator, /business == observability/)
   const envOverrides = sourceWindow(source, 'fn apply_env_overrides', 2_500)
-  assert.match(envOverrides, /KIRO_RS_OBSERVABILITY_REDIS_URL/)
-  assert.match(envOverrides, /KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX/)
+  assert.match(envOverrides, /ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_URL/)
+  assert.match(envOverrides, /ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_KEY_PREFIX/)
 })
 
 const earlyCases = [
   {
     name: 'missing business Redis URL',
-    env: { KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL: undefined },
-    error: /KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL is required/,
+    env: { ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL: undefined },
+    error: /ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL is required/,
   },
   {
     name: 'missing observability Redis URL',
-    env: { KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: undefined },
-    error: /KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL is required/,
+    env: { ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: undefined },
+    error: /ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL is required/,
   },
   {
     name: 'isolation marker is absent',
-    env: { KIRO_RS_TEST_REDIS_ISOLATED: undefined },
-    error: /KIRO_RS_TEST_REDIS_ISOLATED=1 is required/,
+    env: { ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED: undefined },
+    error: /ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 is required/,
   },
   {
     name: 'database zero',
-    env: { KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL: 'redis://127.0.0.1:1/0' },
+    env: { ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL: 'redis://127.0.0.1:1/0' },
     error: /isolated nonzero Redis database in 1\.\.15/,
   },
   {
     name: 'protected port 9022',
-    env: { KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL: 'redis://127.0.0.1:9022/15' },
+    env: { ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL: 'redis://127.0.0.1:9022/15' },
     error: /protected port 9022/,
   },
   {
     name: 'same authority with different DB',
     env: {
-      KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL: 'redis://127.0.0.1:1/14',
-      KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: 'redis://localhost:1/15',
+      ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL: 'redis://127.0.0.1:1/14',
+      ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: 'redis://localhost:1/15',
     },
     error: /distinct network authorities/,
   },
   {
     name: 'non-loopback Redis',
-    env: { KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: 'redis://redis.internal:6379/15' },
+    env: { ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: 'redis://redis.internal:6379/15' },
     error: /must target loopback Redis/,
   },
   {
     name: 'invalid outer rounds',
-    env: { KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS: '0' },
-    error: /KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS must be an integer in 1\.\.5/,
+    env: { ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS: '0' },
+    error: /ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS must be an integer in 1\.\.5/,
   },
   {
     name: 'invalid scope',
-    env: { KIRO_REDIS_FAULT_DOMAIN_SCOPE: '../bad' },
-    error: /KIRO_REDIS_FAULT_DOMAIN_SCOPE has an invalid format/,
+    env: { ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE: '../bad' },
+    error: /ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE has an invalid format/,
   },
 ]
 
@@ -329,9 +333,9 @@ for (const signalCase of [
         cwd: ROOT,
         env: runnerEnvironment({
           TMPDIR: fixtureRoot,
-          KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL: LIVE_BUSINESS_URL,
-          KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: LIVE_OBSERVABILITY_URL,
-          KIRO_REDIS_FAULT_DOMAIN_TEST_READY_FILE: readyFile,
+          ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL: LIVE_BUSINESS_URL,
+          ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL: LIVE_OBSERVABILITY_URL,
+          ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_TEST_READY_FILE: readyFile,
         }),
         stdio: ['ignore', 'pipe', 'pipe'],
       })

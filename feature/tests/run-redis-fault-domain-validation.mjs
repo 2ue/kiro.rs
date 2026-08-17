@@ -24,12 +24,12 @@ const OBSERVABILITY_URL = 'redis://127.0.0.1:50892/15'
 const DATABASE = 15
 const OUTER_ROUNDS = Math.max(
   3,
-  Number.parseInt(process.env.KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS || '3', 10) || 3,
+  Number.parseInt(process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS || '3', 10) || 3,
 )
 const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-redis-fault-domain-${process.pid}-`))
 const CHILDREN = new Set()
 const PROXIES = new Set()
-const DEBUG = process.env.KIRO_REDIS_FAULT_DOMAIN_DEBUG === '1'
+const DEBUG = process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_DEBUG === '1'
 let cleanupPromise = null
 let signalHandling = false
 

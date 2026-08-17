@@ -227,9 +227,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Runtime storage overrides now read `ACCOUNT_RUNTIME_*` names only, and README, Docker Compose and maintained deployment docs inject the account-runtime storage/port variables.
 - Startup local-upstream API-key bootstrap and service bind overrides now read only `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; the old Kiro-named runtime fallback env vars were removed from main startup helpers and tests.
 - Active validation runners that spawn the service now set `LOCAL_UPSTREAM_API_KEY`, `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures now use account-runtime/local-upstream variable names.
+- Active storage, integration and chaos validation runner/test inputs now use account-runtime environment names. Old maintained `KIRO_RS_TEST_*`, `KIRO_RS_REQUIRE_STORAGE_TESTS`, `KIRO_RS_RUN_*`, `KIRO_REDIS_FAULT_DOMAIN_*`, `KIRO_SCHEDULER_CHAOS_*`, `KIRO_CLAUDE_TRANSCRIPT_*`, `KIRO_RS_REAL_*`, `KIRO_MULTI_INSTANCE_*` and `KIRO_TOKEN_REFRESH_CLUSTER_*` inputs were removed from active harnesses. Active runner exact Rust test paths now target `local_upstream_impl::token_manager`.
 
 Last verified on 2026-08-17:
 
+- `feature/tests/run-cargo-scoped.sh account-runtime-test-env-fmt -- cargo fmt`
+- `bash -n feature/tests/run-external-dispatch-storage-validation.sh feature/tests/run-runtime-quarantine-storage-validation.sh feature/tests/run-redis-usage-writer-validation.sh feature/tests/run-token-refresh-redis-validation.sh`
+- `node --test feature/tests/runtime-validation-paths.test.mjs feature/tests/run-scheduler-redis-chaos-validation.contract.test.mjs feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs feature/tests/run-multi-instance-redis-coordination-validation.contract.test.mjs feature/tests/run-token-refresh-cluster-validation.contract.test.mjs`
+- `feature/tests/run-cargo-scoped.sh account-runtime-test-env-check -- cargo check`
+- `rg -n "KIRO_RS_TEST_|KIRO_RS_REQUIRE_STORAGE_TESTS|KIRO_RS_RUN_|KIRO_REDIS_FAULT_DOMAIN_|KIRO_SCHEDULER_CHAOS_|KIRO_CLAUDE_TRANSCRIPT_|KIRO_RS_REAL_|KIRO_MULTI_INSTANCE_|KIRO_TOKEN_REFRESH_CLUSTER_|kiro::token_manager::manager::tests" README.md src feature/tests scripts --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh account-runtime-storage-env-fmt -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-runtime-storage-env-check -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-env-fallback-cut-fmt -- cargo fmt`

@@ -3355,7 +3355,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_idp_real_credential_file_refreshes_when_env_set() {
-        let Ok(path) = std::env::var("KIRO_RS_REAL_EXTERNAL_IDP_CREDENTIAL_FILE") else {
+        let Ok(path) = std::env::var("ACCOUNT_RUNTIME_REAL_EXTERNAL_IDP_CREDENTIAL_FILE") else {
             eprintln!("skip real external_idp credential test: env not set");
             return;
         };
@@ -3422,7 +3422,7 @@ mod tests {
             .expect("query usage with real external_idp credential");
         assert!(usage.usage_limit() >= usage.current_usage());
 
-        if let Ok(output_path) = std::env::var("KIRO_RS_REAL_EXTERNAL_IDP_REFRESH_OUTPUT") {
+        if let Ok(output_path) = std::env::var("ACCOUNT_RUNTIME_REAL_EXTERNAL_IDP_REFRESH_OUTPUT") {
             fs::write(
                 &output_path,
                 serde_json::to_string_pretty(&refreshed).expect("serialize refreshed credential"),
