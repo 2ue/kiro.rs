@@ -25,6 +25,7 @@ const TOKEN_REFRESH_REDIS_BACKOFF_MAX: StdDuration = StdDuration::from_secs(30);
 pub(crate) enum AuxiliaryConcurrencyKind {
     TokenRefresh,
     ProfileDiscovery,
+    #[cfg(test)]
     ModelDiscovery,
 }
 
@@ -33,6 +34,7 @@ impl AuxiliaryConcurrencyKind {
         match self {
             Self::TokenRefresh => "token_refresh",
             Self::ProfileDiscovery => "profile_discovery",
+            #[cfg(test)]
             Self::ModelDiscovery => "model_discovery",
         }
     }

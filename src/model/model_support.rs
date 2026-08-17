@@ -20,6 +20,7 @@ pub fn normalize_supported_models(models: impl IntoIterator<Item = String>) -> V
     out
 }
 
+#[cfg(test)]
 pub fn expand_claude_supported_model_variants(
     models: impl IntoIterator<Item = String>,
 ) -> Vec<String> {
@@ -38,6 +39,7 @@ pub fn expand_claude_supported_model_variants(
     out
 }
 
+#[cfg(test)]
 fn push_unique_model(out: &mut Vec<String>, model: String) {
     if model.trim().is_empty() {
         return;
@@ -48,6 +50,7 @@ fn push_unique_model(out: &mut Vec<String>, model: String) {
     out.push(model);
 }
 
+#[cfg(test)]
 fn claude_model_variants(model: &str) -> Vec<String> {
     let (base, suffix) = split_supported_model_suffix(model);
     let mut variants = Vec::new();
@@ -62,6 +65,7 @@ fn claude_model_variants(model: &str) -> Vec<String> {
     variants
 }
 
+#[cfg(test)]
 fn split_supported_model_suffix(model: &str) -> (String, Option<&'static str>) {
     if let Some(base) = model.strip_suffix("-thinking") {
         return (base.to_string(), Some("-thinking"));
@@ -69,6 +73,7 @@ fn split_supported_model_suffix(model: &str) -> (String, Option<&'static str>) {
     (model.to_string(), None)
 }
 
+#[cfg(test)]
 fn apply_supported_model_suffix(model: &str, suffix: Option<&str>) -> String {
     match suffix {
         Some(suffix) => format!("{model}{suffix}"),
@@ -76,6 +81,7 @@ fn apply_supported_model_suffix(model: &str, suffix: Option<&str>) -> String {
     }
 }
 
+#[cfg(test)]
 fn claude_base_model_variants(model: &str) -> Vec<String> {
     let parts = model.split('-').collect::<Vec<_>>();
     let mut out = Vec::new();
@@ -121,6 +127,7 @@ fn claude_base_model_variants(model: &str) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
 fn parse_modern_claude_model<'a>(
     parts: &'a [&str],
 ) -> Option<(&'a str, &'a str, Option<&'a str>, Option<&'a str>)> {
@@ -167,6 +174,7 @@ fn parse_modern_claude_model<'a>(
     }
 }
 
+#[cfg(test)]
 fn parse_legacy_claude_35_model<'a>(parts: &'a [&str]) -> Option<(&'a str, Option<&'a str>)> {
     if parts.len() < 3 || parts.first().copied() != Some("claude") {
         return None;
@@ -187,10 +195,12 @@ fn parse_legacy_claude_35_model<'a>(parts: &'a [&str]) -> Option<(&'a str, Optio
     None
 }
 
+#[cfg(test)]
 fn is_yyyymmdd(value: &str) -> bool {
     value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit())
 }
 
+#[cfg(test)]
 fn known_anthropic_dated_model(model: &str) -> Option<&'static str> {
     match model {
         "claude-sonnet-4" => Some("claude-sonnet-4-20250514"),

@@ -58,7 +58,7 @@ use crate::anthropic::{
     },
     model_capabilities::{
         MANUAL_SOURCE, ModelCapabilitiesCatalog, ModelCapabilitiesStatus, ModelCapabilityItem,
-        ModelResolutionSource, normalize_model_id, normalize_supported_input_types,
+        normalize_model_id, normalize_supported_input_types,
     },
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
@@ -72,30 +72,20 @@ use crate::anthropic::{
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
 use crate::http_client::{
-    ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
-    response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
+    ProxyConfig, build_client, response_text_with_limit_and_body_timeout,
+    send_with_response_header_timeout,
 };
 use crate::local_upstream::credentials::{LocalUpstreamCredentials, local_upstream_profile_region};
-use crate::local_upstream::event::LocalUpstreamEvent as Event;
 use crate::local_upstream::manager::{
     LocalUpstreamCredentialAuthUpdate, LocalUpstreamCredentialBaseSnapshot,
     LocalUpstreamCredentialEntrySnapshot, LocalUpstreamCredentialManager,
 };
-use crate::local_upstream::provider::LocalUpstreamProvider;
-use crate::local_upstream::request::{
-    LocalUpstreamConversationState as ConversationState,
-    LocalUpstreamCurrentMessage as CurrentMessage, LocalUpstreamRequest,
-    LocalUpstreamUserInputMessage as UserInputMessage,
-};
-use crate::local_upstream::stream::LocalUpstreamEventStreamDecoder as EventStreamDecoder;
 use crate::local_upstream::usage_limits::LocalUpstreamUsageLimitsResponse;
 use crate::model::config::{
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
     MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
 };
-use crate::model::model_support::{
-    expand_claude_supported_model_variants, normalize_supported_models,
-};
+use crate::model::model_support::normalize_supported_models;
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, NewUsageCleanupJob,
     PostgresStore, PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
@@ -133,8 +123,6 @@ const DEFAULT_PROXY_TEST_URL: &str = "https://api.ipify.org?format=json";
 const PROXY_TEST_TIMEOUT_SECS: u64 = 12;
 const PROXY_TEST_PREVIEW_CHARS: usize = 300;
 const ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES: usize = 64 * 1024;
-const ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
-
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
     pub q: Option<String>,
@@ -460,7 +448,6 @@ pub struct AdminService {
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    local_upstream_provider: Option<Arc<LocalUpstreamProvider>>,
     account_runtime_manager: Arc<AccountRuntimeManager>,
     /// Serializes credential imports so duplicate preflight cannot fan out auxiliary model calls.
     credential_import_lock: Arc<tokio::sync::Mutex<()>>,
@@ -476,7 +463,6 @@ pub struct AdminServiceDependencies {
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
-    pub local_upstream_provider: Option<Arc<LocalUpstreamProvider>>,
     pub postgres_store: Arc<PostgresStore>,
     pub observability_redis_store: Option<Arc<RedisStore>>,
     pub request_api_key_store: Arc<RequestApiKeyStore>,
@@ -551,7 +537,6 @@ impl AdminService {
             prompt_cache_creation_controller,
             pricing_catalog,
             model_capabilities,
-            local_upstream_provider,
             postgres_store,
             observability_redis_store,
             request_api_key_store,
@@ -576,7 +561,6 @@ impl AdminService {
             prompt_cache_creation_controller,
             pricing_catalog,
             model_capabilities,
-            local_upstream_provider,
             account_runtime_manager,
             credential_import_lock: Arc::new(tokio::sync::Mutex::new(())),
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
@@ -2629,29 +2613,16 @@ impl AdminService {
         &self,
         id: u64,
     ) -> Result<Vec<String>, AdminServiceError> {
-        let provider = self.local_upstream_provider.as_ref().ok_or_else(|| {
-            AdminServiceError::InvalidCredential(
-                "当前运行时未启用旧凭据模型发现；请使用上游账号模型发现".to_string(),
-            )
-        })?;
-        let models = provider
-            .list_available_models_for_credential(id)
-            .await
-            .map_err(|err| {
-                AdminServiceError::InvalidCredential(format!(
-                    "同步账号 #{} 支持模型失败: {}",
-                    id, err
-                ))
-            })?;
-        Ok(Self::normalize_discovered_supported_models(
-            models
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect::<Vec<_>>(),
-        ))
+        Err(AdminServiceError::InvalidCredential(format!(
+            "旧本地凭据模型发现已移除，账号 #{} 请使用上游账号模型发现",
+            id
+        )))
     }
 
+    #[cfg(test)]
     fn normalize_discovered_supported_models(model_ids: Vec<String>) -> Vec<String> {
+        use crate::model::model_support::expand_claude_supported_model_variants;
+
         let upstream_model_ids = normalize_supported_models(model_ids);
         let supported_models = expand_claude_supported_model_variants(upstream_model_ids.clone());
         if supported_models.is_empty() {
@@ -2665,20 +2636,8 @@ impl AdminService {
         &self,
         credential: LocalUpstreamCredentials,
     ) -> anyhow::Result<Vec<String>> {
-        let provider = self
-            .local_upstream_provider
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("当前运行时未启用旧凭据模型发现"))?;
-        let models = provider
-            .list_available_models_for_external_credentials(credential)
-            .await
-            .map_err(|err| anyhow::anyhow!("API Key 模型发现失败: {}", err))?;
-        Ok(Self::normalize_discovered_supported_models(
-            models
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect::<Vec<_>>(),
-        ))
+        let _ = credential;
+        anyhow::bail!("旧本地凭据模型发现已移除，请使用上游账号模型发现")
     }
 
     pub fn set_credential_regions(
@@ -3128,53 +3087,15 @@ impl AdminService {
         id: u64,
         req: TestCredentialRequest,
     ) -> Result<TestCredentialResponse, AdminServiceError> {
+        let model = req.model.trim();
         let prompt = req
             .prompt
-            .unwrap_or_else(|| DEFAULT_VALIDATION_TEST_PROMPT.to_string());
-        let (model, model_id, prompt, request_body) =
-            self.build_model_test_request(&req.model, &prompt)?;
-
-        let provider = self.local_upstream_provider.as_ref().ok_or_else(|| {
-            AdminServiceError::InvalidCredential(
-                "当前运行时未启用旧凭据测试；请使用上游账号测试".to_string(),
-            )
-        })?;
-        let started_at = std::time::Instant::now();
-        let api_response = provider
-            .call_api_with_credential(id, &request_body)
-            .await
-            .map_err(|e| self.classify_test_error(e, id))?;
-        let runtime_config = self.token_manager.runtime_config();
-        let credential_id = api_response.credential_id();
-        let (response, completion) = api_response.into_parts();
-        let body_bytes = match response_bytes_with_limit_and_body_timeout(
-            response,
-            runtime_config.local_upstream_response_timeout_secs(),
-            ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                completion.release();
-                return Err(AdminServiceError::UpstreamError(format!(
-                    "读取测试响应失败: {}",
-                    e
-                )));
-            }
-        };
-        let response_text = parse_model_test_response(&body_bytes)?;
-        completion.release();
-
-        Ok(TestCredentialResponse {
-            success: true,
-            credential_id,
-            model,
-            model_id,
-            prompt,
-            response: response_text,
-            duration_ms: started_at.elapsed().as_millis() as u64,
-        })
+            .as_deref()
+            .unwrap_or(DEFAULT_VALIDATION_TEST_PROMPT);
+        let _ = (id, model, prompt);
+        Err(AdminServiceError::InvalidCredential(
+            "旧本地凭据测试已移除，请使用上游账号测试".to_string(),
+        ))
     }
 
     async fn test_external_credential_liveness(
@@ -3183,95 +3104,9 @@ impl AdminService {
         model: &str,
         prompt: &str,
     ) -> Result<String, AdminServiceError> {
-        let (_, _, _, request_body) = self.build_model_test_request(model, prompt)?;
-        let runtime_config = self.token_manager.runtime_config();
-        let provider = self.local_upstream_provider.as_ref().ok_or_else(|| {
-            AdminServiceError::UpstreamError(
-                "当前运行时未启用旧凭据验活；请使用上游账号测试".to_string(),
-            )
-        })?;
-        let api_response = provider
-            .call_api_with_external_credentials(credential, &request_body)
-            .await
-            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
-        let (response, completion) = api_response.into_parts();
-        let body_bytes = match response_bytes_with_limit_and_body_timeout(
-            response,
-            runtime_config.local_upstream_response_timeout_secs(),
-            ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                completion.release();
-                return Err(AdminServiceError::UpstreamError(format!(
-                    "读取验活响应失败: {}",
-                    e
-                )));
-            }
-        };
-        let response_text = parse_model_test_response(&body_bytes)?;
-        completion.release();
-        Ok(response_text)
-    }
-
-    fn build_model_test_request(
-        &self,
-        model: &str,
-        prompt: &str,
-    ) -> Result<(String, String, String, String), AdminServiceError> {
-        let model = model.trim();
-        if model.is_empty() {
-            return Err(AdminServiceError::InvalidCredential(
-                "请选择测试模型".to_string(),
-            ));
-        }
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            return Err(AdminServiceError::InvalidCredential(
-                "测试消息不能为空".to_string(),
-            ));
-        }
-
-        let runtime_config = self.token_manager.runtime_config();
-        let model_resolution = self.model_capabilities.resolve_model_with_mapping(
-            model,
-            runtime_config.model_resolution_mode,
-            &runtime_config.model_mapping,
-        );
-        if model_resolution.source == ModelResolutionSource::Unsupported {
-            return Err(AdminServiceError::InvalidCredential(format!(
-                "不支持的测试模型: {}",
-                model
-            )));
-        }
-        let model_id = model_resolution.upstream_model.clone().ok_or_else(|| {
-            AdminServiceError::InvalidCredential(format!("不支持的测试模型: {}", model))
-        })?;
-
-        let conversation_id = uuid::Uuid::new_v4().to_string();
-        let agent_continuation_id = uuid::Uuid::new_v4().to_string();
-        let user_input = UserInputMessage::new(prompt, &model_id).with_origin("AI_EDITOR");
-        let conversation_state = ConversationState::new(conversation_id)
-            .with_agent_continuation_id(agent_continuation_id)
-            .with_agent_task_type("vibe")
-            .with_chat_trigger_type("MANUAL")
-            .with_current_message(CurrentMessage::new(user_input));
-        let local_upstream_request = LocalUpstreamRequest {
-            conversation_state,
-            profile_arn: None,
-            additional_model_request_fields: None,
-            tool_cache_point_insert_after: Vec::new(),
-            cache_point_plan_recording_enabled: true,
-        };
-        let request_body = serde_json::to_string(&local_upstream_request)
-            .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))?;
-        Ok((
-            model.to_string(),
-            model_id,
-            prompt.to_string(),
-            request_body,
+        let _ = (credential, model, prompt);
+        Err(AdminServiceError::UpstreamError(
+            "旧本地凭据验活已移除，请使用上游账号测试".to_string(),
         ))
     }
 
@@ -4372,23 +4207,10 @@ impl AdminService {
 
     /// 手动同步本地上游模型能力。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_capabilities(&self) -> ModelCapabilitiesStatus {
-        let status = match self.local_upstream_provider.as_ref() {
-            Some(provider) => match provider.list_available_models().await {
-                Ok(models) => self.model_capabilities.sync_from_upstream_catalog(models),
-                Err(err) => {
-                    tracing::warn!("同步本地上游模型能力失败，不影响请求调度: {}", err);
-                    self.model_capabilities.record_sync_error(err.to_string())
-                }
-            },
-            None => {
-                tracing::warn!(
-                    "跳过本地上游模型能力同步：当前运行时未启用 legacy local-upstream executor"
-                );
-                self.model_capabilities.record_sync_error(
-                    "model capability sync skipped because the runtime has no legacy local-upstream executor",
-                )
-            }
-        };
+        tracing::warn!("跳过旧本地上游模型能力同步：账号运行时不再安装 legacy executor");
+        let status = self.model_capabilities.record_sync_error(
+            "model capability sync skipped because the legacy local-upstream executor has been removed from runtime startup",
+        );
         let mut status = status;
         if let Err(err) = self
             .postgres_store
@@ -5807,17 +5629,6 @@ impl AdminService {
         }
     }
 
-    fn classify_test_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
-        let msg = e.to_string();
-        if msg.contains("不存在") {
-            AdminServiceError::NotFound { id }
-        } else if msg.contains("已禁用") || msg.contains("不支持") {
-            AdminServiceError::InvalidCredential(msg)
-        } else {
-            AdminServiceError::UpstreamError(msg)
-        }
-    }
-
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
         let msg = e.to_string();
@@ -5934,66 +5745,6 @@ fn validate_manual_model_id(model: &str) -> Result<(), AdminServiceError> {
         ));
     }
     Ok(())
-}
-
-fn parse_model_test_response(body_bytes: &[u8]) -> Result<String, AdminServiceError> {
-    let mut decoder = EventStreamDecoder::new();
-    decoder
-        .feed(body_bytes)
-        .map_err(|e| AdminServiceError::UpstreamError(format!("解析测试响应失败: {}", e)))?;
-
-    let mut text_content = String::new();
-    let mut invalid_state: Option<String> = None;
-    let mut error: Option<String> = None;
-    let mut exception: Option<String> = None;
-    for result in decoder.decode_iter() {
-        match result {
-            Ok(frame) => match Event::from_frame(frame) {
-                Ok(Event::AssistantResponse(resp)) => {
-                    text_content.push_str(&resp.content);
-                }
-                Ok(Event::InvalidState(invalid)) => {
-                    invalid_state = Some(invalid.error_text());
-                }
-                Ok(Event::Error {
-                    error_code,
-                    error_message,
-                }) => {
-                    error = Some(format!("{}: {}", error_code, error_message));
-                }
-                Ok(Event::Exception {
-                    exception_type,
-                    message,
-                }) => {
-                    exception = Some(format!("{}: {}", exception_type, message));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("测试响应事件解析失败: {}", e);
-                }
-            },
-            Err(e) => {
-                tracing::warn!("测试响应解码失败: {}", e);
-            }
-        }
-    }
-
-    if let Some(message) = invalid_state {
-        return Err(AdminServiceError::UpstreamError(message));
-    }
-    if let Some(message) = error {
-        return Err(AdminServiceError::UpstreamError(message));
-    }
-    if let Some(message) = exception {
-        return Err(AdminServiceError::UpstreamError(message));
-    }
-    if text_content.trim().is_empty() {
-        return Err(AdminServiceError::UpstreamError(
-            "模型调用成功但响应为空".to_string(),
-        ));
-    }
-
-    Ok(text_content)
 }
 
 fn normalize_page(page: usize) -> usize {

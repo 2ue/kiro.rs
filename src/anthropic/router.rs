@@ -11,6 +11,7 @@ use axum::{
 
 use crate::account_runtime::{AccountRuntimeConfig, AccountRuntimeManager};
 use crate::common::auth::RequestApiKeyStore;
+#[cfg(test)]
 use crate::local_upstream::provider::LocalUpstreamProvider;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ImageProcessingConfig,
@@ -45,6 +46,7 @@ use super::{
 pub struct AnthropicRouterDependencies {
     pub request_api_keys: Arc<RequestApiKeyStore>,
     pub request_admission: Arc<RequestAdmissionController>,
+    #[cfg(test)]
     pub local_upstream_provider: Option<Arc<LocalUpstreamProvider>>,
     pub usage_recorder: Arc<UsageRecorder>,
     pub prompt_cache: Arc<PromptCacheTracker>,
@@ -164,6 +166,7 @@ pub fn create_router_with_provider(
     let AnthropicRouterDependencies {
         request_api_keys,
         request_admission,
+        #[cfg(test)]
         local_upstream_provider,
         usage_recorder,
         prompt_cache,
@@ -258,6 +261,7 @@ pub fn create_router_with_provider(
     .with_tool_format_debug_recorder(tool_format_debug_recorder)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
+    #[cfg(test)]
     if let Some(provider) = local_upstream_provider {
         base_state = base_state.with_local_upstream_provider(provider);
     }

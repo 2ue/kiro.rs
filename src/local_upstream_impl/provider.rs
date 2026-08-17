@@ -7,10 +7,14 @@
 
 use chrono::Utc;
 use once_cell::sync::OnceCell;
+use reqwest::Client;
+#[cfg(test)]
+use reqwest::Method;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
-use reqwest::{Client, Method};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,14 +26,16 @@ use crate::anthropic::inference_attempt_budget::{
     AuxiliaryAttemptBudget, AuxiliaryAttemptBudgetExhausted, AuxiliaryAttemptKind,
     InferenceAttemptBudget, InferenceAttemptKind, InferenceAttemptRejection,
 };
+#[cfg(test)]
 use crate::anthropic::model_capabilities::{
     UpstreamReasoningCapabilityState, intersect_authoritative_reasoning_schemas,
 };
 use crate::common::upstream_error::RawUpstreamError;
+#[cfg(test)]
+use crate::http_client::execute_with_response_header_timeout;
 use crate::http_client::{
-    HttpSendError, ProxyConfig, build_client, execute_with_response_header_timeout,
-    response_bytes_with_limit_and_body_timeout, response_text_with_limit_and_body_timeout,
-    send_with_response_header_timeout,
+    HttpSendError, ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
+    response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
 use crate::local_upstream_impl::call_trace::{
     LocalUpstreamCallError, LocalUpstreamCallFailureKind, LocalUpstreamCredentialAttempt,
@@ -39,6 +45,7 @@ use crate::local_upstream_impl::endpoint::{
     LocalUpstreamEndpoint, RequestContext, configured_upstream_url,
 };
 use crate::local_upstream_impl::machine_id;
+#[cfg(test)]
 use crate::local_upstream_impl::model::available_models::{
     LocalUpstreamAvailableModel, LocalUpstreamAvailableModelCatalog,
     LocalUpstreamAvailableModelsResponse,
@@ -61,14 +68,18 @@ const DEFAULT_AUTO_RETRY_ATTEMPTS: usize = 3;
 
 /// Global model discovery is an auxiliary operation, not an inference request. Keep its
 /// credential fan-out independent from the size of the configured account pool.
+#[cfg(test)]
 const MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS: usize = 4;
+#[cfg(test)]
 const MODEL_DISCOVERY_MAX_HTTP_SENDS: usize = 20;
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ModelDiscoverySendBudget {
     consumed: usize,
 }
 
+#[cfg(test)]
 impl ModelDiscoverySendBudget {
     fn new() -> Self {
         Self { consumed: 0 }
@@ -87,6 +98,7 @@ impl ModelDiscoverySendBudget {
     }
 }
 
+#[cfg(test)]
 fn merge_model_discovery_catalogs(
     catalogs: Vec<Vec<LocalUpstreamAvailableModel>>,
     cohort_complete: bool,
@@ -503,8 +515,10 @@ pub struct LocalUpstreamProvider {
     /// 默认端点名称（凭据未指定 endpoint 时使用）
     default_endpoint: String,
     /// Prevent startup and Admin model discovery from scanning the account pool concurrently.
+    #[cfg(test)]
     model_discovery_in_progress: AtomicBool,
     /// Rotates representative accounts within a stable capability cohort across bounded syncs.
+    #[cfg(test)]
     model_discovery_round: AtomicU64,
     /// Per-credential auxiliary profile discovery coordination. The map is bounded and stores
     /// only SHA-256 identities, never raw credential secrets.
@@ -525,10 +539,12 @@ struct ProviderClientCache {
     clock: u64,
 }
 
+#[cfg(test)]
 struct ModelDiscoveryRunGuard<'a> {
     flag: &'a AtomicBool,
 }
 
+#[cfg(test)]
 impl<'a> ModelDiscoveryRunGuard<'a> {
     fn acquire(flag: &'a AtomicBool) -> anyhow::Result<Self> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -539,6 +555,7 @@ impl<'a> ModelDiscoveryRunGuard<'a> {
     }
 }
 
+#[cfg(test)]
 impl Drop for ModelDiscoveryRunGuard<'_> {
     fn drop(&mut self) {
         self.flag.store(false, Ordering::Release);
@@ -6751,7 +6768,9 @@ impl LocalUpstreamProvider {
             tls_backend,
             endpoints,
             default_endpoint,
+            #[cfg(test)]
             model_discovery_in_progress: AtomicBool::new(false),
+            #[cfg(test)]
             model_discovery_round: AtomicU64::new(0),
             profile_arn_discovery_entries: Mutex::new(HashMap::new()),
             profile_arn_discovery_clock: AtomicU64::new(0),
@@ -8428,6 +8447,7 @@ impl LocalUpstreamProvider {
     ///
     /// Admin 测试账号连通性时使用；不参与负载均衡、不做凭据 fallback，
     /// 失败也不累计禁用计数，避免手动测试改变调度状态。
+    #[cfg(test)]
     pub async fn call_api_with_credential(
         &self,
         credential_id: u64,
@@ -8443,42 +8463,7 @@ impl LocalUpstreamProvider {
             .await
     }
 
-    /// 使用外部临时凭据发送一次非流式 API 请求。
-    ///
-    /// 仅用于 Admin 外部 JSON 验活：不加入凭据池、不参与负载均衡、不累计调度状态。
-    pub async fn call_api_with_external_credentials(
-        &self,
-        credentials: LocalUpstreamCredentials,
-        request_body: &str,
-    ) -> anyhow::Result<LocalUpstreamApiResponse> {
-        let ctx = self
-            .token_manager
-            .acquire_context_for_external_credentials(credentials)
-            .await?;
-        self.call_api_with_single_context(
-            ctx,
-            request_body,
-            "external".to_string(),
-            "外部凭据".to_string(),
-        )
-        .await
-    }
-
-    /// 使用外部临时凭据同步可用模型列表。
-    ///
-    /// 该方法不把凭据写入调度池，适合 Admin 新增 / 导入 API Key 时先做能力发现，
-    /// 然后再把发现结果写回 supportedModels。
-    pub async fn list_available_models_for_external_credentials(
-        &self,
-        credentials: LocalUpstreamCredentials,
-    ) -> anyhow::Result<Vec<LocalUpstreamAvailableModel>> {
-        let ctx = self
-            .token_manager
-            .acquire_context_for_external_credentials(credentials)
-            .await?;
-        self.list_available_models_for_context(ctx).await
-    }
-
+    #[cfg(test)]
     async fn call_api_with_single_context(
         &self,
         mut ctx: CallContext,
@@ -8609,6 +8594,7 @@ impl LocalUpstreamProvider {
     /// 该方法只用于后台模型能力同步：失败会返回给调用方记录状态，不会写入调度失败、
     /// 不会禁用凭据，也不会占用请求并发槽。由于同步会真实调用本地上游，
     /// 这里只自动使用未禁用凭据，避免后台任务绕过用户手动禁用。
+    #[cfg(test)]
     pub async fn list_available_models(
         &self,
     ) -> anyhow::Result<LocalUpstreamAvailableModelCatalog> {
@@ -8745,21 +8731,7 @@ impl LocalUpstreamProvider {
         self.token_manager.local_model_capability_cohort_keys()
     }
 
-    /// 使用指定凭据同步本地上游可用模型列表。
-    ///
-    /// 该方法会真实调用上游模型列表接口，但不占用普通请求并发槽。
-    pub async fn list_available_models_for_credential(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<Vec<LocalUpstreamAvailableModel>> {
-        let ctx = self
-            .token_manager
-            .acquire_context_for_credential(id)
-            .await
-            .map_err(|err| anyhow::anyhow!("账号 #{} 获取 token 失败: {}", id, err))?;
-        self.list_available_models_for_context(ctx).await
-    }
-
+    #[cfg(test)]
     async fn list_available_models_for_context(
         &self,
         ctx: CallContext,
@@ -8769,6 +8741,7 @@ impl LocalUpstreamProvider {
             .await
     }
 
+    #[cfg(test)]
     async fn list_available_models_for_context_with_budget(
         &self,
         mut ctx: CallContext,

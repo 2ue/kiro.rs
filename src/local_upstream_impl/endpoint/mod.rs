@@ -6,7 +6,9 @@
 //! [`LocalUpstreamEndpoint`] 抽象了请求侧的差异点；`LocalUpstreamProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
-use reqwest::{Method, RequestBuilder};
+#[cfg(test)]
+use reqwest::Method;
+use reqwest::RequestBuilder;
 
 use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
 use crate::model::config::Config;
@@ -238,17 +240,20 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String;
 
     /// ListAvailableModels endpoint URL.
+    #[cfg(test)]
     fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String;
 
     /// ListAvailableModels HTTP method.
     ///
     /// IDE-compatible endpoints use the legacy GET form. The CLI management
     /// endpoint uses AWS JSON 1.0 POST with a JSON body.
+    #[cfg(test)]
     fn models_method(&self, _ctx: &RequestContext<'_>) -> Method {
         Method::GET
     }
 
     /// Optional ListAvailableModels JSON body.
+    #[cfg(test)]
     fn models_body(
         &self,
         _ctx: &RequestContext<'_>,
@@ -267,6 +272,7 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
     /// 装饰 ListAvailableModels 请求的端点特有 header
+    #[cfg(test)]
     fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
     /// 对已序列化的 API 请求体做端点特有加工（如注入 profileArn）

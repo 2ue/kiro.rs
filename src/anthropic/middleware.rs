@@ -307,6 +307,7 @@ impl AppState {
     }
 
     /// 设置本地上游 provider
+    #[cfg(test)]
     pub fn with_local_upstream_provider(mut self, provider: Arc<LocalUpstreamProvider>) -> Self {
         self.local_upstream_provider = Some(provider);
         self

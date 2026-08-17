@@ -96,8 +96,10 @@ pub(crate) mod event {
 }
 
 pub(crate) mod model_catalog {
+    #[cfg(test)]
     pub(crate) type LocalUpstreamAvailableModel =
         crate::local_upstream_impl::model::available_models::LocalUpstreamAvailableModel;
+    #[cfg(test)]
     pub(crate) type LocalUpstreamAvailableModelCatalog =
         crate::local_upstream_impl::model::available_models::LocalUpstreamAvailableModelCatalog;
     pub(crate) type LocalUpstreamModelCapabilityCohortKey =

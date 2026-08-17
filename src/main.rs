@@ -42,7 +42,6 @@ use futures::StreamExt;
 use local_upstream::{
     credentials::{LocalUpstreamCredentials, LocalUpstreamCredentialsConfig},
     manager::LocalUpstreamCredentialManager,
-    provider::LocalUpstreamProvider,
 };
 use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
 use model::config::Config;
@@ -56,74 +55,7 @@ const BACKGROUND_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const BACKGROUND_DRAIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const BACKGROUND_SHUTDOWN_TOTAL_TIMEOUT: StdDuration = StdDuration::from_secs(45);
 const ABORTED_TASK_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
-const MODEL_CAPABILITY_HEALTH_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
-const MODEL_CAPABILITY_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(300);
 const OBSERVABILITY_REDIS_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(5);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelCapabilityDiscoveryOutcome {
-    Pending,
-    Complete,
-    Incomplete,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeReasoningUnknownReason {
-    NoLocalCohorts,
-    DiscoveryPending,
-    DiscoveryIncomplete,
-    DiscoveryFailed,
-    ContractMismatch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeReasoningStartupDecision {
-    ContinueReady(anthropic::model_capabilities::UpstreamReasoningCohortContractMatch),
-    ContinueReasoningUnknown(NativeReasoningUnknownReason),
-}
-
-fn decide_native_reasoning_startup(
-    discovery: ModelCapabilityDiscoveryOutcome,
-    current_cohort_count: usize,
-    contract_match: anthropic::model_capabilities::UpstreamReasoningCohortContractMatch,
-) -> NativeReasoningStartupDecision {
-    use anthropic::model_capabilities::UpstreamReasoningCohortContractMatch;
-
-    if current_cohort_count == 0 {
-        return NativeReasoningStartupDecision::ContinueReasoningUnknown(
-            NativeReasoningUnknownReason::NoLocalCohorts,
-        );
-    }
-    if contract_match != UpstreamReasoningCohortContractMatch::None {
-        return NativeReasoningStartupDecision::ContinueReady(contract_match);
-    }
-    let reason = match discovery {
-        ModelCapabilityDiscoveryOutcome::Pending => NativeReasoningUnknownReason::DiscoveryPending,
-        ModelCapabilityDiscoveryOutcome::Incomplete => {
-            NativeReasoningUnknownReason::DiscoveryIncomplete
-        }
-        ModelCapabilityDiscoveryOutcome::Failed => NativeReasoningUnknownReason::DiscoveryFailed,
-        ModelCapabilityDiscoveryOutcome::Complete => NativeReasoningUnknownReason::ContractMismatch,
-    };
-    NativeReasoningStartupDecision::ContinueReasoningUnknown(reason)
-}
-
-fn model_capability_retry_delay(consecutive_failures: u32) -> StdDuration {
-    let seconds = match consecutive_failures {
-        0 | 1 => 30,
-        2 => 60,
-        3 => 120,
-        _ => MODEL_CAPABILITY_RETRY_MAX_DELAY.as_secs(),
-    };
-    StdDuration::from_secs(seconds)
-}
-
-#[cfg(test)]
-fn legacy_credential_provider_required(config: &Config) -> bool {
-    let _ = config;
-    false
-}
 
 #[tokio::main]
 async fn main() {
@@ -439,7 +371,7 @@ async fn main() {
         ),
     }
 
-    // 创建运行时管理器。旧凭据 provider 仅在未启用上游账号运行时时安装。
+    // 创建运行时管理器。旧凭据 provider 不再作为生产执行器安装。
     let token_manager =
         LocalUpstreamCredentialManager::new_with_stores_and_runtime_state_and_account_info(
             config.clone(),
@@ -469,45 +401,7 @@ async fn main() {
         request_admission.clone(),
         runtime_event_health.clone(),
     );
-    let local_upstream_provider: Option<Arc<LocalUpstreamProvider>> = None;
-    let model_capability_recovery_task = if let Some(local_upstream_provider) =
-        local_upstream_provider.as_ref()
-    {
-        let initial_capability_cohort_keys = local_upstream_provider.model_capability_cohort_keys();
-        let initial_contract_match = model_capabilities
-            .reasoning_capability_cohort_contract_match(&initial_capability_cohort_keys);
-        match decide_native_reasoning_startup(
-            ModelCapabilityDiscoveryOutcome::Pending,
-            initial_capability_cohort_keys.len(),
-            initial_contract_match,
-        ) {
-            NativeReasoningStartupDecision::ContinueReady(contract_match) => tracing::info!(
-                cohort_count = initial_capability_cohort_keys.len(),
-                ?contract_match,
-                "已加载可覆盖当前账号 cohort 的 native reasoning 合同；能力恢复任务只检查内存 fence"
-            ),
-            NativeReasoningStartupDecision::ContinueReasoningUnknown(reason) => {
-                if model_capabilities.status().last_error.is_none() {
-                    model_capabilities.record_sync_error(
-                        "native reasoning capability is Unknown while background cohort discovery is pending; ordinary and external-only service remains ready",
-                    );
-                }
-                tracing::warn!(
-                    cohort_count = initial_capability_cohort_keys.len(),
-                    ?reason,
-                    "native reasoning 能力当前为 Unknown；服务继续启动，显式 native reasoning fail closed，普通及 external-only 流量不受阻断"
-                );
-            }
-        }
-        Some(spawn_model_capability_recovery_worker(
-            local_upstream_provider.clone(),
-            model_capabilities.clone(),
-            postgres_store.clone(),
-        ))
-    } else {
-        tracing::info!("上游账号运行时不启动旧模型能力恢复任务");
-        None
-    };
+    tracing::info!("账号运行时不启动旧本地上游模型能力恢复任务");
 
     let startup_pricing_sync_task = {
         let postgres_store = postgres_store.clone();
@@ -549,7 +443,8 @@ async fn main() {
         anthropic::AnthropicRouterDependencies {
             request_api_keys: request_api_key_store.clone(),
             request_admission: request_admission.clone(),
-            local_upstream_provider: local_upstream_provider.clone(),
+            #[cfg(test)]
+            local_upstream_provider: None,
             usage_recorder: usage_recorder.clone(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
@@ -581,7 +476,6 @@ async fn main() {
                 prompt_cache_creation_controller: prompt_cache_creation_controller.clone(),
                 pricing_catalog: pricing_catalog.clone(),
                 model_capabilities: model_capabilities.clone(),
-                local_upstream_provider: local_upstream_provider.clone(),
                 postgres_store: postgres_store.clone(),
                 observability_redis_store: observability_redis_store.clone(),
                 request_api_key_store: request_api_key_store.clone(),
@@ -668,10 +562,6 @@ async fn main() {
     runtime_event_health.mark_disconnected();
     tokio::join!(
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
-        abort_optional_task_with_timeout(
-            "model capability recovery",
-            model_capability_recovery_task
-        ),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 
@@ -804,124 +694,6 @@ async fn main() {
     }
 }
 
-fn spawn_model_capability_recovery_worker(
-    local_upstream_provider: Arc<LocalUpstreamProvider>,
-    model_capabilities: Arc<anthropic::model_capabilities::ModelCapabilitiesCatalog>,
-    postgres_store: Arc<PostgresStore>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut consecutive_failures = 0u32;
-        let mut reported_empty_local_cohort = false;
-
-        loop {
-            let current_cohort_keys = local_upstream_provider.model_capability_cohort_keys();
-            if current_cohort_keys.is_empty() {
-                consecutive_failures = 0;
-                if !reported_empty_local_cohort {
-                    let status = model_capabilities.record_sync_error(
-                        "native reasoning capability is Unknown because no local capability cohort is configured; ordinary and external-only service remains ready",
-                    );
-                    if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
-                        tracing::warn!(
-                            "保存 external-only 模式的模型能力健康状态到 PgSQL 失败: {}",
-                            err
-                        );
-                    }
-                    tracing::warn!(
-                        native_reasoning_health = "unknown",
-                        "当前没有本地 capability cohort；跳过上游模型发现并保持服务可用"
-                    );
-                    reported_empty_local_cohort = true;
-                }
-                tokio::time::sleep(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL).await;
-                continue;
-            }
-            reported_empty_local_cohort = false;
-
-            let contract_match =
-                model_capabilities.reasoning_capability_cohort_contract_match(&current_cohort_keys);
-            if contract_match
-                != anthropic::model_capabilities::UpstreamReasoningCohortContractMatch::None
-            {
-                if consecutive_failures > 0 {
-                    tracing::info!(
-                        cohort_count = current_cohort_keys.len(),
-                        ?contract_match,
-                        "native reasoning cohort fence 已恢复；后台任务返回纯内存低频检查"
-                    );
-                }
-                consecutive_failures = 0;
-                tokio::time::sleep(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL).await;
-                continue;
-            }
-
-            let (status, discovery) = match local_upstream_provider.list_available_models().await {
-                Ok(catalog) => {
-                    let discovery = if catalog.complete {
-                        ModelCapabilityDiscoveryOutcome::Complete
-                    } else {
-                        ModelCapabilityDiscoveryOutcome::Incomplete
-                    };
-                    (
-                        model_capabilities.sync_from_upstream_catalog(catalog),
-                        discovery,
-                    )
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "后台模型能力发现失败；native reasoning 保持 Unknown，服务继续运行"
-                    );
-                    (
-                        model_capabilities.record_sync_error(format!(
-                            "native reasoning capability remains Unknown after background discovery failure: {err}"
-                        )),
-                        ModelCapabilityDiscoveryOutcome::Failed,
-                    )
-                }
-            };
-            if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
-                tracing::warn!("保存后台模型能力健康状态到 PgSQL 失败: {}", err);
-            }
-
-            // Cohorts may change while discovery is in flight. Fence the result against a fresh
-            // in-memory snapshot before declaring recovery.
-            let refreshed_cohort_keys = local_upstream_provider.model_capability_cohort_keys();
-            let refreshed_contract_match = model_capabilities
-                .reasoning_capability_cohort_contract_match(&refreshed_cohort_keys);
-            match decide_native_reasoning_startup(
-                discovery,
-                refreshed_cohort_keys.len(),
-                refreshed_contract_match,
-            ) {
-                NativeReasoningStartupDecision::ContinueReady(contract_match) => {
-                    tracing::info!(
-                        cohort_count = refreshed_cohort_keys.len(),
-                        ?contract_match,
-                        ?discovery,
-                        "native reasoning cohort fence 后台恢复成功"
-                    );
-                    consecutive_failures = 0;
-                    tokio::time::sleep(MODEL_CAPABILITY_HEALTH_POLL_INTERVAL).await;
-                }
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(reason) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let retry_delay = model_capability_retry_delay(consecutive_failures);
-                    tracing::warn!(
-                        cohort_count = refreshed_cohort_keys.len(),
-                        ?reason,
-                        ?discovery,
-                        consecutive_failures,
-                        retry_in_secs = retry_delay.as_secs(),
-                        "native reasoning cohort fence 尚未恢复；普通及 external-only 流量继续服务，后台发现按上限退避"
-                    );
-                    tokio::time::sleep(retry_delay).await;
-                }
-            }
-        }
-    })
-}
-
 fn remaining_shutdown_budget(deadline: Instant, stage_limit: StdDuration) -> StdDuration {
     deadline
         .saturating_duration_since(Instant::now())
@@ -939,15 +711,6 @@ async fn abort_task_with_timeout<T>(task_name: &'static str, task: tokio::task::
             timeout_ms = ABORTED_TASK_JOIN_TIMEOUT.as_millis() as u64,
             "等待已中止后台任务退出超时，丢弃任务句柄"
         );
-    }
-}
-
-async fn abort_optional_task_with_timeout<T>(
-    task_name: &'static str,
-    task: Option<tokio::task::JoinHandle<T>>,
-) {
-    if let Some(task) = task {
-        abort_task_with_timeout(task_name, task).await;
     }
 }
 
@@ -1541,90 +1304,6 @@ mod lifecycle_tests {
 
         assert_eq!(body["status"], "ok");
         assert_eq!(body["service"], "account-runtime");
-    }
-
-    #[test]
-    fn native_reasoning_startup_decision_never_blocks_service_for_five_rounds() {
-        use anthropic::model_capabilities::UpstreamReasoningCohortContractMatch;
-
-        for round in 0..5 {
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Failed,
-                    1,
-                    UpstreamReasoningCohortContractMatch::None,
-                ),
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(
-                    NativeReasoningUnknownReason::DiscoveryFailed
-                ),
-                "round {round}: discovery failure must degrade only native reasoning"
-            );
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Incomplete,
-                    5,
-                    UpstreamReasoningCohortContractMatch::None,
-                ),
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(
-                    NativeReasoningUnknownReason::DiscoveryIncomplete
-                ),
-                "round {round}: bounded discovery over four cohorts must keep service ready"
-            );
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Failed,
-                    1,
-                    UpstreamReasoningCohortContractMatch::ConservativeSubset,
-                ),
-                NativeReasoningStartupDecision::ContinueReady(
-                    UpstreamReasoningCohortContractMatch::ConservativeSubset
-                ),
-                "round {round}: a verified superset contract remains safe after discovery failure"
-            );
-            assert_eq!(
-                decide_native_reasoning_startup(
-                    ModelCapabilityDiscoveryOutcome::Pending,
-                    0,
-                    UpstreamReasoningCohortContractMatch::Exact,
-                ),
-                NativeReasoningStartupDecision::ContinueReasoningUnknown(
-                    NativeReasoningUnknownReason::NoLocalCohorts
-                ),
-                "round {round}: an empty local pool must not vacuously enable native reasoning"
-            );
-        }
-    }
-
-    #[test]
-    fn model_capability_recovery_backoff_is_bounded_for_five_rounds() {
-        let expected = [30, 60, 120, 300, 300, 300, 300];
-        for round in 0..5 {
-            for (failure_index, expected_secs) in expected.into_iter().enumerate() {
-                assert_eq!(
-                    model_capability_retry_delay((failure_index + 1) as u32),
-                    StdDuration::from_secs(expected_secs),
-                    "round {round}: failure {}",
-                    failure_index + 1
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn legacy_provider_is_never_required_at_runtime() {
-        let mut config = Config::default();
-
-        config.external_pools.external_pools_enabled = true;
-        assert!(
-            !legacy_credential_provider_required(&config),
-            "enabled upstream account runtime must not install the legacy provider"
-        );
-
-        config.external_pools.external_pools_enabled = false;
-        assert!(
-            !legacy_credential_provider_required(&config),
-            "disabled account routing must fail closed instead of installing the legacy provider"
-        );
     }
 
     #[tokio::test]

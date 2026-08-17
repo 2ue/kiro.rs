@@ -6,9 +6,10 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::types::Model;
+use crate::local_upstream::model_catalog::LocalUpstreamModelCapabilityCohortKey;
+#[cfg(test)]
 use crate::local_upstream::model_catalog::{
     LocalUpstreamAvailableModel, LocalUpstreamAvailableModelCatalog,
-    LocalUpstreamModelCapabilityCohortKey,
 };
 use crate::model::config::{ModelMappingConfig, ModelMappingRuleKind, ModelResolutionMode};
 
@@ -112,6 +113,7 @@ fn reasoning_cohort_contract_match(
 }
 
 impl UpstreamReasoningFieldCapability {
+    #[cfg(test)]
     pub(crate) fn from_schema(schema: &serde_json::Value) -> Option<Self> {
         let mut discovered = None;
         'field_candidates: for (field, path) in [
@@ -204,6 +206,7 @@ impl UpstreamReasoningFieldCapability {
                 .is_none_or(|default| self.efforts.iter().any(|effort| effort == default))
     }
 
+    #[cfg(test)]
     pub(crate) fn to_schema(&self) -> serde_json::Value {
         let field = match self.path {
             UpstreamReasoningFieldPath::OutputConfig => "output_config",
@@ -229,6 +232,7 @@ impl UpstreamReasoningFieldCapability {
 }
 
 /// Compute the only native reasoning schema that is safe for every credential in a cohort.
+#[cfg(test)]
 pub(crate) fn intersect_authoritative_reasoning_schemas<'a>(
     schemas: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
 ) -> UpstreamReasoningCapabilityState {
@@ -608,6 +612,7 @@ impl ModelCapabilitiesCatalog {
             .unwrap_or(UpstreamReasoningCapabilityState::Unknown)
     }
 
+    #[cfg(test)]
     pub(crate) fn reasoning_capability_cohort_contract_match(
         &self,
         current_capability_cohort_keys: &[LocalUpstreamModelCapabilityCohortKey],
@@ -683,6 +688,7 @@ impl ModelCapabilitiesCatalog {
         }
     }
 
+    #[cfg(test)]
     pub fn sync_from_upstream_catalog(
         &self,
         mut catalog: LocalUpstreamAvailableModelCatalog,
@@ -726,6 +732,7 @@ impl ModelCapabilitiesCatalog {
         self.sync_from_upstream_models_with_cohort(models, None, true, 1, 1)
     }
 
+    #[cfg(test)]
     fn sync_from_upstream_models_with_cohort(
         &self,
         models: Vec<LocalUpstreamAvailableModel>,
@@ -985,6 +992,7 @@ impl ModelResolution {
     }
 }
 
+#[cfg(test)]
 fn model_capability_from_upstream_catalog_item(
     model: LocalUpstreamAvailableModel,
 ) -> Option<ModelCapabilityItem> {
@@ -1695,10 +1703,12 @@ fn model_matches_family(model: &str, family: &str) -> bool {
     model == family || model.starts_with(&format!("claude-{}", family))
 }
 
+#[cfg(test)]
 fn contains_claude_model_id<'a>(models: impl IntoIterator<Item = &'a str>) -> bool {
     models.into_iter().any(is_claude_model_id)
 }
 
+#[cfg(test)]
 fn is_claude_model_id(model: &str) -> bool {
     ["claude-opus-", "claude-sonnet-", "claude-haiku-"]
         .into_iter()

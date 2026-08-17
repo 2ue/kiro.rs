@@ -1,5 +1,6 @@
 //! Local-upstream ListAvailableModels response models.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// are never serialized to upstream or exposed through the Admin model payload. Consumers may publish
 /// native reasoning fields only while the current local cohort keys exactly match this snapshot.
 #[derive(Debug, Clone, Default)]
+#[cfg(test)]
 pub struct LocalUpstreamAvailableModelCatalog {
     pub models: Vec<LocalUpstreamAvailableModel>,
     pub capability_cohort_keys: Vec<LocalUpstreamModelCapabilityCohortKey>,
@@ -18,6 +20,7 @@ pub struct LocalUpstreamAvailableModelCatalog {
     pub complete: bool,
 }
 
+#[cfg(test)]
 impl std::ops::Deref for LocalUpstreamAvailableModelCatalog {
     type Target = [LocalUpstreamAvailableModel];
 
@@ -49,6 +52,7 @@ pub(crate) struct LocalUpstreamModelCapabilityCohort {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct LocalUpstreamAvailableModelsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<LocalUpstreamAvailableModel>,
@@ -60,6 +64,7 @@ pub struct LocalUpstreamAvailableModelsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct LocalUpstreamAvailableModel {
     #[serde(default, alias = "id")]
     pub model_id: String,
@@ -85,6 +90,7 @@ pub struct LocalUpstreamAvailableModel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct LocalUpstreamModelTokenLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<i32>,
@@ -94,6 +100,7 @@ pub struct LocalUpstreamModelTokenLimits {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 pub struct LocalUpstreamModelPromptCaching {
     #[serde(default)]
     pub supports_prompt_caching: bool,
