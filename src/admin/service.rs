@@ -106,7 +106,8 @@ const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
-const USAGE_CLEANUP_DEFAULT_BATCH_SIZE: usize = 250;
+const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS: u32 = 3;
+const USAGE_CLEANUP_DEFAULT_BATCH_SIZE: usize = 5_000;
 const USAGE_CLEANUP_MAX_BATCH_SIZE: usize = 5_000;
 const USAGE_CLEANUP_LEASE_SECS: u64 = 30;
 const USAGE_CLEANUP_HEARTBEAT_ATTEMPT_TIMEOUT_MS: u64 = 2_000;
@@ -4071,15 +4072,19 @@ impl AdminService {
     }
 
     /// 兼容旧清空入口：提交一个有界、可审计的全量明细软删除任务。
-    pub fn clear_usage_records(&self) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
-        self.start_usage_cleanup(UsageCleanupRequest {
+    /// 若传入参数，则直接按参数执行；否则保持旧的全量清空语义。
+    pub fn clear_usage_records(
+        &self,
+        request: Option<UsageCleanupRequest>,
+    ) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
+        self.start_usage_cleanup(request.unwrap_or(UsageCleanupRequest {
             mode: UsageCleanupMode::SoftDelete,
             older_than_days: Some(0),
             cutoff_before: None,
             batch_size: Some(USAGE_CLEANUP_DEFAULT_BATCH_SIZE),
             max_batches: None,
             pause_ms_between_batches: None,
-        })
+        }))
     }
 
     pub fn preview_usage_cleanup(
@@ -7097,7 +7102,9 @@ fn normalize_usage_cleanup_request(
             })?
             .with_timezone(&Utc)
     } else {
-        let days = request.older_than_days.unwrap_or(7);
+        let days = request
+            .older_than_days
+            .unwrap_or(USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS);
         if days > 3650 {
             return Err(AdminServiceError::InvalidCredential(
                 "olderThanDays 不能超过 3650".to_string(),

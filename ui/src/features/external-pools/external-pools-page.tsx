@@ -48,11 +48,13 @@ import {
   defaultPoolForm,
   joinRules,
   joinStatusCodeList,
+  parseHeaderOverridesText,
   parseModelMappingRules,
   parseStatusCodeList,
   parseSupportedModelsText,
   poolFormFromPool,
   poolBodyModeSummary,
+  poolHeaderProfileSummary,
   poolModelMappingSummary,
   poolRouteSummary,
   streamRetrySummary,
@@ -206,12 +208,13 @@ export function ExternalPoolsPage() {
     if (!createForm.name?.trim() || !createForm.baseUrl?.trim() || !createForm.apiKey?.trim()) return toast.error('名称、Base URL 和 Key 必填')
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = createForm
+      const { modelMappingRulesText, supportedModelsText, routeRulesText, headerOverridesText, ...form } = createForm
       await createExternalPool({
         ...form,
         name: createForm.name.trim(),
         baseUrl: createForm.baseUrl.trim(),
         apiKey: createForm.apiKey.trim(),
+        headerOverrides: parseHeaderOverridesText(headerOverridesText),
         streamResponseMode: createForm.streamResponseMode === 'inherit' ? null : createForm.streamResponseMode,
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
@@ -240,12 +243,13 @@ export function ExternalPoolsPage() {
     if (!editForm.name?.trim() || !editForm.baseUrl?.trim()) return toast.error('名称和 Base URL 必填')
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = editForm
+      const { modelMappingRulesText, supportedModelsText, routeRulesText, headerOverridesText, ...form } = editForm
       const payload: UpdateExternalPoolRequest = {
         ...form,
         name: editForm.name.trim(),
         baseUrl: editForm.baseUrl.trim(),
         apiKey: editForm.apiKey?.trim() ? editForm.apiKey.trim() : undefined,
+        headerOverrides: parseHeaderOverridesText(headerOverridesText),
         streamResponseMode: editForm.streamResponseMode === 'inherit' ? null : editForm.streamResponseMode,
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
@@ -564,7 +568,7 @@ export function ExternalPoolsPage() {
                           <Badge tone={runtime?.dispatchable ? 'info' : 'neutral'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                         </div>
                         <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {inFlight}/{capacity} · 优先级 {pool.priority}</div>
-                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {streamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} · {poolSupportedModelsSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
+                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {streamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · {poolHeaderProfileSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} · {poolSupportedModelsSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
                         {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                       </div>
                     </div>

@@ -15,8 +15,9 @@ use crate::anthropic::usage::{
 use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
-    ExternalPoolManager, ExternalPoolModelMappingMode, ExternalPoolRawModelMode,
-    ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode, ExternalPoolUsageProjectionMode,
+    ExternalPoolHeaderProfile, ExternalPoolManager, ExternalPoolModelMappingMode,
+    ExternalPoolRawModelMode, ExternalPoolRequestBodyMode, ExternalPoolStreamRetryMode,
+    ExternalPoolTlsProfile, ExternalPoolUsageProjectionMode, ExternalPoolWireProfile,
 };
 use crate::kiro::call_trace::{
     AccountRejectReason, KiroCallError, SelectionFailureStage, SelectionFailureSummary,
@@ -39,7 +40,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Mutex as StdMutex, atomic::AtomicUsize};
@@ -943,6 +944,11 @@ async fn test_external_pool_manager_for_handlers(
             base_url: base_url.to_string(),
             api_key: "sk-handler-external-test".to_string(),
             auth_type: ExternalPoolAuthType::XApiKey,
+            header_profile: ExternalPoolHeaderProfile::Generic,
+            append_beta_query: false,
+            header_overrides: HashMap::new(),
+            wire_profile: ExternalPoolWireProfile::Default,
+            tls_profile: ExternalPoolTlsProfile::Default,
             enabled: true,
             priority: 1,
             max_concurrent_requests: 10,

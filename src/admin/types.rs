@@ -691,13 +691,13 @@ pub struct UsageCleanupRequest {
     #[serde(default)]
     pub mode: UsageCleanupMode,
     /// 清理多少天之前的数据；soft_delete 对应 created_at，hard_delete 对应 deleted_at。
-    /// 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录；最大 3650。
+    /// 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录；未传默认 3 天；最大 3650。
     #[serde(default)]
     pub older_than_days: Option<u32>,
     /// 自定义 cutoff，优先级高于 older_than_days。
     #[serde(default)]
     pub cutoff_before: Option<String>,
-    /// 每批处理行数，默认 1000。
+    /// 每批处理行数，默认 5000。
     #[serde(default)]
     pub batch_size: Option<usize>,
     /// 内部安全批次上限；不传或传 0 时默认 10000，页面默认不暴露这个参数。

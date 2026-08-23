@@ -1468,8 +1468,14 @@ pub async fn get_usage_writer_stats(State(state): State<AdminState>) -> impl Int
 
 /// POST /api/admin/usage-records/clear
 /// 清空请求级 usage 记录
-pub async fn clear_usage_records(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.clear_usage_records() {
+pub async fn clear_usage_records(
+    State(state): State<AdminState>,
+    payload: Option<Json<UsageCleanupRequest>>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .clear_usage_records(payload.map(|Json(payload)| payload))
+    {
         Ok(data) => (StatusCode::ACCEPTED, Json(data)).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

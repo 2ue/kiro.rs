@@ -2,15 +2,19 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatDate, formatNumber } from '@/lib/format'
-import { usePreviewUsageCleanup, useStartUsageCleanup, useCancelUsageCleanup, useUsageCleanupStatus, useClearUsageRecords, useResumeUsageCleanup } from '@/hooks/use-usage'
+import { usePreviewUsageCleanup, useStartUsageCleanup, useCancelUsageCleanup, useUsageCleanupStatus, useResumeUsageCleanup } from '@/hooks/use-usage'
 import type { UsageCleanupRequest } from '@/types/api'
 import { ModalShell, Callout, useConfirm } from '@/components/patterns'
 import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui'
 
 const CLEANUP_MAX_OLDER_THAN_DAYS = 3650
-const CLEANUP_DEFAULT_BATCH_SIZE = 250
+const CLEANUP_DEFAULT_OLDER_THAN_DAYS = 3
+const CLEANUP_DEFAULT_BATCH_SIZE = 5_000
+const CLEANUP_DEFAULT_MAX_BATCHES = 10_000
+const CLEANUP_MAX_BATCHES = 10_000
 const CLEANUP_MAX_BATCH_SIZE = 5000
 const CLEANUP_MAX_PAUSE_MS = 10000
+const CLEANUP_DEFAULT_PAUSE_MS = 100
 
 function boundedInteger(value: string, fallback: number, min: number, max: number): number {
   const parsed = Number(value)
@@ -19,21 +23,21 @@ function boundedInteger(value: string, fallback: number, min: number, max: numbe
 }
 
 function cleanupRangeLabel(days: number): string {
-  return days === 0 ? '执行时刻之前' : `${days} 天前`
+  return days === 0 ? '当前时刻之前' : `${days} 天前`
 }
 
 export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [olderThanDays, setOlderThanDays] = useState('7')
+  const [olderThanDays, setOlderThanDays] = useState(String(CLEANUP_DEFAULT_OLDER_THAN_DAYS))
   const [mode, setMode] = useState<'soft_delete' | 'hard_delete'>('soft_delete')
   const [batchSize, setBatchSize] = useState(String(CLEANUP_DEFAULT_BATCH_SIZE))
-  const [pauseMs, setPauseMs] = useState('100')
+  const [maxBatches, setMaxBatches] = useState(String(CLEANUP_DEFAULT_MAX_BATCHES))
+  const [pauseMs, setPauseMs] = useState(String(CLEANUP_DEFAULT_PAUSE_MS))
   const [previewResult, setPreviewResult] = useState<{ matchedRows: number; cutoffAt: string; oldestCreatedAt?: string; newestCreatedAt?: string } | null>(null)
   const [previewing, setPreviewing] = useState(false)
 
   const preview = usePreviewUsageCleanup()
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
-  const clearRecords = useClearUsageRecords()
   const resumeCleanup = useResumeUsageCleanup()
   const cleanupStatus = useUsageCleanupStatus()
   const confirm = useConfirm()
@@ -43,9 +47,10 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
 
   const buildRequest = (): UsageCleanupRequest => ({
     mode,
-    olderThanDays: boundedInteger(olderThanDays, 30, 0, CLEANUP_MAX_OLDER_THAN_DAYS),
+    olderThanDays: boundedInteger(olderThanDays, CLEANUP_DEFAULT_OLDER_THAN_DAYS, 0, CLEANUP_MAX_OLDER_THAN_DAYS),
     batchSize: boundedInteger(batchSize, CLEANUP_DEFAULT_BATCH_SIZE, 1, CLEANUP_MAX_BATCH_SIZE),
-    pauseMsBetweenBatches: boundedInteger(pauseMs, 100, 0, CLEANUP_MAX_PAUSE_MS),
+    maxBatches: boundedInteger(maxBatches, CLEANUP_DEFAULT_MAX_BATCHES, 1, CLEANUP_MAX_BATCHES),
+    pauseMsBetweenBatches: boundedInteger(pauseMs, CLEANUP_DEFAULT_PAUSE_MS, 0, CLEANUP_MAX_PAUSE_MS),
   })
 
   const handlePreview = async () => {
@@ -60,25 +65,34 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
     }
   }
 
-  const handleStart = async () => {
-    const request = buildRequest()
-    const previewText = previewResult
+  const submitCleanup = async (request: UsageCleanupRequest, title: string) => {
+    const currentRequest = buildRequest()
+    const sharesPreview = request.olderThanDays === currentRequest.olderThanDays
+    const previewText = previewResult && sharesPreview
       ? `预计命中 ${formatNumber(previewResult.matchedRows)} 条，`
       : ''
     const ok = await confirm({
-      title: '确认清理',
-      message: `将${previewText}清理 ${cleanupRangeLabel(request.olderThanDays ?? 7)}的记录（${mode === 'hard_delete' ? '物理删除，不可恢复' : '软删除'}）。确认执行？`,
+      title,
+      message: `将${previewText}清理 ${cleanupRangeLabel(request.olderThanDays ?? 0)}的记录（${request.mode === 'hard_delete' ? '物理删除，不可恢复' : '软删除'}）。\n每批 ${formatNumber(request.batchSize ?? CLEANUP_DEFAULT_BATCH_SIZE)} 条，单次上限 ${formatNumber(request.maxBatches ?? CLEANUP_DEFAULT_MAX_BATCHES)} 批，批次间隔 ${formatNumber(request.pauseMsBetweenBatches ?? CLEANUP_DEFAULT_PAUSE_MS)}ms。确认执行？`,
       confirmText: '执行清理',
       tone: 'danger',
     })
     if (!ok) return
     try {
-      await startCleanup.mutateAsync(buildRequest())
+      await startCleanup.mutateAsync(request)
       toast.success('清理任务已启动')
       setPreviewResult(null)
     } catch (e) {
       toast.error(`启动失败: ${extractErrorMessage(e)}`)
     }
+  }
+
+  const handleStart = async () => {
+    await submitCleanup(buildRequest(), '确认清理')
+  }
+
+  const handleClearAll = async () => {
+    await submitCleanup({ ...buildRequest(), olderThanDays: 0 }, '确认全量清理')
   }
 
   const handleCancel = async () => {
@@ -87,26 +101,6 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
       toast.success('已取消清理任务')
     } catch (e) {
       toast.error(`取消失败: ${extractErrorMessage(e)}`)
-    }
-  }
-
-  const handleClearAll = async () => {
-    if (isRunning) {
-      toast.warning('清理任务正在排队或执行，不能重复提交')
-      return
-    }
-    const ok = await confirm({
-      title: '清空所有记录',
-      message: '将提交后台任务，分批软删除全部用量明细，并同步扣除这些记录对应的累计统计、费用和 Dashboard 汇总。任务可取消并审计。确认继续？',
-      confirmText: '提交清理任务',
-      tone: 'danger',
-    })
-    if (!ok) return
-    try {
-      await clearRecords.mutateAsync()
-      toast.success('全量明细清理任务已提交')
-    } catch (e) {
-      toast.error(`清空失败: ${extractErrorMessage(e)}`)
     }
   }
 
@@ -121,22 +115,22 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
   }
 
   return (
-    <ModalShell open={open} onClose={onClose} title="清理用量记录" width="max-w-lg">
+    <ModalShell open={open} onClose={onClose} title="清理用量记录" width="max-w-xl">
       <div className="space-y-4 text-sm">
         {/* 危险区：清空全部 */}
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 space-y-2">
           <div className="text-xs font-semibold text-destructive">危险操作</div>
           <p className="text-xs text-muted-foreground">
-            后台分批软删除全部历史明细，并同步扣除对应的累计统计、费用和 Dashboard 汇总。任务状态会持久化，可取消并审计。
+            0 表示以任务启动时刻为 cutoff。下面的软删除、物理删除和全量清理都会沿用当前参数，默认保留 3 天、每批 5000 条。任务状态会持久化，可取消并审计。
           </p>
           <Button
             variant="outline"
             size="sm"
             className="text-destructive border-destructive/40 hover:bg-destructive/10 w-full"
             onClick={handleClearAll}
-            disabled={clearRecords.isPending || isRunning}
+            disabled={startCleanup.isPending || isRunning}
           >
-            {isRunning ? '清理任务执行中' : '清理全部历史明细'}
+            {isRunning ? '清理任务执行中' : '清理全部历史明细（按当前设置）'}
           </Button>
         </div>
 
@@ -218,7 +212,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
             />
             <span className="text-xs text-muted-foreground">天前的记录</span>
           </div>
-          <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">允许填 0，表示以任务开始时间作为截止点。</p>
+          <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">默认保留 {CLEANUP_DEFAULT_OLDER_THAN_DAYS} 天；允许填 0，表示以任务开始时间作为截止点，清理当前时刻之前的全部匹配记录。</p>
           <div className="space-y-1">
             <div className="flex items-center gap-3">
               <label className="text-xs text-muted-foreground w-20 shrink-0">每批数量</label>
@@ -236,7 +230,26 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               />
               <span className="text-xs text-muted-foreground/60">条</span>
             </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批短事务，默认 {CLEANUP_DEFAULT_BATCH_SIZE}，后端安全上限 {formatNumber(CLEANUP_MAX_BATCH_SIZE)}；单批过大时任务可能因锁争用暂停，可降低后恢复。</p>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批短事务，默认 {formatNumber(CLEANUP_DEFAULT_BATCH_SIZE)}，后端安全上限 {formatNumber(CLEANUP_MAX_BATCH_SIZE)}；单批过大时任务可能因锁争用暂停，可降低后恢复。</p>
+          </div>
+          <div className="space-y-1">
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-muted-foreground w-20 shrink-0">单次上限</label>
+              <Input
+                type="number"
+                min={1}
+                max={CLEANUP_MAX_BATCHES}
+                className="flex-1 h-8 text-xs"
+                value={maxBatches}
+                onChange={(e) => {
+                  setMaxBatches(e.target.value)
+                  setPreviewResult(null)
+                }}
+                placeholder={String(CLEANUP_DEFAULT_MAX_BATCHES)}
+              />
+              <span className="text-xs text-muted-foreground/60">批</span>
+            </div>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">达到上限会进入暂停状态，可由管理员显式恢复下一轮；默认 {formatNumber(CLEANUP_DEFAULT_MAX_BATCHES)} 批。</p>
           </div>
           <div className="space-y-1">
             <div className="flex items-center gap-3">
@@ -255,7 +268,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               />
               <span className="text-xs text-muted-foreground/60">ms</span>
             </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批之间的等待毫秒，后端安全上限 {CLEANUP_MAX_PAUSE_MS}ms，默认 100ms</p>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批之间的等待毫秒，后端安全上限 {formatNumber(CLEANUP_MAX_PAUSE_MS)}ms，默认 {CLEANUP_DEFAULT_PAUSE_MS}ms。</p>
           </div>
           <div className="text-xs text-muted-foreground/60">每次执行受 maxBatches 保护，达到上限后进入暂停状态，可由管理员显式恢复下一轮。</div>
         </div>

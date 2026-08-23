@@ -11,7 +11,6 @@ import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   useCancelUsageCleanup,
-  useClearUsageRecords,
   useModelPricing,
   usePreviewUsageCleanup,
   useRefreshUsageQueriesAfterCleanup,
@@ -34,6 +33,14 @@ const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
 const EXPORT_LIMIT = 10_000
 const SLOW_FIRST_TOKEN_MS = 10_000
+const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS = 3
+const USAGE_CLEANUP_MAX_OLDER_THAN_DAYS = 3650
+const USAGE_CLEANUP_DEFAULT_BATCH_SIZE = 5_000
+const USAGE_CLEANUP_MAX_BATCH_SIZE = 5000
+const USAGE_CLEANUP_DEFAULT_MAX_BATCHES = 10_000
+const USAGE_CLEANUP_MAX_BATCHES = 10_000
+const USAGE_CLEANUP_DEFAULT_PAUSE_MS = 100
+const USAGE_CLEANUP_MAX_PAUSE_MS = 10000
 
 type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -1752,12 +1759,6 @@ function cleanupStatusLabel(status?: string): string {
   }
 }
 
-const USAGE_CLEANUP_DEFAULT_MAX_BATCHES = 10000
-const USAGE_CLEANUP_MAX_OLDER_THAN_DAYS = 3650
-const USAGE_CLEANUP_DEFAULT_BATCH_SIZE = 250
-const USAGE_CLEANUP_MAX_BATCH_SIZE = 5000
-const USAGE_CLEANUP_MAX_PAUSE_MS = 10000
-
 function parseCleanupInteger(value: string, fallback: number, min: number, max: number): number {
   const parsed = Number(value)
   const normalized = Number.isFinite(parsed) ? Math.floor(parsed) : fallback
@@ -1766,29 +1767,31 @@ function parseCleanupInteger(value: string, fallback: number, min: number, max: 
 
 function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const [mode, setMode] = useState<UsageCleanupMode>('soft_delete')
-  const [olderThanDays, setOlderThanDays] = useState('7')
+  const [olderThanDays, setOlderThanDays] = useState(String(USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS))
   const [batchSize, setBatchSize] = useState(String(USAGE_CLEANUP_DEFAULT_BATCH_SIZE))
-  const [pauseMs, setPauseMs] = useState('100')
+  const [maxBatches, setMaxBatches] = useState(String(USAGE_CLEANUP_DEFAULT_MAX_BATCHES))
+  const [pauseMs, setPauseMs] = useState(String(USAGE_CLEANUP_DEFAULT_PAUSE_MS))
   const cleanupStatus = useUsageCleanupStatus()
   const previewCleanup = usePreviewUsageCleanup()
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
-  const clearRecords = useClearUsageRecords()
   const resumeCleanup = useResumeUsageCleanup()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
-  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0, USAGE_CLEANUP_MAX_OLDER_THAN_DAYS)
+  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS, 0, USAGE_CLEANUP_MAX_OLDER_THAN_DAYS)
   const parsedBatchSize = parseCleanupInteger(batchSize, USAGE_CLEANUP_DEFAULT_BATCH_SIZE, 1, USAGE_CLEANUP_MAX_BATCH_SIZE)
-  const parsedPauseMs = parseCleanupInteger(pauseMs, 100, 0, USAGE_CLEANUP_MAX_PAUSE_MS)
-  const cleanupRangeText = (cutoffLabel: string) => (
-    parsedOlderThanDays === 0
-      ? `${cutoffLabel}早于任务启动时刻（清理当时之前全部匹配记录）`
-      : `${cutoffLabel}早于 ${parsedOlderThanDays} 天`
+  const parsedMaxBatches = parseCleanupInteger(maxBatches, USAGE_CLEANUP_DEFAULT_MAX_BATCHES, 1, USAGE_CLEANUP_MAX_BATCHES)
+  const parsedPauseMs = parseCleanupInteger(pauseMs, USAGE_CLEANUP_DEFAULT_PAUSE_MS, 0, USAGE_CLEANUP_MAX_PAUSE_MS)
+  const cleanupRangeText = (cutoffLabel: string, days = parsedOlderThanDays) => (
+    days === 0
+      ? `${cutoffLabel}早于任务启动时刻（清理当前时刻之前全部匹配记录）`
+      : `${cutoffLabel}早于 ${days} 天`
   )
-  const payload = (): UsageCleanupRequest => ({
+  const payload = (olderThanDaysOverride?: number): UsageCleanupRequest => ({
     mode,
-    olderThanDays: parsedOlderThanDays,
+    olderThanDays: olderThanDaysOverride ?? parsedOlderThanDays,
     batchSize: parsedBatchSize,
+    maxBatches: parsedMaxBatches,
     pauseMsBetweenBatches: parsedPauseMs,
   })
 
@@ -1808,17 +1811,19 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
     })
   }
 
-  const start = () => {
+  const start = (request = payload()) => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
+    const requestDays = request.olderThanDays ?? parsedOlderThanDays
     const previewText = preview
+      && requestDays === parsedOlderThanDays
       ? `预计命中 ${formatNumber(preview.matchedRows)} 条，`
       : ''
     const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n${previewText}范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或本次执行达到安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批；达到上限后可显式恢复下一轮。\n\n软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删除的记录。`
+      `确定开始${cleanupModeLabel(mode)}？\n\n${previewText}范围：${cleanupRangeText(cutoffLabel, requestDays)}\n每批：${formatNumber(request.batchSize ?? USAGE_CLEANUP_DEFAULT_BATCH_SIZE)} 条\n单次上限：${formatNumber(request.maxBatches ?? USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批\n批次间隔：${formatNumber(request.pauseMsBetweenBatches ?? USAGE_CLEANUP_DEFAULT_PAUSE_MS)}ms\n系统会持续分批执行，直到没有更多匹配记录或本次执行达到单次上限；达到上限后可显式恢复下一轮。\n\n软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删除的记录。`
     )
     if (!confirmed) return
 
-    startCleanup.mutate(payload(), {
+    startCleanup.mutate(request, {
       onSuccess: () => {
         toast.success('Usage 分批清理已启动')
         cleanupStatus.refetch()
@@ -1847,14 +1852,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   }
 
   const clearAll = () => {
-    const confirmed = confirm('将提交后台任务，分批软删除全部 Usage 明细，并同步扣除这些记录对应的累计统计、费用和 Dashboard 汇总。任务可取消并审计。确认继续？')
-    if (!confirmed) return
-    clearRecords.mutate(undefined, {
-      onSuccess: () => {
-        toast.success('全量 Usage 明细清理任务已提交')
-      },
-      onError: (error) => toast.error(`清空失败: ${extractErrorMessage(error)}`),
-    })
+    start(payload(0))
   }
 
   return (
@@ -1867,20 +1865,20 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
           <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3">
             <div className="text-xs font-semibold text-destructive">危险操作</div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              后台分批软删除全部历史明细，并同步扣除对应的累计统计、费用和 Dashboard 汇总。任务状态会持久化，可取消并审计。
+              0 表示以任务启动时刻为 cutoff。下面的软删除、物理删除和全量清理都会沿用当前参数，默认保留 3 天、每批 5000 条。任务状态会持久化，可取消并审计。
             </p>
             <Button
               className="mt-3 w-full text-destructive"
               variant="outline"
               onClick={clearAll}
-              disabled={clearRecords.isPending || running}
+              disabled={startCleanup.isPending || running}
             >
-              {running ? '清理任务执行中' : clearRecords.isPending ? '提交中...' : '清理全部历史明细'}
+              {running ? '清理任务执行中' : startCleanup.isPending ? '提交中...' : '清理全部历史明细（按当前设置）'}
             </Button>
           </div>
 
           <div className="rounded-md border border-kiro-warning-soft bg-kiro-warning-soft p-3 text-kiro-warning">
-            这是手动任务，不会定时执行。系统会自动分批清理；每次执行最多 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批，达到上限后暂停并等待管理员显式恢复。软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup；硬删除只物理删除已软删的记录。
+            这是手动任务，不会定时执行。系统会自动分批清理；每次执行最多 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批，达到上限后暂停并等待管理员显式恢复。默认保留 {USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS} 天，每批 {formatNumber(USAGE_CLEANUP_DEFAULT_BATCH_SIZE)} 条；软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup，硬删除只物理删除已软删的记录。
           </div>
 
           <div className="grid gap-3 md:grid-cols-2">
@@ -1894,7 +1892,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             <div className="space-y-1">
               <span className="block text-xs text-muted-foreground">{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
               <Input value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" min={0} max={USAGE_CLEANUP_MAX_OLDER_THAN_DAYS} type="number" />
-              <span className="block text-[0.68rem] text-muted-foreground">填 0 表示以任务启动时刻为 cutoff，最大 {formatNumber(USAGE_CLEANUP_MAX_OLDER_THAN_DAYS)} 天。</span>
+              <span className="block text-[0.68rem] text-muted-foreground">默认 {USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS} 天；填 0 表示以任务启动时刻为 cutoff，清理当前时刻之前全部匹配记录，最大 {formatNumber(USAGE_CLEANUP_MAX_OLDER_THAN_DAYS)} 天。</span>
             </div>
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">每批数量</span>
@@ -1902,9 +1900,14 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
               <span className="block text-[0.68rem] text-muted-foreground">默认 {formatNumber(USAGE_CLEANUP_DEFAULT_BATCH_SIZE)}；后端安全上限 {formatNumber(USAGE_CLEANUP_MAX_BATCH_SIZE)}。单批过大时任务可能因锁争用暂停，可降低后恢复。</span>
             </label>
             <label className="space-y-1">
+              <span className="text-xs text-muted-foreground">单次上限批次</span>
+              <Input value={maxBatches} onChange={(event) => setMaxBatches(event.target.value)} inputMode="numeric" min={1} max={USAGE_CLEANUP_MAX_BATCHES} type="number" />
+              <span className="block text-[0.68rem] text-muted-foreground">默认 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批；达到上限后暂停，可手动恢复继续下一轮。</span>
+            </label>
+            <label className="space-y-1">
               <span className="text-xs text-muted-foreground">批次间隔毫秒</span>
               <Input value={pauseMs} onChange={(event) => setPauseMs(event.target.value)} inputMode="numeric" min={0} max={USAGE_CLEANUP_MAX_PAUSE_MS} type="number" />
-              <span className="block text-[0.68rem] text-muted-foreground">后端安全上限 {formatNumber(USAGE_CLEANUP_MAX_PAUSE_MS)}ms。</span>
+              <span className="block text-[0.68rem] text-muted-foreground">默认 {USAGE_CLEANUP_DEFAULT_PAUSE_MS}ms；后端安全上限 {formatNumber(USAGE_CLEANUP_MAX_PAUSE_MS)}ms。</span>
             </label>
           </div>
 
@@ -1940,7 +1943,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             <Button variant="outline" onClick={previewRows} disabled={previewCleanup.isPending || running}>
               {previewCleanup.isPending ? '预估中...' : '预估'}
             </Button>
-            <Button onClick={start} disabled={startCleanup.isPending || running}>
+            <Button onClick={() => start()} disabled={startCleanup.isPending || running}>
               {startCleanup.isPending ? '启动中...' : '开始分批清理'}
             </Button>
             <Button variant="outline" onClick={cancel} disabled={!running || cancelCleanup.isPending}>

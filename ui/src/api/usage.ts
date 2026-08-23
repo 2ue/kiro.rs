@@ -105,8 +105,8 @@ export async function getUsageDashboardExternalPoolRisk(
   return data
 }
 
-export async function clearUsageRecords(): Promise<UsageCleanupStatusResponse> {
-  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/clear')
+export async function clearUsageRecords(payload?: UsageCleanupRequest): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/clear', payload)
   return data
 }
 

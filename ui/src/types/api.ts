@@ -1316,6 +1316,9 @@ export type ThinkingTriggerMode = 'real_request' | 'always'
 export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
+export type ExternalPoolHeaderProfile = 'generic' | 'anthropic_passthrough' | 'claude_code_mimic'
+export type ExternalPoolWireProfile = 'default' | 'http1_title_case'
+export type ExternalPoolTlsProfile = 'default' | 'native_tls'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolStreamResponseMode = 'event_passthrough'
 export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled'
@@ -1605,6 +1608,11 @@ export interface ExternalPool {
   apiKey?: string
   maskedApiKey?: string
   authType: ExternalPoolAuthType
+  headerProfile: ExternalPoolHeaderProfile
+  appendBetaQuery: boolean
+  headerOverrides: Record<string, string>
+  wireProfile: ExternalPoolWireProfile
+  tlsProfile: ExternalPoolTlsProfile
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
@@ -1656,6 +1664,11 @@ export interface CreateExternalPoolRequest {
   baseUrl: string
   apiKey: string
   authType?: ExternalPoolAuthType
+  headerProfile?: ExternalPoolHeaderProfile
+  appendBetaQuery?: boolean
+  headerOverrides?: Record<string, string>
+  wireProfile?: ExternalPoolWireProfile
+  tlsProfile?: ExternalPoolTlsProfile
   enabled?: boolean
   priority?: number
   maxConcurrentRequests?: number
@@ -1681,6 +1694,11 @@ export interface UpdateExternalPoolRequest {
   baseUrl?: string
   apiKey?: string
   authType?: ExternalPoolAuthType
+  headerProfile?: ExternalPoolHeaderProfile
+  appendBetaQuery?: boolean
+  headerOverrides?: Record<string, string>
+  wireProfile?: ExternalPoolWireProfile
+  tlsProfile?: ExternalPoolTlsProfile
   enabled?: boolean
   priority?: number
   maxConcurrentRequests?: number

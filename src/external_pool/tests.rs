@@ -2191,6 +2191,11 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExtern
         base_url: format!("https://{}.example.test", name),
         api_key: format!("sk-{}", name),
         auth_type: ExternalPoolAuthType::Bearer,
+        header_profile: ExternalPoolHeaderProfile::Generic,
+        append_beta_query: false,
+        header_overrides: HashMap::new(),
+        wire_profile: ExternalPoolWireProfile::Default,
+        tls_profile: ExternalPoolTlsProfile::Default,
         enabled,
         priority,
         max_concurrent_requests: 1,
@@ -11298,6 +11303,11 @@ fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
         api_key: Some("sk-test".to_string()),
         masked_api_key: None,
         auth_type: ExternalPoolAuthType::Bearer,
+        header_profile: ExternalPoolHeaderProfile::Generic,
+        append_beta_query: false,
+        header_overrides: HashMap::new(),
+        wire_profile: ExternalPoolWireProfile::Default,
+        tls_profile: ExternalPoolTlsProfile::Default,
         enabled: true,
         priority: 10,
         max_concurrent_requests: 10,
@@ -11484,7 +11494,7 @@ fn forward_headers_adds_default_anthropic_version_for_external_auth_modes() {
     bearer_pool.auth_type = ExternalPoolAuthType::Bearer;
     bearer_pool.api_key = Some("sk-bearer".to_string());
 
-    let bearer = forward_headers(&headers, &bearer_pool).expect("bearer headers");
+    let bearer = forward_headers(&headers, &bearer_pool, false).expect("bearer headers");
     assert_eq!(
         bearer
             .get(HeaderName::from_static("anthropic-version"))
@@ -11502,7 +11512,7 @@ fn forward_headers_adds_default_anthropic_version_for_external_auth_modes() {
     let mut x_api_key_pool = bearer_pool;
     x_api_key_pool.auth_type = ExternalPoolAuthType::XApiKey;
     x_api_key_pool.api_key = Some("sk-x-api-key".to_string());
-    let x_api_key = forward_headers(&headers, &x_api_key_pool).expect("x-api-key headers");
+    let x_api_key = forward_headers(&headers, &x_api_key_pool, false).expect("x-api-key headers");
     assert_eq!(
         x_api_key
             .get(HeaderName::from_static("anthropic-version"))
@@ -11528,7 +11538,7 @@ fn forward_headers_preserves_client_anthropic_version() {
     headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
     let pool = test_pool("https://example.com/v1", true);
 
-    let forwarded = forward_headers(&headers, &pool).expect("headers");
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
     assert_eq!(
         forwarded
             .get(HeaderName::from_static("anthropic-version"))
@@ -11536,6 +11546,289 @@ fn forward_headers_preserves_client_anthropic_version() {
         Some("2024-02-29")
     );
     assert!(forwarded.get(header::ACCEPT_ENCODING).is_none());
+}
+
+#[test]
+fn forward_headers_strips_auth_cookie_and_google_api_key_residue() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer client"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-api-key"),
+        HeaderValue::from_static("client-key"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-goog-api-key"),
+        HeaderValue::from_static("google-key"),
+    );
+    headers.insert(header::COOKIE, HeaderValue::from_static("sid=client"));
+    headers.insert(
+        HeaderName::from_static("x-custom"),
+        HeaderValue::from_static("kept"),
+    );
+    let pool = test_pool("https://example.com/v1", true);
+
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
+
+    assert_eq!(
+        forwarded
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer sk-test")
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-api-key"))
+            .is_none()
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-goog-api-key"))
+            .is_none()
+    );
+    assert!(forwarded.get(header::COOKIE).is_none());
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-custom"))
+            .and_then(|value| value.to_str().ok()),
+        Some("kept")
+    );
+}
+
+#[test]
+fn anthropic_passthrough_profile_uses_allowlist_and_beta_query() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static("claude-cli/2.1.200"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-stainless-runtime"),
+        HeaderValue::from_static("node"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-client-request-id"),
+        HeaderValue::from_static("req-client"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-custom-not-allowed"),
+        HeaderValue::from_static("drop"),
+    );
+    headers.insert(header::COOKIE, HeaderValue::from_static("sid=drop"));
+    let mut pool = test_pool("https://pool.example.com/v1", true);
+    pool.header_profile = ExternalPoolHeaderProfile::AnthropicPassthrough;
+    pool.auth_type = ExternalPoolAuthType::XApiKey;
+
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
+
+    assert_eq!(
+        forwarded
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+        Some("claude-cli/2.1.200")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-stainless-runtime"))
+            .and_then(|value| value.to_str().ok()),
+        Some("node")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-client-request-id"))
+            .and_then(|value| value.to_str().ok()),
+        Some("req-client")
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-custom-not-allowed"))
+            .is_none()
+    );
+    assert!(forwarded.get(header::COOKIE).is_none());
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-api-key"))
+            .and_then(|value| value.to_str().ok()),
+        Some("sk-test")
+    );
+
+    let config = ExternalPoolsConfig::default();
+    let url = external_pool_url(&pool, "/cc/v1/messages", &config).expect("url");
+    assert_eq!(
+        url.as_str(),
+        "https://pool.example.com/v1/messages?beta=true"
+    );
+}
+
+#[test]
+fn claude_code_mimic_profile_forces_cli_headers_and_request_id() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.header_profile = ExternalPoolHeaderProfile::ClaudeCodeMimic;
+    let headers = HeaderMap::new();
+
+    let forwarded = forward_headers(&headers, &pool, true).expect("headers");
+
+    assert_eq!(
+        forwarded
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+        Some("claude-cli/2.1.161 (external, cli)")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-stainless-runtime-version"))
+            .and_then(|value| value.to_str().ok()),
+        Some("v24.3.0")
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("x-stainless-helper-method"))
+            .and_then(|value| value.to_str().ok()),
+        Some("stream")
+    );
+    assert!(
+        forwarded
+            .get(HeaderName::from_static("x-client-request-id"))
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+    );
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("anthropic-beta"))
+            .and_then(|value| value.to_str().ok()),
+        Some(CLAUDE_CODE_MIMIC_BETA_HEADER)
+    );
+}
+
+#[test]
+fn header_overrides_apply_after_auth_but_reject_sensitive_names() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.header_overrides = normalize_external_pool_header_overrides(HashMap::from([(
+        "anthropic-beta".to_string(),
+        "claude-code-20250219".to_string(),
+    )]))
+    .expect("valid override");
+    let headers = HeaderMap::new();
+
+    let forwarded = forward_headers(&headers, &pool, false).expect("headers");
+    assert_eq!(
+        forwarded
+            .get(HeaderName::from_static("anthropic-beta"))
+            .and_then(|value| value.to_str().ok()),
+        Some("claude-code-20250219")
+    );
+
+    assert!(
+        normalize_external_pool_header_overrides(HashMap::from([(
+            "authorization".to_string(),
+            "Bearer bad".to_string(),
+        )]))
+        .is_err()
+    );
+    assert!(
+        normalize_external_pool_header_overrides(HashMap::from([(
+            "x-client-request-id".to_string(),
+            "fixed".to_string(),
+        )]))
+        .is_err()
+    );
+}
+
+#[test]
+fn anthropic_body_sanitize_removes_context_management_without_beta() {
+    let body = Bytes::from_static(
+        br#"{"model":"claude","context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},"messages":[]}"#,
+    );
+    let headers = HeaderMap::new();
+
+    let sanitized = sanitize_anthropic_body_for_beta_header(&body, &headers);
+    let value: serde_json::Value = serde_json::from_slice(&sanitized).expect("json");
+    assert!(value.get("context_management").is_none());
+
+    let mut beta_headers = HeaderMap::new();
+    beta_headers.insert(
+        HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_static("context-management-2025-06-27"),
+    );
+    let preserved = sanitize_anthropic_body_for_beta_header(&body, &beta_headers);
+    let value: serde_json::Value = serde_json::from_slice(&preserved).expect("json");
+    assert!(value.get("context_management").is_some());
+}
+
+#[test]
+fn sync_claude_code_session_header_uses_metadata_user_id_session() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-claude-code-session-id"),
+        HeaderValue::from_static("00000000-0000-4000-8000-000000000000"),
+    );
+    let body = br#"{"metadata":{"user_id":"{\"device_id\":\"dev\",\"account_uuid\":\"acc\",\"session_id\":\"8bb5523b-ec7c-4540-a9ca-beb6d79f1552\"}"}}"#;
+
+    sync_claude_code_session_header(&mut headers, body);
+
+    assert_eq!(
+        headers
+            .get(HeaderName::from_static("x-claude-code-session-id"))
+            .and_then(|value| value.to_str().ok()),
+        Some("8bb5523b-ec7c-4540-a9ca-beb6d79f1552")
+    );
+}
+
+#[tokio::test]
+async fn http1_title_case_wire_profile_writes_http1_title_case_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw capture server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = vec![0u8; 8192];
+        let mut read = 0usize;
+        loop {
+            let n = socket.read(&mut buf[read..]).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            read += n;
+            if read >= 4 && buf[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            if read == buf.len() {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await
+            .expect("write response");
+        String::from_utf8_lossy(&buf[..read]).to_string()
+    });
+
+    let client = external_pool_reqwest_client(
+        ExternalPoolWireProfile::Http1TitleCase,
+        ExternalPoolTlsProfile::Default,
+    );
+    let response = client
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-stainless-os", "Linux")
+        .header("anthropic-beta", "claude-code-20250219")
+        .body("{}")
+        .send()
+        .await
+        .expect("send raw capture request");
+    assert!(response.status().is_success());
+
+    let raw_request = server.await.expect("server task");
+    assert!(
+        raw_request.starts_with("POST /v1/messages HTTP/1.1\r\n"),
+        "{raw_request}"
+    );
+    assert!(raw_request.contains("\r\nX-Stainless-Os: Linux\r\n"));
+    assert!(raw_request.contains("\r\nAnthropic-Beta: claude-code-20250219\r\n"));
 }
 
 fn test_external_pool_outbound_body(route: &ExternalRouteRequest, pool: &ExternalPool) -> Bytes {

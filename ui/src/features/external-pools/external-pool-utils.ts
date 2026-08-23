@@ -4,6 +4,26 @@ export const splitRules = (value: string) => value.split('\n').map((item) => ite
 export const joinRules = (value: string[] = []) => value.join('\n')
 export const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 
+export const parseHeaderOverridesText = (value: string): Record<string, string> => {
+  const headers: Record<string, string> = {}
+  for (const rawLine of value.split('\n')) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#') || line.startsWith('//')) continue
+    const separatorIndex = line.indexOf(':') >= 0 ? line.indexOf(':') : line.indexOf('=')
+    if (separatorIndex <= 0) continue
+    const name = line.slice(0, separatorIndex).trim().toLowerCase()
+    const headerValue = line.slice(separatorIndex + 1).trim()
+    if (!name || !headerValue) continue
+    headers[name] = headerValue
+  }
+  return headers
+}
+
+export const joinHeaderOverrides = (value: Record<string, string> = {}) => Object.entries(value)
+  .filter(([name, headerValue]) => name.trim() && headerValue.trim())
+  .map(([name, headerValue]) => `${name.trim().toLowerCase()}: ${headerValue.trim()}`)
+  .join('\n')
+
 export const parseStatusCodeList = (value: string): number[] => {
   const seen = new Set<number>()
   const codes: number[] = []
@@ -109,6 +129,11 @@ export type ExternalPoolFormDraft = {
   baseUrl: string
   apiKey: string
   authType: NonNullable<CreateExternalPoolRequest['authType']>
+  headerProfile: NonNullable<CreateExternalPoolRequest['headerProfile']>
+  appendBetaQuery: boolean
+  headerOverridesText: string
+  wireProfile: NonNullable<CreateExternalPoolRequest['wireProfile']>
+  tlsProfile: NonNullable<CreateExternalPoolRequest['tlsProfile']>
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
@@ -134,6 +159,11 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   baseUrl: '',
   apiKey: '',
   authType: 'bearer',
+  headerProfile: 'generic',
+  appendBetaQuery: false,
+  headerOverridesText: '',
+  wireProfile: 'default',
+  tlsProfile: 'default',
   enabled: false,
   priority: 100,
   maxConcurrentRequests: 10,
@@ -159,6 +189,11 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   baseUrl: pool.baseUrl,
   apiKey: '',
   authType: pool.authType,
+  headerProfile: pool.headerProfile || 'generic',
+  appendBetaQuery: Boolean(pool.appendBetaQuery),
+  headerOverridesText: joinHeaderOverrides(pool.headerOverrides || {}),
+  wireProfile: pool.wireProfile || 'default',
+  tlsProfile: pool.tlsProfile || 'default',
   enabled: pool.enabled,
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
@@ -245,6 +280,47 @@ export function poolBodyModeSummary(pool: ExternalPool): string {
       : 'Body：raw透传'
   }
   return 'Body：标准处理'
+}
+
+export function headerProfileDescription(profile: ExternalPool['headerProfile'] | undefined): string {
+  if (profile === 'claude_code_mimic') {
+    return '忽略客户端指纹，使用 Claude Code 风格的 x-stainless、User-Agent、x-client-request-id 和 anthropic-beta；URL 自动追加 beta=true。'
+  }
+  if (profile === 'anthropic_passthrough') {
+    return '只透传 Anthropic/Claude Code 相关请求头，过滤 cookie、x-goog-api-key 和非必要客户端头；URL 自动追加 beta=true。'
+  }
+  return '保持旧版泛用转发策略，仅过滤认证、连接、cookie、x-goog-api-key 等敏感请求头；是否追加 beta=true 由下方开关控制。'
+}
+
+export function poolHeaderProfileSummary(pool: ExternalPool): string {
+  const profile = pool.headerProfile || 'generic'
+  const overrides = Object.keys(pool.headerOverrides || {}).length
+  const parts = [
+    profile === 'claude_code_mimic'
+      ? 'Header：Claude Code'
+      : profile === 'anthropic_passthrough'
+        ? 'Header：Anthropic'
+        : 'Header：默认',
+  ]
+  if (pool.appendBetaQuery || profile !== 'generic') parts.push('beta=true')
+  if (overrides > 0) parts.push(`${overrides} 个覆盖`)
+  if (pool.wireProfile === 'http1_title_case') parts.push('HTTP/1')
+  if (pool.tlsProfile === 'native_tls') parts.push('Native TLS')
+  return parts.join(' · ')
+}
+
+export function wireProfileDescription(profile: ExternalPool['wireProfile'] | undefined): string {
+  if (profile === 'http1_title_case') {
+    return '强制 HTTP/1，并启用 reqwest 的 HTTP/1 Title-Case header 写出；这是兼容增强，不是完整 Claude Code 混合大小写/顺序复刻。'
+  }
+  return '使用默认 reqwest 传输行为，允许 HTTP/2 协商，header wire 大小写由 HTTP 客户端决定。'
+}
+
+export function tlsProfileDescription(profile: ExternalPool['tlsProfile'] | undefined): string {
+  if (profile === 'native_tls') {
+    return '使用系统/native-tls 栈构建外部池客户端；这是 TLS 栈切换，不是完整 Node.js/Claude Code ClientHello 指纹。'
+  }
+  return '使用默认 TLS 栈。当前项目默认仍是常规 reqwest/rustls/native 配置，不伪造 Node.js ClientHello。'
 }
 
 export function poolSupportedModelsSummary(pool: ExternalPool): string {

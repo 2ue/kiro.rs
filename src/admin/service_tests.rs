@@ -591,8 +591,8 @@ fn usage_cleanup_request_uses_safe_manual_defaults() {
     assert_eq!(plan.batch_size, USAGE_CLEANUP_DEFAULT_BATCH_SIZE);
     assert_eq!(plan.max_batches, USAGE_CLEANUP_DEFAULT_MAX_BATCHES);
     assert_eq!(plan.pause_ms_between_batches, 100);
-    assert!(plan.cutoff >= before - ChronoDuration::days(7) - ChronoDuration::seconds(1));
-    assert!(plan.cutoff <= after - ChronoDuration::days(7) + ChronoDuration::seconds(1));
+    assert!(plan.cutoff >= before - ChronoDuration::days(3) - ChronoDuration::seconds(1));
+    assert!(plan.cutoff <= after - ChronoDuration::days(3) + ChronoDuration::seconds(1));
 }
 
 #[test]
@@ -710,7 +710,7 @@ async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_
                 job_id: &job_id,
                 mode: "soft_delete",
                 cutoff_at: Utc::now() - ChronoDuration::days(7),
-                batch_size: 250,
+                batch_size: USAGE_CLEANUP_DEFAULT_BATCH_SIZE,
                 max_batches: 100,
                 pause_ms_between_batches: 10,
             })

@@ -16,11 +16,14 @@ import {
   appendModelMappingPreset,
   appendModelMappingPresets,
   appendModelMappingRules,
+  headerProfileDescription,
   parseModelMappingRules,
   requestBodyModeDescription,
   streamRetryDescription,
   streamResponseDescription,
+  tlsProfileDescription,
   usageProjectionDescription,
+  wireProfileDescription,
 } from './external-pool-utils'
 import {
   FormSection,
@@ -151,6 +154,57 @@ export function ExternalPoolFormModal({
             </SelectBox>
             <TextBox className="md:col-span-2" label="服务地址" description="填写服务地址即可，通常不需要带具体请求路径。" value={draft.baseUrl} disabled={saving} onChange={(v) => set('baseUrl', v)} />
             <TextBox className="md:col-span-2" label={keyLabel} description={keyDescription} value={draft.apiKey} disabled={saving} onChange={(v) => set('apiKey', v)} />
+          </div>
+        </FormSection>
+
+        <FormSection title="上游 Header 兼容" description="控制转发到该外部账号时的请求头、Claude Code 指纹和 beta 查询参数。">
+          <div className="grid gap-3 md:grid-cols-[240px_1fr]">
+            <div className="space-y-3">
+              <SelectBox
+                label="Header profile"
+                value={draft.headerProfile}
+                disabled={saving}
+                onChange={(v) => set('headerProfile', v as ExternalPoolFormDraft['headerProfile'])}
+              >
+                <SelectItem value="generic">默认泛用转发</SelectItem>
+                <SelectItem value="anthropic_passthrough">Anthropic allowlist</SelectItem>
+                <SelectItem value="claude_code_mimic">Claude Code mimic</SelectItem>
+              </SelectBox>
+              <HintBox>{headerProfileDescription(draft.headerProfile)}</HintBox>
+              <ToggleRow
+                label="URL 追加 beta=true"
+                checked={draft.headerProfile !== 'generic' || Boolean(draft.appendBetaQuery)}
+                disabled={saving || draft.headerProfile !== 'generic'}
+                onChange={(v) => set('appendBetaQuery', v)}
+              />
+              <SelectBox
+                label="Wire profile"
+                value={draft.wireProfile}
+                disabled={saving}
+                onChange={(v) => set('wireProfile', v as ExternalPoolFormDraft['wireProfile'])}
+              >
+                <SelectItem value="default">默认传输</SelectItem>
+                <SelectItem value="http1_title_case">HTTP/1 Title-Case</SelectItem>
+              </SelectBox>
+              <HintBox>{wireProfileDescription(draft.wireProfile)}</HintBox>
+              <SelectBox
+                label="TLS profile"
+                value={draft.tlsProfile}
+                disabled={saving}
+                onChange={(v) => set('tlsProfile', v as ExternalPoolFormDraft['tlsProfile'])}
+              >
+                <SelectItem value="default">默认 TLS</SelectItem>
+                <SelectItem value="native_tls">Native TLS</SelectItem>
+              </SelectBox>
+              <HintBox>{tlsProfileDescription(draft.tlsProfile)}</HintBox>
+            </div>
+            <TextAreaBox
+              label="Header 覆盖"
+              description="每行一个 name: value；敏感头如 authorization、x-api-key、cookie、x-goog-api-key、x-client-request-id 会被后端拒绝。"
+              value={draft.headerOverridesText}
+              disabled={saving}
+              onChange={(v) => set('headerOverridesText', v)}
+            />
           </div>
         </FormSection>
 

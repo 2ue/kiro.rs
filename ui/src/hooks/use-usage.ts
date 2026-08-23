@@ -161,7 +161,7 @@ function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQuery
 export function useClearUsageRecords() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: clearUsageRecords,
+    mutationFn: (payload?: UsageCleanupRequest) => clearUsageRecords(payload),
     onSuccess: (status) => {
       queryClient.setQueryData(['usage-cleanup-status'], status)
       queryClient.invalidateQueries({ queryKey: ['usage-records'] })

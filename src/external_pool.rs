@@ -229,6 +229,121 @@ impl ExternalPoolAuthType {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ExternalPoolHeaderProfile {
+    Generic,
+    AnthropicPassthrough,
+    ClaudeCodeMimic,
+}
+
+impl Default for ExternalPoolHeaderProfile {
+    fn default() -> Self {
+        Self::Generic
+    }
+}
+
+impl ExternalPoolHeaderProfile {
+    pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "generic" | "default" => Some(Self::Generic),
+            "anthropic_passthrough" | "anthropic" | "claude_passthrough" => {
+                Some(Self::AnthropicPassthrough)
+            }
+            "claude_code_mimic" | "claude-code-mimic" | "claude_mimic" => {
+                Some(Self::ClaudeCodeMimic)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::AnthropicPassthrough => "anthropic_passthrough",
+            Self::ClaudeCodeMimic => "claude_code_mimic",
+        }
+    }
+
+    fn uses_anthropic_header_policy(self) -> bool {
+        matches!(self, Self::AnthropicPassthrough | Self::ClaudeCodeMimic)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolWireProfile {
+    Default,
+    Http1TitleCase,
+}
+
+impl Default for ExternalPoolWireProfile {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl ExternalPoolWireProfile {
+    pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "generic" => Some(Self::Default),
+            "http1_title_case" | "http1-title-case" | "claude_code_http1" => {
+                Some(Self::Http1TitleCase)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Http1TitleCase => "http1_title_case",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolTlsProfile {
+    Default,
+    NativeTls,
+}
+
+impl Default for ExternalPoolTlsProfile {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl ExternalPoolTlsProfile {
+    pub fn parse(value: &str) -> Self {
+        Self::parse_known(value).unwrap_or_default()
+    }
+
+    pub(crate) fn parse_known(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "rustls" => Some(Self::Default),
+            "native_tls" | "native-tls" | "platform_tls" | "platform-tls" => Some(Self::NativeTls),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::NativeTls => "native_tls",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ExternalPoolUsageProjectionMode {
     PassThrough,
     CurrentPathPolicy,
@@ -466,6 +581,16 @@ pub struct ExternalPool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masked_api_key: Option<String>,
     pub auth_type: ExternalPoolAuthType,
+    #[serde(default)]
+    pub header_profile: ExternalPoolHeaderProfile,
+    #[serde(default)]
+    pub append_beta_query: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub header_overrides: HashMap<String, String>,
+    #[serde(default)]
+    pub wire_profile: ExternalPoolWireProfile,
+    #[serde(default)]
+    pub tls_profile: ExternalPoolTlsProfile,
     pub enabled: bool,
     pub priority: i32,
     pub max_concurrent_requests: u32,
@@ -580,6 +705,16 @@ pub struct CreateExternalPoolRequest {
     pub api_key: String,
     #[serde(default)]
     pub auth_type: ExternalPoolAuthType,
+    #[serde(default)]
+    pub header_profile: ExternalPoolHeaderProfile,
+    #[serde(default)]
+    pub append_beta_query: bool,
+    #[serde(default)]
+    pub header_overrides: HashMap<String, String>,
+    #[serde(default)]
+    pub wire_profile: ExternalPoolWireProfile,
+    #[serde(default)]
+    pub tls_profile: ExternalPoolTlsProfile,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_priority")]
@@ -629,6 +764,16 @@ pub struct UpdateExternalPoolRequest {
     pub api_key: Option<String>,
     #[serde(default)]
     pub auth_type: Option<ExternalPoolAuthType>,
+    #[serde(default)]
+    pub header_profile: Option<ExternalPoolHeaderProfile>,
+    #[serde(default)]
+    pub append_beta_query: Option<bool>,
+    #[serde(default)]
+    pub header_overrides: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub wire_profile: Option<ExternalPoolWireProfile>,
+    #[serde(default)]
+    pub tls_profile: Option<ExternalPoolTlsProfile>,
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
@@ -1197,6 +1342,45 @@ fn external_response_body_timeout_secs(
         .map(|duration| duration.as_secs().max(1))
         .map(|remaining_secs| configured.min(remaining_secs))
         .unwrap_or(configured)
+}
+
+fn external_pool_reqwest_client(
+    wire_profile: ExternalPoolWireProfile,
+    tls_profile: ExternalPoolTlsProfile,
+) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if matches!(wire_profile, ExternalPoolWireProfile::Http1TitleCase) {
+        builder = builder.http1_only().http1_title_case_headers();
+    }
+    if matches!(tls_profile, ExternalPoolTlsProfile::NativeTls) {
+        builder = apply_external_pool_native_tls_profile(builder);
+    }
+    builder.build().unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            wire_profile = wire_profile.as_str(),
+            tls_profile = tls_profile.as_str(),
+            "external pool transport profile client build failed, falling back to default reqwest client"
+        );
+        reqwest::Client::new()
+    })
+}
+
+#[cfg(feature = "native-tls")]
+fn apply_external_pool_native_tls_profile(
+    builder: reqwest::ClientBuilder,
+) -> reqwest::ClientBuilder {
+    builder.use_native_tls()
+}
+
+#[cfg(not(feature = "native-tls"))]
+fn apply_external_pool_native_tls_profile(
+    builder: reqwest::ClientBuilder,
+) -> reqwest::ClientBuilder {
+    tracing::warn!(
+        "external pool tlsProfile=native_tls requested but binary was built without native-tls feature"
+    );
+    builder
 }
 
 struct ExternalForwardResponse {
@@ -3154,6 +3338,9 @@ pub struct ExternalPoolManager {
     redis: Arc<RedisStore>,
     instance_id: String,
     client: reqwest::Client,
+    http1_title_case_client: reqwest::Client,
+    native_tls_client: reqwest::Client,
+    native_tls_http1_title_case_client: reqwest::Client,
     capacity_signal: Arc<CapacitySignal>,
     #[cfg(test)]
     availability_cache: Arc<SyncMutex<Option<CachedPoolAvailabilitySnapshot>>>,
@@ -4459,9 +4646,22 @@ impl ExternalPoolManager {
             postgres,
             redis,
             instance_id: uuid::Uuid::new_v4().to_string(),
-            client: reqwest::Client::builder()
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: external_pool_reqwest_client(
+                ExternalPoolWireProfile::Default,
+                ExternalPoolTlsProfile::Default,
+            ),
+            http1_title_case_client: external_pool_reqwest_client(
+                ExternalPoolWireProfile::Http1TitleCase,
+                ExternalPoolTlsProfile::Default,
+            ),
+            native_tls_client: external_pool_reqwest_client(
+                ExternalPoolWireProfile::Default,
+                ExternalPoolTlsProfile::NativeTls,
+            ),
+            native_tls_http1_title_case_client: external_pool_reqwest_client(
+                ExternalPoolWireProfile::Http1TitleCase,
+                ExternalPoolTlsProfile::NativeTls,
+            ),
             capacity_signal,
             #[cfg(test)]
             availability_cache: Arc::new(SyncMutex::new(None)),
@@ -6616,19 +6816,24 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         dispatch_deadline: Option<Instant>,
     ) -> Result<PreparedExternalForwardRequest, ExternalForwardError> {
+        let mut prepared = external_pool_prepare_request(route, pool)?;
         let url = external_pool_url(pool, &route.endpoint, config)?;
-        let mut headers = forward_headers(&route.headers, pool)?;
+        let mut headers = forward_headers(&route.headers, pool, route.is_stream())?;
+        if pool.header_profile.uses_anthropic_header_policy() {
+            prepared.body = sanitize_anthropic_body_for_beta_header(&prepared.body, &headers);
+            sync_claude_code_session_header(&mut headers, &prepared.body);
+        }
         if !headers.contains_key(header::CONTENT_TYPE) {
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
         }
-        let prepared = external_pool_prepare_request(route, pool)?;
         let outbound_model = prepared.outbound_model.clone();
         let outbound_body = prepared.body.clone();
         let known_tool_names = external_route_known_tool_names(route);
-        let mut request = self.client.post(url).headers(headers).body(prepared.body);
+        let client = self.client_for_pool(pool);
+        let mut request = client.post(url).headers(headers).body(prepared.body);
         if let Some(timeout) = external_request_send_timeout(route, config, dispatch_deadline) {
             request = request.timeout(timeout);
         }
@@ -6641,6 +6846,21 @@ impl ExternalPoolManager {
             known_tool_names,
             response_body_timeout_secs,
         })
+    }
+
+    fn client_for_pool(&self, pool: &ExternalPool) -> &reqwest::Client {
+        match (pool.wire_profile, pool.tls_profile) {
+            (ExternalPoolWireProfile::Default, ExternalPoolTlsProfile::Default) => &self.client,
+            (ExternalPoolWireProfile::Http1TitleCase, ExternalPoolTlsProfile::Default) => {
+                &self.http1_title_case_client
+            }
+            (ExternalPoolWireProfile::Default, ExternalPoolTlsProfile::NativeTls) => {
+                &self.native_tls_client
+            }
+            (ExternalPoolWireProfile::Http1TitleCase, ExternalPoolTlsProfile::NativeTls) => {
+                &self.native_tls_http1_title_case_client
+            }
+        }
     }
 
     #[cfg(test)]
@@ -10121,7 +10341,7 @@ fn external_pool_url(
     _endpoint: &str,
     config: &ExternalPoolsConfig,
 ) -> Result<Url, ExternalPoolError> {
-    external_pool_messages_url(&pool.base_url).map_err(|err| ExternalPoolError {
+    let mut url = external_pool_messages_url(&pool.base_url).map_err(|err| ExternalPoolError {
         status: None,
         message: format!("model endpoint URL is invalid: {}", err),
         retryable: true,
@@ -10132,7 +10352,11 @@ fn external_pool_url(
         )),
         protocol_error: None,
         raw_upstream_error: None,
-    })
+    })?;
+    if pool.append_beta_query || pool.header_profile.uses_anthropic_header_policy() {
+        append_or_replace_query_pair(&mut url, "beta", "true");
+    }
+    Ok(url)
 }
 
 fn base_url_ends_with_v1(base: &str) -> bool {
@@ -10153,17 +10377,35 @@ fn base_url_ends_with_v1(base: &str) -> bool {
         })
 }
 
+fn append_or_replace_query_pair(url: &mut Url, name: &str, value: &str) {
+    let pairs = url
+        .query_pairs()
+        .filter(|(key, _)| key != name)
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in pairs {
+            query.append_pair(&key, &value);
+        }
+        query.append_pair(name, value);
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn forward_headers(
     headers: &HeaderMap,
     pool: &ExternalPool,
+    request_is_stream: bool,
 ) -> Result<HeaderMap, ExternalPoolError> {
-    let mut out = HeaderMap::new();
-    for (name, value) in headers {
-        if should_forward_header(name) {
-            out.insert(name.clone(), value.clone());
+    let mut out = match pool.header_profile {
+        ExternalPoolHeaderProfile::Generic => forward_generic_headers(headers),
+        ExternalPoolHeaderProfile::AnthropicPassthrough => {
+            forward_anthropic_passthrough_headers(headers)
         }
-    }
+        ExternalPoolHeaderProfile::ClaudeCodeMimic => claude_code_mimic_headers(request_is_stream),
+    };
     if !out.contains_key(HeaderName::from_static("anthropic-version")) {
         out.insert(
             HeaderName::from_static("anthropic-version"),
@@ -10200,8 +10442,71 @@ fn forward_headers(
             out.insert(HeaderName::from_static("x-api-key"), value);
         }
     }
+    apply_external_pool_header_overrides(&mut out, &pool.header_overrides);
     Ok(out)
 }
+
+fn forward_generic_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        if should_forward_header(name) {
+            out.insert(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+fn forward_anthropic_passthrough_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        if should_forward_anthropic_header(name) {
+            out.insert(resolve_anthropic_wire_header_name(name), value.clone());
+        }
+    }
+    out
+}
+
+fn claude_code_mimic_headers(request_is_stream: bool) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for &(name, value) in CLAUDE_CODE_MIMIC_HEADERS {
+        out.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    out.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+    if request_is_stream {
+        out.insert(
+            HeaderName::from_static("x-stainless-helper-method"),
+            HeaderValue::from_static("stream"),
+        );
+    }
+    out.insert(
+        HeaderName::from_static("x-client-request-id"),
+        HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("00000000-0000-4000-8000-000000000000")),
+    );
+    out.insert(
+        HeaderName::from_static("anthropic-beta"),
+        HeaderValue::from_static(CLAUDE_CODE_MIMIC_BETA_HEADER),
+    );
+    out
+}
+
+const CLAUDE_CODE_MIMIC_BETA_HEADER: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11";
+const CLAUDE_CODE_MIMIC_HEADERS: &[(&str, &str)] = &[
+    ("user-agent", "claude-cli/2.1.161 (external, cli)"),
+    ("x-stainless-lang", "js"),
+    ("x-stainless-package-version", "0.94.0"),
+    ("x-stainless-os", "Linux"),
+    ("x-stainless-arch", "arm64"),
+    ("x-stainless-runtime", "node"),
+    ("x-stainless-runtime-version", "v24.3.0"),
+    ("x-stainless-retry-count", "0"),
+    ("x-stainless-timeout", "600"),
+    ("x-app", "cli"),
+    ("anthropic-dangerous-direct-browser-access", "true"),
+];
 
 #[cfg(test)]
 #[allow(clippy::result_large_err)]
@@ -10512,6 +10817,108 @@ fn normalize_external_pool_thinking_value(value: &mut serde_json::Value) -> bool
     thinking.remove("budget_tokens").is_some()
 }
 
+const EXTERNAL_POOL_HEADER_OVERRIDE_MAX_ENTRIES: usize = 64;
+const EXTERNAL_POOL_HEADER_OVERRIDE_MAX_NAME_LEN: usize = 200;
+const EXTERNAL_POOL_HEADER_OVERRIDE_MAX_VALUE_LEN: usize = 8192;
+
+pub fn normalize_external_pool_header_overrides(
+    raw: HashMap<String, String>,
+) -> anyhow::Result<HashMap<String, String>> {
+    if raw.len() > EXTERNAL_POOL_HEADER_OVERRIDE_MAX_ENTRIES {
+        anyhow::bail!(
+            "header_overrides cannot contain more than {} entries",
+            EXTERNAL_POOL_HEADER_OVERRIDE_MAX_ENTRIES
+        );
+    }
+    let mut out = HashMap::new();
+    for (name, value) in raw {
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name.is_empty() && value.is_empty() {
+            continue;
+        }
+        if name.is_empty() {
+            anyhow::bail!("header override name cannot be empty");
+        }
+        if value.is_empty() {
+            continue;
+        }
+        if name.len() > EXTERNAL_POOL_HEADER_OVERRIDE_MAX_NAME_LEN {
+            anyhow::bail!("header override name is too long: {}", name);
+        }
+        if value.len() > EXTERNAL_POOL_HEADER_OVERRIDE_MAX_VALUE_LEN {
+            anyhow::bail!("header override value is too long: {}", name);
+        }
+        if external_pool_header_override_blocked(&name) {
+            anyhow::bail!(
+                "header override is not allowed for sensitive header: {}",
+                name
+            );
+        }
+        HeaderName::from_bytes(name.as_bytes())
+            .map_err(|err| anyhow::anyhow!("header override name is invalid: {err}"))?;
+        HeaderValue::from_str(&value)
+            .map_err(|err| anyhow::anyhow!("header override value is invalid for {name}: {err}"))?;
+        out.insert(name, value);
+    }
+    Ok(out)
+}
+
+fn apply_external_pool_header_overrides(
+    headers: &mut HeaderMap,
+    overrides: &HashMap<String, String>,
+) {
+    for (name, value) in overrides {
+        if external_pool_header_override_blocked(name) {
+            continue;
+        }
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        headers.remove(&header_name);
+        headers.insert(header_name, header_value);
+    }
+}
+
+fn external_pool_header_override_blocked(lower: &str) -> bool {
+    matches!(
+        lower,
+        "host"
+            | "content-length"
+            | "content-type"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "authorization"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "cookie"
+            | "accept-encoding"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-extensions"
+            | "sec-websocket-protocol"
+            | "sec-websocket-accept"
+            | "session_id"
+            | "conversation_id"
+            | "x-codex-turn-state"
+            | "x-codex-turn-metadata"
+            | "chatgpt-account-id"
+            | "x-claude-code-session-id"
+            | "x-client-request-id"
+            | "x-grok-conv-id"
+    )
+}
+
 fn should_forward_header(name: &HeaderName) -> bool {
     let lower = name.as_str().to_ascii_lowercase();
     !matches!(
@@ -10528,8 +10935,128 @@ fn should_forward_header(name: &HeaderName) -> bool {
             | "upgrade"
             | "authorization"
             | "x-api-key"
+            | "x-goog-api-key"
+            | "cookie"
             | "accept-encoding"
     )
+}
+
+fn should_forward_anthropic_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "accept"
+            | "x-stainless-retry-count"
+            | "x-stainless-timeout"
+            | "x-stainless-lang"
+            | "x-stainless-package-version"
+            | "x-stainless-os"
+            | "x-stainless-arch"
+            | "x-stainless-runtime"
+            | "x-stainless-runtime-version"
+            | "x-stainless-helper-method"
+            | "anthropic-dangerous-direct-browser-access"
+            | "anthropic-version"
+            | "x-app"
+            | "anthropic-beta"
+            | "accept-language"
+            | "sec-fetch-mode"
+            | "user-agent"
+            | "content-type"
+            | "x-claude-code-session-id"
+            | "x-client-request-id"
+    )
+}
+
+fn resolve_anthropic_wire_header_name(name: &HeaderName) -> HeaderName {
+    match name.as_str().to_ascii_lowercase().as_str() {
+        "x-stainless-retry-count" => HeaderName::from_static("x-stainless-retry-count"),
+        "x-stainless-timeout" => HeaderName::from_static("x-stainless-timeout"),
+        "x-stainless-lang" => HeaderName::from_static("x-stainless-lang"),
+        "x-stainless-package-version" => HeaderName::from_static("x-stainless-package-version"),
+        "x-stainless-os" => HeaderName::from_static("x-stainless-os"),
+        "x-stainless-arch" => HeaderName::from_static("x-stainless-arch"),
+        "x-stainless-runtime" => HeaderName::from_static("x-stainless-runtime"),
+        "x-stainless-runtime-version" => HeaderName::from_static("x-stainless-runtime-version"),
+        "x-stainless-helper-method" => HeaderName::from_static("x-stainless-helper-method"),
+        "anthropic-dangerous-direct-browser-access" => {
+            HeaderName::from_static("anthropic-dangerous-direct-browser-access")
+        }
+        "anthropic-version" => HeaderName::from_static("anthropic-version"),
+        "anthropic-beta" => HeaderName::from_static("anthropic-beta"),
+        "x-app" => HeaderName::from_static("x-app"),
+        "x-claude-code-session-id" => HeaderName::from_static("x-claude-code-session-id"),
+        "x-client-request-id" => HeaderName::from_static("x-client-request-id"),
+        "content-type" => header::CONTENT_TYPE,
+        "user-agent" => header::USER_AGENT,
+        "accept" => header::ACCEPT,
+        "accept-language" => HeaderName::from_static("accept-language"),
+        "sec-fetch-mode" => HeaderName::from_static("sec-fetch-mode"),
+        _ => name.clone(),
+    }
+}
+
+fn sanitize_anthropic_body_for_beta_header(body: &Bytes, headers: &HeaderMap) -> Bytes {
+    const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+    let beta = headers
+        .get(HeaderName::from_static("anthropic-beta"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if beta
+        .split(',')
+        .any(|token| token.trim() == CONTEXT_MANAGEMENT_BETA)
+    {
+        return body.clone();
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    if object.remove("context_management").is_none() {
+        return body.clone();
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
+}
+
+fn sync_claude_code_session_header(headers: &mut HeaderMap, body: &[u8]) {
+    let session_header = HeaderName::from_static("x-claude-code-session-id");
+    if !headers.contains_key(&session_header) {
+        return;
+    }
+    let Some(session_id) = extract_metadata_session_id_from_body(body) else {
+        return;
+    };
+    let Ok(value) = HeaderValue::from_str(&session_id) else {
+        return;
+    };
+    headers.insert(session_header, value);
+}
+
+fn extract_metadata_session_id_from_body(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let user_id = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(|user_id| user_id.as_str())?;
+    extract_session_id_from_metadata_user_id(user_id)
+}
+
+fn extract_session_id_from_metadata_user_id(user_id: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(user_id) {
+        if let Some(session_id) = value.get("session_id").and_then(|value| value.as_str()) {
+            if uuid::Uuid::parse_str(session_id).is_ok() {
+                return Some(session_id.to_string());
+            }
+        }
+    }
+    let pos = user_id.find("session_")?;
+    let session = user_id.get(pos + "session_".len()..)?;
+    let uuid = session.get(..36)?;
+    uuid::Uuid::parse_str(uuid).ok()?;
+    Some(uuid.to_string())
 }
 
 fn should_forward_response_header(name: &HeaderName) -> bool {

@@ -40,6 +40,24 @@ const splitRules = (value: string) => value.split('\n').map((item) => item.trim(
 const joinRules = (value: string[] = []) => value.join('\n')
 const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
+const parseHeaderOverridesText = (value: string): Record<string, string> => {
+  const headers: Record<string, string> = {}
+  for (const rawLine of value.split('\n')) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#') || line.startsWith('//')) continue
+    const separatorIndex = line.indexOf(':') >= 0 ? line.indexOf(':') : line.indexOf('=')
+    if (separatorIndex <= 0) continue
+    const name = line.slice(0, separatorIndex).trim().toLowerCase()
+    const headerValue = line.slice(separatorIndex + 1).trim()
+    if (!name || !headerValue) continue
+    headers[name] = headerValue
+  }
+  return headers
+}
+const joinHeaderOverrides = (value: Record<string, string> = {}) => Object.entries(value)
+  .filter(([name, headerValue]) => name.trim() && headerValue.trim())
+  .map(([name, headerValue]) => `${name.trim().toLowerCase()}: ${headerValue.trim()}`)
+  .join('\n')
 const parseStatusCodeList = (value: string) => {
   const seen = new Set<number>()
   const codes: number[] = []
@@ -188,6 +206,11 @@ type ExternalPoolFormDraft = {
   baseUrl: string
   apiKey: string
   authType: NonNullable<CreateExternalPoolRequest['authType']>
+  headerProfile: NonNullable<CreateExternalPoolRequest['headerProfile']>
+  appendBetaQuery: boolean
+  headerOverridesText: string
+  wireProfile: NonNullable<CreateExternalPoolRequest['wireProfile']>
+  tlsProfile: NonNullable<CreateExternalPoolRequest['tlsProfile']>
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
@@ -212,6 +235,11 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   baseUrl: '',
   apiKey: '',
   authType: 'bearer',
+  headerProfile: 'generic',
+  appendBetaQuery: false,
+  headerOverridesText: '',
+  wireProfile: 'default',
+  tlsProfile: 'default',
   enabled: false,
   priority: 100,
   maxConcurrentRequests: 10,
@@ -236,6 +264,11 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   baseUrl: pool.baseUrl,
   apiKey: '',
   authType: pool.authType,
+  headerProfile: pool.headerProfile || 'generic',
+  appendBetaQuery: Boolean(pool.appendBetaQuery),
+  headerOverridesText: joinHeaderOverrides(pool.headerOverrides || {}),
+  wireProfile: pool.wireProfile || 'default',
+  tlsProfile: pool.tlsProfile || 'default',
   enabled: pool.enabled,
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
@@ -362,12 +395,13 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = createForm
+      const { modelMappingRulesText, supportedModelsText, routeRulesText, headerOverridesText, ...form } = createForm
       await createExternalPool({
         ...form,
         name: createForm.name.trim(),
         baseUrl: createForm.baseUrl.trim(),
         apiKey: createForm.apiKey.trim(),
+        headerOverrides: parseHeaderOverridesText(headerOverridesText),
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
         streamResponseMode: createForm.streamResponseMode === 'inherit' ? null : createForm.streamResponseMode,
@@ -399,12 +433,13 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, routeRulesText, ...form } = editForm
+      const { modelMappingRulesText, supportedModelsText, routeRulesText, headerOverridesText, ...form } = editForm
       const payload: UpdateExternalPoolRequest = {
         ...form,
         name: editForm.name.trim(),
         baseUrl: editForm.baseUrl.trim(),
         apiKey: editForm.apiKey?.trim() ? editForm.apiKey.trim() : undefined,
+        headerOverrides: parseHeaderOverridesText(headerOverridesText),
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
         streamResponseMode: editForm.streamResponseMode === 'inherit' ? null : editForm.streamResponseMode,
@@ -686,7 +721,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolStreamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolStreamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · {poolHeaderProfileSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -875,6 +910,57 @@ function ExternalPoolFormDialog({
               </SelectBox>
               <TextBox className="md:col-span-2" label="Base URL" description="填写到域名或 /v1 均可；不要填写 /cc，外部池请求路径固定为 /v1/messages。" value={draft.baseUrl} disabled={saving} onChange={(baseUrl) => onDraftChange((prev) => ({ ...prev, baseUrl }))} />
               <TextBox className="md:col-span-2" label={keyLabel} description={keyDescription} value={draft.apiKey} disabled={saving} onChange={(apiKey) => onDraftChange((prev) => ({ ...prev, apiKey }))} />
+            </div>
+          </FormSection>
+
+          <FormSection title="上游 Header 兼容" description="控制转发到该外部池时的请求头、Claude Code 指纹和 beta 查询参数。">
+            <div className="grid gap-3 md:grid-cols-[240px_1fr]">
+              <div className="space-y-3">
+                <SelectBox
+                  label="Header profile"
+                  value={draft.headerProfile}
+                  disabled={saving}
+                  onChange={(headerProfile) => onDraftChange((prev) => ({ ...prev, headerProfile: headerProfile as ExternalPoolFormDraft['headerProfile'] }))}
+                >
+                  <option value="generic">默认泛用转发</option>
+                  <option value="anthropic_passthrough">Anthropic allowlist</option>
+                  <option value="claude_code_mimic">Claude Code mimic</option>
+                </SelectBox>
+                <HintBox>{headerProfileDescription(draft.headerProfile)}</HintBox>
+                <Toggle
+                  label="URL 追加 beta=true"
+                  checked={draft.headerProfile !== 'generic' || Boolean(draft.appendBetaQuery)}
+                  disabled={saving || draft.headerProfile !== 'generic'}
+                  onChange={(appendBetaQuery) => onDraftChange((prev) => ({ ...prev, appendBetaQuery }))}
+                />
+                <SelectBox
+                  label="Wire profile"
+                  value={draft.wireProfile}
+                  disabled={saving}
+                  onChange={(wireProfile) => onDraftChange((prev) => ({ ...prev, wireProfile: wireProfile as ExternalPoolFormDraft['wireProfile'] }))}
+                >
+                  <option value="default">默认传输</option>
+                  <option value="http1_title_case">HTTP/1 Title-Case</option>
+                </SelectBox>
+                <HintBox>{wireProfileDescription(draft.wireProfile)}</HintBox>
+                <SelectBox
+                  label="TLS profile"
+                  value={draft.tlsProfile}
+                  disabled={saving}
+                  onChange={(tlsProfile) => onDraftChange((prev) => ({ ...prev, tlsProfile: tlsProfile as ExternalPoolFormDraft['tlsProfile'] }))}
+                >
+                  <option value="default">默认 TLS</option>
+                  <option value="native_tls">Native TLS</option>
+                </SelectBox>
+                <HintBox>{tlsProfileDescription(draft.tlsProfile)}</HintBox>
+              </div>
+              <TextArea
+                label="Header 覆盖"
+                description="每行一个 name: value；敏感头如 authorization、x-api-key、cookie、x-goog-api-key、x-client-request-id 会被后端拒绝。"
+                value={draft.headerOverridesText}
+                disabled={saving}
+                onChange={(headerOverridesText) => onDraftChange((prev) => ({ ...prev, headerOverridesText }))}
+              />
             </div>
           </FormSection>
 
@@ -1472,6 +1558,47 @@ function poolBodyModeSummary(pool: ExternalPool) {
       : 'Body: raw透传'
   }
   return 'Body: 标准处理'
+}
+
+function headerProfileDescription(profile: ExternalPool['headerProfile'] | undefined) {
+  if (profile === 'claude_code_mimic') {
+    return '忽略客户端指纹，使用 Claude Code 风格的 x-stainless、User-Agent、x-client-request-id 和 anthropic-beta；URL 自动追加 beta=true。'
+  }
+  if (profile === 'anthropic_passthrough') {
+    return '只透传 Anthropic/Claude Code 相关请求头，过滤 cookie、x-goog-api-key 和非必要客户端头；URL 自动追加 beta=true。'
+  }
+  return '保持旧版泛用转发策略，仅过滤认证、连接、cookie、x-goog-api-key 等敏感请求头；是否追加 beta=true 由下方开关控制。'
+}
+
+function poolHeaderProfileSummary(pool: ExternalPool) {
+  const profile = pool.headerProfile || 'generic'
+  const overrides = Object.keys(pool.headerOverrides || {}).length
+  const parts = [
+    profile === 'claude_code_mimic'
+      ? 'Header: Claude Code'
+      : profile === 'anthropic_passthrough'
+        ? 'Header: Anthropic'
+        : 'Header: 默认',
+  ]
+  if (pool.appendBetaQuery || profile !== 'generic') parts.push('beta=true')
+  if (overrides > 0) parts.push(`${overrides} 个覆盖`)
+  if (pool.wireProfile === 'http1_title_case') parts.push('HTTP/1')
+  if (pool.tlsProfile === 'native_tls') parts.push('Native TLS')
+  return parts.join(' · ')
+}
+
+function wireProfileDescription(profile: ExternalPool['wireProfile'] | undefined) {
+  if (profile === 'http1_title_case') {
+    return '强制 HTTP/1，并启用 reqwest 的 HTTP/1 Title-Case header 写出；这是兼容增强，不是完整 Claude Code 混合大小写/顺序复刻。'
+  }
+  return '使用默认 reqwest 传输行为，允许 HTTP/2 协商，header wire 大小写由 HTTP 客户端决定。'
+}
+
+function tlsProfileDescription(profile: ExternalPool['tlsProfile'] | undefined) {
+  if (profile === 'native_tls') {
+    return '使用系统/native-tls 栈构建外部池客户端；这是 TLS 栈切换，不是完整 Node.js/Claude Code ClientHello 指纹。'
+  }
+  return '使用默认 TLS 栈。当前项目默认仍是常规 reqwest/rustls/native 配置，不伪造 Node.js ClientHello。'
 }
 
 function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {
