@@ -227,18 +227,13 @@ impl ExternalPoolAuthType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalPoolHeaderProfile {
+    #[default]
     Generic,
     AnthropicPassthrough,
     ClaudeCodeMimic,
-}
-
-impl Default for ExternalPoolHeaderProfile {
-    fn default() -> Self {
-        Self::Generic
-    }
 }
 
 impl ExternalPoolHeaderProfile {
@@ -272,17 +267,12 @@ impl ExternalPoolHeaderProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalPoolWireProfile {
+    #[default]
     Default,
     Http1TitleCase,
-}
-
-impl Default for ExternalPoolWireProfile {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl ExternalPoolWireProfile {
@@ -308,17 +298,12 @@ impl ExternalPoolWireProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalPoolTlsProfile {
+    #[default]
     Default,
     NativeTls,
-}
-
-impl Default for ExternalPoolTlsProfile {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl ExternalPoolTlsProfile {
