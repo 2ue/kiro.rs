@@ -7,6 +7,9 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { CredentialCard } from '@/components/credential-card'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
@@ -167,6 +170,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [rpmQuery, setRpmQuery] = useState('')
   const [concurrencyQuery, setConcurrencyQuery] = useState('')
   const [activeTab, setActiveTab] = useState<'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
+  const [creditDetailDialogOpen, setCreditDetailDialogOpen] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -222,6 +226,58 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const accountInfoQuery = useCredentialsAccountInfo(visibleCredentialIds)
   const usageSummaryQuery = useCredentialsUsageSummary(visibleCredentialIds)
   const allCredentialsQuery = useCredentials({ enabled: false, refetchInterval: false })
+
+  // 对话框需要的所有账号的 ID
+  const allCredentialIds = useMemo(
+    () => (allCredentialsQuery.data?.credentials || []).map(cred => cred.id),
+    [allCredentialsQuery.data?.credentials]
+  )
+
+  // 获取所有账号的账户信息和使用统计
+  const allAccountInfoQuery = useCredentialsAccountInfo(allCredentialIds)
+  const allUsageSummaryQuery = useCredentialsUsageSummary(allCredentialIds)
+
+  // 合并所有账号的完整数据
+  const allCredentialsWithDetails = useMemo(() => {
+    const accountById = new Map((allAccountInfoQuery.data?.items || []).map((item) => [item.id, item]))
+    const usageById = new Map((allUsageSummaryQuery.data?.items || []).map((item) => [item.id, item]))
+
+    return (allCredentialsQuery.data?.credentials || [])
+      .map(cred => {
+        const usageItem = usageById.get(cred.id)
+        return {
+          ...cred,
+          accountInfo: accountById.get(cred.id),
+          estimatedCostUsd: usageItem?.estimatedCostUsd ?? 0,
+          originalCostUsd: usageItem?.originalCostUsd ?? 0,
+        }
+      })
+  }, [allCredentialsQuery.data?.credentials, allAccountInfoQuery.data?.items, allUsageSummaryQuery.data?.items])
+
+  // 计算精确的统计数据
+  const refinedCreditStats = useMemo(() => {
+    const enabled = allCredentialsWithDetails.filter(cred => !cred.disabled)
+    const all = allCredentialsWithDetails
+
+    return {
+      // 启用账号的剩余额度（可用）
+      enabledCreditRemaining: enabled.reduce((sum, cred) =>
+        sum + (cred.accountInfo?.creditRemaining ?? 0), 0
+      ),
+      // 所有账号的总额度（已购买的）
+      totalCreditLimit: all.reduce((sum, cred) =>
+        sum + (cred.accountInfo?.creditLimit ?? 0), 0
+      ),
+      // 所有账号的已消耗成本（真实发生的）
+      totalEstimatedCostUsd: all.reduce((sum, cred) =>
+        sum + (cred.estimatedCostUsd ?? 0), 0
+      ),
+      totalOriginalCostUsd: all.reduce((sum, cred) =>
+        sum + (cred.originalCostUsd ?? 0), 0
+      ),
+    }
+  }, [allCredentialsWithDetails])
+
   const { mutate: deleteCredential } = useDeleteCredential()
   const deleteDisabled = useDeleteDisabledCredentials()
   const batchUpdateCredentials = useBatchUpdateCredentials()
@@ -760,6 +816,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return next
     })
 
+    const toastId = toast.loading(`正在查询账号信息... 0/${ids.length}`, {
+      duration: Infinity,
+    })
+
     try {
       const response = await refreshCredentialInfo(ids, true)
       setBalanceMap(prev => {
@@ -775,12 +835,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
       queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
       queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
 
+      toast.dismiss(toastId)
       if (response.failed === 0) {
         toast.success(`查询完成：成功 ${response.success}/${response.total}`)
       } else {
         toast.warning(`查询完成：成功 ${response.success} 个，失败 ${response.failed} 个`)
       }
     } catch (error) {
+      toast.dismiss(toastId)
       toast.error(`查询信息失败: ${extractErrorMessage(error)}`)
     } finally {
       setQueryingInfo(false)
@@ -1108,7 +1170,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <div className="text-xs text-muted-foreground">每个凭据同时处理请求上限</div>
             </CardContent>
           </Card>
-          <Card>
+          <Card
+            className="cursor-pointer hover:border-primary/50 transition-colors"
+            onClick={() => setCreditDetailDialogOpen(true)}
+          >
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-1 text-sm font-medium text-muted-foreground">
                 <Wallet className="h-3.5 w-3.5" />
@@ -1518,6 +1583,93 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+
+      {/* 积分详情弹层 */}
+      <Dialog open={creditDetailDialogOpen} onOpenChange={setCreditDetailDialogOpen}>
+        <DialogContent className="max-w-6xl max-h-[80vh]">
+          <DialogHeader>
+            <DialogTitle>启用账号积分详情</DialogTitle>
+          </DialogHeader>
+
+          {/* 统计信息 */}
+          <div className="grid grid-cols-4 gap-4 mb-4">
+            <Card>
+              <CardContent className="pt-4">
+                <div className="text-sm text-muted-foreground">可用剩余积分</div>
+                <div className="text-xl font-bold mt-1">{formatCredits(refinedCreditStats.enabledCreditRemaining)}</div>
+                <div className="text-xs text-muted-foreground mt-1">仅启用账号</div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-4">
+                <div className="text-sm text-muted-foreground">总购买额度</div>
+                <div className="text-xl font-bold mt-1">{formatCredits(refinedCreditStats.totalCreditLimit)}</div>
+                <div className="text-xs text-muted-foreground mt-1">所有账号</div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-4">
+                <div className="text-sm text-muted-foreground">已记录消耗</div>
+                <div className="text-xl font-bold mt-1">{formatUsdFixed2(refinedCreditStats.totalEstimatedCostUsd)}</div>
+                <div className="text-xs text-muted-foreground mt-1">所有账号</div>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-4">
+                <div className="text-sm text-muted-foreground">原始消耗</div>
+                <div className="text-xl font-bold mt-1">{formatUsdFixed2(refinedCreditStats.totalOriginalCostUsd)}</div>
+                <div className="text-xs text-muted-foreground mt-1">所有账号</div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* 账号列表 */}
+          <ScrollArea className="h-[400px]">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-16">序号</TableHead>
+                  <TableHead>账号邮箱</TableHead>
+                  <TableHead className="text-right">剩余积分</TableHead>
+                  <TableHead className="text-right">总积分</TableHead>
+                  <TableHead className="text-right">已记录消耗</TableHead>
+                  <TableHead className="text-right">原始消耗</TableHead>
+                  <TableHead>订阅类型</TableHead>
+                  <TableHead>状态</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {allCredentialsWithDetails.map((cred, index) => (
+                  <TableRow key={cred.id}>
+                    <TableCell className="font-medium">{index + 1}</TableCell>
+                    <TableCell className="font-mono text-sm">{cred.email || '-'}</TableCell>
+                    <TableCell className="text-right font-mono">
+                      {formatCredits(cred.accountInfo?.creditRemaining)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono">
+                      {formatCredits(cred.accountInfo?.creditLimit)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono">
+                      {formatUsdFixed2(cred.estimatedCostUsd)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono">
+                      {formatUsdFixed2(cred.originalCostUsd)}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="outline">{cred.subscriptionTitle || '-'}</Badge>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={cred.disabled ? 'destructive' : 'default'}>
+                        {cred.disabled ? '已禁用' : '启用'}
+                      </Badge>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </ScrollArea>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
