@@ -5696,14 +5696,18 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_route_rules.len() > 200 {
         return Err("externalPoolRouteRules 不能超过 200 条".to_string());
     }
+    if config.local_pool_route_rules.len() > 200 {
+        return Err("localPoolRouteRules 不能超过 200 条".to_string());
+    }
     if config
         .direct_external_model_rules
         .iter()
         .chain(config.direct_external_path_rules.iter())
         .chain(config.external_pool_route_rules.iter())
+        .chain(config.local_pool_route_rules.iter())
         .any(|rule| rule.len() > 256)
     {
-        return Err("外部池规则单条长度不能超过 256".to_string());
+        return Err("路由规则单条长度不能超过 256".to_string());
     }
     if config.local_pool_circuit_window_secs == 0
         || config.local_pool_circuit_window_secs > 24 * 60 * 60

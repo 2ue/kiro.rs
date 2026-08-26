@@ -64,6 +64,7 @@ export function routeLabel(record: UsageRecord): string {
     external_fallback_preflight: '预检 fallback',
     external_fallback_after_local_attempts: '失败后 fallback',
     external_direct_policy: '外部直连',
+    external_route_policy: '路由策略',
     external_error: '外部错误',
   }
   return labels[record.routeSubtype || ''] || (record.routeKind === 'external_pool' ? '外部账号' : '本地')
@@ -71,6 +72,7 @@ export function routeLabel(record: UsageRecord): string {
 
 export function routeTone(record: UsageRecord): NonNullable<BadgeProps['tone']> {
   if (record.routeSubtype === 'external_direct_policy') return 'warning'
+  if (record.routeSubtype === 'external_route_policy') return 'warning'
   if (record.routeSubtype === 'local_rescue_after_external') return 'info'
   if (record.routeKind === 'external_pool') return record.status === 'success' ? 'info' : 'error'
   return record.status === 'success' ? 'success' : 'neutral'

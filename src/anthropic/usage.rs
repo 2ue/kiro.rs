@@ -71,6 +71,7 @@ pub enum UsageRouteSubtype {
     ExternalFallbackPreflight,
     ExternalFallbackAfterLocalAttempts,
     ExternalDirectPolicy,
+    ExternalRoutePolicy,
     ExternalError,
 }
 

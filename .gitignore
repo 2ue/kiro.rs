@@ -25,4 +25,9 @@
 /ui/dist/
 /ui/.vite/
 /ui/tsconfig.tsbuildinfo
+/inventory-system/backend/*.db
+/inventory-system/web/node_modules/
+/inventory-system/web/dist/
+/inventory-system/web/.vite/
+/inventory-system/web/tsconfig.tsbuildinfo
 catch-test/

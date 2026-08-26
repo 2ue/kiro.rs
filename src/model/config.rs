@@ -2859,6 +2859,10 @@ pub struct ExternalPoolsConfig {
     pub external_pool_route_mode: ExternalPoolRouteMode,
     #[serde(default)]
     pub external_pool_route_rules: Vec<String>,
+    #[serde(default)]
+    pub local_pool_route_mode: ExternalPoolRouteMode,
+    #[serde(default)]
+    pub local_pool_route_rules: Vec<String>,
     #[serde(default = "default_true")]
     pub fallback_on_local_capacity_exhausted: bool,
     /// Redis scheduler coordination is a local routing failure, so historical
@@ -3006,6 +3010,8 @@ impl Default for ExternalPoolsConfig {
             direct_external_path_rules: Vec::new(),
             external_pool_route_mode: ExternalPoolRouteMode::default(),
             external_pool_route_rules: Vec::new(),
+            local_pool_route_mode: ExternalPoolRouteMode::default(),
+            local_pool_route_rules: Vec::new(),
             fallback_on_local_capacity_exhausted: true,
             fallback_on_scheduler_redis_degraded: true,
             fallback_on_no_available_credentials: true,
@@ -3089,17 +3095,19 @@ impl ExternalPoolsConfig {
     }
 
     pub fn external_pool_route_allowed(&self, endpoint: &str) -> bool {
-        match self.external_pool_route_mode {
-            ExternalPoolRouteMode::AllowAll => true,
-            ExternalPoolRouteMode::AllowList => self
-                .external_pool_route_rules
-                .iter()
-                .any(|rule| route_rule_matches(rule, endpoint)),
-            ExternalPoolRouteMode::DenyList => !self
-                .external_pool_route_rules
-                .iter()
-                .any(|rule| route_rule_matches(rule, endpoint)),
-        }
+        route_policy_allows(
+            self.external_pool_route_mode,
+            &self.external_pool_route_rules,
+            endpoint,
+        )
+    }
+
+    pub fn local_pool_route_allowed(&self, endpoint: &str) -> bool {
+        route_policy_allows(
+            self.local_pool_route_mode,
+            &self.local_pool_route_rules,
+            endpoint,
+        )
     }
 
     pub fn same_pool_retry_status_codes(&self) -> BTreeSet<u16> {
@@ -3116,6 +3124,18 @@ impl ExternalPoolsConfig {
             .copied()
             .filter(|code| (100..=599).contains(code))
             .collect()
+    }
+}
+
+fn route_policy_allows(mode: ExternalPoolRouteMode, rules: &[String], endpoint: &str) -> bool {
+    match mode {
+        ExternalPoolRouteMode::AllowAll => true,
+        ExternalPoolRouteMode::AllowList => {
+            rules.iter().any(|rule| route_rule_matches(rule, endpoint))
+        }
+        ExternalPoolRouteMode::DenyList => {
+            !rules.iter().any(|rule| route_rule_matches(rule, endpoint))
+        }
     }
 }
 
@@ -6000,6 +6020,11 @@ mod tests {
                 .external_pools
                 .external_pool_route_allowed("/dfcache/team-a/v1/messages")
         );
+        assert!(
+            config
+                .external_pools
+                .local_pool_route_allowed("/cc/v1/messages")
+        );
     }
 
     #[test]
@@ -6020,6 +6045,23 @@ mod tests {
     }
 
     #[test]
+    fn local_pool_route_policy_denies_matching_routes_only() {
+        let mut config = ExternalPoolsConfig {
+            local_pool_route_mode: ExternalPoolRouteMode::DenyList,
+            local_pool_route_rules: vec!["/cc".to_string(), "/dfcache/team-a".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(!config.local_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.local_pool_route_allowed("/dfcache/team-a/v1/messages"));
+        assert!(config.local_pool_route_allowed("/v1/messages"));
+
+        config.local_pool_route_rules = vec!["*".to_string()];
+        assert!(!config.local_pool_route_allowed("/v1/messages"));
+        assert!(!config.local_pool_route_allowed("/ha/v1/messages"));
+    }
+
+    #[test]
     fn external_pool_route_policy_allow_list_requires_a_match() {
         let config = ExternalPoolsConfig {
             external_pool_route_mode: ExternalPoolRouteMode::AllowList,
@@ -6031,6 +6073,20 @@ mod tests {
         assert!(config.external_pool_route_allowed("/dfcache/team-b/v1/messages"));
         assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
         assert!(!config.external_pool_route_allowed("/v1/messages"));
+    }
+
+    #[test]
+    fn local_pool_route_policy_allow_list_requires_a_match() {
+        let config = ExternalPoolsConfig {
+            local_pool_route_mode: ExternalPoolRouteMode::AllowList,
+            local_pool_route_rules: vec!["/ha".to_string(), "/dfcache/team-b".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(config.local_pool_route_allowed("/ha/v1/messages"));
+        assert!(config.local_pool_route_allowed("/dfcache/team-b/v1/messages"));
+        assert!(!config.local_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.local_pool_route_allowed("/v1/messages"));
     }
 
     #[test]
@@ -6046,6 +6102,18 @@ mod tests {
     }
 
     #[test]
+    fn local_pool_route_policy_matches_case_insensitively() {
+        let config = ExternalPoolsConfig {
+            local_pool_route_mode: ExternalPoolRouteMode::AllowList,
+            local_pool_route_rules: vec!["/CC/V1".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(config.local_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.local_pool_route_allowed("/ha/v1/messages"));
+    }
+
+    #[test]
     fn external_pool_route_policy_does_not_match_mid_path_segments() {
         let config = ExternalPoolsConfig {
             external_pool_route_mode: ExternalPoolRouteMode::AllowList,
@@ -6056,6 +6124,19 @@ mod tests {
         assert!(config.external_pool_route_allowed("/v1/messages"));
         assert!(!config.external_pool_route_allowed("/cc/v1/messages"));
         assert!(!config.external_pool_route_allowed("/ha/v1/messages"));
+    }
+
+    #[test]
+    fn local_pool_route_policy_does_not_match_mid_path_segments() {
+        let config = ExternalPoolsConfig {
+            local_pool_route_mode: ExternalPoolRouteMode::AllowList,
+            local_pool_route_rules: vec!["/v1".to_string()],
+            ..ExternalPoolsConfig::default()
+        };
+
+        assert!(config.local_pool_route_allowed("/v1/messages"));
+        assert!(!config.local_pool_route_allowed("/cc/v1/messages"));
+        assert!(!config.local_pool_route_allowed("/ha/v1/messages"));
     }
 
     #[test]

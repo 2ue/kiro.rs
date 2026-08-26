@@ -102,6 +102,8 @@ const BASE_EXTERNAL_POOLS_CONFIG = {
   externalDirectPolicyEnabled: true,
   directExternalPathRules: [ROUTE_RULE],
   directExternalModelRules: [MODEL],
+  localPoolRouteMode: 'allow_all',
+  localPoolRouteRules: [],
   externalPoolRouteMode: 'allow_all',
   externalPoolRouteRules: [],
   fallbackOnLocalCapacityExhausted: false,
@@ -294,6 +296,24 @@ const SCENARIOS = [
       backup_b: { type: 'json_success' },
     },
     expect: { all200: true, primaryHitsMax: 0, backupHitsMin: 1, noLocal: true },
+  },
+  {
+    id: 'local_route_block_falls_to_external',
+    stream: false,
+    requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+    concurrency: Math.min(MAX_CONCURRENCY, 4),
+    externalPoolsOverrides: {
+      externalDirectPolicyEnabled: true,
+      externalPoolLocalRescueEnabled: false,
+      localPoolRouteMode: 'deny_list',
+      localPoolRouteRules: [ROUTE_RULE],
+    },
+    behaviors: {
+      primary: { type: 'json_success' },
+      backup_a: { type: 'json_success' },
+      backup_b: { type: 'json_success' },
+    },
+    expect: { all200: true, primaryHitsMin: 1, backupHitsMax: 0, noLocal: true },
   },
   {
     id: 'priority_500_stream_failover',

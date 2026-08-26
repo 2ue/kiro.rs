@@ -74,6 +74,11 @@ import {
   ToggleRow,
 } from './external-pool-components'
 
+function normalizeExternalPoolRouteMode(value?: string): ExternalPoolsConfig['externalPoolRouteMode'] {
+  if (value === 'allow_list' || value === 'deny_list') return value
+  return 'allow_all'
+}
+
 // ============================================================================
 // Local sub-components
 // ============================================================================
@@ -113,6 +118,8 @@ export function ExternalPoolsPage() {
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
   const [modelRulesText, setModelRulesText] = useState('')
   const [pathRulesText, setPathRulesText] = useState('')
+  const [externalRouteRulesText, setExternalRouteRulesText] = useState('')
+  const [localRouteRulesText, setLocalRouteRulesText] = useState('')
   const [retryStatusCodesText, setRetryStatusCodesText] = useState('')
   const [samePoolRetryStatusCodesText, setSamePoolRetryStatusCodesText] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
@@ -127,6 +134,8 @@ export function ExternalPoolsPage() {
     setConfigDraft(externalPools)
     setModelRulesText(joinRules(externalPools.directExternalModelRules))
     setPathRulesText(joinRules(externalPools.directExternalPathRules))
+    setExternalRouteRulesText(joinRules(externalPools.externalPoolRouteRules))
+    setLocalRouteRulesText(joinRules(externalPools.localPoolRouteRules))
     setRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolRetryStatusCodes))
     setSamePoolRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolSamePoolRetryStatusCodes))
   }, [runtimeConfig.data?.externalPools])
@@ -294,6 +303,12 @@ export function ExternalPoolsPage() {
     || outputUpliftActive
     || configDraft.externalPoolUsageProjectionCostFloorEnabled
   const usageDebugActive = externalEnabled && configDraft.externalPoolUsageDebugEnabled
+  const routePolicyActive = externalEnabled && (
+    configDraft.externalPoolRouteMode !== 'allow_all'
+    || configDraft.externalPoolRouteRules.length > 0
+    || configDraft.localPoolRouteMode !== 'allow_all'
+    || configDraft.localPoolRouteRules.length > 0
+  )
 
   const poolStatuses = status.data?.pools ?? []
   const totalPools = pools.data?.pools.length ?? poolStatuses.length
@@ -329,8 +344,8 @@ export function ExternalPoolsPage() {
         <StatCard title="按路径整理 usage" value={`${currentPathPoolCount} 个`} />
         <StatCard
           title="入口策略"
-          value={fallbackActive || directPolicyActive ? '已配置' : '未配置'}
-          tone={fallbackActive || directPolicyActive ? 'success' : 'warning'}
+          value={fallbackActive || directPolicyActive || routePolicyActive ? '已配置' : '未配置'}
+          tone={fallbackActive || directPolicyActive || routePolicyActive ? 'success' : 'warning'}
         />
       </StatGrid>
 
@@ -348,6 +363,69 @@ export function ExternalPoolsPage() {
           <PolicyBlock title="启用控制" active={externalEnabled} description="关闭后不会进入任何外部账号，请求只走本地账号。">
             <div className="grid gap-3 md:grid-cols-2">
               <ToggleRow label="启用外部账号" checked={configDraft.externalPoolsEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolsEnabled: v }))} />
+            </div>
+          </PolicyBlock>
+
+          <PolicyBlock
+            title="路由策略"
+            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            active={externalEnabled}
+            description="控制哪些入口进入本地账号或外部账号。"
+          >
+            <div className="grid gap-4 lg:grid-cols-2">
+              <FormSection title="本地账号路由" description="决定哪些入口允许进入本地账号；其余入口会按外部池策略处理。">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <SelectBox
+                    disabled={!externalEnabled}
+                    label="路由模式"
+                    value={configDraft.localPoolRouteMode}
+                    onChange={(localPoolRouteMode) => setConfigDraft((prev) => ({
+                      ...prev,
+                      localPoolRouteMode: normalizeExternalPoolRouteMode(localPoolRouteMode),
+                    }))}
+                  >
+                    <SelectItem value="allow_all">全部入口允许进入本地账号</SelectItem>
+                    <SelectItem value="allow_list">只允许下列入口进入本地账号</SelectItem>
+                    <SelectItem value="deny_list">禁止下列入口进入本地账号</SelectItem>
+                  </SelectBox>
+                  <TextAreaBox
+                    disabled={!externalEnabled || configDraft.localPoolRouteMode === 'allow_all'}
+                    label="路由规则"
+                    value={localRouteRulesText}
+                    onChange={(value) => {
+                      setLocalRouteRulesText(value)
+                      setConfigDraft((prev) => ({ ...prev, localPoolRouteRules: splitRules(value) }))
+                    }}
+                  />
+                </div>
+              </FormSection>
+
+              <FormSection title="外部账号路由" description="决定哪些入口允许进入外部账号；默认允许全部入口。">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <SelectBox
+                    disabled={!externalEnabled}
+                    label="路由模式"
+                    value={configDraft.externalPoolRouteMode}
+                    onChange={(externalPoolRouteMode) => setConfigDraft((prev) => ({
+                      ...prev,
+                      externalPoolRouteMode: normalizeExternalPoolRouteMode(externalPoolRouteMode),
+                    }))}
+                  >
+                    <SelectItem value="allow_all">全部入口允许进入外部账号</SelectItem>
+                    <SelectItem value="allow_list">只允许下列入口进入外部账号</SelectItem>
+                    <SelectItem value="deny_list">禁止下列入口进入外部账号</SelectItem>
+                  </SelectBox>
+                  <TextAreaBox
+                    disabled={!externalEnabled || configDraft.externalPoolRouteMode === 'allow_all'}
+                    label="路由规则"
+                    value={externalRouteRulesText}
+                    onChange={(value) => {
+                      setExternalRouteRulesText(value)
+                      setConfigDraft((prev) => ({ ...prev, externalPoolRouteRules: splitRules(value) }))
+                    }}
+                  />
+                </div>
+              </FormSection>
             </div>
           </PolicyBlock>
 

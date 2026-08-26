@@ -795,7 +795,7 @@ export interface UsageRecord {
   fallbackFromSticky: boolean
   credentialAttempts?: KiroCredentialAttempt[]
   routeKind?: 'local_credential' | 'external_pool'
-  routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_external' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
+  routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'local_rescue_after_external' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_route_policy' | 'external_error'
   fallbackReason?: string
   directPolicyReason?: string
   localAttempted?: boolean
@@ -1554,6 +1554,8 @@ export interface ExternalPoolsConfig {
   directExternalPathRules: string[]
   externalPoolRouteMode: ExternalPoolRouteMode
   externalPoolRouteRules: string[]
+  localPoolRouteMode: ExternalPoolRouteMode
+  localPoolRouteRules: string[]
   fallbackOnLocalCapacityExhausted: boolean
   fallbackOnSchedulerRedisDegraded: boolean
   fallbackOnNoAvailableCredentials: boolean

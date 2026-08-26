@@ -1833,6 +1833,37 @@ impl ExternalFallbackContext {
         }
     }
 
+    async fn route_policy_response(
+        &self,
+        request_id: &str,
+        model_resolution: Option<ModelResolution>,
+    ) -> Option<Response> {
+        let mut external = self.clone();
+        external.model_resolution = model_resolution;
+        let route = match external.route_request(
+            request_id.to_string(),
+            UsageRouteSubtype::ExternalRoutePolicy,
+            Some("local_route_blocked".to_string()),
+            None,
+            false,
+            Some(json!({
+                "reason": "local_route_blocked",
+            })),
+            Vec::new(),
+        ) {
+            Ok(route) => route,
+            Err(err) => return Some(payload_guard_error_response(err)),
+        };
+        match self
+            .manager
+            .forward_with_failover_result(self.config.clone(), route)
+            .await
+        {
+            ExternalPoolForwardOutcome::Response(response) => Some(response),
+            ExternalPoolForwardOutcome::FinalError(err) => Some(err.into_response(request_id)),
+        }
+    }
+
     async fn local_pool_preflight_outcome(
         &self,
         request_id: &str,
@@ -2007,24 +2038,26 @@ impl ExternalFallbackContext {
         if self.config.local_pool_circuit_enabled {
             let mut seen_credentials = HashSet::new();
             let mut recorded = false;
-            for attempt in &classification_attempts {
-                if seen_credentials.insert(attempt.credential_id) {
-                    recorded = true;
+            if classified_reason != "local_request_body_invalid" {
+                for attempt in &classification_attempts {
+                    if seen_credentials.insert(attempt.credential_id) {
+                        recorded = true;
+                        let _ = self
+                            .manager
+                            .record_local_pool_failure(
+                                &self.config,
+                                Some(attempt.credential_id),
+                                &classified_reason,
+                            )
+                            .await;
+                    }
+                }
+                if !recorded {
                     let _ = self
                         .manager
-                        .record_local_pool_failure(
-                            &self.config,
-                            Some(attempt.credential_id),
-                            &classified_reason,
-                        )
+                        .record_local_pool_failure(&self.config, None, &classified_reason)
                         .await;
                 }
-            }
-            if !recorded {
-                let _ = self
-                    .manager
-                    .record_local_pool_failure(&self.config, None, &classified_reason)
-                    .await;
             }
         }
         tracing::warn!(
@@ -2430,6 +2463,9 @@ fn classify_local_error_for_external_fallback_with_kind(
     if config.fallback_on_unsupported_model && is_unsupported_model_error(&lower, attempts) {
         return Some("unsupported_model".to_string());
     }
+    if is_local_request_body_invalid_for_external_fallback(&lower, attempts) {
+        return Some("local_request_body_invalid".to_string());
+    }
     if is_request_error_that_must_not_fallback(&lower, attempts) {
         return None;
     }
@@ -2524,6 +2560,9 @@ fn is_request_error_that_must_not_fallback(
     lower_message: &str,
     attempts: &[KiroCredentialAttempt],
 ) -> bool {
+    if is_local_request_body_invalid_for_external_fallback(lower_message, attempts) {
+        return false;
+    }
     if lower_message.contains("bad request")
         || lower_message.contains("invalid_request")
         || lower_message.contains("content_length_exceeds_threshold")
@@ -2541,6 +2580,30 @@ fn is_request_error_that_must_not_fallback(
             attempt.error_type.as_deref(),
             Some("bad_request") | Some("client_error") | Some("invalid_request_error")
         ) || attempt.status == Some(400)
+    })
+}
+
+fn is_local_request_body_invalid_for_external_fallback(
+    lower_message: &str,
+    attempts: &[KiroCredentialAttempt],
+) -> bool {
+    if lower_message.contains("request_body_invalid_bad_request")
+        || lower_message.contains("request body invalid")
+        || lower_message.contains("invalid tool use format")
+    {
+        return true;
+    }
+    attempts.iter().any(|attempt| {
+        attempt
+            .error_type
+            .as_deref()
+            .is_some_and(|error_type| error_type == "request_body_invalid_bad_request")
+            || attempt.error_message.as_deref().is_some_and(|message| {
+                let message = message.to_ascii_lowercase();
+                message.contains("request_body_invalid")
+                    || message.contains("invalid tool use format")
+                    || message.contains("request validation failed")
+            })
     })
 }
 
@@ -6021,6 +6084,55 @@ async fn post_messages_inner(
         request_history_contaminated,
         raw_preflight_failure,
     );
+    let prompt_steering_for_external = super::prompt_steering::should_apply_to_external_pool(
+        &endpoint,
+        runtime_config.compat_profile,
+        &runtime_config.prompt_steering,
+    );
+    let local_route_allowed = runtime_config
+        .external_pools
+        .local_pool_route_allowed(&endpoint);
+    if !local_route_allowed {
+        if prompt_steering_for_external {
+            super::prompt_steering::apply_to_messages_request(
+                &endpoint,
+                runtime_config.compat_profile,
+                &runtime_config.prompt_steering,
+                &mut payload,
+            );
+        }
+        if let Some(external) = external_fallback.as_mut() {
+            external.refresh_payload(&payload);
+            let request_id = envelope::request_id();
+            let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping(
+                &payload.model,
+                runtime_config.model_resolution_mode,
+                &runtime_config.model_mapping,
+            );
+            let direct_model_resolution = (direct_model_resolution.source
+                != ModelResolutionSource::Unsupported)
+                .then(|| external_route_model_resolution(direct_model_resolution));
+            if let Some(response) = external
+                .route_policy_response(&request_id, direct_model_resolution)
+                .await
+            {
+                return response;
+            }
+        }
+        let response = envelope::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "request route is blocked by local pool route policy",
+        );
+        record_pre_usage_rejection(
+            attribution.as_ref(),
+            RequestRejectionReason::LocalRouteBlocked,
+            &endpoint,
+            &response,
+        );
+        return response;
+    }
+
     let parsed_body_plan =
         ParsedAnthropicBodyPlan::shared_compatible(runtime_config.image_processing);
     let _parsed_body_report = match parsed_body_pipeline::prepare(
@@ -6045,11 +6157,6 @@ async fn post_messages_inner(
         }
     };
 
-    let prompt_steering_for_external = super::prompt_steering::should_apply_to_external_pool(
-        &endpoint,
-        runtime_config.compat_profile,
-        &runtime_config.prompt_steering,
-    );
     if prompt_steering_for_external {
         super::prompt_steering::apply_to_messages_request(
             &endpoint,
@@ -6069,7 +6176,6 @@ async fn post_messages_inner(
             &mut payload,
         );
     }
-
     if let Some(external) = external_fallback.as_ref() {
         let request_id = envelope::request_id();
         let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping(
@@ -6804,6 +6910,7 @@ fn local_fallback_reason_blocks_local_rescue(
                 | "local_scheduler_redis_degraded"
                 | "local_pool_risk_circuit_open"
                 | "local_transient_exhausted"
+                | "local_request_body_invalid"
                 | "no_available_credentials"
                 | "unsupported_model"
         )

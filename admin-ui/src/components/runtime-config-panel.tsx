@@ -367,6 +367,8 @@ export const defaultExternalPoolsConfig = () => ({
   directExternalPathRules: [],
   externalPoolRouteMode: 'allow_all' as const,
   externalPoolRouteRules: [],
+  localPoolRouteMode: 'allow_all' as const,
+  localPoolRouteRules: [],
   fallbackOnLocalCapacityExhausted: true,
   fallbackOnSchedulerRedisDegraded: true,
   fallbackOnNoAvailableCredentials: true,

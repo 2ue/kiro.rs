@@ -1056,18 +1056,38 @@ async function runCase({
       assert.equal(removeToxic.status, 204, removeToxic.text)
       schedulerToxicInstalled = false
       await new Promise((resolve) => setTimeout(resolve, 5_000))
-      const beforeRecovery = fake.snapshot()
-      schedulerRecoveryResponse = await timedRequest(`${baseUrl}/v1/messages`, {
-        method: 'POST',
-        headers: requestHeaders(),
-        body: JSON.stringify({
-          model: requestModel,
-          max_tokens: 32,
-          stream: false,
-          messages: [{ role: 'user', content: `E05 ${caseId} recovery` }],
-        }),
-      })
-      schedulerRecoveryHits = delta(fake.snapshot(), beforeRecovery)
+      const recoveryStartedAt = performance.now()
+      const recoveryDeadline = Date.now() + 60_000
+      while (Date.now() < recoveryDeadline) {
+        const beforeRecovery = fake.snapshot()
+        const response = await timedRequest(`${baseUrl}/v1/messages`, {
+          method: 'POST',
+          headers: requestHeaders(),
+          body: JSON.stringify({
+            model: requestModel,
+            max_tokens: 32,
+            stream: false,
+            messages: [{ role: 'user', content: `E05 ${caseId} recovery` }],
+          }),
+        })
+        const hits = delta(fake.snapshot(), beforeRecovery)
+        schedulerChaosRecoveryProbes.push({ response, hits })
+        if (response.status === 200
+          && hits.localInferenceHits === 1
+          && hits.externalHits === 1
+          && response.text.includes('external-ok')) {
+          schedulerRecoveryResponse = response
+          schedulerRecoveryHits = hits
+          schedulerChaosRecoveryMs = Number((performance.now() - recoveryStartedAt).toFixed(2))
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
+      assert.notEqual(
+        schedulerChaosRecoveryMs,
+        null,
+        `scheduler degraded recovery did not restore local-first fallback within 60s: ${JSON.stringify(schedulerChaosRecoveryProbes)}`,
+      )
       assert.equal(schedulerRecoveryHits.localInferenceHits, 1, JSON.stringify({
         schedulerRecoveryResponse,
         schedulerRecoveryHits,

@@ -5867,6 +5867,53 @@ fn fallback_reservation_has_a_dedicated_internal_classification() {
 }
 
 #[test]
+fn request_body_invalid_errors_can_fallback_without_triggering_local_rescue() {
+    let config = ExternalPoolsConfig::default();
+
+    for (message, expected) in [
+        (
+            r#"upstream_failure class=invalid_request_error upstream_status=400 public_status=400 body_bytes=128 retry_after_secs=unknown content_type=json reason=request_body_invalid_bad_request"#,
+            Some("local_request_body_invalid"),
+        ),
+        (
+            r#"upstream_failure class=invalid_request_error upstream_status=400 public_status=400 body_bytes=256 retry_after_secs=unknown content_type=json reason=invalid tool use format"#,
+            Some("local_request_body_invalid"),
+        ),
+        (
+            r#"upstream_failure class=invalid_request_error upstream_status=400 public_status=400 body_bytes=512 retry_after_secs=unknown content_type=json reason=malformed_request"#,
+            None,
+        ),
+    ] {
+        assert_eq!(
+            classify_local_error_for_external_fallback(message, &[], &config).as_deref(),
+            expected,
+            "message={message}"
+        );
+    }
+
+    let err = ExternalPoolFinalError {
+        status: StatusCode::BAD_REQUEST,
+        response_error_type: "invalid_request_error".to_string(),
+        route_error_type: "client_error".to_string(),
+        message: "invalid tool use format".to_string(),
+        error_id: "req_local_request_body_invalid".to_string(),
+        retryable: false,
+        attempts: Vec::new(),
+        pool_id: Some(1),
+        pool_name: Some("backup".to_string()),
+    };
+    assert_eq!(
+        local_rescue_reason_after_external_error(
+            &config,
+            &err,
+            Some("local_request_body_invalid"),
+            Some(1),
+        ),
+        None
+    );
+}
+
+#[test]
 fn auxiliary_focus_typed_failures_use_local_transient_fallback_policy_for_five_rounds() {
     for _ in 0..5 {
         let mut config = ExternalPoolsConfig::default();
