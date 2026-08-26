@@ -106,7 +106,8 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
           run_install: false
 
-      - name: Setup Node.js
+      - name: Setup Node.js with pnpm cache
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -114,6 +115,12 @@ jobs:
           cache-dependency-path: |
             admin-ui/pnpm-lock.yaml
             ui/pnpm-lock.yaml
+
+      - name: Setup Node.js for release
+        if: ${{ env.QUALITY_PROFILE == 'release' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
