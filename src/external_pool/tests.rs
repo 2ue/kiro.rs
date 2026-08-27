@@ -12278,6 +12278,232 @@ fn external_pool_raw_passthrough_keeps_body_byte_for_byte() {
 }
 
 #[test]
+fn external_pool_normalized_body_removes_whitespace_text_blocks_and_preserves_structured_blocks() {
+    let raw = br#"{
+        "model":"client-model",
+        "max_tokens":8,
+        "stream":false,
+        "messages":[
+            {
+                "role":"user",
+                "content":[
+                    {"type":"text","text":" \t\n "},
+                    {"type":"text","text":"keep user text","future_text_field":"keep"}
+                ]
+            },
+            {
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking","thinking":"private thought","signature":"opaque-signature"},
+                    {"type":"text","text":"\n\t"},
+                    {"type":"tool_use","id":"toolu_whitespace_1","name":"Bash","input":{}}
+                ]
+            },
+            {
+                "role":"user",
+                "content":[
+                    {
+                        "type":"tool_result",
+                        "tool_use_id":"toolu_whitespace_1",
+                        "content":[
+                            {"type":"text","text":"  \n"},
+                            {"type":"text","text":"tool output"}
+                        ]
+                    },
+                    {"type":"text","text":"\t "}
+                ]
+            }
+        ],
+        "future_top":{"keep":true}
+    }"#;
+    let mut route = test_route("client-model");
+    let payload: MessagesRequest = serde_json::from_slice(raw).expect("typed whitespace fixture");
+    route.effective_raw_body = Bytes::from_static(raw);
+    route.raw_body = route.effective_raw_body.clone();
+    route.payload = Some(payload);
+    route.payload_guard_external_enabled = false;
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+
+    let prepared = external_pool_prepare_request(&route, &pool).expect("normalized request");
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("normalized body remains JSON");
+    let messages = value["messages"].as_array().expect("messages");
+
+    assert_eq!(value["future_top"]["keep"], true);
+    assert_eq!(
+        messages[0]["content"],
+        json!([{"type":"text","text":"keep user text","future_text_field":"keep"}])
+    );
+    assert_eq!(
+        messages[1]["content"],
+        json!([
+            {"type":"thinking","thinking":"private thought","signature":"opaque-signature"},
+            {"type":"tool_use","id":"toolu_whitespace_1","name":"Bash","input":{}}
+        ])
+    );
+    assert_eq!(
+        messages[2]["content"],
+        json!([{
+            "type":"tool_result",
+            "tool_use_id":"toolu_whitespace_1",
+            "content":[{"type":"text","text":"tool output"}]
+        }])
+    );
+}
+
+#[test]
+fn external_pool_normalized_body_replaces_empty_message_and_tool_result_content() {
+    let raw = br#"{
+        "model":"client-model",
+        "max_tokens":8,
+        "stream":false,
+        "messages":[
+            {"role":"assistant","content":[{"type":"text","text":" \n\t"}]},
+            {
+                "role":"user",
+                "content":[
+                    {
+                        "type":"tool_result",
+                        "tool_use_id":"toolu_empty_1",
+                        "content":[{"type":"text","text":"  "}]
+                    },
+                    {"type":"text","text":"\n"}
+                ]
+            },
+            {"role":"user","content":" \t"}
+        ]
+    }"#;
+    let mut route = test_route("client-model");
+    let payload: MessagesRequest = serde_json::from_slice(raw).expect("typed empty fixture");
+    route.effective_raw_body = Bytes::from_static(raw);
+    route.raw_body = route.effective_raw_body.clone();
+    route.payload = Some(payload);
+    route.payload_guard_external_enabled = false;
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+
+    let prepared = external_pool_prepare_request(&route, &pool).expect("normalized request");
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("normalized body remains JSON");
+    let messages = value["messages"].as_array().expect("messages");
+
+    assert_eq!(messages[0]["content"], json!([{"type":"text","text":"."}]));
+    assert_eq!(
+        messages[1]["content"],
+        json!([{
+            "type":"tool_result",
+            "tool_use_id":"toolu_empty_1",
+            "content":[{"type":"text","text":"Tool result content was empty."}]
+        }])
+    );
+    assert_eq!(messages[2]["content"], json!("."));
+}
+
+#[test]
+fn external_pool_raw_passthrough_keeps_whitespace_text_blocks_byte_for_byte() {
+    let raw = br#" { "model":"client-model","stream":false,"messages":[{"role":"user","content":[{"type":"text","text":" \t\n "}]}] } "#;
+    let route = raw_test_route(raw);
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+    pool.raw_model_mode = ExternalPoolRawModelMode::None;
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+
+    let prepared = external_pool_prepare_request(&route, &pool).expect("raw request");
+
+    assert_eq!(prepared.body, Bytes::from_static(raw));
+}
+
+#[test]
+fn external_pool_normalized_body_corrects_declared_base64_image_mime_from_signature() {
+    let jpeg = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00],
+    );
+    let raw = Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "client-model",
+            "max_tokens": 8,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "future_message_field": "keep-message",
+                "content": [{
+                    "type": "image",
+                    "future_block_field": "keep-block",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": jpeg,
+                        "future_source_field": "keep-source"
+                    }
+                }]
+            }],
+            "future_top_field": {"keep": true}
+        }))
+        .expect("raw image fixture JSON"),
+    );
+    let route = raw_test_route(raw.as_ref());
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+
+    let prepared =
+        external_pool_prepare_request(&route, &pool).expect("normalized external request");
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("normalized body remains JSON");
+    let source = &value["messages"][0]["content"][0]["source"];
+
+    assert_eq!(source["media_type"], "image/jpeg");
+    assert_eq!(source["data"], jpeg);
+    assert_eq!(source["future_source_field"], "keep-source");
+    assert_eq!(
+        value["messages"][0]["content"][0]["future_block_field"],
+        "keep-block"
+    );
+    assert_eq!(value["messages"][0]["future_message_field"], "keep-message");
+    assert_eq!(value["future_top_field"]["keep"], true);
+}
+
+#[test]
+fn external_pool_raw_passthrough_keeps_image_mime_mismatch_byte_for_byte() {
+    let jpeg = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00],
+    );
+    let raw = Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "client-model",
+            "max_tokens": 8,
+            "stream": false,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": jpeg
+                    }
+                }]
+            }]
+        }))
+        .expect("raw image fixture JSON"),
+    );
+    let route = raw_test_route(raw.as_ref());
+    let mut pool = test_pool("https://example.com/v1", true);
+    pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+    pool.raw_model_mode = ExternalPoolRawModelMode::None;
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+
+    let prepared = external_pool_prepare_request(&route, &pool).expect("raw external request");
+
+    assert_eq!(prepared.body, raw);
+}
+
+#[test]
 fn raw_route_can_build_normalized_body_for_selected_normalized_pool() {
     let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}],"max_tokens":8}"#;
     let route = raw_test_route(raw);
@@ -13904,9 +14130,20 @@ fn external_non_stream_response_contamination_is_retryable_not_partial_success()
                 maybe_project_non_stream_usage_with_tools(body, None, ["Bash".to_string()]);
             assert!(projected.protocol_contamination);
             let wire = String::from_utf8(projected.body.to_vec()).unwrap();
-            assert!(!wire.contains("user Continue"));
-            assert!(!wire.contains("Bash: hidden"));
             let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            let block_type = content["type"].as_str().unwrap_or_default();
+            if matches!(block_type, "thinking" | "redacted_thinking")
+                && (content.get("signature").is_some() || block_type == "redacted_thinking")
+            {
+                // Authenticated thinking is inspected for contamination but never rewritten:
+                // changing its body while retaining its signature/data would corrupt the block.
+                assert!(wire.contains("user Continue"));
+                assert!(wire.contains("Bash: hidden"));
+                assert_eq!(value["content"][0], content.clone());
+            } else {
+                assert!(!wire.contains("user Continue"));
+                assert!(!wire.contains("Bash: hidden"));
+            }
             assert_eq!(value["usage"]["input_tokens"], 12);
             assert_eq!(value["usage"]["output_tokens"], 7);
             assert_eq!(value["future_field"]["preserved"], true);

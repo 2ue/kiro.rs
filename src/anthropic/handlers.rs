@@ -10,7 +10,6 @@ use std::{
     },
 };
 
-use crate::common::upstream_error::RawUpstreamError;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -281,7 +280,6 @@ struct RequestUsageContext {
     payload_breakdown: Option<PayloadByteBreakdown>,
     payload_guard_report: Option<PayloadGuardReport>,
     error_metadata: Arc<Mutex<Option<serde_json::Value>>>,
-    raw_upstream_error: Arc<Mutex<Option<RawUpstreamError>>>,
     route_subtype_override: Option<UsageRouteSubtype>,
     fallback_reason: Option<String>,
     local_preflight: Option<serde_json::Value>,
@@ -2659,10 +2657,6 @@ impl RequestUsageContext {
         *current = merge_error_metadata_values(current.take(), Some(metadata));
     }
 
-    fn set_raw_upstream_error(&self, error: RawUpstreamError) {
-        *self.raw_upstream_error.lock() = Some(error);
-    }
-
     fn set_capacity_weight_units(&self, units: u32) {
         self.capacity_weight_units
             .store(units.clamp(1, 64), Ordering::Release);
@@ -4379,12 +4373,11 @@ impl CredentialUsageContext {
             error_source,
             error_id,
             error_metadata,
-            raw_upstream_error: self.request.raw_upstream_error.lock().clone().or_else(|| {
-                self.credential_attempts
-                    .iter()
-                    .rev()
-                    .find_map(|attempt| attempt.raw_upstream_error.clone())
-            }),
+            raw_upstream_error: self
+                .credential_attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.raw_upstream_error.clone()),
             public_error_status_code: public_error.as_ref().map(|error| error.status_code),
             public_error_type: public_error.as_ref().map(|error| error.error_type.clone()),
             public_error_message: public_error.map(|error| error.message),
@@ -4811,7 +4804,6 @@ fn prepare_usage_context_with_inference_attempt_budget(
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6630,7 +6622,7 @@ fn build_thinking_signature_retry_body(request: &KiroRequest) -> anyhow::Result<
     let mut retry_request = request.clone();
     let removed = retry_request
         .conversation_state
-        .clear_history_reasoning_content();
+        .clear_history_reasoning_content_for_compatibility_retry();
     if removed == 0 {
         anyhow::bail!("thinking signature retry request has no historical reasoningContent");
     }
@@ -6995,7 +6987,9 @@ async fn call_stream_local_rescue_after_external_error(
                 dispatch_model_filter,
                 external.inference_attempt_budget.clone(),
                 false,
-                Some(1),
+                // The local rescue itself gets one normal send plus one same-credential
+                // compatibility retry when historical reasoning has an invalid signature.
+                Some(2),
                 move || build_thinking_signature_retry_body(kiro_request),
             )
             .await;
@@ -7046,7 +7040,9 @@ async fn call_non_stream_local_rescue_after_external_error(
                 dispatch_model_filter,
                 external.inference_attempt_budget.clone(),
                 false,
-                Some(1),
+                // The local rescue itself gets one normal send plus one same-credential
+                // compatibility retry when historical reasoning has an invalid signature.
+                Some(2),
                 move || build_thinking_signature_retry_body(kiro_request),
             )
             .await;
@@ -7989,7 +7985,6 @@ struct JsonStreamError {
     internal_detail: String,
     body_bytes: usize,
     diagnostics: Option<serde_json::Value>,
-    raw_upstream_error: Option<RawUpstreamError>,
 }
 
 enum JsonStreamSniffResult {
@@ -8089,12 +8084,6 @@ impl JsonStreamErrorSniffer {
                     None,
                     false,
                 )),
-                raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                    "kiro_official",
-                    Some(StatusCode::OK.as_u16()),
-                    self.content_type.as_deref(),
-                    trimmed,
-                )),
             }),
         }
     }
@@ -8119,12 +8108,6 @@ impl JsonStreamErrorSniffer {
                     None,
                     false,
                 )),
-                raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                    "kiro_official",
-                    Some(StatusCode::OK.as_u16()),
-                    self.content_type.as_deref(),
-                    trimmed,
-                )),
             });
         }
 
@@ -8139,12 +8122,6 @@ impl JsonStreamErrorSniffer {
                 "json_incomplete",
                 None,
                 false,
-            )),
-            raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                "kiro_official",
-                Some(StatusCode::OK.as_u16()),
-                self.content_type.as_deref(),
-                trimmed,
             )),
         })
     }
@@ -8167,12 +8144,6 @@ impl JsonStreamErrorSniffer {
                 body_kind,
                 None,
                 true,
-            )),
-            raw_upstream_error: Some(RawUpstreamError::from_bytes(
-                "kiro_official",
-                Some(StatusCode::OK.as_u16()),
-                self.content_type.as_deref(),
-                trimmed,
             )),
         }
     }
@@ -8380,12 +8351,6 @@ fn classify_json_stream_error(
             Some(value),
             false,
         )),
-        raw_upstream_error: Some(RawUpstreamError::from_bytes(
-            "kiro_official",
-            Some(StatusCode::OK.as_u16()),
-            content_type,
-            raw_body,
-        )),
     }
 }
 
@@ -8411,7 +8376,6 @@ fn inspect_complete_upstream_body(
                     None,
                     false,
                 )),
-                raw_upstream_error: None,
             }))
         }
     }
@@ -8761,14 +8725,6 @@ fn create_sse_stream(
                                             json!({ "upstreamBodyDiagnostics": diagnostics })
                                         }),
                                     );
-                                    if let Some(raw_upstream_error) = error.raw_upstream_error.clone()
-                                    {
-                                        state
-                                            .usage_guard
-                                            .context()
-                                            .request
-                                            .set_raw_upstream_error(raw_upstream_error);
-                                    }
                                     state.ctx.record_stream_error(error.error_type, error.internal_detail);
                                     let bytes = finish_stream_with_recorded_error(
                                         &mut state.ctx,
@@ -9057,13 +9013,6 @@ fn create_sse_stream(
                                         json!({ "upstreamBodyDiagnostics": diagnostics })
                                     }),
                                 );
-                                if let Some(raw_upstream_error) = error.raw_upstream_error.clone() {
-                                    state
-                                        .usage_guard
-                                        .context()
-                                        .request
-                                        .set_raw_upstream_error(raw_upstream_error);
-                                }
                                 state.ctx.record_stream_error(error.error_type, error.internal_detail);
                                 let bytes = finish_stream_with_recorded_error(
                                     &mut state.ctx,
@@ -10118,11 +10067,6 @@ async fn handle_non_stream_request(
                         .clone()
                         .map(|diagnostics| json!({ "upstreamBodyDiagnostics": diagnostics })),
                 );
-                if let Some(raw_upstream_error) = error.raw_upstream_error.clone() {
-                    credential_usage
-                        .request
-                        .set_raw_upstream_error(raw_upstream_error);
-                }
                 credential_usage.record_failure_with_public_error(
                     UsageRecordStatus::Error,
                     error.error_type,

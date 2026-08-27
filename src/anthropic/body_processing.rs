@@ -447,6 +447,22 @@ pub(crate) fn normalize_base64_image_media_types(payload: &mut MessagesRequest) 
     normalize_message_base64_image_media_types(&mut payload.messages)
 }
 
+/// Corrects only safely detectable base64 image media-type mismatches in a serialized request
+/// value. This preserves unknown message, block, and source fields carried by normalized routes.
+pub(crate) fn normalize_base64_image_media_types_in_request_value(value: &mut Value) -> usize {
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut fixed = 0usize;
+    for message in messages {
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        fixed += normalize_content_base64_image_media_types(content);
+    }
+    fixed
+}
+
 fn normalize_message_base64_image_media_types(messages: &mut [Message]) -> usize {
     let mut fixed = 0usize;
     for message in messages {

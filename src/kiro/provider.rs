@@ -25,7 +25,6 @@ use crate::anthropic::inference_attempt_budget::{
 use crate::anthropic::model_capabilities::{
     KiroReasoningCapabilityState, intersect_authoritative_reasoning_schemas,
 };
-use crate::common::upstream_error::RawUpstreamError;
 use crate::http_client::{
     HttpSendError, ProxyConfig, build_client, execute_with_response_header_timeout,
     response_bytes_with_limit_and_body_timeout, response_text_with_limit_and_body_timeout,
@@ -4417,7 +4416,7 @@ mod tests {
                         is_stream,
                         budget.clone(),
                         false,
-                        None,
+                        Some(2),
                         move || {
                             builder_counter.fetch_add(1, Ordering::SeqCst);
                             Ok(retry_body)
@@ -7220,15 +7219,6 @@ impl KiroProvider {
             )
             .with_model(model),
         );
-    }
-
-    fn attach_last_attempt_raw_upstream_error(
-        attempts: &mut [KiroCredentialAttempt],
-        raw_upstream_error: &RawUpstreamError,
-    ) {
-        if let Some(attempt) = attempts.last_mut() {
-            attempt.raw_upstream_error = Some(raw_upstream_error.clone());
-        }
     }
 
     fn push_mcp_attempt(
@@ -10572,13 +10562,6 @@ impl KiroProvider {
             };
             let body_bytes = upstream_body.bytes;
             let body = upstream_body.text;
-            let raw_upstream_error = RawUpstreamError::from_text(
-                "kiro_official",
-                Some(status.as_u16()),
-                Some(content_kind.as_str()),
-                &body,
-            );
-
             if status.is_success() {
                 let failure_kind = Self::classify_non_eventstream_body(&body, content_kind);
                 let body_kind = if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
@@ -10626,7 +10609,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 if let Some(transient_kind) = failure_kind.transient_failure_kind() {
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
                         ctx.id,
@@ -10718,10 +10700,6 @@ impl KiroProvider {
                         Some(message.clone()),
                         attempt_started_at,
                         model.as_deref(),
-                    );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
                     );
                     last_error = Some(anyhow::anyhow!(message.clone()));
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
@@ -10818,10 +10796,6 @@ impl KiroProvider {
                         attempt_started_at,
                         model.as_deref(),
                     );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
-                    );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
                     return if risk_outcome.circuit_open {
@@ -10846,7 +10820,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 last_error = Some(anyhow::anyhow!(message.clone()));
                 let retry_target_available = self.maybe_exclude_after_transient_failure(
                     model.as_deref(),
@@ -10905,10 +10878,6 @@ impl KiroProvider {
                         attempt_started_at,
                         model.as_deref(),
                     );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
-                    );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
                     return Err(Self::traced_error(final_message, &attempts));
@@ -10926,7 +10895,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 last_error = Some(anyhow::anyhow!(message.clone()));
                 self.maybe_exclude_after_soft_failure(
                     conversation_id.as_deref(),
@@ -10960,7 +10928,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 last_error = Some(anyhow::anyhow!(message.clone()));
                 if let Err(err) = self.token_manager.report_transient_failure_kind(
                     ctx.id,
@@ -11004,7 +10971,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
 
                 // An explicit caller send cap remains authoritative. Do not use `max_retries`
                 // here: it may have been reduced by `preserve_external_attempt`, while this
@@ -11278,13 +11244,6 @@ impl KiroProvider {
                         ));
                     }
                 };
-                let retry_raw_upstream_error = RawUpstreamError::from_text(
-                    "kiro_official",
-                    Some(retry_status.as_u16()),
-                    Some(retry_content_kind.as_str()),
-                    &retry_upstream_body.text,
-                );
-
                 if Self::is_thinking_signature_invalid_response(
                     retry_status,
                     &retry_upstream_body.text,
@@ -11308,10 +11267,6 @@ impl KiroProvider {
                         Some(message.clone()),
                         retry_started_at,
                         model.as_deref(),
-                    );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &retry_raw_upstream_error,
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -11357,10 +11312,6 @@ impl KiroProvider {
                         Some(message.clone()),
                         retry_started_at,
                         model.as_deref(),
-                    );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &retry_raw_upstream_error,
                     );
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
                         ctx.id,
@@ -11423,10 +11374,6 @@ impl KiroProvider {
                         retry_started_at,
                         model.as_deref(),
                     );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &retry_raw_upstream_error,
-                    );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
                     return Err(Self::traced_error(message, &attempts));
@@ -11448,10 +11395,6 @@ impl KiroProvider {
                     Some(message.clone()),
                     retry_started_at,
                     model.as_deref(),
-                );
-                Self::attach_last_attempt_raw_upstream_error(
-                    &mut attempts,
-                    &retry_raw_upstream_error,
                 );
                 Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                 self.finish_attempt(&mut ctx);
@@ -11501,10 +11444,6 @@ impl KiroProvider {
                         attempt_started_at,
                         model.as_deref(),
                     );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
-                    );
                     if can_retry {
                         if let Some(session_id) = conversation_id.as_deref() {
                             self.token_manager
@@ -11550,10 +11489,6 @@ impl KiroProvider {
                         Some(message.clone()),
                         attempt_started_at,
                         model.as_deref(),
-                    );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
                     );
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
                         ctx.id,
@@ -11606,10 +11541,6 @@ impl KiroProvider {
                         Some(message.clone()),
                         attempt_started_at,
                         model.as_deref(),
-                    );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
                     );
                     if let Err(err) = self
                         .token_manager
@@ -11669,7 +11600,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                 self.finish_attempt(&mut ctx);
                 return Err(Self::traced_error(message, &attempts));
@@ -11731,10 +11661,6 @@ impl KiroProvider {
                             attempt_started_at,
                             model.as_deref(),
                         );
-                        Self::attach_last_attempt_raw_upstream_error(
-                            &mut attempts,
-                            &raw_upstream_error,
-                        );
                         Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                         self.finish_attempt(&mut ctx);
                         return Err(Self::traced_error(final_message, &attempts));
@@ -11754,10 +11680,6 @@ impl KiroProvider {
                         attempt_started_at,
                         model.as_deref(),
                     );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
-                    );
                     self.finish_attempt(&mut ctx);
                     continue;
                 }
@@ -11776,10 +11698,6 @@ impl KiroProvider {
                         Some(final_message.clone()),
                         attempt_started_at,
                         model.as_deref(),
-                    );
-                    Self::attach_last_attempt_raw_upstream_error(
-                        &mut attempts,
-                        &raw_upstream_error,
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -11809,7 +11727,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 last_error = Some(anyhow::anyhow!(message.clone()));
                 self.finish_attempt(&mut ctx);
                 continue;
@@ -11854,7 +11771,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 last_error = Some(anyhow::anyhow!(message.clone()));
                 if let Err(err) = self.token_manager.report_transient_failure_kind(
                     ctx.id,
@@ -11926,7 +11842,6 @@ impl KiroProvider {
                     attempt_started_at,
                     model.as_deref(),
                 );
-                Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
                 Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                 self.finish_attempt(&mut ctx);
                 return Err(Self::traced_error(message, &attempts));
@@ -11963,7 +11878,6 @@ impl KiroProvider {
                 attempt_started_at,
                 model.as_deref(),
             );
-            Self::attach_last_attempt_raw_upstream_error(&mut attempts, &raw_upstream_error);
             Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
             self.finish_attempt(&mut ctx);
             return Err(Self::traced_error(message, &attempts));

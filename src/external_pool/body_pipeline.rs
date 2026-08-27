@@ -149,6 +149,18 @@ fn build_normalized_request_base(
     if normalize_thinking {
         super::normalize_external_pool_thinking_value(&mut value);
     }
+    let normalized_image_media_types =
+        crate::anthropic::body_processing::normalize_base64_image_media_types_in_request_value(
+            &mut value,
+        );
+    if normalized_image_media_types > 0 {
+        tracing::warn!(
+            request_id = %route.request_id,
+            fixed = normalized_image_media_types,
+            "base64 image media_type mismatches were corrected before normalized external dispatch"
+        );
+    }
+    sanitize_normalized_external_message_content(&mut value);
     route
         .preparation_cache
         .record_normalized_json_serialization();
@@ -237,6 +249,98 @@ fn normalized_request_value(
         original_object.insert((*field).to_string(), overlaid);
     }
     Ok(original)
+}
+
+const EMPTY_NORMALIZED_EXTERNAL_TEXT_PLACEHOLDER: &str = ".";
+const EMPTY_NORMALIZED_EXTERNAL_TOOL_RESULT_PLACEHOLDER: &str = "Tool result content was empty.";
+
+/// Normalized requests can retain untyped client blocks while overlaying typed fields. Strict
+/// external Anthropic-compatible upstreams reject whitespace-only text blocks, so remove only
+/// those invalid blocks and keep each affected message and tool result structurally sendable.
+fn sanitize_normalized_external_message_content(value: &mut serde_json::Value) {
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for message in messages {
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        sanitize_normalized_external_message_value(content);
+    }
+}
+
+fn sanitize_normalized_external_message_value(content: &mut serde_json::Value) {
+    if let Some(text) = content.as_str() {
+        if text.trim().is_empty() {
+            *content =
+                serde_json::Value::String(EMPTY_NORMALIZED_EXTERNAL_TEXT_PLACEHOLDER.to_string());
+        }
+        return;
+    }
+    let Some(blocks) = content.as_array_mut() else {
+        return;
+    };
+    for block in blocks.iter_mut() {
+        sanitize_normalized_external_tool_result_content(block);
+    }
+    blocks.retain(|block| !is_empty_normalized_external_text_block(block));
+    if blocks.is_empty() {
+        blocks.push(normalized_external_text_placeholder());
+    }
+}
+
+fn sanitize_normalized_external_tool_result_content(block: &mut serde_json::Value) {
+    if block.get("type").and_then(serde_json::Value::as_str) != Some("tool_result") {
+        return;
+    }
+    let Some(object) = block.as_object_mut() else {
+        return;
+    };
+    let needs_placeholder = match object.get_mut("content") {
+        Some(content) => sanitize_normalized_external_tool_result_value(content),
+        None => true,
+    };
+    if needs_placeholder {
+        object.insert(
+            "content".to_string(),
+            serde_json::json!([{
+                "type": "text",
+                "text": EMPTY_NORMALIZED_EXTERNAL_TOOL_RESULT_PLACEHOLDER
+            }]),
+        );
+    }
+}
+
+fn sanitize_normalized_external_tool_result_value(content: &mut serde_json::Value) -> bool {
+    if let Some(text) = content.as_str() {
+        return text.trim().is_empty();
+    }
+    let Some(items) = content.as_array_mut() else {
+        return content.is_null();
+    };
+    items.retain(|item| {
+        !item.as_str().is_some_and(|text| text.trim().is_empty())
+            && !is_empty_normalized_external_text_block(item)
+    });
+    items.is_empty()
+}
+
+fn is_empty_normalized_external_text_block(block: &serde_json::Value) -> bool {
+    block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|text| text.trim().is_empty())
+}
+
+fn normalized_external_text_placeholder() -> serde_json::Value {
+    serde_json::json!({
+        "type": "text",
+        "text": EMPTY_NORMALIZED_EXTERNAL_TEXT_PLACEHOLDER
+    })
 }
 
 fn parse_json_value_unbounded(bytes: &[u8]) -> Result<serde_json::Value, serde_json::Error> {

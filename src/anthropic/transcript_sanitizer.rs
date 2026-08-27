@@ -115,8 +115,8 @@ impl std::fmt::Display for RawAssistantHistorySanitizationError {
 /// Sanitizes assistant text in a normalized Anthropic request payload.
 ///
 /// User text, tool results, and tool inputs are intentionally untouched. Unsigned assistant
-/// thinking is sanitized as thinking, while a polluted signed or redacted thinking block is
-/// removed atomically so its opaque integrity metadata can never be paired with rewritten data.
+/// thinking is sanitized as thinking, while signed or redacted thinking remains opaque and
+/// byte-for-byte stable so its integrity metadata can never be paired with rewritten data.
 pub(crate) fn sanitize_messages_request_assistant_history(
     request: &mut MessagesRequest,
 ) -> AssistantHistorySanitization {
@@ -348,9 +348,11 @@ pub(crate) fn sanitize_response_content(
         role: "assistant".to_string(),
         content: original,
     };
-    let report = sanitize_assistant_message_runs(
+    let report = sanitize_assistant_message_runs_with_policy(
         std::slice::from_mut(&mut message),
         known_tool_names.into_iter().collect::<Vec<_>>(),
+        true,
+        true,
     );
     if report.blocks > 0 {
         response["content"] = message.content;
@@ -361,6 +363,15 @@ pub(crate) fn sanitize_response_content(
 pub(crate) fn sanitize_assistant_message_runs(
     messages: &mut [AnthropicMessage],
     known_tool_names: impl IntoIterator<Item = String> + Clone,
+) -> AssistantHistorySanitization {
+    sanitize_assistant_message_runs_with_policy(messages, known_tool_names, true, false)
+}
+
+fn sanitize_assistant_message_runs_with_policy(
+    messages: &mut [AnthropicMessage],
+    known_tool_names: impl IntoIterator<Item = String> + Clone,
+    preserve_authenticated_thinking: bool,
+    inspect_authenticated_thinking: bool,
 ) -> AssistantHistorySanitization {
     let mut report = AssistantHistorySanitization::default();
     let mut start = 0usize;
@@ -375,7 +386,12 @@ pub(crate) fn sanitize_assistant_message_runs(
         }
         merge_sanitization_report(
             &mut report,
-            sanitize_assistant_run(&mut messages[start..end], known_tool_names.clone()),
+            sanitize_assistant_run(
+                &mut messages[start..end],
+                known_tool_names.clone(),
+                preserve_authenticated_thinking,
+                inspect_authenticated_thinking,
+            ),
         );
         start = end;
     }
@@ -391,6 +407,8 @@ enum TextLocation {
 fn sanitize_assistant_run(
     messages: &mut [AnthropicMessage],
     known_tool_names: impl IntoIterator<Item = String>,
+    preserve_authenticated_thinking: bool,
+    inspect_authenticated_thinking: bool,
 ) -> AssistantHistorySanitization {
     let known_tool_names = known_tool_names.into_iter().collect::<Vec<_>>();
     let originals = messages
@@ -433,6 +451,9 @@ fn sanitize_assistant_run(
                         if !pending.is_empty() {
                             released_text.push((last_text, pending));
                         }
+                        // Signed thinking and redacted thinking are upstream-authenticated
+                        // opaque values. Never scan, rewrite, or remove their body or signature:
+                        // changing either side can make the provider reject the whole history.
                         let (field, atomic) = if block_type.as_deref() == Some("thinking") {
                             (
                                 "thinking",
@@ -444,6 +465,21 @@ fn sanitize_assistant_run(
                         } else {
                             ("data", true)
                         };
+                        if atomic && preserve_authenticated_thinking {
+                            if inspect_authenticated_thinking {
+                                // Complete upstream responses are rejected when authenticated
+                                // thinking carries internal transcript scaffolding, but the
+                                // opaque body must remain untouched while it is being inspected.
+                                let _ = thinking_sanitizer.push(
+                                    block
+                                        .get(field)
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default(),
+                                );
+                                let _ = thinking_sanitizer.finish();
+                            }
+                            continue;
+                        }
                         let Some(original) = block
                             .get(field)
                             .and_then(|value| value.as_str())
@@ -454,18 +490,8 @@ fn sanitize_assistant_run(
                         let suppressed_before = thinking_sanitizer.suppressed_blocks();
                         let mut safe = thinking_sanitizer.push(&original);
                         safe.push_str(&thinking_sanitizer.finish());
-                        if atomic && block_type.as_deref() == Some("thinking") {
-                            if let Some(signature) =
-                                block.get("signature").and_then(|value| value.as_str())
-                            {
-                                let _ = thinking_sanitizer.push(signature);
-                                let _ = thinking_sanitizer.finish();
-                            }
-                        }
                         let suppressed = thinking_sanitizer.suppressed_blocks() > suppressed_before;
-                        if suppressed && atomic {
-                            removed_blocks.insert((message_idx, block_idx));
-                        } else if suppressed {
+                        if suppressed {
                             if safe.is_empty() {
                                 removed_blocks.insert((message_idx, block_idx));
                             } else {
@@ -1429,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_request_sanitization_keeps_user_and_tool_data_but_drops_signed_leak() {
+    fn normalized_request_sanitization_keeps_signed_thinking_and_tool_data() {
         let fixture = "user Continue\n\nbashHashd1e9567d: hidden";
         let mut request: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "claude-sonnet-4",
@@ -1454,17 +1480,20 @@ mod tests {
 
         let report = sanitize_messages_request_assistant_history(&mut request);
         assert_eq!(report.messages, 1);
-        assert_eq!(report.blocks, 2);
+        assert_eq!(report.blocks, 1);
         assert_eq!(request.messages[0].content, serde_json::json!(fixture));
-        assert_eq!(request.messages[1].content[0]["text"], "safe\n");
-        assert_eq!(request.messages[1].content[1]["type"], "tool_use");
-        assert_eq!(request.messages[1].content[1]["input"]["value"], fixture);
-        assert_eq!(request.messages[1].content[2]["text"], "after tool");
+        assert_eq!(request.messages[1].content[0]["type"], "thinking");
+        assert_eq!(request.messages[1].content[0]["thinking"], fixture);
+        assert_eq!(request.messages[1].content[0]["signature"], "sig");
+        assert_eq!(request.messages[1].content[1]["text"], "safe\n");
+        assert_eq!(request.messages[1].content[2]["type"], "tool_use");
+        assert_eq!(request.messages[1].content[2]["input"]["value"], fixture);
+        assert_eq!(request.messages[1].content[3]["text"], "after tool");
         assert_eq!(request.messages[2].content[0]["content"], fixture);
     }
 
     #[test]
-    fn assistant_history_thinking_policy_is_atomic_for_signed_and_redacted() {
+    fn assistant_history_thinking_policy_keeps_signed_and_redacted_opaque() {
         let fixture = "safe prefix\nuser Continue\n\nBash: hidden";
         for _round in 0..5 {
             let mut request: MessagesRequest = serde_json::from_value(serde_json::json!({
@@ -1487,7 +1516,7 @@ mod tests {
             .unwrap();
 
             let report = sanitize_messages_request_assistant_history(&mut request);
-            assert_eq!(report.blocks, 4);
+            assert_eq!(report.blocks, 1);
             let blocks = request.messages[1].content.as_array().unwrap();
             assert_eq!(
                 blocks[0],
@@ -1495,10 +1524,22 @@ mod tests {
             );
             assert_eq!(
                 blocks[1],
+                serde_json::json!({"type": "thinking", "thinking": fixture, "signature": "signed-value"})
+            );
+            assert_eq!(
+                blocks[2],
+                serde_json::json!({"type": "thinking", "thinking": "ordinary reasoning", "signature": fixture})
+            );
+            assert_eq!(
+                blocks[3],
+                serde_json::json!({"type": "redacted_thinking", "data": fixture})
+            );
+            assert_eq!(
+                blocks[4],
                 serde_json::json!({"type": "text", "text": "visible"})
             );
-            assert_eq!(blocks[2]["type"], "tool_use");
-            assert_eq!(blocks[2]["input"]["discussion"], fixture);
+            assert_eq!(blocks[5]["type"], "tool_use");
+            assert_eq!(blocks[5]["input"]["discussion"], fixture);
             assert_eq!(request.messages[0].content, serde_json::json!(fixture));
             assert_eq!(request.messages[2].content[0]["content"], fixture);
         }
@@ -1626,6 +1667,7 @@ mod tests {
                 "future": {"keep": true},
                 "messages": [
                     {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": fixture},
                         {"type": "thinking", "thinking": fixture, "signature": "opaque"},
                         {"type": "text", "text": "visible"}
                     ]}
@@ -1644,9 +1686,20 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                1
+                3
             );
-            assert_eq!(rewritten["messages"][0]["content"][0]["text"], "visible");
+            assert_eq!(
+                rewritten["messages"][0]["content"][0],
+                serde_json::json!({"type": "thinking", "thinking": "safe prefix\n"})
+            );
+            assert_eq!(
+                rewritten["messages"][0]["content"][1],
+                serde_json::json!({"type": "thinking", "thinking": fixture, "signature": "opaque"})
+            );
+            assert_eq!(
+                rewritten["messages"][0]["content"][2],
+                serde_json::json!({"type": "text", "text": "visible"})
+            );
 
             let mut response = serde_json::json!({
                 "type": "message",
@@ -1661,6 +1714,9 @@ mod tests {
                 "future": "keep"
             });
             let report = sanitize_response_content(&mut response, ["Bash".to_string()]);
+            // Complete upstream responses are scanned fail-closed, including authenticated
+            // thinking/redacted-thinking payloads. Their bodies remain opaque and unchanged,
+            // but each polluted block is reported so the external route can reject the body.
             assert_eq!(report.blocks, 3);
             assert_eq!(response["future"], "keep");
             assert_eq!(response["usage"]["output_tokens"], 20);
@@ -1670,8 +1726,13 @@ mod tests {
             );
             assert_eq!(response["content"][0]["type"], "thinking");
             assert_eq!(response["content"][0]["thinking"], "safe prefix\n");
-            assert_eq!(response["content"][1]["text"], "visible");
-            assert_eq!(response["content"][2]["input"]["discussion"], fixture);
+            assert_eq!(response["content"][1]["type"], "thinking");
+            assert_eq!(response["content"][1]["thinking"], fixture);
+            assert_eq!(response["content"][1]["signature"], "opaque");
+            assert_eq!(response["content"][2]["type"], "redacted_thinking");
+            assert_eq!(response["content"][2]["data"], fixture);
+            assert_eq!(response["content"][3]["text"], "visible");
+            assert_eq!(response["content"][4]["input"]["discussion"], fixture);
         }
     }
 
@@ -1712,31 +1773,27 @@ mod tests {
 
     #[test]
     fn raw_request_prefilter_handles_unicode_escaped_newlines_without_false_rewrite() {
-        for (raw, expected) in [
-            (
-                br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"safe\u000auser Continue\u000a\u000aBash: hidden","signature":"opaque"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#.as_slice(),
-                serde_json::json!({"type":"text","text":" "}),
-            ),
-            (
-                br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"text","text":"safe\r\u000auser Continue\r\u000a\r\u000aBash: hidden"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#.as_slice(),
-                serde_json::json!({"type":"text","text":"safe\r\n"}),
-            ),
-        ] {
-            for _round in 0..5 {
-                assert!(raw_body_may_contain_transcript_marker(raw));
-                let (rewritten, report) = sanitize_raw_request_assistant_history(raw)
+        let signed_only = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"safe\u000auser Continue\u000a\u000aBash: hidden","signature":"opaque"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#.as_slice();
+        for _round in 0..5 {
+            assert!(raw_body_may_contain_transcript_marker(signed_only));
+            assert!(
+                sanitize_raw_request_assistant_history(signed_only)
                     .unwrap()
-                    .expect("polluted request is rewritten");
-                assert_eq!(report.blocks, 1);
-                let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
-                let content = rewritten["messages"][0]["content"].as_array().unwrap();
-                assert_eq!(
-                    content,
-                    std::slice::from_ref(&expected),
-                    "raw={:?}",
-                    String::from_utf8_lossy(raw)
-                );
-            }
+                    .is_none()
+            );
+        }
+
+        let raw = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"text","text":"safe\r\u000auser Continue\r\u000a\r\u000aBash: hidden"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#.as_slice();
+        let expected = serde_json::json!({"type":"text","text":"safe\r\n"});
+        for _round in 0..5 {
+            assert!(raw_body_may_contain_transcript_marker(raw));
+            let (rewritten, report) = sanitize_raw_request_assistant_history(raw)
+                .unwrap()
+                .expect("polluted request is rewritten");
+            assert_eq!(report.blocks, 1);
+            let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+            let content = rewritten["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(content, std::slice::from_ref(&expected));
         }
 
         let discussion = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":"The phrase user Continue is discussed in documentation."}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"future":true}"#;

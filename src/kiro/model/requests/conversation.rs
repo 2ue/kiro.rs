@@ -3,6 +3,7 @@
 //! 定义 Kiro API 中对话相关的类型，包括消息、历史记录等
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use super::tool::{Tool, ToolResult, ToolUseEntry};
 
@@ -97,6 +98,52 @@ impl ConversationState {
                     .reasoning_content
                     .take(),
                 Message::User(_) => None,
+            })
+            .count()
+    }
+
+    /// Remove only reasoning that is outside the active tool continuation.
+    ///
+    /// A compatibility retry may omit stale historical reasoning, but it must retain the latest
+    /// assistant reasoning when every tool use is paired with a current tool result. That pair is
+    /// part of the protocol turn and deleting it can change the request shape that Kiro validates.
+    pub fn clear_history_reasoning_content_for_compatibility_retry(&mut self) -> usize {
+        let current_results = &self
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        let current_result_ids = current_results
+            .iter()
+            .map(|result| result.tool_use_id.as_str())
+            .collect::<HashSet<_>>();
+        let protected_assistant = self.history.len().checked_sub(1).filter(|index| {
+            let Some(Message::Assistant(assistant)) = self.history.get(*index) else {
+                return false;
+            };
+            let Some(tool_uses) = assistant.assistant_response_message.tool_uses.as_ref() else {
+                return false;
+            };
+            !tool_uses.is_empty()
+                && tool_uses
+                    .iter()
+                    .all(|tool_use| current_result_ids.contains(tool_use.tool_use_id.as_str()))
+        });
+
+        self.history
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                if protected_assistant == Some(index) {
+                    return None;
+                }
+                match message {
+                    Message::Assistant(assistant) => assistant
+                        .assistant_response_message
+                        .reasoning_content
+                        .take(),
+                    Message::User(_) => None,
+                }
             })
             .count()
     }
@@ -553,5 +600,120 @@ mod tests {
             assert!(!serialized.contains(&format!("thought {round}")));
             assert!(!serialized.contains(&format!("sig-{round}")));
         }
+    }
+
+    #[test]
+    fn compatibility_retry_preserves_paired_active_tool_reasoning() {
+        for round in 0..5 {
+            let old_reasoning = ReasoningContent::reasoning_text(
+                format!("old thought {round}"),
+                format!("old-sig-{round}"),
+            );
+            let active_reasoning =
+                ReasoningContent::redacted_content(format!("active-data-{round}"));
+            let active_assistant = AssistantMessage::new("active answer")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-active", "read")])
+                .with_reasoning_content(active_reasoning.clone());
+            let mut state = ConversationState::new(format!("compat-{round}"))
+                .with_history(vec![
+                    Message::Assistant(HistoryAssistantMessage {
+                        assistant_response_message: AssistantMessage::new("old answer")
+                            .with_reasoning_content(old_reasoning),
+                    }),
+                    Message::Assistant(HistoryAssistantMessage {
+                        assistant_response_message: active_assistant.clone(),
+                    }),
+                ])
+                .with_current_message(CurrentMessage::new(
+                    UserInputMessage::new("tool continuation", "model").with_context(
+                        UserInputMessageContext::new()
+                            .with_tool_results(vec![ToolResult::success("tool-active", "done")]),
+                    ),
+                ));
+
+            let before_active = serde_json::to_value(&state.history[1]).unwrap();
+            assert_eq!(
+                state.clear_history_reasoning_content_for_compatibility_retry(),
+                1,
+                "round {round}"
+            );
+            assert!(
+                matches!(
+                    &state.history[0],
+                    Message::Assistant(assistant)
+                        if assistant.assistant_response_message.reasoning_content.is_none()
+                ),
+                "round {round}: stale reasoning removed"
+            );
+            assert_eq!(
+                serde_json::to_value(&state.history[1]).unwrap(),
+                before_active,
+                "round {round}: active tool continuation is opaque"
+            );
+            assert_eq!(
+                state.history.get(1).and_then(|message| match message {
+                    Message::Assistant(assistant) => {
+                        assistant
+                            .assistant_response_message
+                            .reasoning_content
+                            .as_ref()
+                    }
+                    Message::User(_) => None,
+                }),
+                Some(&active_reasoning),
+                "round {round}: active reasoning remains"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_retry_does_not_protect_mismatched_or_earlier_tool_turns() {
+        let paired_earlier = AssistantMessage::new("earlier")
+            .with_tool_uses(vec![ToolUseEntry::new("tool-earlier", "read")])
+            .with_reasoning_content(ReasoningContent::reasoning_text(
+                "earlier-thought",
+                "earlier-sig",
+            ));
+        let mismatched_latest = AssistantMessage::new("latest")
+            .with_tool_uses(vec![ToolUseEntry::new("tool-latest", "read")])
+            .with_reasoning_content(ReasoningContent::redacted_content("latest-data"));
+        let mut state = ConversationState::new("compat-mismatch")
+            .with_history(vec![
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: paired_earlier,
+                }),
+                Message::Assistant(HistoryAssistantMessage {
+                    assistant_response_message: mismatched_latest,
+                }),
+            ])
+            .with_current_message(CurrentMessage::new(
+                UserInputMessage::new("tool continuation", "model").with_context(
+                    UserInputMessageContext::new()
+                        .with_tool_results(vec![ToolResult::success("tool-earlier", "done")]),
+                ),
+            ));
+
+        assert_eq!(
+            state.clear_history_reasoning_content_for_compatibility_retry(),
+            2
+        );
+        assert!(state.history.iter().all(|message| matches!(
+            message,
+            Message::Assistant(assistant)
+                if assistant.assistant_response_message.reasoning_content.is_none()
+        )));
+    }
+
+    #[test]
+    fn compatibility_retry_reports_noop_when_history_has_no_reasoning() {
+        let mut state = ConversationState::new("compat-empty").with_history(vec![
+            Message::User(HistoryUserMessage::new("question", "model")),
+            Message::Assistant(HistoryAssistantMessage::new("answer")),
+        ]);
+        assert_eq!(
+            state.clear_history_reasoning_content_for_compatibility_retry(),
+            0
+        );
+        assert!(!state.has_history_reasoning_content());
     }
 }

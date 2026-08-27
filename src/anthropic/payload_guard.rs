@@ -1624,6 +1624,31 @@ fn is_anthropic_reasoning_content_block(block: &Value) -> bool {
         || block.get("signature").is_some()
 }
 
+/// Returns the assistant immediately preceding the current user tool-result turn.
+///
+/// The assistant's signed/redacted reasoning is part of the active tool continuation and must
+/// not be treated as disposable historical context. Only a fully paired latest assistant is
+/// protected; ordinary assistant history remains eligible for shaping.
+fn active_anthropic_tool_turn_assistant_index(messages: &[AnthropicMessage]) -> Option<usize> {
+    let current_index = messages.len().checked_sub(1)?;
+    let current = messages.get(current_index)?;
+    if current.role != "user" {
+        return None;
+    }
+    let result_ids = anthropic_tool_result_ids(&current.content);
+    if result_ids.is_empty() {
+        return None;
+    }
+    let assistant_index = current_index.checked_sub(1)?;
+    let assistant = messages.get(assistant_index)?;
+    if assistant.role != "assistant" {
+        return None;
+    }
+    let use_ids = anthropic_tool_use_ids(&assistant.content);
+    (!use_ids.is_empty() && use_ids.iter().all(|id| result_ids.contains(id)))
+        .then_some(assistant_index)
+}
+
 fn anthropic_history_reasoning_content_stats(messages: &[AnthropicMessage]) -> (usize, usize) {
     messages
         .iter()
@@ -1983,7 +2008,12 @@ fn apply_anthropic_payload_safety_shaping(
     let history_end = request.messages.len().saturating_sub(1);
 
     if config.discard_historical_thinking {
-        let result = discard_anthropic_history_thinking(&mut request.messages[..history_end]);
+        let protected_assistant = active_anthropic_tool_turn_assistant_index(&request.messages)
+            .filter(|index| *index < history_end);
+        let result = discard_anthropic_history_thinking(
+            &mut request.messages[..history_end],
+            protected_assistant,
+        );
         stats.removed_history_thinking_blocks += result.0;
         stats.removed_history_thinking_chars += result.1;
     }
@@ -2064,7 +2094,17 @@ fn apply_payload_shaping(request: &mut KiroRequest, config: PayloadShapingConfig
     }
 
     if config.discard_historical_thinking {
-        let result = discard_history_thinking(&mut request.conversation_state.history);
+        let protected_assistant = active_kiro_tool_turn_assistant_index(
+            &request.conversation_state.history,
+            &request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results,
+        );
+        let result =
+            discard_history_thinking(&mut request.conversation_state.history, protected_assistant);
         stats.removed_history_thinking_blocks += result.0;
         stats.removed_history_thinking_chars += result.1;
     }
@@ -2136,7 +2176,12 @@ fn apply_anthropic_payload_shaping(
     }
 
     if config.discard_historical_thinking {
-        let result = discard_anthropic_history_thinking(&mut request.messages[..history_end]);
+        let protected_assistant = active_anthropic_tool_turn_assistant_index(&request.messages)
+            .filter(|index| *index < history_end);
+        let result = discard_anthropic_history_thinking(
+            &mut request.messages[..history_end],
+            protected_assistant,
+        );
         stats.removed_history_thinking_blocks += result.0;
         stats.removed_history_thinking_chars += result.1;
     }
@@ -2226,11 +2271,17 @@ fn trim_anthropic_history_web_fetch_content(
     (blocks_trimmed, omitted_chars)
 }
 
-fn discard_anthropic_history_thinking(messages: &mut [AnthropicMessage]) -> (usize, usize) {
+fn discard_anthropic_history_thinking(
+    messages: &mut [AnthropicMessage],
+    protected_assistant: Option<usize>,
+) -> (usize, usize) {
     let mut removed_blocks = 0usize;
     let mut removed_chars = 0usize;
-    for message in messages {
+    for (index, message) in messages.iter_mut().enumerate() {
         if message.role != "assistant" {
+            continue;
+        }
+        if protected_assistant == Some(index) {
             continue;
         }
         if let Some(text) = message.content.as_str() {
@@ -2992,13 +3043,45 @@ fn fit_truncated_text_with_marker(
     }
 }
 
-fn discard_history_thinking(history: &mut [Message]) -> (usize, usize) {
+fn active_kiro_tool_turn_assistant_index(
+    history: &[Message],
+    current_results: &[ToolResult],
+) -> Option<usize> {
+    if current_results.is_empty() {
+        return None;
+    }
+    let assistant_index = history.len().checked_sub(1)?;
+    let Message::Assistant(assistant) = history.get(assistant_index)? else {
+        return None;
+    };
+    let tool_uses = assistant.assistant_response_message.tool_uses.as_ref()?;
+    if tool_uses.is_empty() {
+        return None;
+    }
+    let result_ids = current_results
+        .iter()
+        .map(|result| result.tool_use_id.as_str())
+        .collect::<HashSet<_>>();
+    tool_uses
+        .iter()
+        .map(|tool_use| tool_use.tool_use_id.as_str())
+        .all(|id| result_ids.contains(id))
+        .then_some(assistant_index)
+}
+
+fn discard_history_thinking(
+    history: &mut [Message],
+    protected_assistant: Option<usize>,
+) -> (usize, usize) {
     let mut blocks = 0usize;
     let mut chars = 0usize;
-    for message in history {
+    for (index, message) in history.iter_mut().enumerate() {
         let Message::Assistant(assistant) = message else {
             continue;
         };
+        if protected_assistant == Some(index) {
+            continue;
+        }
         if let Some(reasoning_content) = assistant
             .assistant_response_message
             .reasoning_content
@@ -7592,16 +7675,26 @@ mod tests {
                 ),
                 ReasoningContent::redacted_content(base64_zeros_for_decoded_bytes(round + 1)),
             ] {
+                let native_is_signed = matches!(native, ReasoningContent::ReasoningText(_));
                 let native_bytes = json_len(&native);
                 let assistant = HistoryAssistantMessage {
                     assistant_response_message: AssistantMessage::new(format!(
-                        "visible\n<thinking>legacy {round}</thinking>\nanswer"
+                        "active-visible\n<thinking>active-legacy {round}</thinking>\nactive-answer"
                     ))
                     .with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")])
                     .with_reasoning_content(native),
                 };
                 let mut request = request_with_history(vec![
                     Message::User(HistoryUserMessage::new("question", TEST_MODEL)),
+                    Message::Assistant(HistoryAssistantMessage {
+                        assistant_response_message: AssistantMessage::new(format!(
+                            "stale-visible\n<thinking>stale-legacy {round}</thinking>\nstale-answer"
+                        ))
+                        .with_reasoning_content(ReasoningContent::reasoning_text(
+                            format!("stale thought {round}"),
+                            format!("stale-signature-{round}"),
+                        )),
+                    }),
                     Message::Assistant(assistant),
                 ]);
                 request
@@ -7627,18 +7720,28 @@ mod tests {
                     report.removed_history_thinking_chars >= native_bytes,
                     "round {round}"
                 );
-                let Message::Assistant(assistant) = &request.conversation_state.history[1] else {
+                let Message::Assistant(stale) = &request.conversation_state.history[1] else {
+                    panic!("expected stale assistant");
+                };
+                assert_eq!(
+                    stale.assistant_response_message.content,
+                    "stale-visible\n\nstale-answer"
+                );
+                assert!(stale.assistant_response_message.reasoning_content.is_none());
+                let Message::Assistant(assistant) = &request.conversation_state.history[2] else {
                     panic!("expected assistant");
                 };
                 assert_eq!(
                     assistant.assistant_response_message.content,
-                    "visible\n\nanswer"
+                    format!(
+                        "active-visible\n<thinking>active-legacy {round}</thinking>\nactive-answer"
+                    )
                 );
                 assert!(
                     assistant
                         .assistant_response_message
                         .reasoning_content
-                        .is_none()
+                        .is_some()
                 );
                 assert_eq!(
                     assistant
@@ -7648,9 +7751,11 @@ mod tests {
                         .map(Vec::len),
                     Some(1)
                 );
-                assert!(!body.contains("reasoningContent"));
-                assert!(!body.contains("signature-"));
-                assert!(!body.contains("<thinking>"));
+                assert!(body.contains("reasoningContent"));
+                if native_is_signed {
+                    assert!(body.contains("signature-"));
+                }
+                assert!(body.contains("<thinking>"));
             }
         }
     }

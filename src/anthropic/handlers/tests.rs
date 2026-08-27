@@ -5638,7 +5638,13 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
                     },
                     {
                         "assistantResponseMessage": {
-                            "content": format!("old-answer-{}", "y".repeat(4096))
+                            "content": format!("old-answer-{}", "y".repeat(4096)),
+                            "reasoningContent": {
+                                "reasoningText": {
+                                    "text": "old-private-thought",
+                                    "signature": "old-private-signature"
+                                }
+                            }
                         }
                     },
                     {
@@ -5649,7 +5655,29 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
                     },
                     {
                         "assistantResponseMessage": {
+                            "content": "STALE_ASSISTANT_MUST_REMAIN",
+                            "reasoningContent": {
+                                "reasoningText": {
+                                    "text": "stale-private-thought",
+                                    "signature": "stale-private-signature"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "userInputMessage": {
+                            "content": "ACTIVE_TOOL_PROMPT_MUST_REMAIN",
+                            "modelId": "claude-sonnet-4"
+                        }
+                    },
+                    {
+                        "assistantResponseMessage": {
                             "content": "RECENT_ASSISTANT_MUST_REMAIN",
+                            "toolUses": [{
+                                "toolUseId": "recent-tool",
+                                "name": "read",
+                                "input": {"path": "README.md"}
+                            }],
                             "reasoningContent": {
                                 "reasoningText": {
                                     "text": "recent-private-thought",
@@ -5663,7 +5691,13 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
                     "userInputMessage": {
                         "content": "CURRENT_MUST_REMAIN",
                         "modelId": "claude-sonnet-4",
-                        "userInputMessageContext": {}
+                        "userInputMessageContext": {
+                            "toolResults": [{
+                                "toolUseId": "recent-tool",
+                                "content": [{"text": "done"}],
+                                "status": "success"
+                            }]
+                        }
                     }
                 }
             }
@@ -5688,8 +5722,12 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
         .unwrap_or_else(|error| panic!("round {round}: {error}"));
 
         assert_eq!(report.trimmed_history_entries, 2, "round {round}");
-        assert_eq!(request.conversation_state.history.len(), 2, "round {round}");
+        assert_eq!(request.conversation_state.history.len(), 4, "round {round}");
         assert!(!guarded_body.contains("OLD_HISTORY_MUST_STAY_TRIMMED"));
+        assert!(guarded_body.contains("STALE_ASSISTANT_MUST_REMAIN"));
+        assert!(guarded_body.contains("stale-private-thought"));
+        assert!(guarded_body.contains("stale-private-signature"));
+        assert!(guarded_body.contains("ACTIVE_TOOL_PROMPT_MUST_REMAIN"));
         assert!(guarded_body.contains("RECENT_USER_MUST_REMAIN"));
         assert!(guarded_body.contains("RECENT_ASSISTANT_MUST_REMAIN"));
         assert!(request.conversation_state.has_history_reasoning_content());
@@ -5697,8 +5735,15 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
         let signature_retry_body = build_thinking_signature_retry_body(&request)
             .unwrap_or_else(|error| panic!("round {round}: {error}"));
         assert!(!signature_retry_body.contains("OLD_HISTORY_MUST_STAY_TRIMMED"));
-        assert!(!signature_retry_body.contains("recent-private-thought"));
-        assert!(!signature_retry_body.contains("recent-private-signature"));
+        assert!(!signature_retry_body.contains("old-private-thought"));
+        assert!(!signature_retry_body.contains("old-private-signature"));
+        assert!(!signature_retry_body.contains("stale-private-thought"));
+        assert!(!signature_retry_body.contains("stale-private-signature"));
+        assert!(signature_retry_body.contains("STALE_ASSISTANT_MUST_REMAIN"));
+        assert!(signature_retry_body.contains("ACTIVE_TOOL_PROMPT_MUST_REMAIN"));
+        assert!(signature_retry_body.contains("recent-private-thought"));
+        assert!(signature_retry_body.contains("recent-private-signature"));
+        assert!(signature_retry_body.contains("recent-tool"));
         assert!(signature_retry_body.contains("RECENT_USER_MUST_REMAIN"));
         assert!(signature_retry_body.contains("RECENT_ASSISTANT_MUST_REMAIN"));
         assert!(signature_retry_body.contains("CURRENT_MUST_REMAIN"));
@@ -6784,7 +6829,6 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6888,7 +6932,6 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -6983,7 +7026,6 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7081,7 +7123,6 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7194,7 +7235,6 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7288,7 +7328,6 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7412,7 +7451,6 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7750,7 +7788,6 @@ fn path_overrides_independently_control_reported_usage_fields() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -7924,7 +7961,6 @@ fn creation_control_preserves_reported_usage_input_policy() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -8016,7 +8052,6 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -8099,7 +8134,6 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -8659,7 +8693,6 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
@@ -8762,7 +8795,6 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         payload_breakdown: None,
         payload_guard_report: None,
         error_metadata: Arc::new(Mutex::new(None)),
-        raw_upstream_error: Arc::new(Mutex::new(None)),
         route_subtype_override: None,
         fallback_reason: None,
         local_preflight: None,
