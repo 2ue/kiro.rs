@@ -511,6 +511,7 @@ const emptyConfig: RuntimeConfig = {
     queueTimeoutMs: 1000,
   },
   credentialMaxConcurrentRequests: 0,
+  credentialInfoRefreshConcurrency: 3,
   credentialTransientCooldownSecs: 10,
   credentialRateLimitCooldownSecs: 30,
   credentialServerErrorCooldownSecs: 5,
@@ -2887,6 +2888,7 @@ export function RuntimeConfigPanel() {
         queueTimeoutMs: toWhole(draft.requestAdmission.queueTimeoutMs, 0, 300_000),
       },
       credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
+      credentialInfoRefreshConcurrency: toWhole(draft.credentialInfoRefreshConcurrency, 1, 16),
       credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
       credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
       credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
@@ -3155,6 +3157,17 @@ export function RuntimeConfigPanel() {
               suffix="并发"
               onChange={(credentialMaxConcurrentRequests) =>
                 setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))
+              }
+            />
+            <NumberField
+              title="积分查询上游并发"
+              description="控制管理端强制查询积分时，同时向 Kiro 请求账号额度的数量；它独立于推理并发。建议保持 1 到 3，避免批量查询触发上游限流。"
+              value={draft.credentialInfoRefreshConcurrency}
+              min={1}
+              max={16}
+              suffix="并发"
+              onChange={(credentialInfoRefreshConcurrency) =>
+                setDraft((prev) => ({ ...prev, credentialInfoRefreshConcurrency }))
               }
             />
             <NumberField

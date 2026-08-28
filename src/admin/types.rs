@@ -1495,6 +1495,7 @@ pub struct RuntimeConfigResponse {
     /// 单实例、单个请求 API Key 的准入配置；不表示跨实例聚合上限。
     pub request_admission: RequestAdmissionConfig,
     pub credential_max_concurrent_requests: u32,
+    pub credential_info_refresh_concurrency: u32,
     pub credential_transient_cooldown_secs: u64,
     pub credential_rate_limit_cooldown_secs: u64,
     pub credential_server_error_cooldown_secs: u64,
@@ -1591,6 +1592,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub request_admission: Option<RequestAdmissionConfig>,
     #[serde(default)]
     pub credential_max_concurrent_requests: u32,
+    #[serde(default)]
+    pub credential_info_refresh_concurrency: Option<u32>,
     pub credential_transient_cooldown_secs: u64,
     #[serde(default)]
     pub credential_rate_limit_cooldown_secs: Option<u64>,

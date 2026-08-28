@@ -83,7 +83,7 @@ use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
 use crate::model::config::{
-    ExternalPoolsConfig, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM,
+    Config, ExternalPoolsConfig, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM,
     MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
 };
 use crate::model::model_support::{
@@ -100,7 +100,8 @@ use crate::storage::redis_cache::{RedisPatternDeleteStats, RedisStore};
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
-const CREDENTIAL_INFO_REFRESH_CONCURRENCY: usize = 16;
+const MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 1;
+const MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 16;
 const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
@@ -128,6 +129,13 @@ const PROXY_TEST_TIMEOUT_SECS: u64 = 12;
 const PROXY_TEST_PREVIEW_CHARS: usize = 300;
 const ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+fn effective_credential_info_refresh_concurrency(config: &Config) -> usize {
+    config.credential_info_refresh_concurrency.clamp(
+        MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY,
+        MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY,
+    ) as usize
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
@@ -2347,6 +2355,8 @@ impl AdminService {
             )));
         }
 
+        let concurrency =
+            effective_credential_info_refresh_concurrency(&self.token_manager.runtime_config());
         let labels = self.credential_lookup();
         let mut items = stream::iter(ids.into_iter().map(|id| {
             let label = labels.get(&id).cloned();
@@ -2371,7 +2381,7 @@ impl AdminService {
                 }
             }
         }))
-        .buffer_unordered(CREDENTIAL_INFO_REFRESH_CONCURRENCY)
+        .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
         .await;
         items.sort_unstable_by_key(|item| item.id);
@@ -4397,6 +4407,7 @@ impl AdminService {
             credential_rpm: config.credential_rpm.unwrap_or(0),
             request_admission: config.request_admission.normalized(),
             credential_max_concurrent_requests: config.credential_max_concurrent_requests,
+            credential_info_refresh_concurrency: config.credential_info_refresh_concurrency,
             credential_transient_cooldown_secs: config.credential_transient_cooldown_secs,
             credential_rate_limit_cooldown_secs: config.credential_rate_limit_cooldown_secs,
             credential_server_error_cooldown_secs: config.credential_server_error_cooldown_secs,
@@ -4529,6 +4540,9 @@ impl AdminService {
             .request_admission
             .unwrap_or(current_config.request_admission);
         let request_admission = normalize_admin_request_admission(request_admission)?;
+        let credential_info_refresh_concurrency = req
+            .credential_info_refresh_concurrency
+            .unwrap_or(current_config.credential_info_refresh_concurrency);
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
@@ -4831,6 +4845,14 @@ impl AdminService {
                 "credentialRetryMaxAttempts 不能大于 10000".to_string(),
             ));
         }
+        if !(MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY..=MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY)
+            .contains(&credential_info_refresh_concurrency)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "credentialInfoRefreshConcurrency 必须在 {} 到 {} 之间",
+                MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY, MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY
+            )));
+        }
         if !(1..=10).contains(&inference_upstream_max_attempts) {
             return Err(AdminServiceError::InvalidCredential(
                 "inferenceUpstreamMaxAttempts 必须在 1 到 10 之间".to_string(),
@@ -5050,6 +5072,7 @@ impl AdminService {
                 config.credential_rpm = credential_rpm;
                 config.request_admission = request_admission;
                 config.credential_max_concurrent_requests = req.credential_max_concurrent_requests;
+                config.credential_info_refresh_concurrency = credential_info_refresh_concurrency;
                 config.credential_transient_cooldown_secs = req.credential_transient_cooldown_secs;
                 config.credential_rate_limit_cooldown_secs = credential_rate_limit_cooldown_secs;
                 config.credential_server_error_cooldown_secs =

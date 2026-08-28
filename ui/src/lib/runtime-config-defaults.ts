@@ -422,6 +422,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
     queueTimeoutMs: 1000,
   },
   credentialMaxConcurrentRequests: 0,
+  credentialInfoRefreshConcurrency: 3,
   credentialTransientCooldownSecs: 10,
   credentialRateLimitCooldownSecs: 30,
   credentialServerErrorCooldownSecs: 5,

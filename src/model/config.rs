@@ -3496,6 +3496,13 @@ pub struct Config {
     #[serde(default = "default_credential_max_concurrent_requests")]
     pub credential_max_concurrent_requests: u32,
 
+    /// 管理端强制刷新账号信息时，对 Kiro 上游请求的最大并发数。
+    ///
+    /// 该限制独立于推理调度使用的 `credential_max_concurrent_requests`：
+    /// 刷新操作会逐账号调用 Kiro `getUsageLimits`，因此必须使用保守的固定上限。
+    #[serde(default = "default_credential_info_refresh_concurrency")]
+    pub credential_info_refresh_concurrency: u32,
+
     /// 上游瞬态错误没有 Retry-After 时，对单个凭据设置的临时冷却秒数。
     #[serde(default = "default_credential_transient_cooldown_secs")]
     pub credential_transient_cooldown_secs: u64,
@@ -4042,6 +4049,10 @@ fn default_credential_rpm() -> Option<u32> {
 
 fn default_credential_max_concurrent_requests() -> u32 {
     30
+}
+
+fn default_credential_info_refresh_concurrency() -> u32 {
+    3
 }
 
 fn default_credential_dispatch_max_wait_secs() -> u64 {
@@ -4816,6 +4827,7 @@ impl Default for Config {
             request_admission: RequestAdmissionConfig::default(),
             credential_rpm: default_credential_rpm(),
             credential_max_concurrent_requests: default_credential_max_concurrent_requests(),
+            credential_info_refresh_concurrency: default_credential_info_refresh_concurrency(),
             credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
             credential_rate_limit_cooldown_secs: default_credential_rate_limit_cooldown_secs(),
             credential_server_error_cooldown_secs: default_credential_server_error_cooldown_secs(),
@@ -5421,6 +5433,7 @@ mod tests {
         assert_eq!(config.redis.key_prefix, "kiro_rs:local");
         assert_eq!(config.credential_rpm, Some(100));
         assert_eq!(config.credential_max_concurrent_requests, 30);
+        assert_eq!(config.credential_info_refresh_concurrency, 3);
         assert_eq!(config.credential_transient_cooldown_secs, 10);
         assert_eq!(config.credential_rate_limit_cooldown_secs, 30);
         assert_eq!(config.credential_server_error_cooldown_secs, 5);
@@ -5569,6 +5582,7 @@ mod tests {
         assert_eq!(config.request_admission, RequestAdmissionConfig::default());
         assert_eq!(config.credential_rpm, Some(100));
         assert_eq!(config.credential_max_concurrent_requests, 30);
+        assert_eq!(config.credential_info_refresh_concurrency, 3);
         assert_eq!(config.credential_dispatch_max_wait_secs, 5);
         assert_eq!(config.dispatch_global_max_concurrent_requests, 512);
         assert_eq!(config.dispatch_max_queued_requests, 30);

@@ -1655,6 +1655,7 @@ export interface RuntimeConfig {
   credentialRpm: number
   requestAdmission: RequestAdmissionConfig
   credentialMaxConcurrentRequests: number
+  credentialInfoRefreshConcurrency: number
   credentialTransientCooldownSecs: number
   credentialRateLimitCooldownSecs: number
   credentialServerErrorCooldownSecs: number

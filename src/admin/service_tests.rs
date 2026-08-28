@@ -1,6 +1,8 @@
 use super::*;
 use crate::model::config::{ExternalPoolsConfig, RequestAdmissionConfig};
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn cleanup_request() -> UsageCleanupRequest {
     UsageCleanupRequest {
@@ -11,6 +13,67 @@ fn cleanup_request() -> UsageCleanupRequest {
         max_batches: None,
         pause_ms_between_batches: None,
     }
+}
+
+#[test]
+fn credential_info_refresh_concurrency_defaults_and_clamps() {
+    let mut config = crate::model::config::Config::default();
+    assert_eq!(effective_credential_info_refresh_concurrency(&config), 3);
+
+    config.credential_info_refresh_concurrency = 0;
+    assert_eq!(effective_credential_info_refresh_concurrency(&config), 1);
+
+    config.credential_info_refresh_concurrency = 99;
+    assert_eq!(effective_credential_info_refresh_concurrency(&config), 16);
+}
+
+#[tokio::test]
+async fn credential_info_refresh_stream_limits_concurrency_and_completes_all_items() {
+    use futures::{StreamExt, stream};
+
+    let mut config = crate::model::config::Config::default();
+    config.credential_info_refresh_concurrency = 3;
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let mut results = stream::iter((0..183usize).map(|id| {
+        let active = Arc::clone(&active);
+        let peak = Arc::clone(&peak);
+        async move {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut observed = peak.load(Ordering::SeqCst);
+            while current > observed {
+                match peak.compare_exchange(observed, current, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(actual) => observed = actual,
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            (id, id % 19 != 0)
+        }
+    }))
+    .buffer_unordered(effective_credential_info_refresh_concurrency(&config))
+    .collect::<Vec<_>>()
+    .await;
+
+    results.sort_unstable_by_key(|(id, _)| *id);
+    assert_eq!(results.len(), 183);
+    assert_eq!(results.iter().filter(|(_, ok)| !ok).count(), 10);
+    assert_eq!(
+        results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        (0..183usize).collect::<Vec<_>>(),
+    );
+    assert!(
+        results.iter().any(|(id, ok)| *id == 182 && *ok),
+        "a failure in an earlier task must not prevent later tasks from running"
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) <= 3,
+        "peak upstream refresh concurrency exceeded configured cap"
+    );
+    assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 
 #[test]

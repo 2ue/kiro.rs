@@ -294,6 +294,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       queueTimeoutMs: toWhole(draft.requestAdmission.queueTimeoutMs, 0, 300_000),
     },
     credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
+    credentialInfoRefreshConcurrency: toWhole(draft.credentialInfoRefreshConcurrency, 1, 16),
     credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
     credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
     credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
@@ -719,6 +720,7 @@ export function RuntimePage() {
                 <NumField label="每实例 · 每 Key 等待" desc="每个实例内同一 Key 等待并发名额的最长时间；0 表示不排队并立即返回 429。" value={draft.requestAdmission.queueTimeoutMs} min={0} max={300_000} suffix="毫秒" onChange={setRequestAdmission('queueTimeoutMs')} />
                 <NumField label="单账号每分钟请求上限" desc="每个账号一分钟最多接多少个请求；0 表示不做本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={set('credentialRpm')} />
                 <NumField label="单账号最大并发" desc="每个账号同一时间最多处理多少个请求；0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={set('credentialMaxConcurrentRequests')} />
+                <NumField label="积分查询上游并发" desc="管理端强制查询积分时，同时向 Kiro 请求账号额度的数量；与推理并发独立。建议保持 1 到 3，避免批量查询触发上游限流。" value={draft.credentialInfoRefreshConcurrency} min={1} max={16} suffix="并发" onChange={set('credentialInfoRefreshConcurrency')} />
                 <NumField label="全局最大并发" desc="整个服务同一时间最多处理多少个请求；0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={set('dispatchGlobalMaxConcurrentRequests')} />
                 <NumField label="最大排队请求数" desc="账号忙不过来时最多让多少个请求排队；0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={set('dispatchMaxQueuedRequests')} />
                 <TogField
