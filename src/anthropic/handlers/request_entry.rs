@@ -72,7 +72,7 @@ pub(super) async fn handle_messages_endpoint(
         return error.to_response(&request_id);
     }
 
-    let mut request_history_contaminated = false;
+    let mut requires_normalized_body = false;
     let raw_history_sanitization =
         super::super::transcript_sanitizer::sanitize_raw_request_assistant_history_with_probe(
             &raw_body, &raw_probe,
@@ -89,10 +89,13 @@ pub(super) async fn handle_messages_endpoint(
             return error.to_response(&request_id);
         }
     };
+    if raw_history_sanitization.requires_normalized_body {
+        requires_normalized_body = true;
+    }
     let effective_raw_probe = Arc::new(raw_probe);
     let mut parsed_raw_probe = effective_raw_probe.clone();
-    if let Some((sanitized_body, _report)) = raw_history_sanitization {
-        if runtime_config.compat_profile.is_strict() {
+    if let Some((sanitized_body, report)) = raw_history_sanitization.sanitized_body {
+        if runtime_config.compat_profile.is_strict() && report.blocks > 0 {
             let request_id = envelope::request_id();
             let error = EntryRequestError::invalid(
                 envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
@@ -109,10 +112,10 @@ pub(super) async fn handle_messages_endpoint(
         }
         raw_body = Bytes::from(sanitized_body);
         parsed_raw_probe = Arc::new(probe_raw_messages_body(&raw_body));
-        request_history_contaminated = true;
+        requires_normalized_body = true;
     }
 
-    if should_try_raw_external_routes(request_history_contaminated) {
+    if should_try_raw_external_routes(requires_normalized_body) {
         if let Some(response) = maybe_raw_external_direct_response(
             &state,
             headers.clone(),
@@ -155,7 +158,7 @@ pub(super) async fn handle_messages_endpoint(
             endpoint,
             inference_attempt_budget,
             request_api_key_id,
-            request_history_contaminated,
+            requires_normalized_body,
             attribution,
             raw_preflight_failure,
         )
@@ -171,7 +174,7 @@ pub(super) async fn handle_messages_endpoint(
         endpoint,
         inference_attempt_budget,
         request_api_key_id,
-        request_history_contaminated,
+        requires_normalized_body,
         attribution,
         None,
     )
@@ -189,7 +192,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     endpoint: String,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
-    request_history_contaminated: bool,
+    requires_normalized_body: bool,
     attribution: Option<RequestRejectionAttribution>,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Response {
@@ -226,15 +229,15 @@ async fn continue_messages_endpoint_after_raw_external_routes(
         endpoint,
         inference_attempt_budget,
         request_api_key_id,
-        request_history_contaminated,
+        requires_normalized_body,
         attribution,
         raw_preflight_failure,
     )
     .await
 }
 
-fn should_try_raw_external_routes(request_history_contaminated: bool) -> bool {
-    !request_history_contaminated
+fn should_try_raw_external_routes(requires_normalized_body: bool) -> bool {
+    !requires_normalized_body
 }
 
 fn maybe_local_pool_unavailable_fast_fail_response(
@@ -660,15 +663,35 @@ mod tests {
         for _round in 0..5 {
             assert!(should_try_raw_external_routes(false));
             for fixture in fixtures {
-                assert!(
-                    super::super::super::transcript_sanitizer::sanitize_raw_request_assistant_history(
-                        fixture,
-                    )
-                    .expect("assistant history inspection succeeds")
-                    .is_some()
-                );
-                assert!(!should_try_raw_external_routes(true));
+                let inspection = super::super::super::transcript_sanitizer::sanitize_raw_request_assistant_history(
+                    fixture,
+                )
+                .expect("assistant history inspection succeeds");
+                assert!(inspection.sanitized_body.is_some());
+                assert!(inspection.requires_normalized_body);
+                assert!(!should_try_raw_external_routes(
+                    inspection.requires_normalized_body
+                ));
             }
+        }
+    }
+
+    #[test]
+    fn authenticated_history_without_transcript_leak_still_skips_raw_direct_and_preflight_five_rounds()
+     {
+        let signed_only = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"private thought","signature":"opaque-signature"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#;
+
+        for _round in 0..5 {
+            let inspection =
+                super::super::super::transcript_sanitizer::sanitize_raw_request_assistant_history(
+                    signed_only,
+                )
+                .expect("assistant history inspection succeeds");
+            assert!(inspection.sanitized_body.is_none());
+            assert!(inspection.requires_normalized_body);
+            assert!(!should_try_raw_external_routes(
+                inspection.requires_normalized_body
+            ));
         }
     }
 

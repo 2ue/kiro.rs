@@ -5582,6 +5582,92 @@ fn thinking_signature_retry_body_removes_only_native_reasoning_five_rounds() {
 }
 
 #[test]
+fn thinking_signature_retry_body_removes_active_paired_reasoning_without_breaking_tool_continuation()
+ {
+    for round in 1..=5 {
+        let request = serde_json::from_value::<KiroRequest>(json!({
+            "conversationState": {
+                "conversationId": format!("paired-signature-{round}"),
+                "history": [
+                    {
+                        "assistantResponseMessage": {
+                            "content": "active-visible-content",
+                            "toolUses": [{
+                                "toolUseId": "active-tool",
+                                "name": "read",
+                                "input": {"path": "README.md"}
+                            }],
+                            "reasoningContent": {
+                                "reasoningText": {
+                                    "text": "active-private-thought",
+                                    "signature": "active-private-signature"
+                                }
+                            }
+                        }
+                    }
+                ],
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "continue after tool",
+                        "modelId": "claude-sonnet-4",
+                        "userInputMessageContext": {
+                            "toolResults": [{
+                                "toolUseId": "active-tool",
+                                "content": [{"text": "done"}],
+                                "status": "success"
+                            }]
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize paired signature fixture");
+
+        let original_body = serialize_kiro_request(&request).expect("serialize original fixture");
+        let retry_body = build_thinking_signature_retry_body(&request)
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        let original: serde_json::Value =
+            serde_json::from_str(&original_body).expect("original fixture JSON");
+        let retry: serde_json::Value =
+            serde_json::from_str(&retry_body).expect("retry fixture JSON");
+
+        assert!(
+            original
+                .pointer("/conversationState/history/0/assistantResponseMessage/reasoningContent")
+                .is_some(),
+            "round {round}: original reasoning must be present"
+        );
+        assert!(
+            retry
+                .pointer("/conversationState/history/0/assistantResponseMessage/reasoningContent")
+                .is_none(),
+            "round {round}: retry must remove active reasoning"
+        );
+        assert_eq!(
+            retry.pointer("/conversationState/history/0/assistantResponseMessage/toolUses"),
+            original.pointer("/conversationState/history/0/assistantResponseMessage/toolUses"),
+            "round {round}: retry must preserve tool use"
+        );
+        assert_eq!(
+            retry.pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/toolResults"
+            ),
+            original.pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/toolResults"
+            ),
+            "round {round}: retry must preserve tool result"
+        );
+        assert!(!retry_body.contains("active-private-thought"));
+        assert!(!retry_body.contains("active-private-signature"));
+        assert_eq!(
+            serialize_kiro_request(&request).expect("reserialize original fixture"),
+            original_body,
+            "round {round}: retry clone must not mutate original request"
+        );
+    }
+}
+
+#[test]
 fn cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds() {
     for round in 1..=5 {
         let mut cache_retry_request = thinking_signature_retry_kiro_fixture();
@@ -5741,8 +5827,8 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
         assert!(!signature_retry_body.contains("stale-private-signature"));
         assert!(signature_retry_body.contains("STALE_ASSISTANT_MUST_REMAIN"));
         assert!(signature_retry_body.contains("ACTIVE_TOOL_PROMPT_MUST_REMAIN"));
-        assert!(signature_retry_body.contains("recent-private-thought"));
-        assert!(signature_retry_body.contains("recent-private-signature"));
+        assert!(!signature_retry_body.contains("recent-private-thought"));
+        assert!(!signature_retry_body.contains("recent-private-signature"));
         assert!(signature_retry_body.contains("recent-tool"));
         assert!(signature_retry_body.contains("RECENT_USER_MUST_REMAIN"));
         assert!(signature_retry_body.contains("RECENT_ASSISTANT_MUST_REMAIN"));

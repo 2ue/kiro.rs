@@ -27,6 +27,7 @@ const RAW_PREFILTER_MARKERS: &[&[u8]] = &[
     b"user Tool results provided",
     b"Tool results:",
 ];
+const RAW_AUTHENTICATED_REASONING_MARKERS: &[&[u8]] = &[b"redacted_thinking", b"\"signature\""];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TranscriptLeakKind {
@@ -99,6 +100,12 @@ pub(crate) enum RawAssistantHistorySanitizationError {
     Serialize,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RawAssistantHistoryInspection {
+    pub(crate) sanitized_body: Option<(Vec<u8>, AssistantHistorySanitization)>,
+    pub(crate) requires_normalized_body: bool,
+}
+
 impl std::fmt::Display for RawAssistantHistorySanitizationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -152,11 +159,11 @@ pub(crate) fn collect_known_tool_names_from_request(request: &MessagesRequest) -
 /// Raw external-pool routes run before `MessagesRequest` deserialization. Parsing into the typed
 /// request and serializing it again would silently drop fields added by newer Anthropic clients,
 /// so this path mutates only each message's `content` inside a generic JSON value. Clean payloads
-/// return `None` and retain their original bytes exactly.
+/// return an empty inspection and retain their original bytes exactly.
 #[cfg(test)]
 pub(crate) fn sanitize_raw_request_assistant_history(
     raw_body: &[u8],
-) -> Result<Option<(Vec<u8>, AssistantHistorySanitization)>, RawAssistantHistorySanitizationError> {
+) -> Result<RawAssistantHistoryInspection, RawAssistantHistorySanitizationError> {
     let raw_body = Bytes::copy_from_slice(raw_body);
     let probe = probe_raw_messages_body(&raw_body);
     sanitize_raw_request_assistant_history_with_probe(&raw_body, &probe)
@@ -165,12 +172,14 @@ pub(crate) fn sanitize_raw_request_assistant_history(
 pub(crate) fn sanitize_raw_request_assistant_history_with_probe(
     raw_body: &Bytes,
     probe: &RawMessagesBodyProbe,
-) -> Result<Option<(Vec<u8>, AssistantHistorySanitization)>, RawAssistantHistorySanitizationError> {
+) -> Result<RawAssistantHistoryInspection, RawAssistantHistorySanitizationError> {
     if !probe.matches_body(raw_body) || probe.scan_error().is_some() {
         return Err(RawAssistantHistorySanitizationError::InvalidJson);
     }
-    if !raw_body_may_contain_transcript_marker(raw_body) {
-        return Ok(None);
+    if !raw_body_may_contain_transcript_marker(raw_body)
+        && !raw_body_may_contain_authenticated_reasoning_marker(raw_body)
+    {
+        return Ok(RawAssistantHistoryInspection::default());
     }
     let mut deserializer = serde_json::Deserializer::from_slice(raw_body);
     deserializer.disable_recursion_limit();
@@ -184,7 +193,7 @@ pub(crate) fn sanitize_raw_request_assistant_history_with_probe(
         .get_mut("messages")
         .and_then(serde_json::Value::as_array_mut)
     else {
-        return Ok(None);
+        return Ok(RawAssistantHistoryInspection::default());
     };
     let mut projected = messages
         .iter()
@@ -202,8 +211,13 @@ pub(crate) fn sanitize_raw_request_assistant_history_with_probe(
         .collect::<Vec<_>>();
 
     let report = sanitize_assistant_message_runs(&mut projected, known_tool_names);
+    let requires_normalized_body =
+        report.blocks > 0 || request_has_authenticated_reasoning(&projected);
     if report.blocks == 0 {
-        return Ok(None);
+        return Ok(RawAssistantHistoryInspection {
+            sanitized_body: None,
+            requires_normalized_body,
+        });
     }
 
     for (message, sanitized) in messages.iter_mut().zip(projected) {
@@ -212,7 +226,10 @@ pub(crate) fn sanitize_raw_request_assistant_history_with_probe(
         }
     }
     serde_json::to_vec(&value)
-        .map(|body| Some((body, report)))
+        .map(|body| RawAssistantHistoryInspection {
+            sanitized_body: Some((body, report)),
+            requires_normalized_body,
+        })
         .map_err(|_| RawAssistantHistorySanitizationError::Serialize)
 }
 
@@ -243,6 +260,40 @@ fn escaped_json_may_contain_transcript_marker(raw_body: &[u8]) -> bool {
         };
 
         for (marker, matched_bytes) in RAW_PREFILTER_MARKERS.iter().zip(&mut matched) {
+            if decoded == marker[*matched_bytes] {
+                *matched_bytes += 1;
+                if *matched_bytes == marker.len() {
+                    return true;
+                }
+            } else {
+                *matched_bytes = usize::from(decoded == marker[0]);
+            }
+        }
+    }
+    false
+}
+
+fn raw_body_may_contain_authenticated_reasoning_marker(raw_body: &[u8]) -> bool {
+    if !raw_body.contains(&b'\\') {
+        return RAW_AUTHENTICATED_REASONING_MARKERS.iter().any(|marker| {
+            raw_body
+                .windows(marker.len())
+                .any(|window| window == *marker)
+        });
+    }
+
+    let mut matched = [0usize; RAW_AUTHENTICATED_REASONING_MARKERS.len()];
+    let mut offset = 0usize;
+    while offset < raw_body.len() {
+        let (decoded, consumed) = decode_ascii_json_escape(&raw_body[offset..]);
+        offset += consumed;
+        let Some(decoded) = decoded else {
+            matched.fill(0);
+            continue;
+        };
+
+        for (marker, matched_bytes) in RAW_AUTHENTICATED_REASONING_MARKERS.iter().zip(&mut matched)
+        {
             if decoded == marker[*matched_bytes] {
                 *matched_bytes += 1;
                 if *matched_bytes == marker.len() {
@@ -299,6 +350,21 @@ fn hex_nibble(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn request_has_authenticated_reasoning(messages: &[AnthropicMessage]) -> bool {
+    messages.iter().any(|message| {
+        message.role == "assistant"
+            && message.content.as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    matches!(
+                        block.get("type").and_then(serde_json::Value::as_str),
+                        Some("thinking") | Some("redacted_thinking")
+                    ) || block.get("thinking").is_some()
+                        || block.get("signature").is_some()
+                })
+            })
+    })
 }
 
 pub(crate) fn collect_known_tool_names_from_value(value: &serde_json::Value) -> Vec<String> {
@@ -1635,8 +1701,11 @@ mod tests {
             "tools":[{"name":"FutureMcp","description":"run","input_schema":{"type":"object"},"future_tool_field":7}]
         }"#;
 
-        let (body, report) = sanitize_raw_request_assistant_history(raw)
-            .expect("assistant history inspection succeeds")
+        let inspection = sanitize_raw_request_assistant_history(raw)
+            .expect("assistant history inspection succeeds");
+        assert!(inspection.requires_normalized_body);
+        let (body, report) = inspection
+            .sanitized_body
             .expect("polluted request is rewritten");
         assert_eq!(report.blocks, 1);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1675,8 +1744,10 @@ mod tests {
                 "tools": [{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}]
             }))
             .unwrap();
-            let (rewritten, report) = sanitize_raw_request_assistant_history(&raw)
-                .unwrap()
+            let inspection = sanitize_raw_request_assistant_history(&raw).unwrap();
+            assert!(inspection.requires_normalized_body);
+            let (rewritten, report) = inspection
+                .sanitized_body
                 .expect("polluted request is rewritten");
             assert_eq!(report.blocks, 1);
             let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
@@ -1764,11 +1835,9 @@ mod tests {
     fn raw_request_sanitization_keeps_clean_body_byte_identical() {
         let raw = br#"{ "model": "claude-sonnet-4", "max_tokens": 128, "messages": [{"role":"user","content":"user Continue is being discussed"}], "future": true }"#;
         assert!(raw_body_may_contain_transcript_marker(raw));
-        assert!(
-            sanitize_raw_request_assistant_history(raw)
-                .unwrap()
-                .is_none()
-        );
+        let inspection = sanitize_raw_request_assistant_history(raw).unwrap();
+        assert!(!inspection.requires_normalized_body);
+        assert!(inspection.sanitized_body.is_none());
     }
 
     #[test]
@@ -1776,19 +1845,22 @@ mod tests {
         let signed_only = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"safe\u000auser Continue\u000a\u000aBash: hidden","signature":"opaque"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#.as_slice();
         for _round in 0..5 {
             assert!(raw_body_may_contain_transcript_marker(signed_only));
-            assert!(
-                sanitize_raw_request_assistant_history(signed_only)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(raw_body_may_contain_authenticated_reasoning_marker(
+                signed_only
+            ));
+            let inspection = sanitize_raw_request_assistant_history(signed_only).unwrap();
+            assert!(inspection.requires_normalized_body);
+            assert!(inspection.sanitized_body.is_none());
         }
 
         let raw = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"text","text":"safe\r\u000auser Continue\r\u000a\r\u000aBash: hidden"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#.as_slice();
         let expected = serde_json::json!({"type":"text","text":"safe\r\n"});
         for _round in 0..5 {
             assert!(raw_body_may_contain_transcript_marker(raw));
-            let (rewritten, report) = sanitize_raw_request_assistant_history(raw)
-                .unwrap()
+            let inspection = sanitize_raw_request_assistant_history(raw).unwrap();
+            assert!(inspection.requires_normalized_body);
+            let (rewritten, report) = inspection
+                .sanitized_body
                 .expect("polluted request is rewritten");
             assert_eq!(report.blocks, 1);
             let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
@@ -1798,11 +1870,9 @@ mod tests {
 
         let discussion = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":"The phrase user Continue is discussed in documentation."}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"future":true}"#;
         assert!(raw_body_may_contain_transcript_marker(discussion));
-        assert!(
-            sanitize_raw_request_assistant_history(discussion)
-                .unwrap()
-                .is_none()
-        );
+        let inspection = sanitize_raw_request_assistant_history(discussion).unwrap();
+        assert!(!inspection.requires_normalized_body);
+        assert!(inspection.sanitized_body.is_none());
     }
 
     #[test]
@@ -1810,8 +1880,10 @@ mod tests {
         let polluted = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"assistant","content":"safe\u000a\u0075\u0073\u0065\u0072\u0020\u0043\u006f\u006e\u0074\u0069\u006e\u0075\u0065\u000a\u000aBash: hidden"}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}]}"#;
         for _round in 0..5 {
             assert!(raw_body_may_contain_transcript_marker(polluted));
-            let (rewritten, report) = sanitize_raw_request_assistant_history(polluted)
-                .unwrap()
+            let inspection = sanitize_raw_request_assistant_history(polluted).unwrap();
+            assert!(inspection.requires_normalized_body);
+            let (rewritten, report) = inspection
+                .sanitized_body
                 .expect("polluted request is rewritten");
             assert_eq!(report.blocks, 1);
             let rewritten: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
@@ -1821,11 +1893,9 @@ mod tests {
         let clean_user = br#"{"model":"claude-sonnet-4","max_tokens":128,"messages":[{"role":"user","content":"\u0075ser Continue\n\nBash: literal user data"}],"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"future":true}"#;
         for _round in 0..5 {
             assert!(raw_body_may_contain_transcript_marker(clean_user));
-            assert!(
-                sanitize_raw_request_assistant_history(clean_user)
-                    .unwrap()
-                    .is_none()
-            );
+            let inspection = sanitize_raw_request_assistant_history(clean_user).unwrap();
+            assert!(!inspection.requires_normalized_body);
+            assert!(inspection.sanitized_body.is_none());
         }
 
         let large_clean = format!(
@@ -1836,11 +1906,10 @@ mod tests {
             assert!(!raw_body_may_contain_transcript_marker(
                 large_clean.as_bytes()
             ));
-            assert!(
-                sanitize_raw_request_assistant_history(large_clean.as_bytes())
-                    .unwrap()
-                    .is_none()
-            );
+            let inspection =
+                sanitize_raw_request_assistant_history(large_clean.as_bytes()).unwrap();
+            assert!(!inspection.requires_normalized_body);
+            assert!(inspection.sanitized_body.is_none());
         }
     }
 
@@ -1871,11 +1940,9 @@ mod tests {
         );
         for _round in 0..5 {
             assert!(!raw_body_may_contain_transcript_marker(raw.as_bytes()));
-            assert!(
-                sanitize_raw_request_assistant_history(raw.as_bytes())
-                    .unwrap()
-                    .is_none()
-            );
+            let inspection = sanitize_raw_request_assistant_history(raw.as_bytes()).unwrap();
+            assert!(!inspection.requires_normalized_body);
+            assert!(inspection.sanitized_body.is_none());
         }
 
         let escaped_backslash = br#"{"messages":[{"role":"assistant","content":"\\u0075ser Continue is literal documentation"}]}"#;
@@ -1886,11 +1953,9 @@ mod tests {
     fn raw_request_prefilter_skips_json_dom_for_marker_free_bodies() {
         let raw = br#"{ "model": "claude-sonnet-4", "messages": [{"role":"assistant","content":"artifactHashdeadbeef is ordinary prose"}], "future": true }"#;
         assert!(!raw_body_may_contain_transcript_marker(raw));
-        assert!(
-            sanitize_raw_request_assistant_history(raw)
-                .unwrap()
-                .is_none()
-        );
+        let inspection = sanitize_raw_request_assistant_history(raw).unwrap();
+        assert!(!inspection.requires_normalized_body);
+        assert!(inspection.sanitized_body.is_none());
 
         let malformed_but_marker_free = b"not json and no transcript scaffold";
         assert!(!raw_body_may_contain_transcript_marker(
@@ -1924,10 +1989,13 @@ mod tests {
             for tool_name in ["Bash", "bashHashd1e9567d", "project_tool_without_hash"] {
                 for depth in [127usize, 128, 129, 191, 192] {
                     let raw = polluted_raw_request_at_depth(depth, tool_name);
-                    let (rewritten, report) = sanitize_raw_request_assistant_history(&raw)
-                        .unwrap_or_else(|error| {
+                    let inspection =
+                        sanitize_raw_request_assistant_history(&raw).unwrap_or_else(|error| {
                             panic!("round {round}, depth {depth}, tool {tool_name}: {error}")
-                        })
+                        });
+                    assert!(inspection.requires_normalized_body);
+                    let (rewritten, report) = inspection
+                        .sanitized_body
                         .expect("polluted assistant history is rewritten");
                     assert_eq!(report.blocks, 1, "round {round}, depth {depth}");
                     let mut deserializer = serde_json::Deserializer::from_slice(&rewritten);

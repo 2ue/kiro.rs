@@ -6020,7 +6020,7 @@ async fn post_messages_inner(
     endpoint: String,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
-    request_history_contaminated: bool,
+    requires_normalized_body: bool,
     attribution: Option<RequestRejectionAttribution>,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
 ) -> Response {
@@ -6073,7 +6073,7 @@ async fn post_messages_inner(
         &payload,
         inference_attempt_budget.clone(),
         request_api_key_id.clone(),
-        request_history_contaminated,
+        requires_normalized_body,
         raw_preflight_failure,
     );
     let prompt_steering_for_external = super::prompt_steering::should_apply_to_external_pool(

@@ -38,6 +38,14 @@ TEXT_EXTENSIONS = {
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(
+            r"(?im)(\b[A-Za-z_][A-Za-z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|"
+            r"API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY)\b\s*[:=]\s*)"
+            r"([^\s#\"'{}]+)"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
             r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?\s*)"
             r"(bearer|basic)\s+([A-Za-z0-9._~+/=-]{12,})"
         ),
@@ -80,6 +88,10 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
         "[REDACTED_EMAIL]",
     ),
+    (
+        re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"),
+        "[REDACTED_IP]",
+    ),
 ]
 
 SENSITIVE_JSON_KEYS = {
@@ -96,7 +108,33 @@ SENSITIVE_JSON_KEYS = {
     "access_token",
     "session_id",
     "cookie",
+    "request_api_key_id",
+    "credential_label",
+    "credential_email",
 }
+
+
+def is_shareable_path(rel: Path) -> bool:
+    """Keep high-risk raw-derived tables out of the default shareable archive.
+
+    The raw captures remain available locally for audit, while the problem folders contain
+    deliberately minimized evidence suitable for sharing outside the production session.
+    """
+
+    if not rel.parts or rel.parts[0] != "redacted":
+        return True
+    if len(rel.parts) >= 2 and rel.parts[1] in {"host", "docker"}:
+        return False
+    if len(rel.parts) >= 3 and rel.parts[1] == "app" and rel.parts[2] == "process-env.txt":
+        return False
+    if len(rel.parts) >= 3 and rel.parts[1] == "db":
+        name = rel.parts[2]
+        if (
+            name.startswith("request-")
+            or name in {"request-record.txt", "thinking-errors.txt", "latest-usage.txt", "schema.txt"}
+        ):
+            return False
+    return True
 
 
 def sha256_file(path: Path) -> str:
@@ -284,6 +322,8 @@ def build_manifest(
         rel = path.relative_to(root)
         if rel.parts and rel.parts[0] == "raw" and not include_raw:
             continue
+        if not is_shareable_path(rel):
+            continue
         if rel == Path("manifest.json"):
             continue
         if path.name.endswith(".tar.gz"):
@@ -312,6 +352,8 @@ def create_archive(
                 for path in iter_files(root):
                     rel = path.relative_to(root)
                     if rel.parts and rel.parts[0] == "raw" and not include_raw:
+                        continue
+                    if not is_shareable_path(rel):
                         continue
                     if path.name.endswith(".tar.gz") or path.resolve() == archive.resolve():
                         continue

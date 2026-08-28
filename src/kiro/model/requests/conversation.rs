@@ -2,10 +2,8 @@
 //!
 //! 定义 Kiro API 中对话相关的类型，包括消息、历史记录等
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-
 use super::tool::{Tool, ToolResult, ToolUseEntry};
+use serde::{Deserialize, Serialize};
 
 /// 对话状态
 ///
@@ -90,6 +88,16 @@ impl ConversationState {
     /// This is intentionally narrower than removing an assistant entry: visible
     /// content and tool uses remain byte-for-byte equivalent after serialization.
     pub fn clear_history_reasoning_content(&mut self) -> usize {
+        self.clear_history_reasoning_content_for_compatibility_retry()
+    }
+
+    /// Remove native reasoning from every assistant history entry for a compatibility retry.
+    ///
+    /// Kiro may reject a signed reasoning block after the conversation has crossed a model,
+    /// credential, or context boundary. The retry must therefore keep the visible/tool history
+    /// intact while omitting every opaque reasoning union value, including the latest assistant
+    /// entry paired with current tool results.
+    pub fn clear_history_reasoning_content_for_compatibility_retry(&mut self) -> usize {
         self.history
             .iter_mut()
             .filter_map(|message| match message {
@@ -98,52 +106,6 @@ impl ConversationState {
                     .reasoning_content
                     .take(),
                 Message::User(_) => None,
-            })
-            .count()
-    }
-
-    /// Remove only reasoning that is outside the active tool continuation.
-    ///
-    /// A compatibility retry may omit stale historical reasoning, but it must retain the latest
-    /// assistant reasoning when every tool use is paired with a current tool result. That pair is
-    /// part of the protocol turn and deleting it can change the request shape that Kiro validates.
-    pub fn clear_history_reasoning_content_for_compatibility_retry(&mut self) -> usize {
-        let current_results = &self
-            .current_message
-            .user_input_message
-            .user_input_message_context
-            .tool_results;
-        let current_result_ids = current_results
-            .iter()
-            .map(|result| result.tool_use_id.as_str())
-            .collect::<HashSet<_>>();
-        let protected_assistant = self.history.len().checked_sub(1).filter(|index| {
-            let Some(Message::Assistant(assistant)) = self.history.get(*index) else {
-                return false;
-            };
-            let Some(tool_uses) = assistant.assistant_response_message.tool_uses.as_ref() else {
-                return false;
-            };
-            !tool_uses.is_empty()
-                && tool_uses
-                    .iter()
-                    .all(|tool_use| current_result_ids.contains(tool_use.tool_use_id.as_str()))
-        });
-
-        self.history
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, message)| {
-                if protected_assistant == Some(index) {
-                    return None;
-                }
-                match message {
-                    Message::Assistant(assistant) => assistant
-                        .assistant_response_message
-                        .reasoning_content
-                        .take(),
-                    Message::User(_) => None,
-                }
             })
             .count()
     }
@@ -603,22 +565,21 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_retry_preserves_paired_active_tool_reasoning() {
+    fn compatibility_retry_removes_paired_active_tool_reasoning_but_preserves_tool_pairing() {
         for round in 0..5 {
-            let old_reasoning = ReasoningContent::reasoning_text(
-                format!("old thought {round}"),
-                format!("old-sig-{round}"),
-            );
-            let active_reasoning =
-                ReasoningContent::redacted_content(format!("active-data-{round}"));
             let active_assistant = AssistantMessage::new("active answer")
                 .with_tool_uses(vec![ToolUseEntry::new("tool-active", "read")])
-                .with_reasoning_content(active_reasoning.clone());
+                .with_reasoning_content(ReasoningContent::redacted_content(format!(
+                    "active-data-{round}"
+                )));
             let mut state = ConversationState::new(format!("compat-{round}"))
                 .with_history(vec![
                     Message::Assistant(HistoryAssistantMessage {
                         assistant_response_message: AssistantMessage::new("old answer")
-                            .with_reasoning_content(old_reasoning),
+                            .with_reasoning_content(ReasoningContent::reasoning_text(
+                                format!("old thought {round}"),
+                                format!("old-sig-{round}"),
+                            )),
                     }),
                     Message::Assistant(HistoryAssistantMessage {
                         assistant_response_message: active_assistant.clone(),
@@ -631,10 +592,9 @@ mod tests {
                     ),
                 ));
 
-            let before_active = serde_json::to_value(&state.history[1]).unwrap();
             assert_eq!(
                 state.clear_history_reasoning_content_for_compatibility_retry(),
-                1,
+                2,
                 "round {round}"
             );
             assert!(
@@ -646,11 +606,6 @@ mod tests {
                 "round {round}: stale reasoning removed"
             );
             assert_eq!(
-                serde_json::to_value(&state.history[1]).unwrap(),
-                before_active,
-                "round {round}: active tool continuation is opaque"
-            );
-            assert_eq!(
                 state.history.get(1).and_then(|message| match message {
                     Message::Assistant(assistant) => {
                         assistant
@@ -660,8 +615,33 @@ mod tests {
                     }
                     Message::User(_) => None,
                 }),
-                Some(&active_reasoning),
-                "round {round}: active reasoning remains"
+                None,
+                "round {round}: active reasoning is removed"
+            );
+            assert_eq!(
+                serde_json::to_value(&state.history[1]).unwrap(),
+                serde_json::json!({
+                    "assistantResponseMessage": {
+                        "content": "active answer",
+                        "toolUses": [{
+                            "toolUseId": "tool-active",
+                            "name": "read",
+                            "input": {}
+                        }]
+                    }
+                }),
+                "round {round}: visible/tool history remains"
+            );
+            assert_eq!(
+                state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .first()
+                    .map(|result| result.tool_use_id.as_str()),
+                Some("tool-active"),
+                "round {round}: current tool result remains paired"
             );
         }
     }

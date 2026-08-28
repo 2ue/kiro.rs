@@ -12831,11 +12831,13 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
     let original = Bytes::from(serde_json::to_vec(&original_value).expect("original JSON"));
 
     for round in 1..=5 {
-        let (sanitized, report) =
+        let inspection =
             crate::anthropic::transcript_sanitizer::sanitize_raw_request_assistant_history(
                 &original,
             )
-            .expect("assistant history inspection succeeds")
+            .expect("assistant history inspection succeeds");
+        let (sanitized, report) = inspection
+            .sanitized_body
             .expect("polluted assistant history is sanitized");
         assert_eq!(report.blocks, 1, "round {round}");
         let mut payload: MessagesRequest =
@@ -12856,7 +12858,7 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
 
         let mut route = test_route("claude-sonnet-4-5");
         route.effective_raw_body = original.clone();
-        route.raw_body = Bytes::from(sanitized);
+        route.raw_body = Bytes::from(sanitized.clone());
         route.payload = Some(payload);
         route.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
         let mut pool = test_pool("https://example.com/v1", true);
