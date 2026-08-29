@@ -102,9 +102,7 @@ import {
 import { mapById, mergeCredentialPlanes } from './credential-utils'
 import {
   buildCredentialRefreshReport,
-  credentialRefreshSourceLabel,
   refreshCredentialInfoInBatches,
-  type CredentialRefreshReport,
 } from './credential-refresh-utils'
 
 // ============================================================================
@@ -174,67 +172,6 @@ const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'id', label: 'ID' },
 ]
 
-function CreditRefreshReportPanel({
-  report,
-  onClear,
-}: {
-  report: CredentialRefreshReport
-  onClear: () => void
-}) {
-  return (
-    <div className="mb-3 rounded-lg border border-warning/30 bg-warning/5 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-semibold">最近一次积分查询结果</span>
-          <Badge tone="success">成功 {report.success}</Badge>
-          <Badge tone={report.failed > 0 ? 'warning' : 'neutral'}>失败 {report.failed}</Badge>
-          <span className="text-xs text-muted-foreground">总数 {report.total}</span>
-        </div>
-        <Button variant="ghost" size="xs" onClick={onClear} title="清除查询结果">
-          <X className="h-3.5 w-3.5" />
-          清除
-        </Button>
-      </div>
-      {report.failed === 0 ? (
-        <div className="mt-2 text-xs text-muted-foreground">本次查询没有失败账号。</div>
-      ) : (
-        <div className="mt-3 space-y-2">
-          {report.groups.map((group) => (
-            <div key={group.key} className="rounded-md border border-border/60 bg-background/70 p-2.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge tone={group.source === 'external_pool' ? 'info' : group.source === 'unknown' ? 'neutral' : 'error'}>
-                  {credentialRefreshSourceLabel(group.source)}
-                </Badge>
-                <Badge tone="secondary">{group.count} 个</Badge>
-                <code className="text-xs font-semibold">{group.fingerprint}</code>
-              </div>
-              <div className="mt-1 break-words text-xs text-muted-foreground">{group.message}</div>
-              {group.items.length > 0 && (
-                <div className="mt-2 max-h-32 overflow-auto rounded border border-border/50 bg-muted/20 p-2 text-xs">
-                  <div className="grid gap-1 sm:grid-cols-2">
-                    {group.items.map((item) => (
-                      <div key={`${group.key}-${item.id}`} className="min-w-0">
-                        <span className="font-mono">#{item.id}</span>
-                        <span className="ml-1 truncate text-muted-foreground">{item.email || '未返回账号'}</span>
-                        <span className={`ml-1 ${item.disabled ? 'text-destructive' : 'text-success'}`}>
-                          {item.disabled ? '已禁用' : '启用'}
-                        </span>
-                        {item.error && (
-                          <div className="break-words text-[0.68rem] text-muted-foreground">{item.error}</div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
 // ============================================================================
 // CredentialsPage
 // ============================================================================
@@ -272,7 +209,6 @@ export function CredentialsPage() {
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [queryingCreditInfo, setQueryingCreditInfo] = useState(false)
-  const [lastCreditRefresh, setLastCreditRefresh] = useState<CredentialRefreshReport | null>(null)
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [creditDetailsOpen, setCreditDetailsOpen] = useState(false)
@@ -579,7 +515,6 @@ export function CredentialsPage() {
       invalidate()
       await creditSummary.refetch()
       if (creditDetailsOpen) await loadCreditDetails()
-      setLastCreditRefresh(report)
       if (report.failed === 0) toast.success(`启用账号积分已更新：成功 ${report.success}/${report.total}`)
       else toast.warning(`启用账号积分更新完成：成功 ${report.success}，失败 ${report.failed}`)
     } catch (e) {
@@ -622,7 +557,6 @@ export function CredentialsPage() {
       const report = buildCredentialRefreshReport(responses)
       invalidate()
       await creditSummary.refetch()
-      setLastCreditRefresh(report)
       if (report.failed === 0) toast.success(`积分查询完成：成功 ${report.success}/${report.total}`)
       else toast.warning(`积分查询完成：成功 ${report.success}，失败 ${report.failed}`)
     } catch (e) {
@@ -1091,10 +1025,6 @@ export function CredentialsPage() {
               </div>
             )}
           </div>
-        )}
-
-        {lastCreditRefresh && (
-          <CreditRefreshReportPanel report={lastCreditRefresh} onClear={() => setLastCreditRefresh(null)} />
         )}
 
         {/* Batch actions bar */}

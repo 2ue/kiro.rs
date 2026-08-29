@@ -55,9 +55,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import {
   buildCredentialRefreshReport,
-  credentialRefreshSourceLabel,
   refreshCredentialInfoInBatches,
-  type CredentialRefreshReport,
 } from '@/lib/credential-refresh'
 import type {
   BalanceResponse,
@@ -173,67 +171,6 @@ function credentialFromListItem(item: CredentialListItem): CredentialStatusItem 
   }
 }
 
-function CreditRefreshReportPanel({
-  report,
-  onClear,
-}: {
-  report: CredentialRefreshReport
-  onClear: () => void
-}) {
-  return (
-    <Card className="border-amber-500/30 bg-amber-500/5">
-      <CardHeader className="flex flex-row items-center justify-between gap-3 pb-3">
-        <div className="min-w-0">
-          <CardTitle className="text-base">最近一次积分查询结果</CardTitle>
-          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <Badge variant="success">成功 {report.success}</Badge>
-            <Badge variant={report.failed > 0 ? 'warning' : 'secondary'}>失败 {report.failed}</Badge>
-            <span>总数 {report.total}</span>
-          </div>
-        </div>
-        <Button variant="ghost" size="sm" onClick={onClear} title="清除查询结果">
-          <X className="h-4 w-4" />
-          清除
-        </Button>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        {report.failed === 0 ? (
-          <p className="text-sm text-muted-foreground">本次查询没有失败账号。</p>
-        ) : (
-          report.groups.map((group) => (
-            <div key={group.key} className="rounded-md border bg-background/70 p-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge variant={group.source === 'external_pool' ? 'secondary' : group.source === 'unknown' ? 'outline' : 'destructive'}>
-                  {credentialRefreshSourceLabel(group.source)}
-                </Badge>
-                <Badge variant="outline">{group.count} 个</Badge>
-                <code className="text-xs font-semibold">{group.fingerprint}</code>
-              </div>
-              <p className="mt-1 break-words text-xs text-muted-foreground">{group.message}</p>
-              {group.items.length > 0 && (
-                <div className="mt-2 max-h-36 overflow-auto rounded border bg-muted/20 p-2 text-xs">
-                  <div className="grid gap-1 md:grid-cols-2">
-                    {group.items.map((item) => (
-                      <div key={`${group.key}-${item.id}`} className="min-w-0">
-                        <span className="font-mono">#{item.id}</span>
-                        <span className="ml-1 text-muted-foreground">{item.email || '未返回账号'}</span>
-                        <span className={`ml-1 ${item.disabled ? 'text-destructive' : 'text-green-600'}`}>
-                          {item.disabled ? '已禁用' : '启用'}
-                        </span>
-                        {item.error && <div className="break-words text-[0.68rem] text-muted-foreground">{item.error}</div>}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          ))
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
 interface DashboardProps {
   onLogout: () => void
 }
@@ -254,7 +191,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [queryingInfo, setQueryingInfo] = useState(false)
-  const [lastCreditRefresh, setLastCreditRefresh] = useState<CredentialRefreshReport | null>(null)
   const [queryText, setQueryText] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
   const [authFilter, setAuthFilter] = useState('all')
@@ -784,7 +720,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
       queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
-      setLastCreditRefresh(report)
       if (report.failed === 0) {
         toast.success(`查询完成：成功 ${report.success}/${report.total}`)
       } else {
@@ -978,7 +913,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
       queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
 
       toast.dismiss(toastId)
-      setLastCreditRefresh(report)
       if (report.failed === 0) {
         toast.success(`查询完成：成功 ${report.success}/${report.total}`)
       } else {
@@ -1334,12 +1268,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </CardContent>
           </Card>
           </div>
-
-          {lastCreditRefresh && (
-            <div className="mb-6">
-              <CreditRefreshReportPanel report={lastCreditRefresh} onClear={() => setLastCreditRefresh(null)} />
-            </div>
-          )}
 
         {/* 凭据列表 */}
         <div className="space-y-4">
