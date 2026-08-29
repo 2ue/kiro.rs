@@ -862,15 +862,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   // 查询账号信息。后端批量接口会逐个查询并返回每个凭据的结果，避免前端制造请求风暴。
-  const handleQueryCurrentPageInfo = async (enabledOnly = false) => {
-    const ids = enabledOnly
+  const handleQueryCurrentPageInfo = async (queryAllCredentials = false) => {
+    const ids = queryAllCredentials
       ? ((allCredentialsQuery.data ?? (await allCredentialsQuery.refetch()).data)?.credentials || [])
-        .filter(credential => !credential.disabled)
         .map(credential => credential.id)
       : currentCredentials.map(credential => credential.id)
 
     if (ids.length === 0) {
-      toast.error(enabledOnly ? '没有启用凭据可查询' : '当前页没有可查询信息的凭据')
+      toast.error(queryAllCredentials ? '没有凭据可查询' : '当前页没有可查询信息的凭据')
       return
     }
 
@@ -1376,7 +1375,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   {queryingInfo ? '查询中...' : '查询本页信息'}
                 </Button>
               )}
-              {(summaryData?.available || 0) > 0 && (
+              {(data?.total || 0) > 0 && (
                 <Button
                   onClick={() => handleQueryCurrentPageInfo(true)}
                   size="sm"
@@ -1384,7 +1383,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   disabled={queryingInfo}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  查询启用信息
+                  查询全部信息
                 </Button>
               )}
               {(data?.total || 0) > 0 && (

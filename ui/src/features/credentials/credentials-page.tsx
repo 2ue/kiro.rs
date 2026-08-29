@@ -478,16 +478,15 @@ export function CredentialsPage() {
     loadCreditDetails()
   }
 
-  const queryEnabledCreditInfo = async () => {
+  const queryAllCreditInfo = async () => {
     setQueryingCreditInfo(true)
     let ids: number[] = []
     try {
       const snapshot = (await allCredentials.refetch()).data
       ids = (snapshot?.credentials || [])
-        .filter((credential) => !credential.disabled)
         .map((credential) => credential.id)
       if (!ids.length) {
-        toast.error('没有启用账号可查询积分')
+        toast.error('没有账号可查询积分')
         return
       }
       setLoadingBalanceIds((prev) => {
@@ -515,10 +514,10 @@ export function CredentialsPage() {
       invalidate()
       await creditSummary.refetch()
       if (creditDetailsOpen) await loadCreditDetails()
-      if (report.failed === 0) toast.success(`启用账号积分已更新：成功 ${report.success}/${report.total}`)
-      else toast.warning(`启用账号积分更新完成：成功 ${report.success}，失败 ${report.failed}`)
+      if (report.failed === 0) toast.success(`全部账号积分已更新：成功 ${report.success}/${report.total}`)
+      else toast.warning(`全部账号积分更新完成：成功 ${report.success}，失败 ${report.failed}`)
     } catch (e) {
-      toast.error(`查询启用账号积分失败: ${extractErrorMessage(e)}`)
+      toast.error(`查询全部账号积分失败: ${extractErrorMessage(e)}`)
     } finally {
       setQueryingCreditInfo(false)
       setLoadingBalanceIds((prev) => {
@@ -760,9 +759,9 @@ export function CredentialsPage() {
             <Button variant="outline" size="sm" onClick={() => credentials.refetch()}>
               <RefreshCw className={`h-4 w-4 ${credentials.isFetching ? 'animate-spin' : ''}`} />
             </Button>
-            <Button variant="outline" size="sm" onClick={queryEnabledCreditInfo} disabled={queryingCreditInfo} title="查询所有启用账号信息，刷新积分汇总">
+            <Button variant="outline" size="sm" onClick={queryAllCreditInfo} disabled={queryingCreditInfo} title="查询全部账号订阅和积分信息，刷新汇总">
               {queryingCreditInfo ? <Spinner size="sm" /> : <Wallet className="h-4 w-4" />}
-              <span className="hidden sm:inline">查询启用积分</span>
+              <span className="hidden sm:inline">查询全部积分</span>
             </Button>
             <Button variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" /><span className="hidden sm:inline">KAM</span>
