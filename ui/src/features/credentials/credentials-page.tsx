@@ -150,6 +150,13 @@ interface CreditDetailRow {
   disabled: boolean
 }
 
+function compareCreditDetailRows(left: CreditDetailRow, right: CreditDetailRow): number {
+  if (left.disabled !== right.disabled) {
+    return Number(left.disabled) - Number(right.disabled)
+  }
+  return left.id - right.id
+}
+
 const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'default', label: '默认排序' },
   { value: 'priority', label: '优先级' },
@@ -403,6 +410,10 @@ export function CredentialsPage() {
       totalOriginalCostUsd: creditDetailRows.reduce((sum, row) => sum + row.originalCostUsd, 0),
     }
   }, [creditDetailRows])
+  const orderedCreditDetailRows = useMemo(
+    () => [...creditDetailRows].sort(compareCreditDetailRows),
+    [creditDetailRows],
+  )
 
   // Reset page on filter change
   useEffect(() => {
@@ -1267,7 +1278,7 @@ export function CredentialsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {creditDetailRows.map((row, i) => (
+                    {orderedCreditDetailRows.map((row, i) => (
                       <tr key={row.id} className={i % 2 === 0 ? 'bg-muted/20' : ''}>
                         <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{i + 1}</td>
                         <td className="px-3 py-2 font-mono text-xs text-muted-foreground">#{row.id}</td>

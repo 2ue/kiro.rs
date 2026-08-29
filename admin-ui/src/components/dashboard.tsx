@@ -82,6 +82,13 @@ interface CreditDetailRow {
   disabled: boolean
 }
 
+function compareCreditDetailRows(left: CreditDetailRow, right: CreditDetailRow): number {
+  if (left.disabled !== right.disabled) {
+    return Number(left.disabled) - Number(right.disabled)
+  }
+  return left.id - right.id
+}
+
 const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'default', label: '默认排序' },
   { value: 'priority', label: '优先级' },
@@ -334,6 +341,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       totalOriginalCostUsd: creditDetailRows.reduce((sum, row) => sum + row.originalCostUsd, 0),
     }
   }, [creditDetailRows])
+  const orderedCreditDetailRows = useMemo(
+    () => [...creditDetailRows].sort(compareCreditDetailRows),
+    [creditDetailRows],
+  )
 
   const { mutate: deleteCredential } = useDeleteCredential()
   const deleteDisabled = useDeleteDisabledCredentials()
@@ -1783,7 +1794,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {creditDetailRows.map((row, index) => (
+                    {orderedCreditDetailRows.map((row, index) => (
                       <TableRow key={row.id}>
                         <TableCell className="font-medium">{index + 1}</TableCell>
                         <TableCell className="font-mono text-xs">#{row.id}</TableCell>
