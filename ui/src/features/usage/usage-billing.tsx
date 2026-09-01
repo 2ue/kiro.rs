@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { DollarSign } from 'lucide-react'
 import { Badge, Button } from '@/components/ui'
 import { SectionCard } from '@/components/patterns'
-import { formatCompact, formatMeteringUsage, formatNumber, formatPercent, formatUsdDetailed, formatUsdFixed2 } from '@/lib/format'
+import { formatCompact, formatMeteringUsage, formatNumber, formatUsdDetailed, formatUsdFixed2 } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import type {
   ExternalPoolBilling,
@@ -78,6 +78,16 @@ function CostMetric({
       {detail && <div className="mt-1 text-xs text-muted-foreground/60">{detail}</div>}
     </div>
   )
+}
+
+function costMultiplier(rawCostUsd: number, shapedCostUsd: number): string {
+  if (!(rawCostUsd > 0) || !(shapedCostUsd > 0)) return '-'
+  return (rawCostUsd / shapedCostUsd).toFixed(3)
+}
+
+function costDeltaPercent(deltaUsd: number, rawCostUsd: number): string {
+  if (!(rawCostUsd > 0)) return '-'
+  return `${((deltaUsd / rawCostUsd) * 100).toFixed(2)}%`
 }
 
 export function UsageCostInline({
@@ -232,6 +242,7 @@ export function ExternalPoolBillingPanel({
   const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
   const delta = billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
   const deltaRatio = billing.rawCostUsd > 0 ? delta / billing.rawCostUsd : 0
+  const multiplier = costMultiplier(billing.rawCostUsd, shapedCost)
   const deltaTone = billingDeltaTone(delta)
   const hasNegativeDelta = deltaTone === 'loss'
   const hasPositiveDelta = deltaTone === 'profit'
@@ -239,8 +250,8 @@ export function ExternalPoolBillingPanel({
 
   return (
     <SectionCard
-      title="外部账号计费拆分"
-      description="展示外部账号的上游原始成本、展示计费和计费差额"
+      title="外部池成本拆分"
+      description="区分上游原始成本、整形后成本、补偿后成本，并计算每个外部池的差额占比和原始/整形倍率"
       icon={<DollarSign />}
       actions={
         <Badge tone={billingDeltaBadgeTone(deltaTone)}>
@@ -251,7 +262,7 @@ export function ExternalPoolBillingPanel({
       <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <CostMetric
-            label="外部账号请求"
+            label="外部池请求"
             value={<span title={formatNumber(billing.requests)}>{formatCompact(billing.requests)}</span>}
             detail={<>可计价 <span title={formatNumber(billing.pricedRequests)}>{formatCompact(billing.pricedRequests)}</span> / 未计价 <span title={formatNumber(billing.unpricedRequests)}>{formatCompact(billing.unpricedRequests)}</span></>}
           />
@@ -274,9 +285,9 @@ export function ExternalPoolBillingPanel({
 
         <div className="space-y-1.5">
           <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="truncate font-medium text-foreground/75">差额占上游原始成本</span>
+            <span className="truncate font-medium text-foreground/75">总体差额占上游原始成本</span>
             <span className="shrink-0 font-mono text-muted-foreground">
-              {delta >= 0 ? '+' : ''}{formatUsdFixed2(delta)} · {formatPercent(deltaRatio)}
+              {delta >= 0 ? '+' : ''}{formatUsdFixed2(delta)} · {costDeltaPercent(delta, billing.rawCostUsd)} · 原始/整形倍率 {multiplier}
             </span>
           </div>
           <div className="h-1.5 overflow-hidden rounded-full bg-muted">
@@ -289,24 +300,25 @@ export function ExternalPoolBillingPanel({
 
         <div className="pt-1">
           <div className="mb-2 flex items-center justify-between gap-2">
-            <div className="text-xs font-semibold text-foreground/70">外部账号成本与差额</div>
+            <div className="text-xs font-semibold text-foreground/70">各外部池成本与差额</div>
             <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
           </div>
           {visiblePools.length === 0 ? (
             <div className="rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground/60">
-              当前窗口没有外部账号计费样本。
+              当前窗口没有外部池计费样本；发生外部池请求后，这里会按池列出原始成本、差额占比和原始/整形倍率。
             </div>
           ) : (
             <div className="scrollbar-thin overflow-x-auto rounded-lg bg-card">
               <table className="w-full min-w-[640px] text-xs">
                 <thead>
                   <tr className="bg-muted/40 text-muted-foreground">
-                    <th className="px-3 py-2 text-left font-medium">外部账号</th>
+                    <th className="px-3 py-2 text-left font-medium">外部池</th>
                     <th className="px-3 py-2 text-right font-medium">请求</th>
                     <th className="px-3 py-2 text-right font-medium">上游原始成本</th>
                     <th className="px-3 py-2 text-right font-medium">展示计费</th>
                     <th className="px-3 py-2 text-right font-medium">补偿后</th>
-                    <th className="px-3 py-2 text-right font-medium">差额</th>
+                    <th className="px-3 py-2 text-right font-medium">差额占原始</th>
+                    <th className="px-3 py-2 text-right font-medium">原始/整形倍率</th>
                     <th className="px-3 py-2 text-right font-medium">未计价</th>
                     <th className="px-3 py-2 text-right font-medium">兜底</th>
                   </tr>
@@ -314,6 +326,7 @@ export function ExternalPoolBillingPanel({
                 <tbody>
                   {visiblePools.map((pool) => {
                     const poolDelta = pool.profitUsd ?? ((pool.upliftedCostUsd ?? pool.reportedCostUsd ?? 0) - pool.rawCostUsd)
+                    const poolShapedCost = pool.shapedCostUsd ?? pool.reportedCostUsd ?? 0
                     const poolTone = billingDeltaTone(poolDelta)
                     return (
                       <tr key={pool.poolId} className="bg-card transition-colors hover:bg-muted/30">
@@ -326,7 +339,13 @@ export function ExternalPoolBillingPanel({
                         <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(pool.shapedCostUsd ?? pool.reportedCostUsd)}</td>
                         <td className="px-3 py-2 text-right font-mono">{formatUsdFixed2(pool.upliftedCostUsd ?? pool.reportedCostUsd)}</td>
                         <td className={cn('px-3 py-2 text-right font-mono', billingDeltaTextClass(poolTone))}>
-                          {poolDelta >= 0 ? '+' : ''}{formatUsdFixed2(poolDelta)}
+                          <div>{poolDelta >= 0 ? '+' : ''}{formatUsdFixed2(poolDelta)}</div>
+                          <div className="text-[0.62rem]" title="当前账号差额 ÷ 当前账号上游原始成本">
+                            {costDeltaPercent(poolDelta, pool.rawCostUsd)}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono" title="上游原始成本 ÷ 整形后展示成本；原始100、整形200时为0.500">
+                          {costMultiplier(pool.rawCostUsd, poolShapedCost)}
                         </td>
                         <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.unpricedRequests)}>{formatCompact(pool.unpricedRequests)}</td>
                         <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.costFloorAppliedRequests)}>{formatCompact(pool.costFloorAppliedRequests)}</td>

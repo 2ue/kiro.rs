@@ -59,8 +59,53 @@ pub(super) async fn handle_messages_endpoint(
         record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
         return error.to_response(&request_id);
     }
-    // Raw external routes preserve the effective client request after the
-    // configured missing-max-tokens policy, before any compatibility cleanup.
+    let mut requires_normalized_body = false;
+    let model_max_output_tokens = raw_probe.model.as_deref().and_then(|model| {
+        let resolution = state.model_capabilities.resolve_model_with_mapping(
+            model,
+            runtime_config.model_resolution_mode,
+            &runtime_config.model_mapping,
+        );
+        resolution
+            .upstream_model
+            .as_deref()
+            .and_then(|resolved| state.model_capabilities.max_output_tokens_for(resolved))
+            .or_else(|| state.model_capabilities.max_output_tokens_for(model))
+    });
+    match normalize_raw_reasoning_protocol_with_probe_and_limit(
+        &raw_body,
+        &raw_probe,
+        model_max_output_tokens,
+    ) {
+        Ok(Some(normalization)) => {
+            tracing::info!(
+                endpoint,
+                model = ?raw_probe.model,
+                model_max_output_tokens,
+                thinking_type = normalization.thinking_type,
+                original_max_tokens = ?normalization.original_max_tokens,
+                normalized_max_tokens = ?normalization.normalized_max_tokens,
+                original_budget_tokens = ?normalization.original_budget_tokens,
+                normalized_budget_tokens = ?normalization.normalized_budget_tokens,
+                normalization_reason = %normalization.normalization_reason,
+                "normalized recoverable thinking token controls before routing"
+            );
+            raw_body = normalization.body;
+            raw_probe = probe_raw_messages_body(&raw_body);
+            requires_normalized_body = true;
+        }
+        Ok(None) => {}
+        Err(message) => {
+            let request_id = envelope::request_id();
+            let error = EntryRequestError::invalid(message, "reasoning_normalization_failed");
+            record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+            return error.to_response(&request_id);
+        }
+    }
+
+    // Raw external routes preserve the request after missing-max-token and
+    // recoverable-thinking normalization. Requests that needed any rewrite
+    // bypass raw passthrough so all routes use the same parsed body.
     let effective_raw_body = raw_body.clone();
 
     if let Err(message) =
@@ -72,7 +117,6 @@ pub(super) async fn handle_messages_endpoint(
         return error.to_response(&request_id);
     }
 
-    let mut requires_normalized_body = false;
     let raw_history_sanitization =
         super::super::transcript_sanitizer::sanitize_raw_request_assistant_history_with_probe(
             &raw_body, &raw_probe,
@@ -885,6 +929,95 @@ mod tests {
                     .is_none(),
                 "round {round}: typed serialization must not add effort"
             );
+        }
+    }
+
+    #[test]
+    fn recoverable_thinking_boundary_is_normalized_before_routing_for_five_rounds() {
+        let client = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4","max_tokens":2048,"messages":[{"role":"user","content":"hello"}],"thinking":{"type":"enabled","budget_tokens":2048}}"#,
+        );
+
+        for round in 0..5 {
+            let probe = probe_raw_messages_body(&client);
+            let normalization = normalize_raw_reasoning_protocol_with_probe(&client, &probe)
+                .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                .unwrap_or_else(|| panic!("round {round}: expected normalization"));
+            assert!(!should_try_raw_external_routes(true), "round {round}");
+            validate_raw_reasoning_protocol(&normalization.body)
+                .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            let parsed = parse_messages_payload(&normalization.body, "req_normalized_thinking")
+                .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+
+            assert_eq!(parsed.max_tokens, 2048, "round {round}");
+            assert_eq!(
+                parsed
+                    .thinking
+                    .as_ref()
+                    .map(|thinking| thinking.budget_tokens),
+                Some(2047),
+                "round {round}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_entry_normalizes_omitted_or_conflicting_thinking_controls_before_dispatch() {
+        let state = test_state(Arc::new(UsageRecorder::new(10)));
+        let cases = [
+            (
+                "both controls omitted",
+                br#"{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}],"thinking":{"type":"enabled"}}"#
+                    as &[u8],
+            ),
+            (
+                "budget exceeds max",
+                br#"{"model":"claude-sonnet-4","max_tokens":2048,"messages":[{"role":"user","content":"hello"}],"thinking":{"type":"enabled","budget_tokens":4096}}"#
+                    as &[u8],
+            ),
+            (
+                "small explicit max",
+                br#"{"model":"claude-sonnet-4","max_tokens":512,"messages":[{"role":"user","content":"hello"}],"thinking":{"type":"enabled","budget_tokens":20000}}"#
+                    as &[u8],
+            ),
+        ];
+        let endpoints = [
+            "/v1/messages",
+            "/cc/v1/messages",
+            "/na/v1/messages",
+            "/ha/v1/messages",
+            "/dfcache/demo/v1/messages",
+        ];
+
+        for round in 0..5 {
+            for (case_name, body) in cases {
+                for endpoint in endpoints {
+                    let response = handle_messages_endpoint(
+                        state.clone(),
+                        HeaderMap::new(),
+                        Bytes::copy_from_slice(body),
+                        endpoint.to_string(),
+                        None,
+                        None,
+                    )
+                    .await;
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "round {round}, {case_name}, {endpoint}: request must pass entry validation before the intentionally providerless dispatch"
+                    );
+                    let response_body = axum::body::to_bytes(response.into_body(), 32 * 1024)
+                        .await
+                        .expect("read provider-not-ready response");
+                    let response_body = String::from_utf8(response_body.to_vec())
+                        .expect("provider-not-ready response UTF-8");
+                    assert!(
+                        !response_body
+                            .contains("thinking.budget_tokens must be less than max_tokens"),
+                        "round {round}, {case_name}, {endpoint}: {response_body}"
+                    );
+                }
+            }
         }
     }
 

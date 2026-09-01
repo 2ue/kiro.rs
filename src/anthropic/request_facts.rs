@@ -102,6 +102,7 @@ pub(crate) struct RawMessagesBodyProbe {
     pub(crate) complete_top_level_object: bool,
     object_start_index: Option<usize>,
     model_value_span: Option<std::ops::Range<usize>>,
+    max_tokens_value_span: Option<std::ops::Range<usize>>,
     thinking_value_span: Option<std::ops::Range<usize>>,
     output_config_value_span: Option<std::ops::Range<usize>>,
     duplicate_thinking_field: bool,
@@ -119,6 +120,17 @@ pub(crate) struct RawMessagesBodyProbe {
     body_snapshot: RawRequestBodySnapshot,
     scan_work_units: usize,
     max_nesting_depth: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RawReasoningProtocolNormalization {
+    pub(crate) body: Bytes,
+    pub(crate) thinking_type: String,
+    pub(crate) original_max_tokens: Option<i64>,
+    pub(crate) normalized_max_tokens: Option<i32>,
+    pub(crate) original_budget_tokens: Option<i64>,
+    pub(crate) normalized_budget_tokens: Option<i32>,
+    pub(crate) normalization_reason: String,
 }
 
 impl RawMessagesBodyProbe {
@@ -215,6 +227,15 @@ pub(crate) fn validate_raw_reasoning_protocol_with_probe(
         );
     }
 
+    if probe.max_tokens_present {
+        let max_tokens = probe
+            .max_tokens
+            .ok_or_else(|| "max_tokens must be an integer".to_string())?;
+        if !(1..=i32::MAX as i64).contains(&max_tokens) {
+            return Err("max_tokens must be between 1 and 2147483647".to_string());
+        }
+    }
+
     let thinking = parse_bounded_protocol_value(raw_body, probe.thinking_value_span.as_ref())?;
     let output_config =
         parse_bounded_protocol_value(raw_body, probe.output_config_value_span.as_ref())?;
@@ -301,6 +322,218 @@ pub(crate) fn validate_raw_reasoning_protocol_with_probe(
     };
 
     Ok(())
+}
+
+const MIN_ENABLED_THINKING_BUDGET_TOKENS: i32 = 1_024;
+const DEFAULT_ENABLED_THINKING_BUDGET_TOKENS: i32 = 20_000;
+const DEFAULT_BOUNDED_EXPANSION_MAX_TOKENS: i32 = 128_000;
+const MAX_BOUNDED_EXPANSION_DELTA_TOKENS: i64 = 64_000;
+
+/// Normalize recoverable Anthropic thinking controls before every route is chosen.
+///
+/// An enabled-thinking request needs `1024 <= budget_tokens < max_tokens`. Some
+/// Claude-compatible clients send an equality boundary while adapting their own
+/// output limit. Rejecting that request locally makes account selection and
+/// upstream routing irrelevant. We preserve the user's enabled-thinking intent
+/// with a bounded expansion policy:
+///
+/// * equality (`budget == max`) is repaired by subtracting one from the budget;
+/// * a larger budget is preserved only when `max` can be raised to `budget + 1`
+///   within the known model limit, a 2x expansion bound, and a 64K delta bound;
+/// * otherwise the original max is preserved and the budget is clipped to `max - 1`.
+///
+/// A missing budget uses a conservative value that leaves at least 1024 output
+/// tokens available whenever the requested max is large enough.
+///
+/// This is deliberately a surgical rewrite: only the small top-level
+/// `thinking` and `max_tokens` values are materialized. Messages, tools,
+/// images, and historical thinking signatures retain their original bytes.
+#[cfg(test)]
+pub(crate) fn normalize_raw_reasoning_protocol_with_probe(
+    raw_body: &Bytes,
+    probe: &RawMessagesBodyProbe,
+) -> Result<Option<RawReasoningProtocolNormalization>, String> {
+    normalize_raw_reasoning_protocol_with_probe_and_limit(raw_body, probe, None)
+}
+
+/// Variant of [`normalize_raw_reasoning_protocol_with_probe`] that accepts an
+/// authoritative model output limit when the request entry point has one.
+pub(crate) fn normalize_raw_reasoning_protocol_with_probe_and_limit(
+    raw_body: &Bytes,
+    probe: &RawMessagesBodyProbe,
+    model_max_output_tokens: Option<i32>,
+) -> Result<Option<RawReasoningProtocolNormalization>, String> {
+    if !probe.matches_body(raw_body) {
+        return Err("raw request probe does not match the request body snapshot".to_string());
+    }
+    if probe.duplicate_max_tokens_field || probe.duplicate_thinking_field {
+        // Leave ambiguous JSON untouched. The ordinary protocol validator will
+        // return its precise duplicate-field error.
+        return Ok(None);
+    }
+    if let Some(error) = probe.scan_error() {
+        return Err(error.to_string());
+    }
+
+    let Some(thinking_span) = probe.thinking_value_span.as_ref() else {
+        return Ok(None);
+    };
+    if json_object_has_duplicate_keys(&raw_body[thinking_span.clone()])? {
+        return Ok(None);
+    }
+    let Some(serde_json::Value::Object(mut thinking)) =
+        parse_bounded_protocol_value(raw_body, Some(thinking_span))?
+    else {
+        return Ok(None);
+    };
+    let Some(thinking_type) = thinking
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+
+    let original_max_tokens = probe.max_tokens;
+    let mut normalized_max_tokens = match probe.max_tokens {
+        Some(max_tokens) => match i32::try_from(max_tokens) {
+            Ok(max_tokens) => max_tokens,
+            Err(_) => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let mut original_budget_tokens = None;
+    let mut rewrite_thinking = false;
+    let mut rewrite_max_tokens = false;
+    let mut normalization_reason = String::new();
+
+    let normalized_budget_tokens = match thinking_type.as_str() {
+        "enabled" => {
+            original_budget_tokens = thinking
+                .get("budget_tokens")
+                .and_then(serde_json::Value::as_i64);
+            if thinking.contains_key("budget_tokens") && original_budget_tokens.is_none() {
+                // Preserve malformed user input for the strict validator. It
+                // remains a public 400 with the established error semantics.
+                return Ok(None);
+            }
+            let requested_budget = original_budget_tokens.unwrap_or_else(|| {
+                let conservative_max =
+                    normalized_max_tokens.saturating_sub(MIN_ENABLED_THINKING_BUDGET_TOKENS);
+                i64::from(
+                    DEFAULT_ENABLED_THINKING_BUDGET_TOKENS
+                        .min(conservative_max.max(MIN_ENABLED_THINKING_BUDGET_TOKENS)),
+                )
+            });
+            let mut budget = match i32::try_from(requested_budget) {
+                Ok(budget) => budget.max(MIN_ENABLED_THINKING_BUDGET_TOKENS),
+                Err(_) => return Ok(None),
+            };
+            if original_budget_tokens.is_some()
+                && requested_budget < i64::from(MIN_ENABLED_THINKING_BUDGET_TOKENS)
+            {
+                normalization_reason = "raise_budget_to_minimum".to_string();
+            }
+
+            if normalized_max_tokens <= MIN_ENABLED_THINKING_BUDGET_TOKENS {
+                // There is no valid enabled-thinking pair below this threshold.
+                // Keep the repair bounded to the smallest compatible values
+                // instead of expanding max_tokens to a large requested budget.
+                normalized_max_tokens = MIN_ENABLED_THINKING_BUDGET_TOKENS + 1;
+                budget = MIN_ENABLED_THINKING_BUDGET_TOKENS;
+                rewrite_max_tokens = true;
+                normalization_reason = "raise_small_max_to_minimum_pair".to_string();
+            } else if budget == normalized_max_tokens {
+                budget = normalized_max_tokens - 1;
+                normalization_reason = "clamp_equal_budget_to_max_minus_one".to_string();
+            } else if budget > normalized_max_tokens {
+                let candidate_max = i64::from(budget).saturating_add(1);
+                let current_max = i64::from(normalized_max_tokens);
+                let model_limit = i64::from(
+                    model_max_output_tokens
+                        .filter(|tokens| *tokens > 0)
+                        .unwrap_or(DEFAULT_BOUNDED_EXPANSION_MAX_TOKENS),
+                );
+                let ratio_limit = current_max.saturating_mul(2).saturating_add(1);
+                let expansion_delta = candidate_max.saturating_sub(current_max);
+                let can_expand = candidate_max <= model_limit
+                    && candidate_max <= i64::from(DEFAULT_BOUNDED_EXPANSION_MAX_TOKENS)
+                    && candidate_max <= ratio_limit
+                    && expansion_delta <= MAX_BOUNDED_EXPANSION_DELTA_TOKENS
+                    && candidate_max <= i64::from(i32::MAX);
+                if can_expand {
+                    normalized_max_tokens = candidate_max as i32;
+                    rewrite_max_tokens = true;
+                    normalization_reason = "bounded_expand_max_to_preserve_budget".to_string();
+                } else {
+                    budget = normalized_max_tokens - 1;
+                    normalization_reason = "clamp_budget_to_max_minus_one".to_string();
+                }
+            }
+
+            if original_budget_tokens != Some(i64::from(budget)) {
+                thinking.insert("budget_tokens".to_string(), serde_json::Value::from(budget));
+                rewrite_thinking = true;
+            }
+            if original_budget_tokens.is_none() && normalization_reason.is_empty() {
+                normalization_reason = "default_missing_budget".to_string();
+            }
+            Some(budget)
+        }
+        "adaptive" | "disabled" => {
+            if thinking.remove("budget_tokens").is_some() {
+                rewrite_thinking = true;
+                normalization_reason = "remove_budget_for_non_enabled_thinking".to_string();
+            }
+            None
+        }
+        _ => return Ok(None),
+    };
+
+    if !rewrite_thinking && !rewrite_max_tokens {
+        return Ok(None);
+    }
+
+    let mut replacements = Vec::with_capacity(2);
+    if rewrite_max_tokens {
+        let Some(max_tokens_span) = probe.max_tokens_value_span.as_ref() else {
+            return Ok(None);
+        };
+        replacements.push((
+            max_tokens_span.clone(),
+            normalized_max_tokens.to_string().into_bytes(),
+        ));
+    }
+    if rewrite_thinking {
+        let encoded_thinking =
+            serde_json::to_vec(&serde_json::Value::Object(thinking)).map_err(|error| {
+                format!("failed to serialize normalized thinking configuration: {error}")
+            })?;
+        replacements.push((thinking_span.clone(), encoded_thinking));
+    }
+    replacements.sort_unstable_by_key(|(span, _)| span.start);
+
+    let replacement_len_delta = replacements.iter().fold(0isize, |delta, (span, bytes)| {
+        delta + bytes.len() as isize - (span.end - span.start) as isize
+    });
+    let mut out = Vec::with_capacity(raw_body.len().saturating_add_signed(replacement_len_delta));
+    let mut cursor = 0;
+    for (span, bytes) in replacements {
+        out.extend_from_slice(&raw_body[cursor..span.start]);
+        out.extend_from_slice(&bytes);
+        cursor = span.end;
+    }
+    out.extend_from_slice(&raw_body[cursor..]);
+
+    Ok(Some(RawReasoningProtocolNormalization {
+        body: Bytes::from(out),
+        thinking_type,
+        original_max_tokens,
+        normalized_max_tokens: Some(normalized_max_tokens),
+        original_budget_tokens,
+        normalized_budget_tokens,
+        normalization_reason,
+    }))
 }
 
 fn parse_bounded_protocol_value(
@@ -778,6 +1011,7 @@ fn scan_top_level_object(
             probe.max_tokens_present = true;
             let value_end = skip_json_value(bytes, value_start, 1, budget)?;
             probe.max_tokens = serde_json::from_slice::<i64>(&bytes[value_start..value_end]).ok();
+            probe.max_tokens_value_span = Some(value_start..value_end);
             i = value_end;
         } else if matches!(
             key,
@@ -1125,6 +1359,338 @@ mod tests {
                 validate_raw_reasoning_protocol(&body)
                     .unwrap_or_else(|error| panic!("round {round}: {error}"));
                 assert_eq!(body, before, "round {round}: validation must be read-only");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_reasoning_protocol_rejects_invalid_top_level_max_tokens_for_all_routes() {
+        let fixtures: &[(&[u8], &str)] = &[
+            (
+                br#"{"model":"m","max_tokens":null,"messages":[]}"#,
+                "max_tokens must be an integer",
+            ),
+            (
+                br#"{"model":"m","max_tokens":1.5,"messages":[]}"#,
+                "max_tokens must be an integer",
+            ),
+            (
+                br#"{"model":"m","max_tokens":0,"messages":[]}"#,
+                "max_tokens must be between 1 and 2147483647",
+            ),
+            (
+                br#"{"model":"m","max_tokens":-1,"messages":[]}"#,
+                "max_tokens must be between 1 and 2147483647",
+            ),
+            (
+                br#"{"model":"m","max_tokens":2147483648,"messages":[]}"#,
+                "max_tokens must be between 1 and 2147483647",
+            ),
+        ];
+
+        for round in 0..5 {
+            for (fixture, expected_error) in fixtures {
+                let body = Bytes::copy_from_slice(fixture);
+                let error = validate_raw_reasoning_protocol(&body)
+                    .expect_err("invalid max_tokens must be rejected");
+                assert_eq!(error, *expected_error, "round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_reasoning_protocol_normalizes_recoverable_thinking_controls_without_touching_messages() {
+        struct Fixture {
+            raw: &'static [u8],
+            expected_max_tokens: i64,
+            expected_thinking: serde_json::Value,
+        }
+
+        let fixtures = [
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":4096,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"opaque"}]}],"thinking":{"type":"enabled","budget_tokens":4096}}"#,
+                expected_max_tokens: 4096,
+                expected_thinking: serde_json::json!({"type":"enabled","budget_tokens":4095}),
+            },
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":100}}"#,
+                expected_max_tokens: 4096,
+                expected_thinking: serde_json::json!({"type":"enabled","budget_tokens":1024}),
+            },
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":8192}}"#,
+                expected_max_tokens: 8193,
+                expected_thinking: serde_json::json!({"type":"enabled","budget_tokens":8192}),
+            },
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":4096,"messages":[],"thinking":{"type":"enabled"}}"#,
+                expected_max_tokens: 4096,
+                expected_thinking: serde_json::json!({"type":"enabled","budget_tokens":3072}),
+            },
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":512,"messages":[],"thinking":{"type":"enabled","budget_tokens":512}}"#,
+                expected_max_tokens: 1025,
+                expected_thinking: serde_json::json!({"type":"enabled","budget_tokens":1024}),
+            },
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":512,"messages":[],"thinking":{"type":"enabled","budget_tokens":20000}}"#,
+                expected_max_tokens: 1025,
+                expected_thinking: serde_json::json!({"type":"enabled","budget_tokens":1024}),
+            },
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":4096,"messages":[],"thinking":{"type":"adaptive","budget_tokens":"ignored"}}"#,
+                expected_max_tokens: 4096,
+                expected_thinking: serde_json::json!({"type":"adaptive"}),
+            },
+            Fixture {
+                raw: br#"{"model":"claude-sonnet-4","max_tokens":4096,"messages":[],"thinking":{"type":"disabled","budget_tokens":1234}}"#,
+                expected_max_tokens: 4096,
+                expected_thinking: serde_json::json!({"type":"disabled"}),
+            },
+        ];
+
+        for round in 0..5 {
+            for fixture in &fixtures {
+                let body = Bytes::copy_from_slice(fixture.raw);
+                let probe = probe_raw_messages_body(&body);
+                let normalization = normalize_raw_reasoning_protocol_with_probe(&body, &probe)
+                    .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                    .unwrap_or_else(|| panic!("round {round}: expected normalization"));
+                let normalized: serde_json::Value =
+                    serde_json::from_slice(&normalization.body).expect("normalized JSON");
+
+                assert_eq!(
+                    normalized["max_tokens"], fixture.expected_max_tokens,
+                    "round {round}"
+                );
+                assert_eq!(
+                    normalized["thinking"], fixture.expected_thinking,
+                    "round {round}"
+                );
+                assert_eq!(
+                    normalized["messages"],
+                    serde_json::from_slice::<serde_json::Value>(fixture.raw).expect("fixture JSON")
+                        ["messages"],
+                    "round {round}: message history must remain untouched"
+                );
+                validate_raw_reasoning_protocol(&normalization.body)
+                    .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_reasoning_protocol_uses_bounded_expansion_before_budget_clamping() {
+        struct Fixture {
+            raw: &'static [u8],
+            model_limit: Option<i32>,
+            expected_max_tokens: i64,
+            expected_budget_tokens: i64,
+            expected_reason: &'static str,
+        }
+
+        let fixtures = [
+            Fixture {
+                raw: br#"{"model":"m","max_tokens":3000,"messages":[],"thinking":{"type":"enabled","budget_tokens":4096}}"#,
+                model_limit: None,
+                expected_max_tokens: 4097,
+                expected_budget_tokens: 4096,
+                expected_reason: "bounded_expand_max_to_preserve_budget",
+            },
+            Fixture {
+                raw: br#"{"model":"m","max_tokens":2048,"messages":[],"thinking":{"type":"enabled","budget_tokens":4096}}"#,
+                model_limit: None,
+                expected_max_tokens: 4097,
+                expected_budget_tokens: 4096,
+                expected_reason: "bounded_expand_max_to_preserve_budget",
+            },
+            Fixture {
+                raw: br#"{"model":"m","max_tokens":2048,"messages":[],"thinking":{"type":"enabled","budget_tokens":20000}}"#,
+                model_limit: None,
+                expected_max_tokens: 2048,
+                expected_budget_tokens: 2047,
+                expected_reason: "clamp_budget_to_max_minus_one",
+            },
+            Fixture {
+                raw: br#"{"model":"m","max_tokens":2048,"messages":[],"thinking":{"type":"enabled","budget_tokens":4096}}"#,
+                model_limit: Some(4096),
+                expected_max_tokens: 2048,
+                expected_budget_tokens: 2047,
+                expected_reason: "clamp_budget_to_max_minus_one",
+            },
+            Fixture {
+                raw: br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":4096}}"#,
+                model_limit: None,
+                expected_max_tokens: 4096,
+                expected_budget_tokens: 4095,
+                expected_reason: "clamp_equal_budget_to_max_minus_one",
+            },
+            Fixture {
+                raw: br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled"}}"#,
+                model_limit: None,
+                expected_max_tokens: 4096,
+                expected_budget_tokens: 3072,
+                expected_reason: "default_missing_budget",
+            },
+        ];
+
+        for round in 0..5 {
+            for fixture in &fixtures {
+                let body = Bytes::copy_from_slice(fixture.raw);
+                let probe = probe_raw_messages_body(&body);
+                let normalization = normalize_raw_reasoning_protocol_with_probe_and_limit(
+                    &body,
+                    &probe,
+                    fixture.model_limit,
+                )
+                .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                .unwrap_or_else(|| panic!("round {round}: expected normalization"));
+                let normalized: serde_json::Value =
+                    serde_json::from_slice(&normalization.body).expect("normalized JSON");
+                assert_eq!(
+                    normalized["max_tokens"], fixture.expected_max_tokens,
+                    "round {round}"
+                );
+                assert_eq!(
+                    normalized["thinking"]["budget_tokens"], fixture.expected_budget_tokens,
+                    "round {round}"
+                );
+                assert_eq!(
+                    normalization.normalization_reason, fixture.expected_reason,
+                    "round {round}"
+                );
+                validate_raw_reasoning_protocol(&normalization.body)
+                    .unwrap_or_else(|error| panic!("round {round}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_reasoning_protocol_repairs_zero_and_negative_thinking_controls() {
+        let fixtures = [
+            (
+                br#"{"model":"m","max_tokens":0,"messages":[],"thinking":{"type":"enabled","budget_tokens":0}}"#
+                    .as_slice(),
+                1025,
+                1024,
+            ),
+            (
+                br#"{"model":"m","max_tokens":-1,"messages":[],"thinking":{"type":"enabled","budget_tokens":-1}}"#
+                    .as_slice(),
+                1025,
+                1024,
+            ),
+            (
+                br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":0}}"#
+                    .as_slice(),
+                4096,
+                1024,
+            ),
+            (
+                br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":-1}}"#
+                    .as_slice(),
+                4096,
+                1024,
+            ),
+        ];
+
+        for (raw, expected_max_tokens, expected_budget_tokens) in fixtures {
+            let body = Bytes::copy_from_slice(raw);
+            let probe = probe_raw_messages_body(&body);
+            let normalization = normalize_raw_reasoning_protocol_with_probe(&body, &probe)
+                .expect("normalization")
+                .expect("recoverable controls");
+            let normalized: serde_json::Value =
+                serde_json::from_slice(&normalization.body).expect("normalized JSON");
+
+            assert_eq!(normalized["max_tokens"], expected_max_tokens);
+            assert_eq!(
+                normalized["thinking"]["budget_tokens"],
+                expected_budget_tokens
+            );
+            validate_raw_reasoning_protocol(&normalization.body).expect("valid normalized pair");
+        }
+    }
+
+    #[test]
+    fn raw_reasoning_protocol_leaves_integer_overflow_for_strict_validation() {
+        let oversized_budget = Bytes::from_static(
+            br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":2147483648}}"#,
+        );
+        let budget_probe = probe_raw_messages_body(&oversized_budget);
+        assert!(
+            normalize_raw_reasoning_protocol_with_probe(&oversized_budget, &budget_probe)
+                .expect("normalization")
+                .is_none()
+        );
+        let budget_error =
+            validate_raw_reasoning_protocol(&oversized_budget).expect_err("overflow budget");
+        assert!(budget_error.contains("between 1024 and 2147483647"));
+
+        let oversized_max = Bytes::from_static(
+            br#"{"model":"m","max_tokens":2147483648,"messages":[],"thinking":{"type":"enabled","budget_tokens":1024}}"#,
+        );
+        let max_probe = probe_raw_messages_body(&oversized_max);
+        assert!(
+            normalize_raw_reasoning_protocol_with_probe(&oversized_max, &max_probe)
+                .expect("normalization")
+                .is_none()
+        );
+        assert_eq!(max_probe.max_tokens, Some(2_147_483_648));
+        assert!(
+            deserialize_messages_request_with_probe(&oversized_max, &max_probe).is_err(),
+            "typed request must reject max_tokens outside i32"
+        );
+    }
+
+    #[test]
+    fn raw_reasoning_normalization_changes_only_top_level_controls() {
+        let raw = Bytes::from_static(
+            br#"{"model":"m","max_tokens":4096,"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"private","signature":"sig"}]}],"tools":[{"name":"tool","input_schema":{"type":"object","properties":{"x":{"type":"string"}}}}],"thinking":{"type":"enabled","budget_tokens":4096},"metadata":{"keep":"exact"}}"#,
+        );
+        let probe = probe_raw_messages_body(&raw);
+        let normalization = normalize_raw_reasoning_protocol_with_probe(&raw, &probe)
+            .expect("normalization")
+            .expect("equality must be repaired");
+        let before: serde_json::Value = serde_json::from_slice(&raw).expect("raw JSON");
+        let after: serde_json::Value =
+            serde_json::from_slice(&normalization.body).expect("normalized JSON");
+
+        assert_eq!(before["messages"], after["messages"]);
+        assert_eq!(before["tools"], after["tools"]);
+        assert_eq!(before["metadata"], after["metadata"]);
+        assert_eq!(
+            after["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 4095
+            })
+        );
+        assert_eq!(after["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn raw_reasoning_protocol_leaves_unknown_or_ambiguous_controls_for_validation() {
+        let fixtures: &[&[u8]] = &[
+            br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"mystery"}}"#,
+            br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":"bad"}}"#,
+            br#"{"model":"m","max_tokens":4096,"messages":[],"thinking":{"type":"enabled","budget_tokens":4096},"thinking":{"type":"enabled","budget_tokens":2048}}"#,
+        ];
+
+        for round in 0..5 {
+            for &raw in fixtures {
+                let body = Bytes::copy_from_slice(raw);
+                let probe = probe_raw_messages_body(&body);
+                assert!(
+                    normalize_raw_reasoning_protocol_with_probe(&body, &probe)
+                        .unwrap_or_else(|error| panic!("round {round}: {error}"))
+                        .is_none(),
+                    "round {round}"
+                );
+                assert!(
+                    validate_raw_reasoning_protocol(&body).is_err(),
+                    "round {round}"
+                );
             }
         }
     }

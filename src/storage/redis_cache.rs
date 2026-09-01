@@ -2840,21 +2840,31 @@ impl RedisStore {
             return Ok(None);
         }
 
-        let top = UsageDashboardTop {
-            window_key: "lifetime".to_string(),
-            models: self
-                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_MODELS_KEY, "model")
-                .await?,
-            credentials: self
-                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_CREDENTIALS_KEY, "credential")
-                .await?,
-            endpoints: self
-                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ENDPOINTS_KEY, "endpoint")
-                .await?,
-            errors: self
-                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ERRORS_KEY, "error")
-                .await?,
-        };
+        let (models, models_total) = self
+            .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_MODELS_KEY, "model")
+            .await?;
+        let (credentials, credentials_total) = self
+            .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_CREDENTIALS_KEY, "credential")
+            .await?;
+        let (endpoints, endpoints_total) = self
+            .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ENDPOINTS_KEY, "endpoint")
+            .await?;
+        let (errors, errors_total) = self
+            .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ERRORS_KEY, "error")
+            .await?;
+        let mut top = UsageDashboardTop::empty("lifetime");
+        top.models = models;
+        top.credentials = credentials;
+        top.endpoints = endpoints;
+        top.errors = errors;
+        top.models_total = models_total;
+        top.credentials_total = credentials_total;
+        top.endpoints_total = endpoints_total;
+        top.errors_total = errors_total;
+        top.models_truncated = models_total > top.models.len();
+        top.credentials_truncated = credentials_total > top.credentials.len();
+        top.endpoints_truncated = endpoints_total > top.endpoints.len();
+        top.errors_truncated = errors_total > top.errors.len();
 
         let elapsed_ms = started_at.elapsed().as_millis();
         if elapsed_ms >= 250 {
@@ -2955,24 +2965,34 @@ impl RedisStore {
         };
 
         let now = Utc::now();
-        Ok(Some((
-            now.to_rfc3339(),
-            UsageDashboardTop {
-                window_key: "lifetime".to_string(),
-                models: self
-                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_MODELS_KEY, "model")
-                    .await?,
-                credentials: self
-                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_CREDENTIALS_KEY, "credential")
-                    .await?,
-                endpoints: self
-                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ENDPOINTS_KEY, "endpoint")
-                    .await?,
-                errors: self
-                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ERRORS_KEY, "error")
-                    .await?,
-            },
-        )))
+        Ok(Some((now.to_rfc3339(), {
+            let mut top = UsageDashboardTop::empty("lifetime");
+            let (models, models_total) = self
+                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_MODELS_KEY, "model")
+                .await?;
+            let (credentials, credentials_total) = self
+                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_CREDENTIALS_KEY, "credential")
+                .await?;
+            let (endpoints, endpoints_total) = self
+                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ENDPOINTS_KEY, "endpoint")
+                .await?;
+            let (errors, errors_total) = self
+                .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ERRORS_KEY, "error")
+                .await?;
+            top.models = models;
+            top.credentials = credentials;
+            top.endpoints = endpoints;
+            top.errors = errors;
+            top.models_total = models_total;
+            top.credentials_total = credentials_total;
+            top.endpoints_total = endpoints_total;
+            top.errors_total = errors_total;
+            top.models_truncated = models_total > top.models.len();
+            top.credentials_truncated = credentials_total > top.credentials.len();
+            top.endpoints_truncated = endpoints_total > top.endpoints.len();
+            top.errors_truncated = errors_total > top.errors.len();
+            top
+        })))
     }
 
     pub async fn clear_usage_summary_aggregates_bounded(
@@ -3180,11 +3200,12 @@ impl RedisStore {
         &self,
         index_key: &str,
         dimension: &str,
-    ) -> anyhow::Result<Vec<UsageTopAggregate>> {
+    ) -> anyhow::Result<(Vec<UsageTopAggregate>, usize)> {
         let mut manager = self.manager.clone();
+        let total: usize = manager.zcard(self.key(index_key)).await?;
         let keys: Vec<String> = manager.zrevrange(self.key(index_key), 0, 9).await?;
         if keys.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), total));
         }
 
         let mut pipe = redis::pipe();
@@ -3227,7 +3248,7 @@ impl RedisStore {
             )
         });
         items.truncate(10);
-        Ok(items)
+        Ok((items, total))
     }
 
     #[allow(dead_code)]

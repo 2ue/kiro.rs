@@ -7,6 +7,7 @@ import type {
   ModelPricingStatus,
   UpsertManualModelRequest,
   UsageDashboardResponse,
+  UsageDashboardAccountsResponse,
   UsageDashboardBreakdownResponse,
   UsageDashboardExternalPoolBillingResponse,
   UsageDashboardSeriesResponse,
@@ -72,6 +73,27 @@ export async function getUsageDashboardTop(
 ): Promise<UsageDashboardTopResponse> {
   const { data } = await api.get<UsageDashboardTopResponse>('/usage-dashboard/top', {
     params: { timezone, windowKey },
+  })
+  return data
+}
+
+export async function getUsageDashboardAccounts(params: {
+  timezone?: string
+  windowKey?: string
+  page?: number
+  pageSize?: number
+  q?: string
+  status?: string
+  sortBy?: string
+  sortOrder?: 'asc' | 'desc'
+} = {}): Promise<UsageDashboardAccountsResponse> {
+  const { data } = await api.get<UsageDashboardAccountsResponse>('/usage-dashboard/accounts', {
+    params: {
+      timezone: 'Asia/Shanghai',
+      page: 1,
+      pageSize: 50,
+      ...params,
+    },
   })
   return data
 }

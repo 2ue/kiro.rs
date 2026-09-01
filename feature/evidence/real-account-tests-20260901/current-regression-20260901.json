@@ -1,0 +1,86 @@
+{
+  "generatedAt": "2026-09-01T15:55:11.671Z",
+  "instance": {
+    "listen": "127.0.0.1:19023",
+    "config": "tmp/thinking-budget-local/config.json",
+    "pid": 89324,
+    "binary": "/tmp/kiro-thinking-candidate.tf6Wsb/kiro-rs",
+    "binarySha256": "f02b9883f5b8ce831b4801f0b14802d9a53619bff44c6bcdb72dcc7c76a15ffd"
+  },
+  "requestPolicy": {
+    "apiKey": "redacted-local-test-key",
+    "model": "claude-sonnet-4.5",
+    "prompt": "Reply with exactly: pong",
+    "route": "local_credential",
+    "externalPools": 0
+  },
+  "cases": {
+    "equality": {
+      "requestId": "req_01AvucTGaqDFiHzuEixbkyxZ",
+      "input": {
+        "thinkingType": "enabled",
+        "budgetTokens": 2048,
+        "maxTokens": 2048
+      },
+      "httpStatus": 200,
+      "contentBlockTypes": ["thinking", "text"],
+      "inputTokens": 6,
+      "outputTokens": 204,
+      "thinkingTokens": 203,
+      "error": null
+    },
+    "boundedExpansion": {
+      "requestId": "req_01PPmCUoyXYQDMsZdBN4DfV2",
+      "input": {
+        "thinkingType": "enabled",
+        "budgetTokens": 4096,
+        "maxTokens": 2048
+      },
+      "normalizedMaxTokens": 4097,
+      "httpStatus": 200,
+      "contentBlockTypes": ["thinking", "text"],
+      "inputTokens": 13,
+      "outputTokens": 157,
+      "thinkingTokens": 156,
+      "error": null
+    },
+    "adaptiveCleanup": {
+      "requestId": "req_01ng3avmtbrZaPoUURyvE1Su",
+      "input": {
+        "thinkingType": "adaptive",
+        "budgetTokens": 4096,
+        "maxTokens": 2048
+      },
+      "httpStatus": 200,
+      "contentBlockTypes": ["text"],
+      "inputTokens": 9,
+      "outputTokens": 1,
+      "thinkingTokens": null,
+      "error": null
+    },
+    "disabledCleanup": {
+      "requestId": "req_01boeVUg7VKd71c5siDM51jW",
+      "input": {
+        "thinkingType": "disabled",
+        "budgetTokens": 4096,
+        "maxTokens": 2048
+      },
+      "httpStatus": 200,
+      "contentBlockTypes": ["text"],
+      "inputTokens": 8,
+      "outputTokens": 1,
+      "thinkingTokens": null,
+      "error": null
+    }
+  },
+  "conclusion": {
+    "allCasesSucceeded": true,
+    "firstSendNormalizationProvenBy": [
+      "all responses are HTTP 200",
+      "enabled equality produced thinking and non-zero thinking_tokens",
+      "bounded expansion preserved budget with normalized max_tokens=4097",
+      "adaptive and disabled requests returned text without thinking"
+    ],
+    "retryWasNotRequiredToRepairControls": true
+  }
+}

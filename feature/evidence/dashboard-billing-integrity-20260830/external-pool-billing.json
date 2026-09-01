@@ -1,0 +1,21 @@
+{
+  "capturedAt": "2026-08-30T03:20:22.016556+00:00",
+  "environment": "local-isolated",
+  "endpoint": "/api/admin/usage-dashboard/external-pool-billing?windowKey=today",
+  "externalPoolBillingByPool": [
+    {
+      "poolId": 1,
+      "poolName": "Dashboard fixture pool",
+      "requests": 43,
+      "pricedRequests": 17,
+      "unpricedRequests": 26,
+      "rawCostUsd": 0.126837,
+      "shapedCostUsd": 0.0922083,
+      "upliftedCostUsd": 0.1335729,
+      "profitUsd": 0.0067359,
+      "reportedCostUsd": 0.1335729,
+      "billableCostUsd": 0.1335729,
+      "costFloorDeltaUsd": 0
+    }
+  ]
+}

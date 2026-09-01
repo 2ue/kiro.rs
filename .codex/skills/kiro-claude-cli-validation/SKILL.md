@@ -9,8 +9,14 @@ Use this skill to validate kiro.rs with the real Claude Code CLI, not only unit 
 
 ## Safety Contract
 
-- For normal local validation, default to the existing local environment and local service port (commonly `9022`); restart that service directly when a restart is needed.
-- Use an isolated temporary service only when isolation is required: initialization/deployment validation, no usable local service/config, or a concrete risk of corrupting unrelated state.
+- Apply `docs/testing/project-test-instance.md`. In this repository the
+  designated instance is `127.0.0.1:19023` with
+  `tmp/thinking-budget-local/config.json`; all CLI cases reuse that one
+  project-owned `kiro.rs` process. Isolation is a project ownership boundary,
+  not a new service per case.
+- Start a temporary `kiro.rs` service only when the designated instance cannot
+  safely execute a destructive case. Record the reason, exact resources,
+  lifetime, and cleanup result in the evidence report.
 - Before touching an existing local service, identify the exact listener PID/command and confirm it is this project’s `kiro-rs`; stop only that process.
 - Verify the selected port before and after the run with `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
 - Use isolated Claude config directories for tests:
@@ -18,7 +24,9 @@ Use this skill to validate kiro.rs with the real Claude Code CLI, not only unit 
   - `CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-<port>`
 - Never print API keys, refresh tokens, client secrets, or full credential JSON.
 - Keep real upstream calls modest unless the user explicitly asks for high-volume real traffic.
-- Stop every temp service started by the validation.
+- Stop every temporary service started by the validation. Do not stop the
+  designated project instance unless the test explicitly covers restart or
+  recovery and the process is verified to belong to this repository.
 
 ## Build Artifact Contract
 
@@ -62,19 +70,24 @@ Record the CLI version:
 claude --version
 ```
 
-Exercise the release binary by restarting the existing local service by default:
+When a new binary must be exercised, restart the verified designated instance
+in place. Do not launch a second `kiro.rs` process:
 
 ```bash
-pid="$(lsof -nP -iTCP:9022 -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
+project_test_port="${KIRO_PROJECT_TEST_PORT:-19023}"
+project_test_config="${KIRO_PROJECT_TEST_CONFIG:-tmp/thinking-budget-local/config.json}"
+pid="$(lsof -nP -iTCP:${project_test_port} -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
 if [ -n "$pid" ]; then
   cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  case "$cmd" in *kiro-rs*) kill "$pid" ;; *) echo "9022 is not kiro-rs: $cmd" >&2; exit 1 ;; esac
+  case "$cmd" in *kiro-rs*) kill "$pid" ;; *) echo "${project_test_port} is not this project's kiro.rs: $cmd" >&2; exit 1 ;; esac
 fi
-"$KIRO_RS_BINARY" -c config.json --credentials credentials.json
+"$KIRO_RS_BINARY" -c "$project_test_config"
 ```
 
-If runtime config is loaded from PgSQL, confirm the restarted process actually listens on the intended local port.
-Start a temporary service port only when isolation is required, for example initialization/deployment validation, no usable local service/config, or a concrete risk of corrupting unrelated state.
+If runtime config is loaded from PostgreSQL, confirm that the replacement
+process uses the same database and listens on the designated port before
+sending requests. A temporary service requires the documented exception in
+`docs/testing/project-test-instance.md`.
 
 ## How To Prove Thinking Is Real
 

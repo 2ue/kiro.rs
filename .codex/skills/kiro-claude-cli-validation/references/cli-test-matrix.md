@@ -16,18 +16,18 @@ Use direct HTTP/SSE to prove the proxy protocol before involving Claude CLI.
 
 ## C2 Claude CLI Non-Interactive
 
-Use the existing local service port by default, commonly `9022`, and restart that local
-`kiro-rs` process directly when a rebuild needs to be exercised. Use an isolated service
-port only for initialization/deployment validation, missing local config, or tests that
-could corrupt unrelated local state. Always keep Claude's own HOME/config isolated so the
+Apply `docs/testing/project-test-instance.md`. For this repository, send Claude
+CLI traffic to the already running project instance at `127.0.0.1:19023`.
+Reuse that one `kiro.rs` process for all C2 cases; do not create a new proxy
+service for each case. Only Claude's own HOME/config is temporary, so the
 operator's normal Claude Code state is not mutated.
 
 Common flags:
 
 ```bash
-HOME=/tmp/kiro-claude-home-9022 \
-CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-9022 \
-ANTHROPIC_BASE_URL=http://127.0.0.1:9022/cc \
+HOME=/tmp/kiro-claude-home-19023 \
+CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-19023 \
+ANTHROPIC_BASE_URL=http://127.0.0.1:19023/cc \
 ANTHROPIC_API_KEY=<redacted> \
 claude --bare --print --verbose \
   --output-format=stream-json \

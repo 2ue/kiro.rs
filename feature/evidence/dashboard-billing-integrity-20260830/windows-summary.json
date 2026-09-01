@@ -1,0 +1,17 @@
+{
+  "capturedAt": "2026-08-30T03:20:22.016556+00:00",
+  "environment": "local-isolated",
+  "endpoint": "/api/admin/usage-dashboard/windows",
+  "windowKey": "today",
+  "summary": {
+    "totalRequests": 147,
+    "successRequests": 84,
+    "errorRequests": 63,
+    "totalEstimatedCostUsd": 0.1335729,
+    "totalOriginalCostUsd": 0.126837,
+    "totalKiroMeteringUsage": 16.5,
+    "externalPoolRequests": 43,
+    "externalPoolPricedRequests": 17,
+    "externalPoolUnpricedRequests": 26
+  }
+}

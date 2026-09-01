@@ -20,17 +20,17 @@ use crate::anthropic::pricing::{
 };
 use crate::anthropic::usage::{
     CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem,
-    UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop,
-    UsageDashboardWindow, UsageDashboardWindowSpec, UsageExternalPoolBillingByPool,
-    UsageExternalPoolBillingSummary, UsageExternalPoolRiskBucket, UsageExternalPoolRiskCacheStats,
-    UsageExternalPoolRiskCostConfig, UsageExternalPoolRiskCostStats, UsageExternalPoolRiskFilters,
-    UsageExternalPoolRiskGroup, UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse,
-    UsageExternalPoolRiskSample, UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals,
-    UsageExternalPoolRiskWindow, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
-    UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult, UsageRouteKind,
-    UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
-    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
-    usage_dashboard_windows,
+    UsageDashboardCredentialAggregate, UsageDashboardResponse, UsageDashboardSeries,
+    UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow, UsageDashboardWindowSpec,
+    UsageExternalPoolBillingByPool, UsageExternalPoolBillingSummary, UsageExternalPoolRiskBucket,
+    UsageExternalPoolRiskCacheStats, UsageExternalPoolRiskCostConfig,
+    UsageExternalPoolRiskCostStats, UsageExternalPoolRiskFilters, UsageExternalPoolRiskGroup,
+    UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageExternalPoolRiskSample,
+    UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals, UsageExternalPoolRiskWindow,
+    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
+    UsageRecordsResult, UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary,
+    UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
+    usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -6335,22 +6335,40 @@ impl PostgresUsageStore {
 
     pub async fn dashboard_top_only(&self) -> anyhow::Result<(String, UsageDashboardTop)> {
         let now = Utc::now();
+        let models = self
+            .dashboard_top_aggregates(DashboardTopGroup::Model)
+            .await?;
+        let credentials = self
+            .dashboard_top_aggregates(DashboardTopGroup::Credential)
+            .await?;
+        let endpoints = self
+            .dashboard_top_aggregates(DashboardTopGroup::Endpoint)
+            .await?;
+        let errors = self
+            .dashboard_top_aggregates(DashboardTopGroup::Error)
+            .await?;
+        let models_len = models.items.len();
+        let credentials_len = credentials.items.len();
+        let endpoints_len = endpoints.items.len();
+        let errors_len = errors.items.len();
         Ok((
             now.to_rfc3339(),
             UsageDashboardTop {
                 window_key: "lifetime".to_string(),
-                models: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Model)
-                    .await?,
-                credentials: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Credential)
-                    .await?,
-                endpoints: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Endpoint)
-                    .await?,
-                errors: self
-                    .dashboard_top_aggregates(DashboardTopGroup::Error)
-                    .await?,
+                models: models.items,
+                credentials: credentials.items,
+                endpoints: endpoints.items,
+                errors: errors.items,
+                models_total: models.total,
+                credentials_total: credentials.total,
+                endpoints_total: endpoints.total,
+                errors_total: errors.total,
+                models_truncated: models.total > models_len,
+                credentials_truncated: credentials.total > credentials_len,
+                endpoints_truncated: endpoints.total > endpoints_len,
+                errors_truncated: errors.total > errors_len,
+                order_by: "estimated_cost_usd".to_string(),
+                errors_order_by: "error_requests".to_string(),
             },
         ))
     }
@@ -6364,24 +6382,251 @@ impl PostgresUsageStore {
         let (_timezone, offset) = usage_dashboard_timezone(timezone);
         let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
         let specs = [window_spec.clone()];
+        let models = self
+            .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Model)
+            .await?;
+        let credentials = self
+            .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Credential)
+            .await?;
+        let endpoints = self
+            .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Endpoint)
+            .await?;
+        let errors = self
+            .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Error)
+            .await?;
+        let models_len = models.items.len();
+        let credentials_len = credentials.items.len();
+        let endpoints_len = endpoints.items.len();
+        let errors_len = errors.items.len();
         Ok((
             now.to_rfc3339(),
             UsageDashboardTop {
                 window_key: window_spec.key,
-                models: self
-                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Model)
-                    .await?,
-                credentials: self
-                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Credential)
-                    .await?,
-                endpoints: self
-                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Endpoint)
-                    .await?,
-                errors: self
-                    .dashboard_top_aggregates_for_window(&specs, DashboardTopGroup::Error)
-                    .await?,
+                models: models.items,
+                credentials: credentials.items,
+                endpoints: endpoints.items,
+                errors: errors.items,
+                models_total: models.total,
+                credentials_total: credentials.total,
+                endpoints_total: endpoints.total,
+                errors_total: errors.total,
+                models_truncated: models.total > models_len,
+                credentials_truncated: credentials.total > credentials_len,
+                endpoints_truncated: endpoints.total > endpoints_len,
+                errors_truncated: errors.total > errors_len,
+                order_by: "estimated_cost_usd".to_string(),
+                errors_order_by: "error_requests".to_string(),
             },
         ))
+    }
+
+    /// Read all credential usage aggregates for one dashboard window.
+    ///
+    /// The query is rollup-first and only scans the two partial boundary hours
+    /// from `usage_records`, matching the existing dashboard aggregation rules.
+    /// It is read-only and never touches credential runtime state.
+    pub async fn dashboard_credential_aggregates_for_window(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+        credential_ids: &[u64],
+    ) -> anyhow::Result<(
+        String,
+        String,
+        String,
+        Vec<UsageDashboardCredentialAggregate>,
+    )> {
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
+        let specs = [window_spec.clone()];
+        if credential_ids.is_empty() {
+            return Ok((now.to_rfc3339(), timezone, window_spec.key, Vec::new()));
+        }
+        let credential_keys: Vec<String> = credential_ids.iter().map(|id| id.to_string()).collect();
+        let credential_ids_i64: Vec<i64> = credential_ids
+            .iter()
+            .filter_map(|id| i64::try_from(*id).ok())
+            .collect();
+
+        let mut builder = QueryBuilder::<Postgres>::new("");
+        push_dashboard_windows_cte(&mut builder, &specs);
+        builder.push(
+            r#", window_credential_segments AS (
+            SELECT
+                b.dimension_key AS credential_key,
+                b.requests,
+                b.error_requests,
+                b.total_input_tokens,
+                b.total_output_tokens,
+                b.total_estimated_cost_usd,
+                CASE
+                    WHEN COALESCE(b.total_original_cost_usd, 0) <> 0
+                    THEN b.total_original_cost_usd
+                    ELSE COALESCE(b.total_estimated_cost_usd, 0)
+                END::double precision AS total_original_cost_usd,
+                b.total_kiro_metering_usage,
+                b.priced_requests,
+                b.unpriced_requests
+            FROM window_bounds w
+            JOIN usage_rollup_time_buckets b
+              ON b.dimension = 'credential'
+             AND b.dimension_key = ANY(
+            "#,
+        );
+        builder.push_bind(&credential_keys);
+        builder.push(
+            r#"::text[])
+             AND b.bucket_start >= w.full_from_at
+             AND b.bucket_start < w.full_to_at
+            UNION ALL
+            SELECT
+                r.credential_id::text AS credential_key,
+                COUNT(*)::bigint AS requests,
+                COUNT(*) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
+                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision
+                    AS total_estimated_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(r.original_cost_usd, 0) <> 0
+                        THEN r.original_cost_usd
+                        ELSE COALESCE(r.estimated_cost_usd, 0)
+                    END
+                ), 0)::double precision AS total_original_cost_usd,
+                COALESCE(SUM(r.kiro_metering_usage), 0)::double precision
+                    AS total_kiro_metering_usage,
+                COUNT(*) FILTER (WHERE r.pricing_available)::bigint AS priced_requests,
+                COUNT(*) FILTER (WHERE NOT r.pricing_available)::bigint AS unpriced_requests
+            FROM window_boundary_records r
+            WHERE r.credential_id IS NOT NULL
+              AND r.credential_id = ANY(
+            "#,
+        );
+        builder.push_bind(&credential_ids_i64);
+        builder.push(
+            r#"::bigint[])
+            GROUP BY r.credential_id
+            ), window_credential_totals AS (
+            SELECT
+                credential_key,
+                SUM(requests)::bigint AS requests,
+                SUM(error_requests)::bigint AS error_requests,
+                SUM(total_input_tokens)::bigint AS total_input_tokens,
+                SUM(total_output_tokens)::bigint AS total_output_tokens,
+                SUM(total_estimated_cost_usd)::double precision AS total_estimated_cost_usd,
+                SUM(total_original_cost_usd)::double precision AS total_original_cost_usd,
+                SUM(total_kiro_metering_usage)::double precision AS total_kiro_metering_usage,
+                SUM(priced_requests)::bigint AS priced_requests,
+                SUM(unpriced_requests)::bigint AS unpriced_requests
+            FROM window_credential_segments
+            GROUP BY credential_key
+            ), lifetime_credentials AS (
+            SELECT
+                dimension_key,
+                requests,
+                error_requests,
+                total_input_tokens,
+                total_output_tokens,
+                total_estimated_cost_usd,
+                total_original_cost_usd,
+                total_kiro_metering_usage,
+                priced_requests,
+                unpriced_requests
+            FROM usage_rollup_totals
+            WHERE dimension = 'credential'
+              AND dimension_key = ANY(
+            "#,
+        );
+        builder.push_bind(&credential_keys);
+        builder.push(
+            r#"::text[])
+            )
+            SELECT
+                COALESCE(window_credential_totals.credential_key, lifetime.dimension_key)
+                    AS credential_id,
+                COALESCE(window_credential_totals.requests, 0)::bigint AS window_requests,
+                COALESCE(window_credential_totals.error_requests, 0)::bigint
+                    AS window_error_requests,
+                COALESCE(window_credential_totals.total_input_tokens, 0)::bigint
+                    AS window_total_input_tokens,
+                COALESCE(window_credential_totals.total_output_tokens, 0)::bigint
+                    AS window_total_output_tokens,
+                COALESCE(window_credential_totals.total_estimated_cost_usd, 0)::double precision
+                    AS window_estimated_cost_usd,
+                COALESCE(window_credential_totals.total_original_cost_usd, 0)::double precision
+                    AS window_original_cost_usd,
+                COALESCE(window_credential_totals.total_kiro_metering_usage, 0)::double precision
+                    AS window_kiro_metering_usage,
+                COALESCE(window_credential_totals.priced_requests, 0)::bigint
+                    AS window_priced_requests,
+                COALESCE(window_credential_totals.unpriced_requests, 0)::bigint
+                    AS window_unpriced_requests,
+                COALESCE(lifetime.requests, 0)::bigint AS lifetime_requests,
+                COALESCE(lifetime.error_requests, 0)::bigint AS lifetime_error_requests,
+                COALESCE(lifetime.total_input_tokens, 0)::bigint
+                    AS lifetime_total_input_tokens,
+                COALESCE(lifetime.total_output_tokens, 0)::bigint
+                    AS lifetime_total_output_tokens,
+                COALESCE(lifetime.total_estimated_cost_usd, 0)::double precision
+                    AS lifetime_estimated_cost_usd,
+                COALESCE(
+                    CASE
+                        WHEN COALESCE(lifetime.total_original_cost_usd, 0) <> 0
+                        THEN lifetime.total_original_cost_usd
+                        ELSE lifetime.total_estimated_cost_usd
+                    END,
+                    0
+                )::double precision AS lifetime_original_cost_usd,
+                COALESCE(lifetime.total_kiro_metering_usage, 0)::double precision
+                    AS lifetime_kiro_metering_usage,
+                COALESCE(lifetime.priced_requests, 0)::bigint AS lifetime_priced_requests,
+                COALESCE(lifetime.unpriced_requests, 0)::bigint AS lifetime_unpriced_requests
+            FROM lifetime_credentials lifetime
+            FULL OUTER JOIN window_credential_totals
+              ON window_credential_totals.credential_key = lifetime.dimension_key
+            WHERE window_credential_totals.credential_key IS NOT NULL
+               OR lifetime.dimension_key IS NOT NULL
+            ORDER BY credential_id
+            "#,
+        );
+
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = builder.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+
+        let mut aggregates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let credential_id: String = row.try_get("credential_id")?;
+            let Ok(credential_id) = credential_id.parse::<u64>() else {
+                continue;
+            };
+            aggregates.push(UsageDashboardCredentialAggregate {
+                credential_id,
+                window_requests: row_i64_to_usize(&row, "window_requests")?,
+                window_error_requests: row_i64_to_usize(&row, "window_error_requests")?,
+                window_total_input_tokens: row.try_get("window_total_input_tokens")?,
+                window_total_output_tokens: row.try_get("window_total_output_tokens")?,
+                window_estimated_cost_usd: row.try_get("window_estimated_cost_usd")?,
+                window_original_cost_usd: row.try_get("window_original_cost_usd")?,
+                window_kiro_metering_usage: row.try_get("window_kiro_metering_usage")?,
+                window_priced_requests: row_i64_to_usize(&row, "window_priced_requests")?,
+                window_unpriced_requests: row_i64_to_usize(&row, "window_unpriced_requests")?,
+                lifetime_requests: row_i64_to_usize(&row, "lifetime_requests")?,
+                lifetime_error_requests: row_i64_to_usize(&row, "lifetime_error_requests")?,
+                lifetime_total_input_tokens: row.try_get("lifetime_total_input_tokens")?,
+                lifetime_total_output_tokens: row.try_get("lifetime_total_output_tokens")?,
+                lifetime_estimated_cost_usd: row.try_get("lifetime_estimated_cost_usd")?,
+                lifetime_original_cost_usd: row.try_get("lifetime_original_cost_usd")?,
+                lifetime_kiro_metering_usage: row.try_get("lifetime_kiro_metering_usage")?,
+                lifetime_priced_requests: row_i64_to_usize(&row, "lifetime_priced_requests")?,
+                lifetime_unpriced_requests: row_i64_to_usize(&row, "lifetime_unpriced_requests")?,
+            });
+        }
+
+        Ok((now.to_rfc3339(), timezone, window_spec.key, aggregates))
     }
 
     pub async fn dashboard_breakdown_only(
@@ -7051,7 +7296,7 @@ impl PostgresUsageStore {
     async fn dashboard_top_aggregates(
         &self,
         group: DashboardTopGroup,
-    ) -> anyhow::Result<Vec<UsageTopAggregate>> {
+    ) -> anyhow::Result<DashboardTopAggregateResult> {
         let mut builder = QueryBuilder::<Postgres>::new(
             r#"
             SELECT
@@ -7071,33 +7316,47 @@ impl PostgresUsageStore {
                     ELSE COALESCE(total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
                 COALESCE(total_kiro_metering_usage, 0)::double precision
-                    AS total_kiro_metering_usage
+                    AS total_kiro_metering_usage,
+                COUNT(*) OVER()::bigint AS total_dimension_count
             FROM usage_rollup_totals
             WHERE dimension = "#,
         );
         builder.push_bind(group.rollup_dimension());
         builder.push(group.rollup_extra_where());
         builder.push(" AND requests > 0 ");
-        builder.push(
-            " ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC LIMIT 10",
-        );
+        let order_by = if matches!(group, DashboardTopGroup::Error) {
+            " ORDER BY error_requests DESC, requests DESC, total_estimated_cost_usd DESC, key LIMIT 10"
+        } else {
+            " ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC, key LIMIT 10"
+        };
+        builder.push(order_by);
 
         let mut tx = self.store.pool().begin().await?;
         configure_usage_dashboard_read_transaction(&mut tx).await?;
         let rows = builder.build().fetch_all(&mut *tx).await?;
         tx.commit().await?;
-        rows.into_iter()
+        let total = rows
+            .first()
+            .map(|row| row_i64_to_usize(row, "total_dimension_count"))
+            .transpose()?
+            .unwrap_or(0);
+        let items = rows
+            .into_iter()
             .map(usage_top_aggregate_from_row)
-            .collect::<anyhow::Result<Vec<_>>>()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(DashboardTopAggregateResult { items, total })
     }
 
     async fn dashboard_top_aggregates_for_window(
         &self,
         specs: &[UsageDashboardWindowSpec],
         group: DashboardTopGroup,
-    ) -> anyhow::Result<Vec<UsageTopAggregate>> {
+    ) -> anyhow::Result<DashboardTopAggregateResult> {
         if specs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(DashboardTopAggregateResult {
+                items: Vec::new(),
+                total: 0,
+            });
         }
 
         let item_dimension = group.rollup_dimension();
@@ -7206,21 +7465,41 @@ impl PostgresUsageStore {
                 total_cache_creation_input_tokens,
                 total_estimated_cost_usd,
                 total_original_cost_usd,
-                total_kiro_metering_usage
+                total_kiro_metering_usage,
+                COUNT(*) OVER()::bigint AS total_dimension_count
             FROM top_metric_totals
             WHERE requests > 0
-            ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC, key
+            ORDER BY
+                "#,
+        );
+        if matches!(group, DashboardTopGroup::Error) {
+            builder.push(
+                r#"error_requests DESC, requests DESC, total_estimated_cost_usd DESC, key
             LIMIT 10
             "#,
-        );
+            );
+        } else {
+            builder.push(
+                r#"total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC, key
+            LIMIT 10
+            "#,
+            );
+        }
 
         let mut tx = self.store.pool().begin().await?;
         configure_usage_dashboard_read_transaction(&mut tx).await?;
         let rows = builder.build().fetch_all(&mut *tx).await?;
         tx.commit().await?;
-        rows.into_iter()
+        let total = rows
+            .first()
+            .map(|row| row_i64_to_usize(row, "total_dimension_count"))
+            .transpose()?
+            .unwrap_or(0);
+        let items = rows
+            .into_iter()
             .map(usage_top_aggregate_from_row)
-            .collect::<anyhow::Result<Vec<_>>>()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(DashboardTopAggregateResult { items, total })
     }
 
     pub async fn credential_cost_summary(
@@ -9504,6 +9783,11 @@ enum DashboardTopGroup {
     Credential,
     Endpoint,
     Error,
+}
+
+struct DashboardTopAggregateResult {
+    items: Vec<UsageTopAggregate>,
+    total: usize,
 }
 
 impl DashboardTopGroup {
@@ -14753,9 +15037,9 @@ mod tests {
             .dashboard_top_aggregates_for_window(&[specs[1].clone()], DashboardTopGroup::Credential)
             .await
             .unwrap();
-        assert_eq!(top_credentials[0].key, "7");
+        assert_eq!(top_credentials.items[0].key, "7");
         assert!(
-            (top_credentials[0].total_kiro_metering_usage - 15.0).abs() < 1e-12,
+            (top_credentials.items[0].total_kiro_metering_usage - 15.0).abs() < 1e-12,
             "windowed credential top must preserve Kiro metering from rollup and boundary rows"
         );
 

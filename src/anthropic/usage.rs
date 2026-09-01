@@ -32,6 +32,7 @@ const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_m
 const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
 const USAGE_WRITER_ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_millis(100);
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 120;
+const USAGE_DASHBOARD_ACCOUNTS_TIMEOUT_SECS: u64 = 15;
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_MAX_CONCURRENT_QUERIES: usize = 2;
 const USAGE_DASHBOARD_GATE_WAIT_MS: u64 = 30_000;
@@ -1193,6 +1194,85 @@ pub struct UsageDashboardTop {
     pub credentials: Vec<UsageTopAggregate>,
     pub endpoints: Vec<UsageTopAggregate>,
     pub errors: Vec<UsageTopAggregate>,
+    /// 每个榜单维度的覆盖元数据。榜单只返回 Top N，不能被当成全量。
+    #[serde(default)]
+    pub models_total: usize,
+    #[serde(default)]
+    pub credentials_total: usize,
+    #[serde(default)]
+    pub endpoints_total: usize,
+    #[serde(default)]
+    pub errors_total: usize,
+    #[serde(default)]
+    pub models_truncated: bool,
+    #[serde(default)]
+    pub credentials_truncated: bool,
+    #[serde(default)]
+    pub endpoints_truncated: bool,
+    #[serde(default)]
+    pub errors_truncated: bool,
+    #[serde(default = "default_dashboard_top_order_by")]
+    pub order_by: String,
+    #[serde(default = "default_dashboard_top_error_order_by")]
+    pub errors_order_by: String,
+}
+
+fn default_dashboard_top_order_by() -> String {
+    "estimated_cost_usd".to_string()
+}
+
+fn default_dashboard_top_error_order_by() -> String {
+    "error_requests".to_string()
+}
+
+impl UsageDashboardTop {
+    pub fn empty(window_key: impl Into<String>) -> Self {
+        Self {
+            window_key: window_key.into(),
+            models: Vec::new(),
+            credentials: Vec::new(),
+            endpoints: Vec::new(),
+            errors: Vec::new(),
+            models_total: 0,
+            credentials_total: 0,
+            endpoints_total: 0,
+            errors_total: 0,
+            models_truncated: false,
+            credentials_truncated: false,
+            endpoints_truncated: false,
+            errors_truncated: false,
+            order_by: default_dashboard_top_order_by(),
+            errors_order_by: default_dashboard_top_error_order_by(),
+        }
+    }
+}
+
+/// Window/lifetime usage aggregates for one local credential.
+///
+/// This is intentionally sourced from rollup tables only. It must not trigger
+/// token refreshes, account probes, or scheduler mutations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardCredentialAggregate {
+    pub credential_id: u64,
+    pub window_requests: usize,
+    pub window_error_requests: usize,
+    pub window_total_input_tokens: i64,
+    pub window_total_output_tokens: i64,
+    pub window_estimated_cost_usd: f64,
+    pub window_original_cost_usd: f64,
+    pub window_kiro_metering_usage: f64,
+    pub window_priced_requests: usize,
+    pub window_unpriced_requests: usize,
+    pub lifetime_requests: usize,
+    pub lifetime_error_requests: usize,
+    pub lifetime_total_input_tokens: i64,
+    pub lifetime_total_output_tokens: i64,
+    pub lifetime_estimated_cost_usd: f64,
+    pub lifetime_original_cost_usd: f64,
+    pub lifetime_kiro_metering_usage: f64,
+    pub lifetime_priced_requests: usize,
+    pub lifetime_unpriced_requests: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2771,6 +2851,42 @@ impl UsageRecorder {
             return Ok(UsageDashboardTopResponse { generated_at, top });
         }
         anyhow::bail!("usage dashboard top 需要 Redis 或 PgSQL 聚合存储")
+    }
+
+    /// Read all local-account usage aggregates through the bounded dashboard gate.
+    ///
+    /// This path is deliberately separate from the scheduler and account probes.
+    pub fn dashboard_credential_aggregates(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+        credential_ids: &[u64],
+    ) -> anyhow::Result<(
+        String,
+        String,
+        String,
+        Vec<crate::anthropic::usage::UsageDashboardCredentialAggregate>,
+    )> {
+        let Some(store) = &self.postgres_store else {
+            anyhow::bail!("usage dashboard accounts 需要 PgSQL 聚合存储");
+        };
+        let store = store.clone();
+        let timezone = timezone.map(str::to_string);
+        let window_key = window_key.to_string();
+        let credential_ids = credential_ids.to_vec();
+        self.dashboard_query(
+            "PgSQL usage dashboard accounts",
+            USAGE_DASHBOARD_ACCOUNTS_TIMEOUT_SECS,
+            async move {
+                store
+                    .dashboard_credential_aggregates_for_window(
+                        timezone.as_deref(),
+                        &window_key,
+                        &credential_ids,
+                    )
+                    .await
+            },
+        )
     }
 
     pub fn dashboard_breakdown(

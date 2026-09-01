@@ -261,6 +261,62 @@ export interface CredentialUsageSummaryResponse {
   fresh: boolean
 }
 
+export interface UsageDashboardAccountItem {
+  id: number
+  email?: string | null
+  label: string
+  authMethod?: string | null
+  provider?: string | null
+  endpoint: string
+  subscriptionTitle?: string | null
+  disabled: boolean
+  isCurrent: boolean
+  inFlightRequests: number
+  rateLimited: boolean
+  cooledDown: boolean
+  rpm: number
+  maxConcurrentRequests: number
+  creditLimit?: number | null
+  creditRemaining?: number | null
+  creditUsed?: number | null
+  accountInfoCheckedAt?: string | null
+  windowRequests: number
+  windowErrorRequests: number
+  windowTotalInputTokens: number
+  windowTotalOutputTokens: number
+  windowEstimatedCostUsd: number
+  windowOriginalCostUsd: number
+  windowKiroMeteringUsage: number
+  windowPricedRequests: number
+  windowUnpricedRequests: number
+  lifetimeRequests: number
+  lifetimeErrorRequests: number
+  lifetimeTotalInputTokens: number
+  lifetimeTotalOutputTokens: number
+  lifetimeEstimatedCostUsd: number
+  lifetimeOriginalCostUsd: number
+  lifetimeKiroMeteringUsage: number
+  lifetimePricedRequests: number
+  lifetimeUnpricedRequests: number
+}
+
+export interface UsageDashboardAccountsResponse {
+  generatedAt: string
+  timezone: string
+  windowKey: string
+  page: number
+  pageSize: number
+  total: number
+  filteredTotal: number
+  totalPages: number
+  configuredLocalAccounts: number
+  windowActiveLocalAccounts: number
+  windowIdleLocalAccounts: number
+  complete: boolean
+  reason?: string
+  items: UsageDashboardAccountItem[]
+}
+
 export interface BulkCredentialActionResponse {
   totalMatched: number
   totalAttempted: number
@@ -1243,6 +1299,16 @@ export interface UsageDashboardTop {
   credentials: UsageTopAggregate[]
   endpoints: UsageTopAggregate[]
   errors: UsageTopAggregate[]
+  modelsTotal: number
+  credentialsTotal: number
+  endpointsTotal: number
+  errorsTotal: number
+  modelsTruncated: boolean
+  credentialsTruncated: boolean
+  endpointsTruncated: boolean
+  errorsTruncated: boolean
+  orderBy: string
+  errorsOrderBy: string
 }
 
 export interface UsageTopAggregate {

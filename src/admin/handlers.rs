@@ -158,6 +158,19 @@ pub struct UsageDashboardWindowQueryParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageDashboardAccountsQueryParams {
+    pub timezone: Option<String>,
+    pub window_key: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+    pub q: Option<String>,
+    pub status: Option<String>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageExternalPoolRiskQueryParams {
     pub timezone: Option<String>,
     pub window_key: Option<String>,
@@ -1407,6 +1420,24 @@ pub async fn get_usage_dashboard_top(
         Ok(data) => Json(data).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/usage-dashboard/accounts
+/// 获取全量本地账号窗口统计与运行态快照（分页）。
+pub async fn get_usage_dashboard_accounts(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardAccountsQueryParams>,
+) -> impl IntoResponse {
+    Json(state.service.get_usage_dashboard_accounts(
+        params.timezone,
+        params.window_key,
+        params.page.unwrap_or(1),
+        params.page_size.unwrap_or(50),
+        params.q,
+        params.status,
+        params.sort_by,
+        params.sort_order,
+    ))
 }
 
 /// GET /api/admin/usage-dashboard/breakdown

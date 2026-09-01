@@ -1,0 +1,34 @@
+{
+  "baseUrl": "http://127.0.0.1:19023/",
+  "path": "/cc/v1/messages",
+  "scenario": "true",
+  "streamMode": true,
+  "conversationMode": "derived",
+  "durationMs": 10000,
+  "concurrency": 2,
+  "targetRpm": 120,
+  "sent": 13,
+  "completed": 13,
+  "ok": 0,
+  "failed": 13,
+  "statusCodes": {
+    "400": 11,
+    "502": 2
+  },
+  "errors": {},
+  "latencyMs": {
+    "p50": 836.66,
+    "p95": 4517.23,
+    "p99": 4517.23,
+    "max": 4517.23
+  },
+  "firstByteMs": {
+    "p50": 836.62,
+    "p95": 4517.16,
+    "p99": 4517.16
+  },
+  "duplicates": {
+    "responseDigests": 0,
+    "adjacentAssistantChunks": 0
+  }
+}

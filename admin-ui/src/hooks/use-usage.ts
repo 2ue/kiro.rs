@@ -9,6 +9,7 @@ import {
   getModelCapabilities,
   getModelPricing,
   getUsageDashboard,
+  getUsageDashboardAccounts,
   getUsageDashboardBreakdown,
   getUsageDashboardExternalPoolBilling,
   getUsageDashboardSeries,
@@ -105,6 +106,29 @@ export function useUsageDashboardTop(
   })
 }
 
+export function useUsageDashboardAccounts(
+  params: {
+    timezone?: string
+    windowKey?: string
+    page?: number
+    pageSize?: number
+    q?: string
+    status?: string
+    sortBy?: string
+    sortOrder?: 'asc' | 'desc'
+  } = {},
+  refetchInterval: RefetchInterval = false,
+  enabled = true
+) {
+  return useQuery({
+    queryKey: ['usage-dashboard-accounts', params],
+    queryFn: () => getUsageDashboardAccounts(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
 export function useUsageDashboardBreakdown(
   timezone = 'Asia/Shanghai',
   windowKey = 'today',
@@ -138,6 +162,7 @@ function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQuery
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-windows'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-series'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-top'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-dashboard-accounts'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-breakdown'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-external-pool-billing'] })
   queryClient.invalidateQueries({ queryKey: ['usage-writer-stats'] })

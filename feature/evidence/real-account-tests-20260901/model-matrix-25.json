@@ -1,0 +1,213 @@
+{
+  "generatedAt": "2026-09-01T10:40:40.529Z",
+  "models": [
+    "sonnet",
+    "claude-sonnet-4",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5-20250929"
+  ],
+  "total": 25,
+  "results": [
+    {
+      "model": "sonnet",
+      "n": 1,
+      "status": 400,
+      "ms": 1741,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01hy7G2TxGGUccLnpX4ag381\"},\"request_id\":\"req_014mZuSwLQA8bKoRZoLduQtL\"}"
+    },
+    {
+      "model": "sonnet",
+      "n": 2,
+      "status": 400,
+      "ms": 676,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01CKkEAQuuSr6B6KRLLzbj6Q\"},\"request_id\":\"req_01FPfJrSKHzSM7biGo9iDFqf\"}"
+    },
+    {
+      "model": "sonnet",
+      "n": 3,
+      "status": 400,
+      "ms": 661,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01tH6EHXV5baDugB69EWHCrq\"},\"request_id\":\"req_01yS2jxLAS68S417yfb1gsi5\"}"
+    },
+    {
+      "model": "sonnet",
+      "n": 4,
+      "status": 400,
+      "ms": 918,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01mcchUAxs45JoJNMFPm2S21\"},\"request_id\":\"req_01dCRzgXSLnHaRjaCwADEf2y\"}"
+    },
+    {
+      "model": "sonnet",
+      "n": 5,
+      "status": 400,
+      "ms": 2159,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01YPvERxvdwTVLt2onjk1GyE\"},\"request_id\":\"req_01tnD22J4d83TmV5pd8TBPsD\"}"
+    },
+    {
+      "model": "claude-sonnet-4",
+      "n": 1,
+      "status": 400,
+      "ms": 835,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01jyJf9C2Ng1Km9PZHMnY3Pm\"},\"request_id\":\"req_01PuLJdXYZfUoZPTTGmZwqng\"}"
+    },
+    {
+      "model": "claude-sonnet-4",
+      "n": 2,
+      "status": 400,
+      "ms": 711,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01Gs1JRayieS56Fcn5CkM8ka\"},\"request_id\":\"req_01X4tLCeNDGdDwEaPnSFY1W3\"}"
+    },
+    {
+      "model": "claude-sonnet-4",
+      "n": 3,
+      "status": 400,
+      "ms": 1011,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01mruCRucbe98R8W7wkvSDCn\"},\"request_id\":\"req_01JtkztDRA9a1ymfSui9pGvL\"}"
+    },
+    {
+      "model": "claude-sonnet-4",
+      "n": 4,
+      "status": 400,
+      "ms": 740,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01G2S7fytgTjEWzh9zSaSayj\"},\"request_id\":\"req_01v1Ew8qFwwNZ3ZT1At5YhDr\"}"
+    },
+    {
+      "model": "claude-sonnet-4",
+      "n": 5,
+      "status": 400,
+      "ms": 1994,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01imL2XunTo4dTSC1dUPj9tW\"},\"request_id\":\"req_016mBH6aHmnnBysjMnxuwiht\"}"
+    },
+    {
+      "model": "claude-sonnet-4.5",
+      "n": 1,
+      "status": 400,
+      "ms": 827,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_011jUaqhqc1e72dzxaZ4bkvZ\"},\"request_id\":\"req_011ehBapxANyq3fU5W8z7C85\"}"
+    },
+    {
+      "model": "claude-sonnet-4.5",
+      "n": 2,
+      "status": 400,
+      "ms": 777,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01YA9Y2EhPRiyovZxKDFaFQV\"},\"request_id\":\"req_01ndkQi4gZNeLaYavUhUytsa\"}"
+    },
+    {
+      "model": "claude-sonnet-4.5",
+      "n": 3,
+      "status": 400,
+      "ms": 1808,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01yADwgEQDZUvmfy1oHxLqSZ\"},\"request_id\":\"req_01p4oVEeYnEz1vjJ7rGR6Nu7\"}"
+    },
+    {
+      "model": "claude-sonnet-4.5",
+      "n": 4,
+      "status": 400,
+      "ms": 1673,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01cqbgdqh4RjNFwAMP68W54p\"},\"request_id\":\"req_01Cwcj3iRPwP2JpKyxmhtcEK\"}"
+    },
+    {
+      "model": "claude-sonnet-4.5",
+      "n": 5,
+      "status": 400,
+      "ms": 740,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_012ysSCysBqJHbMkdZaJdezr\"},\"request_id\":\"req_01JaSLJizzmMFZGeCuV6X8E4\"}"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "n": 1,
+      "status": 400,
+      "ms": 792,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01jwT1VL2FMT1qiUuTZgwDgn\"},\"request_id\":\"req_011ckeJS1r1Pnfq4zpM6GwAS\"}"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "n": 2,
+      "status": 400,
+      "ms": 961,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01eRCbwcZL6d7NBA55dd9UM7\"},\"request_id\":\"req_01MXeEezJZKW7a7LxyTQW5d5\"}"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "n": 3,
+      "status": 400,
+      "ms": 630,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01fs3CYYnYZt1LDVpnFkKyVf\"},\"request_id\":\"req_01tb67SmPCCanJA2LSTCqH44\"}"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "n": 4,
+      "status": 400,
+      "ms": 845,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01xPLfTnLeeK5iSnjfrBmKCM\"},\"request_id\":\"req_01wBoHbzs2Yx7eY6pXGEEXQh\"}"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "n": 5,
+      "status": 400,
+      "ms": 841,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01znijuaUfpbtQkUiSrA3Pvn\"},\"request_id\":\"req_01nSaU1i1HfwMvYN1fHaPDJN\"}"
+    },
+    {
+      "model": "claude-sonnet-4-5-20250929",
+      "n": 1,
+      "status": 400,
+      "ms": 797,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01Tf5RSnt41KAxR4mdZs89bj\"},\"request_id\":\"req_016BCu1YHnMjTn9GGmDtWw3D\"}"
+    },
+    {
+      "model": "claude-sonnet-4-5-20250929",
+      "n": 2,
+      "status": 400,
+      "ms": 752,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01hWfLhd8oiaFydubD2qpPrS\"},\"request_id\":\"req_018NKKbnRbmjtNDva4HfsE3s\"}"
+    },
+    {
+      "model": "claude-sonnet-4-5-20250929",
+      "n": 3,
+      "status": 400,
+      "ms": 2170,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01x1iknk3BNtPn26xD7UDvsh\"},\"request_id\":\"req_01ubB9V1qGKiGiuDVU2aWY4h\"}"
+    },
+    {
+      "model": "claude-sonnet-4-5-20250929",
+      "n": 4,
+      "status": 400,
+      "ms": 3069,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01v72B1iJKH7K6qJcCoCtH6m\"},\"request_id\":\"req_01qAHtUAoLQmcFopZjDFzAVr\"}"
+    },
+    {
+      "model": "claude-sonnet-4-5-20250929",
+      "n": 5,
+      "status": 400,
+      "ms": 1758,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01QkNkFLiqhFH4uDjfCqi4vQ\"},\"request_id\":\"req_016ugA43m1oWs3WTcn1yPbtL\"}"
+    }
+  ]
+}

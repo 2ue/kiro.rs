@@ -36,5 +36,6 @@ Greenfield work must preserve the compatibility and dispatch semantics above unl
 3. [Prompt logic retry](topics/prompt-logic-retry.md)
 4. [Config and capability information architecture](topics/config-capability-information-architecture.md)
 5. [Regression plan](topics/regression-plan.md)
-6. [Roadmap](roadmap.md)
-7. [Historical implementation snapshot](history/implementation-snapshot-2026-07-07.md)
+6. [Dashboard 运营统计设计](topics/dashboard-statistics-design.md)
+7. [Roadmap](roadmap.md)
+8. [Historical implementation snapshot](history/implementation-snapshot-2026-07-07.md)

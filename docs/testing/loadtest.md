@@ -49,13 +49,18 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
   --report "$KIRO_VALIDATION_ARTIFACT_DIR/reports/smoke.json"
 ```
 
-## 测本地代理
+## 测试本项目固定实例
 
-只使用隔离测试代理，例如 `19022`。`9022` 是受保护的现有服务端口，验证脚本和本说明均禁止将负载发送到该端口。
+本项目固定使用 `127.0.0.1:19023` 和
+`tmp/thinking-budget-local/config.json` 指定的单一长期测试实例。所有
+load/chaos case 在这个已经启动的实例上顺序或分阶段执行，不为每个 case
+新建 `kiro.rs` 服务。完整边界和例外条件见
+`docs/testing/project-test-instance.md`。禁止把负载发送到其他项目的服务
+端口（例如本机 `9022` 的 `account-runtime`）。
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
   --requests 100 \
@@ -69,7 +74,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
   --requests 30 \
@@ -90,7 +95,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
   --requests 30 \
@@ -107,7 +112,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --dfcache-route /dfcache/cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
@@ -120,7 +125,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --dfcache-route /dfcache/not-configured/v1/messages \
   --requests 5 \
   --concurrency 1 \
@@ -217,9 +222,9 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ## Payload 热点专项 case
 
-这些 case 用于压 payload guard、converter、usage 诊断和 prompt-cache 模拟路径，不用于证明上游模型能力。建议只打隔离代理端口，例如 `19022`，不要打日常 `9022`。
+这些 case 用于压 payload guard、converter、usage 诊断和 prompt-cache 模拟路径，不用于证明上游模型能力。应发送到本项目固定测试实例，不要发送到其他项目的日常服务。
 
-如果需要让压测工具同时启动 fake upstream，在命令里加 `--fake-listen 127.0.0.1:19080`，并确保隔离代理的上游配置指向这个地址；否则先用上面的 `--fake-only true` 单独启动 fake upstream。
+如果需要让压测工具同时启动 fake upstream，在命令里加 `--fake-listen 127.0.0.1:19080`，并确保本项目固定实例的上游配置指向这个地址；否则先用上面的 `--fake-only true` 单独启动 fake upstream。
 
 可用 `--payload-case`：
 
@@ -233,7 +238,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --auth-key admin123 \
   --requests 200 \
@@ -250,7 +255,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --auth-key admin123 \
   --requests 200 \
@@ -269,7 +274,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --auth-key admin123 \
   --requests 200 \
@@ -285,7 +290,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --auth-key admin123 \
   --requests 200 \
@@ -303,7 +308,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 
 ```bash
 "$KIRO_LOADTEST_BINARY" \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --auth-key admin123 \
   --requests 100000 \
@@ -337,7 +342,7 @@ shasum -a 256 "$KIRO_LOADTEST_BINARY"
 KIRO_LOADTEST_ALLOW_REAL_UPSTREAM=1 \
 "$KIRO_LOADTEST_BINARY" \
   --real-upstream true \
-  --base-url http://127.0.0.1:19022 \
+  --base-url http://127.0.0.1:19023 \
   --route /cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
@@ -367,7 +372,7 @@ KIRO_LOADTEST_ALLOW_REAL_UPSTREAM=1 \
 ## 大并发建议
 
 - 先用 fake server 做 100 并发验证工具本身。
-- 再用本地隔离代理从 `concurrency=5` 开始。
+- 再用本项目固定测试实例从 `concurrency=5` 开始。
 - 如果 `ttfbMs.p95` 随并发明显升高，优先降低单账号并发或缩短 dispatch wait。
 - 如果错误主要是 429，检查单账号 RPM、全局并发和排队长度。
 - 如果 `memory.peak` 持续上涨且结束后不回落，需要进一步查 stream 是否释放资源。

@@ -40,7 +40,8 @@ use super::types::{
     UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
     UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
     UsageCleanupRequest, UsageCleanupResumeRequest, UsageCleanupStatusResponse,
-    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+    UsageDashboardAccountItem, UsageDashboardAccountsResponse, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
     inference_attempt_budget::{
@@ -56,9 +57,9 @@ use crate::anthropic::{
     prompt_cache_creation_control::PromptCacheCreationController,
     request_admission::RequestAdmissionController,
     usage::{
-        UsageDashboardResponse, UsageExternalPoolRiskCostConfig, UsageExternalPoolRiskQuery,
-        UsageExternalPoolRiskResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
-        UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
+        UsageDashboardCredentialAggregate, UsageDashboardResponse, UsageExternalPoolRiskCostConfig,
+        UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageRecordQuery, UsageRecorder,
+        UsageRecorderStats, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
@@ -3824,6 +3825,231 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_usage_dashboard_accounts(
+        &self,
+        timezone: Option<String>,
+        window_key: Option<String>,
+        page: usize,
+        page_size: usize,
+        q: Option<String>,
+        status: Option<String>,
+        sort_by: Option<String>,
+        sort_order: Option<String>,
+    ) -> UsageDashboardAccountsResponse {
+        let page = page.max(1);
+        let page_size = if page_size == 0 {
+            50
+        } else {
+            page_size.clamp(20, 200)
+        };
+        let requested_window = window_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("today");
+        let (_, _, _, _, _, _, _, credentials) =
+            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
+        let credential_ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
+        let (generated_at, resolved_timezone, resolved_window_key, aggregates, complete, reason) =
+            match self.usage_recorder.dashboard_credential_aggregates(
+                timezone.as_deref(),
+                requested_window,
+                &credential_ids,
+            ) {
+                Ok((generated_at, timezone, window_key, aggregates)) => {
+                    (generated_at, timezone, window_key, aggregates, true, None)
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "读取 dashboard 全量账号统计失败");
+                    (
+                        Utc::now().to_rfc3339(),
+                        crate::anthropic::usage::usage_dashboard_timezone(timezone.as_deref()).0,
+                        requested_window.to_string(),
+                        Vec::new(),
+                        false,
+                        Some(err.to_string()),
+                    )
+                }
+            };
+
+        let aggregate_by_id: HashMap<u64, UsageDashboardCredentialAggregate> = aggregates
+            .into_iter()
+            .map(|aggregate| (aggregate.credential_id, aggregate))
+            .collect();
+
+        // Account info is a persisted snapshot. Loading it is read-only and
+        // must never trigger a token refresh or an upstream usage probe.
+        let account_info = match block_on_admin_store({
+            let store = self.postgres_store.clone();
+            async move { store.load_credential_account_info().await }
+        }) {
+            Ok(info) => info,
+            Err(err) => {
+                tracing::warn!("加载 dashboard 账号积分快照失败: {}", err);
+                HashMap::new()
+            }
+        };
+
+        let configured_local_accounts = credentials.len();
+        let window_active_local_accounts = credentials
+            .iter()
+            .filter(|credential| {
+                aggregate_by_id
+                    .get(&credential.id)
+                    .is_some_and(|usage| usage.window_requests > 0)
+            })
+            .count();
+        let window_idle_local_accounts =
+            configured_local_accounts.saturating_sub(window_active_local_accounts);
+
+        let q = q
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
+        let status = status
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "all")
+            .map(str::to_lowercase);
+
+        let mut items: Vec<UsageDashboardAccountItem> = credentials
+            .iter()
+            .filter(|credential| {
+                let status_matches = match status.as_deref() {
+                    Some("enabled") => !credential.disabled,
+                    Some("disabled") => credential.disabled,
+                    Some("active") => aggregate_by_id
+                        .get(&credential.id)
+                        .is_some_and(|usage| usage.window_requests > 0),
+                    Some("idle") => aggregate_by_id
+                        .get(&credential.id)
+                        .is_none_or(|usage| usage.window_requests == 0),
+                    _ => true,
+                };
+                if !status_matches {
+                    return false;
+                }
+                q.as_deref().is_none_or(|query| {
+                    let haystack = format!(
+                        "{} {} {} {}",
+                        credential.id,
+                        credential.email.as_deref().unwrap_or_default(),
+                        credential.subscription_title.as_deref().unwrap_or_default(),
+                        credential.endpoint
+                    )
+                    .to_lowercase();
+                    haystack.contains(query)
+                })
+            })
+            .map(|credential| {
+                let usage = aggregate_by_id
+                    .get(&credential.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let info = account_info.get(&credential.id).map(account_info_from_row);
+                UsageDashboardAccountItem {
+                    id: credential.id,
+                    email: credential.email.clone(),
+                    label: credential
+                        .email
+                        .clone()
+                        .unwrap_or_else(|| format!("账号 #{}", credential.id)),
+                    auth_method: credential.auth_method.clone(),
+                    provider: credential.provider.clone(),
+                    endpoint: credential.endpoint.clone(),
+                    subscription_title: credential.subscription_title.clone(),
+                    disabled: credential.disabled,
+                    is_current: credential.is_current,
+                    in_flight_requests: credential.in_flight_requests,
+                    rate_limited: credential.rate_limited,
+                    cooled_down: credential.cooled_down,
+                    rpm: credential.rpm,
+                    max_concurrent_requests: credential.max_concurrent_requests,
+                    credit_limit: info.as_ref().map(|value| value.credit_limit),
+                    credit_remaining: info.as_ref().map(|value| value.credit_remaining),
+                    credit_used: info
+                        .as_ref()
+                        .map(|value| (value.credit_limit - value.credit_remaining).max(0.0)),
+                    account_info_checked_at: info.as_ref().map(|value| value.checked_at.clone()),
+                    window_requests: usage.window_requests,
+                    window_error_requests: usage.window_error_requests,
+                    window_total_input_tokens: usage.window_total_input_tokens,
+                    window_total_output_tokens: usage.window_total_output_tokens,
+                    window_estimated_cost_usd: usage.window_estimated_cost_usd,
+                    window_original_cost_usd: usage.window_original_cost_usd,
+                    window_kiro_metering_usage: usage.window_kiro_metering_usage,
+                    window_priced_requests: usage.window_priced_requests,
+                    window_unpriced_requests: usage.window_unpriced_requests,
+                    lifetime_requests: usage.lifetime_requests,
+                    lifetime_error_requests: usage.lifetime_error_requests,
+                    lifetime_total_input_tokens: usage.lifetime_total_input_tokens,
+                    lifetime_total_output_tokens: usage.lifetime_total_output_tokens,
+                    lifetime_estimated_cost_usd: usage.lifetime_estimated_cost_usd,
+                    lifetime_original_cost_usd: usage.lifetime_original_cost_usd,
+                    lifetime_kiro_metering_usage: usage.lifetime_kiro_metering_usage,
+                    lifetime_priced_requests: usage.lifetime_priced_requests,
+                    lifetime_unpriced_requests: usage.lifetime_unpriced_requests,
+                }
+            })
+            .collect();
+
+        let sort_by = sort_by
+            .as_deref()
+            .unwrap_or("window_requests")
+            .trim()
+            .to_ascii_lowercase();
+        let descending = !matches!(
+            sort_order.as_deref().map(str::trim),
+            Some("asc") | Some("ascending")
+        );
+        items.sort_by(|a, b| {
+            let ordering = match sort_by.as_str() {
+                "id" => a.id.cmp(&b.id),
+                "window_error_requests" | "errors" => {
+                    a.window_error_requests.cmp(&b.window_error_requests)
+                }
+                "window_estimated_cost_usd" | "cost" => a
+                    .window_estimated_cost_usd
+                    .total_cmp(&b.window_estimated_cost_usd),
+                "lifetime_requests" => a.lifetime_requests.cmp(&b.lifetime_requests),
+                "lifetime_estimated_cost_usd" => a
+                    .lifetime_estimated_cost_usd
+                    .total_cmp(&b.lifetime_estimated_cost_usd),
+                _ => a.window_requests.cmp(&b.window_requests),
+            };
+            let ordering = if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            ordering.then_with(|| a.id.cmp(&b.id))
+        });
+
+        let filtered_total = items.len();
+        let total_pages = total_pages(filtered_total, page_size);
+        let start = page.saturating_sub(1).saturating_mul(page_size);
+        let items = items.into_iter().skip(start).take(page_size).collect();
+
+        UsageDashboardAccountsResponse {
+            generated_at,
+            timezone: resolved_timezone,
+            window_key: resolved_window_key,
+            page,
+            page_size,
+            total: configured_local_accounts,
+            filtered_total,
+            total_pages,
+            configured_local_accounts,
+            window_active_local_accounts,
+            window_idle_local_accounts,
+            complete,
+            reason,
+            items,
+        }
+    }
+
     pub fn get_usage_dashboard_breakdown(
         &self,
         timezone: Option<String>,
@@ -7378,6 +7604,7 @@ fn spawn_usage_cleanup_lease_heartbeat(
     UsageCleanupLeaseHeartbeat { task }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_usage_cleanup_job(
     job_id: String,
     store: PostgresUsageStore,

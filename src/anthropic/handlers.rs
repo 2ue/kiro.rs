@@ -69,9 +69,13 @@ use super::prompt_cache::{
 use super::request_admission::{RequestRejectionAttribution, RequestRejectionReason};
 use super::request_body::MessagesBody;
 #[cfg(test)]
-use super::request_facts::MAX_MESSAGES_JSON_NESTING_DEPTH;
 use super::request_facts::{
-    RawMessagesBodyProbe, deserialize_messages_request_with_probe, probe_raw_messages_body,
+    MAX_MESSAGES_JSON_NESTING_DEPTH, normalize_raw_reasoning_protocol_with_probe,
+    validate_raw_reasoning_protocol,
+};
+use super::request_facts::{
+    RawMessagesBodyProbe, deserialize_messages_request_with_probe,
+    normalize_raw_reasoning_protocol_with_probe_and_limit, probe_raw_messages_body,
     rewrite_raw_missing_top_level_max_tokens_with_probe,
     validate_raw_reasoning_protocol_with_probe,
 };

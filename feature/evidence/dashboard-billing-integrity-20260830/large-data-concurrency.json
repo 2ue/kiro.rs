@@ -1,0 +1,16 @@
+{
+  "capturedAt": "2026-08-30",
+  "environment": "local-isolated",
+  "endpoint": "/api/admin/usage-dashboard/accounts",
+  "concurrentRequests": 20,
+  "pageSize": 50,
+  "allHttp200": true,
+  "allComplete": true,
+  "totalAccountsSeen": 5000,
+  "returnedItemsPerPage": 50,
+  "healthStatus": 200,
+  "totalElapsedMs": 615,
+  "p50Ms": 362,
+  "p95Ms": 591,
+  "maxMs": 610
+}

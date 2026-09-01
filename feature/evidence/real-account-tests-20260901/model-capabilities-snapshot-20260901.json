@@ -1,0 +1,17 @@
+{
+  "available": true,
+  "source": "kiro-list-available-models",
+  "modelCount": 9,
+  "lastError": "native reasoning capability discovery is incomplete (2/6 cohorts observed)",
+  "models": [
+    "auto",
+    "claude-haiku-4.5",
+    "claude-sonnet-4",
+    "claude-sonnet-4.5",
+    "deepseek-3.2",
+    "glm-5",
+    "minimax-m2.1",
+    "minimax-m2.5",
+    "qwen3-coder-next"
+  ]
+}

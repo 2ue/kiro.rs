@@ -1,0 +1,211 @@
+{
+  "base": "http://127.0.0.1:19023/cc/v1/messages",
+  "generatedAt": "2026-09-01T10:36:33.577Z",
+  "total": 20,
+  "concurrency": 2,
+  "results": [
+    {
+      "seq": 0,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 819,
+      "totalMs": 819,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01pc5ofXfqEJZJMbVxDm9u6m\"},\"request_id\":\"req_01whQHczrpDPT2CHBYxX29Ah\"}"
+    },
+    {
+      "seq": 1,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 674,
+      "totalMs": 674,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01QTnKaM6v5Bon9XW195nrL7\"},\"request_id\":\"req_01kKttVHiZDyhBg6nzqrKTfV\"}"
+    },
+    {
+      "seq": 2,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 578,
+      "totalMs": 578,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01CVy4Yvx46bWLSVDSkg7mMD\"},\"request_id\":\"req_012QKFiXuZ189Ens3giYG17K\"}"
+    },
+    {
+      "seq": 3,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 763,
+      "totalMs": 764,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_018XmMyZbZvMoX5VCUyFYZ6x\"},\"request_id\":\"req_01rUBaJA9W2M3ULwUZTKJwGj\"}"
+    },
+    {
+      "seq": 4,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 1484,
+      "totalMs": 1484,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01KhS4Dh9Dttq2nspn37bMxg\"},\"request_id\":\"req_01MZwUZq2jhtYejDWAU9pMGh\"}"
+    },
+    {
+      "seq": 5,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 816,
+      "totalMs": 816,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01rrM1TGrwPNQZsdtEokpSeU\"},\"request_id\":\"req_01RzBTYn1ajCDsG4edUGKn3G\"}"
+    },
+    {
+      "seq": 6,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 651,
+      "totalMs": 651,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01Vk3KmXc1rkpPyFu1DBPKKE\"},\"request_id\":\"req_01xE4dmK1QqzDD8zMEFCkaQP\"}"
+    },
+    {
+      "seq": 7,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 798,
+      "totalMs": 798,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01eYqrJSHHLMA8XWgpW9pecg\"},\"request_id\":\"req_01YLSs6XiSJRMi9DPddHsbAK\"}"
+    },
+    {
+      "seq": 8,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 852,
+      "totalMs": 852,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01aTNfSp5qHX4bq6xfHE12gi\"},\"request_id\":\"req_017A9GPiRVbpbVM1axnbCMG6\"}"
+    },
+    {
+      "seq": 9,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 498,
+      "totalMs": 499,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_011X4hY2Qfb4eiNDqFM7VTn3\"},\"request_id\":\"req_01JUhNzVVSahTT2PwJpwyujf\"}"
+    },
+    {
+      "seq": 10,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 573,
+      "totalMs": 573,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_016qz7g9yVL6VGYfNHL76rHB\"},\"request_id\":\"req_01wcj3bfAAEhjyNnRw1rBep3\"}"
+    },
+    {
+      "seq": 11,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 1964,
+      "totalMs": 1964,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01Dx5ifnktH8yq2yGvBDcSr9\"},\"request_id\":\"req_015PuHeBKJYVBCruzsBg1Hp5\"}"
+    },
+    {
+      "seq": 12,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 726,
+      "totalMs": 726,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01DWxMDtCyn2eFGUdg3juPXa\"},\"request_id\":\"req_01AjjMi9aAUhhEKGoDWFmxYs\"}"
+    },
+    {
+      "seq": 13,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 535,
+      "totalMs": 535,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01VbgY1bsez8mRg1VShK6LJJ\"},\"request_id\":\"req_01n8Dfk4PvEGtouTJvDcLxor\"}"
+    },
+    {
+      "seq": 14,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 743,
+      "totalMs": 743,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01S1Tx3TwxH2N37dVL6CQ688\"},\"request_id\":\"req_01ra4xfiALycu7SyBmxJoqdx\"}"
+    },
+    {
+      "seq": 15,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 3461,
+      "totalMs": 3461,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01bW7MqwvH6g4sFekheaCn6f\"},\"request_id\":\"req_013YfjhYU7qe7FtPBmrGt2ZN\"}"
+    },
+    {
+      "seq": 16,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 3138,
+      "totalMs": 3138,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01jxk6P2KbXnpjLf4pEtNM2J\"},\"request_id\":\"req_01Xoji1aeekwGRxqKr6n7qSf\"}"
+    },
+    {
+      "seq": 17,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 3620,
+      "totalMs": 3620,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01aXg9BxY8SVvzKG4845e34x\"},\"request_id\":\"req_018RV6MYs7G7p14NQPwgXEb3\"}"
+    },
+    {
+      "seq": 18,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 18186,
+      "totalMs": 18186,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_01tzR2aBvKm61NnUxPNQUw4t\"},\"request_id\":\"req_01yBVET3HrW5i1rV3VKkGSAR\"}"
+    },
+    {
+      "seq": 19,
+      "status": 400,
+      "contentType": "application/json",
+      "requestId": null,
+      "firstByteMs": 2586,
+      "totalMs": 2586,
+      "bytes": 302,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The request body is invalid. Simplify the message, tools, tool results, files, or images and retry. If this continues, contact the administrator with error ID: req_013JN6VXYx192TaYbsjwgegX\"},\"request_id\":\"req_01asX4HUo5muZGpWqyNNmSGr\"}"
+    }
+  ],
+  "statuses": {
+    "400": 20
+  }
+}

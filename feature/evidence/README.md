@@ -26,6 +26,9 @@ deep-audit 的脚本、汇总和部分 report 存在，但真实 Claude CLI/dire
 
 ## 当前专项证据
 
+- [2026-09-01 真实本地账号模型 400 与 thinking 规范化](real-account-model-invalid-400-20260901.md)：唯一 `127.0.0.1:19023` 测试实例加载 220 条真实凭据；修复前逐请求 baseline 20/20 为 400，模型矩阵 25/25 为 400。修复后 equality、bounded expansion、adaptive cleanup、disabled cleanup 四个真实本地账号用例均为 HTTP 200，usage 记录显示 `requestedMaxTokens=4097` 的有界扩展。该证据确认入口格式修复有效，并明确历史统一 400 不能全部归因于单一字段；本轮外部池数量为 0。
+- [2026-09-02 raw 顶层 `max_tokens` 类型和范围校验](raw-max-tokens-invalid-400-20260902.md)：当前候选 release 二进制运行于唯一长期测试实例 `127.0.0.1:19023`（PID `81106`，SHA-256 `d7764aea6ea97abe55decfd182732db771f719fe51f60462488f1c5fb543b623`）。`null`、浮点数、0、负数和 `2147483648` 五类请求均首次返回明确 HTTP 400；未进入上游、重试、换号或 external pool。源码聚焦测试 `9/9`，静态门禁通过；状态为 `fixed / local-runtime-verified / not-committed / not-released`，不能据此宣称 `v0.0.158` 或生产已包含修复。
+
 - [2026-08-05 external-pool HA scheduler validation](external-pool-ha-scheduler-validation-20260805.md)：确认并修复本进程自发 Redis
   外部池变更事件清空本地权威快照的根因；最终候选完成 3 轮真实 HTTP 多池故障接管/恢复、
   256 并发、1800 RPM/60 秒持续到达率、外部直连边界、隔离 PgSQL/Redis 回归、全量 Rust
@@ -91,6 +94,7 @@ deep-audit 的脚本、汇总和部分 report 存在，但真实 Claude CLI/dire
 - [Strict local-first 与 scheduler chaos](strict-local-first-and-scheduler-chaos-20260716.md)：七种 local/external 状态、真实 CapacityFull holder、Toxiproxy 150 ms Redis degraded 红绿、恢复与 startup auxiliary 4-hit 上限；记录了 degraded 状态仍带 dispatchable 时错误压制 fallback 的实质缺陷及修复，同时保留 1.5-2.0 秒异常路径延迟为未关闭性能项。
 - [Usage cleanup storage integration](usage-cleanup-storage-integration-20260716.md)：隔离 PostgreSQL/Redis 的持久任务、watermark、soft/hard rollup 一致性、legacy cost、duration、高基数零行清理、Redis guarded commit、fallback 性能与 scheduler burst；同时记录 same-ID soft-tombstone 合同漂移、hard-delete 后防重边界、in-flight PostgreSQL commit transaction guard 及待重跑状态。
 - [Usage Dashboard P95 与时间窗语义](usage-dashboard-p95-window-semantics-20260716.md)：静态红证据确认两存储都把 duration maximum 冒充 P95，并确认滚动窗口的 Redis/PgSQL 下边界人口不同；给出 weighted nearest-rank SQL、精确首尾小时方案、1..100/重权/跨 hour/cleanup 矩阵及索引/query-plan 门禁，Rust 修复与共享 build 动态证据待补。
+- [Dashboard 费用、积分与外部池计费口径验证](dashboard-billing-integrity-20260830.md)：记录窗口/累计原始计费与估算成本的字段映射、请求级 Kiro 积分和余额快照的边界、外部池独立明细接口，以及在 5,000 个本地账号和外部池 `current_path_policy` 隔离样本上的真实接口结果、差额百分比与原始/整形倍率。
 - [Redis scheduler fallback v5 聚焦证据](redis-scheduler-fallback-v5-20260716.md)：配置兼容迁移、分类、有限等待和两套 UI 构建已通过；真实 PgSQL/Redis fault injection 与双实例 chaos 仍待执行。
 - [Evidence skill 本地验证](evidence-skill-local-validation-20260716.md)：零依赖结构校验与假 secret 打包 3 轮确定性验证通过；记录了首次 Authorization 漏项及修复后的 archive 扫描结果。
 - [Payload 图片 decoded-byte 边界](payload-image-decoded-boundary-20260716.md)：记录修复前编码长度误判、修复后 `5 MiB-1/= /+1`、data URL、Kiro/Anthropic 和单一占位聚焦结果；真实格式、CLI 和性能仍待验证。

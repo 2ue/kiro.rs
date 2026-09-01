@@ -721,6 +721,7 @@ async fn main() {
         tracing::info!("  GET  /api/admin/usage-records-paged");
         tracing::info!("  GET  /api/admin/usage-summary");
         tracing::info!("  GET  /api/admin/usage-dashboard");
+        tracing::info!("  GET  /api/admin/usage-dashboard/accounts");
         tracing::info!("  GET  /api/admin/model-pricing");
         tracing::info!("  POST /api/admin/model-pricing/sync");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");

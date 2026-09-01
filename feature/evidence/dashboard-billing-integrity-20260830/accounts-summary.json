@@ -1,0 +1,24 @@
+{
+  "capturedAt": "2026-08-30T03:19:46.389573+00:00",
+  "environment": "local-isolated",
+  "endpoint": "/api/admin/usage-dashboard/accounts?windowKey=today&page=1&pageSize=100",
+  "page": 1,
+  "pageSize": 20,
+  "total": 5000,
+  "filteredTotal": 5000,
+  "totalPages": 250,
+  "configuredLocalAccounts": 5000,
+  "windowActiveLocalAccounts": 67,
+  "windowIdleLocalAccounts": 4933,
+  "complete": true,
+  "sampleItem": {
+    "id": 21,
+    "windowRequests": 3,
+    "windowErrorRequests": 2,
+    "windowKiroMeteringUsage": 0.3,
+    "windowEstimatedCostUsd": 0,
+    "windowOriginalCostUsd": 0,
+    "lifetimeEstimatedCostUsd": 0.21,
+    "lifetimeOriginalCostUsd": 0.42
+  }
+}

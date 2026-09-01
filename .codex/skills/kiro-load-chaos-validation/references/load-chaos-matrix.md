@@ -61,7 +61,15 @@ Pass criteria:
 
 ## L4 Restart And Failure Chaos
 
-Only use temp service unless explicitly approved.
+Run restart and failure cases against the repository's designated
+project-owned validation instance from `docs/testing/project-test-instance.md`.
+Reuse that single `kiro.rs` process for the whole validation run. A temporary
+`kiro.rs` process is permitted only when the case would irreversibly corrupt
+the shared validation PostgreSQL/Redis/credential state and the same behavior
+cannot be proven with ordered cases, bounded concurrency, unique run IDs, or
+cleanup. The evidence report must record the exception, exact resources,
+lifetime, and cleanup result. A temporary fake upstream or proxy does not
+count as a second `kiro.rs` instance.
 
 Cases:
 
@@ -94,4 +102,3 @@ Track:
 - queueing symptoms.
 
 The run fails if RSS or FD remains elevated after idle cooldown, or if p95 latency worsens without a matching upstream/fake-server delay.
-

@@ -1,0 +1,132 @@
+{
+  "page": 1,
+  "limit": 50,
+  "hasNext": false,
+  "total": 4,
+  "records": [
+    {
+      "requestId": "req_01T3GSJ7QSdminRhucuw2Wwq",
+      "endpoint": "/cc/v1/messages",
+      "model": "claude-sonnet-4.5",
+      "upstreamModel": "claude-sonnet-4.5",
+      "modelResolutionSource": "exact_upstream",
+      "credentialId": 76,
+      "status": "success",
+      "stream": false,
+      "errorType": null,
+      "errorMessage": null,
+      "requestedMaxTokens": 2048,
+      "routeKind": "local_credential",
+      "routeSubtype": "local_success",
+      "localAttempted": true,
+      "inferenceAttempts": {
+        "maxAttempts": 4,
+        "consumed": 1,
+        "localAttempts": 1,
+        "externalAttempts": 0,
+        "exhausted": false
+      },
+      "auxiliaryAttempts": {
+        "maxAttempts": 2,
+        "consumed": 0,
+        "tokenRefreshAttempts": 0,
+        "profileDiscoveryAttempts": 0,
+        "exhausted": false
+      },
+      "createdAt": "2026-09-01T14:52:21.355793+00:00"
+    },
+    {
+      "requestId": "req_017v77er7imeefWMMZ9PpZXB",
+      "endpoint": "/cc/v1/messages",
+      "model": "claude-sonnet-4.5",
+      "upstreamModel": "claude-sonnet-4.5",
+      "modelResolutionSource": "exact_upstream",
+      "credentialId": 76,
+      "status": "success",
+      "stream": false,
+      "errorType": null,
+      "errorMessage": null,
+      "requestedMaxTokens": 2048,
+      "routeKind": "local_credential",
+      "routeSubtype": "local_success",
+      "localAttempted": true,
+      "inferenceAttempts": {
+        "maxAttempts": 4,
+        "consumed": 1,
+        "localAttempts": 1,
+        "externalAttempts": 0,
+        "exhausted": false
+      },
+      "auxiliaryAttempts": {
+        "maxAttempts": 2,
+        "consumed": 0,
+        "tokenRefreshAttempts": 0,
+        "profileDiscoveryAttempts": 0,
+        "exhausted": false
+      },
+      "createdAt": "2026-09-01T14:52:19.659382+00:00"
+    },
+    {
+      "requestId": "req_01G2NsMnuJEJFMxq4jm2K3Ej",
+      "endpoint": "/cc/v1/messages",
+      "model": "claude-sonnet-4.5",
+      "upstreamModel": "claude-sonnet-4.5",
+      "modelResolutionSource": "exact_upstream",
+      "credentialId": 76,
+      "status": "success",
+      "stream": false,
+      "errorType": null,
+      "errorMessage": null,
+      "requestedMaxTokens": 4097,
+      "routeKind": "local_credential",
+      "routeSubtype": "local_success",
+      "localAttempted": true,
+      "inferenceAttempts": {
+        "maxAttempts": 4,
+        "consumed": 1,
+        "localAttempts": 1,
+        "externalAttempts": 0,
+        "exhausted": false
+      },
+      "auxiliaryAttempts": {
+        "maxAttempts": 2,
+        "consumed": 0,
+        "tokenRefreshAttempts": 0,
+        "profileDiscoveryAttempts": 0,
+        "exhausted": false
+      },
+      "createdAt": "2026-09-01T14:52:17.865168+00:00"
+    },
+    {
+      "requestId": "req_019puMQjxhPthcgnq9PEcXeL",
+      "endpoint": "/cc/v1/messages",
+      "model": "claude-sonnet-4.5",
+      "upstreamModel": "claude-sonnet-4.5",
+      "modelResolutionSource": "exact_upstream",
+      "credentialId": 76,
+      "status": "success",
+      "stream": false,
+      "errorType": null,
+      "errorMessage": null,
+      "requestedMaxTokens": 2048,
+      "routeKind": "local_credential",
+      "routeSubtype": "local_success",
+      "localAttempted": true,
+      "inferenceAttempts": {
+        "maxAttempts": 4,
+        "consumed": 1,
+        "localAttempts": 1,
+        "externalAttempts": 0,
+        "exhausted": false
+      },
+      "auxiliaryAttempts": {
+        "maxAttempts": 2,
+        "consumed": 1,
+        "tokenRefreshAttempts": 1,
+        "profileDiscoveryAttempts": 0,
+        "exhausted": false
+      },
+      "createdAt": "2026-09-01T14:52:13.359650+00:00"
+    }
+  ]
+}

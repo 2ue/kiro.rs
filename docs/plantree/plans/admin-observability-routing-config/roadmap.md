@@ -22,6 +22,8 @@
 - Added opt-in runtime config for selected prompt/protocol 400 retry classes with an untried credential and bounded max attempts.
 - Improved external pool form grouping so dispatch eligibility, body processing, model processing, usage projection, and error handling are visually separate.
 - Completed local regression: Rust tests, frontend builds, and fake upstream smoke/chaos.
+- Added `/api/admin/usage-dashboard/accounts` as a bounded, read-only, rollup-first full-account aggregate with zero-fill, coverage metadata, pagination, and explicit degraded status.
+- Updated both `ui` and `admin-ui` account statistics views to use the full-account paginated aggregate instead of Top 10 plus per-account usage requests.
 
 ## In Progress
 
@@ -31,6 +33,7 @@
 
 - Optional low-volume real upstream smoke for model sync and supported-model dispatch, only when explicitly requested.
 - Optional UI follow-up: add a dedicated request-id field or explanatory placeholder in usage search.
+- Dashboard follow-up: run an isolated PostgreSQL dataset regression with 20+ accounts, zero-usage accounts, partial-hour boundaries, and timeout/degradation injection; design and implementation are documented in [Dashboard 运营统计设计](topics/dashboard-statistics-design.md).
 
 ## Deferred
 

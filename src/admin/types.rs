@@ -204,6 +204,78 @@ pub struct CredentialUsageSummaryResponse {
     pub fresh: bool,
 }
 
+/// 全量账号 dashboard 统计响应。
+///
+/// 账号元数据和运行态来自当前内存快照，usage 指标来自只读 rollup 查询；
+/// 两者在服务层按 ID 合并，避免前端逐账号请求。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardAccountsResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub window_key: String,
+    pub page: usize,
+    pub page_size: usize,
+    pub total: usize,
+    pub filtered_total: usize,
+    pub total_pages: usize,
+    pub configured_local_accounts: usize,
+    pub window_active_local_accounts: usize,
+    pub window_idle_local_accounts: usize,
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub items: Vec<UsageDashboardAccountItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardAccountItem {
+    pub id: u64,
+    pub email: Option<String>,
+    pub label: String,
+    pub auth_method: Option<String>,
+    pub provider: Option<String>,
+    pub endpoint: String,
+    pub subscription_title: Option<String>,
+    pub disabled: bool,
+    pub is_current: bool,
+    pub in_flight_requests: u32,
+    pub rate_limited: bool,
+    pub cooled_down: bool,
+    pub rpm: u32,
+    pub max_concurrent_requests: u32,
+    /// 最近一次只读账号信息快照中的积分总额。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_limit: Option<f64>,
+    /// 最近一次只读账号信息快照中的剩余积分。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_remaining: Option<f64>,
+    /// 积分总额减去剩余积分；仅表示已保存快照，不会触发刷新。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit_used: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_info_checked_at: Option<String>,
+    pub window_requests: usize,
+    pub window_error_requests: usize,
+    pub window_total_input_tokens: i64,
+    pub window_total_output_tokens: i64,
+    pub window_estimated_cost_usd: f64,
+    pub window_original_cost_usd: f64,
+    pub window_kiro_metering_usage: f64,
+    pub window_priced_requests: usize,
+    pub window_unpriced_requests: usize,
+    pub lifetime_requests: usize,
+    pub lifetime_error_requests: usize,
+    pub lifetime_total_input_tokens: i64,
+    pub lifetime_total_output_tokens: i64,
+    pub lifetime_estimated_cost_usd: f64,
+    pub lifetime_original_cost_usd: f64,
+    pub lifetime_kiro_metering_usage: f64,
+    pub lifetime_priced_requests: usize,
+    pub lifetime_unpriced_requests: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialUsageSummaryItem {

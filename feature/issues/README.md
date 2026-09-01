@@ -26,6 +26,9 @@ Status: `execute-ready / issue-by-issue implementation and verification in progr
 
 ## 本轮专题覆盖范围
 
+- [真实本地账号模型请求 400 与 thinking 边界](real-account-model-invalid-400-20260901.md) - 2026-09-01；记录 220 条真实凭据、修复前 20x2 与 25 次模型矩阵、修复后真实 thinking 边界 4/4 HTTP 200。已确认入口字段规范化和显式 Claude minor 不静默降级；历史统一 `invalid_request_error` 的全部具体坏字段仍未完全归因，且本轮无外部池。
+- [raw 路由顶层 `max_tokens` 类型和范围未统一校验](raw-max-tokens-invalid-400-20260902.md) - 2026-09-02；P004；已在 raw external 与本地账号共用入口统一拒绝 `null`、浮点数、0、负数和超过 `i32::MAX` 的 `max_tokens`，避免把确定性格式错误发送到上游、进入 thinking-signature rescue、换号或 external fallback。聚焦 Rust 9/9、本地长期实例 HTTP 5/5 首次 400 已通过；当前状态为 `fixed / local-runtime-verified / not-committed / not-released`。
+
 以下范围均已有独立专题入口，但 `partial`/`pending` 项仍需在统一候选上完成动态证据，不因文档存在而视为关闭：Claude Code transcript/tool history；thinking 与 signed/redacted 内容；external raw/normalized/SSE/strict；payload/body/image/document/web fetch；prompt/tool_choice/thinking/chunk/count_tokens；stream/HTTP 200 exception；重试预算/API-key admission/RPM；Redis degraded/external fallback/local-first/多实例；usage cleanup；两 UI；旧版本升级；AWS API key/region；生产证据脱敏。
 
 Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细及其累计统计、费用、credential summary、Dashboard、cache-read 和 duration rollup 贡献，hard cleanup 只物理删除 tombstone、不重复扣减；soft tombstone 存在期间同 ID 不复活，cutoff 后的新 ID 可写。hard cleanup 后不承诺永久 ID 防重。当前源码测试、两 UI 文案和真实浏览器交互已按该合同更新，并增加 in-flight writer/watermark transaction guard；`每批数量` 默认 250、后端/UI 上限已从 500 提高到 5,000，并补充旧 PostgreSQL CHECK 约束迁移和迁移关闭时的 schema compatibility guard；cleanup 过滤组最新 42/42 通过，但完整套件、writer 性能、Redis chaos、生产规模吞吐和动态多实例门禁未关闭。

@@ -191,11 +191,7 @@ export function CredentialCard({
   const recentErrorRate = numberOrZero(credential.recentErrorRate)
   const schedulerScore = numberOrZero(credential.schedulerScore)
   const schedulerSelectionCount = numberOrZero(credential.schedulerSelectionCount)
-  const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
   const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
-  const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
-  const projectedRpm10s = recentSelection10s * 6
-  const averageRpm5m = Math.round(recentSelection5m / 5)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
   const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
   const dispatchStatus = dispatchStatusLabel(credential, probationRemainingSecs)
@@ -453,7 +449,7 @@ export function CredentialCard({
       </div>
 
       {/* ── Summary Row ── */}
-      <div className="grid grid-cols-7 gap-2 px-3 pb-2 pt-1">
+      <div className="grid grid-cols-6 gap-2 px-3 pb-2 pt-1">
         <SummaryCell label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} />
         <SummaryCell
           label="并发"
@@ -467,17 +463,9 @@ export function CredentialCard({
         />
         <SummaryCell
           label="RPM"
-          value={
-            credential.rpm != null
-              ? credential.rpm === 0 ? '不限' : String(credential.rpm)
-              : '-'
-          }
+          value={`${formatCompact(recentSelection60s)}/${credential.rpm === 0 ? '∞' : formatCompact(credential.rpm)}`}
+          error={credential.rpm > 0 && recentSelection60s >= credential.rpm}
           onClick={() => setEditingRpm(true)}
-        />
-        <SummaryCell
-          label="当前RPM"
-          value={`${formatCompact(recentSelection60s)}/min`}
-          error={(credential.rpm ?? 0) > 0 && recentSelection60s >= (credential.rpm ?? 0)}
         />
         <SummaryCell label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
         <SummaryCell label="成功" value={<span title={formatNumber(credential.successCount)}>{formatCompact(credential.successCount)}</span>} />
@@ -609,28 +597,6 @@ export function CredentialCard({
                   }
                 />
               </div>
-              <div className="flex flex-col gap-0.5">
-                <button
-                  type="button"
-                  className="text-left rounded px-1 -mx-1 transition-colors hover:bg-muted/60"
-                  onClick={() => setEditingRpm(true)}
-                  title="修改RPM"
-                >
-                  <MetaItem
-                    label="RPM 限制"
-                    value={
-                      credential.rpm != null
-                        ? credential.rpm === 0 ? '不限制' : `${credential.rpm} /min`
-                        : '-'
-                    }
-                    detail={
-                      typeof credential.rpmOverride === 'number'
-                        ? credential.rpmOverride === 0 ? '账号覆盖：不限制' : `账号覆盖：${credential.rpmOverride}`
-                        : '继承全局'
-                    }
-                  />
-                </button>
-              </div>
               <MetaItem
                 label="429自动禁用"
                 value={
@@ -648,12 +614,6 @@ export function CredentialCard({
               <MetaItem label="延迟 EWMA" value={credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`} />
               <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />
               <MetaItem label="总调度" value={<span title={formatNumber(schedulerSelectionCount)}>{formatCompact(schedulerSelectionCount)}</span>} />
-              <MetaItem
-                label="当前 RPM"
-                value={`${formatNumber(recentSelection60s)}/min`}
-                detail={`10s折算 ${formatNumber(projectedRpm10s)}/min · 5m均 ${formatNumber(averageRpm5m)}/min`}
-                error={(credential.rpm ?? 0) > 0 && recentSelection60s >= (credential.rpm ?? 0)}
-              />
               <MetaItem
                 label="调度压力"
                 value={schedulerSelectionPressure.toFixed(2)}

@@ -9,12 +9,21 @@ Use this skill to validate that kiro.rs remains fast and stable under normal tra
 
 ## Safety Contract
 
-- Do not run load against production or the user's active `9022` service unless explicitly requested.
-- Prefer a temp port and a release binary.
+- Do not run load against production or another project's active service.
+- Apply `docs/testing/project-test-instance.md`. In this repository the
+  designated instance is `127.0.0.1:19023` with
+  `tmp/thinking-budget-local/config.json`; all load and chaos cases reuse that
+  one project-owned `kiro.rs` process. Isolation is a project ownership
+  boundary, not a new service per case.
+- Start a temporary `kiro.rs` service only when the designated instance cannot
+  safely execute a destructive case. Record the reason, exact resources,
+  lifetime, and cleanup result in the evidence report.
 - Use fake upstream scenarios before real upstream pressure.
 - Real upstream pressure requires an explicit purpose, low starting concurrency, and a hard cap.
 - Do not print secrets or full credentials.
-- Stop every fake server, temp proxy, and background load process.
+- Stop every fake server, temp proxy, and background load process. Do not stop
+  the designated project instance unless the test explicitly covers
+  restart/recovery and the process is confirmed to belong to this repository.
 - Save raw reports under an owned temporary directory. Retain only redacted summaries and hashes under `feature/evidence/`, then remove the raw directory.
 
 ## Build Artifact Contract
