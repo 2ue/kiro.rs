@@ -5014,6 +5014,7 @@ mod tests {
             ("non_model_endpoint_unavailable", "bad_request", None),
         ];
 
+        let mut expected_total_hits = 0;
         for pool_size in [1, 20, 60] {
             for round in 0..5 {
                 for (scenario, expected_reason, retry_action) in cases {
@@ -5032,6 +5033,7 @@ mod tests {
                     } else {
                         1
                     };
+                    expected_total_hits += expected_hits;
                     assert_eq!(
                         hits, expected_hits,
                         "unexpected hit count for {scenario}, pool {pool_size}, round {round}"
@@ -5082,8 +5084,8 @@ mod tests {
 
         assert_eq!(
             server.state.total_hits.load(Ordering::Relaxed),
-            180,
-            "the full 1/20/60 x five-round matrix should issue exactly 180 inference requests"
+            expected_total_hits,
+            "the full retry matrix should issue exactly the sum of each case's expected inference requests"
         );
     }
 
