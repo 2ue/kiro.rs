@@ -10607,7 +10607,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
 }
 
 #[test]
-fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
+fn direct_external_policy_never_rescues_recoverable_error_classes_five_rounds() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = ExternalPoolsConfig {
@@ -10629,7 +10629,7 @@ fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
                 pool_id: Some(1),
                 pool_name: Some("direct".to_string()),
             },
-            Some("external_rate_limit"),
+            None,
         ),
         (
             ExternalPoolFinalError {
@@ -10643,7 +10643,7 @@ fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
                 pool_id: Some(1),
                 pool_name: Some("direct".to_string()),
             },
-            Some("external_timeout"),
+            None,
         ),
         (
             ExternalPoolFinalError {
@@ -10657,7 +10657,7 @@ fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
                 pool_id: None,
                 pool_name: None,
             },
-            Some("external_capacity"),
+            None,
         ),
         (
             ExternalPoolFinalError {
@@ -10685,7 +10685,7 @@ fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
                 pool_id: Some(1),
                 pool_name: Some("direct".to_string()),
             },
-            Some("external_error"),
+            None,
         ),
     ];
 
@@ -10700,7 +10700,7 @@ fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
                     Some(1),
                 ),
                 *expected,
-                "round {round}: direct external policy should only rescue recoverable external failures"
+                "round {round}: strict direct policy must never rescue into local credentials"
             );
             assert_eq!(
                 local_rescue_reason_after_external_route_error(
@@ -10711,7 +10711,7 @@ fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
                     Some(1),
                 ),
                 *expected,
-                "round {round}: direct policy without a prior local fallback reason should rescue only when local credentials are dispatchable"
+                "round {round}: strict direct policy must ignore local dispatchability"
             );
             assert_eq!(
                 local_rescue_reason_after_external_route_error(
@@ -10739,14 +10739,14 @@ fn direct_external_policy_rescues_recoverable_error_classes_five_rounds() {
                     &budget,
                 ),
                 *expected,
-                "round {round}: direct external policy should honor remaining rescue budget"
+                "round {round}: strict direct policy must not consume local rescue budget"
             );
         }
     }
 }
 
 #[test]
-fn direct_external_route_subtype_rescues_recoverable_failures_even_without_global_direct_flag() {
+fn direct_external_route_subtype_never_rescues_into_local_even_without_global_direct_flag() {
     use crate::anthropic::inference_attempt_budget::InferenceAttemptKind;
 
     let config = ExternalPoolsConfig {
@@ -10776,8 +10776,8 @@ fn direct_external_route_subtype_rescues_recoverable_failures_even_without_globa
                 Some("local_capacity_full"),
                 Some(4),
             ),
-            Some("external_error"),
-            "round {round}: route subtype external_direct_policy may rescue recoverable failures"
+            None,
+            "round {round}: strict external_direct_policy must never rescue into local credentials"
         );
 
         let budget = InferenceAttemptBudget::new(8);
@@ -10793,8 +10793,8 @@ fn direct_external_route_subtype_rescues_recoverable_failures_even_without_globa
                 Some(4),
                 &budget,
             ),
-            Some("external_error"),
-            "round {round}: direct route subtype should honor remaining local rescue budget"
+            None,
+            "round {round}: strict direct route must not consume local rescue budget"
         );
 
         assert_eq!(

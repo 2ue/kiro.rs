@@ -1346,6 +1346,17 @@ async fn maybe_raw_external_preflight_response(
     {
         return None;
     }
+    // Explicit external direct mode is strict: do not enter the local
+    // capacity-preflight path. If the raw direct route cannot run yet, the
+    // parsed direct route will return the external terminal error instead of
+    // turning this request into a local-account rescue.
+    if manager
+        .direct_policy_reason(&config, endpoint, raw_probe.model.as_deref().unwrap_or(""))
+        .await
+        .is_some()
+    {
+        return None;
+    }
 
     let (reason, local_state) = local_pool_preflight_reason_after_capacity_grace(
         provider.as_ref(),
@@ -1809,29 +1820,11 @@ impl ExternalFallbackContext {
             .await
         {
             ExternalPoolForwardOutcome::Response(response) => Some(response),
-            ExternalPoolForwardOutcome::FinalError(err) => {
-                if let Some(reason) = budgeted_local_rescue_reason_after_external_route_error(
-                    UsageRouteSubtype::ExternalDirectPolicy,
-                    &self.config,
-                    &err,
-                    None,
-                    self.current_local_dispatchable(Some(&self.payload.model)),
-                    self.inference_attempt_budget.as_ref(),
-                ) {
-                    tracing::warn!(
-                        request_id,
-                        reason,
-                        status = err.status.as_u16(),
-                        route_error_type = %err.route_error_type,
-                        pool_id = ?err.pool_id,
-                        pool_name = ?err.pool_name,
-                        "external direct policy failed with a rescuable error; continuing with local credentials"
-                    );
-                    None
-                } else {
-                    Some(err.into_response(request_id))
-                }
-            }
+            // Explicit direct mode is a hard routing boundary. The external
+            // manager may retry or switch external pools internally, but a
+            // terminal external error must never fall through to local
+            // credentials.
+            ExternalPoolForwardOutcome::FinalError(err) => Some(err.into_response(request_id)),
         }
     }
 
@@ -6808,12 +6801,13 @@ fn local_rescue_reason_after_external_route_error(
     local_fallback_reason: Option<&str>,
     current_local_dispatchable: Option<usize>,
 ) -> Option<&'static str> {
-    if !external_route_subtype_allows_local_rescue(route_subtype) {
+    // `ExternalDirectPolicy` is strict direct mode: external-pool failover is
+    // allowed inside the external manager, but local credentials are never a
+    // fallback for this route subtype.
+    if route_subtype == UsageRouteSubtype::ExternalDirectPolicy {
         return None;
     }
-    if route_subtype == UsageRouteSubtype::ExternalDirectPolicy
-        && !external_direct_policy_error_allows_local_rescue(err)
-    {
+    if !external_route_subtype_allows_local_rescue(route_subtype) {
         return None;
     }
     if !config.external_pool_local_rescue_enabled {
@@ -6865,20 +6859,7 @@ fn external_route_subtype_allows_local_rescue(route_subtype: UsageRouteSubtype) 
         route_subtype,
         UsageRouteSubtype::ExternalFallbackPreflight
             | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
-            | UsageRouteSubtype::ExternalDirectPolicy
     )
-}
-
-fn external_direct_policy_error_allows_local_rescue(err: &ExternalPoolFinalError) -> bool {
-    if err.is_public_invalid_request() || err.is_external_payload_too_large() {
-        return false;
-    }
-    err.retryable
-        || err.is_rate_limit()
-        || err.is_timeout_like()
-        || err.is_capacity_like()
-        || err.status.is_server_error()
-        || err.status == StatusCode::SERVICE_UNAVAILABLE
 }
 
 fn external_fallback_route_subtype_for_attempts(

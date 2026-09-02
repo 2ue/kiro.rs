@@ -4076,10 +4076,15 @@ fn spawn_external_release_fallback(
     };
     EXTERNAL_POOL_RELEASE_FALLBACK_ACCEPTED.fetch_add(1, Ordering::Relaxed);
     handle.spawn(async move {
-        let _permit = permit;
         if let Err(err) = future.await {
             tracing::error!(description, error = %err, "外部池 Redis release 有界重试失败，将由 TTL 回收");
         }
+        // Return the admission permit before publishing completion. Tests and
+        // operational gauges use the completion counter as the point at which
+        // the fallback slot is reusable; keeping the permit alive through the
+        // counter update creates a one-tick race where `finished == accepted`
+        // but one semaphore permit is still held.
+        drop(permit);
         EXTERNAL_POOL_RELEASE_FALLBACK_FINISHED.fetch_add(1, Ordering::Release);
     });
     true

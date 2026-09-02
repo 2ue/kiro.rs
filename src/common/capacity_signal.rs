@@ -70,9 +70,28 @@ impl CapacitySignal {
     }
 
     fn unregister(&self) {
-        let previous = self.waiters.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "capacity waiter count underflow");
-        let remaining = previous.saturating_sub(1);
+        // A waiter owns exactly one registration, but cancellation and task
+        // teardown can race with the caller's final state transition. Use a
+        // saturating CAS instead of `fetch_sub`: a duplicate teardown must not
+        // wrap the counter (or panic in debug builds), which would corrupt
+        // future capacity-credit accounting for the whole scheduler.
+        let mut current = self.waiters.load(Ordering::Acquire);
+        let remaining = loop {
+            if current == 0 {
+                tracing::debug!("capacity waiter unregister observed an already-empty waiter set");
+                return;
+            }
+            let remaining = current - 1;
+            match self.waiters.compare_exchange_weak(
+                current,
+                remaining,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break remaining,
+                Err(actual) => current = actual,
+            }
+        };
         let _ = self
             .credits
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |credits| {
@@ -208,6 +227,18 @@ mod tests {
         signal.capacity_released(2);
         first.finish_acquired();
         drop(second);
+        assert_eq!(signal.test_snapshot(), (0, 0, 0));
+    }
+
+    #[test]
+    fn duplicate_unregister_is_saturating_and_does_not_corrupt_future_waiters() {
+        let signal = Arc::new(CapacitySignal::default());
+        signal.unregister();
+        assert_eq!(signal.test_snapshot(), (0, 0, 0));
+
+        let waiter = signal.register();
+        drop(waiter);
+        signal.unregister();
         assert_eq!(signal.test_snapshot(), (0, 0, 0));
     }
 }
