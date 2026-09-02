@@ -7431,10 +7431,14 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_adds_404_to_external_pool_retry_status_codes_once() {
-        let mut config = Config::default();
-        config.runtime_config_migration_version = 9;
-        config.external_pools.external_pool_retry_status_codes =
-            vec![408, 425, 429, 500, 502, 503, 504, 529];
+        let mut config = Config {
+            runtime_config_migration_version: 9,
+            external_pools: ExternalPoolsConfig {
+                external_pool_retry_status_codes: vec![408, 425, 429, 500, 502, 503, 504, 529],
+                ..ExternalPoolsConfig::default()
+            },
+            ..Config::default()
+        };
 
         assert!(config.apply_runtime_config_migrations());
         assert_eq!(

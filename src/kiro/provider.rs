@@ -7003,6 +7003,7 @@ impl KiroProvider {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_model_region_diagnostic(
         endpoint: &str,
         reason: &'static str,
@@ -7024,11 +7025,14 @@ impl KiroProvider {
         let supports_requested_model = model
             .map(|requested| credentials.supports_model(&[Some(requested)]))
             .unwrap_or(true);
-        let supports_opus_model = model
+        let supports_opus_model = if model
             .map(|requested| requested.to_ascii_lowercase().contains("opus"))
             .unwrap_or(false)
-            .then(|| credentials.supports_opus())
-            .unwrap_or(true);
+        {
+            credentials.supports_opus()
+        } else {
+            true
+        };
         tracing::warn!(
             credential_id,
             credential_label = %credential_label,
