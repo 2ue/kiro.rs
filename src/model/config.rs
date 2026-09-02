@@ -3969,7 +3969,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 9;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 10;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -4518,7 +4518,9 @@ fn default_external_pool_retry_max_attempts() -> u32 {
 
 fn default_external_pool_retry_status_codes() -> Vec<u16> {
     // 500 is treated as the default 5xx family retry guard by retry_pipeline.
-    vec![408, 425, 429, 500, 502, 503, 504, 529]
+    // 404 is included because some upstreams surface model-unavailable and
+    // invalid-model failures as exact Not Found responses.
+    vec![404, 408, 425, 429, 500, 502, 503, 504, 529]
 }
 
 fn default_external_pool_same_pool_retry_count() -> u32 {
@@ -5171,6 +5173,22 @@ impl Config {
             self.runtime_config_migration_version = 9;
             changed = true;
         }
+        if self.runtime_config_migration_version < 10 {
+            // Model-mismatch 404s are routed through the same cross-pool retry path as the
+            // existing model-unavailable errors. Historical runtime configs may still be missing
+            // the exact 404 code even though the code path now classifies it as retryable.
+            if !self
+                .external_pools
+                .external_pool_retry_status_codes
+                .contains(&404)
+            {
+                self.external_pools
+                    .external_pool_retry_status_codes
+                    .insert(0, 404);
+            }
+            self.runtime_config_migration_version = 10;
+            changed = true;
+        }
         changed
     }
 
@@ -5506,7 +5524,7 @@ mod tests {
         assert_eq!(config.external_pools.external_pool_retry_max_attempts, 3);
         assert_eq!(
             config.external_pools.external_pool_retry_status_codes,
-            vec![408, 425, 429, 500, 502, 503, 504, 529]
+            vec![404, 408, 425, 429, 500, 502, 503, 504, 529]
         );
         assert!(config.external_pools.external_pool_retry_on_network_error);
         assert!(config.external_pools.external_pool_retry_on_protocol_error);
@@ -7409,6 +7427,28 @@ mod tests {
         }))
         .unwrap();
         assert!(!current_without_field.prompt_steering.apply_to_external_pool);
+    }
+
+    #[test]
+    fn runtime_config_migration_adds_404_to_external_pool_retry_status_codes_once() {
+        let mut config = Config::default();
+        config.runtime_config_migration_version = 9;
+        config.external_pools.external_pool_retry_status_codes =
+            vec![408, 425, 429, 500, 502, 503, 504, 529];
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+        assert_eq!(
+            config.external_pools.external_pool_retry_status_codes,
+            vec![404, 408, 425, 429, 500, 502, 503, 504, 529]
+        );
+
+        config.external_pools.external_pool_retry_status_codes =
+            vec![404, 408, 425, 429, 500, 502, 503, 504, 529];
+        assert!(!config.apply_runtime_config_migrations());
     }
 
     #[test]

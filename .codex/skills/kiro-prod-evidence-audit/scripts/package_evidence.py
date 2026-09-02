@@ -81,6 +81,20 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "[REDACTED_API_KEY]",
     ),
     (
+        re.compile(r"\bksk_[A-Za-z0-9._-]+\b"),
+        "[REDACTED_KIRO_KEY]",
+    ),
+    (
+        re.compile(r"\barn:aws:[A-Za-z0-9:/_-]+\b"),
+        "[REDACTED_PROFILE_ARN]",
+    ),
+    (
+        re.compile(
+            r"(?i)(machineid[\"']?\s*[:=]\s*[\"']?)[a-f0-9]{32,}"
+        ),
+        r"\1[REDACTED_MACHINE_ID]",
+    ),
+    (
         re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
         "[REDACTED_JWT]",
     ),
@@ -111,6 +125,9 @@ SENSITIVE_JSON_KEYS = {
     "request_api_key_id",
     "credential_label",
     "credential_email",
+    "kiroapikey",
+    "profilearn",
+    "machineid",
 }
 
 
@@ -131,7 +148,14 @@ def is_shareable_path(rel: Path) -> bool:
         name = rel.parts[2]
         if (
             name.startswith("request-")
-            or name in {"request-record.txt", "thinking-errors.txt", "latest-usage.txt", "schema.txt"}
+            or name
+            in {
+                "request-record.txt",
+                "thinking-errors.txt",
+                "latest-usage.txt",
+                "schema.txt",
+                "credential-data-shape.txt",
+            }
         ):
             return False
     return True

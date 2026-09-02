@@ -2889,6 +2889,9 @@ impl AdminService {
             tracing::warn!(credential_id = balance.id, "{}", message);
             return Err(AdminServiceError::InternalError(message));
         }
+        let _ = self
+            .token_manager
+            .apply_account_info_snapshot_for_credential(balance.id, &info);
         Ok(())
     }
 

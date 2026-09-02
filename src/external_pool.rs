@@ -11492,6 +11492,22 @@ fn external_error_message_indicates_model_unavailable(lower_message: &str) -> bo
         || lower_message.contains("failed to get available channel for model")
         || lower_message.contains("no available channel")
         || lower_message.contains("model is unavailable")
+        || lower_message.contains("requested model is not available")
+        || lower_message.contains("model is not available")
+        || lower_message.contains("model is not supported in this region")
+        || lower_message.contains("model is not available for this account")
+        || lower_message.contains("model is not available for this endpoint")
+}
+
+fn external_error_message_indicates_invalid_model(lower_message: &str) -> bool {
+    lower_message.contains("invalid model")
+        || lower_message.contains("invalid_model_id")
+        || lower_message.contains("invalid_model")
+        || lower_message.contains("model not found")
+        || lower_message.contains("model_not_found")
+        || lower_message.contains("unsupported model")
+        || lower_message.contains("unknown model")
+        || lower_message.contains("not available for this endpoint")
 }
 
 fn external_error_message_indicates_payload_too_large(lower_message: &str) -> bool {
@@ -11659,7 +11675,10 @@ fn classify_external_error(
         )
         .with_raw_upstream_error(Some(raw_upstream_error));
     }
-    if external_error_message_indicates_model_unavailable(&lower) {
+    if external_error_message_indicates_model_unavailable(&lower)
+        || (status == StatusCode::NOT_FOUND
+            && external_error_message_indicates_invalid_model(&lower))
+    {
         return classified_external_error(
             status,
             "external upstream model is unavailable",
@@ -11817,7 +11836,11 @@ fn error_type_for_external_error(err: &ExternalPoolError) -> String {
     if let Some(reason) = err.auto_disable_reason.as_deref() {
         return reason.to_string();
     }
-    if external_error_message_indicates_model_unavailable(&err.message.to_ascii_lowercase()) {
+    let lower_message = err.message.to_ascii_lowercase();
+    if external_error_message_indicates_model_unavailable(&lower_message)
+        || (err.status == Some(StatusCode::NOT_FOUND)
+            && external_error_message_indicates_invalid_model(&lower_message))
+    {
         return "model_unavailable".to_string();
     }
     if let Some((_, reason)) = err.cooldown.as_ref().filter(|(_, reason)| {

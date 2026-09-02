@@ -7782,6 +7782,32 @@ impl MultiTokenManager {
         changed
     }
 
+    pub(crate) fn apply_account_info_snapshot_for_credential(
+        &self,
+        credential_id: u64,
+        account_info: &CredentialAccountInfoRow,
+    ) -> bool {
+        let changed = {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == credential_id) else {
+                tracing::debug!(
+                    credential_id,
+                    "账号信息快照已保存，但本地运行态未找到对应凭据，跳过调度态刷新"
+                );
+                return false;
+            };
+            Self::apply_account_info_quota_guard(entry, Some(account_info))
+        };
+
+        if changed {
+            self.select_highest_priority();
+            self.notify_dispatch_state_changed();
+            self.publish_credentials_changed("credential_account_info_updated");
+        }
+
+        changed
+    }
+
     /// 非破坏性地将当前凭据快照 upsert 到 PgSQL。
     ///
     /// 该方法只用于旧数据补全、环境变量凭据导入等 bootstrap 场景。底层

@@ -7064,6 +7064,65 @@ async fn external_pool_cross_pool_retry_status_codes_can_stop_failover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_not_found_invalid_model_uses_default_cross_pool_retry_status_codes() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::NOT_FOUND,
+        fake_external_error_body("Invalid model ID. Please select a different model to continue."),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("404-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "not-found-model-default-retry-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "not-found-model-default-retry-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_not_found_model_default_retry".to_string();
+    route.error_id = "err_not_found_model_default_retry".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("not found invalid-model failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("404 invalid-model should fail over to the next pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_terminal_account_error_skips_same_pool_retry_and_fails_over() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -10542,6 +10601,26 @@ fn external_pool_error_classifies_model_unavailable_as_retryable() {
     let err = classify_external_error(
         StatusCode::BAD_REQUEST,
         Bytes::from_static(br#"{"error":{"code":"model_not_found"}}"#),
+        HeaderMap::new(),
+        &ExternalPoolsConfig::default(),
+    );
+
+    assert!(err.retryable);
+    assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+    assert!(err.auto_disable_reason.is_none());
+    assert_eq!(
+        err.cooldown.as_ref().map(|(_, reason)| reason.as_str()),
+        Some("model_unavailable")
+    );
+}
+
+#[test]
+fn external_pool_error_classifies_not_found_invalid_model_as_retryable() {
+    let err = classify_external_error(
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(
+            br#"{"message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#,
+        ),
         HeaderMap::new(),
         &ExternalPoolsConfig::default(),
     );

@@ -39,7 +39,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{
     KiroAvailableModel, KiroAvailableModelCatalog, KiroAvailableModelsResponse,
 };
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::protocol::{
     extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
 };
@@ -1703,6 +1703,10 @@ mod tests {
                 "message": "Invalid model ID. Please select a different model to continue.",
                 "reason": "INVALID_MODEL_ID"
             }),
+            "invalid_model_404" => serde_json::json!({
+                "message": "Invalid model ID. Please select a different model to continue.",
+                "reason": "INVALID_MODEL_ID"
+            }),
             "image_empty" => serde_json::json!({
                 "message": "Image data cannot be empty.",
                 "reason": "REQUEST_BODY_INVALID"
@@ -1779,6 +1783,7 @@ mod tests {
         let status = match scenario.as_str() {
             "rescue_server_error" | "provider_status_500" => StatusCode::INTERNAL_SERVER_ERROR,
             "provider_status_503" => StatusCode::SERVICE_UNAVAILABLE,
+            "invalid_model_404" => StatusCode::NOT_FOUND,
             "provider_status_401" => StatusCode::UNAUTHORIZED,
             "provider_status_403" => StatusCode::FORBIDDEN,
             "provider_status_408" => StatusCode::REQUEST_TIMEOUT,
@@ -4343,6 +4348,30 @@ mod tests {
     }
 
     #[test]
+    fn model_404_retry_requires_reason_and_model() {
+        assert!(KiroProvider::should_retry_model_404_bad_request(
+            "model_unavailable_bad_request",
+            Some("claude-opus-4-8"),
+        ));
+        assert!(KiroProvider::should_retry_model_404_bad_request(
+            "model_invalid_bad_request",
+            Some("claude-opus-4-8"),
+        ));
+        assert!(!KiroProvider::should_retry_model_404_bad_request(
+            "bad_request",
+            Some("claude-opus-4-8"),
+        ));
+        assert!(!KiroProvider::should_retry_model_404_bad_request(
+            "model_unavailable_bad_request",
+            None,
+        ));
+        assert!(!KiroProvider::should_retry_model_404_bad_request(
+            "model_invalid_bad_request",
+            Some("  "),
+        ));
+    }
+
+    #[test]
     fn thinking_signature_invalid_classifier_is_exact_and_structural_for_five_rounds() {
         let positives = [
             r#"{"reason":"THINKING_SIGNATURE_INVALID"}"#,
@@ -4958,6 +4987,11 @@ mod tests {
                 Some("model_unavailable_retry_next"),
             ),
             ("invalid_model", "model_invalid_bad_request", None),
+            (
+                "invalid_model_404",
+                "model_invalid_bad_request",
+                Some("model_unavailable_retry_next"),
+            ),
             ("image_empty", "image_invalid_bad_request", None),
             (
                 "image_format_unsupported",
@@ -6965,6 +6999,53 @@ impl KiroProvider {
                 .unwrap_or("unknown"),
             reason.unwrap_or(kind.scheduler_reason())
         )
+    }
+
+    fn log_model_region_diagnostic(
+        endpoint: &str,
+        reason: &'static str,
+        credential_id: u64,
+        credential_label: &str,
+        model: Option<&str>,
+        credentials: &KiroCredentials,
+        config: &Config,
+        upstream_status: reqwest::StatusCode,
+        body_bytes: usize,
+        attempt: usize,
+        max_retries: usize,
+    ) {
+        let effective_api_region = credentials.effective_api_region(config);
+        let profile_arn_region = credentials
+            .profile_arn
+            .as_deref()
+            .and_then(profile_arn_region);
+        let supports_requested_model = model
+            .map(|requested| credentials.supports_model(&[Some(requested)]))
+            .unwrap_or(true);
+        let supports_opus_model = model
+            .map(|requested| requested.to_ascii_lowercase().contains("opus"))
+            .unwrap_or(false)
+            .then(|| credentials.supports_opus())
+            .unwrap_or(true);
+        tracing::warn!(
+            credential_id,
+            credential_label = %credential_label,
+            endpoint,
+            model = ?model,
+            effective_api_region,
+            profile_arn_region = ?profile_arn_region,
+            auth_method = ?credentials.auth_method.as_deref(),
+            provider = ?credentials.provider.as_deref(),
+            supported_model_count = credentials.supported_models.len(),
+            supports_requested_model,
+            supports_opus_model,
+            upstream_status = upstream_status.as_u16(),
+            body_bytes,
+            attempt,
+            max_retries,
+            reason,
+            "Kiro bad request carried routing capability context"
+        );
     }
 
     fn upstream_body_diagnostics_metadata(
@@ -11416,6 +11497,26 @@ impl KiroProvider {
                     Some(content_kind),
                     Some(Self::bad_request_diagnostic_reason(bad_request_reason)),
                 );
+                if matches!(
+                    bad_request_reason,
+                    "model_unavailable_bad_request"
+                        | "model_invalid_bad_request"
+                        | "profile_arn_bad_request"
+                ) {
+                    Self::log_model_region_diagnostic(
+                        endpoint.name(),
+                        bad_request_reason,
+                        ctx.id,
+                        &credential_label,
+                        model.as_deref(),
+                        &ctx.credentials,
+                        &config,
+                        status,
+                        body_bytes,
+                        attempt + 1,
+                        max_retries,
+                    );
+                }
                 // A fresh account-info quota guard is the only case where an otherwise opaque
                 // 400 may be attributed to the selected credential. Generic malformed/tool/image
                 // 400s remain fail-fast and never trigger broad fallback.
@@ -11468,16 +11569,6 @@ impl KiroProvider {
                         ctx.id,
                     )
                 {
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        model = model.as_deref(),
-                        upstream_status = status.as_u16(),
-                        body_bytes,
-                        attempt = attempt + 1,
-                        max_retries,
-                        "Kiro API model is unavailable for the selected credential"
-                    );
                     Self::push_attempt(
                         &mut attempts,
                         attempt,
@@ -11521,15 +11612,6 @@ impl KiroProvider {
                 }
                 if bad_request_reason == "profile_arn_bad_request" {
                     self.clear_profile_arn_discovery_state(&ctx, &config, &machine_id);
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        upstream_status = status.as_u16(),
-                        body_bytes,
-                        attempt = attempt + 1,
-                        max_retries,
-                        "Kiro API rejected the persisted profile ARN"
-                    );
                     Self::push_attempt(
                         &mut attempts,
                         attempt,
@@ -11584,6 +11666,101 @@ impl KiroProvider {
                     ) {
                         excluded_ids.insert(ctx.id);
                     }
+                    last_error = Some(anyhow::anyhow!(message));
+                    self.finish_attempt(&mut ctx);
+                    continue;
+                }
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "fail",
+                    Some(bad_request_reason),
+                    Some(message.clone()),
+                    attempt_started_at,
+                    model.as_deref(),
+                );
+                Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                self.finish_attempt(&mut ctx);
+                return Err(Self::traced_error(message, &attempts));
+            }
+
+            // 404 Not Found - 只要 body 明确指向模型不可用/不匹配，也允许切到下一个账号。
+            if status.as_u16() == 404 {
+                let bad_request_reason = Self::classify_bad_request_reason(&body);
+                let message = Self::api_failure_diagnostic(
+                    ApiUpstreamFailureKind::InvalidRequest,
+                    status,
+                    Some(body_bytes),
+                    retry_after,
+                    Some(content_kind),
+                    Some(Self::bad_request_diagnostic_reason(bad_request_reason)),
+                );
+                if matches!(
+                    bad_request_reason,
+                    "model_unavailable_bad_request" | "model_invalid_bad_request"
+                ) {
+                    Self::log_model_region_diagnostic(
+                        endpoint.name(),
+                        bad_request_reason,
+                        ctx.id,
+                        &credential_label,
+                        model.as_deref(),
+                        &ctx.credentials,
+                        &config,
+                        status,
+                        body_bytes,
+                        attempt + 1,
+                        max_retries,
+                    );
+                }
+                if Self::should_retry_model_404_bad_request(bad_request_reason, model.as_deref())
+                    && attempt + 1 < max_retries
+                    && self.token_manager.has_alternate_usable_credential_cached(
+                        model.as_deref(),
+                        &excluded_ids,
+                        ctx.id,
+                    )
+                {
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "model_unavailable_retry_next",
+                        Some(bad_request_reason),
+                        Some(message.clone()),
+                        attempt_started_at,
+                        model.as_deref(),
+                    );
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        model.as_deref(),
+                        TransientFailureKind::Protocol,
+                        retry_after,
+                        "api_model_unavailable",
+                    ) {
+                        let final_message = format!(
+                            "{} API 请求失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
+                    }
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        self.token_manager
+                            .unbind_session_if_bound_to_deferred(session_id, ctx.id);
+                    }
+                    excluded_ids.insert(ctx.id);
                     last_error = Some(anyhow::anyhow!(message));
                     self.finish_attempt(&mut ctx);
                     continue;
@@ -12240,6 +12417,13 @@ impl KiroProvider {
     fn should_retry_model_unavailable_bad_request(reason: &str, model: Option<&str>) -> bool {
         reason == "model_unavailable_bad_request"
             && model.map(str::trim).is_some_and(|value| !value.is_empty())
+    }
+
+    fn should_retry_model_404_bad_request(reason: &str, model: Option<&str>) -> bool {
+        matches!(
+            reason,
+            "model_unavailable_bad_request" | "model_invalid_bad_request"
+        ) && model.map(str::trim).is_some_and(|value| !value.is_empty())
     }
 
     fn bad_request_reason_label(reason: &str) -> &'static str {

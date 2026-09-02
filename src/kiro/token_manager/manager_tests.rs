@@ -1908,6 +1908,45 @@ fn quota_guard_ignores_stale_missing_non_disabled_and_oauth_account_snapshots() 
     assert!(!manager.entries.lock()[0].account_quota_blocked);
 }
 
+#[test]
+fn apply_account_info_snapshot_for_credential_refreshes_only_one_entry_and_reselects_current() {
+    let mut first = api_key_credential("snapshot-refresh-first");
+    first.id = Some(1);
+    first.priority = 0;
+    let mut second = api_key_credential("snapshot-refresh-second");
+    second.id = Some(2);
+    second.priority = 1;
+
+    let manager = MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+        .expect("quota snapshot fixture");
+    assert_eq!(manager.current_id(), 1);
+    assert!(!manager.is_credential_account_quota_blocked(1));
+    assert!(!manager.is_credential_account_quota_blocked(2));
+
+    let exhausted = CredentialAccountInfoRow {
+        remaining: 0.0,
+        credit_remaining: 0.0,
+        overage_status: Some("DISABLED".to_string()),
+        checked_at: Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    assert!(manager.apply_account_info_snapshot_for_credential(1, &exhausted));
+    assert!(manager.is_credential_account_quota_blocked(1));
+    assert!(!manager.is_credential_account_quota_blocked(2));
+    assert_eq!(manager.current_id(), 2);
+
+    let healthy = CredentialAccountInfoRow {
+        remaining: 10.0,
+        credit_remaining: 10.0,
+        overage_status: Some("ENABLED".to_string()),
+        checked_at: Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    assert!(manager.apply_account_info_snapshot_for_credential(1, &healthy));
+    assert!(!manager.is_credential_account_quota_blocked(1));
+    assert_eq!(manager.current_id(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reload_remote_delete_clears_pending_persistence_for_removed_id() {
     let Some(store) = test_postgres_store().await else {
