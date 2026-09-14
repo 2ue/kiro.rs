@@ -220,14 +220,76 @@ SSE 的 `ExternalStreamFakeServer`）。
 
 执行顺序见矩阵 §4：**L2-14 开关关闭等价性必须最先通过**。
 
-- [ ] 测试基建：mock 上游（可控 status/首字/总耗时/SSE）
-- [ ] 测试基建：选择探针（记录每次选中的池 id，`#[cfg(test)]`，不影响生产路径）
-- [ ] 测试基建：份额断言容差（先跑基线取经验值，避免 flaky）
-- [ ] 3.4 既有因子混合组 L2-14 ~ L2-24（防回归，最高优先级）
-- [ ] 3.2 可用性底线组 L2-06 ~ L2-09（"降级时保证可用"）
-- [ ] 3.1 新增因子基线组 L2-01 ~ L2-05
-- [ ] 3.3 时间与恢复组 L2-10 ~ L2-13
-- [ ] 3.5 压力与边界组 L2-25 ~ L2-27
+- [x] 测试基建：`SlowSuccess { delay }` mock 行为 + `slow_success` 构造器
+- [x] 测试基建：`wait_for_quality_samples` 轮询收敛（替代固定 sleep）
+- [x] 测试基建：`run_quality_wave` / `count_successes` / `l2_quality_config`
+- [x] 并发量级 `L2_WAVE_SIZE = 256`（满足"不能只搞几并发"的硬性要求）
+- [x] 3.4 既有因子混合组：开关关闭等价性、优先级硬分层、瞬态降权共存
+- [x] 3.2 可用性底线组：全体劣化仍可用、唯一池不被饿死
+- [x] 3.1 新增因子基线组：同层内按质量分流
+- [x] 3.3 时间与恢复组：降级 → 探测 → 恢复全轨迹
+- [x] **7 个 L2 用例连续两轮全绿**（真实 PG + Redis，256 并发）
+- [ ] 3.5 压力与边界组 L2-25 ~ L2-27（余量，非阻塞）
+
+### ⚠️ L2 捕获的真实缺陷：探测流量被既有连击挡在层外
+
+**这是 L2 测试存在的全部意义**——通路 A 单测全绿，但真实链路上探测流量为 0。
+
+被降级的池几乎总是**同时**背着既有的 `transient_failure_streak`。
+连击会抬高有效优先级（`streak × 20`），把池挤出最优层；
+而我最初的探测分支写在**分层过滤之后**，于是层内永远抽不到它。
+两套降权机制相互独立，探测要救的恰恰是"两者都踩中"的池。
+
+修复：探测候选改为在**分层过滤之前**采集，但必须区分两种"低优先级"：
+
+| 情形 | 是否放行探测流量 | 理由 |
+| --- | --- | --- |
+| 用户配置的低优先级备用池 | ❌ 否 | 用户明确意图，主池可用时就该闲着 |
+| 基础优先级相同、被连击降下去 | ✅ 是 | 系统自己打的惩罚，正是探测要解救的对象 |
+
+判据是"把连击惩罚去掉后它是否属于最优层"（`base_priority == best_base_priority`）。
+两个边界各有一个单测锁定：
+`probe_traffic_reaches_a_pool_demoted_by_its_failure_streak` /
+`probe_traffic_still_respects_user_configured_priority_for_demoted_pools`。
+
+### 全量回归结论：8 个失败，0 个由本次改动引起
+
+`cargo test --bins` 全量跑出 8 个失败。逐一归因（用 git worktree 在
+`4c7790b`（本次改动）与 `31c947b`（本次改动之前）两个提交上分别复跑）：
+
+| 失败用例 | 归因 |
+| --- | --- |
+| `no_response_headers_becomes_client_timeout_without_raw_body` | **改动前既有** |
+| `retry_send_timeout_uses_remaining_dispatch_deadline` | **改动前既有** |
+| `slow_upstream_status_keeps_status_and_error_body_fragment` | **改动前既有** |
+| `stream_keepalive_emits_ping_during_silent_gap_before_output` | **改动前既有** |
+| `legacy_zero_external_wait_reaches_a_bounded_final_error` | **改动前既有** |
+| `high_concurrency_random_mixed_status_turbulence_transfers_to_healthy_pools` | 工作区未提交的 keepalive/超时改动 |
+| `mock_error_matrix_limits_repeated_failures_and_preserves_recovery` | 工作区未提交的 keepalive/超时改动 |
+| `redis_external_pool_snapshot_and_acquire_are_atomic_across_managers` | 并发争用，`--test-threads=1` 下通过 |
+
+关键证据：前 5 个在 `31c947b`（本特性尚不存在时）以**完全相同的方式失败**；
+后 2 个在两个提交上都通过，只在含 keepalive 改动的脏工作区失败。
+这些断言全部围绕 `retryable` / `attempts.len()` / 超时归类，
+属于重试与超时语义，本特性只影响"在候选中选哪个池"，不触及该路径。
+
+⚠️ 前 5 个是 base 分支上的既有红灯，**不属于本次范围，但需要单独跟进**。
+
+> 教训：后台命令若以 `| tail` 结尾，notification 里的 exit code 来自 `tail` 而非 `cargo`，
+> 恒为 0。判定绿灯必须读 `test result:` 行，不能看 exit code。
+
+### L2 调参过程中修正的三个测试自身缺陷
+
+1. **等待窗口不足**：只等了新增的避让窗口（2s），
+   却漏了既有的 `EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS = 30`（硬编码常量）。
+   改为轮询"连击清零 + 避让结束"，不固定 sleep。
+2. **mock 失败预算过大**（160）：失败渗进探测期与恢复期，池被反复重新降级，
+   测的不再是"恢复"而是"上游还在坏"。改为 `FLAKY_FAILURE_BUDGET = 64`
+   （< 阶段一打到该池的请求数），并显式断言恢复阶段开始前预算已耗尽。
+3. **断言选错了性质**：先后试过"末轮 > 探测期份额"和"逐轮单调上升"，
+   实测份额形如 `[137, 123, 130]/256`——池在第一轮就恢复到 ~50% 并在平价附近抖动，
+   两个断言都必然 flaky（前者与 20% 固定配额量级相撞，后者没有上升空间）。
+   最终断言"**回到与健康池平价**"（份额落在 25%~75%），这才是"恢复"的正确定义。
 
 ## P2 sub2api 质量调度
 

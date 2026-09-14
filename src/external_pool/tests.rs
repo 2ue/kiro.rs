@@ -922,6 +922,13 @@ enum PatternExternalMessagesBehavior {
         seed: u64,
         statuses: Arc<Vec<(StatusCode, String)>>,
     },
+    /// 成功但慢：响应前固定延迟，用于制造"首字慢 / 总耗时长"的质量信号。
+    ///
+    /// 非流式响应下首字与总耗时是同一个时间点，因此一个延迟参数即可覆盖
+    /// D2 的两种慢信号；两者在评分中走不同的归一化项，已由通路 A 单测分别覆盖。
+    SlowSuccess {
+        delay: Duration,
+    },
 }
 
 #[derive(Clone)]
@@ -972,6 +979,10 @@ impl PatternExternalMessagesFakeServer {
                     Some((*status, message.as_str()))
                 }
                 PatternExternalMessagesBehavior::Intermittent { .. } => None,
+                PatternExternalMessagesBehavior::SlowSuccess { delay } => {
+                    tokio::time::sleep(*delay).await;
+                    None
+                }
             };
             if let Some((status, message)) = failure {
                 state.failures.fetch_add(1, Ordering::Relaxed);
@@ -1013,6 +1024,15 @@ impl PatternExternalMessagesFakeServer {
     async fn always_success(text: &str) -> Self {
         Self::start(
             PatternExternalMessagesBehavior::AlwaysSuccess,
+            fake_external_success_body(text),
+        )
+        .await
+    }
+
+    /// 成功但慢的上游：用于制造首字/耗时劣化的质量信号。
+    async fn slow_success(delay: Duration, text: &str) -> Self {
+        Self::start(
+            PatternExternalMessagesBehavior::SlowSuccess { delay },
             fake_external_success_body(text),
         )
         .await
@@ -18071,6 +18091,50 @@ fn probe_traffic_never_crosses_priority_tiers() {
     );
 }
 
+#[test]
+fn probe_traffic_reaches_a_pool_demoted_by_its_failure_streak() {
+    // L2 捕获的缺陷：被降级的池通常同时背着既有的瞬态失败连击，
+    // 连击会抬高有效优先级把它挤出最优层，于是层内探测永远抽不到它。
+    //
+    // 这与"用户配置的低优先级"必须区别对待：
+    // 这个池的**基础优先级与主池相同**，只是被系统的失败惩罚降了下去。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_probe_share_percent = 20;
+    config.external_pool_transient_failure_priority_penalty = 20;
+
+    let healthy = scored_pool(1, 5, 0.0, Some(200.0), Some(1_000.0));
+    let mut demoted = probationary_pool(2, 5, 10_000);
+    // 同样的基础优先级 5，但背着 3 连击 → 有效优先级 5 + 60 = 65
+    demoted.transient_failure_streak = 3;
+
+    let shares = selection_shares(&[healthy, demoted], &config, 0, DISTRIBUTION_ROUNDS);
+    let probe_share = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        probe_share > 0.1 && probe_share < 0.3,
+        "被连击挤出最优层的避让池仍须获得探测流量，否则它永远拿不到样本自证恢复，实际 {probe_share:.3}"
+    );
+}
+
+#[test]
+fn probe_traffic_still_respects_user_configured_priority_for_demoted_pools() {
+    // 边界：一个池既是用户配置的低优先级、又背着连击、还在避让期。
+    // 用户意图优先——它不该拿到探测流量。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_probe_share_percent = 50;
+    config.external_pool_transient_failure_priority_penalty = 20;
+
+    let healthy = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
+    let mut demoted_backup = probationary_pool(2, 9, 10_000);
+    demoted_backup.transient_failure_streak = 3;
+
+    let shares = selection_shares(&[healthy, demoted_backup], &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&2).copied().unwrap_or(0.0),
+        0.0,
+        "用户配置为低优先级的备用池不得因为处于避让期就获得探测流量"
+    );
+}
+
 // ---- 恢复爬坡 ----
 
 #[test]
@@ -18238,4 +18302,679 @@ fn quality_view_marks_cold_start_pools_as_not_scoring() {
     assert_eq!(view.sample_count, 3);
     assert!(!view.in_probation);
     assert_eq!(view.recovery_progress, 1.0);
+}
+
+// ============================================================================
+// L2 真实调度测试：mock 账号 + 高并发
+//
+// 与通路 A（纯函数单测）的分工：通路 A 验证评分数学，这里验证**整条调度链路**
+// ——真实 Postgres + Redis、真实 HTTP mock 上游、真实并发下的流量分布。
+// 维度设计见 docs/plantree/.../quality-aware-scheduling-test-matrix.md
+//
+// 三条防 flaky 纪律（矩阵 §2 调研结论）：
+// 1. 质量采样是 fire-and-forget 的 detached task，wave 跑完样本未必已落 Redis
+//    → 一律用 wait_for_quality_samples 轮询收敛，不用固定 sleep。
+// 2. Top-K 加权随机用未播种的 fastrand → 只断言统计份额区间，不断言精确落点。
+// 3. 失败注入用 deterministic_failure_percent，不用 fastrand，保证可复现。
+// ============================================================================
+
+/// L2 测试的并发量级。
+///
+/// 用户明确要求："调度测试不是只搞 1 并发几并发这种，这种测试没有意义"。
+/// 256 足以让 Top-K 加权随机的份额收敛到可断言的区间，
+/// 也足以暴露羊群效应与并发下的状态竞争。
+const L2_WAVE_SIZE: usize = 256;
+
+/// 轮询等待若干池的质量样本落到 Redis。
+///
+/// **不能用固定 sleep**：质量采样是 detached `tokio::spawn`，wave 返回时
+/// 样本可能还在路上。既有测试里的 `sleep(150ms)` 正是 flaky 来源。
+async fn wait_for_quality_samples(
+    manager: &ExternalPoolManager,
+    pool_ids: &[u64],
+    min_samples: u64,
+) -> bool {
+    for _ in 0..100 {
+        let mut all_ready = true;
+        for pool_id in pool_ids {
+            let ready = manager
+                .load_pool_runtime_snapshot(*pool_id, &[])
+                .await
+                .ok()
+                .and_then(|runtime| runtime.quality)
+                .is_some_and(|quality| quality.sample_count >= min_samples);
+            if !ready {
+                all_ready = false;
+                break;
+            }
+        }
+        if all_ready {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// 读取一个池当前的质量状态。
+async fn pool_quality(
+    manager: &ExternalPoolManager,
+    pool_id: u64,
+) -> Option<ExternalPoolQualityState> {
+    manager
+        .load_pool_runtime_snapshot(pool_id, &[])
+        .await
+        .ok()
+        .and_then(|runtime| runtime.quality)
+}
+
+/// 跑一轮并发流量，返回全部结果。
+async fn run_quality_wave(
+    manager: &ExternalPoolManager,
+    config: &ExternalPoolsConfig,
+    batch: &str,
+    size: usize,
+) -> Vec<ExternalPoolForwardOutcome> {
+    let batch = batch.to_string();
+    futures::future::join_all((0..size).map(|index| {
+        let manager = manager.clone();
+        let config = config.clone();
+        let batch = batch.clone();
+        async move {
+            let mut route = test_route("claude-sonnet-4-6");
+            route.request_id = format!("req_{batch}_{index}");
+            route.error_id = format!("err_{batch}_{index}");
+            route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(5));
+            timeout(
+                Duration::from_secs(20),
+                manager.forward_with_failover_result(config, route),
+            )
+            .await
+            .expect("质量调度 wave 请求必须在超时前结束")
+        }
+    }))
+    .await
+}
+
+/// 统计一轮 wave 中成功的请求数。
+fn count_successes(outcomes: &[ExternalPoolForwardOutcome]) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| match outcome {
+            ExternalPoolForwardOutcome::Response(response) => response.status() == StatusCode::OK,
+            ExternalPoolForwardOutcome::FinalError(_) => false,
+        })
+        .count()
+}
+
+/// L2 测试用的基础配置：关闭重试以免掩盖调度分布，保留质量感知。
+fn l2_quality_config() -> ExternalPoolsConfig {
+    ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 1024,
+        // 重试会把"选错池"悄悄修正成成功，从而掩盖调度分布问题。
+        // L2 要观测的是**第一次选了谁**，所以关掉重试。
+        external_pool_retry_max_attempts: 0,
+        external_pool_same_pool_retry_count: 0,
+        external_pool_quality_aware_scheduling_enabled: true,
+        external_pool_quality_min_samples: 3,
+        ..ExternalPoolsConfig::default()
+    }
+}
+
+// ---- L2-14：主开关关闭等价性（防回归总闸门，必须最先通过）----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn l2_quality_disabled_keeps_legacy_priority_routing_under_load() {
+    // 矩阵 §4 规定这是**最先必须通过**的用例：
+    // 新功能不生效只是没收益，旧逻辑被破坏是事故。
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    // 主池慢且优先级高，备池快但优先级低。
+    // 关闭质量感知后，必须严格按优先级走——慢不构成让位的理由。
+    let slow_primary =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(120), "slow-primary")
+            .await;
+    let fast_backup = PatternExternalMessagesFakeServer::always_success("fast-backup").await;
+
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-off-primary",
+        1,
+        &slow_primary.base_url,
+        512,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-off-backup",
+        10,
+        &fast_backup.base_url,
+        512,
+    )
+    .await;
+
+    let mut config = l2_quality_config();
+    config.external_pool_quality_aware_scheduling_enabled = false;
+
+    let outcomes = run_quality_wave(&manager, &config, "l2_off", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "关闭质量感知时全部请求仍应成功"
+    );
+
+    let (primary_hits, _) = slow_primary.snapshot();
+    let backup_hits = fast_backup.snapshot().0;
+    assert_eq!(
+        primary_hits as usize, L2_WAVE_SIZE,
+        "主开关关闭时必须严格按优先级路由到主池，实际主池 {primary_hits} 次"
+    );
+    assert_eq!(
+        backup_hits, 0,
+        "主开关关闭时低优先级备池不得分流，实际 {backup_hits} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+// ---- L2-01：同优先级内按质量分流 ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn l2_quality_shifts_traffic_to_the_faster_pool_within_one_priority_tier() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let slow = PatternExternalMessagesFakeServer::slow_success(
+        Duration::from_millis(150),
+        "l2-slow-but-ok",
+    )
+    .await;
+    let fast = PatternExternalMessagesFakeServer::always_success("l2-fast-ok").await;
+
+    // 关键：两个池**同优先级**，质量是唯一的区分因素。
+    let slow_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-tier-slow", 5, &slow.base_url, 512)
+            .await;
+    let fast_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-tier-fast", 5, &fast.base_url, 512)
+            .await;
+
+    let config = l2_quality_config();
+
+    // 第一轮：质量数据为空，两池应大致均分（此时没有任何倾向性依据）。
+    let warmup = run_quality_wave(&manager, &config, "l2_tier_warm", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&warmup),
+        L2_WAVE_SIZE,
+        "两个池都健康时全部请求应成功"
+    );
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[slow_pool.id, fast_pool.id],
+            config.external_pool_quality_min_samples
+        )
+        .await,
+        "质量样本必须在轮询窗口内落到 Redis"
+    );
+
+    let (slow_before, _) = slow.snapshot();
+    let (fast_before, _) = fast.snapshot();
+
+    // 第二轮：质量数据已形成，流量应显著偏向快池。
+    let outcomes = run_quality_wave(&manager, &config, "l2_tier_hot", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "质量调度不得让健康池上的请求失败"
+    );
+
+    let slow_delta = slow.snapshot().0 - slow_before;
+    let fast_delta = fast.snapshot().0 - fast_before;
+    assert!(
+        fast_delta > slow_delta,
+        "同优先级下流量应偏向更快的池：快池 {fast_delta} 次 vs 慢池 {slow_delta} 次"
+    );
+    // 只断言"显著偏向"而非精确比例：Top-K 加权随机用未播种 fastrand。
+    assert!(
+        slow_delta > 0,
+        "慢池不应被完全饿死（它只是慢，不是坏），实际 {slow_delta} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+// ---- L2-06 / L2-07：可用性底线（"降级时保证可用"）----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn l2_all_pools_degraded_still_serves_traffic_without_emptying_candidates() {
+    // 用户要求的核心保证之一：外部池整体不稳定时，尽可能保证可用。
+    // 全体一起慢的场景下，相对中位数归一化必须让所有池都不被额外降权。
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let slow_a =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(120), "slow-a").await;
+    let slow_b =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(130), "slow-b").await;
+    let slow_c =
+        PatternExternalMessagesFakeServer::slow_success(Duration::from_millis(125), "slow-c").await;
+
+    let pool_a =
+        create_messages_pool_with_concurrency(&postgres, "l2-allslow-a", 5, &slow_a.base_url, 512)
+            .await;
+    let pool_b =
+        create_messages_pool_with_concurrency(&postgres, "l2-allslow-b", 5, &slow_b.base_url, 512)
+            .await;
+    let pool_c =
+        create_messages_pool_with_concurrency(&postgres, "l2-allslow-c", 5, &slow_c.base_url, 512)
+            .await;
+
+    let config = l2_quality_config();
+
+    let warmup = run_quality_wave(&manager, &config, "l2_allslow_warm", L2_WAVE_SIZE).await;
+    assert_eq!(count_successes(&warmup), L2_WAVE_SIZE);
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[pool_a.id, pool_b.id, pool_c.id],
+            config.external_pool_quality_min_samples
+        )
+        .await,
+        "质量样本必须落盘"
+    );
+
+    let before = [
+        slow_a.snapshot().0,
+        slow_b.snapshot().0,
+        slow_c.snapshot().0,
+    ];
+    let outcomes = run_quality_wave(&manager, &config, "l2_allslow_hot", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "全体劣化时必须仍然全部可用——这是'降级时保证可用'的底线"
+    );
+
+    let after = [
+        slow_a.snapshot().0,
+        slow_b.snapshot().0,
+        slow_c.snapshot().0,
+    ];
+    for (index, (before, after)) in before.iter().zip(after.iter()).enumerate() {
+        assert!(
+            after > before,
+            "全体一起慢时第 {index} 个池仍应分到流量，不得被中位数归一化误判为差池"
+        );
+    }
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn l2_single_remaining_pool_is_never_starved_even_when_failing() {
+    // 极端场景：只剩一个池且它一直在失败。候选集必须不清空——
+    // 即使它很差，它也是唯一的希望。
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let only = PatternExternalMessagesFakeServer::always_fail(
+        StatusCode::BAD_GATEWAY,
+        "upstream is down",
+    )
+    .await;
+    let pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-only-bad", 1, &only.base_url, 512)
+            .await;
+
+    let config = l2_quality_config();
+
+    // 先打一轮把失败率拉满并触发降级
+    let first = run_quality_wave(&manager, &config, "l2_only_first", 64).await;
+    assert_eq!(count_successes(&first), 0, "上游全失败时不应有成功");
+    assert!(
+        wait_for_quality_samples(&manager, &[pool.id], config.external_pool_quality_min_samples)
+            .await,
+        "失败样本也必须落盘"
+    );
+
+    let hits_before = only.snapshot().0;
+    // 第二轮：即使已被降级，唯一的池仍必须继续收到请求。
+    let _ = run_quality_wave(&manager, &config, "l2_only_second", 64).await;
+    let hits_after = only.snapshot().0;
+    assert!(
+        hits_after > hits_before,
+        "唯一可用的池即使被降级也必须继续收到流量，否则服务直接不可用；\
+         降级前 {hits_before} 次，降级后 {hits_after} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+// ---- L2-03 / L2-15：优先级硬分层在真实并发下不被质量分打穿 ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn l2_quality_never_promotes_a_lower_priority_tier_under_load() {
+    // 这是 P0-b 那个被既有测试捕获的缺陷的 L2 版本：
+    // 主池又慢又差，备池又快又好，但只要主池还能用，就不该让位。
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let slow_primary = PatternExternalMessagesFakeServer::slow_success(
+        Duration::from_millis(150),
+        "slow-but-primary",
+    )
+    .await;
+    let fast_backup = PatternExternalMessagesFakeServer::always_success("fast-backup").await;
+
+    let primary_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-tier-primary",
+        1,
+        &slow_primary.base_url,
+        512,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-tier-backup",
+        10,
+        &fast_backup.base_url,
+        512,
+    )
+    .await;
+
+    let config = l2_quality_config();
+
+    let warmup = run_quality_wave(&manager, &config, "l2_prio_warm", L2_WAVE_SIZE).await;
+    assert_eq!(count_successes(&warmup), L2_WAVE_SIZE);
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[primary_pool.id],
+            config.external_pool_quality_min_samples
+        )
+        .await,
+        "主池质量样本必须落盘"
+    );
+
+    let backup_before = fast_backup.snapshot().0;
+    let outcomes = run_quality_wave(&manager, &config, "l2_prio_hot", L2_WAVE_SIZE).await;
+    assert_eq!(count_successes(&outcomes), L2_WAVE_SIZE);
+
+    let backup_delta = fast_backup.snapshot().0 - backup_before;
+    assert_eq!(
+        backup_delta, 0,
+        "主池只是慢、并未失败时，质量分不得把低优先级备池提上来，实际备池收到 {backup_delta} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+// ---- L2-10 / L2-11：降级 → 探测 → 恢复的完整时间轨迹 ----
+
+/// 恢复轨迹测试里 mock 上游的失败预算。
+///
+/// 取 64（约 L2_WAVE_SIZE 的 1/4）：足以把失败率 EWMA 推过降级阈值，
+/// 又能确保在阶段一之内耗尽，让探测期与恢复期观测到的是真正"已恢复"的上游。
+const FLAKY_FAILURE_BUDGET: u64 = 64;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn l2_failing_pool_is_probationed_then_recovers_and_regains_traffic() {
+    // D3 全轨迹：一个池先持续失败被降级，随后上游恢复，
+    // 它必须靠探测流量拿回样本、走完恢复爬坡、重新承担流量。
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    // fail_first：前 N 次失败，之后恢复正常——模拟"一段时间后恢复"。
+    //
+    // 预算必须小于阶段一实际打到这个池的请求数（约 L2_WAVE_SIZE/2），
+    // 否则失败会渗进探测期与恢复期，池被反复重新降级——
+    // 那测的就不是"恢复"，而是"上游还在坏"。
+    let flaky = PatternExternalMessagesFakeServer::fail_first(
+        FLAKY_FAILURE_BUDGET,
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+        "flaky-recovered",
+    )
+    .await;
+    let healthy = PatternExternalMessagesFakeServer::always_success("healthy-peer").await;
+
+    let flaky_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-flaky", 5, &flaky.base_url, 512).await;
+    let healthy_pool =
+        create_messages_pool_with_concurrency(&postgres, "l2-healthy", 5, &healthy.base_url, 512)
+            .await;
+
+    // 压缩时间参数：Redis TTL 不随 tokio::time::pause 前进（矩阵 §2 调研结论），
+    // 因此必须把避让窗口压到秒级并配合真实 sleep。
+    let mut config = l2_quality_config();
+    config.external_pool_degrade_probation_secs = 2;
+    config.external_pool_max_probation_secs = 2;
+    config.external_pool_recovery_ramp_secs = 1;
+    config.external_pool_probe_share_percent = 20;
+    config.external_pool_degrade_error_rate_threshold = 0.5;
+
+    // 阶段一：制造持续失败，触发降级
+    let _ = run_quality_wave(&manager, &config, "l2_recover_fail", L2_WAVE_SIZE).await;
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[flaky_pool.id, healthy_pool.id],
+            config.external_pool_quality_min_samples
+        )
+        .await,
+        "质量样本必须落盘"
+    );
+
+    // 轮询等待降级状态写入（同样是 detached task）
+    let mut probationed = false;
+    for _ in 0..100 {
+        if pool_quality(&manager, flaky_pool.id)
+            .await
+            .is_some_and(|quality| quality.probation_until_ms.is_some())
+        {
+            probationed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        probationed,
+        "持续失败的池必须被标记为临时降级；这是'长时间质量差就降低调度优先级'的落地"
+    );
+
+    // 阶段二：降级期内，健康池应承担绝大部分流量，
+    // 但失败池仍必须收到少量探测流量（否则无法自证恢复）。
+    let flaky_before = flaky.snapshot().0;
+    let _ = run_quality_wave(&manager, &config, "l2_recover_probe", L2_WAVE_SIZE).await;
+    let flaky_probe_delta = flaky.snapshot().0 - flaky_before;
+    let diagnostic = manager
+        .load_pool_runtime_snapshot(flaky_pool.id, &[])
+        .await
+        .map(|runtime| {
+            format!(
+                "cooldown_secs={} reason={:?} streak={} quality={:?}",
+                runtime.pool_cooldown_remaining_secs,
+                runtime.pool_cooldown_reason,
+                runtime.transient_failure_streak,
+                runtime.quality,
+            )
+        })
+        .unwrap_or_else(|err| format!("runtime snapshot failed: {err}"));
+    assert!(
+        flaky_probe_delta > 0,
+        "被降级的池必须保留探测流量，否则临时降级会变成永久放逐；运行态：{diagnostic}"
+    );
+    assert!(
+        flaky_probe_delta < L2_WAVE_SIZE as u64,
+        "被降级的池不应再承担主要流量，实际 {flaky_probe_delta}/{L2_WAVE_SIZE}"
+    );
+
+    // 阶段三：等到池真正重新具备承接主流量的资格。
+    //
+    // 这里必须等**两个独立的窗口**都过去，不能只等避让窗口：
+    // - 新增的避让窗口（本测试压到 2 秒）；
+    // - 既有的瞬态失败连击窗口 `EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS`（30 秒，
+    //   硬编码常量，不可配置）。连击只要还在，有效优先级就被抬高，
+    //   池会停留在最优层之外，只能靠探测流量存活。
+    //
+    // Redis TTL 不随 tokio::time::pause 前进（矩阵 §2 调研结论），
+    // 因此只能真实 sleep。轮询到连击清零即可提前结束，不必固定睡满 30 秒。
+    let mut streak_cleared = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let runtime = manager
+            .load_pool_runtime_snapshot(flaky_pool.id, &[])
+            .await
+            .expect("读取恢复期运行态");
+        let probation_over = runtime
+            .quality
+            .as_ref()
+            .is_none_or(|quality| !quality.is_in_probation(external_pool_now_ms()));
+        if runtime.transient_failure_streak == 0 && probation_over {
+            streak_cleared = true;
+            break;
+        }
+    }
+    assert!(
+        streak_cleared,
+        "瞬态失败连击与避让窗口都应在轮询窗口内自然过期"
+    );
+
+    let mut recovery_deltas = Vec::new();
+    for wave in 0..3 {
+        let before = flaky.snapshot().0;
+        let outcomes = run_quality_wave(
+            &manager,
+            &config,
+            &format!("l2_recover_back_{wave}"),
+            L2_WAVE_SIZE,
+        )
+        .await;
+        assert_eq!(
+            count_successes(&outcomes),
+            L2_WAVE_SIZE,
+            "上游恢复后全部请求应成功"
+        );
+        recovery_deltas.push(flaky.snapshot().0 - before);
+    }
+
+    // 断言的是"**回到与健康池平起平坐**"，不是"逐轮持续上升"。
+    //
+    // 实测三轮份额形如 [137, 123, 130]/256——池在第一轮就已恢复到 ~50% 并在
+    // 平价附近抖动。单调上升断言在这里必然 flaky：没有上升空间了。
+    // 之所以恢复得这么快，是因为上面等待连击过期的 30 秒里，
+    // 探测流量已经在持续用成功样本压低失败率 EWMA。
+    //
+    // 同理刻意**不**拿"探测期份额"当基准：探测期是 probe_share_percent 的
+    // 固定配额（20% × 256 ≈ 51），与恢复中挣到的份额量级相撞，
+    // 实测会在 47/51 这种边界上随机翻面。
+    let last = recovery_deltas[recovery_deltas.len() - 1];
+    let healthy_last_wave = L2_WAVE_SIZE as u64 - last;
+    assert!(
+        last > 0 && healthy_last_wave > 0,
+        "恢复末轮两个池都应在承接流量：恢复池 {last} 次，健康池 {healthy_last_wave} 次"
+    );
+    // 平价区间放宽到 [25%, 75%]：Top-K 加权随机用未播种 fastrand，
+    // 只能断言统计区间，不能断言精确份额（矩阵 §2 防 flaky 纪律第 2 条）。
+    let last_share = last as f64 / L2_WAVE_SIZE as f64;
+    assert!(
+        (0.25..=0.75).contains(&last_share),
+        "恢复完成后应与健康池大致平分流量，实际份额 {last_share:.3}（全部轮次 {recovery_deltas:?}）"
+    );
+    // 先确认 mock 的失败预算确实已经用尽——否则"仍在避让"是上游真的还在失败，
+    // 那是测试夹具没造好，不是调度逻辑的问题。
+    let (_, total_failures) = flaky.snapshot();
+    assert_eq!(
+        total_failures, FLAKY_FAILURE_BUDGET,
+        "恢复阶段开始前 mock 的失败预算应已耗尽，否则上游仍在真实失败"
+    );
+    let recovered_quality = pool_quality(&manager, flaky_pool.id)
+        .await
+        .expect("恢复后必须仍有质量状态");
+    assert!(
+        !recovered_quality.is_in_probation(external_pool_now_ms()),
+        "恢复后不应仍处于避让期"
+    );
+    assert!(
+        recovered_quality.recent_error_rate < 0.9,
+        "持续成功应把失败率 EWMA 压下来，实际 {}",
+        recovered_quality.recent_error_rate
+    );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+// ---- L2-20：与既有因子混合（瞬态失败降权 + 质量感知同时生效）----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn l2_quality_composes_with_existing_transient_failure_penalty() {
+    // 既有的"瞬态失败临时降权"（硬分层内的有效优先级惩罚）
+    // 必须与新的质量评分同时生效且不互相破坏。
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = PatternExternalMessagesFakeServer::always_fail(
+        StatusCode::BAD_GATEWAY,
+        "temporary upstream failure",
+    )
+    .await;
+    let healthy = PatternExternalMessagesFakeServer::always_success("mixed-healthy").await;
+
+    // 失败池优先级更高：只有既有的瞬态降权 + 新的质量降级共同作用，
+    // 流量才会转移到优先级更低的健康池。
+    let failing_pool = create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-mixed-failing",
+        1,
+        &failing.base_url,
+        512,
+    )
+    .await;
+    create_messages_pool_with_concurrency(
+        &postgres,
+        "l2-mixed-healthy",
+        10,
+        &healthy.base_url,
+        512,
+    )
+    .await;
+
+    let mut config = l2_quality_config();
+    // 保留既有因子：瞬态失败降权 20 级，足以跨越 1 → 10 的优先级差。
+    config.external_pool_transient_failure_priority_penalty = 20;
+    config.external_pool_retry_max_attempts = 2;
+
+    let first = run_quality_wave(&manager, &config, "l2_mixed_first", L2_WAVE_SIZE).await;
+    assert!(
+        count_successes(&first) > 0,
+        "有健康备池时，重试应能把请求救回来"
+    );
+    assert!(
+        wait_for_quality_samples(
+            &manager,
+            &[failing_pool.id],
+            config.external_pool_quality_min_samples
+        )
+        .await,
+        "失败池的质量样本必须落盘"
+    );
+
+    let healthy_before = healthy.snapshot().0;
+    let outcomes = run_quality_wave(&manager, &config, "l2_mixed_second", L2_WAVE_SIZE).await;
+    assert_eq!(
+        count_successes(&outcomes),
+        L2_WAVE_SIZE,
+        "既有瞬态降权与质量降级共同作用后，流量应稳定落在健康池上"
+    );
+    let healthy_delta = healthy.snapshot().0 - healthy_before;
+    assert!(
+        healthy_delta >= L2_WAVE_SIZE as u64,
+        "健康池应承担全部流量，实际 {healthy_delta} 次"
+    );
+
+    postgres.drop_test_schema().await.unwrap();
 }

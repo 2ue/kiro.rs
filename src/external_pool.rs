@@ -10396,6 +10396,38 @@ fn select_external_pool_candidate(
             + (candidate.transient_failure_streak as u64).saturating_mul(transient_failure_penalty)
     };
     let best_priority = candidates.iter().map(effective_priority_of).min()?;
+
+    // 探测候选必须在**分层过滤之前**取。
+    //
+    // 被降级的池通常同时背着既有的瞬态失败连击（`transient_failure_streak`），
+    // 而连击会抬高有效优先级、把它挤出最优层——于是它在分层后根本不在候选里，
+    // 层内的探测抽样永远抽不到它。这两套降权机制是独立的：
+    // 探测流量要救的恰恰是"两者都踩中"的池，否则它拿不到任何样本自证恢复。
+    //
+    // 只有**真实处于避让期**的池才有探测资格：避让是质量系统主动打的标记，
+    // 代表"我降了它，但我想要它回来"；仅有连击而无避让的池不在此列，
+    // 那是既有逻辑的判断，不该被这里放行。
+    // 关键区分：**用户配置的**低优先级 vs **被失败连击降下去的**低优先级。
+    // 前者是用户的明确意图（备用池就该在主池可用时闲着），绝不放行探测流量；
+    // 后者是系统自己打的惩罚，正是探测要解救的对象。
+    // 判据：把连击惩罚去掉后，它本来是否属于最优层。
+    let base_priority_of =
+        |candidate: &ExternalPoolCandidate| -> u64 { candidate.pool.priority.max(0) as u64 };
+    let best_base_priority = candidates.iter().map(base_priority_of).min()?;
+
+    let probe_candidates: Vec<ExternalPoolCandidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            effective_priority_of(candidate) != best_priority
+                && base_priority_of(candidate) == best_base_priority
+                && candidate
+                    .quality
+                    .as_ref()
+                    .is_some_and(|quality| quality.is_in_probation(now_ms))
+        })
+        .cloned()
+        .collect();
+
     let candidates: Vec<ExternalPoolCandidate> = candidates
         .into_iter()
         .filter(|candidate| effective_priority_of(candidate) == best_priority)
@@ -10423,23 +10455,32 @@ fn select_external_pool_candidate(
     // 因此按 `probe_share_percent` 的概率，直接从避让池中抽一个放行。
     let probe_share = f64::from(config.external_pool_probe_share_percent.min(100)) / 100.0;
     if probe_share > 0.0 {
-        let probationary: Vec<&(ExternalPoolCandidate, f64)> = scored
+        // 层内的避让池 + 被连击挤出最优层的避让池，共同构成探测候选。
+        let mut probationary: Vec<&ExternalPoolCandidate> = scored
             .iter()
-            .filter(|(candidate, _)| {
+            .map(|(candidate, _)| candidate)
+            .filter(|candidate| {
                 candidate
                     .quality
                     .as_ref()
                     .is_some_and(|quality| quality.is_in_probation(now_ms))
             })
             .collect();
+        let in_tier_probationary = probationary.len();
+        probationary.extend(probe_candidates.iter());
+
         // 全员避让时不走探测分支：此时避让罚分对所有池是常数，
         // 正常评分路径本身就是公平的，再抽一次反而丢掉了质量信号。
+        // 注意只在"层内全是避让池且没有层外探测候选"时才算全员避让。
+        let everyone_in_tier_is_probationary =
+            in_tier_probationary == scored.len() && probe_candidates.is_empty();
+
         if !probationary.is_empty()
-            && probationary.len() < scored.len()
+            && !everyone_in_tier_is_probationary
             && fastrand::f64() < probe_share
         {
             let picked = fastrand::usize(..probationary.len());
-            return Some(probationary[picked].0.pool.clone());
+            return Some(probationary[picked].pool.clone());
         }
     }
 
