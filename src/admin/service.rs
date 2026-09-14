@@ -5939,6 +5939,71 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_local_rescue_max_wait_secs > 300 {
         return Err("externalPoolLocalRescueMaxWaitSecs 不能大于 300".to_string());
     }
+    if !(0.01..=1.0).contains(&config.external_pool_quality_ewma_alpha) {
+        return Err("externalPoolQualityEwmaAlpha 必须在 0.01 到 1 之间".to_string());
+    }
+    for (label, weight) in [
+        (
+            "externalPoolQualityPriorityWeight",
+            config.external_pool_quality_priority_weight,
+        ),
+        (
+            "externalPoolQualityLoadWeight",
+            config.external_pool_quality_load_weight,
+        ),
+        (
+            "externalPoolQualityErrorWeight",
+            config.external_pool_quality_error_weight,
+        ),
+        (
+            "externalPoolQualityLatencyWeight",
+            config.external_pool_quality_latency_weight,
+        ),
+        (
+            "externalPoolQualityProbationWeight",
+            config.external_pool_quality_probation_weight,
+        ),
+    ] {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(format!("{label} 必须是大于等于 0 的有限数"));
+        }
+        if weight > 1_000_000.0 {
+            return Err(format!("{label} 不能大于 1000000"));
+        }
+    }
+    if config.external_pool_quality_top_k > 100 {
+        return Err("externalPoolQualityTopK 不能大于 100".to_string());
+    }
+    if config.external_pool_quality_min_samples > 10_000 {
+        return Err("externalPoolQualityMinSamples 不能大于 10000".to_string());
+    }
+    if config.external_pool_quality_sample_ttl_secs > 86_400 {
+        return Err("externalPoolQualitySampleTtlSecs 不能大于 86400".to_string());
+    }
+    if config.external_pool_degrade_window_secs > 86_400 {
+        return Err("externalPoolDegradeWindowSecs 不能大于 86400".to_string());
+    }
+    if !(0.0..=1.0).contains(&config.external_pool_degrade_error_rate_threshold) {
+        return Err("externalPoolDegradeErrorRateThreshold 必须在 0 到 1 之间".to_string());
+    }
+    if config.external_pool_degrade_probation_secs > 86_400 {
+        return Err("externalPoolDegradeProbationSecs 不能大于 86400".to_string());
+    }
+    if config.external_pool_max_probation_secs > 86_400 {
+        return Err("externalPoolMaxProbationSecs 不能大于 86400".to_string());
+    }
+    // 避让上限必须不小于单次避让时长，否则指数退避的上限语义自相矛盾。
+    if config.external_pool_max_probation_secs < config.external_pool_degrade_probation_secs {
+        return Err(
+            "externalPoolMaxProbationSecs 不能小于 externalPoolDegradeProbationSecs".to_string(),
+        );
+    }
+    if config.external_pool_probe_share_percent > 100 {
+        return Err("externalPoolProbeSharePercent 不能大于 100".to_string());
+    }
+    if config.external_pool_recovery_ramp_secs > 86_400 {
+        return Err("externalPoolRecoveryRampSecs 不能大于 86400".to_string());
+    }
     if config.direct_external_model_rules.len() > 200 {
         return Err("directExternalModelRules 不能超过 200 条".to_string());
     }

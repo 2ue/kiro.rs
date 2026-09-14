@@ -88,7 +88,8 @@ use crate::{
             ExternalPoolCoordinatorGuardError, ExternalPoolCoordinatorGuardState,
             ExternalPoolCoordinatorSnapshot, ExternalPoolCoordinatorSnapshotRequest,
             ExternalPoolLeaseAcquireResult as RedisExternalPoolLeaseAcquireResult,
-            ExternalPoolLeaseReleaseRequest, LocalPoolCircuitState, RedisStore,
+            ExternalPoolLeaseReleaseRequest, ExternalPoolQualityState, LocalPoolCircuitState,
+            RedisStore, external_pool_quality_key,
         },
     },
     token,
@@ -174,6 +175,9 @@ const EXTERNAL_POOL_AUTO_DISABLE_POSTGRES_TIMEOUT: Duration = Duration::from_mil
 const EXTERNAL_POOL_AUTO_DISABLE_TRANSITION_CLAIM_TTL_SECS: usize = 5;
 const EXTERNAL_POOL_SUCCESS_RESET_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const EXTERNAL_POOL_SUCCESS_RESET_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
+/// 质量样本写入超时。质量数据是调度优化项，写入慢时直接放弃本次样本，
+/// 绝不允许拖住后台任务或影响主请求。
+const EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
 const EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS: usize = 64;
 const EXTERNAL_POOL_SUCCESS_RESET_MAX_TRACKED_POOLS: usize = 4_096;
 const EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS: usize = 30;
@@ -827,6 +831,62 @@ pub struct ExternalPoolStatus {
     pub transient_failure_ttl_secs: u64,
     pub dispatchable: bool,
     pub skipped_reason: Option<String>,
+    /// 被动质量采样视图；主开关关闭或样本为空时为 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<ExternalPoolQualityView>,
+}
+
+/// 管理端展示用的质量状态视图。
+///
+/// 与内部 `ExternalPoolQualityState` 分离：内部结构用绝对时间戳，
+/// 管理端需要的是"还剩多少秒"这类相对量，且不应随内部字段调整而破坏 API。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPoolQualityView {
+    /// 失败率 EWMA，范围 `0.0..=1.0`。
+    pub recent_error_rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ewma_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ewma_ms: Option<f64>,
+    pub sample_count: u64,
+    /// 样本是否已达到参与评分的门槛。
+    pub scoring_active: bool,
+    /// 是否处于临时避让（降低调度优先级）。
+    pub in_probation: bool,
+    /// 避让剩余秒数；未避让时为 0。
+    pub probation_remaining_secs: u64,
+    /// 连续避让层级，用于展示指数退避进展。
+    pub probation_level: u32,
+    /// 恢复爬坡进度 `0.0..=1.0`；`1.0` 表示已完全恢复。
+    pub recovery_progress: f64,
+}
+
+impl ExternalPoolQualityView {
+    fn from_state(
+        quality: &ExternalPoolQualityState,
+        config: &ExternalPoolsConfig,
+        now_ms: i64,
+    ) -> Self {
+        let in_probation = quality.is_in_probation(now_ms);
+        let probation_remaining_secs = quality
+            .probation_until_ms
+            .map(|until_ms| until_ms.saturating_sub(now_ms).max(0) as u64 / 1_000)
+            .unwrap_or(0);
+        let ramp_ms = (config.external_pool_recovery_ramp_secs as i64).saturating_mul(1_000);
+        Self {
+            recent_error_rate: quality.recent_error_rate,
+            ttft_ewma_ms: quality.ttft_ewma_ms,
+            latency_ewma_ms: quality.latency_ewma_ms,
+            sample_count: quality.sample_count,
+            scoring_active: quality
+                .has_enough_samples(config.external_pool_quality_min_samples),
+            in_probation,
+            probation_remaining_secs,
+            probation_level: quality.probation_level,
+            recovery_progress: quality.recovery_progress(now_ms, ramp_ms),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4331,6 +4391,8 @@ struct PoolRuntimeSnapshot {
     model_cooldown: Option<(u64, Option<String>)>,
     transient_failure_streak: u32,
     transient_failure_ttl: Option<Duration>,
+    /// 被动质量采样状态；`None` 表示无数据，评分时按中性值处理。
+    quality: Option<ExternalPoolQualityState>,
 }
 
 #[cfg(test)]
@@ -5700,6 +5762,7 @@ impl ExternalPoolManager {
                     transient_failure_ttl_secs: 0,
                     dispatchable: false,
                     skipped_reason: Some("coordinator_state_invalid".to_string()),
+                    quality: None,
                 });
                 continue;
             };
@@ -5719,6 +5782,15 @@ impl ExternalPoolManager {
                 cooldown_remaining_secs,
                 config,
             );
+            // 主开关关闭时不展示质量数据：此时它既不参与调度，
+            // 展示出来只会让运维误以为调度正在依据它决策。
+            let quality = config
+                .external_pool_quality_aware_scheduling_enabled
+                .then(|| runtime.quality.as_ref())
+                .flatten()
+                .map(|quality| {
+                    ExternalPoolQualityView::from_state(quality, config, external_pool_now_ms())
+                });
             statuses.push(ExternalPoolStatus {
                 dispatchable: skipped_reason.is_none(),
                 pool,
@@ -5728,6 +5800,7 @@ impl ExternalPoolManager {
                 transient_failure_streak,
                 transient_failure_ttl_secs,
                 skipped_reason,
+                quality,
             });
         }
         Ok(statuses)
@@ -6507,6 +6580,7 @@ impl ExternalPoolManager {
                     }
                     route.inference_attempt_budget.mark_downstream_committed();
                     self.record_external_success(
+                        &config,
                         &route,
                         &pool,
                         attempts.clone(),
@@ -6557,6 +6631,11 @@ impl ExternalPoolManager {
                         continue;
                     }
                     let cooldown_hint = err.cooldown.clone();
+                    // 被动质量采样：只有"上游质量相关"的错误才计入健康度。
+                    // 下游请求自身非法（请求体/schema/超长）与客户端断开不污染账号。
+                    if external_error_affects_pool_quality(&err) {
+                        self.record_pool_quality_sample(&config, pool_id, false, None, None);
+                    }
                     let mut soft_failure_cooldown = false;
                     let mut soft_failure_streak = None;
                     if let Some((_, reason)) = &cooldown_hint {
@@ -7524,13 +7603,21 @@ impl ExternalPoolManager {
                     )
             })
             .cloned()
-            .map(|pool| (pool, 0, 0))
+            .map(|pool| ExternalPoolCandidate {
+                pool,
+                in_flight: 0,
+                transient_failure_streak: 0,
+                quality: None,
+            })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             return None;
         }
         let eligible_pools = candidates.len();
-        let selected_pool = select_external_pool_candidate(candidates, config)?;
+        // 降级兜底路径**刻意只用优先级**：走到这里说明 Redis 不可用，
+        // 而质量数据正是存在 Redis 里的——此时它要么读不到、要么已经陈旧，
+        // 拿它做调度决策比不用更危险。
+        let selected_pool = select_external_pool_candidate_legacy(candidates, config)?;
         Some(PoolSelectionSnapshot {
             selected_pool: Some(selected_pool),
             availability: PoolAvailabilitySnapshot {
@@ -7735,7 +7822,12 @@ impl ExternalPoolManager {
                 None => {
                     availability.available_pools += 1;
                     if let Some(candidates) = candidates.as_mut() {
-                        candidates.push((pool, in_flight, transient_failure_streak));
+                        candidates.push(ExternalPoolCandidate {
+                            pool,
+                            in_flight,
+                            transient_failure_streak,
+                            quality: runtime.quality,
+                        });
                     }
                 }
                 Some("pool_concurrency_full" | "global_concurrency_full") => {
@@ -7764,7 +7856,9 @@ impl ExternalPoolManager {
         let selected_pool = if availability.coordinator_unavailable {
             None
         } else {
-            candidates.and_then(|candidates| select_external_pool_candidate(candidates, config))
+            candidates.and_then(|candidates| {
+                select_external_pool_candidate(candidates, config, external_pool_now_ms())
+            })
         };
         PoolSelectionSnapshot {
             selected_pool,
@@ -8699,6 +8793,12 @@ impl ExternalPoolManager {
                 pool_id: *pool_id,
                 cooldown_keys: external_pool_cooldown_keys(*pool_id, models),
                 transient_failure_key: external_pool_transient_failure_key(*pool_id),
+                // 质量状态始终随并发/冷却一起读取：它与既有键在同一次 Lua
+                // 往返内完成，额外开销只有一个 GET。若改为按开关条件读取，
+                // 选择运行态快照的缓存键就要带上开关状态，开关切换会让缓存
+                // 失效并在热路径上造成抖动。读取与否和是否参与评分解耦，
+                // 由 select_external_pool_candidate 按配置决定。
+                quality_key: Some(external_pool_quality_key(*pool_id)),
             })
             .collect::<Vec<_>>();
         let mut epoch_reconciliations = 0usize;
@@ -9061,8 +9161,98 @@ impl ExternalPoolManager {
         });
     }
 
+    /// 记录一次外部池被动质量样本。
+    ///
+    /// 与 `reset_pool_auto_disable_failure_counts` 不同，这里**不做合并**：
+    /// 每个请求都是一个独立数据点，合并会直接破坏 EWMA 的统计意义。
+    /// 写入是 fire-and-forget 的后台任务，失败只记日志，绝不影响主请求。
+    fn record_pool_quality_sample(
+        &self,
+        config: &ExternalPoolsConfig,
+        pool_id: u64,
+        success: bool,
+        ttft_ms: Option<u64>,
+        latency_ms: Option<u64>,
+    ) {
+        if !config.external_pool_quality_aware_scheduling_enabled {
+            return;
+        }
+        let redis = self.redis.clone();
+        let alpha = config.external_pool_quality_ewma_alpha;
+        let ttl = Duration::from_secs(config.external_pool_quality_sample_ttl_secs.max(1));
+        // 劣化判定在采样返回的最新状态上就地完成，不额外读一次 Redis。
+        let degrade_config = config.clone();
+        tokio::spawn(async move {
+            let result = timeout(
+                EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT,
+                redis.record_external_pool_quality_sample(
+                    pool_id, success, ttft_ms, latency_ms, alpha, ttl,
+                ),
+            )
+            .await;
+            let quality = match result {
+                Ok(Ok(quality)) => quality,
+                Ok(Err(err)) => {
+                    tracing::debug!(
+                        pool_id,
+                        error = %err,
+                        "记录外部池质量样本失败"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(pool_id, "记录外部池质量样本超时");
+                    return;
+                }
+            };
+
+            let decision = evaluate_external_pool_degrade(
+                &quality,
+                &degrade_config,
+                external_pool_now_ms(),
+            );
+            let ExternalPoolDegradeDecision::Probation {
+                until_ms,
+                level,
+                ttl_secs,
+            } = decision
+            else {
+                return;
+            };
+
+            tracing::info!(
+                pool_id,
+                error_rate = quality.recent_error_rate,
+                sample_count = quality.sample_count,
+                probation_level = level,
+                probation_secs = ttl_secs,
+                "外部池失败率持续超阈值，临时降低调度优先级"
+            );
+            let marked = timeout(
+                EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT,
+                redis.mark_external_pool_probation(
+                    pool_id,
+                    until_ms,
+                    level,
+                    Duration::from_secs(ttl_secs.max(1)),
+                ),
+            )
+            .await;
+            match marked {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::debug!(
+                    pool_id,
+                    error = %err,
+                    "写入外部池临时避让状态失败"
+                ),
+                Err(_) => tracing::debug!(pool_id, "写入外部池临时避让状态超时"),
+            }
+        });
+    }
+
     fn record_external_success(
         &self,
+        config: &ExternalPoolsConfig,
         route: &ExternalRouteRequest,
         pool: &ExternalPool,
         attempts: Vec<ExternalPoolAttempt>,
@@ -9070,6 +9260,14 @@ impl ExternalPoolManager {
         downstream_stop_reason: Option<String>,
     ) {
         self.reset_pool_auto_disable_failure_counts(pool.id);
+        // 成功回灌：此前外部池只有失败信号靠 TTL 过期，成功请求对调度零反馈，
+        // 导致质量曲线只降不升。这里补上延迟 EWMA 与失败率衰减。
+        let ttft_ms = match route.first_token_latency_ms.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(value),
+        };
+        let latency_ms = route.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.record_pool_quality_sample(config, pool.id, true, ttft_ms, Some(latency_ms));
         self.record_external(
             route,
             Some(pool),
@@ -9588,6 +9786,7 @@ impl ExternalStreamUsageGuard {
             terminal_message: None,
         });
         self.manager.record_external_success(
+            &self.config,
             &self.route,
             &self.pool,
             self.attempts.clone(),
@@ -9911,44 +10110,363 @@ fn load_score(in_flight: u32, max: u32) -> u64 {
     ((in_flight as u64) * 1_000_000) / max
 }
 
-fn select_external_pool_candidate(
-    mut candidates: Vec<(ExternalPool, u32, u32)>,
+/// 一个参与调度选择的外部池候选。
+///
+/// 携带调度所需的全部运行态信号，使 [`select_external_pool_candidate`] 保持
+/// **纯函数**——这是高并发分布测试可行的前提（见测试维度设计文档）。
+#[derive(Debug, Clone)]
+struct ExternalPoolCandidate {
+    pool: ExternalPool,
+    in_flight: u32,
+    transient_failure_streak: u32,
+    /// 被动质量采样状态；`None` 表示无数据，按中性值处理。
+    quality: Option<ExternalPoolQualityState>,
+}
+
+/// 质量感知评分所需的、跨候选集共享的归一化基准。
+///
+/// 首字与耗时必须**相对于同批候选的中位数**归一化，而不是用绝对毫秒阈值：
+/// 不同账号跑的模型不同，绝对延迟没有可比性——用绝对阈值会系统性地偏袒
+/// 跑小模型的账号。同时这也是"全体劣化时不降级任何人"的实现基础。
+#[derive(Debug, Clone, Copy, Default)]
+struct ExternalPoolQualityBaseline {
+    median_ttft_ms: Option<f64>,
+    median_latency_ms: Option<f64>,
+    median_error_rate: f64,
+}
+
+impl ExternalPoolQualityBaseline {
+    fn from_candidates(candidates: &[ExternalPoolCandidate], min_samples: u64) -> Self {
+        fn qualified(
+            candidate: &ExternalPoolCandidate,
+            min_samples: u64,
+        ) -> Option<&ExternalPoolQualityState> {
+            candidate
+                .quality
+                .as_ref()
+                .filter(|quality| quality.has_enough_samples(min_samples))
+        }
+        Self {
+            median_ttft_ms: median_of(
+                candidates
+                    .iter()
+                    .filter_map(|candidate| qualified(candidate, min_samples))
+                    .filter_map(|quality| quality.ttft_ewma_ms),
+            ),
+            median_latency_ms: median_of(
+                candidates
+                    .iter()
+                    .filter_map(|candidate| qualified(candidate, min_samples))
+                    .filter_map(|quality| quality.latency_ewma_ms),
+            ),
+            median_error_rate: median_of(
+                candidates
+                    .iter()
+                    .filter_map(|candidate| qualified(candidate, min_samples))
+                    .map(|quality| quality.recent_error_rate),
+            )
+            .unwrap_or(0.0),
+        }
+    }
+}
+
+fn median_of(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut values: Vec<f64> = values.filter(|value| value.is_finite()).collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+/// 相对劣化倍率：`value` 比中位数差多少倍。
+///
+/// 返回 `0.0` 表示不差于中位数（不罚分）。刻意只惩罚"比同伴差"，
+/// 不奖励"比同伴好"——否则全体一起变慢时会有人被无端降权。
+fn relative_penalty(value: Option<f64>, median: Option<f64>) -> f64 {
+    let (Some(value), Some(median)) = (value, median) else {
+        return 0.0;
+    };
+    if !value.is_finite() || !median.is_finite() || median <= 0.0 {
+        return 0.0;
+    }
+    ((value - median) / median).max(0.0)
+}
+
+/// 外部池调度评分。**分数越低越优先**，与既有 `scheduler_score_with_config` 一致。
+///
+/// 权重量级设计（见设计文档 §3）：错误率权重远大于延迟权重，
+/// 保证"重试/报错多"的判断优先级**高于**首字等延迟曲线——这是用户的明确要求。
+///
+/// 注意：调用方已按最优先级层过滤，因此层内所有候选的 `effective_priority`
+/// 相同，优先级项在比较中是常数。保留该项是为了让分数可直接用于
+/// 可观测性展示（管理端要能看出"这个池因为优先级低所以分高"）。
+fn external_pool_quality_score(
+    candidate: &ExternalPoolCandidate,
+    baseline: &ExternalPoolQualityBaseline,
+    config: &ExternalPoolsConfig,
+    now_ms: i64,
+) -> f64 {
+    let transient_failure_penalty = config.external_pool_transient_failure_priority_penalty as f64;
+    let effective_priority = candidate.pool.priority.max(0) as f64
+        + candidate.transient_failure_streak as f64 * transient_failure_penalty;
+    let load = load_score(candidate.in_flight, candidate.pool.max_concurrent_requests) as f64
+        / 1_000_000.0;
+
+    let mut score = effective_priority * config.external_pool_quality_priority_weight.max(0.0)
+        + load * config.external_pool_quality_load_weight.max(0.0);
+
+    // 样本不足的池按中性值处理：不加分也不减分。冷启动时不能因为"没数据"
+    // 就把一个池判成差的，否则新加入的账号永远起不来。
+    let Some(quality) = candidate
+        .quality
+        .as_ref()
+        .filter(|quality| quality.has_enough_samples(config.external_pool_quality_min_samples))
+    else {
+        return score;
+    };
+
+    // 失败率：相对中位数惩罚。全体一起坏时中位数同样高，无人被额外降权，
+    // 候选集因此不会被清空——这是"降级时保证可用"的核心机制。
+    let relative_error = (quality.recent_error_rate.clamp(0.0, 1.0) - baseline.median_error_rate)
+        .max(0.0);
+    score += relative_error * config.external_pool_quality_error_weight.max(0.0);
+
+    // 首字与总耗时分别归一化后再加权，两者独立生效。
+    let ttft_penalty = relative_penalty(quality.ttft_ewma_ms, baseline.median_ttft_ms);
+    let latency_penalty = relative_penalty(quality.latency_ewma_ms, baseline.median_latency_ms);
+    score += (ttft_penalty + latency_penalty) * config.external_pool_quality_latency_weight.max(0.0);
+
+    // 临时避让：加一个大额罚分使其排到末尾，但**不从候选集移除**，
+    // 保证探测流量仍能到达、账号有机会自证恢复。
+    if quality.is_in_probation(now_ms) {
+        score += config.external_pool_quality_probation_weight.max(0.0);
+    } else {
+        // 恢复爬坡：避让刚结束时仍保留部分罚分并线性衰减，
+        // 避免高优先级账号恢复瞬间被重新打满。
+        let ramp_ms = (config.external_pool_recovery_ramp_secs as i64).saturating_mul(1_000);
+        let progress = quality.recovery_progress(now_ms, ramp_ms);
+        if progress < 1.0 {
+            score +=
+                (1.0 - progress) * config.external_pool_quality_probation_weight.max(0.0);
+        }
+    }
+
+    score
+}
+
+/// 一次质量采样后得出的劣化判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPoolDegradeDecision {
+    /// 不需要改变避让状态。
+    Keep,
+    /// 进入（或延长）临时避让。
+    Probation {
+        until_ms: i64,
+        level: u32,
+        ttl_secs: u64,
+    },
+}
+
+/// 判定一次采样后是否需要把池临时降级。**纯函数**，时间由入参注入。
+///
+/// 这里刻意只看单个池的绝对失败率，不看候选集中位数——采样回调发生在请求
+/// 结束时，此时拿不到全局视图。安全性由评分层保证：避让在评分中是一个
+/// **常数罚分**，全体一起被避让时相对顺序不变、候选集也不会被清空，
+/// 因此"上游整体故障"不会退化成"无池可用"。
+///
+/// 指数退避：连续第 n 次进入避让，时长为 `probation_secs * 2^(n-1)`，
+/// 并被 `max_probation_secs` 封顶。恢复后（`probation_level` 随状态 TTL
+/// 自然过期）层级归零。
+fn evaluate_external_pool_degrade(
+    quality: &ExternalPoolQualityState,
+    config: &ExternalPoolsConfig,
+    now_ms: i64,
+) -> ExternalPoolDegradeDecision {
+    if !config.external_pool_quality_aware_scheduling_enabled {
+        return ExternalPoolDegradeDecision::Keep;
+    }
+    // 样本不足不判定：冷启动时几个失败样本不足以定性一个池。
+    if !quality.has_enough_samples(config.external_pool_quality_min_samples) {
+        return ExternalPoolDegradeDecision::Keep;
+    }
+    // 已在避让中则不重复延长，否则持续失败会让避让无限续期，
+    // 池永远等不到到期后的恢复爬坡窗口。
+    if quality.is_in_probation(now_ms) {
+        return ExternalPoolDegradeDecision::Keep;
+    }
+    let threshold = config
+        .external_pool_degrade_error_rate_threshold
+        .clamp(0.0, 1.0);
+    if quality.recent_error_rate < threshold {
+        return ExternalPoolDegradeDecision::Keep;
+    }
+
+    let level = quality.probation_level.saturating_add(1);
+    let base_secs = config.external_pool_degrade_probation_secs.max(1);
+    let max_secs = config
+        .external_pool_max_probation_secs
+        .max(base_secs);
+    // 指数退避，用移位前先夹紧指数避免溢出。
+    let shift = (level - 1).min(32);
+    let backoff_secs = base_secs
+        .saturating_mul(1u64 << shift)
+        .min(max_secs);
+    let until_ms = now_ms.saturating_add((backoff_secs as i64).saturating_mul(1_000));
+    // 状态 TTL 必须覆盖整个避让窗口加恢复爬坡，否则避让会随状态过期被抹掉。
+    let ttl_secs = backoff_secs
+        .saturating_add(config.external_pool_recovery_ramp_secs)
+        .max(config.external_pool_quality_sample_ttl_secs);
+
+    ExternalPoolDegradeDecision::Probation {
+        until_ms,
+        level,
+        ttl_secs,
+    }
+}
+
+/// 旧版（纯优先级 + 负载）选择逻辑。
+///
+/// 主开关关闭时**必须**走这里，保证与变更前行为完全等价。
+fn select_external_pool_candidate_legacy(
+    mut candidates: Vec<ExternalPoolCandidate>,
     config: &ExternalPoolsConfig,
 ) -> Option<ExternalPool> {
     let transient_failure_penalty = config.external_pool_transient_failure_priority_penalty as u64;
-    candidates.sort_by(|(a, a_in_flight, a_streak), (b, b_in_flight, b_streak)| {
-        let a_effective_priority =
-            a.priority.max(0) as u64 + (*a_streak as u64).saturating_mul(transient_failure_penalty);
-        let b_effective_priority =
-            b.priority.max(0) as u64 + (*b_streak as u64).saturating_mul(transient_failure_penalty);
-        let a_load = load_score(*a_in_flight, a.max_concurrent_requests);
-        let b_load = load_score(*b_in_flight, b.max_concurrent_requests);
-        a_effective_priority
-            .cmp(&b_effective_priority)
+    let effective_priority_of = |candidate: &ExternalPoolCandidate| -> u64 {
+        candidate.pool.priority.max(0) as u64
+            + (candidate.transient_failure_streak as u64).saturating_mul(transient_failure_penalty)
+    };
+    candidates.sort_by(|a, b| {
+        let a_load = load_score(a.in_flight, a.pool.max_concurrent_requests);
+        let b_load = load_score(b.in_flight, b.pool.max_concurrent_requests);
+        effective_priority_of(a)
+            .cmp(&effective_priority_of(b))
             .then_with(|| a_load.cmp(&b_load))
-            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.pool.id.cmp(&b.pool.id))
     });
-    let (best_priority, best_load) = candidates.first().map(|(pool, in_flight, streak)| {
-        let effective_priority = pool.priority.max(0) as u64
-            + (*streak as u64).saturating_mul(transient_failure_penalty);
+    let (best_priority, best_load) = candidates.first().map(|candidate| {
         (
-            effective_priority,
-            load_score(*in_flight, pool.max_concurrent_requests),
+            effective_priority_of(candidate),
+            load_score(candidate.in_flight, candidate.pool.max_concurrent_requests),
         )
     })?;
     let best: Vec<_> = candidates
         .into_iter()
-        .filter(|(pool, in_flight, streak)| {
-            pool.priority.max(0) as u64 + (*streak as u64).saturating_mul(transient_failure_penalty)
-                == best_priority
-                && load_score(*in_flight, pool.max_concurrent_requests) == best_load
+        .filter(|candidate| {
+            effective_priority_of(candidate) == best_priority
+                && load_score(candidate.in_flight, candidate.pool.max_concurrent_requests)
+                    == best_load
         })
         .collect();
     if best.is_empty() {
         return None;
     }
     let idx = fastrand::usize(..best.len());
-    best.into_iter().nth(idx).map(|(pool, _, _)| pool)
+    best.into_iter().nth(idx).map(|candidate| candidate.pool)
+}
+
+fn select_external_pool_candidate(
+    candidates: Vec<ExternalPoolCandidate>,
+    config: &ExternalPoolsConfig,
+    now_ms: i64,
+) -> Option<ExternalPool> {
+    if !config.external_pool_quality_aware_scheduling_enabled {
+        return select_external_pool_candidate_legacy(candidates, config);
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let baseline = ExternalPoolQualityBaseline::from_candidates(
+        &candidates,
+        config.external_pool_quality_min_samples,
+    );
+
+    // 优先级是**硬分层**，不是可被质量分抵消的一项权重。
+    // 先取出最优先级层，质量评分只在层内重排——否则 Top-K 加权随机会把
+    // 低优先级池提拔到高优先级池之上，破坏用户配置优先级的原意。
+    let transient_failure_penalty = config.external_pool_transient_failure_priority_penalty as u64;
+    let effective_priority_of = |candidate: &ExternalPoolCandidate| -> u64 {
+        candidate.pool.priority.max(0) as u64
+            + (candidate.transient_failure_streak as u64).saturating_mul(transient_failure_penalty)
+    };
+    let best_priority = candidates.iter().map(effective_priority_of).min()?;
+    let candidates: Vec<ExternalPoolCandidate> = candidates
+        .into_iter()
+        .filter(|candidate| effective_priority_of(candidate) == best_priority)
+        .collect();
+
+    let mut scored: Vec<(ExternalPoolCandidate, f64)> = candidates
+        .into_iter()
+        .map(|candidate| {
+            let score = external_pool_quality_score(&candidate, &baseline, config, now_ms);
+            (candidate, score)
+        })
+        .collect();
+    // 分数升序；同分时按 id 排序保证确定性。
+    scored.sort_by(|(a, a_score), (b, b_score)| {
+        a_score
+            .partial_cmp(b_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.pool.id.cmp(&b.pool.id))
+    });
+
+    // 避让期探测流量：这是"不是真冷却，只是临时降低优先级"的落地。
+    //
+    // 仅靠罚分不够——被避让的池会排到 Top-K 之外拿到**零**流量，
+    // 于是永远产生不了新样本来自证恢复，临时避让会变成永久放逐。
+    // 因此按 `probe_share_percent` 的概率，直接从避让池中抽一个放行。
+    let probe_share = f64::from(config.external_pool_probe_share_percent.min(100)) / 100.0;
+    if probe_share > 0.0 {
+        let probationary: Vec<&(ExternalPoolCandidate, f64)> = scored
+            .iter()
+            .filter(|(candidate, _)| {
+                candidate
+                    .quality
+                    .as_ref()
+                    .is_some_and(|quality| quality.is_in_probation(now_ms))
+            })
+            .collect();
+        // 全员避让时不走探测分支：此时避让罚分对所有池是常数，
+        // 正常评分路径本身就是公平的，再抽一次反而丢掉了质量信号。
+        if !probationary.is_empty()
+            && probationary.len() < scored.len()
+            && fastrand::f64() < probe_share
+        {
+            let picked = fastrand::usize(..probationary.len());
+            return Some(probationary[picked].0.pool.clone());
+        }
+    }
+
+    // Top-K 加权随机：只在最优的 K 个里按分差加权抽取。
+    // 纯取最优会让所有实例同时扑向同一个池（羊群效应），
+    // 而完全随机又会浪费质量信号——Top-K 是两者的平衡。
+    let top_k = (config.external_pool_quality_top_k.max(1) as usize).min(scored.len());
+    let top = &scored[..top_k];
+    let worst_score = top.last()?.1;
+    let weight_of = |score: f64| (worst_score - score + 1.0).max(0.01);
+    let total_weight: f64 = top.iter().map(|(_, score)| weight_of(*score)).sum();
+    if !total_weight.is_finite() || total_weight <= 0.0 {
+        return top.first().map(|(candidate, _)| candidate.pool.clone());
+    }
+    let mut roll = fastrand::f64() * total_weight;
+    for (candidate, score) in top {
+        roll -= weight_of(*score);
+        if roll <= 0.0 {
+            return Some(candidate.pool.clone());
+        }
+    }
+    top.last().map(|(candidate, _)| candidate.pool.clone())
+}
+
+/// 调度使用的当前时间（epoch 毫秒）。
+fn external_pool_now_ms() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
 async fn external_pool_lease_lost(lease: Option<&ExternalPoolLease>) {
@@ -10712,6 +11230,7 @@ fn decode_pool_runtime_snapshot(
         global_in_flight: coordinator.capacity.global_in_flight_requests,
         transient_failure_streak: coordinator.transient_failure_streak,
         transient_failure_ttl: coordinator.transient_failure_ttl,
+        quality: coordinator.quality,
         ..PoolRuntimeSnapshot::default()
     };
     if let Some(raw) = coordinator
@@ -11590,6 +12109,34 @@ fn should_escalate_external_pool_soft_failure(
 ) -> bool {
     let threshold = config.external_pool_transient_failure_cooldown_threshold;
     threshold > 0 && streak.is_some_and(|streak| streak >= threshold as u64)
+}
+
+/// 判断一次外部池错误是否应计入该池的被动质量健康度。
+///
+/// 只有"上游质量相关"的失败才计入。以下两类明确排除：
+///
+/// 1. **下游请求自身的问题**：请求体非法、工具 schema 非法、输入超长。
+///    这类错误换任何账号都会失败，计入健康度会凭空冤枉一个健康账号，
+///    并在客户端反复发送坏请求时把整个池打成"不健康"。
+/// 2. **模型不支持/映射未命中**：属于路由维度问题，已由模型级冷却处理，
+///    不应污染账号的整体质量曲线。
+///
+/// 慢成功不走这里——它是成功样本，只影响延迟 EWMA，永远不触发错误降权。
+fn external_error_affects_pool_quality(err: &ExternalPoolError) -> bool {
+    if let Some(status) = err.status {
+        // 400 且可判定为下游请求问题时不计入。
+        if status == StatusCode::BAD_REQUEST
+            && retry_pipeline::payload_too_long_message(&err.message)
+        {
+            return false;
+        }
+    }
+    if let Some((_, reason)) = &err.cooldown {
+        if !should_record_external_pool_soft_failure(reason) {
+            return false;
+        }
+    }
+    true
 }
 
 fn should_mark_external_pool_hard_cooldown(reason: &str) -> bool {

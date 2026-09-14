@@ -361,6 +361,22 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolSamePoolRetryDelayMs: 500,
   externalPoolTransientFailurePriorityPenalty: 20,
   externalPoolTransientFailureCooldownThreshold: 0,
+  externalPoolQualityAwareSchedulingEnabled: true,
+  externalPoolQualityEwmaAlpha: 0.2,
+  externalPoolQualitySampleTtlSecs: 600,
+  externalPoolQualityMinSamples: 5,
+  externalPoolQualityPriorityWeight: 1,
+  externalPoolQualityLoadWeight: 100,
+  externalPoolQualityErrorWeight: 100,
+  externalPoolQualityLatencyWeight: 10,
+  externalPoolQualityProbationWeight: 50,
+  externalPoolQualityTopK: 3,
+  externalPoolDegradeWindowSecs: 120,
+  externalPoolDegradeErrorRateThreshold: 0.5,
+  externalPoolDegradeProbationSecs: 180,
+  externalPoolMaxProbationSecs: 900,
+  externalPoolProbeSharePercent: 5,
+  externalPoolRecoveryRampSecs: 60,
   externalDirectPolicyEnabled: false,
   directExternalOnLocalMaintenance: false,
   directExternalModelRules: [],
@@ -1760,6 +1776,13 @@ function toWhole(value: number, min = 0, max?: number): number {
   return typeof max === 'number' ? Math.min(max, normalized) : normalized
 }
 
+/// 夹紧浮点配置值。与 toRatio 不同，上界可自定义且允许取到 1.0——
+/// 质量评分权重可以远大于 1，失败率阈值也允许设成 1.0 表示"全失败才降级"。
+function clampFloat(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min
+  return Math.min(max, Math.max(min, Number(value.toFixed(4))))
+}
+
 function toRatio(value: number): number {
   if (!Number.isFinite(value)) {
     return 0
@@ -2973,6 +2996,27 @@ export function RuntimeConfigPanel() {
         externalPoolSamePoolRetryDelayMs: toWhole(draft.externalPools.externalPoolSamePoolRetryDelayMs),
         externalPoolTransientFailurePriorityPenalty: toWhole(draft.externalPools.externalPoolTransientFailurePriorityPenalty),
         externalPoolTransientFailureCooldownThreshold: toWhole(draft.externalPools.externalPoolTransientFailureCooldownThreshold),
+        externalPoolQualityAwareSchedulingEnabled: Boolean(draft.externalPools.externalPoolQualityAwareSchedulingEnabled),
+        externalPoolQualityEwmaAlpha: clampFloat(draft.externalPools.externalPoolQualityEwmaAlpha, 0.01, 1),
+        externalPoolQualitySampleTtlSecs: toWhole(draft.externalPools.externalPoolQualitySampleTtlSecs, 1, 86_400),
+        externalPoolQualityMinSamples: toWhole(draft.externalPools.externalPoolQualityMinSamples, 1, 10_000),
+        externalPoolQualityPriorityWeight: clampFloat(draft.externalPools.externalPoolQualityPriorityWeight, 0, 1_000_000),
+        externalPoolQualityLoadWeight: clampFloat(draft.externalPools.externalPoolQualityLoadWeight, 0, 1_000_000),
+        externalPoolQualityErrorWeight: clampFloat(draft.externalPools.externalPoolQualityErrorWeight, 0, 1_000_000),
+        externalPoolQualityLatencyWeight: clampFloat(draft.externalPools.externalPoolQualityLatencyWeight, 0, 1_000_000),
+        externalPoolQualityProbationWeight: clampFloat(draft.externalPools.externalPoolQualityProbationWeight, 0, 1_000_000),
+        externalPoolQualityTopK: toWhole(draft.externalPools.externalPoolQualityTopK, 1, 100),
+        externalPoolDegradeWindowSecs: toWhole(draft.externalPools.externalPoolDegradeWindowSecs, 1, 86_400),
+        externalPoolDegradeErrorRateThreshold: clampFloat(draft.externalPools.externalPoolDegradeErrorRateThreshold, 0, 1),
+        externalPoolDegradeProbationSecs: toWhole(draft.externalPools.externalPoolDegradeProbationSecs, 1, 86_400),
+        // 避让上限不得低于单次避让时长，与后端 validate_external_pools_config 的跨字段校验保持一致，
+        // 避免用户在前端就提交一个必然被后端拒绝的组合。
+        externalPoolMaxProbationSecs: Math.max(
+          toWhole(draft.externalPools.externalPoolMaxProbationSecs, 1, 86_400),
+          toWhole(draft.externalPools.externalPoolDegradeProbationSecs, 1, 86_400),
+        ),
+        externalPoolProbeSharePercent: toWhole(draft.externalPools.externalPoolProbeSharePercent, 0, 100),
+        externalPoolRecoveryRampSecs: toWhole(draft.externalPools.externalPoolRecoveryRampSecs, 0, 86_400),
         externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
         localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
         localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),

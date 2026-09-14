@@ -53,6 +53,7 @@ import {
   normalizeWeightedCapacity,
   toRatio,
   toScale,
+  clampFloat,
   toWhole,
 } from '@/lib/runtime-config-defaults'
 import {
@@ -378,6 +379,27 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolSamePoolRetryDelayMs: toWhole(draft.externalPools.externalPoolSamePoolRetryDelayMs),
       externalPoolTransientFailurePriorityPenalty: toWhole(draft.externalPools.externalPoolTransientFailurePriorityPenalty),
       externalPoolTransientFailureCooldownThreshold: toWhole(draft.externalPools.externalPoolTransientFailureCooldownThreshold),
+      externalPoolQualityAwareSchedulingEnabled: Boolean(draft.externalPools.externalPoolQualityAwareSchedulingEnabled),
+      externalPoolQualityEwmaAlpha: clampFloat(draft.externalPools.externalPoolQualityEwmaAlpha, 0.01, 1),
+      externalPoolQualitySampleTtlSecs: toWhole(draft.externalPools.externalPoolQualitySampleTtlSecs, 1, 86_400),
+      externalPoolQualityMinSamples: toWhole(draft.externalPools.externalPoolQualityMinSamples, 1, 10_000),
+      externalPoolQualityPriorityWeight: clampFloat(draft.externalPools.externalPoolQualityPriorityWeight, 0, 1_000_000),
+      externalPoolQualityLoadWeight: clampFloat(draft.externalPools.externalPoolQualityLoadWeight, 0, 1_000_000),
+      externalPoolQualityErrorWeight: clampFloat(draft.externalPools.externalPoolQualityErrorWeight, 0, 1_000_000),
+      externalPoolQualityLatencyWeight: clampFloat(draft.externalPools.externalPoolQualityLatencyWeight, 0, 1_000_000),
+      externalPoolQualityProbationWeight: clampFloat(draft.externalPools.externalPoolQualityProbationWeight, 0, 1_000_000),
+      externalPoolQualityTopK: toWhole(draft.externalPools.externalPoolQualityTopK, 1, 100),
+      externalPoolDegradeWindowSecs: toWhole(draft.externalPools.externalPoolDegradeWindowSecs, 1, 86_400),
+      externalPoolDegradeErrorRateThreshold: clampFloat(draft.externalPools.externalPoolDegradeErrorRateThreshold, 0, 1),
+      externalPoolDegradeProbationSecs: toWhole(draft.externalPools.externalPoolDegradeProbationSecs, 1, 86_400),
+      // 避让上限不得低于单次避让时长，与后端 validate_external_pools_config 的跨字段校验保持一致，
+      // 避免用户在前端就提交一个必然被后端拒绝的组合。
+      externalPoolMaxProbationSecs: Math.max(
+        toWhole(draft.externalPools.externalPoolMaxProbationSecs, 1, 86_400),
+        toWhole(draft.externalPools.externalPoolDegradeProbationSecs, 1, 86_400),
+      ),
+      externalPoolProbeSharePercent: toWhole(draft.externalPools.externalPoolProbeSharePercent, 0, 100),
+      externalPoolRecoveryRampSecs: toWhole(draft.externalPools.externalPoolRecoveryRampSecs, 0, 86_400),
       externalPoolLocalRescueMaxWaitSecs: toWhole(draft.externalPools.externalPoolLocalRescueMaxWaitSecs),
       localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
       localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
@@ -1113,6 +1135,205 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolMaxInputTokens')}
                   />
                 </TwoCol>
+
+                <div className="rounded-lg border p-4">
+                  <div className="mb-3 space-y-1">
+                    <div className="text-sm font-medium">质量感知调度</div>
+                    <div className="text-xs leading-5 text-muted-foreground">
+                      根据真实请求观测到的失败率、首字延迟和总耗时，在**同优先级的账号之间**选择更好的那个。
+                      全部数据来自用户真实流量，不做任何主动探测；优先级本身是硬分层，质量分不会把低优先级账号提上来。
+                    </div>
+                  </div>
+                  <TwoCol>
+                    <TogField
+                      label="启用质量感知调度"
+                      desc="关闭后完全退回“优先级 → 负载”的旧排序，既不读也不写质量数据，可作为线上快速回退手段。"
+                      checked={draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityAwareSchedulingEnabled')}
+                    />
+                    <NumField
+                      label="候选池大小 K"
+                      desc="在评分最优的 K 个账号里加权随机挑选，避免多实例同时扑向同一个账号。1 表示总是选最优。"
+                      value={draft.externalPools.externalPoolQualityTopK}
+                      min={1}
+                      max={100}
+                      suffix="个"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityTopK')}
+                    />
+                    <NumField
+                      label="质量平滑系数"
+                      desc="EWMA 系数，有效窗口约为最近 1/系数 个请求。越大越灵敏，越小越稳定。"
+                      value={draft.externalPools.externalPoolQualityEwmaAlpha}
+                      min={0.01}
+                      max={1}
+                      step={0.01}
+                      suffix="系数"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityEwmaAlpha')}
+                    />
+                    <NumField
+                      label="最少样本数"
+                      desc="累计样本不足时按中性处理，不加分也不减分；避免新账号因冷启动数据难看而永远起不来。"
+                      value={draft.externalPools.externalPoolQualityMinSamples}
+                      min={1}
+                      max={10_000}
+                      suffix="次"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityMinSamples')}
+                    />
+                    <NumField
+                      label="质量数据有效期"
+                      desc="超过该时长没有新请求，质量数据过期并回到中性值。"
+                      value={draft.externalPools.externalPoolQualitySampleTtlSecs}
+                      min={1}
+                      max={86_400}
+                      suffix="秒"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualitySampleTtlSecs')}
+                    />
+                  </TwoCol>
+                </div>
+
+                <div className="rounded-lg border p-4">
+                  <div className="mb-3 space-y-1">
+                    <div className="text-sm font-medium">评分权重</div>
+                    <div className="text-xs leading-5 text-muted-foreground">
+                      分数越低越优先。延迟类指标按“相对候选集中位数”计算，只惩罚明显比同伴差的账号——
+                      因此全体一起变慢时不会有账号被无端降权，候选集也不会被清空。
+                    </div>
+                  </div>
+                  <TwoCol>
+                    <NumField
+                      label="失败率权重"
+                      desc="量级刻意远高于延迟权重：报错比“慢”严重得多，必须能压过首字延迟的倾向。默认 100。"
+                      value={draft.externalPools.externalPoolQualityErrorWeight}
+                      min={0}
+                      max={1_000_000}
+                      step={1}
+                      suffix="权重"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityErrorWeight')}
+                    />
+                    <NumField
+                      label="延迟权重"
+                      desc="首字延迟与总耗时各自相对中位数归一化后共用该权重；慢一倍贡献 1 个权重单位。"
+                      value={draft.externalPools.externalPoolQualityLatencyWeight}
+                      min={0}
+                      max={1_000_000}
+                      step={1}
+                      suffix="权重"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityLatencyWeight')}
+                    />
+                    <NumField
+                      label="负载权重"
+                      desc="账号当前并发占用率的权重，用于在质量相近时摊平负载。"
+                      value={draft.externalPools.externalPoolQualityLoadWeight}
+                      min={0}
+                      max={1_000_000}
+                      step={1}
+                      suffix="权重"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityLoadWeight')}
+                    />
+                    <NumField
+                      label="临时降级权重"
+                      desc="被临时降级的账号额外增加的分数，使其排到末尾但不移出候选集。"
+                      value={draft.externalPools.externalPoolQualityProbationWeight}
+                      min={0}
+                      max={1_000_000}
+                      step={1}
+                      suffix="权重"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityProbationWeight')}
+                    />
+                    <NumField
+                      label="优先级权重"
+                      desc="仅用于管理端展示分数构成；优先级是硬分层，同层内该项为常数，不影响实际比较。"
+                      value={draft.externalPools.externalPoolQualityPriorityWeight}
+                      min={0}
+                      max={1_000_000}
+                      step={1}
+                      suffix="权重"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolQualityPriorityWeight')}
+                    />
+                  </TwoCol>
+                </div>
+
+                <div className="rounded-lg border p-4">
+                  <div className="mb-3 space-y-1">
+                    <div className="text-sm font-medium">劣化与恢复</div>
+                    <div className="text-xs leading-5 text-muted-foreground">
+                      持续失败的账号会被<strong>临时降低调度优先级</strong>，这不是真正的冷却——
+                      它仍会保留一小部分探测流量，否则永远产生不了新数据来自证恢复。
+                    </div>
+                  </div>
+                  <TwoCol>
+                    <NumField
+                      label="降级失败率阈值"
+                      desc="失败率达到该比例即临时降级。设为 1 表示只在全部失败时才降级。"
+                      value={draft.externalPools.externalPoolDegradeErrorRateThreshold}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      suffix="比例"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolDegradeErrorRateThreshold')}
+                    />
+                    <NumField
+                      label="劣化判定窗口"
+                      desc="失败率的观察窗口长度。"
+                      value={draft.externalPools.externalPoolDegradeWindowSecs}
+                      min={1}
+                      max={86_400}
+                      suffix="秒"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolDegradeWindowSecs')}
+                    />
+                    <NumField
+                      label="单次降级时长"
+                      desc="首次触发降级持续多久；连续再次触发会按 2 倍逐次延长。"
+                      value={draft.externalPools.externalPoolDegradeProbationSecs}
+                      min={1}
+                      max={86_400}
+                      suffix="秒"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolDegradeProbationSecs')}
+                    />
+                    <NumField
+                      label="最长降级时长"
+                      desc="连续降级指数退避的上限，不得低于单次降级时长。"
+                      value={draft.externalPools.externalPoolMaxProbationSecs}
+                      min={draft.externalPools.externalPoolDegradeProbationSecs}
+                      max={86_400}
+                      suffix="秒"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolMaxProbationSecs')}
+                    />
+                    <NumField
+                      label="降级期探测流量"
+                      desc="被降级账号仍保留的流量比例。设为 0 会让降级变成硬避让，账号将无法自证恢复，除非它重新进入候选前列。"
+                      value={draft.externalPools.externalPoolProbeSharePercent}
+                      min={0}
+                      max={100}
+                      suffix="%"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolProbeSharePercent')}
+                    />
+                    <NumField
+                      label="恢复爬坡时长"
+                      desc="降级到期后流量线性回升的时长，避免账号刚恢复就被瞬间打满。0 表示立即全量恢复。"
+                      value={draft.externalPools.externalPoolRecoveryRampSecs}
+                      min={0}
+                      max={86_400}
+                      suffix="秒"
+                      disabled={!draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
+                      onChange={setExternalPools('externalPoolRecoveryRampSecs')}
+                    />
+                  </TwoCol>
+                </div>
               </div>
             )}
 

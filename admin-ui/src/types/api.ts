@@ -1468,6 +1468,22 @@ export interface ExternalPoolsConfig {
   externalPoolSamePoolRetryDelayMs: number
   externalPoolTransientFailurePriorityPenalty: number
   externalPoolTransientFailureCooldownThreshold: number
+  externalPoolQualityAwareSchedulingEnabled: boolean
+  externalPoolQualityEwmaAlpha: number
+  externalPoolQualitySampleTtlSecs: number
+  externalPoolQualityMinSamples: number
+  externalPoolQualityPriorityWeight: number
+  externalPoolQualityLoadWeight: number
+  externalPoolQualityErrorWeight: number
+  externalPoolQualityLatencyWeight: number
+  externalPoolQualityProbationWeight: number
+  externalPoolQualityTopK: number
+  externalPoolDegradeWindowSecs: number
+  externalPoolDegradeErrorRateThreshold: number
+  externalPoolDegradeProbationSecs: number
+  externalPoolMaxProbationSecs: number
+  externalPoolProbeSharePercent: number
+  externalPoolRecoveryRampSecs: number
   externalDirectPolicyEnabled: boolean
   directExternalOnLocalMaintenance: boolean
   directExternalModelRules: string[]

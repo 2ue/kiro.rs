@@ -935,3 +935,112 @@ fn extracts_model_ids_from_kiro_compatible_models_response() {
         ]
     );
 }
+
+#[test]
+fn external_pool_quality_defaults_pass_validation() {
+    // 默认配置必须开箱可用——主开关默认打开，所有默认值都必须合法。
+    let config = ExternalPoolsConfig::default();
+    assert!(
+        config.external_pool_quality_aware_scheduling_enabled,
+        "质量感知调度主开关必须默认打开"
+    );
+    validate_external_pools_config(&config).expect("默认配置必须通过校验");
+}
+
+#[test]
+fn external_pool_quality_ewma_alpha_validation_is_bounded() {
+    let mut config = ExternalPoolsConfig::default();
+
+    config.external_pool_quality_ewma_alpha = 0.01;
+    validate_external_pools_config(&config).expect("下界必须被接受");
+    config.external_pool_quality_ewma_alpha = 1.0;
+    validate_external_pools_config(&config).expect("上界必须被接受");
+
+    for invalid in [0.0, 1.0001, -0.5, f64::NAN] {
+        config.external_pool_quality_ewma_alpha = invalid;
+        let err = validate_external_pools_config(&config).unwrap_err();
+        assert!(
+            err.contains("externalPoolQualityEwmaAlpha"),
+            "alpha={invalid} 应被拒绝，实际错误: {err}"
+        );
+    }
+}
+
+#[test]
+fn external_pool_quality_weights_reject_negative_and_non_finite() {
+    // 负权重会把"差"变成"好"，是最危险的误配置方向。
+    for mutate in [
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_error_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_latency_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_probation_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_priority_weight = value
+        },
+        |config: &mut ExternalPoolsConfig, value: f64| {
+            config.external_pool_quality_load_weight = value
+        },
+    ] {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, 1_000_001.0] {
+            let mut config = ExternalPoolsConfig::default();
+            mutate(&mut config, invalid);
+            let err = validate_external_pools_config(&config)
+                .expect_err(&format!("权重 {invalid} 必须被拒绝"));
+            assert!(
+                err.contains("externalPoolQuality"),
+                "unexpected validation error: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn external_pool_probation_ceiling_cannot_be_below_single_probation() {
+    // 避让上限小于单次避让时长会让指数退避的上限语义自相矛盾。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_degrade_probation_secs = 600;
+    config.external_pool_max_probation_secs = 300;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(
+        err.contains("externalPoolMaxProbationSecs"),
+        "unexpected validation error: {err}"
+    );
+
+    config.external_pool_max_probation_secs = 600;
+    validate_external_pools_config(&config).expect("相等必须被接受");
+}
+
+#[test]
+fn external_pool_degrade_error_rate_threshold_is_a_ratio() {
+    let mut config = ExternalPoolsConfig::default();
+    for valid in [0.0, 0.5, 1.0] {
+        config.external_pool_degrade_error_rate_threshold = valid;
+        validate_external_pools_config(&config).expect("合法比率必须被接受");
+    }
+    for invalid in [-0.1, 1.1] {
+        config.external_pool_degrade_error_rate_threshold = invalid;
+        let err = validate_external_pools_config(&config).unwrap_err();
+        assert!(
+            err.contains("externalPoolDegradeErrorRateThreshold"),
+            "unexpected validation error: {err}"
+        );
+    }
+}
+
+#[test]
+fn external_pool_quality_probe_share_and_top_k_are_bounded() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_probe_share_percent = 101;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(err.contains("externalPoolProbeSharePercent"), "{err}");
+
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_top_k = 101;
+    let err = validate_external_pools_config(&config).unwrap_err();
+    assert!(err.contains("externalPoolQualityTopK"), "{err}");
+}

@@ -330,6 +330,22 @@ export function defaultExternalPoolsConfig() {
     externalPoolSamePoolRetryDelayMs: 500,
     externalPoolTransientFailurePriorityPenalty: 20,
     externalPoolTransientFailureCooldownThreshold: 0,
+    externalPoolQualityAwareSchedulingEnabled: true,
+    externalPoolQualityEwmaAlpha: 0.2,
+    externalPoolQualitySampleTtlSecs: 600,
+    externalPoolQualityMinSamples: 5,
+    externalPoolQualityPriorityWeight: 1,
+    externalPoolQualityLoadWeight: 100,
+    externalPoolQualityErrorWeight: 100,
+    externalPoolQualityLatencyWeight: 10,
+    externalPoolQualityProbationWeight: 50,
+    externalPoolQualityTopK: 3,
+    externalPoolDegradeWindowSecs: 120,
+    externalPoolDegradeErrorRateThreshold: 0.5,
+    externalPoolDegradeProbationSecs: 180,
+    externalPoolMaxProbationSecs: 900,
+    externalPoolProbeSharePercent: 5,
+    externalPoolRecoveryRampSecs: 60,
     externalDirectPolicyEnabled: false,
     directExternalOnLocalMaintenance: false,
     directExternalModelRules: [],
@@ -556,6 +572,13 @@ export function fieldNeedsTarget(policy: ReportedUsageFieldPolicy): boolean {
 export function toWhole(value: number, min = 0, max?: number): number {
   const normalized = Math.max(min, Math.floor(value || 0))
   return typeof max === 'number' ? Math.min(max, normalized) : normalized
+}
+
+/// 夹紧浮点配置值。与 toRatio 不同，上界可自定义且允许取到 1.0——
+/// 质量评分权重可以远大于 1，失败率阈值也允许设成 1.0 表示"全失败才降级"。
+export function clampFloat(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min
+  return Math.min(max, Math.max(min, Number(value.toFixed(4))))
 }
 
 export function toRatio(value: number): number {

@@ -1,0 +1,267 @@
+# 质量感知调度实现进度
+
+Last updated: 2026-09-15
+
+设计文档：[external-pool-quality-aware-scheduling.md](external-pool-quality-aware-scheduling.md)
+测试维度设计：[quality-aware-scheduling-test-matrix.md](quality-aware-scheduling-test-matrix.md)
+
+本文件用于防止实现进度丢失。每完成一个子项立即更新。
+
+## 状态图例
+
+- `[ ]` 未开始
+- `[~]` 进行中
+- `[x]` 完成
+- `[!]` 阻塞
+
+---
+
+## P0-a kiro.rs 质量采样（仅采集，不改选择逻辑）
+
+- [x] `ExternalPoolQualityState` 结构定义 `src/storage/redis_cache.rs:325`
+      （error_rate / ttft_ewma / latency_ewma / sample_count / probation / recovery）
+- [x] Redis Lua：质量状态读取并入 `external_pool_coordinator_snapshots`（**同一次往返**，
+      新增 `quality_key` 可选键 + `ARGV` 标志位；未请求时回填空串保证游标算术恒定）
+- [x] Redis Lua：`record_external_pool_quality_sample` 原子读改写
+      （失败率 EWMA 双向 + 延迟/首字 EWMA 仅成功样本累计）
+- [x] Redis Lua：`mark_external_pool_probation`（取最大值，支持指数退避层级）
+- [x] `clear_external_pool_quality`（管理端清除用）
+- [x] `PoolRuntimeSnapshot` 扩展 `quality` 字段并在 `decode_pool_runtime_snapshot` 透传
+- [x] `record_external_success` 接入成功回灌（**此前完全缺失**，是最大缺口）
+- [x] 失败路径接入质量采样（`forward_with_failover_result` 错误分支）
+- [x] `external_error_affects_pool_quality`：下游请求自身问题不污染健康度
+- [x] 配置项：主开关 + 18 个参数 + 默认值 + Default impl
+- [x] `cargo check --bins` 通过
+- [ ] `ExternalPoolStatus` 暴露质量字段（移到 P1 可观测性一并做）
+- [x] **单元测试 15 项全部通过**（`KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379`）
+  - 纯逻辑 6 项（`src/storage/redis_cache.rs` tests）：
+    损坏载荷退化为 None / 越界字段夹紧与丢弃 / 样本门槛冷启动 /
+    避让窗口到期边界（右开区间）/ 恢复爬坡线性且饱和 / 质量键按池隔离
+  - Redis Lua 往返 5 项：EWMA 数学 / 损坏与 WRONGTYPE 自愈 /
+    避让取最大值不缩短 / **200 并发采样零丢失（读-改-写原子性）** /
+    批量快照携带质量且仍是 **1 次往返**
+  - 错误归因 4 项（`src/external_pool/tests.rs`）：
+    下游超长请求不污染 / 真实上游 400 计入 / 模型路由缺失不污染 /
+    上游故障（429/5xx/超时/网络层）全部计入
+- [x] **全量回归：2002 passed / 0 failed**，既有逻辑未破坏
+
+### P0-a 测试中发现并修复的问题
+
+- `external_pool_coordinator_snapshot`（单池路径）未带 `quality_key`。
+  确认仅测试与诊断使用，调度热路径走批量接口，故显式置 `None` 并加注释说明。
+- `cargo check --bins` **不编译测试代码**，必须用 `cargo test --bins --no-run` 才能
+  发现结构体新增字段导致的既有测试断裂。后续阶段一律以后者为准。
+
+### P0-a 设计决策
+
+- **质量键始终读取，不按开关条件**：选择运行态快照缓存键若带上开关状态，
+  开关切换会让 100ms TTL 的热路径缓存失效并抖动。读取与是否参与评分解耦。
+- **质量样本不做合并**（对比 `reset_pool_auto_disable_failure_counts` 的 1s 合并）：
+  每个请求都是独立数据点，合并会破坏 EWMA 统计意义。
+- **延迟只在成功样本上累计**：失败请求的耗时多为超时或立即拒绝，
+  混入会同时污染"快"和"慢"两个方向。
+- `ExternalPoolsConfig` 去掉 `Eq` 派生（f64 权重），既有变更检测只依赖 `PartialEq`。
+
+## P0-b kiro.rs 加权评分选择
+
+**可测性约束（来自测试维度设计）**：`select_external_pool_candidate` 必须保持纯函数，
+质量状态与**当前时间 `now_ms` 都要作为入参注入**，不得在函数内部读 `Utc::now()`。
+否则通路 A 的 `D3-slow-recover` / `D3-never-recover` 无法测试。
+
+- [x] 配置项：主开关 + 权重组 + Top-K（P0-a 已完成）
+- [x] 候选集改为 `ExternalPoolCandidate` 结构体，携带质量状态（保持纯函数、`now_ms` 注入）
+- [x] `select_external_pool_candidate` 改加权评分 + Top-K 加权随机
+- [x] `select_external_pool_candidate_legacy` 保留旧逻辑，主开关关闭时走它
+- [x] 相对中位数归一化（首字/耗时/失败率各自独立）
+- [x] 降级兜底路径改用 legacy（Redis 不可用时质量数据本不可信）
+- [x] **优先级硬分层**（见下方重大修正）
+- [x] 配置校验 `validate_external_pools_config`（`src/admin/service.rs`，含跨字段校验
+      `max_probation_secs >= degrade_probation_secs`）
+- [x] **单元测试 24 项全部通过**
+  - 选择逻辑 18 项（`src/external_pool/tests.rs`）：
+    **开关关闭与 legacy 逐字节等价（L2-14 闸门）** / 优先级硬分层不被质量分打穿 /
+    失败率信号权重高于延迟信号 / 首字与总耗时信号相互独立 /
+    **全员劣化时候选池不清空**（"降级时保证可用"）/ 避让池不被饿死 /
+    样本不足视为中性 / Top-K 加权随机份额分布
+  - 配置校验 6 项（`src/admin/service_tests.rs`）：
+    **默认开关为 true** / EWMA alpha 边界 / 权重拒绝负数与非有限值 /
+    避让上限不得低于单次避让 / 失败率阈值必须是比率 / probe share 与 Top-K 边界
+- [x] **全量回归：2024 passed / 0 failed**，既有逻辑未破坏
+
+### ⚠️ P0-b 重大设计修正：优先级必须是硬分层
+
+**既有测试 `external_pool_candidate_selection_handles_multiple_backup_pools` 捕获了一个
+会静默破坏生产语义的缺陷**，这正是"不得破坏既有逻辑"要求的价值所在。
+
+初版实现把优先级当作评分中的**一项权重**（`priority * priority_weight`），
+再对全体候选做 Top-K 加权随机。问题：
+
+- 默认 `priority_weight = 1.0`，优先级 1/2/3 的池只差 1.0 分；
+- Top-K 权重公式 `worst - score + 1.0` 让优先级 3 的池仍能拿到 1/6 的抽中概率；
+- 结果：**用户配置的优先级被质量分打穿**，备用池会抢主池流量。
+
+修正：**先按 `effective_priority` 取最优层过滤，质量评分只在层内重排。**
+优先级是硬分层语义，不是可被质量分抵消的一项权重。
+质量感知的作用是"同优先级内选更好的"，不是"把差优先级的提上来"。
+
+> 保留评分中的优先级项仅用于可观测性展示（管理端要能看出分数构成），
+> 在比较中它对层内候选是常数。
+
+## P1 kiro.rs 劣化 / 避让 / 恢复
+
+- [x] 劣化判定 `evaluate_external_pool_degrade`（纯函数，`now_ms` 注入）
+- [x] 避让状态 + 指数退避 + 上限（`base * 2^(n-1)`，封顶 `max_probation_secs`）
+- [x] 避让期探测流量（probe share）
+- [x] 恢复爬坡（线性衰减罚分，P0-a 已实现数学、P1 接入选择路径）
+- [x] 配置项 + 校验（P0-b 已完成）
+- [x] UI：质量采样 / 评分权重 / 劣化与恢复 三组（`ui/src/features/runtime/runtime-page.tsx`）
+- [x] 可观测性：`ExternalPoolQualityView` 挂到 `ExternalPoolStatus`
+- [x] **单元测试 15 项全部通过**（12 劣化/探测/爬坡 + 2 可观测性 + 1 前后端键契约）
+- [x] **全量回归：2040 passed / 0 failed**
+
+### P1 可观测性与 UI
+
+- `ExternalPoolQualityView` 与内部 `ExternalPoolQualityState` **刻意分离**：
+  内部用绝对时间戳，管理端要的是"还剩多少秒"这类相对量；
+  分开后内部字段调整不会破坏管理端 API。
+- 视图带 `scoring_active` 字段：样本不足时必须显式告诉运维
+  "这个池的数据还没参与调度"，否则会误以为调度器在依据一份冷启动数据决策。
+- **主开关关闭时不展示质量数据**：此时它既不参与调度，
+  展示出来只会让运维误以为调度正在依据它决策。
+- 前端 `clampFloat` 与既有 `toRatio` 分开：`toRatio` 上界是 0.99，
+  而失败率阈值必须允许取到 1.0（表示"全失败才降级"），权重更是可以远大于 1。
+- 前端对 `maxProbationSecs` 做了与后端一致的跨字段夹紧，
+  避免用户提交一个必然被后端拒绝的组合。
+- 新增 `quality_config_serializes_with_the_camel_case_keys_the_ui_sends`
+  锁定前后端键契约：任一侧改名都会让设置被 serde 默认值**静默吞掉**，
+  用户会以为保存成功了。该测试同时断言主开关默认为 `true`。
+
+### 两套前端的分工（调研结论）
+
+`ui/` 与 `admin-ui/` **都被 rust-embed 编译进二进制并对外提供**
+（`src/admin_ui/router.rs:23/31`），admin-ui 不是遗留目录。
+但外部池表单**只存在于 `ui/`**——admin-ui 对外部池配置只做透传与清洗，
+不渲染任何外部池表单项。因此 admin-ui 只需补类型、默认值与清洗逻辑，无需补表单。
+
+> admin-ui 的 `tsc` 报 `@radix-ui/react-scroll-area` 缺失，
+> 已用 `git stash` 在未改动的树上复现，确认是**既有问题**，与本次变更无关。
+
+### ⚠️ P1 重大缺陷修复：避让会变成永久放逐
+
+纯罚分方案有一个致命问题：`top_k = 3` 且有 3 个健康池时，被避让的池
+**排在第 4 位，拿到的流量恰好是零**。而质量样本只来自真实流量，
+于是它永远产生不了新样本来自证恢复——"临时降低优先级"退化成了永久放逐，
+直接违背用户"不是真冷却"的要求。
+
+修复：在 Top-K 加权随机**之前**加一条独立的探测分支，
+按 `probe_share_percent` 概率直接从避让池中抽一个放行。
+三条边界由测试锁定：
+
+- `probe_share = 0` 时退化为硬避让（尊重配置）；
+- **全员避让时不走探测分支**——此时避让罚分对所有池是常数，
+  正常评分路径本身就公平，再抽一次反而丢掉质量信号；
+- **探测流量不得跨优先级层**：低优先级的避让池不能借探测通道越层抢流量。
+
+### P1 设计决策
+
+- **劣化判定只看单池绝对失败率，不看中位数**：采样回调发生在请求结束时，
+  此时拿不到全局视图。安全性由评分层保证——避让在评分中是**常数罚分**，
+  全体一起被避让时相对顺序不变、候选集不清空，
+  "上游整体故障"因此不会退化成"无池可用"。
+- **避让期内不重复延长**：否则持续失败会让避让无限续期，
+  池永远等不到到期后的恢复爬坡窗口。到期后才允许再次降级并递增层级。
+- **判定复用采样返回的状态，不额外读 Redis**：
+  `record_external_pool_quality_sample` 本就返回更新后的状态。
+- **避让状态 TTL 必须覆盖"避让窗口 + 恢复爬坡"**：
+  TTL 短于避让窗口会让状态随键过期被抹掉，降级形同虚设。
+
+## 测试场景维度设计
+
+- [x] 六维度矩阵已定稿：[quality-aware-scheduling-test-matrix.md](quality-aware-scheduling-test-matrix.md)
+      D1 账号规模/优先级 · D2 质量信号形态 · D3 时间与恢复轨迹 ·
+      D4 既有因子混合 · D5 并发量级 · D6 断言类型
+- [x] 27 个 L2 用例（L2-01 ~ L2-27）按风险优先排定执行顺序
+- [x] 测试基建调研完成，矩阵已按调研结果修正
+
+### 调研结论（推翻了两个初始假设）
+
+1. **不存在时间旅行**：全仓库零 `tokio::time::pause()`，且冷却与质量 EWMA 窗口
+   都是 **Redis TTL 而非进程内定时器**——暂停运行时也不会让 TTL 前进。
+   `now_ms` 注入只对通路 A 纯函数有效；通路 B 必须"压缩 TTL 配置 + 真实 sleep"。
+2. **质量采样是 detached `tokio::spawn`**（已核实 `src/external_pool.rs:9100`）：
+   wave 跑完后样本可能未落 Redis。必须新建 poll-until-converged 助手，
+   **不能**用固定 sleep（既有测试的 150ms sleep 正是 flaky 来源）。
+
+### 基建：可复用远多于预期
+
+现成可抄的两个高并发多池调度测试：`tests.rs:7772`（3 池 128/轮湍流）、
+`tests.rs:7922`（4 池三轮 wave）。它们用 **fake server 命中计数轮间差分**
+断言流量转移，正是 `A-share` 的现成做法。
+
+mock 账号夹具齐备（`PatternExternalMessagesFakeServer` 的
+`always_success`/`always_fail`/`fail_first`/`intermittent`、`TurbulentExternalMessagesFakeServer`、
+SSE 的 `ExternalStreamFakeServer`）。
+
+**唯一必须扩展的 mock 能力**：给 `PatternExternalMessagesBehavior`（`tests.rs:908`）
+加 `Delay(Duration)` 变体——D2 的 `slow-ttft`/`slow-total` 依赖它。
+
+### 三个 flaky 来源（写用例时逐条规避）
+
+1. `select_external_pool_candidate` 并列打散用**未播种 `fastrand`**
+   （已核实 `src/external_pool.rs:10017`）→ 只用统计容差，不断言精确落点。
+2. fire-and-forget 采样 → poll-until-converged。
+3. 失败注入一律用 `deterministic_failure_percent(index, seed)`（`tests.rs:1080`），
+   不用 `fastrand`，保证跨运行可复现。
+
+环境变量是 `KIRO_RS_TEST_POSTGRES_URL` + `KIRO_RS_TEST_REDIS_URL`
+（不是 `KIRO_RS_TEST_DATABASE_URL`）；`drop_test_schema()` 无 `Drop` 守卫，panic 会泄漏 schema。
+
+## kiro.rs L2 真实调度测试（mock 账号 + 高并发）
+
+执行顺序见矩阵 §4：**L2-14 开关关闭等价性必须最先通过**。
+
+- [ ] 测试基建：mock 上游（可控 status/首字/总耗时/SSE）
+- [ ] 测试基建：选择探针（记录每次选中的池 id，`#[cfg(test)]`，不影响生产路径）
+- [ ] 测试基建：份额断言容差（先跑基线取经验值，避免 flaky）
+- [ ] 3.4 既有因子混合组 L2-14 ~ L2-24（防回归，最高优先级）
+- [ ] 3.2 可用性底线组 L2-06 ~ L2-09（"降级时保证可用"）
+- [ ] 3.1 新增因子基线组 L2-01 ~ L2-05
+- [ ] 3.3 时间与恢复组 L2-10 ~ L2-13
+- [ ] 3.5 压力与边界组 L2-25 ~ L2-27
+
+## P2 sub2api 质量调度
+
+- [ ] openspec change 立项（proposal/design/tasks/specs）
+- [ ] 泛化评分器到 Anthropic/Gemini 路径
+- [ ] `ReportResult` 回灌（FirstTokenMs 已有）
+- [ ] settings 键 + DTO + admin API
+- [ ] 前端开关与权重
+- [ ] 修复 `buildOpenAIAccountSchedulerScoreSnapshot` 硬编码
+
+## P3 sub2api 复杂场景测试
+
+- [ ] 同 kiro.rs 场景矩阵
+- [ ] 与 sticky session 混合
+- [ ] 与优先级硬门槛语义混合
+- [ ] 与 rate limit / temp unschedulable 混合
+- [ ] 与 failover 排除集合混合
+
+---
+
+## 决策记录
+
+- 质量状态不做 Postgres 持久化（短窗口信号，重启重建）
+- 降级兜底路径不做质量感知（Redis 不可用时质量数据本不可信）
+- P0 拆 a/b：先采集观察，再影响调度
+
+## 硬性要求（用户明确指定）
+
+1. **必须充分测试**：每个阶段完成后立即补测试，不允许"先实现完再统一补"。
+2. **每次动手前先加待办**：用 TaskCreate/TaskUpdate 跟踪，复杂任务先写计划文档。
+3. **不得破坏既有逻辑**：新因子必须与既有因子做混合测试，主开关关闭时必须与旧行为逐字节等价。
+4. **测试分两层，顺序不可颠倒**：
+   - 第一层 **单元测试**：先保证基本正确性（EWMA 数学、判定边界、开关等价）。
+   - 第二层 **真实调度测试**：mock 账号 + 真实调度链路跑流量，不是纯单元测试。
+5. **真实调度测试必须是高并发**：1 并发 / 几并发的测试没有意义，
+   必须达到能暴露分布、抖动、羊群效应的并发量级（见测试场景维度表）。
+6. **必须先设计测试场景维度**，再写测试用例（维度表见下方"测试场景维度设计"）。

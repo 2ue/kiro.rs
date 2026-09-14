@@ -2792,7 +2792,10 @@ impl ExternalPoolStreamResponseMode {
 }
 
 /// 外部备用号池全局策略配置。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// 注意：因质量评分权重为 `f64`，本结构体只实现 `PartialEq` 不实现 `Eq`。
+/// 既有的配置变更检测（`external_pool_policy_changed`）只依赖 `PartialEq`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolsConfig {
     #[serde(default)]
@@ -2847,6 +2850,71 @@ pub struct ExternalPoolsConfig {
     /// 显式配置非 0 阈值。
     #[serde(default = "default_external_pool_transient_failure_cooldown_threshold")]
     pub external_pool_transient_failure_cooldown_threshold: u32,
+
+    // ==================== 质量感知调度（被动采样） ====================
+    //
+    // 这组配置让外部账号调度从"优先级 + 负载"的字典序排序，升级为把
+    // 真实请求观测到的失败率与首字延迟一并纳入的加权评分。
+    //
+    // 全部数据来自用户真实请求，不做任何主动探测。
+    /// 质量感知调度主开关。
+    ///
+    /// 关闭后完全退回"有效优先级 → 负载"的字典序排序，既不读也不写质量
+    /// 状态，行为与引入本特性之前完全一致，可作为线上快速回退手段。
+    #[serde(default = "default_external_pool_quality_aware_scheduling_enabled")]
+    pub external_pool_quality_aware_scheduling_enabled: bool,
+    /// 质量 EWMA 平滑系数，有效窗口约为最近 `1/alpha` 个请求。
+    #[serde(default = "default_external_pool_quality_ewma_alpha")]
+    pub external_pool_quality_ewma_alpha: f64,
+    /// 质量样本有效期；超过该时长无请求则质量数据过期并回到中性值。
+    #[serde(default = "default_external_pool_quality_sample_ttl_secs")]
+    pub external_pool_quality_sample_ttl_secs: u64,
+    /// 参与质量评分所需的最少样本数；不足时按中性值处理，避免冷启动误判。
+    #[serde(default = "default_external_pool_quality_min_samples")]
+    pub external_pool_quality_min_samples: u64,
+    /// 优先级权重（分数越低越优先）。
+    #[serde(default = "default_external_pool_quality_priority_weight")]
+    pub external_pool_quality_priority_weight: f64,
+    /// 负载率权重。
+    #[serde(default = "default_external_pool_quality_load_weight")]
+    pub external_pool_quality_load_weight: f64,
+    /// 失败率权重。
+    ///
+    /// 量级刻意显著高于延迟权重：报错是比"慢"严重得多的问题，
+    /// 必须能压过首字延迟的倾向，但仍保持在同一个连续可比空间内。
+    #[serde(default = "default_external_pool_quality_error_weight")]
+    pub external_pool_quality_error_weight: f64,
+    /// 相对首字延迟权重（以候选集中位数为 1.0 的相对值）。
+    #[serde(default = "default_external_pool_quality_latency_weight")]
+    pub external_pool_quality_latency_weight: f64,
+    /// 临时避让权重。
+    #[serde(default = "default_external_pool_quality_probation_weight")]
+    pub external_pool_quality_probation_weight: f64,
+    /// 候选池大小 K：在分数最优的 K 个候选里加权随机，避免惊群。
+    #[serde(default = "default_external_pool_quality_top_k")]
+    pub external_pool_quality_top_k: u32,
+    /// 持续劣化判定窗口。
+    #[serde(default = "default_external_pool_degrade_window_secs")]
+    pub external_pool_degrade_window_secs: u64,
+    /// 触发临时降级的失败率阈值。
+    #[serde(default = "default_external_pool_degrade_error_rate_threshold")]
+    pub external_pool_degrade_error_rate_threshold: f64,
+    /// 临时降级时长。
+    #[serde(default = "default_external_pool_degrade_probation_secs")]
+    pub external_pool_degrade_probation_secs: u64,
+    /// 连续劣化指数退避后的最长降级时长。
+    #[serde(default = "default_external_pool_max_probation_secs")]
+    pub external_pool_max_probation_secs: u64,
+    /// 降级期保留的探测流量比例（百分比）。
+    ///
+    /// 这是"不是真冷却"的落地：被降级的账号仍保留少量真实流量，
+    /// 否则它永远不会产生新样本来证明自己已经恢复。
+    #[serde(default = "default_external_pool_probe_share_percent")]
+    pub external_pool_probe_share_percent: u32,
+    /// 恢复爬坡时长；降级到期后流量线性回升，避免瞬间重新打满。
+    #[serde(default = "default_external_pool_recovery_ramp_secs")]
+    pub external_pool_recovery_ramp_secs: u64,
+
     #[serde(default)]
     pub external_direct_policy_enabled: bool,
     #[serde(default)]
@@ -3002,6 +3070,25 @@ impl Default for ExternalPoolsConfig {
             ),
             external_pool_transient_failure_priority_penalty:
                 default_external_pool_transient_failure_priority_penalty(),
+            external_pool_quality_aware_scheduling_enabled:
+                default_external_pool_quality_aware_scheduling_enabled(),
+            external_pool_quality_ewma_alpha: default_external_pool_quality_ewma_alpha(),
+            external_pool_quality_sample_ttl_secs: default_external_pool_quality_sample_ttl_secs(),
+            external_pool_quality_min_samples: default_external_pool_quality_min_samples(),
+            external_pool_quality_priority_weight: default_external_pool_quality_priority_weight(),
+            external_pool_quality_load_weight: default_external_pool_quality_load_weight(),
+            external_pool_quality_error_weight: default_external_pool_quality_error_weight(),
+            external_pool_quality_latency_weight: default_external_pool_quality_latency_weight(),
+            external_pool_quality_probation_weight:
+                default_external_pool_quality_probation_weight(),
+            external_pool_quality_top_k: default_external_pool_quality_top_k(),
+            external_pool_degrade_window_secs: default_external_pool_degrade_window_secs(),
+            external_pool_degrade_error_rate_threshold:
+                default_external_pool_degrade_error_rate_threshold(),
+            external_pool_degrade_probation_secs: default_external_pool_degrade_probation_secs(),
+            external_pool_max_probation_secs: default_external_pool_max_probation_secs(),
+            external_pool_probe_share_percent: default_external_pool_probe_share_percent(),
+            external_pool_recovery_ramp_secs: default_external_pool_recovery_ramp_secs(),
             external_pool_transient_failure_cooldown_threshold:
                 default_external_pool_transient_failure_cooldown_threshold(),
             external_direct_policy_enabled: false,
@@ -4534,6 +4621,75 @@ fn default_external_pool_same_pool_retry_status_codes() -> Vec<u16> {
 
 fn default_external_pool_same_pool_retry_delay_ms() -> u64 {
     500
+}
+
+fn default_external_pool_quality_aware_scheduling_enabled() -> bool {
+    true
+}
+
+fn default_external_pool_quality_ewma_alpha() -> f64 {
+    // 有效窗口约为最近 10 个请求：足够快地跟上真实劣化，
+    // 又不会被单次抖动带偏。
+    0.2
+}
+
+fn default_external_pool_quality_sample_ttl_secs() -> u64 {
+    600
+}
+
+fn default_external_pool_quality_min_samples() -> u64 {
+    5
+}
+
+fn default_external_pool_quality_priority_weight() -> f64 {
+    1.0
+}
+
+fn default_external_pool_quality_load_weight() -> f64 {
+    100.0
+}
+
+fn default_external_pool_quality_error_weight() -> f64 {
+    // 失败率 0→30% 贡献 30 分，约等于 30 级优先级差或 3 倍中位数首字延迟，
+    // 保证"报错多"的判断优先级天然高于"首字慢"。
+    100.0
+}
+
+fn default_external_pool_quality_latency_weight() -> f64 {
+    // 相对值制：候选集中位数为 1.0。慢一倍（2.0）贡献 10 分。
+    10.0
+}
+
+fn default_external_pool_quality_probation_weight() -> f64 {
+    50.0
+}
+
+fn default_external_pool_quality_top_k() -> u32 {
+    3
+}
+
+fn default_external_pool_degrade_window_secs() -> u64 {
+    120
+}
+
+fn default_external_pool_degrade_error_rate_threshold() -> f64 {
+    0.5
+}
+
+fn default_external_pool_degrade_probation_secs() -> u64 {
+    180
+}
+
+fn default_external_pool_max_probation_secs() -> u64 {
+    900
+}
+
+fn default_external_pool_probe_share_percent() -> u32 {
+    5
+}
+
+fn default_external_pool_recovery_ramp_secs() -> u64 {
+    60
 }
 
 fn default_external_pool_transient_failure_priority_penalty() -> u32 {

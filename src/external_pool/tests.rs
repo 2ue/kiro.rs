@@ -3238,18 +3238,23 @@ fn external_pool_candidate_selection_handles_multiple_backup_pools() {
 
     let selected = select_external_pool_candidate(
         vec![
-            (secondary.clone(), 0, 0),
-            (tertiary.clone(), 0, 0),
-            (primary.clone(), 0, 0),
+            candidate(secondary.clone(), 0, 0),
+            candidate(tertiary.clone(), 0, 0),
+            candidate(primary.clone(), 0, 0),
         ],
         &config,
+        0,
     )
     .expect("candidate should be selected");
     assert_eq!(selected.id, primary.id);
 
     let selected = select_external_pool_candidate(
-        vec![(secondary.clone(), 0, 0), (tertiary.clone(), 0, 0)],
+        vec![
+            candidate(secondary.clone(), 0, 0),
+            candidate(tertiary.clone(), 0, 0),
+        ],
         &config,
+        0,
     )
     .expect("fallback candidate should be selected when primary is excluded/full");
     assert_eq!(selected.id, secondary.id);
@@ -3259,8 +3264,12 @@ fn external_pool_candidate_selection_handles_multiple_backup_pools() {
     primary.max_concurrent_requests = 2;
     secondary.max_concurrent_requests = 4;
     let selected = select_external_pool_candidate(
-        vec![(primary.clone(), 1, 0), (secondary.clone(), 1, 0)],
+        vec![
+            candidate(primary.clone(), 1, 0),
+            candidate(secondary.clone(), 1, 0),
+        ],
         &config,
+        0,
     )
     .expect("lower same-priority load should be selected");
     assert_eq!(selected.id, secondary.id);
@@ -3279,10 +3288,11 @@ fn external_pool_candidate_selection_penalizes_transient_failures() {
     healthy_backup.max_concurrent_requests = 4;
     let selected = select_external_pool_candidate(
         vec![
-            (failing_primary.clone(), 0, 1),
-            (healthy_backup.clone(), 0, 0),
+            candidate(failing_primary.clone(), 0, 1),
+            candidate(healthy_backup.clone(), 0, 0),
         ],
         &config,
+        0,
     )
     .expect("healthy backup should be selected once the primary accumulated a transient failure");
     assert_eq!(selected.id, healthy_backup.id);
@@ -17315,4 +17325,917 @@ fn external_sse_atomic_overflow_records_stream_failure_and_stops_terminal_succes
         capture.lock().stream_error_message.as_deref(),
         Some("external thinking block exceeded bounded atomic buffer")
     );
+}
+
+// ---- 外部池被动质量采样：错误归因单元测试 ----
+
+fn quality_test_error(
+    status: Option<StatusCode>,
+    message: &str,
+    cooldown_reason: Option<&str>,
+) -> ExternalPoolError {
+    ExternalPoolError {
+        status,
+        message: message.to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: cooldown_reason
+            .map(|reason| (Duration::from_secs(10), reason.to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    }
+}
+
+#[test]
+fn quality_sampling_ignores_downstream_caused_payload_errors() {
+    // 下游自己发了超长请求体导致的 400，责任不在上游账号。
+    // 计入健康度会让"用户发了一次长上下文"变成"这个账号不好"，
+    // 进而错误降级一个完全健康的账号。
+    for message in [
+        "input is too long",
+        "Prompt is too long for this model",
+        "context window is full",
+        "content_length_exceeds_threshold",
+        "request payload is too large",
+    ] {
+        assert!(
+            !external_error_affects_pool_quality(&quality_test_error(
+                Some(StatusCode::BAD_REQUEST),
+                message,
+                None
+            )),
+            "下游超长请求不得计入账号健康度: {message}"
+        );
+    }
+}
+
+#[test]
+fn quality_sampling_counts_genuine_upstream_400s() {
+    // 同样是 400，但不是超长请求——这类仍然是上游行为异常，必须计入。
+    assert!(external_error_affects_pool_quality(&quality_test_error(
+        Some(StatusCode::BAD_REQUEST),
+        "upstream rejected the request unexpectedly",
+        None
+    )));
+}
+
+#[test]
+fn quality_sampling_ignores_model_routing_misses() {
+    // 模型不匹配是路由/配置问题，不是账号质量问题：
+    // 与既有的 should_record_external_pool_soft_failure 判定保持一致，
+    // 否则同一个事件会在两套健康度里得出相反结论。
+    for reason in ["model_mapping_miss", "model_unavailable"] {
+        assert!(
+            !external_error_affects_pool_quality(&quality_test_error(
+                Some(StatusCode::NOT_FOUND),
+                "model not available",
+                Some(reason)
+            )),
+            "{reason} 不得计入账号健康度"
+        );
+        assert!(
+            !should_record_external_pool_soft_failure(reason),
+            "质量归因必须与既有软失败判定一致"
+        );
+    }
+}
+
+#[test]
+fn quality_sampling_counts_upstream_faults() {
+    // 真正的上游故障必须全部计入，否则质量曲线只会向好、永远不降级。
+    let cases = [
+        (Some(StatusCode::TOO_MANY_REQUESTS), "rate limit", Some("rate_limited")),
+        (Some(StatusCode::INTERNAL_SERVER_ERROR), "server error", Some("server_error")),
+        (Some(StatusCode::BAD_GATEWAY), "bad gateway", Some("server_error")),
+        (Some(StatusCode::SERVICE_UNAVAILABLE), "unavailable", None),
+        (Some(StatusCode::GATEWAY_TIMEOUT), "timeout", None),
+        (Some(StatusCode::UNAUTHORIZED), "auth failed", Some("auth_failed")),
+        // 无 status = 网络层错误（连接失败/超时），是最典型的账号不可用信号。
+        (None, "connection reset by peer", None),
+    ];
+    for (status, message, reason) in cases {
+        assert!(
+            external_error_affects_pool_quality(&quality_test_error(status, message, reason)),
+            "上游故障必须计入健康度: {status:?} {message}"
+        );
+    }
+}
+
+/// 构造一个无质量数据的调度候选（等价于冷启动/无样本状态）。
+fn candidate(pool: ExternalPool, in_flight: u32, transient_failure_streak: u32)
+    -> ExternalPoolCandidate
+{
+    ExternalPoolCandidate {
+        pool,
+        in_flight,
+        transient_failure_streak,
+        quality: None,
+    }
+}
+
+/// 构造一个带质量数据的调度候选。
+fn quality_candidate(
+    pool: ExternalPool,
+    in_flight: u32,
+    transient_failure_streak: u32,
+    quality: ExternalPoolQualityState,
+) -> ExternalPoolCandidate {
+    ExternalPoolCandidate {
+        pool,
+        in_flight,
+        transient_failure_streak,
+        quality: Some(quality),
+    }
+}
+
+// ============================================================================
+// P0-b 质量感知选择：单元测试 + 通路 A 高并发分布测试
+// 测试维度设计见 docs/plantree/.../quality-aware-scheduling-test-matrix.md
+// ============================================================================
+
+/// 构造带指定质量信号的池候选。
+fn scored_pool(
+    id: u64,
+    priority: i32,
+    error_rate: f64,
+    ttft_ms: Option<f64>,
+    latency_ms: Option<f64>,
+) -> ExternalPoolCandidate {
+    let mut pool = test_pool(&format!("https://pool-{id}.example.test"), true);
+    pool.id = id;
+    pool.priority = priority;
+    pool.max_concurrent_requests = 64;
+    quality_candidate(
+        pool,
+        0,
+        0,
+        ExternalPoolQualityState {
+            recent_error_rate: error_rate,
+            ttft_ewma_ms: ttft_ms,
+            latency_ewma_ms: latency_ms,
+            sample_count: 100,
+            ..Default::default()
+        },
+    )
+}
+
+/// 跑 N 次选择，返回每个池的命中份额。
+///
+/// 选择函数用未播种的 `fastrand` 做打散，因此只能做统计断言。
+/// 样本量取 4000 以保证份额断言稳定。
+fn selection_shares(
+    candidates: &[ExternalPoolCandidate],
+    config: &ExternalPoolsConfig,
+    now_ms: i64,
+    rounds: usize,
+) -> HashMap<u64, f64> {
+    let mut counts: HashMap<u64, u64> = HashMap::new();
+    for _ in 0..rounds {
+        let selected = select_external_pool_candidate(candidates.to_vec(), config, now_ms)
+            .expect("候选集非空时必须能选出一个池");
+        *counts.entry(selected.id).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(id, count)| (id, count as f64 / rounds as f64))
+        .collect()
+}
+
+const DISTRIBUTION_ROUNDS: usize = 4_000;
+
+// ---- L2-14：主开关关闭等价性（防回归总闸门，必须最先通过）----
+
+#[test]
+fn quality_scheduling_disabled_matches_legacy_selection_exactly() {
+    // 主开关关闭时必须走 legacy 路径，与变更前行为完全一致：
+    // 只选最优先级 + 最低负载层，且质量数据**完全不影响**结果。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_aware_scheduling_enabled = false;
+
+    // 给低优先级池配极好的质量、高优先级池配极差的质量。
+    // 开关关闭时，质量必须被完全忽略，高优先级池仍然全取。
+    let candidates = vec![
+        scored_pool(1, 1, 0.9, Some(9_000.0), Some(60_000.0)),
+        scored_pool(2, 5, 0.0, Some(50.0), Some(200.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&1).copied().unwrap_or(0.0),
+        1.0,
+        "开关关闭时必须严格按优先级选择，质量数据不得有任何影响"
+    );
+    assert!(!shares.contains_key(&2), "低优先级池不得被选中");
+}
+
+#[test]
+fn quality_scheduling_disabled_preserves_legacy_load_balancing() {
+    // legacy 的同优先级负载均衡语义必须保持：负载低的胜出。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_aware_scheduling_enabled = false;
+
+    let mut light = test_pool("https://light.example.test", true);
+    light.id = 1;
+    light.priority = 1;
+    light.max_concurrent_requests = 10;
+    let mut heavy = test_pool("https://heavy.example.test", true);
+    heavy.id = 2;
+    heavy.priority = 1;
+    heavy.max_concurrent_requests = 10;
+
+    let selected = select_external_pool_candidate(
+        vec![candidate(light, 1, 0), candidate(heavy, 8, 0)],
+        &config,
+        0,
+    )
+    .expect("必须选出一个池");
+    assert_eq!(selected.id, 1, "同优先级下负载低的池必须胜出");
+}
+
+// ---- 优先级硬分层（P0-b 修正的核心不变量）----
+
+#[test]
+fn quality_scheduling_never_promotes_lower_priority_tier() {
+    // 这是 P0-b 修正的核心：无论质量分差多大，
+    // 低优先级层都不得被提拔到高优先级层之上。
+    let config = ExternalPoolsConfig::default();
+    let candidates = vec![
+        // 高优先级但质量极差
+        scored_pool(1, 1, 0.95, Some(30_000.0), Some(120_000.0)),
+        // 低优先级但质量完美
+        scored_pool(2, 2, 0.0, Some(10.0), Some(50.0)),
+        scored_pool(3, 3, 0.0, Some(10.0), Some(50.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&1).copied().unwrap_or(0.0),
+        1.0,
+        "优先级是硬分层，质量分不得跨层提拔"
+    );
+}
+
+#[test]
+fn quality_scheduling_reorders_within_the_same_priority_tier() {
+    // 同一优先级层内，质量好的必须显著占优。
+    let config = ExternalPoolsConfig::default();
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.8, Some(200.0), Some(1_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let healthy = shares.get(&1).copied().unwrap_or(0.0);
+    let erroring = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        healthy > erroring,
+        "同层内健康池份额必须高于报错池：healthy={healthy:.3} erroring={erroring:.3}"
+    );
+    assert!(
+        healthy > 0.75,
+        "失败率权重(100)应让健康池占据绝大多数份额，实际 {healthy:.3}"
+    );
+}
+
+// ---- 失败率优先级高于延迟曲线（用户明确要求）----
+
+#[test]
+fn quality_scheduling_ranks_error_rate_above_latency_signals() {
+    // 用户明确要求：报错/重试多的判断优先级要**高于**首字等质量曲线。
+    // 构造：A 报错但很快，B 不报错但很慢。B 必须胜出。
+    let config = ExternalPoolsConfig::default();
+    let candidates = vec![
+        // 快但报错
+        scored_pool(1, 1, 0.5, Some(50.0), Some(200.0)),
+        // 慢但不报错
+        scored_pool(2, 1, 0.0, Some(8_000.0), Some(40_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let fast_but_erroring = shares.get(&1).copied().unwrap_or(0.0);
+    let slow_but_reliable = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        slow_but_reliable > fast_but_erroring,
+        "失败率必须压过延迟：slow_reliable={slow_but_reliable:.3} fast_erroring={fast_but_erroring:.3}"
+    );
+}
+
+#[test]
+fn quality_scheduling_separates_ttft_and_total_latency_signals() {
+    // 首字高 与 总耗时长 是两个独立因子，必须能分别生效。
+    let config = ExternalPoolsConfig::default();
+
+    // 仅首字劣化
+    let ttft_only = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(6_000.0), Some(1_000.0)),
+    ];
+    let ttft_shares = selection_shares(&ttft_only, &config, 0, DISTRIBUTION_ROUNDS);
+    assert!(
+        ttft_shares.get(&1).copied().unwrap_or(0.0)
+            > ttft_shares.get(&2).copied().unwrap_or(0.0),
+        "首字劣化必须降低份额"
+    );
+
+    // 仅总耗时劣化
+    let latency_only = vec![
+        scored_pool(3, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(4, 1, 0.0, Some(200.0), Some(30_000.0)),
+    ];
+    let latency_shares = selection_shares(&latency_only, &config, 0, DISTRIBUTION_ROUNDS);
+    assert!(
+        latency_shares.get(&3).copied().unwrap_or(0.0)
+            > latency_shares.get(&4).copied().unwrap_or(0.0),
+        "总耗时劣化必须降低份额（且与首字独立）"
+    );
+}
+
+// ---- 可用性底线：降级时保证可用 ----
+
+#[test]
+fn quality_scheduling_keeps_all_pools_available_when_everyone_is_degraded() {
+    // 全体劣化时，相对中位数比较让所有人罚分归零，
+    // 候选集**绝不能**被清空——这是"降级时保证可用"的核心。
+    let config = ExternalPoolsConfig::default();
+    let candidates = vec![
+        scored_pool(1, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(2, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(3, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    for id in [1u64, 2, 3] {
+        let share = shares.get(&id).copied().unwrap_or(0.0);
+        assert!(
+            share > 0.15,
+            "全体劣化时不得饿死任何池，池 {id} 份额仅 {share:.3}"
+        );
+    }
+}
+
+#[test]
+fn quality_scheduling_still_selects_the_only_pool_even_when_degraded() {
+    // 唯一账号即使质量极差也必须继续被选中，否则服务直接不可用。
+    let config = ExternalPoolsConfig::default();
+    let candidates = vec![scored_pool(1, 1, 1.0, Some(60_000.0), Some(300_000.0))];
+
+    let selected = select_external_pool_candidate(candidates, &config, 0);
+    assert_eq!(
+        selected.map(|pool| pool.id),
+        Some(1),
+        "唯一账号劣化也必须被选中"
+    );
+}
+
+#[test]
+fn quality_scheduling_never_starves_a_probationary_pool() {
+    // 避让中的池只是罚分靠后，**不得**被移出候选集，
+    // 否则它永远拿不到探测流量、永远无法自证恢复。
+    let config = ExternalPoolsConfig::default();
+    let now_ms = 1_000_000;
+
+    let mut healthy = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
+    let mut probation = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+    if let Some(quality) = probation.quality.as_mut() {
+        quality.probation_until_ms = Some(now_ms + 60_000);
+    }
+    let _ = &mut healthy;
+
+    let shares = selection_shares(&[healthy, probation], &config, now_ms, DISTRIBUTION_ROUNDS);
+    let probation_share = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        probation_share > 0.0,
+        "避让池必须仍能收到探测流量，实际份额为 0"
+    );
+    assert!(
+        probation_share < 0.15,
+        "避让池份额必须显著低于健康池，实际 {probation_share:.3}"
+    );
+}
+
+// ---- 冷启动 / 样本不足 ----
+
+#[test]
+fn quality_scheduling_treats_insufficient_samples_as_neutral() {
+    // 样本不足的池按中性值处理：既不因"没数据"被判差，也不被优待。
+    // 否则新加入的账号永远起不来。
+    let config = ExternalPoolsConfig::default();
+
+    let mut cold = test_pool("https://cold.example.test", true);
+    cold.id = 1;
+    cold.priority = 1;
+    cold.max_concurrent_requests = 64;
+    // 样本数低于 min_samples(5)，但数据看起来极差
+    let cold = quality_candidate(
+        cold,
+        0,
+        0,
+        ExternalPoolQualityState {
+            recent_error_rate: 1.0,
+            ttft_ewma_ms: Some(60_000.0),
+            latency_ewma_ms: Some(300_000.0),
+            sample_count: 2,
+            ..Default::default()
+        },
+    );
+
+    let warm = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+
+    let shares = selection_shares(&[cold, warm], &config, 0, DISTRIBUTION_ROUNDS);
+    let cold_share = shares.get(&1).copied().unwrap_or(0.0);
+    assert!(
+        cold_share > 0.2,
+        "样本不足的池不得因数据难看被降权，实际份额 {cold_share:.3}"
+    );
+}
+
+#[test]
+fn quality_scheduling_handles_pools_without_any_quality_data() {
+    // 完全无质量记录（Redis 里没有键）时必须退化为中性，不得 panic。
+    let config = ExternalPoolsConfig::default();
+    let mut a = test_pool("https://a.example.test", true);
+    a.id = 1;
+    a.priority = 1;
+    let mut b = test_pool("https://b.example.test", true);
+    b.id = 2;
+    b.priority = 1;
+
+    let shares = selection_shares(
+        &[candidate(a, 0, 0), candidate(b, 0, 0)],
+        &config,
+        0,
+        DISTRIBUTION_ROUNDS,
+    );
+    for id in [1u64, 2] {
+        assert!(
+            shares.get(&id).copied().unwrap_or(0.0) > 0.3,
+            "无质量数据时两池应大致均分"
+        );
+    }
+}
+
+// ---- Top-K 边界 ----
+
+#[test]
+fn quality_scheduling_top_k_larger_than_candidate_count_is_safe() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_top_k = 99;
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.1, Some(300.0), Some(1_200.0)),
+    ];
+    let shares = selection_shares(&candidates, &config, 0, 500);
+    assert_eq!(shares.values().map(|share| share).sum::<f64>().round(), 1.0);
+}
+
+#[test]
+fn quality_scheduling_top_k_one_always_picks_the_best_scoring_pool() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_top_k = 1;
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.9, Some(9_000.0), Some(50_000.0)),
+    ];
+    let shares = selection_shares(&candidates, &config, 0, 500);
+    assert_eq!(
+        shares.get(&1).copied().unwrap_or(0.0),
+        1.0,
+        "top_k=1 时必须确定性地选最优池"
+    );
+}
+
+#[test]
+fn quality_scheduling_empty_candidates_returns_none() {
+    let config = ExternalPoolsConfig::default();
+    assert!(select_external_pool_candidate(Vec::new(), &config, 0).is_none());
+}
+
+// ---- 相对中位数归一化的数学性质 ----
+
+#[test]
+fn quality_relative_penalty_only_punishes_worse_than_median() {
+    // 只惩罚"比同伴差"，不奖励"比同伴好"——
+    // 否则全体一起变慢时会有人被无端降权。
+    assert_eq!(relative_penalty(Some(100.0), Some(200.0)), 0.0, "优于中位数不罚分");
+    assert_eq!(relative_penalty(Some(200.0), Some(200.0)), 0.0, "等于中位数不罚分");
+    assert!((relative_penalty(Some(400.0), Some(200.0)) - 1.0).abs() < 1e-9);
+
+    // 缺失数据、非法中位数一律不罚分
+    assert_eq!(relative_penalty(None, Some(200.0)), 0.0);
+    assert_eq!(relative_penalty(Some(200.0), None), 0.0);
+    assert_eq!(relative_penalty(Some(200.0), Some(0.0)), 0.0);
+    assert_eq!(relative_penalty(Some(f64::NAN), Some(200.0)), 0.0);
+    assert_eq!(relative_penalty(Some(f64::INFINITY), Some(200.0)), 0.0);
+}
+
+#[test]
+fn quality_median_handles_even_odd_and_empty_inputs() {
+    assert_eq!(median_of([].into_iter()), None);
+    assert_eq!(median_of([5.0].into_iter()), Some(5.0));
+    assert_eq!(median_of([1.0, 3.0].into_iter()), Some(2.0));
+    assert_eq!(median_of([3.0, 1.0, 2.0].into_iter()), Some(2.0));
+    // 非有限值必须被剔除而不是污染中位数
+    assert_eq!(median_of([f64::NAN, 2.0].into_iter()), Some(2.0));
+}
+
+// ============================================================================
+// P1 劣化判定 / 指数退避 / 探测流量 / 恢复爬坡：单元测试
+// 对应测试矩阵 D3（时间与恢复轨迹）
+// ============================================================================
+
+/// 构造一个已累积足够样本的质量状态。
+fn degrade_state(error_rate: f64, probation_level: u32) -> ExternalPoolQualityState {
+    ExternalPoolQualityState {
+        recent_error_rate: error_rate,
+        sample_count: 100,
+        probation_level,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn degrade_requires_error_rate_at_or_above_threshold() {
+    let config = ExternalPoolsConfig::default();
+    let threshold = config.external_pool_degrade_error_rate_threshold;
+
+    // 阈值以下不降级
+    assert_eq!(
+        evaluate_external_pool_degrade(&degrade_state(threshold - 0.01, 0), &config, 0),
+        ExternalPoolDegradeDecision::Keep
+    );
+    // 恰好等于阈值即降级（闭区间，避免阈值设 1.0 时永不触发）
+    assert!(matches!(
+        evaluate_external_pool_degrade(&degrade_state(threshold, 0), &config, 0),
+        ExternalPoolDegradeDecision::Probation { .. }
+    ));
+}
+
+#[test]
+fn degrade_never_fires_when_master_switch_is_off() {
+    // 主开关关闭时不得写入任何避让状态，否则关开关也无法回退。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_aware_scheduling_enabled = false;
+    assert_eq!(
+        evaluate_external_pool_degrade(&degrade_state(1.0, 0), &config, 0),
+        ExternalPoolDegradeDecision::Keep
+    );
+}
+
+#[test]
+fn degrade_ignores_pools_with_insufficient_samples() {
+    // 冷启动：前几个请求全失败也不足以定性一个池。
+    let config = ExternalPoolsConfig::default();
+    let state = ExternalPoolQualityState {
+        recent_error_rate: 1.0,
+        sample_count: config.external_pool_quality_min_samples - 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_external_pool_degrade(&state, &config, 0),
+        ExternalPoolDegradeDecision::Keep
+    );
+}
+
+#[test]
+fn degrade_does_not_extend_an_active_probation() {
+    // 避让期内持续失败不得无限续期，否则池永远等不到恢复爬坡窗口。
+    let config = ExternalPoolsConfig::default();
+    let state = ExternalPoolQualityState {
+        recent_error_rate: 1.0,
+        sample_count: 100,
+        probation_until_ms: Some(10_000),
+        probation_level: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_external_pool_degrade(&state, &config, 5_000),
+        ExternalPoolDegradeDecision::Keep
+    );
+    // 到期之后才允许再次降级
+    assert!(matches!(
+        evaluate_external_pool_degrade(&state, &config, 10_001),
+        ExternalPoolDegradeDecision::Probation { level: 2, .. }
+    ));
+}
+
+#[test]
+fn degrade_backoff_doubles_and_is_capped() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_degrade_probation_secs = 100;
+    config.external_pool_max_probation_secs = 700;
+
+    let secs_at = |level: u32| -> i64 {
+        match evaluate_external_pool_degrade(&degrade_state(1.0, level), &config, 0) {
+            ExternalPoolDegradeDecision::Probation { until_ms, .. } => until_ms / 1_000,
+            other => panic!("期望降级，实际 {other:?}"),
+        }
+    };
+
+    // 第 n 次避让：base * 2^(n-1)，被上限封顶
+    assert_eq!(secs_at(0), 100);
+    assert_eq!(secs_at(1), 200);
+    assert_eq!(secs_at(2), 400);
+    assert_eq!(secs_at(3), 700, "超过上限必须被封顶");
+    assert_eq!(secs_at(20), 700, "高层级不得溢出，必须稳定在上限");
+}
+
+#[test]
+fn degrade_level_increments_from_existing_level() {
+    let config = ExternalPoolsConfig::default();
+    for existing in [0u32, 1, 5] {
+        match evaluate_external_pool_degrade(&degrade_state(1.0, existing), &config, 0) {
+            ExternalPoolDegradeDecision::Probation { level, .. } => {
+                assert_eq!(level, existing + 1, "避让层级必须在既有层级上递增");
+            }
+            other => panic!("期望降级，实际 {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn degrade_ttl_covers_probation_window_plus_recovery_ramp() {
+    // TTL 若短于避让窗口，避让状态会随 Redis 键过期被抹掉，降级形同虚设。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_degrade_probation_secs = 300;
+    config.external_pool_max_probation_secs = 300;
+    config.external_pool_recovery_ramp_secs = 60;
+    config.external_pool_quality_sample_ttl_secs = 10;
+
+    match evaluate_external_pool_degrade(&degrade_state(1.0, 0), &config, 0) {
+        ExternalPoolDegradeDecision::Probation {
+            until_ms, ttl_secs, ..
+        } => {
+            assert_eq!(until_ms, 300_000);
+            assert!(
+                ttl_secs >= 300 + 60,
+                "TTL {ttl_secs} 必须覆盖避让窗口加恢复爬坡"
+            );
+        }
+        other => panic!("期望降级，实际 {other:?}"),
+    }
+}
+
+// ---- 探测流量：避让不是真冷却 ----
+
+/// 构造一个处于避让期的池候选。
+fn probationary_pool(id: u64, priority: i32, until_ms: i64) -> ExternalPoolCandidate {
+    let mut candidate = scored_pool(id, priority, 0.9, Some(5_000.0), Some(20_000.0));
+    if let Some(quality) = candidate.quality.as_mut() {
+        quality.probation_until_ms = Some(until_ms);
+        quality.probation_level = 1;
+        quality.probation_cleared_at_ms = Some(until_ms);
+    }
+    candidate
+}
+
+#[test]
+fn probationary_pool_still_receives_probe_traffic_outside_top_k() {
+    // 核心回归：Top-K = 3 且有 3 个健康池时，被避让的池会排在第 4 位，
+    // 纯罚分方案会让它拿到**零**流量，从而永远无法自证恢复。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_top_k = 3;
+    config.external_pool_probe_share_percent = 10;
+
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(210.0), Some(1_050.0)),
+        scored_pool(3, 1, 0.0, Some(220.0), Some(1_100.0)),
+        probationary_pool(4, 1, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let probe_share = shares.get(&4).copied().unwrap_or(0.0);
+    assert!(
+        probe_share > 0.05 && probe_share < 0.16,
+        "避让池必须保留约 10% 探测流量，实际 {probe_share:.3}"
+    );
+}
+
+#[test]
+fn probe_share_zero_gives_probationary_pool_no_traffic() {
+    // 探测比例设为 0 时退化为"硬避让"，必须尊重该配置。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_top_k = 3;
+    config.external_pool_probe_share_percent = 0;
+
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(210.0), Some(1_050.0)),
+        scored_pool(3, 1, 0.0, Some(220.0), Some(1_100.0)),
+        probationary_pool(4, 1, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(shares.get(&4).copied().unwrap_or(0.0), 0.0);
+}
+
+#[test]
+fn all_probationary_pools_still_share_traffic_fairly() {
+    // 全员避让（上游整体故障）：候选集不得被清空，且不得退化成只打一个池。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_probe_share_percent = 10;
+
+    let candidates = vec![
+        probationary_pool(1, 1, 10_000),
+        probationary_pool(2, 1, 10_000),
+        probationary_pool(3, 1, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    for id in [1u64, 2, 3] {
+        let share = shares.get(&id).copied().unwrap_or(0.0);
+        assert!(
+            share > 0.15,
+            "全员避让时池 {id} 仍须获得流量，实际 {share:.3}"
+        );
+    }
+}
+
+#[test]
+fn probe_traffic_never_crosses_priority_tiers() {
+    // 探测流量只在最优优先级层内发生：一个低优先级的避让池
+    // 不得借探测通道抢到高优先级层的流量。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_probe_share_percent = 50;
+
+    let candidates = vec![
+        scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
+        probationary_pool(2, 5, 10_000),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    assert_eq!(
+        shares.get(&2).copied().unwrap_or(0.0),
+        0.0,
+        "低优先级层的避让池不得通过探测通道越层抢流量"
+    );
+}
+
+// ---- 恢复爬坡 ----
+
+#[test]
+fn recovery_ramp_gradually_restores_traffic_after_probation_expires() {
+    // 避让到期不得瞬间全量回流，份额必须随时间单调回升。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_recovery_ramp_secs = 60;
+    config.external_pool_probe_share_percent = 0;
+
+    let recovered = |elapsed_ms: i64| -> f64 {
+        let until_ms = 10_000;
+        let mut healed = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+        if let Some(quality) = healed.quality.as_mut() {
+            quality.probation_until_ms = Some(until_ms);
+            quality.probation_cleared_at_ms = Some(until_ms);
+            quality.probation_level = 1;
+        }
+        let candidates = vec![scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)), healed];
+        let shares = selection_shares(
+            &candidates,
+            &config,
+            until_ms + elapsed_ms,
+            DISTRIBUTION_ROUNDS,
+        );
+        shares.get(&2).copied().unwrap_or(0.0)
+    };
+
+    let just_cleared = recovered(1);
+    let half_way = recovered(30_000);
+    let fully_ramped = recovered(60_001);
+
+    assert!(
+        just_cleared < half_way,
+        "刚出避让份额 {just_cleared:.3} 应低于爬坡中段 {half_way:.3}"
+    );
+    assert!(
+        half_way < fully_ramped,
+        "爬坡中段份额 {half_way:.3} 应低于完全恢复 {fully_ramped:.3}"
+    );
+    assert!(
+        fully_ramped > 0.4,
+        "完全恢复后应回到与健康池相当的份额，实际 {fully_ramped:.3}"
+    );
+}
+
+#[test]
+fn never_recovering_pool_keeps_being_re_probationed() {
+    // D3 "永不恢复"：每次避让到期后失败率仍超标，层级必须持续递增、
+    // 避让时长持续拉长，直至上限。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_degrade_probation_secs = 100;
+    config.external_pool_max_probation_secs = 400;
+
+    let mut level = 0u32;
+    let mut now_ms = 0i64;
+    let mut observed = Vec::new();
+    for _ in 0..5 {
+        match evaluate_external_pool_degrade(&degrade_state(1.0, level), &config, now_ms) {
+            ExternalPoolDegradeDecision::Probation {
+                until_ms,
+                level: next_level,
+                ..
+            } => {
+                observed.push((until_ms - now_ms) / 1_000);
+                level = next_level;
+                now_ms = until_ms + 1;
+            }
+            other => panic!("持续失败必须持续降级，实际 {other:?}"),
+        }
+    }
+    assert_eq!(observed, vec![100, 200, 400, 400, 400]);
+}
+
+// ---- 可观测性视图 ----
+
+#[test]
+fn quality_view_reports_probation_countdown_and_recovery_progress() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_min_samples = 5;
+    config.external_pool_recovery_ramp_secs = 60;
+
+    let state = ExternalPoolQualityState {
+        recent_error_rate: 0.75,
+        ttft_ewma_ms: Some(1_800.0),
+        latency_ewma_ms: Some(9_000.0),
+        sample_count: 42,
+        probation_until_ms: Some(120_000),
+        probation_level: 2,
+        probation_cleared_at_ms: Some(120_000),
+    };
+
+    // 避让期内：剩余秒数向下取整，恢复进度为满（尚未开始爬坡）
+    let during = ExternalPoolQualityView::from_state(&state, &config, 90_500);
+    assert!(during.in_probation);
+    assert_eq!(during.probation_remaining_secs, 29);
+    assert_eq!(during.probation_level, 2);
+    assert!(during.scoring_active);
+    assert_eq!(during.recent_error_rate, 0.75);
+
+    // 避让到期后爬坡中段：进度约 50%
+    let ramping = ExternalPoolQualityView::from_state(&state, &config, 150_000);
+    assert!(!ramping.in_probation);
+    assert_eq!(ramping.probation_remaining_secs, 0);
+    assert!(
+        (ramping.recovery_progress - 0.5).abs() < 0.01,
+        "爬坡中段进度应约为 0.5，实际 {}",
+        ramping.recovery_progress
+    );
+
+    // 完全恢复
+    let recovered = ExternalPoolQualityView::from_state(&state, &config, 200_000);
+    assert_eq!(recovered.recovery_progress, 1.0);
+}
+
+#[test]
+fn quality_config_serializes_with_the_camel_case_keys_the_ui_sends() {
+    // 锁定前后端配置键契约：前端 ui/src/types/api.ts 按这些 camelCase 键提交，
+    // 任一侧改名都会让设置被 serde 默认值静默吞掉——用户会以为保存成功了。
+    let config = ExternalPoolsConfig::default();
+    let value = serde_json::to_value(&config).expect("配置必须可序列化");
+    let object = value.as_object().expect("配置必须是 JSON 对象");
+
+    for key in [
+        "externalPoolQualityAwareSchedulingEnabled",
+        "externalPoolQualityEwmaAlpha",
+        "externalPoolQualitySampleTtlSecs",
+        "externalPoolQualityMinSamples",
+        "externalPoolQualityPriorityWeight",
+        "externalPoolQualityLoadWeight",
+        "externalPoolQualityErrorWeight",
+        "externalPoolQualityLatencyWeight",
+        "externalPoolQualityProbationWeight",
+        "externalPoolQualityTopK",
+        "externalPoolDegradeWindowSecs",
+        "externalPoolDegradeErrorRateThreshold",
+        "externalPoolDegradeProbationSecs",
+        "externalPoolMaxProbationSecs",
+        "externalPoolProbeSharePercent",
+        "externalPoolRecoveryRampSecs",
+    ] {
+        assert!(object.contains_key(key), "缺少前端依赖的配置键 {key}");
+    }
+
+    // 主开关默认必须为 true——这是用户明确要求的"默认打开"。
+    assert_eq!(
+        object["externalPoolQualityAwareSchedulingEnabled"],
+        serde_json::Value::Bool(true)
+    );
+}
+
+#[test]
+fn quality_view_marks_cold_start_pools_as_not_scoring() {
+    // 样本不足时必须显式告诉运维"这个池的数据还没参与调度"，
+    // 否则会误以为调度器在依据一份难看的冷启动数据决策。
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_min_samples = 10;
+
+    let state = ExternalPoolQualityState {
+        recent_error_rate: 1.0,
+        sample_count: 3,
+        ..Default::default()
+    };
+    let view = ExternalPoolQualityView::from_state(&state, &config, 0);
+    assert!(!view.scoring_active);
+    assert_eq!(view.sample_count, 3);
+    assert!(!view.in_probation);
+    assert_eq!(view.recovery_progress, 1.0);
 }
