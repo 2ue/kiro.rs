@@ -7,4 +7,5 @@ pub mod model;
 pub mod parser;
 pub mod protocol;
 pub mod provider;
+pub mod retry_pipeline;
 pub mod token_manager;

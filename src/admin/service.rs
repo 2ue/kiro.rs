@@ -4694,6 +4694,10 @@ impl AdminService {
             credential_prompt_logic_retry_enabled: config.credential_prompt_logic_retry_enabled,
             credential_prompt_logic_retry_max_attempts: config
                 .credential_prompt_logic_retry_max_attempts,
+            kiro_upstream_region_rotation: config.kiro_upstream_region_rotation.clone(),
+            local_berserk_mode_enabled: config.local_berserk_mode_enabled,
+            local_berserk_max_rounds: config.local_berserk_max_rounds,
+            local_berserk_round_delay_ms: config.local_berserk_round_delay_ms,
             credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
             dispatch_global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
             dispatch_max_queued_requests: config.dispatch_max_queued_requests,
@@ -4820,6 +4824,19 @@ impl AdminService {
         let credential_prompt_logic_retry_max_attempts = req
             .credential_prompt_logic_retry_max_attempts
             .unwrap_or(current_config.credential_prompt_logic_retry_max_attempts);
+        let kiro_upstream_region_rotation = req
+            .kiro_upstream_region_rotation
+            .clone()
+            .unwrap_or_else(|| current_config.kiro_upstream_region_rotation.clone());
+        let local_berserk_mode_enabled = req
+            .local_berserk_mode_enabled
+            .unwrap_or(current_config.local_berserk_mode_enabled);
+        let local_berserk_max_rounds = req
+            .local_berserk_max_rounds
+            .unwrap_or(current_config.local_berserk_max_rounds);
+        let local_berserk_round_delay_ms = req
+            .local_berserk_round_delay_ms
+            .unwrap_or(current_config.local_berserk_round_delay_ms);
         let credential_in_flight_lease_max_secs = req
             .credential_in_flight_lease_max_secs
             .unwrap_or(current_config.credential_in_flight_lease_max_secs);
@@ -5120,6 +5137,37 @@ impl AdminService {
                 "credentialPromptLogicRetryMaxAttempts 不能大于 10000".to_string(),
             ));
         }
+        // 狂暴轮数上限 10：总尝试量是 账号数 × region数 × 轮数，放开轮数会让
+        // 单个下游请求打出成百上千次上游调用，必须硬性封顶。
+        if !(1..=10).contains(&local_berserk_max_rounds) {
+            return Err(AdminServiceError::InvalidCredential(
+                "localBerserkMaxRounds 必须在 1 到 10 之间".to_string(),
+            ));
+        }
+        if local_berserk_round_delay_ms > 60_000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "localBerserkRoundDelayMs 不能大于 60000".to_string(),
+            ));
+        }
+        if kiro_upstream_region_rotation.len() > 16 {
+            return Err(AdminServiceError::InvalidCredential(
+                "kiroUpstreamRegionRotation 最多配置 16 个 region".to_string(),
+            ));
+        }
+        for region in &kiro_upstream_region_rotation {
+            // region 会被直接拼进 `https://q.{region}.amazonaws.com`，
+            // 必须按主机名 label 校验，杜绝域名注入。
+            if region.trim().is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "kiroUpstreamRegionRotation 不能包含空 region".to_string(),
+                ));
+            }
+            if crate::kiro::model::credentials::validate_kiro_region_host_label(region).is_err() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "kiroUpstreamRegionRotation 包含非法 region: {region}"
+                )));
+            }
+        }
         if kiro_upstream_response_timeout_secs > 86_400 {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
@@ -5342,6 +5390,10 @@ impl AdminService {
                     credential_prompt_logic_retry_enabled;
                 config.credential_prompt_logic_retry_max_attempts =
                     credential_prompt_logic_retry_max_attempts;
+                config.kiro_upstream_region_rotation = kiro_upstream_region_rotation;
+                config.local_berserk_mode_enabled = local_berserk_mode_enabled;
+                config.local_berserk_max_rounds = local_berserk_max_rounds;
+                config.local_berserk_round_delay_ms = local_berserk_round_delay_ms;
                 config.credential_in_flight_lease_max_secs = credential_in_flight_lease_max_secs;
                 config.dispatch_global_max_concurrent_requests =
                     dispatch_global_max_concurrent_requests;

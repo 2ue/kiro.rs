@@ -2859,8 +2859,9 @@ pub struct ExternalPoolsConfig {
     // 全部数据来自用户真实请求，不做任何主动探测。
     /// 质量感知调度主开关。
     ///
-    /// 关闭后完全退回"有效优先级 → 负载"的字典序排序，既不读也不写质量
-    /// 状态，行为与引入本特性之前完全一致，可作为线上快速回退手段。
+    /// 关闭后完全退回"有效优先级 → 负载"的字典序排序；质量状态仍可随既有
+    /// 运行态快照读取，但不参与选择、不展示，也不会写入新的质量样本，
+    /// 行为与引入本特性之前的选择结果完全一致，可作为线上快速回退手段。
     #[serde(default = "default_external_pool_quality_aware_scheduling_enabled")]
     pub external_pool_quality_aware_scheduling_enabled: bool,
     /// 质量 EWMA 平滑系数，有效窗口约为最近 `1/alpha` 个请求。
@@ -3079,8 +3080,8 @@ impl Default for ExternalPoolsConfig {
             external_pool_quality_load_weight: default_external_pool_quality_load_weight(),
             external_pool_quality_error_weight: default_external_pool_quality_error_weight(),
             external_pool_quality_latency_weight: default_external_pool_quality_latency_weight(),
-            external_pool_quality_probation_weight:
-                default_external_pool_quality_probation_weight(),
+            external_pool_quality_probation_weight: default_external_pool_quality_probation_weight(
+            ),
             external_pool_quality_top_k: default_external_pool_quality_top_k(),
             external_pool_degrade_window_secs: default_external_pool_degrade_window_secs(),
             external_pool_degrade_error_rate_threshold:
@@ -3739,6 +3740,42 @@ pub struct Config {
     #[serde(default)]
     pub credential_prompt_logic_retry_max_attempts: u32,
 
+    /// 本地账号上游 region 轮换列表。
+    ///
+    /// 列表中的每一项会拼成 `https://q.{region}.amazonaws.com` 作为上游 base URL，
+    /// 使同一个账号可以在多个 AWS region 之间轮换重试。空列表表示关闭轮换，
+    /// 行为与引入该特性之前完全一致。
+    ///
+    /// 该开关独立于狂暴模式：普通模式下开启也会在瞬态失败时尝试其他 region。
+    /// 注意账号的 `profileArn` 可能内嵌 region，轮换到不匹配的 region 时上游
+    /// 可能直接报错，该次尝试仍按一次正常尝试计入。
+    #[serde(default)]
+    pub kiro_upstream_region_rotation: Vec<String>,
+
+    /// 本地账号 429 狂暴轮换模式主开关。
+    ///
+    /// 默认关闭。关闭时所有调度、重试与冷却行为与引入该特性之前逐项一致。
+    /// 开启后遇到可重试的 429/瞬态失败会优先换账号重试，把所有账号轮一遍后
+    /// 再切换到下一个 region，构成 `账号 × region` 的笛卡尔积遍历。
+    ///
+    /// 仅作用于本地账号；外部池有独立的重试管线，不受该开关影响。
+    #[serde(default)]
+    pub local_berserk_mode_enabled: bool,
+
+    /// 狂暴模式下 `账号 × region` 最多完整轮换几轮。
+    ///
+    /// 仅在 `localBerserkModeEnabled=true` 时生效；合法范围 1..=10，
+    /// 0 等价于 1 轮。总尝试上限为 `账号数 × region数 × 轮数`。
+    #[serde(default = "default_local_berserk_max_rounds")]
+    pub local_berserk_max_rounds: u32,
+
+    /// 狂暴模式跨轮次退避毫秒数。
+    ///
+    /// 同一轮内切换账号不等待（不同账号不共享上游限流配额）；
+    /// 一轮全部失败后等待该时长再开始下一轮，避免连环撞墙放大限流。
+    #[serde(default = "default_local_berserk_round_delay_ms")]
+    pub local_berserk_round_delay_ms: u64,
+
     /// 并发占用 lease 的最大存活秒数。
     ///
     /// `0` 表示不自动回收；`>0` 时，调度前会清理超过该时间仍未释放的占用，
@@ -4160,6 +4197,20 @@ fn default_kiro_upstream_stream_retry_enabled() -> bool {
 
 fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
     2
+}
+
+/// 狂暴模式默认轮换 1 轮：开启后至少完整遍历一遍 `账号 × region`。
+pub(crate) fn default_local_berserk_max_rounds() -> u32 {
+    1
+}
+
+/// 狂暴模式跨轮退避默认 1s。
+///
+/// 对齐 kiro-rs-main `retry_delay_throttle` 的 1s 基线：429 是账号级速率配额
+/// 耗尽，一轮全部失败后需要给配额留出恢复窗口，否则只会反复撞墙持续触顶。
+/// 同一轮内切换账号不使用该退避（不同账号不共享配额）。
+pub(crate) fn default_local_berserk_round_delay_ms() -> u64 {
+    1_000
 }
 
 pub(crate) fn default_inference_upstream_max_attempts() -> u32 {
@@ -5020,6 +5071,10 @@ impl Default for Config {
             credential_retry_max_attempts: 0,
             credential_prompt_logic_retry_enabled: false,
             credential_prompt_logic_retry_max_attempts: 0,
+            kiro_upstream_region_rotation: Vec::new(),
+            local_berserk_mode_enabled: false,
+            local_berserk_max_rounds: default_local_berserk_max_rounds(),
+            local_berserk_round_delay_ms: default_local_berserk_round_delay_ms(),
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             dispatch_global_max_concurrent_requests:
                 default_dispatch_global_max_concurrent_requests(),
@@ -5625,6 +5680,17 @@ mod tests {
         assert!(config.kiro_upstream_stream_retry_on_status_error);
         assert_eq!(config.kiro_upstream_base_url, None);
         assert_eq!(config.credential_retry_max_attempts, 0);
+        // 狂暴模式必须默认关闭：开启会显著放大上游请求量，必须由用户显式打开。
+        assert!(
+            !config.local_berserk_mode_enabled,
+            "狂暴模式必须默认关闭，否则会在未经用户确认的情况下放大上游限流"
+        );
+        assert!(
+            config.kiro_upstream_region_rotation.is_empty(),
+            "region 轮换默认必须为空列表，保持与引入该特性之前完全一致的上游地址"
+        );
+        assert_eq!(config.local_berserk_max_rounds, 1);
+        assert_eq!(config.local_berserk_round_delay_ms, 1_000);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.dispatch_global_max_concurrent_requests, 512);
         assert_eq!(config.dispatch_max_queued_requests, 30);
