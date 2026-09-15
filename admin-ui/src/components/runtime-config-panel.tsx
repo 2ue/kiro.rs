@@ -578,6 +578,10 @@ const emptyConfig: RuntimeConfig = {
   credentialRetryMaxAttempts: 0,
   credentialPromptLogicRetryEnabled: false,
   credentialPromptLogicRetryMaxAttempts: 0,
+  kiroUpstreamRegionRotationEnabled: false,
+  localBerserkModeEnabled: false,
+  localBerserkMaxRounds: 1,
+  localBerserkRoundDelayMs: 1000,
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
   dispatchMaxQueuedRequests: 0,
@@ -2903,6 +2907,10 @@ export function RuntimeConfigPanel() {
     const definedCacheRoutes = normalizeDefinedCacheRoutes(draft.definedCacheRoutes || [])
     const next: RuntimeConfig = {
       ...draft,
+      kiroUpstreamRegionRotationEnabled: Boolean(draft.kiroUpstreamRegionRotationEnabled),
+      localBerserkModeEnabled: Boolean(draft.localBerserkModeEnabled),
+      localBerserkMaxRounds: toWhole(draft.localBerserkMaxRounds, 1, 10),
+      localBerserkRoundDelayMs: toWhole(draft.localBerserkRoundDelayMs, 0, 60_000),
       credentialRpm: toWhole(draft.credentialRpm),
       requestAdmission: {
         rpm: toWhole(draft.requestAdmission.rpm, 0, 1_000_000),
@@ -3406,6 +3414,46 @@ export function RuntimeConfigPanel() {
               disabled={!draft.credentialPromptLogicRetryEnabled}
               onChange={(credentialPromptLogicRetryMaxAttempts) =>
                 setDraft((prev) => ({ ...prev, credentialPromptLogicRetryMaxAttempts }))
+              }
+            />
+            <ToggleField
+              title="上游端点轮换"
+              description="开启后，本地账号遇到上游瞬态错误会在官方支持的 us-east-1 / eu-central-1 两个端点之间轮换重试（端点由程序内置，无需配置）。关闭则始终使用账号自身的端点。该开关与狂暴模式互相独立。"
+              checked={draft.kiroUpstreamRegionRotationEnabled}
+              onCheckedChange={(kiroUpstreamRegionRotationEnabled) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamRegionRotationEnabled }))
+              }
+            />
+            <ToggleField
+              title="狂暴模式（429 暴力轮换）"
+              description="仅作用于本地账号。开启后遇到普通 429 会优先换号重试，把所有账号轮一遍后再换端点，直到成功或轮次耗尽。会显著放大上游请求量，默认关闭。风控型 429 与带 Retry-After 的 429 不受影响。"
+              checked={draft.localBerserkModeEnabled}
+              onCheckedChange={(localBerserkModeEnabled) =>
+                setDraft((prev) => ({ ...prev, localBerserkModeEnabled }))
+              }
+            />
+            <NumberField
+              title="狂暴模式最多轮换几轮"
+              description="仅在狂暴模式开启时生效。一轮 = 所有账号 × 所有端点各试一遍。"
+              value={draft.localBerserkMaxRounds}
+              min={1}
+              max={10}
+              suffix="轮"
+              disabled={!draft.localBerserkModeEnabled}
+              onChange={(localBerserkMaxRounds) =>
+                setDraft((prev) => ({ ...prev, localBerserkMaxRounds }))
+              }
+            />
+            <NumberField
+              title="狂暴模式轮次间隔"
+              description="仅在狂暴模式开启时生效。同一轮内换号不等待；只有进入下一轮时才退避这么久，给账号配额留恢复窗口。填 0 表示完全不等待。"
+              value={draft.localBerserkRoundDelayMs}
+              min={0}
+              max={60000}
+              suffix="毫秒"
+              disabled={!draft.localBerserkModeEnabled}
+              onChange={(localBerserkRoundDelayMs) =>
+                setDraft((prev) => ({ ...prev, localBerserkRoundDelayMs }))
               }
             />
             <NumberField

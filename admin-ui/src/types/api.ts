@@ -1780,6 +1780,10 @@ export interface RuntimeConfig {
   credentialRetryMaxAttempts: number
   credentialPromptLogicRetryEnabled: boolean
   credentialPromptLogicRetryMaxAttempts: number
+  kiroUpstreamRegionRotationEnabled: boolean
+  localBerserkModeEnabled: boolean
+  localBerserkMaxRounds: number
+  localBerserkRoundDelayMs: number
   credentialInFlightLeaseMaxSecs: number
   dispatchGlobalMaxConcurrentRequests: number
   dispatchMaxQueuedRequests: number

@@ -10347,9 +10347,12 @@ impl KiroProvider {
                 }
             };
 
-            // 本次尝试使用的 region 覆盖：由轮换游标决定。无 region 列表时为
-            // None，退回凭据自身的解析链，行为与引入轮换之前一致。
-            let attempt_region_override = berserk_plan.region_at(rotation_cursor.region_index());
+            // 本次尝试使用的 region 覆盖：由轮换游标决定，顺序以凭据自身的 region
+            // 为主端点（对齐 kiro-rs-main）。关闭轮换时为 None，退回凭据自身的
+            // 解析链，行为与引入轮换之前一致。
+            let credential_region = ctx.credentials.effective_api_region(&config).to_string();
+            let attempt_region_override =
+                berserk_plan.region_at(&credential_region, rotation_cursor.region_index());
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
@@ -12037,7 +12040,9 @@ impl KiroProvider {
                                 credential_label = %credential_label,
                                 round = rotation_cursor.round(),
                                 region_index,
-                                region = berserk_plan.region_at(region_index).unwrap_or("default"),
+                                region = berserk_plan
+                                    .region_at(&credential_region, region_index)
+                                    .unwrap_or("default"),
                                 "狂暴模式：本轮账号已全部 429，切换上游 region 并重新轮换全部账号"
                             );
                             excluded_ids.clear();
@@ -12074,7 +12079,9 @@ impl KiroProvider {
                     tracing::debug!(
                         credential_id = ctx.id,
                         region_index,
-                        region = berserk_plan.region_at(region_index).unwrap_or("default"),
+                        region = berserk_plan
+                            .region_at(&credential_region, region_index)
+                            .unwrap_or("default"),
                         "普通模式：瞬态失败后切换上游 region 重试"
                     );
                 }

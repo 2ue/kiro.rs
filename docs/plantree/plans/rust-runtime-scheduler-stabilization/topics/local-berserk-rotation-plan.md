@@ -22,13 +22,14 @@
 | 1 | **狂暴模式关闭后，理论上就不能影响现在调度逻辑** |
 | 2 | **端点轮换可以加到普通模式去**（独立于狂暴模式的开关） |
 | 3 | **端点轮换指的是调用上游的 baseUrl**（本地账号调度 AWS 上游），不是 ide/cli 协议实现 |
+| 5 | **前端页面不需要配置具体端点，只需要开关**；端点按 kiro-rs-main 的来 |
 | 4 | **按 kiro-rs-main 的模式来实现狂暴模式，额外加狂暴模式开关** |
 
 ### 1.3 已确认的设计决策
 
 | 决策点 | 选择 |
 |---|---|
-| 轮换列表形态 | 可配置 **region 列表**，拼 `https://q.{region}.amazonaws.com`；空列表 = 不轮换 |
+| 轮换列表形态 | **端点内置不可配**：只在官方支持的 `us-east-1` / `eu-central-1` 间轮换，用户只有一个布尔开关（见 §4.2） |
 | profileArn region 冲突 | **强制轮换，失败算一次尝试** |
 | 换号退避 | 同轮内换号**完全不等待** |
 | 429 冷却副作用 | **仅本次请求内 `excluded_ids` 临时排除，不写全局冷却** |
@@ -51,7 +52,13 @@
 | 轮换游标 | `grep rotate/rotation/next_region` 只命中 client-key 轮换与日志 rotate |
 | baseUrl 覆盖 | kiro-rs-main **连 `kiro_upstream_base_url` 都没有**（本项目反而有） |
 
-所以 **region 轮换是本项目的新增设计**；从 kiro-rs-main 借鉴的是它的**429 错误分类与重试骨架**。
+所以**在推理主链路上 region 轮换是本项目的新增设计**；从 kiro-rs-main 借鉴的是它的**429 错误分类与重试骨架**。
+
+**但 kiro-rs-main 在 REST 辅助接口上确实有两端点回退**：
+`rest_api_region_candidates`（`src/kiro/token_manager.rs:465`）对
+getUsageLimits / ListAvailableModels / setUserPreference 就是在
+`us-east-1` 与 `eu-central-1` 之间按 SSO 区域排序后做 403 回退，并注明
+「这些接口**仅在这两个端点提供服务**」。本方案的端点集合与排序规则直接取自这里。
 
 ### 2.2 kiro-rs-main 的 429 三分法（本方案的基线）
 
@@ -87,7 +94,8 @@
 | 误判防护：子串预扫 + JSON 确认 `reason` | ✅ | ✅ 沿用 |
 | 总重试上限 4 | ✅ | ❌ 狂暴模式下按 `账号 × region × 轮数` 放开 |
 | 普通 429 同账号重试 | ✅ | ❌ 狂暴模式改为**优先换号**（用户明确要求） |
-| region/baseUrl 轮换 | ❌ 不存在 | ✅ 本项目新增 |
+| 推理链路 region 轮换 | ❌ 不存在 | ✅ 本项目新增 |
+| 两端点集合与排序规则 | ✅ `rest_api_region_candidates`（REST 接口） | **✅ 沿用**，移植到推理链路 |
 
 ---
 
@@ -156,7 +164,7 @@ KiroEndpoint::api_url(ctx)
 ```
 开关 A：端点（region）轮换（普通模式亦可用）
   kiroUpstreamRegionRotationEnabled: false   ← 总开关，默认关
-  kiroUpstreamRegionRotation: []             ← region 列表
+  端点由程序内置，无需配置
 
 开关 B：狂暴模式（默认关闭）
   localBerserkModeEnabled: false
@@ -166,9 +174,18 @@ KiroEndpoint::api_url(ctx)
 
 可只开 A（普通模式多一层 region 容错）、只开 B（仅换号轮换）、或同时开（完整笛卡尔积）。
 
-**A 采用「总开关 + 列表」两段式而非「空列表 = 关闭」**：用户诉求是
-「防止有一些端点不可用导致调度一直失败」时能一键回退到改造之前的端点，
-而不必清空已经调好的 region 列表。关闭总开关后 `BerserkPlan.regions` 直接归空，
+**A 只有一个布尔开关，端点列表不暴露给用户**：Kiro/Q 上游只在
+`us-east-1` 与 `eu-central-1` 两个端点提供服务（依据 kiro-rs-main
+`rest_api_region_candidates`，`src/kiro/token_manager.rs:465`——该项目对
+getUsageLimits / ListAvailableModels 就是在这两个端点间做 403 回退）。
+让用户填 region 只会引入「填错 → 打到不存在的域名」这一类新故障，
+因此端点内置为 `KIRO_ROTATION_REGIONS`，用户只需要决定开或关。
+
+轮换顺序同样沿用 kiro-rs-main 的规则：`eu-central-1` 或任意 `eu-*` 账号以
+`eu-central-1` 为主端点、`us-east-1` 为回退；其余账号反之。这样 Enterprise / IdC
+账号即使 SSO 区域不是 `us-east-1`，首次尝试也能命中正确端点。
+
+关闭总开关后 `region_at()` 恒返回 `None`、`region_slots()` 恒为 1，
 下游所有轮换判断统一退化为「沿用凭据自身的 region」，回退路径只有这一个收敛点。
 
 两个开关**完全正交**：关闭 A 不影响 B 的换号轮换（此时 region 固定为改造前的端点），
@@ -216,8 +233,7 @@ KiroEndpoint::api_url(ctx)
 
 | 字段（Rust） | JSON key | 类型 | 默认 | 说明 |
 |---|---|---|---|---|
-| `kiro_upstream_region_rotation_enabled` | `kiroUpstreamRegionRotationEnabled` | `bool` | `false` | 端点轮换总开关，关 = 使用改造前的端点 |
-| `kiro_upstream_region_rotation` | `kiroUpstreamRegionRotation` | `Vec<String>` | `[]` | region 轮换列表，最多 16 项 |
+| `kiro_upstream_region_rotation_enabled` | `kiroUpstreamRegionRotationEnabled` | `bool` | `false` | 端点轮换总开关，关 = 使用改造前的端点；端点内置不可配 |
 | `local_berserk_mode_enabled` | `localBerserkModeEnabled` | `bool` | `false` | 狂暴模式主开关 |
 | `local_berserk_max_rounds` | `localBerserkMaxRounds` | `u32` | `1` | 轮数，校验 `1..=10` |
 | `local_berserk_round_delay_ms` | `localBerserkRoundDelayMs` | `u64` | `1000` | 跨轮退避，对齐 kiro-rs-main |
@@ -248,6 +264,7 @@ KiroEndpoint::api_url(ctx)
 | 7 | `src/kiro/provider.rs:10197` | **狂暴模式豁免 `InferenceAttemptBudget`**（否则静默截断到 10）；保留"下游已提交即停" |
 | 8 | `src/kiro/provider.rs:11918` 429 分支 | 在第③类内插入狂暴分支：优先换号 → 换 region → 换轮次；跳过全局冷却写入；同轮不 sleep |
 | 9 | `src/kiro/provider.rs:7949` | 狂暴下无备选账号时不直接失败，转而换 region / 下一轮 |
+| 10 | `admin-ui/` + `ui/` 两套前端 | 三个开关 + 两个数值必须在管理页面可视化配置（类型、默认值、归一化、表单控件），不能只靠配置文件 |
 
 ---
 
@@ -261,7 +278,7 @@ KiroEndpoint::api_url(ctx)
 |---|---|
 | `src/kiro/retry_pipeline.rs` | 轮换序列 N×M×R 顺序正确且"优先换号"；空 region 列表退化为仅换号；轮数边界 0/1/10 |
 | `src/model/config.rs` | 默认值断言；camelCase 序列化往返 |
-| `src/admin/service_tests.rs` | 轮数越界拒绝；非法 region 拒绝；默认配置通过校验 |
+| `src/admin/service_tests.rs` | 轮数越界拒绝；延迟越界拒绝；默认配置通过校验 |
 | `src/kiro/provider.rs` | `max_retry_attempts` 开关取值；`retry_delay_throttle` 曲线（1s→8s、封顶、抖动范围）；429 三分法分类 |
 
 ### 7.2 Mock 上游真实调度测试

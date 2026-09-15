@@ -323,6 +323,10 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
     credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
     credentialPromptLogicRetryMaxAttempts: toWhole(draft.credentialPromptLogicRetryMaxAttempts),
+    kiroUpstreamRegionRotationEnabled: Boolean(draft.kiroUpstreamRegionRotationEnabled),
+    localBerserkModeEnabled: Boolean(draft.localBerserkModeEnabled),
+    localBerserkMaxRounds: toWhole(draft.localBerserkMaxRounds, 1, 10),
+    localBerserkRoundDelayMs: toWhole(draft.localBerserkRoundDelayMs, 0, 60_000),
     credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
     dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
     dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
@@ -851,6 +855,10 @@ export function RuntimePage() {
                 <NumField label="本地 provider 尝试上限" desc="单次本地调用最多尝试多少个凭据；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
                 <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />
+                <TogField label="上游端点轮换" desc="开启后，本地账号遇到上游瞬态错误会在官方支持的 us-east-1 / eu-central-1 两个端点之间轮换重试（端点由程序内置，无需配置）。关闭则始终使用账号自身的端点。与狂暴模式互相独立。" checked={draft.kiroUpstreamRegionRotationEnabled} onChange={set('kiroUpstreamRegionRotationEnabled')} />
+                <TogField label="狂暴模式（429 暴力轮换）" desc="仅作用于本地账号。开启后遇到普通 429 会优先换号重试，把所有账号轮一遍后再换端点，直到成功或轮次耗尽。会显著放大上游请求量，默认关闭。风控型 429 与带 Retry-After 的 429 不受影响。" checked={draft.localBerserkModeEnabled} onChange={set('localBerserkModeEnabled')} />
+                <NumField label="狂暴模式最多轮换几轮" desc="仅在狂暴模式开启时生效。一轮 = 所有账号 × 所有端点各试一遍。" value={draft.localBerserkMaxRounds} min={1} max={10} suffix="轮" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkMaxRounds')} />
+                <NumField label="狂暴模式轮次间隔" desc="仅在狂暴模式开启时生效。同一轮内换号不等待；只有进入下一轮时才退避这么久。0 表示完全不等待。" value={draft.localBerserkRoundDelayMs} min={0} max={60000} suffix="毫秒" disabled={!draft.localBerserkModeEnabled} onChange={set('localBerserkRoundDelayMs')} />
                 <NumField label="异常并发自动回收" desc="请求长时间没有结束时自动释放占用，避免账号并发数被卡住；0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={set('credentialInFlightLeaseMaxSecs')} />
               </TwoCol>
             )}

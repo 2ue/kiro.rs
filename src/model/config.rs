@@ -3740,23 +3740,15 @@ pub struct Config {
     #[serde(default)]
     pub credential_prompt_logic_retry_max_attempts: u32,
 
-    /// 本地账号上游 region 轮换列表。
-    ///
-    /// 列表中的每一项会拼成 `https://q.{region}.amazonaws.com` 作为上游 base URL，
-    /// 使同一个账号可以在多个 AWS region 之间轮换重试。空列表表示关闭轮换，
-    /// 行为与引入该特性之前完全一致。
-    ///
-    /// 该开关独立于狂暴模式：普通模式下开启也会在瞬态失败时尝试其他 region。
-    /// 注意账号的 `profileArn` 可能内嵌 region，轮换到不匹配的 region 时上游
-    /// 可能直接报错，该次尝试仍按一次正常尝试计入。
-    #[serde(default)]
-    pub kiro_upstream_region_rotation: Vec<String>,
-
     /// 上游 region（端点）轮换总开关。
     ///
-    /// 默认关闭。关闭时无论 `kiroUpstreamRegionRotation` 配了什么，都一律使用
-    /// 改造之前的端点（即凭据自身解析出的 region），便于在某些 region 不可用
-    /// 导致调度持续失败时一键回退，而不必清空已有的 region 列表。
+    /// 默认关闭，关闭时一律使用改造之前的端点（凭据自身解析出的 region），
+    /// 便于某个端点不可用导致调度持续失败时一键回退。
+    ///
+    /// 开启后在官方支持的 `us-east-1` / `eu-central-1` 两个端点之间轮换
+    /// （见 `KIRO_ROTATION_REGIONS`，对齐 kiro-rs-main）。具体端点由程序内置，
+    /// 无需用户配置——Kiro/Q 上游只在这两个端点提供服务，填其他值只会打到
+    /// 不存在的域名上。顺序按凭据自身 region 决定：`eu-*` 账号优先 `eu-central-1`。
     ///
     /// 该开关与狂暴模式完全独立、互不影响：普通模式下也可以单独开启端点轮换重试。
     #[serde(default)]
@@ -5081,7 +5073,6 @@ impl Default for Config {
             credential_retry_max_attempts: 0,
             credential_prompt_logic_retry_enabled: false,
             credential_prompt_logic_retry_max_attempts: 0,
-            kiro_upstream_region_rotation: Vec::new(),
             kiro_upstream_region_rotation_enabled: false,
             local_berserk_mode_enabled: false,
             local_berserk_max_rounds: default_local_berserk_max_rounds(),
@@ -5695,10 +5686,6 @@ mod tests {
         assert!(
             !config.local_berserk_mode_enabled,
             "狂暴模式必须默认关闭，否则会在未经用户确认的情况下放大上游限流"
-        );
-        assert!(
-            config.kiro_upstream_region_rotation.is_empty(),
-            "region 轮换默认必须为空列表，保持与引入该特性之前完全一致的上游地址"
         );
         assert!(
             !config.kiro_upstream_region_rotation_enabled,

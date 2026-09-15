@@ -302,7 +302,7 @@ pub(crate) fn validate_kiro_api_key_pipe_format(raw: &str) -> Result<(), &'stati
     validate_kiro_region_host_label(region)
 }
 
-pub(crate) fn validate_kiro_region_host_label(region: &str) -> Result<(), &'static str> {
+fn validate_kiro_region_host_label(region: &str) -> Result<(), &'static str> {
     if region.is_empty() {
         return Ok(());
     }

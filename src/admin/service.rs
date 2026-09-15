@@ -4694,7 +4694,6 @@ impl AdminService {
             credential_prompt_logic_retry_enabled: config.credential_prompt_logic_retry_enabled,
             credential_prompt_logic_retry_max_attempts: config
                 .credential_prompt_logic_retry_max_attempts,
-            kiro_upstream_region_rotation: config.kiro_upstream_region_rotation.clone(),
             kiro_upstream_region_rotation_enabled: config.kiro_upstream_region_rotation_enabled,
             local_berserk_mode_enabled: config.local_berserk_mode_enabled,
             local_berserk_max_rounds: config.local_berserk_max_rounds,
@@ -4825,10 +4824,6 @@ impl AdminService {
         let credential_prompt_logic_retry_max_attempts = req
             .credential_prompt_logic_retry_max_attempts
             .unwrap_or(current_config.credential_prompt_logic_retry_max_attempts);
-        let kiro_upstream_region_rotation = req
-            .kiro_upstream_region_rotation
-            .clone()
-            .unwrap_or_else(|| current_config.kiro_upstream_region_rotation.clone());
         let kiro_upstream_region_rotation_enabled = req
             .kiro_upstream_region_rotation_enabled
             .unwrap_or(current_config.kiro_upstream_region_rotation_enabled);
@@ -5153,35 +5148,6 @@ impl AdminService {
                 "localBerserkRoundDelayMs 不能大于 60000".to_string(),
             ));
         }
-        if kiro_upstream_region_rotation_enabled
-            && kiro_upstream_region_rotation
-                .iter()
-                .all(|region| region.trim().is_empty())
-        {
-            // 开了总开关却没有可用 region，轮换会静默失效，属于配置错误而非降级场景。
-            return Err(AdminServiceError::InvalidCredential(
-                "开启 kiroUpstreamRegionRotationEnabled 时必须至少配置一个 region".to_string(),
-            ));
-        }
-        if kiro_upstream_region_rotation.len() > 16 {
-            return Err(AdminServiceError::InvalidCredential(
-                "kiroUpstreamRegionRotation 最多配置 16 个 region".to_string(),
-            ));
-        }
-        for region in &kiro_upstream_region_rotation {
-            // region 会被直接拼进 `https://q.{region}.amazonaws.com`，
-            // 必须按主机名 label 校验，杜绝域名注入。
-            if region.trim().is_empty() {
-                return Err(AdminServiceError::InvalidCredential(
-                    "kiroUpstreamRegionRotation 不能包含空 region".to_string(),
-                ));
-            }
-            if crate::kiro::model::credentials::validate_kiro_region_host_label(region).is_err() {
-                return Err(AdminServiceError::InvalidCredential(format!(
-                    "kiroUpstreamRegionRotation 包含非法 region: {region}"
-                )));
-            }
-        }
         if kiro_upstream_response_timeout_secs > 86_400 {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
@@ -5404,7 +5370,6 @@ impl AdminService {
                     credential_prompt_logic_retry_enabled;
                 config.credential_prompt_logic_retry_max_attempts =
                     credential_prompt_logic_retry_max_attempts;
-                config.kiro_upstream_region_rotation = kiro_upstream_region_rotation;
                 config.kiro_upstream_region_rotation_enabled =
                     kiro_upstream_region_rotation_enabled;
                 config.local_berserk_mode_enabled = local_berserk_mode_enabled;

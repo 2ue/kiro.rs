@@ -298,22 +298,6 @@ pub struct RequestContext<'a> {
 }
 
 impl<'a> RequestContext<'a> {
-    /// 构造不带 region 覆盖的请求上下文（既有行为）。
-    pub fn new(
-        credentials: &'a KiroCredentials,
-        token: &'a str,
-        machine_id: &'a str,
-        config: &'a Config,
-    ) -> Self {
-        Self {
-            credentials,
-            token,
-            machine_id,
-            config,
-            region_override: None,
-        }
-    }
-
     /// 解析本次尝试实际使用的 API region。
     ///
     /// 优先级：轮换覆盖 > 凭据自身解析链（credentials.api_region > profileArn
