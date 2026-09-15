@@ -329,11 +329,77 @@ SSE 的 `ExternalStreamFakeServer`）。
 ## P2 sub2api 质量调度
 
 - [ ] openspec change 立项（proposal/design/tasks/specs）
-- [ ] 泛化评分器到 Anthropic/Gemini 路径
+- [x] **S1** 修复 `buildOpenAIAccountSchedulerScoreSnapshot` 硬编码 → `fb125c7d2`
+- [x] **S2** 泛化质量因子到 Anthropic/Gemini 路径 → `4eae01456`
+- [x] **S3** 观察期降级 + 指数退避 + 探测配额（Redis 状态）→ `4eae01456`
+- [ ] **S4** settings 键 + DTO + admin API + 前端开关与权重
 - [ ] `ReportResult` 回灌（FirstTokenMs 已有）
-- [ ] settings 键 + DTO + admin API
-- [ ] 前端开关与权重
-- [ ] 修复 `buildOpenAIAccountSchedulerScoreSnapshot` 硬编码
+
+### S1 已完成（commit `fb125c7d2`）
+
+`buildOpenAIAccountSchedulerScoreSnapshot` 原本把 errorRate/TTFT 硬编码为常量，
+导致 admin 快照里这两个因子对所有账号相同、完全抵消（死因子）。现改为经
+`OpenAIAccountSchedulerStatsSource` 接口读取真实 EWMA。
+沿用既有 `SetAccountRuntimeBlocker` 反向注册模式，无需改 wire/DI。
+
+### S2 已完成（commit `4eae01456`）
+
+链路：`优先级 →（可选）最早重置 → 负载率 →（新）质量 → LRU`
+
+**关键决策：软过滤而非硬过滤。** 开关默认开启，若做成硬过滤会直接改变所有既有
+部署的行为；软过滤仅在质量差距超过 `minGap`(0.15) 时介入，否则原样返回交还 LRU。
+
+- 错误率权重 0.7 > 首字 0.3 —— 满足"报错/重试多的账号判断优先级高于首字曲线"。
+- 首字按候选集内 min/max **相对归一化**，上游整体变慢时不清空候选池。
+- 无采样数据 → 中性分，避免"没数据→不调度→永远没数据"死锁。
+- `filterByMinPriority` 硬分层不变：低优先级账号质量再好也不得越级（有测试钉死）。
+
+**⚠️ 测试捕获的真实缺陷：相对归一化把噪声放大成满分差距。**
+500ms 与 520ms 本质无差别，归一化后却变成 1.0 与 0.0，足以越过 minGap 触发误降级。
+修复：引入 `qualityTTFTMinSpreadMS = 150` 跨度下限，低于该值一律按中性处理。
+已补回归测试 `TestFilterByQualityIgnoresNoiseLevelTTFTSpread`。
+
+### S3 已完成（commit `4eae01456`）
+
+**观察期（软降级）必须与既有 `BlockAccountScheduling`（硬屏蔽）严格区分：**
+
+| | BlockAccountScheduling（既有） | 质量观察期（新增） |
+|---|---|---|
+| 语义 | 硬屏蔽，完全不可调度 | 软降级，仍可调度只是排后 |
+| 触发 | 429 / 鉴权失败等确定性故障 | 被动采样质量持续差 |
+| 平台 | **仅 OpenAI/Grok**（`isOpenAIAccount` 门控） | 全平台 |
+| 状态 | 进程内 `sync.Map` | **Redis**（多副本共享） |
+
+多副本下状态必须放 Redis：进程内状态会让每个副本独立降级，探测流量变成 N 倍、
+降级时长不可控。
+
+- 迟滞阈值（进入 0.35 / 退出 0.15）避免阈值附近反复抖动。
+- 指数退避 `base*2^(n-1)`，上限 30min；shift 与乘法**双重钳位**防溢出回绕
+  （回绕会让退避时长反而变短，是这类实现的典型缺陷）。
+- **观察期内不顺延结束时间** —— 否则持续报错会把软降级演变成永久封禁。
+- 保留 5% 探测流量，且**任何退避等级下都开放**，保证账号始终有恢复路径。
+- 恢复后重置退避等级，不永久惩罚曾出问题的账号。
+
+### 测试与验证方法
+
+32 个新增用例，全部通过；`internal/service` 全包回归 122s 通过，未破坏既有逻辑。
+
+**用变异测试验证"非空跑"**（避免写出恒绿的无效测试）：分别注入三处缺陷，
+确认被对应用例捕获后立即还原——
+
+| 注入的缺陷 | 捕获它的测试 |
+|---|---|
+| 移除溢出钳位 | `DurationCappedAtMax` / `DurationNeverOverflows` |
+| 移除观察期顺延防护 | `DoesNotExtendWhileActive` / `FullLifecycle` |
+| 压缩迟滞区间 | `HysteresisBandHoldsState` |
+| 整体禁用质量过滤 | 5 个 filterByQuality 用例变红（其余为不变量守卫，本应双向绿） |
+
+### ⚠️ 环境约束（本机）
+
+swap 曾达 22.7G/23.5G、go build cache 膨胀到 **67G**。此后所有 Go 命令一律加
+`GOFLAGS="-p=2" GOMAXPROCS=2` 限制并行度，且**每轮测试后 `go clean -cache
+-testcache` 并清理残留进程**。注意 `sub2api-kiro` 下有用户自己的 `air` 热重载
+dev server（PID 随会话变化），**不要误杀**。
 
 ## P3 sub2api 复杂场景测试
 
