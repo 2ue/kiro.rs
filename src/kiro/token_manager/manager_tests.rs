@@ -7362,10 +7362,7 @@ fn batch_capacity_updates_preserve_per_account_warmup_progress() {
         .iter()
         .map(|entry| entry.warmup_remaining)
         .collect();
-    assert_eq!(
-        after, before,
-        "批量修改容量不得改变任何账号的预热状态"
-    );
+    assert_eq!(after, before, "批量修改容量不得改变任何账号的预热状态");
 
     for entry in manager.snapshot().entries {
         assert_eq!(entry.rpm_override, Some(30));
