@@ -43,6 +43,7 @@ use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::protocol::{
     extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
 };
+use crate::kiro::retry_pipeline::{BerserkPlan, RotationCursor, RotationStep};
 use crate::kiro::token_manager::{
     AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind,
     AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason,
@@ -8475,6 +8476,8 @@ impl KiroProvider {
             token: &ctx.token,
             machine_id: &machine_id,
             config: &config,
+            // 辅助通道（models / profile 发现）不参与 region 轮换。
+            region_override: None,
         };
 
         let url = endpoint.api_url(&rctx);
@@ -8754,6 +8757,8 @@ impl KiroProvider {
             token: &ctx.token,
             machine_id: &machine_id,
             config: &config,
+            // 辅助通道（models / profile 发现）不参与 region 轮换。
+            region_override: None,
         };
 
         let mut all_models = Vec::new();
@@ -9329,6 +9334,8 @@ impl KiroProvider {
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config: &config,
+                // MCP 通道不参与 region 轮换。
+                region_override: None,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -10188,14 +10195,30 @@ impl KiroProvider {
         thinking_signature_retry_body_builder: Option<ThinkingSignatureRetryBodyBuilder<'_>>,
     ) -> anyhow::Result<ApiCallResponse> {
         let total_credentials = self.token_manager.total_count();
+        // 请求开始时拍一次配置快照：热重载不得在同一请求中途改变轮换语义，
+        // 否则轮换计划会前后不一致。
+        let berserk_plan = BerserkPlan::from_config(&self.token_manager.runtime_config());
+        let mut rotation_cursor = RotationCursor::new(&berserk_plan);
+        // 仅在跨轮次推进时置位一次，用于在下一次重试前做轮次间隔退避。
+        let mut berserk_round_delay: Option<Duration> = None;
         let mut max_retries =
             Self::max_retry_attempts(total_credentials, &self.token_manager.runtime_config());
+        if let Some(berserk_budget) = berserk_plan.attempt_budget(total_credentials) {
+            // 狂暴模式接管尝试预算：账号数 × region数 × 轮数。
+            max_retries = max_retries.max(berserk_budget);
+        }
         if let Some(max_sends) = max_sends {
             max_retries = max_retries.min(max_sends);
         }
         if let Some(budget) = inference_attempt_budget {
             let preserve_attempts = u32::from(preserve_external_attempt);
-            max_retries = max_retries.min(budget.available_attempts(preserve_attempts) as usize);
+            // 狂暴模式豁免请求级发送预算（默认 clamp 在 1..=10），否则 20 个账号
+            // 根本轮不完就被静默截断。豁免后仍由 max_retries 硬封顶，且下游一旦
+            // 提交就立即停止重试，不会重复吐字节。
+            if !berserk_plan.active() {
+                max_retries =
+                    max_retries.min(budget.available_attempts(preserve_attempts) as usize);
+            }
             if max_retries == 0 {
                 let snapshot = budget.snapshot();
                 let rejection = if snapshot.downstream_committed {
@@ -10324,11 +10347,15 @@ impl KiroProvider {
                 }
             };
 
+            // 本次尝试使用的 region 覆盖：由轮换游标决定。无 region 列表时为
+            // None，退回凭据自身的解析链，行为与引入轮换之前一致。
+            let attempt_region_override = berserk_plan.region_at(rotation_cursor.region_index());
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config: &config,
+                region_override: attempt_region_override,
             };
 
             let url = endpoint.api_url(&rctx);
@@ -11200,6 +11227,9 @@ impl KiroProvider {
                     token: &ctx.token,
                     machine_id: &machine_id,
                     config: &config,
+                    // 同一次尝试内的原地重试必须沿用同一个 region，
+                    // 否则重试会打到与首次请求不同的上游地址。
+                    region_override: attempt_region_override,
                 };
                 let retry_upstream_body = crate::http_client::maybe_compress_json_whitespace(
                     endpoint.transform_api_body(&retry_body, &retry_rctx),
@@ -11955,27 +11985,34 @@ impl KiroProvider {
                     model.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!(message.clone()));
-                if let Err(err) = self.token_manager.report_transient_failure_kind(
-                    ctx.id,
-                    model.as_deref(),
-                    failure_kind
-                        .transient_failure_kind()
-                        .expect("retryable status has a transient failure kind"),
-                    retry_after,
-                    failure_kind.scheduler_reason(),
-                ) {
-                    let final_message = format!(
-                        "{} API 请求失败（{}，调度状态写入失败）: {}",
-                        api_type, credential_context, err
-                    );
-                    if let Some(last) = attempts.last_mut() {
-                        last.action = "fail".to_string();
-                        last.error_type = Some("scheduler_state_error".to_string());
-                        last.error_message = Some(final_message.clone());
+                // 狂暴模式下的普通 429 属于「换号即可绕开」的瞬态限流，
+                // 写入全局冷却会让后续请求也看不到这些账号，与「本次请求内暴力轮换」
+                // 的语义冲突；因此仅在狂暴模式关闭时保留既有的全局调度状态写入。
+                let berserk_skips_cooldown =
+                    berserk_plan.active() && failure_kind == ApiUpstreamFailureKind::RateLimit;
+                if !berserk_skips_cooldown {
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        model.as_deref(),
+                        failure_kind
+                            .transient_failure_kind()
+                            .expect("retryable status has a transient failure kind"),
+                        retry_after,
+                        failure_kind.scheduler_reason(),
+                    ) {
+                        let final_message = format!(
+                            "{} API 请求失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
                     }
-                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
-                    self.finish_attempt(&mut ctx);
-                    return Err(Self::traced_error(final_message, &attempts));
                 }
                 self.maybe_exclude_after_soft_failure(
                     conversation_id.as_deref(),
@@ -11984,16 +12021,77 @@ impl KiroProvider {
                     &credential_label,
                     &mut excluded_ids,
                 );
-                let retry_target_available = self.maybe_exclude_after_transient_failure(
+                let mut retry_target_available = self.maybe_exclude_after_transient_failure(
                     model.as_deref(),
                     ctx.id,
                     &credential_label,
                     &mut excluded_ids,
                 );
+                // 优先换号：仅当本轮所有账号都已被排除（无可用备选）时，
+                // 才推进到下一个 region，再不行才推进到下一轮。
+                if berserk_plan.active() && !retry_target_available && attempt + 1 < max_retries {
+                    match rotation_cursor.advance_after_accounts_exhausted(&berserk_plan) {
+                        RotationStep::NextRegion { region_index } => {
+                            tracing::warn!(
+                                credential_id = ctx.id,
+                                credential_label = %credential_label,
+                                round = rotation_cursor.round(),
+                                region_index,
+                                region = berserk_plan.region_at(region_index).unwrap_or("default"),
+                                "狂暴模式：本轮账号已全部 429，切换上游 region 并重新轮换全部账号"
+                            );
+                            excluded_ids.clear();
+                            retry_target_available = true;
+                        }
+                        RotationStep::NextRound { round, delay } => {
+                            tracing::warn!(
+                                credential_id = ctx.id,
+                                credential_label = %credential_label,
+                                round,
+                                round_delay_ms = delay.as_millis() as u64,
+                                "狂暴模式：全部 region 已轮换一遍，进入下一轮重试"
+                            );
+                            excluded_ids.clear();
+                            retry_target_available = true;
+                            berserk_round_delay = Some(delay);
+                        }
+                        RotationStep::Exhausted => {
+                            tracing::warn!(
+                                credential_id = ctx.id,
+                                credential_label = %credential_label,
+                                round = rotation_cursor.round(),
+                                "狂暴模式：账号 × region × 轮次已全部耗尽，放弃重试"
+                            );
+                        }
+                    }
+                } else if !berserk_plan.active()
+                    && berserk_plan.region_rotation_active()
+                    && retry_target_available
+                {
+                    // 普通模式下的 region 轮换：不改变账号故障转移语义，
+                    // 只让下一次重试打到另一个上游地址。
+                    let region_index = rotation_cursor.advance_region_for_normal_retry();
+                    tracing::debug!(
+                        credential_id = ctx.id,
+                        region_index,
+                        region = berserk_plan.region_at(region_index).unwrap_or("default"),
+                        "普通模式：瞬态失败后切换上游 region 重试"
+                    );
+                }
                 can_retry &= retry_target_available;
                 self.finish_attempt(&mut ctx);
                 if can_retry {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 狂暴模式的核心诉求是「遇 429 立刻换号」，同一轮内不做任何等待；
+                    // 只有跨轮次时才按配置的轮次间隔退避一次。
+                    if let Some(delay) = berserk_round_delay.take() {
+                        if !delay.is_zero() {
+                            sleep(delay).await;
+                        }
+                    } else if !(berserk_plan.active()
+                        && failure_kind == ApiUpstreamFailureKind::RateLimit)
+                    {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                     continue;
                 }
                 if let Some(last) = attempts.last_mut() {

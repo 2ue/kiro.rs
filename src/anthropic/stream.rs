@@ -3312,6 +3312,49 @@ impl StreamContext {
         ))
     }
 
+    /// 检查是否可以发送保活文本块（需要有活跃的 message）
+    pub fn can_send_keepalive_text_block(&self) -> bool {
+        self.state_manager.message_started
+    }
+
+    /// 创建一个保活用的文本块事件（仅在没有活跃块时使用）
+    /// 发送一个空的 text delta 作为保活信号
+    pub fn create_keepalive_text_block_event(&self) -> Option<SseEvent> {
+        if !self.state_manager.message_started {
+            return None;
+        }
+
+        // 如果已经有活跃块，使用 noop delta
+        if let Some((index, block_type)) = self.state_manager.active_open_block_for_keepalive() {
+            let delta = match block_type.as_str() {
+                "text" => json!({
+                    "type": "text_delta",
+                    "text": ""
+                }),
+                "thinking" => json!({
+                    "type": "thinking_delta",
+                    "thinking": ""
+                }),
+                "tool_use" => json!({
+                    "type": "input_json_delta",
+                    "partial_json": ""
+                }),
+                _ => return None,
+            };
+
+            return Some(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": delta
+                }),
+            ));
+        }
+
+        None
+    }
+
     /// 创建官方 Anthropic extended-thinking 签名 delta。
     fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
         SseEvent::new(

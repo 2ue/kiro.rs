@@ -1147,7 +1147,7 @@ export function RuntimePage() {
                   <TwoCol>
                     <TogField
                       label="启用质量感知调度"
-                      desc="关闭后完全退回“优先级 → 负载”的旧排序，既不读也不写质量数据，可作为线上快速回退手段。"
+                      desc="关闭后完全退回“优先级 → 负载”的旧排序；质量状态仍随运行态快照读取，但不参与选择、不展示，也不会写入新的质量样本，可作为线上快速回退手段。"
                       checked={draft.externalPools.externalPoolQualityAwareSchedulingEnabled}
                       onChange={setExternalPools('externalPoolQualityAwareSchedulingEnabled')}
                     />

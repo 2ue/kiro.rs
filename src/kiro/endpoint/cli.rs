@@ -29,7 +29,8 @@ impl CliEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        ctx.credentials.effective_api_region(ctx.config)
+        // 优先使用轮换覆盖；无覆盖时行为与引入 region 轮换之前完全一致。
+        ctx.effective_api_region()
     }
 
     fn runtime_host(&self, ctx: &RequestContext<'_>) -> String {
@@ -358,6 +359,7 @@ mod tests {
             token,
             machine_id: "machine",
             config,
+            region_override: None,
         }
     }
 

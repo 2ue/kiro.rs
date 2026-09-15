@@ -1,6 +1,6 @@
 # 外部账号质量感知调度（被动采样）方案
 
-Status: `design / implementation-pending`
+Status: `implemented / focused-validated for kiro.rs; sub2api follow-up pending`
 
 Last reviewed: 2026-09-15 Asia/Shanghai
 
@@ -81,7 +81,7 @@ a_effective_priority.cmp(&b_effective_priority)
 
 直接比较原始首字毫秒数是错误的：`haiku` 的首字天然快于 `opus`，非流式请求的"首字"实际是整包返回。若不归一化，调度会系统性地偏向跑小模型的账号，与账号质量无关。
 
-**采用相对化处理**：对每个 `(账号, 模型, 是否流式)` 维度维护 EWMA，评分时与**同一维度下所有候选的中位数**比较，只使用相对比值：
+**采用相对化处理**：对每个 `(账号, 模型, 是否流式)` 维度维护 EWMA，评分时与**同一维度、同一最优有效优先级层下候选的中位数**比较，只使用相对比值：
 
 ```
 ttft_factor = clamp(ttft_ewma / median_ttft_across_candidates, 0.5, 4.0)
@@ -190,7 +190,7 @@ AND 该账号 error_rate 明显劣于候选集中位数（避免全局故障时�
 
 `external_pool_quality_aware_scheduling_enabled`，**默认 `true`**（按你的要求）。
 
-关闭时行为：完全退回当前的 `优先级 → 负载` 字典序排序，不读也不写质量状态。这提供了一条确定的回退路径——线上若出现非预期调度行为，关掉开关即恢复旧行为，无需回滚版本。
+关闭时行为：完全退回当前的 `优先级 → 负载` 字典序排序；质量状态仍可随既有运行态快照读取，但不参与选择、不展示，也不会写入新的质量样本。这提供了一条确定的回退路径——线上若出现非预期调度行为，关掉开关即恢复旧行为，无需回滚版本。
 
 ### 5.2 完整配置清单
 

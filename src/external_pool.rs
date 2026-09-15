@@ -879,8 +879,7 @@ impl ExternalPoolQualityView {
             ttft_ewma_ms: quality.ttft_ewma_ms,
             latency_ewma_ms: quality.latency_ewma_ms,
             sample_count: quality.sample_count,
-            scoring_active: quality
-                .has_enough_samples(config.external_pool_quality_min_samples),
+            scoring_active: quality.has_enough_samples(config.external_pool_quality_min_samples),
             in_probation,
             probation_remaining_secs,
             probation_level: quality.probation_level,
@@ -8749,6 +8748,7 @@ impl ExternalPoolManager {
         let pool_keys = [
             format!("external_pool:{pool_id}:cooldown"),
             external_pool_transient_failure_key(pool_id),
+            external_pool_quality_key(pool_id),
         ];
         let pool_deleted = self.redis.del_many(&pool_keys).await?;
         let model_deleted = self
@@ -9180,13 +9180,20 @@ impl ExternalPoolManager {
         let redis = self.redis.clone();
         let alpha = config.external_pool_quality_ewma_alpha;
         let ttl = Duration::from_secs(config.external_pool_quality_sample_ttl_secs.max(1));
+        let degrade_window = Duration::from_secs(config.external_pool_degrade_window_secs.max(1));
         // 劣化判定在采样返回的最新状态上就地完成，不额外读一次 Redis。
         let degrade_config = config.clone();
         tokio::spawn(async move {
             let result = timeout(
                 EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT,
-                redis.record_external_pool_quality_sample(
-                    pool_id, success, ttft_ms, latency_ms, alpha, ttl,
+                redis.record_external_pool_quality_sample_with_window(
+                    pool_id,
+                    success,
+                    ttft_ms,
+                    latency_ms,
+                    alpha,
+                    ttl,
+                    degrade_window,
                 ),
             )
             .await;
@@ -9206,15 +9213,13 @@ impl ExternalPoolManager {
                 }
             };
 
-            let decision = evaluate_external_pool_degrade(
-                &quality,
-                &degrade_config,
-                external_pool_now_ms(),
-            );
+            let decision =
+                evaluate_external_pool_degrade(&quality, &degrade_config, external_pool_now_ms());
             let ExternalPoolDegradeDecision::Probation {
                 until_ms,
                 level,
                 ttl_secs,
+                reset_level,
             } = decision
             else {
                 return;
@@ -9230,11 +9235,12 @@ impl ExternalPoolManager {
             );
             let marked = timeout(
                 EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT,
-                redis.mark_external_pool_probation(
+                redis.mark_external_pool_probation_with_reset(
                     pool_id,
                     until_ms,
                     level,
                     Duration::from_secs(ttl_secs.max(1)),
+                    reset_level,
                 ),
             )
             .await;
@@ -9677,6 +9683,11 @@ impl ExternalStreamUsageGuard {
             .as_ref()
             .and_then(|capture| capture.lock().stream_error_message.clone());
         if let Some(message) = stream_error_message {
+            // SSE error events arrive with an HTTP 2xx response and therefore
+            // bypass the outer request error path. They are still genuine
+            // upstream failures and must feed passive pool quality.
+            self.manager
+                .record_pool_quality_sample(&self.config, self.pool.id, false, None, None);
             external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
                 config: &self.config,
                 route: &self.route,
@@ -9800,6 +9811,10 @@ impl ExternalStreamUsageGuard {
         if self.completed {
             return;
         }
+        // A body/read failure happens after response headers were returned, so
+        // the outer dispatch loop cannot record it. Count it here instead.
+        self.manager
+            .record_pool_quality_sample(&self.config, self.pool.id, false, None, None);
         external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
             config: &self.config,
             route: &self.route,
@@ -10233,14 +10248,15 @@ fn external_pool_quality_score(
 
     // 失败率：相对中位数惩罚。全体一起坏时中位数同样高，无人被额外降权，
     // 候选集因此不会被清空——这是"降级时保证可用"的核心机制。
-    let relative_error = (quality.recent_error_rate.clamp(0.0, 1.0) - baseline.median_error_rate)
-        .max(0.0);
+    let relative_error =
+        (quality.recent_error_rate.clamp(0.0, 1.0) - baseline.median_error_rate).max(0.0);
     score += relative_error * config.external_pool_quality_error_weight.max(0.0);
 
     // 首字与总耗时分别归一化后再加权，两者独立生效。
     let ttft_penalty = relative_penalty(quality.ttft_ewma_ms, baseline.median_ttft_ms);
     let latency_penalty = relative_penalty(quality.latency_ewma_ms, baseline.median_latency_ms);
-    score += (ttft_penalty + latency_penalty) * config.external_pool_quality_latency_weight.max(0.0);
+    score +=
+        (ttft_penalty + latency_penalty) * config.external_pool_quality_latency_weight.max(0.0);
 
     // 临时避让：加一个大额罚分使其排到末尾，但**不从候选集移除**，
     // 保证探测流量仍能到达、账号有机会自证恢复。
@@ -10252,8 +10268,7 @@ fn external_pool_quality_score(
         let ramp_ms = (config.external_pool_recovery_ramp_secs as i64).saturating_mul(1_000);
         let progress = quality.recovery_progress(now_ms, ramp_ms);
         if progress < 1.0 {
-            score +=
-                (1.0 - progress) * config.external_pool_quality_probation_weight.max(0.0);
+            score += (1.0 - progress) * config.external_pool_quality_probation_weight.max(0.0);
         }
     }
 
@@ -10270,6 +10285,7 @@ enum ExternalPoolDegradeDecision {
         until_ms: i64,
         level: u32,
         ttl_secs: u64,
+        reset_level: bool,
     },
 }
 
@@ -10281,8 +10297,8 @@ enum ExternalPoolDegradeDecision {
 /// 因此"上游整体故障"不会退化成"无池可用"。
 ///
 /// 指数退避：连续第 n 次进入避让，时长为 `probation_secs * 2^(n-1)`，
-/// 并被 `max_probation_secs` 封顶。恢复后（`probation_level` 随状态 TTL
-/// 自然过期）层级归零。
+/// 并被 `max_probation_secs` 封顶。恢复爬坡完整结束后层级显式归零；
+/// 质量键在持续有流量时会刷新 TTL，不能依赖自然过期。
 fn evaluate_external_pool_degrade(
     quality: &ExternalPoolQualityState,
     config: &ExternalPoolsConfig,
@@ -10291,8 +10307,15 @@ fn evaluate_external_pool_degrade(
     if !config.external_pool_quality_aware_scheduling_enabled {
         return ExternalPoolDegradeDecision::Keep;
     }
-    // 样本不足不判定：冷启动时几个失败样本不足以定性一个池。
-    if !quality.has_enough_samples(config.external_pool_quality_min_samples) {
+    // 样本不足不判定：冷启动时几个失败样本不足以定性一个池。新状态使用
+    // 独立的劣化窗口；读取旧格式（没有窗口字段）时回退到总样本数，保持
+    // Redis 中已有状态与纯逻辑调用方的向后兼容。
+    let window_sample_count = if quality.degrade_window_sample_count > 0 {
+        quality.degrade_window_sample_count
+    } else {
+        quality.sample_count
+    };
+    if window_sample_count < config.external_pool_quality_min_samples.max(1) {
         return ExternalPoolDegradeDecision::Keep;
     }
     // 已在避让中则不重复延长，否则持续失败会让避让无限续期，
@@ -10300,23 +10323,35 @@ fn evaluate_external_pool_degrade(
     if quality.is_in_probation(now_ms) {
         return ExternalPoolDegradeDecision::Keep;
     }
+    let window_error_rate = if quality.degrade_window_sample_count > 0 {
+        (quality.degrade_window_failure_count as f64 / quality.degrade_window_sample_count as f64)
+            .clamp(0.0, 1.0)
+    } else {
+        quality.recent_error_rate
+    };
     let threshold = config
         .external_pool_degrade_error_rate_threshold
         .clamp(0.0, 1.0);
-    if quality.recent_error_rate < threshold {
+    if window_error_rate < threshold {
         return ExternalPoolDegradeDecision::Keep;
     }
 
-    let level = quality.probation_level.saturating_add(1);
+    // 质量键在持续有流量时会被每次采样刷新 TTL，因此不能只依赖
+    // Redis 自然过期来清零避让层级。恢复爬坡完整结束后，下一轮独立
+    // 劣化应从第一层重新开始，而不是继承很久以前的指数退避。
+    let ramp_ms = (config.external_pool_recovery_ramp_secs as i64).saturating_mul(1_000);
+    let fully_recovered = quality.probation_level > 0
+        && quality.probation_cleared_at_ms.is_some()
+        && quality.recovery_progress(now_ms, ramp_ms) >= 1.0;
+    let previous_level = fully_recovered
+        .then_some(0)
+        .unwrap_or(quality.probation_level);
+    let level = previous_level.saturating_add(1);
     let base_secs = config.external_pool_degrade_probation_secs.max(1);
-    let max_secs = config
-        .external_pool_max_probation_secs
-        .max(base_secs);
+    let max_secs = config.external_pool_max_probation_secs.max(base_secs);
     // 指数退避，用移位前先夹紧指数避免溢出。
     let shift = (level - 1).min(32);
-    let backoff_secs = base_secs
-        .saturating_mul(1u64 << shift)
-        .min(max_secs);
+    let backoff_secs = base_secs.saturating_mul(1u64 << shift).min(max_secs);
     let until_ms = now_ms.saturating_add((backoff_secs as i64).saturating_mul(1_000));
     // 状态 TTL 必须覆盖整个避让窗口加恢复爬坡，否则避让会随状态过期被抹掉。
     let ttl_secs = backoff_secs
@@ -10327,6 +10362,7 @@ fn evaluate_external_pool_degrade(
         until_ms,
         level,
         ttl_secs,
+        reset_level: fully_recovered,
     }
 }
 
@@ -10382,10 +10418,6 @@ fn select_external_pool_candidate(
     if candidates.is_empty() {
         return None;
     }
-    let baseline = ExternalPoolQualityBaseline::from_candidates(
-        &candidates,
-        config.external_pool_quality_min_samples,
-    );
 
     // 优先级是**硬分层**，不是可被质量分抵消的一项权重。
     // 先取出最优先级层，质量评分只在层内重排——否则 Top-K 加权随机会把
@@ -10432,6 +10464,12 @@ fn select_external_pool_candidate(
         .into_iter()
         .filter(|candidate| effective_priority_of(candidate) == best_priority)
         .collect();
+    // 质量只在最终的最优有效优先级层内比较。低优先级备用池不能改变
+    // 主层候选的中位数基准，否则会稀释或扭曲同层内质量排序。
+    let baseline = ExternalPoolQualityBaseline::from_candidates(
+        &candidates,
+        config.external_pool_quality_min_samples,
+    );
 
     let mut scored: Vec<(ExternalPoolCandidate, f64)> = candidates
         .into_iter()
@@ -12164,6 +12202,16 @@ fn should_escalate_external_pool_soft_failure(
 ///
 /// 慢成功不走这里——它是成功样本，只影响延迟 EWMA，永远不触发错误降权。
 fn external_error_affects_pool_quality(err: &ExternalPoolError) -> bool {
+    let lower_message = err.message.to_ascii_lowercase();
+    // 模型不可用是路由/模型支持问题，不是账号质量问题。这个判定不能只
+    // 依赖 cooldown reason：管理员可以关闭模型级 cooldown，此时错误仍然
+    // 必须保持质量中性。
+    if external_error_message_indicates_model_unavailable(&lower_message)
+        || (err.status == Some(StatusCode::NOT_FOUND)
+            && external_error_message_indicates_invalid_model(&lower_message))
+    {
+        return false;
+    }
     if let Some(status) = err.status {
         // 400 且可判定为下游请求问题时不计入。
         if status == StatusCode::BAD_REQUEST

@@ -5,6 +5,29 @@ Last updated: 2026-09-15
 设计文档：[external-pool-quality-aware-scheduling.md](external-pool-quality-aware-scheduling.md)
 测试维度设计：[quality-aware-scheduling-test-matrix.md](quality-aware-scheduling-test-matrix.md)
 
+## 2026-09-15 实现补强与验证
+
+- [x] `external_pool_degrade_window_secs` 已接入 Redis 质量采样 Lua：
+      维护窗口内样本/失败计数，劣化判定使用当前窗口失败率，旧状态无窗口字段时兼容回退
+      到累计样本与 EWMA。
+- [x] 质量采样写入会保留已有更长 Redis TTL，避免避让期内的真实请求用较短样本 TTL
+      提前抹掉避让/恢复状态。
+- [x] 恢复爬坡完成后显式重置连续劣化层级，避免持续流量刷新质量键 TTL 时继承历史指数退避。
+- [x] 流式外部请求的 SSE `error` 事件、响应体读取错误与 post-header 传输错误已回灌质量失败
+      样本；客户端主动取消仍保持健康度中性。
+- [x] 管理端“清除冷却”同步清除外部池质量键，避免手动恢复后旧质量状态立即重新降权。
+- [x] `ui` / `admin-ui` 的外部池状态类型补充质量视图字段；两套池列表展示错误率、首字/总耗时、
+      样本数、冷启动、避让与恢复进度。
+- [x] 回归验证：质量聚焦测试 `47/47`、恢复层级回归 `2/2`、劣化窗口回归 `1/1`、Redis
+      避让层级重置回归 `1/1`、Rust
+      `cargo check --all-targets --locked`、`cargo fmt --all -- --check`、UI `pnpm check` /
+      `pnpm build` 均通过；完整 Rust 二进制回归覆盖 `2055` 个非忽略测试（首轮
+      `2054 passed / 1 flaky failure / 6 ignored`，唯一失败用例隔离复跑
+      `1 passed / 0 failed`），`kiro_loadtest` 为 `31/31`，`external_pool::tests` 分组为
+      `343/343`。
+- [x] `admin-ui pnpm build`：本地 `node_modules` 缺少锁文件中已声明的
+      `@radix-ui/react-scroll-area`；按锁文件安装依赖后构建通过，与本次质量调度字段改动无关。
+
 本文件用于防止实现进度丢失。每完成一个子项立即更新。
 
 ## 状态图例
@@ -143,8 +166,8 @@ Last updated: 2026-09-15
 但外部池表单**只存在于 `ui/`**——admin-ui 对外部池配置只做透传与清洗，
 不渲染任何外部池表单项。因此 admin-ui 只需补类型、默认值与清洗逻辑，无需补表单。
 
-> admin-ui 的 `tsc` 报 `@radix-ui/react-scroll-area` 缺失，
-> 已用 `git stash` 在未改动的树上复现，确认是**既有问题**，与本次变更无关。
+> admin-ui 初始 `tsc` 报 `@radix-ui/react-scroll-area` 缺失；该包已在
+> `package.json` 与锁文件声明，按锁文件补齐本地依赖后 `pnpm build` 通过。
 
 ### ⚠️ P1 重大缺陷修复：避让会变成永久放逐
 
@@ -252,7 +275,13 @@ SSE 的 `ExternalStreamFakeServer`）。
 `probe_traffic_reaches_a_pool_demoted_by_its_failure_streak` /
 `probe_traffic_still_respects_user_configured_priority_for_demoted_pools`。
 
-### 全量回归结论：8 个失败，0 个由本次改动引起
+### 历史全量回归结论：8 个失败，0 个由本次改动引起
+
+以下是早期脏工作区基线记录，不代表当前状态。2026-09-15 当前工作区完整 Rust 二进制
+回归覆盖 `2055` 个非忽略测试：首轮为 `2054 passed / 1 flaky failure / 6 ignored`，
+唯一失败用例隔离复跑为 `1 passed / 0 failed`；`kiro_loadtest` 为 `31/31`。其中下列
+5 个曾经的本机红灯也已逐项复验通过。历史归因保留用于解释当时的测试夹具/平台差异，
+不再作为当前阻塞。
 
 `cargo test --bins` 全量跑出 8 个失败。逐一归因（用 git worktree 在
 `4c7790b`（本次改动）与 `31c947b`（本次改动之前）两个提交上分别复跑）：
@@ -275,7 +304,7 @@ SSE 的 `ExternalStreamFakeServer`）。
 
 ⚠️ 前 5 个是 base 分支上的既有红灯，**不属于本次范围**。
 
-#### 既有红灯的进一步定位：是 macOS/Linux 平台差异，不是产品缺陷
+#### 历史既有红灯的进一步定位：是 macOS/Linux 平台差异，不是产品缺陷
 
 用户要求"顺手修掉"，遂展开定位。关键证据：
 

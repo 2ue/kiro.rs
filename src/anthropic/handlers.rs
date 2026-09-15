@@ -7146,7 +7146,7 @@ impl SseStreamState {
             finished: false,
             completion,
             usage_guard,
-            ping_interval: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            ping_interval: interval(Duration::from_secs(get_keepalive_interval_secs())),
             idle_deadline: Instant::now() + Duration::from_secs(stream_idle_timeout_secs),
             stream_idle_timeout_secs,
             initial_events,
@@ -7913,6 +7913,20 @@ const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const JSON_STREAM_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
 const CLAUDE_CODE_NOOP_DELTA_KEEPALIVE_MIN_VERSION: &str = "2.1.193";
 
+/// 获取保活间隔配置（秒）
+/// 支持通过环境变量 KIRO_STREAM_KEEPALIVE_INTERVAL_SECS 覆盖默认值
+fn get_keepalive_interval_secs() -> u64 {
+    static CACHED_INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+    *CACHED_INTERVAL.get_or_init(|| {
+        std::env::var("KIRO_STREAM_KEEPALIVE_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&val| val > 0 && val <= 300) // 限制在 1-300 秒之间
+            .unwrap_or(PING_INTERVAL_SECS)
+    })
+}
+
 fn request_user_agent(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::USER_AGENT)
@@ -8625,7 +8639,7 @@ fn create_sse_stream(
     usage_context: CredentialUsageContext,
     stream_idle_timeout_secs: u64,
     retry_plan: Option<StreamRetryPlan>,
-    claude_code_noop_delta_keepalive: bool,
+    _claude_code_noop_delta_keepalive: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let usage_guard = StreamUsageGuard::new(usage_context);
     let stream_idle_timeout_secs = normalize_stream_idle_timeout_secs(stream_idle_timeout_secs);
@@ -9211,17 +9225,25 @@ fn create_sse_stream(
                         let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
                         return Some((stream::iter(bytes), state));
                     }
-                    let keepalive = if claude_code_noop_delta_keepalive {
-                        state.ctx.claude_code_noop_delta_keepalive_event()
-                            .map(|event| Bytes::from(event.to_sse_string()))
-                    } else {
-                        None
-                    };
+                    // 优先使用空 delta 保活（更可靠穿透 CF 等代理），降级为 ping
+                    let keepalive = state.ctx.claude_code_noop_delta_keepalive_event()
+                        .map(|event| {
+                            tracing::trace!("发送空 delta 保活事件");
+                            Bytes::from(event.to_sse_string())
+                        })
+                        .or_else(|| {
+                            // 如果没有活跃块，尝试创建一个临时文本块用于保活
+                            if state.ctx.can_send_keepalive_text_block() {
+                                tracing::trace!("发送保活文本块");
+                                state.ctx.create_keepalive_text_block_event()
+                                    .map(|event| Bytes::from(event.to_sse_string()))
+                            } else {
+                                None
+                            }
+                        });
+
                     let bytes = match keepalive {
-                        Some(bytes) => {
-                            tracing::trace!("发送 Claude Code 空 delta 保活事件");
-                            bytes
-                        }
+                        Some(bytes) => bytes,
                         None => {
                             tracing::trace!("发送 ping 保活事件");
                             create_ping_sse()

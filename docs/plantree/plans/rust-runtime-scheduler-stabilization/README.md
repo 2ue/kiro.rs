@@ -4,9 +4,9 @@ Role: 当前 Rust 项目的运行时、调度、外部池、thinking signature �
 
 Status: `In Progress`
 
-Current phase: `external-pool hot-path fixed / scheduler architecture and signature blockers open`
+Current phase: `external-pool quality-aware scheduling focused-validated / scheduler architecture and signature blockers open`
 
-Last reviewed: 2026-08-07 Asia/Shanghai
+Last reviewed: 2026-09-15 Asia/Shanghai
 
 Authority:
 
@@ -25,6 +25,10 @@ Authority:
    - [当前目标符合度矩阵](topics/scheduler-target-compliance-matrix.md)
    - [持续调度验证方案](topics/sustained-scheduling-validation.md)
    - [外部池流式首语义输出前错误恢复](topics/external-pool-stream-pre-output-retry-20260806.md)
+   - [外部账号质量感知调度方案](topics/external-pool-quality-aware-scheduling.md)
+   - [质量感知调度实现进度](topics/quality-aware-scheduling-progress.md)
+   - [质量感知调度总览](topics/quality-aware-scheduling-summary.md)
+   - [质量感知调度测试矩阵](topics/quality-aware-scheduling-test-matrix.md)
    - [Thinking signature 协议安全](topics/thinking-signature-protocol-safety.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Decisions:

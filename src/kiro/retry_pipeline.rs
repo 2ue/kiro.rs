@@ -185,6 +185,19 @@ impl RotationCursor {
         self.round
     }
 
+    /// 普通模式下的 region 轮换：每次瞬态失败重试都换到下一个 region，
+    /// 用完后回到第一个循环使用。
+    ///
+    /// 与 [`Self::advance_after_accounts_exhausted`] 的区别是这里没有"轮次"概念，
+    /// 也不清空账号排除集合——普通模式的账号故障转移语义保持原样，
+    /// 仅仅是让连续重试打到不同的上游地址。
+    pub(crate) fn advance_region_for_normal_retry(&mut self) -> usize {
+        if self.region_slots > 1 {
+            self.region_index = (self.region_index + 1) % self.region_slots;
+        }
+        self.region_index
+    }
+
     /// 当前 region 下所有账号都试过后调用，推进游标。
     ///
     /// 调用方拿到 [`RotationStep::NextRegion`] / [`RotationStep::NextRound`] 后
@@ -244,6 +257,41 @@ mod tests {
         assert!(!plan.active());
         assert!(plan.region_rotation_active());
         assert_eq!(plan.regions(), ["us-east-1", "eu-west-1"]);
+    }
+
+    #[test]
+    fn normal_mode_region_rotation_cycles_through_every_region() {
+        // 普通模式没有"轮次"概念，region 用完后回到第一个循环使用。
+        let plan = BerserkPlan::from_config(&config_with(
+            false,
+            &["us-east-1", "eu-west-1", "ap-northeast-1"],
+            1,
+            0,
+        ));
+        let mut cursor = RotationCursor::new(&plan);
+        assert_eq!(cursor.region_index(), 0, "首次请求必须使用主力 region");
+        assert_eq!(cursor.advance_region_for_normal_retry(), 1);
+        assert_eq!(cursor.advance_region_for_normal_retry(), 2);
+        assert_eq!(
+            cursor.advance_region_for_normal_retry(),
+            0,
+            "用完一圈后必须回到第一个 region 继续循环"
+        );
+    }
+
+    #[test]
+    fn normal_mode_region_rotation_is_a_noop_without_configured_regions() {
+        // 零影响保证：没有配置 region 列表时，游标必须恒定停在默认槽位。
+        let plan = BerserkPlan::from_config(&Config::default());
+        let mut cursor = RotationCursor::new(&plan);
+        for _ in 0..5 {
+            assert_eq!(
+                cursor.advance_region_for_normal_retry(),
+                0,
+                "未配置 region 轮换时不得产生任何 region 覆盖"
+            );
+        }
+        assert_eq!(plan.region_at(0), None, "槽位 0 必须表示\"不覆盖\"");
     }
 
     #[test]
@@ -326,12 +374,8 @@ mod tests {
     #[test]
     fn cursor_prefers_switching_accounts_then_region_then_round() {
         // 这是用户要求的核心顺序语义：优先换号 → 换 region → 换轮次。
-        let plan = BerserkPlan::from_config(&config_with(
-            true,
-            &["us-east-1", "eu-west-1"],
-            2,
-            1_000,
-        ));
+        let plan =
+            BerserkPlan::from_config(&config_with(true, &["us-east-1", "eu-west-1"], 2, 1_000));
         let mut cursor = RotationCursor::new(&plan);
 
         assert_eq!(cursor.region_index(), 0);

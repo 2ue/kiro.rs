@@ -111,7 +111,7 @@ fn retry_status_matches(status: StatusCode, configured: &std::collections::BTree
     configured.contains(&code) || (status.is_server_error() && configured.contains(&500))
 }
 
-fn payload_too_long_message(message: &str) -> bool {
+pub(super) fn payload_too_long_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("context window is full")
         || lower.contains("input is too long")
@@ -119,4 +119,6 @@ fn payload_too_long_message(message: &str) -> bool {
         || lower.contains("content_length_exceeds_threshold")
         || lower.contains("request payload is too large")
         || lower.contains("payload is too large")
+        || lower.contains("request body is too large")
+        || lower.contains("content length exceeded")
 }

@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-08-07 Asia/Shanghai
+Last reviewed: 2026-09-15 Asia/Shanghai
 
 ## Done
 
@@ -42,6 +42,14 @@ Last reviewed: 2026-08-07 Asia/Shanghai
   `9/9`, L4 `12/12`, and L5 `900s` soak `6820/6820` with `300s` idle RSS/FD recovery. Production
   observation remains open. See
   [focused validation](../../../../feature/evidence/external-pool-stream-pre-output-retry-validation-20260806.md).
+- External-pool passive quality-aware scheduling: real request success/failure samples are
+  recorded in Redis with atomic EWMA updates, same-priority quality scoring uses Top-K weighted
+  selection, probation/probe/recovery state is bounded and observable, and the master switch
+  defaults on with an exact legacy-selection fallback. The implementation also records stream
+  body/error failures, applies the configured degradation window, clears quality state with
+  manual cooldown clearing, and exposes quality state in both UI status contracts. Focused
+  quality tests pass; the remaining sub2api settings/`ReportResult` work is tracked separately
+  in the topic progress document.
 - Source-verified scheduler architecture analysis: the current local-account/external-pool
   request chain, normal and exceptional transitions, queue/capacity/cooldown/retry semantics,
   fallback/rescue boundaries, `sub2api` comparison, configuration regrouping and target

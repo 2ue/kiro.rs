@@ -27,7 +27,12 @@ import {
 import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
 import { useRuntimeConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage, cn } from '@/lib/utils'
-import type { ExternalPool, ExternalPoolsConfig, UpdateExternalPoolRequest } from '@/types/api'
+import type {
+  ExternalPool,
+  ExternalPoolQualityView,
+  ExternalPoolsConfig,
+  UpdateExternalPoolRequest,
+} from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import {
   EmptyState,
@@ -77,6 +82,23 @@ import {
 function normalizeExternalPoolRouteMode(value?: string): ExternalPoolsConfig['externalPoolRouteMode'] {
   if (value === 'allow_list' || value === 'deny_list') return value
   return 'allow_all'
+}
+
+function externalPoolQualitySummary(quality?: ExternalPoolQualityView) {
+  if (!quality) return null
+  const parts = [
+    `质量错误率 ${Math.round(quality.recentErrorRate * 100)}%`,
+    quality.ttftEwmaMs != null ? `首字 ${Math.round(quality.ttftEwmaMs)}ms` : null,
+    quality.latencyEwmaMs != null ? `总耗时 ${Math.round(quality.latencyEwmaMs)}ms` : null,
+    `样本 ${quality.sampleCount}`,
+  ].filter(Boolean) as string[]
+  if (!quality.scoringActive) parts.push('冷启动')
+  if (quality.inProbation) {
+    parts.push(`避让 ${quality.probationRemainingSecs}s`)
+  } else if (quality.recoveryProgress < 1) {
+    parts.push(`恢复 ${Math.round(quality.recoveryProgress * 100)}%`)
+  }
+  return parts.join(' · ')
 }
 
 // ============================================================================
@@ -626,6 +648,7 @@ export function ExternalPoolsPage() {
               const inFlight = runtime?.inFlight ?? 0
               const capacity = pool.maxConcurrentRequests
               const usePct = capacity > 0 ? Math.round((inFlight / capacity) * 100) : 0
+              const qualitySummary = externalPoolQualitySummary(runtime?.quality)
               return (
                 <div key={pool.id} className="rounded-lg bg-card p-4 shadow-sm">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -647,6 +670,7 @@ export function ExternalPoolsPage() {
                         </div>
                         <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {inFlight}/{capacity} · 优先级 {pool.priority}</div>
                         <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {streamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · {poolHeaderProfileSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} · {poolSupportedModelsSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
+                        {qualitySummary && <div className="text-xs text-muted-foreground">{qualitySummary}</div>}
                         {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                       </div>
                     </div>

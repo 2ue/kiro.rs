@@ -286,6 +286,44 @@ pub struct RequestContext<'a> {
     pub machine_id: &'a str,
     /// 全局配置
     pub config: &'a Config,
+    /// 本次尝试的 region 覆盖（狂暴 / region 轮换用）。
+    ///
+    /// `None` 表示沿用凭据自身的 [`KiroCredentials::effective_api_region`]，
+    /// 即引入 region 轮换之前的行为。`Some(region)` 时端点实现必须优先使用它
+    /// 拼 `https://q.{region}.amazonaws.com`，从而在同一个账号上切换上游地址。
+    ///
+    /// 注意该覆盖只影响 **API region**（上游调用地址），不影响 auth region
+    /// （token 刷新），避免轮换把 token 刷新也打到错误的区域。
+    pub region_override: Option<&'a str>,
+}
+
+impl<'a> RequestContext<'a> {
+    /// 构造不带 region 覆盖的请求上下文（既有行为）。
+    pub fn new(
+        credentials: &'a KiroCredentials,
+        token: &'a str,
+        machine_id: &'a str,
+        config: &'a Config,
+    ) -> Self {
+        Self {
+            credentials,
+            token,
+            machine_id,
+            config,
+            region_override: None,
+        }
+    }
+
+    /// 解析本次尝试实际使用的 API region。
+    ///
+    /// 优先级：轮换覆盖 > 凭据自身解析链（credentials.api_region > profileArn
+    /// 内嵌 region > 全局配置）。
+    pub fn effective_api_region(&self) -> &str {
+        self.region_override
+            .map(str::trim)
+            .filter(|region| !region.is_empty())
+            .unwrap_or_else(|| self.credentials.effective_api_region(self.config))
+    }
 }
 
 /// 默认的额度用尽判断逻辑

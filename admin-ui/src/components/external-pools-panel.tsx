@@ -32,7 +32,7 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
-import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
+import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolQualityView, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
 import { defaultExternalPoolsConfig } from '@/components/runtime-config-panel'
 import { SupportedModelTagsEditor, parseSupportedModelItems } from '@/components/supported-model-tags-editor'
 
@@ -93,6 +93,23 @@ const supportedModelsSummary = (models: string[] = []) => {
   if (models.length === 0) return '支持：不限制'
   if (models.length <= 2) return `支持：${models.join(', ')}`
   return `支持：${models[0]}, ${models[1]} 等 ${models.length} 个`
+}
+
+const externalPoolQualitySummary = (quality?: ExternalPoolQualityView) => {
+  if (!quality) return null
+  const parts = [
+    `quality error ${Math.round(quality.recentErrorRate * 100)}%`,
+    quality.ttftEwmaMs != null ? `TTFT ${Math.round(quality.ttftEwmaMs)}ms` : null,
+    quality.latencyEwmaMs != null ? `total ${Math.round(quality.latencyEwmaMs)}ms` : null,
+    `samples ${quality.sampleCount}`,
+  ].filter(Boolean) as string[]
+  if (!quality.scoringActive) parts.push('cold start')
+  if (quality.inProbation) {
+    parts.push(`probation ${quality.probationRemainingSecs}s`)
+  } else if (quality.recoveryProgress < 1) {
+    parts.push(`recovery ${Math.round(quality.recoveryProgress * 100)}%`)
+  }
+  return parts.join(' · ')
 }
 
 const parseModelMappingRules = (value: string): ExternalPoolModelMappingRule[] => value
@@ -785,6 +802,7 @@ export function ExternalPoolsPanel() {
       <div className="grid gap-4">
         {pools.data?.pools.map((pool) => {
           const runtime = statusMap.get(pool.id)
+          const qualitySummary = externalPoolQualitySummary(runtime?.quality)
           return (
             <Card key={pool.id}>
               <CardContent className="space-y-4 p-5">
@@ -798,6 +816,7 @@ export function ExternalPoolsPanel() {
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
                   <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolStreamSummary(pool, configDraft)} · {poolStreamRetrySummary(pool, configDraft)} · {poolRouteSummary(pool)} · {poolBodyModeSummary(pool)} · {poolHeaderProfileSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}{runtime?.transientFailureStreak ? ` · 失败窗口 ${runtime.transientFailureStreak} 次/${runtime.transientFailureTtlSecs}s` : ''}</div>
+                  {qualitySummary && <div className="text-xs text-muted-foreground">{qualitySummary}</div>}
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">

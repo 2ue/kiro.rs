@@ -344,6 +344,16 @@ pub struct ExternalPoolQualityState {
     pub probation_level: u32,
     /// 避让到期时间戳（epoch 毫秒），用于恢复爬坡线性衰减。
     pub probation_cleared_at_ms: Option<i64>,
+    /// 当前劣化判定窗口内的样本数。
+    ///
+    /// 该窗口与质量样本 TTL 分离：TTL 决定调度评分数据保留多久，
+    /// 窗口只用于判断“失败是否持续发生”，避免很久以前的失败在新一轮
+    /// 请求到来时立即触发再次避让。
+    pub degrade_window_sample_count: u64,
+    /// 当前劣化判定窗口内的失败数。
+    pub degrade_window_failure_count: u64,
+    /// 当前劣化判定窗口起点（epoch 毫秒）。
+    pub degrade_window_started_at_ms: Option<i64>,
 }
 
 impl ExternalPoolQualityState {
@@ -395,7 +405,7 @@ pub struct ExternalPoolCoordinatorSnapshotRequest {
     pub pool_id: u64,
     pub cooldown_keys: Vec<String>,
     pub transient_failure_key: String,
-    /// 质量状态键；为空表示本次不读取质量数据（主开关关闭）。
+    /// 质量状态键；为空表示本次不读取质量数据（例如测试或诊断调用）。
     pub quality_key: Option<String>,
 }
 
@@ -5106,6 +5116,7 @@ impl RedisStore {
     ///
     /// 调用方必须保证只传入"上游质量相关"的样本：下游请求自身非法
     /// （请求体错误、schema 错误、超长）和客户端主动断开都不应计入。
+    #[cfg(test)]
     pub async fn record_external_pool_quality_sample(
         &self,
         pool_id: u64,
@@ -5114,6 +5125,32 @@ impl RedisStore {
         latency_ms: Option<u64>,
         alpha: f64,
         ttl: StdDuration,
+    ) -> anyhow::Result<ExternalPoolQualityState> {
+        self.record_external_pool_quality_sample_with_window(
+            pool_id,
+            success,
+            ttft_ms,
+            latency_ms,
+            alpha,
+            ttl,
+            StdDuration::ZERO,
+        )
+        .await
+    }
+
+    /// 记录质量样本，并维护独立的劣化判定窗口。
+    ///
+    /// 保留不带窗口参数的 `record_external_pool_quality_sample` 作为兼容入口，
+    /// 让现有诊断/测试调用仍保持原有语义；调度主路径传入配置的窗口时长。
+    pub async fn record_external_pool_quality_sample_with_window(
+        &self,
+        pool_id: u64,
+        success: bool,
+        ttft_ms: Option<u64>,
+        latency_ms: Option<u64>,
+        alpha: f64,
+        ttl: StdDuration,
+        degrade_window: StdDuration,
     ) -> anyhow::Result<ExternalPoolQualityState> {
         let script = r#"
             local raw = redis.pcall('GET', KEYS[1])
@@ -5132,6 +5169,13 @@ impl RedisStore {
             local latency_ms = tonumber(ARGV[3])
             local alpha = tonumber(ARGV[4])
             local ttl_ms = tonumber(ARGV[5])
+            local degrade_window_ms = tonumber(ARGV[6]) or 0
+            -- 采样发生在避让期内时，不得用较短的样本 TTL 抹掉
+            -- `mark_external_pool_probation` 写入的避让/恢复状态。
+            local existing_ttl_ms = redis.call('PTTL', KEYS[1])
+            local redis_time = redis.call('TIME')
+            local now_ms = tonumber(redis_time[1]) * 1000
+                + math.floor(tonumber(redis_time[2]) / 1000)
 
             local error_rate = tonumber(state['recent_error_rate']) or 0.0
             local sample = 0.0
@@ -5165,7 +5209,31 @@ impl RedisStore {
             end
 
             state['sample_count'] = (tonumber(state['sample_count']) or 0) + 1
-            redis.call('SET', KEYS[1], cjson.encode(state), 'PX', ttl_ms)
+            local window_sample_count = tonumber(state['degrade_window_sample_count']) or 0
+            local window_failure_count = tonumber(state['degrade_window_failure_count']) or 0
+            local window_started_at_ms = tonumber(state['degrade_window_started_at_ms'])
+            -- 使用固定窗口而不是永久累加：持续有流量时也必须淘汰旧失败
+            -- 证据，否则一次早期故障会在数小时后仍触发避让。
+            if degrade_window_ms > 0 and window_started_at_ms
+                and now_ms >= window_started_at_ms + degrade_window_ms then
+                window_sample_count = 0
+                window_failure_count = 0
+                window_started_at_ms = now_ms
+            elseif degrade_window_ms > 0 and not window_started_at_ms then
+                window_started_at_ms = now_ms
+            end
+            window_sample_count = window_sample_count + 1
+            if success == 0 then
+                window_failure_count = window_failure_count + 1
+            end
+            state['degrade_window_sample_count'] = window_sample_count
+            state['degrade_window_failure_count'] = window_failure_count
+            state['degrade_window_started_at_ms'] = window_started_at_ms
+            local write_ttl_ms = ttl_ms
+            if existing_ttl_ms > write_ttl_ms then
+                write_ttl_ms = existing_ttl_ms
+            end
+            redis.call('SET', KEYS[1], cjson.encode(state), 'PX', write_ttl_ms)
             return cjson.encode(state)
         "#;
         let mut manager = self.scheduler_capacity_manager();
@@ -5178,18 +5246,39 @@ impl RedisStore {
             .arg(latency_ms.map(|value| value as i64).unwrap_or(-1))
             .arg(alpha.clamp(0.01, 1.0))
             .arg(ttl.as_millis().max(1) as i64)
+            .arg(degrade_window.as_millis().max(0) as i64)
             .query_async(&mut manager)
             .await?;
         Ok(decode_external_pool_quality_state(&encoded).unwrap_or_default())
     }
 
     /// 写入外部池临时避让状态（降级），并记录避让层级用于指数退避。
+    #[cfg(test)]
     pub async fn mark_external_pool_probation(
         &self,
         pool_id: u64,
         probation_until_ms: i64,
         probation_level: u32,
         ttl: StdDuration,
+    ) -> anyhow::Result<()> {
+        self.mark_external_pool_probation_with_reset(
+            pool_id,
+            probation_until_ms,
+            probation_level,
+            ttl,
+            false,
+        )
+        .await
+    }
+
+    /// 写入外部池临时避让状态，并在已完成恢复爬坡时显式重置退避层级。
+    pub async fn mark_external_pool_probation_with_reset(
+        &self,
+        pool_id: u64,
+        probation_until_ms: i64,
+        probation_level: u32,
+        ttl: StdDuration,
+        reset_level: bool,
     ) -> anyhow::Result<()> {
         let script = r#"
             local raw = redis.pcall('GET', KEYS[1])
@@ -5205,12 +5294,17 @@ impl RedisStore {
             end
             local until_ms = tonumber(ARGV[1])
             local level = tonumber(ARGV[2])
+            local reset_level = tonumber(ARGV[4]) or 0
             local existing = tonumber(state['probation_until_ms']) or 0
+            local existing_level = tonumber(state['probation_level']) or 0
             if until_ms > existing then
                 state['probation_until_ms'] = until_ms
                 state['probation_cleared_at_ms'] = until_ms
+                if reset_level == 1 then
+                    state['probation_level'] = level
+                    existing_level = level
+                end
             end
-            local existing_level = tonumber(state['probation_level']) or 0
             if level > existing_level then
                 state['probation_level'] = level
             end
@@ -5225,12 +5319,14 @@ impl RedisStore {
             .arg(probation_until_ms)
             .arg(i64::from(probation_level))
             .arg(ttl.as_millis().max(1) as i64)
+            .arg(i64::from(reset_level))
             .query_async(&mut manager)
             .await?;
         Ok(())
     }
 
     /// 清除外部池质量状态（管理端"清除冷却"时一并清理）。
+    #[cfg(test)]
     pub async fn clear_external_pool_quality(&self, pool_id: u64) -> anyhow::Result<()> {
         let mut manager = self.scheduler_capacity_manager();
         let _: i64 = redis::cmd("DEL")
@@ -7357,6 +7453,15 @@ fn decode_external_pool_quality_state(raw: &str) -> Option<ExternalPoolQualitySt
         probation_cleared_at_ms: read_f64("probation_cleared_at_ms")
             .filter(|value| value.is_finite() && *value > 0.0)
             .map(|value| value as i64),
+        degrade_window_sample_count: read_f64("degrade_window_sample_count")
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0) as u64,
+        degrade_window_failure_count: read_f64("degrade_window_failure_count")
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0) as u64,
+        degrade_window_started_at_ms: read_f64("degrade_window_started_at_ms")
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| value as i64),
     })
 }
 
@@ -9435,7 +9540,10 @@ mod tests {
                 "latency_ewma_ms": 1800.5,
                 "sample_count": 42,
                 "probation_until_ms": 0,
-                "probation_level": 2
+                "probation_level": 2,
+                "degrade_window_sample_count": 12,
+                "degrade_window_failure_count": 7,
+                "degrade_window_started_at_ms": 1000
             }"#,
         )
         .expect("合法 JSON 对象应能解析");
@@ -9446,6 +9554,9 @@ mod tests {
         assert_eq!(state.sample_count, 42);
         assert_eq!(state.probation_until_ms, None, "0 不是有效避让时间戳");
         assert_eq!(state.probation_level, 2);
+        assert_eq!(state.degrade_window_sample_count, 12);
+        assert_eq!(state.degrade_window_failure_count, 7);
+        assert_eq!(state.degrade_window_started_at_ms, Some(1000));
 
         let negative = decode_external_pool_quality_state(r#"{"recent_error_rate": -2.0}"#)
             .expect("合法 JSON 对象应能解析");
@@ -9561,13 +9672,11 @@ mod tests {
             .unwrap();
         assert!((failed.recent_error_rate - 0.5).abs() < 1e-6);
         assert_eq!(
-            failed.ttft_ewma_ms,
-            second.ttft_ewma_ms,
+            failed.ttft_ewma_ms, second.ttft_ewma_ms,
             "失败样本不得改变首字 EWMA"
         );
         assert_eq!(
-            failed.latency_ewma_ms,
-            second.latency_ewma_ms,
+            failed.latency_ewma_ms, second.latency_ewma_ms,
             "失败样本不得改变耗时 EWMA"
         );
         assert_eq!(failed.sample_count, 3);
@@ -9590,6 +9699,47 @@ mod tests {
             "无首字的样本不得凭空生成首字曲线"
         );
         store.clear_external_pool_quality(101).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redis_external_pool_quality_degradation_window_resets_old_failures() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let ttl = StdDuration::from_secs(60);
+        let window = StdDuration::from_millis(50);
+        store.clear_external_pool_quality(109).await.unwrap();
+
+        let first = store
+            .record_external_pool_quality_sample_with_window(
+                109, false, None, None, 1.0, ttl, window,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.degrade_window_sample_count, 1);
+        assert_eq!(first.degrade_window_failure_count, 1);
+
+        let second = store
+            .record_external_pool_quality_sample_with_window(
+                109, false, None, None, 1.0, ttl, window,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.degrade_window_sample_count, 2);
+        assert_eq!(second.degrade_window_failure_count, 2);
+
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        let after_gap = store
+            .record_external_pool_quality_sample_with_window(
+                109, true, None, None, 1.0, ttl, window,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_gap.degrade_window_sample_count, 1);
+        assert_eq!(after_gap.degrade_window_failure_count, 0);
+        store.clear_external_pool_quality(109).await.unwrap();
     }
 
     #[tokio::test]
@@ -9696,6 +9846,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redis_external_pool_quality_sample_does_not_shorten_probation_ttl() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let pool_id = 110;
+        store.clear_external_pool_quality(pool_id).await.unwrap();
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        store
+            .mark_external_pool_probation(
+                pool_id,
+                now_ms.saturating_add(30_000),
+                1,
+                StdDuration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
+        // 样本 TTL 明显短于避让 TTL；采样后避让状态仍必须保留。
+        store
+            .record_external_pool_quality_sample_with_window(
+                pool_id,
+                true,
+                None,
+                None,
+                0.5,
+                StdDuration::from_secs(1),
+                StdDuration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
+        let mut manager = store.manager.clone();
+        let pttl_ms: i64 = manager
+            .pttl(store.key(&external_pool_quality_key(pool_id)))
+            .await
+            .unwrap();
+        assert!(
+            pttl_ms >= 20_000,
+            "质量采样不得把 30 秒避让状态缩短为 1 秒，实际剩余 {pttl_ms}ms"
+        );
+        store.clear_external_pool_quality(pool_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redis_external_pool_quality_probation_level_can_reset_after_recovery() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let pool_id = 111;
+        store.clear_external_pool_quality(pool_id).await.unwrap();
+
+        store
+            .mark_external_pool_probation(pool_id, 5_000, 4, StdDuration::from_secs(60))
+            .await
+            .unwrap();
+        store
+            .mark_external_pool_probation_with_reset(
+                pool_id,
+                9_000,
+                1,
+                StdDuration::from_secs(60),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let state = store
+            .record_external_pool_quality_sample(
+                pool_id,
+                true,
+                None,
+                None,
+                0.5,
+                StdDuration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.probation_level, 1);
+        assert_eq!(state.probation_until_ms, Some(9_000));
+        store.clear_external_pool_quality(pool_id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn redis_external_pool_quality_concurrent_samples_are_atomic() {
         let Some(config) = test_config() else {
             eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
@@ -9762,14 +10000,13 @@ mod tests {
 
         // 池 106 有质量数据、池 107 没有、池 108 显式不请求质量键——
         // 三种情况混在一批里，验证 Lua 的游标算术不会错位。
-        let snapshot_request = |pool_id: u64, want_quality: bool| {
-            ExternalPoolCoordinatorSnapshotRequest {
+        let snapshot_request =
+            |pool_id: u64, want_quality: bool| ExternalPoolCoordinatorSnapshotRequest {
                 pool_id,
                 cooldown_keys: vec![format!("external_pool:{pool_id}:cooldown")],
                 transient_failure_key: format!("external_pool:{pool_id}:transient_failures"),
                 quality_key: want_quality.then(|| external_pool_quality_key(pool_id)),
-            }
-        };
+            };
         // 池 106 有质量数据、池 107 没有、池 108 显式不请求质量键——
         // 三种情况混在一批里，验证 Lua 的游标算术不会错位。
         let requests = vec![
@@ -9794,10 +10031,7 @@ mod tests {
             "质量数据必须并入既有批量 Lua，不得新增热路径往返"
         );
 
-        let quality = snapshots[0]
-            .quality
-            .as_ref()
-            .expect("池 106 应带质量数据");
+        let quality = snapshots[0].quality.as_ref().expect("池 106 应带质量数据");
         assert!((quality.recent_error_rate - 1.0).abs() < 1e-6);
         assert_eq!(quality.sample_count, 1);
 

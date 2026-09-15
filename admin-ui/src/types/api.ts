@@ -1584,6 +1584,19 @@ export interface ExternalPoolStatus {
   transientFailureTtlSecs: number
   dispatchable: boolean
   skippedReason?: string
+  quality?: ExternalPoolQualityView
+}
+
+export interface ExternalPoolQualityView {
+  recentErrorRate: number
+  ttftEwmaMs?: number
+  latencyEwmaMs?: number
+  sampleCount: number
+  scoringActive: boolean
+  inProbation: boolean
+  probationRemainingSecs: number
+  probationLevel: number
+  recoveryProgress: number
 }
 
 export interface ExternalPoolsStatusResponse {

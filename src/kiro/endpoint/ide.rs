@@ -30,7 +30,8 @@ impl IdeEndpoint {
     }
 
     fn api_region<'a>(&self, ctx: &'a RequestContext<'_>) -> &'a str {
-        ctx.credentials.effective_api_region(ctx.config)
+        // 优先使用轮换覆盖；无覆盖时行为与引入 region 轮换之前完全一致。
+        ctx.effective_api_region()
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
@@ -523,6 +524,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         let url = endpoint.models_url(&ctx, Some("next-token"));
@@ -544,6 +546,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         let url = endpoint.models_url(&ctx, None);
@@ -565,6 +568,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         let url = endpoint.models_url(&ctx, None);
@@ -586,6 +590,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         let body = endpoint.transform_api_body(r#"{"conversationState":{}}"#, &ctx);
@@ -608,6 +613,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         let body = endpoint.transform_api_body(r#"{"conversationState":{}}"#, &ctx);
@@ -645,6 +651,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         let req = endpoint
@@ -697,6 +704,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         let models_req = endpoint
@@ -749,6 +757,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
         let body = " {\n  \"conversationState\": { \"futureField\" : { \"z\" : 1.0, \"a\" : 1e+02 } },\n  \"unknownRoot\": \"keep  spaces\\n\\u00e9\"\n} \n";
 
@@ -772,6 +781,7 @@ mod tests {
             token: "token",
             machine_id: "machine",
             config: &config,
+            region_override: None,
         };
 
         assert_eq!(

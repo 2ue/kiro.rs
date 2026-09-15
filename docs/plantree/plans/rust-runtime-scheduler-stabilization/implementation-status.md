@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last reviewed: 2026-08-07 Asia/Shanghai
+Last reviewed: 2026-09-15 Asia/Shanghai
 
 Current phase:
 
@@ -135,6 +135,21 @@ Current phase:
   (`31145966147`) completed successfully for the quality gate, image build matrix and manifest.
   Production rollout observation and renewed `yuenan` / `yuenan-1` recurrence checks remain
   post-release work.
+- 2026-09-15 external-pool quality-aware scheduling implementation completed on the current
+  feature branch: Redis-backed passive EWMA sampling, hard priority tiers, Top-K weighted
+  selection, probation/probe/recovery, configuration validation, status/UI contracts and L2
+  high-concurrency fake-upstream coverage are present. This pass additionally made
+  `externalPoolDegradeWindowSecs` operational, counted post-header stream SSE/read failures as
+  quality failures, preserved longer probation TTLs during sampling, reset the backoff level after
+  a completed recovery ramp, and made manual pool cooldown clearing remove passive quality state.
+  Focused quality tests passed (`47/47`), recovery-level regression passed (`2/2`), the new
+  degradation-window regression and Redis probation-level reset regressions passed, Rust
+  `cargo check --all-targets --locked` and format checks passed, `external_pool::tests`
+  passed (`343/343`), and the complete Rust binary regression covered 2,055 non-ignored tests
+  (the first full run had one flaky body-boundary failure; that case passed in an isolated
+  rerun). UI typecheck/build passed, and `admin-ui` build passed after restoring the
+  lockfile-declared local dependency; sub2api settings/`ReportResult` remain separate follow-up
+  work.
 
 Last landed evidence:
 

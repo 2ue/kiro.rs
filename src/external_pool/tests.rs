@@ -5510,10 +5510,23 @@ async fn external_pool_soft_failure_streak_accumulates_and_requires_manual_clear
         "one later success should not reset accumulated soft failure streak"
     );
 
+    manager
+        .redis
+        .record_external_pool_quality_sample(
+            pool_id,
+            false,
+            None,
+            None,
+            0.5,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
     let cleared = manager.clear_pool_cooldowns(pool_id).await.unwrap();
     assert!(
         cleared >= 1,
-        "manual clear should remove soft failure streak"
+        "manual clear should remove soft failure streak and quality state"
     );
     let after_clear = manager
         .redis
@@ -5535,6 +5548,15 @@ async fn external_pool_soft_failure_streak_accumulates_and_requires_manual_clear
     assert!(
         after_reason_clear.is_none(),
         "manual clear should reset reason-scoped soft failure streak"
+    );
+    let after_quality_clear = manager
+        .redis
+        .get_json::<serde_json::Value>(external_pool_quality_key(pool_id))
+        .await
+        .unwrap();
+    assert!(
+        after_quality_clear.is_none(),
+        "manual clear should reset passive quality state"
     );
 
     postgres.drop_test_schema().await.unwrap();
@@ -17359,8 +17381,7 @@ fn quality_test_error(
         message: message.to_string(),
         retryable: true,
         auto_disable_reason: None,
-        cooldown: cooldown_reason
-            .map(|reason| (Duration::from_secs(10), reason.to_string())),
+        cooldown: cooldown_reason.map(|reason| (Duration::from_secs(10), reason.to_string())),
         protocol_error: None,
         raw_upstream_error: None,
     }
@@ -17418,18 +17439,51 @@ fn quality_sampling_ignores_model_routing_misses() {
             "质量归因必须与既有软失败判定一致"
         );
     }
+    // 模型级 cooldown 关闭时没有 reason，仍必须依据错误正文保持中性。
+    for (status, message) in [
+        (
+            Some(StatusCode::NOT_FOUND),
+            "external upstream model is unavailable",
+        ),
+        (Some(StatusCode::NOT_FOUND), "invalid model id"),
+        (
+            Some(StatusCode::BAD_REQUEST),
+            "requested model is not available",
+        ),
+    ] {
+        assert!(
+            !external_error_affects_pool_quality(&quality_test_error(status, message, None)),
+            "无 cooldown reason 的模型路由错误不得计入账号健康度: {status:?} {message}"
+        );
+    }
 }
 
 #[test]
 fn quality_sampling_counts_upstream_faults() {
     // 真正的上游故障必须全部计入，否则质量曲线只会向好、永远不降级。
     let cases = [
-        (Some(StatusCode::TOO_MANY_REQUESTS), "rate limit", Some("rate_limited")),
-        (Some(StatusCode::INTERNAL_SERVER_ERROR), "server error", Some("server_error")),
-        (Some(StatusCode::BAD_GATEWAY), "bad gateway", Some("server_error")),
+        (
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            "rate limit",
+            Some("rate_limited"),
+        ),
+        (
+            Some(StatusCode::INTERNAL_SERVER_ERROR),
+            "server error",
+            Some("server_error"),
+        ),
+        (
+            Some(StatusCode::BAD_GATEWAY),
+            "bad gateway",
+            Some("server_error"),
+        ),
         (Some(StatusCode::SERVICE_UNAVAILABLE), "unavailable", None),
         (Some(StatusCode::GATEWAY_TIMEOUT), "timeout", None),
-        (Some(StatusCode::UNAUTHORIZED), "auth failed", Some("auth_failed")),
+        (
+            Some(StatusCode::UNAUTHORIZED),
+            "auth failed",
+            Some("auth_failed"),
+        ),
         // 无 status = 网络层错误（连接失败/超时），是最典型的账号不可用信号。
         (None, "connection reset by peer", None),
     ];
@@ -17442,9 +17496,11 @@ fn quality_sampling_counts_upstream_faults() {
 }
 
 /// 构造一个无质量数据的调度候选（等价于冷启动/无样本状态）。
-fn candidate(pool: ExternalPool, in_flight: u32, transient_failure_streak: u32)
-    -> ExternalPoolCandidate
-{
+fn candidate(
+    pool: ExternalPool,
+    in_flight: u32,
+    transient_failure_streak: u32,
+) -> ExternalPoolCandidate {
     ExternalPoolCandidate {
         pool,
         in_flight,
@@ -17617,6 +17673,31 @@ fn quality_scheduling_reorders_within_the_same_priority_tier() {
     );
 }
 
+#[test]
+fn quality_baseline_ignores_lower_priority_pools() {
+    let config = ExternalPoolsConfig::default();
+    let candidates = vec![
+        // 最优层：质量差异必须仍然影响排序。
+        scored_pool(1, 1, 0.0, Some(100.0), Some(100.0)),
+        scored_pool(2, 1, 0.0, Some(1_000.0), Some(1_000.0)),
+        // 备用层的极慢账号不应扭曲主层中位数。
+        scored_pool(3, 5, 0.0, Some(100_000.0), Some(100_000.0)),
+        scored_pool(4, 5, 0.0, Some(100_000.0), Some(100_000.0)),
+    ];
+
+    let shares = selection_shares(&candidates, &config, 0, DISTRIBUTION_ROUNDS);
+    let fast = shares.get(&1).copied().unwrap_or(0.0);
+    let slow = shares.get(&2).copied().unwrap_or(0.0);
+    assert!(
+        fast > slow,
+        "低优先级池的延迟不得稀释最优层质量排序：fast={fast:.3} slow={slow:.3}"
+    );
+    assert!(
+        !shares.contains_key(&3) && !shares.contains_key(&4),
+        "低优先级池仍不得越过硬分层"
+    );
+}
+
 // ---- 失败率优先级高于延迟曲线（用户明确要求）----
 
 #[test]
@@ -17652,8 +17733,7 @@ fn quality_scheduling_separates_ttft_and_total_latency_signals() {
     ];
     let ttft_shares = selection_shares(&ttft_only, &config, 0, DISTRIBUTION_ROUNDS);
     assert!(
-        ttft_shares.get(&1).copied().unwrap_or(0.0)
-            > ttft_shares.get(&2).copied().unwrap_or(0.0),
+        ttft_shares.get(&1).copied().unwrap_or(0.0) > ttft_shares.get(&2).copied().unwrap_or(0.0),
         "首字劣化必须降低份额"
     );
 
@@ -17836,8 +17916,16 @@ fn quality_scheduling_empty_candidates_returns_none() {
 fn quality_relative_penalty_only_punishes_worse_than_median() {
     // 只惩罚"比同伴差"，不奖励"比同伴好"——
     // 否则全体一起变慢时会有人被无端降权。
-    assert_eq!(relative_penalty(Some(100.0), Some(200.0)), 0.0, "优于中位数不罚分");
-    assert_eq!(relative_penalty(Some(200.0), Some(200.0)), 0.0, "等于中位数不罚分");
+    assert_eq!(
+        relative_penalty(Some(100.0), Some(200.0)),
+        0.0,
+        "优于中位数不罚分"
+    );
+    assert_eq!(
+        relative_penalty(Some(200.0), Some(200.0)),
+        0.0,
+        "等于中位数不罚分"
+    );
     assert!((relative_penalty(Some(400.0), Some(200.0)) - 1.0).abs() < 1e-9);
 
     // 缺失数据、非法中位数一律不罚分
@@ -17917,6 +18005,39 @@ fn degrade_ignores_pools_with_insufficient_samples() {
 }
 
 #[test]
+fn degrade_uses_the_current_window_failure_rate() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_quality_min_samples = 5;
+    config.external_pool_degrade_error_rate_threshold = 0.5;
+
+    // 历史 EWMA 很高，但当前窗口已经恢复：不能因为旧失败率再次触发避让。
+    let recovered_window = ExternalPoolQualityState {
+        recent_error_rate: 0.95,
+        sample_count: 100,
+        degrade_window_sample_count: 10,
+        degrade_window_failure_count: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        evaluate_external_pool_degrade(&recovered_window, &config, 0),
+        ExternalPoolDegradeDecision::Keep
+    );
+
+    // 当前窗口达到阈值时，即使历史 EWMA 较低，也必须触发避让。
+    let failing_window = ExternalPoolQualityState {
+        recent_error_rate: 0.05,
+        sample_count: 100,
+        degrade_window_sample_count: 10,
+        degrade_window_failure_count: 8,
+        ..Default::default()
+    };
+    assert!(matches!(
+        evaluate_external_pool_degrade(&failing_window, &config, 0),
+        ExternalPoolDegradeDecision::Probation { .. }
+    ));
+}
+
+#[test]
 fn degrade_does_not_extend_an_active_probation() {
     // 避让期内持续失败不得无限续期，否则池永远等不到恢复爬坡窗口。
     let config = ExternalPoolsConfig::default();
@@ -17969,6 +18090,27 @@ fn degrade_level_increments_from_existing_level() {
             }
             other => panic!("期望降级，实际 {other:?}"),
         }
+    }
+}
+
+#[test]
+fn degrade_level_resets_after_recovery_ramp() {
+    let mut config = ExternalPoolsConfig::default();
+    config.external_pool_recovery_ramp_secs = 60;
+    let state = ExternalPoolQualityState {
+        recent_error_rate: 1.0,
+        sample_count: 100,
+        probation_level: 4,
+        probation_cleared_at_ms: Some(100_000),
+        ..Default::default()
+    };
+
+    // 恢复爬坡完成后再次劣化应从第一层开始，即使质量键尚未因持续流量过期。
+    match evaluate_external_pool_degrade(&state, &config, 160_000) {
+        ExternalPoolDegradeDecision::Probation { level, .. } => {
+            assert_eq!(level, 1);
+        }
+        other => panic!("恢复后再次劣化应从第一层开始，实际 {other:?}"),
     }
 }
 
@@ -18224,6 +18366,7 @@ fn quality_view_reports_probation_countdown_and_recovery_progress() {
         probation_until_ms: Some(120_000),
         probation_level: 2,
         probation_cleared_at_ms: Some(120_000),
+        ..Default::default()
     };
 
     // 避让期内：剩余秒数向下取整，恢复进度为满（尚未开始爬坡）
@@ -18620,11 +18763,9 @@ async fn l2_single_remaining_pool_is_never_starved_even_when_failing() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
-    let only = PatternExternalMessagesFakeServer::always_fail(
-        StatusCode::BAD_GATEWAY,
-        "upstream is down",
-    )
-    .await;
+    let only =
+        PatternExternalMessagesFakeServer::always_fail(StatusCode::BAD_GATEWAY, "upstream is down")
+            .await;
     let pool =
         create_messages_pool_with_concurrency(&postgres, "l2-only-bad", 1, &only.base_url, 512)
             .await;
@@ -18635,8 +18776,12 @@ async fn l2_single_remaining_pool_is_never_starved_even_when_failing() {
     let first = run_quality_wave(&manager, &config, "l2_only_first", 64).await;
     assert_eq!(count_successes(&first), 0, "上游全失败时不应有成功");
     assert!(
-        wait_for_quality_samples(&manager, &[pool.id], config.external_pool_quality_min_samples)
-            .await,
+        wait_for_quality_samples(
+            &manager,
+            &[pool.id],
+            config.external_pool_quality_min_samples
+        )
+        .await,
         "失败样本也必须落盘"
     );
 
