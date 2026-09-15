@@ -21,10 +21,12 @@ Last updated: 2026-09-15
 - [x] 回归验证：质量聚焦测试 `47/47`、恢复层级回归 `2/2`、劣化窗口回归 `1/1`、Redis
       避让层级重置回归 `1/1`、Rust
       `cargo check --all-targets --locked`、`cargo fmt --all -- --check`、UI `pnpm check` /
-      `pnpm build` 均通过；完整 Rust 二进制回归覆盖 `2055` 个非忽略测试（首轮
-      `2054 passed / 1 flaky failure / 6 ignored`，唯一失败用例隔离复跑
+      `pnpm build` 均通过；质量调度提交基线的完整 Rust 二进制回归覆盖 `2055` 个非忽略
+      测试（首轮 `2054 passed / 1 flaky failure / 6 ignored`，唯一失败用例隔离复跑
       `1 passed / 0 failed`），`kiro_loadtest` 为 `31/31`，`external_pool::tests` 分组为
-      `343/343`。
+      `343/343`。随后在当前共享工作区（含并发的 region rotation 改动）复跑完整回归：
+      主二进制 `2074 passed / 0 failed / 6 ignored`，`kiro_loadtest` `31/31`，合计
+      `2105` 个非忽略测试，全部通过。
 - [x] `admin-ui pnpm build`：本地 `node_modules` 缺少锁文件中已声明的
       `@radix-ui/react-scroll-area`；按锁文件安装依赖后构建通过，与本次质量调度字段改动无关。
 
@@ -277,11 +279,13 @@ SSE 的 `ExternalStreamFakeServer`）。
 
 ### 历史全量回归结论：8 个失败，0 个由本次改动引起
 
-以下是早期脏工作区基线记录，不代表当前状态。2026-09-15 当前工作区完整 Rust 二进制
+以下是早期脏工作区基线记录，不代表当前状态。质量调度提交基线的完整 Rust 二进制
 回归覆盖 `2055` 个非忽略测试：首轮为 `2054 passed / 1 flaky failure / 6 ignored`，
-唯一失败用例隔离复跑为 `1 passed / 0 failed`；`kiro_loadtest` 为 `31/31`。其中下列
-5 个曾经的本机红灯也已逐项复验通过。历史归因保留用于解释当时的测试夹具/平台差异，
-不再作为当前阻塞。
+唯一失败用例隔离复跑为 `1 passed / 0 failed`；`kiro_loadtest` 为 `31/31`。随后在
+当前共享工作区（含并发的 region rotation 改动）复跑为主二进制
+`2074 passed / 0 failed / 6 ignored` 加 `kiro_loadtest 31/31`，合计 `2105` 个非忽略
+测试，全部通过。其中下列 5 个曾经的本机红灯也已逐项复验通过。历史归因保留用于
+解释当时的测试夹具/平台差异，不再作为当前阻塞。
 
 `cargo test --bins` 全量跑出 8 个失败。逐一归因（用 git worktree 在
 `4c7790b`（本次改动）与 `31c947b`（本次改动之前）两个提交上分别复跑）：

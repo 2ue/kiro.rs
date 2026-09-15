@@ -145,11 +145,13 @@ Current phase:
   Focused quality tests passed (`47/47`), recovery-level regression passed (`2/2`), the new
   degradation-window regression and Redis probation-level reset regressions passed, Rust
   `cargo check --all-targets --locked` and format checks passed, `external_pool::tests`
-  passed (`343/343`), and the complete Rust binary regression covered 2,055 non-ignored tests
-  (the first full run had one flaky body-boundary failure; that case passed in an isolated
-  rerun). UI typecheck/build passed, and `admin-ui` build passed after restoring the
-  lockfile-declared local dependency; sub2api settings/`ReportResult` remain separate follow-up
-  work.
+  passed (`343/343`), and the quality-branch baseline complete Rust binary regression covered
+  2,055 non-ignored tests (the first full run had one flaky body-boundary failure; that case
+  passed in an isolated rerun). A subsequent full run on the current shared worktree, which
+  also contains concurrent region-rotation changes, passed `2074/0/6 ignored` in the main
+  binary plus `kiro_loadtest 31/31` (`2105` non-ignored tests total). UI typecheck/build passed,
+  and `admin-ui` build passed after restoring the lockfile-declared local dependency; sub2api
+  settings/`ReportResult` remain separate follow-up work.
 
 Last landed evidence:
 

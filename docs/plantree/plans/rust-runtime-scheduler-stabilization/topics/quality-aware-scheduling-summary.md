@@ -156,6 +156,11 @@ Last updated: 2026-09-15
 - Rust `cargo check --all-targets --locked` 与 `cargo fmt --all -- --check`：通过；
 - `ui` `pnpm check` 与 `pnpm build`：通过；
 - `admin-ui pnpm build`：按现有锁文件补齐本地依赖后通过；
+- 质量调度提交基线的完整 Rust 二进制回归为 `2055` 个非忽略测试（首轮
+  `2054 passed / 1 flaky failure / 6 ignored`，唯一失败用例隔离复跑
+  `1 passed / 0 failed`）。随后在当前共享工作区（含并发的 region rotation 改动）复跑
+  为主二进制 `2074 passed / 0 failed / 6 ignored`、`kiro_loadtest 31/31`，合计
+  `2105` 个非忽略测试，全部通过；
 - sub2api 的 settings/DTO/admin API/前端开关与 `ReportResult` 回灌仍是独立未完成项。
 
 ### 4.2 已实现清单
@@ -376,9 +381,11 @@ Top-K 加权随机让优先级 3 的池仍能拿到 ~1/6 的抽中概率
 
 ### 7.1 历史本机 5 个红灯记录（当前已不再复现）
 
-以下内容是早期基线的历史记录。2026-09-15 当前工作区完整 Rust 二进制回归覆盖
+以下内容是早期基线的历史记录。质量调度提交基线的完整 Rust 二进制回归覆盖
 `2055` 个非忽略测试：首轮为 `2054 passed / 1 flaky failure / 6 ignored`，唯一失败用例
-隔离复跑为 `1 passed / 0 failed`；`kiro_loadtest` 为 `31/31`。下面列出的 5 个用例也
+隔离复跑为 `1 passed / 0 failed`；`kiro_loadtest` 为 `31/31`。随后在当前共享工作区
+（含并发的 region rotation 改动）复跑为主二进制 `2074 passed / 0 failed / 6 ignored`
+加 `kiro_loadtest 31/31`，合计 `2105` 个非忽略测试，全部通过。下面列出的 5 个用例也
 已逐项复验通过，因此它们不再是当前阻塞。保留归因内容仅用于解释历史平台差异。
 
 `no_response_headers_becomes_client_timeout_without_raw_body` /
