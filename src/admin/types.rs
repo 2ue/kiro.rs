@@ -1598,6 +1598,7 @@ pub struct RuntimeConfigResponse {
     pub credential_prompt_logic_retry_enabled: bool,
     pub credential_prompt_logic_retry_max_attempts: u32,
     pub kiro_upstream_region_rotation: Vec<String>,
+    pub kiro_upstream_region_rotation_enabled: bool,
     pub local_berserk_mode_enabled: bool,
     pub local_berserk_max_rounds: u32,
     pub local_berserk_round_delay_ms: u64,
@@ -1724,6 +1725,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_prompt_logic_retry_max_attempts: Option<u32>,
     #[serde(default)]
     pub kiro_upstream_region_rotation: Option<Vec<String>>,
+    #[serde(default)]
+    pub kiro_upstream_region_rotation_enabled: Option<bool>,
     #[serde(default)]
     pub local_berserk_mode_enabled: Option<bool>,
     #[serde(default)]

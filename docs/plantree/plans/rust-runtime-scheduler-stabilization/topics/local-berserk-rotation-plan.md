@@ -154,8 +154,9 @@ KiroEndpoint::api_url(ctx)
 ### 4.2 两个正交开关
 
 ```
-开关 A：region 轮换（普通模式亦可用）
-  kiroUpstreamRegionRotation: []        空 = 关闭 = 保持现状
+开关 A：端点（region）轮换（普通模式亦可用）
+  kiroUpstreamRegionRotationEnabled: false   ← 总开关，默认关
+  kiroUpstreamRegionRotation: []             ← region 列表
 
 开关 B：狂暴模式（默认关闭）
   localBerserkModeEnabled: false
@@ -164,6 +165,14 @@ KiroEndpoint::api_url(ctx)
 ```
 
 可只开 A（普通模式多一层 region 容错）、只开 B（仅换号轮换）、或同时开（完整笛卡尔积）。
+
+**A 采用「总开关 + 列表」两段式而非「空列表 = 关闭」**：用户诉求是
+「防止有一些端点不可用导致调度一直失败」时能一键回退到改造之前的端点，
+而不必清空已经调好的 region 列表。关闭总开关后 `BerserkPlan.regions` 直接归空，
+下游所有轮换判断统一退化为「沿用凭据自身的 region」，回退路径只有这一个收敛点。
+
+两个开关**完全正交**：关闭 A 不影响 B 的换号轮换（此时 region 固定为改造前的端点），
+关闭 B 不影响 A 在普通模式下的端点轮换重试。四种组合均有单测覆盖。
 
 ### 4.3 轮换顺序（优先换号）
 
@@ -207,7 +216,8 @@ KiroEndpoint::api_url(ctx)
 
 | 字段（Rust） | JSON key | 类型 | 默认 | 说明 |
 |---|---|---|---|---|
-| `kiro_upstream_region_rotation` | `kiroUpstreamRegionRotation` | `Vec<String>` | `[]` | region 轮换列表，空 = 关闭 |
+| `kiro_upstream_region_rotation_enabled` | `kiroUpstreamRegionRotationEnabled` | `bool` | `false` | 端点轮换总开关，关 = 使用改造前的端点 |
+| `kiro_upstream_region_rotation` | `kiroUpstreamRegionRotation` | `Vec<String>` | `[]` | region 轮换列表，最多 16 项 |
 | `local_berserk_mode_enabled` | `localBerserkModeEnabled` | `bool` | `false` | 狂暴模式主开关 |
 | `local_berserk_max_rounds` | `localBerserkMaxRounds` | `u32` | `1` | 轮数，校验 `1..=10` |
 | `local_berserk_round_delay_ms` | `localBerserkRoundDelayMs` | `u64` | `1000` | 跨轮退避，对齐 kiro-rs-main |

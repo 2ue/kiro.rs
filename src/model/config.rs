@@ -3752,6 +3752,16 @@ pub struct Config {
     #[serde(default)]
     pub kiro_upstream_region_rotation: Vec<String>,
 
+    /// 上游 region（端点）轮换总开关。
+    ///
+    /// 默认关闭。关闭时无论 `kiroUpstreamRegionRotation` 配了什么，都一律使用
+    /// 改造之前的端点（即凭据自身解析出的 region），便于在某些 region 不可用
+    /// 导致调度持续失败时一键回退，而不必清空已有的 region 列表。
+    ///
+    /// 该开关与狂暴模式完全独立、互不影响：普通模式下也可以单独开启端点轮换重试。
+    #[serde(default)]
+    pub kiro_upstream_region_rotation_enabled: bool,
+
     /// 本地账号 429 狂暴轮换模式主开关。
     ///
     /// 默认关闭。关闭时所有调度、重试与冷却行为与引入该特性之前逐项一致。
@@ -5072,6 +5082,7 @@ impl Default for Config {
             credential_prompt_logic_retry_enabled: false,
             credential_prompt_logic_retry_max_attempts: 0,
             kiro_upstream_region_rotation: Vec::new(),
+            kiro_upstream_region_rotation_enabled: false,
             local_berserk_mode_enabled: false,
             local_berserk_max_rounds: default_local_berserk_max_rounds(),
             local_berserk_round_delay_ms: default_local_berserk_round_delay_ms(),
@@ -5688,6 +5699,10 @@ mod tests {
         assert!(
             config.kiro_upstream_region_rotation.is_empty(),
             "region 轮换默认必须为空列表，保持与引入该特性之前完全一致的上游地址"
+        );
+        assert!(
+            !config.kiro_upstream_region_rotation_enabled,
+            "端点轮换总开关必须默认关闭，保证默认使用改造之前的端点"
         );
         assert_eq!(config.local_berserk_max_rounds, 1);
         assert_eq!(config.local_berserk_round_delay_ms, 1_000);

@@ -62,7 +62,13 @@ impl BerserkPlan {
     pub(crate) fn from_config(config: &Config) -> Self {
         Self {
             enabled: config.local_berserk_mode_enabled,
-            regions: normalize_regions(&config.kiro_upstream_region_rotation),
+            // 总开关关闭时直接丢弃 region 列表，使下游所有轮换判断统一退化为
+            // "沿用凭据自身的 region"，即改造之前的端点行为。
+            regions: if config.kiro_upstream_region_rotation_enabled {
+                normalize_regions(&config.kiro_upstream_region_rotation)
+            } else {
+                Vec::new()
+            },
             // 0 等价于 1 轮；上限与 admin 校验一致，防止配置文件绕过 admin 写入超大值。
             rounds: config.local_berserk_max_rounds.clamp(1, MAX_BERSERK_ROUNDS),
             round_delay: Duration::from_millis(config.local_berserk_round_delay_ms.min(60_000)),
@@ -232,6 +238,9 @@ mod tests {
         config.local_berserk_mode_enabled = enabled;
         config.kiro_upstream_region_rotation =
             regions.iter().map(|region| region.to_string()).collect();
+        // 绝大多数用例关注轮换生效后的行为，默认把总开关打开；
+        // 总开关本身的语义由专门的用例覆盖。
+        config.kiro_upstream_region_rotation_enabled = !regions.is_empty();
         config.local_berserk_max_rounds = rounds;
         config.local_berserk_round_delay_ms = delay_ms;
         config
@@ -257,6 +266,65 @@ mod tests {
         assert!(!plan.active());
         assert!(plan.region_rotation_active());
         assert_eq!(plan.regions(), ["us-east-1", "eu-west-1"]);
+    }
+
+    #[test]
+    fn region_rotation_switch_off_falls_back_to_the_original_endpoint() {
+        // 用户诉求：某些 region 不可用导致调度一直失败时，关掉总开关即可一键回退，
+        // 而不必清空已配置的 region 列表。
+        let mut config = Config::default();
+        config.kiro_upstream_region_rotation =
+            vec!["us-east-1".to_string(), "eu-west-1".to_string()];
+        config.kiro_upstream_region_rotation_enabled = false;
+
+        let plan = BerserkPlan::from_config(&config);
+        assert!(
+            !plan.region_rotation_active(),
+            "总开关关闭时必须视为未配置任何轮换 region"
+        );
+        assert_eq!(
+            plan.region_at(0),
+            None,
+            "总开关关闭时必须不覆盖 region，即使用改造之前的端点"
+        );
+        assert_eq!(plan.region_slots(), 1, "总开关关闭时只有默认这一个槽位");
+
+        let mut cursor = RotationCursor::new(&plan);
+        assert_eq!(
+            cursor.advance_region_for_normal_retry(),
+            0,
+            "总开关关闭时普通模式重试不得切换端点"
+        );
+    }
+
+    #[test]
+    fn region_rotation_switch_is_independent_of_berserk_mode() {
+        // 两个开关必须正交：任意组合都不得互相影响。
+        let mut config = Config::default();
+        config.kiro_upstream_region_rotation =
+            vec!["us-east-1".to_string(), "eu-west-1".to_string()];
+
+        // 仅开端点轮换：普通模式下也能轮换端点。
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.local_berserk_mode_enabled = false;
+        let plan = BerserkPlan::from_config(&config);
+        assert!(!plan.active(), "端点轮换不得连带开启狂暴模式");
+        assert!(plan.region_rotation_active());
+
+        // 仅开狂暴模式：账号轮换生效，但端点固定为改造之前的行为。
+        config.kiro_upstream_region_rotation_enabled = false;
+        config.local_berserk_mode_enabled = true;
+        let plan = BerserkPlan::from_config(&config);
+        assert!(plan.active(), "关闭端点轮换不得连带关闭狂暴模式");
+        assert!(
+            !plan.region_rotation_active(),
+            "狂暴模式不得绕过端点轮换总开关"
+        );
+        assert_eq!(
+            plan.attempt_budget(20),
+            Some(20),
+            "仅开狂暴模式时预算退化为 账号数 × 1个端点 × 1轮"
+        );
     }
 
     #[test]

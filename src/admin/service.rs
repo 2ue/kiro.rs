@@ -4695,6 +4695,7 @@ impl AdminService {
             credential_prompt_logic_retry_max_attempts: config
                 .credential_prompt_logic_retry_max_attempts,
             kiro_upstream_region_rotation: config.kiro_upstream_region_rotation.clone(),
+            kiro_upstream_region_rotation_enabled: config.kiro_upstream_region_rotation_enabled,
             local_berserk_mode_enabled: config.local_berserk_mode_enabled,
             local_berserk_max_rounds: config.local_berserk_max_rounds,
             local_berserk_round_delay_ms: config.local_berserk_round_delay_ms,
@@ -4828,6 +4829,9 @@ impl AdminService {
             .kiro_upstream_region_rotation
             .clone()
             .unwrap_or_else(|| current_config.kiro_upstream_region_rotation.clone());
+        let kiro_upstream_region_rotation_enabled = req
+            .kiro_upstream_region_rotation_enabled
+            .unwrap_or(current_config.kiro_upstream_region_rotation_enabled);
         let local_berserk_mode_enabled = req
             .local_berserk_mode_enabled
             .unwrap_or(current_config.local_berserk_mode_enabled);
@@ -5149,6 +5153,16 @@ impl AdminService {
                 "localBerserkRoundDelayMs 不能大于 60000".to_string(),
             ));
         }
+        if kiro_upstream_region_rotation_enabled
+            && kiro_upstream_region_rotation
+                .iter()
+                .all(|region| region.trim().is_empty())
+        {
+            // 开了总开关却没有可用 region，轮换会静默失效，属于配置错误而非降级场景。
+            return Err(AdminServiceError::InvalidCredential(
+                "开启 kiroUpstreamRegionRotationEnabled 时必须至少配置一个 region".to_string(),
+            ));
+        }
         if kiro_upstream_region_rotation.len() > 16 {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamRegionRotation 最多配置 16 个 region".to_string(),
@@ -5391,6 +5405,8 @@ impl AdminService {
                 config.credential_prompt_logic_retry_max_attempts =
                     credential_prompt_logic_retry_max_attempts;
                 config.kiro_upstream_region_rotation = kiro_upstream_region_rotation;
+                config.kiro_upstream_region_rotation_enabled =
+                    kiro_upstream_region_rotation_enabled;
                 config.local_berserk_mode_enabled = local_berserk_mode_enabled;
                 config.local_berserk_max_rounds = local_berserk_max_rounds;
                 config.local_berserk_round_delay_ms = local_berserk_round_delay_ms;
