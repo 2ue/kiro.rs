@@ -289,7 +289,7 @@ getUsageLimits / ListAvailableModels 就是在这两个端点间做 403 回退�
 
 | # | 场景 | 断言 |
 |---|---|---|
-| S1 | 全账号全 region 429 | 命中 = N×M×R；最终失败；无 panic |
+| S1 ✅ | 全账号全 region 429 | 命中 = N×M×R；最终失败；无 panic |
 | S2 | 最后一个账号成功 | 恰好轮到即停，不多试 |
 | S3 | region[0] 全 429、region[1] 正常 | **先轮完所有账号再换 region**（验证优先换号） |
 | S4 | 429 后逐步恢复 | 第 2 轮成功，验证轮数生效 |
@@ -301,6 +301,19 @@ getUsageLimits / ListAvailableModels 就是在这两个端点间做 403 回退�
 | S10 | 狂暴 + 外部池同时配置 | 外部池行为与改动前完全一致 |
 | S11 | 流式已提交后失败 | 不重试，避免重复吐字节 |
 | S12 | 高并发（≥64 并发 × 多轮） | 无死锁、无预算泄漏、`excluded_ids` 不串请求 |
+
+### 7.2.1 mock 调度测试实际发现的两个缺陷
+
+单测全绿、结构审查也通过，但 mock 上游调度测试仍然抓到两个真实缺陷 ——
+这正是「不能只做单元测试」的价值所在：
+
+| # | 缺陷 | 症状 | 修复 |
+|---|---|---|---|
+| B1 | **狂暴模式被 `InferenceAttemptBudget` 静默截断在 10 次** | 豁免只加在 `max_retries` 上，但每次发送前还要过 `budget.reserve`，那里以预算自身上限为准。12 个账号的池子打满 10 次就报 `local inference routing limit reached`，第二个端点根本轮不到 | 新增 `raise_max_attempts_for_berserk`，把预算上限抬到 `账号×端点×轮数`；`max_attempts` 改为原子字段。只放宽计数上限，`reserve` 的「下游已提交」「为 fallback 预留」两条语义不变（S10/S11 锁定） |
+| B2 | **带 `Retry-After` 的 429 也会触发狂暴轮换** | 三分法第 ② 类本应立即返回。但判定只看 `failure_kind == RateLimit`，对所有 429 一律成立；而狂暴又跳过了写冷却 —— 恰恰是唯一会消费 `Retry-After` 的地方，于是上游明确说了「7 秒后再来」还是被打满整个矩阵 | 引入 `berserk_applies = active && RateLimit && retry_after.is_none()`，并把轮换触发、冷却跳过、退避控制三处统一切到该判定 |
+
+> B1 的教训：豁免一个限制时，必须找全该限制的**所有**执行点。
+> 当时只审了 `max_retries` 一条路径就下了「结构上正确」的结论。
 
 ### 7.3 与既有逻辑的混合测试（不破坏原有逻辑）
 

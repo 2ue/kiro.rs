@@ -1024,6 +1024,7 @@ mod tests {
     };
     use crate::anthropic::inference_attempt_budget::{
         AuxiliaryAttemptBudget, AuxiliaryAttemptKind, InferenceAttemptBudget, InferenceAttemptKind,
+        InferenceAttemptRejection,
     };
     use crate::http_client::ProxyConfig;
     use crate::kiro::call_trace::{
@@ -1031,8 +1032,274 @@ mod tests {
     };
     use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
     use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::retry_pipeline::KIRO_ROTATION_REGIONS;
     use crate::kiro::token_manager::{AcquireMode, AuxiliaryConcurrencyKind, MultiTokenManager};
     use crate::model::config::Config;
+
+    // ==================== 狂暴/端点轮换的 mock 上游调度测试 ====================
+    //
+    // 观察通道：即便 `kiro_upstream_base_url` 把请求重定向到本地 mock，
+    // `host` 头依然是 `q.{region}.amazonaws.com`（`ide.rs:112`），
+    // `Authorization` 依然是 `Bearer fake-token-{id}`。两者合起来让 mock
+    // 能完整还原「第 N 次尝试用了哪个账号的哪个端点」这一调度序列。
+
+    /// 一次上游尝试的落点。
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RotationAttempt {
+        account: u64,
+        region: String,
+    }
+
+    /// mock 上游对某次尝试的应答。
+    #[derive(Clone, Copy, Debug)]
+    enum RotationReply {
+        TooManyRequests,
+        TooManyRequestsWithRetryAfter,
+        RiskControl,
+        ServerError,
+        BadRequest,
+        Forbidden,
+        Success,
+    }
+
+    type RotationRule = Arc<dyn Fn(&RotationAttempt) -> RotationReply + Send + Sync>;
+
+    #[derive(Clone)]
+    struct RotationState {
+        attempts: Arc<StdMutex<Vec<RotationAttempt>>>,
+        rule: RotationRule,
+    }
+
+    impl RotationState {
+        fn new(rule: RotationRule) -> Self {
+            Self {
+                attempts: Arc::new(StdMutex::new(Vec::new())),
+                rule,
+            }
+        }
+
+        fn attempts(&self) -> Vec<RotationAttempt> {
+            self.attempts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+
+        /// 调度序列去掉账号身份，只保留端点，便于断言「换端点」的时机。
+        fn regions(&self) -> Vec<String> {
+            self.attempts()
+                .into_iter()
+                .map(|attempt| attempt.region)
+                .collect()
+        }
+    }
+
+    struct RotationServer {
+        base_url: String,
+        state: RotationState,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RotationServer {
+        async fn start(rule: RotationRule) -> Self {
+            let state = RotationState::new(rule);
+            let app = Router::new()
+                .route("/generateAssistantResponse", post(rotation_response))
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind rotation upstream");
+            let address = listener.local_addr().expect("rotation upstream address");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve rotation upstream");
+            });
+            Self {
+                base_url: format!("http://{address}"),
+                state,
+                task,
+            }
+        }
+    }
+
+    impl Drop for RotationServer {
+        fn drop(&mut self) {
+            // 测试结束立刻回收监听任务，避免并发用例堆出大量常驻端口。
+            self.task.abort();
+        }
+    }
+
+    async fn rotation_response(
+        State(state): State<RotationState>,
+        headers: AxumHeaderMap,
+    ) -> axum::response::Response {
+        let account = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer fake-token-"))
+            .and_then(|id| id.parse::<u64>().ok())
+            .expect("rotation upstream expects fake-token-{id} bearer");
+        // host 形如 q.us-east-1.amazonaws.com，取中段即当前端点。
+        let region = headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|host| host.strip_prefix("q."))
+            .and_then(|rest| rest.strip_suffix(".amazonaws.com"))
+            .expect("rotation upstream expects q.{region}.amazonaws.com host")
+            .to_string();
+
+        let attempt = RotationAttempt { account, region };
+        let reply = (state.rule)(&attempt);
+        state
+            .attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(attempt);
+
+        match reply {
+            RotationReply::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"message": "rate limited"})),
+            )
+                .into_response(),
+            RotationReply::TooManyRequestsWithRetryAfter => axum::response::Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header(axum::http::header::RETRY_AFTER, "7")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(r#"{"message":"slow down"}"#))
+                .expect("retry-after response"),
+            // 风控判定要求同时出现 suspicious activity 与 temporary limits
+            // （`detect_risk_control_error`），缺一就会被当成普通 429。
+            RotationReply::RiskControl => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "message": "Due to suspicious activity, we are imposing temporary limits on your account."
+                })),
+            )
+                .into_response(),
+            RotationReply::ServerError => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message": "boom"})),
+            )
+                .into_response(),
+            RotationReply::BadRequest => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"message": "malformed"})),
+            )
+                .into_response(),
+            RotationReply::Forbidden => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"message": "forbidden"})),
+            )
+                .into_response(),
+            // 空 eventstream 体即视为成功，沿用既有 fake 上游的做法。
+            RotationReply::Success => (
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/vnd.amazon.eventstream",
+                )],
+                Vec::<u8>::new(),
+            )
+                .into_response(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct RotationConfig {
+        pool_size: usize,
+        berserk: bool,
+        region_rotation: bool,
+        rounds: u32,
+    }
+
+    impl RotationConfig {
+        fn new(pool_size: usize) -> Self {
+            Self {
+                pool_size,
+                berserk: false,
+                region_rotation: false,
+                rounds: 1,
+            }
+        }
+
+        fn berserk(mut self, rounds: u32) -> Self {
+            self.berserk = true;
+            self.rounds = rounds;
+            self
+        }
+
+        fn with_region_rotation(mut self) -> Self {
+            self.region_rotation = true;
+            self
+        }
+    }
+
+    async fn call_rotation_provider(
+        server: &RotationServer,
+        settings: RotationConfig,
+        conversation: &str,
+    ) -> Result<(), anyhow::Error> {
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        // 重试次数给足，让「何时停止」完全由轮换游标决定而非被预算截断。
+        config.credential_retry_max_attempts = 10_000;
+        config.kiro_upstream_region_rotation_enabled = settings.region_rotation;
+        config.local_berserk_mode_enabled = settings.berserk;
+        config.local_berserk_max_rounds = settings.rounds;
+        // 轮次间隔置 0，避免测试为等待退避而空转。
+        config.local_berserk_round_delay_ms = 0;
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                fake_bad_request_credentials(settings.pool_size),
+                None,
+                None,
+                false,
+            )
+            .expect("rotation token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": conversation,
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "test",
+                        "modelId": "claude-sonnet-4"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        // 预算给到远大于 账号×端点×轮数 的上限，确认停止来自轮换逻辑本身。
+        let budget = Arc::new(InferenceAttemptBudget::new(100_000));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-rotation"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                budget,
+                false,
+            ),
+        )
+        .await
+        .expect("rotation provider call timed out")
+        .map(|_| ())
+    }
+
+    fn rule_always(reply: RotationReply) -> RotationRule {
+        Arc::new(move |_| reply)
+    }
 
     #[derive(Clone, Default)]
     struct FakeBadRequestState {
@@ -6229,6 +6496,458 @@ mod tests {
         assert_eq!(KiroProvider::test_max_retry_attempts(10_000, &config), 12);
     }
 
+    /// S1：全账号全端点持续 429，狂暴模式应恰好打满 账号 × 端点 × 轮数 后失败。
+    #[tokio::test]
+    async fn s1_berserk_exhausts_exactly_accounts_times_regions_times_rounds() {
+        for pool_size in [1usize, 3, 8] {
+            for rounds in [1u32, 2, 3] {
+                let server = RotationServer::start(rule_always(RotationReply::TooManyRequests)).await;
+                let settings = RotationConfig::new(pool_size)
+                    .berserk(rounds)
+                    .with_region_rotation();
+                let result =
+                    call_rotation_provider(&server, settings, &format!("s1-{pool_size}-{rounds}"))
+                        .await;
+
+                assert!(result.is_err(), "全 429 必须最终失败");
+                let attempts = server.state.attempts();
+                let expected = pool_size * KIRO_ROTATION_REGIONS.len() * rounds as usize;
+                assert_eq!(
+                    attempts.len(),
+                    expected,
+                    "pool={pool_size} rounds={rounds}：尝试次数应恰好等于 账号×端点×轮数"
+                );
+
+                // 每个 (账号, 端点) 组合在每轮中恰好出现一次，确认没有重复消耗。
+                let mut seen: HashMap<(u64, String), usize> = HashMap::new();
+                for attempt in &attempts {
+                    *seen
+                        .entry((attempt.account, attempt.region.clone()))
+                        .or_insert(0) += 1;
+                }
+                assert_eq!(seen.len(), pool_size * KIRO_ROTATION_REGIONS.len());
+                for (key, count) in seen {
+                    assert_eq!(count, rounds as usize, "{key:?} 每轮应恰好尝试一次");
+                }
+            }
+        }
+    }
+
+    /// S3：端点[0] 全 429、端点[1] 正常 —— 必须**先轮完所有账号再换端点**（优先换号）。
+    #[tokio::test]
+    async fn s3_berserk_exhausts_every_account_before_switching_region() {
+        for pool_size in [2usize, 5, 12] {
+            let primary = KIRO_ROTATION_REGIONS[0];
+            let rule: RotationRule = Arc::new(move |attempt: &RotationAttempt| {
+                if attempt.region == primary {
+                    RotationReply::TooManyRequests
+                } else {
+                    RotationReply::Success
+                }
+            });
+            let server = RotationServer::start(rule).await;
+            let settings = RotationConfig::new(pool_size)
+                .berserk(3)
+                .with_region_rotation();
+            let result =
+                call_rotation_provider(&server, settings, &format!("s3-{pool_size}")).await;
+
+            assert!(result.is_ok(), "第二个端点可用时最终应成功");
+            let attempts = server.state.attempts();
+            // 前 pool_size 次必须全部落在第一个端点上 —— 这正是「优先换号」的定义：
+            // 换端点之前，所有账号都要在当前端点试过一遍。
+            assert_eq!(
+                attempts.len(),
+                pool_size + 1,
+                "pool={pool_size}：应当先用光所有账号，再换端点一次命中"
+            );
+            for attempt in attempts.iter().take(pool_size) {
+                assert_eq!(attempt.region, primary, "换端点前必须先轮完所有账号");
+            }
+            let first_region_accounts: HashSet<u64> = attempts
+                .iter()
+                .take(pool_size)
+                .map(|attempt| attempt.account)
+                .collect();
+            assert_eq!(
+                first_region_accounts.len(),
+                pool_size,
+                "第一个端点上每个账号都应恰好被试一次"
+            );
+            assert_eq!(attempts[pool_size].region, KIRO_ROTATION_REGIONS[1]);
+        }
+    }
+
+    /// S2：最后一个账号才成功 —— 恰好轮到即停，不多打一次上游。
+    #[tokio::test]
+    async fn s2_berserk_stops_immediately_once_an_account_succeeds() {
+        for pool_size in [2usize, 6, 20] {
+            let lucky = pool_size as u64;
+            let rule: RotationRule = Arc::new(move |attempt: &RotationAttempt| {
+                if attempt.account == lucky {
+                    RotationReply::Success
+                } else {
+                    RotationReply::TooManyRequests
+                }
+            });
+            let server = RotationServer::start(rule).await;
+            let settings = RotationConfig::new(pool_size)
+                .berserk(3)
+                .with_region_rotation();
+            let result =
+                call_rotation_provider(&server, settings, &format!("s2-{pool_size}")).await;
+
+            assert!(result.is_ok(), "存在可用账号时必须成功");
+            let attempts = server.state.attempts();
+            assert!(
+                attempts.len() <= pool_size,
+                "pool={pool_size}：命中后应立刻停止，实际打了 {} 次",
+                attempts.len()
+            );
+            assert_eq!(
+                attempts.last().expect("至少一次尝试").account,
+                lucky,
+                "最后一次尝试应当是成功的那个账号"
+            );
+            // 成功账号只应被使用一次，不应在成功后继续轮换。
+            assert_eq!(
+                attempts
+                    .iter()
+                    .filter(|attempt| attempt.account == lucky)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// S8：两个开关全关 —— 调度序列必须与改造之前逐项一致（单端点、不做笛卡尔积）。
+    #[tokio::test]
+    async fn s8_both_switches_off_keeps_the_legacy_single_endpoint_behaviour() {
+        for pool_size in [1usize, 4, 10] {
+            let server = RotationServer::start(rule_always(RotationReply::TooManyRequests)).await;
+            let settings = RotationConfig::new(pool_size);
+            let result =
+                call_rotation_provider(&server, settings, &format!("s8-{pool_size}")).await;
+
+            assert!(result.is_err());
+            let regions: HashSet<String> = server.state.regions().into_iter().collect();
+            assert_eq!(
+                regions.len(),
+                1,
+                "pool={pool_size}：开关全关时不得出现第二个端点，实际 {regions:?}"
+            );
+            // 关闭时必须落在凭据自身的 region 上，即改造之前的默认端点。
+            assert_eq!(
+                regions.into_iter().next().expect("单一端点"),
+                Config::default().effective_api_region(),
+                "开关全关时必须使用改造之前的默认端点"
+            );
+        }
+    }
+
+    /// S9：只开端点轮换（普通模式）—— 换端点生效，但不做多轮笛卡尔积。
+    #[tokio::test]
+    async fn s9_region_rotation_alone_switches_endpoints_without_berserk_amplification() {
+        for pool_size in [2usize, 5] {
+            let server = RotationServer::start(rule_always(RotationReply::TooManyRequests)).await;
+            let settings = RotationConfig::new(pool_size).with_region_rotation();
+            let result =
+                call_rotation_provider(&server, settings, &format!("s9-{pool_size}")).await;
+
+            assert!(result.is_err());
+            let attempts = server.state.attempts();
+            let regions: HashSet<String> =
+                attempts.iter().map(|a| a.region.clone()).collect();
+            assert!(
+                regions.len() > 1,
+                "pool={pool_size}：普通模式下开启端点轮换后应当换过端点，实际 {regions:?}"
+            );
+            assert!(
+                regions
+                    .iter()
+                    .all(|region| KIRO_ROTATION_REGIONS.contains(&region.as_str())),
+                "只能落在内置的两个官方端点上，实际 {regions:?}"
+            );
+            // 普通模式不豁免尝试预算，总量必须远小于狂暴模式的 账号×端点×轮数。
+            assert!(
+                attempts.len() <= pool_size * KIRO_ROTATION_REGIONS.len(),
+                "pool={pool_size}：普通模式不应放大到狂暴规模，实际 {} 次",
+                attempts.len()
+            );
+        }
+    }
+
+    /// S4：第一轮全 429、第二轮起恢复 —— 验证「轮数」确实生效。
+    #[tokio::test]
+    async fn s4_berserk_recovers_on_a_later_round() {
+        for pool_size in [2usize, 4] {
+            let first_round = pool_size * KIRO_ROTATION_REGIONS.len();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let rule: RotationRule = Arc::new(move |_: &RotationAttempt| {
+                // 前一整轮（账号×端点）全部 429，之后恢复。
+                if seen.fetch_add(1, Ordering::SeqCst) < first_round {
+                    RotationReply::TooManyRequests
+                } else {
+                    RotationReply::Success
+                }
+            });
+            let server = RotationServer::start(rule).await;
+
+            // 只给 1 轮：第一轮全败后没有第二轮可用，必须失败。
+            let single = RotationConfig::new(pool_size)
+                .berserk(1)
+                .with_region_rotation();
+            assert!(
+                call_rotation_provider(&server, single, &format!("s4-single-{pool_size}"))
+                    .await
+                    .is_err(),
+                "pool={pool_size}：只配 1 轮时不应该等到第二轮的恢复"
+            );
+            assert_eq!(server.state.attempts().len(), first_round);
+
+            // 给 2 轮：第二轮第一次尝试即命中。
+            let seen = Arc::new(AtomicUsize::new(0));
+            let rule: RotationRule = Arc::new(move |_: &RotationAttempt| {
+                if seen.fetch_add(1, Ordering::SeqCst) < first_round {
+                    RotationReply::TooManyRequests
+                } else {
+                    RotationReply::Success
+                }
+            });
+            let server = RotationServer::start(rule).await;
+            let two_rounds = RotationConfig::new(pool_size)
+                .berserk(2)
+                .with_region_rotation();
+            assert!(
+                call_rotation_provider(&server, two_rounds, &format!("s4-two-{pool_size}"))
+                    .await
+                    .is_ok(),
+                "pool={pool_size}：配 2 轮时第二轮应当成功"
+            );
+            assert_eq!(
+                server.state.attempts().len(),
+                first_round + 1,
+                "pool={pool_size}：应当在第二轮第一次尝试就命中"
+            );
+        }
+    }
+
+    /// S5：带 `Retry-After` 的 429 —— 属于 kiro-rs-main 三分法的第 ② 类，
+    /// 必须立即返回，不进入狂暴轮换。
+    #[tokio::test]
+    async fn s5_rate_limit_with_retry_after_does_not_trigger_berserk() {
+        let server =
+            RotationServer::start(rule_always(RotationReply::TooManyRequestsWithRetryAfter)).await;
+        let settings = RotationConfig::new(8).berserk(3).with_region_rotation();
+        let result = call_rotation_provider(&server, settings, "s5").await;
+
+        assert!(result.is_err());
+        let attempts = server.state.attempts().len();
+        assert!(
+            attempts < 8 * KIRO_ROTATION_REGIONS.len(),
+            "带 Retry-After 的 429 不应打满整个 账号×端点 矩阵，实际 {attempts} 次"
+        );
+    }
+
+    /// S6：风控型 429（suspicious activity）—— 第 ① 类，走冷却+故障转移，不狂暴。
+    #[tokio::test]
+    async fn s6_risk_control_rate_limit_does_not_trigger_berserk() {
+        let server = RotationServer::start(rule_always(RotationReply::RiskControl)).await;
+        let settings = RotationConfig::new(6).berserk(3).with_region_rotation();
+        let result = call_rotation_provider(&server, settings, "s6").await;
+
+        assert!(result.is_err());
+        let attempts = server.state.attempts();
+        // 风控账号会被冷却剔除，每个账号最多被试一次，绝不会 ×端点×轮数 地放大。
+        let mut per_account: HashMap<u64, usize> = HashMap::new();
+        for attempt in &attempts {
+            *per_account.entry(attempt.account).or_insert(0) += 1;
+        }
+        for (account, count) in per_account {
+            assert_eq!(
+                count, 1,
+                "风控型 429 的账号 {account} 不应被反复重试（实际 {count} 次）"
+            );
+        }
+    }
+
+    /// S7：400 / 403 属于终止类，必须立即停止，不参与轮换。
+    #[tokio::test]
+    async fn s7_terminal_failures_stop_immediately_even_in_berserk_mode() {
+        for reply in [RotationReply::BadRequest, RotationReply::Forbidden] {
+            let server = RotationServer::start(rule_always(reply)).await;
+            let settings = RotationConfig::new(6).berserk(3).with_region_rotation();
+            let result = call_rotation_provider(&server, settings, "s7").await;
+
+            assert!(result.is_err());
+            let attempts = server.state.attempts().len();
+            assert!(
+                attempts < 6 * KIRO_ROTATION_REGIONS.len(),
+                "{reply:?}：终止类错误不应打满 账号×端点 矩阵，实际 {attempts} 次"
+            );
+        }
+    }
+
+    /// S7 补充：500 与 429 混合 —— 5xx 同属可重试类，也应参与轮换并被账号覆盖。
+    #[tokio::test]
+    async fn s7_server_errors_participate_in_rotation_alongside_rate_limits() {
+        let pool_size = 4usize;
+        // 奇数账号 429、偶数账号 500，只有最后一个账号在第二个端点上成功。
+        let secondary = KIRO_ROTATION_REGIONS[1];
+        let lucky = pool_size as u64;
+        let rule: RotationRule = Arc::new(move |attempt: &RotationAttempt| {
+            if attempt.account == lucky && attempt.region == secondary {
+                RotationReply::Success
+            } else if attempt.account % 2 == 0 {
+                RotationReply::ServerError
+            } else {
+                RotationReply::TooManyRequests
+            }
+        });
+        let server = RotationServer::start(rule).await;
+        let settings = RotationConfig::new(pool_size)
+            .berserk(2)
+            .with_region_rotation();
+        let result = call_rotation_provider(&server, settings, "s7-mixed").await;
+
+        assert!(result.is_ok(), "混合 429/500 时仍应轮换到可用组合并成功");
+        let attempts = server.state.attempts();
+        let last = attempts.last().expect("至少一次尝试");
+        assert_eq!(last.account, lucky);
+        assert_eq!(last.region, secondary);
+        // 500 的账号同样应被轮换覆盖，而不是卡在某一个账号上反复重试。
+        let touched: HashSet<u64> = attempts.iter().map(|attempt| attempt.account).collect();
+        assert_eq!(
+            touched.len(),
+            pool_size,
+            "429 与 500 的账号都应被轮换到，实际只碰到 {touched:?}"
+        );
+    }
+
+    /// S12：高并发下轮换互不串扰 —— 每个请求的排除集与游标必须各自独立。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn s12_concurrent_requests_do_not_share_rotation_state() {
+        const CONCURRENCY: usize = 64;
+        let pool_size = 4usize;
+
+        // 每个账号都只在第二个端点上成功：并发请求若互相污染排除集或游标，
+        // 就会出现「某个请求没轮到第二个端点就失败」。
+        let secondary = KIRO_ROTATION_REGIONS[1];
+        let rule: RotationRule = Arc::new(move |attempt: &RotationAttempt| {
+            if attempt.region == secondary {
+                RotationReply::Success
+            } else {
+                RotationReply::TooManyRequests
+            }
+        });
+        let server = Arc::new(RotationServer::start(rule).await);
+        let settings = RotationConfig::new(pool_size)
+            .berserk(3)
+            .with_region_rotation();
+
+        let mut handles = Vec::with_capacity(CONCURRENCY);
+        for index in 0..CONCURRENCY {
+            let server = Arc::clone(&server);
+            handles.push(tokio::spawn(async move {
+                call_rotation_provider(&server, settings, &format!("s12-{index}")).await
+            }));
+        }
+
+        let mut succeeded = 0usize;
+        for handle in handles {
+            if handle.await.expect("并发任务不应 panic").is_ok() {
+                succeeded += 1;
+            }
+        }
+        assert_eq!(
+            succeeded, CONCURRENCY,
+            "第二个端点始终可用时，{CONCURRENCY} 个并发请求都应当成功"
+        );
+
+        // 所有请求最终都应落到可用端点上，且没有任何请求被卡死或漏掉。
+        let attempts = server.state.attempts();
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|attempt| attempt.region == secondary)
+                .count(),
+            CONCURRENCY,
+            "每个请求都应当恰好在可用端点上成功一次"
+        );
+    }
+
+    /// S11：下游已提交后必须立刻停止重试 —— 狂暴模式抬高预算上限不得削弱这道保护，
+    /// 否则会对同一个下游连接重复吐字节。
+    #[test]
+    fn s11_raising_the_berserk_budget_still_stops_once_downstream_is_committed() {
+        let budget = InferenceAttemptBudget::new(4);
+        budget.raise_max_attempts_for_berserk(120);
+        assert_eq!(budget.max_attempts(), 120, "狂暴模式应当抬高上限");
+
+        // 抬高之后仍能正常预留。
+        budget
+            .reserve(InferenceAttemptKind::LocalCredential, 0)
+            .expect("抬高上限后应可继续预留");
+
+        budget.mark_downstream_committed();
+        assert!(
+            matches!(
+                budget.reserve(InferenceAttemptKind::LocalCredential, 0),
+                Err(InferenceAttemptRejection::DownstreamCommitted)
+            ),
+            "下游已提交后，无论预算多大都必须停止重试"
+        );
+        assert_eq!(budget.available_attempts(0), 0);
+    }
+
+    #[test]
+    fn berserk_budget_raise_is_monotonic_and_cannot_touch_the_committed_flag() {
+        let budget = InferenceAttemptBudget::new(4);
+        budget.raise_max_attempts_for_berserk(50);
+        // 只升不降：并发 fallback 路径不应因为一次较小的抬高而丢失额度。
+        budget.raise_max_attempts_for_berserk(10);
+        assert_eq!(budget.max_attempts(), 50);
+
+        // 消耗计数只占低 31 位，上限不得溢出踩到「下游已提交」标志位。
+        budget.raise_max_attempts_for_berserk(u32::MAX);
+        assert!(budget.max_attempts() < 1 << 31);
+        budget
+            .reserve(InferenceAttemptKind::LocalCredential, 0)
+            .expect("上限被夹取后仍应可用");
+        assert!(!budget.snapshot().downstream_committed);
+    }
+
+    /// S10：狂暴模式与外部池共存 —— 狂暴只作用于本地账号，外部池的预留语义不变。
+    #[test]
+    fn s10_berserk_does_not_consume_the_external_pool_reservation() {
+        let budget = InferenceAttemptBudget::new(4);
+        // preserve_attempts=1 表示给外部池 fallback 留一次机会。
+        budget.raise_max_attempts_for_berserk(60);
+
+        // 本地狂暴把放大后的额度几乎耗尽……
+        for _ in 0..59 {
+            budget
+                .reserve(InferenceAttemptKind::LocalCredential, 1)
+                .expect("本地狂暴应可持续预留");
+        }
+        // ……第 60 次本地预留被「为 fallback 预留」挡下，而不是直接耗尽。
+        assert!(
+            matches!(
+                budget.reserve(InferenceAttemptKind::LocalCredential, 1),
+                Err(InferenceAttemptRejection::ReservedForFallback)
+            ),
+            "狂暴模式不得吃掉留给外部池的那一次尝试"
+        );
+        // 外部池仍然拿得到它被预留的那次机会。
+        budget
+            .reserve(InferenceAttemptKind::ExternalPool, 0)
+            .expect("外部池的预留额度必须仍然可用");
+
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.external_attempts, 1);
+        assert_eq!(snapshot.local_attempts, 59);
+    }
+
     #[test]
     fn berserk_switches_do_not_change_the_retry_attempt_budget() {
         // 狂暴模式的放大发生在轮换游标上，不该偷偷改写 max_retry_attempts，
@@ -10335,7 +11054,13 @@ impl KiroProvider {
             // 狂暴模式豁免请求级发送预算（默认 clamp 在 1..=10），否则 20 个账号
             // 根本轮不完就被静默截断。豁免后仍由 max_retries 硬封顶，且下游一旦
             // 提交就立即停止重试，不会重复吐字节。
-            if !berserk_plan.active() {
+            if berserk_plan.active() {
+                // 仅放宽 max_retries 是不够的：每次发送前还要过 `budget.reserve`，
+                // 那里以预算自身的上限为准，狂暴模式会被静默截断在 10 次。
+                budget.raise_max_attempts_for_berserk(
+                    max_retries.saturating_add(preserve_attempts as usize) as u32,
+                );
+            } else {
                 max_retries =
                     max_retries.min(budget.available_attempts(preserve_attempts) as usize);
             }
@@ -12111,8 +12836,13 @@ impl KiroProvider {
                 // 狂暴模式下的普通 429 属于「换号即可绕开」的瞬态限流，
                 // 写入全局冷却会让后续请求也看不到这些账号，与「本次请求内暴力轮换」
                 // 的语义冲突；因此仅在狂暴模式关闭时保留既有的全局调度状态写入。
-                let berserk_skips_cooldown =
-                    berserk_plan.active() && failure_kind == ApiUpstreamFailureKind::RateLimit;
+                // kiro-rs-main 三分法的第 ② 类：上游显式给了 Retry-After，说明它已经
+                // 告诉我们「多久之后再来」。此时暴力轮换既无意义又会加剧限流，因此
+                // 狂暴模式在这种 429 上不生效，回落到既有的冷却 + 故障转移路径。
+                let berserk_applies = berserk_plan.active()
+                    && failure_kind == ApiUpstreamFailureKind::RateLimit
+                    && retry_after.is_none();
+                let berserk_skips_cooldown = berserk_applies;
                 if !berserk_skips_cooldown {
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
                         ctx.id,
@@ -12152,7 +12882,7 @@ impl KiroProvider {
                 );
                 // 优先换号：仅当本轮所有账号都已被排除（无可用备选）时，
                 // 才推进到下一个 region，再不行才推进到下一轮。
-                if berserk_plan.active() && !retry_target_available && attempt + 1 < max_retries {
+                if berserk_applies && !retry_target_available && attempt + 1 < max_retries {
                     match rotation_cursor.advance_after_accounts_exhausted(&berserk_plan) {
                         RotationStep::NextRegion { region_index } => {
                             tracing::warn!(
@@ -12189,7 +12919,7 @@ impl KiroProvider {
                             );
                         }
                     }
-                } else if !berserk_plan.active()
+                } else if !berserk_applies
                     && berserk_plan.region_rotation_active()
                     && retry_target_available
                 {
@@ -12214,9 +12944,9 @@ impl KiroProvider {
                         if !delay.is_zero() {
                             sleep(delay).await;
                         }
-                    } else if !(berserk_plan.active()
-                        && failure_kind == ApiUpstreamFailureKind::RateLimit)
-                    {
+                    } else if !berserk_applies {
+                        // 狂暴模式同轮内换号不退避（不同账号不共享配额）；
+                        // 其余情况一律保留既有的指数退避。
                         sleep(Self::retry_delay(attempt)).await;
                     }
                     continue;

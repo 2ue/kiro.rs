@@ -174,7 +174,13 @@ impl AuxiliaryAttemptBudget {
 
 #[derive(Debug)]
 pub(crate) struct InferenceAttemptBudget {
-    max_attempts: u32,
+    /// 请求级发送上限。
+    ///
+    /// 常规路径构造后即固定在 `1..=10`；狂暴模式会通过
+    /// [`raise_max_attempts_for_berserk`] 一次性抬高到 `账号×端点×轮数`，
+    /// 因此这里必须是原子的。抬高只放宽计数上限，`reserve` 的
+    /// 「下游已提交」「为 fallback 预留」两条语义完全不受影响。
+    max_attempts: AtomicU32,
     state: AtomicU32,
     local_attempts: AtomicU32,
     external_attempts: AtomicU32,
@@ -199,10 +205,10 @@ impl InferenceAttemptBudget {
         auxiliary_max_attempts: u32,
     ) -> Self {
         Self {
-            max_attempts: max_attempts.clamp(
+            max_attempts: AtomicU32::new(max_attempts.clamp(
                 MIN_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
                 MAX_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
-            ),
+            )),
             state: AtomicU32::new(0),
             local_attempts: AtomicU32::new(0),
             external_attempts: AtomicU32::new(0),
@@ -212,6 +218,24 @@ impl InferenceAttemptBudget {
             started_at: Instant::now(),
             dispatch_deadline: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn max_attempts(&self) -> u32 {
+        self.max_attempts.load(Ordering::Acquire)
+    }
+
+    /// 狂暴模式抬高请求级发送上限到 `账号数 × 端点数 × 轮数`。
+    ///
+    /// 常规上限硬 clamp 在 `1..=10`，而狂暴模式的整个意义就是把所有账号在所有
+    /// 端点上轮一遍：20 个账号根本轮不完就会被这个上限静默截断。这里只放宽计数
+    /// 上限，`reserve` 仍然逐次预留，「下游已提交后立即停止」的保护不受影响。
+    ///
+    /// 只升不降：并发的 fallback 路径不会因为本次抬高而丢失既有额度。
+    pub(crate) fn raise_max_attempts_for_berserk(&self, required: u32) {
+        // 消耗计数与「下游已提交」共用一个 u32，计数只占低 31 位，
+        // 上限必须留在 CONSUMED_MASK 之内，否则计数会溢出踩到标志位。
+        self.max_attempts
+            .fetch_max(required.min(CONSUMED_MASK), Ordering::AcqRel);
     }
 
     /// The request start is shared by local and external routing phases.  A
@@ -255,9 +279,9 @@ impl InferenceAttemptBudget {
         kind: InferenceAttemptKind,
         preserve_attempts: u32,
     ) -> Result<u32, InferenceAttemptRejection> {
-        let effective_limit = self
-            .max_attempts
-            .saturating_sub(preserve_attempts.min(self.max_attempts.saturating_sub(1)));
+        let max_attempts = self.max_attempts();
+        let effective_limit =
+            max_attempts.saturating_sub(preserve_attempts.min(max_attempts.saturating_sub(1)));
         let next = self
             .state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
@@ -271,7 +295,7 @@ impl InferenceAttemptBudget {
             .map_err(|state| {
                 if state & DOWNSTREAM_COMMITTED_BIT != 0 {
                     InferenceAttemptRejection::DownstreamCommitted
-                } else if state & CONSUMED_MASK < self.max_attempts {
+                } else if state & CONSUMED_MASK < max_attempts {
                     InferenceAttemptRejection::ReservedForFallback
                 } else {
                     self.exhausted.store(true, Ordering::Release);
@@ -304,8 +328,8 @@ impl InferenceAttemptBudget {
             return 0;
         }
         let consumed = state & CONSUMED_MASK;
-        self.max_attempts
-            .saturating_sub(preserve_attempts.min(self.max_attempts.saturating_sub(1)))
+        self.max_attempts()
+            .saturating_sub(preserve_attempts.min(self.max_attempts().saturating_sub(1)))
             .saturating_sub(consumed)
     }
 
@@ -313,12 +337,12 @@ impl InferenceAttemptBudget {
         let state = self.state.load(Ordering::Acquire);
         let consumed = state & CONSUMED_MASK;
         InferenceAttemptSnapshot {
-            max_attempts: self.max_attempts,
+            max_attempts: self.max_attempts(),
             consumed,
             local_attempts: self.local_attempts.load(Ordering::Acquire),
             external_attempts: self.external_attempts.load(Ordering::Acquire),
             mcp_attempts: self.mcp_attempts.load(Ordering::Acquire),
-            exhausted: consumed >= self.max_attempts || self.exhausted.load(Ordering::Acquire),
+            exhausted: consumed >= self.max_attempts() || self.exhausted.load(Ordering::Acquire),
             downstream_committed: state & DOWNSTREAM_COMMITTED_BIT != 0,
         }
     }
