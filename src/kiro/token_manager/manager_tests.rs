@@ -7393,7 +7393,7 @@ fn global_runtime_capacity_change_still_resets_warmup() {
     // 单账号属性修改与全局运行时配置变更是两回事：后者改变的是所有账号的
     // 容量基线，重置 warmup 仍然是既有的有意行为，不在本次修复范围内。
     let mut updated = config.clone();
-    updated.credential_rpm = config.credential_rpm + 10;
+    updated.credential_rpm = Some(config.credential_rpm.unwrap_or(0) + 10);
     let reset = manager.reset_active_warmup_after_runtime_capacity_change(
         &config,
         &updated,
