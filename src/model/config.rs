@@ -4201,6 +4201,15 @@ fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
     2
 }
 
+/// 狂暴模式轮数上限。
+///
+/// 总尝试量是 `账号数 × region数 × 轮数`，放开轮数会让单个下游请求打出成百上千次
+/// 上游调用。管理端校验与运行时 clamp 共用此常量，避免两处阈值漂移。
+pub const MAX_LOCAL_BERSERK_ROUNDS: u32 = 10;
+
+/// 狂暴模式跨轮间隔上限 60s：sleep 期间并发 lease 仍被占用，不能无限拉长。
+pub const MAX_LOCAL_BERSERK_ROUND_DELAY_MS: u64 = 60_000;
+
 /// 狂暴模式默认轮换 1 轮：开启后至少完整遍历一遍 `账号 × region`。
 pub(crate) fn default_local_berserk_max_rounds() -> u32 {
     1
@@ -5889,6 +5898,41 @@ mod tests {
 
         assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
         assert_eq!(config.kiro_agent_mode_strategy, KiroAgentModeStrategy::Auto);
+    }
+
+    #[test]
+    fn berserk_switches_round_trip_through_camel_case() {
+        let mut config = Config::default();
+        config.kiro_upstream_region_rotation_enabled = true;
+        config.local_berserk_mode_enabled = true;
+        config.local_berserk_max_rounds = 7;
+        config.local_berserk_round_delay_ms = 2_500;
+
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["kiroUpstreamRegionRotationEnabled"], true);
+        assert_eq!(serialized["localBerserkModeEnabled"], true);
+        assert_eq!(serialized["localBerserkMaxRounds"], 7);
+        assert_eq!(serialized["localBerserkRoundDelayMs"], 2_500);
+        // 端点列表已内置，不得再出现在序列化结果里——否则旧前端会把它当成可配项。
+        assert!(serialized.get("kiroUpstreamRegionRotation").is_none());
+
+        let restored: Config = serde_json::from_value(serialized).unwrap();
+        assert!(restored.kiro_upstream_region_rotation_enabled);
+        assert!(restored.local_berserk_mode_enabled);
+        assert_eq!(restored.local_berserk_max_rounds, 7);
+        assert_eq!(restored.local_berserk_round_delay_ms, 2_500);
+    }
+
+    #[test]
+    fn berserk_fields_absent_from_stored_config_fall_back_to_disabled_defaults() {
+        // 升级场景：老配置文件里没有这几个键，反序列化后必须是「全关」，
+        // 否则升级会在用户毫不知情的情况下启用狂暴轮换。
+        let config: Config = serde_json::from_str(r#"{"apiKey":"sk-legacy"}"#).unwrap();
+
+        assert!(!config.kiro_upstream_region_rotation_enabled);
+        assert!(!config.local_berserk_mode_enabled);
+        assert_eq!(config.local_berserk_max_rounds, 1);
+        assert_eq!(config.local_berserk_round_delay_ms, 1_000);
     }
 
     #[test]

@@ -6229,6 +6229,121 @@ mod tests {
         assert_eq!(KiroProvider::test_max_retry_attempts(10_000, &config), 12);
     }
 
+    #[test]
+    fn berserk_switches_do_not_change_the_retry_attempt_budget() {
+        // 狂暴模式的放大发生在轮换游标上，不该偷偷改写 max_retry_attempts，
+        // 否则「关闭时零影响」的保证就无从谈起。
+        let baseline = KiroProvider::test_max_retry_attempts(25, &Config::default());
+
+        let mut config = Config::default();
+        config.kiro_upstream_region_rotation_enabled = true;
+        assert_eq!(KiroProvider::test_max_retry_attempts(25, &config), baseline);
+
+        config.local_berserk_mode_enabled = true;
+        config.local_berserk_max_rounds = 10;
+        config.local_berserk_round_delay_ms = 8_000;
+        assert_eq!(KiroProvider::test_max_retry_attempts(25, &config), baseline);
+    }
+
+    #[test]
+    fn retry_backoff_doubles_from_200ms_and_caps_at_two_seconds() {
+        assert_eq!(KiroProvider::test_retry_backoff_ms(0), 200);
+        assert_eq!(KiroProvider::test_retry_backoff_ms(1), 400);
+        assert_eq!(KiroProvider::test_retry_backoff_ms(2), 800);
+        assert_eq!(KiroProvider::test_retry_backoff_ms(3), 1_600);
+        // 第 4 次起触顶，之后恒为 2s —— 包括远超 `attempt.min(6)` 夹取点的取值，
+        // 确认不会因 2^n 溢出而回绕成一个很小的退避。
+        for attempt in [4usize, 5, 6, 7, 64, usize::MAX] {
+            assert_eq!(
+                KiroProvider::test_retry_backoff_ms(attempt),
+                2_000,
+                "attempt={attempt} 应封顶在 2s"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_backoff_is_monotonic_until_the_cap() {
+        let mut previous = 0;
+        for attempt in 0..8 {
+            let current = KiroProvider::test_retry_backoff_ms(attempt);
+            assert!(
+                current >= previous,
+                "退避曲线必须单调不降：attempt={attempt} {current} < {previous}"
+            );
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn retry_jitter_stays_within_a_quarter_of_the_backoff() {
+        for attempt in 0..8 {
+            let backoff = KiroProvider::test_retry_backoff_ms(attempt);
+            let ceiling = KiroProvider::test_retry_jitter_ceiling_ms(backoff);
+            assert_eq!(ceiling, (backoff / 4).max(1));
+            // 抖动只能往上加 25%，总时长因此严格落在 [backoff, backoff * 1.25]。
+            assert!(backoff + ceiling <= backoff + backoff / 4 + 1);
+        }
+
+        // 退避极小时抖动不能塌成 0..=0 的空区间。
+        assert_eq!(KiroProvider::test_retry_jitter_ceiling_ms(0), 1);
+        assert_eq!(KiroProvider::test_retry_jitter_ceiling_ms(3), 1);
+    }
+
+    #[test]
+    fn http_status_classification_separates_retryable_from_terminal_failures() {
+        use super::ApiUpstreamFailureKind;
+        use reqwest::StatusCode;
+
+        // 参与重试/轮换的瞬态类：429 / 408 / 5xx。
+        assert_eq!(
+            KiroProvider::test_classify_http_status_failure(StatusCode::TOO_MANY_REQUESTS),
+            ApiUpstreamFailureKind::RateLimit
+        );
+        assert_eq!(
+            KiroProvider::test_classify_http_status_failure(StatusCode::REQUEST_TIMEOUT),
+            ApiUpstreamFailureKind::Timeout
+        );
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(
+                KiroProvider::test_classify_http_status_failure(status),
+                ApiUpstreamFailureKind::Server,
+                "{status} 应归类为可重试的服务端错误"
+            );
+        }
+
+        // 终止类：不得进入狂暴轮换，否则会把必然失败的请求放大 N×M×R 倍。
+        assert_eq!(
+            KiroProvider::test_classify_http_status_failure(StatusCode::BAD_REQUEST),
+            ApiUpstreamFailureKind::InvalidRequest
+        );
+        assert_eq!(
+            KiroProvider::test_classify_http_status_failure(StatusCode::PAYMENT_REQUIRED),
+            ApiUpstreamFailureKind::Quota
+        );
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert_eq!(
+                KiroProvider::test_classify_http_status_failure(status),
+                ApiUpstreamFailureKind::Auth,
+                "{status} 应归类为鉴权失败"
+            );
+        }
+        // 其余 4xx 一律按无效请求处理，不参与轮换。
+        assert_eq!(
+            KiroProvider::test_classify_http_status_failure(StatusCode::NOT_FOUND),
+            ApiUpstreamFailureKind::InvalidRequest
+        );
+        assert_eq!(
+            KiroProvider::test_classify_http_status_failure(StatusCode::PAYLOAD_TOO_LARGE),
+            ApiUpstreamFailureKind::InvalidRequest
+        );
+    }
+
     #[tokio::test]
     async fn mcp_local_acquire_failure_stops_retry_loop() {
         let mut config = Config::default();
@@ -7164,6 +7279,11 @@ impl KiroProvider {
             _ if status.is_client_error() => ApiUpstreamFailureKind::InvalidRequest,
             _ => ApiUpstreamFailureKind::Unknown,
         }
+    }
+
+    #[cfg(test)]
+    fn test_classify_http_status_failure(status: reqwest::StatusCode) -> ApiUpstreamFailureKind {
+        Self::classify_http_status_failure(status)
     }
 
     fn api_transport_failure_diagnostic(kind: ApiUpstreamFailureKind) -> String {
@@ -12241,21 +12361,43 @@ impl KiroProvider {
         Self::max_retry_attempts(total_credentials, config)
     }
 
-    #[cfg(not(test))]
-    fn retry_delay(attempt: usize) -> Duration {
-        // 指数退避 + 少量抖动，避免上游抖动时放大故障
+    /// 指数退避的确定性部分：200ms 起步翻倍、封顶 2s。
+    ///
+    /// 与抖动拆开是为了让退避曲线可被单测断言 —— `retry_delay` 在 `cfg(test)`
+    /// 下被压成 1ms 以免拖慢测试，曲线本身便无从验证。
+    fn retry_backoff_ms(attempt: usize) -> u64 {
         const BASE_MS: u64 = 200;
         const MAX_MS: u64 = 2_000;
         let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
-        let backoff = exp.min(MAX_MS);
-        let jitter_max = (backoff / 4).max(1);
-        let jitter = fastrand::u64(0..=jitter_max);
+        exp.min(MAX_MS)
+    }
+
+    /// 抖动上界 = 退避的 1/4，至少 1ms。
+    fn retry_jitter_ceiling_ms(backoff_ms: u64) -> u64 {
+        (backoff_ms / 4).max(1)
+    }
+
+    #[cfg(not(test))]
+    fn retry_delay(attempt: usize) -> Duration {
+        // 指数退避 + 少量抖动，避免上游抖动时放大故障
+        let backoff = Self::retry_backoff_ms(attempt);
+        let jitter = fastrand::u64(0..=Self::retry_jitter_ceiling_ms(backoff));
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
     #[cfg(test)]
     fn retry_delay(_attempt: usize) -> Duration {
         Duration::from_millis(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retry_backoff_ms(attempt: usize) -> u64 {
+        Self::retry_backoff_ms(attempt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retry_jitter_ceiling_ms(backoff_ms: u64) -> u64 {
+        Self::retry_jitter_ceiling_ms(backoff_ms)
     }
 
     fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {

@@ -34,10 +34,10 @@
 
 use std::time::Duration;
 
-use crate::model::config::Config;
+use crate::model::config::{Config, MAX_LOCAL_BERSERK_ROUNDS};
 
-/// 狂暴轮数硬上限，与 admin 校验保持一致。
-pub(crate) const MAX_BERSERK_ROUNDS: u32 = 10;
+/// 狂暴轮数硬上限，与 admin 校验共用 `MAX_LOCAL_BERSERK_ROUNDS` 这一个来源。
+pub(crate) const MAX_BERSERK_ROUNDS: u32 = MAX_LOCAL_BERSERK_ROUNDS;
 
 /// 官方 Kiro/Q 上游只在 `us-east-1` 与 `eu-central-1` 两个端点提供服务。
 ///

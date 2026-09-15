@@ -84,8 +84,9 @@ use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
 use crate::model::config::{
-    Config, ExternalPoolsConfig, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM,
-    MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
+    Config, ExternalPoolsConfig, MAX_LOCAL_BERSERK_ROUND_DELAY_MS, MAX_LOCAL_BERSERK_ROUNDS,
+    MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
+    MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
 };
 use crate::model::model_support::{
     expand_claude_supported_model_variants, normalize_supported_models,
@@ -5136,18 +5137,7 @@ impl AdminService {
                 "credentialPromptLogicRetryMaxAttempts 不能大于 10000".to_string(),
             ));
         }
-        // 狂暴轮数上限 10：总尝试量是 账号数 × region数 × 轮数，放开轮数会让
-        // 单个下游请求打出成百上千次上游调用，必须硬性封顶。
-        if !(1..=10).contains(&local_berserk_max_rounds) {
-            return Err(AdminServiceError::InvalidCredential(
-                "localBerserkMaxRounds 必须在 1 到 10 之间".to_string(),
-            ));
-        }
-        if local_berserk_round_delay_ms > 60_000 {
-            return Err(AdminServiceError::InvalidCredential(
-                "localBerserkRoundDelayMs 不能大于 60000".to_string(),
-            ));
-        }
+        validate_berserk_settings(local_berserk_max_rounds, local_berserk_round_delay_ms)?;
         if kiro_upstream_response_timeout_secs > 86_400 {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
@@ -5909,6 +5899,27 @@ fn validate_runtime_cooldown_settings(
         return Err(AdminServiceError::InvalidCredential(
             "各错误类型基础冷却秒数必须大于 0".to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// 校验狂暴模式的两个数值参数。
+///
+/// 轮数上限 10：总尝试量是 账号数 × region数 × 轮数，放开轮数会让单个下游请求
+/// 打出成百上千次上游调用。轮次间隔上限 60s：跨轮 sleep 期间并发 lease 仍被占用。
+fn validate_berserk_settings(
+    max_rounds: u32,
+    round_delay_ms: u64,
+) -> Result<(), AdminServiceError> {
+    if !(1..=MAX_LOCAL_BERSERK_ROUNDS).contains(&max_rounds) {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "localBerserkMaxRounds 必须在 1 到 {MAX_LOCAL_BERSERK_ROUNDS} 之间"
+        )));
+    }
+    if round_delay_ms > MAX_LOCAL_BERSERK_ROUND_DELAY_MS {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "localBerserkRoundDelayMs 不能大于 {MAX_LOCAL_BERSERK_ROUND_DELAY_MS}"
+        )));
     }
     Ok(())
 }

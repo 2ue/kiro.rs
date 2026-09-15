@@ -202,6 +202,62 @@ fn runtime_cooldown_validation_rejects_zero_values() {
 }
 
 #[test]
+fn berserk_settings_accept_the_full_supported_range() {
+    let config = crate::model::config::Config::default();
+    // 默认配置必须能通过校验，否则未改过任何设置的用户一保存就报错。
+    validate_berserk_settings(
+        config.local_berserk_max_rounds,
+        config.local_berserk_round_delay_ms,
+    )
+    .expect("默认配置应当通过校验");
+
+    for rounds in 1..=MAX_LOCAL_BERSERK_ROUNDS {
+        validate_berserk_settings(rounds, 0).expect("1..=上限的轮数都应接受");
+    }
+    validate_berserk_settings(1, MAX_LOCAL_BERSERK_ROUND_DELAY_MS)
+        .expect("间隔取到上限应当接受");
+}
+
+#[test]
+fn berserk_rounds_validation_rejects_zero_and_overflow() {
+    // 0 轮语义含糊（关闭？还是不重试？），一律要求显式用开关表达关闭。
+    assert!(matches!(
+        validate_berserk_settings(0, 1_000),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+    assert!(matches!(
+        validate_berserk_settings(MAX_LOCAL_BERSERK_ROUNDS + 1, 1_000),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+    assert!(matches!(
+        validate_berserk_settings(u32::MAX, 1_000),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+}
+
+#[test]
+fn berserk_round_delay_validation_rejects_values_above_one_minute() {
+    assert!(matches!(
+        validate_berserk_settings(1, MAX_LOCAL_BERSERK_ROUND_DELAY_MS + 1),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+    assert!(matches!(
+        validate_berserk_settings(1, u64::MAX),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+}
+
+#[test]
+fn berserk_admin_bound_matches_the_runtime_clamp() {
+    // 校验阈值与 retry_pipeline 的 clamp 必须同源，否则管理端放行的轮数
+    // 会被运行时静默改写，用户看到的配置与实际行为不一致。
+    assert_eq!(
+        MAX_LOCAL_BERSERK_ROUNDS,
+        crate::kiro::retry_pipeline::MAX_BERSERK_ROUNDS
+    );
+}
+
+#[test]
 fn external_pool_transient_failure_priority_penalty_validation_is_bounded() {
     let mut config = ExternalPoolsConfig {
         external_pool_transient_failure_priority_penalty: 10_000,
