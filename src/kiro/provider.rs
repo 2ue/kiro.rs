@@ -6798,7 +6798,7 @@ mod tests {
         let rule: RotationRule = Arc::new(move |attempt: &RotationAttempt| {
             if attempt.account == lucky && attempt.region == secondary {
                 RotationReply::Success
-            } else if attempt.account % 2 == 0 {
+            } else if attempt.account.is_multiple_of(2) {
                 RotationReply::ServerError
             } else {
                 RotationReply::TooManyRequests

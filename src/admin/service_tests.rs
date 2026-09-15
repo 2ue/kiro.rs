@@ -1004,9 +1004,10 @@ fn external_pool_quality_defaults_pass_validation() {
 
 #[test]
 fn external_pool_quality_ewma_alpha_validation_is_bounded() {
-    let mut config = ExternalPoolsConfig::default();
-
-    config.external_pool_quality_ewma_alpha = 0.01;
+    let mut config = ExternalPoolsConfig {
+        external_pool_quality_ewma_alpha: 0.01,
+        ..Default::default()
+    };
     validate_external_pools_config(&config).expect("下界必须被接受");
     config.external_pool_quality_ewma_alpha = 1.0;
     validate_external_pools_config(&config).expect("上界必须被接受");
@@ -1057,9 +1058,11 @@ fn external_pool_quality_weights_reject_negative_and_non_finite() {
 #[test]
 fn external_pool_probation_ceiling_cannot_be_below_single_probation() {
     // 避让上限小于单次避让时长会让指数退避的上限语义自相矛盾。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_degrade_probation_secs = 600;
-    config.external_pool_max_probation_secs = 300;
+    let mut config = ExternalPoolsConfig {
+        external_pool_degrade_probation_secs: 600,
+        external_pool_max_probation_secs: 300,
+        ..Default::default()
+    };
     let err = validate_external_pools_config(&config).unwrap_err();
     assert!(
         err.contains("externalPoolMaxProbationSecs"),
@@ -1089,13 +1092,17 @@ fn external_pool_degrade_error_rate_threshold_is_a_ratio() {
 
 #[test]
 fn external_pool_quality_probe_share_and_top_k_are_bounded() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_probe_share_percent = 101;
+    let config = ExternalPoolsConfig {
+        external_pool_probe_share_percent: 101,
+        ..Default::default()
+    };
     let err = validate_external_pools_config(&config).unwrap_err();
     assert!(err.contains("externalPoolProbeSharePercent"), "{err}");
 
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_top_k = 101;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_top_k: 101,
+        ..Default::default()
+    };
     let err = validate_external_pools_config(&config).unwrap_err();
     assert!(err.contains("externalPoolQualityTopK"), "{err}");
 }

@@ -3150,8 +3150,10 @@ fn inference_attempt_rejection_keeps_attempt_list_empty_and_public_error_masked(
 
 #[test]
 fn pool_auto_disable_policy_can_override_global_switch() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_auto_disable_enabled = false;
+    let mut config = ExternalPoolsConfig {
+        external_pool_auto_disable_enabled: false,
+        ..Default::default()
+    };
 
     assert!(!pool_auto_disable_policy_enabled(
         ExternalPoolAutoDisablePolicy::Inherit,
@@ -3203,8 +3205,10 @@ fn external_pool_default_retry_attempts_cover_eligible_pools_and_payload_guard_r
 
 #[test]
 fn external_pool_skip_reason_respects_enabled_switches_and_capacity() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pools_enabled = false;
+    let mut config = ExternalPoolsConfig {
+        external_pools_enabled: false,
+        ..Default::default()
+    };
     let mut pool = test_pool("https://pool.example.test", true);
 
     assert_eq!(
@@ -3323,8 +3327,10 @@ async fn external_pool_manager_respects_disabled_switch_and_disabled_pools() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pools_enabled = false;
+    let mut config = ExternalPoolsConfig {
+        external_pools_enabled: false,
+        ..Default::default()
+    };
 
     let disabled = postgres
         .create_external_pool(create_pool_request("external-disabled", 1, false))
@@ -3432,9 +3438,11 @@ async fn external_pool_manager_distinguishes_global_capacity_from_no_pool() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pools_enabled = true;
-    config.external_pool_global_max_concurrent_requests = 1;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 1,
+        ..Default::default()
+    };
 
     let primary = postgres
         .create_external_pool(create_pool_request("external-global-a", 1, true))
@@ -3740,8 +3748,10 @@ async fn external_pool_fallback_eligibility_bypasses_stale_empty_cache() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pools_enabled = true;
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        ..Default::default()
+    };
 
     let cached_empty = manager
         .pool_availability_snapshot(&HashSet::new(), &config)
@@ -17585,8 +17595,10 @@ const DISTRIBUTION_ROUNDS: usize = 4_000;
 fn quality_scheduling_disabled_matches_legacy_selection_exactly() {
     // 主开关关闭时必须走 legacy 路径，与变更前行为完全一致：
     // 只选最优先级 + 最低负载层，且质量数据**完全不影响**结果。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_aware_scheduling_enabled = false;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: false,
+        ..Default::default()
+    };
 
     // 给低优先级池配极好的质量、高优先级池配极差的质量。
     // 开关关闭时，质量必须被完全忽略，高优先级池仍然全取。
@@ -17607,8 +17619,10 @@ fn quality_scheduling_disabled_matches_legacy_selection_exactly() {
 #[test]
 fn quality_scheduling_disabled_preserves_legacy_load_balancing() {
     // legacy 的同优先级负载均衡语义必须保持：负载低的胜出。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_aware_scheduling_enabled = false;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: false,
+        ..Default::default()
+    };
 
     let mut light = test_pool("https://light.example.test", true);
     light.id = 1;
@@ -17878,20 +17892,24 @@ fn quality_scheduling_handles_pools_without_any_quality_data() {
 
 #[test]
 fn quality_scheduling_top_k_larger_than_candidate_count_is_safe() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_top_k = 99;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_top_k: 99,
+        ..Default::default()
+    };
     let candidates = vec![
         scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
         scored_pool(2, 1, 0.1, Some(300.0), Some(1_200.0)),
     ];
     let shares = selection_shares(&candidates, &config, 0, 500);
-    assert_eq!(shares.values().map(|share| share).sum::<f64>().round(), 1.0);
+    assert_eq!(shares.values().sum::<f64>().round(), 1.0);
 }
 
 #[test]
 fn quality_scheduling_top_k_one_always_picks_the_best_scoring_pool() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_top_k = 1;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_top_k: 1,
+        ..Default::default()
+    };
     let candidates = vec![
         scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
         scored_pool(2, 1, 0.9, Some(9_000.0), Some(50_000.0)),
@@ -17981,8 +17999,10 @@ fn degrade_requires_error_rate_at_or_above_threshold() {
 #[test]
 fn degrade_never_fires_when_master_switch_is_off() {
     // 主开关关闭时不得写入任何避让状态，否则关开关也无法回退。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_aware_scheduling_enabled = false;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: false,
+        ..Default::default()
+    };
     assert_eq!(
         evaluate_external_pool_degrade(&degrade_state(1.0, 0), &config, 0),
         ExternalPoolDegradeDecision::Keep
@@ -18006,9 +18026,11 @@ fn degrade_ignores_pools_with_insufficient_samples() {
 
 #[test]
 fn degrade_uses_the_current_window_failure_rate() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_min_samples = 5;
-    config.external_pool_degrade_error_rate_threshold = 0.5;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_min_samples: 5,
+        external_pool_degrade_error_rate_threshold: 0.5,
+        ..Default::default()
+    };
 
     // 历史 EWMA 很高，但当前窗口已经恢复：不能因为旧失败率再次触发避让。
     let recovered_window = ExternalPoolQualityState {
@@ -18061,9 +18083,11 @@ fn degrade_does_not_extend_an_active_probation() {
 
 #[test]
 fn degrade_backoff_doubles_and_is_capped() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_degrade_probation_secs = 100;
-    config.external_pool_max_probation_secs = 700;
+    let config = ExternalPoolsConfig {
+        external_pool_degrade_probation_secs: 100,
+        external_pool_max_probation_secs: 700,
+        ..Default::default()
+    };
 
     let secs_at = |level: u32| -> i64 {
         match evaluate_external_pool_degrade(&degrade_state(1.0, level), &config, 0) {
@@ -18095,8 +18119,10 @@ fn degrade_level_increments_from_existing_level() {
 
 #[test]
 fn degrade_level_resets_after_recovery_ramp() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_recovery_ramp_secs = 60;
+    let config = ExternalPoolsConfig {
+        external_pool_recovery_ramp_secs: 60,
+        ..Default::default()
+    };
     let state = ExternalPoolQualityState {
         recent_error_rate: 1.0,
         sample_count: 100,
@@ -18117,11 +18143,13 @@ fn degrade_level_resets_after_recovery_ramp() {
 #[test]
 fn degrade_ttl_covers_probation_window_plus_recovery_ramp() {
     // TTL 若短于避让窗口，避让状态会随 Redis 键过期被抹掉，降级形同虚设。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_degrade_probation_secs = 300;
-    config.external_pool_max_probation_secs = 300;
-    config.external_pool_recovery_ramp_secs = 60;
-    config.external_pool_quality_sample_ttl_secs = 10;
+    let config = ExternalPoolsConfig {
+        external_pool_degrade_probation_secs: 300,
+        external_pool_max_probation_secs: 300,
+        external_pool_recovery_ramp_secs: 60,
+        external_pool_quality_sample_ttl_secs: 10,
+        ..Default::default()
+    };
 
     match evaluate_external_pool_degrade(&degrade_state(1.0, 0), &config, 0) {
         ExternalPoolDegradeDecision::Probation {
@@ -18154,9 +18182,11 @@ fn probationary_pool(id: u64, priority: i32, until_ms: i64) -> ExternalPoolCandi
 fn probationary_pool_still_receives_probe_traffic_outside_top_k() {
     // 核心回归：Top-K = 3 且有 3 个健康池时，被避让的池会排在第 4 位，
     // 纯罚分方案会让它拿到**零**流量，从而永远无法自证恢复。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_top_k = 3;
-    config.external_pool_probe_share_percent = 10;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_top_k: 3,
+        external_pool_probe_share_percent: 10,
+        ..Default::default()
+    };
 
     let candidates = vec![
         scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
@@ -18176,9 +18206,11 @@ fn probationary_pool_still_receives_probe_traffic_outside_top_k() {
 #[test]
 fn probe_share_zero_gives_probationary_pool_no_traffic() {
     // 探测比例设为 0 时退化为"硬避让"，必须尊重该配置。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_top_k = 3;
-    config.external_pool_probe_share_percent = 0;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_top_k: 3,
+        external_pool_probe_share_percent: 0,
+        ..Default::default()
+    };
 
     let candidates = vec![
         scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
@@ -18194,8 +18226,10 @@ fn probe_share_zero_gives_probationary_pool_no_traffic() {
 #[test]
 fn all_probationary_pools_still_share_traffic_fairly() {
     // 全员避让（上游整体故障）：候选集不得被清空，且不得退化成只打一个池。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_probe_share_percent = 10;
+    let config = ExternalPoolsConfig {
+        external_pool_probe_share_percent: 10,
+        ..Default::default()
+    };
 
     let candidates = vec![
         probationary_pool(1, 1, 10_000),
@@ -18217,8 +18251,10 @@ fn all_probationary_pools_still_share_traffic_fairly() {
 fn probe_traffic_never_crosses_priority_tiers() {
     // 探测流量只在最优优先级层内发生：一个低优先级的避让池
     // 不得借探测通道抢到高优先级层的流量。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_probe_share_percent = 50;
+    let config = ExternalPoolsConfig {
+        external_pool_probe_share_percent: 50,
+        ..Default::default()
+    };
 
     let candidates = vec![
         scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
@@ -18240,9 +18276,11 @@ fn probe_traffic_reaches_a_pool_demoted_by_its_failure_streak() {
     //
     // 这与"用户配置的低优先级"必须区别对待：
     // 这个池的**基础优先级与主池相同**，只是被系统的失败惩罚降了下去。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_probe_share_percent = 20;
-    config.external_pool_transient_failure_priority_penalty = 20;
+    let config = ExternalPoolsConfig {
+        external_pool_probe_share_percent: 20,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..Default::default()
+    };
 
     let healthy = scored_pool(1, 5, 0.0, Some(200.0), Some(1_000.0));
     let mut demoted = probationary_pool(2, 5, 10_000);
@@ -18261,9 +18299,11 @@ fn probe_traffic_reaches_a_pool_demoted_by_its_failure_streak() {
 fn probe_traffic_still_respects_user_configured_priority_for_demoted_pools() {
     // 边界：一个池既是用户配置的低优先级、又背着连击、还在避让期。
     // 用户意图优先——它不该拿到探测流量。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_probe_share_percent = 50;
-    config.external_pool_transient_failure_priority_penalty = 20;
+    let config = ExternalPoolsConfig {
+        external_pool_probe_share_percent: 50,
+        external_pool_transient_failure_priority_penalty: 20,
+        ..Default::default()
+    };
 
     let healthy = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
     let mut demoted_backup = probationary_pool(2, 9, 10_000);
@@ -18282,9 +18322,11 @@ fn probe_traffic_still_respects_user_configured_priority_for_demoted_pools() {
 #[test]
 fn recovery_ramp_gradually_restores_traffic_after_probation_expires() {
     // 避让到期不得瞬间全量回流，份额必须随时间单调回升。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_recovery_ramp_secs = 60;
-    config.external_pool_probe_share_percent = 0;
+    let config = ExternalPoolsConfig {
+        external_pool_recovery_ramp_secs: 60,
+        external_pool_probe_share_percent: 0,
+        ..Default::default()
+    };
 
     let recovered = |elapsed_ms: i64| -> f64 {
         let until_ms = 10_000;
@@ -18326,9 +18368,11 @@ fn recovery_ramp_gradually_restores_traffic_after_probation_expires() {
 fn never_recovering_pool_keeps_being_re_probationed() {
     // D3 "永不恢复"：每次避让到期后失败率仍超标，层级必须持续递增、
     // 避让时长持续拉长，直至上限。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_degrade_probation_secs = 100;
-    config.external_pool_max_probation_secs = 400;
+    let config = ExternalPoolsConfig {
+        external_pool_degrade_probation_secs: 100,
+        external_pool_max_probation_secs: 400,
+        ..Default::default()
+    };
 
     let mut level = 0u32;
     let mut now_ms = 0i64;
@@ -18354,9 +18398,11 @@ fn never_recovering_pool_keeps_being_re_probationed() {
 
 #[test]
 fn quality_view_reports_probation_countdown_and_recovery_progress() {
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_min_samples = 5;
-    config.external_pool_recovery_ramp_secs = 60;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_min_samples: 5,
+        external_pool_recovery_ramp_secs: 60,
+        ..Default::default()
+    };
 
     let state = ExternalPoolQualityState {
         recent_error_rate: 0.75,
@@ -18432,8 +18478,10 @@ fn quality_config_serializes_with_the_camel_case_keys_the_ui_sends() {
 fn quality_view_marks_cold_start_pools_as_not_scoring() {
     // 样本不足时必须显式告诉运维"这个池的数据还没参与调度"，
     // 否则会误以为调度器在依据一份难看的冷启动数据决策。
-    let mut config = ExternalPoolsConfig::default();
-    config.external_pool_quality_min_samples = 10;
+    let config = ExternalPoolsConfig {
+        external_pool_quality_min_samples: 10,
+        ..Default::default()
+    };
 
     let state = ExternalPoolQualityState {
         recent_error_rate: 1.0,

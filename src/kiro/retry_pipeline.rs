@@ -491,6 +491,7 @@ mod tests {
     #[test]
     fn attempt_budget_treats_empty_pool_as_a_single_account() {
         let plan = BerserkPlan::from_config(&config_with(true, true, 2, 0));
-        assert_eq!(plan.attempt_budget(0), Some(1 * 2 * 2));
+        // 账号 1（空池按单账号兜底）× 端点 2 × 轮数 2。
+        assert_eq!(plan.attempt_budget(0), Some(4));
     }
 }

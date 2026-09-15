@@ -323,6 +323,20 @@ pub struct ExternalPoolCapacityState {
     pub global_in_flight_requests: u32,
 }
 
+/// 外部池质量采样的调参项。
+///
+/// 这三个值都来自运行时配置而非单次请求，打包传递可以让采样入口的签名
+/// 只保留「这次请求发生了什么」，避免调用点把一串裸标量排错顺序。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExternalPoolQualitySampleTuning {
+    /// 失败率/延迟 EWMA 的平滑系数。
+    pub alpha: f64,
+    /// 质量状态在 Redis 中的存活时长。
+    pub ttl: StdDuration,
+    /// 劣化判定窗口；`ZERO` 表示不维护独立窗口。
+    pub degrade_window: StdDuration,
+}
+
 /// 外部池被动质量采样状态。
 ///
 /// 全部字段都来自真实用户请求，不做任何主动探测。该状态只在 Redis 中保存
@@ -5131,9 +5145,11 @@ impl RedisStore {
             success,
             ttft_ms,
             latency_ms,
-            alpha,
-            ttl,
-            StdDuration::ZERO,
+            ExternalPoolQualitySampleTuning {
+                alpha,
+                ttl,
+                degrade_window: StdDuration::ZERO,
+            },
         )
         .await
     }
@@ -5148,10 +5164,13 @@ impl RedisStore {
         success: bool,
         ttft_ms: Option<u64>,
         latency_ms: Option<u64>,
-        alpha: f64,
-        ttl: StdDuration,
-        degrade_window: StdDuration,
+        tuning: ExternalPoolQualitySampleTuning,
     ) -> anyhow::Result<ExternalPoolQualityState> {
+        let ExternalPoolQualitySampleTuning {
+            alpha,
+            ttl,
+            degrade_window,
+        } = tuning;
         let script = r#"
             local raw = redis.pcall('GET', KEYS[1])
             if type(raw) == 'table' and raw.err then
@@ -5240,13 +5259,13 @@ impl RedisStore {
         let encoded: String = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
-            .arg(self.key(&external_pool_quality_key(pool_id)))
+            .arg(self.key(external_pool_quality_key(pool_id)))
             .arg(i64::from(success))
             .arg(ttft_ms.map(|value| value as i64).unwrap_or(-1))
             .arg(latency_ms.map(|value| value as i64).unwrap_or(-1))
             .arg(alpha.clamp(0.01, 1.0))
             .arg(ttl.as_millis().max(1) as i64)
-            .arg(degrade_window.as_millis().max(0) as i64)
+            .arg(degrade_window.as_millis() as i64)
             .query_async(&mut manager)
             .await?;
         Ok(decode_external_pool_quality_state(&encoded).unwrap_or_default())
@@ -5315,7 +5334,7 @@ impl RedisStore {
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
-            .arg(self.key(&external_pool_quality_key(pool_id)))
+            .arg(self.key(external_pool_quality_key(pool_id)))
             .arg(probation_until_ms)
             .arg(i64::from(probation_level))
             .arg(ttl.as_millis().max(1) as i64)
@@ -5330,7 +5349,7 @@ impl RedisStore {
     pub async fn clear_external_pool_quality(&self, pool_id: u64) -> anyhow::Result<()> {
         let mut manager = self.scheduler_capacity_manager();
         let _: i64 = redis::cmd("DEL")
-            .arg(self.key(&external_pool_quality_key(pool_id)))
+            .arg(self.key(external_pool_quality_key(pool_id)))
             .query_async(&mut manager)
             .await?;
         Ok(())
@@ -9714,7 +9733,15 @@ mod tests {
 
         let first = store
             .record_external_pool_quality_sample_with_window(
-                109, false, None, None, 1.0, ttl, window,
+                109,
+                false,
+                None,
+                None,
+                ExternalPoolQualitySampleTuning {
+                    alpha: 1.0,
+                    ttl,
+                    degrade_window: window,
+                },
             )
             .await
             .unwrap();
@@ -9723,7 +9750,15 @@ mod tests {
 
         let second = store
             .record_external_pool_quality_sample_with_window(
-                109, false, None, None, 1.0, ttl, window,
+                109,
+                false,
+                None,
+                None,
+                ExternalPoolQualitySampleTuning {
+                    alpha: 1.0,
+                    ttl,
+                    degrade_window: window,
+                },
             )
             .await
             .unwrap();
@@ -9733,7 +9768,15 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(80)).await;
         let after_gap = store
             .record_external_pool_quality_sample_with_window(
-                109, true, None, None, 1.0, ttl, window,
+                109,
+                true,
+                None,
+                None,
+                ExternalPoolQualitySampleTuning {
+                    alpha: 1.0,
+                    ttl,
+                    degrade_window: window,
+                },
             )
             .await
             .unwrap();
@@ -9753,7 +9796,7 @@ mod tests {
 
         // 键被写成非法 JSON（或被其他进程写坏）时，采样必须重建状态而不是报错。
         let _: () = manager
-            .set(store.key(&external_pool_quality_key(102)), "garbage")
+            .set(store.key(external_pool_quality_key(102)), "garbage")
             .await
             .unwrap();
         let state = store
@@ -9771,7 +9814,7 @@ mod tests {
         assert!((state.recent_error_rate - 0.5).abs() < 1e-6);
 
         // 键被写成错误的 Redis 类型（WRONGTYPE）时同样不得让主请求失败。
-        let quality_key = store.key(&external_pool_quality_key(103));
+        let quality_key = store.key(external_pool_quality_key(103));
         let _: () = manager.del(&quality_key).await.unwrap();
         let _: i64 = manager.lpush(&quality_key, "wrong-type").await.unwrap();
         let wrong_type = store
@@ -9873,16 +9916,18 @@ mod tests {
                 true,
                 None,
                 None,
-                0.5,
-                StdDuration::from_secs(1),
-                StdDuration::from_secs(30),
+                ExternalPoolQualitySampleTuning {
+                    alpha: 0.5,
+                    ttl: StdDuration::from_secs(1),
+                    degrade_window: StdDuration::from_secs(30),
+                },
             )
             .await
             .unwrap();
 
         let mut manager = store.manager.clone();
         let pttl_ms: i64 = manager
-            .pttl(store.key(&external_pool_quality_key(pool_id)))
+            .pttl(store.key(external_pool_quality_key(pool_id)))
             .await
             .unwrap();
         assert!(

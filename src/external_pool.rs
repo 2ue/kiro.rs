@@ -5785,7 +5785,7 @@ impl ExternalPoolManager {
             // 展示出来只会让运维误以为调度正在依据它决策。
             let quality = config
                 .external_pool_quality_aware_scheduling_enabled
-                .then(|| runtime.quality.as_ref())
+                .then_some(runtime.quality.as_ref())
                 .flatten()
                 .map(|quality| {
                     ExternalPoolQualityView::from_state(quality, config, external_pool_now_ms())
@@ -9191,9 +9191,11 @@ impl ExternalPoolManager {
                     success,
                     ttft_ms,
                     latency_ms,
-                    alpha,
-                    ttl,
-                    degrade_window,
+                    crate::storage::redis_cache::ExternalPoolQualitySampleTuning {
+                        alpha,
+                        ttl,
+                        degrade_window,
+                    },
                 ),
             )
             .await;
@@ -10192,7 +10194,7 @@ fn median_of(values: impl Iterator<Item = f64>) -> Option<f64> {
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let middle = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]
@@ -10343,9 +10345,11 @@ fn evaluate_external_pool_degrade(
     let fully_recovered = quality.probation_level > 0
         && quality.probation_cleared_at_ms.is_some()
         && quality.recovery_progress(now_ms, ramp_ms) >= 1.0;
-    let previous_level = fully_recovered
-        .then_some(0)
-        .unwrap_or(quality.probation_level);
+    let previous_level = if fully_recovered {
+        0
+    } else {
+        quality.probation_level
+    };
     let level = previous_level.saturating_add(1);
     let base_secs = config.external_pool_degrade_probation_secs.max(1);
     let max_secs = config.external_pool_max_probation_secs.max(base_secs);

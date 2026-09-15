@@ -5902,11 +5902,13 @@ mod tests {
 
     #[test]
     fn berserk_switches_round_trip_through_camel_case() {
-        let mut config = Config::default();
-        config.kiro_upstream_region_rotation_enabled = true;
-        config.local_berserk_mode_enabled = true;
-        config.local_berserk_max_rounds = 7;
-        config.local_berserk_round_delay_ms = 2_500;
+        let config = Config {
+            kiro_upstream_region_rotation_enabled: true,
+            local_berserk_mode_enabled: true,
+            local_berserk_max_rounds: 7,
+            local_berserk_round_delay_ms: 2_500,
+            ..Default::default()
+        };
 
         let serialized = serde_json::to_value(&config).unwrap();
         assert_eq!(serialized["kiroUpstreamRegionRotationEnabled"], true);
@@ -6046,21 +6048,29 @@ mod tests {
 
     #[test]
     fn request_admission_rejects_admin_values_above_hard_bounds() {
-        let mut config = RequestAdmissionConfig::default();
-        config.rpm = MAX_REQUEST_API_KEY_RPM + 1;
+        let config = RequestAdmissionConfig {
+            rpm: MAX_REQUEST_API_KEY_RPM + 1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert_eq!(config.normalized().rpm, MAX_REQUEST_API_KEY_RPM);
 
-        let mut config = RequestAdmissionConfig::default();
-        config.max_concurrent_requests = MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS + 1;
+        let config = RequestAdmissionConfig {
+            max_concurrent_requests: MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS + 1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
-        let mut config = RequestAdmissionConfig::default();
-        config.max_queued_requests = MAX_REQUEST_API_KEY_QUEUED_REQUESTS + 1;
+        let config = RequestAdmissionConfig {
+            max_queued_requests: MAX_REQUEST_API_KEY_QUEUED_REQUESTS + 1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
-        let mut config = RequestAdmissionConfig::default();
-        config.queue_timeout_ms = MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS + 1;
+        let config = RequestAdmissionConfig {
+            queue_timeout_ms: MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS + 1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
@@ -7624,9 +7634,11 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_rewrites_legacy_payload_guard_default_once() {
-        let mut config = Config::default();
-        config.runtime_config_migration_version = 0;
-        config.payload_guard_mode = PayloadGuardMode::Preemptive;
+        let mut config = Config {
+            runtime_config_migration_version: 0,
+            payload_guard_mode: PayloadGuardMode::Preemptive,
+            ..Default::default()
+        };
 
         assert!(config.apply_runtime_config_migrations());
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
@@ -7642,8 +7654,10 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_disables_online_usage_rollup_compression_once() {
-        let mut config = Config::default();
-        config.runtime_config_migration_version = 6;
+        let mut config = Config {
+            runtime_config_migration_version: 6,
+            ..Default::default()
+        };
         config.postgres.compress_usage_rollups_on_start = true;
 
         assert!(config.apply_runtime_config_migrations());
@@ -7725,8 +7739,10 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_updates_legacy_default_task_quality_prompt_only() {
-        let mut legacy_default = Config::default();
-        legacy_default.runtime_config_migration_version = 1;
+        let mut legacy_default = Config {
+            runtime_config_migration_version: 1,
+            ..Default::default()
+        };
         legacy_default.prompt_steering.task_quality.prompt =
             LEGACY_TASK_QUALITY_PROMPT_V1.to_string();
 
@@ -7740,8 +7756,10 @@ mod tests {
             DEFAULT_TASK_QUALITY_PROMPT.trim()
         );
 
-        let mut legacy_default_v2 = Config::default();
-        legacy_default_v2.runtime_config_migration_version = 2;
+        let mut legacy_default_v2 = Config {
+            runtime_config_migration_version: 2,
+            ..Default::default()
+        };
         legacy_default_v2.prompt_steering.task_quality.prompt =
             LEGACY_TASK_QUALITY_PROMPT_V2.to_string();
 
@@ -7755,8 +7773,10 @@ mod tests {
             DEFAULT_TASK_QUALITY_PROMPT.trim()
         );
 
-        let mut custom = Config::default();
-        custom.runtime_config_migration_version = 1;
+        let mut custom = Config {
+            runtime_config_migration_version: 1,
+            ..Default::default()
+        };
         custom.prompt_steering.task_quality.prompt = "custom task prompt".to_string();
 
         assert!(custom.apply_runtime_config_migrations());
@@ -7769,8 +7789,10 @@ mod tests {
             "custom task prompt"
         );
 
-        let mut legacy_default_v3 = Config::default();
-        legacy_default_v3.runtime_config_migration_version = 3;
+        let mut legacy_default_v3 = Config {
+            runtime_config_migration_version: 3,
+            ..Default::default()
+        };
         legacy_default_v3.prompt_steering.task_quality.prompt =
             LEGACY_TASK_QUALITY_PROMPT_V3.to_string();
 
@@ -7784,8 +7806,10 @@ mod tests {
             DEFAULT_TASK_QUALITY_PROMPT.trim()
         );
 
-        let mut customized_v3 = Config::default();
-        customized_v3.runtime_config_migration_version = 3;
+        let mut customized_v3 = Config {
+            runtime_config_migration_version: 3,
+            ..Default::default()
+        };
         customized_v3.prompt_steering.task_quality.prompt =
             format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix");
 
@@ -7795,8 +7819,10 @@ mod tests {
             format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix")
         );
 
-        let mut whitespace_customized_v3 = Config::default();
-        whitespace_customized_v3.runtime_config_migration_version = 3;
+        let mut whitespace_customized_v3 = Config {
+            runtime_config_migration_version: 3,
+            ..Default::default()
+        };
         whitespace_customized_v3.prompt_steering.task_quality.prompt =
             format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}");
 
@@ -7806,8 +7832,10 @@ mod tests {
             format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}")
         );
 
-        let mut persisted_by_old_ui_at_v5 = Config::default();
-        persisted_by_old_ui_at_v5.runtime_config_migration_version = 5;
+        let mut persisted_by_old_ui_at_v5 = Config {
+            runtime_config_migration_version: 5,
+            ..Default::default()
+        };
         persisted_by_old_ui_at_v5
             .prompt_steering
             .task_quality
@@ -7826,8 +7854,10 @@ mod tests {
             format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}"),
             "operator custom task prompt".to_string(),
         ] {
-            let mut customized_at_v5 = Config::default();
-            customized_at_v5.runtime_config_migration_version = 5;
+            let mut customized_at_v5 = Config {
+                runtime_config_migration_version: 5,
+                ..Default::default()
+            };
             customized_at_v5.prompt_steering.task_quality.prompt = custom_prompt.clone();
             assert!(customized_at_v5.apply_runtime_config_migrations());
             assert_eq!(
@@ -7896,8 +7926,10 @@ mod tests {
     #[test]
     fn runtime_config_migration_restores_legacy_scheduler_fallback_intent_once() {
         for legacy_version in [0, 1, 2, 3, 4] {
-            let mut config = Config::default();
-            config.runtime_config_migration_version = legacy_version;
+            let mut config = Config {
+                runtime_config_migration_version: legacy_version,
+                ..Default::default()
+            };
             config.external_pools.external_pools_enabled = true;
             config.external_pools.fallback_on_scheduler_redis_degraded = false;
 
@@ -7922,8 +7954,10 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_does_not_enable_scheduler_fallback_without_legacy_intent() {
-        let mut external_disabled = Config::default();
-        external_disabled.runtime_config_migration_version = 4;
+        let mut external_disabled = Config {
+            runtime_config_migration_version: 4,
+            ..Default::default()
+        };
         external_disabled.external_pools.external_pools_enabled = false;
         external_disabled
             .external_pools
@@ -7936,8 +7970,10 @@ mod tests {
         );
 
         for disable_legacy_fallback in ["capacity", "no_credentials", "transient"] {
-            let mut config = Config::default();
-            config.runtime_config_migration_version = 4;
+            let mut config = Config {
+                runtime_config_migration_version: 4,
+                ..Default::default()
+            };
             config.external_pools.external_pools_enabled = true;
             config.external_pools.fallback_on_scheduler_redis_degraded = false;
             match disable_legacy_fallback {
@@ -7956,8 +7992,10 @@ mod tests {
             );
         }
 
-        let mut explicit_true = Config::default();
-        explicit_true.runtime_config_migration_version = 4;
+        let mut explicit_true = Config {
+            runtime_config_migration_version: 4,
+            ..Default::default()
+        };
         explicit_true.external_pools.external_pools_enabled = true;
         assert!(explicit_true.apply_runtime_config_migrations());
         assert!(
@@ -7969,8 +8007,10 @@ mod tests {
 
     #[test]
     fn runtime_config_migration_bounds_legacy_unlimited_external_wait() {
-        let mut config = Config::default();
-        config.runtime_config_migration_version = 4;
+        let mut config = Config {
+            runtime_config_migration_version: 4,
+            ..Default::default()
+        };
         config.external_pools.external_pool_capacity_mode = ExternalPoolCapacityMode::Wait;
         config.external_pools.external_pool_dispatch_max_wait_secs = 0;
 
@@ -8001,8 +8041,10 @@ mod tests {
 
     #[test]
     fn cache_policy_legacy_defined_cache_routes_default_to_current_strategy() {
-        let mut config = Config::default();
-        config.defined_cache_routes = vec!["/dfcache/team-a".to_string()];
+        let config = Config {
+            defined_cache_routes: vec!["/dfcache/team-a".to_string()],
+            ..Default::default()
+        };
 
         let resolved = config.cache_policy_for_path("/dfcache/team-a/v1/messages");
 
