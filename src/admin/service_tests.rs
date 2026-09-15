@@ -214,8 +214,7 @@ fn berserk_settings_accept_the_full_supported_range() {
     for rounds in 1..=MAX_LOCAL_BERSERK_ROUNDS {
         validate_berserk_settings(rounds, 0).expect("1..=上限的轮数都应接受");
     }
-    validate_berserk_settings(1, MAX_LOCAL_BERSERK_ROUND_DELAY_MS)
-        .expect("间隔取到上限应当接受");
+    validate_berserk_settings(1, MAX_LOCAL_BERSERK_ROUND_DELAY_MS).expect("间隔取到上限应当接受");
 }
 
 #[test]

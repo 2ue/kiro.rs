@@ -8218,13 +8218,17 @@ impl MultiTokenManager {
         requested.normalize_api_key_defaults();
         requested.normalize_external_idp_defaults();
 
-        let warmup_remaining = self.config.lock().credential_warmup_requests;
-        if capacity_changed && warmup_remaining > 0 {
+        if capacity_changed {
+            // 容量变更只推进 runtime generation（让在途的容量租约失效），
+            // 不重置 warmup。warmup 表达的是「这个账号还需要多少次请求才算热」，
+            // 属于账号自身的运行进度；改并发/RPM 是调整容量上限，两者语义无关。
+            // 过去在这里顺手重置 warmup，导致单个或批量修改账号属性时
+            // 账号被重新打回预热状态，warmup 只应由显式开关（见
+            // `set_warmup_remaining`）、新增账号与全局运行时配置变更来改写。
             self.persist_credential_update_with_runtime_patch(
                 &base,
                 &requested,
                 CredentialRuntimeStatePatch {
-                    warmup_remaining: Some(warmup_remaining),
                     advance_generation: true,
                     ..Default::default()
                 },

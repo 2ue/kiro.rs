@@ -6501,7 +6501,8 @@ mod tests {
     async fn s1_berserk_exhausts_exactly_accounts_times_regions_times_rounds() {
         for pool_size in [1usize, 3, 8] {
             for rounds in [1u32, 2, 3] {
-                let server = RotationServer::start(rule_always(RotationReply::TooManyRequests)).await;
+                let server =
+                    RotationServer::start(rule_always(RotationReply::TooManyRequests)).await;
                 let settings = RotationConfig::new(pool_size)
                     .berserk(rounds)
                     .with_region_rotation();
@@ -6656,8 +6657,7 @@ mod tests {
 
             assert!(result.is_err());
             let attempts = server.state.attempts();
-            let regions: HashSet<String> =
-                attempts.iter().map(|a| a.region.clone()).collect();
+            let regions: HashSet<String> = attempts.iter().map(|a| a.region.clone()).collect();
             assert!(
                 regions.len() > 1,
                 "pool={pool_size}：普通模式下开启端点轮换后应当换过端点，实际 {regions:?}"

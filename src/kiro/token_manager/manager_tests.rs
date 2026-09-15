@@ -5186,7 +5186,8 @@ async fn postgres_admin_capacity_update_defers_runtime_patch_during_recovery() {
         let entries = manager.entries.lock();
         let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
         assert_eq!(entry.credentials.max_concurrent_requests, Some(20));
-        assert_eq!(entry.warmup_remaining, 7);
+        // 容量变更只推进 generation，不触碰 warmup。
+        assert_eq!(entry.warmup_remaining, 0);
         assert_eq!(entry.runtime_generation, 1);
         assert!(entry.runtime_persistence_degraded);
         assert!(entry.runtime_persistence_quarantined);
@@ -7231,7 +7232,7 @@ async fn priority_mode_respects_warmup_candidate_share() {
 }
 
 #[test]
-fn credential_capacity_updates_reset_warmup_remaining() {
+fn credential_capacity_updates_preserve_warmup_remaining() {
     let mut config = Config::default();
     config.credential_warmup_requests = 7;
     let manager = MultiTokenManager::new(
@@ -7243,15 +7244,162 @@ fn credential_capacity_updates_reset_warmup_remaining() {
     )
     .unwrap();
 
+    // 改容量不得把账号打回预热：初始未预热就应保持未预热。
     assert_eq!(manager.snapshot().entries[0].warmup_remaining, 0);
     manager.set_credential_rpm(1, Some(30)).unwrap();
-    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 7);
+    assert_eq!(
+        manager.snapshot().entries[0].warmup_remaining,
+        0,
+        "修改 RPM 不应重新打开预热"
+    );
+    assert_eq!(
+        manager.snapshot().entries[0].rpm_override,
+        Some(30),
+        "容量本身仍需写入"
+    );
 
-    manager.report_success(1);
-    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 6);
     manager
         .set_credential_max_concurrent_requests(1, Some(20))
         .unwrap();
+    assert_eq!(
+        manager.snapshot().entries[0].warmup_remaining,
+        0,
+        "修改并发不应重新打开预热"
+    );
+    assert_eq!(
+        manager.snapshot().entries[0].max_concurrent_requests_override,
+        Some(20),
+        "容量本身仍需写入"
+    );
+}
+
+#[test]
+fn credential_capacity_updates_do_not_rewind_warmup_progress() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 7;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![test_access_token_credential("capacity", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    // 显式开关才是改写 warmup 的唯一入口。
+    manager.set_warmup_remaining(1, 7).unwrap();
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 7);
+
+    // 预热已经推进两次，改容量不能把进度退回起点。
+    manager.report_success(1);
+    manager.report_success(1);
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 5);
+
+    manager.set_credential_rpm(1, Some(30)).unwrap();
+    assert_eq!(
+        manager.snapshot().entries[0].warmup_remaining,
+        5,
+        "修改 RPM 不应回退预热进度"
+    );
+
+    manager
+        .set_credential_max_concurrent_requests(1, Some(20))
+        .unwrap();
+    assert_eq!(
+        manager.snapshot().entries[0].warmup_remaining,
+        5,
+        "修改并发不应回退预热进度"
+    );
+
+    // 显式关闭预热仍然生效。
+    manager.set_warmup_remaining(1, 0).unwrap();
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 0);
+}
+
+#[test]
+fn batch_capacity_updates_preserve_per_account_warmup_progress() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 7;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            test_access_token_credential("batch-a", "Pro"),
+            test_access_token_credential("batch-b", "Pro"),
+            test_access_token_credential("batch-c", "Pro"),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    // 三个账号处于不同的预热阶段：全新、预热中、已热。
+    manager.set_warmup_remaining(1, 7).unwrap();
+    manager.set_warmup_remaining(2, 7).unwrap();
+    manager.report_success(2);
+    manager.report_success(2);
+    manager.set_warmup_remaining(3, 0).unwrap();
+
+    let before: Vec<u32> = manager
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.warmup_remaining)
+        .collect();
+    assert_eq!(before, vec![7, 5, 0]);
+
+    // 复刻 admin 批量修改的做法：对选中的每个账号逐个下发容量变更。
+    for id in [1u64, 2, 3] {
+        manager.set_credential_rpm(id, Some(30)).unwrap();
+        manager
+            .set_credential_max_concurrent_requests(id, Some(20))
+            .unwrap();
+    }
+
+    let after: Vec<u32> = manager
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.warmup_remaining)
+        .collect();
+    assert_eq!(
+        after, before,
+        "批量修改容量不得改变任何账号的预热状态"
+    );
+
+    for entry in manager.snapshot().entries {
+        assert_eq!(entry.rpm_override, Some(30));
+        assert_eq!(entry.max_concurrent_requests_override, Some(20));
+    }
+}
+
+#[test]
+fn global_runtime_capacity_change_still_resets_warmup() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 7;
+    let manager = MultiTokenManager::new(
+        config.clone(),
+        vec![test_access_token_credential("global", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    manager.set_warmup_remaining(1, 7).unwrap();
+    manager.report_success(1);
+    assert_eq!(manager.snapshot().entries[0].warmup_remaining, 6);
+
+    // 单账号属性修改与全局运行时配置变更是两回事：后者改变的是所有账号的
+    // 容量基线，重置 warmup 仍然是既有的有意行为，不在本次修复范围内。
+    let mut updated = config.clone();
+    updated.credential_rpm = config.credential_rpm + 10;
+    let reset = manager.reset_active_warmup_after_runtime_capacity_change(
+        &config,
+        &updated,
+        "test_global_capacity_change",
+    );
+    assert_eq!(reset, 1);
     assert_eq!(manager.snapshot().entries[0].warmup_remaining, 7);
 }
 
