@@ -273,7 +273,42 @@ SSE 的 `ExternalStreamFakeServer`）。
 这些断言全部围绕 `retryable` / `attempts.len()` / 超时归类，
 属于重试与超时语义，本特性只影响"在候选中选哪个池"，不触及该路径。
 
-⚠️ 前 5 个是 base 分支上的既有红灯，**不属于本次范围，但需要单独跟进**。
+⚠️ 前 5 个是 base 分支上的既有红灯，**不属于本次范围**。
+
+#### 既有红灯的进一步定位：是 macOS/Linux 平台差异，不是产品缺陷
+
+用户要求"顺手修掉"，遂展开定位。关键证据：
+
+1. 在**引入该测试的那个提交**（`2f38e53`）上直接复跑，
+   `slow_upstream_status` 以**完全相同的方式失败**——
+   这个测试在本机**从未通过过**，不存在"回归"一说。
+2. CI 跑在 `ubuntu-24.04`（`.github/workflows/build.yaml:52`），
+   且 `cargo test --locked --all-targets -- --test-threads=1` 是必跑步骤，
+   说明这些用例**在 Linux 上是绿的**。
+3. 失败根因是测试假服务器与客户端之间的 TCP 关闭语义：
+   客户端拿到的错误链是
+   `reqwest::Error{Decode} <- Body <- hyper <- ECONNRESET(os error 54)`。
+   即 HTTP 头已成功解析（status 524 已拿到），但**响应体读取时连接被重置**，
+   于是触发同池重试 → 假服务器已消费掉唯一一次 accept → 第二次连接失败，
+   最终 `attempts.len()` 从期望的 1 变成 2。
+
+已排除的假设（逐一实测证伪，避免后续重复走弯路）：
+
+- ❌ 重试预算：`payload_guard_retry_config` 为 `None`，budget 确为 1
+- ❌ 缺 `Content-Type` 头：补上后行为不变
+- ❌ 请求未读完导致 RST：已改为完整 drain（实测读满 6910 字节到 JSON 结尾），行为不变
+- ❌ reqwest 总超时打断读体：配置 2s，远大于 200ms 延迟
+- ❌ `lease.wait_until_lost()` 抢占：该分支返回的是另一种错误
+- ❌ 服务端写失败：实测 header 与 body 两次 `write_all` 均 `Ok`，
+      且头部字节完全合法（`HTTP/1.1 524 Test\r\nContent-Length: 46\r\n...`）
+
+尝试过的修法：`shutdown()` 半关闭 + 等待对端关闭后再 drop socket。
+**在 macOS 上仍未修复**，已回滚，未留在工作区。
+
+结论与建议：这 5 个是**测试夹具的平台可移植性问题**，不影响 CI、不影响生产逻辑。
+真正的修法应是让假 HTTP 服务器在 macOS 上也能干净地完成"写完响应再关闭"，
+或给这些用例加 `#[cfg_attr(target_os = "macos", ignore)]` 并注明原因。
+考虑到它与本次特性无关且 CI 已覆盖，**建议单独排期处理，不阻塞 sub2api 工作**。
 
 > 教训：后台命令若以 `| tail` 结尾，notification 里的 exit code 来自 `tail` 而非 `cargo`，
 > 恒为 0。判定绿灯必须读 `test result:` 行，不能看 exit code。
