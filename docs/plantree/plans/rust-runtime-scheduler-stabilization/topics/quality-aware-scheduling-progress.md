@@ -1,6 +1,6 @@
 # 质量感知调度实现进度
 
-Last updated: 2026-09-15
+Last updated: 2026-09-18
 
 设计文档：[external-pool-quality-aware-scheduling.md](external-pool-quality-aware-scheduling.md)
 测试维度设计：[quality-aware-scheduling-test-matrix.md](quality-aware-scheduling-test-matrix.md)
@@ -29,6 +29,29 @@ Last updated: 2026-09-15
       `2105` 个非忽略测试，全部通过。
 - [x] `admin-ui pnpm build`：本地 `node_modules` 缺少锁文件中已声明的
       `@radix-ui/react-scroll-area`；按锁文件安装依赖后构建通过，与本次质量调度字段改动无关。
+
+## 2026-09-18 事故修复与语义收敛
+
+- [x] `external_pool_quality_aware_scheduling_enabled` 的代码/UI 默认值已统一为 `false`；
+      显式配置 `true` 仍启用质量调度。
+- [x] 普通瞬态失败不再按 `external_pool_transient_failure_cooldown_threshold`
+      升级为池级 hard cooldown；transient streak 只作为短期排序信号。
+- [x] 质量采样和 probation 写入使用独立 Redis connection manager，并以 32 个 detached
+      task 上限保护；超限丢弃样本，不等待、不影响 coordinator/lease 正式链路。
+- [x] probation 使用当前请求通过路径/模型准入、cooldown、并发和 runtime 检查后的整个
+      候选池进行相对比较；全体同向变差时不因绝对阈值全部进入 probation。
+- [x] 开关打开但全候选无合格样本时严格回退 legacy selector；新增冷启动负载语义测试。
+- [x] selector 出现 `available_pools > 0 && selected_pool == None` 时改为有界 503，
+      避免无条件空转到 dispatch deadline。
+- [x] 质量聚焦测试复跑：`15 passed / 0 failed`；`cargo fmt --all` 通过。
+
+### 当前设计边界
+
+- hard cooldown 仅表示明确不可用或准入类极端状态；质量 probation 不是 cooldown，
+  账号不会在最外层被质量样本直接摘除。
+- 质量基线受当前请求的路径和 Claude Code 模型准入集合约束，不能把不同路径、不同模型
+  或不具备当前请求能力的池混在一起。
+- 全体候选无样本时保持旧的优先级/负载分布；只有至少两个合格样本才计算相对 probation。
 
 本文件用于防止实现进度丢失。每完成一个子项立即更新。
 
@@ -97,7 +120,7 @@ Last updated: 2026-09-15
 - [x] 候选集改为 `ExternalPoolCandidate` 结构体，携带质量状态（保持纯函数、`now_ms` 注入）
 - [x] `select_external_pool_candidate` 改加权评分 + Top-K 加权随机
 - [x] `select_external_pool_candidate_legacy` 保留旧逻辑，主开关关闭时走它
-- [x] 相对中位数归一化（首字/耗时/失败率各自独立）
+- [x] 相对中位数归一化（首字/耗时/失败率各自独立；probation 另用窗口失败率 cohort 中位数）
 - [x] 降级兜底路径改用 legacy（Redis 不可用时质量数据本不可信）
 - [x] **优先级硬分层**（见下方重大修正）
 - [x] 配置校验 `validate_external_pools_config`（`src/admin/service.rs`，含跨字段校验
@@ -109,7 +132,7 @@ Last updated: 2026-09-15
     **全员劣化时候选池不清空**（"降级时保证可用"）/ 避让池不被饿死 /
     样本不足视为中性 / Top-K 加权随机份额分布
   - 配置校验 6 项（`src/admin/service_tests.rs`）：
-    **默认开关为 true** / EWMA alpha 边界 / 权重拒绝负数与非有限值 /
+    **默认开关为 false** / EWMA alpha 边界 / 权重拒绝负数与非有限值 /
     避让上限不得低于单次避让 / 失败率阈值必须是比率 / probe share 与 Top-K 边界
 - [x] **全量回归：2024 passed / 0 failed**，既有逻辑未破坏
 
@@ -159,7 +182,7 @@ Last updated: 2026-09-15
   避免用户提交一个必然被后端拒绝的组合。
 - 新增 `quality_config_serializes_with_the_camel_case_keys_the_ui_sends`
   锁定前后端键契约：任一侧改名都会让设置被 serde 默认值**静默吞掉**，
-  用户会以为保存成功了。该测试同时断言主开关默认为 `true`。
+  用户会以为保存成功了。该测试同时断言主开关默认为 `false`。
 
 ### 两套前端的分工（调研结论）
 
@@ -379,8 +402,9 @@ SSE 的 `ExternalStreamFakeServer`）。
 
 链路：`优先级 →（可选）最早重置 → 负载率 →（新）质量 → LRU`
 
-**关键决策：软过滤而非硬过滤。** 开关默认开启，若做成硬过滤会直接改变所有既有
-部署的行为；软过滤仅在质量差距超过 `minGap`(0.15) 时介入，否则原样返回交还 LRU。
+**关键决策：软过滤而非硬过滤。** kiro.rs 外部池开关默认关闭，显式开启后质量只做
+软降权而非硬过滤；这样升级不会改变既有部署行为，且质量差距不足时仍交还 legacy
+选择语义。
 
 - 错误率权重 0.7 > 首字 0.3 —— 满足"报错/重试多的账号判断优先级高于首字曲线"。
 - 首字按候选集内 min/max **相对归一化**，上游整体变慢时不清空候选池。

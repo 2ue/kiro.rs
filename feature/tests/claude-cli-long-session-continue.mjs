@@ -10,6 +10,10 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { performance } from 'node:perf_hooks'
 
+import {
+  detectLeaks,
+  summarizeTranscript,
+} from './claude-cli-leak-scanner.mjs'
 import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
@@ -32,17 +36,6 @@ const REDIS_PREFIX = `kiro_rs:validation:${RUN_ID}`
 const ACTIVE_CHILDREN = new Set()
 const ACTIVE_SERVERS = new Set()
 let cleanupPromise = null
-
-const LEAK_PATTERNS = [
-  ['new_continue_transcript', /(?:^|\n)user Continue(?:\r?\n|$)/i],
-  ['legacy_tool_results_transcript', /(?:^|\n)user Tool results provided\.?/i],
-  ['tool_results_heading', /(?:^|\n)Tool results:\s*(?:\r?\n|$)/i],
-  ['function_results_envelope', /<\/?function_results>/i],
-  ['function_calls_envelope', /<\/?function_calls>/i],
-  ['invoke_envelope', /<invoke\s+name=/i],
-  ['known_hash_tool_name', /\b(?:bash|read|edit|write|glob|grep|websearch|webfetch|task)Hash[0-9a-f]{8}\b/i],
-  ['generic_hash_tool_name', /\b[A-Za-z][A-Za-z0-9]{0,50}Hash[0-9a-f]{8}\b/],
-]
 
 function requiredEnvironment(name) {
   const value = String(process.env[name] || '').trim()
@@ -618,22 +611,6 @@ function parseClaudeJsonl(stdout) {
   }
 }
 
-function detectLeaks(parsed, stderr) {
-  const surfaces = {
-    assistantText: parsed.assistantText,
-    resultText: parsed.resultText,
-    stderr,
-    toolNames: parsed.toolNames.join('\n'),
-  }
-  const matches = []
-  for (const [surface, text] of Object.entries(surfaces)) {
-    for (const [name, pattern] of LEAK_PATTERNS) {
-      if (pattern.test(text)) matches.push(`${surface}:${name}`)
-    }
-  }
-  return matches
-}
-
 async function runClaude({ baseUrl, sessionRoot, prompt, firstTurn, sessionId }) {
   const home = path.join(sessionRoot, 'home')
   const configDir = path.join(sessionRoot, 'config')
@@ -721,6 +698,8 @@ async function runClaude({ baseUrl, sessionRoot, prompt, firstTurn, sessionId })
     stderrText,
     stdoutSha256: sha256(stdoutText),
     stderrSha256: sha256(stderrText),
+    stdoutByteLength: Buffer.byteLength(stdoutText),
+    stdoutLineCount: stdoutText.split(/\r?\n/).length,
   }
 }
 
@@ -897,7 +876,9 @@ async function main() {
           sessionId,
         })
         const parsed = parseClaudeJsonl(cli.stdoutText)
-        const leaks = detectLeaks(parsed, cli.stderrText)
+        const knownSecrets = [REQUEST_KEY, ADMIN_KEY, KIRO_KEY, POSTGRES_URL, REDIS_URL]
+        const leaks = detectLeaks(parsed, cli.stderrText, cli.stdoutText, { knownSecrets })
+        const stdoutEvidence = summarizeTranscript(cli.stdoutText, { knownSecrets })
         assert.equal(cli.timedOut, false, `${scenario.id}: Claude CLI timed out`)
         assert.equal(
           cli.code,
@@ -946,6 +927,9 @@ async function main() {
           historyEntries: wire.at(-1).historyEntries,
           stdoutSha256: cli.stdoutSha256,
           stderrSha256: cli.stderrSha256,
+          stdoutByteLength: cli.stdoutByteLength,
+          stdoutLineCount: cli.stdoutLineCount,
+          stdoutEvidence,
         })
         progressLog({
           event: 'turn_done',

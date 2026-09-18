@@ -171,11 +171,57 @@ fn discovered_supported_models_preserve_non_claude_model_ids() {
         " QWEN3-CODER-NEXT ".to_string(),
         "minimax-m2.5".to_string(),
         "qwen3-coder-next".to_string(),
+        "claude-sonnet-4-5-20250929".to_string(),
     ]);
 
     assert_eq!(
         models,
-        vec!["qwen3-coder-next".to_string(), "minimax-m2.5".to_string()]
+        vec![
+            "qwen3-coder-next".to_string(),
+            "minimax-m2.5".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn external_pool_supported_models_use_claude_code_family_commands() {
+    assert_eq!(
+        AdminService::normalize_external_pool_supported_models(vec![
+            "claude-sonnet-4-5-20250929".to_string(),
+            "claude-haiku-4.5".to_string(),
+            "claude-opus-4-6-thinking".to_string(),
+            "tenant-haiku-model".to_string(),
+            "QWEN3-CODER-NEXT".to_string(),
+        ]),
+        vec![
+            "sonnet-4.5".to_string(),
+            "haiku-4.5".to_string(),
+            "opus-4.6-thinking".to_string(),
+            "tenant-haiku-model".to_string(),
+            "qwen3-coder-next".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn external_pool_supported_models_canonicalize_legacy_claude_35_commands() {
+    assert_eq!(
+        AdminService::normalize_external_pool_supported_models(vec![
+            "claude-3-5-sonnet-20241022".to_string(),
+            "claude-3.5-sonnet".to_string(),
+            "claude-3-5-haiku-20241022-thinking[1m]".to_string(),
+            "claude-3.5-haiku".to_string(),
+            "claude-3-5-opus-20241022".to_string(),
+            "tenant-claude-3-5-sonnet".to_string(),
+        ]),
+        vec![
+            "sonnet-3.5".to_string(),
+            "haiku-3.5-thinking[1m]".to_string(),
+            "haiku-3.5".to_string(),
+            "claude-3-5-opus-20241022".to_string(),
+            "tenant-claude-3-5-sonnet".to_string(),
+        ]
     );
 }
 
@@ -993,11 +1039,12 @@ fn extracts_model_ids_from_kiro_compatible_models_response() {
 
 #[test]
 fn external_pool_quality_defaults_pass_validation() {
-    // 默认配置必须开箱可用——主开关默认打开，所有默认值都必须合法。
+    // Quality-aware scheduling changes runtime decisions and must be opt-in on
+    // upgrades. The remaining defaults still need to validate as a whole.
     let config = ExternalPoolsConfig::default();
     assert!(
-        config.external_pool_quality_aware_scheduling_enabled,
-        "质量感知调度主开关必须默认打开"
+        !config.external_pool_quality_aware_scheduling_enabled,
+        "质量感知调度主开关必须默认关闭"
     );
     validate_external_pools_config(&config).expect("默认配置必须通过校验");
 }

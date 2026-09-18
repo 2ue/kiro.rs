@@ -304,8 +304,8 @@ CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test kiro::token_ma
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test kiro::provider::tests -- --nocapture --test-threads=1
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test reported_usage -- --nocapture --test-threads=1
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test sub2api -- --nocapture --test-threads=1
-(cd admin-ui && npm run build)
-(cd ui && npm run build)
+(pnpm --dir admin-ui build)
+(pnpm --dir ui build)
 ```
 
 结果：

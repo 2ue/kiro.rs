@@ -2843,11 +2843,10 @@ pub struct ExternalPoolsConfig {
     /// 优先级 10/20 的健康池；填 0 会退回只按配置优先级和负载排序。
     #[serde(default = "default_external_pool_transient_failure_priority_penalty")]
     pub external_pool_transient_failure_priority_penalty: u32,
-    /// 连续瞬态失败升级为池级短冷却的阈值。
+    /// 兼容字段：普通瞬态失败只产生短期调度罚分，不再升级为池级冷却。
     ///
-    /// 0 表示关闭升级，只保留短期优先级罚分。默认关闭，避免外部服务
-    /// 抖动时把多个池快速推入冷却并造成调度容量不足；需要强保护时可
-    /// 显式配置非 0 阈值。
+    /// 保留该字段以兼容已有配置和 API；无论取值如何，池级冷却只由
+    /// 明确的模型不可用、端点配置错误或自动禁用等极端状态触发。
     #[serde(default = "default_external_pool_transient_failure_cooldown_threshold")]
     pub external_pool_transient_failure_cooldown_threshold: u32,
 
@@ -4686,7 +4685,9 @@ fn default_external_pool_same_pool_retry_delay_ms() -> u64 {
 }
 
 fn default_external_pool_quality_aware_scheduling_enabled() -> bool {
-    true
+    // This feature changes scheduling decisions and performs background Redis
+    // sampling. Keep upgrades backwards-compatible unless an operator opts in.
+    false
 }
 
 fn default_external_pool_quality_ewma_alpha() -> f64 {

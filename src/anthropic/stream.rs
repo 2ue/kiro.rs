@@ -4570,6 +4570,161 @@ mod tests {
         );
     }
 
+    fn typed_kiro_event(event_type: &str, payload: Value) -> Event {
+        use crate::kiro::parser::frame::Frame;
+        use crate::kiro::parser::header::{HeaderValue, Headers};
+
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String(event_type.to_string()),
+        );
+        Event::from_frame(Frame {
+            headers,
+            payload: serde_json::to_vec(&payload).expect("test event payload"),
+        })
+        .expect("typed Kiro event")
+    }
+
+    #[test]
+    fn nested_kiro_events_round_trip_to_claude_sse_lifecycle() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            128,
+            true,
+            HashMap::new(),
+            HashSet::from(["Bash".to_string()]),
+        );
+        let mut events = ctx.generate_initial_events();
+        for event in [
+            typed_kiro_event(
+                "reasoningContentEvent",
+                json!({"reasoningContentEvent": {"text": "plan"}}),
+            ),
+            typed_kiro_event(
+                "assistantResponseEvent",
+                json!({"assistantResponseEvent": {"content": "Result: "}}),
+            ),
+            typed_kiro_event(
+                "toolUseEvent",
+                json!({
+                    "toolUseEvent": {
+                        "toolUseId": "toolu_nested",
+                        "name": "Bash",
+                        "input": {"command": "printf ok"},
+                        "stop": true
+                    }
+                }),
+            ),
+            typed_kiro_event(
+                "metadataEvent",
+                json!({
+                    "metadataEvent": {
+                        "tokenUsage": {
+                            "uncachedInputTokens": 42,
+                            "cacheReadInputTokens": 3,
+                            "cacheWriteInputTokens": 5,
+                            "outputTokens": 9,
+                            "totalTokens": 59
+                        }
+                    }
+                }),
+            ),
+        ] {
+            events.extend(ctx.process_kiro_event(&event));
+        }
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "message_start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "message_delta")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "message_stop")
+                .count(),
+            1
+        );
+        assert_eq!(collect_thinking_content(&events), "plan");
+        assert_eq!(collect_text_content(&events), "Result: ");
+        assert_eq!(
+            collect_tool_uses(&events),
+            vec![("Bash".to_string(), r#"{"command":"printf ok"}"#.to_string())]
+        );
+
+        let thinking_start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .expect("thinking block start");
+        let text_start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "text"
+            })
+            .expect("text block start");
+        let tool_start = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block start");
+        let delta_pos = events
+            .iter()
+            .position(|event| event.event == "message_delta")
+            .expect("message_delta");
+        let stop_pos = events
+            .iter()
+            .position(|event| event.event == "message_stop")
+            .expect("message_stop");
+
+        assert!(thinking_start < text_start);
+        assert!(text_start < tool_start);
+        assert!(tool_start < delta_pos);
+        assert!(delta_pos < stop_pos);
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.event == "content_block_stop")
+                .all(|event| {
+                    events
+                        .iter()
+                        .position(|candidate| std::ptr::eq(candidate, event))
+                        .is_some_and(|pos| pos < delta_pos)
+                }),
+            "all content blocks must stop before message_delta"
+        );
+
+        let message_delta = &events[delta_pos];
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 42);
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            5
+        );
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 9);
+    }
+
     #[test]
     fn test_native_reasoning_content_uses_cumulative_deltas() {
         use crate::kiro::model::events::ReasoningContentEvent;

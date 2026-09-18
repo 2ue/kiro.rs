@@ -88,9 +88,7 @@ use crate::model::config::{
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
     MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
 };
-use crate::model::model_support::{
-    expand_claude_supported_model_variants, normalize_supported_models,
-};
+use crate::model::model_support::normalize_supported_models;
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, NewUsageCleanupJob,
     PostgresStore, PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
@@ -108,6 +106,87 @@ const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
+
+fn claude_code_model_name(model: &str) -> String {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return normalized;
+    }
+
+    let (base, suffix) = if let Some(base) = normalized.strip_suffix("[1m]") {
+        (base, "[1m]")
+    } else {
+        (normalized.as_str(), "")
+    };
+    let (base, thinking) = if let Some(base) = base.strip_suffix("-thinking") {
+        (base, "-thinking")
+    } else {
+        (base, "")
+    };
+
+    let parts = base.split('-').collect::<Vec<_>>();
+    if parts.len() < 3 || parts[0] != "claude" {
+        return normalized;
+    }
+    let family = parts[1];
+
+    let all_digits = |value: &str| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit());
+    let is_date = |value: &str| value.len() == 8 && all_digits(value);
+
+    // Legacy Anthropic IDs use either `claude-3-5-sonnet[-date]` or
+    // `claude-3.5-sonnet`. Claude Code exposes these as `sonnet-3.5`
+    // (and the corresponding `haiku-3.5`) commands.
+    let legacy_family = match parts.as_slice() {
+        ["claude", "3", "5", family] if matches!(*family, "sonnet" | "haiku") => Some(*family),
+        ["claude", "3", "5", family, date]
+            if matches!(*family, "sonnet" | "haiku") && is_date(date) =>
+        {
+            Some(*family)
+        }
+        ["claude", "3.5", family] if matches!(*family, "sonnet" | "haiku") => Some(*family),
+        ["claude", "3.5", family, date]
+            if matches!(*family, "sonnet" | "haiku") && is_date(date) =>
+        {
+            Some(*family)
+        }
+        _ => None,
+    };
+    if let Some(family) = legacy_family {
+        return format!("{family}-3.5{thinking}{suffix}");
+    }
+
+    if !matches!(family, "opus" | "sonnet" | "haiku") {
+        return normalized;
+    }
+
+    let version = match parts.as_slice() {
+        ["claude", _, version]
+            if version
+                .split_once('.')
+                .is_some_and(|(major, minor)| all_digits(major) && all_digits(minor))
+                || all_digits(version) =>
+        {
+            version.to_string()
+        }
+        ["claude", _, major, third]
+            if all_digits(major) && (all_digits(third) || is_date(third)) =>
+        {
+            if is_date(third) {
+                major.to_string()
+            } else {
+                format!("{major}.{third}")
+            }
+        }
+        ["claude", _, major, minor, date]
+            if all_digits(major) && all_digits(minor) && is_date(date) =>
+        {
+            format!("{major}.{minor}")
+        }
+        _ => return normalized,
+    };
+
+    format!("{family}-{version}{thinking}{suffix}")
+}
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS: u32 = 3;
 const USAGE_CLEANUP_DEFAULT_BATCH_SIZE: usize = 5_000;
@@ -974,8 +1053,10 @@ impl AdminService {
 
     pub fn create_external_pool(
         &self,
-        request: CreateExternalPoolRequest,
+        mut request: CreateExternalPoolRequest,
     ) -> Result<ExternalPool, AdminServiceError> {
+        request.supported_models =
+            Self::normalize_external_pool_supported_models(request.supported_models);
         let store = self.postgres_store.clone();
         let pool =
             block_on_admin_store(async move { store.create_external_pool_unmasked(request).await })
@@ -995,8 +1076,11 @@ impl AdminService {
     pub fn update_external_pool(
         &self,
         id: u64,
-        request: UpdateExternalPoolRequest,
+        mut request: UpdateExternalPoolRequest,
     ) -> Result<ExternalPool, AdminServiceError> {
+        request.supported_models = request
+            .supported_models
+            .map(Self::normalize_external_pool_supported_models);
         let store = self.postgres_store.clone();
         let pool =
             block_on_admin_store(
@@ -1021,10 +1105,12 @@ impl AdminService {
         id: u64,
         request: SetSupportedModelsRequest,
     ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let supported_models =
+            Self::normalize_external_pool_supported_models(request.supported_models);
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move {
             store
-                .set_external_pool_supported_models_unmasked(id, request.supported_models)
+                .set_external_pool_supported_models_unmasked(id, supported_models)
                 .await
         })
         .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
@@ -1174,8 +1260,9 @@ impl AdminService {
                 status, suffix
             )));
         }
-        let supported_models =
-            normalize_supported_models(extract_model_ids_from_models_response(&body));
+        let supported_models = Self::normalize_external_pool_supported_models(
+            extract_model_ids_from_models_response(&body),
+        );
         if supported_models.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
                 "外部池模型列表响应中没有可识别的模型 ID".to_string(),
@@ -2217,13 +2304,21 @@ impl AdminService {
     }
 
     fn normalize_discovered_supported_models(model_ids: Vec<String>) -> Vec<String> {
-        let kiro_model_ids = normalize_supported_models(model_ids);
-        let supported_models = expand_claude_supported_model_variants(kiro_model_ids.clone());
-        if supported_models.is_empty() {
-            kiro_model_ids
-        } else {
-            supported_models
+        normalize_supported_models(model_ids)
+    }
+
+    /// External-pool allowlists are exposed in Claude Code command syntax.
+    /// Keep arbitrary provider-specific IDs intact, but collapse official
+    /// Claude dated/dashed IDs to a stable family/version command.
+    fn normalize_external_pool_supported_models(model_ids: Vec<String>) -> Vec<String> {
+        let mut normalized = Vec::new();
+        for model in normalize_supported_models(model_ids) {
+            let canonical = claude_code_model_name(&model);
+            if !normalized.iter().any(|existing| existing == &canonical) {
+                normalized.push(canonical);
+            }
         }
+        normalized
     }
 
     async fn discover_supported_models_for_external_credential(

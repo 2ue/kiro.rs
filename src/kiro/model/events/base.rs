@@ -212,6 +212,25 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::parser::error::ParseError;
+    use crate::kiro::parser::frame::Frame;
+    use crate::kiro::parser::header::{HeaderValue, Headers};
+
+    fn event_frame(event_type: &str, payload: serde_json::Value) -> Frame {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String(event_type.to_string()),
+        );
+        Frame {
+            headers,
+            payload: serde_json::to_vec(&payload).expect("event payload"),
+        }
+    }
 
     #[test]
     fn test_event_type_from_str() {
@@ -258,5 +277,71 @@ mod tests {
         assert_eq!(EventType::Code.as_str(), "codeEvent");
         assert_eq!(EventType::MessageMetadata.as_str(), "messageMetadataEvent");
         assert_eq!(EventType::InvalidState.as_str(), "invalidStateEvent");
+    }
+
+    #[test]
+    fn known_events_accept_nested_and_top_level_payload_shapes() {
+        let nested = Event::from_frame(event_frame(
+            "assistantResponseEvent",
+            serde_json::json!({
+                "assistantResponseEvent": {
+                    "content": "nested",
+                    "messageStatus": "COMPLETED"
+                }
+            }),
+        ))
+        .expect("nested assistant event");
+        match nested {
+            Event::AssistantResponse(event) => {
+                assert_eq!(event.content, "nested");
+                assert_eq!(event.message_status.as_deref(), Some("COMPLETED"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let top_level = Event::from_frame(event_frame(
+            "reasoningContentEvent",
+            serde_json::json!({"text": "top-level"}),
+        ))
+        .expect("top-level reasoning event");
+        match top_level {
+            Event::ReasoningContent(event) => assert_eq!(event.text, "top-level"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_tool_input_object_is_encoded_as_one_json_fragment() {
+        let event = Event::from_frame(event_frame(
+            "toolUseEvent",
+            serde_json::json!({
+                "toolUseEvent": {
+                    "toolUseId": "toolu_nested",
+                    "name": "Bash",
+                    "input": {"command": "printf ok"},
+                    "stop": true
+                }
+            }),
+        ))
+        .expect("nested tool event");
+
+        match event {
+            Event::ToolUse(event) => {
+                assert_eq!(event.tool_use_id, "toolu_nested");
+                assert_eq!(event.name, "Bash");
+                assert_eq!(event.input, r#"{"command":"printf ok"}"#);
+                assert!(event.stop);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_known_nested_payload_is_not_downgraded_to_unknown_or_text() {
+        let result = Event::from_frame(event_frame(
+            "assistantResponseEvent",
+            serde_json::json!({"assistantResponseEvent": "not-an-object"}),
+        ));
+        assert!(matches!(result, Err(ParseError::PayloadDeserialize(_))));
     }
 }

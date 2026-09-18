@@ -7185,6 +7185,71 @@ async fn external_pool_not_found_invalid_model_uses_default_cross_pool_retry_sta
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_bad_request_model_unavailable_fails_over_without_same_pool_replay() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalMessagesFakeServer::start(
+        StatusCode::BAD_REQUEST,
+        fake_external_error_body("No available channel for model claude-sonnet-4-6"),
+    )
+    .await;
+    let succeeding =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("400-ok"))
+            .await;
+    create_messages_pool(
+        &postgres,
+        "bad-request-model-unavailable-primary",
+        1,
+        &failing.base_url,
+    )
+    .await;
+    create_messages_pool(
+        &postgres,
+        "bad-request-model-unavailable-secondary",
+        2,
+        &succeeding.base_url,
+    )
+    .await;
+
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 8,
+        external_pool_retry_max_attempts: 2,
+        external_pool_same_pool_retry_count: 3,
+        external_pool_same_pool_retry_status_codes: vec![StatusCode::BAD_REQUEST.as_u16()],
+        external_pool_same_pool_retry_delay_ms: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-sonnet-4-6");
+    route.request_id = "req_bad_request_model_unavailable".to_string();
+    route.error_id = "err_bad_request_model_unavailable".to_string();
+    route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(4));
+
+    let response = match timeout(
+        Duration::from_secs(3),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("400 model-unavailable failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("400 model-unavailable should fail over to the next pool: {error:?}")
+        }
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        failing.snapshot(),
+        1,
+        "model-unavailable must not replay the same pool even when 400 is listed"
+    );
+    assert_eq!(succeeding.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_terminal_account_error_skips_same_pool_retry_and_fails_over() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -7308,7 +7373,7 @@ async fn external_pool_retry_after_header_records_soft_failure_without_pool_cool
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_repeated_soft_failures_escalate_to_short_cooldown() {
+async fn external_pool_repeated_soft_failures_never_create_pool_cooldown() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -7353,34 +7418,31 @@ async fn external_pool_repeated_soft_failures_escalate_to_short_cooldown() {
         .load_pool_runtime_snapshot(pool.id, &[])
         .await
         .expect("read runtime after repeated soft failures");
-    assert!(
-        runtime.pool_cooldown_remaining_secs > 0,
-        "third same-reason soft failure should create a short hard cooldown"
-    );
     assert_eq!(
-        runtime.pool_cooldown_reason.as_deref(),
-        Some("server_error")
+        runtime.pool_cooldown_remaining_secs, 0,
+        "普通瞬态失败不能升级成池级硬冷却"
     );
+    assert_eq!(runtime.pool_cooldown_reason.as_deref(), None);
     assert_eq!(runtime.transient_failure_streak, 3);
 
     let mut blocked_route = test_route("claude-sonnet-4-6");
     blocked_route.request_id = "req_repeated_soft_cooldown_blocked".to_string();
     blocked_route.error_id = "err_repeated_soft_cooldown_blocked".to_string();
     blocked_route.inference_attempt_budget = Arc::new(InferenceAttemptBudget::new(2));
-    let blocked = timeout(
+    let attempted_again = timeout(
         Duration::from_secs(3),
         manager.forward_with_failover_result(config, blocked_route),
     )
     .await
-    .expect("cooldown-blocked request should finish");
+    .expect("request after repeated soft failures should finish");
     assert!(
-        matches!(blocked, ExternalPoolForwardOutcome::FinalError(_)),
-        "cooldown should fail fast when no other pool is available"
+        matches!(attempted_again, ExternalPoolForwardOutcome::FinalError(_)),
+        "the fake upstream still fails, but must be attempted instead of blocked by cooldown"
     );
     assert_eq!(
         failing.snapshot(),
-        3,
-        "active cooldown must prevent immediately hitting the failing upstream again"
+        4,
+        "ordinary transient failure must not prevent the next request from reaching the pool"
     );
 
     postgres.drop_test_schema().await.unwrap();
@@ -10716,7 +10778,7 @@ fn external_pool_error_classifies_model_unavailable_without_cooldown_when_disabl
 }
 
 #[test]
-fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors() {
+fn external_pool_retry_boundary_same_pool_limit_caps_to_one_and_rejects_terminal_errors() {
     let mut config = ExternalPoolsConfig {
         external_pool_same_pool_retry_count: 3,
         external_pool_same_pool_retry_status_codes: vec![401, 403, 429, 500, 502, 503, 504],
@@ -10783,6 +10845,119 @@ fn external_pool_same_pool_retry_limit_caps_to_one_and_rejects_terminal_errors()
         1,
         "rate limit may retry once on the same pool, not more"
     );
+
+    let model_mapping_miss = ExternalPoolError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "external pool #1 requires model mapping match, but no rule matched model sonnet"
+            .to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &model_mapping_miss),
+        0,
+        "a pool-local mapping miss must not replay the same pool"
+    );
+
+    let model_unavailable = ExternalPoolError {
+        status: Some(StatusCode::BAD_REQUEST),
+        message: "external upstream model is unavailable".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(30), "model_unavailable".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert_eq!(
+        retry_pipeline::same_pool_retry_limit(&config, &model_unavailable),
+        0,
+        "model-unavailable responses must not replay the same pool"
+    );
+}
+
+#[test]
+fn external_pool_retry_boundary_cross_pool_separates_route_errors_from_protocol_and_request_errors()
+{
+    let mut config = ExternalPoolsConfig {
+        external_pool_retry_status_codes: vec![StatusCode::BAD_GATEWAY.as_u16()],
+        external_pool_retry_on_protocol_error: false,
+        external_pool_retry_on_network_error: false,
+        ..ExternalPoolsConfig::default()
+    };
+
+    let mapping_miss = ExternalPoolError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "external pool #1 requires model mapping match, but no rule matched model sonnet"
+            .to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &mapping_miss
+    ));
+
+    let model_unavailable_400 = ExternalPoolError {
+        status: Some(StatusCode::BAD_REQUEST),
+        message: "external upstream model is unavailable".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(30), "model_unavailable".to_string())),
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &model_unavailable_400
+    ));
+
+    let model_unavailable_without_cooldown = ExternalPoolError {
+        cooldown: None,
+        ..model_unavailable_400.clone()
+    };
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &model_unavailable_without_cooldown
+    ));
+
+    let ordinary_bad_request = ExternalPoolError {
+        status: Some(StatusCode::BAD_REQUEST),
+        message: "external upstream rejected the request".to_string(),
+        retryable: false,
+        auto_disable_reason: None,
+        cooldown: None,
+        protocol_error: None,
+        raw_upstream_error: None,
+    };
+    assert!(!retry_pipeline::should_retry_cross_pool(
+        &config,
+        &ordinary_bad_request
+    ));
+
+    let protocol_error = ExternalPoolError {
+        status: Some(StatusCode::OK),
+        message: "external upstream returned an unexpected response shape".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((Duration::from_secs(1), "protocol_error".to_string())),
+        protocol_error: Some("unexpected_response_shape"),
+        raw_upstream_error: None,
+    };
+    assert!(!retry_pipeline::should_retry_cross_pool(
+        &config,
+        &protocol_error
+    ));
+    config.external_pool_retry_on_protocol_error = true;
+    assert!(retry_pipeline::should_retry_cross_pool(
+        &config,
+        &protocol_error
+    ));
 }
 
 #[test]
@@ -11550,6 +11725,135 @@ fn supported_model_filter_uses_original_payload_and_raw_model_candidates() {
     ));
 }
 
+#[test]
+fn supported_model_filter_bridges_claude_code_aliases_to_kiro_models() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("haiku");
+
+    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["haiku".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_bridges_dotted_dashed_and_dated_claude_forms() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("claude-sonnet-4-5-20250929");
+
+    pool.supported_models = vec!["sonnet-4.5".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["sonnet-4-5".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.6".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_preserves_thinking_and_one_m_suffixes() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("sonnet-thinking[1m]");
+
+    pool.supported_models = vec!["claude-sonnet-4.6-thinking[1m]".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.6-thinking".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-sonnet-4.6[1m]".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_keeps_custom_names_exact_unless_resolution_is_explicit() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let mut route = test_route("client-alias");
+    route.upstream_model = Some("claude-sonnet-4.5".to_string());
+
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["client-alias".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    route.model_resolution_source = Some("alias".to_string());
+    pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
+fn supported_model_filter_does_not_family_match_custom_names() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let route = test_route("tenant-haiku-model");
+
+    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["tenant-haiku-model".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    let route = test_route("claude-custom-haiku-model");
+    pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
 #[tokio::test]
 async fn external_pool_max_input_tokens_does_not_short_circuit_dispatch() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
@@ -11624,7 +11928,7 @@ fn supported_model_filter_requires_a_candidate_when_list_is_restricted() {
     assert!(!external_pool_matches_supported_models(&pool, None));
     assert!(!external_pool_matches_supported_models(
         &pool,
-        Some(&[None, None, None])
+        Some(&[None, None, None, None])
     ));
 }
 
@@ -17589,6 +17893,13 @@ fn selection_shares(
 
 const DISTRIBUTION_ROUNDS: usize = 4_000;
 
+fn quality_enabled_config() -> ExternalPoolsConfig {
+    ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        ..ExternalPoolsConfig::default()
+    }
+}
+
 // ---- L2-14：主开关关闭等价性（防回归总闸门，必须最先通过）----
 
 #[test]
@@ -17648,7 +17959,7 @@ fn quality_scheduling_disabled_preserves_legacy_load_balancing() {
 fn quality_scheduling_never_promotes_lower_priority_tier() {
     // 这是 P0-b 修正的核心：无论质量分差多大，
     // 低优先级层都不得被提拔到高优先级层之上。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
     let candidates = vec![
         // 高优先级但质量极差
         scored_pool(1, 1, 0.95, Some(30_000.0), Some(120_000.0)),
@@ -17668,7 +17979,7 @@ fn quality_scheduling_never_promotes_lower_priority_tier() {
 #[test]
 fn quality_scheduling_reorders_within_the_same_priority_tier() {
     // 同一优先级层内，质量好的必须显著占优。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
     let candidates = vec![
         scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0)),
         scored_pool(2, 1, 0.8, Some(200.0), Some(1_000.0)),
@@ -17689,7 +18000,7 @@ fn quality_scheduling_reorders_within_the_same_priority_tier() {
 
 #[test]
 fn quality_baseline_ignores_lower_priority_pools() {
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
     let candidates = vec![
         // 最优层：质量差异必须仍然影响排序。
         scored_pool(1, 1, 0.0, Some(100.0), Some(100.0)),
@@ -17718,7 +18029,7 @@ fn quality_baseline_ignores_lower_priority_pools() {
 fn quality_scheduling_ranks_error_rate_above_latency_signals() {
     // 用户明确要求：报错/重试多的判断优先级要**高于**首字等质量曲线。
     // 构造：A 报错但很快，B 不报错但很慢。B 必须胜出。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
     let candidates = vec![
         // 快但报错
         scored_pool(1, 1, 0.5, Some(50.0), Some(200.0)),
@@ -17738,7 +18049,7 @@ fn quality_scheduling_ranks_error_rate_above_latency_signals() {
 #[test]
 fn quality_scheduling_separates_ttft_and_total_latency_signals() {
     // 首字高 与 总耗时长 是两个独立因子，必须能分别生效。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
 
     // 仅首字劣化
     let ttft_only = vec![
@@ -17770,7 +18081,7 @@ fn quality_scheduling_separates_ttft_and_total_latency_signals() {
 fn quality_scheduling_keeps_all_pools_available_when_everyone_is_degraded() {
     // 全体劣化时，相对中位数比较让所有人罚分归零，
     // 候选集**绝不能**被清空——这是"降级时保证可用"的核心。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
     let candidates = vec![
         scored_pool(1, 1, 0.9, Some(20_000.0), Some(90_000.0)),
         scored_pool(2, 1, 0.9, Some(20_000.0), Some(90_000.0)),
@@ -17790,7 +18101,7 @@ fn quality_scheduling_keeps_all_pools_available_when_everyone_is_degraded() {
 #[test]
 fn quality_scheduling_still_selects_the_only_pool_even_when_degraded() {
     // 唯一账号即使质量极差也必须继续被选中，否则服务直接不可用。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
     let candidates = vec![scored_pool(1, 1, 1.0, Some(60_000.0), Some(300_000.0))];
 
     let selected = select_external_pool_candidate(candidates, &config, 0);
@@ -17805,7 +18116,7 @@ fn quality_scheduling_still_selects_the_only_pool_even_when_degraded() {
 fn quality_scheduling_never_starves_a_probationary_pool() {
     // 避让中的池只是罚分靠后，**不得**被移出候选集，
     // 否则它永远拿不到探测流量、永远无法自证恢复。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
     let now_ms = 1_000_000;
 
     let mut healthy = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
@@ -17833,7 +18144,7 @@ fn quality_scheduling_never_starves_a_probationary_pool() {
 fn quality_scheduling_treats_insufficient_samples_as_neutral() {
     // 样本不足的池按中性值处理：既不因"没数据"被判差，也不被优待。
     // 否则新加入的账号永远起不来。
-    let config = ExternalPoolsConfig::default();
+    let config = quality_enabled_config();
 
     let mut cold = test_pool("https://cold.example.test", true);
     cold.id = 1;
@@ -17866,7 +18177,10 @@ fn quality_scheduling_treats_insufficient_samples_as_neutral() {
 #[test]
 fn quality_scheduling_handles_pools_without_any_quality_data() {
     // 完全无质量记录（Redis 里没有键）时必须退化为中性，不得 panic。
-    let config = ExternalPoolsConfig::default();
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
     let mut a = test_pool("https://a.example.test", true);
     a.id = 1;
     a.priority = 1;
@@ -17888,11 +18202,180 @@ fn quality_scheduling_handles_pools_without_any_quality_data() {
     }
 }
 
+#[test]
+fn quality_scheduling_without_samples_preserves_legacy_load_selection() {
+    // 开关显式打开但被动采样尚未产生任何合格样本时，必须保持旧的
+    // "有效优先级 -> 最低负载" 语义，不能因 Top-K 加权随机改变冷启动流量。
+    let config = quality_enabled_config();
+    let mut light = test_pool("https://cold-light.example.test", true);
+    light.id = 1;
+    light.priority = 1;
+    light.max_concurrent_requests = 10;
+    let mut heavy = test_pool("https://cold-heavy.example.test", true);
+    heavy.id = 2;
+    heavy.priority = 1;
+    heavy.max_concurrent_requests = 10;
+
+    for _ in 0..100 {
+        let selected = select_external_pool_candidate(
+            vec![
+                candidate(light.clone(), 1, 0),
+                candidate(heavy.clone(), 8, 0),
+            ],
+            &config,
+            0,
+        )
+        .expect("无样本的非空候选集必须能选出池");
+        assert_eq!(
+            selected.id, 1,
+            "冷启动无样本时必须保持 legacy 的最低负载选择"
+        );
+    }
+}
+
+#[test]
+fn relative_degradation_does_not_probation_all_pools_when_the_pool_is_globally_bad() {
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        external_pool_degrade_error_rate_threshold: 0.5,
+        ..ExternalPoolsConfig::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(2, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+        scored_pool(3, 1, 0.9, Some(20_000.0), Some(90_000.0)),
+    ];
+    let baseline = ExternalPoolQualityBaseline::from_candidates(
+        &candidates,
+        config.external_pool_quality_min_samples,
+    );
+
+    for candidate in &candidates {
+        assert_eq!(
+            evaluate_external_pool_degrade_relative(candidate, &baseline, &config, 0),
+            None,
+            "全体一起变差时不应按绝对红线把池全部打入 probation"
+        );
+    }
+}
+
+#[test]
+fn relative_degradation_probation_only_targets_an_outlier_in_the_eligible_pool() {
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        external_pool_degrade_error_rate_threshold: 0.5,
+        ..ExternalPoolsConfig::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 1.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(3, 1, 0.0, Some(200.0), Some(1_000.0)),
+    ];
+    let baseline = ExternalPoolQualityBaseline::from_candidates(
+        &candidates,
+        config.external_pool_quality_min_samples,
+    );
+
+    assert!(matches!(
+        evaluate_external_pool_degrade_relative(&candidates[0], &baseline, &config, 0),
+        Some(ExternalPoolDegradeDecision::Probation { .. })
+    ));
+    assert_eq!(
+        evaluate_external_pool_degrade_relative(&candidates[1], &baseline, &config, 0),
+        None
+    );
+    assert_eq!(
+        evaluate_external_pool_degrade_relative(&candidates[2], &baseline, &config, 0),
+        None
+    );
+}
+
+#[test]
+fn relative_degradation_uses_the_full_path_model_eligible_cohort() {
+    // probation 的基线不能只看最优先级层：同一路径/模型下的整个可派发
+    // 账号池共同变差时，任何单个账号都不应因固定绝对红线被摘除。
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        external_pool_degrade_error_rate_threshold: 0.5,
+        ..ExternalPoolsConfig::default()
+    };
+    let candidates = vec![
+        scored_pool(1, 1, 1.0, Some(200.0), Some(1_000.0)),
+        scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0)),
+        scored_pool(3, 5, 0.9, Some(20_000.0), Some(90_000.0)),
+    ];
+    let baseline = ExternalPoolQualityBaseline::from_candidates(
+        &candidates,
+        config.external_pool_quality_min_samples,
+    );
+
+    assert_eq!(
+        baseline.median_error_rate, 0.9,
+        "质量基线必须覆盖同一路径/模型的整个准入候选池"
+    );
+    assert_eq!(
+        evaluate_external_pool_degrade_relative(&candidates[0], &baseline, &config, 0),
+        None,
+        "全 cohort 已整体劣化时不能仅因最优层账号达到绝对红线而 probation"
+    );
+}
+
+#[test]
+fn relative_degradation_uses_a_window_error_rate_baseline() {
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        external_pool_quality_min_samples: 5,
+        external_pool_degrade_error_rate_threshold: 0.5,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut recent_bad = scored_pool(1, 1, 0.0, Some(200.0), Some(1_000.0));
+    recent_bad
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_sample_count = 10;
+    recent_bad
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_failure_count = 8;
+    let mut recent_good = scored_pool(2, 1, 0.0, Some(200.0), Some(1_000.0));
+    recent_good
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_sample_count = 10;
+    recent_good
+        .quality
+        .as_mut()
+        .unwrap()
+        .degrade_window_failure_count = 0;
+    let candidates = vec![recent_bad, recent_good];
+    let baseline = ExternalPoolQualityBaseline::from_candidates(
+        &candidates,
+        config.external_pool_quality_min_samples,
+    );
+
+    assert_eq!(
+        baseline.median_error_rate, 0.0,
+        "评分仍使用累计 EWMA 失败率基线"
+    );
+    assert_eq!(
+        baseline.median_window_error_rate, 0.4,
+        "probation 使用窗口失败率基线"
+    );
+    assert!(
+        evaluate_external_pool_degrade_relative(&candidates[0], &baseline, &config, 0).is_none(),
+        "窗口失败率与同 cohort 中位数一致时不得 probation"
+    );
+}
+
 // ---- Top-K 边界 ----
 
 #[test]
 fn quality_scheduling_top_k_larger_than_candidate_count_is_safe() {
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_quality_top_k: 99,
         ..Default::default()
     };
@@ -17907,6 +18390,7 @@ fn quality_scheduling_top_k_larger_than_candidate_count_is_safe() {
 #[test]
 fn quality_scheduling_top_k_one_always_picks_the_best_scoring_pool() {
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_quality_top_k: 1,
         ..Default::default()
     };
@@ -17981,7 +18465,10 @@ fn degrade_state(error_rate: f64, probation_level: u32) -> ExternalPoolQualitySt
 
 #[test]
 fn degrade_requires_error_rate_at_or_above_threshold() {
-    let config = ExternalPoolsConfig::default();
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
     let threshold = config.external_pool_degrade_error_rate_threshold;
 
     // 阈值以下不降级
@@ -18012,7 +18499,10 @@ fn degrade_never_fires_when_master_switch_is_off() {
 #[test]
 fn degrade_ignores_pools_with_insufficient_samples() {
     // 冷启动：前几个请求全失败也不足以定性一个池。
-    let config = ExternalPoolsConfig::default();
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
     let state = ExternalPoolQualityState {
         recent_error_rate: 1.0,
         sample_count: config.external_pool_quality_min_samples - 1,
@@ -18027,6 +18517,7 @@ fn degrade_ignores_pools_with_insufficient_samples() {
 #[test]
 fn degrade_uses_the_current_window_failure_rate() {
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_quality_min_samples: 5,
         external_pool_degrade_error_rate_threshold: 0.5,
         ..Default::default()
@@ -18062,7 +18553,10 @@ fn degrade_uses_the_current_window_failure_rate() {
 #[test]
 fn degrade_does_not_extend_an_active_probation() {
     // 避让期内持续失败不得无限续期，否则池永远等不到恢复爬坡窗口。
-    let config = ExternalPoolsConfig::default();
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
     let state = ExternalPoolQualityState {
         recent_error_rate: 1.0,
         sample_count: 100,
@@ -18084,6 +18578,7 @@ fn degrade_does_not_extend_an_active_probation() {
 #[test]
 fn degrade_backoff_doubles_and_is_capped() {
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_degrade_probation_secs: 100,
         external_pool_max_probation_secs: 700,
         ..Default::default()
@@ -18106,7 +18601,10 @@ fn degrade_backoff_doubles_and_is_capped() {
 
 #[test]
 fn degrade_level_increments_from_existing_level() {
-    let config = ExternalPoolsConfig::default();
+    let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
+        ..ExternalPoolsConfig::default()
+    };
     for existing in [0u32, 1, 5] {
         match evaluate_external_pool_degrade(&degrade_state(1.0, existing), &config, 0) {
             ExternalPoolDegradeDecision::Probation { level, .. } => {
@@ -18120,6 +18618,7 @@ fn degrade_level_increments_from_existing_level() {
 #[test]
 fn degrade_level_resets_after_recovery_ramp() {
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_recovery_ramp_secs: 60,
         ..Default::default()
     };
@@ -18144,6 +18643,7 @@ fn degrade_level_resets_after_recovery_ramp() {
 fn degrade_ttl_covers_probation_window_plus_recovery_ramp() {
     // TTL 若短于避让窗口，避让状态会随 Redis 键过期被抹掉，降级形同虚设。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_degrade_probation_secs: 300,
         external_pool_max_probation_secs: 300,
         external_pool_recovery_ramp_secs: 60,
@@ -18183,6 +18683,7 @@ fn probationary_pool_still_receives_probe_traffic_outside_top_k() {
     // 核心回归：Top-K = 3 且有 3 个健康池时，被避让的池会排在第 4 位，
     // 纯罚分方案会让它拿到**零**流量，从而永远无法自证恢复。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_quality_top_k: 3,
         external_pool_probe_share_percent: 10,
         ..Default::default()
@@ -18207,6 +18708,7 @@ fn probationary_pool_still_receives_probe_traffic_outside_top_k() {
 fn probe_share_zero_gives_probationary_pool_no_traffic() {
     // 探测比例设为 0 时退化为"硬避让"，必须尊重该配置。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_quality_top_k: 3,
         external_pool_probe_share_percent: 0,
         ..Default::default()
@@ -18227,6 +18729,7 @@ fn probe_share_zero_gives_probationary_pool_no_traffic() {
 fn all_probationary_pools_still_share_traffic_fairly() {
     // 全员避让（上游整体故障）：候选集不得被清空，且不得退化成只打一个池。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_probe_share_percent: 10,
         ..Default::default()
     };
@@ -18252,6 +18755,7 @@ fn probe_traffic_never_crosses_priority_tiers() {
     // 探测流量只在最优优先级层内发生：一个低优先级的避让池
     // 不得借探测通道抢到高优先级层的流量。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_probe_share_percent: 50,
         ..Default::default()
     };
@@ -18277,6 +18781,7 @@ fn probe_traffic_reaches_a_pool_demoted_by_its_failure_streak() {
     // 这与"用户配置的低优先级"必须区别对待：
     // 这个池的**基础优先级与主池相同**，只是被系统的失败惩罚降了下去。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_probe_share_percent: 20,
         external_pool_transient_failure_priority_penalty: 20,
         ..Default::default()
@@ -18300,6 +18805,7 @@ fn probe_traffic_still_respects_user_configured_priority_for_demoted_pools() {
     // 边界：一个池既是用户配置的低优先级、又背着连击、还在避让期。
     // 用户意图优先——它不该拿到探测流量。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_probe_share_percent: 50,
         external_pool_transient_failure_priority_penalty: 20,
         ..Default::default()
@@ -18323,6 +18829,7 @@ fn probe_traffic_still_respects_user_configured_priority_for_demoted_pools() {
 fn recovery_ramp_gradually_restores_traffic_after_probation_expires() {
     // 避让到期不得瞬间全量回流，份额必须随时间单调回升。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_recovery_ramp_secs: 60,
         external_pool_probe_share_percent: 0,
         ..Default::default()
@@ -18369,6 +18876,7 @@ fn never_recovering_pool_keeps_being_re_probationed() {
     // D3 "永不恢复"：每次避让到期后失败率仍超标，层级必须持续递增、
     // 避让时长持续拉长，直至上限。
     let config = ExternalPoolsConfig {
+        external_pool_quality_aware_scheduling_enabled: true,
         external_pool_degrade_probation_secs: 100,
         external_pool_max_probation_secs: 400,
         ..Default::default()
@@ -18467,10 +18975,10 @@ fn quality_config_serializes_with_the_camel_case_keys_the_ui_sends() {
         assert!(object.contains_key(key), "缺少前端依赖的配置键 {key}");
     }
 
-    // 主开关默认必须为 true——这是用户明确要求的"默认打开"。
+    // 主开关默认关闭，避免升级后未经显式同意改变外部池调度行为。
     assert_eq!(
         object["externalPoolQualityAwareSchedulingEnabled"],
-        serde_json::Value::Bool(true)
+        serde_json::Value::Bool(false)
     );
 }
 

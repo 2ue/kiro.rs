@@ -41,8 +41,8 @@ formatter 单测、API round-trip、两套 production build、浏览器截图与
 
 - `node feature/tests/cost-format-contract.mjs`：PASS。脚本使用仓库现有 TypeScript 编译器加载两套 UI 的真实 formatter，实现相同值矩阵；覆盖 `0`、`0.0000000049`、`0.000000005`、`0.00000123`、`0.99999999`、`1`、`-2`、NaN 和 null。
 - 第一次尝试使用当前 Node 不支持的 `--experimental-strip-types` 失败，没有计为 pass；最终脚本不新增依赖，编译到一次性系统临时目录并自动清理。
-- `ui npm run build`：PASS，2456 modules。
-- `admin-ui npm run build`：PASS，1775 modules。
+- `pnpm --dir ui build`：PASS，2456 modules。
+- `pnpm --dir admin-ui build`：PASS，1775 modules。
 - promptSteering 保存路径不再把 prompt 子开关镜像覆盖 `bodyConversion.*`；静态测试/构建已通过，真实后端 save-refresh 和两 UI 交叉 round-trip 仍待浏览器 gate。
 - 2026-07-16 再次按仓库规定的应用内 Browser gate 建立会话，仍在打开任何项目页面之前被宿主元数据缺失拒绝（固定分类：`sandbox-state metadata missing sandboxPolicy`）。因此本轮没有产生页面交互、viewport、截图、网络请求或 save-refresh 证据；该结果只证明 browser gate 仍被宿主工具阻断，不能记为 UI pass，也不能用独立 Playwright/其他浏览器替代后宣称通过。
 - 桌面、窄桌面、移动 viewport 的详情、tooltip、CSV 下载和配置交互尚未执行，因此本专题还不能标记 `verified-fixed`。

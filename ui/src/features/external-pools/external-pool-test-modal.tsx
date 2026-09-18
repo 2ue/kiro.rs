@@ -4,7 +4,12 @@ import { toast } from 'sonner'
 import { testExternalPool } from '@/api/credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import { buildTestModelOptions, defaultTestModelForOptions, DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT } from '@/lib/test-models'
+import {
+  buildClaudeCodeTestModelOptions,
+  defaultClaudeCodeTestModelForOptions,
+  DEFAULT_CLAUDE_CODE_TEST_MODEL,
+  DEFAULT_TEST_PROMPT,
+} from '@/lib/test-models'
 import type { ExternalPool, ExternalPoolTestResponse } from '@/types/api'
 import { ModalShell } from '@/components/patterns'
 import { Badge, Button, Input, Label } from '@/components/ui'
@@ -28,7 +33,7 @@ export function ExternalPoolTestModal({
   onDone: () => void
 }) {
   const modelCapabilities = useModelCapabilities()
-  const [model, setModel] = useState(DEFAULT_TEST_MODEL)
+  const [model, setModel] = useState(DEFAULT_CLAUDE_CODE_TEST_MODEL)
   const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
   const [result, setResult] = useState<ExternalPoolTestResponse | null>(null)
   const [error, setError] = useState('')
@@ -36,9 +41,9 @@ export function ExternalPoolTestModal({
   const userSelectedModelRef = useRef(false)
 
   const modelOptions = useMemo(() => {
-    return buildTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels)
+    return buildClaudeCodeTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels)
   }, [modelCapabilities.data?.models, pool?.supportedModels])
-  const defaultModel = defaultTestModelForOptions(modelOptions)
+  const defaultModel = defaultClaudeCodeTestModelForOptions(modelOptions)
 
   const selectedModelLabel = useMemo(
     () => modelOptions.find((o) => o.id === model)?.label || model,

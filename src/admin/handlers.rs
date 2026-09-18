@@ -633,7 +633,7 @@ pub async fn sync_credential_supported_models(
 }
 
 /// POST /api/admin/credentials/:id/supported-models/discover
-/// 使用该凭据拉取上游模型并生成可编辑的 Claude/Claude Code 支持模型建议，不写回。
+/// 使用该凭据拉取 Kiro upstream 模型并生成可编辑的 Kiro 支持模型建议，不写回。
 pub async fn discover_credential_supported_models(
     State(state): State<AdminState>,
     Path(id): Path<u64>,

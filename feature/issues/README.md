@@ -35,6 +35,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 
 ## 当前权威专题
 
+- [外部池质量感知调度零派发活锁](external-pool-quality-scheduling-zero-dispatch-20260918.md) - 2026-09-18；P0；`v0.0.162`/`v0.0.163`（二者代码一致）外部池零派发、usage 无记录、切回 `v0.0.161` 立即恢复。已确认升级兼容缺陷：质量调度默认值曾为开启，普通瞬态失败可升级池级 hard cooldown；已确认并修复质量采样与正式 Redis 调度链路的资源隔离、相对 cohort probation、selector 空转兜底和无样本 legacy 回退。现网 coordinator/Redis 争用是否为零 upstream 派发的最终根因仍未闭环，状态见专项文档。
 - [当前问题状态索引与文档维护规则](current-issue-status-index-20260731.md) - 2026-07-31 当前 open/fix-pending/NO-GO/验证缺口汇总；代码或状态改动必须同步更新 owning issue、该索引和必要的 plan-tree 状态。
 - [当前问题逐项分析优先级队列](issue-analysis-priority-queue-20260731.md) - 2026-07-31 按紧急度和难度排序的问题分析执行顺序；先处理本地账号 Claude Code/WebSearch/tools/image，再推进协议、调度、存储和 UI/release gates。
 - [Claude Code 本地账号 WebSearch/tools/image 真实调用分析](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) - 2026-07-29/31 本地账号 7/8 + `claude-sonnet-4.5` 的当前权威记录；direct native `web_search_YYYYMMDD`、mixed native WebSearch、当前 Claude CLI `WebSearch`、工具命名/schema key 映射和 tool-result-only follow-up focused path 已验证，图片来源矩阵、模型报告和复杂工具历史仍 open；旧 external-pool 调试结论不能替代此本地账号诊断。

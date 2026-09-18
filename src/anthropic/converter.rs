@@ -1600,6 +1600,99 @@ mod tests {
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
+    #[test]
+    fn mapped_tool_name_is_used_across_serialized_kiro_payload() {
+        use super::super::payload_guard::serialize_kiro_request;
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+        use crate::kiro::model::requests::kiro::KiroRequest;
+
+        let original_name = "mcp__server-name__read_file";
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert(
+            "properties".to_string(),
+            serde_json::json!({"path": {"type": "string"}}),
+        );
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "calling tool"},
+                        {"type": "tool_use", "id": "toolu_01", "name": original_name, "input": {"path": "README.md"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: Some(vec![AnthropicTool {
+                name: original_name.to_string(),
+                description: "Read a file.".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }]),
+            thinking: None,
+            tool_choice: Some(serde_json::json!({"type": "tool", "name": original_name})),
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("convert request");
+        let (mapped_name, mapped_original) = result
+            .tool_name_map
+            .iter()
+            .next()
+            .expect("unsafe tool name should be mapped");
+        assert_eq!(mapped_original, original_name);
+        assert!(mapped_name.len() <= TOOL_NAME_MAX_LEN);
+        assert!(mapped_name.chars().all(|ch| ch.is_ascii_alphanumeric()));
+
+        let request = KiroRequest {
+            conversation_state: result.conversation_state,
+            profile_arn: None,
+            additional_model_request_fields: result.additional_model_request_fields,
+            tool_cache_point_insert_after: result.tool_cache_point_insert_after,
+            cache_point_plan_recording_enabled: result.cache_point_plan_recording_enabled,
+        };
+        let body = serialize_kiro_request(&request).expect("serialize Kiro request");
+
+        assert!(
+            !body.contains(original_name),
+            "Kiro-facing payload must not leak the unsafe Claude tool name"
+        );
+        assert!(
+            body.contains(&format!(r#""name":"{}""#, mapped_name)),
+            "current tool definition should use the mapped Kiro name"
+        );
+        assert!(
+            body.contains(&format!(r#""toolChoiceName":"{}""#, mapped_name))
+                || body.contains(&format!(
+                    "<tool_choice_name>{}</tool_choice_name>",
+                    mapped_name
+                )),
+            "Kiro-facing tool choice steering should use the mapped Kiro name"
+        );
+    }
+
     fn schema_key_mapping_request(
         properties: serde_json::Value,
         required: serde_json::Value,
@@ -3867,7 +3960,10 @@ mod tests {
                 .any(|message| matches!(
                     message,
                     Message::User(user)
-                        if user.user_input_message.content.contains("<tool_choice_name>read_file</tool_choice_name>")
+                        if user.user_input_message.content.contains(&format!(
+                            "<tool_choice_name>{}</tool_choice_name>",
+                            kiro_tool_name
+                        ))
                 )),
             "compat mode should add a Kiro-facing forced-tool steering prefix"
         );

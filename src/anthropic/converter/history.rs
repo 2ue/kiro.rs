@@ -61,7 +61,7 @@ pub(super) fn build_history(
     } else {
         None
     };
-    let tool_choice_prefix = generate_tool_choice_prefix(req, options.clone());
+    let tool_choice_prefix = generate_tool_choice_prefix(req, tool_name_map, options.clone());
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {

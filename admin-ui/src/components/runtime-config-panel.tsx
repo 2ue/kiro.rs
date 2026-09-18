@@ -361,7 +361,7 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolSamePoolRetryDelayMs: 500,
   externalPoolTransientFailurePriorityPenalty: 20,
   externalPoolTransientFailureCooldownThreshold: 0,
-  externalPoolQualityAwareSchedulingEnabled: true,
+  externalPoolQualityAwareSchedulingEnabled: false,
   externalPoolQualityEwmaAlpha: 0.2,
   externalPoolQualitySampleTtlSecs: 600,
   externalPoolQualityMinSamples: 5,

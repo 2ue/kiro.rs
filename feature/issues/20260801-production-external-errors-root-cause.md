@@ -175,7 +175,7 @@ P002 固定复现条件：
 - focused Rust：PG/Redis 集成 dispatch hit 通过，`normalized_external_direct_policy_skips_raw_preparse_without_raw_pool`
   确认直接外部池请求进入 fake external 一次，usage 的“模型（请求）”保留
   `claude-opus-4-6-thinking`，“模型（上游）”和外发 body `model` 为 `claude-opus-4.6`；
-- frontend：`npm run check` 通过，外部账号策略页和运行时配置页的兼容字段文案类型检查通过；
+- frontend：`pnpm --dir ui check` 通过，外部账号策略页和运行时配置页的兼容字段文案类型检查通过；
 - frontend contract：发布前检查发现 `admin-ui` 类型合同仍缺外部池路径策略字段，且旧后台仍显示
   “输入上限预检”；已补齐 `externalPoolRouteMode` / `externalPoolRouteRules` 并把旧后台文案
   同步为“估算输入上限（兼容）”；

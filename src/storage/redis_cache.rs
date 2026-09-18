@@ -565,6 +565,7 @@ pub struct RedisStore {
     manager: ConnectionManager,
     scheduler_manager: ConnectionManager,
     scheduler_capacity_manager: ConnectionManager,
+    quality_sample_manager: ConnectionManager,
     role: RedisStoreRole,
     usage_summary_write_gate: Arc<Semaphore>,
     key_prefix: String,
@@ -1512,12 +1513,13 @@ impl RedisStore {
             .ok_or_else(|| anyhow::anyhow!("必须配置 redis.url"))?;
         let client = redis::Client::open(url)?;
         let manager = client.get_connection_manager().await?;
-        let (scheduler_manager, scheduler_capacity_manager) = match role {
+        let (scheduler_manager, scheduler_capacity_manager, quality_sample_manager) = match role {
             RedisStoreRole::Business => (
                 client.get_connection_manager().await?,
                 client.get_connection_manager().await?,
+                client.get_connection_manager().await?,
             ),
-            RedisStoreRole::Observability => (manager.clone(), manager.clone()),
+            RedisStoreRole::Observability => (manager.clone(), manager.clone(), manager.clone()),
         };
         #[cfg(test)]
         let usage_summary_write_permits = std::env::var("KIRO_RS_TEST_USAGE_SUMMARY_WRITE_PERMITS")
@@ -1532,6 +1534,7 @@ impl RedisStore {
             manager,
             scheduler_manager,
             scheduler_capacity_manager,
+            quality_sample_manager,
             role,
             usage_summary_write_gate: Arc::new(Semaphore::new(usage_summary_write_permits)),
             key_prefix: config.key_prefix.trim_end_matches(':').to_string(),
@@ -1589,6 +1592,10 @@ impl RedisStore {
 
     fn scheduler_capacity_manager(&self) -> ConnectionManager {
         self.scheduler_capacity_manager.clone()
+    }
+
+    fn quality_sample_manager(&self) -> ConnectionManager {
+        self.quality_sample_manager.clone()
     }
 
     async fn dashboard_bucket_cache(
@@ -5255,7 +5262,10 @@ impl RedisStore {
             redis.call('SET', KEYS[1], cjson.encode(state), 'PX', write_ttl_ms)
             return cjson.encode(state)
         "#;
-        let mut manager = self.scheduler_capacity_manager();
+        // Quality sampling is deliberately isolated from the scheduler capacity
+        // connection. A burst of detached EWMA writes must not queue behind
+        // lease/snapshot commands on the dispatch hot path.
+        let mut manager = self.quality_sample_manager();
         let encoded: String = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -5330,7 +5340,7 @@ impl RedisStore {
             redis.call('SET', KEYS[1], cjson.encode(state), 'PX', tonumber(ARGV[3]))
             return 1
         "#;
-        let mut manager = self.scheduler_capacity_manager();
+        let mut manager = self.quality_sample_manager();
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -5347,7 +5357,7 @@ impl RedisStore {
     /// 清除外部池质量状态（管理端"清除冷却"时一并清理）。
     #[cfg(test)]
     pub async fn clear_external_pool_quality(&self, pool_id: u64) -> anyhow::Result<()> {
-        let mut manager = self.scheduler_capacity_manager();
+        let mut manager = self.quality_sample_manager();
         let _: i64 = redis::cmd("DEL")
             .arg(self.key(external_pool_quality_key(pool_id)))
             .query_async(&mut manager)

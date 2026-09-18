@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-09-15 Asia/Shanghai
+Last reviewed: 2026-09-18 Asia/Shanghai
 
 ## Done
 
@@ -45,11 +45,12 @@ Last reviewed: 2026-09-15 Asia/Shanghai
 - External-pool passive quality-aware scheduling: real request success/failure samples are
   recorded in Redis with atomic EWMA updates, same-priority quality scoring uses Top-K weighted
   selection, probation/probe/recovery state is bounded and observable, and the master switch
-  defaults on with an exact legacy-selection fallback. The implementation also records stream
-  body/error failures, applies the configured degradation window, clears quality state with
-  manual cooldown clearing, and exposes quality state in both UI status contracts. Focused
-  quality tests pass; the remaining sub2api settings/`ReportResult` work is tracked separately
-  in the topic progress document.
+  defaults **off** with an exact legacy-selection fallback. Ordinary transient failures do not
+  enter pool hard cooldown; quality writes use an isolated Redis manager with a bounded task cap;
+  probation uses the current request's full path/model-eligible cohort; and no-sample cold starts
+  preserve legacy load selection. Selector invariant failure now returns bounded 503 instead of
+  spinning. Focused quality tests pass; current production coordinator/Redis contention remains
+  an evidence/observation follow-up.
 - Source-verified scheduler architecture analysis: the current local-account/external-pool
   request chain, normal and exceptional transitions, queue/capacity/cooldown/retry semantics,
   fallback/rescue boundaries, `sub2api` comparison, configuration regrouping and target
@@ -81,6 +82,17 @@ Last reviewed: 2026-09-15 Asia/Shanghai
   - candidate rejection observability and clearer model-stage display;
   - no-local-credential temporary external-direct and quick return to local-first.
   - optional long-window hard-disable policy for fully unavailable external pools, after production recurrence evidence proves it will not disable merely overloaded providers.
+- Claude Code/Kiro 协议互转优化计划：
+  - 已完成 2026-09-15 `sub2api-kiro` 协议互操作对比和 2026-09-16 优化路线；
+  - P0 fixture/contract test 与已知 event shape/tool input/tool-name/SSE lifecycle 的窄范围实现已 `focused-validated`；
+  - 2026-09-16/17 已完成隔离真实本地凭据的 normal/alias/usage 闭环和真实 Claude Code CLI
+    `2.1.273` 验证；thinking/tool-use 因真实账号额度耗尽只能记为 `partial`；
+  - fake 外部池 non-stream/stream 协议链路已通过；临时 `supportedModels` 白名单暴露了
+    canonical normalization 缺口，不能记为已修复；
+  - semantic fallback 仍仅限已知 event key，trim 后 tool pair、schema profile、thinking 多块、
+    WebSearch index 和错误分类消费仍不得在真实证据前扩大默认行为；
+  - 实现、进度、测试结果和复现记录见 [sub2api-kiro 协议互转优化执行计划](topics/sub2api-kiro-protocol-interop-optimization.md)，
+    本批次证据见 [P0 evidence](../../../../feature/evidence/sub2api-kiro-protocol-interop-p0-20260916.md)。
 - Scheduler target decision and implementation readiness:
   - core target semantics are accepted in [Decision 001](decisions/001-local-external-scheduler-target-contract.md):
     all upstream errors default to temporary turbulence, priority cannot block healthy-pool
@@ -105,12 +117,29 @@ Last reviewed: 2026-09-15 Asia/Shanghai
     gates also passed; `v0.0.134` was published by GitHub Actions `Publish Docker Images #166`;
     remaining work is production rollout observation and renewed `yuenan` / `yuenan-1`
     recurrence checks.
+- Claude Code/Kiro 互转运行时验证 follow-up：
+  - CLI runner 已补最小脱敏 stdout hash/行数/字节数/可疑行摘要合同；完整长会话动态门
+    尚未用当前工作树重跑；
+  - external pool `supportedModels` 已增加 Claude Code 模型命令 canonical normalization
+    contract，并保留 exact allowlist/unknown-model 本地拒绝作为独立决策；
+  - 2026-09-17 已补外部池错误消费边界合同：`model_mapping_miss` 和 `model_unavailable`
+    跳过当前池并允许其它合格池，不在同池重放；普通请求 400 仍 fail-closed，协议错误仍
+    遵循显式协议重试开关。scoped Cargo 纯策略合同为 `2/2` 通过，HTTP 400 模型不可用
+    failover loop 合同为 `1/1` 通过（本地未配置 PG/Redis 时按 helper 安全返回），第三方
+    池和本地 provider 完整错误矩阵仍未重跑；
+  - 2026-09-17 已补本地 provider 400/404 消费合同：`MODEL_UNAVAILABLE` 的 400/404
+    只在有其它可用凭据时跨账号切换，普通 malformed/schema/tool/image/body-invalid
+    400 保持单次 fail-closed；scoped fake-upstream 矩阵 `1/1` 通过。该合同不替代真实
+    Kiro 404 body 验证，且不改变 thinking signature 的同凭据受控 retry。
+  - 取得可用额度后补 thinking、tool-use、长会话和真实外部第三方池验证；不得把本轮
+    `402 quota exhausted` 归类为协议解析失败。
 
 ## Next
 
 1. Perform read-only `v0.0.134` production observation and update the issue/evidence
    indexes without changing usage semantics.
-2. Continue the independent documentation archive and scheduler observability follow-ups.
+2. Close the Claude Code/Kiro interop follow-ups above before widening fallback behavior.
+3. Continue the independent documentation archive and scheduler observability follow-ups.
 
 ## Deferred
 

@@ -19,6 +19,8 @@
 use super::crc::crc32;
 use super::error::{ParseError, ParseResult};
 use super::header::{Headers, parse_headers};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 /// Prelude 固定大小 (12 字节)
 pub const PRELUDE_SIZE: usize = 12;
@@ -52,6 +54,29 @@ impl Frame {
     /// 将 payload 解析为 JSON
     pub fn payload_as_json<T: serde::de::DeserializeOwned>(&self) -> ParseResult<T> {
         serde_json::from_slice(&self.payload).map_err(ParseError::PayloadDeserialize)
+    }
+
+    /// Parse a known event payload while accepting the two shapes observed
+    /// across Kiro endpoint versions:
+    ///
+    /// ```json
+    /// {"content":"..."}
+    /// {"assistantResponseEvent":{"content":"..."}}
+    /// ```
+    ///
+    /// This is intentionally scoped to a caller-supplied, known event key.
+    /// Unknown events and malformed nested values remain visible to the typed
+    /// parser instead of being guessed into ordinary text.
+    pub fn payload_as_event_json<T: DeserializeOwned>(&self, event_type: &str) -> ParseResult<T> {
+        let value: Value = self.payload_as_json()?;
+        let selected = match value {
+            Value::Object(mut object) => match object.remove(event_type) {
+                Some(nested) => nested,
+                None => Value::Object(object),
+            },
+            other => other,
+        };
+        serde_json::from_value(selected).map_err(ParseError::PayloadDeserialize)
     }
 
     /// 将 payload 解析为字符串
@@ -157,6 +182,38 @@ pub fn parse_frame(buffer: &[u8]) -> ParseResult<Option<(Frame, usize)>> {
 mod tests {
     use super::*;
 
+    fn string_header(name: &str, value: &str, output: &mut Vec<u8>) {
+        let name = name.as_bytes();
+        let value = value.as_bytes();
+        assert!(name.len() <= u8::MAX as usize);
+        assert!(value.len() <= u16::MAX as usize);
+        output.push(name.len() as u8);
+        output.extend_from_slice(name);
+        output.push(7); // HeaderValueType::String
+        output.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        output.extend_from_slice(value);
+    }
+
+    fn event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        string_header(":message-type", "event", &mut headers);
+        string_header(":event-type", event_type, &mut headers);
+        string_header(":content-type", "application/json", &mut headers);
+
+        let total_length = PRELUDE_SIZE + headers.len() + payload.len() + 4;
+        let mut frame = vec![0u8; total_length];
+        frame[0..4].copy_from_slice(&(total_length as u32).to_be_bytes());
+        frame[4..8].copy_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&frame[..8]);
+        frame[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
+        frame[PRELUDE_SIZE..PRELUDE_SIZE + headers.len()].copy_from_slice(&headers);
+        let payload_start = PRELUDE_SIZE + headers.len();
+        frame[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+        let message_crc = crc32(&frame[..total_length - 4]);
+        frame[total_length - 4..].copy_from_slice(&message_crc.to_be_bytes());
+        frame
+    }
+
     #[test]
     fn test_frame_insufficient_data() {
         let buffer = [0u8; 10]; // 小于 PRELUDE_SIZE
@@ -174,5 +231,62 @@ mod tests {
 
         let result = parse_frame(&buffer);
         assert!(matches!(result, Err(ParseError::MessageTooSmall { .. })));
+    }
+
+    #[test]
+    fn valid_event_frame_round_trips_headers_and_payload() {
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"ok"}"#);
+        let (parsed, consumed) = parse_frame(&frame)
+            .expect("frame parse")
+            .expect("complete frame");
+
+        assert_eq!(consumed, frame.len());
+        assert_eq!(parsed.message_type(), Some("event"));
+        assert_eq!(parsed.event_type(), Some("assistantResponseEvent"));
+        assert_eq!(parsed.payload_as_str(), r#"{"content":"ok"}"#);
+    }
+
+    #[test]
+    fn bad_prelude_crc_is_rejected() {
+        let mut frame = event_frame("assistantResponseEvent", br#"{"content":"ok"}"#);
+        frame[8] ^= 0xff;
+        assert!(matches!(
+            parse_frame(&frame),
+            Err(ParseError::PreludeCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn bad_message_crc_is_rejected() {
+        let mut frame = event_frame("assistantResponseEvent", br#"{"content":"ok"}"#);
+        let last = frame.len() - 1;
+        frame[last] ^= 0xff;
+        assert!(matches!(
+            parse_frame(&frame),
+            Err(ParseError::MessageCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_header_type_is_rejected_after_frame_integrity_checks() {
+        let mut frame = event_frame("assistantResponseEvent", br#"{"content":"ok"}"#);
+        let headers_start = PRELUDE_SIZE;
+        let second_header_start = headers_start + 1 + ":message-type".len() + 1 + 2 + "event".len();
+        let second_header_value_type = second_header_start + 1 + ":event-type".len();
+        frame[second_header_value_type] = 0xff;
+        let payload_end = frame.len() - 4;
+        let message_crc = crc32(&frame[..payload_end]);
+        frame[payload_end..].copy_from_slice(&message_crc.to_be_bytes());
+
+        assert!(matches!(
+            parse_frame(&frame),
+            Err(ParseError::InvalidHeaderType(0xff))
+        ));
+    }
+
+    #[test]
+    fn truncated_frame_is_incomplete_until_eof() {
+        let frame = event_frame("assistantResponseEvent", br#"{"content":"ok"}"#);
+        assert!(matches!(parse_frame(&frame[..frame.len() - 1]), Ok(None)));
     }
 }

@@ -50,7 +50,7 @@ pub struct AssistantResponseEvent {
 
 impl EventPayload for AssistantResponseEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        frame.payload_as_event_json("assistantResponseEvent")
     }
 }
 

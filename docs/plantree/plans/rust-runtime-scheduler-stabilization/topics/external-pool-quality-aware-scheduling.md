@@ -2,7 +2,7 @@
 
 Status: `implemented / focused-validated for kiro.rs; sub2api follow-up pending`
 
-Last reviewed: 2026-09-15 Asia/Shanghai
+Last reviewed: 2026-09-18 Asia/Shanghai
 
 适用范围：`kiro.rs`（外部池）与 `sub2api`（Anthropic/Gemini 调度路径）。
 
@@ -28,7 +28,18 @@ Related:
 | --- | --- | --- | --- |
 | **健康降权**（soft） | 质量分下滑 | 连续降低被选中概率，**仍然可被选中** | 质量回升即自动恢复，无需等待 |
 | **临时避让**（probation） | 短窗口内多次独立失败 | 大幅降权 + 限流探测，**保留少量探测流量** | 到期自动恢复，探测成功后逐步回流 |
-| **冷却**（cooldown，已存在） | 429/5xx 等明确信号且连续达阈值 | 完全不可调度 | 到期或手动清除 |
+| **冷却**（cooldown，已存在） | 明确模型不可用、端点配置错误、自动禁用等极端不可用状态 | 完全不可调度 | 到期或手动清除 |
+
+2026-09-18 事故复核后的兼容性决定：
+
+- `external_pool_quality_aware_scheduling_enabled` 默认关闭；只有显式开启才改变调度。
+- 普通 `429/5xx/网络/协议` 瞬态失败只记录短期排序信号，不再按 streak 升级为池级
+  hard cooldown。否则账号会在最外层被过滤，无法通过被动采样证明恢复。
+- 开关打开但当前候选池完全没有达到 `quality_min_samples` 的样本时，严格回退旧的
+  “有效优先级 -> 最低负载”选择，冷启动不因 Top-K 随机改变流量分布。
+- probation 的比较集合是当前请求已经通过启用状态、自动禁用、路径准入、模型准入、
+  cooldown、并发和 coordinator runtime 检查的整个候选池；不同路径或模型不会混入同一
+  次比较。质量只是相对降权，不是最外层准入过滤。
 
 **为什么必须保留"仍然可被选中"**：如果降权等价于摘除，那么全部账号都变差时（上游整体抖动）就会无池可用，直接违背"降级时保证可用"。降权只改变**相对倾向**，绝对可用性由"至少保留最优的那个"兜底。
 
@@ -81,15 +92,20 @@ a_effective_priority.cmp(&b_effective_priority)
 
 直接比较原始首字毫秒数是错误的：`haiku` 的首字天然快于 `opus`，非流式请求的"首字"实际是整包返回。若不归一化，调度会系统性地偏向跑小模型的账号，与账号质量无关。
 
-**采用相对化处理**：对每个 `(账号, 模型, 是否流式)` 维度维护 EWMA，评分时与**同一维度、同一最优有效优先级层下候选的中位数**比较，只使用相对比值：
+**采用相对化处理**：质量状态仍按池保存，评分和 probation 判定时使用当前请求
+已经通过路径/模型准入的候选池作为比较 cohort；只在同一请求上下文内与候选中位数比较，
+不把未匹配该路径或模型的池混入：
 
 ```
 ttft_factor = clamp(ttft_ewma / median_ttft_across_candidates, 0.5, 4.0)
 ```
 
-这样"慢"始终意味着"比同场景下的其他账号慢"，而不是"比某个绝对阈值慢"。sub2api 的 OpenAI 评分器已用 min-max 归一化达成类似效果（`openai_account_scheduler.go:982-1011`），kiro.rs 侧沿用同样思路。
+这样"慢"始终意味着"比当前可派发同类候选慢"，而不是"比某个绝对阈值慢"。优先级仍是硬分层，
+质量只在选择时对最优有效层内的候选重排；但 probation 的基线不再缩窄到单个优先级层，
+避免瞬态 streak 把三个账号拆成三个单成员层后失去整体池比较。
 
-样本不足时（`< min_samples`，默认 5）使用中性值，**不惩罚也不奖励**——避免新账号或冷启动账号因无数据被永久边缘化。这是 sub2api 现有实现的 `默认 0.5` 语义。
+样本不足时（`< min_samples`，默认 5）使用中性值，**不惩罚也不奖励**。若本次候选中
+完全没有合格样本，则整个选择函数回退 legacy，确保冷启动账号仍按既有负载语义获得流量。
 
 ### 2.2 失败权重必须高于延迟权重
 
@@ -176,11 +192,14 @@ score = priority        * W_priority          //  静态优先级，运营意图
 ```
 在 degrade_window_secs 窗口内：
     样本数 >= quality_min_samples
-AND error_rate >= degrade_error_rate_threshold (默认 0.5)
-AND 该账号 error_rate 明显劣于候选集中位数（避免全局故障时把所有账号都避让）
+AND 该账号窗口 error_rate - 当前准入 cohort 的窗口 error_rate 中位数
+    >= degrade_error_rate_threshold (默认 0.5)
+AND 该账号窗口错误率明显劣于当前准入 cohort（避免全局故障时把所有账号都避让）
 ```
 
-最后一条是关键的**相对性保护**：当上游整体故障时，所有账号错误率都高，此时不应把任何账号打入避让——否则就无账号可用。只有"明显比同伴差"才避让。这直接保证了"降级时可用"。
+最后一条是关键的**相对性保护**：当上游整体故障时，所有账号窗口错误率都一起升高，
+中位数会同步移动，不应把任何账号打入避让——否则就无账号可用。只有“明显比当前可派发
+同类候选差”才避让。这直接保证了“降级时可用”。
 
 ---
 
@@ -188,7 +207,8 @@ AND 该账号 error_rate 明显劣于候选集中位数（避免全局故障时�
 
 ### 5.1 主开关
 
-`external_pool_quality_aware_scheduling_enabled`，**默认 `true`**（按你的要求）。
+`external_pool_quality_aware_scheduling_enabled`，**默认 `false`**。这是升级兼容和止血策略；
+质量调度会改变选择并产生后台 Redis 采样，必须由运维显式开启。
 
 关闭时行为：完全退回当前的 `优先级 → 负载` 字典序排序；质量状态仍可随既有运行态快照读取，但不参与选择、不展示，也不会写入新的质量样本。这提供了一条确定的回退路径——线上若出现非预期调度行为，关掉开关即恢复旧行为，无需回滚版本。
 
@@ -200,7 +220,7 @@ AND 该账号 error_rate 明显劣于候选集中位数（避免全局故障时�
 
 | 页面文案 | 字段 | 默认 |
 | --- | --- | --- |
-| 启用质量感知调度 | `..._quality_aware_scheduling_enabled` | 开启 |
+| 启用质量感知调度 | `..._quality_aware_scheduling_enabled` | 关闭 |
 | 平滑系数 | `..._quality_ewma_alpha` | 0.2 |
 | 样本有效期 | `..._quality_sample_ttl_secs` | 600 秒 |
 | 最少样本数 | `..._quality_min_samples` | 5 |
@@ -240,6 +260,10 @@ AND 该账号 error_rate 明显劣于候选集中位数（避免全局故障时�
 **必须扩展现有批量 Lua，不能新增一次往返**：`external_pool_coordinator_snapshots`（`src/storage/redis_cache.rs:4806`）已经在**单次**批量 Lua 里读取 epoch、ZCARD 并发、cooldown GET+PTTL、transient GET+PTTL。质量字段必须并入这个脚本。外部池选择运行态快照 TTL 只有 100ms（`EXTERNAL_POOL_SELECTION_RUNTIME_SNAPSHOT_TTL`），是真正的热路径，多一次 Redis 往返会直接抬高调度延迟。
 
 **必须走 Redis 而非进程内存**：外部池已经是多实例共享 Redis 协调并发槽的模型，质量状态若只在进程内，两个实例会各自学习、互相打架，并且 HA 计划 §4.3 明确把"多实例放大"列为必须验证的风险项。
+
+质量样本写入使用独立的 Redis connection manager，并由有界 semaphore 限制最多
+`32` 个后台任务；达到上限直接丢弃优化样本，不等待、不阻塞 coordinator snapshot、
+lease acquire 或 dispatch fence。质量采样失败/超时只记录日志，正式请求继续按调度主链路执行。
 
 EWMA 更新沿用现有 Lua 脚本模式（`src/storage/redis_cache.rs:3753` 已有一份本地账号的 EWMA 更新脚本可直接参照），保证读-改-写原子性。
 

@@ -268,12 +268,12 @@ export function ExternalPoolFormModal({
             <SupportedModelTagsEditor
               value={parseSupportedModelItems(draft.supportedModelsText)}
               disabled={saving || syncingModels}
-              placeholder="claude-sonnet-5"
+              placeholder="sonnet sonnet-4.5 haiku-4.5"
               onChange={(models) => set('supportedModelsText', models.join('\n'))}
             />
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs leading-5 text-muted-foreground">
-                空列表表示不限制；非空时，请求模型必须精确命中这里的标签才会调度到该外部账号。
+                空列表表示不限制；请填写 Claude Code 模型命令（如 sonnet-4.5、haiku）；非空时，请求模型必须命中这里的标签才会调度到该外部账号。
               </div>
               <Button type="button" variant="outline" size="sm" disabled={saving || syncingModels || !onDiscoverSupportedModels} onClick={syncSupportedModels}>
                 {syncingModels && <Loader2 className="h-4 w-4 animate-spin" />}发现模型

@@ -31,6 +31,7 @@ use crate::{
         cache::{
             CacheAmplification, CacheSimulation, CacheUsage, RawUsage, ReportedCacheUsagePolicy,
         },
+        converter::map_model,
         envelope,
         inference_attempt_budget::{
             InferenceAttemptBudget, InferenceAttemptKind, InferenceAttemptRejection,
@@ -81,7 +82,9 @@ use crate::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
         process_model,
     },
-    model::model_support::{normalize_model_id, normalize_supported_models},
+    model::model_support::{
+        expand_claude_supported_model_variants, normalize_model_id, normalize_supported_models,
+    },
     storage::{
         postgres::PostgresStore,
         redis_cache::{
@@ -178,6 +181,7 @@ const EXTERNAL_POOL_SUCCESS_RESET_REDIS_TIMEOUT: Duration = Duration::from_milli
 /// 质量样本写入超时。质量数据是调度优化项，写入慢时直接放弃本次样本，
 /// 绝不允许拖住后台任务或影响主请求。
 const EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT: Duration = Duration::from_millis(500);
+const EXTERNAL_POOL_QUALITY_SAMPLE_MAX_TASKS: usize = 32;
 const EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS: usize = 64;
 const EXTERNAL_POOL_SUCCESS_RESET_MAX_TRACKED_POOLS: usize = 4_096;
 const EXTERNAL_POOL_TRANSIENT_FAILURE_WINDOW_SECS: usize = 30;
@@ -1114,10 +1118,16 @@ impl ExternalRouteRequest {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    fn model_candidates_for_support(&self) -> [Option<&str>; 3] {
+    fn model_candidates_for_support(&self) -> [Option<&str>; 4] {
         [
             self.payload.as_ref().map(|payload| payload.model.as_str()),
             self.model_hint.as_deref(),
+            (matches!(
+                self.model_resolution_source.as_deref(),
+                Some("alias" | "family_normalized")
+            ))
+            .then_some(self.upstream_model.as_deref())
+            .flatten(),
             None,
         ]
     }
@@ -3419,6 +3429,7 @@ pub struct ExternalPoolManager {
     observed_pool_data_generation: Arc<AtomicU64>,
     success_reset_recent: Arc<SyncMutex<HashMap<u64, Instant>>>,
     success_reset_semaphore: Arc<Semaphore>,
+    quality_sample_semaphore: Arc<Semaphore>,
     #[cfg(test)]
     success_reset_tasks_started: Arc<AtomicU64>,
     #[cfg(test)]
@@ -4748,6 +4759,9 @@ impl ExternalPoolManager {
             success_reset_recent: Arc::new(SyncMutex::new(HashMap::new())),
             success_reset_semaphore: Arc::new(Semaphore::new(
                 EXTERNAL_POOL_SUCCESS_RESET_MAX_TASKS,
+            )),
+            quality_sample_semaphore: Arc::new(Semaphore::new(
+                EXTERNAL_POOL_QUALITY_SAMPLE_MAX_TASKS,
             )),
             #[cfg(test)]
             success_reset_tasks_started: Arc::new(AtomicU64::new(0)),
@@ -6369,7 +6383,41 @@ impl ExternalPoolManager {
                     }
                 }
                 if snapshot.available_pools > 0 {
-                    continue;
+                    tracing::error!(
+                        request_id = %route.request_id,
+                        error_id = %route.error_id,
+                        available_pools = snapshot.available_pools,
+                        eligible_pools = snapshot.eligible_pools,
+                        "external pool selector returned no pool despite available candidates"
+                    );
+                    let error_type = "external_pool_selection_invariant";
+                    let message = "External pool selection was inconsistent with availability";
+                    let context = snapshot.capacity_context();
+                    self.record_external_failure(
+                        &route,
+                        None,
+                        attempts.clone(),
+                        error_type,
+                        message,
+                        synthetic_external_capacity_error_diagnostics(
+                            &route,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "external_dispatch",
+                            &config,
+                            Some(&context),
+                        ),
+                    );
+                    return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        response_error_type: "service_unavailable".to_string(),
+                        route_error_type: error_type.to_string(),
+                        message: message.to_string(),
+                        error_id: route.error_id.clone(),
+                        retryable: false,
+                        attempts,
+                        pool_id: None,
+                        pool_name: None,
+                    });
                 }
                 break;
             };
@@ -6635,26 +6683,20 @@ impl ExternalPoolManager {
                     if external_error_affects_pool_quality(&err) {
                         self.record_pool_quality_sample(&config, pool_id, false, None, None);
                     }
-                    let mut soft_failure_cooldown = false;
-                    let mut soft_failure_streak = None;
                     if let Some((_, reason)) = &cooldown_hint {
                         if should_record_external_pool_soft_failure(reason) {
-                            soft_failure_streak = self
+                            // Keep the short-lived failure streak as a ranking
+                            // signal, but never turn an ordinary transient
+                            // failure into a pool-level cooldown.
+                            let _ = self
                                 .record_external_pool_soft_failure(pool_id, reason)
                                 .await;
-                            if should_escalate_external_pool_soft_failure(
-                                &config,
-                                soft_failure_streak,
-                            ) {
-                                soft_failure_cooldown = true;
-                            }
                         }
                     }
                     let same_pool_retry_count = same_pool_retry_counts.entry(pool_id).or_insert(0);
                     let same_pool_retry_limit =
                         retry_pipeline::same_pool_retry_limit(&config, &err);
-                    if !soft_failure_cooldown
-                        && *same_pool_retry_count < same_pool_retry_limit
+                    if *same_pool_retry_count < same_pool_retry_limit
                         && route.inference_attempt_budget.available_attempts(0) > 0
                     {
                         *same_pool_retry_count = (*same_pool_retry_count).saturating_add(1);
@@ -6719,20 +6761,6 @@ impl ExternalPoolManager {
                         } else if should_mark_external_pool_hard_cooldown(reason) {
                             self.mark_pool_cooldown(pool_id, *duration, reason.clone())
                                 .await;
-                        } else if soft_failure_cooldown {
-                            self.mark_pool_cooldown(pool_id, *duration, reason.clone())
-                                .await;
-                            tracing::warn!(
-                                request_id = %route.request_id,
-                                error_id = %route.error_id,
-                                pool_id,
-                                pool_name = %pool.name,
-                                reason,
-                                streak = soft_failure_streak.unwrap_or_default(),
-                                threshold = config.external_pool_transient_failure_cooldown_threshold,
-                                cooldown_ms = duration.as_millis(),
-                                "external pool repeated soft failures escalated to short cooldown"
-                            );
                         }
                     }
                     if let Some(reason) = &err.auto_disable_reason {
@@ -7851,6 +7879,9 @@ impl ExternalPoolManager {
             availability.coordinator_unavailable_kind =
                 Some(PoolCoordinatorUnavailableKind::RedisError);
             availability.wait_reason = Some(PoolCapacityWaitReason::CoordinatorUnavailable);
+        }
+        if let Some(candidates) = candidates.as_ref() {
+            self.schedule_relative_quality_probation(candidates, config);
         }
         let selected_pool = if availability.coordinator_unavailable {
             None
@@ -9177,13 +9208,20 @@ impl ExternalPoolManager {
         if !config.external_pool_quality_aware_scheduling_enabled {
             return;
         }
+        let Ok(task_permit) = self.quality_sample_semaphore.clone().try_acquire_owned() else {
+            tracing::debug!(
+                pool_id,
+                max_tasks = EXTERNAL_POOL_QUALITY_SAMPLE_MAX_TASKS,
+                "外部池质量采样后台任务已达上限，丢弃本次样本"
+            );
+            return;
+        };
         let redis = self.redis.clone();
         let alpha = config.external_pool_quality_ewma_alpha;
         let ttl = Duration::from_secs(config.external_pool_quality_sample_ttl_secs.max(1));
         let degrade_window = Duration::from_secs(config.external_pool_degrade_window_secs.max(1));
-        // 劣化判定在采样返回的最新状态上就地完成，不额外读一次 Redis。
-        let degrade_config = config.clone();
         tokio::spawn(async move {
+            let _task_permit = task_permit;
             let result = timeout(
                 EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT,
                 redis.record_external_pool_quality_sample_with_window(
@@ -9199,24 +9237,57 @@ impl ExternalPoolManager {
                 ),
             )
             .await;
-            let quality = match result {
-                Ok(Ok(quality)) => quality,
+            match result {
+                Ok(Ok(_quality)) => {}
                 Ok(Err(err)) => {
                     tracing::debug!(
                         pool_id,
                         error = %err,
                         "记录外部池质量样本失败"
                     );
-                    return;
                 }
                 Err(_) => {
                     tracing::debug!(pool_id, "记录外部池质量样本超时");
-                    return;
                 }
-            };
+            }
+        });
+    }
 
-            let decision =
-                evaluate_external_pool_degrade(&quality, &degrade_config, external_pool_now_ms());
+    /// 在当前请求已经通过路径和模型准入的整个候选池内计算相对劣化。
+    ///
+    /// 质量采样是被动的，不能在单个样本写入时拿一个绝对红线决定账号
+    /// 是否降级。这里使用同一请求候选集合的中位数作为基线：全体一起慢/报错
+    /// 时没有相对落差，不会把整个外部池一起打入 probation。
+    fn schedule_relative_quality_probation(
+        &self,
+        candidates: &[ExternalPoolCandidate],
+        config: &ExternalPoolsConfig,
+    ) {
+        if !config.external_pool_quality_aware_scheduling_enabled || candidates.len() < 2 {
+            return;
+        }
+        let qualified_count = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.quality.as_ref().is_some_and(|quality| {
+                    quality.has_enough_samples(config.external_pool_quality_min_samples)
+                })
+            })
+            .count();
+        if qualified_count < 2 {
+            return;
+        }
+        let baseline = ExternalPoolQualityBaseline::from_candidates(
+            candidates,
+            config.external_pool_quality_min_samples,
+        );
+        let now_ms = external_pool_now_ms();
+        for candidate in candidates.iter().cloned() {
+            let Some(decision) =
+                evaluate_external_pool_degrade_relative(&candidate, &baseline, config, now_ms)
+            else {
+                continue;
+            };
             let ExternalPoolDegradeDecision::Probation {
                 until_ms,
                 level,
@@ -9224,38 +9295,42 @@ impl ExternalPoolManager {
                 reset_level,
             } = decision
             else {
-                return;
+                continue;
             };
-
-            tracing::info!(
-                pool_id,
-                error_rate = quality.recent_error_rate,
-                sample_count = quality.sample_count,
-                probation_level = level,
-                probation_secs = ttl_secs,
-                "外部池失败率持续超阈值，临时降低调度优先级"
-            );
-            let marked = timeout(
-                EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT,
-                redis.mark_external_pool_probation_with_reset(
-                    pool_id,
-                    until_ms,
-                    level,
-                    Duration::from_secs(ttl_secs.max(1)),
-                    reset_level,
-                ),
-            )
-            .await;
-            match marked {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::debug!(
-                    pool_id,
-                    error = %err,
-                    "写入外部池临时避让状态失败"
-                ),
-                Err(_) => tracing::debug!(pool_id, "写入外部池临时避让状态超时"),
-            }
-        });
+            let Ok(task_permit) = self.quality_sample_semaphore.clone().try_acquire_owned() else {
+                tracing::debug!(
+                    pool_id = candidate.pool.id,
+                    max_tasks = EXTERNAL_POOL_QUALITY_SAMPLE_MAX_TASKS,
+                    "外部池质量 probation 写入任务已达上限，跳过本次标记"
+                );
+                continue;
+            };
+            let redis = self.redis.clone();
+            let pool_id = candidate.pool.id;
+            tokio::spawn(async move {
+                let _task_permit = task_permit;
+                let marked = timeout(
+                    EXTERNAL_POOL_QUALITY_SAMPLE_REDIS_TIMEOUT,
+                    redis.mark_external_pool_probation_with_reset(
+                        pool_id,
+                        until_ms,
+                        level,
+                        Duration::from_secs(ttl_secs.max(1)),
+                        reset_level,
+                    ),
+                )
+                .await;
+                match marked {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::debug!(
+                        pool_id,
+                        error = %err,
+                        "写入外部池相对质量 probation 失败"
+                    ),
+                    Err(_) => tracing::debug!(pool_id, "写入外部池相对质量 probation 超时"),
+                }
+            });
+        }
     }
 
     fn record_external_success(
@@ -10150,6 +10225,7 @@ struct ExternalPoolQualityBaseline {
     median_ttft_ms: Option<f64>,
     median_latency_ms: Option<f64>,
     median_error_rate: f64,
+    median_window_error_rate: f64,
 }
 
 impl ExternalPoolQualityBaseline {
@@ -10183,7 +10259,34 @@ impl ExternalPoolQualityBaseline {
                     .map(|quality| quality.recent_error_rate),
             )
             .unwrap_or(0.0),
+            median_window_error_rate: median_of(
+                candidates
+                    .iter()
+                    .filter_map(|candidate| qualified(candidate, min_samples))
+                    .filter(|quality| {
+                        quality_degrade_window_sample_count(quality) >= min_samples.max(1)
+                    })
+                    .map(quality_degrade_window_error_rate),
+            )
+            .unwrap_or(0.0),
         }
+    }
+}
+
+fn quality_degrade_window_sample_count(quality: &ExternalPoolQualityState) -> u64 {
+    if quality.degrade_window_sample_count > 0 {
+        quality.degrade_window_sample_count
+    } else {
+        quality.sample_count
+    }
+}
+
+fn quality_degrade_window_error_rate(quality: &ExternalPoolQualityState) -> f64 {
+    if quality.degrade_window_sample_count > 0 {
+        (quality.degrade_window_failure_count as f64 / quality.degrade_window_sample_count as f64)
+            .clamp(0.0, 1.0)
+    } else {
+        quality.recent_error_rate.clamp(0.0, 1.0)
     }
 }
 
@@ -10281,6 +10384,7 @@ fn external_pool_quality_score(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalPoolDegradeDecision {
     /// 不需要改变避让状态。
+    #[allow(dead_code)]
     Keep,
     /// 进入（或延长）临时避让。
     Probation {
@@ -10289,6 +10393,69 @@ enum ExternalPoolDegradeDecision {
         ttl_secs: u64,
         reset_level: bool,
     },
+}
+
+/// Evaluate degradation relative to the current eligible candidate set.
+///
+/// The candidate set has already passed pool enabled/route/model admission,
+/// cooldown, concurrency and runtime-coordinator checks. A single account is
+/// therefore compared only with peers that could actually serve this request.
+/// If every eligible account degrades together, the median moves with them and
+/// no account is probationed solely because of an absolute red line.
+fn evaluate_external_pool_degrade_relative(
+    candidate: &ExternalPoolCandidate,
+    baseline: &ExternalPoolQualityBaseline,
+    config: &ExternalPoolsConfig,
+    now_ms: i64,
+) -> Option<ExternalPoolDegradeDecision> {
+    if !config.external_pool_quality_aware_scheduling_enabled {
+        return None;
+    }
+    let quality = candidate
+        .quality
+        .as_ref()
+        .filter(|quality| quality.has_enough_samples(config.external_pool_quality_min_samples))?;
+    if quality.is_in_probation(now_ms) {
+        return None;
+    }
+    let window_sample_count = quality_degrade_window_sample_count(quality);
+    if window_sample_count < config.external_pool_quality_min_samples.max(1) {
+        return None;
+    }
+    let window_error_rate = quality_degrade_window_error_rate(quality);
+    let relative_error_gap = (window_error_rate - baseline.median_window_error_rate).max(0.0);
+    let threshold = config
+        .external_pool_degrade_error_rate_threshold
+        .clamp(0.0, 1.0);
+    if relative_error_gap < threshold {
+        return None;
+    }
+
+    let base_secs = config.external_pool_degrade_probation_secs.max(1);
+    let max_secs = config.external_pool_max_probation_secs.max(base_secs);
+    let ramp_ms = (config.external_pool_recovery_ramp_secs as i64).saturating_mul(1_000);
+    let fully_recovered = quality.probation_level > 0
+        && quality.probation_cleared_at_ms.is_some()
+        && quality.recovery_progress(now_ms, ramp_ms) >= 1.0;
+    let previous_level = if fully_recovered {
+        0
+    } else {
+        quality.probation_level
+    };
+    let level = previous_level.saturating_add(1);
+    let shift = (level - 1).min(32);
+    let backoff_secs = base_secs.saturating_mul(1u64 << shift).min(max_secs);
+    let until_ms = now_ms.saturating_add((backoff_secs as i64).saturating_mul(1_000));
+    let ttl_secs = backoff_secs
+        .saturating_add(config.external_pool_recovery_ramp_secs)
+        .max(config.external_pool_quality_sample_ttl_secs);
+
+    Some(ExternalPoolDegradeDecision::Probation {
+        until_ms,
+        level,
+        ttl_secs,
+        reset_level: fully_recovered,
+    })
 }
 
 /// 判定一次采样后是否需要把池临时降级。**纯函数**，时间由入参注入。
@@ -10301,6 +10468,7 @@ enum ExternalPoolDegradeDecision {
 /// 指数退避：连续第 n 次进入避让，时长为 `probation_secs * 2^(n-1)`，
 /// 并被 `max_probation_secs` 封顶。恢复爬坡完整结束后层级显式归零；
 /// 质量键在持续有流量时会刷新 TTL，不能依赖自然过期。
+#[cfg(test)]
 fn evaluate_external_pool_degrade(
     quality: &ExternalPoolQualityState,
     config: &ExternalPoolsConfig,
@@ -10421,6 +10589,21 @@ fn select_external_pool_candidate(
     }
     if candidates.is_empty() {
         return None;
+    }
+    // Quality is passively learned from real requests. During cold start, or
+    // after the sample TTL has expired for every candidate, there is no
+    // meaningful peer baseline yet. Preserve the pre-quality selector exactly
+    // instead of letting Top-K weighted randomness change load balancing.
+    let qualified_candidates = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.quality.as_ref().is_some_and(|quality| {
+                quality.has_enough_samples(config.external_pool_quality_min_samples)
+            })
+        })
+        .count();
+    if qualified_candidates == 0 {
+        return select_external_pool_candidate_legacy(candidates, config);
     }
 
     // 优先级是**硬分层**，不是可被质量分抵消的一项权重。
@@ -11121,13 +11304,162 @@ fn normalize_external_pool_support_candidates<'a>(
 ) -> Vec<String> {
     let mut normalized = Vec::new();
     for candidate in candidates {
-        if let Some(candidate) = normalize_model_id(candidate)
-            .filter(|candidate| !normalized.iter().any(|existing| existing == candidate))
-        {
-            normalized.push(candidate);
+        let Some(candidate) = normalize_model_id(candidate) else {
+            continue;
+        };
+        for variant in external_pool_model_support_variants(&candidate) {
+            if !normalized.iter().any(|existing| existing == &variant) {
+                normalized.push(variant);
+            }
         }
     }
     normalized
+}
+
+/// External pool allowlists are expressed in Claude Code model names, while a
+/// resolved route may carry a Kiro model id. Keep this expansion local to
+/// external-pool matching so the local credential model-support contract stays
+/// exact-only.
+fn external_pool_model_support_variants(model: &str) -> Vec<String> {
+    const CLAUDE_CODE_ALIASES: &[&str] = &[
+        "opus",
+        "opusplan",
+        "best",
+        "default",
+        "sonnet",
+        "haiku",
+        "sonnet-4.5",
+        "sonnet-4-5",
+        "sonnet-4.6",
+        "sonnet-4-6",
+        "haiku-4.5",
+        "haiku-4-5",
+        "opus-4.5",
+        "opus-4-5",
+        "opus-4.6",
+        "opus-4-6",
+        "opus-4.7",
+        "opus-4-7",
+    ];
+
+    let (base, thinking, one_m) = split_external_pool_model_suffix(model);
+    let mut variants = vec![model.to_string()];
+    let known_model = CLAUDE_CODE_ALIASES.contains(&base.as_str())
+        || is_external_pool_official_claude_model(&base);
+    let mapped_base = known_model.then(|| map_model(&base)).flatten();
+
+    let mut add_base_variants = |value: &str| {
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        let seeds = if is_external_pool_official_claude_model(value) {
+            expand_claude_supported_model_variants(vec![value.to_string()])
+        } else {
+            Vec::new()
+        };
+        if seeds.is_empty() {
+            push_external_pool_model_variant(
+                &mut variants,
+                apply_external_pool_model_suffix(value, thinking, one_m),
+            );
+        } else {
+            for seed in seeds {
+                push_external_pool_model_variant(
+                    &mut variants,
+                    apply_external_pool_model_suffix(&seed, thinking, one_m),
+                );
+            }
+        }
+    };
+
+    if let Some(mapped_base) = mapped_base.as_deref() {
+        add_base_variants(mapped_base);
+        for alias in CLAUDE_CODE_ALIASES {
+            if map_model(alias).as_deref() == Some(mapped_base) {
+                push_external_pool_model_variant(
+                    &mut variants,
+                    apply_external_pool_model_suffix(alias, thinking, one_m),
+                );
+            }
+        }
+    } else {
+        add_base_variants(&base);
+    }
+
+    variants
+}
+
+/// Returns true only for the Claude model shapes that are safe to family-map.
+///
+/// External-pool allowlists may contain arbitrary provider-specific names. A
+/// substring such as `tenant-haiku-model` must therefore remain exact-only;
+/// accepting every `claude-*` value here would make a custom name match a
+/// different model family through `map_model`.
+fn is_external_pool_official_claude_model(model: &str) -> bool {
+    let Some(rest) = model.strip_prefix("claude-") else {
+        return false;
+    };
+    let parts = rest.split('-').collect::<Vec<_>>();
+    let is_family = |value: &str| matches!(value, "opus" | "sonnet" | "haiku");
+    let all_digits = |value: &str| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit());
+    let valid_version = |value: &str| {
+        if let Some((major, minor)) = value.split_once('.') {
+            all_digits(major) && all_digits(minor)
+        } else {
+            all_digits(value)
+        }
+    };
+    let valid_date = |value: &str| is_yyyymmdd(value);
+
+    match parts.as_slice() {
+        ["3.5", family] => is_family(family),
+        ["3", "5", family] => is_family(family),
+        ["3", "5", family, date] => is_family(family) && valid_date(date),
+        [family, version] => is_family(family) && valid_version(version),
+        [family, major, third] => {
+            is_family(family) && all_digits(major) && (all_digits(third) || valid_date(third))
+        }
+        [family, major, minor, date] => {
+            is_family(family) && all_digits(major) && all_digits(minor) && valid_date(date)
+        }
+        _ => false,
+    }
+}
+
+fn is_yyyymmdd(value: &str) -> bool {
+    value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn split_external_pool_model_suffix(model: &str) -> (String, bool, bool) {
+    let mut base = model;
+    let one_m = base.strip_suffix("[1m]").is_some();
+    if one_m {
+        base = base.strip_suffix("[1m]").unwrap_or(base);
+    }
+    let thinking = base.strip_suffix("-thinking").is_some();
+    if thinking {
+        base = base.strip_suffix("-thinking").unwrap_or(base);
+    }
+    (base.to_string(), thinking, one_m)
+}
+
+fn apply_external_pool_model_suffix(base: &str, thinking: bool, one_m: bool) -> String {
+    let mut model = base.to_string();
+    if thinking {
+        model.push_str("-thinking");
+    }
+    if one_m {
+        model.push_str("[1m]");
+    }
+    model
+}
+
+fn push_external_pool_model_variant(variants: &mut Vec<String>, model: String) {
+    if model.is_empty() || variants.iter().any(|existing| existing == &model) {
+        return;
+    }
+    variants.push(model);
 }
 
 fn external_pool_matches_supported_models_normalized(
@@ -12184,14 +12516,6 @@ fn external_pool_cooldown_duration(
 
 fn should_record_external_pool_soft_failure(reason: &str) -> bool {
     !matches!(reason, "model_mapping_miss" | "model_unavailable")
-}
-
-fn should_escalate_external_pool_soft_failure(
-    config: &ExternalPoolsConfig,
-    streak: Option<u64>,
-) -> bool {
-    let threshold = config.external_pool_transient_failure_cooldown_threshold;
-    threshold > 0 && streak.is_some_and(|streak| streak >= threshold as u64)
 }
 
 /// 判断一次外部池错误是否应计入该池的被动质量健康度。

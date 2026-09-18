@@ -1963,7 +1963,7 @@ mod tests {
         }
 
         let response = match scenario.as_str() {
-            "model_unavailable" => serde_json::json!({
+            "model_unavailable" | "model_unavailable_404" => serde_json::json!({
                 "message": "The requested model is not available for this endpoint.",
                 "reason": "MODEL_UNAVAILABLE"
             }),
@@ -2051,7 +2051,7 @@ mod tests {
         let status = match scenario.as_str() {
             "rescue_server_error" | "provider_status_500" => StatusCode::INTERNAL_SERVER_ERROR,
             "provider_status_503" => StatusCode::SERVICE_UNAVAILABLE,
-            "invalid_model_404" => StatusCode::NOT_FOUND,
+            "invalid_model_404" | "model_unavailable_404" => StatusCode::NOT_FOUND,
             "provider_status_401" => StatusCode::UNAUTHORIZED,
             "provider_status_403" => StatusCode::FORBIDDEN,
             "provider_status_408" => StatusCode::REQUEST_TIMEOUT,
@@ -5251,6 +5251,11 @@ mod tests {
         let cases = [
             (
                 "model_unavailable",
+                "model_unavailable_bad_request",
+                Some("model_unavailable_retry_next"),
+            ),
+            (
+                "model_unavailable_404",
                 "model_unavailable_bad_request",
                 Some("model_unavailable_retry_next"),
             ),

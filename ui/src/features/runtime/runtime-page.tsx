@@ -1107,8 +1107,8 @@ export function RuntimePage() {
                     onChange={setExternalPools('externalPoolTransientFailurePriorityPenalty')}
                   />
                   <NumField
-                    label="连续失败冷却阈值"
-                    desc="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；0 表示关闭。"
+                      label="连续失败计数（兼容）"
+                      desc="保留旧配置字段；普通瞬态失败只降低调度优先级，不会触发池级冷却。池级冷却仅用于模型不可用、端点错误或自动禁用等极端状态。"
                     value={draft.externalPools.externalPoolTransientFailureCooldownThreshold}
                     min={0}
                     max={1000}

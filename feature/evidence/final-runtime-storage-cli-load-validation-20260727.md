@@ -114,10 +114,10 @@ cargo check --locked --all-targets --no-default-features: pass
 Result: pass.
 
 ```text
-npm --prefix ui run check: pass
-npm --prefix admin-ui exec -- tsc -b admin-ui/tsconfig.json --pretty false: pass
-npm --prefix ui run build: pass
-npm --prefix admin-ui run build: pass
+pnpm --dir ui check: pass
+pnpm --dir admin-ui exec tsc -b --pretty false: pass
+pnpm --dir ui build: pass
+pnpm --dir admin-ui build: pass
 ```
 
 Non-blocking note: `ui` Vite build still warns about a chunk above 500k. This belongs to the

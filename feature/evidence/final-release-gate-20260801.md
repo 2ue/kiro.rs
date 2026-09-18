@@ -56,12 +56,12 @@ The candidate binary was built before the release version bump while `Cargo.toml
 
 ### Frontend
 
-- `npm run check` in `ui`
+- `pnpm --dir ui check`
   - Passed.
-- `npm run build` in `ui`
+- `pnpm --dir ui build`
   - Passed.
   - Vite emitted the existing chunk-size warning; build completed successfully.
-- `npm run build` in `admin-ui`
+- `pnpm --dir admin-ui build`
   - Passed.
 
 ### Node Contracts And Documentation

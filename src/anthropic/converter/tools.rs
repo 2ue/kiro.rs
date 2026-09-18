@@ -410,8 +410,41 @@ fn normalize_tool_description(tool_name: &str, description: &str) -> String {
     }
 }
 
+fn kiro_facing_tool_choice_name(
+    req: &MessagesRequest,
+    requested_name: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> String {
+    if let Some((mapped, _)) = tool_name_map
+        .iter()
+        .find(|(_, original)| original.as_str() == requested_name)
+    {
+        return mapped.clone();
+    }
+
+    let Some(tools) = &req.tools else {
+        return requested_name.to_string();
+    };
+    let normalized_requested = sanitize_tool_name(requested_name);
+    let mut matches = tools.iter().filter(|tool| {
+        tool.name != requested_name && sanitize_tool_name(&tool.name) == normalized_requested
+    });
+    let Some(tool) = matches.next() else {
+        return requested_name.to_string();
+    };
+    if matches.next().is_some() {
+        return requested_name.to_string();
+    }
+    tool_name_map
+        .iter()
+        .find(|(_, original)| original.as_str() == tool.name)
+        .map(|(mapped, _)| mapped.clone())
+        .unwrap_or_else(|| tool.name.clone())
+}
+
 pub(super) fn generate_tool_choice_prefix(
     req: &MessagesRequest,
+    tool_name_map: &HashMap<String, String>,
     options: ConverterOptions,
 ) -> Option<String> {
     if !options.inject_tool_choice_prefix() {
@@ -423,10 +456,13 @@ pub(super) fn generate_tool_choice_prefix(
             "<tool_choice>any</tool_choice><tool_choice_policy>Use at least one available tool in this turn when a tool can satisfy the request.</tool_choice_policy>"
                 .to_string(),
         ),
-        ToolChoiceDirective::Tool(name) => Some(format!(
-            "<tool_choice>tool</tool_choice><tool_choice_name>{}</tool_choice_name><tool_choice_policy>Use the named tool in this turn when responding.</tool_choice_policy>",
-            name
-        )),
+        ToolChoiceDirective::Tool(name) => {
+            let kiro_name = kiro_facing_tool_choice_name(req, &name, tool_name_map);
+            Some(format!(
+                "<tool_choice>tool</tool_choice><tool_choice_name>{}</tool_choice_name><tool_choice_policy>Use the named tool in this turn when responding.</tool_choice_policy>",
+                kiro_name
+            ))
+        }
         ToolChoiceDirective::None if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) => {
             Some(
                 "<tool_choice>none</tool_choice><tool_choice_policy>Do not call tools in this turn.</tool_choice_policy>"

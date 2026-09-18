@@ -57,12 +57,7 @@ pub(super) fn should_retry_same_pool(
     // These errors should leave the current candidate for this request instead
     // of repeatedly sending to the same pool. They are still treated as
     // recoverable health signals by the pool scheduler.
-    if err.auto_disable_reason.is_some()
-        || err
-            .cooldown
-            .as_ref()
-            .is_some_and(|(_, reason)| reason == "model_unavailable")
-    {
+    if err.auto_disable_reason.is_some() || is_pool_or_model_route_error(err) {
         return false;
     }
     let Some(status) = err.status else {
@@ -89,6 +84,12 @@ pub(super) fn should_retry_cross_pool(
     if !err.retryable {
         return false;
     }
+    // Mapping misses and model-unavailable responses are local to the selected
+    // pool/model route. Replaying the same pool cannot fix them, but a
+    // different eligible pool may still serve the Claude Code model.
+    if is_pool_or_model_route_error(err) {
+        return true;
+    }
     if err.auto_disable_reason.is_some() {
         return true;
     }
@@ -109,6 +110,19 @@ pub(super) fn same_pool_retry_delay(config: &ExternalPoolsConfig) -> Option<Dura
 fn retry_status_matches(status: StatusCode, configured: &std::collections::BTreeSet<u16>) -> bool {
     let code = status.as_u16();
     configured.contains(&code) || (status.is_server_error() && configured.contains(&500))
+}
+
+fn is_pool_or_model_route_error(err: &ExternalPoolError) -> bool {
+    if err.cooldown.as_ref().is_some_and(|(_, reason)| {
+        matches!(reason.as_str(), "model_mapping_miss" | "model_unavailable")
+    }) {
+        return true;
+    }
+
+    // Model-unavailable cooldown can be disabled. The classifier emits this
+    // exact safe message in that mode, so preserve cross-pool behavior without
+    // broad keyword matching.
+    err.message.trim() == "external upstream model is unavailable"
 }
 
 pub(super) fn payload_too_long_message(message: &str) -> bool {

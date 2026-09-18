@@ -24,7 +24,7 @@ The mandatory in-app Browser bootstrap was retried after these checks. The brows
 - `node feature/tests/prompt-control-independence.mjs`: 2/2 UI surfaces pass. Prompt setters contain no `bodyConversion` mutation and save paths normalize both objects independently.
 - `node scripts/check-frontend-contracts.mjs`: 167 shared frontend API types match.
 - `node feature/tests/prompt-default-parity.mjs`: first failed because both UI defaults differed from Rust and each contained six internal transcript markers; after replacing only the legacy line, Rust/UI/Admin defaults match byte-for-byte and all marker checks pass.
-- Both `npm run build` production builds pass after the default-prompt fix. The new UI retains an existing 545.35 kB chunk warning; Admin UI's main entry is 427.53 kB.
+- Both `pnpm --dir ... build` production builds pass after the default-prompt fix. The new UI retains an existing 545.35 kB chunk warning; Admin UI's main entry is 427.53 kB.
 - Runtime migration v6 exact-match coverage passes: a V5 config containing the old UI's exact V3 built-in is replaced; V3 plus suffix, leading whitespace, and arbitrary custom prompts remain byte-identical.
 
 ## Contract proven

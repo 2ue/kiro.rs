@@ -81,8 +81,8 @@ Backend classifier inputs covered by the regression:
 - `feature/tests/run-cargo-scoped.sh subscription-tier-focused -- cargo test --bin kiro-rs subscription_key_and_rank_distinguish_pro_max_from_pro -- --nocapture`: `1 passed / 0 failed`.
 - `feature/tests/run-cargo-scoped.sh admin-service-focused -- cargo test --bin kiro-rs admin::service::tests -- --nocapture`: `31 passed / 0 failed` (PgSQL integration test skipped because no test URL was provided).
 - `feature/tests/run-cargo-scoped.sh fmt-subscription -- cargo fmt --check`: passed.
-- `npm run check` in `ui`: passed.
-- `npm run build` in `admin-ui`: passed.
+- `pnpm --dir ui check`: passed.
+- `pnpm --dir admin-ui build`: passed.
 
 ## 残余风险与边界
 

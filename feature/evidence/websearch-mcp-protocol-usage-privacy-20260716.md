@@ -190,10 +190,10 @@ mcpAttempts = actual MCP sends
 node feature/tests/mcp-attempt-channel-contract.mjs
 PASS: both UI contracts expose the explicit MCP attempt channel
 
-(cd ui && npm run build)
+(pnpm --dir ui build)
 PASS；Vite build 7.60s；存在既有 >500 kB chunk warning
 
-(cd admin-ui && npm run build)
+(pnpm --dir admin-ui build)
 PASS；Vite build 7.08s
 
 CARGO_TARGET_DIR=/tmp/kiro-rs-protocol-matrix-target cargo check --all-targets

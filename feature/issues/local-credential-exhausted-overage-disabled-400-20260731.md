@@ -134,8 +134,8 @@ Focused evidence:
 Commands run locally:
 
 ```bash
-cd ui && npm run check
-cd admin-ui && npm run build
+pnpm --dir ui check
+pnpm --dir admin-ui build
 feature/tests/run-cargo-scoped.sh quota-guard -- cargo test --bin kiro-rs quota_guard_
 KIRO_RS_REQUIRE_STORAGE_TESTS=1 KIRO_RS_TEST_POSTGRES_URL="<local config PgSQL URL>" feature/tests/run-cargo-scoped.sh reload-quota-guard-pg -- cargo test --bin kiro-rs reload_account_info_quota_guard_reselects_healthy_credential -- --nocapture
 feature/tests/run-cargo-scoped.sh provider-bad-request -- cargo test --bin kiro-rs bad_request_retry_matrix_bounds_real_provider_http_hits
@@ -143,8 +143,8 @@ feature/tests/run-cargo-scoped.sh postgres-account-info -- cargo test --bin kiro
 feature/tests/run-cargo-scoped.sh token-manager -- cargo test --bin kiro-rs kiro::token_manager
 feature/tests/run-cargo-scoped.sh all-targets-test -- cargo test --all-targets --locked
 node --test feature/tests/*.test.mjs
-cd ui && npm run check
-cd admin-ui && npm run build
+pnpm --dir ui check
+pnpm --dir admin-ui build
 feature/tests/run-cargo-scoped.sh release-build -- cargo build --release --bins --locked
 feature/tests/run-cargo-scoped.sh fmt-check -- cargo fmt --check
 git diff --check

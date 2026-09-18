@@ -35,8 +35,8 @@ feature/tests/run-cargo-scoped.sh postgres-account-info -- cargo test --bin kiro
 feature/tests/run-cargo-scoped.sh token-manager -- cargo test --bin kiro-rs kiro::token_manager
 feature/tests/run-cargo-scoped.sh all-targets-test -- cargo test --all-targets --locked
 node --test feature/tests/*.test.mjs
-cd ui && npm run check
-cd admin-ui && npm run build
+pnpm --dir ui check
+pnpm --dir admin-ui build
 feature/tests/run-cargo-scoped.sh release-build -- cargo build --release --bins --locked
 feature/tests/run-cargo-scoped.sh fmt-check -- cargo fmt --check
 git diff --check

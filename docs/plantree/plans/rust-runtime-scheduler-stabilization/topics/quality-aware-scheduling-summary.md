@@ -1,6 +1,6 @@
 # 外部账号质量感知调度 — 改造总览
 
-Last updated: 2026-09-15
+Last updated: 2026-09-18
 适用项目：**kiro.rs（本仓库）**
 
 相关文档：
@@ -49,7 +49,7 @@ Last updated: 2026-09-15
 | 约束 | 来源 | 对设计的影响 |
 | --- | --- | --- |
 | **不主动探测** | 用户明确要求 | 质量数据只能来自真实用户流量的被动采样 |
-| **开关默认打开** | 用户明确要求 | 不能做成硬过滤——默认开启的硬过滤会直接改变所有既有部署的行为 |
+| **开关默认关闭** | 升级兼容与事故止血决定 | 显式开启才改变调度并启动被动质量采样 |
 | **不是真冷却** | 用户明确要求 | 降级必须是"临时调低优先级"，必须能自动恢复，不能变成永久放逐 |
 | **错误率优先于首字** | 用户明确要求 | 错误率权重必须显著高于延迟权重 |
 | **降级时保证可用** | 用户明确要求 | 全员劣化时候选池**不得清空**，必须仍能选出账号 |
@@ -80,13 +80,17 @@ Last updated: 2026-09-15
 ```
 候选池
   ↓
-① 优先级硬分层过滤   ← 先取最优层，质量分只在层内工作
+① 准入过滤            ← 启用/自动禁用/路径/模型/cooldown/并发/runtime
   ↓
-② 避让池探测分支     ← 按 probe_share 概率直接放行一个避让池
+② 相对质量 cohort      ← 用当前请求可派发的整个候选池计算质量基线
   ↓
-③ 质量加权评分       ← 失败率 + 首字 + 总耗时，各自相对中位数归一化
+③ 优先级硬分层         ← 质量只在最优有效优先级层内重排
   ↓
-④ Top-K 加权随机     ← 不钉死在单个"最优"上，避免羊群效应
+④ 避让池探测分支       ← 按 probe_share 概率直接放行一个避让池
+  ↓
+⑤ 质量加权评分         ← 失败率 + 首字 + 总耗时，各自相对中位数归一化
+  ↓
+⑥ Top-K 加权随机       ← 不钉死在单个"最优"上，避免羊群效应
 ```
 
 > ② 必须在 ① **之前**采集候选（见 §5.2 的真实缺陷），否则探测流量恒为 0。
@@ -106,17 +110,19 @@ Last updated: 2026-09-15
 ### 3.3 评分（错误率优先）
 
 各信号**各自独立**相对中位数归一化，只惩罚"比中位数差"的一侧。
-中位数基准只取最终最优有效优先级层内候选，低优先级备用池不会稀释主层质量排序。
+质量 probation 的中位数基准来自当前请求已经通过路径和模型准入的整个候选池；
+评分重排仍只发生在最优有效优先级层内，低优先级池不能被质量分提拔。
 失败率权重显著高于延迟权重，满足"报错多的判断优先级高于首字曲线"。
 
 **样本不足按中性处理** —— 否则新池会陷入
-"没数据 → 不被调度 → 永远没数据"的死锁。
+"没数据 → 不被调度 → 永远没数据"的死锁。若整个候选池都没有达到
+`quality_min_samples` 的样本，则选择函数严格回退 legacy，冷启动流量分布不变。
 
 ### 3.4 降级 / 避让 / 恢复（"不是真冷却"）
 
 | 机制 | 说明 |
 | --- | --- |
-| 触发 | 单池失败率 ≥ 阈值且样本量达标 |
+| 触发 | 当前请求准入 cohort 中，单池窗口失败率相对中位数的差值 ≥ 阈值且样本量达标 |
 | 退避 | `base × 2^(n-1)`，封顶 `max_probation_secs` |
 | **不顺延** | 避让期内**不重复延长**，否则持续失败会让避让无限续期，永远等不到恢复窗口 |
 | 探测 | 避让期内按 `probe_share_percent` 概率放行，保证有恢复路径 |
@@ -181,13 +187,24 @@ Last updated: 2026-09-15
 - `external_error_affects_pool_quality`：错误归因
 
 **配置层**（`src/model/config.rs`）
-- 主开关（**默认 `true`**）+ 参数组（采样 / 权重 / 劣化 / 探测 / 恢复 / Top-K）
+- 主开关（**默认 `false`**）+ 参数组（采样 / 权重 / 劣化 / 探测 / 恢复 / Top-K）
 - `validate_external_pools_config`（`src/admin/service.rs`），含跨字段校验
 
 **可观测性 / UI**
 - `ExternalPoolQualityView` 挂到 `ExternalPoolStatus`，带 `scoring_active` 标志
 - `ui/src/features/runtime/runtime-page.tsx`：质量采样 / 评分权重 / 劣化与恢复 三组表单
 - `admin-ui`：补类型、默认值与清洗逻辑（该目录不渲染外部池表单）
+
+2026-09-18 事故修复补充：
+
+- 质量采样和 probation 写入使用独立 Redis connection manager，并由 32 个后台任务硬上限
+  保护；达到上限直接丢弃样本，不阻塞正式 coordinator/lease 链路。
+- 普通瞬态失败不再升级为池级 cooldown；`externalPoolTransientFailureCooldownThreshold`
+  仅保留为兼容字段。
+- 相对 probation 基线改为当前请求已通过路径/模型准入的整个候选池；全体候选一起变差时
+  不因绝对红线全部进入 probation。
+- 开关显式打开但完全没有合格样本时选择严格回退 legacy；新增冷启动负载语义回归测试。
+- selector 出现“有可用池但无 selected pool”的不变量破坏时，返回有界 503，不再无条件空转。
 
 ### 4.3 未完成
 
@@ -286,13 +303,13 @@ Last updated: 2026-09-15
 | --- | --- |
 | `quality_view_reports_probation_countdown_and_recovery_progress` | 避让倒计时与恢复进度 |
 | `quality_view_marks_cold_start_pools_as_not_scoring` | 冷启动池显式标注"未参与调度" |
-| `quality_config_serializes_with_the_camel_case_keys_the_ui_sends` | **锁定前后端键契约**，同时断言主开关默认 `true` |
+| `quality_config_serializes_with_the_camel_case_keys_the_ui_sends` | **锁定前后端键契约**，同时断言主开关默认 `false` |
 
 #### 配置校验（`src/admin/service_tests.rs`）
 
 | 用例 | 覆盖点 |
 | --- | --- |
-| `external_pool_quality_defaults_pass_validation` | **默认配置合法、主开关为 true** |
+| `external_pool_quality_defaults_pass_validation` | **默认配置合法、主开关为 false** |
 | `external_pool_quality_ewma_alpha_validation_is_bounded` | EWMA alpha 边界 |
 | `external_pool_quality_weights_reject_negative_and_non_finite` | 权重拒绝负数与非有限值 |
 | `external_pool_probation_ceiling_cannot_be_below_single_probation` | 避让上限不得低于单次避让 |

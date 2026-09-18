@@ -212,14 +212,16 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
-涉及 UI 时必须：
+涉及 UI 时必须使用仓库现有的 pnpm 工作流：
 
 ```bash
-npm test
-npm run build
+pnpm --dir ui check
+pnpm --dir ui build
+pnpm --dir admin-ui build
 ```
 
-如果项目 UI 使用其他包管理器，则使用项目现有命令。
+如果某个前端包后续新增了 `test` 脚本，再使用对应目录的
+`pnpm --dir <ui-dir> test`；当前两个前端包没有该脚本。
 
 涉及热路径时必须运行：
 
@@ -318,4 +320,3 @@ cargo run --bin kiro_loadtest -- --scenario recovery_after_burst
 - 管理端 error id 搜索页。
 - per-route scheduler strategy。
 - 更细粒度 cachePoint 策略。
-

@@ -71,7 +71,7 @@ CI、Docker 和发布构建固定使用 Node.js `22.23.0`、pnpm `11.11.0` 与 R
 
 > **发布/嵌入式构建前置步骤**：从干净 checkout 构建二进制时，必须先生成新旧两套前端的 `dist`：
 > ```bash
-> npm install --global pnpm@11.11.0
+> npm install --global pnpm@11.11.0  # 仅用于安装 pnpm；项目命令统一使用 pnpm
 > pnpm --dir admin-ui install --frozen-lockfile
 > pnpm --dir admin-ui build
 > pnpm --dir ui install --frozen-lockfile

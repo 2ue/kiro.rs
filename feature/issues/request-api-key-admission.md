@@ -115,8 +115,8 @@ cargo test request_admission -- --nocapture
 cargo test authentication_is_outer_to_message_admission_for_five_rounds -- --nocapture
 cargo test actual_anthropic_message_routes_reject_before_handler_for_five_rounds -- --nocapture
 cargo check --tests
-npm run build --prefix ui
-npm run build --prefix admin-ui
+pnpm --dir ui build
+pnpm --dir admin-ui build
 ```
 
 当前结果：

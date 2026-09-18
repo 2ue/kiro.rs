@@ -26,7 +26,7 @@ pub struct ReasoningContentEvent {
 
 impl EventPayload for ReasoningContentEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        frame.payload_as_event_json("reasoningContentEvent")
     }
 }
 
@@ -84,7 +84,7 @@ pub struct MetadataEvent {
 
 impl EventPayload for MetadataEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        frame.payload_as_event_json("metadataEvent")
     }
 }
 
@@ -102,7 +102,7 @@ pub struct MessageMetadataEvent {
 
 impl EventPayload for MessageMetadataEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        frame.payload_as_event_json("messageMetadataEvent")
     }
 }
 
@@ -120,7 +120,7 @@ pub struct MeteringEvent {
 
 impl EventPayload for MeteringEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        frame.payload_as_event_json("meteringEvent")
     }
 }
 
@@ -134,7 +134,7 @@ pub struct CodeEvent {
 
 impl EventPayload for CodeEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        frame.payload_as_event_json("codeEvent")
     }
 }
 
@@ -160,7 +160,7 @@ impl InvalidStateEvent {
 
 impl EventPayload for InvalidStateEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
-        frame.payload_as_json()
+        frame.payload_as_event_json("invalidStateEvent")
     }
 }
 
