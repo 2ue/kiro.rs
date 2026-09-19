@@ -4843,8 +4843,7 @@ fn validate_kiro_tool_pairing_invariant(request: &KiroRequest) -> Result<(), Pay
                         .user_input_message
                         .user_input_message_context
                         .tool_results
-                        .iter()
-                        .count();
+                        .len();
                 }
             }
         }
