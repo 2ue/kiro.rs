@@ -593,7 +593,11 @@ fn prepare_normalized_payload(
     ) {
         Ok(prepared) => Ok((prepared, None)),
         Err(err) => {
-            if matches!(err, PayloadGuardError::OversizedImage { .. }) {
+            if matches!(
+                err,
+                PayloadGuardError::OversizedImage { .. }
+                    | PayloadGuardError::ToolPairingInvariant { .. }
+            ) {
                 return Err(err);
             }
             let mut payload = payload.clone();
@@ -625,6 +629,10 @@ fn payload_guard_error(pool: &ExternalPool, err: PayloadGuardError) -> ExternalP
             StatusCode::BAD_REQUEST,
             "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry."
                 .to_string(),
+        ),
+        PayloadGuardError::ToolPairingInvariant { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request body could not be prepared".to_string(),
         ),
     };
     ExternalPoolError {

@@ -4829,7 +4829,7 @@ fn non_stream_thinking_policy_sanitizes_unsigned_and_drops_atomic_blocks() {
         let mut redacted = Vec::new();
         let mut redacted_sanitizer =
             super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(known.clone());
-        let error = append_non_stream_reasoning_and_text(
+        append_non_stream_reasoning_and_text(
             &mut redacted,
             true,
             true,
@@ -4843,9 +4843,17 @@ fn non_stream_thinking_policy_sanitizes_unsigned_and_drops_atomic_blocks() {
             &mut HashSet::new(),
             &mut redacted_sanitizer,
         )
-        .expect_err("plaintext redacted data must be rejected");
-        assert!(error.contains("canonical base64"));
-        assert!(redacted.is_empty());
+        .expect("opaque redacted data must be preserved");
+        assert_eq!(
+            redacted,
+            vec![
+                json!({
+                    "type": "redacted_thinking",
+                    "data": polluted
+                }),
+                json!({"type": "text", "text": "visible"})
+            ]
+        );
     }
 }
 

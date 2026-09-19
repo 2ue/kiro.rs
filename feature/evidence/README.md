@@ -26,6 +26,7 @@ deep-audit 的脚本、汇总和部分 report 存在，但真实 Claude CLI/dire
 
 ## 当前专项证据
 
+- [2026-09-18 Claude Code ↔ Kiro 协议互转 P1 当前 HEAD](sub2api-kiro-protocol-interop-p1-20260918.md)：当前 `09c0021` / `v0.0.164` 的 C0、payload trim/pairing 合同和批量余额刷新后的真实低并发 C1/C2 运行。冻结 release binary SHA-256 为 `3133106baa178ea343e3f5542d0b6ffacc26326970f6a19e58d95a5e19558008`；主二进制 `2129/0/6 ignored`、`kiro_loadtest 31/31`、Node model/leak contracts `6/6`、artifact inventory `targets=0 reservations=0 target_processes=0 blockers=0`。235 条凭据导入为 `15 success / 220 skipped / 0 failed`，237 条余额刷新为 `233 success / 4 failed`，299/302/303 通过真实模型 discovery；唯一 `19023` 实例完成 Sonnet 4.5/Haiku 4.5 direct 成功、Sonnet thinking、Sonnet Bash tool-use/tool-result、非零 usage 和完整 SSE lifecycle，状态为 `runtime-validated / cli-pass`。真实第三方池 discovery/runtime 仍未重跑。
 - [2026-09-01 真实本地账号模型 400 与 thinking 规范化](real-account-model-invalid-400-20260901.md)：唯一 `127.0.0.1:19023` 测试实例加载 220 条真实凭据；修复前逐请求 baseline 20/20 为 400，模型矩阵 25/25 为 400。修复后 equality、bounded expansion、adaptive cleanup、disabled cleanup 四个真实本地账号用例均为 HTTP 200，usage 记录显示 `requestedMaxTokens=4097` 的有界扩展。该证据确认入口格式修复有效，并明确历史统一 400 不能全部归因于单一字段；本轮外部池数量为 0。
 - [2026-09-02 raw 顶层 `max_tokens` 类型和范围校验](raw-max-tokens-invalid-400-20260902.md)：当前候选 release 二进制运行于唯一长期测试实例 `127.0.0.1:19023`（PID `81106`，SHA-256 `d7764aea6ea97abe55decfd182732db771f719fe51f60462488f1c5fb543b623`）。`null`、浮点数、0、负数和 `2147483648` 五类请求均首次返回明确 HTTP 400；未进入上游、重试、换号或 external pool。源码聚焦测试 `9/9`，静态门禁通过；状态为 `fixed / local-runtime-verified / not-committed / not-released`，不能据此宣称 `v0.0.158` 或生产已包含修复。
 

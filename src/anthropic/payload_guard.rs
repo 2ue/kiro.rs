@@ -6,7 +6,7 @@
 //! entries while preserving Kiro history invariants.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, Write},
     time::{Duration, Instant},
 };
@@ -390,6 +390,10 @@ pub enum PayloadGuardError {
         historical_image_bytes: usize,
         max_source_bytes: usize,
     },
+    ToolPairingInvariant {
+        orphan_tool_uses: usize,
+        orphan_tool_results: usize,
+    },
 }
 
 impl std::fmt::Display for PayloadGuardError {
@@ -410,6 +414,14 @@ impl std::fmt::Display for PayloadGuardError {
                 historical_images,
                 historical_image_bytes,
                 max_source_bytes
+            ),
+            PayloadGuardError::ToolPairingInvariant {
+                orphan_tool_uses,
+                orphan_tool_results,
+            } => write!(
+                f,
+                "tool pairing invariant failed: orphan_tool_uses={}, orphan_tool_results={}",
+                orphan_tool_uses, orphan_tool_results
             ),
         }
     }
@@ -641,6 +653,8 @@ pub fn guard_kiro_request(
         guard_serializations += 1;
         serialize_elapsed += serialize_started_at.elapsed();
     }
+
+    validate_kiro_tool_pairing_invariant(request)?;
 
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
@@ -4763,6 +4777,136 @@ fn remove_unpaired_tool_uses(history: &mut [Message], current_results: &[ToolRes
     removed
 }
 
+/// Verify the exact pairing shape that is sent to Kiro after all guard repairs.
+///
+/// This is intentionally a final fail-closed check. The repair path should
+/// already remove malformed entries, but a later shaping or trim change must
+/// never be able to serialize an orphan `tool_use` or `tool_result`.
+fn validate_kiro_tool_pairing_invariant(request: &KiroRequest) -> Result<(), PayloadGuardError> {
+    let history = &request.conversation_state.history;
+    let current_results = &request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tool_results;
+    let mut orphan_tool_uses = 0usize;
+    let mut orphan_tool_results = 0usize;
+
+    for (index, message) in history.iter().enumerate() {
+        match message {
+            Message::Assistant(assistant) => {
+                let Some(tool_uses) = assistant.assistant_response_message.tool_uses.as_ref()
+                else {
+                    continue;
+                };
+                if tool_uses.is_empty() {
+                    continue;
+                }
+                let result_ids = if let Some(Message::User(user)) = history.get(index + 1) {
+                    user.user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter()
+                        .map(|result| result.tool_use_id.as_str())
+                        .collect::<Vec<_>>()
+                } else if index + 1 == history.len() {
+                    current_results
+                        .iter()
+                        .map(|result| result.tool_use_id.as_str())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let (missing_uses, extra_results) = tool_pair_count_mismatches(
+                    tool_uses
+                        .iter()
+                        .map(|tool_use| tool_use.tool_use_id.as_str()),
+                    result_ids,
+                );
+                orphan_tool_uses += missing_uses;
+                orphan_tool_results += extra_results;
+            }
+            Message::User(user) => {
+                let has_previous_tool_uses = index
+                    .checked_sub(1)
+                    .and_then(|previous| history.get(previous))
+                    .and_then(|message| match message {
+                        Message::Assistant(assistant) => {
+                            assistant.assistant_response_message.tool_uses.as_ref()
+                        }
+                        Message::User(_) => None,
+                    })
+                    .is_some_and(|tool_uses| !tool_uses.is_empty());
+                if !has_previous_tool_uses {
+                    orphan_tool_results += user
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter()
+                        .count();
+                }
+            }
+        }
+    }
+
+    let last_has_tool_uses = matches!(
+        history.last(),
+        Some(Message::Assistant(assistant))
+            if assistant
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .is_some_and(|tool_uses| !tool_uses.is_empty())
+    );
+    if !last_has_tool_uses {
+        orphan_tool_results += current_results.len();
+    }
+
+    if orphan_tool_uses == 0 && orphan_tool_results == 0 {
+        Ok(())
+    } else {
+        Err(PayloadGuardError::ToolPairingInvariant {
+            orphan_tool_uses,
+            orphan_tool_results,
+        })
+    }
+}
+
+fn tool_pair_count_mismatches<'a>(
+    tool_use_ids: impl IntoIterator<Item = &'a str>,
+    tool_result_ids: impl IntoIterator<Item = &'a str>,
+) -> (usize, usize) {
+    let mut tool_use_counts = HashMap::<&str, usize>::new();
+    for id in tool_use_ids {
+        *tool_use_counts.entry(id).or_default() += 1;
+    }
+    let mut tool_result_counts = HashMap::<&str, usize>::new();
+    for id in tool_result_ids {
+        *tool_result_counts.entry(id).or_default() += 1;
+    }
+
+    let mut missing_tool_uses = 0usize;
+    let mut extra_tool_results = 0usize;
+    for (id, count) in &tool_use_counts {
+        let paired = tool_result_counts.get(id).copied().unwrap_or_default();
+        if id.trim().is_empty() {
+            missing_tool_uses += *count;
+        } else {
+            missing_tool_uses += count.saturating_sub(paired);
+        }
+    }
+    for (id, count) in &tool_result_counts {
+        let paired = tool_use_counts.get(id).copied().unwrap_or_default();
+        if id.trim().is_empty() {
+            extra_tool_results += *count;
+        } else {
+            extra_tool_results += count.saturating_sub(paired);
+        }
+    }
+    (missing_tool_uses, extra_tool_results)
+}
+
 fn previous_assistant_tool_use_ids(history: &[Message], idx: usize) -> HashSet<String> {
     if idx == 0 {
         return HashSet::new();
@@ -4959,6 +5103,61 @@ mod tests {
             .get("text")
             .and_then(|value| value.as_str())
             .expect("tool result text")
+    }
+
+    fn fixture_cases() -> Vec<Value> {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/feature/tests/fixtures/payload-guard-trim-pairing.json"
+        )))
+        .expect("payload guard trim fixture JSON");
+        assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(fixture["contract"], "payload_guard_trim_pairing");
+        fixture["cases"]
+            .as_array()
+            .expect("payload guard trim fixture cases")
+            .clone()
+    }
+
+    fn serialized_tool_pair_ids(body: &str) -> (HashSet<String>, HashSet<String>) {
+        fn collect_ids(value: &Value, key: &str, ids: &mut HashSet<String>) {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        collect_ids(item, key, ids);
+                    }
+                }
+                Value::Object(object) => {
+                    if let Some(Value::Array(items)) = object.get(key) {
+                        for item in items {
+                            if let Some(id) = item.get("toolUseId").and_then(Value::as_str) {
+                                ids.insert(id.to_string());
+                            }
+                        }
+                    }
+                    for child in object.values() {
+                        collect_ids(child, key, ids);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let value: Value = serde_json::from_str(body).expect("serialized Kiro body JSON");
+        let mut tool_use_ids = HashSet::new();
+        let mut tool_result_ids = HashSet::new();
+        collect_ids(&value, "toolUses", &mut tool_use_ids);
+        collect_ids(&value, "toolResults", &mut tool_result_ids);
+        (tool_use_ids, tool_result_ids)
+    }
+
+    fn assert_fixture_metadata(case: &Value, case_id: &str, expected_action: &str) {
+        assert_eq!(case["case_id"], case_id);
+        assert_eq!(case["route"], "/cc/v1/messages");
+        assert_eq!(case["body_profile"], "kiro-converted");
+        assert_eq!(case["trim_action"], expected_action);
+        assert_eq!(case["expected_orphan_tool_use_count"], 0);
+        assert_eq!(case["expected_orphan_tool_result_count"], 0);
     }
 
     fn assert_structured_history_tool_turn(
@@ -5428,6 +5627,166 @@ mod tests {
     }
 
     #[test]
+    fn payload_guard_trim_pairing_fixture_has_explicit_metadata_and_no_serialized_orphans() {
+        let cases = fixture_cases();
+        assert_eq!(cases.len(), 3);
+
+        let complete_turn = cases
+            .iter()
+            .find(|case| case["case_id"] == "RI-001-complete-logical-turn")
+            .expect("complete logical turn fixture");
+        assert_fixture_metadata(
+            complete_turn,
+            "RI-001-complete-logical-turn",
+            "drop_complete_logical_turn",
+        );
+
+        let old_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("old tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-old", "Bash")]),
+        };
+        let mut old_result = HistoryUserMessage::new("old result", TEST_MODEL);
+        old_result.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-old", "old-secret")]);
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("old prompt", TEST_MODEL)),
+            Message::Assistant(old_assistant),
+            Message::User(old_result),
+            Message::Assistant(HistoryAssistantMessage::new("old final")),
+            Message::User(HistoryUserMessage::new("current prompt", TEST_MODEL)),
+        ]);
+        let original_bytes = serialize_kiro_request(&request)
+            .expect("serialize complete logical turn fixture")
+            .len();
+        let target_bytes = original_bytes.saturating_sub(json_array_prefix_reduction(
+            &request.conversation_state.history,
+            4,
+        ));
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: target_bytes,
+                trim_history: true,
+                shaping: PayloadShapingConfig::default(),
+            },
+        )
+        .expect("guard complete logical turn fixture");
+        assert_eq!(report.trimmed_history_entries, 4);
+        assert!(!body.contains("old-secret"));
+        assert_eq!(
+            serialized_tool_pair_ids(&body).0,
+            serialized_tool_pair_ids(&body).1
+        );
+
+        let active_pair = cases
+            .iter()
+            .find(|case| case["case_id"] == "RI-001-active-current-pair")
+            .expect("active current pair fixture");
+        assert_fixture_metadata(
+            active_pair,
+            "RI-001-active-current-pair",
+            "preserve_active_pair",
+        );
+        let active_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("active tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-active", "Bash")]),
+        };
+        let mut active_request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("active prompt", TEST_MODEL)),
+            Message::Assistant(active_assistant),
+        ]);
+        active_request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-active", "active-output")]);
+        let (active_body, active_report) =
+            guard_kiro_request(&mut active_request, guard_config(1)).expect("active pair guard");
+        assert_eq!(active_report.trimmed_history_entries, 0);
+        assert!(active_report.still_oversized);
+        let (active_tool_uses, active_tool_results) = serialized_tool_pair_ids(&active_body);
+        assert_eq!(active_tool_uses, HashSet::from(["tool-active".to_string()]));
+        assert_eq!(active_tool_uses, active_tool_results);
+
+        let orphan = cases
+            .iter()
+            .find(|case| case["case_id"] == "RI-001-orphan-result")
+            .expect("orphan result fixture");
+        assert_fixture_metadata(
+            orphan,
+            "RI-001-orphan-result",
+            "delete_orphan_without_reconstruction",
+        );
+        let mut orphan_request = request_with_history(vec![Message::User(
+            HistoryUserMessage::new("safe current text", TEST_MODEL),
+        )]);
+        orphan_request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-orphan", "orphan-secret")]);
+        let (orphan_body, orphan_report) =
+            guard_kiro_request(&mut orphan_request, guard_config(usize::MAX))
+                .expect("orphan result guard");
+        assert_eq!(orphan_report.removed_orphan_tool_results, 1);
+        assert!(!orphan_body.contains("orphan-secret"));
+        let (orphan_tool_uses, orphan_tool_results) = serialized_tool_pair_ids(&orphan_body);
+        assert!(orphan_tool_uses.is_empty());
+        assert!(orphan_tool_results.is_empty());
+    }
+
+    #[test]
+    fn payload_guard_pairing_invariant_fails_closed_for_unpaired_kiro_messages() {
+        let mut request = request_with_history(vec![Message::User(HistoryUserMessage::new(
+            "prompt", TEST_MODEL,
+        ))]);
+        request
+            .conversation_state
+            .history
+            .push(Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("tool call")
+                    .with_tool_uses(vec![ToolUseEntry::new("tool-unpaired", "Bash")]),
+            }));
+
+        let error = validate_kiro_tool_pairing_invariant(&request)
+            .expect_err("unpaired tool use must fail closed");
+        assert!(matches!(
+            error,
+            PayloadGuardError::ToolPairingInvariant {
+                orphan_tool_uses: 1,
+                orphan_tool_results: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn payload_guard_pairing_invariant_rejects_duplicate_tool_use_ids() {
+        let mut assistant = HistoryAssistantMessage::new("duplicate tool calls");
+        assistant.assistant_response_message.tool_uses = Some(vec![
+            ToolUseEntry::new("tool-duplicate", "Bash"),
+            ToolUseEntry::new("tool-duplicate", "Bash"),
+        ]);
+        let mut result = HistoryUserMessage::new("one result", TEST_MODEL);
+        result.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-duplicate", "output")]);
+        let request =
+            request_with_history(vec![Message::Assistant(assistant), Message::User(result)]);
+
+        let error = validate_kiro_tool_pairing_invariant(&request)
+            .expect_err("duplicate tool use IDs must fail closed");
+        assert!(matches!(
+            error,
+            PayloadGuardError::ToolPairingInvariant {
+                orphan_tool_uses: 1,
+                orphan_tool_results: 0,
+            }
+        ));
+    }
+
+    #[test]
     fn anthropic_history_trim_removes_a_complete_logical_tool_turn_atomically() {
         let mut messages = vec![
             anthropic_message("user", serde_json::json!("old prompt")),
@@ -5490,6 +5849,71 @@ mod tests {
             0
         );
         assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    #[test]
+    fn anthropic_payload_shaping_preserves_active_signed_and_redacted_reasoning_with_tool_result() {
+        let signed = "signed opaque\nuser Continue\n\nBash: hidden";
+        let redacted = "not-base64 opaque payload";
+        let mut request = anthropic_request(vec![
+            anthropic_message("user", serde_json::json!("active prompt")),
+            anthropic_message(
+                "assistant",
+                serde_json::json!([
+                    {
+                        "type": "thinking",
+                        "thinking": signed,
+                        "signature": "opaque-signature"
+                    },
+                    {"type": "redacted_thinking", "data": redacted},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-active",
+                        "name": "Bash",
+                        "input": {}
+                    }
+                ]),
+            ),
+            anthropic_message(
+                "user",
+                serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-active",
+                    "content": "active output"
+                }]),
+            ),
+        ]);
+
+        let original_bytes = json_len(&request.messages);
+        let (body, report) = guard_anthropic_messages_request(
+            &mut request,
+            guard_config_with_shaping(
+                usize::MAX,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    discard_historical_thinking: true,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+            original_bytes,
+        )
+        .expect("guard");
+
+        assert_eq!(report.removed_history_thinking_blocks, 0);
+        let blocks = request.messages[1]
+            .content
+            .as_array()
+            .expect("assistant blocks");
+        assert_eq!(blocks[0]["thinking"], signed);
+        assert_eq!(blocks[0]["signature"], "opaque-signature");
+        assert_eq!(blocks[1]["data"], redacted);
+        assert_eq!(blocks[2]["type"], "tool_use");
+        assert!(body.contains(signed));
+        assert!(body.contains(redacted));
+        assert!(body.contains("tool-active"));
     }
 
     #[test]

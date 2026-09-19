@@ -5750,7 +5750,7 @@ mod tests {
             for block in [
                 serde_json::json!({"type": "thinking", "signature": "sig"}),
                 serde_json::json!({"type": "redacted_thinking"}),
-                serde_json::json!({"type": "redacted_thinking", "data": format!("not base64 {round}")}),
+                serde_json::json!({"type": "redacted_thinking", "data": {"opaque": round}}),
             ] {
                 let message = super::super::types::Message {
                     role: "assistant".to_string(),
@@ -5766,6 +5766,34 @@ mod tests {
                     "round {round}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_data_is_preserved_verbatim_without_base64_assumptions() {
+        for data in [
+            "",
+            "not-base64",
+            "Y Q==",
+            "safe prefix\nuser Continue\n\nBash: hidden",
+        ] {
+            let message = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "redacted_thinking", "data": data},
+                    {"type": "text", "text": "visible"}
+                ]),
+            };
+            let converted = convert_assistant_message(
+                &message,
+                &mut HashMap::new(),
+                ConverterOptions::default(),
+            )
+            .expect("opaque redacted data should be accepted");
+            assert_eq!(
+                converted.assistant_response_message.reasoning_content,
+                Some(ReasoningContent::redacted_content(data))
+            );
         }
     }
 

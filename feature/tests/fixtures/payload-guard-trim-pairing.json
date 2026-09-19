@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "contract": "payload_guard_trim_pairing",
+  "cases": [
+    {
+      "case_id": "RI-001-complete-logical-turn",
+      "source_shape": "kiro_history_user_assistant_user_tool_result",
+      "route": "/cc/v1/messages",
+      "body_profile": "kiro-converted",
+      "expected_outcome": "trimmed_body_has_no_orphan_tool_pairs",
+      "trim_action": "drop_complete_logical_turn",
+      "expected_removed_history_entries": 4,
+      "expected_orphan_tool_use_count": 0,
+      "expected_orphan_tool_result_count": 0
+    },
+    {
+      "case_id": "RI-001-active-current-pair",
+      "source_shape": "kiro_history_assistant_plus_current_tool_result",
+      "route": "/cc/v1/messages",
+      "body_profile": "kiro-converted",
+      "expected_outcome": "active_current_pair_preserved",
+      "trim_action": "preserve_active_pair",
+      "expected_removed_history_entries": 0,
+      "expected_orphan_tool_use_count": 0,
+      "expected_orphan_tool_result_count": 0
+    },
+    {
+      "case_id": "RI-001-orphan-result",
+      "source_shape": "kiro_current_orphan_tool_result",
+      "route": "/cc/v1/messages",
+      "body_profile": "kiro-converted",
+      "expected_outcome": "orphan_tool_result_removed",
+      "trim_action": "delete_orphan_without_reconstruction",
+      "expected_removed_history_entries": 0,
+      "expected_orphan_tool_use_count": 0,
+      "expected_orphan_tool_result_count": 0
+    }
+  ]
+}

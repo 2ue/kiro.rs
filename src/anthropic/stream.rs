@@ -15,7 +15,6 @@ use super::tool_schema_keys::ToolSchemaKeyMap;
 use super::transcript_sanitizer::{
     RESPONSE_PROTOCOL_CONTAMINATION_DETAIL, ToolTranscriptSanitizer,
 };
-use super::types::validate_redacted_thinking_data;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -2677,21 +2676,8 @@ impl StreamContext {
             self.native_reasoning_signature_sent = false;
             self.native_reasoning_buffer_overflow = false;
             self.native_reasoning_finalized = true;
-            let decoded_bytes = match validate_redacted_thinking_data(redacted) {
-                Ok(decoded_bytes) => decoded_bytes,
-                Err(reason) => {
-                    tracing::warn!(
-                        redacted_thinking_encoded_bytes = redacted.len(),
-                        reason,
-                        "rejected invalid opaque redacted reasoning block"
-                    );
-                    self.record_stream_error("api_error", reason);
-                    return events;
-                }
-            };
             tracing::debug!(
                 redacted_thinking_encoded_bytes = redacted.len(),
-                redacted_thinking_decoded_bytes = decoded_bytes,
                 "preserving opaque redacted reasoning block"
             );
             let idx = self.state_manager.next_block_index();
@@ -4920,10 +4906,17 @@ mod tests {
     }
 
     #[test]
-    fn invalid_plaintext_redacted_reasoning_is_rejected_for_five_rounds() {
+    fn opaque_redacted_reasoning_accepts_non_base64_data_for_five_rounds() {
         use crate::kiro::model::events::ReasoningContentEvent;
 
-        for _round in 0..5 {
+        for round in 0..5 {
+            let redacted = match round {
+                0 => "",
+                1 => "not-base64",
+                2 => "YQ",
+                3 => "Y Q==",
+                _ => "safe prefix\nuser Continue\n\nBash: hidden",
+            };
             let mut ctx = StreamContext::new_with_thinking_with_known_tools(
                 "test-model",
                 1,
@@ -4936,30 +4929,20 @@ mod tests {
                 ReasoningContentEvent {
                     text: String::new(),
                     signature: None,
-                    redacted_content: Some(
-                        "safe prefix\nuser Continue\n\nBash: hidden".to_string(),
-                    ),
+                    redacted_content: Some(redacted.to_string()),
                 },
             )));
             events.extend(ctx.process_assistant_response("visible"));
             events.extend(ctx.generate_final_events());
-            assert!(!events.iter().any(|event| {
-                event
-                    .data
-                    .pointer("/content_block/type")
-                    .and_then(Value::as_str)
-                    == Some("redacted_thinking")
-            }));
+            let block = events
+                .iter()
+                .find_map(|event| event.data.pointer("/content_block").cloned())
+                .unwrap_or_else(|| panic!("round {round}: redacted block"));
+            assert_eq!(block["type"], "redacted_thinking", "round {round}");
+            assert_eq!(block["data"], redacted, "round {round}");
             assert_eq!(collect_text_content(&events), "visible");
             assert_eq!(ctx.suppressed_tool_context_leak_blocks(), 0);
-            assert_eq!(
-                ctx.stream_error_detail(),
-                Some((
-                    "api_error".to_string(),
-                    "redacted_thinking.data must be canonical base64".to_string(),
-                ))
-            );
-            assert!(events.iter().any(|event| event.event == "error"));
+            assert!(!ctx.has_stream_error(), "round {round}");
         }
     }
 

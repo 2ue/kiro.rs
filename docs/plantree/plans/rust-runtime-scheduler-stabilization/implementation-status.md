@@ -153,7 +153,7 @@ Current phase:
   and `admin-ui` build passed after restoring the lockfile-declared local dependency; sub2api
   settings/`ReportResult` remain separate follow-up work.
 - 2026-09-16/17 Claude Code ↔ Kiro 协议互转 P0 focused and isolated-real validation
-  completed on `main` at `5313bc1`: known Kiro event keys accept nested/top-level payloads,
+  was completed on `v0.0.163` (`5313bc1`): known Kiro event keys accept nested/top-level payloads,
   complete JSON tool inputs remain ordered tool fragments, serialized Kiro payloads keep
   mapped tool names consistent across definitions/history/tool-choice steering, and nested
   thinking/text/tool events preserve Anthropic SSE lifecycle and usage fields. Full Rust
@@ -165,9 +165,24 @@ Current phase:
   `local_credential/local_success` and non-zero usage, and fake external-pool non-stream/stream
   SSE cases returned `200`. Thinking/tool-use real-account cases remain partial because the
   selected accounts returned Kiro `402 quota exhausted`. The temporary pool
-  `supportedModels` whitelist mismatch is a reproducible follow-up, not a passed behavior.
+  `supportedModels` whitelist mismatch observed in that historical run is covered by the later
+  Claude Code model-name canonicalization contract; real third-party pool discovery/runtime
+  remains unverified.
   Evidence and cleanup details are in
   [P0 interop evidence](../../../../feature/evidence/sub2api-kiro-protocol-interop-p0-20260916.md).
+- 2026-09-18 current-HEAD interop follow-up on `09c0021` / `v0.0.164`:
+  added `feature/tests/fixtures/payload-guard-trim-pairing.json` and a Rust contract that
+  executes complete logical-turn trimming, preserves the active current tool pair, deletes an
+  orphan result without reconstructing an unknown tool use, and asserts the final serialized
+  Kiro body has identical tool-use/tool-result ID sets. The production Kiro guard now performs
+  a final fail-closed `tool_use`/`tool_result` invariant check before dispatch; local and
+  external public errors do not expose internal pool/scheduler wording. Payload guard suite
+  passed `73/0/1 ignored`, the new invariant contract passed `1/0/0`, the fixture contract
+  passed `1/0/0`, and current-tree C0 passed `2129/0/6 ignored` plus `kiro_loadtest 31/31`,
+  release build, diff and artifact inventory. Scoped targets and reservations were removed.
+  External-pool model canonicalization, model-mapping/model-unavailable cross-pool boundaries,
+  and local provider 400/404 consumption are already present in current code and have focused
+  contracts; real third-party discovery/runtime remains unverified.
 - 2026-09-18 external-pool quality scheduling zero-dispatch remediation:
   - Confirmed the upgrade-compatibility defect: the quality-aware scheduling default was
     accidentally enabled. Rust/UI/Admin UI defaults now all resolve to `false`; explicit `true`
@@ -215,7 +230,7 @@ Last landed evidence:
   the temporary external pool returned `200`; temporary PgSQL/Redis/ports/target/processes
   were cleaned. The external-pool `supportedModels` mismatch observed in that run is covered by
   the later Claude Code model-name canonicalization contract; real third-party pool discovery
-  is still not rerun.
+  is still not rerun, and this historical report is not current-HEAD runtime PASS evidence.
 - 2026-09-17 protocol retry-boundary follow-up:
   - External-pool `model_mapping_miss` and `model_unavailable` are now treated as
     pool/model route errors: the current pool is excluded for this request and another
@@ -243,6 +258,18 @@ Last landed evidence:
     `1 passed / 0 failed / 0 ignored`; `git diff --check` passed and the wrapper
     removed the isolated target and reservation. This is a fake-upstream source
     contract, not proof of a real Kiro 404 body shape.
+- 2026-09-18 current-HEAD runtime verification was actually executed with the frozen
+  release binary (`3133106baa178ea343e3f5542d0b6ffacc26326970f6a19e58d95a5e19558008`)
+  on the single designated `127.0.0.1:19023` instance. The system batch-imported
+  `235` credentials (`15 success / 220 skipped / 0 failed`) and refreshed balances for
+  all `237` database credentials (`233 success / 4 failed`). Fresh positive-balance
+  candidates `299/302/303` each returned nine real upstream models including
+  `claude-sonnet-4.5` and `claude-haiku-4.5`. Direct C1 requests for both models
+  returned `200`; real Claude CLI `2.1.273` completed Sonnet thinking, Haiku text,
+  and a Sonnet Bash `tool_use/tool_result` case with non-zero usage and complete
+  stream lifecycle. No internal pool/scheduler/credential terms leaked. The service
+  was stopped and port `19023` was confirmed clear. Current-HEAD dynamic status is
+  `runtime-validated / cli-pass`; real third-party pool discovery/runtime remains open.
 - `external_pool_cached_immediate_availability` real local PgSQL/Redis: `2 passed / 0 failed`.
 - `external_pool_immediate_availability_requires_current_capacity_and_recovers`: `1 passed / 0 failed`.
 - `external_fallback`: `9 passed / 0 failed`.
@@ -314,8 +341,10 @@ Active TODO:
 1. Observe the three production deployments after rollout without changing the local `9022`
    service or usage calculation chain.
 2. Finish first archive batch for old slow-first-token/stream-fluidity analysis.
-3. Close Claude Code/Kiro interop follow-ups: review the CLI leak warning, canonicalize
-   external-pool `supportedModels`, and obtain usable quota for real thinking/tool-use.
+3. Close the remaining Claude Code/Kiro interop follow-up: verify third-party pool
+   discovery/runtime. The current-HEAD CLI dynamic gate, CLI leak warning contract,
+   external-pool `supportedModels` canonicalization, and local real-account
+   thinking/tool-use cases are closed.
 4. Continue candidate rejection observability and model-field display improvements as separate
    follow-up work.
 
@@ -326,13 +355,12 @@ Blocked by:
   and must not be claimed before rollout.
 - Thinking signature Branch A vs B, image-source matrix, browser follow-up, and broader
   architecture gates remain independent open items and are not part of this P0 release.
-- Real-account thinking/tool-use is blocked by the available credential pool returning
-  `402 quota exhausted`; this is an external account-state blocker, not evidence of a parser
-  regression. The external-pool `supportedModels` mismatch and CLI runner leak warning remain
-  actionable local follow-ups.
+- Real third-party pool discovery/runtime remains open. The current local-account
+  thinking/tool-use blocker was cleared by refreshing all database balances and selecting
+  positive-quota credentials; this is not evidence of a parser regression.
 
 Next target:
 
 - Observe the `v0.0.134` rollout and keep that production observation separate from
-  already-published `v0.0.133`; in parallel, close the two interop follow-ups and rerun
-  thinking/tool-use only with a credential that has confirmed quota.
+  already-published `v0.0.133`; in parallel, verify the real third-party pool
+  discovery/runtime combination.

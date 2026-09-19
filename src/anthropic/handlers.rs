@@ -87,7 +87,6 @@ use super::transcript_sanitizer::RESPONSE_PROTOCOL_CONTAMINATION_DETAIL;
 use super::types::OutputConfig;
 use super::types::{
     CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, Thinking,
-    validate_redacted_thinking_data,
 };
 use super::usage::{
     ExternalPoolAttempt, ExternalPoolUsageSnapshot, StreamTerminalReason, UsageLatencyTrace,
@@ -5658,6 +5657,11 @@ fn payload_guard_error_response(err: PayloadGuardError) -> Response {
             "invalid_request_error",
             "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.",
         ),
+        PayloadGuardError::ToolPairingInvariant { .. } => envelope::error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        ),
     }
 }
 
@@ -9322,10 +9326,8 @@ fn append_non_stream_reasoning_and_text(
 ) -> Result<(), &'static str> {
     if native_reasoning_enabled {
         if let Some(redacted) = redacted_thinking {
-            let decoded_bytes = validate_redacted_thinking_data(redacted)?;
             tracing::debug!(
                 redacted_thinking_encoded_bytes = redacted.len(),
-                redacted_thinking_decoded_bytes = decoded_bytes,
                 "preserving opaque non-stream redacted reasoning block"
             );
             content.push(json!({

@@ -2,9 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::anthropic::types::{
-    ContentBlock, Message as AnthropicMessage, MessagesRequest, validate_redacted_thinking_data,
-};
+use crate::anthropic::types::{ContentBlock, Message as AnthropicMessage, MessagesRequest};
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ReasoningContent,
     UserInputMessageContext, UserMessage,
@@ -267,6 +265,23 @@ fn convert_assistant_message_with_known_tools(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("redacted_thinking")
+                {
+                    let data = item
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            ConversionError::UnsupportedContent(
+                                "assistant redacted_thinking.data must be a JSON string"
+                                    .to_string(),
+                            )
+                        })?;
+                    set_native_reasoning_content(
+                        &mut native_reasoning_content,
+                        ReasoningContent::redacted_content(data),
+                    )?;
+                    continue;
+                }
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
@@ -291,9 +306,6 @@ fn convert_assistant_message_with_known_tools(
                                 ConversionError::UnsupportedContent(
                                     "assistant redacted_thinking block is missing data".to_string(),
                                 )
-                            })?;
-                            validate_redacted_thinking_data(&data).map_err(|message| {
-                                ConversionError::UnsupportedContent(message.to_string())
                             })?;
                             set_native_reasoning_content(
                                 &mut native_reasoning_content,

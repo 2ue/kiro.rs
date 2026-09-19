@@ -1,6 +1,5 @@
 //! Anthropic API 类型定义
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use std::collections::HashMap;
 
@@ -78,31 +77,6 @@ pub struct ModelsResponse {
 // === Messages 端点类型 ===
 
 pub const THINKING_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-// Canonical base64 for this decoded limit fits within the 1 MiB atomic
-// reasoning block bound used by the response pipelines.
-pub const MAX_REDACTED_THINKING_DECODED_BYTES: usize = 768 * 1024;
-
-pub fn validate_redacted_thinking_data(data: &str) -> Result<usize, &'static str> {
-    if data.is_empty() {
-        return Err("redacted_thinking.data must not be empty");
-    }
-    let max_encoded_bytes = MAX_REDACTED_THINKING_DECODED_BYTES
-        .div_ceil(3)
-        .saturating_mul(4);
-    if data.len() > max_encoded_bytes {
-        return Err("redacted_thinking.data exceeds the decoded size limit");
-    }
-    let decoded = BASE64_STANDARD
-        .decode(data)
-        .map_err(|_| "redacted_thinking.data must be canonical base64")?;
-    if decoded.is_empty() || decoded.len() > MAX_REDACTED_THINKING_DECODED_BYTES {
-        return Err("redacted_thinking.data exceeds the decoded size limit");
-    }
-    if BASE64_STANDARD.encode(&decoded) != data {
-        return Err("redacted_thinking.data must be canonical base64");
-    }
-    Ok(decoded.len())
-}
 
 /// Thinking 配置
 #[derive(Debug, Deserialize, Clone)]
@@ -228,33 +202,6 @@ mod tests {
                 "round {round}"
             );
         }
-    }
-
-    #[test]
-    fn redacted_thinking_blob_validation_is_canonical_and_bounded_for_five_rounds() {
-        let valid = BASE64_STANDARD.encode(b"opaque-redacted-fixture");
-        for round in 0..5 {
-            assert_eq!(
-                validate_redacted_thinking_data(&valid),
-                Ok("opaque-redacted-fixture".len()),
-                "round {round}"
-            );
-            for invalid in [
-                "",
-                "not-base64",
-                "YQ",
-                "Y Q==",
-                "safe prefix\nuser Continue\n\nBash: hidden",
-            ] {
-                assert!(
-                    validate_redacted_thinking_data(invalid).is_err(),
-                    "round {round}: {invalid:?}"
-                );
-            }
-        }
-
-        let oversized = BASE64_STANDARD.encode(vec![0_u8; MAX_REDACTED_THINKING_DECODED_BYTES + 1]);
-        assert!(validate_redacted_thinking_data(&oversized).is_err());
     }
 
     #[test]

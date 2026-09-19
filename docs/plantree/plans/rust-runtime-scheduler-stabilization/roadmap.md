@@ -86,11 +86,14 @@ Last reviewed: 2026-09-18 Asia/Shanghai
   - 已完成 2026-09-15 `sub2api-kiro` 协议互操作对比和 2026-09-16 优化路线；
   - P0 fixture/contract test 与已知 event shape/tool input/tool-name/SSE lifecycle 的窄范围实现已 `focused-validated`；
   - 2026-09-16/17 已完成隔离真实本地凭据的 normal/alias/usage 闭环和真实 Claude Code CLI
-    `2.1.273` 验证；thinking/tool-use 因真实账号额度耗尽只能记为 `partial`；
-  - fake 外部池 non-stream/stream 协议链路已通过；临时 `supportedModels` 白名单暴露了
-    canonical normalization 缺口，不能记为已修复；
-  - semantic fallback 仍仅限已知 event key，trim 后 tool pair、schema profile、thinking 多块、
-    WebSearch index 和错误分类消费仍不得在真实证据前扩大默认行为；
+    `2.1.273` 验证；2026-09-18 又在批量刷新全部账号余额后完成当前 HEAD 的
+    Sonnet 4.5/Haiku 4.5 成功、thinking 和 tool-use 验证；
+  - fake 外部池 non-stream/stream 协议链路已通过；`supportedModels` 的 Claude Code 模型命令
+    canonical normalization 已由当前代码和 focused contract 覆盖，但真实第三方池
+    discovery/runtime 组合尚未重跑；
+  - semantic fallback 仍仅限已知 event key；trim 后 tool pair 的安全配对 invariant 已由
+    metadata fixture 和当前 HEAD Rust contract 覆盖，minimal tool-use reconstruction 不实现；
+    schema profile、thinking 多块、WebSearch index 和错误分类消费仍不得在真实证据前扩大默认行为；
   - 实现、进度、测试结果和复现记录见 [sub2api-kiro 协议互转优化执行计划](topics/sub2api-kiro-protocol-interop-optimization.md)，
     本批次证据见 [P0 evidence](../../../../feature/evidence/sub2api-kiro-protocol-interop-p0-20260916.md)。
 - Scheduler target decision and implementation readiness:
@@ -131,8 +134,18 @@ Last reviewed: 2026-09-18 Asia/Shanghai
     只在有其它可用凭据时跨账号切换，普通 malformed/schema/tool/image/body-invalid
     400 保持单次 fail-closed；scoped fake-upstream 矩阵 `1/1` 通过。该合同不替代真实
     Kiro 404 body 验证，且不改变 thinking signature 的同凭据受控 retry。
-  - 取得可用额度后补 thinking、tool-use、长会话和真实外部第三方池验证；不得把本轮
-    `402 quota exhausted` 归类为协议解析失败。
+  - 当前 HEAD 已补 payload trim/pairing metadata fixture、最终 body 无孤儿断言，以及
+    Kiro dispatch 前的 fail-closed tool pairing invariant；local/external public error
+    不暴露内部 pool/scheduler 术语。当前树 C0 已通过（主 Rust `2129/0/6 ignored`、
+    `kiro_loadtest 31/31`、release build、diff 和 artifact inventory）。
+  - 当前 HEAD 动态验证已实际运行：先批量导入 235 条凭据（15 success、220 skipped、
+    0 failed），再刷新数据库 237 条余额（233 success、4 failed），筛出 299/302/303
+    三个正额度目标账号。冻结 binary SHA-256
+    `3133106baa178ea343e3f5542d0b6ffacc26326970f6a19e58d95a5e19558008` 在唯一
+    `19023` 实例上完成 health/models、真实 upstream discovery、direct C1 和真实
+    Claude CLI `2.1.273` C2；Sonnet thinking、Haiku text、Sonnet Bash
+    `tool_use/tool_result`、usage、SSE lifecycle 和无内部术语泄漏均通过，状态为
+    `runtime-validated / cli-pass`。服务已停止、`19023` 无残留。
 
 ## Next
 

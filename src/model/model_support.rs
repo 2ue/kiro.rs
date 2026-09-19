@@ -204,12 +204,32 @@ fn known_anthropic_dated_model(model: &str) -> Option<&'static str> {
     }
 }
 
+fn support_match_variants(model: String) -> Vec<String> {
+    let mut variants = expand_claude_supported_model_variants([model.clone()]);
+    if let Some(base) = model.strip_suffix("-thinking") {
+        variants.extend(expand_claude_supported_model_variants([base.to_string()]));
+    } else {
+        variants.extend(expand_claude_supported_model_variants([format!(
+            "{model}-thinking"
+        )]));
+    }
+    if variants.is_empty() {
+        variants.push(model);
+    }
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
 pub fn model_is_supported_by_list(models: &[String], candidates: &[Option<&str>]) -> bool {
     if models.is_empty() {
         return true;
     }
 
-    let supported_models = normalize_supported_models(models.iter().cloned());
+    let supported_models = normalize_supported_models(models.iter().cloned())
+        .into_iter()
+        .flat_map(support_match_variants)
+        .collect::<Vec<_>>();
     if supported_models.is_empty() {
         return false;
     }
@@ -218,7 +238,12 @@ pub fn model_is_supported_by_list(models: &[String], candidates: &[Option<&str>]
         let Some(model) = normalize_model_id(candidate) else {
             continue;
         };
-        if supported_models.iter().any(|supported| supported == &model) {
+        let candidate_variants = support_match_variants(model);
+        if supported_models.iter().any(|supported| {
+            candidate_variants
+                .iter()
+                .any(|candidate| candidate == supported)
+        }) {
             return true;
         }
     }
@@ -312,26 +337,38 @@ mod tests {
     }
 
     #[test]
-    fn supported_models_do_not_match_version_equivalent_aliases() {
-        assert!(!model_is_supported_by_list(
+    fn supported_models_match_version_equivalent_claude_aliases() {
+        assert!(model_is_supported_by_list(
             &["claude-opus-4.8".to_string()],
             &[Some("claude-opus-4-8")]
         ));
-        assert!(!model_is_supported_by_list(
+        assert!(model_is_supported_by_list(
             &["claude-opus-4-8".to_string()],
             &[Some("claude-opus-4.8")]
         ));
     }
 
     #[test]
-    fn supported_models_do_not_match_explicit_anthropic_date_aliases() {
-        assert!(!model_is_supported_by_list(
+    fn supported_models_match_explicit_anthropic_date_aliases() {
+        assert!(model_is_supported_by_list(
             &["claude-sonnet-4-20250514".to_string()],
             &[Some("claude-sonnet-4")]
         ));
-        assert!(!model_is_supported_by_list(
+        assert!(model_is_supported_by_list(
             &["claude-sonnet-4".to_string()],
             &[Some("claude-sonnet-4-20250514")]
+        ));
+    }
+
+    #[test]
+    fn supported_models_match_thinking_and_dated_sonnet_haiku_aliases() {
+        assert!(model_is_supported_by_list(
+            &["claude-sonnet-4-5-20250929".to_string()],
+            &[Some("claude-sonnet-4.5-thinking")]
+        ));
+        assert!(model_is_supported_by_list(
+            &["claude-haiku-4.5-thinking".to_string()],
+            &[Some("claude-haiku-4-5-20251001")]
         ));
     }
 
