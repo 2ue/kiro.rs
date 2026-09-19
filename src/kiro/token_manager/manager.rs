@@ -12028,6 +12028,40 @@ impl MultiTokenManager {
         let usage_limits =
             get_usage_limits(&credentials, &config, &token, effective_proxy.as_ref()).await?;
 
+        // 上游只负责提供可验证的身份提示；仅在本地 email 为空时写回，
+        // 避免覆盖管理员手工维护的账号标签或发生并发覆盖。
+        if let Some(email) = usage_limits.email() {
+            let email = email.to_string();
+            let current_email = self
+                .entries
+                .lock()
+                .iter()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| entry.credentials.email.clone());
+            if current_email
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                if let Err(error) = self.persist_credential_mutation(id, |credential| {
+                    if credential
+                        .email
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty())
+                    {
+                        credential.email = Some(email.clone());
+                    }
+                    Ok(())
+                }) {
+                    tracing::warn!(
+                        "上游 email 自动补齐后持久化失败（不影响本次查询）: {}",
+                        error
+                    );
+                } else {
+                    self.publish_credentials_changed("credential_email_updated");
+                }
+            }
+        }
+
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
             let old_title = self

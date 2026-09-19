@@ -929,11 +929,11 @@ pub(crate) async fn get_usage_limits(
     // 构建 URL
     let mut url = configured_upstream_url(
         config,
-        "getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+        "getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
     )
     .unwrap_or_else(|| {
         format!(
-            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
             host
         )
     });
@@ -1716,6 +1716,9 @@ mod tests {
                 "subscriptionTitle": "KIRO TEST",
                 "overageCapability": "OVERAGE_CAPABLE"
             },
+            "userInfo": {
+                "email": "user@example.com"
+            },
             "usageBreakdownList": [{
                 "currentUsageWithPrecision": 1.0,
                 "usageLimitWithPrecision": 100.0
@@ -1757,13 +1760,14 @@ mod tests {
         server.abort();
 
         assert_eq!(usage.subscription_title(), Some("KIRO TEST"));
+        assert_eq!(usage.email(), Some("user@example.com"));
         let (host, authorization, token_type, uri) = captured.lock().unwrap().clone().unwrap();
         assert_eq!(host, "q.ap-south-2.amazonaws.com");
         assert_eq!(authorization, "Bearer ksk_fake_balance");
         assert_eq!(token_type, "API_KEY");
         assert_eq!(
             uri,
-            "/fake/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
+            "/fake/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
         );
     }
 

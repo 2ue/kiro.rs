@@ -176,7 +176,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint : undefined,
     issuerUrl: authMethod === 'external_idp' ? issuerUrl : undefined,
     scopes: authMethod === 'external_idp' ? scopes : undefined,
-    email: stringField(normalized.email) ?? stringField(normalized.nickname),
+    email: stringField(normalized.email) ?? stringField(nested?.email),
     profileArn,
     priority: numberField(normalized.priority),
     maxConcurrentRequests: numberField(normalized.maxConcurrentRequests) ?? numberField(nested?.maxConcurrentRequests),

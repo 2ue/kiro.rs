@@ -775,7 +775,8 @@ pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.service.get_account_info(id, false).await {
+    // 手动查询必须绕过账号信息缓存，让一次上游响应同时补齐订阅、额度和 email。
+    match state.service.get_account_info(id, true).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

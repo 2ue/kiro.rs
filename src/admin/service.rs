@@ -2388,7 +2388,18 @@ impl AdminService {
         id: u64,
         force: bool,
     ) -> Result<BalanceResponse, AdminServiceError> {
-        if !force {
+        // 账号 email 不在 credential_account_info 快照中。若本地尚未补齐 email，
+        // 即使额度缓存仍新鲜，也必须回源一次，让同一条 getUsageLimits 响应补齐
+        // subscription、usage 和 userInfo.email。
+        let email_missing = self
+            .token_manager
+            .base_snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.email)
+            .is_none_or(|email| email.trim().is_empty());
+        if !force && !email_missing {
             if let Some(redis) = self.observability_redis_store.as_ref() {
                 if let Ok(Some(cached)) =
                     redis.get_json::<CachedBalance>(balance_cache_key(id)).await
@@ -3085,9 +3096,14 @@ impl AdminService {
             }
         }
 
-        // 主动获取订阅等级并保存账号信息快照，避免首次请求时 Free 账号绕过 Opus 模型过滤。
-        if let Err(e) = self.get_balance(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        // 导入时同步补齐订阅、额度和 email。查询失败只记录警告，不影响凭据导入；
+        // get_usage_limits_for 使用 health-neutral refresh，不会把失败写入调度健康。
+        if let Err(error) = self.get_balance(credential_id).await {
+            tracing::warn!(
+                credential_id,
+                "导入后同步补齐订阅、额度和 email 失败（不影响导入和正常调度）: {}",
+                error
+            );
         }
         self.audit(
             "add_credential",

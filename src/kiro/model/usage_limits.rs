@@ -8,6 +8,10 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitsResponse {
+    /// 上游账号身份信息。仅用于后台展示和补齐账号 email，不参与鉴权。
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+
     /// 下次重置日期 (Unix 时间戳)
     #[serde(default)]
     pub next_date_reset: Option<f64>,
@@ -23,6 +27,14 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+}
+
+/// 上游返回的账号身份信息。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 /// 订阅信息
@@ -166,6 +178,15 @@ impl FreeTrialInfo {
 }
 
 impl UsageLimitsResponse {
+    /// 获取上游账号 email。
+    pub fn email(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.email.as_deref())
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+    }
+
     /// 获取订阅标题
     pub fn subscription_title(&self) -> Option<&str> {
         self.subscription_info
