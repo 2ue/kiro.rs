@@ -1528,8 +1528,14 @@ export interface ExternalPoolsConfig {
   externalPoolStreamPreOutputRetryEnabled: boolean
   externalPoolAutoDisableOnChannelDisabled: boolean
   externalPoolUsageProjectionUpliftPercent: number
+  externalPoolUsageProjectionCostFloorEnabled: boolean
+  externalPoolUsageProjectionCostFloorMarginPercent: number
   externalPoolUsageProjectionOutputUpliftMinTokens: number
   externalPoolUsageProjectionOutputUpliftPercent: number
+  externalPoolUsageDebugEnabled: boolean
+  externalPoolUsageDebugDir: string
+  externalPoolUsageDebugMaxBodyBytes: number
+  externalPoolUsageDebugMaxFiles: number
 }
 
 export interface ExternalPool {

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
+use crate::kiro::token_manager::CredentialIdentitySnapshot;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
     ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
@@ -344,6 +345,8 @@ pub struct CredentialListItem {
     pub effective_auth_region: String,
     pub effective_api_region: String,
     pub has_profile_arn: bool,
+    /// 账号级身份画像摘要，不包含原始 token、machineId 或 profileArn。
+    pub identity: CredentialIdentitySnapshot,
     pub refresh_token_hash: Option<String>,
     pub api_key_hash: Option<String>,
     pub masked_api_key: Option<String>,
@@ -445,6 +448,8 @@ pub struct CredentialStatusItem {
     pub effective_api_region: String,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// 账号级身份画像摘要，不包含原始 token、machineId 或 profileArn。
+    pub identity: CredentialIdentitySnapshot,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
     /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）

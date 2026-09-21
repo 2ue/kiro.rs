@@ -402,9 +402,15 @@ export function ExternalPoolsPanel() {
           externalPoolStreamRequestTimeoutSecs: whole(configDraft.externalPoolStreamRequestTimeoutSecs),
           externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
           externalPoolStreamPreOutputRetryEnabled: Boolean(configDraft.externalPoolStreamPreOutputRetryEnabled),
+          externalPoolUsageProjectionCostFloorEnabled: Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled),
           externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
+          externalPoolUsageProjectionCostFloorMarginPercent: whole(configDraft.externalPoolUsageProjectionCostFloorMarginPercent),
           externalPoolUsageProjectionOutputUpliftMinTokens: whole(configDraft.externalPoolUsageProjectionOutputUpliftMinTokens),
           externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
+          externalPoolUsageDebugEnabled: Boolean(configDraft.externalPoolUsageDebugEnabled),
+          externalPoolUsageDebugDir: String(configDraft.externalPoolUsageDebugDir || '').trim(),
+          externalPoolUsageDebugMaxBodyBytes: whole(configDraft.externalPoolUsageDebugMaxBodyBytes),
+          externalPoolUsageDebugMaxFiles: whole(configDraft.externalPoolUsageDebugMaxFiles),
         },
       })
       toast.success('备用号池策略已保存')

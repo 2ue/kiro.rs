@@ -19,7 +19,8 @@ pub use account_state::CredentialRiskControlReason;
 #[allow(unused_imports)]
 pub use admin_snapshot::{
     CredentialBaseSnapshot, CredentialCooldownSnapshot, CredentialEntrySnapshot,
-    ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
+    CredentialIdentitySnapshot, ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot,
+    ManagerSummarySnapshot,
 };
 pub(crate) use auxiliary::{
     AuxiliaryConcurrencyKind, AuxiliaryConcurrencySaturated, TokenRefreshAdmissionRejected,

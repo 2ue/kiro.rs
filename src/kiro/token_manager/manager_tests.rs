@@ -4112,6 +4112,66 @@ async fn test_add_credential_api_key_success() {
     assert_eq!(manager.available_count(), 1);
 }
 
+#[tokio::test]
+async fn test_add_credential_reject_duplicate_machine_id() {
+    let config = Config::default();
+    let mut existing = KiroCredentials::default();
+    existing.kiro_api_key = Some("ksk_existing_machine_id".to_string());
+    existing.auth_method = Some("api_key".to_string());
+    existing.machine_id = Some("a".repeat(64));
+    let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+
+    let mut duplicate = KiroCredentials::default();
+    duplicate.kiro_api_key = Some("ksk_other_machine_id".to_string());
+    duplicate.auth_method = Some("api_key".to_string());
+    duplicate.machine_id = Some("a".repeat(64));
+
+    let result = manager.add_credential(duplicate).await;
+    assert!(result.is_err());
+    assert!(result.err().unwrap().to_string().contains("独立 machineId"));
+}
+
+#[test]
+fn test_manager_rejects_duplicate_machine_ids_at_startup() {
+    let mut first = KiroCredentials::default();
+    first.id = Some(1);
+    first.machine_id = Some("b".repeat(64));
+    let mut second = KiroCredentials::default();
+    second.id = Some(2);
+    second.machine_id = Some("b".repeat(64));
+
+    let result = MultiTokenManager::new(Config::default(), vec![first, second], None, None, false);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().to_string().contains("共享身份"));
+}
+
+#[test]
+fn test_update_credential_auth_preserves_account_machine_id() {
+    let mut existing = KiroCredentials::default();
+    existing.kiro_api_key = Some("ksk_rotation_old".to_string());
+    existing.auth_method = Some("api_key".to_string());
+    existing.machine_id = Some("c".repeat(64));
+    let original_machine_id = existing.machine_id.clone();
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();
+
+    manager
+        .update_credential_auth(
+            1,
+            CredentialAuthUpdate {
+                kiro_api_key: Some("ksk_rotation_new".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+    let entries = manager.entries.lock();
+    let updated = entries.iter().find(|entry| entry.id == 1).unwrap();
+    assert_eq!(updated.credentials.machine_id, original_machine_id);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_row_level_update_does_not_delete_credentials_added_by_other_instance() {
     let Some(store) = test_postgres_store().await else {
@@ -5973,7 +6033,7 @@ async fn test_supported_model_exact_match_allows_local_scheduler_selection() {
 }
 
 #[tokio::test]
-async fn test_supported_model_filter_does_not_alias_local_scheduler_selection() {
+async fn test_supported_model_filter_aliases_local_scheduler_selection() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();
 
@@ -5983,14 +6043,13 @@ async fn test_supported_model_filter_does_not_alias_local_scheduler_selection() 
     cred.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
 
     let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
-    let err = manager
+    let mut ctx = manager
         .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
         .await
-        .err()
-        .unwrap()
-        .to_string();
+        .unwrap();
 
-    assert!(err.contains("没有支持当前模型的可用账号"), "{err}");
+    assert_eq!(ctx.id, 1);
+    ctx.release_in_flight();
 }
 
 #[tokio::test]

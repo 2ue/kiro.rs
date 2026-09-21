@@ -2,6 +2,7 @@
 
 pub mod call_trace;
 pub mod endpoint;
+pub mod identity;
 pub mod machine_id;
 pub mod model;
 pub mod parser;

@@ -5910,9 +5910,11 @@ mod tests {
         assert_eq!(blocks[0]["signature"], "opaque-signature");
         assert_eq!(blocks[1]["data"], redacted);
         assert_eq!(blocks[2]["type"], "tool_use");
-        assert!(body.contains(signed));
-        assert!(body.contains(redacted));
-        assert!(body.contains("tool-active"));
+        let serialized: serde_json::Value =
+            serde_json::from_str(&body).expect("serialized request body");
+        assert_eq!(serialized["messages"][1]["content"][0]["thinking"], signed);
+        assert_eq!(serialized["messages"][1]["content"][1]["data"], redacted);
+        assert_eq!(serialized["messages"][1]["content"][2]["id"], "tool-active");
     }
 
     #[test]

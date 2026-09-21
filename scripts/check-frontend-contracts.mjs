@@ -11,7 +11,20 @@ const uiContractPath = path.join(root, 'ui/src/types/api.ts')
 const adminContractPath = path.join(root, 'admin-ui/src/types/api.ts')
 const virtualCheckPath = path.join(root, 'scripts/.frontend-contract-check.ts')
 
-const intentionallyUiOnly = new Set(['UsageRouteKindFilter'])
+const intentionallyUiOnly = new Set([
+  'UsageRouteKindFilter',
+  'UsageExternalPoolRiskBucket',
+  'UsageExternalPoolRiskCacheStats',
+  'UsageExternalPoolRiskCostStats',
+  'UsageExternalPoolRiskFilters',
+  'UsageExternalPoolRiskGroup',
+  'UsageExternalPoolRiskQuery',
+  'UsageExternalPoolRiskResponse',
+  'UsageExternalPoolRiskSample',
+  'UsageExternalPoolRiskThresholds',
+  'UsageExternalPoolRiskTotals',
+  'UsageExternalPoolRiskWindow',
+])
 const intentionallyAdminOnly = new Set(['AdminErrorResponse', 'BulkCredentialActionError'])
 
 function exportedTypeNames(filePath) {

@@ -3514,6 +3514,14 @@ pub struct Config {
     #[serde(default)]
     pub machine_id: Option<String>,
 
+    /// 是否允许全局 `machineId` 作为账号身份的兼容 fallback。
+    ///
+    /// 默认关闭。账号存在 refreshToken、API key 或稳定凭据 ID 时，系统始终
+    /// 优先生成账号级 machineId，避免多账号共享同一个全局设备身份。只有需要
+    /// 兼容旧版单账号行为时才应显式打开。
+    #[serde(default)]
+    pub global_machine_id_fallback_enabled: bool,
+
     #[serde(default)]
     pub api_key: Option<String>,
 
@@ -5033,6 +5041,7 @@ impl Default for Config {
             api_region: None,
             kiro_version: default_kiro_version(),
             machine_id: None,
+            global_machine_id_fallback_enabled: false,
             api_key: None,
             api_keys: Vec::new(),
             system_version: default_system_version(),

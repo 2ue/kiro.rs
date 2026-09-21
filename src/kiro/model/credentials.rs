@@ -137,6 +137,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none", alias = "machine_id")]
     pub machine_id: Option<String>,
 
+    /// machineId 的派生来源。用于证明账号身份不是全局配置覆盖。
+    #[serde(skip_serializing_if = "Option::is_none", alias = "machine_id_source")]
+    pub machine_id_source: Option<String>,
+
+    /// 账号身份派生规则版本。
+    #[serde(skip_serializing_if = "Option::is_none", alias = "fingerprint_version")]
+    pub fingerprint_version: Option<String>,
+
     /// 用户邮箱（从 Anthropic API 获取）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -219,6 +227,8 @@ impl fmt::Debug for KiroCredentials {
             .field("auth_region_present", &self.auth_region.is_some())
             .field("api_region_present", &self.api_region.is_some())
             .field("machine_id_present", &self.machine_id.is_some())
+            .field("machine_id_source", &self.machine_id_source)
+            .field("fingerprint_version", &self.fingerprint_version)
             .field("email_present", &self.email.is_some())
             .field(
                 "subscription_title_present",
@@ -563,6 +573,8 @@ impl KiroCredentials {
             && self.auth_region == other.auth_region
             && self.api_region == other.api_region
             && self.machine_id == other.machine_id
+            && self.machine_id_source == other.machine_id_source
+            && self.fingerprint_version == other.fingerprint_version
             && self.email == other.email
             && self.subscription_title == other.subscription_title
             && self.supported_models == other.supported_models
@@ -879,6 +891,8 @@ mod tests {
             auth_region: Some("auth-region-sensitive-value".to_string()),
             api_region: Some("api-region-sensitive-value".to_string()),
             machine_id: Some("machine-id-sensitive-value".to_string()),
+            machine_id_source: Some("stored_credential".to_string()),
+            fingerprint_version: Some("account-v2".to_string()),
             email: Some("email-sensitive-value@example.invalid".to_string()),
             subscription_title: Some("subscription-sensitive-value".to_string()),
             supported_models: vec!["model-sensitive-value".to_string()],

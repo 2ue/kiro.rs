@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::ProxyConfig;
+use crate::kiro::identity::AccountIdentityProfile;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
@@ -14,6 +15,35 @@ use super::rpm::{effective_rpm, entry_rate_limit_remaining};
 use super::strategy::{scheduler_score_with_config, selection_pressure_from_totals};
 
 /// 凭据条目快照（用于 Admin API 读取）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialIdentitySnapshot {
+    /// 仅用于审计和比对的 machineId 哈希，不返回原始 machineId。
+    pub machine_id_hash: String,
+    /// machineId 的来源。
+    pub machine_id_source: String,
+    /// 身份派生规则版本。
+    pub fingerprint_version: String,
+    /// 请求使用的客户端身份模板。
+    pub ua_profile: String,
+    /// 请求使用的 TLS 后端模板。
+    pub tls_profile: String,
+}
+
+fn identity_snapshot_from_credentials(
+    credentials: &KiroCredentials,
+    config: &Config,
+) -> CredentialIdentitySnapshot {
+    let profile = AccountIdentityProfile::from_credentials(credentials, config);
+    CredentialIdentitySnapshot {
+        machine_id_hash: profile.machine_id_hash,
+        machine_id_source: profile.machine_id_source.as_str().to_string(),
+        fingerprint_version: profile.fingerprint_version.to_string(),
+        ua_profile: profile.ua_profile.to_string(),
+        tls_profile: profile.tls_profile.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialEntrySnapshot {
@@ -48,6 +78,8 @@ pub struct CredentialEntrySnapshot {
     pub effective_api_region: String,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// 账号级身份画像摘要。
+    pub identity: CredentialIdentitySnapshot,
     /// Token 过期时间
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -185,6 +217,8 @@ pub struct CredentialBaseSnapshot {
     pub effective_auth_region: String,
     pub effective_api_region: String,
     pub has_profile_arn: bool,
+    /// 账号级身份画像摘要。
+    pub identity: CredentialIdentitySnapshot,
     pub refresh_token_hash: Option<String>,
     pub api_key_hash: Option<String>,
     pub masked_api_key: Option<String>,
@@ -360,6 +394,7 @@ pub(super) fn base_snapshot_from_entry(
         effective_auth_region: entry.credentials.effective_auth_region(config).to_string(),
         effective_api_region: entry.credentials.effective_api_region(config).to_string(),
         has_profile_arn: entry.credentials.profile_arn.is_some(),
+        identity: identity_snapshot_from_credentials(&entry.credentials, config),
         refresh_token_hash: if entry.credentials.is_api_key_credential() {
             None
         } else {
@@ -450,6 +485,7 @@ pub(super) fn runtime_snapshot_from_entry(
         effective_auth_region: entry.credentials.effective_auth_region(config).to_string(),
         effective_api_region: entry.credentials.effective_api_region(config).to_string(),
         has_profile_arn: entry.credentials.profile_arn.is_some(),
+        identity: identity_snapshot_from_credentials(&entry.credentials, config),
         expires_at: if entry.credentials.is_api_key_credential() {
             None
         } else {

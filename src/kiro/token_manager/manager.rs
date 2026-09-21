@@ -270,7 +270,15 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
         clear_access_token = true;
     }
     apply_optional_string(&mut credential.api_region, update.api_region);
-    apply_optional_string(&mut credential.machine_id, update.machine_id);
+    if update.machine_id.is_some() {
+        apply_optional_string(&mut credential.machine_id, update.machine_id);
+        credential.machine_id_source = credential
+            .machine_id
+            .as_ref()
+            .map(|_| "stored_credential".to_string());
+        credential.fingerprint_version =
+            Some(machine_id::MACHINE_ID_DERIVATION_VERSION.to_string());
+    }
     apply_optional_string(&mut credential.email, update.email);
     apply_optional_string(&mut credential.endpoint, update.endpoint);
 
@@ -2165,9 +2173,14 @@ impl MultiTokenManager {
                     has_new_ids = true;
                     id
                 });
-                if cred.machine_id.is_none() {
-                    cred.machine_id =
-                        Some(machine_id::generate_from_credentials(&cred, config_ref));
+                if machine_id::is_legacy_global_machine_id(&cred, config_ref) {
+                    tracing::warn!(
+                        credential_id = id,
+                        "检测到旧版本全局 machineId，迁移为账号级 identity profile"
+                    );
+                    cred.machine_id = None;
+                }
+                if machine_id::ensure_identity_fields(&mut cred, config_ref) {
                     has_new_machine_ids = true;
                 }
                 CredentialEntry {
@@ -2242,6 +2255,21 @@ impl MultiTokenManager {
         }
         if !duplicate_ids.is_empty() {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
+        }
+
+        // 一个账号记录只允许对应一个独立 machineId；同一账号池内也不能
+        // 有两个账号复用同一个身份，否则上游会把它们视为同一设备。
+        let mut seen_machine_ids = HashMap::new();
+        for entry in &entries {
+            let effective_machine_id =
+                machine_id::generate_from_credentials(&entry.credentials, &config);
+            if let Some(other_id) = seen_machine_ids.insert(effective_machine_id, entry.id) {
+                anyhow::bail!(
+                    "检测到重复的账号 machineId：账号 #{} 与账号 #{} 共享身份",
+                    other_id,
+                    entry.id
+                );
+            }
         }
 
         // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
@@ -7428,6 +7456,32 @@ impl MultiTokenManager {
         cred
     }
 
+    fn ensure_machine_id_available(
+        &self,
+        credentials: &KiroCredentials,
+        excluded_id: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let config = self.runtime_config();
+        let candidate = machine_id::generate_from_credentials(credentials, &config);
+        let conflict = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|entry| Some(entry.id) != excluded_id)
+                .find(|entry| {
+                    machine_id::generate_from_credentials(&entry.credentials, &config) == candidate
+                })
+                .map(|entry| entry.id)
+        };
+        if let Some(other_id) = conflict {
+            anyhow::bail!(
+                "machineId 与账号 #{} 冲突：每个账号必须使用独立 machineId",
+                other_id
+            );
+        }
+        Ok(())
+    }
+
     fn merge_refresh_fields(target: &mut KiroCredentials, source: &KiroCredentials) {
         target.access_token = source.access_token.clone();
         target.refresh_token = source.refresh_token.clone();
@@ -11874,6 +11928,7 @@ impl MultiTokenManager {
                 }
             }
         }
+        self.ensure_machine_id_available(&credential, Some(id))?;
 
         self.invalidate_refresh_state_for_credential(id);
 
@@ -12278,6 +12333,7 @@ impl MultiTokenManager {
                 anyhow::bail!("凭据已存在（refreshToken 重复）");
             }
         }
+        self.ensure_machine_id_available(&new_cred, None)?;
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
         let mut validated_cred = if new_cred.is_api_key_credential() {
@@ -12327,13 +12383,6 @@ impl MultiTokenManager {
         validated_cred.endpoint = new_cred.endpoint;
         validated_cred.normalize_api_key_defaults();
         validated_cred.normalize_external_idp_defaults();
-        if validated_cred.machine_id.is_none() {
-            validated_cred.machine_id = Some(machine_id::generate_from_credentials(
-                &validated_cred,
-                &self.runtime_config(),
-            ));
-        }
-
         let initial_disabled = new_cred.disabled;
         let warmup_remaining = self.runtime_config().credential_warmup_requests;
         let initial_runtime_patch = CredentialRuntimeStatePatch {
@@ -12376,6 +12425,27 @@ impl MultiTokenManager {
             validated_cred.id = Some(id);
             (id, None)
         };
+
+        // 账号 ID 已经确定后再补齐 identity profile，确保无 token 的凭据也不会
+        // 因为临时导入对象缺少 id 而落入共享 fallback bucket。
+        let identity_changed =
+            machine_id::ensure_identity_fields(&mut validated_cred, &self.runtime_config());
+        if identity_changed {
+            if let Some(store) = &self.postgres_store {
+                let saved = credential_pgsql_sync_with_timeout(
+                    "保存新增凭据 identity profile",
+                    CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                    store.upsert_credential(&validated_cred),
+                )
+                .await?;
+                match saved {
+                    CredentialUpsertCasOutcome::Applied(saved) => validated_cred = saved,
+                    CredentialUpsertCasOutcome::Conflict { .. } => {
+                        anyhow::bail!("新增凭据 identity profile 写入发生并发冲突")
+                    }
+                }
+            }
+        }
 
         let persisted_state = persisted_runtime.as_ref().map(|runtime| &runtime.state);
         let persisted_disabled = persisted_runtime

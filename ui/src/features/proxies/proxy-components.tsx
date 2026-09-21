@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Activity, ChevronDown, ChevronUp, Edit3, Eye, EyeOff, Plus, Trash2, Users } from 'lucide-react'
+import { Activity, Edit3, Eye, EyeOff, Plus, Trash2, Users } from 'lucide-react'
 import { toast } from 'sonner'
 import { formatDate } from '@/lib/format'
 import { extractErrorMessage, cn } from '@/lib/utils'
@@ -340,7 +340,7 @@ function Detail({ label, children }: { label: string; children: React.ReactNode 
 export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResource; onEdit: (r: ProxyResource) => void }) {
   const [showSecrets, setShowSecrets] = React.useState(false)
   const [testResult, setTestResult] = React.useState<ProxyResourceTestResponse | null>(null)
-  const [expanded, setExpanded] = React.useState(false)
+  const [bindingOpen, setBindingOpen] = React.useState(false)
   const [selectedIds, setSelectedIds] = React.useState<Set<number>>(new Set())
   const [bindingReady, setBindingReady] = React.useState(false)
   const [savingBindings, setSavingBindings] = React.useState(false)
@@ -349,13 +349,13 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
   const testProxy = useTestProxyResource()
   const setCredentialProxy = useSetCredentialProxy()
   const confirm = useConfirm()
-  const credentials = useCredentials({ enabled: expanded })
+  const credentials = useCredentials({ enabled: bindingOpen })
 
   const allCredentials = credentials.data?.credentials || []
 
-  // 当展开时加载账号并初始化选中状态
+  // 打开绑定弹层时加载账号并初始化选中状态
   React.useEffect(() => {
-    if (!expanded) return
+    if (!bindingOpen) return
     let cancelled = false
     setBindingReady(false)
     credentials.refetch().then((result) => {
@@ -366,7 +366,7 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
     })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, resource.id])
+  }, [bindingOpen, resource.id])
 
   const toggleCredential = (id: number) =>
     setSelectedIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next })
@@ -383,14 +383,21 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
           return null
         })
         .filter((op): op is { id: number; proxyResourceId: number | null } => Boolean(op))
-      if (!ops.length) { toast.success('绑定关系无变化'); return }
+      if (!ops.length) {
+        toast.success('绑定关系无变化')
+        setBindingOpen(false)
+        return
+      }
       const results = await Promise.allSettled(
         ops.map((op) => setCredentialProxy.mutateAsync({ id: op.id, request: { proxyResourceId: op.proxyResourceId } }))
       )
       const ok = results.filter((r) => r.status === 'fulfilled').length
       const fail = results.filter((r) => r.status === 'rejected').length
       if (fail > 0) toast.warning(`绑定成功 ${ok} 个，失败 ${fail} 个`)
-      else toast.success(`已同步 ${ok} 个账号绑定`)
+      else {
+        toast.success(`已同步 ${ok} 个账号绑定`)
+        setBindingOpen(false)
+      }
     } catch (error) {
       toast.error(`保存绑定失败: ${extractErrorMessage(error)}`)
     } finally {
@@ -496,35 +503,45 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
             </Button>
             <Button
               variant="ghost" size="xs"
-              className={cn(expanded ? 'text-primary' : '')}
-              onClick={() => setExpanded((v) => !v)}
+              className={cn(bindingOpen ? 'text-primary' : '')}
+              onClick={() => setBindingOpen(true)}
             >
               <Users className="size-3.5" />账号绑定
-              {expanded ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
             </Button>
           </div>
         </div>
       </div>
 
-      {/* 展开态：账号绑定选择器 */}
-      {expanded && (
-        <div className="p-4 pt-2 space-y-3 animate-in fade-in-0 slide-in-from-top-2 duration-200">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-semibold">账号绑定</div>
-              <div className="text-xs text-muted-foreground">勾选账号后点击保存绑定同步到服务器；已禁用账号以红色标识。</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Badge tone="info">{selectedIds.size} 已选</Badge>
-              <Button
-                size="xs"
-                disabled={!bindingReady || savingBindings || setCredentialProxy.isPending}
-                onClick={saveBindings}
-              >
-                {savingBindings ? <Spinner size="sm" /> : null}
-                保存绑定
-              </Button>
-            </div>
+      <ModalShell
+        open={bindingOpen}
+        onClose={() => {
+          if (!savingBindings && !setCredentialProxy.isPending) setBindingOpen(false)
+        }}
+        title={`账号绑定：${resource.name}`}
+        description="勾选账号后保存绑定关系；已禁用账号以红色标识。"
+        width="max-w-2xl"
+        footer={(
+          <>
+            <Button
+              variant="outline"
+              onClick={() => setBindingOpen(false)}
+              disabled={savingBindings || setCredentialProxy.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              disabled={!bindingReady || savingBindings || setCredentialProxy.isPending}
+              onClick={saveBindings}
+            >
+              {savingBindings ? <Spinner size="sm" /> : null}
+              保存绑定
+            </Button>
+          </>
+        )}
+      >
+        <div className="space-y-3">
+          <div className="flex items-center justify-end">
+            <Badge tone="info">{selectedIds.size} 已选</Badge>
           </div>
           {!bindingReady && (credentials.isLoading || credentials.isFetching) ? (
             <LoadingState text="加载账号..." />
@@ -540,7 +557,7 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
             />
           )}
         </div>
-      )}
+      </ModalShell>
     </div>
   )
 }

@@ -561,6 +561,13 @@ fn credential_item(
         effective_auth_region: "us-east-1".to_string(),
         effective_api_region: "us-east-1".to_string(),
         has_profile_arn: false,
+        identity: crate::kiro::token_manager::CredentialIdentitySnapshot {
+            machine_id_hash: "identity-hash".to_string(),
+            machine_id_source: "deterministic_fallback".to_string(),
+            fingerprint_version: "account-v2".to_string(),
+            ua_profile: "kiro-ide-js-1.0.34-codewhispererstreaming".to_string(),
+            tls_profile: "rustls".to_string(),
+        },
         refresh_token_hash: None,
         api_key_hash: None,
         masked_api_key: None,
