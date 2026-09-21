@@ -4115,16 +4115,20 @@ async fn test_add_credential_api_key_success() {
 #[tokio::test]
 async fn test_add_credential_reject_duplicate_machine_id() {
     let config = Config::default();
-    let mut existing = KiroCredentials::default();
-    existing.kiro_api_key = Some("ksk_existing_machine_id".to_string());
-    existing.auth_method = Some("api_key".to_string());
-    existing.machine_id = Some("a".repeat(64));
+    let existing = KiroCredentials {
+        kiro_api_key: Some("ksk_existing_machine_id".to_string()),
+        auth_method: Some("api_key".to_string()),
+        machine_id: Some("a".repeat(64)),
+        ..Default::default()
+    };
     let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
 
-    let mut duplicate = KiroCredentials::default();
-    duplicate.kiro_api_key = Some("ksk_other_machine_id".to_string());
-    duplicate.auth_method = Some("api_key".to_string());
-    duplicate.machine_id = Some("a".repeat(64));
+    let duplicate = KiroCredentials {
+        kiro_api_key: Some("ksk_other_machine_id".to_string()),
+        auth_method: Some("api_key".to_string()),
+        machine_id: Some("a".repeat(64)),
+        ..Default::default()
+    };
 
     let result = manager.add_credential(duplicate).await;
     assert!(result.is_err());
@@ -4133,12 +4137,16 @@ async fn test_add_credential_reject_duplicate_machine_id() {
 
 #[test]
 fn test_manager_rejects_duplicate_machine_ids_at_startup() {
-    let mut first = KiroCredentials::default();
-    first.id = Some(1);
-    first.machine_id = Some("b".repeat(64));
-    let mut second = KiroCredentials::default();
-    second.id = Some(2);
-    second.machine_id = Some("b".repeat(64));
+    let first = KiroCredentials {
+        id: Some(1),
+        machine_id: Some("b".repeat(64)),
+        ..Default::default()
+    };
+    let second = KiroCredentials {
+        id: Some(2),
+        machine_id: Some("b".repeat(64)),
+        ..Default::default()
+    };
 
     let result = MultiTokenManager::new(Config::default(), vec![first, second], None, None, false);
     assert!(result.is_err());
@@ -4147,10 +4155,12 @@ fn test_manager_rejects_duplicate_machine_ids_at_startup() {
 
 #[test]
 fn test_update_credential_auth_preserves_account_machine_id() {
-    let mut existing = KiroCredentials::default();
-    existing.kiro_api_key = Some("ksk_rotation_old".to_string());
-    existing.auth_method = Some("api_key".to_string());
-    existing.machine_id = Some("c".repeat(64));
+    let existing = KiroCredentials {
+        kiro_api_key: Some("ksk_rotation_old".to_string()),
+        auth_method: Some("api_key".to_string()),
+        machine_id: Some("c".repeat(64)),
+        ..Default::default()
+    };
     let original_machine_id = existing.machine_id.clone();
     let manager =
         MultiTokenManager::new(Config::default(), vec![existing], None, None, false).unwrap();

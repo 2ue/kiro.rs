@@ -112,12 +112,11 @@ pub fn resolve_from_credentials(
     // A persisted account machineId is authoritative after the first assignment.
     // Refresh-token/API-key rotation must not silently change the account identity.
     if let Some(source) = recorded_source {
-        if source == MachineIdSource::GlobalFallback {
-            if config.global_machine_id_fallback_enabled {
-                if let Some(machine_id) = source_machine_id(credentials, config, source) {
-                    return MachineIdResolution { machine_id, source };
-                }
-            }
+        if source == MachineIdSource::GlobalFallback
+            && config.global_machine_id_fallback_enabled
+            && let Some(machine_id) = source_machine_id(credentials, config, source)
+        {
+            return MachineIdResolution { machine_id, source };
         } else if let Some(machine_id) = credentials
             .machine_id
             .as_deref()
@@ -144,25 +143,25 @@ pub fn resolve_from_credentials(
 
     // Legacy credentials may have a persisted machineId without source metadata.
     // Preserve that value instead of deriving a new identity from a rotated token.
-    if let Some(ref machine_id) = credentials.machine_id {
-        if let Some(normalized) = normalize_machine_id(machine_id) {
-            return MachineIdResolution {
-                machine_id: normalized,
-                source: MachineIdSource::StoredCredential,
-            };
-        }
+    if let Some(ref machine_id) = credentials.machine_id
+        && let Some(normalized) = normalize_machine_id(machine_id)
+    {
+        return MachineIdResolution {
+            machine_id: normalized,
+            source: MachineIdSource::StoredCredential,
+        };
     }
 
     // 按凭据类型派生（API Key 与 refreshToken 两条路径互斥，不回落）
     if credentials.is_api_key_credential() {
         // API Key 凭据：基于 kiroApiKey 派生
-        if let Some(ref api_key) = credentials.kiro_api_key {
-            if !api_key.is_empty() {
-                return MachineIdResolution {
-                    machine_id: sha256_hex(&format!("KiroAPIKey/{}", api_key)),
-                    source: MachineIdSource::DerivedApiKey,
-                };
-            }
+        if let Some(ref api_key) = credentials.kiro_api_key
+            && !api_key.is_empty()
+        {
+            return MachineIdResolution {
+                machine_id: sha256_hex(&format!("KiroAPIKey/{}", api_key)),
+                source: MachineIdSource::DerivedApiKey,
+            };
         }
     } else if let Some(ref refresh_token) = credentials.refresh_token {
         // OAuth 凭据：基于 refreshToken 派生
@@ -175,15 +174,14 @@ pub fn resolve_from_credentials(
     }
 
     // 全局 machineId 只作为显式兼容开关，不参与正常账号身份隔离。
-    if config.global_machine_id_fallback_enabled {
-        if let Some(ref machine_id) = config.machine_id {
-            if let Some(normalized) = normalize_machine_id(machine_id) {
-                return MachineIdResolution {
-                    machine_id: normalized,
-                    source: MachineIdSource::GlobalFallback,
-                };
-            }
-        }
+    if config.global_machine_id_fallback_enabled
+        && let Some(ref machine_id) = config.machine_id
+        && let Some(normalized) = normalize_machine_id(machine_id)
+    {
+        return MachineIdResolution {
+            machine_id: normalized,
+            source: MachineIdSource::GlobalFallback,
+        };
     }
 
     MachineIdResolution {
@@ -456,9 +454,11 @@ mod tests {
 
     #[test]
     fn test_resolution_reports_account_material_source() {
-        let mut credentials = KiroCredentials::default();
-        credentials.id = Some(42);
-        credentials.refresh_token = Some("refresh".to_string());
+        let mut credentials = KiroCredentials {
+            id: Some(42),
+            refresh_token: Some("refresh".to_string()),
+            ..Default::default()
+        };
         let resolution = resolve_from_credentials(&credentials, &Config::default());
         assert_eq!(resolution.source, MachineIdSource::DerivedRefreshToken);
 
@@ -469,18 +469,22 @@ mod tests {
 
     #[test]
     fn legacy_persisted_derived_machine_id_recovers_its_source() {
-        let mut credentials = KiroCredentials::default();
-        credentials.refresh_token = Some("refresh".to_string());
-        credentials.machine_id = Some(sha256_hex("KotlinNativeAPI/refresh"));
+        let credentials = KiroCredentials {
+            refresh_token: Some("refresh".to_string()),
+            machine_id: Some(sha256_hex("KotlinNativeAPI/refresh")),
+            ..Default::default()
+        };
         let resolution = resolve_from_credentials(&credentials, &Config::default());
         assert_eq!(resolution.source, MachineIdSource::DerivedRefreshToken);
     }
 
     #[test]
     fn persisted_account_machine_id_survives_refresh_token_rotation() {
-        let mut credentials = KiroCredentials::default();
-        credentials.id = Some(42);
-        credentials.refresh_token = Some("old-refresh".to_string());
+        let mut credentials = KiroCredentials {
+            id: Some(42),
+            refresh_token: Some("old-refresh".to_string()),
+            ..Default::default()
+        };
         ensure_identity_fields(&mut credentials, &Config::default());
         let original = credentials.machine_id.clone().unwrap();
         credentials.refresh_token = Some("new-refresh".to_string());
@@ -496,10 +500,12 @@ mod tests {
 
     #[test]
     fn persisted_account_machine_id_survives_api_key_rotation() {
-        let mut credentials = KiroCredentials::default();
-        credentials.id = Some(43);
-        credentials.auth_method = Some("api_key".to_string());
-        credentials.kiro_api_key = Some("old-api-key".to_string());
+        let mut credentials = KiroCredentials {
+            id: Some(43),
+            auth_method: Some("api_key".to_string()),
+            kiro_api_key: Some("old-api-key".to_string()),
+            ..Default::default()
+        };
         ensure_identity_fields(&mut credentials, &Config::default());
         let original = credentials.machine_id.clone().unwrap();
         credentials.kiro_api_key = Some("new-api-key".to_string());
@@ -524,10 +530,12 @@ mod tests {
 
     #[test]
     fn disabling_global_fallback_migrates_persisted_global_identity() {
-        let mut credentials = KiroCredentials::default();
-        credentials.id = Some(7);
-        credentials.machine_id = Some("a".repeat(64));
-        credentials.machine_id_source = Some("global_fallback".to_string());
+        let mut credentials = KiroCredentials {
+            id: Some(7),
+            machine_id: Some("a".repeat(64)),
+            machine_id_source: Some("global_fallback".to_string()),
+            ..Default::default()
+        };
 
         let mut config = Config::default();
         config.machine_id = Some("a".repeat(64));
@@ -549,10 +557,14 @@ mod tests {
 
     #[test]
     fn test_fallback_is_not_shared_for_missing_id_when_stable_metadata_differs() {
-        let mut first = KiroCredentials::default();
-        first.email = Some("first@example.invalid".to_string());
-        let mut second = KiroCredentials::default();
-        second.email = Some("second@example.invalid".to_string());
+        let first = KiroCredentials {
+            email: Some("first@example.invalid".to_string()),
+            ..Default::default()
+        };
+        let second = KiroCredentials {
+            email: Some("second@example.invalid".to_string()),
+            ..Default::default()
+        };
         let config = Config::default();
 
         assert_ne!(
