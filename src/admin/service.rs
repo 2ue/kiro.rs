@@ -6055,19 +6055,15 @@ fn manual_model_item_from_request(
         .filter(|value| !value.is_empty())
         .unwrap_or(&model)
         .to_string();
-    if let Some(value) = req.max_input_tokens {
-        if value <= 0 {
-            return Err(AdminServiceError::InvalidCredential(
-                "输入上限必须大于 0，或留空".to_string(),
-            ));
-        }
+    if matches!(req.max_input_tokens, Some(value) if value <= 0) {
+        return Err(AdminServiceError::InvalidCredential(
+            "输入上限必须大于 0，或留空".to_string(),
+        ));
     }
-    if let Some(value) = req.max_output_tokens {
-        if value <= 0 {
-            return Err(AdminServiceError::InvalidCredential(
-                "输出上限必须大于 0，或留空".to_string(),
-            ));
-        }
+    if matches!(req.max_output_tokens, Some(value) if value <= 0) {
+        return Err(AdminServiceError::InvalidCredential(
+            "输出上限必须大于 0，或留空".to_string(),
+        ));
     }
     Ok(ModelCapabilityItem {
         model,
