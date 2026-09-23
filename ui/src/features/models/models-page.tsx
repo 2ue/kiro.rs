@@ -46,6 +46,7 @@ import {
   useSyncModelPricing,
   useUpsertManualModel,
 } from '@/hooks/use-usage'
+import { useCredentialList } from '@/hooks/use-credentials'
 import type { ModelCapabilityItem, ModelPriceItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
@@ -256,9 +257,12 @@ export function ModelsPage() {
 
   const [editTarget, setEditTarget] = useState<ModelCapabilityItem | null>(null)
   const [addOpen, setAddOpen] = useState(false)
+  const [syncCredentialIds, setSyncCredentialIds] = useState<number[]>([])
+  const credentialList = useCredentialList({ page: 1, limit: 500 })
 
   const models = capabilities.data?.models ?? []
   const priceIndex = useMemo(() => pricingIndex(pricing.data?.models ?? []), [pricing.data?.models])
+  const credentialOptions = credentialList.data?.items ?? []
 
   const handleDelete = async (item: ModelCapabilityItem) => {
     const ok = await confirm({
@@ -288,20 +292,51 @@ export function ModelsPage() {
         subtitle="查看同步来的模型列表、手动维护能力参数；价格会用于用量页的成本估算和明细分析"
         actions={
           <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={syncCap.isPending}
-              onClick={() =>
-                syncCap.mutate(undefined, {
-                  onSuccess: () => toast.success('能力目录已同步'),
-                  onError: (e) => toast.error(`同步失败: ${extractErrorMessage(e)}`),
-                })
-              }
-            >
-              {syncCap.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
-              同步能力
-            </Button>
+            <div className="flex items-center gap-2">
+              <select
+                multiple
+                size={Math.min(Math.max(credentialOptions.length, 3), 6)}
+                aria-label="选择用于同步模型能力的账号"
+                className="min-h-9 min-w-[220px] max-w-[320px] rounded-md border border-input bg-background px-2 py-1 text-xs"
+                value={syncCredentialIds.map(String)}
+                disabled={syncCap.isPending || credentialList.isLoading}
+                onChange={(event) => {
+                  const ids = Array.from(event.target.selectedOptions)
+                    .map((option) => Number(option.value))
+                    .filter((id) => Number.isFinite(id))
+                  setSyncCredentialIds(ids)
+                }}
+              >
+                <option value="" disabled>
+                  {credentialList.isLoading ? '加载账号...' : '自动选择（按能力分组采样）'}
+                </option>
+                {credentialOptions.map((credential) => {
+                  const account = credential.email || credential.maskedApiKey || `账号 #${credential.id}`
+                  const subscription = credential.subscriptionTitle || '订阅未知'
+                  return (
+                    <option key={credential.id} value={credential.id} disabled={credential.disabled}>
+                      #{credential.id} {account} · {subscription}{credential.disabled ? ' · 已禁用' : ''}
+                    </option>
+                  )
+                })}
+              </select>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={syncCap.isPending}
+                onClick={() =>
+                  syncCap.mutate({ credentialIds: syncCredentialIds }, {
+                    onSuccess: (status) => toast.success(
+                      `${syncCredentialIds.length ? `已按 ${syncCredentialIds.length} 个账号` : '已按自动策略'}同步能力目录：${status.modelCount} 个模型`,
+                    ),
+                    onError: (e) => toast.error(`同步失败: ${extractErrorMessage(e)}`),
+                  })
+                }
+              >
+                {syncCap.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
+                同步能力{syncCredentialIds.length ? `（${syncCredentialIds.length}）` : ''}
+              </Button>
+            </div>
             <Button
               variant="outline"
               size="sm"

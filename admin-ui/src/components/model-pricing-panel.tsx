@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { RefreshCw, AlertTriangle, Plus, Edit3, Trash2 } from 'lucide-react'
+import { RefreshCw, AlertTriangle, Plus, Edit3, Trash2, ListChecks } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -22,6 +22,7 @@ import {
   useSyncModelPricing,
   useUpsertManualModel,
 } from '@/hooks/use-usage'
+import { useCredentialsList } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { ModelCapabilityItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
 
@@ -327,9 +328,12 @@ export function ModelPricingPanel() {
   const syncPricing = useSyncModelPricing()
   const capabilities = useModelCapabilities()
   const syncCapabilities = useSyncModelCapabilities()
+  const credentialList = useCredentialsList({ page: 1, limit: 500 })
   const deleteManual = useDeleteManualModel()
   const data = pricing.data
   const capabilityData = capabilities.data
+  const [syncCredentialIds, setSyncCredentialIds] = useState<number[]>([])
+  const credentialOptions = credentialList.data?.items ?? []
   const priceMap = useMemo(() => priceMapFrom(data), [data])
 
   const handleSync = () => {
@@ -343,7 +347,7 @@ export function ModelPricingPanel() {
   }
 
   const handleSyncCapabilities = () => {
-    syncCapabilities.mutate(undefined, {
+    syncCapabilities.mutate({ credentialIds: syncCredentialIds }, {
       onSuccess: (status) => {
         if (status.lastError) toast.warning(`模型能力同步失败，继续使用当前目录: ${status.lastError}`)
         else toast.success(`模型能力已同步：${status.modelCount} 个模型`)
@@ -388,14 +392,45 @@ export function ModelPricingPanel() {
             从 Kiro 上游同步可用模型、上下文窗口、输出上限和缓存能力；手动模型作为补充保留。
           </div>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            <ListChecks className="h-4 w-4 text-muted-foreground" />
+            <select
+              multiple
+              size={Math.min(Math.max(credentialOptions.length, 3), 6)}
+              aria-label="选择用于同步模型能力的账号"
+              className="min-h-9 min-w-[240px] max-w-[340px] rounded-md border border-input bg-background px-2 py-1 text-xs"
+              value={syncCredentialIds.map(String)}
+              disabled={syncCapabilities.isPending || credentialList.isLoading}
+              onChange={(event) => {
+                setSyncCredentialIds(
+                  Array.from(event.target.selectedOptions)
+                    .map((option) => Number(option.value))
+                    .filter((id) => Number.isFinite(id)),
+                )
+              }}
+            >
+              <option value="" disabled>
+                {credentialList.isLoading ? '加载账号...' : '自动选择（按能力分组采样）'}
+              </option>
+              {credentialOptions.map((credential) => {
+                const account = credential.email || credential.maskedApiKey || `账号 #${credential.id}`
+                const subscription = credential.subscriptionTitle || '订阅未知'
+                return (
+                  <option key={credential.id} value={credential.id} disabled={credential.disabled}>
+                    #{credential.id} {account} · {subscription}{credential.disabled ? ' · 已禁用' : ''}
+                  </option>
+                )
+              })}
+            </select>
+          </div>
           <Button size="sm" onClick={openAdd}>
             <Plus className="h-4 w-4" />
             手动添加模型
           </Button>
           <Button variant="outline" size="sm" onClick={handleSyncCapabilities} disabled={syncCapabilities.isPending}>
             <RefreshCw className={`h-4 w-4 ${syncCapabilities.isPending ? 'animate-spin' : ''}`} />
-            同步模型能力
+            同步模型能力{syncCredentialIds.length ? `（${syncCredentialIds.length}）` : ''}
           </Button>
         </div>
       </div>

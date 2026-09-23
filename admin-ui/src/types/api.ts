@@ -655,6 +655,29 @@ export interface CreateProxyResourceRequest {
   notes?: string
 }
 
+export interface BatchProxyResourceImportRequest {
+  content: string
+  namePrefix?: string
+  enabled?: boolean
+  continueOnError?: boolean
+}
+
+export interface BatchProxyResourceImportItem {
+  index: number
+  ok: boolean
+  resourceId?: number
+  name?: string
+  proxyUrl?: string
+  error?: string
+}
+
+export interface BatchProxyResourceImportResponse {
+  total: number
+  success: number
+  failed: number
+  items: BatchProxyResourceImportItem[]
+}
+
 export interface UpdateProxyResourceRequest {
   name?: string
   proxyUrl?: string
@@ -1926,6 +1949,10 @@ export interface ModelCapabilitiesStatus {
     efforts: string[]
     defaultEffort?: string
   }>
+}
+
+export interface SyncModelCapabilitiesRequest {
+  credentialIds?: number[]
 }
 
 export interface ManualModelPricingRequest {

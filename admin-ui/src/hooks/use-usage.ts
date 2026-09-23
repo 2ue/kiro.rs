@@ -282,7 +282,7 @@ export function useModelCapabilities() {
 export function useSyncModelCapabilities() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: syncModelCapabilities,
+    mutationFn: (payload: { credentialIds?: number[] } = {}) => syncModelCapabilities(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
     },

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { type ChangeEvent, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { Activity, Edit3, Eye, EyeOff, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { Activity, Edit3, Eye, EyeOff, Plus, RefreshCw, Trash2, Upload } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -19,6 +19,7 @@ import {
   useCreateProxyResource,
   useCredentials,
   useDeleteProxyResource,
+  useImportProxyResources,
   useProxyResources,
   useSetCredentialProxy,
   useTestProxyResource,
@@ -355,8 +356,8 @@ function ProxyEditorDialog({
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">代理 URL</label>
-              <Input value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="socks5h://127.0.0.1:1080" />
-              <p className="text-xs text-muted-foreground">支持 http://、https://、socks5://、socks5h://</p>
+              <Input value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="127.0.0.1:8080 或 socks5://127.0.0.1:1080" />
+              <p className="text-xs text-muted-foreground">支持 http://、https://、socks5://、socks5h://；不写协议头时按 http 解析</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">用户名</label>
@@ -565,6 +566,7 @@ function ProxyResourceCard({
 export function ProxyResourcesPanel() {
   const resources = useProxyResources()
   const [editorOpen, setEditorOpen] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
   const [editing, setEditing] = useState<ProxyResource | null>(null)
   const list = resources.data?.resources || []
   const enabledCount = useMemo(() => list.filter((resource) => resource.enabled).length, [list])
@@ -642,6 +644,10 @@ export function ProxyResourcesPanel() {
             <Plus className="h-4 w-4" />
             新增代理
           </Button>
+          <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}>
+            <Upload className="h-4 w-4" />
+            批量导入
+          </Button>
           <Button size="sm" variant="outline" onClick={() => resources.refetch()}>
             <RefreshCw className="h-4 w-4" />
             刷新列表
@@ -662,6 +668,100 @@ export function ProxyResourcesPanel() {
       )}
 
       <ProxyEditorDialog open={editorOpen} resource={editing} onOpenChange={closeEditor} />
+      <ProxyImportDialog open={importOpen} onOpenChange={setImportOpen} />
     </div>
+  )
+}
+
+function ProxyImportDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const [content, setContent] = useState('')
+  const [namePrefix, setNamePrefix] = useState('proxy')
+  const importResources = useImportProxyResources()
+
+  useEffect(() => {
+    if (open) {
+      setContent('')
+      setNamePrefix('proxy')
+    }
+  }, [open])
+
+  const submit = async () => {
+    if (!content.trim()) {
+      toast.error('请粘贴代理内容或选择文件')
+      return
+    }
+    try {
+      const result = await importResources.mutateAsync({
+        content,
+        namePrefix: namePrefix.trim() || 'proxy',
+        continueOnError: true,
+      })
+      if (result.failed > 0) {
+        const details = result.items
+          .filter((item) => !item.ok)
+          .slice(0, 3)
+          .map((item) => `${item.index}: ${item.error}`)
+          .join('；')
+        toast.warning(`代理导入完成：成功 ${result.success}，失败 ${result.failed}${details ? `（${details}）` : ''}`)
+      } else {
+        toast.success(`已导入 ${result.success} 个代理`)
+      }
+      onOpenChange(false)
+    } catch (error) {
+      toast.error(`代理导入失败: ${extractErrorMessage(error)}`)
+    }
+  }
+
+  const readFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    setContent(await file.text())
+    event.target.value = ''
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(nextOpen) => !importResources.isPending && onOpenChange(nextOpen)}>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>批量导入代理</DialogTitle>
+          <DialogDescription>
+            每行一个；支持 host:port、host:port:username:password、username:password@host:port、|、----、逗号、JSON 数组和 JSONL。缺少协议头时按 http 解析。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <label className="text-sm font-medium">默认名称前缀</label>
+            <Input value={namePrefix} onChange={(event) => setNamePrefix(event.target.value)} placeholder="proxy" />
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium">代理内容</label>
+            <textarea
+              rows={12}
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+              placeholder={'1.2.3.4:8080:user:pass\nuser:pass@2.3.4.5:3128\nsocks5://127.0.0.1:1080'}
+              className="flex min-h-48 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            />
+          </div>
+          <div className="flex items-center gap-3">
+            <Input type="file" accept=".txt,.json,.jsonl,.csv,text/plain,application/json" onChange={readFile} />
+            <span className="shrink-0 text-xs text-muted-foreground">导入文件会覆盖当前文本</span>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={importResources.isPending}>取消</Button>
+          <Button onClick={submit} disabled={importResources.isPending || !content.trim()}>
+            {importResources.isPending ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+            导入代理
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

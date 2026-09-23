@@ -15,6 +15,7 @@ import {
   initialParameterDefaults,
   mergeCredentialDefaults,
   optionalTrimmed,
+  validateProxyAssignment,
 } from '@/components/credential-parameter-defaults'
 import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -177,7 +178,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
 
     try {
-      credentials = credentials.map(credential => mergeCredentialDefaults(credential, defaults))
+      const proxyError = validateProxyAssignment(defaults)
+      if (proxyError) {
+        toast.error(proxyError)
+        return
+      }
+      credentials = credentials.map((credential, index) => mergeCredentialDefaults(credential, defaults, index))
     } catch (error) {
       toast.error(extractErrorMessage(error))
       return

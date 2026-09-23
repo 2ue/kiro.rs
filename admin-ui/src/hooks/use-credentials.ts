@@ -8,6 +8,7 @@ import {
   getCredentialsSummary,
   getCredentialsUsageSummary,
   getProxyResources,
+  importProxyResources,
   createProxyResource,
   updateProxyResource,
   deleteProxyResource,
@@ -43,6 +44,7 @@ import type {
   AddCredentialRequest,
   BatchUpdateCredentialsRequest,
   CreateProxyResourceRequest,
+  BatchProxyResourceImportRequest,
   CredentialsPageQuery,
   SetCredentialConcurrencyRequest,
   SetCredentialRateLimitAutoDisableRequest,
@@ -181,6 +183,17 @@ export function useCreateProxyResource() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (req: CreateProxyResourceRequest) => createProxyResource(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
+      invalidateCredentialCaches(queryClient)
+    },
+  })
+}
+
+export function useImportProxyResources() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: BatchProxyResourceImportRequest) => importProxyResources(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
       invalidateCredentialCaches(queryClient)

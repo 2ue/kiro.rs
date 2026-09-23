@@ -166,6 +166,120 @@ fn missing_auth_method_with_kiro_api_key_is_inferred_as_api_key() {
 }
 
 #[test]
+fn batch_import_proxy_ids_are_deduplicated_preserving_order() {
+    assert_eq!(
+        normalized_batch_proxy_resource_ids(&[3, 1, 3, 2, 1]),
+        vec![3, 1, 2]
+    );
+}
+
+#[test]
+fn batch_import_round_robin_proxy_assignment_is_stable() {
+    let defaults = BatchCredentialImportDefaults {
+        proxy_resource_ids: vec![1, 2, 3],
+        ..Default::default()
+    };
+    let assigned = (0..5)
+        .map(|index| {
+            let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+                "kiroApiKey": format!("ksk_test_{index}")
+            }))
+            .unwrap();
+            apply_batch_import_defaults(request, &defaults, Some([1, 2, 3][index % 3]))
+                .proxy_resource_id
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(assigned, vec![Some(1), Some(2), Some(3), Some(1), Some(2)]);
+}
+
+#[test]
+fn batch_import_round_robin_does_not_override_explicit_direct_proxy() {
+    let defaults = BatchCredentialImportDefaults {
+        proxy_resource_ids: vec![1, 2],
+        ..Default::default()
+    };
+    let request: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "kiroApiKey": "ksk_direct",
+        "proxyUrl": "socks5h://127.0.0.1:8080"
+    }))
+    .unwrap();
+
+    let merged = apply_batch_import_defaults(request, &defaults, Some(1));
+    assert_eq!(merged.proxy_resource_id, None);
+    assert_eq!(
+        merged.proxy_url.as_deref(),
+        Some("socks5h://127.0.0.1:8080")
+    );
+}
+
+#[test]
+fn batch_import_without_round_robin_keeps_single_proxy_default() {
+    let defaults = BatchCredentialImportDefaults {
+        proxy_resource_id: Some(Some(9)),
+        ..Default::default()
+    };
+    let request: AddCredentialRequest =
+        serde_json::from_value(serde_json::json!({ "kiroApiKey": "ksk_single" })).unwrap();
+
+    let merged = apply_batch_import_defaults(request, &defaults, None);
+    assert_eq!(merged.proxy_resource_id, Some(9));
+}
+
+#[test]
+fn proxy_import_parser_supports_common_formats_and_default_http() {
+    let parsed = parse_proxy_resource_import_content(
+        "1.2.3.4:8080:user:pass\nuser2:pass2@proxy.example:3128\nproxy.example:8081|user3|pass3",
+    )
+    .unwrap();
+    assert_eq!(parsed.len(), 3);
+    let first = parsed[0].as_ref().unwrap();
+    assert_eq!(first.proxy_url.as_deref(), Some("1.2.3.4:8080"));
+    assert_eq!(first.proxy_username.as_deref(), Some("user"));
+    assert_eq!(first.proxy_password.as_deref(), Some("pass"));
+    let second = parsed[1].as_ref().unwrap();
+    assert_eq!(second.proxy_url.as_deref(), Some("proxy.example:3128"));
+    assert_eq!(second.proxy_username.as_deref(), Some("user2"));
+    assert_eq!(second.proxy_password.as_deref(), Some("pass2"));
+    let third = parsed[2].as_ref().unwrap();
+    assert_eq!(third.proxy_url.as_deref(), Some("proxy.example:8081"));
+    assert_eq!(third.proxy_username.as_deref(), Some("user3"));
+    assert_eq!(third.proxy_password.as_deref(), Some("pass3"));
+    let ipv6 = parse_proxy_resource_import_content("[::1]:8080:user:pass:with:colon").unwrap();
+    assert_eq!(
+        ipv6[0].as_ref().unwrap().proxy_url.as_deref(),
+        Some("[::1]:8080")
+    );
+    assert_eq!(
+        ipv6[0].as_ref().unwrap().proxy_password.as_deref(),
+        Some("pass:with:colon")
+    );
+    assert_eq!(
+        validate_proxy_url("1.2.3.4:8080").unwrap(),
+        "http://1.2.3.4:8080"
+    );
+}
+
+#[test]
+fn proxy_import_parser_supports_json_and_jsonl() {
+    let parsed = parse_proxy_resource_import_content(
+        r#"[{"name":"a","proxyUrl":"10.0.0.1:80","proxyUsername":"u","proxyPassword":"p"},{"proxyUrl":"socks5://127.0.0.1:1080"}]"#,
+    )
+    .unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].as_ref().unwrap().name.as_deref(), Some("a"));
+    assert_eq!(
+        parsed[1].as_ref().unwrap().proxy_url.as_deref(),
+        Some("socks5://127.0.0.1:1080")
+    );
+    let jsonl = parse_proxy_resource_import_content(
+        "{\"proxyUrl\":\"proxy-a:8000\"}\n{\"proxyUrl\":\"https://proxy-b:8443\"}",
+    )
+    .unwrap();
+    assert_eq!(jsonl.len(), 2);
+}
+
+#[test]
 fn discovered_supported_models_preserve_non_claude_model_ids() {
     let models = AdminService::normalize_discovered_supported_models(vec![
         " QWEN3-CODER-NEXT ".to_string(),

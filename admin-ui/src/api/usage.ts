@@ -5,6 +5,7 @@ import type {
   AdminAuditLogPageQuery,
   ManualModelResponse,
   ModelCapabilitiesStatus,
+  SyncModelCapabilitiesRequest,
   ModelPricingStatus,
   UpsertManualModelRequest,
   UsageDashboardResponse,
@@ -208,8 +209,10 @@ export async function getModelCapabilities(): Promise<ModelCapabilitiesStatus> {
   return data
 }
 
-export async function syncModelCapabilities(): Promise<ModelCapabilitiesStatus> {
-  const { data } = await api.post<ModelCapabilitiesStatus>('/model-capabilities/sync')
+export async function syncModelCapabilities(
+  payload: SyncModelCapabilitiesRequest = {},
+): Promise<ModelCapabilitiesStatus> {
+  const { data } = await api.post<ModelCapabilitiesStatus>('/model-capabilities/sync', payload)
   return data
 }
 

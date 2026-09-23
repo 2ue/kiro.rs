@@ -14,14 +14,15 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
-        BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
-        CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
-        ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
-        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
-        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
-        SetCredentialRegionsRequest, SetCredentialRpmRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
-        SetWarmupRequest, SuccessResponse, SystemVersionResponse, TestCredentialRequest,
+        BatchProxyResourceImportRequest, BatchUpdateCredentialsRequest, ClearInFlightRequest,
+        CreateProxyResourceRequest, CreateRequestApiKeyRequest,
+        DiscoverExternalPoolSupportedModelsRequest, ExportCredentialsQuery,
+        ExternalPoolTestRequest, ProxyResourceTestRequest, RefreshCredentialInfoRequest,
+        SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
+        SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
+        SetCredentialRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
+        SyncModelCapabilitiesRequest, SystemVersionResponse, TestCredentialRequest,
         UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
         UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
         UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
@@ -70,6 +71,13 @@ pub struct CredentialInfoQueryParams {
 #[serde(rename_all = "camelCase")]
 pub struct CredentialsIdsQueryParams {
     pub ids: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialDiagnosticsQueryParams {
+    pub page: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 impl CredentialsIdsQueryParams {
@@ -481,6 +489,18 @@ pub async fn get_credentials_runtime(
     }
 }
 
+/// GET /api/admin/credentials/:id/diagnostics
+/// 懒加载单个凭据的调度快照和错误记录。
+pub async fn get_credential_diagnostics(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(params): Query<CredentialDiagnosticsQueryParams>,
+) -> impl IntoResponse {
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    Json(state.service.get_credential_diagnostics(id, page, limit)).into_response()
+}
+
 /// GET /api/admin/credentials/account-info
 pub async fn get_credentials_account_info(
     State(state): State<AdminState>,
@@ -882,6 +902,18 @@ pub async fn create_proxy_resource(
     }
 }
 
+/// POST /api/admin/proxy-resources/import
+/// 批量导入代理/家宽资源
+pub async fn import_proxy_resources(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchProxyResourceImportRequest>,
+) -> impl IntoResponse {
+    match state.service.import_proxy_resources(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/proxy-resources/test
 /// 测试未保存的代理配置
 pub async fn test_proxy_resource_config(
@@ -1234,8 +1266,26 @@ pub async fn get_model_capabilities(State(state): State<AdminState>) -> impl Int
 
 /// POST /api/admin/model-capabilities/sync
 /// 手动同步 Kiro 模型能力
-pub async fn sync_model_capabilities(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.sync_model_capabilities().await)
+pub async fn sync_model_capabilities(
+    State(state): State<AdminState>,
+    payload: Option<Json<SyncModelCapabilitiesRequest>>,
+) -> impl IntoResponse {
+    Json(
+        state
+            .service
+            .sync_model_capabilities(
+                payload
+                    .map(|Json(request)| {
+                        let mut ids = request.credential_ids;
+                        if let Some(id) = request.credential_id {
+                            ids.push(id);
+                        }
+                        ids
+                    })
+                    .unwrap_or_default(),
+            )
+            .await,
+    )
 }
 
 /// POST /api/admin/model-capabilities/manual

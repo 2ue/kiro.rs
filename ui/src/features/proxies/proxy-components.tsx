@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Activity, Edit3, Eye, EyeOff, Plus, Trash2, Users } from 'lucide-react'
+import { Activity, Edit3, Eye, EyeOff, Plus, Trash2, Upload, Users } from 'lucide-react'
 import { toast } from 'sonner'
 import { formatDate } from '@/lib/format'
 import { extractErrorMessage, cn } from '@/lib/utils'
@@ -7,6 +7,7 @@ import {
   useCreateProxyResource,
   useCredentials,
   useDeleteProxyResource,
+  useImportProxyResources,
   useSetCredentialProxy,
   useTestProxyResource,
   useUpdateProxyResource,
@@ -261,8 +262,8 @@ export function ProxyEditorModal({ open, resource, onClose }: {
           <Field label="名称">
             <Input value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="住宅家宽 A / US Proxy 1" />
           </Field>
-          <Field label="代理 URL" description="支持 http://、https://、socks5://、socks5h://">
-            <Input value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="socks5h://127.0.0.1:1080" />
+          <Field label="代理 URL" description="支持 http://、https://、socks5://、socks5h://；不写协议头时按 http 解析">
+            <Input value={form.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} placeholder="127.0.0.1:8080 或 socks5://127.0.0.1:1080" />
           </Field>
           <Field label="用户名">
             <SecretInput value={form.proxyUsername} onChange={(v) => set('proxyUsername', v)} visible={showUsername} onToggle={() => setShowUsername((v) => !v)} />
@@ -315,6 +316,82 @@ export function ProxyEditorModal({ open, resource, onClose }: {
           )}
         </div>
       </form>
+    </ModalShell>
+  )
+}
+
+export function ProxyImportModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [content, setContent] = React.useState('')
+  const [namePrefix, setNamePrefix] = React.useState('proxy')
+  const importResources = useImportProxyResources()
+
+  React.useEffect(() => {
+    if (open) {
+      setContent('')
+      setNamePrefix('proxy')
+    }
+  }, [open])
+
+  const submit = async () => {
+    if (!content.trim()) return toast.error('请粘贴代理内容或选择文件')
+    try {
+      const result = await importResources.mutateAsync({
+        content,
+        namePrefix: namePrefix.trim() || 'proxy',
+        continueOnError: true,
+      })
+      if (result.failed > 0) {
+        const details = result.items.filter((item) => !item.ok).slice(0, 3).map((item) => `${item.index}: ${item.error}`).join('；')
+        toast.warning(`代理导入完成：成功 ${result.success}，失败 ${result.failed}${details ? `（${details}）` : ''}`)
+      } else {
+        toast.success(`已导入 ${result.success} 个代理`)
+      }
+      onClose()
+    } catch (error) {
+      toast.error(`代理导入失败: ${extractErrorMessage(error)}`)
+    }
+  }
+
+  const readFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    setContent(await file.text())
+    event.target.value = ''
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={() => !importResources.isPending && onClose()}
+      title="批量导入代理"
+      width="max-w-3xl"
+      footer={(
+        <>
+          <Button variant="outline" size="sm" onClick={onClose} disabled={importResources.isPending}>取消</Button>
+          <Button size="sm" onClick={submit} disabled={importResources.isPending || !content.trim()}>
+            {importResources.isPending ? <Spinner size="sm" /> : <Upload className="size-4" />}
+            导入代理
+          </Button>
+        </>
+      )}
+    >
+      <div className="space-y-4">
+        <Field label="默认名称前缀">
+          <Input value={namePrefix} onChange={(event) => setNamePrefix(event.target.value)} placeholder="proxy" />
+        </Field>
+        <Field label="代理内容" description="每行一个；支持 host:port、host:port:username:password、username:password@host:port、|、----、逗号、JSON 数组和 JSONL。缺少协议头时按 http 解析。">
+          <Textarea
+            rows={12}
+            value={content}
+            onChange={(event) => setContent(event.target.value)}
+            placeholder={'1.2.3.4:8080:user:pass\nuser:pass@2.3.4.5:3128\nsocks5://127.0.0.1:1080'}
+          />
+        </Field>
+        <div className="flex items-center gap-3">
+          <Input type="file" accept=".txt,.json,.jsonl,.csv,text/plain,application/json" onChange={readFile} />
+          <span className="shrink-0 text-xs text-muted-foreground">导入文件会覆盖当前文本</span>
+        </div>
+      </div>
     </ModalShell>
   )
 }

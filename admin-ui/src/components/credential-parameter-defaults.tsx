@@ -5,6 +5,8 @@ import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
 import type { AddCredentialRequest, ProxyResource } from '@/types/api'
 
+export type ProxyAssignmentMode = 'single' | 'round_robin' | 'none'
+
 export interface CredentialParameterDefaults {
   disabled: string
   priority: string
@@ -15,7 +17,9 @@ export interface CredentialParameterDefaults {
   apiRegion: string
   machineId: string
   endpoint: string
+  proxyMode: ProxyAssignmentMode
   proxyResourceId: string
+  proxyResourceIds: string[]
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
@@ -33,7 +37,9 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
     apiRegion: '',
     machineId: '',
     endpoint: '',
+    proxyMode: 'single',
     proxyResourceId: '',
+    proxyResourceIds: [],
     proxyUrl: '',
     proxyUsername: '',
     proxyPassword: '',
@@ -61,9 +67,18 @@ export function parseOptionalNonNegativeInteger(value: string, label: string): n
 
 export function mergeCredentialDefaults(
   credential: AddCredentialRequest,
-  defaults: CredentialParameterDefaults
+  defaults: CredentialParameterDefaults,
+  importIndex = 0,
 ): AddCredentialRequest {
-  const defaultProxyResourceId = parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID')
+  const roundRobinProxyResourceId = defaults.proxyResourceIds.length > 0
+    ? parseOptionalNonNegativeInteger(
+      defaults.proxyResourceIds[importIndex % defaults.proxyResourceIds.length],
+      '代理资源 ID',
+    )
+    : undefined
+  const defaultProxyResourceId = roundRobinProxyResourceId !== undefined
+    ? roundRobinProxyResourceId
+    : parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID')
   const credentialHasDirectProxy = Boolean(
     optionalTrimmed(credential.proxyUrl) ||
     optionalTrimmed(credential.proxyUsername) ||
@@ -104,12 +119,11 @@ export function mergeCredentialDefaults(
   }
 }
 
-function clearDirectProxyDraft<T extends { proxyUrl: string; proxyUsername: string; proxyPassword: string }>(values: T): T {
-  return { ...values, proxyUrl: '', proxyUsername: '', proxyPassword: '' }
-}
-
-function clearProxyResourceDraft<T extends { proxyResourceId: string }>(values: T): T {
-  return { ...values, proxyResourceId: '' }
+export function validateProxyAssignment(defaults: CredentialParameterDefaults): string | undefined {
+  if (defaults.proxyMode === 'round_robin' && defaults.proxyResourceIds.length === 0) {
+    return '已选择多个代理轮换，请至少选择一个代理资源'
+  }
+  return undefined
 }
 
 function FieldLabel({
@@ -186,15 +200,29 @@ export function CredentialParameterDefaultsPanel({
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
 
-  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport'>
+  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds'>
 
   const update = (key: StringDefaultKey, value: string) => {
     if (key === 'proxyResourceId' && value) {
-      onChange(clearDirectProxyDraft({ ...defaults, proxyResourceId: value }))
+      onChange({
+        ...defaults,
+        proxyMode: 'single',
+        proxyResourceId: value,
+        proxyResourceIds: [],
+        proxyUrl: '',
+        proxyUsername: '',
+        proxyPassword: '',
+      })
       return
     }
     if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && value.trim()) {
-      onChange(clearProxyResourceDraft({ ...defaults, [key]: value }))
+      onChange({
+        ...defaults,
+        proxyMode: 'single',
+        [key]: value,
+        proxyResourceId: '',
+        proxyResourceIds: [],
+      })
       return
     }
     if (key === 'region' && value.trim() && !defaults.authRegion.trim()) {
@@ -202,6 +230,46 @@ export function CredentialParameterDefaultsPanel({
       return
     }
     onChange({ ...defaults, [key]: value })
+  }
+
+  const setProxyMode = (proxyMode: ProxyAssignmentMode) => {
+    if (proxyMode === 'none') {
+      onChange({
+        ...defaults,
+        proxyMode,
+        proxyResourceId: '',
+        proxyResourceIds: [],
+        proxyUrl: '',
+        proxyUsername: '',
+        proxyPassword: '',
+      })
+      return
+    }
+    if (proxyMode === 'round_robin') {
+      onChange({
+        ...defaults,
+        proxyMode,
+        proxyResourceId: '',
+        proxyUrl: '',
+        proxyUsername: '',
+        proxyPassword: '',
+      })
+      return
+    }
+    onChange({ ...defaults, proxyMode, proxyResourceIds: [] })
+  }
+
+  const toggleProxyResource = (id: number, checked: boolean | 'indeterminate') => {
+    const idValue = String(id)
+    const selected = new Set(defaults.proxyResourceIds)
+    if (checked === true) selected.add(idValue)
+    else selected.delete(idValue)
+    onChange({
+      ...defaults,
+      proxyMode: 'round_robin',
+      proxyResourceId: '',
+      proxyResourceIds: Array.from(selected),
+    })
   }
 
   const proxyLocked = Boolean(defaults.proxyResourceId)
@@ -267,49 +335,90 @@ export function CredentialParameterDefaultsPanel({
         <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
           <Input value={defaults.endpoint} disabled={disabled} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
         </FieldLabel>
-        <FieldLabel title="代理资源" description="选择资源会清空直连代理；填写直连代理会取消资源">
+        <FieldLabel title="代理分配方式" description="轮换按导入顺序循环分配；账号自身代理配置优先">
           <select
-            value={defaults.proxyResourceId}
+            value={defaults.proxyMode}
             disabled={disabled}
-            onChange={(event) => update('proxyResourceId', event.target.value)}
+            onChange={(event) => setProxyMode(event.target.value as ProxyAssignmentMode)}
             className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <option value="">不绑定</option>
-            {proxyResources.map((resource) => (
-              <option key={resource.id} value={resource.id}>
-                {resource.name}
-              </option>
-            ))}
+            <option value="single">统一代理</option>
+            <option value="round_robin">多个代理轮换</option>
+            <option value="none">不设置代理</option>
           </select>
         </FieldLabel>
-        <FieldLabel title="独立代理 URL" description={proxyLocked ? '已选择代理资源，输入前请先取消资源' : '可填 direct 或完整代理 URL'}>
-          <Input
-            value={defaults.proxyUrl}
-            disabled={disabled || proxyLocked}
-            onChange={(event) => update('proxyUrl', event.target.value)}
-            placeholder="socks5h://127.0.0.1:1080"
-          />
-        </FieldLabel>
-        <FieldLabel title="代理用户名">
-          <SecretInput
-            value={defaults.proxyUsername}
-            onChange={(value) => update('proxyUsername', value)}
-            visible={showProxyUsername}
-            onToggle={() => setShowProxyUsername((value) => !value)}
-            disabled={disabled || proxyLocked}
-            placeholder="可选"
-          />
-        </FieldLabel>
-        <FieldLabel title="代理密码">
-          <SecretInput
-            value={defaults.proxyPassword}
-            onChange={(value) => update('proxyPassword', value)}
-            visible={showProxyPassword}
-            onToggle={() => setShowProxyPassword((value) => !value)}
-            disabled={disabled || proxyLocked}
-            placeholder="可选"
-          />
-        </FieldLabel>
+        {defaults.proxyMode === 'round_robin' && (
+          <div className="md:col-span-2 space-y-1.5">
+            <div className="text-sm font-medium">轮换代理资源</div>
+            {proxyResources.length > 0 ? (
+              <div className="grid max-h-40 gap-2 overflow-y-auto rounded-md border bg-background/60 p-2 sm:grid-cols-2">
+                {proxyResources.map((resource) => (
+                  <label key={resource.id} className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted/60">
+                    <Checkbox
+                      checked={defaults.proxyResourceIds.includes(String(resource.id))}
+                      onCheckedChange={(checked) => toggleProxyResource(resource.id, checked)}
+                      disabled={disabled}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-sm">{resource.name}</span>
+                    {!resource.enabled && <span className="shrink-0 text-[0.7rem] text-muted-foreground">已禁用</span>}
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">暂无可用代理资源</div>
+            )}
+            <p className="text-xs leading-5 text-muted-foreground">
+              已选 {defaults.proxyResourceIds.length} 个，按选择顺序循环分配给账号 1、2、3…。
+            </p>
+          </div>
+        )}
+        {defaults.proxyMode === 'single' && (
+          <>
+            <FieldLabel title="代理资源" description="选择资源会清空直连代理；填写直连代理会取消资源">
+              <select
+                value={defaults.proxyResourceId}
+                disabled={disabled}
+                onChange={(event) => update('proxyResourceId', event.target.value)}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">不绑定</option>
+                {proxyResources.map((resource) => (
+                  <option key={resource.id} value={resource.id}>
+                    {resource.name}{resource.enabled ? '' : '（已禁用）'}
+                  </option>
+                ))}
+              </select>
+            </FieldLabel>
+            <FieldLabel title="独立代理 URL" description={proxyLocked ? '已选择代理资源，输入前请先取消资源' : '可填 direct 或完整代理 URL'}>
+              <Input
+                value={defaults.proxyUrl}
+                disabled={disabled || proxyLocked}
+                onChange={(event) => update('proxyUrl', event.target.value)}
+                placeholder="socks5h://127.0.0.1:1080"
+              />
+            </FieldLabel>
+            <FieldLabel title="代理用户名">
+              <SecretInput
+                value={defaults.proxyUsername}
+                onChange={(value) => update('proxyUsername', value)}
+                visible={showProxyUsername}
+                onToggle={() => setShowProxyUsername((value) => !value)}
+                disabled={disabled || proxyLocked}
+                placeholder="可选"
+              />
+            </FieldLabel>
+            <FieldLabel title="代理密码">
+              <SecretInput
+                value={defaults.proxyPassword}
+                onChange={(value) => update('proxyPassword', value)}
+                visible={showProxyPassword}
+                onToggle={() => setShowProxyPassword((value) => !value)}
+                disabled={disabled || proxyLocked}
+                placeholder="可选"
+              />
+            </FieldLabel>
+          </>
+        )}
       </div>
     </div>
   )

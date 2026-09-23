@@ -138,6 +138,7 @@ function ImportResultFooter({
 
 type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
 type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
+type ProxyAssignmentMode = 'single' | 'round_robin' | 'none'
 
 // ============================================================================
 // Verify result type (used by BatchVerifyModal)
@@ -164,7 +165,9 @@ interface CredentialParameterDefaults {
   apiRegion: string
   machineId: string
   endpoint: string
+  proxyMode: ProxyAssignmentMode
   proxyResourceId: string
+  proxyResourceIds: string[]
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
@@ -172,7 +175,24 @@ interface CredentialParameterDefaults {
 }
 
 function initialParameterDefaults(): CredentialParameterDefaults {
-  return { disabled: 'false', priority: '', maxConcurrentRequests: '', rpm: '', region: '', authRegion: '', apiRegion: '', machineId: '', endpoint: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', enableOverageAfterImport: false }
+  return {
+    disabled: 'false',
+    priority: '',
+    maxConcurrentRequests: '',
+    rpm: '',
+    region: '',
+    authRegion: '',
+    apiRegion: '',
+    machineId: '',
+    endpoint: '',
+    proxyMode: 'single',
+    proxyResourceId: '',
+    proxyResourceIds: [],
+    proxyUrl: '',
+    proxyUsername: '',
+    proxyPassword: '',
+    enableOverageAfterImport: false,
+  }
 }
 
 function initialCredentialForm() {
@@ -240,8 +260,20 @@ function parseOptionalNonNegativeInteger(value: string, label: string): number |
   return n
 }
 
-function mergeCredentialDefaults(cred: AddCredentialRequest, defaults: CredentialParameterDefaults): AddCredentialRequest {
-  const defaultProxyResourceId = parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID')
+function mergeCredentialDefaults(
+  cred: AddCredentialRequest,
+  defaults: CredentialParameterDefaults,
+  importIndex = 0,
+): AddCredentialRequest {
+  const roundRobinProxyResourceId = defaults.proxyResourceIds.length > 0
+    ? parseOptionalNonNegativeInteger(
+      defaults.proxyResourceIds[importIndex % defaults.proxyResourceIds.length],
+      '代理资源 ID',
+    )
+    : undefined
+  const defaultProxyResourceId = roundRobinProxyResourceId !== undefined
+    ? roundRobinProxyResourceId
+    : parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID')
   const hasDirectProxy = Boolean(optionalTrimmed(cred.proxyUrl) || optionalTrimmed(cred.proxyUsername) || optionalTrimmed(cred.proxyPassword))
   const proxyResourceId = typeof cred.proxyResourceId !== 'undefined' ? cred.proxyResourceId : hasDirectProxy ? undefined : defaultProxyResourceId
   const useProxyResource = typeof proxyResourceId === 'number'
@@ -262,6 +294,13 @@ function mergeCredentialDefaults(cred: AddCredentialRequest, defaults: Credentia
     proxyUsername: optionalTrimmed(cred.proxyUsername) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUsername)),
     proxyPassword: optionalTrimmed(cred.proxyPassword) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyPassword)),
   }
+}
+
+function validateProxyAssignment(defaults: CredentialParameterDefaults): string | undefined {
+  if (defaults.proxyMode === 'round_robin' && defaults.proxyResourceIds.length === 0) {
+    return '已选择多个代理轮换，请至少选择一个代理资源'
+  }
+  return undefined
 }
 
 async function verifyImportedCredential(
@@ -309,13 +348,60 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
 }) {
   const [showPu, setShowPu] = useState(false)
   const [showPp, setShowPp] = useState(false)
-  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport'>
+  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds'>
   const update = (key: StringDefaultKey, value: string) => {
     const text = value
-    if (key === 'proxyResourceId' && value && value !== '__none__') { onChange({ ...defaults, proxyResourceId: value, proxyUrl: '', proxyUsername: '', proxyPassword: '' }); return }
-    if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && text.trim()) { onChange({ ...defaults, [key]: text, proxyResourceId: '' }); return }
+    if (key === 'proxyResourceId' && value && value !== '__none__') {
+      onChange({
+        ...defaults,
+        proxyMode: 'single',
+        proxyResourceId: value,
+        proxyResourceIds: [],
+        proxyUrl: '',
+        proxyUsername: '',
+        proxyPassword: '',
+      })
+      return
+    }
+    if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && text.trim()) {
+      onChange({ ...defaults, proxyMode: 'single', [key]: text, proxyResourceId: '', proxyResourceIds: [] })
+      return
+    }
     if (key === 'region' && text.trim() && !defaults.authRegion.trim()) { onChange({ ...defaults, region: text, authRegion: text }); return }
     onChange({ ...defaults, [key]: value })
+  }
+  const setProxyMode = (proxyMode: ProxyAssignmentMode) => {
+    if (proxyMode === 'none') {
+      onChange({
+        ...defaults,
+        proxyMode,
+        proxyResourceId: '',
+        proxyResourceIds: [],
+        proxyUrl: '',
+        proxyUsername: '',
+        proxyPassword: '',
+      })
+      return
+    }
+    if (proxyMode === 'round_robin') {
+      onChange({
+        ...defaults,
+        proxyMode,
+        proxyResourceId: '',
+        proxyUrl: '',
+        proxyUsername: '',
+        proxyPassword: '',
+      })
+      return
+    }
+    onChange({ ...defaults, proxyMode, proxyResourceIds: [] })
+  }
+  const toggleProxyResource = (id: number, checked: boolean | 'indeterminate') => {
+    const idValue = String(id)
+    const selected = new Set(defaults.proxyResourceIds)
+    if (checked === true) selected.add(idValue)
+    else selected.delete(idValue)
+    onChange({ ...defaults, proxyMode: 'round_robin', proxyResourceId: '', proxyResourceIds: Array.from(selected) })
   }
   const proxyLocked = Boolean(defaults.proxyResourceId)
   return (
@@ -356,18 +442,57 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
         <Field label="API Region"><Input className="font-mono" value={defaults.apiRegion} disabled={disabled} onChange={(e) => update('apiRegion', e.target.value)} placeholder="us-east-1" /></Field>
         <Field label="Machine ID"><Input value={defaults.machineId} disabled={disabled} onChange={(e) => update('machineId', e.target.value)} /></Field>
         <Field label="端点"><Input value={defaults.endpoint} disabled={disabled} onChange={(e) => update('endpoint', e.target.value)} placeholder="ide / cli" /></Field>
-        <Field label="代理资源">
-          <Select value={defaults.proxyResourceId || '__none__'} onValueChange={(v) => update('proxyResourceId', v === '__none__' ? '' : v)} disabled={disabled}>
+        <Field label="代理分配方式" description="轮换按导入顺序循环分配；账号自身代理配置优先。">
+          <Select value={defaults.proxyMode} onValueChange={(v) => setProxyMode(v as ProxyAssignmentMode)} disabled={disabled}>
             <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="__none__">不绑定</SelectItem>
-              {proxyResources.map((r) => <SelectItem key={r.id} value={String(r.id)}>{r.name}</SelectItem>)}
+              <SelectItem value="single">统一代理</SelectItem>
+              <SelectItem value="round_robin">多个代理轮换</SelectItem>
+              <SelectItem value="none">不设置代理</SelectItem>
             </SelectContent>
           </Select>
         </Field>
-        <Field label="直连代理 URL"><Input value={defaults.proxyUrl} disabled={disabled || proxyLocked} onChange={(e) => update('proxyUrl', e.target.value)} placeholder="socks5h://..." /></Field>
-        <Field label="代理用户名"><SecretInput value={defaults.proxyUsername} onChange={(v) => update('proxyUsername', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} disabled={disabled || proxyLocked} placeholder="可选" /></Field>
-        <Field label="代理密码"><SecretInput value={defaults.proxyPassword} onChange={(v) => update('proxyPassword', v)} visible={showPp} onToggle={() => setShowPp((v) => !v)} disabled={disabled || proxyLocked} placeholder="可选" /></Field>
+        {defaults.proxyMode === 'round_robin' && (
+          <div className="sm:col-span-2 space-y-1.5">
+            <div className="text-sm font-medium">轮换代理资源</div>
+            {proxyResources.length > 0 ? (
+              <div className="grid max-h-40 gap-2 overflow-y-auto rounded-md border bg-background/60 p-2 sm:grid-cols-2">
+                {proxyResources.map((resource) => (
+                  <label key={resource.id} className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted/60">
+                    <Checkbox
+                      checked={defaults.proxyResourceIds.includes(String(resource.id))}
+                      onCheckedChange={(checked) => toggleProxyResource(resource.id, checked)}
+                      disabled={disabled}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-sm">{resource.name}</span>
+                    {!resource.enabled && <span className="shrink-0 text-[0.7rem] text-muted-foreground">已禁用</span>}
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">暂无可用代理资源</div>
+            )}
+            <p className="text-[0.7rem] leading-4 text-muted-foreground">
+              已选 {defaults.proxyResourceIds.length} 个，按选择顺序循环分配给账号 1、2、3…。
+            </p>
+          </div>
+        )}
+        {defaults.proxyMode === 'single' && (
+          <>
+            <Field label="代理资源">
+              <Select value={defaults.proxyResourceId || '__none__'} onValueChange={(v) => update('proxyResourceId', v === '__none__' ? '' : v)} disabled={disabled}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">不绑定</SelectItem>
+                  {proxyResources.map((r) => <SelectItem key={r.id} value={String(r.id)}>{r.name}{r.enabled ? '' : '（已禁用）'}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field label="直连代理 URL"><Input value={defaults.proxyUrl} disabled={disabled || proxyLocked} onChange={(e) => update('proxyUrl', e.target.value)} placeholder="socks5h://..." /></Field>
+            <Field label="代理用户名"><SecretInput value={defaults.proxyUsername} onChange={(v) => update('proxyUsername', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} disabled={disabled || proxyLocked} placeholder="可选" /></Field>
+            <Field label="代理密码"><SecretInput value={defaults.proxyPassword} onChange={(v) => update('proxyPassword', v)} visible={showPp} onToggle={() => setShowPp((v) => !v)} disabled={disabled || proxyLocked} placeholder="可选" /></Field>
+          </>
+        )}
       </FieldGrid>
     </div>
   )
@@ -603,7 +728,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const [parsed, setParsed] = useState<AddCredentialRequest[]>([])
   const [parseError, setParseError] = useState('')
   const proxyResources = useProxyResources()
-  const proxyOptions = proxyResources.data?.resources || []
+  const proxyOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
   const modelCapabilities = useModelCapabilities()
   const testModelOptions = useMemo(
     () => buildTestModelOptions(modelCapabilities.data?.models),
@@ -619,9 +744,11 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const handleParse = () => {
     setParseError('')
     try {
+      const proxyError = validateProxyAssignment(defaults)
+      if (proxyError) { setParseError(proxyError); return }
       const items = parseCredentialImportText(text)
       if (!items.length) { setParseError('未找到有效账号，请检查格式'); return }
-      const merged = items.map((c) => mergeCredentialDefaults(c, defaults))
+      const merged = items.map((c, index) => mergeCredentialDefaults(c, defaults, index))
       setParsed(merged)
       setResults(merged.map((_, i) => ({ index: i, status: 'pending' })))
     } catch (e) {
@@ -829,7 +956,7 @@ export function KamImportModal({ open, onClose, onDone }: {
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
   const proxyResources = useProxyResources()
-  const proxyOptions = proxyResources.data?.resources || []
+  const proxyOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
   const modelCapabilities = useModelCapabilities()
   const testModelOptions = useMemo(
     () => buildTestModelOptions(modelCapabilities.data?.models),
@@ -848,6 +975,8 @@ export function KamImportModal({ open, onClose, onDone }: {
   }, [open])
 
   const handleParse = () => {
+    const proxyError = validateProxyAssignment(defaults)
+    if (proxyError) { toast.error(proxyError); return }
     try {
       const result = parseKamJson(text)
       if (!result.length) { toast.error('未找到有效的 KAM 账号'); return }
@@ -871,13 +1000,18 @@ export function KamImportModal({ open, onClose, onDone }: {
     } catch (e) { toast.error(`文件解析失败: ${extractErrorMessage(e)}`) }
   }
 
-  const runAccounts = async (targetAccounts: KamAccount[], isRetry = false) => {
+  const runAccounts = async (
+    targetAccounts: KamAccount[],
+    isRetry = false,
+    originalIndices = targetAccounts.map((_, index) => index),
+  ) => {
     setRunning(true)
     const newResults: ImportResult[] = targetAccounts.map((_, i) => ({ index: i, status: 'pending' }))
     if (!isRetry) setResults([...newResults])
     let skippedCount = 0
     for (let i = 0; i < targetAccounts.length; i++) {
       const acc = targetAccounts[i]
+      const originalIndex = originalIndices[i] ?? i
       // skip error-status accounts if option enabled (only on first run, not retry)
       if (!isRetry && skipErrorAccounts && acc.status === 'error') {
         newResults[i] = { ...newResults[i], status: 'skipped', error: '跳过 error 状态账号' }
@@ -904,7 +1038,7 @@ export function KamImportModal({ open, onClose, onDone }: {
           apiRegion: optionalTrimmed(acc.credentials.apiRegion),
           email: optionalTrimmed(acc.email),
           machineId: optionalTrimmed(acc.machineId),
-        }, defaults)
+        }, defaults, originalIndex)
         const res = await addCredential({ ...cred, autoDiscoverSupportedModels })
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
         if (skipVerify) {
@@ -945,8 +1079,19 @@ export function KamImportModal({ open, onClose, onDone }: {
 
   const run = () => { if (accounts.length) runAccounts(accounts) }
 
-  const failedAccounts = accounts.filter((_, i) => results[i]?.status === 'failed')
-  const retryFailed = () => { if (failedAccounts.length) runAccounts(failedAccounts, true) }
+  const failedAccountEntries = accounts
+    .map((account, index) => ({ account, index }))
+    .filter(({ index }) => results[index]?.status === 'failed')
+  const failedAccounts = failedAccountEntries.map(({ account }) => account)
+  const retryFailed = () => {
+    if (failedAccounts.length) {
+      runAccounts(
+        failedAccounts,
+        true,
+        failedAccountEntries.map(({ index }) => index),
+      )
+    }
+  }
 
   return (
     <ModalShell open={open} title="KAM 导入账号" width="max-w-2xl" onClose={onClose}>

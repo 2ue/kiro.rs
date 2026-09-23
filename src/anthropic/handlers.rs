@@ -7290,7 +7290,7 @@ async fn handle_stream_request(
                             Err(rescue_error) => {
                                 let rescue_message = rescue_error.to_string();
                                 let rescue_attempts =
-                                    KiroProvider::attempts_from_error(&rescue_error);
+                                    KiroProvider::diagnostic_attempts_from_error(&rescue_error);
                                 log_provider_call_failure(
                                     &rescue_message,
                                     Some(&usage_context.error_id),
@@ -7341,7 +7341,7 @@ async fn handle_stream_request(
             Ok(resp) => resp,
             Err(e) => {
                 let message = e.to_string();
-                let attempts = KiroProvider::attempts_from_error(&e);
+                let attempts = KiroProvider::diagnostic_attempts_from_error(&e);
                 log_provider_call_failure(&message, Some(&usage_context.error_id));
                 let endpoint = usage_context.endpoint.clone();
                 attach_and_log_tool_use_format_diagnostics(
@@ -7401,7 +7401,8 @@ async fn handle_stream_request(
                         }
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                KiroProvider::diagnostic_attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -7512,7 +7513,8 @@ async fn handle_stream_request(
                         }
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                KiroProvider::diagnostic_attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -7605,7 +7607,7 @@ async fn handle_stream_request(
                                                         let rescue_message =
                                                             rescue_error.to_string();
                                                         let rescue_attempts =
-                                                            KiroProvider::attempts_from_error(
+                                                            KiroProvider::diagnostic_attempts_from_error(
                                                                 &rescue_error,
                                                             );
                                                         let all_attempts =
@@ -7736,7 +7738,7 @@ async fn handle_stream_request(
                                             Err(rescue_error) => {
                                                 let rescue_message = rescue_error.to_string();
                                                 let rescue_attempts =
-                                                    KiroProvider::attempts_from_error(
+                                                    KiroProvider::diagnostic_attempts_from_error(
                                                         &rescue_error,
                                                     );
                                                 let all_attempts = merge_credential_attempts(
@@ -9508,7 +9510,7 @@ async fn handle_non_stream_request(
                             Err(rescue_error) => {
                                 let rescue_message = rescue_error.to_string();
                                 let rescue_attempts =
-                                    KiroProvider::attempts_from_error(&rescue_error);
+                                    KiroProvider::diagnostic_attempts_from_error(&rescue_error);
                                 log_provider_call_failure(
                                     &rescue_message,
                                     Some(&usage_context.error_id),
@@ -9559,7 +9561,7 @@ async fn handle_non_stream_request(
             Ok(resp) => resp,
             Err(e) => {
                 let message = e.to_string();
-                let attempts = KiroProvider::attempts_from_error(&e);
+                let attempts = KiroProvider::diagnostic_attempts_from_error(&e);
                 log_provider_call_failure(&message, Some(&usage_context.error_id));
                 let endpoint = usage_context.endpoint.clone();
                 attach_and_log_tool_use_format_diagnostics(
@@ -9616,7 +9618,8 @@ async fn handle_non_stream_request(
                         Ok(resp) => resp,
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                KiroProvider::diagnostic_attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -9724,7 +9727,8 @@ async fn handle_non_stream_request(
                         Ok(resp) => resp,
                         Err(retry_error) => {
                             let retry_message = retry_error.to_string();
-                            let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                            let retry_attempts =
+                                KiroProvider::diagnostic_attempts_from_error(&retry_error);
                             let classification_attempts = retry_attempts.clone();
                             let all_attempts = merge_credential_attempts(
                                 retry_attempt_prefix.clone(),
@@ -9812,7 +9816,7 @@ async fn handle_non_stream_request(
                                                 Err(rescue_error) => {
                                                     let rescue_message = rescue_error.to_string();
                                                     let rescue_attempts =
-                                                        KiroProvider::attempts_from_error(
+                                                        KiroProvider::diagnostic_attempts_from_error(
                                                             &rescue_error,
                                                         );
                                                     let all_attempts = merge_credential_attempts(
@@ -9939,7 +9943,7 @@ async fn handle_non_stream_request(
                                             Err(rescue_error) => {
                                                 let rescue_message = rescue_error.to_string();
                                                 let rescue_attempts =
-                                                    KiroProvider::attempts_from_error(
+                                                    KiroProvider::diagnostic_attempts_from_error(
                                                         &rescue_error,
                                                     );
                                                 let all_attempts = merge_credential_attempts(

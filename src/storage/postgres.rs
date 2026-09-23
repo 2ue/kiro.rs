@@ -5814,6 +5814,49 @@ impl PostgresUsageStore {
         })
     }
 
+    pub async fn query_credential_error_page(
+        &self,
+        credential_id: u64,
+        page: usize,
+        limit: usize,
+    ) -> anyhow::Result<UsageRecordsPageResult> {
+        let page = page.max(1);
+        let limit = normalize_page_limit(limit);
+        let offset = page.saturating_sub(1).saturating_mul(limit);
+        let credential_id = credential_id as i64;
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "SELECT data FROM usage_records WHERE deleted_at IS NULL AND ((status <> 'success' AND credential_id = ",
+        );
+        builder.push_bind(credential_id);
+        builder.push(
+            ") OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(data->'credentialAttempts', '[]'::jsonb)) AS attempt WHERE CASE WHEN (attempt->>'credentialId') ~ '^[0-9]+$' THEN (attempt->>'credentialId')::bigint END = ",
+        );
+        builder.push_bind(credential_id);
+        builder.push(" AND COALESCE(attempt->>'action', '') <> 'success')) ORDER BY created_at DESC, id DESC OFFSET ");
+        builder.push_bind(usize_to_i64(offset));
+        builder.push(" LIMIT ");
+        builder.push_bind(usize_to_i64(limit.saturating_add(1)));
+
+        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let value: serde_json::Value = row.try_get("data")?;
+            let mut record: UsageRecord = serde_json::from_value(value)?;
+            apply_usage_record_legacy_cost_compatibility(&mut record);
+            records.push(record);
+        }
+        let has_next = records.len() > limit;
+        if has_next {
+            records.truncate(limit);
+        }
+        Ok(UsageRecordsPageResult {
+            page,
+            limit,
+            has_next,
+            records,
+        })
+    }
+
     pub async fn preview_soft_delete_cleanup(
         &self,
         cutoff: DateTime<Utc>,

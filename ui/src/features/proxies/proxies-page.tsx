@@ -15,12 +15,13 @@ import {
   StatGrid,
 } from '@/components/patterns'
 import { Button } from '@/components/ui'
-import { ProxyResourceCard, ProxyEditorModal } from './proxy-components'
+import { ProxyResourceCard, ProxyEditorModal, ProxyImportModal } from './proxy-components'
 
 export function ProxiesPage() {
   const resources = useProxyResources()
   const [editorOpen, setEditorOpen] = React.useState(false)
   const [editing, setEditing] = React.useState<ProxyResource | null>(null)
+  const [importOpen, setImportOpen] = React.useState(false)
   const list = resources.data?.resources || []
 
   const enabledCount = React.useMemo(() => list.filter((r) => r.enabled).length, [list])
@@ -42,6 +43,9 @@ export function ProxiesPage() {
             </Button>
             <Button size="sm" onClick={openCreate}>
               <Plus className="h-4 w-4" />新增代理
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
+              批量导入
             </Button>
           </div>
         }
@@ -82,6 +86,7 @@ export function ProxiesPage() {
       </SectionCard>
 
       <ProxyEditorModal open={editorOpen} resource={editing} onClose={closeEditor} />
+      <ProxyImportModal open={importOpen} onClose={() => setImportOpen(false)} />
     </PageContainer>
   )
 }

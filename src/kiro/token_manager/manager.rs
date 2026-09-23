@@ -8469,6 +8469,19 @@ impl MultiTokenManager {
         Ok(changed)
     }
 
+    /// 返回当前运行时快照中不存在的代理资源 ID。
+    ///
+    /// 批量导入在真正写入凭据前使用该检查，避免无效代理导致导入进行到中途才失败。
+    /// 这里只读代理资源快照，不改变任何调度状态。
+    pub fn missing_proxy_resource_ids(&self, ids: &[u64]) -> Vec<u64> {
+        let resources = self.proxy_resources.lock();
+        let mut seen = HashSet::new();
+        ids.iter()
+            .copied()
+            .filter(|id| seen.insert(*id) && !resources.contains_key(id))
+            .collect()
+    }
+
     fn publish_runtime_config_changed(&self, version: Option<i64>, reason: &str) {
         publish_redis_runtime_config_changed(self.redis_store.as_ref(), version, reason);
     }
@@ -11403,6 +11416,27 @@ impl MultiTokenManager {
         // Populate or refresh both Arc snapshots through the single cold rebuild path.
         let _ = self.local_model_capability_cohorts();
         self.model_capability_cohort_cache.lock().keys.clone()
+    }
+
+    pub(crate) fn model_capability_cohort_keys_for_credentials(
+        &self,
+        credential_ids: &[u64],
+    ) -> Vec<KiroModelCapabilityCohortKey> {
+        let requested = credential_ids.iter().copied().collect::<HashSet<_>>();
+        let mut keys = self
+            .local_model_capability_cohorts()
+            .iter()
+            .filter(|cohort| {
+                cohort
+                    .credential_ids
+                    .iter()
+                    .any(|credential_id| requested.contains(credential_id))
+            })
+            .map(|cohort| cohort.key.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
     }
 
     fn invalidate_model_capability_cohorts(&self) {

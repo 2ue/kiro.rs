@@ -100,6 +100,8 @@ pub struct KiroCredentialAttempt {
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    // Raw provider bodies are persisted on usage records for admin diagnostics.
+    // Provider-facing error surfaces use a redacted attempt projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_upstream_error: Option<RawUpstreamError>,
     pub duration_ms: u64,
@@ -143,7 +145,43 @@ impl KiroCredentialAttempt {
             .map(|status| status.to_string())
             .or_else(|| self.error_type.clone())
             .unwrap_or_else(|| self.action.clone());
-        format!("{}({})", label, outcome)
+        let detail = self
+            .error_message
+            .as_deref()
+            .map(|message| {
+                let mut bounded = message.chars().take(240).collect::<String>();
+                if message.chars().count() > 240 {
+                    bounded.push_str("...");
+                }
+                bounded
+            })
+            .filter(|message| !message.trim().is_empty())
+            .map(|message| format!(":{}", message))
+            .unwrap_or_default();
+        // Keep raw upstream content out of the normal rotation log. The full,
+        // bounded body remains available through the credential diagnostics
+        // endpoint, while the log retains enough metadata to correlate the
+        // failure without leaking provider-private response fields.
+        let raw_detail = self
+            .raw_upstream_error
+            .as_ref()
+            .map(|raw| {
+                let status = raw
+                    .status_code
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let content_type = raw.content_type.as_deref().unwrap_or("-");
+                format!(
+                    ":raw_upstream_error source={} status={} content_type={} body_bytes={} truncated={}",
+                    raw.source,
+                    status,
+                    content_type,
+                    raw.body_bytes,
+                    raw.truncated
+                )
+            })
+            .unwrap_or_default();
+        format!("{}({}{}{})", label, outcome, detail, raw_detail)
     }
 }
 
@@ -299,7 +337,9 @@ impl std::error::Error for KiroCallError {}
 
 #[cfg(test)]
 mod tests {
-    use super::McpCallAttributionSink;
+    use super::{KiroCredentialAttempt, McpCallAttributionSink};
+    use crate::common::upstream_error::RawUpstreamError;
+    use reqwest::StatusCode;
 
     #[test]
     fn mcp_attribution_sink_finalizes_pending_send_on_client_drop_for_five_rounds() {
@@ -326,5 +366,35 @@ mod tests {
                 Some("mcp_client_cancelled")
             );
         }
+    }
+
+    #[test]
+    fn credential_attempt_compact_includes_bounded_raw_upstream_error() {
+        let mut attempt = KiroCredentialAttempt::new(
+            0,
+            42,
+            Some("diagnostic@example.com".to_string()),
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            "transient_retry",
+            Some("rate_limit"),
+            Some("upstream_failure reason=api_rate_limit"),
+            1,
+        );
+        attempt.raw_upstream_error = Some(RawUpstreamError::from_text(
+            "kiro_api",
+            Some(429),
+            Some("application/json"),
+            r#"{"__type":"ThrottlingException","message":"too many requests"}"#,
+        ));
+
+        let compact = attempt.compact();
+        assert!(compact.contains("api_rate_limit"));
+        assert!(compact.contains("raw_upstream_error"));
+        assert!(compact.contains("source=kiro_api"));
+        assert!(compact.contains("status=429"));
+        assert!(compact.contains("content_type=application/json"));
+        assert!(compact.contains("body_bytes="));
+        assert!(!compact.contains("ThrottlingException"));
+        assert!(!compact.contains("too many requests"));
     }
 }

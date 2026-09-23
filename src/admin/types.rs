@@ -3,6 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
+use crate::anthropic::usage::UsageRecord;
 use crate::kiro::token_manager::CredentialIdentitySnapshot;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
@@ -150,6 +151,19 @@ pub struct CredentialRuntimeResponse {
     pub items: Vec<CredentialRuntimeItem>,
     pub updated_at: String,
     pub fresh: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialDiagnosticsResponse {
+    pub credential_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<CredentialRuntimeItem>,
+    pub page: usize,
+    pub limit: usize,
+    pub has_next: bool,
+    pub records: Vec<UsageRecord>,
+    pub generated_at: String,
 }
 
 /// 高频变化的凭据运行态字段。
@@ -1021,6 +1035,11 @@ pub struct BatchCredentialImportDefaults {
     pub proxy_password: Option<String>,
     #[serde(default)]
     pub proxy_resource_id: Option<Option<u64>>,
+    /// 批量导入时按账号原始顺序循环绑定的代理资源 ID。
+    ///
+    /// 非空时优先于单个 `proxy_resource_id` 默认值；账号自身显式代理配置仍优先。
+    #[serde(default, alias = "proxy_resource_ids")]
+    pub proxy_resource_ids: Vec<u64>,
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
@@ -1144,6 +1163,68 @@ pub struct CreateProxyResourceRequest {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourceImportEntry {
+    pub name: Option<String>,
+    #[serde(alias = "url", alias = "proxy", alias = "address")]
+    pub proxy_url: Option<String>,
+    #[serde(alias = "username", alias = "user")]
+    pub proxy_username: Option<String>,
+    #[serde(alias = "password", alias = "pass")]
+    pub proxy_password: Option<String>,
+    pub enabled: Option<bool>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchProxyResourceImportRequest {
+    /// 纯文本、JSON 数组或 JSONL。与 resources 二选一。
+    pub content: Option<String>,
+    /// 结构化导入项。与 content 二选一。
+    pub resources: Option<Vec<ProxyResourceImportEntry>>,
+    #[serde(default = "default_proxy_resource_enabled")]
+    pub enabled: bool,
+    pub name_prefix: Option<String>,
+    #[serde(default = "default_batch_import_continue_on_error")]
+    pub continue_on_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchProxyResourceImportItem {
+    pub index: usize,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchProxyResourceImportResponse {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub items: Vec<BatchProxyResourceImportItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncModelCapabilitiesRequest {
+    /// 留空时按现有策略观察多个账号/能力 cohort；指定后只使用这些账号。
+    #[serde(default)]
+    pub credential_ids: Vec<u64>,
+    /// 兼容旧调用方的单账号字段。
+    pub credential_id: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateProxyResourceRequest {
@@ -1215,6 +1296,10 @@ pub struct ExternalPoolTestRequest {
 }
 
 fn default_proxy_resource_enabled() -> bool {
+    true
+}
+
+fn default_batch_import_continue_on_error() -> bool {
     true
 }
 
@@ -2127,11 +2212,25 @@ mod tests {
 
         let batch_override: BatchCredentialImportRequest =
             serde_json::from_value(serde_json::json!({
-                "autoDiscoverSupportedModels": true,
-                "credentials": [{ "kiroApiKey": "ksk_fake" }]
+                    "autoDiscoverSupportedModels": true,
+                    "credentials": [{ "kiroApiKey": "ksk_fake" }]
             }))
             .unwrap();
         assert!(batch_override.auto_discover_supported_models);
+    }
+
+    #[test]
+    fn batch_import_accepts_round_robin_proxy_resource_ids() {
+        let request: BatchCredentialImportRequest = serde_json::from_value(serde_json::json!({
+            "defaults": {
+                "proxyResourceIds": [1, 3, 5]
+            },
+            "credentials": [{ "kiroApiKey": "ksk_fake" }]
+        }))
+        .unwrap();
+
+        assert_eq!(request.defaults.proxy_resource_ids, vec![1, 3, 5]);
+        assert!(request.defaults.proxy_resource_id.is_none());
     }
 
     #[test]

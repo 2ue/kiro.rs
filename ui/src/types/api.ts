@@ -240,6 +240,16 @@ export interface CredentialRuntimeResponse {
   fresh: boolean
 }
 
+export interface CredentialDiagnosticsResponse {
+  credentialId: number
+  runtime?: CredentialRuntimeItem
+  page: number
+  limit: number
+  hasNext: boolean
+  records: UsageRecord[]
+  generatedAt: string
+}
+
 export type CredentialAccountInfoItem = CredentialAccountInfo & {
   id: number
 }
@@ -686,6 +696,29 @@ export interface CreateProxyResourceRequest {
   proxyPassword?: string
   enabled?: boolean
   notes?: string
+}
+
+export interface BatchProxyResourceImportRequest {
+  content: string
+  namePrefix?: string
+  enabled?: boolean
+  continueOnError?: boolean
+}
+
+export interface BatchProxyResourceImportItem {
+  index: number
+  ok: boolean
+  resourceId?: number
+  name?: string
+  proxyUrl?: string
+  error?: string
+}
+
+export interface BatchProxyResourceImportResponse {
+  total: number
+  success: number
+  failed: number
+  items: BatchProxyResourceImportItem[]
 }
 
 export interface UpdateProxyResourceRequest {
@@ -2071,6 +2104,10 @@ export interface ModelCapabilitiesStatus {
     efforts: string[]
     defaultEffort?: string
   }>
+}
+
+export interface SyncModelCapabilitiesRequest {
+  credentialIds?: number[]
 }
 
 export interface ManualModelPricingRequest {

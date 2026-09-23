@@ -45,6 +45,8 @@ import type {
   ProxyResourceTestResponse,
   ProxyResourcesResponse,
   CreateProxyResourceRequest,
+  BatchProxyResourceImportRequest,
+  BatchProxyResourceImportResponse,
   UpdateProxyResourceRequest,
   ValidateExistingCredentialsRequest,
   ValidateExternalCredentialsRequest,
@@ -435,6 +437,13 @@ export async function createProxyResource(
   req: CreateProxyResourceRequest
 ): Promise<ProxyResource> {
   const { data } = await api.post<ProxyResource>('/proxy-resources', req)
+  return data
+}
+
+export async function importProxyResources(
+  req: BatchProxyResourceImportRequest,
+): Promise<BatchProxyResourceImportResponse> {
+  const { data } = await api.post<BatchProxyResourceImportResponse>('/proxy-resources/import', req)
   return data
 }
 

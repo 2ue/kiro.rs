@@ -164,6 +164,7 @@ fn json_error_key(key: &str) -> bool {
         key.to_ascii_lowercase().as_str(),
         "error"
             | "errors"
+            | "__type"
             | "message"
             | "error_message"
             | "error_type"

@@ -15,6 +15,7 @@ import {
   initialParameterDefaults,
   mergeCredentialDefaults,
   optionalTrimmed,
+  validateProxyAssignment,
 } from '@/components/credential-parameter-defaults'
 import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -322,7 +323,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
   }
 
-  const handleImport = async (retryAccounts?: KamAccount[]) => {
+  const handleImport = async (
+    retryAccounts?: KamAccount[],
+    retryOriginalIndices?: number[],
+  ) => {
     let validAccounts: KamAccount[]
     if (retryAccounts) {
       validAccounts = retryAccounts
@@ -348,6 +352,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
 
     try {
+      const proxyError = validateProxyAssignment(defaults)
+      if (proxyError) {
+        toast.error(proxyError)
+        return
+      }
 
       setImporting(true)
       setProgress({ current: 0, total: validAccounts.length })
@@ -375,6 +384,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
       for (let i = 0; i < validAccounts.length; i++) {
         const account = validAccounts[i]
+        const originalIndex = retryOriginalIndices?.[i] ?? i
 
         // 跳过 error 状态的账号
         if (skipErrorAccounts && account.status === 'error') {
@@ -453,7 +463,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             scopes: authMethod === 'external_idp' ? stringField(cred.scopes) : undefined,
             machineId: stringField(account.machineId),
           }
-          const addedCred = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
+          const addedCred = await addCredential(
+            mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }, originalIndex),
+          )
 
           addedCredId = addedCred.credentialId
 
@@ -548,18 +560,22 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
   }
 
-  const failedAccounts = results
+  const failedAccountEntries = results
     .filter((result): result is VerificationResult & { account: KamAccount } => (
       result.status === 'failed' && Boolean(result.account)
     ))
-    .map((result) => result.account)
+    .map((result) => ({ account: result.account, index: result.index - 1 }))
+  const failedAccounts = failedAccountEntries.map(({ account }) => account)
 
   const handleRetryFailed = async () => {
     if (failedAccounts.length === 0) {
       toast.error('没有可重试的失败账号')
       return
     }
-    await handleImport(failedAccounts)
+    await handleImport(
+      failedAccounts,
+      failedAccountEntries.map(({ index }) => index),
+    )
   }
 
   const getStatusIcon = (status: VerificationResult['status']) => {

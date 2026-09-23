@@ -9,6 +9,7 @@ import type {
   BulkCredentialActionResponse,
   CredentialAccountInfoListResponse,
   CredentialCreditSummaryResponse,
+  CredentialDiagnosticsResponse,
   CredentialInfoRefreshResponse,
   CredentialExportFormat,
   CredentialListItem,
@@ -21,6 +22,8 @@ import type {
   CredentialsPageResponse,
   CredentialsStatusResponse,
   CreateProxyResourceRequest,
+  BatchProxyResourceImportRequest,
+  BatchProxyResourceImportResponse,
   AccessKeysResponse,
   RuntimeConfig,
   SetCredentialConcurrencyRequest,
@@ -140,6 +143,17 @@ export async function getCredentialSummary(): Promise<CredentialSummaryResponse>
 export async function getCredentialRuntime(ids: number[]): Promise<CredentialRuntimeResponse> {
   const { data } = await api.get<CredentialRuntimeResponse>('/credentials/runtime', {
     params: { ids: ids.join(',') },
+  })
+  return data
+}
+
+export async function getCredentialDiagnostics(
+  id: number,
+  page = 1,
+  limit = 20,
+): Promise<CredentialDiagnosticsResponse> {
+  const { data } = await api.get<CredentialDiagnosticsResponse>(`/credentials/${id}/diagnostics`, {
+    params: { page, limit },
   })
   return data
 }
@@ -305,6 +319,13 @@ export async function testProxyResource(id: number, req: ProxyResourceTestReques
 
 export async function createProxyResource(req: CreateProxyResourceRequest): Promise<ProxyResource> {
   const { data } = await api.post<ProxyResource>('/proxy-resources', req)
+  return data
+}
+
+export async function importProxyResources(
+  req: BatchProxyResourceImportRequest,
+): Promise<BatchProxyResourceImportResponse> {
+  const { data } = await api.post<BatchProxyResourceImportResponse>('/proxy-resources/import', req)
   return data
 }
 

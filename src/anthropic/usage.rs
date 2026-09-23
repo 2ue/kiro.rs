@@ -2419,6 +2419,37 @@ impl UsageRecorder {
         self.query_page_without_postgres(query, page, limit)
     }
 
+    /// 查询单个本地凭据参与过的错误记录。
+    ///
+    /// `credential_id` 同时匹配记录最终归属凭据和轮换链中的任一尝试凭据，
+    /// 这样账号在请求中途被替换时仍能在诊断页看到原始错误。
+    pub fn query_credential_error_page(
+        &self,
+        credential_id: u64,
+        page: usize,
+        limit: usize,
+    ) -> UsageRecordsPageResult {
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            return self
+                .dashboard_query("credential diagnostics", 10, async move {
+                    store
+                        .query_credential_error_page(credential_id, page, limit)
+                        .await
+                })
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        credential_id,
+                        "分页查询凭据错误诊断记录失败，回退内存记录: {}",
+                        err
+                    );
+                    self.query_credential_error_page_memory(credential_id, page, limit)
+                });
+        }
+
+        self.query_credential_error_page_memory(credential_id, page, limit)
+    }
+
     fn query_page_without_postgres(
         &self,
         query: UsageRecordQuery,
@@ -2466,6 +2497,43 @@ impl UsageRecorder {
             records.truncate(limit);
         }
 
+        UsageRecordsPageResult {
+            page,
+            limit,
+            has_next,
+            records,
+        }
+    }
+
+    fn query_credential_error_page_memory(
+        &self,
+        credential_id: u64,
+        page: usize,
+        limit: usize,
+    ) -> UsageRecordsPageResult {
+        let page = normalize_page(page);
+        let limit = normalize_page_limit(limit);
+        let start = page.saturating_sub(1).saturating_mul(limit);
+        let mut records: Vec<UsageRecord> = self
+            .records
+            .lock()
+            .iter()
+            .rev()
+            .filter(|record| {
+                (record.status != UsageRecordStatus::Success
+                    && record.credential_id == Some(credential_id))
+                    || record.credential_attempts.iter().any(|attempt| {
+                        attempt.credential_id == credential_id && attempt.action != "success"
+                    })
+            })
+            .skip(start)
+            .take(limit.saturating_add(1))
+            .cloned()
+            .collect();
+        let has_next = records.len() > limit;
+        if has_next {
+            records.truncate(limit);
+        }
         UsageRecordsPageResult {
             page,
             limit,
@@ -3745,6 +3813,22 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let original_cost = record.original_cost_usd.to_string();
     let kiro_metering_usage = record.kiro_metering_usage.to_string();
     let attempt_chain = summarize_attempts(&record.credential_attempts);
+    // Keep the pre-diagnostic compact form searchable for existing callers.
+    // `summarize_attempts` now includes bounded error details, but old admin
+    // filters may still use chains such as `#6(429)>#9(200)`.
+    let legacy_attempt_chain = record
+        .credential_attempts
+        .iter()
+        .map(|attempt| {
+            let outcome = attempt
+                .status
+                .map(|status| status.to_string())
+                .or_else(|| attempt.error_type.clone())
+                .unwrap_or_else(|| attempt.action.clone());
+            format!("#{}({})", attempt.credential_id, outcome)
+        })
+        .collect::<Vec<_>>()
+        .join(">");
 
     [
         Some(record.id.as_str()),
@@ -3770,6 +3854,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         Some(estimated_cost.as_str()),
         Some(kiro_metering_usage.as_str()),
         Some(attempt_chain.as_str()),
+        Some(legacy_attempt_chain.as_str()),
         credential_id.as_deref(),
     ]
     .into_iter()
@@ -4861,6 +4946,54 @@ mod tests {
         assert!(!second_page.has_next);
         assert_eq!(second_page.records.len(), 1);
         assert_eq!(second_page.records[0].id, "1");
+    }
+
+    #[test]
+    fn credential_error_page_includes_rotated_attempts_and_excludes_successes() {
+        let recorder = UsageRecorder::new(10);
+        let mut rotated = record("rotated-error", 0, UsageSource::None);
+        rotated.status = UsageRecordStatus::Error;
+        rotated.credential_id = Some(9);
+        rotated.credential_attempts = vec![KiroCredentialAttempt::new(
+            0,
+            42,
+            Some("rotated@example.com".to_string()),
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            "transient_retry",
+            Some("rate_limit"),
+            Some("upstream_failure reason=api_rate_limit".to_string()),
+            12,
+        )];
+        recorder.record(rotated);
+
+        let mut success = record("rotated-success", 0, UsageSource::None);
+        success.credential_id = Some(42);
+        recorder.record(success);
+
+        let mut recovered = record("rotated-recovered", 0, UsageSource::None);
+        recovered.credential_id = Some(9);
+        recovered.credential_attempts = vec![KiroCredentialAttempt::new(
+            0,
+            42,
+            Some("rotated@example.com".to_string()),
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            "transient_retry",
+            Some("rate_limit"),
+            Some("upstream_failure reason=api_rate_limit".to_string()),
+            12,
+        )];
+        recorder.record(recovered);
+
+        let result = recorder.query_credential_error_page(42, 1, 20);
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].id, "rotated-recovered");
+        assert_eq!(result.records[1].id, "rotated-error");
+        assert_eq!(
+            result.records[0].credential_attempts[0]
+                .error_message
+                .as_deref(),
+            Some("upstream_failure reason=api_rate_limit")
+        );
     }
 
     #[test]

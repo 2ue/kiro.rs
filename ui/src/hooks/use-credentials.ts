@@ -12,6 +12,7 @@ import {
   getCredentialAccountInfo,
   getCredentialBalance,
   getCredentialCreditSummary,
+  getCredentialDiagnostics,
   getCredentialList,
   getCredentialRuntime,
   getCredentialSummary,
@@ -20,6 +21,7 @@ import {
   getCredentialsPage,
   getLoadBalancingMode,
   getProxyResources,
+  importProxyResources,
   getRuntimeConfig,
   getSystemVersion,
   resetCredentialFailure,
@@ -45,6 +47,7 @@ import type {
   AddCredentialRequest,
   BatchUpdateCredentialsRequest,
   CreateProxyResourceRequest,
+  BatchProxyResourceImportRequest,
   CredentialsPageQuery,
   SetCredentialConcurrencyRequest,
   SetCredentialProxyRequest,
@@ -116,6 +119,15 @@ export function useCredentialRuntime(ids: number[]) {
   })
 }
 
+export function useCredentialDiagnostics(id: number | null, page = 1, enabled = false) {
+  return useQuery({
+    queryKey: ['credential-diagnostics', id, page],
+    queryFn: () => getCredentialDiagnostics(id!, page),
+    enabled: enabled && id !== null,
+    retry: false,
+  })
+}
+
 export function useCredentialAccountInfo(ids: number[], options: { enabled?: boolean; refetchInterval?: number | false } = {}) {
   return useQuery({
     queryKey: ['credential-account-info', ids],
@@ -180,6 +192,17 @@ export function useCreateProxyResource() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (req: CreateProxyResourceRequest) => createProxyResource(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
+      invalidateCredentialCaches(queryClient)
+    },
+  })
+}
+
+export function useImportProxyResources() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: BatchProxyResourceImportRequest) => importProxyResources(req),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
       invalidateCredentialCaches(queryClient)

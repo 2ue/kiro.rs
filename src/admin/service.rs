@@ -18,18 +18,19 @@ use super::types::{
     AccessKeysResponse, AddCredentialRequest, AddCredentialResponse,
     AuxiliaryUpstreamRuntimeResponse, BalanceResponse, BatchCredentialImportDefaults,
     BatchCredentialImportDuplicateMode, BatchCredentialImportItem, BatchCredentialImportRequest,
-    BatchCredentialImportResponse, BatchUpdateCredentialItem, BatchUpdateCredentialsRequest,
+    BatchCredentialImportResponse, BatchProxyResourceImportItem, BatchProxyResourceImportRequest,
+    BatchProxyResourceImportResponse, BatchUpdateCredentialItem, BatchUpdateCredentialsRequest,
     BatchUpdateCredentialsResponse, BulkCredentialActionError, BulkCredentialActionResponse,
     ClearInFlightRequest, CreateProxyResourceRequest, CreateRequestApiKeyRequest,
     CredentialAccountInfo, CredentialAccountInfoItem, CredentialAccountInfoListResponse,
-    CredentialCooldown, CredentialCreditSummaryResponse, CredentialInfoRefreshItem,
-    CredentialInfoRefreshResponse, CredentialListItem, CredentialListResponse,
-    CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
+    CredentialCooldown, CredentialCreditSummaryResponse, CredentialDiagnosticsResponse,
+    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialListItem,
+    CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
     CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
     CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
     CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
     DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest, LoadBalancingModeResponse,
-    ManualModelResponse, ProxyResourceResponse, ProxyResourceTestRequest,
+    ManualModelResponse, ProxyResourceImportEntry, ProxyResourceResponse, ProxyResourceTestRequest,
     ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
     RequestApiKeyItem, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
     SetCredentialOverageRequest, SetCredentialProxyRequest,
@@ -72,6 +73,7 @@ use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_limit_and_body_timeout,
     response_text_with_limit_and_body_timeout, send_with_response_header_timeout,
 };
+use crate::kiro::model::available_models::KiroAvailableModelCatalog;
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::{
@@ -106,6 +108,7 @@ const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
+const MAX_PROXY_RESOURCE_IMPORT_ITEMS: usize = 5_000;
 
 fn claude_code_model_name(model: &str) -> String {
     let normalized = model.trim().to_ascii_lowercase();
@@ -1897,6 +1900,35 @@ impl AdminService {
         }
     }
 
+    pub fn get_credential_diagnostics(
+        &self,
+        credential_id: u64,
+        page: usize,
+        limit: usize,
+    ) -> CredentialDiagnosticsResponse {
+        let runtime = self
+            .token_manager
+            .runtime_snapshot_for_ids(&[credential_id])
+            .entries
+            .into_iter()
+            .next()
+            .map(|entry| {
+                credential_runtime_item_from_snapshot(entry, self.token_manager.current_id())
+            });
+        let result = self
+            .usage_recorder
+            .query_credential_error_page(credential_id, page, limit);
+        CredentialDiagnosticsResponse {
+            credential_id,
+            runtime,
+            page: result.page,
+            limit: result.limit,
+            has_next: result.has_next,
+            records: result.records,
+            generated_at: Utc::now().to_rfc3339(),
+        }
+    }
+
     pub async fn get_credentials_account_info(
         &self,
         ids: &[u64],
@@ -3242,9 +3274,29 @@ impl AdminService {
         let total = req.credentials.len();
         let mut items = Vec::with_capacity(total);
         let auto_discover_supported_models = req.auto_discover_supported_models;
+        let proxy_resource_ids =
+            normalized_batch_proxy_resource_ids(&req.defaults.proxy_resource_ids);
+        if !proxy_resource_ids.is_empty() {
+            let missing_proxy_resource_ids = self
+                .token_manager
+                .missing_proxy_resource_ids(&proxy_resource_ids);
+            if !missing_proxy_resource_ids.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "代理资源不存在或已删除: {:?}",
+                    missing_proxy_resource_ids
+                )));
+            }
+        }
         for (index, credential) in req.credentials.into_iter().enumerate() {
             let import_index = index + 1;
-            let mut credential = apply_batch_import_defaults(credential, &req.defaults);
+            let round_robin_proxy_resource_id = proxy_resource_ids
+                .get(index % proxy_resource_ids.len().max(1))
+                .copied();
+            let mut credential = apply_batch_import_defaults(
+                credential,
+                &req.defaults,
+                round_robin_proxy_resource_id,
+            );
             if credential.auto_discover_supported_models.is_none() {
                 credential.auto_discover_supported_models = Some(auto_discover_supported_models);
             }
@@ -3501,6 +3553,154 @@ impl AdminService {
             json!({ "name": name, "proxyUrl": proxy_url, "enabled": created.enabled }),
         );
         Ok(proxy_resource_response(created))
+    }
+
+    pub fn import_proxy_resources(
+        &self,
+        req: BatchProxyResourceImportRequest,
+    ) -> Result<BatchProxyResourceImportResponse, AdminServiceError> {
+        let mut candidates = Vec::new();
+        if let Some(resources) = req.resources {
+            candidates.extend(resources.into_iter().map(Ok));
+        }
+        if let Some(content) = req.content {
+            candidates.extend(parse_proxy_resource_import_content(&content)?);
+        }
+        if candidates.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请提供代理内容或结构化代理资源列表".to_string(),
+            ));
+        }
+        if candidates.len() > MAX_PROXY_RESOURCE_IMPORT_ITEMS {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多导入 {} 个代理资源",
+                MAX_PROXY_RESOURCE_IMPORT_ITEMS
+            )));
+        }
+
+        let prefix = optional_trimmed(req.name_prefix).unwrap_or_else(|| "proxy".to_string());
+        let mut items = Vec::with_capacity(candidates.len());
+        let mut created_count = 0usize;
+
+        for (offset, candidate) in candidates.into_iter().enumerate() {
+            let index = offset + 1;
+            let entry = match candidate {
+                Ok(entry) => entry,
+                Err(error) => {
+                    items.push(BatchProxyResourceImportItem {
+                        index,
+                        ok: false,
+                        resource_id: None,
+                        name: None,
+                        proxy_url: None,
+                        error: Some(error),
+                    });
+                    if !req.continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            let name =
+                optional_trimmed(entry.name).unwrap_or_else(|| format!("{}-{}", prefix, index));
+            let raw_proxy_url = match entry
+                .proxy_url
+                .and_then(|value| optional_trimmed(Some(value)))
+            {
+                Some(value) => value,
+                None => {
+                    items.push(BatchProxyResourceImportItem {
+                        index,
+                        ok: false,
+                        resource_id: None,
+                        name: Some(name),
+                        proxy_url: None,
+                        error: Some("代理 URL 不能为空".to_string()),
+                    });
+                    if !req.continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let proxy_url = match validate_proxy_url(&raw_proxy_url) {
+                Ok(value) => value,
+                Err(error) => {
+                    items.push(BatchProxyResourceImportItem {
+                        index,
+                        ok: false,
+                        resource_id: None,
+                        name: Some(name),
+                        proxy_url: Some(raw_proxy_url),
+                        error: Some(error.to_string()),
+                    });
+                    if !req.continue_on_error {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let row = CreateProxyResourceRow {
+                name: name.clone(),
+                proxy_url: proxy_url.clone(),
+                proxy_username: optional_trimmed(entry.proxy_username),
+                proxy_password: optional_trimmed(entry.proxy_password),
+                enabled: entry.enabled.unwrap_or(req.enabled),
+                notes: optional_trimmed(entry.notes),
+            };
+            let created = block_on_admin_store({
+                let store = self.postgres_store.clone();
+                let row = row.clone();
+                async move { store.insert_proxy_resource(&row).await }
+            });
+            match created {
+                Ok(created) => {
+                    created_count += 1;
+                    items.push(BatchProxyResourceImportItem {
+                        index,
+                        ok: true,
+                        resource_id: Some(created.id),
+                        name: Some(created.name),
+                        proxy_url: Some(created.proxy_url),
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    items.push(BatchProxyResourceImportItem {
+                        index,
+                        ok: false,
+                        resource_id: None,
+                        name: Some(name),
+                        proxy_url: Some(proxy_url),
+                        error: Some(error.to_string()),
+                    });
+                    if !req.continue_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if created_count > 0 {
+            self.reload_proxy_resources_after_admin_change();
+        }
+        let success = items.iter().filter(|item| item.ok).count();
+        let failed = items.len().saturating_sub(success);
+        self.audit(
+            "batch_import_proxy_resources",
+            "proxy_resource",
+            None,
+            failed == 0,
+            (failed > 0).then(|| format!("{} 条导入失败", failed)),
+            json!({ "total": items.len(), "success": success, "failed": failed }),
+        );
+        Ok(BatchProxyResourceImportResponse {
+            total: items.len(),
+            success,
+            failed,
+            items,
+        })
     }
 
     pub fn update_proxy_resource(
@@ -4251,13 +4451,86 @@ impl AdminService {
     }
 
     /// 手动同步 Kiro 模型能力。失败不影响调度，只体现在返回状态的 last_error。
-    pub async fn sync_model_capabilities(&self) -> ModelCapabilitiesStatus {
-        let status = match self.kiro_provider.list_available_models().await {
-            Ok(models) => self.model_capabilities.sync_from_kiro_catalog(models),
+    pub async fn sync_model_capabilities(
+        &self,
+        credential_ids: Vec<u64>,
+    ) -> ModelCapabilitiesStatus {
+        let mut selected_ids = credential_ids;
+        selected_ids.sort_unstable();
+        selected_ids.dedup();
+        let truncated_count = selected_ids.len().saturating_sub(32);
+        if selected_ids.len() > 32 {
+            selected_ids.truncate(32);
+        }
+        let status = if selected_ids.is_empty() {
+            self.kiro_provider
+                .list_available_models()
+                .await
+                .map(|models| self.model_capabilities.sync_from_kiro_catalog(models))
+        } else {
+            let mut merged_models = Vec::new();
+            let mut errors = Vec::new();
+            let mut successful_count = 0usize;
+            if truncated_count > 0 {
+                errors.push(format!(
+                    "选择了 {} 个账号，本次最多同步前 32 个账号",
+                    truncated_count + selected_ids.len()
+                ));
+            }
+            for id in &selected_ids {
+                match self
+                    .kiro_provider
+                    .list_available_models_for_credential(*id)
+                    .await
+                {
+                    Ok(models) if !models.is_empty() => {
+                        successful_count += 1;
+                        merged_models.extend(models);
+                    }
+                    Ok(_) => errors.push(format!("账号 #{} 返回空模型列表", id)),
+                    Err(err) => errors.push(format!("账号 #{}: {}", id, err)),
+                }
+            }
+            if merged_models.is_empty() {
+                Err(anyhow::anyhow!(errors.join("; ")))
+            } else {
+                let cohort_keys = self
+                    .kiro_provider
+                    .model_capability_cohort_keys_for_credentials(&selected_ids);
+                let complete = errors.is_empty() && !cohort_keys.is_empty();
+                let successful_cohort_count = if complete {
+                    cohort_keys.len()
+                } else {
+                    successful_count.min(cohort_keys.len())
+                };
+                let catalog = KiroAvailableModelCatalog {
+                    models: merged_models,
+                    capability_cohort_keys: cohort_keys.clone(),
+                    successful_cohort_count,
+                    cohort_count: cohort_keys.len(),
+                    complete,
+                };
+                let mut status = Ok(self.model_capabilities.sync_from_kiro_catalog(catalog));
+                if !errors.is_empty() {
+                    status = Ok(self.model_capabilities.record_sync_error(format!(
+                        "已同步 {} 个账号，但部分账号失败或被截断：{}",
+                        successful_count,
+                        errors.join("; ")
+                    )));
+                }
+                status
+            }
+        };
+        let status = match status {
             Err(err) => {
-                tracing::warn!("同步 Kiro 模型能力失败，不影响请求调度: {}", err);
+                tracing::warn!(
+                    credential_ids = ?selected_ids,
+                    "同步 Kiro 模型能力失败，不影响请求调度: {}",
+                    err
+                );
                 self.model_capabilities.record_sync_error(err.to_string())
             }
+            Ok(status) => status,
         };
         let mut status = status;
         if let Err(err) = self
@@ -4276,7 +4549,11 @@ impl AdminService {
             None,
             status.last_error.is_none(),
             status.last_error.clone(),
-            json!({ "source": status.source, "modelCount": status.model_count }),
+            json!({
+                "source": status.source,
+                "modelCount": status.model_count,
+                "credentialIds": selected_ids
+            }),
         );
         status
     }
@@ -5949,18 +6226,254 @@ fn normalize_proxy_url(value: Option<String>) -> Result<Option<String>, AdminSer
 }
 
 fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
-    let parsed = url::Url::parse(value).map_err(|_| {
+    let value = value.trim();
+    let normalized = if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("http://{}", value)
+    };
+    let parsed = url::Url::parse(&normalized).map_err(|_| {
         AdminServiceError::InvalidCredential(
-            "代理 URL 必须是 http://、https://、socks5:// 或 socks5h:// 开头的完整地址".to_string(),
+            "代理 URL 必须是有效的 host:port 或 http://、https://、socks5://、socks5h:// 地址"
+                .to_string(),
         )
     })?;
     match parsed.scheme() {
-        "http" | "https" | "socks5" | "socks5h" => Ok(value.to_string()),
+        "http" | "https" | "socks5" | "socks5h" => {
+            if parsed.host_str().is_none() || parsed.port_or_known_default().is_none() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "代理 URL 必须包含主机名和端口".to_string(),
+                ));
+            }
+            Ok(normalized)
+        }
         scheme => Err(AdminServiceError::InvalidCredential(format!(
             "不支持的代理协议: {}，仅支持 http/https/socks5/socks5h",
             scheme
         ))),
     }
+}
+
+fn parse_proxy_resource_import_content(
+    content: &str,
+) -> Result<Vec<Result<ProxyResourceImportEntry, String>>, AdminServiceError> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        let values = match value {
+            serde_json::Value::Array(values) => values,
+            value => vec![value],
+        };
+        return Ok(values
+            .into_iter()
+            .map(|value| match value {
+                serde_json::Value::String(line) => parse_proxy_import_line(&line),
+                serde_json::Value::Object(_) => serde_json::from_value(value)
+                    .map_err(|err| format!("代理对象格式无效: {}", err)),
+                _ => Err("代理项必须是字符串或对象".to_string()),
+            })
+            .collect());
+    }
+
+    let mut items = Vec::new();
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line.starts_with('{') || line.starts_with('[') {
+            let value = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => value,
+                Err(err) if line.starts_with('{') => {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "JSONL 解析失败: {}",
+                        err
+                    )));
+                }
+                Err(_) => {
+                    items.push(parse_proxy_import_line(line));
+                    continue;
+                }
+            };
+            match value {
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        items.push(match value {
+                            serde_json::Value::String(line) => parse_proxy_import_line(&line),
+                            serde_json::Value::Object(_) => serde_json::from_value(value)
+                                .map_err(|err| format!("代理对象格式无效: {}", err)),
+                            _ => Err("代理项必须是字符串或对象".to_string()),
+                        });
+                    }
+                }
+                serde_json::Value::String(line) => items.push(parse_proxy_import_line(&line)),
+                serde_json::Value::Object(_) => items.push(
+                    serde_json::from_value(value)
+                        .map_err(|err| format!("代理对象格式无效: {}", err)),
+                ),
+                _ => items.push(Err("代理项必须是字符串或对象".to_string())),
+            }
+        } else {
+            items.push(parse_proxy_import_line(line));
+        }
+    }
+    Ok(items)
+}
+
+fn parse_proxy_import_line(line: &str) -> Result<ProxyResourceImportEntry, String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Err("代理项不能为空".to_string());
+    }
+
+    if line.contains("://") {
+        if let Ok(mut parsed) = url::Url::parse(line) {
+            let username = parsed.username().trim().to_string();
+            let password = parsed.password().map(str::to_string);
+            if !username.is_empty() || password.is_some() {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+                return Ok(ProxyResourceImportEntry {
+                    name: None,
+                    proxy_url: Some(parsed.to_string()),
+                    proxy_username: (!username.is_empty()).then_some(username),
+                    proxy_password: password,
+                    enabled: None,
+                    notes: None,
+                });
+            }
+        }
+        return Ok(ProxyResourceImportEntry {
+            name: None,
+            proxy_url: Some(line.to_string()),
+            proxy_username: None,
+            proxy_password: None,
+            enabled: None,
+            notes: None,
+        });
+    }
+
+    if let Some((credentials, address)) = line.split_once('@') {
+        if let Some((username, password)) = credentials.split_once(':') {
+            return Ok(ProxyResourceImportEntry {
+                name: None,
+                proxy_url: Some(address.trim().to_string()),
+                proxy_username: Some(username.trim().to_string()),
+                proxy_password: Some(password.trim().to_string()),
+                enabled: None,
+                notes: None,
+            });
+        }
+    }
+
+    if line.starts_with('[') {
+        if let Some(close) = line.find("]:") {
+            let address = &line[..close + 1];
+            let fields = line[close + 2..].splitn(3, ':').collect::<Vec<_>>();
+            if fields.len() == 3 && fields[0].parse::<u16>().is_ok() {
+                return Ok(ProxyResourceImportEntry {
+                    name: None,
+                    proxy_url: Some(format!("{}:{}", address, fields[0].trim())),
+                    proxy_username: Some(fields[1].trim().to_string()),
+                    proxy_password: Some(fields[2].trim().to_string()),
+                    enabled: None,
+                    notes: None,
+                });
+            }
+        }
+    }
+
+    let (parts, separator) = if line.contains("----") {
+        (
+            line.split("----").map(str::trim).collect::<Vec<_>>(),
+            "----",
+        )
+    } else if line.contains('|') {
+        (line.split('|').map(str::trim).collect::<Vec<_>>(), "|")
+    } else if line.contains('\t') {
+        (line.split('\t').map(str::trim).collect::<Vec<_>>(), "\t")
+    } else if line.contains(',') {
+        (line.split(',').map(str::trim).collect::<Vec<_>>(), ",")
+    } else {
+        (line.splitn(4, ':').map(str::trim).collect::<Vec<_>>(), ":")
+    };
+
+    if separator == ":" && parts.len() == 4 {
+        return Ok(ProxyResourceImportEntry {
+            name: None,
+            proxy_url: Some(format!("{}:{}", parts[0], parts[1])),
+            proxy_username: Some(parts[2].to_string()),
+            proxy_password: Some(parts[3].to_string()),
+            enabled: None,
+            notes: None,
+        });
+    }
+    if parts.len() == 4 && separator != ":" {
+        return Ok(ProxyResourceImportEntry {
+            name: Some(parts[0].to_string()),
+            proxy_url: Some(parts[1].to_string()),
+            proxy_username: Some(parts[2].to_string()),
+            proxy_password: Some(parts[3].to_string()),
+            enabled: None,
+            notes: None,
+        });
+    }
+    if parts.len() == 3 {
+        if separator != ":" && looks_like_host_port(parts[0]) {
+            return Ok(ProxyResourceImportEntry {
+                name: None,
+                proxy_url: Some(parts[0].to_string()),
+                proxy_username: Some(parts[1].to_string()),
+                proxy_password: Some(parts[2].to_string()),
+                enabled: None,
+                notes: None,
+            });
+        }
+        if separator != ":" {
+            return Ok(ProxyResourceImportEntry {
+                name: Some(parts[0].to_string()),
+                proxy_url: Some(parts[1].to_string()),
+                proxy_username: Some(parts[2].to_string()),
+                proxy_password: None,
+                enabled: None,
+                notes: None,
+            });
+        }
+    }
+    if parts.len() == 2 && separator != ":" {
+        return Ok(ProxyResourceImportEntry {
+            name: Some(parts[0].to_string()),
+            proxy_url: Some(parts[1].to_string()),
+            proxy_username: None,
+            proxy_password: None,
+            enabled: None,
+            notes: None,
+        });
+    }
+    Ok(ProxyResourceImportEntry {
+        name: None,
+        proxy_url: Some(line.to_string()),
+        proxy_username: None,
+        proxy_password: None,
+        enabled: None,
+        notes: None,
+    })
+}
+
+fn looks_like_host_port(value: &str) -> bool {
+    let value = value.trim();
+    if value.starts_with('[') {
+        return value
+            .rfind("]:")
+            .is_some_and(|index| value[index + 2..].parse::<u16>().is_ok());
+    }
+    value
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .is_some()
 }
 
 fn validate_proxy_test_url(value: Option<String>) -> Result<String, AdminServiceError> {
@@ -6288,6 +6801,7 @@ fn proxy_resource_response(row: ProxyResourceRow) -> ProxyResourceResponse {
 fn apply_batch_import_defaults(
     mut credential: AddCredentialRequest,
     defaults: &BatchCredentialImportDefaults,
+    round_robin_proxy_resource_id: Option<u64>,
 ) -> AddCredentialRequest {
     if credential.disabled.is_none() {
         credential.disabled = defaults.disabled;
@@ -6324,26 +6838,31 @@ fn apply_batch_import_defaults(
     if credential.api_region.as_deref().is_none_or(str::is_empty) {
         credential.api_region = defaults.api_region.clone();
     }
-    if credential.proxy_url.as_deref().is_none_or(str::is_empty) {
-        credential.proxy_url = defaults.proxy_url.clone();
-    }
-    if credential
-        .proxy_username
-        .as_deref()
-        .is_none_or(str::is_empty)
-    {
-        credential.proxy_username = defaults.proxy_username.clone();
-    }
-    if credential
-        .proxy_password
-        .as_deref()
-        .is_none_or(str::is_empty)
-    {
-        credential.proxy_password = defaults.proxy_password.clone();
+    let has_explicit_direct_proxy = credential_has_direct_proxy(&credential);
+    if credential.proxy_resource_id.is_none() && !has_explicit_direct_proxy {
+        if let Some(proxy_resource_id) = round_robin_proxy_resource_id {
+            credential.proxy_resource_id = Some(proxy_resource_id);
+        } else if let Some(proxy_resource_id) = defaults.proxy_resource_id {
+            credential.proxy_resource_id = proxy_resource_id;
+        }
     }
     if credential.proxy_resource_id.is_none() {
-        if let Some(proxy_resource_id) = defaults.proxy_resource_id {
-            credential.proxy_resource_id = proxy_resource_id;
+        if credential.proxy_url.as_deref().is_none_or(str::is_empty) {
+            credential.proxy_url = defaults.proxy_url.clone();
+        }
+        if credential
+            .proxy_username
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            credential.proxy_username = defaults.proxy_username.clone();
+        }
+        if credential
+            .proxy_password
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            credential.proxy_password = defaults.proxy_password.clone();
         }
     }
     if credential.endpoint.as_deref().is_none_or(str::is_empty) {
@@ -6358,6 +6877,26 @@ fn apply_batch_import_defaults(
         }
     }
     credential
+}
+
+fn credential_has_direct_proxy(credential: &AddCredentialRequest) -> bool {
+    credential
+        .proxy_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || credential
+            .proxy_username
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || credential
+            .proxy_password
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn normalized_batch_proxy_resource_ids(ids: &[u64]) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    ids.iter().copied().filter(|id| seen.insert(*id)).collect()
 }
 
 fn resolve_add_credential_auth_method(req: &AddCredentialRequest) -> String {

@@ -1,4 +1,5 @@
 import {
+  Activity,
   ChevronDown,
   ChevronUp,
   MoreHorizontal,
@@ -43,6 +44,7 @@ import {
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useClearInFlight,
+  useCredentialDiagnostics,
   useDeleteCredential,
   useForceRefreshToken,
   useProxyResources,
@@ -60,7 +62,7 @@ import {
   useSetPriority,
   useSetWarmup,
 } from '@/hooks/use-credentials'
-import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem, UsageRecord } from '@/types/api'
 import {
   accountInfoValue,
   authLabel,
@@ -145,6 +147,9 @@ export function CredentialCard({
   const [editingRegions, setEditingRegions] = useState(false)
   const [editingSupportedModels, setEditingSupportedModels] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [showDiagnostics, setShowDiagnostics] = useState(false)
+  const [diagnosticsPage, setDiagnosticsPage] = useState(1)
+  const [diagnosticRecords, setDiagnosticRecords] = useState<UsageRecord[]>([])
 
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [concurrencyValue, setConcurrencyValue] = useState(
@@ -182,6 +187,7 @@ export function CredentialCard({
   const clearInFlight = useClearInFlight()
   const forceRefresh = useForceRefreshToken()
   const runtimeConfig = useRuntimeConfig()
+  const diagnostics = useCredentialDiagnostics(credential.id, diagnosticsPage, showDiagnostics)
   const confirmDialog = useConfirm()
 
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
@@ -264,6 +270,18 @@ export function CredentialCard({
     setSupportedModelsDraft(supportedModels)
   }, [credential.id, supportedModels])
   useEffect(() => { resetProxyDraft() }, [credential.id, credential.proxyResourceId, credential.proxyUrl, credential.proxyUsername, credential.proxyPassword])
+  useEffect(() => {
+    if (!showDiagnostics || !diagnostics.data) return
+    setDiagnosticRecords((current) => diagnosticsPage === 1
+      ? diagnostics.data.records
+      : [...current, ...diagnostics.data.records.filter((record) => !current.some((item) => item.id === record.id))])
+  }, [diagnostics.data, diagnosticsPage, showDiagnostics])
+  useEffect(() => {
+    if (!showDiagnostics) {
+      setDiagnosticsPage(1)
+      setDiagnosticRecords([])
+    }
+  }, [showDiagnostics])
 
   const savePriority = () => {
     const p = Number(priorityValue)
@@ -477,6 +495,15 @@ export function CredentialCard({
         {/* 高频操作：直接展示 */}
         <Button type="button" variant="ghost" size="xs" onClick={() => onTest(credential)}>
           <Wand2 className="h-3.5 w-3.5" /> 测试
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          onClick={() => { setDiagnosticsPage(1); setDiagnosticRecords([]); setShowDiagnostics(true) }}
+          title="查看账号调度与错误诊断"
+        >
+          <Activity className="h-3.5 w-3.5" /> 诊断
         </Button>
         <Button type="button" variant="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance}>
           {loadingBalance ? <Spinner size="sm" /> : <Wallet className="h-3.5 w-3.5" />} 查询
@@ -1016,6 +1043,110 @@ export function CredentialCard({
               {setCredentialProxy.isPending && <Spinner size="sm" />}保存
             </Button>
           </div>
+        </div>
+      </ModalShell>
+
+      {/* ── Diagnostics ── */}
+      <ModalShell
+        open={showDiagnostics}
+        title={`账号诊断：${credentialLabel(credential)}`}
+        width="max-w-5xl"
+        onClose={() => setShowDiagnostics(false)}
+      >
+        <div className="space-y-4">
+          {diagnostics.isLoading && !diagnostics.data ? (
+            <LoadingState text="加载账号调度与错误记录..." />
+          ) : diagnostics.error ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              {extractErrorMessage(diagnostics.error)}
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <MetaItem
+                  label="调度状态"
+                  value={diagnostics.data?.runtime
+                    ? diagnostics.data.runtime.cooledDown
+                      ? '冷却中'
+                      : diagnostics.data.runtime.rateLimited
+                        ? '限流中'
+                        : '可调度'
+                    : dispatchStatus}
+                  error={diagnostics.data?.runtime?.cooledDown || diagnostics.data?.runtime?.rateLimited || dispatchStatus !== '可调度'}
+                />
+                <MetaItem
+                  label="冷却"
+                  value={diagnostics.data?.runtime?.cooledDown ? `${diagnostics.data.runtime.cooldownRemainingSecs}s` : '无'}
+                  error={Boolean(diagnostics.data?.runtime?.cooledDown)}
+                />
+                <MetaItem
+                  label="并发"
+                  value={`${diagnostics.data?.runtime?.inFlightRequests ?? credential.inFlightRequests}/${diagnostics.data?.runtime?.maxConcurrentRequests || credential.maxConcurrentRequests || '∞'}`}
+                />
+                <MetaItem
+                  label="最近错误"
+                  value={diagnostics.data?.runtime?.lastErrorKind || credential.lastErrorKind || '无'}
+                  detail={diagnostics.data?.runtime?.lastErrorReason || credential.lastErrorReason}
+                  error={Boolean(diagnostics.data?.runtime?.lastErrorReason || credential.lastErrorReason)}
+                />
+              </div>
+              <div className="rounded-lg border border-border">
+                <div className="border-b border-border px-3 py-2 text-sm font-semibold">错误记录</div>
+                {diagnosticRecords.length === 0 ? (
+                  <EmptyState title="暂无错误记录" description="该账号尚未留下可展示的请求级错误记录。" />
+                ) : (
+                  <div className="max-h-[55vh] space-y-2 overflow-y-auto p-3">
+                    {diagnosticRecords.map((record) => (
+                      <div key={record.id} className="rounded-lg border border-border bg-muted/20 p-3 text-xs">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-muted-foreground">{record.createdAt}</span>
+                          <Badge tone="error">{record.errorType || record.status}</Badge>
+                          {record.errorStatusCode && <Badge>{record.errorStatusCode}</Badge>}
+                          <span className="font-mono text-muted-foreground">{record.id}</span>
+                        </div>
+                        {record.errorMessage && <div className="mt-2 text-sm text-foreground">{record.errorMessage}</div>}
+                        {record.rawUpstreamError && (
+                          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-background p-2 font-mono text-[0.7rem] text-muted-foreground">
+                            {record.rawUpstreamError.body}
+                          </pre>
+                        )}
+                        {record.credentialAttempts && record.credentialAttempts.length > 0 && (
+                          <div className="mt-2 space-y-1 border-t border-border pt-2">
+                            {record.credentialAttempts.map((attempt) => (
+                              <div key={`${record.id}-${attempt.attempt}-${attempt.credentialId}`} className="rounded bg-background px-2 py-1">
+                                <span className="font-semibold">#{attempt.credentialId}</span>
+                                <span className="ml-2 text-muted-foreground">{attempt.action}</span>
+                                {attempt.errorType && <span className="ml-2 text-destructive">{attempt.errorType}</span>}
+                                {attempt.errorMessage && <span className="ml-2 text-muted-foreground">{attempt.errorMessage}</span>}
+                                {attempt.rawUpstreamError && (
+                                  <pre className="mt-1 whitespace-pre-wrap font-mono text-[0.68rem] text-muted-foreground">
+                                    {attempt.rawUpstreamError.body}
+                                  </pre>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="flex justify-between gap-2">
+                <Button variant="ghost" size="sm" onClick={() => diagnostics.refetch()} disabled={diagnostics.isFetching}>
+                  {diagnostics.isFetching && <Spinner size="sm" />}刷新诊断
+                </Button>
+                <div className="flex gap-2">
+                  {diagnostics.data?.hasNext && (
+                    <Button size="sm" onClick={() => setDiagnosticsPage((page) => page + 1)} disabled={diagnostics.isFetching}>
+                      加载更早记录
+                    </Button>
+                  )}
+                  <Button variant="outline" size="sm" onClick={() => setShowDiagnostics(false)}>关闭</Button>
+                </div>
+              </div>
+            </>
+          )}
         </div>
       </ModalShell>
 
