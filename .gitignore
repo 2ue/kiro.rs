@@ -13,6 +13,7 @@
 /admin-ui-daisy/.vite/
 /admin-ui-daisy/tsconfig.tsbuildinfo
 /credentials.*
+/kiro-credentials-*.json
 /kiro_balance_cache.json
 /kiro_stats.json
 /kiro_usage_records.jsonl
