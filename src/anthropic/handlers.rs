@@ -6531,6 +6531,7 @@ async fn post_messages_inner(
             too_long_retry,
             cache_point_retry,
             external_fallback,
+            LocalStreamRetryConfig::from_runtime_config(&runtime_config),
             capacity_weight_units,
         )
         .await
@@ -8426,6 +8427,60 @@ fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<Event>, String> {
     Ok(events)
 }
 
+fn non_stream_status_error_before_first_output(events: &[Event]) -> Option<String> {
+    let mut saw_output = false;
+    for event in events {
+        match event {
+            Event::AssistantResponse(resp) if !resp.content.is_empty() => {
+                saw_output = true;
+            }
+            Event::Code(code) if !code.content.is_empty() => {
+                saw_output = true;
+            }
+            Event::ReasoningContent(reasoning)
+                if !reasoning.text.is_empty()
+                    || reasoning
+                        .signature
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    || reasoning
+                        .redacted_content
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty()) =>
+            {
+                saw_output = true;
+            }
+            Event::ToolUse(tool_use)
+                if !tool_use.name.is_empty()
+                    || !tool_use.tool_use_id.is_empty()
+                    || !tool_use.input.is_empty() =>
+            {
+                saw_output = true;
+            }
+            Event::Error {
+                error_code,
+                error_message,
+            } if !saw_output => {
+                return Some(format!(
+                    "upstream error event {}: {}",
+                    error_code, error_message
+                ));
+            }
+            Event::Exception {
+                exception_type,
+                message,
+            } if !saw_output && exception_type != "ContentLengthExceededException" => {
+                return Some(format!(
+                    "upstream exception event {}: {}",
+                    exception_type, message
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
@@ -9498,6 +9553,7 @@ async fn handle_non_stream_request(
     too_long_retry: Option<PayloadTooLongRetryRequest>,
     cache_point_retry: Option<CachePointRetryRequest>,
     external_fallback: Option<ExternalFallbackContext>,
+    stream_retry_config: LocalStreamRetryConfig,
     capacity_weight_units: u32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -9505,7 +9561,7 @@ async fn handle_non_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
-    let api_response = if let Some(outcome) =
+    let mut api_response = if let Some(outcome) =
         maybe_local_pool_preflight_external_outcome_for_local_request(
             external_fallback.as_ref(),
             &request_id,
@@ -10047,115 +10103,207 @@ async fn handle_non_stream_request(
             }
         }
     };
-    usage_context.mark_upstream_header();
-    let credential_attempts =
-        merge_credential_attempts(retry_attempt_prefix, api_response.attempts().to_vec());
-    let credential_usage = prepare_credential_usage_context(
-        usage_context,
-        &provider,
-        api_response.credential_id(),
-        api_response.sticky_bound(),
-        api_response.fallback_from_sticky(),
-        credential_attempts,
-    );
-    let (response, completion) = api_response.into_parts();
-    let upstream_content_type = response
-        .headers()
-        .get(REQWEST_CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
+    let mut non_stream_status_retry_attempt = 1_u32;
+    let (credential_usage, completion, upstream_events) = loop {
+        usage_context.mark_upstream_header();
+        let credential_attempts = merge_credential_attempts(
+            retry_attempt_prefix.clone(),
+            api_response.attempts().to_vec(),
+        );
+        let credential_usage = prepare_credential_usage_context(
+            usage_context.clone(),
+            &provider,
+            api_response.credential_id(),
+            api_response.sticky_bound(),
+            api_response.fallback_from_sticky(),
+            credential_attempts,
+        );
+        let (response, completion) = api_response.into_parts();
+        let upstream_content_type = response
+            .headers()
+            .get(REQWEST_CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
 
-    // 读取响应体
-    let body_bytes = match response_bytes_with_limit_and_body_timeout(
-        response,
-        provider
-            .runtime_config()
-            .kiro_upstream_response_timeout_secs,
-        LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
-            credential_usage.record_failure(
-                UsageRecordStatus::Error,
-                "api_error",
-                format!("读取响应失败: {}", e),
-            );
-            completion.release();
-            return envelope::error_response_with_id(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-                &credential_usage.request.request_id,
-            );
-        }
-    };
-
-    let body_bytes =
-        match inspect_complete_upstream_body(upstream_content_type.as_deref(), body_bytes) {
-            Ok(body) => body,
-            Err(error) => {
-                tracing::warn!(
-                    error_type = error.error_type,
-                    error_detail = %error.internal_detail,
-                    body_bytes = error.body_bytes,
-                    "非流式 API 返回 2xx JSON 错误体"
-                );
-                let status = if error.error_type == "rate_limit_error" {
-                    StatusCode::TOO_MANY_REQUESTS
-                } else if error.error_type == "invalid_request_error" {
-                    StatusCode::BAD_REQUEST
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
-                let public_message = if error.error_type == "rate_limit_error" {
-                    envelope::PUBLIC_RATE_LIMIT_MESSAGE
-                } else if error.error_type == "invalid_request_error" {
-                    UPSTREAM_INVALID_REQUEST_MESSAGE
-                } else {
-                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE
-                };
-                credential_usage.request.merge_error_metadata(
-                    error
-                        .diagnostics
-                        .clone()
-                        .map(|diagnostics| json!({ "upstreamBodyDiagnostics": diagnostics })),
-                );
-                credential_usage.record_failure_with_public_error(
+        // 读取响应体
+        let body_bytes = match response_bytes_with_limit_and_body_timeout(
+            response,
+            provider
+                .runtime_config()
+                .kiro_upstream_response_timeout_secs,
+            LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!("读取响应体失败: {}", e);
+                credential_usage.record_failure(
                     UsageRecordStatus::Error,
-                    error.error_type,
-                    error.internal_detail,
-                    Some(usage_public_error(
-                        status,
-                        error.error_type,
-                        public_message,
-                        Some(&credential_usage.request.error_id),
-                    )),
+                    "api_error",
+                    format!("读取响应失败: {}", e),
                 );
                 completion.release();
                 return envelope::error_response_with_id(
-                    status,
-                    error.error_type,
-                    public_message,
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
                     &credential_usage.request.request_id,
                 );
             }
         };
-    let upstream_events = match decode_complete_eventstream(&body_bytes) {
-        Ok(events) => events,
-        Err(detail) => {
-            tracing::warn!(error = %detail, "非流式 EventStream 响应不完整");
-            credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-            completion.release();
-            return envelope::error_response_with_id(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-                &credential_usage.request.request_id,
-            );
+
+        let body_bytes =
+            match inspect_complete_upstream_body(upstream_content_type.as_deref(), body_bytes) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(
+                        error_type = error.error_type,
+                        error_detail = %error.internal_detail,
+                        body_bytes = error.body_bytes,
+                        "非流式 API 返回 2xx JSON 错误体"
+                    );
+                    let status = if error.error_type == "rate_limit_error" {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else if error.error_type == "invalid_request_error" {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    let public_message = if error.error_type == "rate_limit_error" {
+                        envelope::PUBLIC_RATE_LIMIT_MESSAGE
+                    } else if error.error_type == "invalid_request_error" {
+                        UPSTREAM_INVALID_REQUEST_MESSAGE
+                    } else {
+                        envelope::PUBLIC_PROCESSING_FAILED_MESSAGE
+                    };
+                    credential_usage.request.merge_error_metadata(
+                        error
+                            .diagnostics
+                            .clone()
+                            .map(|diagnostics| json!({ "upstreamBodyDiagnostics": diagnostics })),
+                    );
+                    credential_usage.record_failure_with_public_error(
+                        UsageRecordStatus::Error,
+                        error.error_type,
+                        error.internal_detail,
+                        Some(usage_public_error(
+                            status,
+                            error.error_type,
+                            public_message,
+                            Some(&credential_usage.request.error_id),
+                        )),
+                    );
+                    completion.release();
+                    return envelope::error_response_with_id(
+                        status,
+                        error.error_type,
+                        public_message,
+                        &credential_usage.request.request_id,
+                    );
+                }
+            };
+        let upstream_events = match decode_complete_eventstream(&body_bytes) {
+            Ok(events) => events,
+            Err(detail) => {
+                tracing::warn!(error = %detail, "非流式 EventStream 响应不完整");
+                credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+                completion.release();
+                return envelope::error_response_with_id(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                    &credential_usage.request.request_id,
+                );
+            }
+        };
+
+        if let Some(detail) = non_stream_status_error_before_first_output(&upstream_events) {
+            if stream_retry_config.active()
+                && stream_retry_config.allows(StreamRetryReason::StatusError)
+                && non_stream_status_retry_attempt < stream_retry_config.max_attempts
+            {
+                let next_attempt = non_stream_status_retry_attempt.saturating_add(1);
+                tracing::warn!(
+                    request_id = %request_id,
+                    attempt = non_stream_status_retry_attempt,
+                    next_attempt,
+                    max_attempts = stream_retry_config.max_attempts,
+                    detail = %detail,
+                    "本地 Kiro 非流式响应在首个输出前返回状态事件，准备换号重试"
+                );
+                retry_attempt_prefix =
+                    merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
+                completion.report_upstream_body_status_failure(detail.clone());
+                let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
+                let consumed_before = attempt_budget.snapshot().consumed;
+                let retry_dispatch = call_api_maybe_fail_fast(
+                    &provider,
+                    request_body,
+                    Some(kiro_request),
+                    Some(&request_id),
+                    external_fallback.as_ref(),
+                    capacity_weight_units,
+                    Some(model),
+                    attempt_budget.clone(),
+                )
+                .await;
+                let retry_sends = attempt_budget
+                    .snapshot()
+                    .consumed
+                    .saturating_sub(consumed_before);
+                if retry_sends > 0 {
+                    usage_context
+                        .mark_stream_retry_sends(retry_sends, StreamRetryReason::StatusError);
+                } else if retry_dispatch.is_err() {
+                    usage_context
+                        .mark_stream_retry_dispatch_failure(StreamRetryReason::StatusError);
+                }
+                match retry_dispatch {
+                    Ok(response) => {
+                        api_response = response;
+                        non_stream_status_retry_attempt = next_attempt;
+                        continue;
+                    }
+                    Err(retry_error) => {
+                        let retry_message = retry_error.to_string();
+                        let retry_attempts =
+                            KiroProvider::diagnostic_attempts_from_error(&retry_error);
+                        let all_attempts =
+                            merge_credential_attempts(retry_attempt_prefix, retry_attempts);
+                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
+                        let endpoint = usage_context.endpoint.clone();
+                        attach_and_log_tool_use_format_diagnostics(
+                            &retry_message,
+                            request_body,
+                            kiro_request,
+                            &mut usage_context,
+                            &endpoint,
+                            model,
+                            preflight_model,
+                        );
+                        let error_id = usage_context.error_id.clone();
+                        usage_context
+                            .attach_provider_error_credential(
+                                &provider,
+                                &retry_message,
+                                all_attempts,
+                            )
+                            .with_error_metadata(provider_error_metadata(&retry_error))
+                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
+                        return map_provider_error_with_admission_feedback(
+                            retry_error,
+                            Some(&request_id),
+                            Some(&error_id),
+                            Some(provider.as_ref()),
+                            admission_attribution.as_ref(),
+                        );
+                    }
+                }
+            }
         }
+
+        break (credential_usage, completion, upstream_events);
     };
 
     let mut text_content = String::new();
@@ -10410,8 +10558,12 @@ async fn handle_non_stream_request(
             } => {
                 let detail = format!("upstream error event {}: {}", error_code, error_message);
                 tracing::warn!(error = %detail, "非流式响应收到 error 事件");
-                credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-                completion.release();
+                credential_usage.record_failure(
+                    UsageRecordStatus::Error,
+                    "api_error",
+                    detail.clone(),
+                );
+                completion.report_upstream_body_status_failure(detail);
                 return envelope::error_response_with_id(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -10429,8 +10581,12 @@ async fn handle_non_stream_request(
                     let detail =
                         format!("upstream exception event {}: {}", exception_type, message);
                     tracing::warn!(error = %detail, "非流式响应收到异常事件");
-                    credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-                    completion.release();
+                    credential_usage.record_failure(
+                        UsageRecordStatus::Error,
+                        "api_error",
+                        detail.clone(),
+                    );
+                    completion.report_upstream_body_status_failure(detail);
                     return envelope::error_response_with_id(
                         StatusCode::BAD_GATEWAY,
                         "api_error",
@@ -10973,7 +11129,8 @@ pub async fn count_tokens_ha(
 
 /// POST /cc/v1/messages/count_tokens
 ///
-/// Uses the same route-policy resolution as `/cc/v1/messages`.
+/// Mounted path only; token counting uses the same endpoint-scoped runtime
+/// policy resolution as every other local messages route.
 pub async fn count_tokens_cc(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
@@ -11063,7 +11220,9 @@ pub async fn count_tokens_dfcache(
 
 /// POST /cc/v1/messages
 ///
-/// Claude Code 常用入口。兼容 profile、缓存、usage 和外部池策略由运行配置解析。
+/// Claude Code 常用挂载入口。请求解析、本地 Kiro body 转换、调度、重试、
+/// 错误处理和 usage 记录都复用通用 messages 入口；路由差异只来自运行时
+/// endpoint policy，例如缓存、reported usage 和 fallback 开关。
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     headers: HeaderMap,

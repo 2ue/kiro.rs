@@ -39,7 +39,7 @@ This baseline records project-wide facts that plans can reference without duplic
 - Requests can use operator-owned Kiro credentials or configured external compatible pools with raw or normalized body behavior.
 - PgSQL is the durable authority for configuration and operational records; Redis coordinates cross-process transient state and derived realtime views.
 - Multiple replicas are an availability and capacity concern inside the same operator trust domain, not a tenant boundary.
-- `/v1/messages`, `/na/v1/messages`, `/ha/v1/messages`, `/dfcache/*/v1/messages`, and `/cc/v1/messages` share an entry path but apply distinct route, cache, usage, and compatibility policies.
+- `/v1/messages`, `/na/v1/messages`, `/ha/v1/messages`, `/dfcache/*/v1/messages`, and `/cc/v1/messages` share the same local request processing, Kiro conversion, scheduling, retry, fallback, and error semantics; endpoint policy selects route-specific cache, reported usage, and fallback settings.
 - The implementation already has meaningful modules; the primary structural problem is broad state ownership, dependency direction, request-path I/O, and orchestration concentrated in a few objects.
 
 ## Maintenance Rules

@@ -19,7 +19,7 @@ actual endpoint path; built-in route addresses are not immutable strategy names.
 | `/na/v1/messages` | `post_messages_na` | no-cache | Built-in entrypoint; cache/usage can be changed by path policy |
 | `/ha/v1/messages` | `post_messages_ha` | current-high-cache | Built-in entrypoint; cache/usage can be changed by path policy |
 | `/dfcache/{route}/v1/messages` | `post_messages_dfcache` | current-high-cache with path namespace | Route name must be explicitly configured |
-| `/cc/v1/messages` | `post_messages_cc` | current-high-cache plus Claude Code prompt default | Claude Code event/usage compatibility |
+| `/cc/v1/messages` | `post_messages_cc` | current-high-cache unless overridden by endpoint policy | Same local processing semantics as other message routes; endpoint policy controls cache, reported usage, and fallback behavior |
 
 Models, Files, and count-tokens routes are mounted for the same route families. The global HTTP request-body limit is 50 MiB.
 

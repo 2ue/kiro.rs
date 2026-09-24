@@ -7960,8 +7960,102 @@ impl ExternalPoolManager {
     ) -> ExternalCapacityDecision {
         let reason = context.reason;
         let wait_for = context.wait_for;
-        if reason == PoolCapacityWaitReason::CoordinatorUnavailable
-            || context.is_model_unavailable()
+        if reason == PoolCapacityWaitReason::CoordinatorUnavailable {
+            if config.external_pool_capacity_mode != ExternalPoolCapacityMode::Wait {
+                let (error_type, message) = external_capacity_error(reason);
+                self.record_external_failure(
+                    route,
+                    None,
+                    attempts,
+                    error_type,
+                    message,
+                    synthetic_external_capacity_error_diagnostics(
+                        route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                        config,
+                        Some(&context),
+                    ),
+                );
+                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_type,
+                    message,
+                    &route.error_id,
+                ));
+            }
+
+            let started = *wait_started_at.get_or_insert_with(Instant::now);
+            let configured_wait = Duration::from_secs(config.effective_dispatch_max_wait_secs());
+            let max_wait = dispatch_deadline
+                .map(|deadline| {
+                    configured_wait.min(deadline.saturating_duration_since(Instant::now()))
+                })
+                .unwrap_or(configured_wait);
+            if max_wait.is_zero() || started.elapsed() >= max_wait {
+                let (error_type, message) = external_capacity_error(reason);
+                self.record_external_failure(
+                    route,
+                    None,
+                    attempts,
+                    error_type,
+                    message,
+                    synthetic_external_capacity_error_diagnostics(
+                        route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                        config,
+                        Some(&context),
+                    ),
+                );
+                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_type,
+                    message,
+                    &route.error_id,
+                ));
+            }
+
+            // Redis itself is the external-pool capacity coordinator, so do not
+            // try to enter the Redis-backed queue while the coordinator is
+            // unavailable. Sleep briefly within the dispatch deadline, then let
+            // the caller re-read the coordinator and select a pool if it has
+            // recovered.
+            let mut wakeup = wait_for
+                .unwrap_or_else(|| Duration::from_millis(100))
+                .min(Duration::from_secs(1));
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let (error_type, message) = external_capacity_error(reason);
+                self.record_external_failure(
+                    route,
+                    None,
+                    attempts,
+                    error_type,
+                    message,
+                    synthetic_external_capacity_error_diagnostics(
+                        route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                        config,
+                        Some(&context),
+                    ),
+                );
+                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    error_type,
+                    message,
+                    &route.error_id,
+                ));
+            }
+            wakeup = wakeup.min(remaining);
+            if !wakeup.is_zero() {
+                let _ = timeout(wakeup, capacity_waiter.wait_for_change()).await;
+            }
+            return ExternalCapacityDecision::Retry;
+        }
+
+        if context.is_model_unavailable()
             || config.external_pool_capacity_mode != ExternalPoolCapacityMode::Wait
         {
             let (error_type, message) = external_capacity_error(reason);

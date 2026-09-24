@@ -98,7 +98,7 @@ Single-user operation does not eliminate security boundaries:
 | `/na/v1/*` | Built-in route whose historical default is no-cache; runtime cache/usage policy is configurable |
 | `/ha/v1/*` | Built-in route whose historical default is high-cache; runtime cache/usage policy is configurable |
 | `/dfcache/{name}/v1/*` | Operator-defined route with longest-prefix policy resolution; route name must be explicitly configured |
-| `/cc/v1/*` | Built-in Claude Code compatibility route; protocol/profile behavior is configurable separately from cache/usage policy |
+| `/cc/v1/*` | Built-in route commonly used by Claude Code clients; shares local processing semantics with the other message routes and differs by endpoint policy |
 | `/api/admin/*` | Privileged management API for the same operator-owned service |
 | `/healthz`, `/readyz` | Process liveness and dependency/runtime readiness |
 

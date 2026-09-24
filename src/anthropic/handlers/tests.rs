@@ -686,9 +686,9 @@ fn multimodal_handler_test_router(base_url: &str) -> Router {
 fn multimodal_handler_test_router_with_usage(base_url: &str) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
     config.kiro_upstream_base_url = Some(base_url.to_string());
+    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
     config.kiro_upstream_response_timeout_secs = 2;
     config.credential_retry_max_attempts = 1;
-    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
     multimodal_handler_test_router_from_config(config)
 }
 
@@ -3556,6 +3556,7 @@ fn handler_eventstream_fault_router_with_limits(
     config.kiro_upstream_stream_retry_on_status_error = true;
     config.credential_retry_max_attempts = credential_retry_max_attempts;
     config.inference_upstream_max_attempts = 4;
+    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
     let credentials = (1..=credential_count)
         .map(|id| KiroCredentials {
             id: Some(id),
@@ -3605,9 +3606,9 @@ fn handler_eventstream_fault_router(base_url: &str) -> (Router, Arc<UsageRecorde
     handler_eventstream_fault_router_with_credential_count(base_url, 2)
 }
 
-fn handler_eventstream_fault_request(stream: bool) -> Request<Body> {
+fn handler_eventstream_fault_request_for_path(path: &str, stream: bool) -> Request<Body> {
     multimodal_handler_request(
-        "/cc/v1/messages",
+        path,
         json!({
             "model":"claude-sonnet-4-20250514",
             "max_tokens":2048,
@@ -3654,9 +3655,17 @@ fn handler_thinking_signature_retry_request(stream: bool) -> Request<Body> {
 }
 
 async fn call_handler_eventstream_fault(app: Router, stream: bool) -> (StatusCode, String, String) {
+    call_handler_eventstream_fault_on_path(app, "/cc/v1/messages", stream).await
+}
+
+async fn call_handler_eventstream_fault_on_path(
+    app: Router,
+    path: &str,
+    stream: bool,
+) -> (StatusCode, String, String) {
     let response = tokio::time::timeout(
         Duration::from_secs(5),
-        app.oneshot(handler_eventstream_fault_request(stream)),
+        app.oneshot(handler_eventstream_fault_request_for_path(path, stream)),
     )
     .await
     .expect("fault handler response timed out")
@@ -3979,6 +3988,37 @@ fn handler_eventstream_precommit_faults_retry_once_and_recover_for_five_rounds()
         .expect("spawn precommit matrix thread")
         .join()
         .expect("run precommit matrix thread");
+}
+
+#[test]
+fn handler_eventstream_status_retry_is_shared_by_dfcache_route_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("dfcache-precommit-eventstream-fixture", || async {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::ExceptionEventBeforeOutput,
+            )
+            .await;
+            let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, request_id, body) =
+                call_handler_eventstream_fault_on_path(app, "/dfcache/demo/v1/messages", true)
+                    .await;
+
+            assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+            assert!(body.contains("recovered-ok"), "round={round} body={body}");
+            assert_eq!(upstream.hits(), 2, "round={round}");
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+            let record = usage_record_for_request(&usage_recorder, &request_id);
+            let trace = record
+                .latency_trace
+                .as_ref()
+                .expect("dfcache precommit retry trace");
+            assert_eq!(
+                trace.stream_retry_reasons.as_deref(),
+                Some(&["status_error:sends=1".to_string()][..]),
+                "round={round}"
+            );
+        }
+    });
 }
 
 async fn run_provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds()
@@ -4386,6 +4426,106 @@ fn handler_non_stream_eventstream_faults_fail_closed_for_five_rounds() {
         "non-stream-eventstream-fixture",
         run_handler_non_stream_eventstream_faults_matrix,
     );
+}
+
+#[test]
+fn handler_non_stream_status_events_retry_once_and_recover_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("non-stream-status-retry-fixture", || async {
+        const PATHS: [&str; 5] = [
+            "/v1/messages",
+            "/na/v1/messages",
+            "/cc/v1/messages",
+            "/ha/v1/messages",
+            "/dfcache/demo/v1/messages",
+        ];
+        for fault in [
+            HandlerEventStreamFault::ExceptionEventBeforeOutput,
+            HandlerEventStreamFault::ErrorEventBeforeOutput,
+        ] {
+            for path in PATHS {
+                for round in 1..=5 {
+                    let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+                    let (app, usage_recorder) =
+                        handler_eventstream_fault_router(&upstream.base_url);
+                    let (status, request_id, body) =
+                        call_handler_eventstream_fault_on_path(app, path, false).await;
+
+                    assert_eq!(
+                        status,
+                        StatusCode::OK,
+                        "fault={fault:?} path={path} round={round}"
+                    );
+                    assert!(
+                        body.contains("recovered-ok"),
+                        "fault={fault:?} path={path} round={round} body={body}"
+                    );
+                    assert!(
+                        !body.contains("private fault fixture detail"),
+                        "fault={fault:?} path={path} round={round}"
+                    );
+                    assert_eq!(
+                        upstream.hits(),
+                        2,
+                        "fault={fault:?} path={path} round={round}"
+                    );
+                    assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+                    let record = usage_record_for_request(&usage_recorder, &request_id);
+                    let trace = record
+                        .latency_trace
+                        .as_ref()
+                        .expect("non-stream status retry trace");
+                    assert_eq!(trace.stream_retry_attempts, Some(1));
+                    assert_eq!(trace.stream_retry_dispatch_failures, None);
+                    assert_eq!(
+                        trace.stream_retry_reasons.as_deref(),
+                        Some(&["status_error:sends=1".to_string()][..]),
+                        "fault={fault:?} path={path} round={round}"
+                    );
+                    assert_eq!(record.credential_attempts.len(), 2);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn handler_non_stream_status_retry_fails_closed_without_eligible_credential_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("non-stream-status-retry-single-credential", || async {
+        for fault in [
+            HandlerEventStreamFault::ExceptionEventBeforeOutput,
+            HandlerEventStreamFault::ErrorEventBeforeOutput,
+        ] {
+            for round in 1..=5 {
+                let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+                let (app, usage_recorder) =
+                    handler_eventstream_fault_router_with_credential_count(&upstream.base_url, 1);
+                let (status, request_id, body) =
+                    call_handler_eventstream_fault_on_path(app, "/v1/messages", false).await;
+
+                assert!(
+                    status.is_client_error() || status.is_server_error(),
+                    "fault={fault:?} round={round} status={status} body={body}"
+                );
+                assert!(body.contains(&request_id));
+                assert!(!body.contains("private fault fixture detail"));
+                assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
+                assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
+                let record = usage_record_for_request(&usage_recorder, &request_id);
+                let trace = record
+                    .latency_trace
+                    .as_ref()
+                    .expect("non-stream status retry failure trace");
+                assert_eq!(trace.stream_retry_attempts, None);
+                assert_eq!(trace.stream_retry_dispatch_failures, Some(1));
+                assert_eq!(
+                    trace.stream_retry_reasons.as_deref(),
+                    Some(&["status_error:dispatch_failed_without_send".to_string()][..]),
+                    "fault={fault:?} round={round}"
+                );
+                assert_eq!(record.credential_attempts.len(), 1);
+            }
+        }
+    });
 }
 
 async fn run_handler_binary_eventstream_with_json_content_type_matrix() {

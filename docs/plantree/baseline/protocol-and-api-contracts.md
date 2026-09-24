@@ -46,7 +46,7 @@ Evidence: `src/anthropic/router.rs:40-41`, `src/anthropic/handlers/request_entry
 | --- | --- | --- |
 | `/v1` | Default local/external route with the current high-cache policy | General Anthropic compatibility |
 | `/na/v1` | No-cache route policy | Does not apply local prompt-cache simulation |
-| `/cc/v1` | High-cache route with Claude Code-oriented compatibility | Stricter SSE ordering and terminal usage behavior |
+| `/cc/v1` | Built-in route commonly used by Claude Code clients; cache/reporting policy is endpoint-scoped | Same local processing, conversion, scheduling, retry, and error semantics as other local message routes |
 | `/ha/v1` | High-cache route | Has an independent path-level reported-usage policy |
 | `/dfcache/{route}/v1` | Named high-cache policy | `{route}` must be configured; an unknown route returns 404 |
 

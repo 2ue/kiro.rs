@@ -6087,13 +6087,14 @@ async fn external_pool_dispatch_uses_shared_request_deadline_before_pool_timeout
 }
 
 #[tokio::test]
-async fn external_pool_coordinator_failure_fails_closed_without_queue_admission() {
+async fn external_pool_coordinator_failure_fails_closed_in_fail_fast_mode_without_queue_admission()
+{
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
     let config = ExternalPoolsConfig {
         external_pools_enabled: true,
-        external_pool_capacity_mode: ExternalPoolCapacityMode::Wait,
+        external_pool_capacity_mode: ExternalPoolCapacityMode::FailFast,
         external_pool_max_queued_requests: 1,
         external_pool_dispatch_max_wait_secs: 0,
         ..ExternalPoolsConfig::default()
@@ -6142,6 +6143,101 @@ async fn external_pool_coordinator_failure_fails_closed_without_queue_admission(
             .unwrap(),
         0
     );
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn external_pool_coordinator_failure_wait_mode_retries_without_queue_admission() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_capacity_mode: ExternalPoolCapacityMode::Wait,
+        external_pool_max_queued_requests: 1,
+        external_pool_dispatch_max_wait_secs: 1,
+        ..ExternalPoolsConfig::default()
+    };
+    let route = test_route("claude-sonnet-4-5");
+    let mut queue_guard = None;
+    let mut wait_started_at = None;
+    let mut capacity_waiter = manager.capacity_signal.register();
+
+    let started = Instant::now();
+    let decision = manager
+        .handle_capacity_unavailable(
+            &route,
+            Vec::new(),
+            &config,
+            PoolCapacityWaitContext {
+                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                wait_for: Some(Duration::from_millis(1)),
+                cooldown_reason: None,
+                cooldown_scope: None,
+                cooldown_remaining_secs: None,
+                eligible_pools: 3,
+                available_pools: 0,
+                temporary_unavailable_pools: 3,
+                coordinator_unavailable_kind: Some(PoolCoordinatorUnavailableKind::RedisError),
+            },
+            &mut queue_guard,
+            &mut wait_started_at,
+            &mut capacity_waiter,
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(decision, ExternalCapacityDecision::Retry),
+        "coordinator failure in wait mode should retry selection"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "coordinator retry backoff should be short and bounded"
+    );
+    assert!(queue_guard.is_none());
+    assert_eq!(
+        manager
+            .redis
+            .external_pool_dispatch_queue_size()
+            .await
+            .unwrap(),
+        0
+    );
+
+    let mut expired_wait_started_at = Some(Instant::now() - Duration::from_secs(2));
+    let mut expired_waiter = manager.capacity_signal.register();
+    let expired = manager
+        .handle_capacity_unavailable(
+            &route,
+            Vec::new(),
+            &config,
+            PoolCapacityWaitContext {
+                reason: PoolCapacityWaitReason::CoordinatorUnavailable,
+                wait_for: None,
+                cooldown_reason: None,
+                cooldown_scope: None,
+                cooldown_remaining_secs: None,
+                eligible_pools: 3,
+                available_pools: 0,
+                temporary_unavailable_pools: 3,
+                coordinator_unavailable_kind: Some(PoolCoordinatorUnavailableKind::RedisError),
+            },
+            &mut queue_guard,
+            &mut expired_wait_started_at,
+            &mut expired_waiter,
+            None,
+        )
+        .await;
+    let ExternalCapacityDecision::FinalError(error) = expired else {
+        panic!("expired coordinator wait must fail closed");
+    };
+    assert_eq!(
+        error.route_error_type,
+        "external_pool_coordinator_unavailable"
+    );
+    assert!(error.retryable);
 
     postgres.drop_test_schema().await.unwrap();
 }

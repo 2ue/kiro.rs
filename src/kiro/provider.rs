@@ -805,6 +805,34 @@ impl KiroApiCompletion {
         self.in_flight_lease.lock().take();
     }
 
+    /// Upstream returned successful headers, but the complete EventStream body
+    /// contained a retryable Kiro status event before any downstream response
+    /// was committed.
+    pub fn report_upstream_body_status_failure(&self, reason: impl Into<String>) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.in_flight_lease.lock().take();
+        let reason = reason.into();
+        if let Err(err) = self.token_manager.report_transient_failure_kind(
+            self.credential_id,
+            self.model.as_deref(),
+            TransientFailureKind::Stream,
+            None,
+            format!("non_stream_status_error {}", reason),
+        ) {
+            tracing::warn!(
+                credential_id = self.credential_id,
+                "记录上游非流式状态事件失败冷却失败: {}",
+                err
+            );
+        }
+        if let Some(session_id) = self.session_id.as_deref() {
+            self.token_manager
+                .record_session_soft_failure_deferred(session_id, self.credential_id);
+        }
+    }
+
     pub fn credential_id(&self) -> u64 {
         self.credential_id
     }
