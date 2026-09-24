@@ -960,7 +960,7 @@ async fn test_external_pool_manager_for_handlers(
             pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
             preserve_path: true,
             normalize_model_version_dots: false,
-            model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+            model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
             supported_models: Vec::new(),

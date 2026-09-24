@@ -28,7 +28,8 @@ fn process_external_pool_model(
     let fallback_transform = (pool.normalize_model_version_dots
         && matches!(
             pool.model_mapping_mode,
-            ExternalPoolModelMappingMode::DirectMapping
+            ExternalPoolModelMappingMode::PassthroughMapping
+                | ExternalPoolModelMappingMode::DirectMapping
                 | ExternalPoolModelMappingMode::ProcessedMapping
         ))
     .then_some(normalize_outbound_model as fn(&str) -> String);

@@ -8318,6 +8318,19 @@ async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
 }
 
 #[test]
+fn test_local_pool_route_state_matches_dashed_request_to_dotted_supported_model() {
+    let mut pro = api_key_credential("ksk_model_dotted_supported");
+    pro.subscription_title = Some("Pro".to_string());
+    pro.supported_models = vec!["claude-opus-4.8".to_string()];
+    let manager = MultiTokenManager::new(Config::default(), vec![pro], None, None, false).unwrap();
+
+    let ready = manager.local_pool_route_state(Some("claude-opus-4-8"));
+    assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+    assert_eq!(ready.model_usable, 1);
+    assert_eq!(ready.dispatchable, 1);
+}
+
+#[test]
 fn test_local_pool_route_state_auto_heals_too_many_failures() {
     let manager = MultiTokenManager::new(
         Config::default(),

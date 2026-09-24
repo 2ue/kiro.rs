@@ -520,7 +520,7 @@ pub enum ExternalPoolModelMappingMode {
 
 impl Default for ExternalPoolModelMappingMode {
     fn default() -> Self {
-        Self::ProcessedMapping
+        Self::PassthroughMapping
     }
 }
 

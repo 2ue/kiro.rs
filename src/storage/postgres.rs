@@ -1041,6 +1041,12 @@ impl PostgresStore {
                     USAGE_CLEANUP_BATCH_SIZE_LIMIT_SQL,
                 )
                 .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "external-pool-default-model-mapping-passthrough-v1",
+                    EXTERNAL_POOL_DEFAULT_MODEL_MAPPING_PASSTHROUGH_SQL,
+                )
+                .await?;
 
                 sqlx::query(
                     r#"
@@ -11571,7 +11577,7 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     auto_disabled_last_error TEXT,
     preserve_path BOOLEAN NOT NULL DEFAULT true,
     normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false,
-    model_mapping_mode TEXT NOT NULL DEFAULT 'processed_mapping',
+    model_mapping_mode TEXT NOT NULL DEFAULT 'passthrough_mapping',
     model_mapping_require_match BOOLEAN NOT NULL DEFAULT false,
     model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
     supported_models JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -11656,7 +11662,7 @@ ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS model_mapping_mode TEXT NOT NULL DEFAULT 'processed_mapping';
+    ADD COLUMN IF NOT EXISTS model_mapping_mode TEXT NOT NULL DEFAULT 'passthrough_mapping';
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS model_mapping_require_match BOOLEAN NOT NULL DEFAULT false;
@@ -12276,6 +12282,21 @@ UPDATE usage_credential_cost_summary
 SET original_cost_usd = estimated_cost_usd
 WHERE original_cost_usd = 0
   AND estimated_cost_usd <> 0;
+"#;
+
+const EXTERNAL_POOL_DEFAULT_MODEL_MAPPING_PASSTHROUGH_SQL: &str = r#"
+ALTER TABLE external_upstream_pools
+    ALTER COLUMN model_mapping_mode SET DEFAULT 'passthrough_mapping';
+
+UPDATE external_upstream_pools
+SET model_mapping_mode = 'passthrough_mapping',
+    revision = revision + 1,
+    updated_at = now()
+WHERE deleted_at IS NULL
+  AND model_mapping_mode = 'processed_mapping'
+  AND normalize_model_version_dots = false
+  AND model_mapping_require_match = false
+  AND model_mapping_rules = '[]'::jsonb;
 "#;
 
 const CREDENTIAL_RUNTIME_REVISION_SQL: &str = r#"

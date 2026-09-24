@@ -561,11 +561,13 @@ struct ExternalMessagesFakeState {
     status: StatusCode,
     headers: HeaderMap,
     body: serde_json::Value,
+    request_bodies: Arc<SyncMutex<Vec<Bytes>>>,
 }
 
 struct ExternalMessagesFakeServer {
     base_url: String,
     hits: Arc<AtomicU64>,
+    request_bodies: Arc<SyncMutex<Vec<Bytes>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -581,20 +583,25 @@ impl ExternalMessagesFakeServer {
     ) -> Self {
         async fn messages(
             axum::extract::State(state): axum::extract::State<ExternalMessagesFakeState>,
+            body: Bytes,
         ) -> impl axum::response::IntoResponse {
             state.hits.fetch_add(1, Ordering::Relaxed);
+            state.request_bodies.lock().push(body);
             (state.status, state.headers.clone(), axum::Json(state.body))
         }
 
         let hits = Arc::new(AtomicU64::new(0));
+        let request_bodies = Arc::new(SyncMutex::new(Vec::new()));
         let state = ExternalMessagesFakeState {
             hits: hits.clone(),
             status,
             headers,
             body,
+            request_bodies: request_bodies.clone(),
         };
         let app = axum::Router::new()
             .route("/v1/messages", axum::routing::post(messages))
+            .route("/cc/v1/messages", axum::routing::post(messages))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -608,12 +615,17 @@ impl ExternalMessagesFakeServer {
         Self {
             base_url: format!("http://{address}"),
             hits,
+            request_bodies,
             task,
         }
     }
 
     fn snapshot(&self) -> u64 {
         self.hits.load(Ordering::Acquire)
+    }
+
+    fn request_bodies(&self) -> Vec<Bytes> {
+        self.request_bodies.lock().clone()
     }
 }
 
@@ -2227,7 +2239,7 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExtern
         pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
         preserve_path: true,
         normalize_model_version_dots: false,
-        model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+        model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
         supported_models: Vec::new(),
@@ -2278,7 +2290,7 @@ async fn restore_dispatch_pool_configuration(
             request_body_mode = 'normalized',
             raw_model_mode = 'none',
             auto_disable_policy = 'inherit',
-            model_mapping_mode = 'processed_mapping',
+            model_mapping_mode = 'passthrough_mapping',
             model_mapping_require_match = false,
             model_mapping_rules = '[]'::jsonb,
             supported_models = $4,
@@ -11640,7 +11652,7 @@ fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
         auto_disabled_last_error: None,
         preserve_path,
         normalize_model_version_dots: false,
-        model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+        model_mapping_mode: ExternalPoolModelMappingMode::PassthroughMapping,
         model_mapping_require_match: false,
         model_mapping_rules: Vec::new(),
         supported_models: Vec::new(),
@@ -11780,6 +11792,32 @@ fn supported_model_filter_bridges_dotted_dashed_and_dated_claude_forms() {
 }
 
 #[test]
+fn supported_model_filter_prefers_caller_model_but_keeps_dotted_compatibility() {
+    let mut pool = test_pool("https://example.com/v1", true);
+    let mut route = test_route("claude-opus-4-8");
+    route.upstream_model = Some("claude-opus-4.8".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+
+    pool.supported_models = vec!["claude-opus-4-8".to_string()];
+    assert!(external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+
+    pool.supported_models = vec!["claude-opus-4.8".to_string()];
+    assert!(
+        external_pool_matches_supported_models(&pool, Some(&route.model_candidates_for_support())),
+        "dotted allowlists remain compatibility-only filters"
+    );
+
+    pool.supported_models = vec!["claude-haiku-4-5".to_string()];
+    assert!(!external_pool_matches_supported_models(
+        &pool,
+        Some(&route.model_candidates_for_support())
+    ));
+}
+
+#[test]
 fn supported_model_filter_preserves_thinking_and_one_m_suffixes() {
     let mut pool = test_pool("https://example.com/v1", true);
     let route = test_route("sonnet-thinking[1m]");
@@ -11884,6 +11922,45 @@ async fn external_pool_max_input_tokens_does_not_short_circuit_dispatch() {
     };
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(fake.snapshot().3, hits_before + 1);
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_dispatch_preserves_caller_model_when_upstream_model_is_kiro_dot() {
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let fake =
+        ExternalMessagesFakeServer::start(StatusCode::OK, fake_external_success_body("model-ok"))
+            .await;
+    let mut pool_request = create_pool_request("external-model-body-preserve", 1, true);
+    pool_request.base_url = fake.base_url.clone();
+    pool_request.supported_models = vec!["claude-opus-4-8".to_string()];
+    postgres.create_external_pool(pool_request).await.unwrap();
+    let config = ExternalPoolsConfig {
+        external_pools_enabled: true,
+        external_pool_global_max_concurrent_requests: 4,
+        external_pool_retry_max_attempts: 0,
+        ..ExternalPoolsConfig::default()
+    };
+    let mut route = test_route("claude-opus-4-8");
+    route.upstream_model = Some("claude-opus-4.8".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+
+    let response = match manager.forward_with_failover_result(config, route).await {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("external pool dispatch should succeed: {}", error.message)
+        }
+    };
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = fake.request_bodies();
+    assert_eq!(bodies.len(), 1);
+    let value: serde_json::Value =
+        serde_json::from_slice(&bodies[0]).expect("external pool request body is json");
+    assert_eq!(value["model"], "claude-opus-4-8");
+
     postgres.drop_test_schema().await.unwrap();
 }
 
@@ -12611,7 +12688,8 @@ fn external_pool_outbound_body_applies_resolved_upstream_model() {
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
 
-    let pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
     let outbound = test_external_pool_outbound_body(&route, &pool);
     let prepared = external_pool_prepare_request(&route, &pool).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
@@ -12644,7 +12722,8 @@ fn external_pool_outbound_body_uses_normalized_payload_not_stale_raw_body() {
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"/9j/stale"}}]}],"stream":true}"#,
         );
 
-    let pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
     let outbound = test_external_pool_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -12675,7 +12754,8 @@ fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization(
             br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
         );
 
-    let pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
     let outbound = test_external_pool_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -12689,7 +12769,8 @@ fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization(
 fn external_pool_outbound_body_normalizes_payload_claude_model_without_mapping() {
     let route = test_route("claude-haiku-4.5");
 
-    let pool = test_pool_with_model_dot_normalization();
+    let mut pool = test_pool_with_model_dot_normalization();
+    pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
     let outbound = test_external_pool_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -12705,6 +12786,49 @@ fn external_pool_outbound_body_preserves_dot_model_when_pool_normalization_disab
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
 
     assert_eq!(value["model"], "claude-haiku-4.5");
+}
+
+#[test]
+fn external_pool_passthrough_mapping_normalizes_dot_model_on_miss_when_enabled() {
+    let route = test_route("claude-haiku-4.5");
+    let pool = test_pool_with_model_dot_normalization();
+
+    assert_eq!(
+        pool.model_mapping_mode,
+        ExternalPoolModelMappingMode::PassthroughMapping
+    );
+
+    let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-haiku-4-5");
+    assert_eq!(prepared.outbound_model.as_deref(), Some("claude-haiku-4-5"));
+}
+
+#[test]
+fn external_pool_default_model_mapping_preserves_caller_claude_code_model() {
+    let mut route = test_route("claude-opus-4-8");
+    route.upstream_model = Some("claude-opus-4.8".to_string());
+    route.model_resolution_source = Some("alias".to_string());
+    route.raw_body = Bytes::from_static(
+        br#"{"model":"claude-opus-4-8","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    );
+    route.effective_raw_body = route.raw_body.clone();
+
+    let pool = test_pool("https://example.com/v1", true);
+    assert_eq!(
+        pool.model_mapping_mode,
+        ExternalPoolModelMappingMode::PassthroughMapping
+    );
+
+    let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&prepared.body).expect("parse outbound body");
+
+    assert_eq!(value["model"], "claude-opus-4-8");
+    assert_eq!(prepared.outbound_model.as_deref(), Some("claude-opus-4-8"));
+    assert_eq!(route.upstream_model.as_deref(), Some("claude-opus-4.8"));
 }
 
 #[test]

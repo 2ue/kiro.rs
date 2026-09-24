@@ -67,15 +67,7 @@ pub fn process_model(
                     processed_model(input).map(|model| (model, ModelProcessingSource::Processed))
                 })
                 .ok_or(ModelProcessingError::MissingModel)?;
-            mapped_or_fallback(
-                model,
-                source,
-                ModelProcessingConfig {
-                    fallback_transform: None,
-                    ..config
-                },
-                model,
-            )
+            mapped_or_fallback(model, source, config, model)
         }
         ModelProcessingMode::MappingThenProcessed => {
             let original = original_model(input).ok_or(ModelProcessingError::MissingModel)?;
@@ -199,7 +191,37 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_mapping_maps_hit_and_preserves_original_on_miss() {
+    fn passthrough_mapping_maps_hit_and_preserves_original_on_miss_without_transform() {
+        let rules = [rule("claude-opus-4.8", "external-opus")];
+        let hit = process_model(
+            input("claude-opus-4.8", "claude-opus-4.7"),
+            ModelProcessingConfig {
+                mode: ModelProcessingMode::PassthroughMapping,
+                rules: &rules,
+                require_mapping_match: false,
+                fallback_transform: None,
+            },
+        )
+        .unwrap();
+        let miss = process_model(
+            input("claude-sonnet-4.8", "claude-sonnet-4.7"),
+            ModelProcessingConfig {
+                mode: ModelProcessingMode::PassthroughMapping,
+                rules: &rules,
+                require_mapping_match: false,
+                fallback_transform: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(hit.model, "external-opus");
+        assert!(hit.mapping_applied);
+        assert_eq!(miss.model, "claude-sonnet-4.8");
+        assert_eq!(miss.source, ModelProcessingSource::Original);
+    }
+
+    #[test]
+    fn passthrough_mapping_maps_hit_and_transforms_original_on_miss_when_configured() {
         let rules = [rule("claude-opus-4.8", "external-opus")];
         let hit = process_model(
             input("claude-opus-4.8", "claude-opus-4.7"),
@@ -224,7 +246,7 @@ mod tests {
 
         assert_eq!(hit.model, "external-opus");
         assert!(hit.mapping_applied);
-        assert_eq!(miss.model, "claude-sonnet-4.8");
+        assert_eq!(miss.model, "claude-sonnet-4-8");
         assert_eq!(miss.source, ModelProcessingSource::Original);
     }
 

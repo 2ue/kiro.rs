@@ -32,9 +32,9 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import {
-  buildClaudeCodeTestModelOptions,
-  defaultClaudeCodeTestModelForOptions,
-  DEFAULT_CLAUDE_CODE_TEST_MODEL,
+  buildExternalPoolTestModelOptions,
+  defaultExternalPoolTestModelForOptions,
+  DEFAULT_EXTERNAL_POOL_TEST_MODEL,
   DEFAULT_TEST_PROMPT,
 } from '@/lib/test-models'
 import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolQualityView, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
@@ -48,7 +48,7 @@ const normalizeExternalPoolRouteMode = (value?: string): ExternalPoolsConfig['ex
   if (value === 'allow_list' || value === 'deny_list') return value
   return 'allow_all'
 }
-const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
+const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'passthrough_mapping'
 const parseHeaderOverridesText = (value: string): Record<string, string> => {
   const headers: Record<string, string> = {}
   for (const rawLine of value.split('\n')) {
@@ -145,31 +145,31 @@ type ExternalPoolModelMappingPreset = {
 const DIRECT_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
   { label: 'Sonnet 4 完整ID→4', source: 'claude-sonnet-4-20250514', target: 'claude-sonnet-4', tone: 'blue' },
   { label: 'Sonnet 4透传', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
-  { label: 'Sonnet 4.5 完整ID→4.5', source: 'claude-sonnet-4-5-20250929', target: 'claude-sonnet-4.5', tone: 'blue' },
-  { label: 'Sonnet 4.5→4.5', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4.5', tone: 'blue' },
-  { label: 'Sonnet 4.5 点号', source: 'claude-sonnet-4.5', target: 'claude-sonnet-4.5', tone: 'blue' },
-  { label: 'Sonnet 4.6→4.6', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4.6', tone: 'cyan' },
-  { label: 'Sonnet 4.6 点号', source: 'claude-sonnet-4.6', target: 'claude-sonnet-4.6', tone: 'cyan' },
-  { label: 'Sonnet 4.7→4.7', source: 'claude-sonnet-4-7', target: 'claude-sonnet-4.7', tone: 'cyan' },
-  { label: 'Sonnet 4.7 点号', source: 'claude-sonnet-4.7', target: 'claude-sonnet-4.7', tone: 'cyan' },
-  { label: 'Sonnet 4.8→4.8', source: 'claude-sonnet-4-8', target: 'claude-sonnet-4.8', tone: 'cyan' },
-  { label: 'Sonnet 4.8 点号', source: 'claude-sonnet-4.8', target: 'claude-sonnet-4.8', tone: 'cyan' },
-  { label: 'Opus 4.5 完整ID→4.5', source: 'claude-opus-4-5-20251101', target: 'claude-opus-4.5', tone: 'purple' },
-  { label: 'Opus 4.5→4.5', source: 'claude-opus-4-5', target: 'claude-opus-4.5', tone: 'purple' },
-  { label: 'Opus 4.5 点号', source: 'claude-opus-4.5', target: 'claude-opus-4.5', tone: 'purple' },
-  { label: 'Opus 4-5 thinking→4.5', source: 'claude-opus-4-5-thinking', target: 'claude-opus-4.5-thinking', tone: 'purple' },
-  { label: 'Opus 4.6→4.6', source: 'claude-opus-4-6', target: 'claude-opus-4.6', tone: 'purple' },
-  { label: 'Opus 4.6 thinking', source: 'claude-opus-4-6-thinking', target: 'claude-opus-4.6-thinking', tone: 'purple' },
-  { label: 'Opus 4.7→4.7', source: 'claude-opus-4-7', target: 'claude-opus-4.7', tone: 'purple' },
-  { label: 'Opus 4.7 点号', source: 'claude-opus-4.7', target: 'claude-opus-4.7', tone: 'purple' },
-  { label: 'Opus 4.8→4.8', source: 'claude-opus-4-8', target: 'claude-opus-4.8', tone: 'purple' },
-  { label: 'Opus 4.8 点号', source: 'claude-opus-4.8', target: 'claude-opus-4.8', tone: 'purple' },
-  { label: 'Opus 4.8 thinking', source: 'claude-opus-4-8-thinking', target: 'claude-opus-4.8-thinking', tone: 'purple' },
-  { label: 'Haiku 4.5 完整ID→4.5', source: 'claude-haiku-4-5-20251001', target: 'claude-haiku-4.5', tone: 'emerald' },
-  { label: 'Haiku 4.5→4.5', source: 'claude-haiku-4-5', target: 'claude-haiku-4.5', tone: 'emerald' },
-  { label: 'Haiku 4.5 点号', source: 'claude-haiku-4.5', target: 'claude-haiku-4.5', tone: 'emerald' },
-  { label: '3.5 Sonnet 完整ID', source: 'claude-3-5-sonnet-20241022', target: 'claude-3.5-sonnet', tone: 'amber' },
-  { label: '3.5 Haiku 完整ID', source: 'claude-3-5-haiku-20241022', target: 'claude-3.5-haiku', tone: 'emerald' },
+  { label: 'Sonnet 4.5 完整ID→4-5', source: 'claude-sonnet-4-5-20250929', target: 'claude-sonnet-4-5', tone: 'blue' },
+  { label: 'Sonnet 4-5透传', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4-5', tone: 'blue' },
+  { label: 'Sonnet 4.5 点号→4-5', source: 'claude-sonnet-4.5', target: 'claude-sonnet-4-5', tone: 'blue' },
+  { label: 'Sonnet 4-6透传', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4-6', tone: 'cyan' },
+  { label: 'Sonnet 4.6 点号→4-6', source: 'claude-sonnet-4.6', target: 'claude-sonnet-4-6', tone: 'cyan' },
+  { label: 'Sonnet 4-7透传', source: 'claude-sonnet-4-7', target: 'claude-sonnet-4-7', tone: 'cyan' },
+  { label: 'Sonnet 4.7 点号→4-7', source: 'claude-sonnet-4.7', target: 'claude-sonnet-4-7', tone: 'cyan' },
+  { label: 'Sonnet 4-8透传', source: 'claude-sonnet-4-8', target: 'claude-sonnet-4-8', tone: 'cyan' },
+  { label: 'Sonnet 4.8 点号→4-8', source: 'claude-sonnet-4.8', target: 'claude-sonnet-4-8', tone: 'cyan' },
+  { label: 'Opus 4.5 完整ID→4-5', source: 'claude-opus-4-5-20251101', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4-5透传', source: 'claude-opus-4-5', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4.5 点号→4-5', source: 'claude-opus-4.5', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4-5 thinking透传', source: 'claude-opus-4-5-thinking', target: 'claude-opus-4-5-thinking', tone: 'purple' },
+  { label: 'Opus 4-6透传', source: 'claude-opus-4-6', target: 'claude-opus-4-6', tone: 'purple' },
+  { label: 'Opus 4-6 thinking透传', source: 'claude-opus-4-6-thinking', target: 'claude-opus-4-6-thinking', tone: 'purple' },
+  { label: 'Opus 4-7透传', source: 'claude-opus-4-7', target: 'claude-opus-4-7', tone: 'purple' },
+  { label: 'Opus 4.7 点号→4-7', source: 'claude-opus-4.7', target: 'claude-opus-4-7', tone: 'purple' },
+  { label: 'Opus 4-8透传', source: 'claude-opus-4-8', target: 'claude-opus-4-8', tone: 'purple' },
+  { label: 'Opus 4.8 点号→4-8', source: 'claude-opus-4.8', target: 'claude-opus-4-8', tone: 'purple' },
+  { label: 'Opus 4-8 thinking透传', source: 'claude-opus-4-8-thinking', target: 'claude-opus-4-8-thinking', tone: 'purple' },
+  { label: 'Haiku 4.5 完整ID→4-5', source: 'claude-haiku-4-5-20251001', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: 'Haiku 4-5透传', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: 'Haiku 4.5 点号→4-5', source: 'claude-haiku-4.5', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: '3.5 Sonnet 完整ID→3-5', source: 'claude-3-5-sonnet-20241022', target: 'claude-3-5-sonnet', tone: 'amber' },
+  { label: '3.5 Haiku 完整ID→3-5', source: 'claude-3-5-haiku-20241022', target: 'claude-3-5-haiku', tone: 'emerald' },
 ]
 
 const PROCESSED_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
@@ -200,6 +200,13 @@ const modelMappingPresetsForMode = (mode: ExternalPoolFormDraft['modelMappingMod
   if (mode === 'direct_mapping') return DIRECT_MODEL_MAPPING_PRESETS
   if (mode === 'processed_mapping') return PROCESSED_MODEL_MAPPING_PRESETS
   return []
+}
+
+const modelMappingRulesDescription = (mode: ExternalPoolFormDraft['modelMappingMode']) => {
+  if (mode === 'processed_mapping') {
+    return '每行一条：Kiro 点号模型 -> 外部池 Claude Code 模型，例如 claude-sonnet-4.5 -> claude-sonnet-4-5'
+  }
+  return '每行一条：下游原始模型 -> 外部池模型，例如 claude-sonnet-4-5-20250929 -> claude-sonnet-4-5'
 }
 
 const appendModelMappingPreset = (currentText: string, preset: ExternalPoolModelMappingPreset) => {
@@ -1116,7 +1123,7 @@ function ExternalPoolFormDialog({
               <SupportedModelTagsEditor
                 value={parseSupportedModelItems(draft.supportedModelsText)}
                 disabled={saving || syncingModels}
-                placeholder="sonnet sonnet-4.5 haiku-4.5"
+                placeholder="claude-sonnet-4-5 claude-opus-4-8 claude-haiku-4-5"
                 onChange={(supportedModels) => onDraftChange((prev) => ({ ...prev, supportedModelsText: supportedModels.join('\n') }))}
               />
               <div className="flex flex-wrap items-center gap-2">
@@ -1125,7 +1132,7 @@ function ExternalPoolFormDialog({
                   发现模型
                 </Button>
                 <div className="text-xs text-muted-foreground">
-                  空列表表示不限制；请填写 Claude Code 模型命令（如 sonnet-4.5、haiku）；非空时，请求模型必须命中这里的列表才会调度到该外部池。
+                  空列表表示不限制；请填写外部池可承接的 Claude Code 完整模型 ID（如 claude-sonnet-4-5、claude-opus-4-8）；非空时，请求模型必须命中这里的列表才会调度到该外部池。
                 </div>
               </div>
             </div>
@@ -1203,7 +1210,7 @@ function ExternalPoolFormDialog({
                 <div className="space-y-3">
                   <TextArea
                     label="映射规则"
-                    description="每行一条：claude-sonnet-4-5-20250929 -> claude-sonnet-4.5"
+                    description={modelMappingRulesDescription(draft.modelMappingMode)}
                     value={draft.modelMappingRulesText}
                     disabled={saving}
                     action={<Button type="button" variant="outline" size="sm" onClick={addAllMappingPresets} disabled={saving || mappingPresets.length === 0}>全部添加</Button>}
@@ -1266,17 +1273,17 @@ function ExternalPoolTestDialog({
   onDone: () => void
 }) {
   const modelCapabilities = useModelCapabilities()
-  const [model, setModel] = useState(DEFAULT_CLAUDE_CODE_TEST_MODEL)
+  const [model, setModel] = useState(DEFAULT_EXTERNAL_POOL_TEST_MODEL)
   const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
   const [result, setResult] = useState<ExternalPoolTestResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
 
   const modelOptions = useMemo(
-    () => buildClaudeCodeTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels),
+    () => buildExternalPoolTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels),
     [modelCapabilities.data?.models, pool?.supportedModels]
   )
-  const defaultModel = defaultClaudeCodeTestModelForOptions(modelOptions)
+  const defaultModel = defaultExternalPoolTestModelForOptions(modelOptions)
   const selectedModelLabel = useMemo(
     () => modelOptions.find((option) => option.id === model)?.label || model,
     [model, modelOptions]
@@ -1621,11 +1628,12 @@ function modelMappingPresetClass(tone: ExternalPoolModelMappingPreset['tone']) {
 }
 
 function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefined, normalizeFallback: boolean) {
-  const processedFallback = normalizeFallback ? '未命中后使用内部处理模型，并把数字点号转横杠。' : '未命中后使用内部处理模型。'
+  const passthroughFallback = normalizeFallback ? '未命中时把下游请求模型中的 Claude 数字点号转横杠后发送。' : '未命中时仍原样透传请求模型。'
+  const processedFallback = normalizeFallback ? '未命中后使用本系统解析出的 Kiro 点号模型，并把 Claude 数字点号转横杠后发往外部池。' : '未命中后使用本系统解析出的 Kiro 点号模型。'
   if (mode === 'passthrough') return '直接发送下游请求里的原始模型，不应用映射规则和兜底转换。'
-  if (mode === 'passthrough_mapping') return '用下游原始请求模型匹配规则；未命中时仍原样透传请求模型。'
+  if (mode === 'passthrough_mapping') return `用下游原始请求模型匹配规则；${passthroughFallback}`
   if (mode === 'direct_mapping') return `用下游原始请求模型匹配规则；${processedFallback}`
-  return `先使用本系统解析后的模型匹配规则；${processedFallback}`
+  return `先使用本系统解析后的 Kiro 点号模型匹配规则；${processedFallback}`
 }
 
 function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined) {
