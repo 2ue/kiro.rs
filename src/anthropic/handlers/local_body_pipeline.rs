@@ -91,8 +91,7 @@ fn payload_guard_error_kind(error: &PayloadGuardError) -> &'static str {
 fn bounded_diagnostic_text(value: String) -> String {
     const MAX_DIAGNOSTIC_CHARS: usize = 256;
     let mut sanitized = String::with_capacity(value.len().min(MAX_DIAGNOSTIC_CHARS));
-    let mut chars = 0usize;
-    for ch in value.chars() {
+    for (chars, ch) in value.chars().enumerate() {
         if chars >= MAX_DIAGNOSTIC_CHARS {
             sanitized.push_str("...");
             return sanitized;
@@ -102,7 +101,6 @@ fn bounded_diagnostic_text(value: String) -> String {
         } else {
             sanitized.push(ch);
         }
-        chars += 1;
     }
     sanitized
 }
