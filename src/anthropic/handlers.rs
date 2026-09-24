@@ -5861,6 +5861,16 @@ fn record_pre_usage_rejection(
     endpoint: &str,
     response: &Response,
 ) {
+    record_pre_usage_rejection_with_metadata(attribution, reason, endpoint, response, None);
+}
+
+fn record_pre_usage_rejection_with_metadata(
+    attribution: Option<&RequestRejectionAttribution>,
+    reason: RequestRejectionReason,
+    endpoint: &str,
+    response: &Response,
+    extra_metadata: Option<Value>,
+) {
     let Some(attribution) = attribution else {
         return;
     };
@@ -5871,12 +5881,13 @@ fn record_pre_usage_rejection(
     else {
         return;
     };
-    attribution.record(
+    attribution.record_with_metadata(
         reason,
         "handler_preflight",
         response.status(),
         request_id,
         endpoint,
+        extra_metadata,
     );
 }
 
@@ -6411,14 +6422,15 @@ async fn post_messages_inner(
         native_reasoning_capability,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => {
-            record_pre_usage_rejection(
+        Err(error) => {
+            record_pre_usage_rejection_with_metadata(
                 attribution.as_ref(),
                 RequestRejectionReason::LocalBodyPrepare,
                 &endpoint,
-                &response,
+                &error.response,
+                Some(error.error_metadata.clone()),
             );
-            return response;
+            return error.response;
         }
     };
     let local_body_pipeline::PreparedLocalKiroBody {
@@ -9088,6 +9100,37 @@ fn create_sse_stream(
                                     prepend_initial_bytes_if_needed(&mut state, bytes, true);
                                 state.finished = true;
                                 return Some((stream::iter(bytes), state));
+                            }
+
+                            // Kiro may report an upstream Error/Exception as a valid
+                            // EventStream frame and then close the stream. That path does
+                            // not produce a decoder/read/protocol error, so handle it here
+                            // while replay is still safe (nothing reached the downstream).
+                            if !state.downstream_committed {
+                                if let Some((error_type, detail)) =
+                                    state.ctx.stream_error_detail()
+                                {
+                                    if error_type != "invalid_request_error" {
+                                        let retry_detail =
+                                            format!("{}: {}", error_type, detail);
+                                        match retry_stream_before_downstream_commit(
+                                            state,
+                                            StreamRetryReason::StatusError,
+                                            retry_detail,
+                                        )
+                                        .await
+                                        {
+                                            StreamRetryOutcome::Retried(state) => {
+                                                let bytes: Vec<Result<Bytes, Infallible>> =
+                                                    Vec::new();
+                                                return Some((stream::iter(bytes), state));
+                                            }
+                                            StreamRetryOutcome::NotRetried(next_state) => {
+                                                state = next_state;
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             let had_stream_error_before_finalization = state.ctx.has_stream_error();

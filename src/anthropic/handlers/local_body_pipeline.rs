@@ -20,6 +20,93 @@ pub(super) struct PreparedLocalKiroBody {
     pub(super) cache_point_retry: Option<CachePointRetryRequest>,
 }
 
+pub(super) struct LocalBodyPrepareError {
+    pub(super) response: Response,
+    pub(super) error_metadata: serde_json::Value,
+}
+
+impl LocalBodyPrepareError {
+    fn conversion(error: &ConversionError) -> Self {
+        Self {
+            response: conversion_error_response(error),
+            error_metadata: serde_json::json!({
+                "localBodyPrepareKind": "conversion_error",
+                "localBodyPrepareCategory": conversion_error_category(error),
+                "localBodyPrepareDiagnostic": bounded_diagnostic_text(conversion_error_public_message(error)),
+            }),
+        }
+    }
+
+    fn payload_guard(error: PayloadGuardError) -> Self {
+        let kind = payload_guard_error_kind(&error);
+        Self {
+            response: payload_guard_error_response(error),
+            error_metadata: serde_json::json!({
+                "localBodyPrepareKind": "payload_guard_error",
+                "localBodyPrepareCategory": kind,
+                "localBodyPrepareDiagnostic": kind,
+            }),
+        }
+    }
+}
+
+fn conversion_error_category(error: &ConversionError) -> &'static str {
+    match error {
+        ConversionError::UnsupportedModel(_) => "unsupported_model",
+        ConversionError::EmptyMessages => "empty_messages",
+        ConversionError::UnsupportedContent(message) => {
+            if message.starts_with("unsupported image media_type:") {
+                "unsupported_image_media_type"
+            } else if message.starts_with("invalid image data for media_type:") {
+                "invalid_image_data"
+            } else if message.starts_with("Image data cannot be empty.") {
+                "empty_image_data"
+            } else if message.contains("image") {
+                "image_content"
+            } else {
+                "unsupported_content"
+            }
+        }
+    }
+}
+
+fn conversion_error_public_message(error: &ConversionError) -> String {
+    match error {
+        ConversionError::UnsupportedModel(model) => {
+            format!("The requested model is not available: {}", model)
+        }
+        ConversionError::EmptyMessages => "messages: at least one message is required".to_string(),
+        ConversionError::UnsupportedContent(message) => message.clone(),
+    }
+}
+
+fn payload_guard_error_kind(error: &PayloadGuardError) -> &'static str {
+    match error {
+        PayloadGuardError::Serialize(_) => "serialize",
+        PayloadGuardError::OversizedImage { .. } => "oversized_image",
+        PayloadGuardError::ToolPairingInvariant { .. } => "tool_pairing_invariant",
+    }
+}
+
+fn bounded_diagnostic_text(value: String) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 256;
+    let mut sanitized = String::with_capacity(value.len().min(MAX_DIAGNOSTIC_CHARS));
+    let mut chars = 0usize;
+    for ch in value.chars() {
+        if chars >= MAX_DIAGNOSTIC_CHARS {
+            sanitized.push_str("...");
+            return sanitized;
+        }
+        if ch.is_control() {
+            sanitized.push(' ');
+        } else {
+            sanitized.push(ch);
+        }
+        chars += 1;
+    }
+    sanitized
+}
+
 pub(super) fn prepare(
     endpoint: &str,
     payload: &MessagesRequest,
@@ -27,7 +114,7 @@ pub(super) fn prepare(
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
     native_reasoning_capability: KiroReasoningCapabilityState,
-) -> Result<PreparedLocalKiroBody, Response> {
+) -> Result<PreparedLocalKiroBody, LocalBodyPrepareError> {
     let plan = LocalKiroBodyPlan::compatible_with_config(
         runtime_config.initial_payload_guard_config(),
         runtime_config.body_conversion.clone(),
@@ -51,7 +138,7 @@ pub(super) fn prepare_with_plan(
     model_resolution: &ModelResolution,
     native_reasoning_capability: KiroReasoningCapabilityState,
     plan: LocalKiroBodyPlan,
-) -> Result<PreparedLocalKiroBody, Response> {
+) -> Result<PreparedLocalKiroBody, LocalBodyPrepareError> {
     debug_assert_eq!(plan.profile.as_str(), "local_credential");
     debug_assert_eq!(plan.conversion, BodyStageState::Enabled);
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
@@ -76,7 +163,7 @@ pub(super) fn prepare_with_plan(
     ) {
         Ok(result) => result,
         Err(e) => {
-            return Err(conversion_error_response(&e));
+            return Err(LocalBodyPrepareError::conversion(&e));
         }
     };
 
@@ -107,7 +194,7 @@ pub(super) fn prepare_with_plan(
     let prepared_payload =
         match prepare_kiro_request_body(&mut kiro_request, plan.payload_guard.config) {
             Ok(result) => result,
-            Err(err) => return Err(payload_guard_error_response(err)),
+            Err(err) => return Err(LocalBodyPrepareError::payload_guard(err)),
         };
     let request_body = prepared_payload.body;
     let payload_guard_report = prepared_payload.report;

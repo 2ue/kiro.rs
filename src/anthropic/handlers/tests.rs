@@ -47,6 +47,39 @@ use std::sync::{Mutex as StdMutex, atomic::AtomicUsize};
 use tower::ServiceExt;
 
 fn eventstream_test_frame(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
+    let payload = serde_json::to_vec(&payload).expect("test event payload serializes");
+    eventstream_test_raw_frame(
+        "event",
+        &[
+            (":event-type", event_type),
+            (":content-type", "application/json"),
+        ],
+        &payload,
+    )
+}
+
+fn eventstream_test_control_frame(
+    message_type: &str,
+    header_name: &str,
+    header_value: &str,
+    payload: serde_json::Value,
+) -> Vec<u8> {
+    let payload = serde_json::to_vec(&payload).expect("test control payload serializes");
+    eventstream_test_raw_frame(
+        message_type,
+        &[
+            (header_name, header_value),
+            (":content-type", "application/json"),
+        ],
+        &payload,
+    )
+}
+
+fn eventstream_test_raw_frame(
+    message_type: &str,
+    additional_headers: &[(&str, &str)],
+    payload: &[u8],
+) -> Vec<u8> {
     fn push_string_header(headers: &mut Vec<u8>, name: &str, value: &str) {
         headers.push(name.len() as u8);
         headers.extend_from_slice(name.as_bytes());
@@ -56,10 +89,10 @@ fn eventstream_test_frame(event_type: &str, payload: serde_json::Value) -> Vec<u
     }
 
     let mut headers = Vec::new();
-    push_string_header(&mut headers, ":message-type", "event");
-    push_string_header(&mut headers, ":event-type", event_type);
-    push_string_header(&mut headers, ":content-type", "application/json");
-    let payload = serde_json::to_vec(&payload).expect("test event payload serializes");
+    push_string_header(&mut headers, ":message-type", message_type);
+    for (name, value) in additional_headers {
+        push_string_header(&mut headers, name, value);
+    }
     let total_length = 12 + headers.len() + payload.len() + 4;
 
     let mut frame = Vec::with_capacity(total_length);
@@ -68,7 +101,7 @@ fn eventstream_test_frame(event_type: &str, payload: serde_json::Value) -> Vec<u
     let prelude_crc = crate::kiro::parser::crc::crc32(&frame[..8]);
     frame.extend_from_slice(&prelude_crc.to_be_bytes());
     frame.extend_from_slice(&headers);
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(payload);
     let message_crc = crate::kiro::parser::crc::crc32(&frame);
     frame.extend_from_slice(&message_crc.to_be_bytes());
     frame
@@ -840,6 +873,86 @@ async fn run_local_non_stream_success_commits_shared_attempt_budget_before_usage
 fn local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread("local-non-stream-matrix", || async {
         run_local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_local_body_prepare_unsupported_image_media_type_records_diagnostic_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let (app, usage_recorder) = multimodal_handler_test_router_with_usage(&upstream.base_url);
+
+    for round in 1..=5 {
+        let html_payload = BASE64_STANDARD.encode(format!("<html>not-an-image-{round}</html>"));
+        let response = app
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/dfcache/demo/v1/messages",
+                json!({
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 32,
+                    "stream": false,
+                    "messages": [{
+                        "role": "user",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "text/html",
+                                "data": html_payload
+                            }
+                        }]
+                    }]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("local body prepare rejection response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "round {round}");
+        let request_id = response_request_id(&response);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("local body prepare error body");
+        let value: Value = serde_json::from_slice(&body).expect("error JSON");
+        assert_eq!(
+            value["error"]["message"],
+            "unsupported image media_type: text/html"
+        );
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Error);
+        assert_eq!(record.error_source.as_deref(), Some("request_rejection"));
+        assert_eq!(record.error_status_code, Some(400));
+        let metadata = record.error_metadata.as_ref().expect("error metadata");
+        assert_eq!(metadata["stage"], "handler_preflight");
+        assert_eq!(metadata["reason"], "local_body_prepare");
+        assert_eq!(metadata["localBodyPrepareKind"], "conversion_error");
+        assert_eq!(
+            metadata["localBodyPrepareCategory"],
+            "unsupported_image_media_type"
+        );
+        assert_eq!(
+            metadata["localBodyPrepareDiagnostic"],
+            "unsupported image media_type: text/html"
+        );
+        let serialized_record = serde_json::to_string(&record).expect("serialize usage record");
+        assert!(
+            !serialized_record.contains("not-an-image"),
+            "usage diagnostics must not retain raw base64 payload content"
+        );
+    }
+
+    assert_eq!(
+        upstream.hits(),
+        0,
+        "local body prepare rejection must not call Kiro upstream"
+    );
+}
+
+#[test]
+fn local_body_prepare_unsupported_image_media_type_records_diagnostic_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("local-body-prepare-image-diagnostic", || async {
+        run_local_body_prepare_unsupported_image_media_type_records_diagnostic_for_five_rounds()
             .await;
     });
 }
@@ -2970,6 +3083,8 @@ fn local_stream_protocol_contamination_retry_uses_status_policy_and_explicit_ter
 #[derive(Debug, Clone, Copy)]
 enum HandlerEventStreamFault {
     JsonExceptionBeforeOutput,
+    ExceptionEventBeforeOutput,
+    ErrorEventBeforeOutput,
     BinaryEventStreamWithJsonContentType,
     JsonBodyWithEventStreamContentType,
     SignatureInvalidThenJsonLabeledEventStreamSuccess,
@@ -3172,6 +3287,22 @@ async fn handler_eventstream_fault_upstream(
             })),
         )
             .into_response(),
+        HandlerEventStreamFault::ExceptionEventBeforeOutput => {
+            handler_eventstream_bytes_response(eventstream_test_control_frame(
+                "exception",
+                ":exception-type",
+                "InternalServerException",
+                json!({"message": state.json_secret_marker}),
+            ))
+        }
+        HandlerEventStreamFault::ErrorEventBeforeOutput => {
+            handler_eventstream_bytes_response(eventstream_test_control_frame(
+                "error",
+                ":error-code",
+                "InternalServerError",
+                json!({"message": state.json_secret_marker}),
+            ))
+        }
         HandlerEventStreamFault::BinaryEventStreamWithJsonContentType => {
             handler_eventstream_json_labeled_bytes_response(handler_eventstream_normal_body())
         }
@@ -3738,6 +3869,8 @@ fn expected_precommit_retry_reason(fault: HandlerEventStreamFault) -> &'static s
             "protocol_contamination:sends=1"
         }
         HandlerEventStreamFault::JsonBodyWithEventStreamContentType => "protocol_error:sends=1",
+        HandlerEventStreamFault::ExceptionEventBeforeOutput
+        | HandlerEventStreamFault::ErrorEventBeforeOutput => "status_error:sends=1",
         other => panic!("not a precommit retry fixture: {other:?}"),
     }
 }
@@ -3801,6 +3934,8 @@ fn boxed_precommit_retry_matrix() -> Pin<Box<dyn Future<Output = ()> + Send>> {
             HandlerEventStreamFault::TruncatedFrameBeforeOutput,
             HandlerEventStreamFault::IncompleteStatusBeforeOutput,
             HandlerEventStreamFault::ProtocolContaminationBeforeOutput,
+            HandlerEventStreamFault::ExceptionEventBeforeOutput,
+            HandlerEventStreamFault::ErrorEventBeforeOutput,
         ] {
             for round in 1..=5 {
                 assert_handler_eventstream_precommit_retry(fault, round).await;
