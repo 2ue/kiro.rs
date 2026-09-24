@@ -38,9 +38,9 @@ env:
   NODE_VERSION: '22.23.0'
   PNPM_VERSION: '11.11.0'
   RUST_TOOLCHAIN: '1.92.0'
-  KIRO_RS_TEST_POSTGRES_URL: postgres://kiro_rs:kiro_rs_test@127.0.0.1:5432/kiro_rs_test
-  KIRO_RS_TEST_REDIS_URL: redis://127.0.0.1:6379/0
-  KIRO_RS_REQUIRE_STORAGE_TESTS: '1'
+  ACCOUNT_RUNTIME_TEST_POSTGRES_URL: postgres://account_runtime:account_runtime_test@127.0.0.1:5432/account_runtime_test
+  ACCOUNT_RUNTIME_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+  ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS: '1'
   CARGO_PROFILE_RELEASE_LTO: 'false'
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
   CARGO_TERM_COLOR: always
@@ -56,13 +56,13 @@ jobs:
       postgres:
         image: postgres:16.9-alpine3.21
         env:
-          POSTGRES_USER: kiro_rs
-          POSTGRES_PASSWORD: kiro_rs_test
-          POSTGRES_DB: kiro_rs_test
+          POSTGRES_USER: account_runtime
+          POSTGRES_PASSWORD: account_runtime_test
+          POSTGRES_DB: account_runtime_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U kiro_rs -d kiro_rs_test"
+          --health-cmd "pg_isready -U account_runtime -d account_runtime_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
@@ -112,7 +112,6 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: |
-            admin-ui/pnpm-lock.yaml
             ui/pnpm-lock.yaml
 
       - name: Setup Rust
@@ -134,15 +133,10 @@ jobs:
 
       - name: Verify integration-test services
         run: |
-          : "${KIRO_RS_TEST_POSTGRES_URL:?KIRO_RS_TEST_POSTGRES_URL must be set}"
-          : "${KIRO_RS_TEST_REDIS_URL:?KIRO_RS_TEST_REDIS_URL must be set}"
-          docker exec "${{ job.services.postgres.id }}" pg_isready -U kiro_rs -d kiro_rs_test
+          : "${ACCOUNT_RUNTIME_TEST_POSTGRES_URL:?ACCOUNT_RUNTIME_TEST_POSTGRES_URL must be set}"
+          : "${ACCOUNT_RUNTIME_TEST_REDIS_URL:?ACCOUNT_RUNTIME_TEST_REDIS_URL must be set}"
+          docker exec "${{ job.services.postgres.id }}" pg_isready -U account_runtime -d account_runtime_test
           test "$(docker exec "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
-
-      - name: Install admin-ui dependencies
-        if: ${{ env.QUALITY_PROFILE == 'full' }}
-        working-directory: admin-ui
-        run: pnpm install --frozen-lockfile
 
       - name: Install ui dependencies
         if: ${{ env.QUALITY_PROFILE == 'full' }}
@@ -152,11 +146,6 @@ jobs:
       - name: Check shared frontend contracts
         if: ${{ env.QUALITY_PROFILE == 'full' }}
         run: node scripts/check-frontend-contracts.mjs
-
-      - name: Build admin-ui
-        if: ${{ env.QUALITY_PROFILE == 'full' }}
-        working-directory: admin-ui
-        run: pnpm build
 
       - name: Build ui
         if: ${{ env.QUALITY_PROFILE == 'full' }}
@@ -183,7 +172,7 @@ jobs:
 
       - name: Run release PostgreSQL dashboard smoke test
         if: ${{ env.QUALITY_PROFILE == 'release' }}
-        run: cargo test --locked --bin kiro-rs storage::postgres::tests::postgres_persists_runtime_config_credentials_stats_usage_and_pricing -- --exact --test-threads=1
+        run: cargo test --locked --bin account-runtime storage::postgres::tests::postgres_persists_runtime_config_credentials_stats_usage_and_pricing -- --exact --test-threads=1
 
       - name: Build release with default features
         if: ${{ env.QUALITY_PROFILE == 'full' }}

@@ -39,7 +39,7 @@ function runnerEnvironment(overrides = {}) {
 }
 
 function runRunner(overrides = {}, options = {}) {
-  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-redis-fault-domain-contract-'))
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-redis-fault-domain-contract-'))
   try {
     const result = spawnSync(process.execPath, [RUNNER], {
       cwd: ROOT,
@@ -327,7 +327,7 @@ for (const signalCase of [
     test(`signal cleanup stops owned proxies for ${signalCase.signal}, round ${round}`, {
       skip: !LIVE_BUSINESS_URL || !LIVE_OBSERVABILITY_URL,
     }, async () => {
-      const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-redis-fault-domain-signal-'))
+      const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-redis-fault-domain-signal-'))
       const readyFile = path.join(fixtureRoot, 'ready.json')
       const child = spawn(process.execPath, [RUNNER], {
         cwd: ROOT,

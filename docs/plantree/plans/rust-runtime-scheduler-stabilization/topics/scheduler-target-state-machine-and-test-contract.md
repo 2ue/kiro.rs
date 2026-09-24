@@ -510,8 +510,8 @@ usage、Dashboard 汇总和统计写入必须是旁路操作。写入失败、�
 
 ```text
 测试客户端
-  -> kiro.rs 实例 A（临时端口）
-  -> kiro.rs 实例 B（可选，共享隔离 PostgreSQL/Redis）
+  -> account-runtime 实例 A（临时端口）
+  -> account-runtime 实例 B（可选，共享隔离 PostgreSQL/Redis）
        -> 假本地上游
        -> 外部池 A（优先级 1）
        -> 外部池 B（优先级 10）

@@ -4,7 +4,7 @@
 
 - Backend already has several separated modules:
   - `src/anthropic/handlers/parsed_body_pipeline.rs` for parsed Anthropic preprocessing.
-  - `src/anthropic/handlers/local_body_pipeline.rs` for local Kiro body preparation.
+  - `src/anthropic/handlers/local_body_pipeline.rs` for local Account Runtime body preparation.
   - `src/external_pool/body_pipeline.rs` for external raw/normalized body preparation.
   - `src/external_pool/model_pipeline.rs` for external pool model processing.
   - `src/external_pool/usage_projection.rs` for usage projection.

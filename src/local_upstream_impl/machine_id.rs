@@ -74,7 +74,7 @@ pub fn generate_from_credentials(
         // API Key 凭据：基于兼容 API-key 字段派生
         if let Some(ref api_key) = credentials.api_key {
             if !api_key.is_empty() {
-                return sha256_hex(&format!("KiroAPIKey/{}", api_key));
+                return sha256_hex(&format!("AccountAPIKey/{}", api_key));
             }
         }
     } else if let Some(ref refresh_token) = credentials.refresh_token {
@@ -102,7 +102,7 @@ fn fallback_machine_id(credentials: &LocalUpstreamCredentials) -> String {
     }
 
     let seed = Uuid::new_v4();
-    let derived = sha256_hex(&format!("KiroFallback/{}", seed));
+    let derived = sha256_hex(&format!("AccountFallback/{}", seed));
     tracing::warn!(
         credential_id = ?credentials.id,
         "凭据缺少派生材料（API key/refreshToken 均不可用），使用随机兜底 machineId（进程内稳定）"
@@ -185,7 +185,7 @@ mod tests {
         let result = generate_from_credentials(&credentials, &config);
         assert_eq!(result.len(), 64);
         // 应与既有兼容 API-key hash domain 的哈希一致
-        assert_eq!(result, sha256_hex("KiroAPIKey/ksk_test_api_key"));
+        assert_eq!(result, sha256_hex("AccountAPIKey/ksk_test_api_key"));
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
-        assert_eq!(result, sha256_hex("KiroAPIKey/ksk_test"));
+        assert_eq!(result, sha256_hex("AccountAPIKey/ksk_test"));
     }
 
     #[test]

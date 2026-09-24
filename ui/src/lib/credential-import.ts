@@ -135,7 +135,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   const accessToken = stringField(normalized.accessToken) ?? stringField(nested?.accessToken)
   const expiresAt = stringLikeField(normalized.expiresAt) ?? stringLikeField(normalized.expired) ?? stringLikeField(nested?.expiresAt) ?? stringLikeField(nested?.expired)
   const refreshToken = stringField(normalized.refreshToken) ?? stringField(nested?.refreshToken)
-  const rawApiKey = stringField(normalized.apiKey) ?? stringField(normalized.kiroApiKey)
+  const rawApiKey = stringField(normalized.apiKey) ?? stringField(nested?.apiKey)
   const parsedApiKey = rawApiKey ? splitApiKeyValue(rawApiKey) : undefined
   const apiKey = parsedApiKey?.key
   const clientId = stringField(normalized.clientId) ?? stringField(nested?.clientId)

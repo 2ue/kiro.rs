@@ -1,6 +1,6 @@
 # Prompt Cache Simulation Strategy
 
-本文档描述当前 `kiro.rs` 的缓存模拟策略、配置入口、默认行为和排查口径。它面向后续维护者，脱离历史对话也应能判断“为什么会出现 cache read / cache creation、哪些配置会影响下游看到的 usage、哪些配置不会影响真实上游请求”。
+本文档描述当前 `account-runtime` 的缓存模拟策略、配置入口、默认行为和排查口径。它面向后续维护者，脱离历史对话也应能判断“为什么会出现 cache read / cache creation、哪些配置会影响下游看到的 usage、哪些配置不会影响真实上游请求”。
 
 ## 结论
 
@@ -12,7 +12,7 @@
 
 最重要的边界：
 
-- 缓存模拟只影响下游响应里的 `usage` 和后台 usage record，不改变发给 Kiro 的请求内容。
+- 缓存模拟只影响下游响应里的 `usage` 和后台 usage record，不改变发给 Account Runtime 的请求内容。
 - `reportedUsage` 只改变下游和后台看到的 usage，不改变本地 tracker 的命中状态。
 - `promptCacheCreationControl` 只限制最终上报的 `cache_creation_input_tokens` 出现频次，不改变 tracker 是否已经创建缓存，也不改变 `cache_read_input_tokens` 的命中计算。
 - 真实上游 metadata 里已经有非零 cache read/write 时，真实 metadata 优先，不用本地模拟覆盖。
@@ -252,7 +252,7 @@ credential_id + conversation_id + model
 影响：
 
 - 只影响本地模拟 cache usage 的计算基础。
-- 不改变发给 Kiro 的请求。
+- 不改变发给 Account Runtime 的请求。
 - 不代表最终下游看到的 `input_tokens` 一定放大，最终还会经过 `reportedUsage` 投影。
 
 ### `promptCacheMaxSimulatedInputTokens`
@@ -351,7 +351,7 @@ credential_id + conversation_id + model
 
 ## 外部备用池 usage 策略
 
-外部备用池与本地 Kiro 凭据池不同：
+外部备用池与本地 Account Runtime 凭据池不同：
 
 - 请求固定发到外部池自己的 `/v1/messages`。
 - 原始入口路径只用于决定 usage 投影策略，不用于拼接外部池请求路径。

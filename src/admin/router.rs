@@ -2,143 +2,33 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, post, put},
 };
 
 use super::{
     handlers::{
-        add_credential, batch_import_credentials, batch_update_credentials, cancel_usage_cleanup,
-        clear_account_auto_disabled, clear_account_cooldown, clear_credential_in_flight,
-        clear_external_pool_auto_disabled, clear_external_pool_cooldown, clear_usage_records,
-        create_account, create_external_pool, create_proxy_resource, create_request_api_key,
-        delete_account, delete_credential, delete_disabled_credentials, delete_external_pool,
-        delete_manual_model, delete_proxy_resource, delete_request_api_key,
+        cancel_usage_cleanup, clear_account_auto_disabled, clear_account_cooldown,
+        clear_usage_records, create_account, create_proxy_resource, create_request_api_key,
+        delete_account, delete_manual_model, delete_proxy_resource, delete_request_api_key,
         discover_account_supported_models, discover_account_supported_models_from_request,
-        discover_credential_supported_models, discover_external_pool_supported_models,
-        discover_external_pool_supported_models_from_request, export_credentials,
-        force_refresh_token, get_access_keys, get_account_status, get_accounts,
-        get_all_credentials, get_audit_logs, get_credential_balance, get_credential_credit_summary,
-        get_credential_info, get_credentials_account_info, get_credentials_list,
-        get_credentials_page, get_credentials_runtime, get_credentials_summary,
-        get_credentials_usage_summary, get_external_pool_status, get_external_pools,
-        get_load_balancing_mode, get_model_capabilities, get_model_pricing, get_proxy_resources,
-        get_runtime_config, get_system_version, get_usage_cleanup_status, get_usage_dashboard,
+        get_access_keys, get_account_status, get_accounts, get_audit_logs, get_load_balancing_mode,
+        get_model_capabilities, get_model_pricing, get_proxy_resources, get_runtime_config,
+        get_system_version, get_usage_cleanup_status, get_usage_dashboard,
         get_usage_dashboard_account_billing, get_usage_dashboard_account_risk,
-        get_usage_dashboard_breakdown, get_usage_dashboard_external_pool_billing,
-        get_usage_dashboard_external_pool_risk, get_usage_dashboard_series,
-        get_usage_dashboard_top, get_usage_dashboard_windows, get_usage_records,
-        get_usage_records_page, get_usage_summary, get_usage_writer_stats, preview_usage_cleanup,
-        refresh_credentials_info, reset_failure_count, resume_usage_cleanup, set_account_enabled,
-        set_account_supported_models, set_credential_concurrency, set_credential_disabled,
-        set_credential_overage, set_credential_priority, set_credential_proxy,
-        set_credential_rate_limit_auto_disable, set_credential_regions, set_credential_rpm,
-        set_credential_supported_models, set_credential_warmup, set_external_pool_enabled,
-        set_external_pool_supported_models, set_load_balancing_mode, start_usage_cleanup,
-        sync_account_supported_models, sync_credential_supported_models,
-        sync_external_pool_supported_models, sync_model_capabilities, sync_model_pricing,
-        test_account, test_credential, test_external_pool, test_proxy_resource,
-        test_proxy_resource_config, update_account, update_admin_api_key, update_credential_auth,
-        update_external_pool, update_proxy_resource, update_request_api_key, update_runtime_config,
-        upsert_manual_model, validate_existing_credentials, validate_external_credentials,
+        get_usage_dashboard_breakdown, get_usage_dashboard_series, get_usage_dashboard_top,
+        get_usage_dashboard_windows, get_usage_records, get_usage_records_page, get_usage_summary,
+        get_usage_writer_stats, preview_usage_cleanup, resume_usage_cleanup, set_account_enabled,
+        set_account_supported_models, set_load_balancing_mode, start_usage_cleanup,
+        sync_account_supported_models, sync_model_capabilities, sync_model_pricing, test_account,
+        test_proxy_resource, test_proxy_resource_config, update_account, update_admin_api_key,
+        update_proxy_resource, update_request_api_key, update_runtime_config, upsert_manual_model,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
 
-/// 创建 Admin API 路由
-///
-/// # 端点
-/// - `GET /credentials` - 获取所有凭据状态
-/// - `GET /credentials-paged` - 分页获取凭据状态
-/// - `POST /credentials` - 添加新凭据
-/// - `DELETE /credentials/:id` - 删除凭据
-/// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
-/// - `POST /credentials/:id/priority` - 设置凭据优先级
-/// - `POST /credentials/:id/reset` - 重置失败计数
-/// - `POST /credentials/:id/refresh` - 强制刷新 Token
-/// - `GET /credentials/:id/info` - 查询凭据账号信息
-/// - `GET /credentials/:id/balance` - 获取凭据账号信息（兼容旧路径）
-/// - `POST /credentials/:id/test` - 测试指定凭据的模型调用
-/// - `GET /config/load-balancing` - 获取负载均衡模式
-/// - `PUT /config/load-balancing` - 设置负载均衡模式
-///
-/// # 认证
-/// 需要 Admin API Key 认证，支持：
-/// - `x-api-key` header
-/// - `Authorization: Bearer <token>` header
+/// 创建 Admin API 路由。
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
-        .route(
-            "/credentials",
-            get(get_all_credentials).post(add_credential),
-        )
-        .route("/credentials/import", post(batch_import_credentials))
-        .route("/credentials/batch-update", post(batch_update_credentials))
-        .route("/credentials/export", get(export_credentials))
-        .route(
-            "/credentials/credit-summary",
-            get(get_credential_credit_summary),
-        )
-        .route("/credentials/summary", get(get_credentials_summary))
-        .route("/credentials/runtime", get(get_credentials_runtime))
-        .route(
-            "/credentials/account-info",
-            get(get_credentials_account_info),
-        )
-        .route(
-            "/credentials/usage-summary",
-            get(get_credentials_usage_summary),
-        )
-        .route("/credentials/list", get(get_credentials_list))
-        .route("/credentials-list", get(get_credentials_list))
-        .route("/credentials/disabled", delete(delete_disabled_credentials))
-        .route("/credentials-paged", get(get_credentials_page))
-        .route("/credentials/{id}", delete(delete_credential))
-        .route("/credentials/{id}/auth", patch(update_credential_auth))
-        .route("/credentials/{id}/disabled", post(set_credential_disabled))
-        .route("/credentials/{id}/priority", post(set_credential_priority))
-        .route(
-            "/credentials/{id}/concurrency",
-            post(set_credential_concurrency),
-        )
-        .route("/credentials/{id}/rpm", post(set_credential_rpm))
-        .route(
-            "/credentials/{id}/rate-limit-auto-disable",
-            post(set_credential_rate_limit_auto_disable),
-        )
-        .route(
-            "/credentials/{id}/supported-models",
-            post(set_credential_supported_models),
-        )
-        .route(
-            "/credentials/{id}/supported-models/sync",
-            post(sync_credential_supported_models),
-        )
-        .route(
-            "/credentials/{id}/supported-models/discover",
-            post(discover_credential_supported_models),
-        )
-        .route("/credentials/{id}/regions", post(set_credential_regions))
-        .route("/credentials/{id}/warmup", post(set_credential_warmup))
-        .route(
-            "/credentials/{id}/in-flight/clear",
-            post(clear_credential_in_flight),
-        )
-        .route("/credentials/{id}/reset", post(reset_failure_count))
-        .route("/credentials/{id}/refresh", post(force_refresh_token))
-        .route("/credentials/{id}/balance", get(get_credential_balance))
-        .route("/credentials/{id}/info", get(get_credential_info))
-        .route("/credentials/{id}/overage", post(set_credential_overage))
-        .route("/credentials/info/refresh", post(refresh_credentials_info))
-        .route("/credentials/{id}/test", post(test_credential))
-        .route("/credentials/{id}/proxy", post(set_credential_proxy))
-        .route(
-            "/credential-validation/existing",
-            post(validate_existing_credentials),
-        )
-        .route(
-            "/credential-validation/external",
-            post(validate_external_credentials),
-        )
         .route(
             "/proxy-resources",
             get(get_proxy_resources).post(create_proxy_resource),
@@ -149,72 +39,34 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/proxy-resources/{id}",
             put(update_proxy_resource).delete(delete_proxy_resource),
         )
-        .route(
-            "/external-pools",
-            get(get_external_pools).post(create_external_pool),
-        )
         .route("/accounts", get(get_accounts).post(create_account))
-        .route("/external-pools/status", get(get_external_pool_status))
         .route("/accounts/status", get(get_account_status))
-        .route(
-            "/external-pools/supported-models/discover",
-            post(discover_external_pool_supported_models_from_request),
-        )
         .route(
             "/accounts/supported-models/discover",
             post(discover_account_supported_models_from_request),
         )
-        .route(
-            "/external-pools/{id}",
-            put(update_external_pool).delete(delete_external_pool),
-        )
         .route("/accounts/{id}", put(update_account).delete(delete_account))
-        .route(
-            "/external-pools/{id}/enabled",
-            post(set_external_pool_enabled),
-        )
         .route("/accounts/{id}/enabled", post(set_account_enabled))
-        .route(
-            "/external-pools/{id}/supported-models",
-            post(set_external_pool_supported_models),
-        )
         .route(
             "/accounts/{id}/supported-models",
             post(set_account_supported_models),
-        )
-        .route(
-            "/external-pools/{id}/supported-models/sync",
-            post(sync_external_pool_supported_models),
         )
         .route(
             "/accounts/{id}/supported-models/sync",
             post(sync_account_supported_models),
         )
         .route(
-            "/external-pools/{id}/supported-models/discover",
-            post(discover_external_pool_supported_models),
-        )
-        .route(
             "/accounts/{id}/supported-models/discover",
             post(discover_account_supported_models),
-        )
-        .route(
-            "/external-pools/{id}/auto-disabled/clear",
-            post(clear_external_pool_auto_disabled),
         )
         .route(
             "/accounts/{id}/auto-disabled/clear",
             post(clear_account_auto_disabled),
         )
         .route(
-            "/external-pools/{id}/cooldown/clear",
-            post(clear_external_pool_cooldown),
-        )
-        .route(
             "/accounts/{id}/cooldown/clear",
             post(clear_account_cooldown),
         )
-        .route("/external-pools/{id}/test", post(test_external_pool))
         .route("/accounts/{id}/test", post(test_account))
         .route("/usage-records", get(get_usage_records))
         .route("/usage-records-paged", get(get_usage_records_page))
@@ -240,16 +92,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_usage_dashboard_breakdown),
         )
         .route(
-            "/usage-dashboard/external-pool-billing",
-            get(get_usage_dashboard_external_pool_billing),
-        )
-        .route(
             "/usage-dashboard/account-billing",
             get(get_usage_dashboard_account_billing),
-        )
-        .route(
-            "/usage-dashboard/external-pool-risk",
-            get(get_usage_dashboard_external_pool_risk),
         )
         .route(
             "/usage-dashboard/account-risk",

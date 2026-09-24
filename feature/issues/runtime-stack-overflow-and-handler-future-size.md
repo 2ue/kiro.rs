@@ -28,7 +28,7 @@ Last updated: 2026-07-18
 
 旧 release test binary 的反证：
 
-- 路径：`target/release/deps/kiro_rs-8e21067b2ccc5c02`
+- 路径：`target/release/deps/account_runtime-8e21067b2ccc5c02`
 - SHA-256：`4cf63c759a39d1f1987dbdf7ecc0b1da3bca3c7c622d7902cc2a7d9d51e96d15`
 - 基线 revision：`401473ca1649997bdeccf4468e3add1bdb187248` 加当时 dirty remediation tree
 - 最小 release case：2 MiB Tokio worker，`1/1` 通过
@@ -39,7 +39,7 @@ Last updated: 2026-07-18
 当前 checkpoint 在同一路径重新构建后的身份与结果：
 
 - 构建完成：2026-07-16 17:23:59 +0800；release 编译耗时 9 分 01 秒。
-- 路径：`target/release/deps/kiro_rs-8e21067b2ccc5c02`。
+- 路径：`target/release/deps/account_runtime-8e21067b2ccc5c02`。
 - 大小：28,293,904 bytes。
 - SHA-256：`3b7825c33ff1c4fde3d3856a239852af7f36882f14bcf22a7d4ff7b168243a2e`。
 - 显式 2 MiB Tokio worker、bad CRC 真实 handler precommit retry：`1/1` 通过。

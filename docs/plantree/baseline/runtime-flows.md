@@ -36,7 +36,7 @@ flowchart TD
     G --> H[Resolve request runtime config and model]
     H --> I[Parsed body processing]
     I --> J{Local or external route decision}
-    J -->|local| K[Anthropic to Kiro preparation]
+    J -->|local| K[Anthropic to Account Runtime preparation]
     J -->|external| L[Raw or normalized external preparation]
     K --> M[Execute with retries]
     L --> M
@@ -54,7 +54,7 @@ Current details:
 
 The two runtime-config reads are a current implementation fact; they can observe different versions during a concurrent Admin update.
 
-## Local Kiro Flow
+## Local Account Runtime Flow
 
 ```mermaid
 sequenceDiagram
@@ -62,8 +62,8 @@ sequenceDiagram
     participant B as Body/converter pipeline
     participant S as MultiTokenManager
     participant R as Redis
-    participant P as KiroProvider
-    participant K as Kiro upstream
+    participant P as Account RuntimeProvider
+    participant K as Account Runtime upstream
     participant U as UsageRecorder/PgSQL
 
     H->>B: parsed request plus route policy
@@ -71,7 +71,7 @@ sequenceDiagram
     H->>S: acquire request context
     S->>R: sticky/capacity/queue operations when enabled
     S-->>H: credential, token, endpoint, lease
-    H->>P: prepared Kiro request
+    H->>P: prepared Account Runtime request
     P->>K: IDE or CLI upstream call
     K-->>P: event stream or response body
     P-->>H: translated events/result and completion guard
@@ -84,12 +84,12 @@ Detailed local stages:
 1. thinking trigger and compatibility normalization;
 2. Files/remote source materialization in safe image-processing mode;
 3. model mapping and supported-model validation;
-4. Anthropic-to-Kiro conversion of system, history, tools, schemas, thinking, images, documents, and cache points;
+4. Anthropic-to-Account Runtime conversion of system, history, tools, schemas, thinking, images, documents, and cache points;
 5. payload measurement, repair, compression/shaping, and optional history trimming;
 6. credential eligibility scan for enabled state, model support, priority, cooldown, RPM, concurrency, health, and previous attempts;
 7. optional sticky lookup, dispatch queue admission, and local/Redis lease acquisition;
 8. token refresh or API-key preparation;
-9. endpoint-specific IDE/CLI envelope construction and Kiro HTTP call;
+9. endpoint-specific IDE/CLI envelope construction and Account Runtime HTTP call;
 10. bounded retry/failover based on status and normalized error class;
 11. streaming or non-streaming Anthropic response translation;
 12. lease release, credential state mutation, usage projection, and background persistence.
@@ -238,6 +238,6 @@ Usage or general storage abandonment is currently logged but does not independen
 
 - Completion and lease guards use `Drop` to release capacity when request futures are cancelled.
 - Streaming is pull-based; a connected client that stops polling can retain upstream/body/lease state until another timeout or disconnect occurs.
-- Kiro stream idle timeout is configurable and should not be confused with total execution time.
+- Account Runtime stream idle timeout is configurable and should not be confused with total execution time.
 - Upstream first-byte delays above 30 or 60 seconds and total durations above 180 seconds are legitimate validation scenarios.
 - Remote source materialization has a separate 25-second HTTP-client timeout and should remain governed by a tighter resource-fetch policy than model execution.

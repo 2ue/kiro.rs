@@ -12,12 +12,12 @@ import { performance } from 'node:perf_hooks'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '../..')
-const CLAUDE = resolveExecutable(process.env.KIRO_CLAUDE_BINARY || 'claude')
-const ROUNDS = Number.parseInt(process.env.KIRO_THINKING_CAPTURE_ROUNDS || '5', 10)
+const CLAUDE = resolveExecutable(process.env.ACCOUNT_RUNTIME_CLAUDE_BINARY || 'claude')
+const ROUNDS = Number.parseInt(process.env.ACCOUNT_RUNTIME_THINKING_CAPTURE_ROUNDS || '5', 10)
 const EFFORTS = ['absent', 'low', 'medium', 'high', 'xhigh', 'max']
 
 if (ROUNDS !== 5) {
-  throw new Error('KIRO_THINKING_CAPTURE_ROUNDS must be exactly 5 for the A09/D07 capture gate')
+  throw new Error('ACCOUNT_RUNTIME_THINKING_CAPTURE_ROUNDS must be exactly 5 for the A09/D07 capture gate')
 }
 
 const RUN_ID = `thinking-effort-capture-${Date.now()}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`

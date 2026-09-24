@@ -40,15 +40,15 @@ Status: 复核进行中；本表不是发布通过声明
 | OPS-003 | Redis usage writer 原子性、基数与 scheduler 干扰 | `focused-implementation-pass / real-redis-pending`；snapshot/detail/index、aggregate 与 seen 已合并为一个 Lua EVAL，命令级错误 invalidation，cache-read bucket 上限 4096，64 条 batch 改为单共享 deadline 串行准入 | `usage-summary-atomic-c0-r3` 两个精确测试均 `running 1 / passed 1`，各内部 5 轮；all-targets 编译真实 Redis WRONGTYPE/基数测试；scope `2016696 KiB` 且完整清理 | 本机无非 Docker Redis/Lua，R1/R2 和 usage+scheduler latency/disconnect/recovery 尚未动态执行；冻结 release、多实例和生产规模性能 |
 | UI-001 | 两 UI 费用精度与配置权威 | `static-evidence`；列表/详情 8 位，汇总仍有 2/6 位；prompt/body 配置会互相覆盖 | 两套 UI 源码，无格式化或浏览器回归 | formatter 单测、两 UI build、浏览器截图与交互矩阵 |
 | MIG-001 | v0.0.101/102/103 升级 | `not-tested`；startup 禁止历史 usage 扫描已有静态保护 | `S-current`：migration 源码与 forbidden SQL 测试；旧日志来源不完整 | 三个 tag 各自数据集，每版 3 轮，二次启动幂等与回滚 |
-| CRD-001 | AWS Kiro API Key + region 生命周期 | `core-and-malformed-lifecycle-pass-on-provisional-build / non-Docker-runner-contract-pass / final-and-browser-pending` | 十个隔离完整运行共 90/90 正向 case；schema-v2/v3 pipe、显式 region 与 plain malformed 共 153/153 在 0 upstream/0 active PG 下拒绝。2026-07-21 runner 改为 caller-owned PG/Redis 后合同 6/6 通过，合批 runtime runner contract 36/36 通过；覆盖 normalize/restart/scheduler/region headers、duplicate、delete/export/audit/cleanup；详见 F06 evidence 与 non-Docker runner evidence | 最终冻结 SHA 重跑；两 UI browser；多实例同时重复导入 auxiliary admission；旧 PG 非法行；L5/高并发 import |
+| CRD-001 | AWS Account Runtime API Key + region 生命周期 | `core-and-malformed-lifecycle-pass-on-provisional-build / non-Docker-runner-contract-pass / final-and-browser-pending` | 十个隔离完整运行共 90/90 正向 case；schema-v2/v3 pipe、显式 region 与 plain malformed 共 153/153 在 0 upstream/0 active PG 下拒绝。2026-07-21 runner 改为 caller-owned PG/Redis 后合同 6/6 通过，合批 runtime runner contract 36/36 通过；覆盖 normalize/restart/scheduler/region headers、duplicate、delete/export/audit/cleanup；详见 F06 evidence 与 non-Docker runner evidence | 最终冻结 SHA 重跑；两 UI browser；多实例同时重复导入 auxiliary admission；旧 PG 非法行；L5/高并发 import |
 | AUD-001 | 生产 evidence skill quick validation | 打包与脱敏有历史证据，quick validation 未关闭 | `H-only`：曾因 PyYAML 缺失未跑通 | 使用无 PyYAML 校验或明确依赖，当前代码重新 quick validate |
 
 ## 已验证但不能代表最终通过的当前基线
 
 - 早期基线 `cargo test transcript_sanitizer -- --nocapture` 为 17/17；该数字对应修复前合同，已经被后续 thinking/history/fail-closed 测试扩展，不能继续称为当前最终门禁。最近聚焦命令、数量和 test-binary identity 见 thinking 专题与 protocol evidence，冻结候选仍需重跑。
-- 早期全树基线曾为主 target 1199/1199、`kiro_loadtest` 26/26；并行修复后测试总数和结果已变化，最终只能使用冻结候选的重新执行结果。
+- 早期全树基线曾为主 target 1199/1199、`account_runtime_loadtest` 26/26；并行修复后测试总数和结果已变化，最终只能使用冻结候选的重新执行结果。
 - 当前 `git diff --check`、`cargo fmt --all -- --check`、`cargo check` 和 `cargo check --tests` 通过；尚未重跑冻结候选的所有静态/全量发布门禁。
-- `target/release/kiro-rs` SHA-256 为 `4623cdf4e3f7bc0e2fe3defa4e0862237e1f64bccbb91671c134e0d6b51556d8`，与 2026-07-15 deep-audit 记录一致；该报告可作为当前候选的修复前动态基线。
+- `target/release/account-runtime` SHA-256 为 `4623cdf4e3f7bc0e2fe3defa4e0862237e1f64bccbb91671c134e0d6b51556d8`，与 2026-07-15 deep-audit 记录一致；该报告可作为当前候选的修复前动态基线。
 - evidence skill 已增加无 PyYAML 的 quick validation 并完成本地三轮脱敏验证；最终冻结候选的发布总门禁仍需重跑。
 - 修复前 17 个 sanitizer 测试曾要求保留 thinking，并允许任意 `*Hash<8hex>` 兜底；该历史合同已被精确 request tool mapping、thinking/signature/redacted 和 false-positive 反例替换。是否最终修复仍由真实 CLI/长历史/故障注入门禁决定，不能只看单元测试总数。
 - 修复前全量测试曾主动断言 duplicate/orphan tool result 被 textify；当前实现和聚焦测试已经改为不复制原文。冻结候选仍需通过 converter/payload/CLI 组合回归，防止其他路径重新引入同类行为。

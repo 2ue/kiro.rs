@@ -23,7 +23,7 @@ Current authority: current source, current production evidence, [Rust Runtime Sc
 | `docs/high-cache-upstream-simulation-analysis.md` | [high-cache-upstream-simulation-analysis.md](high-cache-upstream-simulation-analysis.md) |
 | `docs/prod-usage-error-evidence-20260630.md` | [prod-usage-error-evidence-20260630.md](prod-usage-error-evidence-20260630.md) |
 | `docs/production-error-optimization-plan.md` | [production-error-optimization-plan.md](production-error-optimization-plan.md) |
-| `docs/prompt-cache-scope-and-kiro-rs-tool-parity.md` | [prompt-cache-scope-and-kiro-rs-tool-parity.md](prompt-cache-scope-and-kiro-rs-tool-parity.md) |
+| `docs/prompt-cache-scope-and-account-runtime-tool-parity.md` | [prompt-cache-scope-and-account-runtime-tool-parity.md](prompt-cache-scope-and-account-runtime-tool-parity.md) |
 | `docs/prompt-cache-simulation-strategy.md` | [prompt-cache-simulation-strategy.md](prompt-cache-simulation-strategy.md) |
 | `docs/prompt-cache-strategy-family-refactor-analysis-20260701.md` | [prompt-cache-strategy-family-refactor-analysis-20260701.md](prompt-cache-strategy-family-refactor-analysis-20260701.md) |
 

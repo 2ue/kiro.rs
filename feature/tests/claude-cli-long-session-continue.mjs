@@ -15,20 +15,20 @@ import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '../..')
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
-const POSTGRES_URL = requiredEnvironment('KIRO_LONG_SESSION_POSTGRES_URL')
-const REDIS_URL = requiredEnvironment('KIRO_LONG_SESSION_REDIS_URL')
-const CLAUDE = process.env.KIRO_CLAUDE_BINARY || 'claude'
-const ROUNDS = parseBoundedInteger('KIRO_LONG_SESSION_ROUNDS', 5, 1, 5)
-const TOOL_CYCLES = parseBoundedInteger('KIRO_LONG_SESSION_TOOL_CYCLES', 20, 1, 100)
-const PROGRESS_LOGGING_ENABLED = process.env.KIRO_VALIDATION_PROGRESS === '1'
+const POSTGRES_URL = requiredEnvironment('ACCOUNT_RUNTIME_LONG_SESSION_POSTGRES_URL')
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_LONG_SESSION_REDIS_URL')
+const CLAUDE = process.env.ACCOUNT_RUNTIME_CLAUDE_BINARY || 'claude'
+const ROUNDS = parseBoundedInteger('ACCOUNT_RUNTIME_LONG_SESSION_ROUNDS', 5, 1, 5)
+const TOOL_CYCLES = parseBoundedInteger('ACCOUNT_RUNTIME_LONG_SESSION_TOOL_CYCLES', 20, 1, 100)
+const PROGRESS_LOGGING_ENABLED = process.env.ACCOUNT_RUNTIME_VALIDATION_PROGRESS === '1'
 const RUN_ID = `long-session-${Date.now()}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `${RUN_ID}-`))
 const REPORT_ROOT = path.join(ARTIFACT_ROOT, 'reports', 'claude-cli-long-session-continue')
 const REPORT_PATH = path.join(REPORT_ROOT, `${RUN_ID}.json`)
 const REQUEST_KEY = `sk-request-${RUN_ID}`
 const ADMIN_KEY = `sk-admin-${RUN_ID}`
-const KIRO_KEY = `ksk_${crypto.randomBytes(24).toString('hex')}|us-east-1`
-const REDIS_PREFIX = `kiro_rs:validation:${RUN_ID}`
+const ACCOUNT_RUNTIME_KEY = `ksk_${crypto.randomBytes(24).toString('hex')}|us-east-1`
+const REDIS_PREFIX = `account_runtime:validation:${RUN_ID}`
 const ACTIVE_CHILDREN = new Set()
 const ACTIVE_SERVERS = new Set()
 let cleanupPromise = null
@@ -94,7 +94,7 @@ function commandOutput(command, args, options = {}) {
 
 function redactDiagnosticText(value) {
   let text = String(value || '')
-  for (const forbidden of [REQUEST_KEY, ADMIN_KEY, KIRO_KEY, POSTGRES_URL, REDIS_URL]) {
+  for (const forbidden of [REQUEST_KEY, ADMIN_KEY, ACCOUNT_RUNTIME_KEY, POSTGRES_URL, REDIS_URL]) {
     text = text.split(forbidden).join('<redacted>')
   }
   if (text.length <= 3000) return text
@@ -104,25 +104,25 @@ function redactDiagnosticText(value) {
 function validateStorageUrls() {
   const postgres = new URL(POSTGRES_URL)
   if (!['postgres:', 'postgresql:'].includes(postgres.protocol)) {
-    throw new Error('KIRO_LONG_SESSION_POSTGRES_URL must use PostgreSQL')
+    throw new Error('ACCOUNT_RUNTIME_LONG_SESSION_POSTGRES_URL must use PostgreSQL')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(postgres.hostname)) {
-    throw new Error('KIRO_LONG_SESSION_POSTGRES_URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_LONG_SESSION_POSTGRES_URL must target loopback')
   }
   const database = decodeURIComponent(postgres.pathname.replace(/^\//, ''))
-  if (!/^kiro_long_session_[a-z0-9_]{6,80}$/.test(database)) {
-    throw new Error('KIRO_LONG_SESSION_POSTGRES_URL must name a caller-owned kiro_long_session_* database')
+  if (!/^account_runtime_long_session_[a-z0-9_]{6,80}$/.test(database)) {
+    throw new Error('ACCOUNT_RUNTIME_LONG_SESSION_POSTGRES_URL must name a caller-owned account_runtime_long_session_* database')
   }
 
   const redis = new URL(REDIS_URL)
   if (redis.protocol !== 'redis:') {
-    throw new Error('KIRO_LONG_SESSION_REDIS_URL must use Redis')
+    throw new Error('ACCOUNT_RUNTIME_LONG_SESSION_REDIS_URL must use Redis')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(redis.hostname)) {
-    throw new Error('KIRO_LONG_SESSION_REDIS_URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_LONG_SESSION_REDIS_URL must target loopback')
   }
   const redisPort = Number(redis.port || 6379)
-  if (redisPort === 9022) throw new Error('KIRO_LONG_SESSION_REDIS_URL must not target port 9022')
+  if (redisPort === 9022) throw new Error('ACCOUNT_RUNTIME_LONG_SESSION_REDIS_URL must not target port 9022')
 }
 
 function listeningPids(port) {
@@ -157,7 +157,7 @@ async function waitForHealth(baseUrl, child, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
-      throw new Error(`kiro-rs exited before health check with status ${child.exitCode}`)
+      throw new Error(`account-runtime service exited before health check with status ${child.exitCode}`)
     }
     try {
       const response = await fetch(`${baseUrl}/healthz`)
@@ -165,7 +165,7 @@ async function waitForHealth(baseUrl, child, timeoutMs = 60_000) {
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
-  throw new Error('timed out waiting for isolated kiro-rs health check')
+  throw new Error('timed out waiting for isolated account-runtime health check')
 }
 
 async function stopChild(child) {
@@ -313,7 +313,7 @@ function createFakeUpstream() {
     request.on('data', (chunk) => chunks.push(chunk))
     request.on('end', () => {
       const body = Buffer.concat(chunks)
-      const target = String(request.headers['x-amz-target'] || '')
+      const target = String(request.headers['x-account-runtime-target'] || '')
       const url = new URL(request.url || '/', 'http://127.0.0.1')
       if (target.endsWith('.ListAvailableModels')) {
         records.push({ kind: 'model_discovery', scenario: activeScenario?.id || null })
@@ -366,7 +366,7 @@ function createFakeUpstream() {
           representsPublicTool(name, activeScenario.toolName)
         )) || null
         if (!activeScenario.upstreamToolName) {
-          writeJson(response, 500, { message: 'public tool has no Kiro wire mapping' })
+          writeJson(response, 500, { message: 'public tool has no wire mapping' })
           return
         }
         writeEventStream(response, [
@@ -733,8 +733,8 @@ function isolatedConfig({ servicePort, upstreamPort }) {
     apiKey: REQUEST_KEY,
     adminApiKey: ADMIN_KEY,
     defaultEndpoint: 'cli',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/fixture`,
-    kiroUpstreamResponseTimeoutSecs: 10,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/fixture`,
+    upstreamResponseTimeoutSecs: 10,
     credentialRetryMaxAttempts: 1,
     inferenceUpstreamMaxAttempts: 1,
     credentialWarmupRequests: 0,
@@ -775,7 +775,7 @@ function assertScenarioWire(records, scenario) {
   const expectedHits = scenario.toolName ? 2 : 1
   assert.equal(inference.length, expectedHits, `${scenario.id}: unexpected inference count`)
   for (const record of inference) {
-    assert.equal(record.validJson, true, `${scenario.id}: Kiro wire body is not JSON`)
+    assert.equal(record.validJson, true, `${scenario.id}: account runtime wire body is not JSON`)
     assert.equal(record.currentUserPresent, true, `${scenario.id}: current user marker missing on wire`)
     if (scenario.turn > 1) {
       assert.equal(record.previousAssistantPresent, true, `${scenario.id}: previous assistant turn missing on wire`)
@@ -835,10 +835,10 @@ async function main() {
       { mode: 0o600 },
     )
     const serviceLog = fs.openSync(serviceLogPath, 'a', 0o600)
-    service = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+    service = spawn(BINARY, ['--config', configPath], {
       cwd: ROOT,
       env: validationChildEnvironment({
-        LOCAL_UPSTREAM_API_KEY: KIRO_KEY,
+        LOCAL_UPSTREAM_API_KEY: ACCOUNT_RUNTIME_KEY,
         ACCOUNT_RUNTIME_HOST: '127.0.0.1',
         ACCOUNT_RUNTIME_PORT: String(servicePort),
         RUST_LOG: 'warn',
@@ -1011,7 +1011,7 @@ async function main() {
         isolatedHomePerSession: true,
         isolatedClaudeConfigDirPerSession: true,
         isolatedProjectPerSession: true,
-        fakeKiroCredential: true,
+        fakeCredential: true,
         callerOwnedPostgresDatabase: true,
         ownedRedisPrefixSha256: sha256(REDIS_PREFIX),
       },
@@ -1037,7 +1037,7 @@ async function main() {
       report.result = Object.values(cleanup).every(Boolean) ? 'pass' : 'fail'
       fs.mkdirSync(REPORT_ROOT, { recursive: true })
       const serialized = `${JSON.stringify(report, null, 2)}\n`
-      for (const forbidden of [REQUEST_KEY, ADMIN_KEY, KIRO_KEY, POSTGRES_URL, REDIS_URL, TEMP_ROOT]) {
+      for (const forbidden of [REQUEST_KEY, ADMIN_KEY, ACCOUNT_RUNTIME_KEY, POSTGRES_URL, REDIS_URL, TEMP_ROOT]) {
         assert.equal(serialized.includes(forbidden), false, 'report contains a secret, URL, or temp path')
       }
       fs.writeFileSync(REPORT_PATH, serialized, { mode: 0o600 })

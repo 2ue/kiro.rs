@@ -194,7 +194,7 @@ export function AccountsPage() {
         accountRuntime,
         externalPools: accountRuntime,
       })
-      toast.success('外部账号策略已保存')
+      toast.success('账号策略已保存')
       invalidate()
     } catch (error) {
       toast.error(extractErrorMessage(error))
@@ -221,7 +221,7 @@ export function AccountsPage() {
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
       })
-      toast.success('外部账号已添加')
+      toast.success('账号已添加')
       setCreateOpen(false)
       setCreateForm(defaultAccountForm())
       invalidate()
@@ -256,7 +256,7 @@ export function AccountsPage() {
         supportedModels: parseSupportedModelsText(supportedModelsText),
       }
       await updateAccount(editingAccount.id, payload)
-      toast.success('外部账号已更新')
+      toast.success('账号已更新')
       setEditingAccount(null)
       setEditForm(defaultAccountForm())
       invalidate()
@@ -319,7 +319,7 @@ export function AccountsPage() {
       />
 
       <StatGrid>
-        <StatCard title="外部账号" value={totalAccounts} tone="info" icon={
+        <StatCard title="账号" value={totalAccounts} tone="info" icon={
           <ProgressRing value={concurrencyPct} size={40} strokeWidth={4} color="hsl(var(--info))" label={`${concurrencyPct}%`} />
         } />
         <StatCard title="可调度" value={dispatchableAccounts} tone={dispatchableAccounts > 0 ? 'success' : 'warning'} />
@@ -334,7 +334,7 @@ export function AccountsPage() {
 
       {/* Policy config section */}
       <SectionCard
-        title="外部账号策略"
+        title="账号策略"
         actions={
           <Button size="sm" disabled={savingConfig} onClick={saveConfig}>
             <Save className="h-4 w-4" />
@@ -343,30 +343,30 @@ export function AccountsPage() {
         }
       >
         <div className="space-y-5">
-          <PolicyBlock title="启用控制" active={externalEnabled} description="关闭后不会进入任何外部账号，请求只走本地账号。">
+          <PolicyBlock title="启用控制" active={externalEnabled} description="关闭后不会进入任何上游账号，请求只走本地账号。">
             <div className="grid gap-3 md:grid-cols-2">
-              <ToggleRow label="启用外部账号" checked={configDraft.externalPoolsEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolsEnabled: v }))} />
+              <ToggleRow label="启用账号调度" checked={configDraft.externalPoolsEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolsEnabled: v }))} />
             </div>
           </PolicyBlock>
 
           <PolicyBlock
             title="触发条件"
-            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            titleSuffix={!externalEnabled ? '需先启用账号' : undefined}
             active={Boolean(fallbackActive || directPolicyActive)}
-            description="启用显式直连后，所有请求跳过本地账号，只调度外部账号；关闭后才使用本地优先 fallback。"
+            description="启用显式直连后，所有请求跳过本地账号，只调度上游账号；关闭后才使用本地优先 fallback。"
           >
             <div className="grid gap-4 lg:grid-cols-2">
-              <FormSection title="本地优先" description="先调度本地账号，只有下面情况出现时才转入外部账号。">
+              <FormSection title="本地优先" description="先调度本地账号，只有下面情况出现时才转入上游账号。">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="本地容量预检" checked={configDraft.localPoolPreflightEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, localPoolPreflightEnabled: v }))} />
-                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="容量不足时使用外部账号" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnLocalCapacityExhausted: v }))} />
-                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="调度 Redis 降级时使用外部账号" checked={configDraft.fallbackOnSchedulerRedisDegraded} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnSchedulerRedisDegraded: v }))} />
-                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="没有可用账号时使用外部账号" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnNoAvailableCredentials: v }))} />
-                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="本地临时错误过多时使用外部账号" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnLocalTransientExhausted: v }))} />
-                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="模型不支持时使用外部账号" checked={configDraft.fallbackOnUnsupportedModel} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnUnsupportedModel: v }))} />
+                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="容量不足时使用上游账号" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnLocalCapacityExhausted: v }))} />
+                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="调度 Redis 降级时使用上游账号" checked={configDraft.fallbackOnSchedulerRedisDegraded} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnSchedulerRedisDegraded: v }))} />
+                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="没有可用账号时使用上游账号" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnNoAvailableCredentials: v }))} />
+                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="本地临时错误过多时使用上游账号" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnLocalTransientExhausted: v }))} />
+                  <ToggleRow disabled={!externalEnabled || directPolicyActive} label="模型不支持时使用上游账号" checked={configDraft.fallbackOnUnsupportedModel} onChange={(v) => setConfigDraft((p) => ({ ...p, fallbackOnUnsupportedModel: v }))} />
                 </div>
               </FormSection>
-              <FormSection title="显式直连" description="开关打开即全量直连外部账号；模型和路径规则只用于细分记录的直连原因。">
+              <FormSection title="显式直连" description="开关打开即全量直连上游账号；模型和路径规则只用于细分记录的直连原因。">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <ToggleRow disabled={!externalEnabled} label="启用显式直连" checked={configDraft.externalDirectPolicyEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalDirectPolicyEnabled: v }))} />
                   <ToggleRow disabled={!directPolicyActive} label="记录本地保护原因" checked={configDraft.directExternalOnLocalMaintenance} onChange={(v) => setConfigDraft((p) => ({ ...p, directExternalOnLocalMaintenance: v }))} />
@@ -388,29 +388,29 @@ export function AccountsPage() {
 
           <PolicyBlock
             title="调度策略"
-            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            titleSuffix={!externalEnabled ? '需先启用账号' : undefined}
             active={externalEnabled}
-            description="控制外部账号自己的并发、排队、重试和超时。"
+            description="控制账号自己的并发、排队、重试和超时。"
           >
             <div className="space-y-4">
-              <FormSection title="容量与排队" description={waitModeActive ? '外部账号满并发时会等待容量。' : '外部账号满并发时不会排队。'}>
+              <FormSection title="容量与排队" description={waitModeActive ? '账号满并发时会等待容量。' : '账号满并发时不会排队。'}>
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolCapacityMode: v as AccountRuntimeConfig['externalPoolCapacityMode'] }))}>
                     <SelectItem value="fail_fast">立即失败</SelectItem>
                     <SelectItem value="wait">等待容量</SelectItem>
                   </SelectBox>
-                  <NumberBox disabled={!externalEnabled} label="全局并发上限" description="限制同时进行的外部账号请求数；不是 RPM。0 表示不限。" suffix="并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolGlobalMaxConcurrentRequests: v }))} />
-                  <NumberBox disabled={!waitModeActive} label="外部池排队上限" description="externalPoolMaxQueuedRequests；只限制外部池 wait 队列，不是本地账号 dispatch 队列。" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxQueuedRequests: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="全局并发上限" description="限制同时进行的账号请求数；不是 RPM。0 表示不限。" suffix="并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolGlobalMaxConcurrentRequests: v }))} />
+                  <NumberBox disabled={!waitModeActive} label="账号排队上限" description="externalPoolMaxQueuedRequests；只限制 wait 队列，不是本地账号 dispatch 队列。" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxQueuedRequests: v }))} />
                   <NumberBox disabled={!externalEnabled} label="估算输入上限（兼容）" description="保留历史配置；不再作为本地发送前拒绝条件，真实上下文超限以上游响应和请求大小保护为准。" suffix="Token" value={configDraft.externalPoolMaxInputTokens} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolMaxInputTokens: v }))} />
                   <NumberBox disabled={!waitModeActive} label="最大等待" description="必须大于 0；旧配置中的 0 按安全默认值 30 秒处理。" suffix="秒" min={1} value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolDispatchMaxWaitSecs: v }))} />
-                  <NumberBox disabled={!externalEnabled} label="外部池最多尝试" description="控制同一请求最多尝试多少个外部账号；0 表示按候选账号自动尝试一轮。" suffix="池" value={configDraft.externalPoolRetryMaxAttempts} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryMaxAttempts: v }))} />
-                  <ToggleRow label="网络错误跨池重试" description="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他外部池。" checked={configDraft.externalPoolRetryOnNetworkError} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryOnNetworkError: v }))} />
-                  <ToggleRow label="协议错误跨池重试" description="成功状态码但返回错误信封或协议污染时，是否允许切换其他外部池。" checked={configDraft.externalPoolRetryOnProtocolError} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryOnProtocolError: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="最多尝试账号数" description="控制同一请求最多尝试多少个账号；0 表示按候选账号自动尝试一轮。" suffix="个" value={configDraft.externalPoolRetryMaxAttempts} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryMaxAttempts: v }))} />
+                  <ToggleRow label="网络错误换号重试" description="连接、DNS、超时等没有 HTTP 状态码的错误，是否允许切换其他账号。" checked={configDraft.externalPoolRetryOnNetworkError} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryOnNetworkError: v }))} />
+                  <ToggleRow label="协议错误换号重试" description="成功状态码但返回错误信封或协议污染时，是否允许切换其他账号。" checked={configDraft.externalPoolRetryOnProtocolError} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRetryOnProtocolError: v }))} />
                   <TextAreaBox disabled={!externalEnabled} label="跨池重试状态码" value={retryStatusCodesText} onChange={setRetryStatusCodesText} />
-                  <NumberBox disabled={!externalEnabled} label="同池重试次数" description="命中下面状态码时，先在同一个外部账号上重试；重试耗尽后按跨池策略尝试其他外部账号。" suffix="次" value={configDraft.externalPoolSamePoolRetryCount} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryCount: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="同号重试次数" description="命中下面状态码时，先在同一个账号上重试；重试耗尽后按跨号策略尝试其他账号。" suffix="次" value={configDraft.externalPoolSamePoolRetryCount} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryCount: v }))} />
                   <NumberBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试间隔" suffix="毫秒" value={configDraft.externalPoolSamePoolRetryDelayMs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolSamePoolRetryDelayMs: v }))} />
-                  <NumberBox disabled={!externalEnabled} label="失败池临时降权" description="每个瞬态失败窗口内的失败次数都会临时增加有效优先级；默认 20，可让优先级 1 的故障池让位给 10/20 的健康池，0 表示关闭。" suffix="优先级" min={0} value={configDraft.externalPoolTransientFailurePriorityPenalty} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailurePriorityPenalty: v }))} />
-                  <NumberBox disabled={!externalEnabled} label="连续失败冷却阈值" description="同一外部池同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；默认 0，仅降权不池级冷却。" suffix="次" min={0} value={configDraft.externalPoolTransientFailureCooldownThreshold} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailureCooldownThreshold: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="失败账号临时降权" description="每个瞬态失败窗口内的失败次数都会临时增加有效优先级；默认 20，可让优先级 1 的故障账号让位给 10/20 的健康账号，0 表示关闭。" suffix="优先级" min={0} value={configDraft.externalPoolTransientFailurePriorityPenalty} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailurePriorityPenalty: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="连续失败冷却阈值" description="同一账号同一错误原因连续达到该次数后，才按对应冷却秒数临时避开；默认 0，仅降权不账号级冷却。" suffix="次" min={0} value={configDraft.externalPoolTransientFailureCooldownThreshold} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolTransientFailureCooldownThreshold: v }))} />
                   <TextAreaBox disabled={!externalEnabled || configDraft.externalPoolSamePoolRetryCount <= 0} label="同池重试状态码" value={samePoolRetryStatusCodesText} onChange={setSamePoolRetryStatusCodesText} />
                 </div>
               </FormSection>
@@ -422,17 +422,17 @@ export function AccountsPage() {
                   <NumberBox disabled={!externalEnabled} label="协议/认证冷却" suffix="秒" value={configDraft.externalPoolProtocolErrorCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolProtocolErrorCooldownSecs: v }))} />
                   <SelectBox disabled={!externalEnabled} label="模型不可用冷却范围" value={configDraft.externalPoolModelUnavailableCooldownMode} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownMode: v as AccountRuntimeConfig['externalPoolModelUnavailableCooldownMode'] }))}>
                     <SelectItem value="model">仅当前模型</SelectItem>
-                    <SelectItem value="account">整个外部账号</SelectItem>
+                    <SelectItem value="account">整个账号</SelectItem>
                     <SelectItem value="disabled">不写冷却</SelectItem>
                   </SelectBox>
                   <NumberBox disabled={!externalEnabled || configDraft.externalPoolModelUnavailableCooldownMode === 'disabled'} label="模型不可用冷却" suffix="秒" value={configDraft.externalPoolModelUnavailableCooldownSecs} min={1} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolModelUnavailableCooldownSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="非流式总超时" suffix="秒" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRequestTimeoutSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="流式总超时" suffix="秒" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamRequestTimeoutSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="流式空闲超时" suffix="秒" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamIdleTimeoutSecs: v }))} />
-                  <ToggleRow disabled={!externalEnabled} label="流式首输出前错误换池" description="stream 已返回 200 但还没提交 content、thinking 或 tool_use 前遇到 error、断流、EOF 或空闲超时时，允许在外部账号内换池。" checked={configDraft.externalPoolStreamPreOutputRetryEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamPreOutputRetryEnabled: v }))} />
+                  <ToggleRow disabled={!externalEnabled} label="流式首输出前错误换号" description="stream 已返回 200 但还没提交 content、thinking 或 tool_use 前遇到 error、断流、EOF 或空闲超时时，允许在账号内换号。" checked={configDraft.externalPoolStreamPreOutputRetryEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamPreOutputRetryEnabled: v }))} />
                 </div>
               </FormSection>
-              <FormSection title="流式 SSE 默认转发" description="作为外部账号默认值；单个外部账号仍可在编辑弹窗中覆盖。">
+              <FormSection title="流式 SSE 默认转发" description="作为账号默认值；单个账号仍可在编辑弹窗中覆盖。">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <SelectBox
                     disabled={!externalEnabled}
@@ -447,7 +447,7 @@ export function AccountsPage() {
                   </SelectBox>
                 </div>
               </FormSection>
-              <FormSection title="外部账号失败后回本地" description="仅对本地优先 fallback 到外部账号的请求生效；显式直连开启时不会回本地。">
+              <FormSection title="账号失败后回本地" description="仅对本地优先 fallback 到上游账号的请求生效；显式直连开启时不会回本地。">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <ToggleRow disabled={!externalEnabled || directPolicyActive} label="启用回本地" checked={configDraft.externalPoolLocalRescueEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolLocalRescueEnabled: v }))} />
                   <ToggleRow disabled={!localRescueActive} label="429 时回本地" checked={configDraft.externalPoolLocalRescueOnRateLimit} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolLocalRescueOnRateLimit: v }))} />
@@ -461,9 +461,9 @@ export function AccountsPage() {
 
           <PolicyBlock
             title="自动禁用"
-            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            titleSuffix={!externalEnabled ? '需先启用账号' : undefined}
             active={autoDisableActive}
-            description="自动禁用只作用于外部账号本身；单个外部账号可选择继承、强制启用或关闭。"
+            description="自动禁用只作用于账号本身；单个账号可选择继承、强制启用或关闭。"
           >
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <ToggleRow disabled={!externalEnabled} label="启用自动禁用" checked={configDraft.externalPoolAutoDisableEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolAutoDisableEnabled: v }))} />
@@ -480,9 +480,9 @@ export function AccountsPage() {
 
           <PolicyBlock
             title="用量补偿"
-            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            titleSuffix={!externalEnabled ? '需先启用账号' : undefined}
             active={externalEnabled && usageCompensationActive}
-            description={'仅对下游 usage 口径为“按当前入口路径整理 usage”的外部账号生效；选择“透传上游 usage”的账号不受影响。'}
+            description={'仅对下游 usage 口径为“按当前入口路径整理 usage”的账号生效；选择“透传上游 usage”的账号不受影响。'}
           >
             <div className="space-y-4">
               <FormSection title="成本底线" description="用最终返回给调用方的 usage 覆盖原始上游成本；有上游缓存证据时优先补缓存字段，并遵守当前路径上限。">
@@ -511,9 +511,9 @@ export function AccountsPage() {
 
           <PolicyBlock
             title="诊断记录"
-            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            titleSuffix={!externalEnabled ? '需先启用账号' : undefined}
             active={usageDebugActive}
-            description="临时保存外部池上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；用于排查 output_tokens 为 0 等异常。"
+            description="临时保存上游原始响应/SSE usage 样本、请求关联信息和本系统解析结果；用于排查 output_tokens 为 0 等异常。"
           >
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <ToggleRow disabled={!externalEnabled} label="启用 usage 原始数据诊断" checked={configDraft.externalPoolUsageDebugEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolUsageDebugEnabled: v }))} />
@@ -527,18 +527,18 @@ export function AccountsPage() {
 
       {/* Account list */}
       <SectionCard
-        title="外部账号列表"
-        description="单个外部账号配置只影响自身；全局调度、冷却、补偿策略在上方统一保存。"
+        title="账号列表"
+        description="单个账号配置只影响自身；全局调度、冷却、补偿策略在上方统一保存。"
         actions={
           <Button size="sm" onClick={() => { setCreateForm(defaultAccountForm()); setCreateOpen(true) }}>
-            <Plus className="h-4 w-4" />添加外部账号
+            <Plus className="h-4 w-4" />添加账号
           </Button>
         }
       >
         {accounts.isLoading ? (
           <LoadingState />
         ) : !accounts.data?.accounts.length ? (
-          <EmptyState title="暂无外部账号" description="点击右上角按钮添加第一个外部账号。" />
+          <EmptyState title="暂无账号" description="点击右上角按钮添加第一个账号。" />
         ) : (
           <div className="space-y-3">
             {accounts.data.accounts.map((account) => {
@@ -587,8 +587,8 @@ export function AccountsPage() {
                         variant="ghost" size="xs"
                         className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                         onClick={async () => {
-                          const confirmed = await confirmDialog({ title: '删除外部账号', message: `删除外部账号「${account.name}」？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
-                          if (confirmed) mutateAccount(() => deleteAccount(account.id), '外部账号已删除')
+                          const confirmed = await confirmDialog({ title: '删除账号', message: `删除账号「${account.name}」？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
+                          if (confirmed) mutateAccount(() => deleteAccount(account.id), '账号已删除')
                         }}
                       >
                         <Trash2 className="h-3.5 w-3.5" />删除
@@ -610,7 +610,7 @@ export function AccountsPage() {
         onDraftChange={setCreateForm}
         onDiscoverSupportedModels={async () => {
           if (!createForm.baseUrl.trim() || !createForm.apiKey.trim()) {
-            throw new Error('请先填写外部账号 Base URL 和 Key')
+            throw new Error('请先填写账号 Base URL 和 Key')
           }
           const response = await discoverAccountSupportedModels({
             baseUrl: createForm.baseUrl.trim(),

@@ -14,9 +14,9 @@ Related: [Problem evidence](../topics/problems/correctness-security-and-resource
 
 Two unregistered 2026-07-12 feature reports and current source inspection show three tool-definition failures:
 
-- a missing or empty description becomes an empty string and Kiro rejects the request;
+- a missing or empty description becomes an empty string and Account Runtime rejects the request;
 - explicit `input_schema: null` fails entry deserialization even though a missing field already becomes an empty schema;
-- property names outside the target's accepted pattern reach Kiro/external upstreams and cause an opaque 400.
+- property names outside the target's accepted pattern reach Account Runtime/external upstreams and cause an opaque 400.
 
 Blindly replacing invalid property characters is not safe. It can collapse two names, desynchronize `required`/dependency keywords and cause the model's returned `tool_use.input` keys to differ from the names the downstream client understands. `patternProperties` keys are regular expressions and `$defs` keys are schema-definition identifiers, not ordinary object property names.
 
@@ -26,7 +26,7 @@ Blindly replacing invalid property characters is not safe. It can collapse two n
 
 Raw external mode remains byte-preserving. It performs only bounded raw facts needed for authentication/routing and never parses, repairs or renames tool definitions. Any destination rejection is returned through normalized error handling without mutating or replaying the request.
 
-Kiro/local and explicitly normalized external profiles apply a versioned target-capability policy before sending one attempt:
+Account Runtime/local and explicitly normalized external profiles apply a versioned target-capability policy before sending one attempt:
 
 - missing, empty or whitespace-only tool descriptions become one deterministic neutral nonempty description; an existing nonempty description remains semantically unchanged;
 - absent or explicit-null `input_schema` becomes the same empty object schema only for these normalized profiles;
@@ -46,7 +46,7 @@ Valid property names remain byte-identical. When a normalized target rejects an 
 5. The map is tied to the prepared tool-definition revision and mapped tool identity. Streaming and non-streaming response paths reverse-map every returned `tool_use.input` object at the matching schema path before Anthropic/Claude Code output.
 6. Unknown keys returned by the model are preserved only when the original schema permits them; otherwise they follow the accepted validation/error policy. They are never guessed into an original name.
 
-Normalized external destinations use their own declared capability. Property mapping is never assumed globally merely because Kiro requires `^[a-zA-Z0-9_.-]{1,64}$`.
+Normalized external destinations use their own declared capability. Property mapping is never assumed globally merely because Account Runtime requires `^[a-zA-Z0-9_.-]{1,64}$`.
 
 ### Failure And Replay
 
@@ -56,7 +56,7 @@ If normalization cannot prove semantic and reverse-mapping safety, reject before
 
 - `MOD-PROTO-ANTHROPIC` owns public tool DTO semantics, including profile-aware null handling.
 - `MOD-PAYLOAD` owns pure normalized target validation/mapping and produces a versioned map in `MOD-REQUEST-ARTIFACTS`.
-- `MOD-PROTO-KIRO` and `MOD-PROTO-EXTERNAL` own target capability codecs, not product repair policy.
+- `MOD-PROTO-ACCOUNT_RUNTIME` and `MOD-PROTO-EXTERNAL` own target capability codecs, not product repair policy.
 - `MOD-RESPONSE` plus `MOD-PROTO-SSE` own streaming/non-streaming reverse translation through the prepared map.
 - `MOD-TRANSPORT-PUBLIC` preserves the raw body until route/profile selection and maps local validation errors.
 
@@ -64,7 +64,7 @@ If normalization cannot prove semantic and reverse-mapping safety, reject before
 
 ### Forward every invalid schema unchanged
 
-Rejected for normalized/Kiro profiles because it converts a deterministic local compatibility issue into an opaque upstream failure and unnecessary request/cost.
+Rejected for normalized/Account Runtime profiles because it converts a deterministic local compatibility issue into an opaque upstream failure and unnecessary request/cost.
 
 ### Replace every invalid character with underscore
 
@@ -85,7 +85,7 @@ Safe but unnecessarily incompatible for schemas that admit a provably reversible
 
 ## Current Implementation Note, 2026-07-12
 
-The current dirty tree implements the normalized Kiro/local schema-key subset of this decision:
+The current dirty tree implements the normalized Account Runtime/local schema-key subset of this decision:
 
 - `sanitize` is the default and only maps invalid property names; valid names remain byte-identical and create no response map.
 - Invalid property names are mapped to deterministic `key<16hex>` ids using SHA-256 over the mapped tool identity, schema path, original name and attempt.

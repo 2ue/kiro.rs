@@ -18,7 +18,7 @@ Production symptom:
 
 Fix:
 
-- `src/kiro/provider.rs`
+- `src/local_upstream_impl/provider.rs`
   - `2xx + application/json` is no longer treated as a provider-terminal non-eventstream failure.
   - Provider now preserves response headers/body for handler body sniffing.
 - `src/anthropic/handlers/tests.rs`
@@ -59,7 +59,7 @@ Fix:
     - `contextUsageEvent`
     - `meteringEvent`
     - no `messageStatus`
-  - Verified both stream and non-stream return success and preserve `kiro_metering_usage`.
+  - Verified both stream and non-stream return success and preserve `account-runtime_metering_usage`.
 
 Targeted validation:
 
@@ -113,7 +113,7 @@ outputTokens=1
 cacheCreationInputTokens=4944
 estimatedCostUsd=0.006198
 originalCostUsd=0.004962
-kiroMeteringUsage=0.006290560331674959
+upstreamMeteringUnits=0.006290560331674959
 pricingModel=claude-haiku-4-5
 downstreamStopReason=end_turn
 ```
@@ -157,7 +157,7 @@ outputTokens=1
 cacheCreationInputTokens=4940
 estimatedCostUsd=0.006197000000000001
 originalCostUsd=0.004961999999999999
-kiroMeteringUsage=0.0033496648092868992
+upstreamMeteringUnits=0.0033496648092868992
 pricingModel=claude-haiku-4-5
 downstreamStopReason=end_turn
 ```
@@ -212,7 +212,7 @@ totalInputTokens=6979
 compatInputTokens=9
 outputTokens=2
 cacheCreationInputTokens=6970
-kiroMeteringUsage=0.00905493744610282
+upstreamMeteringUnits=0.00905493744610282
 estimatedCostUsd=0.008731500000000001
 pricingModel=claude-haiku-4-5
 ```
@@ -256,22 +256,22 @@ req_01fwu3PBdcumBkmgGJhHkJBV:
   routeSubtype=local_success
   stop_reason=tool_use
   outputTokens=18
-  kiroMeteringUsage=0.011784541094527364
+  upstreamMeteringUnits=0.011784541094527364
 
 req_01uQopXW4SASnsfu3zRJS1i8:
   status=success
   routeSubtype=local_success
   stop_reason=end_turn
   outputTokens=184
-  kiroMeteringUsage=0.012613988988391374
+  upstreamMeteringUnits=0.012613988988391374
 ```
 
 ## Thinking / effort mapping
 
 External references consulted:
 
-- Kiro CLI effort docs: `https://kiro.dev/docs/cli/chat/effort/`
-  - The Kiro docs describe Claude models as using `output_config.effort` together with `thinking.type` and `thinking.display`.
+- Account Runtime CLI effort docs: `https://account-runtime.dev/docs/cli/chat/effort/`
+  - The Account Runtime docs describe Claude models as using `output_config.effort` together with `thinking.type` and `thinking.display`.
   - The same page lists `low`, `medium`, `high`, `xhigh`, and `max` as supported effort values where supported by the model.
 - Claude Platform thinking steering docs: `https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost`
   - Claude adaptive thinking can choose whether and how much to think per request; effort is guidance, not a guarantee that every turn emits thinking.
@@ -279,7 +279,7 @@ External references consulted:
 Fix:
 
 - `src/anthropic/converter/model.rs`
-  - Native Kiro `output_config` path now sends:
+  - Native Account Runtime `output_config` path now sends:
 
     ```json
     {
@@ -355,7 +355,7 @@ routeSubtype=local_success
 totalInputTokens=5001
 compatInputTokens=10
 outputTokens=3
-kiroMeteringUsage=0.02579119930348259
+upstreamMeteringUnits=0.02579119930348259
 pricingModel=claude-sonnet-4-6
 firstThinkingDeltaMs=2481
 ```
@@ -365,7 +365,7 @@ Debug conversion summary:
 ```text
 reasoning_path=Some("output_config")
 reasoning_effort=Some("max")
-reasoning_source=Some("kiro_model_schema")
+reasoning_source=Some("account-runtime_model_schema")
 ```
 
 Real Claude Code CLI `--effort max`:
@@ -398,7 +398,7 @@ routeSubtype=local_success
 totalInputTokens=6775
 compatInputTokens=5
 outputTokens=7
-kiroMeteringUsage=0.03333279336650083
+upstreamMeteringUnits=0.03333279336650083
 pricingModel=claude-sonnet-4-6
 firstThinkingDeltaMs=1846
 ```
@@ -484,10 +484,10 @@ scoped target cleanup: removed=true reservation_released=true
 
 ## Final candidate rerun - 2026-07-25
 
-Frozen `kiro-rs` candidate:
+Frozen `account-runtime` candidate:
 
 ```text
-path=/var/folders/.../kiro-cli-candidate.q4sULL/kiro-rs
+path=/var/folders/.../account-runtime-cli-candidate.q4sULL/account-runtime
 sha256=25ea01fb741bdffb103fa95397f0fb29b60c8bffee9267741f563f388ae237a4
 service=existing local 127.0.0.1:9022
 pid=49735
@@ -501,7 +501,7 @@ The local service was restarted directly on the existing `9022` process. No sepa
 ```text
 git diff --check: passed
 cargo fmt --check: passed
-cargo test --bin kiro-rs -- --test-threads=2: passed
+cargo test --bin account-runtime -- --test-threads=2: passed
   1784 passed, 0 failed, 6 ignored
 node feature/tests/check-feature-docs.mjs: passed
   50 issue documents, 123 relative links
@@ -514,10 +514,10 @@ node feature/tests/inventory-build-artifacts.mjs --gate: passed
 One full-tree red item was found and fixed during this rerun:
 
 ```text
-kiro::provider::tests::provider_sends_converter_max_effort_without_inventing_thinking_for_five_rounds
+account-runtime::provider::tests::provider_sends_converter_max_effort_without_inventing_thinking_for_five_rounds
 ```
 
-The old test expected `additionalModelRequestFields` to contain only `output_config.max`. That contradicted the corrected native Kiro contract for output-config reasoning, where the final wire must contain both:
+The old test expected `additionalModelRequestFields` to contain only `output_config.max`. That contradicted the corrected native Account Runtime contract for output-config reasoning, where the final wire must contain both:
 
 ```json
 {
@@ -530,9 +530,9 @@ The test was renamed to `provider_sends_converter_max_effort_with_native_adaptiv
 
 - `effort=max` reaches final wire unchanged;
 - `thinking.type=adaptive` is present;
-- Anthropic-only `budget_tokens` is not sent to Kiro native adaptive thinking.
+- Anthropic-only `budget_tokens` is not sent to Account Runtime native adaptive thinking.
 
-The targeted test and full `cargo test --bin kiro-rs` both passed after the correction.
+The targeted test and full `cargo test --bin account-runtime` both passed after the correction.
 
 ### Final direct protocol smoke
 
@@ -550,7 +550,7 @@ usage record=req_01zTw4N2BT1zjB9Dj6TZBTKp
 status=success
 routeSubtype=local_success
 pricingModel=claude-haiku-4-5
-kiroMeteringUsage=0.006603686633499171
+upstreamMeteringUnits=0.006603686633499171
 ```
 
 Direct non-stream:
@@ -566,7 +566,7 @@ usage record=req_01PyMPfCFKwMz3hLEbQmqMof
 status=success
 routeSubtype=local_success
 pricingModel=claude-haiku-4-5
-kiroMeteringUsage=0.003777497379767828
+upstreamMeteringUnits=0.003777497379767828
 ```
 
 Direct `thinking.adaptive + output_config.effort=max`:
@@ -585,7 +585,7 @@ usage record=req_012sgLrDSyGquBRht8opDBef
 status=success
 routeSubtype=local_success
 pricingModel=claude-sonnet-4-6
-kiroMeteringUsage=0.026230265356550583
+upstreamMeteringUnits=0.026230265356550583
 ```
 
 ### Final Claude Code CLI smoke
@@ -641,8 +641,8 @@ MCP CLI:
 ```text
 server=.local-run/cc-real-tests/mcp-ping-server.js
 config=.local-run/cc-real-tests/mcp-config.json
-tool_use=mcp__kiro-local-test__ping
-tool_result contains=mcp-pong-kiro-local
+tool_use=mcp__account-runtime-local-test__ping
+tool_result contains=mcp-pong-account-runtime-local
 final text=final-mcp-ok
 final usage non-zero=true
 leak patterns found=false
@@ -658,7 +658,7 @@ Image:
 valid RGB 16x16 PNG: success
 text=final-image-ok
 usage non-zero=true
-kiroMeteringUsage=0.006530426666666667
+upstreamMeteringUnits=0.006530426666666667
 ```
 
 Bad image:
@@ -671,7 +671,7 @@ usage record=req_01FbRDgE41yTHYCzuBrtRT1Y
 status=error
 model=unknown
 errorMessage=request rejected before upstream dispatch
-kiroMeteringUsage=0
+upstreamMeteringUnits=0
 ```
 
 An earlier 1x1 gray+alpha PNG was rejected by upstream as `image_invalid_bad_request` while payload guard showed no local body mutation. A standard RGB PNG passed, so the proxy image conversion path is not corrupting valid image bodies.
@@ -690,10 +690,10 @@ final usage: input_tokens=946, output_tokens=721
 
 ### Fake-upstream load/chaos validation
 
-`kiro_loadtest` binary:
+`account_runtime_loadtest` binary:
 
 ```text
-path=/var/folders/.../kiro-loadtest-bin.nAer2f/kiro_loadtest
+path=/var/folders/.../account-runtime-loadtest-bin.nAer2f/account_runtime_loadtest
 sha256=da338c62b21a22f061e5eb5dbd2f26f60ab59e34255703fcf93aa5ece819d13f
 ```
 

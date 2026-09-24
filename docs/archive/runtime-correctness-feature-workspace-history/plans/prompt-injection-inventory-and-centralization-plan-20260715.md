@@ -1,14 +1,14 @@
 # 上游请求提示词注入点审计与集中化方案
 
 日期: 2026-07-15
-范围: `kiro.rs` 网关中所有会把提示词 / 合成文本注入到**发往上游请求**里的位置。
+范围: `account-runtime` 网关中所有会把提示词 / 合成文本注入到**发往上游请求**里的位置。
 状态: 分析 + 方案(尚未实施集中化改造)。
 
 ---
 
 ## 1. 背景与目标
 
-网关在把 Anthropic Messages 请求转换 / 转发到上游(Kiro 本地路径或 `/cc` 外部池)时,会注入若干合成文本:
+网关在把 Anthropic Messages 请求转换 / 转发到上游(Account Runtime 本地路径或 `/cc` 外部池)时,会注入若干合成文本:
 系统级行为规约、控制标签、工具描述后缀、以及各类占位符与裁剪留痕。
 
 当前这些文本分散在 `converter/`、`payload_guard.rs`、`config.rs` 等多个文件,缺少统一入口和统一的"作用说明"注释。
@@ -56,7 +56,7 @@
 |---|---|---|---|---|
 | B1 Write 描述后缀 | `converter/tools.rs:16` `WRITE_TOOL_DESCRIPTION_SUFFIX` | `- IMPORTANT: If the content to write exceeds 150 lines...` | 英文 | `inject_chunked_tool_descriptions()` 且工具名 `Write` |
 | B2 Edit 描述后缀 | `converter/tools.rs:19` `EDIT_TOOL_DESCRIPTION_SUFFIX` | `- IMPORTANT: If the new_string content exceeds 50 lines...` | 英文 | 同 B1,工具名 `Edit` |
-| B3 空描述占位 | `converter/tools.rs:21,246-257` | `Tool available to the assistant.` / `Tool \`{name}\` available to the assistant.` | 英文 | 工具 description 为空(Kiro 要求非空) |
+| B3 空描述占位 | `converter/tools.rs:21,246-257` | `Tool available to the assistant.` / `Tool \`{name}\` available to the assistant.` | 英文 | 工具 description 为空(Account Runtime 要求非空) |
 | B4 历史占位工具描述 | `converter/tools.rs:75` `create_placeholder_tool` | `Tool used in conversation history` | 英文 | 历史引用但 tools 列表缺失的工具 |
 
 ### C. 用户 / 工具结果占位符(第二类)

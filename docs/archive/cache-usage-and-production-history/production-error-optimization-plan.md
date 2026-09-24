@@ -9,7 +9,7 @@
 本计划覆盖以下问题：
 
 - 外部备用池流式请求在约 180 秒附近断流。
-- 本地 Kiro 上游流式请求出现 `upstream stream idle timeout`。
+- 本地 Account Runtime 上游流式请求出现 `upstream stream idle timeout`。
 - 外部备用池返回 `429`、`500`、`database is locked`、`Invalid token`、`channel affinity disabled` 等错误时的分类、冷却、切池和自动禁用策略。
 - `Context window is full`、`Input is too long`、`CONTENT_LENGTH_EXCEEDS_THRESHOLD` 类请求过大问题。
 - `Improperly formed request`、`Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered` 类工具序列问题。
@@ -31,13 +31,13 @@
 已知现网服务：
 
 - 主机：`152.53.194.170`
-- 部署目录：`~/docker-compose/kiro-rs-2ue-59137`
+- 部署目录：`~/docker-compose/account-runtime-2ue-59137`
 - 服务端口：`59137`
-- 应用容器：`kiro-rs-2ue-59137-app`
-- Postgres 容器：`kiro-rs-2ue-59137-postgres`
-- Redis 容器：`kiro-rs-2ue-59137-redis`
-- 当前查询到的应用版本：`kiro-rs 0.0.39`
-- 镜像：`ghcr.io/2ue/kiro-rs:latest`
+- 应用容器：`account-runtime-2ue-59137-app`
+- Postgres 容器：`account-runtime-2ue-59137-postgres`
+- Redis 容器：`account-runtime-2ue-59137-redis`
+- 当前查询到的应用版本：`account-runtime 0.0.39`
+- 镜像：`ghcr.io/2ue/account-runtime:latest`
 - 服务状态：healthy
 
 远端操作约束：
@@ -48,7 +48,7 @@
 
 本地仓库上下文：
 
-- 本地路径：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+- 本地路径：`/Users/yuanfeijie/Desktop/procode/account-runtime`
 - 主分支：`main`
 - `Cargo.toml` 当前本地版本曾查询为 `0.0.40`
 - 本地工作区存在未提交的外部池 output uplift 相关改动；这些改动不等于现网已生效。
@@ -59,15 +59,15 @@
 远端查询服务状态：
 
 ```bash
-cd ~/docker-compose/kiro-rs-2ue-59137
+cd ~/docker-compose/account-runtime-2ue-59137
 docker compose ps
-docker exec kiro-rs-2ue-59137-app /app/kiro-rs --version
+docker exec account-runtime-2ue-59137-app /app/account-runtime --version
 ```
 
 远端查询最近错误日志：
 
 ```bash
-docker logs --since 3h --tail 2500 kiro-rs-2ue-59137-app 2>&1 \
+docker logs --since 3h --tail 2500 account-runtime-2ue-59137-app 2>&1 \
   | grep -Ei 'error|Bad Request|timeout|external pool|Input is too long|CONTENT_LENGTH|tool_use|tool_result|model_not_found|database is locked|Improperly|Context window|decoding response body|invalid message sequence|HTML response|Too many requests|429|403|502|503|504' \
   | tail -n 220
 ```
@@ -75,9 +75,9 @@ docker logs --since 3h --tail 2500 kiro-rs-2ue-59137-app 2>&1 \
 远端查询使用记录表结构：
 
 ```bash
-docker exec kiro-rs-2ue-59137-postgres psql \
-  -U kiro_rs_59137 \
-  -d kiro_rs_59137 \
+docker exec account-runtime-2ue-59137-postgres psql \
+  -U account_runtime_59137 \
+  -d account_runtime_59137 \
   -Atc "
 select tablename
 from pg_tables
@@ -95,9 +95,9 @@ order by ordinal_position;
 远端查询错误聚合：
 
 ```bash
-docker exec kiro-rs-2ue-59137-postgres psql \
-  -U kiro_rs_59137 \
-  -d kiro_rs_59137 \
+docker exec account-runtime-2ue-59137-postgres psql \
+  -U account_runtime_59137 \
+  -d account_runtime_59137 \
   -P pager=off \
   -Atc "
 select coalesce(status,'?') || '|' || coalesce(error_type,'?') || '|' || count(*)
@@ -127,9 +127,9 @@ limit 40;
 远端查询外部池错误：
 
 ```bash
-docker exec kiro-rs-2ue-59137-postgres psql \
-  -U kiro_rs_59137 \
-  -d kiro_rs_59137 \
+docker exec account-runtime-2ue-59137-postgres psql \
+  -U account_runtime_59137 \
+  -d account_runtime_59137 \
   -P pager=off \
   -Atc "
 select coalesce(data->>'externalPoolName','?')
@@ -207,7 +207,7 @@ limit 30;
 payload guard：
 
 - `src/anthropic/payload_guard.rs`
-- 函数：`guard_kiro_request`
+- 函数：`guard_account-runtime_request`
 - 函数：`repair_request`
 - 函数：`repair_orphan_tool_results`
 - 函数：`remove_unpaired_tool_uses`
@@ -399,7 +399,7 @@ cache/usage 整形：
 
 测试：
 
-- 构造 600KB Kiro request，最终 body 应小于 `428032`。
+- 构造 600KB Account Runtime request，最终 body 应小于 `428032`。
 - 构造只有当前图片或当前 document 超限的请求，默认不删除当前内容，但记录 `still_oversized`。
 - on-too-long 模式下首次不裁，收到 too long 后只重试一次。
 - 验证 usage record 中 payload diagnostics 正确记录 original/final bytes。
@@ -407,7 +407,7 @@ cache/usage 整形：
 风险：
 
 - 更保守的目标会丢弃更多历史，影响长会话连续性。
-- 需要在页面上说明这是 Kiro HTTP payload 限制，不等同于模型 context window。
+- 需要在页面上说明这是 Account Runtime HTTP payload 限制，不等同于模型 context window。
 
 ### 阶段 4：tool_use/tool_result 序列诊断和保守修复
 
@@ -418,11 +418,11 @@ cache/usage 整形：
 - `Improperly formed request`
 - `Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered`
 
-当前 Kiro payload guard 已做修复，但不一定覆盖所有 Anthropic 原始消息序列、裁剪后边界、多 agent 插入、MCP 工具调用等场景。
+当前 Account Runtime payload guard 已做修复，但不一定覆盖所有 Anthropic 原始消息序列、裁剪后边界、多 agent 插入、MCP 工具调用等场景。
 
 改进方案：
 
-- 新增“消息序列诊断器”，发上游前对转换后的 Kiro request 做最终检查。
+- 新增“消息序列诊断器”，发上游前对转换后的 Account Runtime request 做最终检查。
 - 诊断器记录：
   - 第几个 history entry 出现孤立 tool_result。
   - 第几个 assistant tool_use 没有后续 user tool_result。
@@ -600,7 +600,7 @@ cache/usage 整形：
 
 风险：
 
-- 外部池可能支持的模型集合不同于 Kiro 本地池，不能强制共用本地映射。
+- 外部池可能支持的模型集合不同于 Account Runtime 本地池，不能强制共用本地映射。
 
 ### 阶段 7：使用记录、统计和清理
 
@@ -833,7 +833,7 @@ cargo test --locked --no-default-features
 
 ## 需要避免的错误做法
 
-- 不要把 `1M context` 理解成可以无限发送 1MB 以上 JSON body。模型上下文和 Kiro HTTP payload 限制是两回事。
+- 不要把 `1M context` 理解成可以无限发送 1MB 以上 JSON body。模型上下文和 Account Runtime HTTP payload 限制是两回事。
 - 不要对所有 400 都 fallback 外部池。请求格式错误、工具序列错误、schema 错误、上下文过长都不应该盲目 fallback。
 - 不要为了成本补偿只改后台 `billableCostUsd`，而不改最终下游 usage。否则页面账务和调用方看到的数据不一致。
 - 不要让 pass-through 外部池被全局整形影响。

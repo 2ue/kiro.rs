@@ -106,7 +106,7 @@ The implementation was changing after this review. Each item must be re-reviewed
 
 ## Redis Runner Preflight Evidence
 
-`feature/tests/run-token-refresh-redis-validation.sh` 的 `bash -n` 通过。以下五个 Cargo 前拒绝分支均返回 64：缺 Redis URL、`KIRO_RS_TEST_REDIS_ISOLATED!=1`、outer rounds 为 0、URL 指向受保护 9022、非 loopback 且未 opt-in。
+`feature/tests/run-token-refresh-redis-validation.sh` 的 `bash -n` 通过。以下五个 Cargo 前拒绝分支均返回 64：缺 Redis URL、`ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED!=1`、outer rounds 为 0、URL 指向受保护 9022、非 loopback 且未 opt-in。
 
 这段 preflight 运行发生在尚未提供隔离 Redis 的阶段：五分支执行前后均没有 `target/.validation-build-token-refresh*` 或 Git-common reservation；根 target 保持约 708 MiB，未产生本 runner 构建产物。当时五个 Redis 状态机测试只能算编译覆盖；该限制后来由 2026-07-19 和下节 2026-07-20 的真实隔离 Redis 动态结果取代。
 
@@ -140,10 +140,10 @@ attribution 或 frozen release 通过。
 Environment:
 
 ```text
-KIRO_RS_TEST_POSTGRES_URL=postgres://kiro_rs:<redacted>@127.0.0.1:25433/kiro_rs
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379/2
-KIRO_RS_TEST_POSTGRES_ISOLATED=1
-KIRO_RS_TEST_REDIS_ISOLATED=1
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=postgres://account_runtime:<redacted>@127.0.0.1:25433/account_runtime
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379/2
+ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED=1
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1
 RUSTUP_TOOLCHAIN=1.92.0
 dockerStarted=false
 protected9022ProbeSkipped=true
@@ -153,7 +153,7 @@ Red reproduction before the final fix:
 
 ```text
 scope=token-refresh-cluster
-KIRO_TOKEN_REFRESH_CLUSTER_OUTER_ROUNDS=1
+ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_OUTER_ROUNDS=1
 failed test:
   token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds
 assertion:
@@ -188,7 +188,7 @@ Focused green checks:
 scope=failure-replay-fix
 tests:
   storage::redis_cache::tests::token_refresh_failure_backoff_is_bounded_and_deterministic_for_five_rounds
-  kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds
+  account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds
 result:
   2/2 exact tests passed
 scoped cleanup:
@@ -206,7 +206,7 @@ tests=7
 internalRoundsPerTest=5
 result=pass
 redisDatabase=2
-postgresDatabase=kiro_rs
+postgresDatabase=account_runtime
 cleanup.redisDatabaseEmpty=true
 cleanup.tempRemoved=true
 scoped cleanup:
@@ -226,7 +226,7 @@ exact invocations=21
 internal scenario rounds=105
 result=pass
 redisDatabase=2
-postgresDatabase=kiro_rs
+postgresDatabase=account_runtime
 cleanup:
   childGroupsStopped=true
   redisDatabaseEmpty=true
@@ -242,10 +242,10 @@ scoped cleanup:
 The seven exact tests covered:
 
 ```text
-kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_rotating_and_non_rotating_share_one_send_and_pg_authority_for_five_rounds
-kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_pg_cas_fences_stale_rotating_and_non_rotating_results_for_five_rounds
-kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds
-kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_five_rounds
+account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_rotating_and_non_rotating_share_one_send_and_pg_authority_for_five_rounds
+account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_pg_cas_fences_stale_rotating_and_non_rotating_results_for_five_rounds
+account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds
+account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_five_rounds
 storage::postgres::tests::postgres_refresh_field_cas_fences_non_rotating_refresh_by_access_token_for_five_rounds
 storage::redis_cache::tests::token_refresh_redis_stale_leader_cannot_overwrite_success_for_five_rounds
 storage::redis_cache::tests::token_refresh_redis_failure_replay_health_claim_and_identity_are_fenced_for_five_rounds

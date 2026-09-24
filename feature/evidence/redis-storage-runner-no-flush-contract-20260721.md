@@ -17,7 +17,7 @@ Scope: `run-token-refresh-cluster-validation.mjs` 与 `run-multi-instance-redis-
 本轮改为：
 
 - 启动前仍要求 DB1..15 且 `DBSIZE=0`，非空则在 Cargo 前 fail closed。
-- 测试正文仍依赖 Rust fixture 自己的随机 `kiro_rs:test:<uuid>` namespace 和 `delete_pattern_bounded("*")` 清理。
+- 测试正文仍依赖 Rust fixture 自己的随机 `account_runtime:test:<uuid>` namespace 和 `delete_pattern_bounded("*")` 清理。
 - runner cleanup 只停止自有 child process group 和删除 temp root。
 - runner cleanup 不再执行 `FLUSHDB`/`FLUSHALL`。
 - 如果测试后 Redis DB 仍有残留，runner 返回 `redisDatabaseEmpty=false` / `databaseEmpty=false`、`residualKeyCount=<n>`，并让门禁失败；由调用方按真实 owned 资源边界人工处理。
@@ -34,7 +34,7 @@ Result: `19 pass / 1 skip / 0 fail`.
 
 说明：
 
-- skip 是 `KIRO_MULTI_INSTANCE_CONTRACT_NONEMPTY_REDIS_URL` 的 live nonempty Redis opt-in，未提供时明确 skip，不计产品 pass。
+- skip 是 `ACCOUNT_RUNTIME_MULTI_INSTANCE_CONTRACT_NONEMPTY_REDIS_URL` 的 live nonempty Redis opt-in，未提供时明确 skip，不计产品 pass。
 - 合同覆盖缺 URL、隔离标志、DB0、`9022` 早拒绝且不调用 Cargo。
 - 合同覆盖 source 中无 Docker/protected listener inspection。
 - 新增断言覆盖两个 runner 均不含 `FLUSHDB`/`FLUSHALL`，并报告 `residualKeyCount`。

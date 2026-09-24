@@ -31,7 +31,7 @@ use anyhow::Context as _;
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Redirect},
     routing::get,
 };
@@ -39,11 +39,8 @@ use chrono::Utc;
 use clap::Parser;
 use common::auth::RequestApiKeyStore;
 use futures::StreamExt;
-use local_upstream::{
-    credentials::{LocalUpstreamCredentials, LocalUpstreamCredentialsConfig},
-    manager::LocalUpstreamCredentialManager,
-};
-use model::arg::{Args, Command, CredentialsCommand, MaintenanceCommand};
+use local_upstream::manager::LocalUpstreamCredentialManager;
+use model::arg::{Args, Command, MaintenanceCommand};
 use model::config::Config;
 use serde_json::{Value, json};
 use storage::postgres::{PostgresStore, PostgresUsageLifecycleGuard, PostgresUsageStore};
@@ -80,10 +77,7 @@ async fn main() {
     });
 
     if let Some(command) = args.command {
-        let credentials_path = args
-            .credentials
-            .unwrap_or_else(|| LocalUpstreamCredentials::default_credentials_path().to_string());
-        if let Err(err) = handle_cli_command(command, &file_config, &credentials_path).await {
+        if let Err(err) = handle_cli_command(command, &file_config).await {
             tracing::error!("{}", err);
             std::process::exit(1);
         }
@@ -261,17 +255,17 @@ async fn main() {
         .load_credentials_with_runtime_state_and_account_info()
         .await
         .unwrap_or_else(|e| {
-            tracing::error!("从 PgSQL 一致性加载凭据和运行态失败: {}", e);
+            tracing::error!("从 PgSQL 一致性加载账号和运行态失败: {}", e);
             std::process::exit(1);
         });
 
-    tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
+    tracing::info!("已加载 {} 个账号配置", credentials_list.len());
 
     if let Some(first_credentials) = credentials_list.first() {
         tracing::debug!(
             credential_id = ?first_credentials.id,
             disabled = first_credentials.disabled,
-            "已选择主凭证"
+            "已选择主账号"
         );
     }
 
@@ -371,7 +365,7 @@ async fn main() {
         ),
     }
 
-    // 创建运行时管理器。旧凭据 provider 不再作为生产执行器安装。
+    // 创建运行时管理器。旧账号 provider 不再作为生产执行器安装。
     let token_manager =
         LocalUpstreamCredentialManager::new_with_stores_and_runtime_state_and_account_info(
             config.clone(),
@@ -438,7 +432,7 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
-    // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
+    // 构建 Anthropic API 路由
     let anthropic_app = anthropic::create_router_with_provider(
         anthropic::AnthropicRouterDependencies {
             request_api_keys: request_api_key_store.clone(),
@@ -485,18 +479,15 @@ async fn main() {
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
-            // 创建管理后台 UI 路由
-            let admin_ui_app = admin_ui::create_admin_ui_router();
             let new_ui_app = admin_ui::create_new_ui_router();
 
             tracing::info!("Admin API 已启用");
-            tracing::info!("Admin UI 已启用: /admin");
+            tracing::info!("Admin 旧入口已重定向到 /ui");
             tracing::info!("New UI 已启用: /ui");
             anthropic_app
                 .nest("/api/admin", admin_app)
-                .route("/admin/", get(admin_ui_index_redirect))
+                .nest("/admin", admin_ui_redirect_app())
                 .route("/ui/", get(new_ui_index_redirect))
-                .nest("/admin", admin_ui_app)
                 .nest("/ui", new_ui_app)
         }
     } else {
@@ -530,27 +521,10 @@ async fn main() {
     tracing::info!("  POST /cc/v1/messages");
     tracing::info!("  POST /cc/v1/messages/count_tokens");
     if admin_key_valid {
-        tracing::info!("Admin API:");
-        tracing::info!("  GET  /api/admin/credentials");
-        tracing::info!("  GET  /api/admin/credentials/list");
-        tracing::info!("  GET  /api/admin/credentials/summary");
-        tracing::info!("  GET  /api/admin/credentials/runtime");
-        tracing::info!("  GET  /api/admin/credentials/account-info");
-        tracing::info!("  GET  /api/admin/credentials/usage-summary");
-        tracing::info!("  GET  /api/admin/credentials-paged");
-        tracing::info!("  GET  /api/admin/credentials/export");
-        tracing::info!("  GET  /api/admin/usage-records");
-        tracing::info!("  GET  /api/admin/usage-records-paged");
-        tracing::info!("  GET  /api/admin/usage-summary");
-        tracing::info!("  GET  /api/admin/usage-dashboard");
-        tracing::info!("  GET  /api/admin/model-pricing");
-        tracing::info!("  POST /api/admin/model-pricing/sync");
-        tracing::info!("  POST /api/admin/credentials/:index/disabled");
-        tracing::info!("  POST /api/admin/credentials/:index/priority");
-        tracing::info!("  POST /api/admin/credentials/:index/reset");
-        tracing::info!("  GET  /api/admin/credentials/:index/balance");
-        tracing::info!("Admin UI:");
-        tracing::info!("  GET  /admin");
+        tracing::info!("Admin API 已启用");
+        tracing::info!("  账号管理、usage、runtime、模型与安全配置可通过 /api/admin 访问");
+        tracing::info!("Admin UI 旧入口已重定向到 /ui");
+        tracing::info!("  GET  /admin -> /ui");
         tracing::info!("  GET  /ui");
     }
 
@@ -580,7 +554,7 @@ async fn main() {
         pending_stats_deltas = stats_report.pending_stats_deltas,
         pending_runtime_mutations = stats_report.pending_runtime_mutations,
         overflow_runtime_mutations = stats_report.overflow_runtime_mutations,
-        "凭据统计后台任务已停止"
+        "账号统计后台任务已停止"
     );
     let stats_shutdown_failed = !stats_report.flushed
         || stats_report.timed_out
@@ -594,14 +568,14 @@ async fn main() {
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
     let storage_drain_timeout =
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let external_release_drain_timeout =
+    let account_release_drain_timeout =
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
     let scheduler_release_drain_timeout =
         remaining_shutdown_budget(shutdown_deadline, BACKGROUND_DRAIN_TIMEOUT);
-    let (usage_drain, storage_drain, external_release_drain, scheduler_release_drained) = tokio::join!(
+    let (usage_drain, storage_drain, account_release_drain, scheduler_release_drained) = tokio::join!(
         usage_recorder.drain(usage_drain_timeout),
         drain_account_runtime_storage_tasks(storage_drain_timeout),
-        account_runtime_manager.drain_release_intents(external_release_drain_timeout),
+        account_runtime_manager.drain_release_intents(account_release_drain_timeout),
         token_manager.drain_scheduler_redis_releases(scheduler_release_drain_timeout),
     );
     tracing::info!(
@@ -623,14 +597,14 @@ async fn main() {
         "后台存储任务排空阶段已结束"
     );
     tracing::info!(
-        drained = external_release_drain.drained,
-        pending = external_release_drain.pending,
-        enqueued = external_release_drain.enqueued,
-        completed = external_release_drain.completed,
-        retries = external_release_drain.retries,
-        worker_starts = external_release_drain.worker_starts,
-        spawn_failures = external_release_drain.spawn_failures,
-        "外部池 Redis release intent 排空阶段已结束"
+        drained = account_release_drain.drained,
+        pending = account_release_drain.pending,
+        enqueued = account_release_drain.enqueued,
+        completed = account_release_drain.completed,
+        retries = account_release_drain.retries,
+        worker_starts = account_release_drain.worker_starts,
+        spawn_failures = account_release_drain.spawn_failures,
+        "账号运行时 Redis release intent 排空阶段已结束"
     );
     if scheduler_release_drained {
         tracing::info!("本地 scheduler Redis release intent 排空阶段已结束");
@@ -681,7 +655,7 @@ async fn main() {
 
     if stats_shutdown_failed {
         panic!(
-            "凭据统计关闭未完整排空: timed_out={}, task_failed={}, pending_stats_batches={}, pending_stats_deltas={}, pending_runtime_mutations={}",
+            "账号统计关闭未完整排空: timed_out={}, task_failed={}, pending_stats_batches={}, pending_stats_deltas={}, pending_runtime_mutations={}",
             stats_report.timed_out,
             stats_report.task_failed,
             stats_report.pending_stats_batches,
@@ -977,12 +951,42 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
     )
 }
 
-async fn admin_ui_index_redirect() -> Redirect {
-    Redirect::permanent("/admin")
+fn admin_ui_redirect_app() -> Router {
+    Router::new()
+        .route("/", get(admin_ui_redirect_handler))
+        .route("/{*tail}", get(admin_ui_redirect_handler))
+}
+
+async fn admin_ui_redirect_handler(uri: Uri) -> impl IntoResponse {
+    let location = admin_ui_redirect_location(&uri);
+    (
+        StatusCode::PERMANENT_REDIRECT,
+        [(header::LOCATION, location)],
+        "",
+    )
 }
 
 async fn new_ui_index_redirect() -> Redirect {
     Redirect::permanent("/ui")
+}
+
+fn admin_ui_redirect_location(uri: &Uri) -> String {
+    let path = uri.path();
+    let suffix = path.strip_prefix("/admin").unwrap_or(path);
+    let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+
+    let mut location = if suffix.is_empty() {
+        String::from("/ui")
+    } else {
+        format!("/ui/{suffix}")
+    };
+
+    if let Some(query) = uri.query() {
+        location.push('?');
+        location.push_str(query);
+    }
+
+    location
 }
 
 fn spawn_redis_runtime_event_listener(
@@ -998,7 +1002,7 @@ fn spawn_redis_runtime_event_listener(
             let config_channel = redis_store.runtime_config_changed_channel();
             let credentials_channel = redis_store.credentials_changed_channel();
             let wakeup_channel = redis_store.dispatch_wakeup_channel();
-            let external_pool_data_channel = redis_store.external_pool_data_changed_channel();
+            let account_runtime_data_channel = redis_store.account_runtime_data_changed_channel();
             let mut pubsub = match redis_store.subscribe_runtime_events().await {
                 Ok(pubsub) => pubsub,
                 Err(err) => {
@@ -1042,16 +1046,16 @@ fn spawn_redis_runtime_event_listener(
                             }
                         } else if channel == credentials_channel {
                             match token_manager.reload_credentials_from_postgres() {
-                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知同步凭据快照"),
-                                Ok(false) => tracing::debug!(payload, "收到凭据通知，但凭据快照无变化"),
-                                Err(err) => tracing::warn!(payload, "同步凭据快照失败: {}", err),
+                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知同步账号快照"),
+                                Ok(false) => tracing::debug!(payload, "收到账号通知，但账号快照无变化"),
+                                Err(err) => tracing::warn!(payload, "同步账号快照失败: {}", err),
                             }
                             token_manager.notify_dispatch_state_changed();
                         } else if channel == wakeup_channel {
                             if !token_manager.notify_remote_dispatch_state_changed(&payload) {
                                 tracing::debug!("忽略本实例或无效的 Redis 调度唤醒通知");
                             }
-                        } else if channel == external_pool_data_channel {
+                        } else if channel == account_runtime_data_channel {
                             if account_runtime_manager.observe_account_runtime_data_event(&payload) {
                                 tracing::debug!(payload, "已失效跨实例账号运行时数据快照");
                             } else {
@@ -1076,7 +1080,7 @@ fn spawn_redis_runtime_event_listener(
                             Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),
                         }
                         if let Err(err) = token_manager.reload_credentials_from_postgres() {
-                            tracing::warn!("定时同步凭据快照失败: {}", err);
+                            tracing::warn!("定时同步账号快照失败: {}", err);
                         }
                     }
                 }
@@ -1088,17 +1092,8 @@ fn spawn_redis_runtime_event_listener(
     })
 }
 
-async fn handle_cli_command(
-    command: Command,
-    config: &Config,
-    credentials_path: &str,
-) -> anyhow::Result<()> {
+async fn handle_cli_command(command: Command, config: &Config) -> anyhow::Result<()> {
     match command {
-        Command::Credentials { command } => {
-            // CLI 凭据诊断仍然面向本地文件，用于首次导入前排查 credentials.json。
-            let credentials_config = LocalUpstreamCredentialsConfig::load(credentials_path)?;
-            handle_credentials_command(command, config, credentials_config, credentials_path)
-        }
         Command::Maintenance { command } => handle_maintenance_command(command, config).await,
     }
 }
@@ -1134,96 +1129,6 @@ async fn handle_maintenance_command(
         }
     }
     maintenance_guard.release().await?;
-    Ok(())
-}
-
-fn handle_credentials_command(
-    command: CredentialsCommand,
-    config: &Config,
-    credentials_config: LocalUpstreamCredentialsConfig,
-    credentials_path: &str,
-) -> anyhow::Result<()> {
-    let is_multiple = credentials_config.is_multiple();
-    let credentials = credentials_config.into_sorted_credentials();
-
-    match command {
-        CredentialsCommand::Stats => {
-            println!("credentials: {}", credentials.len());
-            println!(
-                "format: {}",
-                if is_multiple { "multiple" } else { "single" }
-            );
-            println!("loadBalancingMode: {}", config.load_balancing_mode);
-            println!(
-                "credentialRpm: {}",
-                config
-                    .credential_rpm
-                    .map(|rpm| rpm.to_string())
-                    .unwrap_or_else(|| "disabled".to_string())
-            );
-            for (index, credential) in credentials.iter().enumerate() {
-                let id = credential.id.unwrap_or((index + 1) as u64);
-                let label = credential
-                    .email
-                    .as_deref()
-                    .or_else(|| credential.endpoint.as_deref())
-                    .unwrap_or("-");
-                println!(
-                    "#{id} priority={} disabled={} auth={} label={}",
-                    credential.priority,
-                    credential.disabled,
-                    credential
-                        .auth_method
-                        .as_deref()
-                        .unwrap_or(if credential.api_key.is_some() {
-                            "api_key"
-                        } else {
-                            "oauth"
-                        }),
-                    label
-                );
-            }
-        }
-        CredentialsCommand::Diagnostics => {
-            println!("credentialsPath: {}", credentials_path);
-            println!("credentials: {}", credentials.len());
-            println!(
-                "format: {}",
-                if is_multiple { "multiple" } else { "single" }
-            );
-            if !is_multiple {
-                println!("warning: single credentials format cannot be rewritten by token refresh");
-            }
-            if !matches!(
-                config.load_balancing_mode.as_str(),
-                "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
-            ) {
-                println!(
-                    "error: invalid loadBalancingMode '{}', expected priority, balanced, health_balanced or weighted_least_inflight",
-                    config.load_balancing_mode
-                );
-            }
-            let mut ids = std::collections::HashSet::new();
-            for (index, credential) in credentials.iter().enumerate() {
-                let id = credential.id.unwrap_or((index + 1) as u64);
-                if !ids.insert(id) {
-                    println!("error: duplicate credential id #{id}");
-                }
-                if credential.is_api_key_credential() && credential.api_key.is_none() {
-                    println!("error: credential #{id} authMethod=api_key but missing apiKey");
-                }
-                if !credential.is_api_key_credential() && credential.refresh_token.is_none() {
-                    println!("warning: credential #{id} missing refreshToken");
-                }
-                if credential.machine_id.is_none() {
-                    println!(
-                        "info: credential #{id} missing machineId, it will be generated at startup"
-                    );
-                }
-            }
-        }
-    }
-
     Ok(())
 }
 

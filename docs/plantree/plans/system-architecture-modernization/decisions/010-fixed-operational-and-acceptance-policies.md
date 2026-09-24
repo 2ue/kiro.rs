@@ -56,7 +56,7 @@ Process-local Files storage is development-only and must report that it is not a
 | Streamed upstream response | 64 MiB total unless the protocol profile has a lower characterized limit; never fully buffered |
 | Retained upstream error detail | 64 KiB sanitized prefix; the remainder is drained or connection-closed without retention |
 | Diagnostic capture | Off by default; 256 MiB directory, 1,024 files, 24-hour age, and 4 MiB per record maxima when explicitly enabled |
-| Kiro reusable-client cache | 256 entries, 10-minute idle retirement, active-reference protection, bounded concurrent construction |
+| Account Runtime reusable-client cache | 256 entries, 10-minute idle retirement, active-reference protection, bounded concurrent construction |
 | Redis stale cleanup | At most 128 members per request-path invocation; remaining backlog is scheduled and observable |
 | Production admission | Finite; `0 = unlimited` is rejected in a supported profile |
 
@@ -86,7 +86,7 @@ Relative comparison uses at least five alternating legacy/target measured rounds
 
 Ordinary percentile gates require at least 10,000 successful samples; slow/fault/profile-specific tail gates require at least 1,000 classified samples unless the finite corpus is smaller and every case is executed. Missing metrics, wrong process identity, incomplete task accounting, skipped cases, or an invalid percentile population fail closed.
 
-Real Kiro remains low volume: at most 20 requests in one validation run unless a separate hard account quota is lower. Real Claude Code uses three isolated sessions with at least 20 turns each and a predeclared request/token/duration cap. Unknown monetary cost is never treated as zero.
+Real Account Runtime remains low volume: at most 20 requests in one validation run unless a separate hard account quota is lower. Real Claude Code uses three isolated sessions with at least 20 turns each and a predeclared request/token/duration cap. Unknown monetary cost is never treated as zero.
 
 ## `Q-006`: Observation And Soak
 
@@ -106,7 +106,7 @@ Replica-local heuristics may assist request-local decisions but are never presen
 
 An upstream attempt is replay-safe only when no request bytes were transmitted, a target-specific response proves rejection before execution, or the target demonstrably deduplicates the same logical operation with a stable idempotency key whose scope and retention cover the retry window.
 
-Ambiguous Kiro or external POST delivery is not retried. HTTP status, timeout, reset, or client-library error names alone do not prove replay safety. Once downstream headers are committed, no alternate upstream is selected for that request.
+Ambiguous Account Runtime or external POST delivery is not retried. HTTP status, timeout, reset, or client-library error names alone do not prove replay safety. Once downstream headers are committed, no alternate upstream is selected for that request.
 
 ## `Q-009`: Queue Fairness And Lease Timing
 

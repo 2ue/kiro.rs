@@ -11,7 +11,7 @@ Severity: P1
 
 ## 现象
 
-请求携带图片时，上游 Bedrock/Kiro 返回：
+请求携带图片时，上游 Bedrock/Account Runtime 返回：
 
 ```
 400 Bad Request
@@ -54,7 +54,7 @@ Severity: P1
 
 ## 复现 case
 
-前置：本地服务 `127.0.0.1:9022`，API Key `sk-kiro-rs-local-debug`，模型 `claude-sonnet-4-20250514`。
+前置：本地服务 `127.0.0.1:9022`，API Key `sk-account-runtime-local-debug`，模型 `claude-sonnet-4-20250514`。
 
 ### Case 1：合法图片，正常通过（对照）
 
@@ -70,7 +70,7 @@ open('/tmp/ok.b64','w').write(base64.b64encode(png(64,64)).decode())
 PY
 B64=$(cat /tmp/ok.b64)
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
-  -H 'content-type: application/json' -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'content-type: application/json' -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d "{\"model\":\"claude-sonnet-4-20250514\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"$B64\"}},{\"type\":\"text\",\"text\":\"one word: color?\"}]}]}"
 # → HTTP 200
@@ -82,7 +82,7 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 # 垃圾字节声明为 png（magic 不符）
 B64=$(python3 -c "import base64;print(base64.b64encode(b'not-an-image-at-all'*8).decode())")
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
-  -H 'content-type: application/json' -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'content-type: application/json' -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d "{\"model\":\"claude-sonnet-4-20250514\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"$B64\"}},{\"type\":\"text\",\"text\":\"color?\"}]}]}"
 # → HTTP 400，上游日志 reason=IMAGE_FORMAT_UNSUPPORTED
@@ -140,7 +140,7 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
   - 日志记录 `base64 image media_type mismatches were corrected before upstream routing`
   - usage/log 记录 `normalized_image_media_types=1`
 - 真实 Claude Code CLI `Read` 图片成功：
-  - 文件 `/tmp/kiro-cli-red.png`
+  - 文件 `/tmp/account-runtime-cli-red.png`
   - CLI final text `Red`
   - 第二个请求中有 `current_tool_result_count=1`、`current_image_count=1`
   - warning header 包含 `tool-result-content-placeholder=1`

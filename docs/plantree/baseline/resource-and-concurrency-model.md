@@ -81,7 +81,7 @@ Base64 expands binary input by approximately one third before JSON/string overhe
 
 Prompt-cache size is an estimate derived from tracked structures. It does not include all request bodies or upstream buffers. Files storage, prompt-cache tracking, recent usage, and route/session caches have independent limits, so their maxima can coexist.
 
-Evidence: `src/model/config.rs:3330-3432`, `src/anthropic/prompt_cache.rs`, `src/anthropic/usage.rs:21-40`, `src/kiro/token_manager/sticky.rs:10-38`, `src/kiro/token_manager/route_state.rs`.
+Evidence: `src/model/config.rs:3330-3432`, `src/anthropic/prompt_cache.rs`, `src/anthropic/usage.rs:21-40`, `src/local_upstream_impl/token_manager/sticky.rs:10-38`, `src/local_upstream_impl/token_manager/route_state.rs`.
 
 ## Queue And Worker Bounds
 
@@ -97,7 +97,7 @@ Evidence: `src/model/config.rs:3330-3432`, `src/anthropic/prompt_cache.rs`, `src
 
 The queues above are bounded, but bounded admission does not mean request-path isolation. Current saturation and correctness fallbacks can cause a successful request, state mutation, lease release, or terminal usage path to wait for PgSQL or Redis.
 
-Evidence: `src/anthropic/usage.rs:21-40,1398-1483`, `src/kiro/token_manager/storage_task.rs:12-16`, `src/external_pool.rs:2124-2207`.
+Evidence: `src/anthropic/usage.rs:21-40,1398-1483`, `src/local_upstream_impl/token_manager/storage_task.rs:12-16`, `src/external_pool.rs:2124-2207`.
 
 ## Diagnostic Resource Defaults
 
@@ -121,8 +121,8 @@ Evidence: `src/model/config.rs:3330-3432`, `src/anthropic/tool_format_debug.rs:1
 | Operation | Current default |
 | --- | ---: |
 | Local credential dispatch maximum wait | 120 seconds |
-| Kiro upstream response/header timeout | 180 seconds |
-| Kiro stream idle timeout | 180 seconds |
+| Account Runtime upstream response/header timeout | 180 seconds |
+| Account Runtime stream idle timeout | 180 seconds |
 | Credential in-flight lease maximum age | 900 seconds |
 | External dispatch maximum wait | 30 seconds |
 | External request timeout | 180 seconds |
@@ -142,7 +142,7 @@ An operator can therefore run with explicit bounds, but an untouched configurati
 
 External pools have their own concurrency, queue, priority, cooldown, and timeout configuration. Their limits do not create a global bound covering local work, request preprocessing, Files, remote downloads, background storage, and all external pools together.
 
-Evidence: `src/kiro/token_manager/capacity.rs:16-67,118-160`, `src/model/config.rs:3050-3110,3625-3690`, `src/external_pool.rs:2124-2207`.
+Evidence: `src/local_upstream_impl/token_manager/capacity.rs:16-67,118-160`, `src/model/config.rs:3050-3110,3625-3690`, `src/external_pool.rs:2124-2207`.
 
 ## Local Credential Scheduling
 
@@ -163,7 +163,7 @@ Sticky selection improves conversational affinity but is not an ownership bounda
 
 The implementation uses broad shared credential vectors and state maps. Selection scans these structures and coordinates scheduling decisions with Redis/PgSQL/refresh work through `MultiTokenManager`; pure selection and I/O ownership are not isolated into separate runtime components.
 
-Evidence: `src/kiro/token_manager/strategy.rs:33-59,147-300`, `src/kiro/token_manager/manager.rs:3414-3603`, `src/kiro/token_manager/sticky.rs`, `src/kiro/token_manager/capacity.rs`.
+Evidence: `src/local_upstream_impl/token_manager/strategy.rs:33-59,147-300`, `src/local_upstream_impl/token_manager/manager.rs:3414-3603`, `src/local_upstream_impl/token_manager/sticky.rs`, `src/local_upstream_impl/token_manager/capacity.rs`.
 
 ## External Pool Scheduling
 
@@ -190,7 +190,7 @@ The following are confirmed implementation properties relevant to memory, latenc
 - usage batches reduce channel overhead but still issue multiple SQL inserts/upserts per record or rollup class;
 - no benchmark or performance-regression gate currently blocks a release.
 
-Evidence: `src/anthropic/body_processing.rs:139-160,255-279,300-429`, `src/anthropic/converter/content.rs:263-328`, `src/token.rs:107-185`, `src/anthropic/files.rs:255-341`, `src/anthropic/tool_format_debug.rs:369-493`, `src/anthropic/usage.rs:1398-1483`, `src/kiro/token_manager/manager.rs:3414-3603`.
+Evidence: `src/anthropic/body_processing.rs:139-160,255-279,300-429`, `src/anthropic/converter/content.rs:263-328`, `src/token.rs:107-185`, `src/anthropic/files.rs:255-341`, `src/anthropic/tool_format_debug.rs:369-493`, `src/anthropic/usage.rs:1398-1483`, `src/local_upstream_impl/token_manager/manager.rs:3414-3603`.
 
 ## Test And Capacity Interpretation
 

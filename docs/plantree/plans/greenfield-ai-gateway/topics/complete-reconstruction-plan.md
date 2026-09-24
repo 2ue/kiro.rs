@@ -4,7 +4,7 @@ Role: Complete target architecture and implementation specification
 
 Status: Ready for review; implementation Not Started
 
-Authority: Defines target goals, final behavior, module boundaries, contracts, technology stack, Kiro first-release scope, quality attributes, acceptance gates and cutover model
+Authority: Defines target goals, final behavior, module boundaries, contracts, technology stack, Account Runtime first-release scope, quality attributes, acceptance gates and cutover model
 
 As of: 2026-07-13
 
@@ -12,16 +12,16 @@ Related: [Plan root](../README.md), [work graph](../roadmap.md), [decision 001](
 
 ## 1. Executive Conclusion
 
-The target is a new AI model gateway, not a refactor of the existing Rust package tree. It is implemented in a separate repository with Go, React, TypeScript and Tailwind CSS. The current `kiro.rs` repository remains available only as a behavior and failure oracle until final cutover.
+The target is a new AI model gateway, not a refactor of the existing Rust package tree. It is implemented in a separate repository with Go, React, TypeScript and Tailwind CSS. The current `account-runtime` repository remains available only as a behavior and failure oracle until final cutover.
 
 The system is generic in two independent directions:
 
 1. Client protocol modules accept and emit Anthropic, Claude Code, OpenAI, Gemini or future public protocols.
-2. Provider modules execute against Kiro, standard model APIs, other API gateways or future upstreams.
+2. Provider modules execute against Account Runtime, standard model APIs, other API gateways or future upstreams.
 
-The execution core sits between these directions and understands only operation contracts, capabilities, leases, attempts, canonical events, delivery evidence, usage facts and terminal outcomes. It never imports Kiro wire DTOs, credentials, Redis keys or error strings.
+The execution core sits between these directions and understands only operation contracts, capabilities, leases, attempts, canonical events, delivery evidence, usage facts and terminal outcomes. It never imports Account Runtime wire DTOs, credentials, Redis keys or error strings.
 
-Kiro is the first complete provider module. It is more than a parser: it privately owns Kiro authentication, token refresh, IDE/CLI endpoints, accounts, scheduling, distributed leases, transport, AWS EventStream, conversion, errors, models, quota, usage and maintenance workflows.
+Account Runtime is the first complete provider module. It is more than a parser: it privately owns Account Runtime authentication, token refresh, IDE/CLI endpoints, accounts, scheduling, distributed leases, transport, AWS EventStream, conversion, errors, models, quota, usage and maintenance workflows.
 
 Other provider modules may need the same capabilities. They may compose shared default implementations or implement those capabilities privately. Interoperability comes from stable contracts and invariants, not mandatory code reuse.
 
@@ -34,7 +34,7 @@ Large files are symptoms of mixed authority. The inspected current tree includes
 | Current file | Approximate size | Mixed responsibilities that must not be copied |
 | --- | ---: | --- |
 | `src/storage/postgres.rs` | 11,500 lines | schema, repositories, migrations, domain persistence and maintenance |
-| `src/kiro/token_manager/manager.rs` | 8,100 lines | config, credentials, refresh, scheduling, Redis, persistence, Admin mutation, health and statistics |
+| `src/local_upstream_impl/token_manager/manager.rs` | 8,100 lines | config, credentials, refresh, scheduling, Redis, persistence, Admin mutation, health and statistics |
 | `src/anthropic/handlers.rs` | 7,100 lines | admission, routing, parsing, provider selection, retries, response handling and persistence |
 | `src/anthropic/payload_guard.rs` | 6,600 lines | payload policy, transformations, diagnostics and compatibility behavior |
 | `src/admin/service.rs` | 6,600 lines | commands, queries, storage, runtime reload and cross-domain orchestration |
@@ -42,7 +42,7 @@ Large files are symptoms of mixed authority. The inspected current tree includes
 | `src/model/config.rs` | 5,700 lines | bootstrap, runtime config, validation, defaults and unrelated domain policy |
 | `src/anthropic/stream.rs` | 5,400 lines | provider decoding, protocol events, usage and terminal response behavior |
 | `src/external_pool.rs` | 5,000 lines | configuration, scheduling, transport, retries, fallback, usage and health |
-| `src/kiro/provider.rs` | 3,900 lines | Kiro transport, scheduling, retries, completion, models and account outcomes |
+| `src/local_upstream_impl/provider.rs` | 3,900 lines | Account Runtime transport, scheduling, retries, completion, models and account outcomes |
 
 The target therefore ports behavior through characterization tests and contracts. It does not translate these files into similarly broad Go packages.
 
@@ -62,7 +62,7 @@ Verified current risks become target acceptance requirements:
 ### 3.1 Product Goals
 
 - Provide a self-hosted high-performance AI model gateway for one operator and one trust domain.
-- Fully support Kiro in the first complete release while keeping Kiro-specific behavior inside one provider boundary.
+- Fully support Account Runtime in the first complete release while keeping Account Runtime-specific behavior inside one provider boundary.
 - Preserve real Anthropic Messages and Claude Code behavior, including long streaming sessions, tools, thinking, Files, MCP and final usage.
 - Add or replace client protocols and upstream providers without editing unrelated modules.
 - Configure providers, credentials, routes, models, schedulers, retries, usage and operations from one modern control plane.
@@ -95,7 +95,7 @@ Verified current risks become target acceptance requirements:
 - Preserve the current Rust package names, 50-module topology, two Admin frontends or handwritten frontend DTOs.
 - Build a tenant/SaaS billing platform in the first release.
 - Run model inference in-process.
-- Make every provider implement Kiro's scheduler or account model.
+- Make every provider implement Account Runtime's scheduler or account model.
 - Provide a giant universal request object that silently drops unsupported fields.
 - Use Go `.so` runtime plugins, a generic JSON command bus, a global `AppState`, a dependency-injection container or broad generic repositories.
 - Introduce Kubernetes, Envoy, service mesh or microservices as mandatory prerequisites for a single-node deployment.
@@ -130,7 +130,7 @@ Adding OpenAI Responses, Chat Completions, Gemini or another client protocol nor
 - canonical-event and error encoding back to that protocol;
 - compatibility fixtures and generated API documentation.
 
-It must not change Kiro transport, account selection or provider state.
+It must not change Account Runtime transport, account selection or provider state.
 
 ### 5.3 Replacing An Internal Algorithm
 
@@ -163,7 +163,7 @@ A provider can replace its scheduler, usage interpreter, model discovery or tran
                      |                               |                  |
                      v                               v                  v
              +---------------+              +---------------+  +---------------+
-             | Kiro Provider |              | HTTP Provider |  | Mock Provider |
+             | Account Runtime Provider |              | HTTP Provider |  | Mock Provider |
              | own scheduler |              | default/simple|  | deterministic |
              +-------+-------+              +-------+-------+  +---------------+
                      |                              |
@@ -198,7 +198,7 @@ Role separation changes process placement, not domain ownership. No role bypasse
 | Invocation kernel | request identity, operation, model intent, deadline, stream mode, session key, resource budget and required capabilities | provider wire DTOs or client HTTP types |
 | Operation contracts | typed `messages.v1`, `models.v1`, `count_tokens.v1`, `files.v1` and later operation schemas | one all-operations optional-field object |
 | Capability contracts | tools, reasoning, cache control, images, documents, JSON schema, MCP and usage extensions | provider-specific credentials or transport |
-| Canonical events | ordered content, thinking, tool, usage, error and terminal events | Anthropic SSE strings or Kiro EventStream frames |
+| Canonical events | ordered content, thinking, tool, usage, error and terminal events | Anthropic SSE strings or Account Runtime EventStream frames |
 | Outcome contracts | delivery evidence, attempt result, allocation completion, terminal outcome and usage facts | persistence or retry policy implementation |
 
 ### 8.2 Client Gateway Layer
@@ -206,8 +206,8 @@ Role separation changes process placement, not domain ownership. No role bypasse
 | Module | Owns | Must not own |
 | --- | --- | --- |
 | Public edge | listeners, TLS, body limits, request IDs, public authentication and admission | routing policy or provider selection |
-| Anthropic Messages adapter | Anthropic request DTO, validation, stream/non-stream response and error encoding | Kiro accounts, Redis leases or provider retries |
-| Claude Code profile | stricter aliases, headers, event order, thinking/signature, tools, MCP, Files and usage behavior | Kiro transport or scheduling |
+| Anthropic Messages adapter | Anthropic request DTO, validation, stream/non-stream response and error encoding | Account Runtime accounts, Redis leases or provider retries |
+| Claude Code profile | stricter aliases, headers, event order, thinking/signature, tools, MCP, Files and usage behavior | Account Runtime transport or scheduling |
 | Models/count-tokens/Files adapters | public operation semantics and protocol responses | provider-private storage or usage projection |
 | Future protocol adapters | OpenAI/Gemini/custom wire behavior | modifications to existing adapters or providers |
 
@@ -231,7 +231,7 @@ Role separation changes process placement, not domain ownership. No role bypasse
 | Allocation port | acquire, heartbeat, complete and cancel semantics | assumptions about implementation algorithm |
 | Shared default scheduler | optional pure ranking, bounded wait coordination and lease lifecycle | mandatory global state for every provider |
 | Attempt port | prepare and execute exactly one observable business attempt | hidden multi-account retry loops |
-| Kiro provider | complete Kiro vertical behavior | Anthropic HTTP DTOs or generic usage storage |
+| Account Runtime provider | complete Account Runtime vertical behavior | Anthropic HTTP DTOs or generic usage storage |
 | Compatible HTTP provider | simple standard upstream proof and optional reusable implementation | becoming another universal external-pool God module |
 | Mock provider | deterministic events, faults and timing for contract/load tests | production credentials or network access |
 
@@ -489,14 +489,14 @@ Usage events are keyed by terminal/attempt idempotency IDs. PostgreSQL is author
 - Request-level usage stores the contributing attempt ID and projection revision. Attempt idempotency prevents duplicate accounting when finalization/outbox delivery repeats.
 - Reconciliation exposes the gap between known provider usage, estimated/potential cost and delivered client usage instead of hiding it in one total.
 
-## 14. Complete Kiro First-Release Module
+## 14. Complete Account Runtime First-Release Module
 
 ### 14.1 Private Package Shape
 
-The Kiro provider is a vertical module whose internal package layout may include:
+The Account Runtime provider is a vertical module whose internal package layout may include:
 
 ```text
-providers/kiro/
+providers/account-runtime/
   module          registration and capability descriptor
   config          typed module configuration and validation
   credentials     credential types and secret references
@@ -507,20 +507,20 @@ providers/kiro/
   conversion      canonical operations to IDE/CLI requests
   transport       HTTP clients, proxy policy and one-attempt send
   eventstream     AWS EventStream framing, CRC and bounded decoder
-  events          Kiro payloads to canonical typed events
+  events          Account Runtime payloads to canonical typed events
   usage           raw token/cache/quota fact extraction
-  errors          typed Kiro error classification
-  admin           Kiro-specific commands, queries and UI schema
+  errors          typed Account Runtime error classification
+  admin           Account Runtime-specific commands, queries and UI schema
   jobs            refresh, health, model and quota maintenance
 ```
 
-These are Kiro-private implementation details. Other providers can reuse pure libraries but do not import Kiro packages.
+These are Account Runtime-private implementation details. Other providers can reuse pure libraries but do not import Account Runtime packages.
 
-### 14.2 Kiro V1 Acceptance Matrix
+### 14.2 Account Runtime V1 Acceptance Matrix
 
 | Area | Mandatory behavior |
 | --- | --- |
-| Endpoints | Kiro IDE and CLI endpoint families, region/URL selection and endpoint-specific envelopes |
+| Endpoints | Account Runtime IDE and CLI endpoint families, region/URL selection and endpoint-specific envelopes |
 | Authentication | Every currently supported Social, IdC, external IdP and API-key mode; refresh CAS/fencing; invalidation and safe secret rotation |
 | Accounts | enable/disable, supported models, priority, weight, warmup/probation, proxy, health, cooldown and risk state |
 | Capacity | global/per-account RPM, weighted concurrency, bounded wait queue, sticky session, exclusions and controlled fallback |
@@ -529,13 +529,13 @@ These are Kiro-private implementation details. Other providers can reuse pure li
 | Requests | system/history, tools and schemas, tool results, thinking, images, documents, Files materialization, cache points and supported MCP/WebSearch behavior |
 | Transport | bounded reusable clients, proxy/TLS policy, cancellation, idle/total deadlines, stream and non-stream paths |
 | EventStream | official AWS Go decoder where compatible; otherwise an isolated bounded decoder with CRC, fragmentation, corruption and fuzz tests |
-| Responses | canonical content/thinking/tool events, stop reasons, signatures, event order and normalized Kiro errors |
+| Responses | canonical content/thinking/tool events, stop reasons, signatures, event order and normalized Account Runtime errors |
 | Retry | exact delivery evidence, no hidden business replay, auth-before-send refresh and safe account/provider switching only |
 | Usage | raw input/output/cache facts, partial/unknown representation, final event usage and quota evidence |
 | Admin | credential create/test/rotate/disable, account status, scheduler reasons, lease/queue view, model/quota sync, health and diagnostics |
 | Lifecycle | exactly-once completion intent across success, error, cancellation, disconnect, malformed stream, timeout, shutdown and crash recovery |
 
-Kiro completion is not claimed from unit tests alone. It requires real Claude Code compatibility and a bounded, secret-safe real Kiro matrix.
+Account Runtime completion is not claimed from unit tests alone. It requires real Claude Code compatibility and a bounded, secret-safe real Account Runtime matrix.
 
 ## 15. Client Protocol Scope
 
@@ -550,9 +550,9 @@ Kiro completion is not claimed from unit tests alone. It requires real Claude Co
 
 ### 15.2 Generic Contract Proof
 
-The candidate includes a deterministic mock provider and one simple compatible HTTP provider. At least one integration test routes the same canonical message operation to Kiro and the non-Kiro provider without modifying the client adapter or execution core.
+The candidate includes a deterministic mock provider and one simple compatible HTTP provider. At least one integration test routes the same canonical message operation to Account Runtime and the non-Account Runtime provider without modifying the client adapter or execution core.
 
-OpenAI Responses/Chat and Gemini client adapters are natural next built-ins, but they do not block the first complete Kiro release unless separately promoted. Their extension contracts must already be possible without a kernel redesign.
+OpenAI Responses/Chat and Gemini client adapters are natural next built-ins, but they do not block the first complete Account Runtime release unless separately promoted. Their extension contracts must already be possible without a kernel redesign.
 
 ## 16. Configuration And Control Plane
 
@@ -620,7 +620,7 @@ Create a fresh React application and selectively adapt its shell, navigation, co
 | --- | --- |
 | Overview | health, traffic, latency, error, usage, queue and capacity summaries with direct drill-down |
 | Providers | module inventory, instances, capabilities, endpoints, health and configuration |
-| Kiro accounts | credentials, auth state, quota, models, priority, concurrency, RPM, cooldown, proxy, test and maintenance actions |
+| Account Runtime accounts | credentials, auth state, quota, models, priority, concurrency, RPM, cooldown, proxy, test and maintenance actions |
 | Routes and models | aliases, capability constraints, ordered providers, fallback, cache/reporting and policy simulation |
 | Scheduler | live queue/leases, capacity reasons, sticky bindings, cooldowns and safe diagnostic actions |
 | Usage and costs | actual/reported/cache/cost facts, filters, exports, pricing revisions and reconciliation |
@@ -813,7 +813,7 @@ Versions are pinned when the new repository is created. The following major choi
 | IDs | ULID or UUIDv7 behind one typed ID package | sortable, non-secret request/attempt/config identities |
 | Validation | generated schema plus explicit domain validation | avoids tag-only validation hiding cross-field rules |
 | Concurrency | `context`, `x/sync/errgroup`, weighted semaphores and `x/time/rate` where local only | cancellation and bounded structured concurrency |
-| Kiro EventStream | official AWS SDK for Go v2 eventstream decoder where compatible | mature framing/CRC implementation; custom fallback remains isolated and fuzzed |
+| Account Runtime EventStream | official AWS SDK for Go v2 eventstream decoder where compatible | mature framing/CRC implementation; custom fallback remains isolated and fuzzed |
 | Logging | standard `log/slog` with typed redaction adapters | structured standard library logging without global logger state |
 | Telemetry | OpenTelemetry Go and Prometheus `client_golang` | standard traces/metrics correlation and ecosystem support |
 | Bootstrap config | typed environment/file parser used only at composition root | runtime product config remains versioned in PostgreSQL |
@@ -877,7 +877,7 @@ ai-gateway/
       anthropic/
       claudecode/
     providers/
-      kiro/
+      account-runtime/
       compatiblehttp/
       mock/
     scheduling/
@@ -946,7 +946,7 @@ CI enforces:
 ### 26.2 Contract Gates
 
 - Every provider runs the same module descriptor, allocation, attempt, cancellation, terminal, usage and error suite.
-- Kiro, compatible HTTP and mock providers prove the core has no provider-specific assumption.
+- Account Runtime, compatible HTTP and mock providers prove the core has no provider-specific assumption.
 - Faults before send, during request write, after full write and during response streaming prove that direct `Execute` errors mean `NotSent` and every post-send failure remains available through a non-nil attempt session/result.
 - Multi-attempt tests prove one fresh lease per attempt, no overlap with an unreleased prior attempt and no account/provider outcome attributed to the wrong lease.
 - Every client adapter runs canonical-event order, errors, stream/non-stream and capability rejection fixtures.
@@ -961,16 +961,16 @@ CI enforces:
 - PostgreSQL failover, pool exhaustion, slow queries, migration failure, backup/restore and previous-release rollback.
 - Shared Files behavior across replicas, object-store failure and metadata/payload reconciliation.
 
-### 26.4 Kiro And Claude Code Gates
+### 26.4 Account Runtime And Claude Code Gates
 
 - IDE/CLI endpoints and every accepted auth mode.
 - Streaming/non-stream, thinking/signature, tools/tool results, agents, MCP, images/documents, Files, model aliases, count-tokens, errors and final usage.
 - At least three real Claude Code sessions with 20-plus conversational turns and controlled tool/agent/MCP workflows.
-- Bounded real Kiro requests with call caps, credential redaction, artifact manifests and explicit skipped-capability results.
+- Bounded real Account Runtime requests with call caps, credential redaction, artifact manifests and explicit skipped-capability results.
 
 ### 26.5 Load, Chaos And Lifecycle Gates
 
-- 10/100/1,000 Kiro accounts or synthetic targets; scheduler fairness, Redis work bound and acquire/complete latency.
+- 10/100/1,000 Account Runtime accounts or synthetic targets; scheduler fairness, Redis work bound and acquire/complete latency.
 - Mixed bodies, tools, remote media, long first-token delay, long streams, slow/disconnected clients and malformed upstream events.
 - Multi-attempt scenarios prove that every potentially billed attempt appears once in operational cost while only delivered usage appears in the client projection.
 - One/two/four replicas, Redis/PostgreSQL/object-store latency/loss, network partitions, process kills and rolling restart.
@@ -1000,7 +1000,7 @@ Cutover sequence:
 1. Freeze and identify the complete candidate digest, generated contracts, migrations, images, SBOM, signatures and evidence manifest.
 2. Back up the legacy system and the new target stores.
 3. Run the isolated one-time import tool for explicitly selected configuration and credentials; compile and publish one target configuration revision.
-4. Start target roles on private listeners, keep public readiness closed, and run storage, provider, Kiro, Claude Code and Admin smoke gates.
+4. Start target roles on private listeners, keep public readiness closed, and run storage, provider, Account Runtime, Claude Code and Admin smoke gates.
 5. Stop legacy admission and drain it through its supported shutdown path.
 6. Open target readiness and switch the whole public/Admin endpoint to the Go system.
 7. Observe the target with fixed error, latency, usage, lease, outbox and resource abort thresholds.
@@ -1020,7 +1020,7 @@ Keep as behavioral evidence:
 
 - current source, tests and fixtures at a pinned oracle revision;
 - current business context, runtime flows, protocol contracts, resource model, storage model and risk hotspots;
-- verified Kiro/Claude Code, scheduler, usage/cache, Files and external-pool behavior;
+- verified Account Runtime/Claude Code, scheduler, usage/cache, Files and external-pool behavior;
 - conservative replay, terminal, scheduler/lease and producer-aware shutdown invariants from previous decisions 003-006;
 - dated real-client, load, release and failure evidence that can be reproduced safely.
 
@@ -1037,7 +1037,7 @@ Do not delete the old planning tree in this pass. It is marked superseded and re
 ## 29. Failure Patterns To Reject During Implementation
 
 - A `Gateway`, `Provider`, `Manager` or `AppState` object with dozens of unrelated methods.
-- Generic packages importing Kiro because it is the first provider.
+- Generic packages importing Account Runtime because it is the first provider.
 - One canonical request with hundreds of provider/client optional fields.
 - Provider retries that do not report each real send and delivery evidence.
 - A terminal reducer that directly owns leases, credential storage, usage rollups and response writing.
@@ -1054,9 +1054,9 @@ Do not delete the old planning tree in this pass. It is marked superseded and re
 
 The reconstruction is complete only when:
 
-1. The new repository contains the complete target-only Go/React system and no runtime dependency on `kiro.rs`.
-2. Kiro passes the full provider, scheduler, protocol, usage, Admin, multi-replica and real-client matrix.
-3. A mock provider and a non-Kiro compatible provider prove the contracts are genuinely generic.
+1. The new repository contains the complete target-only Go/React system and no runtime dependency on `account-runtime`.
+2. Account Runtime passes the full provider, scheduler, protocol, usage, Admin, multi-replica and real-client matrix.
+3. A mock provider and a non-Account Runtime compatible provider prove the contracts are genuinely generic.
 4. Adding a provider or client protocol requires only its new module, schemas, registration and tests, with architecture fitness checks proving no forbidden edits.
 5. All runtime configuration workflows are available through the modern Admin UI with validation, diff, CAS publication, audit and replica adoption.
 6. PostgreSQL/Redis/object storage, retries, terminal completion, usage and shutdown satisfy their consistency and recovery contracts.

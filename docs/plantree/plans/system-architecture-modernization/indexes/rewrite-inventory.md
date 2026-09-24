@@ -45,9 +45,9 @@ This appendix makes omission mechanically detectable without turning this source
 
 | Inventory surface | Canonical target modules |
 | --- | --- |
-| Foundation, protocol, transport and telemetry | `MOD-KERNEL`, `MOD-RESOURCE-GOVERNOR`, `MOD-SECRET-ENVELOPE`, `MOD-OBSERVABILITY`, `MOD-DIAGNOSTICS`, `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-KIRO`, `MOD-PROTO-EXTERNAL`, `MOD-PROTO-SSE`, `MOD-TRANSPORT-PUBLIC`, `MOD-TRANSPORT-ADMIN`, `MOD-TRANSPORT-HEALTH` |
+| Foundation, protocol, transport and telemetry | `MOD-KERNEL`, `MOD-RESOURCE-GOVERNOR`, `MOD-SECRET-ENVELOPE`, `MOD-OBSERVABILITY`, `MOD-DIAGNOSTICS`, `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-ACCOUNT_RUNTIME`, `MOD-PROTO-EXTERNAL`, `MOD-PROTO-SSE`, `MOD-TRANSPORT-PUBLIC`, `MOD-TRANSPORT-ADMIN`, `MOD-TRANSPORT-HEALTH` |
 | Durable/control authorities | `MOD-RUNTIME-CONFIG`, `MOD-AUTH`, `MOD-MODEL-CATALOG`, `MOD-CREDENTIALS`, `MOD-PROXY-RESOURCES`, `MOD-EXTERNAL-POOLS`, `MOD-TERMINAL-JOURNAL`, `MOD-USAGE`, `MOD-PROMPT-CACHE`, `MOD-FILES`, `MOD-AUDIT`, `MOD-MAINTENANCE-JOBS`, `MOD-MIGRATIONS` |
-| Request/data plane | `MOD-SCHEDULER-LOCAL`, `MOD-SCHEDULER-EXTERNAL`, `MOD-MESSAGES`, `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD`, `MOD-KIRO-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM`, `MOD-ATTEMPT-POLICY`, `MOD-RESPONSE`, `MOD-TERMINAL-LIFECYCLE`, `MOD-MEDIA`, `MOD-TOKEN-COUNT` |
+| Request/data plane | `MOD-SCHEDULER-LOCAL`, `MOD-SCHEDULER-EXTERNAL`, `MOD-MESSAGES`, `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD`, `MOD-ACCOUNT_RUNTIME-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM`, `MOD-ATTEMPT-POLICY`, `MOD-RESPONSE`, `MOD-TERMINAL-LIFECYCLE`, `MOD-MEDIA`, `MOD-TOKEN-COUNT` |
 | Lifecycle and recovery | `MOD-BOOTSTRAP`, `MOD-SUPERVISOR`, `MOD-READINESS`, `MOD-RECOVERY` |
 | Maintained frontends | `MOD-FRONTEND-CONTRACT`, `MOD-ADMIN-UI`, `MOD-OPERATOR-UI` |
 | Validation and release | `MOD-ARCH-FITNESS`, `MOD-CONTRACT-HARNESS`, `MOD-LOAD-CHAOS-HARNESS`, `MOD-REAL-CLIENT-HARNESS`, `MOD-BROWSER-HARNESS`, `MOD-RELEASE-HARNESS` |
@@ -78,10 +78,10 @@ This appendix makes omission mechanically detectable without turning this source
 | `src/anthropic/handlers.rs`, `src/anthropic/handlers/{local_body_pipeline,parsed_body_pipeline,request_entry}.rs` | Messages entry/orchestration/local pipeline | `MOD-MESSAGES`, `MOD-REQUEST-ARTIFACTS` and `MOD-PAYLOAD`; only scoped `MOD-RESOURCE-GOVERNOR` handles cross the transport boundary | R6 | Rewrite | Not Started |
 | `src/anthropic/body_capabilities.rs` | Body capability plan | target processing-plan policy | R6 | Rewrite; preserve characterized semantics | Not Started |
 | `src/anthropic/body_processing.rs` | Files/remote media materialization | `MOD-FILES`/`MOD-MEDIA` owner code consuming scoped `MOD-RESOURCE-GOVERNOR` byte/task/connection handles | R0/R6 | Rewrite | Not Started |
-| `src/anthropic/converter.rs`, `converter/*` | Anthropic-to-Kiro conversion | `protocol::kiro` and target body pipelines | R6 | Rewrite; preserve golden behavior | Not Started |
+| `src/anthropic/converter.rs`, `converter/*` | Anthropic-to-Account Runtime conversion | `protocol::account-runtime` and target body pipelines | R6 | Rewrite; preserve golden behavior | Not Started |
 | `src/anthropic/payload_guard.rs`, `payload_guard_runtime.rs` | Sizing, repair, shaping, diagnostics | `domain::payload`, `application::messages::artifacts` | R6 | Rewrite | Not Started |
 | `src/anthropic/request_facts.rs` | Lightweight raw facts/model rewrite | `application::messages::raw_facts` | R6 | Rewrite | Not Started |
-| `src/anthropic/stream.rs` | Kiro event to Anthropic SSE state machine | `protocol::sse`, response application service | R7 | Rewrite; preserve golden event vectors | Not Started |
+| `src/anthropic/stream.rs` | Account Runtime event to Anthropic SSE state machine | `protocol::sse`, response application service | R7 | Rewrite; preserve golden event vectors | Not Started |
 | `src/anthropic/cache.rs` | Cache/usage helpers | `domain::cache` | R3 | Rewrite | Not Started |
 | `src/anthropic/prompt_cache.rs` | Fingerprints/tracker/simulation | `domain::cache`, accepted cache-state adapter | R3/R6 | Rewrite | Not Started |
 | `src/anthropic/prompt_cache_creation_control.rs` | Creation frequency state | `domain::cache` and cache state port | R3 | Rewrite | Not Started |
@@ -91,18 +91,18 @@ This appendix makes omission mechanically detectable without turning this source
 | `src/anthropic/tool_format_debug.rs` | Diagnostic capture/writer | `observability::diagnostics`, filesystem adapter/retention worker | R0/R9 | Rewrite | Not Started |
 | `src/anthropic/websearch.rs` | WebSearch conversion/special path | target protocol/body/tool module | R6 | Rewrite | Not Started |
 | `src/anthropic/mod.rs` | Old Anthropic module surface | target transport/protocol/application exports | R6/R7/R10 | Delete after replacement | Not Started |
-| `src/kiro/model/**` | Credentials, proxy-resource binding IDs, token refresh, models, usage limits, IDE/CLI request and event wire families | `MOD-CREDENTIALS`, public `MOD-PROXY-RESOURCES` binding facts, `MOD-MODEL-CATALOG`, `MOD-PROTO-KIRO`, and Kiro auth adapters after responsibility-level mapping | R1/R4/R5 | Rewrite | Not Started |
-| `src/kiro/token_manager/manager.rs` | Scheduler/refresh/state/persistence/Admin God Object, including proxy-resource catalog load/reload and binding resolution | `MOD-SCHEDULER-LOCAL`, `MOD-CREDENTIALS`, and `MOD-PROXY-RESOURCES` public catalog/binding contracts; exact symbols split in the entry audit | R4 | Rewrite | Not Started |
-| `src/kiro/token_manager/{account_state,admin_snapshot,capacity,cooldown,queue,refresh,route_state,rpm,sticky,strategy,types}.rs` | Scheduler algorithms/state helpers, proxy-resource runtime records/availability and credential binding projections | `MOD-SCHEDULER-LOCAL`, `MOD-CREDENTIALS`, and `MOD-PROXY-RESOURCES`; schedulers consume the proxy owner's immutable public view | R4 | Rewrite; retain only characterization vectors | Not Started |
-| `src/kiro/token_manager/{concurrency,redis_runtime,storage_task}.rs` | Lease/Redis/background executor and legacy process-local concurrency | scheduler-state adapters/supervised workers; process admission and global permit state move to `MOD-RESOURCE-GOVERNOR` | R1/R2/R4/R9 | Rewrite | Not Started |
-| `src/kiro/token_manager/mod.rs` | Old manager module surface | target scheduler/credential exports | R4/R10 | Delete after replacement | Not Started |
-| `src/kiro/provider.rs` | Kiro transport/retry/completion and proxy-keyed reusable-client lifecycle | `MOD-KIRO-UPSTREAM` consuming bounded resolved transport facts from `MOD-CREDENTIALS` and `MOD-PROXY-RESOURCES`; terminal behavior moves to R7 owners | R5/R7 | Rewrite | Not Started |
-| `src/kiro/endpoint/*` | IDE/CLI request envelopes | `protocol::kiro::{ide,cli}` and Kiro adapters | R5 | Rewrite | Not Started |
-| `src/kiro/parser/*` | AWS/Kiro event framing, CRC, decoding | `protocol::kiro::event_stream` | R5/R7 | Rewrite or proven-library replacement; retain test vectors | Not Started |
-| `src/kiro/protocol.rs` | Kiro wire DTOs | `protocol::kiro` | R5/R7 | Rewrite | Not Started |
-| `src/kiro/call_trace.rs` | Kiro attempt tracing | typed attempt/observability events | R1/R5/R7 | Rewrite | Not Started |
-| `src/kiro/machine_id.rs` | Upstream identity helper | Kiro auth/endpoint adapter | R5 | Rewrite | Not Started |
-| `src/kiro/mod.rs` | Old Kiro module surface | target protocol/domain/adapters | R5/R7/R10 | Delete after replacement | Not Started |
+| `src/local_upstream_impl/model/**` | Credentials, proxy-resource binding IDs, token refresh, models, usage limits, IDE/CLI request and event wire families | `MOD-CREDENTIALS`, public `MOD-PROXY-RESOURCES` binding facts, `MOD-MODEL-CATALOG`, `MOD-PROTO-ACCOUNT_RUNTIME`, and Account Runtime auth adapters after responsibility-level mapping | R1/R4/R5 | Rewrite | Not Started |
+| `src/local_upstream_impl/token_manager/manager.rs` | Scheduler/refresh/state/persistence/Admin God Object, including proxy-resource catalog load/reload and binding resolution | `MOD-SCHEDULER-LOCAL`, `MOD-CREDENTIALS`, and `MOD-PROXY-RESOURCES` public catalog/binding contracts; exact symbols split in the entry audit | R4 | Rewrite | Not Started |
+| `src/local_upstream_impl/token_manager/{account_state,admin_snapshot,capacity,cooldown,queue,refresh,route_state,rpm,sticky,strategy,types}.rs` | Scheduler algorithms/state helpers, proxy-resource runtime records/availability and credential binding projections | `MOD-SCHEDULER-LOCAL`, `MOD-CREDENTIALS`, and `MOD-PROXY-RESOURCES`; schedulers consume the proxy owner's immutable public view | R4 | Rewrite; retain only characterization vectors | Not Started |
+| `src/local_upstream_impl/token_manager/{concurrency,redis_runtime,storage_task}.rs` | Lease/Redis/background executor and legacy process-local concurrency | scheduler-state adapters/supervised workers; process admission and global permit state move to `MOD-RESOURCE-GOVERNOR` | R1/R2/R4/R9 | Rewrite | Not Started |
+| `src/local_upstream_impl/token_manager/mod.rs` | Old manager module surface | target scheduler/credential exports | R4/R10 | Delete after replacement | Not Started |
+| `src/local_upstream_impl/provider.rs` | Account Runtime transport/retry/completion and proxy-keyed reusable-client lifecycle | `MOD-ACCOUNT_RUNTIME-UPSTREAM` consuming bounded resolved transport facts from `MOD-CREDENTIALS` and `MOD-PROXY-RESOURCES`; terminal behavior moves to R7 owners | R5/R7 | Rewrite | Not Started |
+| `src/local_upstream_impl/endpoint/*` | IDE/CLI request envelopes | `protocol::account-runtime::{ide,cli}` and Account Runtime adapters | R5 | Rewrite | Not Started |
+| `src/local_upstream_impl/parser/*` | AWS/Account Runtime event framing, CRC, decoding | `protocol::account-runtime::event_stream` | R5/R7 | Rewrite or proven-library replacement; retain test vectors | Not Started |
+| `src/local_upstream_impl/protocol.rs` | Account Runtime wire DTOs | `protocol::account-runtime` | R5/R7 | Rewrite | Not Started |
+| `src/local_upstream_impl/call_trace.rs` | Account Runtime attempt tracing | typed attempt/observability events | R1/R5/R7 | Rewrite | Not Started |
+| `src/local_upstream_impl/machine_id.rs` | Upstream identity helper | Account Runtime auth/endpoint adapter | R5 | Rewrite | Not Started |
+| `src/local_upstream_impl/mod.rs` | Old Account Runtime module surface | target protocol/domain/adapters | R5/R7/R10 | Delete after replacement | Not Started |
 | `src/external_pool.rs` | External DTOs/selection/transport/stream/usage | domain/application/external adapter modules | R3/R4/R5/R6/R7 | Rewrite | Not Started |
 | `src/external_pool/{body_pipeline,model_pipeline,retry_pipeline,usage_projection}.rs` | Extracted external stages | target processing/model/error/usage modules | R3/R5/R6 | Rewrite; preserve characterized semantics | Not Started |
 | `src/admin/router.rs`, `handlers.rs`, `middleware.rs`, `error.rs`, `types.rs` | Admin HTTP/auth/body/DTO surface, including proxy-resource CRUD/test and plaintext-secret response DTOs | `MOD-TRANSPORT-ADMIN` consuming `MOD-RESOURCE-GOVERNOR` before body retention plus Rust-authoritative `MOD-FRONTEND-CONTRACT`; proxy-resource commands/queries map only to `MOD-PROXY-RESOURCES` | R8 | Rewrite/regenerate | Not Started |
@@ -122,11 +122,11 @@ This appendix makes omission mechanically detectable without turning this source
 | --- | --- | --- | --- | --- |
 | `src/anthropic/handlers/tests.rs` | Black-box Messages/route/body contracts plus new module tests | R6/R7 | Rewrite as black-box harness; retain sanitized fixtures | Not Started |
 | `src/external_pool/tests.rs` | External adapter/route/path/header/usage contracts | R3/R5/R6/R7 | Rewrite as black-box harness | Not Started |
-| `src/kiro/token_manager/manager_tests.rs` | Pure scheduler property/parity plus real Redis/PgSQL coordination tests | R4 | Rewrite as black-box/pure harness | Not Started |
+| `src/local_upstream_impl/token_manager/manager_tests.rs` | Pure scheduler property/parity plus real Redis/PgSQL coordination tests | R4 | Rewrite as black-box/pure harness | Not Started |
 | `src/admin/service_tests.rs` | Domain/API tests, including `MOD-PROXY-RESOURCES` CRUD/test/binding/masking and owner-specific secret-response contracts | R4/R8 | Rewrite as domain/API tests | Not Started |
 | Embedded `#[cfg(test)]` sections in rewritten modules (section scope, not a second whole-file coverage row) | Tests owned by new module boundaries | Corresponding dependency group | Rewrite; protocol vectors may be retained as data | Not Started |
 | `src/test.rs` | Shared isolated fixture/build helpers | R9 | Rewrite | Not Started |
-| `src/bin/kiro_loadtest.rs` | R0-valid target/outcome/resource measurement, R1 canonical workload/metric harness, R9 CI/release integration | R0/R1/R9 | Rewrite as black-box harness | Not Started |
+| `src/bin/account_runtime_loadtest.rs` | R0-valid target/outcome/resource measurement, R1 canonical workload/metric harness, R9 CI/release integration | R0/R1/R9 | Rewrite as black-box harness | Not Started |
 
 Old white-box tests are not retained merely to keep test counts high. Useful behavior is moved to contract/property/integration fixtures owned by the replacement module.
 
@@ -151,9 +151,9 @@ Both frontends remain in scope unless a separate accepted product decision retir
 | `scripts/check-frontend-contracts.mjs` | Rust-schema generation/drift gate | R8 | Replace and delete old comparison | Not Started |
 | `scripts/ci/*` | Dependency, lint, schema, evidence, performance, artifact gates | R8/R9/R10 | Rewrite/update | Not Started |
 | `scripts/dev-ui.sh` | Isolated reproducible frontend development launcher | R8/R9 | Rewrite/update | Not Started |
-| `.codex/skills/kiro-claude-cli-validation/**` | Operator-facing real Claude Code/Kiro validation workflow aligned with the accepted contract manifest | R9 | Rewrite/update under `MOD-REAL-CLIENT-HARNESS`; preserve only current sanitized matrices | Not Started |
-| `.codex/skills/kiro-load-chaos-validation/**` | Operator-facing load/chaos workflow aligned with the accepted workload/report schema | R0/R1/R9 | Rewrite/update under `MOD-LOAD-CHAOS-HARNESS`; delete stale instructions | Not Started |
-| `tools/event-viewer.html` | Local AWS/Kiro event inspection tool and potential sensitive diagnostic surface | R0/R5/R9 | Review; rewrite under bounded diagnostics/contract tooling or delete if obsolete | Not Started |
+| `.codex/skills/account-runtime-claude-cli-validation/**` | Operator-facing real Claude Code/Account Runtime validation workflow aligned with the accepted contract manifest | R9 | Rewrite/update under `MOD-REAL-CLIENT-HARNESS`; preserve only current sanitized matrices | Not Started |
+| `.codex/skills/account-runtime-load-chaos-validation/**` | Operator-facing load/chaos workflow aligned with the accepted workload/report schema | R0/R1/R9 | Rewrite/update under `MOD-LOAD-CHAOS-HARNESS`; delete stale instructions | Not Started |
+| `tools/event-viewer.html` | Local AWS/Account Runtime event inspection tool and potential sensitive diagnostic surface | R0/R5/R9 | Review; rewrite under bounded diagnostics/contract tooling or delete if obsolete | Not Started |
 | `.github/workflows/build.yaml` | Complete static/storage/frontend/protocol/perf gate orchestration | R9 | Rewrite | Not Started |
 | `.github/workflows/docker-build.yaml` | Complete image build/export, SBOM, signing, provenance and signed `ReleaseGenerationManifest` | R9 | Rewrite | Not Started |
 | `Dockerfile`, `docker-compose*.yml` | Target bootstrap/readiness, immutable release-generation examples, expected-instance identity and accepted hardening scope | R9 | Rewrite/update | Not Started |

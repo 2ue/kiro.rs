@@ -70,7 +70,7 @@ Scheduler, credential, and usage owners project their own commands/events from t
 
 ## Legacy Anti-Corruption Boundary
 
-Legacy code is reachable only from characterization and validation tooling through a package-specific adapter registered in the ledger. The adapter translates one accepted public contract, has a technical authority and deletion gate, and cannot be compiled into the final target runtime. Target domain/application modules cannot import `AppState`, `KiroProvider`, `MultiTokenManager`, `ExternalPoolManager`, `UsageRecorder`, broad legacy stores, or legacy handler modules.
+Legacy code is reachable only from characterization and validation tooling through a package-specific adapter registered in the ledger. The adapter translates one accepted public contract, has a technical authority and deletion gate, and cannot be compiled into the final target runtime. Target domain/application modules cannot import `AppState`, `Account RuntimeProvider`, `MultiTokenManager`, `ExternalPoolManager`, `UsageRecorder`, broad legacy stores, or legacy handler modules.
 
 Compatibility direction is explicit during development: validation may invoke the legacy baseline and target candidate separately through the same black-box contract, but target composition never selects a legacy implementation. New modules do not call a broad legacy facade as an internal dependency. Adding methods or state to a legacy facade is outside this modernization unless it is an independent incident hotfix and cannot establish a target contract.
 
@@ -117,7 +117,7 @@ The structure creates more explicit mapping and adapter code. That cost is accep
 
 ## Compatibility And Data Consequences
 
-- Public Anthropic, Claude Code, Kiro, external-pool, Admin, Models, Files, usage, and frontend behavior remains governed by characterization and accepted defect decisions.
+- Public Anthropic, Claude Code, Account Runtime, external-pool, Admin, Models, Files, usage, and frontend behavior remains governed by characterization and accepted defect decisions.
 - Domain-oriented modules do not imply separate processes, databases, Redis instances, or user partitions.
 - PgSQL/Redis schemas may remain physically shared while queries, scripts, records, transactions, and migrations are owned by one target module.
 - Expand-contract data changes and previous-binary compatibility remain required through the final whole-system rollback window.

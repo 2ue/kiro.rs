@@ -117,7 +117,7 @@ Every work unit reviews all axes below and marks each one `Applicable`, `Not App
 Work-unit entry is mandatory but not the only trigger. A bounded audit or candidate record also starts when any of the following occurs:
 
 - a production incident, unexplained error cluster, latency/resource regression, or capacity/recovery anomaly;
-- an upstream Kiro, Anthropic, Claude Code, external-pool, proxy, PgSQL, Redis, browser, or operating-system behavior/version change;
+- an upstream Account Runtime, Anthropic, Claude Code, external-pool, proxy, PgSQL, Redis, browser, or operating-system behavior/version change;
 - a dependency vulnerability, license/security advisory, image/base-toolchain change, or release exception;
 - a new route, configuration field, storage schema, Redis key class, task, queue, cache, file, external URL, retry loop, or blocking workload;
 - a failed or contradictory characterization, load, chaos, real-client, recovery, browser, Docker, or supply-chain gate;

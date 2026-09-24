@@ -119,8 +119,8 @@ PostgreSQL-only 用例没有机械重复成 3 个 outer。
 retry scope 退出后再次检查 scoped target 和 reservation files 均为 0。retry target 峰值
 `1,625,556 KiB`。没有保留本批 Cargo/rustc 子进程。
 
-全部断言和文档校验结束后，已删除 `kiro-extattr-pg-20260717` 与
-`kiro-extattr-redis-20260717`。`docker inspect` 确认两个容器均不存在，host ports `47542`、
+全部断言和文档校验结束后，已删除 `account-runtime-extattr-pg-20260717` 与
+`account-runtime-extattr-redis-20260717`。`docker inspect` 确认两个容器均不存在，host ports `47542`、
 `47492` 均无 listener；本批临时原始日志目录计数为 0。
 
 ## 结论与未关闭项

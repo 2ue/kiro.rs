@@ -41,7 +41,7 @@ cargo test external_non_stream_response_contamination_is_retryable_not_partial_s
 
 ### 端到端与多轮复现
 
-隔离启动 fake external 与临时 kiro.rs，在 raw/normalized/strict、stream/non-stream、direct/fallback/failover 的笛卡尔积上每格至少 5 轮。fake external 记录实际 body SHA、未知字段、上游 hit 与事件顺序；客户端记录首字节、terminal、usage、request/error ID。再以 20/100 tool cycle、120k history/resume、MCP/agent 混合历史重复同一矩阵。
+隔离启动 fake external 与临时 account-runtime，在 raw/normalized/strict、stream/non-stream、direct/fallback/failover 的笛卡尔积上每格至少 5 轮。fake external 记录实际 body SHA、未知字段、上游 hit 与事件顺序；客户端记录首字节、terminal、usage、request/error ID。再以 20/100 tool cycle、120k history/resume、MCP/agent 混合历史重复同一矩阵。
 
 ### 异常、性能与恢复复现
 
@@ -71,10 +71,10 @@ cargo test external_non_stream_response_contamination_is_retryable_not_partial_s
 
 这些结果来自演进中的 dirty test binary，不是最终 handler、真实 CLI 或统一 release candidate 结论。external SSE pre-byte 跨池 retry、完整 route policy、长会话和性能仍为 pending。
 
-2026-07-18 的完整树同时暴露了 external Kiro-RS Tool usage precedence 的潜伏问题：测试在修改 system/history 后没有刷新 token 派生状态，因此通用 `input=raw` 偶然落在 `32..=4096` 并通过。刷新派生状态后，真实冲突变为通用 reported-usage 覆盖 Kiro-RS Tool 自己的 `reportedInputMin/Max`。当前修复让已解析的 Kiro-RS Tool 路由在通用 shaping 关闭时仍执行自身 cache/usage projection；只有显式启用通用策略时才覆盖。失败不提交 cache、成功后下一轮 cache read 和默认输入范围均已有精确测试；当前完整树 `1715/1715` 非 ignored 通过。该 dirty-tree 结果仍不替代 external handler/CLI/load gate，详见 [单测树证据](../evidence/full-unit-tree-red-green-20260718.md)。
+2026-07-18 的完整树同时暴露了 external Account Runtime-RS Tool usage precedence 的潜伏问题：测试在修改 system/history 后没有刷新 token 派生状态，因此通用 `input=raw` 偶然落在 `32..=4096` 并通过。刷新派生状态后，真实冲突变为通用 reported-usage 覆盖 Account Runtime-RS Tool 自己的 `reportedInputMin/Max`。当前修复让已解析的 Account Runtime-RS Tool 路由在通用 shaping 关闭时仍执行自身 cache/usage projection；只有显式启用通用策略时才覆盖。失败不提交 cache、成功后下一轮 cache read 和默认输入范围均已有精确测试；当前完整树 `1715/1715` 非 ignored 通过。该 dirty-tree 结果仍不替代 external handler/CLI/load gate，详见 [单测树证据](../evidence/full-unit-tree-red-green-20260718.md)。
 
 ## 最终验收与残余风险
 
 B01、C01-C06 每路径至少 5 轮；D01-D05 覆盖真实 Claude Code CLI；F01-F02 覆盖 client drop、error burst/recovery 与 3 x 15 分钟 soak。必须同时满足：clean raw byte-identical；normalized 字段保留符合合同；所有污染形态无泄漏、无空白成功、无伪 terminal；总 upstream hit 不超过共享预算；首输出后 0 retry；RSS/FD idle 后回落；小 clean 请求性能在总门禁预算内。
 
-未知未来 Anthropic/Kiro event 类型仍是残余风险。最终只能声明列出的 event、分块、profile、CLI 版本和观察窗口通过；未知类型应 fail closed 并保留脱敏观测，不能靠默认透传承诺永久无泄漏。
+未知未来 Anthropic/Account Runtime event 类型仍是残余风险。最终只能声明列出的 event、分块、profile、CLI 版本和观察窗口通过；未知类型应 fail closed 并保留脱敏观测，不能靠默认透传承诺永久无泄漏。

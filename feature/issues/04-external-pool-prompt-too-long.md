@@ -30,7 +30,7 @@ Severity: P1
 
 | 层 | 错误 | 性质 |
 |---|---|---|
-| 本地 Kiro | 500 高负载 `unexpectedly high load` | 上游容量/瞬态 |
+| 本地 Account Runtime | 500 高负载 `unexpectedly high load` | 上游容量/瞬态 |
 | 外部池 | `prompt is too long: > 1000000 maximum` | 上游硬上限（1M token） |
 
 内容确实超过外部池 1M token 上限 —— 这部分**不可规避**（是真实的上下文过长）。

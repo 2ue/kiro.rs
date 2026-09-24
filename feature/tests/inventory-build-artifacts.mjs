@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process'
 const VERSION = 2
 const MAX_EXPLICIT_TEMP_ENTRIES = 20000
 const MAX_TEMP_DEPTH = 5
-const KNOWN_TEMP_CONTAINER = /^(?:kiro(?:[-_.]|$)|cargo(?:[-_.]?target|[-_.])|\.validation[-_.])/i
+const KNOWN_TEMP_CONTAINER = /^(?:account-runtime(?:[-_.]|$)|cargo(?:[-_.]?target|[-_.])|\.validation[-_.])/i
 
 function usage() {
   process.stdout.write(`Usage: node feature/tests/inventory-build-artifacts.mjs [options]\n\n`)
@@ -178,10 +178,10 @@ function discoverWorktrees(repoRoot) {
 
 function defaultStateDir(repoRoot) {
   const result = gitOutput(repoRoot, ['rev-parse', '--git-common-dir'])
-  if (!result.ok) return path.join(repoRoot, '.git', 'kiro-validation-build-state')
+  if (!result.ok) return path.join(repoRoot, '.git', 'account-runtime-validation-build-state')
   const value = result.stdout.trim()
   const common = canonical(path.isAbsolute(value) ? value : path.join(repoRoot, value))
-  return path.join(common, 'kiro-validation-build-state')
+  return path.join(common, 'account-runtime-validation-build-state')
 }
 
 function readReservations(stateDir) {
@@ -271,7 +271,7 @@ function scanTempTree(root, addCandidate, scanState, source) {
       const candidateName = entry.name === 'target'
         || entry.name.startsWith('.validation-build-')
         || /^cargo[-_.]?target/i.test(entry.name)
-        || /^kiro[-_.].*target/i.test(entry.name)
+        || /^account-runtime[-_.].*target/i.test(entry.name)
       if (candidateName && looksLikeCargoTarget(child)) {
         addCandidate(child, source)
         continue
@@ -321,7 +321,7 @@ function classifyProcess(text) {
   if (lower.includes('rust-analyzer')) return 'rust-analyzer'
   if (/(^|[/\s])cargo([\s]|$)/.test(lower)) return 'cargo'
   if (/(^|[/\s])rustc([\s]|$)/.test(lower)) return 'rustc'
-  if (lower.includes('kiro-rs')) return 'kiro-runtime'
+  if (lower.includes('account-runtime')) return 'account-runtime'
   if (lower.includes('node')) return 'runtime-helper'
   if (lower.includes('bash') || lower.includes('zsh') || lower.includes('/sh ')) return 'shell-wrapper'
   return 'other-target-reference'
@@ -330,7 +330,7 @@ function classifyProcess(text) {
 function inferCargoTargetFromPath(filePath) {
   const cleaned = filePath.replace(/\s+\(deleted\)$/, '')
   if (!path.isAbsolute(cleaned)) return null
-  if (!/(?:^|\/)(?:target|\.validation-build-[^/]*|cargo[-_.]?target[^/]*|kiro[-_.][^/]*target[^/]*)(?:\/|$)/i.test(cleaned)) {
+  if (!/(?:^|\/)(?:target|\.validation-build-[^/]*|cargo[-_.]?target[^/]*|account-runtime[-_.][^/]*target[^/]*)(?:\/|$)/i.test(cleaned)) {
     return null
   }
   let current = canonical(cleaned)
@@ -344,7 +344,7 @@ function inferCargoTargetFromPath(filePath) {
     const namedTarget = name === 'target'
       || name.startsWith('.validation-build-')
       || /^cargo[-_.]?target/i.test(name)
-      || /^kiro[-_.].*target/i.test(name)
+      || /^account-runtime[-_.].*target/i.test(name)
     if ((namedTarget || looksLikeCargoTarget(current)) && looksLikeCargoTarget(current)) {
       return current
     }

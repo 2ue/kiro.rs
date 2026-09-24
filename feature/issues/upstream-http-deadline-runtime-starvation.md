@@ -8,11 +8,11 @@ Last updated: 2026-07-18
 
 ## 问题、现象与影响
 
-配置的 Kiro 上游 response-header/body timeout 在 Tokio executor 高负载或长时间未调度时可能失去严格 wall-clock 语义。已配置 1 秒 header timeout 的请求，在完整单测树压力下于 1.651 秒收到 fake upstream 的 HTTP 500，并被记录为 `server_error/status=500`；同一请求的前三次 attempt 则在约 1.001 至 1.003 秒正确记录为 `upstream_timeout/status=None`。
+配置的 Account Runtime 上游 response-header/body timeout 在 Tokio executor 高负载或长时间未调度时可能失去严格 wall-clock 语义。已配置 1 秒 header timeout 的请求，在完整单测树压力下于 1.651 秒收到 fake upstream 的 HTTP 500，并被记录为 `server_error/status=500`；同一请求的前三次 attempt 则在约 1.001 至 1.003 秒正确记录为 `upstream_timeout/status=None`。
 
 用户可见结果可能是首字延迟超过配置上限、错误类型和 cooldown 原因随调度时序变化、迟到响应继续触发重试或账号健康逻辑。该问题没有 `Hashxxxxxxxx`、tool transcript、thinking 或图片指纹，也不要求长会话；其无指纹特征是 attempt duration 超过 timeout，但仍带有真实上游 status/body 分类。
 
-影响面包括所有通过 `send_with_response_header_timeout`、`execute_with_response_header_timeout`、`response_bytes_with_limit_and_body_timeout` 和测试用 text body helper 的 Kiro API、MCP、profile/model discovery、OAuth/外部辅助调用。是否实际经过某个 helper 仍由各调用链决定，不能从本问题外推为所有网络操作都已覆盖。
+影响面包括所有通过 `send_with_response_header_timeout`、`execute_with_response_header_timeout`、`response_bytes_with_limit_and_body_timeout` 和测试用 text body helper 的 Account Runtime API、MCP、profile/model discovery、OAuth/外部辅助调用。是否实际经过某个 helper 仍由各调用链决定，不能从本问题外推为所有网络操作都已覆盖。
 
 ## 源码链与根因
 

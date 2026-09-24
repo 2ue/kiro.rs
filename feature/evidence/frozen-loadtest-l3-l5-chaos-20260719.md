@@ -6,13 +6,13 @@ Status: `historical L5 reproduced Redis scheduler blocker / r8 L3+L4+L5 pass / r
 
 ## Scope
 
-This evidence extends the frozen fake-upstream validation from L1 into burst, restart/failure chaos, and sustained long-stream soak. It used the current-project isolated PostgreSQL/Redis pair only, random temporary loopback ports, and fake Kiro upstreams. It did not touch the protected local `9022` service and did not run broad Docker validation.
+This evidence extends the frozen fake-upstream validation from L1 into burst, restart/failure chaos, and sustained long-stream soak. It used the current-project isolated PostgreSQL/Redis pair only, random temporary loopback ports, and fake Account Runtime upstreams. It did not touch the protected local `9022` service and did not run broad Docker validation.
 
 The raw load/proxy directories were retained only long enough to extract the L5 root-cause log evidence. After extraction, the owned raw roots were deleted:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-aI9rvO
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-LCCVpq
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-aI9rvO
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-LCCVpq
 ```
 
 Only the redacted summaries and hashes remain.
@@ -22,36 +22,36 @@ Only the redacted summaries and hashes remain.
 Product binary:
 
 ```text
-/tmp/kiro-frozen-20260719-r2/kiro-rs
+/tmp/account-runtime-frozen-20260719-r2/account-runtime
 sha256 e16df13a0ded4d53ac255f26ddc24056c4d385dde418a63944a2e00d122c642a
 ```
 
 Current scheduler-wait candidate binary under rerun:
 
 ```text
-/tmp/kiro-frozen-20260719-r6/kiro-rs
+/tmp/account-runtime-frozen-20260719-r6/account-runtime
 sha256 d75c102191828032b3a8a5b9b7a5e05cb3807307aa6b463a8992eeee8164501c
 ```
 
 Current scheduler-timeout candidate binary under rerun:
 
 ```text
-/tmp/kiro-frozen-20260719-r8/kiro-rs
+/tmp/account-runtime-frozen-20260719-r8/account-runtime
 sha256 131696bd81e1cdaeceaac6a45f9c76bf698eb559785b379a82fd77e2f742e631
 ```
 
 Loadtest binary:
 
 ```text
-/tmp/kiro-frozen-20260719-r5/kiro_loadtest
+/tmp/account-runtime-frozen-20260719-r5/account_runtime_loadtest
 sha256 23c04221deb72dde601d491452d8cc9a99211df99b2cd39a386272141f2db8e3
 ```
 
 Isolated development services:
 
 ```text
-PostgreSQL container: kiro-final-20260718-pg, loopback 127.0.0.1:50891
-Redis container:      kiro-final-20260718-redis, loopback 127.0.0.1:50892
+PostgreSQL container: account-runtime-final-20260718-pg, loopback 127.0.0.1:50891
+Redis container:      account-runtime-final-20260718-redis, loopback 127.0.0.1:50892
 ```
 
 The runner created one temporary PostgreSQL database and one Redis prefix per scenario and cleaned them in `finally`. Summary `cleanupError` was `null` for L3, L4, L5 900s, and L5 300s diagnostic.
@@ -64,7 +64,7 @@ The orchestration runner is:
 feature/tests/frozen-load-chaos-runner.mjs
 ```
 
-The runner was added so frozen `kiro-rs` and frozen `kiro_loadtest` can be validated without discovering or rebuilding from repository `target/`. It accepts explicit binary paths, uses random non-`9022` ports, creates isolated storage namespaces, hashes logs/reports, and deletes raw roots by default.
+The runner was added so frozen `account-runtime` and frozen `account_runtime_loadtest` can be validated without discovering or rebuilding from repository `target/`. It accepts explicit binary paths, uses random non-`9022` ports, creates isolated storage namespaces, hashes logs/reports, and deletes raw roots by default.
 
 The runner itself needed three fixture corrections before the final L3/L4/L5 evidence was considered valid:
 
@@ -77,7 +77,7 @@ The runner itself needed three fixture corrections before the final L3/L4/L5 evi
 Summary:
 
 ```text
-/tmp/kiro-l3-load-chaos-summary-20260719-r5.json
+/tmp/account-runtime-l3-load-chaos-summary-20260719-r5.json
 runId l3_mrrc3gc0_52862
 passed true
 resultCount 9
@@ -102,7 +102,7 @@ L3 conclusion: short burst and immediate recovery scenarios pass for this frozen
 Summary:
 
 ```text
-/tmp/kiro-l4-load-chaos-summary-20260719-r2.json
+/tmp/account-runtime-l4-load-chaos-summary-20260719-r2.json
 runId l4_mrrc75lm_81889
 passed true
 resultCount 12
@@ -132,7 +132,7 @@ The first L5 attempt used a fast mixed-chaos scenario and exhausted 100,000 requ
 Final 900-second summary:
 
 ```text
-/tmp/kiro-l5-load-chaos-summary-20260719-r2.json
+/tmp/account-runtime-l5-load-chaos-summary-20260719-r2.json
 runId l5_mrrch93p_21610
 passed false
 ```
@@ -156,7 +156,7 @@ fdReturnedWithin5=true
 Diagnostic 300-second summary:
 
 ```text
-/tmp/kiro-l5-300s-diagnostic-summary-20260719.json
+/tmp/account-runtime-l5-300s-diagnostic-summary-20260719.json
 runId l5_mrrd8tmu_16612
 passed false
 ```
@@ -240,7 +240,7 @@ Candidate r6 contains the scheduler wait change where normal local requests that
 Summary:
 
 ```text
-/tmp/kiro-l5-120s-after-scheduler-wait-keepraw-20260719-r1.json
+/tmp/account-runtime-l5-120s-after-scheduler-wait-keepraw-20260719-r1.json
 passed false
 ```
 
@@ -252,7 +252,7 @@ passed false
 Raw log inspection before deletion showed no Redis degraded, no 429, and breaker cumulative failures all zero. The only failing gate was the strict RSS return criterion after a short 20-second idle cooldown; FD returned within the configured bound. Raw root deleted after extraction:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-2LSuOK
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-2LSuOK
 ```
 
 ### First 300-second diagnostic
@@ -260,7 +260,7 @@ Raw log inspection before deletion showed no Redis degraded, no 429, and breaker
 Summary:
 
 ```text
-/tmp/kiro-l5-300s-after-scheduler-wait-20260719-r1.json
+/tmp/account-runtime-l5-300s-after-scheduler-wait-20260719-r1.json
 passed false
 ```
 
@@ -276,9 +276,9 @@ This run proved the quick 429 storm was reduced dramatically compared with the h
 Summary:
 
 ```text
-/tmp/kiro-l5-300s-r6-keepraw-20260719-r2.json
+/tmp/account-runtime-l5-300s-r6-keepraw-20260719-r2.json
 passed true
-rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-fhPioD
+rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-fhPioD
 ```
 
 | Case | Requests | Status counts | Success / errors | p95 TTFB ms | p95 first text ms | p95 total ms | RSS start→idle | FD start→idle | Pass |
@@ -297,7 +297,7 @@ affinity admitted=6879 failures=0 suppressed=0
 The raw root was deleted after extraction:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-fhPioD
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-fhPioD
 ```
 
 ### Current interpretation
@@ -309,8 +309,8 @@ r6 closes the deterministic 300-second fake-upstream scheduler-degraded failure 
 Run command used candidate r6, the same frozen loadtest binary, and the same isolated PostgreSQL/Redis pair:
 
 ```text
-/tmp/kiro-l5-900s-r6-final-keepraw-20260719-r1.json
-rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-uJrbSK
+/tmp/account-runtime-l5-900s-r6-final-keepraw-20260719-r1.json
+rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-uJrbSK
 ```
 
 The run was manually stopped after roughly 4.5 minutes because the release-blocking condition had already appeared and continuing would only generate avoidable local load. Extracted redacted proxy-log counts before deletion:
@@ -340,17 +340,17 @@ Redis capacity breaker: 占用 Redis 凭据并发槽超过共享总期限 75ms
 capacity breaker recovery: suppressed_requests=901086
 ```
 
-This identifies a second-stage defect in r6: the bounded degraded wait still listened to ordinary capacity wakeups, so a Redis-breaker-open window could be woken repeatedly by unrelated capacity changes and produce a large internal retry loop without corresponding downstream RPM. The owned raw root, temporary PostgreSQL database `kiro_l5_rhltd6_9003_0`, and Redis prefix `kiro_l5_mrrhltd6_9003:kiro_l5_rhltd6_9003_0:` were deleted after extraction.
+This identifies a second-stage defect in r6: the bounded degraded wait still listened to ordinary capacity wakeups, so a Redis-breaker-open window could be woken repeatedly by unrelated capacity changes and produce a large internal retry loop without corresponding downstream RPM. The owned raw root, temporary PostgreSQL database `account-runtime_l5_rhltd6_9003_0`, and Redis prefix `account-runtime_l5_mrrhltd6_9003:account-runtime_l5_rhltd6_9003_0:` were deleted after extraction.
 
 ### Candidate r7
 
 Candidate r7 adds a dedicated Redis-degraded recovery sleep for normal local requests. The degraded branch no longer waits on ordinary capacity signals, so capacity/stream/usage wakeups cannot spin the request loop while the Redis capacity breaker is open. A focused real-Redis test was updated with a 1ms noisy notifier and passed, asserting the suppressed count stays bounded.
 
 ```text
-/tmp/kiro-frozen-20260719-r7/kiro-rs
+/tmp/account-runtime-frozen-20260719-r7/account-runtime
 sha256 58f465f57b4c5d183338aa823a90828cecf1eb74289bd9bb8153dc801238bba5
 
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:50892/0 \
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:50892/0 \
 RUSTUP_TOOLCHAIN=1.92.0 \
 feature/tests/run-cargo-scoped.sh scheduler-degraded-sleep-redis-20260719-r1 -- \
   cargo test redis_backed_in_flight_limit_does_not_fail_open_while_degraded -- --nocapture
@@ -369,9 +369,9 @@ scope cleanup: size_kib=446948 removed=true reservation_released=true
 r7 L5 300-second keep-raw passed:
 
 ```text
-/tmp/kiro-l5-300s-r7-keepraw-20260719-r1.json
+/tmp/account-runtime-l5-300s-r7-keepraw-20260719-r1.json
 passed true
-rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-4ho8H5
+rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-4ho8H5
 ```
 
 | Case | Requests | Status counts | Success / errors | p95 TTFB ms | p95 first text ms | p95 total ms | RSS start→idle | FD start→idle | Pass |
@@ -409,8 +409,8 @@ r7 later failed the 900-second gate and was replaced by r8.
 Run command used candidate r7, the same frozen loadtest binary, and the same isolated PostgreSQL/Redis pair:
 
 ```text
-/tmp/kiro-l5-900s-r7-final-keepraw-20260719-r1.json
-rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-skwUO0
+/tmp/account-runtime-l5-900s-r7-final-keepraw-20260719-r1.json
+rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-skwUO0
 ```
 
 The run was manually stopped after roughly 2-3 minutes because the release-blocking condition appeared again. Extracted redacted proxy-log counts before deletion:
@@ -436,8 +436,8 @@ The important difference from r6 is that r7 removed the internal retry spin but 
 The owned raw root was deleted after extraction. The runner had already cleaned the temporary database and Redis prefix:
 
 ```text
-PostgreSQL database kiro_l5_riz8b0_2739_0 absent
-Redis prefix kiro_l5_mrriz8b0_2739:kiro_l5_riz8b0_2739_0: remaining keys 0
+PostgreSQL database account-runtime_l5_riz8b0_2739_0 absent
+Redis prefix account-runtime_l5_mrriz8b0_2739:account-runtime_l5_riz8b0_2739_0: remaining keys 0
 ```
 
 ### Candidate r8
@@ -459,11 +459,11 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh scheduler-timeout-r8-f
 result: pass
 scope cleanup: size_kib=447616 removed=true reservation_released=true
 
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:50892/0 RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh scheduler-timeout-r8-focused-redis-backedinflight-20260719-r1 -- cargo test redis_backed_in_flight_limit_does_not_fail_open_while_degraded -- --nocapture
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:50892/0 RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh scheduler-timeout-r8-focused-redis-backedinflight-20260719-r1 -- cargo test redis_backed_in_flight_limit_does_not_fail_open_while_degraded -- --nocapture
 result: 1 passed / 0 failed
 scope cleanup: size_kib=1695752 removed=true reservation_released=true
 
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:50892/0 RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh scheduler-timeout-r8-focused-scheduler-redis-20260719-r1 -- cargo test scheduler_redis_ -- --nocapture
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:50892/0 RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh scheduler-timeout-r8-focused-scheduler-redis-20260719-r1 -- cargo test scheduler_redis_ -- --nocapture
 result: 5 passed / 0 failed
 scope cleanup: size_kib=1693952 removed=true reservation_released=true
 
@@ -475,21 +475,21 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh scheduler-timeout-r8-f
 result: pass
 scope cleanup: size_kib=446948 removed=true reservation_released=true
 
-RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh frozen-product-20260719-r8 -- bash -lc 'cargo build --release --locked --bin kiro-rs && cp "$CARGO_TARGET_DIR/release/kiro-rs" /tmp/kiro-frozen-20260719-r8/kiro-rs && shasum -a 256 /tmp/kiro-frozen-20260719-r8/kiro-rs'
+RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh frozen-product-20260719-r8 -- bash -lc 'cargo build --release --locked --bin account-runtime && cp "$CARGO_TARGET_DIR/release/account-runtime" /tmp/account-runtime-frozen-20260719-r8/account-runtime && shasum -a 256 /tmp/account-runtime-frozen-20260719-r8/account-runtime'
 result: sha256 131696bd81e1cdaeceaac6a45f9c76bf698eb559785b379a82fd77e2f742e631
 scope cleanup: size_kib=788936 removed=true reservation_released=true
 ```
 
-The Toxiproxy latency-injection tests were compiled but skipped because this local environment did not provide `KIRO_RS_TEST_TOXIPROXY_API` / `KIRO_RS_TEST_TOXIPROXY_NAME`. They are not counted as dynamic pass evidence.
+The Toxiproxy latency-injection tests were compiled but skipped because this local environment did not provide `ACCOUNT_RUNTIME_TEST_TOXIPROXY_API` / `ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME`. They are not counted as dynamic pass evidence.
 
 #### r8 300-second L5 diagnostic
 
 Summary:
 
 ```text
-/tmp/kiro-l5-300s-r8-keepraw-20260719-r1.json
+/tmp/account-runtime-l5-300s-r8-keepraw-20260719-r1.json
 passed true
-rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-r8nKcJ
+rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-r8nKcJ
 ```
 
 | Case | Requests | Status counts | Success / errors | p95 TTFB ms | p95 first text ms | p95 total ms | RSS start→idle | FD start→idle | Pass |
@@ -521,9 +521,9 @@ The owned raw root was deleted after extraction.
 Summary:
 
 ```text
-/tmp/kiro-l5-900s-r8-final-keepraw-20260719-r1.json
+/tmp/account-runtime-l5-900s-r8-final-keepraw-20260719-r1.json
 passed true
-rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-l5-load-chaos-4nV05E
+rawRoot /var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-l5-load-chaos-4nV05E
 ```
 
 | Case | Requests | Status counts | Success / errors | p95 TTFB ms | p95 first text ms | p95 total ms | RSS start→idle | FD start→idle | Pass |
@@ -558,7 +558,7 @@ The affinity breaker failures were sticky/session cleanup operations at the reta
 Summary:
 
 ```text
-/tmp/kiro-l3-r8-load-chaos-summary-20260719-r1.json
+/tmp/account-runtime-l3-r8-load-chaos-summary-20260719-r1.json
 passed true
 resultCount 9
 product sha256 131696bd81e1cdaeceaac6a45f9c76bf698eb559785b379a82fd77e2f742e631
@@ -584,7 +584,7 @@ The r8 L3 pass keeps the same fake-upstream burst/error/recovery coverage after 
 Summary:
 
 ```text
-/tmp/kiro-l4-r8-load-chaos-summary-20260719-r1.json
+/tmp/account-runtime-l4-r8-load-chaos-summary-20260719-r1.json
 passed true
 resultCount 12
 product sha256 131696bd81e1cdaeceaac6a45f9c76bf698eb559785b379a82fd77e2f742e631

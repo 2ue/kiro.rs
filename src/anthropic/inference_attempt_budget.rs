@@ -84,6 +84,7 @@ impl<'de> Deserialize<'de> for InferenceAttemptSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuxiliaryAttemptKind {
     TokenRefresh,
+    #[allow(dead_code)]
     ProfileDiscovery,
 }
 

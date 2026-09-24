@@ -1,6 +1,6 @@
 # Account Runtime Upstream Accounts Roadmap
 
-Role: Durable state for the current Rust Kiro-removal refactor
+Role: Durable state for the current Rust Account Runtime-removal refactor
 
 Status: In Progress
 
@@ -12,7 +12,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 
 ## Done
 
-- User intent clarified: the target system must have no Kiro business concept, not even as a first target provider.
+- User intent clarified: the target system must have no Account Runtime business concept, not even as a first target provider.
 - Mainline workflow decided: commit current work, merge to `master`, then branch for implementation.
 - Target plan created under `docs/plantree/plans/account-runtime-upstream-accounts/`.
 - Current `feature/usage-correction-cost-floor` work was committed and merged into `master`.
@@ -59,35 +59,35 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - New upstream account usage records now write `routeKind: "account"` as the primary route kind. Account/upstream-account usage filters, Redis summaries, Postgres rollups/dashboard queries and maintained usage UI display all treat `account` plus historical `external_pool` as the upstream-account class during compatibility migration.
 - Usage records now expose `accountBilling` as the primary upstream-account billing detail while retaining `externalPoolBilling` as a compatibility copy. Recorder/storage paths fill both fields, read paths normalize historical records, and maintained usage UI reads account billing first.
 - Usage summary and dashboard window summary now expose `accountBilling` plus `accountBillingByAccount` aggregate fields while retaining legacy external-pool aggregate fields for compatibility. Redis/Postgres materialization fills both, and the maintained overview UI consumes the account fields first.
-- Usage records, usage summaries, dashboard windows/series/top aggregates and credential usage summaries now expose `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` as the account-neutral metering fields. Old `kiroMeteringUsage` / `totalKiroMeteringUsage` JSON fields and current DB/Redis compatibility keys remain mirrored, historical old-only records are normalized on read, and maintained usage UI surfaces show "上游计量" instead of Kiro metering wording.
-- Stream and handler internals now carry upstream metering values as `upstream_metering_units`; the old Kiro-named usage field remains only as the serialized/storage compatibility copy, and stream tests assert metering stays internal rather than leaking into downstream SSE.
+- Usage records, usage summaries, dashboard windows/series/top aggregates and credential usage summaries now expose `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` as the account-neutral metering fields. Old `upstreamMeteringUnits` / `totalAccount RuntimeMeteringUsage` JSON fields and current DB/Redis compatibility keys remain mirrored, historical old-only records are normalized on read, and maintained usage UI surfaces show "上游计量" instead of Account Runtime metering wording.
+- Stream and handler internals now carry upstream metering values as `upstream_metering_units`; the old Account Runtime-named usage field remains only as the serialized/storage compatibility copy, and stream tests assert metering stays internal rather than leaking into downstream SSE.
 - New upstream account usage route subtypes now serialize with account terminology: `account_fallback_preflight`, `account_fallback_after_local_attempts`, `account_direct_policy`, `account_error` and `local_rescue_after_account`. Historical `external_*` and `local_rescue_after_external` values remain accepted and displayed as compatibility values in maintained UIs.
 - Anthropic parsed/raw fallback routing now uses `AccountFallbackContext` and account-named fallback/preflight helper methods. Local rescue preflight metadata now writes account fields while retaining old `external*` copies, and focused handler/account-only tests passed.
 - Local rescue fallback reasons now use account terminology (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`), and request-entry/local-rescue handler code reads account-named config accessors instead of external-pool fields.
-- Anthropic router, AppState and request runtime now use `payload_guard_account_enabled` for the account-route payload guard switch, while the existing persisted/runtime-config JSON field remains a compatibility boundary. Maintained runtime UI text describes upstream-account payload shaping instead of Kiro/external-pool payload handling.
+- Anthropic router, AppState and request runtime now use `payload_guard_account_enabled` for the account-route payload guard switch, while the existing persisted/runtime-config JSON field remains a compatibility boundary. Maintained runtime UI text describes upstream-account payload shaping instead of Account Runtime/external-pool payload handling.
 - Runtime configuration UI wording now presents the legacy external-pool runtime section as upstream-account routing, covering route policy, retry/failover, local rescue, usage diagnostics, prompt steering and body/payload shaping while retaining compatibility state keys internally.
-- Local parsed body capability planning now has local-upstream type names and logs. The concrete `KiroRequest` payload type is still isolated to the current legacy local-provider boundary pending provider/body replacement.
+- Local parsed body capability planning now has local-upstream type names and logs. The concrete `Account RuntimeRequest` payload type is still isolated to the current legacy local-provider boundary pending provider/body replacement.
 - Account-route raw/normalized body capability planning now has account body plan names, with the legacy executor still delegated through `external_pool` until that module is migrated.
 - Official upstream error-message extraction now uses account-neutral envelope/helper names while preserving the public-message filtering that blocks sensitive or internal scheduler/account/provider wording from downstream protocol errors.
 - Payload guard runtime wrappers and account-forwarding sanitizer now use local-upstream/account names, while the concrete legacy local payload type remains isolated until the provider/body implementation is replaced.
 - Account-route body/model/retry pipeline diagnostics now use account wording for payload guard, model rewrite, model mapping and cooldown failures inside the delegated legacy executor.
-- Account-route usage debug JSON now writes local processing details under `upstreamProcessing` instead of the old Kiro-named processing key.
+- Account-route usage debug JSON now writes local processing details under `upstreamProcessing` instead of the old Account Runtime-named processing key.
 - Account-route model processing helpers now use account names for outbound raw model selection and model processing errors inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while old config field names remain compatibility storage.
 - Core retry/failover tests now use same-account/cross-account terminology for behavior names and assertions while compatibility config fixture fields remain unchanged.
 - Runtime config now provides account-named retry status accessors used by the retry pipeline, with old accessor names retained as compatibility delegates.
 - Account runtime facade comments and upstream-account integration-test skip messages now avoid presenting the migrated runtime as an external-pool feature.
 - Proxy warning responses now use `x-account-runtime-warnings` as the primary header and double-write the old warning header for compatibility.
-- Anthropic handler payload guard call sites now enter local-upstream wrappers for guarding and serialization; cache-point retry and thinking-signature retry no longer call the legacy Kiro-named guard helpers directly.
+- Anthropic handler payload guard call sites now enter local-upstream wrappers for guarding and serialization; cache-point retry and thinking-signature retry no longer call the legacy Account Runtime-named guard helpers directly.
 - JSON stream error-envelope usage diagnostics now keep provider-message privacy by storing shape/fingerprint metadata for complete JSON error envelopes instead of raw message bodies, and remaining malformed/incomplete raw snippet sources use neutral official-upstream wording.
-- Local-upstream payload diagnostics now use wrapper names for byte breakdown and tool-use format diagnostics at handler/local body pipeline call sites, leaving Kiro-named helpers inside the legacy payload implementation only.
-- Anthropic handler runtime log/comment text for local-upstream cache-point retry, payload guard, tool-format, slow interaction and stream/non-stream retry diagnostics now uses local-upstream/account wording instead of Kiro product wording.
+- Local-upstream payload diagnostics now use wrapper names for byte breakdown and tool-use format diagnostics at handler/local body pipeline call sites, leaving Account Runtime-named helpers inside the legacy payload implementation only.
+- Anthropic handler runtime log/comment text for local-upstream cache-point retry, payload guard, tool-format, slow interaction and stream/non-stream retry diagnostics now uses local-upstream/account wording instead of Account Runtime product wording.
 - The local body pipeline now exposes `PreparedLocalUpstreamBody.local_upstream_request` and local-upstream helper parameter names at the handler boundary, while the concrete legacy request type remains isolated behind that boundary.
 - Stream conversion now offers `process_local_upstream_event` as the handler-facing event processor; the legacy concrete event method remains internal to the stream module and existing stream tests until the event model is replaced.
 - Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor, keeping the concrete legacy provider type behind the protocol boundary.
-- Anthropic converter module docs, diagnostics, tool-name collision errors and compatibility comments now describe local-upstream/upstream-safe behavior instead of Kiro protocol behavior.
-- Model capability seed/status source values now use upstream-account terminology for new writes, normalize old `kiro-*` source strings on read, and expose `sync_from_upstream_catalog` as the main/Admin synchronization entrypoint.
-- Stale Kiro-named model capability sync wrappers were removed; runtime and test callers now use upstream-named sync entrypoints directly.
+- Anthropic converter module docs, diagnostics, tool-name collision errors and compatibility comments now describe local-upstream/upstream-safe behavior instead of Account Runtime protocol behavior.
+- Model capability seed/status source values now use upstream-account terminology for new writes, normalize old `account-runtime-*` source strings on read, and expose `sync_from_upstream_catalog` as the main/Admin synchronization entrypoint.
+- Stale Account Runtime-named model capability sync wrappers were removed; runtime and test callers now use upstream-named sync entrypoints directly.
 - Native WebSearch MCP routing now uses local-auxiliary-upstream names for provider/error helper wrappers, MCP call helper names and runtime comments while retaining the concrete legacy provider type as a compatibility detail.
 - `local_upstream` now provides compatibility aliases for the legacy local provider, call-trace, MCP attribution and response types; Anthropic router, middleware, handler and WebSearch boundaries import those aliases instead of legacy provider names.
 - `local_upstream` now provides local request/event aliases used by `payload_guard_runtime`, `tool_format_debug` and `cache`, reducing direct legacy request/event imports in small Anthropic body/diagnostic boundaries.
@@ -97,15 +97,15 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream timeout, stream-retry and cache-point settings now have `Config` accessors, and Anthropic router/AppState/request runtime/converter/Admin model-test/WebSearch call sites use local-upstream runtime names while persisted compatibility fields remain unchanged.
 - The local-upstream agent mode strategy now uses `LocalUpstreamAgentModeStrategy` as the Rust type name while retaining existing compatibility config/wire field names.
 - Maintained runtime UI and Admin UI type/component names now use `LocalUpstreamAgentModeStrategy` while retaining the existing compatibility wire field.
-- The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant while serde keeps legacy `kiro_rs_tool` serialization and accepts `claude_code_tool` on read.
-- Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code while serde keeps `kiroRsTool` output and accepts `claudeCodeTool` on read.
-- Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field and normalize legacy `kiro_rs_tool` / `kiroRsTool` responses into the new UI state.
-- Rust serde now emits `claude_code_tool` / `claudeCodeTool` as the primary prompt-cache strategy value and field while keeping `kiro_rs_tool` / `kiroRsTool` as read aliases.
+- The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant while serde keeps legacy `account_runtime_tool` serialization and accepts `claude_code_tool` on read.
+- Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code while serde keeps `claudeCodeTool` output and accepts `claudeCodeTool` on read.
+- Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field and normalize legacy `account_runtime_tool` / `claudeCodeTool` responses into the new UI state.
+- Rust serde now emits `claude_code_tool` / `claudeCodeTool` as the primary prompt-cache strategy value and field while keeping `account_runtime_tool` / `claudeCodeTool` as read aliases.
 - Claude Code tool prompt-cache tests now use Claude Code Tool names for focused prompt-cache, handler and account-route usage projection cases.
-- Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names while legacy `kiro_rs_tool` config values and `kiroRsTool` fields remain read aliases.
-- Claude Code tool prompt-cache internal methods/helpers now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
-- Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility boundaries.
-- Payload guard report cache-point diagnostics now serialize local-upstream field names and accept old Kiro-named JSON fields only as compatibility read aliases.
+- Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names while legacy `account_runtime_tool` config values and `claudeCodeTool` fields remain read aliases.
+- Claude Code tool prompt-cache internal methods/helpers now use `claude_code_tool_*` names while the existing `account_runtime_tool` config field and strategy value remain compatibility boundaries.
+- Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names while the existing `account_runtime_tool` config field and strategy value remain compatibility boundaries.
+- Payload guard report cache-point diagnostics now serialize local-upstream field names and accept old Account Runtime-named JSON fields only as compatibility read aliases.
 - Local body preparation now uses an upstream reasoning capability alias and local-upstream request aliases at its handler/test boundary.
 - Converter tool-use/tool-result pairing now uses local-upstream request aliases at its production import boundary.
 - Converter body, history, tool and model modules now use local-upstream request aliases and upstream reasoning aliases instead of direct legacy request model imports.
@@ -113,15 +113,15 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Handler local dispatch policy, account fallback preflight and request-entry fast-fail code now use local-upstream dispatch aliases instead of direct token-manager route-state/acquire-mode imports.
 - Model capability catalog ingestion now uses local-upstream model catalog aliases for available models, cohort keys and token-limit fixtures.
 - Payload guard production code and local payload fixtures now use local-upstream request aliases instead of direct legacy request model imports.
-- Payload guard guarding, serialization, byte-breakdown and tool-use diagnostic entrypoints now use local-upstream names instead of Kiro-named module APIs.
+- Payload guard guarding, serialization, byte-breakdown and tool-use diagnostic entrypoints now use local-upstream names instead of Account Runtime-named module APIs.
 - Anthropic stream tests now use local-upstream event facade aliases, removing direct legacy event imports from `src/anthropic`.
 - Admin service model-test request construction and response parsing now use local-upstream request/event/decoder aliases instead of direct legacy paths.
-- Model capability cohort fencing and startup readiness now use upstream reasoning contract-match naming instead of the old Kiro-named type.
+- Model capability cohort fencing and startup readiness now use upstream reasoning contract-match naming instead of the old Account Runtime-named type.
 - Model capability reasoning field path, capability and state types now use upstream names as their real Rust types, including Postgres persistence and local-upstream provider call sites.
 - Main process wiring now uses local-upstream provider naming for the optional local executor and model capability recovery worker.
 - Admin service dependencies and internal provider state now use local-upstream provider naming, leaving legacy credential behavior behind the local executor boundary.
 - Admin service credential backup, validation, balance and snapshot code now uses local-upstream credential/usage-limit/manager aliases instead of direct legacy credential manager imports.
-- The unmounted `src/test.rs` Kiro-specific manual stream caller was removed.
+- The unmounted `src/test.rs` Account Runtime-specific manual stream caller was removed.
 - Account-route local auxiliary attempt traces now use local-upstream credential-attempt aliases instead of direct legacy call-trace paths.
 - Account-route Redis lease cleanup now uses an account-runtime critical storage-task alias, and that bridge now resolves through the local-upstream facade instead of direct legacy token-manager imports.
 - Main shutdown lifecycle now uses account-runtime storage-task aliases for best-effort storage task stats, drain and shutdown calls.
@@ -131,50 +131,50 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Main endpoint registry construction now uses local-upstream endpoint aliases for IDE/CLI endpoint setup instead of direct legacy endpoint imports.
 - Main startup and Redis runtime-event wiring now use local-upstream credential/config/manager aliases instead of direct legacy credential manager imports.
 - Main startup local API-key bootstrap variables and Admin supported-model normalization variables now use local-upstream/upstream naming while legacy environment/config field names remain compatibility boundaries.
-- Local-upstream timeout, stream-retry and base-URL runtime config fields now use `local_upstream_*` / `localUpstream*` as primary Rust/Admin/UI names, while old `kiroUpstream*` config/request/response shapes remain read-only compatibility aliases.
-- Local-upstream cachePoint runtime config fields now use `local_upstream_cache_point_*` / `localUpstreamCachePoint*` as primary Rust/Admin/UI names, while old `kiroCachePoint*` config/request/response shapes remain read-only compatibility aliases.
-- Local-upstream agent-mode runtime config now uses `local_upstream_agent_mode_strategy` / `localUpstreamAgentModeStrategy` as primary Rust/Admin/UI names, while old `kiroAgentModeStrategy` config/request/response shapes remain read-only compatibility aliases.
-- Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field, while old `kiroVersion` config shape remains a read-only compatibility alias.
-- Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Kiro wording while preserving compatibility aliases for old config shapes.
+- Local-upstream timeout, stream-retry and base-URL runtime config fields now use `local_upstream_*` / `localUpstream*` as primary Rust/Admin/UI names, while old `localUpstream*` config/request/response shapes remain read-only compatibility aliases.
+- Local-upstream cachePoint runtime config fields now use `local_upstream_cache_point_*` / `localUpstreamCachePoint*` as primary Rust/Admin/UI names, while old `localUpstreamCachePoint*` config/request/response shapes remain read-only compatibility aliases.
+- Local-upstream agent-mode runtime config now uses `local_upstream_agent_mode_strategy` / `localUpstreamAgentModeStrategy` as primary Rust/Admin/UI names, while old `localUpstreamAgentModeStrategy` config/request/response shapes remain read-only compatibility aliases.
+- Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field, while old `account-runtimeVersion` config shape remains a read-only compatibility alias.
+- Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Account Runtime wording while preserving compatibility aliases for old config shapes.
 - Maintained UI/Admin UI usage API types now name local auxiliary credential traces `LocalUpstreamCredentialAttempt`, while the `credentialAttempts` wire field stays unchanged.
-- Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording, and the sidebar brand mark no longer presents Kiro as the product name.
-- Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
-- Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Kiro request/body/guard behavior.
-- Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `kiro_*` names.
-- Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Kiro protocol/model/cache wording.
-- Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Kiro content/wire-facing behavior.
-- Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `kiro.rs` conversation-id hash domain remains unchanged to avoid behavior drift.
-- Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `kiroMeteringUsage` compatibility field assertion remains unchanged.
-- Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Kiro API-key/API wording while keeping `kiroApiKey` as a compatibility field.
-- Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `kiroApiKey` / `kiro_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
-- Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `kiroApiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
-- Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `kiroApiKey` remains only as a compatibility fallback when reading older credential/import objects.
-- Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
-- Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
-- Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
+- Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording, and the sidebar brand mark no longer presents Account Runtime as the product name.
+- Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Account Runtime model/API behavior.
+- Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Account Runtime request/body/guard behavior.
+- Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `account-runtime_*` names.
+- Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Account Runtime protocol/model/cache wording.
+- Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Account Runtime content/wire-facing behavior.
+- Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `account-runtime` conversation-id hash domain remains unchanged to avoid behavior drift.
+- Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `upstreamMeteringUnits` compatibility field assertion remains unchanged.
+- Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Account Runtime API-key/API wording while keeping `apiKey` as a compatibility field.
+- Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `apiKey` / `account-runtime_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
+- Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `apiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
+- Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `apiKey` remains only as a compatibility fallback when reading older credential/import objects.
+- Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Account Runtime Account Manager / KAM wording.
+- Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Account Runtime API-key/API/credits wording.
+- Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Account Runtime wording.
 - Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving generic label parsing behavior.
-- The load/chaos helper now presents account-runtime/upstream wording for command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and tests while keeping old Kiro-named CLI/env/header inputs only as compatibility aliases/fallbacks.
+- The load/chaos helper now presents account-runtime/upstream wording for command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and tests while keeping old Account Runtime-named CLI/env/header inputs only as compatibility aliases/fallbacks.
 - Anthropic handler and external-pool test helpers now construct local upstream credential, endpoint, manager, provider and EventStream CRC fixtures through the `local_upstream` facade instead of importing legacy local-provider modules directly.
-- Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
+- Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording while old Account Runtime-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
 - The maintained UI HTML document title now uses Account Runtime Console wording.
-- Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Kiro-named semantic test names while preserving existing compatibility fields.
-- The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Kiro-named path remains only as a compatibility wrapper.
-- Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Kiro-branded names.
-- Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
-- Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
-- Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
-- Anthropic handler prompt-cache strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream naming instead of Kiro-scoped route/content variables.
-- Admin UI internal status color utilities now use `runtime` class prefixes instead of Kiro-branded class names while preserving the existing visual behavior.
+- Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Account Runtime-named semantic test names while preserving existing compatibility fields.
+- The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Account Runtime-named path remains only as a compatibility wrapper.
+- Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Account Runtime-branded names.
+- Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Account Runtime-named env inputs retained only as fallback compatibility.
+- Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Account Runtime-named runner paths remain only as compatibility wrappers.
+- Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Account Runtime-scoped fixture strings.
+- Anthropic handler prompt-cache strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream naming instead of Account Runtime-scoped route/content variables.
+- Admin UI internal status color utilities now use `runtime` class prefixes instead of Account Runtime-branded class names while preserving the existing visual behavior.
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming, with the old theme key retained only as a compatibility fallback.
-- New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
+- New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Account Runtime-branded artifact names.
 - Startup env handling now reads only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, and healthz reports `account-runtime`. `LOCAL_UPSTREAM_API_KEY` is no longer a startup import path.
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming while stable hash domains remain unchanged.
-- Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
+- Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Account Runtime-branded artifact prefixes.
 - New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
-- Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Kiro-specific header name.
+- Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Account Runtime-specific header name.
 - Admin, storage and Anthropic handler-test boundaries now import upstream-account storage/status/eligibility/manager aliases through `account_runtime` instead of direct legacy external-pool modules, and unused legacy Rust enable/test DTOs were removed.
-- The legacy local upstream implementation directory moved from `src/kiro` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::kiro` module paths were removed, and the concrete request submodule moved from `model::requests::kiro` to `model::requests::upstream`.
-- Concrete local-upstream request payload structs now use `LocalUpstream*` type names, the request module re-export no longer exposes `KiroRequest`, and `model/requests` comments use local-upstream wording while wire fields and body behavior stay unchanged.
+- The legacy local upstream implementation directory moved from `src/account-runtime` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::account-runtime` module paths were removed, and the concrete request submodule moved from `model::requests::account-runtime` to `model::requests::upstream`.
+- Concrete local-upstream request payload structs now use `LocalUpstream*` type names, the request module re-export no longer exposes `Account RuntimeRequest`, and `model/requests` comments use local-upstream wording while wire fields and body behavior stay unchanged.
 - Concrete local-upstream provider, endpoint trait, API response and stream completion types now use `LocalUpstream*` names. Provider diagnostics and endpoint comments use local-upstream wording while existing transport, retry, completion and body-send behavior stays unchanged.
 - Local-upstream call-trace attempt, call-error and failure-kind types now use `LocalUpstream*` names while preserving serialized attempt fields, provider downcast helpers and MCP attribution behavior.
 - Local-upstream available-model catalog, available-model item, model-capability cohort and token-limit/prompt-cache helper types now use `LocalUpstream*` names while preserving ListAvailableModels parsing and reasoning cohort checks.
@@ -185,7 +185,7 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Local-upstream image request payload types now use `LocalUpstreamImage` and `LocalUpstreamImageSource` as real Rust types, with image JSON shape and payload-guard byte accounting preserved.
 - Local-upstream event model comments and examples now use local-upstream/upstream wording while preserving event names, parser behavior and typed DTOs.
 - Payload-guard local-upstream image tests now use local-upstream variable names while preserving image-budget shaping and exact-limit behavior.
-- Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording; remaining provider Kiro strings are compatibility fields or upstream wire literals.
+- Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording; remaining provider Account Runtime strings are compatibility fields or upstream wire literals.
 - Local-upstream protocol profile ARN constants and machineId diagnostics/comments now use generic local-upstream and compatibility wording while preserving stable hash domains and upstream wire/header literals.
 - Local-upstream endpoint comments and ignored body-performance probes now use local-upstream wording and `LOCAL_UPSTREAM_*` environment variables, and the CLI origin literal is isolated as a wire-value constant.
 - Local-upstream credentials now use `api_key` internally and serialize API-key credentials as `apiKey`; old API-key JSON field names remain read aliases and Postgres hash repair still accepts existing old rows.
@@ -194,13 +194,14 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 - Legacy local-upstream `ide`/`cli` concrete endpoint implementations and provider construction are now test-only; production keeps only the remaining compatibility type boundary until handler/Admin direct-provider paths are removed.
 - Production startup, Anthropic router dependencies and Admin service dependencies no longer carry a local-upstream provider. The old startup/Admin model-discovery worker and legacy Admin credential liveness/model-discovery calls were removed from runtime; old model catalog network DTOs remain test-only.
 - Production Anthropic `AppState`, request-entry and handler runtime-config resolution no longer expose or read a local-upstream provider. Account-only request routing uses account-runtime state/config directly; raw local-pool preflight, cached local-pool fast-fail and provider-derived route-config overrides are now test-only compatibility paths.
-- Model-capability cohort keys no longer include subscription labels, and usage-limit trial credit parsing uses neutral internal names. Old `freeTrial*` strings remain only as compatibility aliases for legacy payload parsing.
+- Model-capability cohort keys no longer include subscription labels, and usage-limit trial credit parsing now uses only neutral internal names. Old trial-specific wire aliases were removed from the active parser.
+- Request-entry account fast-fail reasons now emit account terminology, and Anthropic handler account-preflight helper names plus runtime log text no longer describe the path as a local credential pool.
 - Production Anthropic message handling no longer compiles the legacy local-upstream execution tail. Native WebSearch MCP, local-upstream body conversion, provider stream/non-stream send helpers and local-rescue code are now test/compatibility paths after account-runtime routing declines.
-- Service bind overrides now read only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; Kiro-named runtime fallback env vars and local-upstream API-key bootstrap were removed from code, tests and maintained deployment docs.
+- Service bind overrides now read only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; Account Runtime-named runtime fallback env vars and local-upstream API-key bootstrap were removed from code, tests and maintained deployment docs.
 - Active validation runners that spawn the service now use `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures still use `LOCAL_UPSTREAM_API_KEY` only as a must-not-inherit sentinel.
-- Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Kiro-named loadtest env fallbacks were removed.
-- Internal local-upstream examples, storage-task thread names and Redis test prefixes now use account-runtime identifiers instead of Kiro-branded crate/test names.
-- Active storage, integration and chaos validation runner/test inputs now use account-runtime environment names; old maintained `KIRO_RS_TEST_*`, `KIRO_RS_REQUIRE_STORAGE_TESTS`, `KIRO_RS_RUN_*`, `KIRO_REDIS_FAULT_DOMAIN_*`, `KIRO_SCHEDULER_CHAOS_*`, `KIRO_CLAUDE_TRANSCRIPT_*`, `KIRO_RS_REAL_*`, `KIRO_MULTI_INSTANCE_*` and `KIRO_TOKEN_REFRESH_CLUSTER_*` inputs were removed from active harnesses. Active runner exact Rust test paths now target `local_upstream_impl::token_manager`.
+- Loadtest target resolution and mock upstream scripts now use only account-runtime environment names for base URL, API key, path and mock scenario configuration; old Account Runtime-named loadtest env fallbacks were removed.
+- Internal local-upstream examples, storage-task thread names and Redis test prefixes now use account-runtime identifiers instead of Account Runtime-branded crate/test names.
+- Active storage, integration and chaos validation runner/test inputs now use account-runtime environment names; old maintained `ACCOUNT_RUNTIME_TEST_*`, `ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS`, `ACCOUNT_RUNTIME_RUN_*`, `ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_*`, `ACCOUNT_RUNTIME_SCHEDULER_CHAOS_*`, `ACCOUNT_RUNTIME_CLAUDE_TRANSCRIPT_*`, `ACCOUNT_RUNTIME_REAL_*`, `ACCOUNT_RUNTIME_MULTI_INSTANCE_*` and `ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_*` inputs were removed from active harnesses. Active runner exact Rust test paths now target `local_upstream_impl::token_manager`.
 
 ## In Progress
 
@@ -209,10 +210,10 @@ Related: [Plan root](README.md), [final target plan](topics/final-target-plan.md
 
 ## Next
 
-- Split remaining scheduler primitives from legacy credential/provider dependencies before deleting local Kiro auth, endpoint and EventStream paths.
+- Split remaining scheduler primitives from legacy credential/provider dependencies before deleting local Account Runtime auth, endpoint and EventStream paths.
 - Remove the remaining production compatibility facade exports for legacy provider/request/event types once account runtime no longer needs them for storage and usage compatibility.
-- Convert remaining body and protocol paths to canonical/upstream-account logic with no legacy Kiro envelope or Kiro event dependency.
+- Convert remaining body and protocol paths to canonical/upstream-account logic with no legacy Account Runtime envelope or Account Runtime event dependency.
 
 ## Deferred
 
-- Archive or rewrite old Kiro-focused planning documents after the implementation has landed and the new target has evidence.
+- Archive or rewrite old Account Runtime-focused planning documents after the implementation has landed and the new target has evidence.

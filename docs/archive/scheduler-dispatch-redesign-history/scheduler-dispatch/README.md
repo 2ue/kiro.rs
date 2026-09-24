@@ -1,6 +1,6 @@
-# Kiro credential scheduler dispatch redesign
+# Account Runtime credential scheduler dispatch redesign
 
-This folder records the production scheduler redesign for `kiro.rs` credential dispatch.
+This folder records the production scheduler redesign for `account-runtime` credential dispatch.
 It covers the original problem analysis, the final strategy, and the implementation that
 has been applied in this repository.
 

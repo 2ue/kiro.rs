@@ -8,7 +8,7 @@ Status: `focused deterministic pass / all-target check pass / real Redis and Pos
 
 ## 结论
 
-高并发、低下游 RPM 时，内部高 RPM 不只可能来自 inference retry、OAuth refresh 或 profile discovery。旧本地调度队列为每个 Redis waiter 建立一个租约；默认最大等待为 120 秒、初始 TTL 为 180 秒，初始 TTL 已覆盖整个有限等待期，但 guard 仍每 20 秒续租。500 个持续排队 waiter 会产生约 25 次续租/秒；考虑超时检查先于最后一次续租，完整 120 秒窗口约为 1250-1500 次 Redis renewal/分钟。它不是下游请求 RPM，也不是 Kiro inference RPM，却会在调度拥塞时反向增加 Redis 单线程压力。
+高并发、低下游 RPM 时，内部高 RPM 不只可能来自 inference retry、OAuth refresh 或 profile discovery。旧本地调度队列为每个 Redis waiter 建立一个租约；默认最大等待为 120 秒、初始 TTL 为 180 秒，初始 TTL 已覆盖整个有限等待期，但 guard 仍每 20 秒续租。500 个持续排队 waiter 会产生约 25 次续租/秒；考虑超时检查先于最后一次续租，完整 120 秒窗口约为 1250-1500 次 Redis renewal/分钟。它不是下游请求 RPM，也不是 Account Runtime inference RPM，却会在调度拥塞时反向增加 Redis 单线程压力。
 
 外部池存在同类路径：默认等待 30 秒、旧 TTL 60 秒，本来足以覆盖请求，但第 20 秒仍会续租一次。旧本地实现还有一个相反的正确性缺口：`WaitForCapacityMax` 大于全局配置时，TTL 仍按全局配置计算，只能依赖续租避免合法长等待提前丢 lease。
 

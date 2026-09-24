@@ -1,6 +1,6 @@
 # 历史问题分析状态总索引与证据链（2026-07-15）
 
-本文把 2026-07-12 至 2026-07-15 对 `kiro.rs` 的主要问题分析、修复状态、证据链、复现/验证入口统一登记。它不是替代各专题文档；各专题文档和 evidence 目录仍是细节来源。本文的职责是回答三个问题：
+本文把 2026-07-12 至 2026-07-15 对 `account-runtime` 的主要问题分析、修复状态、证据链、复现/验证入口统一登记。它不是替代各专题文档；各专题文档和 evidence 目录仍是细节来源。本文的职责是回答三个问题：
 
 1. 每个问题当前到底是什么结论；
 2. 结论依赖哪些证据，证据在哪里；
@@ -13,7 +13,7 @@
 - `已实现待生产观察`：本地已验证，但仍需上线后看 recurrence。
 - `待补证据`：已有用户现象或代码风险，但证据不足以定性成已确认故障。
 
-安全口径：本文不保存 SSH 密码、Admin Key、请求 API Key、Kiro API key、refresh token、cookie、Authorization 原文、用户完整 prompt 或未脱敏请求体。
+安全口径：本文不保存 SSH 密码、Admin Key、请求 API Key、Account Runtime API key、refresh token、cookie、Authorization 原文、用户完整 prompt 或未脱敏请求体。
 
 ## 1. 证据根目录
 
@@ -25,8 +25,8 @@
 
 ### 1.2 生产取证包
 
-- [`tmp/prod-evidence/20260713-172403-kiro-rs-2ue-59137/summary/evidence-chain.md`](../../tmp/prod-evidence/20260713-172403-kiro-rs-2ue-59137/summary/evidence-chain.md)：7/13 外部池、模型不可用、request body invalid、usage projection、大 payload 证据链。
-- [`tmp/prod-evidence/20260714-101230-kiro-rs-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md`](../../tmp/prod-evidence/20260714-101230-kiro-rs-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md)：usage summary 高基数 Redis 查询影响本地调度与外部池 fallback 的完整链路。
+- [`tmp/prod-evidence/20260713-172403-account-runtime-2ue-59137/summary/evidence-chain.md`](../../tmp/prod-evidence/20260713-172403-account-runtime-2ue-59137/summary/evidence-chain.md)：7/13 外部池、模型不可用、request body invalid、usage projection、大 payload 证据链。
+- [`tmp/prod-evidence/20260714-101230-account-runtime-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md`](../../tmp/prod-evidence/20260714-101230-account-runtime-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md)：usage summary 高基数 Redis 查询影响本地调度与外部池 fallback 的完整链路。
 - [`tmp/prod-evidence/20260715-125054-152.53.243.159/`](../../tmp/prod-evidence/20260715-125054-152.53.243.159)：升级后旧 slowlog、Redis degraded、本地 transient fallback、usage clear 风险。
 - [`tmp/prod-evidence/20260715-165347-152.53.243.159-redis-scheduler-channel/`](../../tmp/prod-evidence/20260715-165347-152.53.243.159-redis-scheduler-channel)：0.0.109 当前版本下 Redis scheduler degraded、retry amplification、session state pressure、channel attribution gap。
 
@@ -63,7 +63,7 @@
 | D7 | Redis 调度热路径 75ms 脆弱与 queue renewal 放大 | finite waiter 周期续租已 focused 修复；整体 Redis chaos/隔离仍未关闭 | 7/15 production follow-up P7 + [queue lease 专题](../issues/dispatch-queue-lease-renewal-rpm-amplification.md) | 需要真实 Redis deadline、延迟/持久化压力、两实例和冻结 fault test |
 | E1 | 旧版本升级/启动迁移卡死 | 已修复设计口径，待版本回归 | deployment 文档 + 7/14 evidence | 需要旧版本数据集升级 smoke |
 | E2 | 发布/构建/两套 UI gate | 有历史例外，后续需严格 gate | plantree release evidence | 后续发布需完整记录 |
-| F1 | AWS Kiro API Key + region 凭据 | 已实现迹象，需补完整验证文档 | 源码 + protocol 文档 | 用户给定 key 的导入/使用测试未在本文证据中复核 |
+| F1 | AWS Account Runtime API Key + region 凭据 | 已实现迹象，需补完整验证文档 | 源码 + protocol 文档 | 用户给定 key 的导入/使用测试未在本文证据中复核 |
 | F2 | 请求 API Key 作为下游渠道限流实体 | 已确认缺口，待设计实现 | 7/15 production follow-up P6 | 需实现 per-key admission 后验证 |
 | G1 | 生产证据采集 skill / 脱敏 | 已有能力，需按问题补采集 | `.codex/skills` + prod evidence | skill yaml 校验缺 PyYAML，打包脚本已跑过 |
 
@@ -103,7 +103,7 @@
 - D6 下游低 RPM 但上游 HTTP attempts 放大：放大已确认；shared inference budget 不能替代 token refresh 通道。短 TTL 16 caller/30 sends、timeout 32 caller 和旧 invalid-bearer force-refresh fan-out 已独立登记；post-correction process-local 60/8、limit/config/revision 与真实 API/MCP final-attempt zero-refresh 各五轮通过，但 live Redis、cluster/PG CAS/cancellation/load/frozen candidate 继续阻断。详见 [token refresh 专题](../issues/token-refresh-failure-wave-and-cluster-rpm.md)。
 - D7 Redis 调度热路径 75ms 脆弱：除 usage/dashboard 共因外，新增确认 finite queue lease 本已覆盖等待期却仍为每 waiter 每 20 秒 renewal。local/external finite renewal 已删除、unlimited 保留，500 guard 与动态 deadline 各五轮通过；真实 Redis 22 秒 score、两实例和联合 chaos 仍待执行。详见 [queue lease 专题](../issues/dispatch-queue-lease-renewal-rpm-amplification.md)。
 - E1 旧版本升级：设计口径已改，但还需要 101/102/103 等旧数据集升级 smoke 才能关闭。
-- F1 AWS Kiro API Key + region 凭据：源码已有实现迹象，但缺用户给定 key 的导入到使用的完整可引用验证文档。
+- F1 AWS Account Runtime API Key + region 凭据：源码已有实现迹象，但缺用户给定 key 的导入到使用的完整可引用验证文档。
 - F2 请求 API Key 作为下游渠道限流实体：已确认缺口，待设计实现并验证。
 - G1 evidence skill：PyYAML 缺失导致 quick validate 未跑通；后续需要补本地校验依赖或替代校验。
 
@@ -121,7 +121,7 @@
 
 说明：
 
-- 空 `description` 会被 Kiro/Bedrock 拒绝为 `Invalid tool use format / REQUEST_BODY_INVALID`。
+- 空 `description` 会被 Account Runtime/Bedrock 拒绝为 `Invalid tool use format / REQUEST_BODY_INVALID`。
 - `input_schema:null` 原本在入口 serde 解析阶段失败，尚未进入 converter 或上游调用。
 - 这两类是“客户端工具字段边界值”兼容问题，不是账号、Redis、外部池、长上下文问题。
 
@@ -173,13 +173,13 @@
 
 - 根因包：[`tmp/analysis-usage-llm-errors/root-causes/`](../../tmp/analysis-usage-llm-errors/root-causes) 中 `request_body_invalid`、`unsupported_image_format`、`stream_upstream_status_error` 等分类。
 - 7/14 Todo：[`feature/audits/local-todo-for-confirmation-2026-07-14.md`](local-todo-for-confirmation-2026-07-14.md) 第 2 节 P004。
-- 400 malformed 专题：[`docs/archive/request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md`](../../docs/archive/request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md)。
+- 400 malformed 专题：[`docs/archive/request-and-protocol-history/account-runtime-400-improperly-formed-request-analysis.md`](../../docs/archive/request-and-protocol-history/account-runtime-400-improperly-formed-request-analysis.md)。
 
 说明：
 
 - 空图片 `data`、空 data URL、tool_result 内空图片属于明确非法输入，应在本地直接 400。
 - `Improperly formed request` 更宽泛，可能来自 tool schema、tool_use/tool_result 配对、content block 组合、非流式路径差异、历史裁剪后结构不完整。
-- 这类问题不能只用“账号测试正常”排除；账号可用只说明凭据能调用普通请求，不能说明某个复杂请求体可被 Kiro 接受。
+- 这类问题不能只用“账号测试正常”排除；账号可用只说明凭据能调用普通请求，不能说明某个复杂请求体可被 Account Runtime 接受。
 
 复现/验证：
 
@@ -295,13 +295,13 @@
 
 复现/验证：
 
-- 隔离数据库 `kiro_rs_output_uplift_validation` + 独立 Redis prefix 真实调用：`req_01uxhatXzFF7DCfvLCLKuhEQ`，raw output `73`，放大为 `110`，再按有效上限 `80-10=70` 裁剪，最终响应和落库 output 均为 `70`。
+- 隔离数据库 `account_runtime_output_uplift_validation` + 独立 Redis prefix 真实调用：`req_01uxhatXzFF7DCfvLCLKuhEQ`，raw output `73`，放大为 `110`，再按有效上限 `80-10=70` 裁剪，最终响应和落库 output 均为 `70`。
 - 自动化覆盖：四种 output 策略之后再放大、严格大于阈值才放大、放大后按 jitter 有效上限裁剪、外部池 projection 后再 cap。
 
 剩余动作：
 
 - 两套 UI 后续调整时必须把字段放在“输出字段改写（output_tokens）”区域，不应恢复“输出后处理”命名。
-- 本地缓存和 `kiro-rs-tool` 缓存页面布局要求保持单列或清晰分组，不恢复之前用户反复指出的两列布局问题。
+- 本地缓存和 `account-runtime-tool` 缓存页面布局要求保持单列或清晰分组，不恢复之前用户反复指出的两列布局问题。
 
 ### B4. 费用小数展示 6/8 位
 
@@ -319,7 +319,7 @@
 
 复现/验证要求：
 
-- 找到两套 UI usage detail 中估算费用、原始计费、Kiro 计量相关 formatter。
+- 找到两套 UI usage detail 中估算费用、原始计费、Account Runtime 计量相关 formatter。
 - 构造小费用记录，页面打开后确认 detail 展示 6 或 8 位小数；dashboard 汇总不被强制改成高精度。
 - 如果使用 API 返回数值，不应只做前端四舍五入而导致复制/导出与展示不一致；需要明确“展示格式”还是“API 字符串格式”。
 
@@ -362,7 +362,7 @@
 
 说明：
 
-- Kiro 上游不直接给 Anthropic `end_turn`；代理的 `end_turn` 是“流结束 + 无 tool_use/max_tokens/context 信号”时的本地推断。
+- Account Runtime 上游不直接给 Anthropic `end_turn`；代理的 `end_turn` 是“流结束 + 无 tool_use/max_tokens/context 信号”时的本地推断。
 - 修复前 usage 中 `success/end_turn/completed` 无法证明上游真的发过完成标志。
 - 2026-07-14 真实 `/cc` 与 Claude CLI 验证显示，成功轮可以落为 `sawUpstreamCompleted=false`、`stopReasonSource=local_inferred_end_turn/tool_use`。这证明观测盲区存在，但不能单独证明静默截断。
 
@@ -416,13 +416,13 @@
 
 说明：
 
-- Kiro 官方上游结构化错误可以透出安全 message/reason/code，但必须去掉 `kiro` 相关品牌/内部字样，以及 credential/token/api key/scheduler/external pool 等敏感词。
+- Account Runtime 官方上游结构化错误可以透出安全 message/reason/code，但必须去掉 `account-runtime` 相关品牌/内部字样，以及 credential/token/api key/scheduler/external pool 等敏感词。
 - 外部池不可信，可能返回广告、推广、HTML、第三方内部信息；不能原样透给下游。
 - 本地调度/账号/队列/内部错误继续归一化，不泄露内部资源状态。
 
 复现/验证：
 
-- 单测：`official_kiro_upstream_400_message_is_exposed_without_internal_prefix`、`malformed_upstream_error_exposes_safe_official_message`、外部池 prompt too long public message。
+- 单测：`official_account-runtime_upstream_400_message_is_exposed_without_internal_prefix`、`malformed_upstream_error_exposes_safe_official_message`、外部池 prompt too long public message。
 - 真实 bad image 调用返回明确本地 400，未暴露账号/凭据/外部池/调度内部词。
 - 无效模型 direct API 返回 public error，包含定位用 request/error id，不含内部敏感词。
 
@@ -439,8 +439,8 @@
 
 证据链：
 
-- 7/13 证据目录：[`tmp/prod-evidence/20260713-172403-kiro-rs-2ue-59137/problems/P001-external-pool-dispatch-saturation/problem.md`](../../tmp/prod-evidence/20260713-172403-kiro-rs-2ue-59137/problems/P001-external-pool-dispatch-saturation/problem.md)。
-- 不支持模型完整清单：[`tmp/prod-evidence/20260713-172403-kiro-rs-2ue-59137/problems/P002-external-pool-model-unavailable-milus/evidence/model-unavailable-complete-list.md`](../../tmp/prod-evidence/20260713-172403-kiro-rs-2ue-59137/problems/P002-external-pool-model-unavailable-milus/evidence/model-unavailable-complete-list.md)。
+- 7/13 证据目录：[`tmp/prod-evidence/20260713-172403-account-runtime-2ue-59137/problems/P001-external-pool-dispatch-saturation/problem.md`](../../tmp/prod-evidence/20260713-172403-account-runtime-2ue-59137/problems/P001-external-pool-dispatch-saturation/problem.md)。
+- 不支持模型完整清单：[`tmp/prod-evidence/20260713-172403-account-runtime-2ue-59137/problems/P002-external-pool-model-unavailable-milus/evidence/model-unavailable-complete-list.md`](../../tmp/prod-evidence/20260713-172403-account-runtime-2ue-59137/problems/P002-external-pool-model-unavailable-milus/evidence/model-unavailable-complete-list.md)。
 - 7/14 Todo P001/P002：[`feature/audits/local-todo-for-confirmation-2026-07-14.md`](local-todo-for-confirmation-2026-07-14.md) 第 0 节。
 
 说明：
@@ -492,7 +492,7 @@
 
 证据链：
 
-- 7/14 完整链路：[`tmp/prod-evidence/20260714-101230-kiro-rs-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md`](../../tmp/prod-evidence/20260714-101230-kiro-rs-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md)。
+- 7/14 完整链路：[`tmp/prod-evidence/20260714-101230-account-runtime-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md`](../../tmp/prod-evidence/20260714-101230-account-runtime-2ue-59137-scheduler-external-pool/summary/usage-summary-scheduler-impact-analysis.md)。
 - 7/15 当前版本证据：[`tmp/prod-evidence/20260715-165347-152.53.243.159-redis-scheduler-channel/problems/P001-redis-scheduler-degraded/problem.md`](../../tmp/prod-evidence/20260715-165347-152.53.243.159-redis-scheduler-channel/problems/P001-redis-scheduler-degraded/problem.md)。
 - 调度 follow-up：[`feature/audits/scheduler-production-followups-20260715.md`](scheduler-production-followups-20260715.md) P2/P7。
 
@@ -681,14 +681,14 @@
 
 ## 8. F 类：凭据/API Key/channel
 
-### F1. AWS Kiro API Key + region 凭据
+### F1. AWS Account Runtime API Key + region 凭据
 
 状态：已实现迹象，需补完整验证文档。
 
 证据链：
 
-- 协议文档：[`docs/archive/request-and-protocol-history/kiro-upstream-protocol-refactor-analysis-and-test-plan.md`](../../docs/archive/request-and-protocol-history/kiro-upstream-protocol-refactor-analysis-and-test-plan.md)。
-- 源码搜索显示当前已有 `authMethod=api_key`、`kiroApiKey`、CLI endpoint、API Key model discovery、API Key 不刷新 token 等实现：[`src/kiro/endpoint/cli.rs`](../../src/kiro/endpoint/cli.rs)、[`src/kiro/token_manager/manager.rs`](../../src/kiro/token_manager/manager.rs)、[`src/admin/service.rs`](../../src/admin/service.rs)。
+- 协议文档：[`docs/archive/request-and-protocol-history/account-runtime-upstream-protocol-refactor-analysis-and-test-plan.md`](../../docs/archive/request-and-protocol-history/account-runtime-upstream-protocol-refactor-analysis-and-test-plan.md)。
+- 源码搜索显示当前已有 `authMethod=api_key`、`apiKey`、CLI endpoint、API Key model discovery、API Key 不刷新 token 等实现：[`src/local_upstream_impl/endpoint/cli.rs`](../../src/local_upstream_impl/endpoint/cli.rs)、[`src/local_upstream_impl/token_manager/manager.rs`](../../src/local_upstream_impl/token_manager/manager.rs)、[`src/admin/service.rs`](../../src/admin/service.rs)。
 - 测试中有 API Key 示例：[`src/admin/service_tests.rs`](../../src/admin/service_tests.rs)。
 
 说明：
@@ -698,14 +698,14 @@
 
 复现/验证要求：
 
-- Admin 新增 API Key 凭据：`authMethod=api_key`、`kiroApiKey=<key>`、`apiRegion=eu-central-1` 或等价字段。
+- Admin 新增 API Key 凭据：`authMethod=api_key`、`apiKey=<key>`、`apiRegion=eu-central-1` 或等价字段。
 - 验证凭据测试按钮走指定账号直连，但要另做业务请求验证，证明正常调度也能选择该账号。
 - API Key 凭据不应进入 refresh token 路径，不应伪造 profileArn。
 - 真实 `/v1` 或 `/cc` 调用命中该凭据，usage attempt chain 能看到该 credential id，最终成功或明确返回模型/权限错误。
 
 剩余动作：
 
-- 补一份 `docs/kiro-api-key-credential-validation-YYYYMMDD.md` 或追加到 protocol 文档，记录不含密钥原文的导入/调用证据。
+- 补一份 `docs/account-runtime-api-key-credential-validation-YYYYMMDD.md` 或追加到 protocol 文档，记录不含密钥原文的导入/调用证据。
 
 ### F2. 请求 API Key 作为下游渠道限流实体
 
@@ -719,7 +719,7 @@
 
 说明：
 
-- 这是和“API Key 凭据账号”不同的概念。F1 是上游 Kiro 凭据；F2 是调用本服务的下游请求 Key。
+- 这是和“API Key 凭据账号”不同的概念。F1 是上游 Account Runtime 凭据；F2 是调用本服务的下游请求 Key。
 - 当前请求 Key 没有 per-key RPM/并发，也没有 usage channel 归因，无法防止单个下游渠道把压力放大到本地账号池。
 
 复现/验证要求：
@@ -736,8 +736,8 @@
 
 证据链：
 
-- skill 文件：[`./.codex/skills/kiro-prod-evidence-audit/SKILL.md`](../../.codex/skills/kiro-prod-evidence-audit/SKILL.md)。
-- 打包脚本：[`./.codex/skills/kiro-prod-evidence-audit/scripts/package_evidence.py`](../../.codex/skills/kiro-prod-evidence-audit/scripts/package_evidence.py)。
+- skill 文件：[`./.codex/skills/account-runtime-prod-evidence-audit/SKILL.md`](../../.codex/skills/account-runtime-prod-evidence-audit/SKILL.md)。
+- 打包脚本：[`./.codex/skills/account-runtime-prod-evidence-audit/scripts/package_evidence.py`](../../.codex/skills/account-runtime-prod-evidence-audit/scripts/package_evidence.py)。
 - 已产出 evidence 包：`tmp/prod-evidence/*`。
 
 说明：

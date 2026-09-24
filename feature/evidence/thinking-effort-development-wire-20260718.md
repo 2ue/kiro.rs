@@ -5,10 +5,10 @@ Status: `development-wire-pass / frozen-fake-upstream-wire-pass / real-upstream-
 ## Scope And Conclusion
 
 The first part of this evidence closes the development-level request path from the Anthropic
-request model through the production converter, `KiroRequest` serialization,
+request model through the production converter, `Account RuntimeRequest` serialization,
 provider, CLI/IDE endpoint transform, and actual loopback HTTP request bytes.
-It does not use Docker, PostgreSQL, Redis, a running kiro.rs service, real Kiro
-credentials, or a real Kiro upstream.
+It does not use Docker, PostgreSQL, Redis, a running account-runtime service, real Account Runtime
+credentials, or a real Account Runtime upstream.
 
 For an authoritative fake model schema that advertises
 `output_config.effort = [high, max]`, the final captured body was semantically:
@@ -24,7 +24,7 @@ For an authoritative fake model schema that advertises
 The value remained `max`; it was not clamped to `high`. The final wire did not
 contain `additionalModelRequestFields.thinking`. That absence is intentional
 for this schema: Claude's inbound `thinking.type=adaptive` selects native
-reasoning, while the Kiro field name and allowed values come from the
+reasoning, while the Account Runtime field name and allowed values come from the
 authoritative model-discovery schema. The proxy must not invent a second field
 that the upstream schema did not advertise.
 
@@ -62,10 +62,10 @@ node --check <five runner files>
 PASS 5/5
 
 node --test feature/tests/runtime-validation-paths.test.mjs \
-  feature/tests/thinking-effort-kiro-wire-contract.test.mjs
+  feature/tests/thinking-effort-account-runtime-wire-contract.test.mjs
 PASS 11/11, current-source duration 0.574s
 
-node --test feature/tests/thinking-effort-kiro-wire-signal.test.mjs
+node --test feature/tests/thinking-effort-account-runtime-wire-signal.test.mjs
 PASS 42/42, current-source duration 56.363s
 ```
 
@@ -110,7 +110,7 @@ The following runs are preserved and are not counted as passes:
   the fully qualified test name. Its compilation is not dynamic evidence;
   `provider-wire-bytes-r2` is the valid replacement.
 - `provider-max-wire-r1`: compile error because the test tried to serialize
-  `ConversionResult` instead of constructing the production `KiroRequest`.
+  `ConversionResult` instead of constructing the production `Account RuntimeRequest`.
   No HTTP request ran. The corrected test follows the same construction as
   `local_body_pipeline` and passed as `provider-max-wire-r2`.
 
@@ -119,7 +119,7 @@ Every red/invalid scope also reported `removed=true` and
 
 ## Protocol Decision
 
-The mapping authority is the per-model Kiro discovery contract:
+The mapping authority is the per-model Account Runtime discovery contract:
 
 - explicit effort is preserved only when present in the advertised enum;
 - omitted effort uses the advertised default, not a hard-coded `high`;
@@ -128,7 +128,7 @@ The mapping authority is the per-model Kiro discovery contract:
   fails closed instead of disappearing or silently falling back to a prompt;
 - a discovered `reasoning.effort` path is used as advertised instead of always
   forcing `output_config`;
-- Anthropic `thinking` is not copied verbatim unless Kiro advertises an
+- Anthropic `thinking` is not copied verbatim unless Account Runtime advertises an
   equivalent field contract.
 
 Synthetic XML/prompt compatibility remains a separate fallback for models
@@ -144,9 +144,9 @@ parse/serialize only when origin/profile mutation is required. The 80-request
 provider matrix covers compression on/off and both endpoints; the 20-request
 max matrix completed in 0.40 seconds after compilation.
 
-## Frozen Fake-Upstream Kiro Wire Gate
+## Frozen Fake-Upstream Account Runtime Wire Gate
 
-2026-07-18 追加执行真实 Claude Code CLI ingress 后的 Kiro wire gate。该 gate 使用仓库外冻结 `kiro-rs` binary、当前仓库专属隔离 PostgreSQL/Redis、fake Kiro upstream 和独立 Claude config/home；不访问受保护的 `127.0.0.1:9022`，runner 只按端口值拒绝 9022，不读取现有 listener PID。
+2026-07-18 追加执行真实 Claude Code CLI ingress 后的 Account Runtime wire gate。该 gate 使用仓库外冻结 `account-runtime` binary、当前仓库专属隔离 PostgreSQL/Redis、fake Account Runtime upstream 和独立 Claude config/home；不访问受保护的 `127.0.0.1:9022`，runner 只按端口值拒绝 9022，不读取现有 listener PID。
 
 结果：
 
@@ -163,20 +163,20 @@ cc_head_probes=60
 验证结论：
 
 1. Claude CLI 入站仍会为 absent/low/medium/high/xhigh/max 发送 `thinking: { type: "adaptive" }`；absent 的 `output_config.effort` 默认 high，显式 max 仍为 max。这与单独 ingress capture `30/30` 一致。
-2. Kiro outbound wire 保留 `additionalModelRequestFields.output_config.effort`，包括 `max`；没有发生 `max -> high` 截断。
-3. fake model schema 未声明 `thinking` 字段时，Kiro outbound wire 不发明 `additionalModelRequestFields.thinking.type=adaptive`。这是当前协议决策：按上游 schema 映射 effort/reasoning，不把 Claude 入站 adaptive 原样伪造为未声明 Kiro 字段。
+2. Account Runtime outbound wire 保留 `additionalModelRequestFields.output_config.effort`，包括 `max`；没有发生 `max -> high` 截断。
+3. fake model schema 未声明 `thinking` 字段时，Account Runtime outbound wire 不发明 `additionalModelRequestFields.thinking.type=adaptive`。这是当前协议决策：按上游 schema 映射 effort/reasoning，不把 Claude 入站 adaptive 原样伪造为未声明 Account Runtime 字段。
 4. Claude CLI 2.1.197 每个 case 会先发一个 `HEAD /cc` 探针；runner 已把它记录为 `cc_head_probe` 协议事实，仍要求未知 ingress `other=0`。
 
 无效中间结果：
 
 - 旧 wire runner 曾把 `HEAD /cc` 归为 unexpected other，导致 false red；修正分类后重跑 60/60 通过。
 
-该 gate 关闭“frozen fake-upstream handler 是否截断 effort 或发明 thinking”的问题；真实 Kiro upstream 的 native reasoning delta、final usage、主动/被动长会话、tool/search/image/MCP 和异常流仍是 release blocker。
+该 gate 关闭“frozen fake-upstream handler 是否截断 effort 或发明 thinking”的问题；真实 Account Runtime upstream 的 native reasoning delta、final usage、主动/被动长会话、tool/search/image/MCP 和异常流仍是 release blocker。
 
 ## Remaining Gates
 
 The frozen fake-upstream service runner has passed for the effort/thinking wire
-contract above. This is not a real-upstream pass and does not prove native Kiro
+contract above. This is not a real-upstream pass and does not prove native Account Runtime
 reasoning deltas or production usage accounting.
 
 Still open for the release gate:

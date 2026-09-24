@@ -16,7 +16,7 @@
 
 ## 非目标
 
-1. 不修改真实 Kiro metadata 中已经存在的 cache read/write。
+1. 不修改真实 Account Runtime metadata 中已经存在的 cache read/write。
 2. 不全局修改 `token::count_tokens` 的 token 估算口径。
 3. 不对每个请求硬塞固定 cache 大数。
 4. 不让短测试请求凭空出现很大的 cache read/write。

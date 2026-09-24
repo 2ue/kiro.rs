@@ -48,7 +48,7 @@ The default dependency-first order is:
 2. configuration repository/CAS and state ports;
 3. usage/cache accounting event model and durable writers;
 4. scheduler domain and coordinator;
-5. upstream Kiro and external adapters;
+5. upstream Account Runtime and external adapters;
 6. request planning/body artifact pipeline;
 7. response/SSE translation and terminal outcome handling;
 8. Admin command/query services, generated frontend contracts, and both maintained frontend applications;
@@ -76,7 +76,7 @@ Rejected for this plan. Process boundaries would add network consistency and ope
 - Public API, SSE, upstream, cache/usage, and Admin behavior stays characterized throughout the rewrite.
 - Database changes use expand-contract; a new binary can run against the expanded schema while the previous binary remains rollback-capable.
 - Event IDs, versions, and new columns are additive before legacy fields are removed.
-- Old and new code must not both execute a real Kiro/external call for shadow comparison.
+- Old and new code must not both execute a real Account Runtime/external call for shadow comparison.
 - Dual writes are allowed only with explicit idempotency and reconciliation; shadow calculation is preferred.
 
 ## Rollout And Rollback

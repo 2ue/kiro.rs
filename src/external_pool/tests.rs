@@ -2090,8 +2090,8 @@ fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExtern
         max_concurrent_requests: 1,
         usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
         stream_response_mode: None,
-        request_body_mode: ExternalPoolRequestBodyMode::Normalized,
-        raw_model_mode: ExternalPoolRawModelMode::None,
+        request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
+        raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
         auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
         pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
         preserve_path: true,
@@ -2144,8 +2144,8 @@ async fn restore_dispatch_pool_configuration(
             max_concurrent_requests = 1,
             usage_projection_mode = 'pass_through',
             stream_response_mode = NULL,
-            request_body_mode = 'normalized',
-            raw_model_mode = 'none',
+            request_body_mode = 'raw_passthrough',
+            raw_model_mode = 'rewrite_top_level',
             auto_disable_policy = 'inherit',
             model_mapping_mode = 'processed_mapping',
             model_mapping_require_match = false,
@@ -3043,13 +3043,13 @@ fn pool_auto_disable_policy_can_override_global_switch() {
 }
 
 #[test]
-fn external_pool_default_retry_attempts_cover_eligible_pools_and_payload_guard_retry() {
+fn external_pool_default_retry_attempts_cover_eligible_pools() {
     assert_eq!(
         PoolAvailabilitySnapshot {
             eligible_pools: 0,
             ..PoolAvailabilitySnapshot::default()
         }
-        .default_retry_attempts(false),
+        .default_retry_attempts(),
         1
     );
     assert_eq!(
@@ -3057,16 +3057,8 @@ fn external_pool_default_retry_attempts_cover_eligible_pools_and_payload_guard_r
             eligible_pools: 2,
             ..PoolAvailabilitySnapshot::default()
         }
-        .default_retry_attempts(false),
+        .default_retry_attempts(),
         2
-    );
-    assert_eq!(
-        PoolAvailabilitySnapshot {
-            eligible_pools: 2,
-            ..PoolAvailabilitySnapshot::default()
-        }
-        .default_retry_attempts(true),
-        3
     );
 }
 
@@ -10616,127 +10608,6 @@ fn account_same_account_retry_limit_caps_to_one_and_rejects_terminal_errors() {
     );
 }
 
-#[test]
-fn external_payload_guard_retry_route_trims_and_disables_second_retry() {
-    for round in 1..=5 {
-        let mut route = test_route("claude-sonnet-4-6");
-        let mut messages = Vec::new();
-        for idx in 0..32 {
-            messages.push(Message {
-                role: "user".to_string(),
-                content: serde_json::json!(format!(
-                    "round {round} history {} {}",
-                    idx,
-                    "x".repeat(700)
-                )),
-            });
-            messages.push(Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!([{
-                    "type": "text",
-                    "text": format!("round {round} answer {} {}", idx, "y".repeat(500)),
-                }]),
-            });
-        }
-        messages.push(Message {
-            role: "user".to_string(),
-            content: serde_json::json!(format!("current question round {round}")),
-        });
-        route.payload.as_mut().unwrap().messages = messages;
-        refresh_test_route_derived_state(&mut route);
-        let original_input_tokens = route.request_input_tokens;
-        let body = serde_json::to_string(route.payload.as_ref().unwrap())
-            .expect("serialize route payload");
-        route.raw_body = Bytes::from(body);
-        route.payload_guard_retry_config = Some(PayloadGuardConfig {
-            enabled: true,
-            max_bytes: 8_000,
-            trim_history: true,
-            shaping: crate::model::config::PayloadShapingConfig::default(),
-        });
-        let err = classify_external_error(
-            StatusCode::BAD_REQUEST,
-            Bytes::from_static(br#"{"error":{"message":"Context window is full"}}"#),
-            HeaderMap::new(),
-            &ExternalPoolsConfig::default(),
-        );
-
-        assert!(should_retry_external_payload_guard(&route, &err));
-        let retry_route = external_payload_guard_retry_route(&route).expect("retry route");
-
-        assert_eq!(
-            retry_route.body_mode_filter,
-            Some(ExternalPoolRequestBodyMode::Normalized),
-            "round {round}"
-        );
-        assert!(retry_route.raw_body.len() <= 8_000, "round {round}");
-        assert!(
-            retry_route.payload_guard_retry_config.is_none(),
-            "round {round}"
-        );
-        assert!(
-            retry_route
-                .payload_guard_report
-                .as_ref()
-                .is_some_and(|report| report.trimmed_history_entries > 0),
-            "round {round}"
-        );
-        assert_eq!(
-            retry_route
-                .payload
-                .as_ref()
-                .unwrap()
-                .messages
-                .last()
-                .unwrap()
-                .content,
-            serde_json::json!(format!("current question round {round}"))
-        );
-
-        let retry_payload = retry_route.payload.as_ref().expect("retry payload");
-        let retry_input_tokens = count_external_route_input_tokens(retry_payload);
-        assert_eq!(
-            retry_route.request_input_tokens, retry_input_tokens,
-            "round {round}: retry route token estimate must match its trimmed payload"
-        );
-        assert!(
-            retry_input_tokens < original_input_tokens,
-            "round {round}: retry tokens {retry_input_tokens} must be below original {original_input_tokens}"
-        );
-        let body_payload: MessagesRequest = serde_json::from_slice(&retry_route.raw_body)
-            .expect("retry body remains a Messages request");
-        assert_eq!(
-            serde_json::to_value(body_payload).unwrap(),
-            serde_json::to_value(retry_payload).unwrap(),
-            "round {round}: retry raw body and typed payload must remain identical"
-        );
-
-        let mut pool = test_pool("http://pool.example.com", false);
-        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-        let projection = projection_context(&retry_route, &pool, 0)
-            .unwrap_or_else(|| panic!("round {round}: retry usage projection"));
-        assert_eq!(
-            projection.raw_input_tokens, retry_input_tokens,
-            "round {round}: usage projection must use the trimmed request estimate"
-        );
-        assert!(
-            projection.prompt_cache_profile.is_some(),
-            "round {round}: retry payload should build a prompt-cache profile"
-        );
-        let projected = maybe_project_non_stream_usage(
-            Bytes::from_static(
-                br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
-            ),
-            Some(&projection),
-        );
-        assert_eq!(
-            projected.usage_capture.request_input_tokens,
-            Some(retry_input_tokens),
-            "round {round}: projected usage must carry the trimmed request estimate"
-        );
-    }
-}
-
 #[tokio::test]
 async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
     let route = ExternalRouteRequest {
@@ -11253,8 +11124,8 @@ fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
         max_concurrent_requests: 10,
         usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
         stream_response_mode: None,
-        request_body_mode: ExternalPoolRequestBodyMode::Normalized,
-        raw_model_mode: ExternalPoolRawModelMode::None,
+        request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
+        raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
         auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
         pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,
         auto_disabled: false,
@@ -11506,6 +11377,11 @@ fn refresh_test_route_derived_state(route: &mut ExternalRouteRequest) {
     route.reset_preparation_cache();
 }
 
+fn refresh_test_route_raw_snapshot(route: &mut ExternalRouteRequest) {
+    route.effective_raw_body = route.raw_body.clone();
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
+}
+
 fn test_route(model: &str) -> ExternalRouteRequest {
     let payload = test_payload(model);
     let request_input_tokens = count_external_route_input_tokens(&payload);
@@ -11735,32 +11611,26 @@ fn external_pool_route_policy_applies_per_pool_rules() {
 }
 
 #[test]
-fn fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools() {
+fn body_mode_filter_is_a_noop_for_all_pools() {
     let normalized_pool = test_pool("https://normalized.example.com/v1", true);
     let mut raw_pool = test_pool("https://raw.example.com/v1", true);
     raw_pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
 
-    assert!(external_pool_matches_body_mode_filter(
-        &normalized_pool,
-        None
-    ));
-    assert!(external_pool_matches_body_mode_filter(&raw_pool, None));
-    assert!(external_pool_matches_body_mode_filter(
-        &raw_pool,
-        Some(ExternalPoolRequestBodyMode::RawPassthrough)
-    ));
-    assert!(!external_pool_matches_body_mode_filter(
-        &raw_pool,
-        Some(ExternalPoolRequestBodyMode::Normalized)
-    ));
-    assert!(external_pool_matches_body_mode_filter(
-        &normalized_pool,
-        Some(ExternalPoolRequestBodyMode::Normalized)
-    ));
+    for filter in [
+        None,
+        Some(ExternalPoolRequestBodyMode::RawPassthrough),
+        Some(ExternalPoolRequestBodyMode::Normalized),
+    ] {
+        assert!(external_pool_matches_body_mode_filter(
+            &normalized_pool,
+            filter
+        ));
+        assert!(external_pool_matches_body_mode_filter(&raw_pool, filter));
+    }
 }
 
 #[test]
-fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
+fn external_pool_outbound_body_preserves_budget_tokens_for_adaptive_thinking() {
     let mut route = test_route("claude-opus-4-7-thinking");
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
@@ -11772,18 +11642,19 @@ fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
         );
+    refresh_test_route_raw_snapshot(&mut route);
 
     let pool = test_pool("https://example.com/v1", true);
     let outbound = test_external_pool_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
 
     assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("budget_tokens").is_none());
+    assert_eq!(value["thinking"]["budget_tokens"], 20000);
     assert_eq!(value["output_config"]["effort"], "xhigh");
 }
 
 #[test]
-fn external_pool_normalized_wire_preserves_omitted_output_effort_for_five_rounds() {
+fn external_pool_raw_passthrough_preserves_omitted_output_effort_for_five_rounds() {
     let mut route = test_route("claude-opus-4-7-thinking");
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
@@ -11799,13 +11670,13 @@ fn external_pool_normalized_wire_preserves_omitted_output_effort_for_five_rounds
     for round in 0..5 {
         let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
-            serde_json::from_slice(&outbound).expect("parse normalized outbound body");
+            serde_json::from_slice(&outbound).expect("parse raw outbound body");
 
         assert_eq!(value["thinking"]["type"], "adaptive", "round {round}");
         assert_eq!(
             value["output_config"],
             serde_json::json!({}),
-            "round {round}: normalized forwarding must not invent an effort"
+            "round {round}: raw forwarding must not invent an effort"
         );
         assert!(
             value.pointer("/output_config/effort").is_none(),
@@ -11872,7 +11743,7 @@ fn external_pool_outbound_body_uses_normalized_payload_not_stale_raw_body() {
 }
 
 #[test]
-fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization() {
+fn external_pool_outbound_body_applies_model_mapping_without_rewriting_thinking() {
     let mut route = test_route("claude-opus-4-5-20251101");
     route.upstream_model = Some("claude-opus-4.5".to_string());
     route.model_resolution_source = Some("alias".to_string());
@@ -11886,6 +11757,7 @@ fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization(
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
         );
+    refresh_test_route_raw_snapshot(&mut route);
 
     let pool = test_pool_with_model_dot_normalization();
     let outbound = test_external_pool_outbound_body(&route, &pool);
@@ -11893,7 +11765,7 @@ fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization(
 
     assert_eq!(value["model"], "claude-opus-4-5");
     assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("budget_tokens").is_none());
+    assert_eq!(value["thinking"]["budget_tokens"], 20000);
     assert_eq!(value["output_config"]["effort"], "xhigh");
 }
 
@@ -11935,7 +11807,7 @@ fn external_pool_raw_passthrough_keeps_body_byte_for_byte() {
 }
 
 #[test]
-fn raw_route_can_build_normalized_body_for_selected_normalized_pool() {
+fn raw_route_keeps_body_for_selected_raw_pool() {
     let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}],"max_tokens":8}"#;
     let route = raw_test_route(raw);
     assert!(route.payload.is_none());
@@ -11945,22 +11817,24 @@ fn raw_route_can_build_normalized_body_for_selected_normalized_pool() {
     );
 
     let mut pool = test_pool("https://example.com/v1", true);
-    pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+    pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+    pool.raw_model_mode = ExternalPoolRawModelMode::RewriteTopLevel;
     pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
     pool.supported_models = vec!["client-model".to_string()];
 
-    let prepared = external_pool_prepare_request(&route, &pool)
-        .expect("raw route should lazily parse for normalized pool");
+    let prepared =
+        external_pool_prepare_request(&route, &pool).expect("raw route should use raw passthrough");
     let value: serde_json::Value =
-        serde_json::from_slice(&prepared.body).expect("normalized body remains JSON");
+        serde_json::from_slice(&prepared.body).expect("raw body remains JSON");
 
     assert_eq!(value["model"], "client-model");
     assert_eq!(value["messages"][0]["content"], "hello");
     assert_eq!(value["max_tokens"], 8);
+    assert_eq!(prepared.outbound_model.as_deref(), Some("client-model"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn raw_route_failover_reselects_normalized_pool_by_model_after_raw_pool_502() {
+async fn raw_route_failover_reselects_raw_pool_by_model_after_raw_pool_502() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
@@ -11983,7 +11857,8 @@ async fn raw_route_failover_reselects_normalized_pool_by_model_after_raw_pool_50
 
     let mut normalized_pool = create_pool_request("normalized-second-ok", 10, true);
     normalized_pool.base_url = normalized_fake.base_url.clone();
-    normalized_pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+    normalized_pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+    normalized_pool.raw_model_mode = ExternalPoolRawModelMode::RewriteTopLevel;
     normalized_pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
     normalized_pool.supported_models = vec!["client-model".to_string()];
     postgres
@@ -12004,7 +11879,7 @@ async fn raw_route_failover_reselects_normalized_pool_by_model_after_raw_pool_50
     let response = match manager.forward_with_failover_result(config, route).await {
         ExternalPoolForwardOutcome::Response(response) => response,
         ExternalPoolForwardOutcome::FinalError(error) => {
-            panic!("raw 502 should retry a model-supported normalized pool: {error:?}");
+            panic!("raw 502 should retry a model-supported raw pool: {error:?}");
         }
     };
 
@@ -12118,13 +11993,14 @@ fn raw_rewrite_only_changes_effective_top_level_model_for_five_rounds() {
 }
 
 #[test]
-fn normalized_failover_builds_and_serializes_the_full_body_once_per_request() {
+fn raw_failover_keeps_effective_body_without_rebuilding_normalized_bodies() {
     let model = "claude-sonnet-4-5";
     let mut route = test_route(model);
     let mut original = serde_json::to_value(payload_ref(&route)).expect("typed request value");
     original["future_top"] = json!({"preserved": true});
     route.effective_raw_body =
         Bytes::from(serde_json::to_vec(&original).expect("effective request serialization"));
+    route.effective_raw_probe = Some(Arc::new(probe_raw_messages_body(&route.effective_raw_body)));
     route.raw_body = Bytes::from(
         serde_json::to_vec(payload_ref(&route)).expect("working request serialization"),
     );
@@ -12135,27 +12011,22 @@ fn normalized_failover_builds_and_serializes_the_full_body_once_per_request() {
         let mapped_model = format!("mapped-model-{pool_id}");
         let mut pool = test_pool("https://example.com/v1", true);
         pool.id = pool_id;
-        pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
         pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
         pool.model_mapping_rules = vec![model_rule(model, &mapped_model)];
 
-        let prepared = external_pool_prepare_request(&route, &pool).expect("normalized request");
-        let value: serde_json::Value =
-            serde_json::from_slice(&prepared.body).expect("normalized JSON");
+        let prepared = external_pool_prepare_request(&route, &pool).expect("raw request");
+        let value: serde_json::Value = serde_json::from_slice(&prepared.body).expect("raw JSON");
         assert_eq!(value["model"], mapped_model);
         assert_eq!(value["future_top"]["preserved"], true);
     }
 
     let counts = route.preparation_operation_counts();
-    assert_eq!(counts.normalized_base_builds, 1);
-    assert_eq!(counts.normalized_original_value_parses, 1);
-    assert_eq!(counts.normalized_json_serializations, 2);
-    assert_eq!(counts.payload_guard_serializations, 0);
     assert_eq!(counts.raw_payload_parses, 0);
     assert_eq!(
         raw_body_probe_invocations_for_current_thread() - probe_count_before,
-        1,
-        "only the request-scoped normalized base may be probed"
+        0,
+        "the precomputed effective raw probe should be reused"
     );
 }
 
@@ -12194,17 +12065,10 @@ fn raw_failover_shares_tool_and_usage_projection_parsing_across_pools() {
     assert_eq!(counts.raw_payload_parses, 1);
     assert_eq!(counts.known_tool_name_builds, 1);
     assert_eq!(counts.usage_projection_builds, 1);
-    assert_eq!(counts.normalized_base_builds, 0);
-    assert_eq!(counts.normalized_original_value_parses, 0);
-    assert_eq!(counts.normalized_json_serializations, 0);
 }
 
 #[test]
-fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_for_five_rounds() {
-    let jpeg = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        [0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00],
-    );
+fn raw_passthrough_preserves_future_fields_without_prompt_steering_for_five_rounds() {
     let original_value = json!({
         "model": "claude-sonnet-4-5",
         "max_tokens": 128,
@@ -12228,7 +12092,7 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
                     "source": {
                         "type": "base64",
                         "media_type": "image/png",
-                        "data": jpeg,
+                        "data": "/9j/raw-image",
                         "future_source": "source-extra"
                     }
                 }]
@@ -12260,42 +12124,14 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
         "output_config": {"effort": "high", "future_output": "output-extra"}
     });
     let original = Bytes::from(serde_json::to_vec(&original_value).expect("original JSON"));
-
     for round in 1..=5 {
-        let (sanitized, report) =
-            crate::anthropic::transcript_sanitizer::sanitize_raw_request_assistant_history(
-                &original,
-            )
-            .expect("assistant history inspection succeeds")
-            .expect("polluted assistant history is sanitized");
-        assert_eq!(report.blocks, 1, "round {round}");
-        let mut payload: MessagesRequest =
-            serde_json::from_slice(&sanitized).expect("sanitized typed payload");
-        assert_eq!(
-            crate::anthropic::body_processing::normalize_base64_image_media_types(&mut payload),
-            1,
-            "round {round}"
-        );
-        assert!(
-            crate::anthropic::prompt_steering::apply_to_messages_request(
-                "/cc/v1/messages",
-                crate::model::config::CompatProfile::ClaudeCode,
-                &crate::model::config::PromptSteeringConfig::default(),
-                &mut payload,
-            )
-        );
-
-        let mut route = test_route("claude-sonnet-4-5");
-        route.effective_raw_body = original.clone();
-        route.raw_body = Bytes::from(sanitized);
-        route.payload = Some(payload);
-        route.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
+        let route = raw_test_route(&original);
         let mut pool = test_pool("https://example.com/v1", true);
-        pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::RewriteTopLevel;
 
-        let prepared = external_pool_prepare_request(&route, &pool).expect("normalized body");
-        let value: serde_json::Value =
-            serde_json::from_slice(&prepared.body).expect("normalized JSON");
+        let prepared = external_pool_prepare_request(&route, &pool).expect("raw body");
+        let value: serde_json::Value = serde_json::from_slice(&prepared.body).expect("raw JSON");
 
         assert_eq!(value["service_tier"], "auto", "round {round}");
         assert_eq!(
@@ -12314,7 +12150,7 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
         );
         assert_eq!(
             value["messages"][0]["content"][0]["source"]["media_type"],
-            "image/jpeg"
+            "image/png"
         );
         assert_eq!(
             value["messages"][1]["future_message_field"],
@@ -12329,13 +12165,13 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
             "assistant-block-extra"
         );
         assert!(
-            !prepared
+            prepared
                 .body
                 .windows(13)
                 .any(|window| window == b"user Continue")
         );
         assert!(
-            !prepared
+            prepared
                 .body
                 .windows(17)
                 .any(|window| window == b"hidden transcript")
@@ -12351,22 +12187,15 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
         assert_eq!(value["output_config"]["future_output"], "output-extra");
 
         let systems = value["system"].as_array().expect("system array");
-        assert_eq!(systems.len(), 2);
-        assert!(
-            systems[0]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("<prompt_steering"))
-        );
-        assert!(systems[0].get("future_system").is_none());
-        assert_eq!(systems[1]["text"], "original system");
-        assert_eq!(systems[1]["future_system"], "system-extra");
+        assert_eq!(systems.len(), 1);
+        assert_eq!(systems[0]["text"], "original system");
+        assert_eq!(systems[0]["future_system"], "system-extra");
     }
 }
 
 #[test]
-fn normalized_overlay_large_history_and_tool_sets_preserve_tail_identity_for_five_rounds() {
+fn raw_passthrough_preserves_full_history_and_tool_sets_for_five_rounds() {
     const HISTORY_MESSAGES: usize = 4_097;
-    const RETAINED_MESSAGES: usize = 257;
     const TOOLS: usize = 2_048;
 
     let messages = (0..HISTORY_MESSAGES)
@@ -12397,39 +12226,28 @@ fn normalized_overlay_large_history_and_tool_sets_preserve_tail_identity_for_fiv
     });
     let effective_raw_body =
         Bytes::from(serde_json::to_vec(&original_value).expect("large original JSON"));
-    let mut payload: MessagesRequest =
-        serde_json::from_value(original_value).expect("large typed payload");
-    payload.messages = payload
-        .messages
-        .split_off(HISTORY_MESSAGES - RETAINED_MESSAGES);
 
     for round in 1..=5 {
-        let mut route = test_route("claude-sonnet-4-5");
-        route.effective_raw_body = effective_raw_body.clone();
-        route.raw_body =
-            Bytes::from(serde_json::to_vec(&payload).expect("large working payload serialization"));
-        route.payload = Some(payload.clone());
-        route.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
-        route.payload_guard_external_enabled = false;
+        let route = raw_test_route(&effective_raw_body);
         let mut pool = test_pool("https://example.com/v1", true);
-        pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::RewriteTopLevel;
 
-        let prepared = external_pool_prepare_request(&route, &pool).expect("large normalized body");
+        let prepared = external_pool_prepare_request(&route, &pool).expect("large raw body");
         let value: serde_json::Value =
-            serde_json::from_slice(&prepared.body).expect("large normalized JSON");
+            serde_json::from_slice(&prepared.body).expect("large raw JSON");
         let messages = value["messages"].as_array().expect("messages array");
         let tools = value["tools"].as_array().expect("tools array");
 
-        assert_eq!(messages.len(), RETAINED_MESSAGES, "round {round}");
+        assert_eq!(messages.len(), HISTORY_MESSAGES, "round {round}");
         assert_eq!(
-            messages[0]["future_message_index"],
-            HISTORY_MESSAGES - RETAINED_MESSAGES,
-            "round {round} first retained message"
+            messages[0]["future_message_index"], 0,
+            "round {round} first message"
         );
         assert_eq!(
             messages.last().unwrap()["future_message_index"],
             HISTORY_MESSAGES - 1,
-            "round {round} last retained message"
+            "round {round} last message"
         );
         assert_eq!(tools.len(), TOOLS, "round {round}");
         assert_eq!(tools[0]["future_tool_index"], 0);
@@ -12462,6 +12280,8 @@ fn external_pool_raw_body_mode_does_not_apply_payload_guard() {
     let mut route = test_route("client-model");
     route.effective_raw_body = Bytes::from_static(raw);
     route.raw_body = Bytes::from_static(raw);
+    route.upstream_model = None;
+    route.model_resolution_source = None;
     route.payload_guard_external_enabled = true;
     route.payload_guard_initial_config = PayloadGuardConfig {
         enabled: true,
@@ -12479,7 +12299,7 @@ fn external_pool_raw_body_mode_does_not_apply_payload_guard() {
 }
 
 #[test]
-fn external_pool_normalized_body_mode_applies_payload_guard() {
+fn external_pool_normalized_body_mode_keeps_raw_body_without_payload_guard() {
     let mut route = test_route("client-model");
     let mut messages = Vec::new();
     for idx in 0..24 {
@@ -12499,6 +12319,9 @@ fn external_pool_normalized_body_mode_applies_payload_guard() {
     payload_mut(&mut route).messages = messages;
     route.raw_body =
         Bytes::from(serde_json::to_vec(payload_ref(&route)).expect("serialize raw body for route"));
+    route.effective_raw_body = route.raw_body.clone();
+    route.upstream_model = None;
+    route.model_resolution_source = None;
     let original_len = route.raw_body.len();
     route.payload_guard_external_enabled = true;
     route.payload_guard_initial_config = PayloadGuardConfig {
@@ -12512,9 +12335,9 @@ fn external_pool_normalized_body_mode_applies_payload_guard() {
 
     let prepared = external_pool_prepare_request(&route, &pool).unwrap();
     let value: serde_json::Value =
-        serde_json::from_slice(&prepared.body).expect("normalized body remains json");
+        serde_json::from_slice(&prepared.body).expect("raw body remains json");
 
-    assert!(prepared.body.len() < original_len);
+    assert_eq!(prepared.body.len(), original_len);
     assert_eq!(
         value["messages"].as_array().unwrap().last().unwrap()["content"],
         serde_json::json!("current question")
@@ -12876,7 +12699,7 @@ fn external_pool_outbound_model_normalization_only_changes_claude_numeric_versio
 }
 
 #[test]
-fn external_pool_outbound_body_strips_budget_tokens_for_disabled_thinking() {
+fn external_pool_outbound_body_preserves_budget_tokens_for_disabled_thinking() {
     let mut route = test_route("claude-opus-4-7");
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "disabled".to_string(),
@@ -12885,13 +12708,14 @@ fn external_pool_outbound_body_strips_budget_tokens_for_disabled_thinking() {
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-7","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"disabled","budget_tokens":20000}}"#,
         );
+    refresh_test_route_raw_snapshot(&mut route);
 
     let pool = test_pool("https://example.com/v1", true);
     let outbound = test_external_pool_outbound_body(&route, &pool);
     let value: serde_json::Value = serde_json::from_slice(&outbound).expect("parse outbound body");
 
     assert_eq!(value["thinking"]["type"], "disabled");
-    assert!(value["thinking"].get("budget_tokens").is_none());
+    assert_eq!(value["thinking"]["budget_tokens"], 20000);
 }
 
 #[test]
@@ -14574,7 +14398,7 @@ fn claude_code_tool_usage_projection_commits_external_pool_cache_only_after_succ
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
         );
     let mut route = test_route("claude-sonnet-4-5");
-    route.endpoint = "/kiro/v1/messages".to_string();
+    route.endpoint = "/account-runtime/v1/messages".to_string();
     route.prompt_cache_strategy_type = PromptCacheStrategyType::ClaudeCodeTool;
     route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
     route.reported_usage = ReportedUsageConfig {
@@ -14587,7 +14411,7 @@ fn claude_code_tool_usage_projection_commits_external_pool_cache_only_after_succ
         ),
     });
     payload_mut(&mut route).system = Some(vec![SystemMessage {
-        text: "stable external kiro strategy prompt ".repeat(700),
+        text: "stable external account runtime strategy prompt ".repeat(700),
         cache_control: Some(serde_json::json!({"type": "ephemeral"})),
     }]);
     let mut pool = test_pool("http://pool.example.com", false);
@@ -14635,7 +14459,7 @@ fn claude_code_tool_usage_projection_commits_external_pool_cache_only_after_succ
         },
         Message {
             role: "user".to_string(),
-            content: serde_json::json!("continue external kiro strategy session"),
+            content: serde_json::json!("continue external account runtime strategy session"),
         },
     ]);
     refresh_test_route_derived_state(&mut route);
@@ -14690,7 +14514,7 @@ fn claude_code_tool_usage_projection_applies_path_cache_creation_policy() {
         ),
     });
     payload_mut(&mut route).system = Some(vec![SystemMessage {
-        text: "stable external kiro strategy prompt ".repeat(8_000),
+        text: "stable external account runtime strategy prompt ".repeat(8_000),
         cache_control: Some(serde_json::json!({"type": "ephemeral"})),
     }]);
     route.request_input_tokens = count_external_route_input_tokens(payload_ref(&route));

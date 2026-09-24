@@ -46,14 +46,14 @@
 
 ### 2. 瞬态失败后当前请求内临时排除失败账号
 
-变更文件：`src/kiro/token_manager/manager.rs`、`src/kiro/provider.rs`。
+变更文件：`src/local_upstream_impl/token_manager/manager.rs`、`src/local_upstream_impl/provider.rs`。
 
 现网 `credential_retry_chain` 数量不大，但尾部很长，p95 约 `68.343s`，max 约 `299.281s`。其中一种可由代码改善的情况是：上游 429/408/5xx、网络错误、非 eventstream 的 retryable protocol 错误、未知可重试错误之后，如果当前账号没有被本次请求临时排除，下一轮调度可能又命中同一个刚失败或刚变慢的账号，造成 retry 链首字累加。
 
 本次新增：
 
 - `MultiTokenManager::has_alternate_usable_credential_cached(...)`：只读当前进程内存态判断是否存在其他可调度账号，不触发 Redis/PgSQL 同步。
-- `KiroProvider::maybe_exclude_after_transient_failure(...)`：上游瞬态失败写入 cooldown/health 后，如果本机内存态确认还有备选账号，就把当前账号加入当前请求的 `excluded_ids`。
+- `Account RuntimeProvider::maybe_exclude_after_transient_failure(...)`：上游瞬态失败写入 cooldown/health 后，如果本机内存态确认还有备选账号，就把当前账号加入当前请求的 `excluded_ids`。
 - API 和 MCP 两条 retry 路径都接入该 helper，包括 network send error、retryable non-eventstream/protocol、429/408/5xx、payment-required transient、unknown retryable。
 
 预期效果：
@@ -152,7 +152,7 @@
 
 - `src/anthropic/handlers.rs`: 大量新增流式 trace 和兼容处理。
 - `src/anthropic/usage.rs`: 新增 latency trace 字段、错误诊断边界处理。
-- `src/kiro/provider.rs`: 新增 selection failure、retry 诊断和部分软失败排除。
+- `src/local_upstream_impl/provider.rs`: 新增 selection failure、retry 诊断和部分软失败排除。
 - `src/storage/redis_cache.rs`: 新增调度/容量独立 Redis 连接、lease tombstone、更多原子脚本。
 - `src/storage/postgres.rs`: 主要是 usage 写入日志阈值变化，rollup 同步写入结构仍在。
 
@@ -176,10 +176,10 @@
 
 本地 `MultiTokenManager` 有：
 
-- `SCHEDULER_REDIS_HOT_OP_TIMEOUT = 75ms`，见 `src/kiro/token_manager/manager.rs:302`。
-- `SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE = 2s`, max `30s`，见 `src/kiro/token_manager/manager.rs:303` 到 `src/kiro/token_manager/manager.rs:304`。
-- 热路径并发探测上限 `SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS = 2`，见 `src/kiro/token_manager/manager.rs:305`。
-- `block_on_scheduler_redis_hot()` 对 Redis future 做 75ms timeout，失败后进入 degraded，见 `src/kiro/token_manager/manager.rs:1292` 到 `src/kiro/token_manager/manager.rs:1324`。
+- `SCHEDULER_REDIS_HOT_OP_TIMEOUT = 75ms`，见 `src/local_upstream_impl/token_manager/manager.rs:302`。
+- `SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE = 2s`, max `30s`，见 `src/local_upstream_impl/token_manager/manager.rs:303` 到 `src/local_upstream_impl/token_manager/manager.rs:304`。
+- 热路径并发探测上限 `SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS = 2`，见 `src/local_upstream_impl/token_manager/manager.rs:305`。
+- `block_on_scheduler_redis_hot()` 对 Redis future 做 75ms timeout，失败后进入 degraded，见 `src/local_upstream_impl/token_manager/manager.rs:1292` 到 `src/local_upstream_impl/token_manager/manager.rs:1324`。
 - `RedisStore` 将普通 manager、scheduler manager、scheduler capacity manager 拆开，见 `src/storage/redis_cache.rs:143` 到 `src/storage/redis_cache.rs:150`。
 
 这针对现网日志中的“Redis 调度热路径超过 75ms”是直接改善。预计升级本地版本后，Redis 慢导致每个请求都阻塞的概率会降低。
@@ -188,23 +188,23 @@
 
 本地新增 released lease tombstone，避免 Redis release 异步慢、旧 lease 又被读回本地占用容量。代码锚点：
 
-- 本地 tombstone TTL 和硬上限，见 `src/kiro/token_manager/concurrency.rs:18` 到 `src/kiro/token_manager/concurrency.rs:22`。
-- release 时先记录 tombstone，再异步释放 Redis lease，见 `src/kiro/token_manager/concurrency.rs:123` 到 `src/kiro/token_manager/concurrency.rs:166`。
+- 本地 tombstone TTL 和硬上限，见 `src/local_upstream_impl/token_manager/concurrency.rs:18` 到 `src/local_upstream_impl/token_manager/concurrency.rs:22`。
+- release 时先记录 tombstone，再异步释放 Redis lease，见 `src/local_upstream_impl/token_manager/concurrency.rs:123` 到 `src/local_upstream_impl/token_manager/concurrency.rs:166`。
 - Redis 层新增 `release_in_flight_lease_with_tombstone` 和原子脚本，见 `src/storage/redis_cache.rs` diff 中的 lease tombstone 变更。
 
 这能改善“并发槽状态不准导致排队等待”的一类尾延迟。
 
 5. 凭据统计写入从请求热路径转成增量缓冲。
 
-请求选中账号时，本地先更新内存和 `pending_stats_deltas`，见 `src/kiro/token_manager/manager.rs:3794` 到 `src/kiro/token_manager/manager.rs:3812`。保存时批量写 `credential_stats` delta，见 `src/kiro/token_manager/manager.rs:3324` 到 `src/kiro/token_manager/manager.rs:3355`，Postgres 写入实现见 `src/storage/postgres.rs:1325` 到 `src/storage/postgres.rs:1384`。
+请求选中账号时，本地先更新内存和 `pending_stats_deltas`，见 `src/local_upstream_impl/token_manager/manager.rs:3794` 到 `src/local_upstream_impl/token_manager/manager.rs:3812`。保存时批量写 `credential_stats` delta，见 `src/local_upstream_impl/token_manager/manager.rs:3324` 到 `src/local_upstream_impl/token_manager/manager.rs:3355`，Postgres 写入实现见 `src/storage/postgres.rs:1325` 到 `src/storage/postgres.rs:1384`。
 
-这比每次请求同步更新 `credential_stats` 更好，但加载统计仍是同步 `block_on_storage`，见 `src/kiro/token_manager/manager.rs:3292` 到 `src/kiro/token_manager/manager.rs:3305`。
+这比每次请求同步更新 `credential_stats` 更好，但加载统计仍是同步 `block_on_storage`，见 `src/local_upstream_impl/token_manager/manager.rs:3292` 到 `src/local_upstream_impl/token_manager/manager.rs:3305`。
 
 6. Retry 诊断更清楚。
 
-本地 `KiroProvider` 为本地账号调度失败附带 `SelectionFailureSummary`，见 `src/kiro/provider.rs:932` 到 `src/kiro/provider.rs:950`，最后错误包装见 `src/kiro/provider.rs:3090` 到 `src/kiro/provider.rs:3094`。
+本地 `Account RuntimeProvider` 为本地账号调度失败附带 `SelectionFailureSummary`，见 `src/local_upstream_impl/provider.rs:932` 到 `src/local_upstream_impl/provider.rs:950`，最后错误包装见 `src/local_upstream_impl/provider.rs:3090` 到 `src/local_upstream_impl/provider.rs:3094`。
 
-Transient 错误会写入账号健康/冷却状态，429 使用 `TransientFailureKind::RateLimit`，5xx 使用 `TransientFailureKind::Server`，见 `src/kiro/provider.rs:2929` 到 `src/kiro/provider.rs:2995`。
+Transient 错误会写入账号健康/冷却状态，429 使用 `TransientFailureKind::RateLimit`，5xx 使用 `TransientFailureKind::Server`，见 `src/local_upstream_impl/provider.rs:2929` 到 `src/local_upstream_impl/provider.rs:2995`。
 
 ### 本地仍未解决或仍需优化的部分
 
@@ -243,7 +243,7 @@ Transient 错误会写入账号健康/冷却状态，429 使用 `TransientFailur
 
 5. Background best-effort task 没有统一限流。
 
-`spawn_best_effort_storage_task()` 直接在当前 runtime `tokio::spawn`，没有队列长度、并发上限、超时、单独连接池或拒绝策略，见 `src/kiro/token_manager/storage_task.rs:28` 到 `src/kiro/token_manager/storage_task.rs:56`。
+`spawn_best_effort_storage_task()` 直接在当前 runtime `tokio::spawn`，没有队列长度、并发上限、超时、单独连接池或拒绝策略，见 `src/local_upstream_impl/token_manager/storage_task.rs:28` 到 `src/local_upstream_impl/token_manager/storage_task.rs:56`。
 
 本地很多 Redis 状态更新、审计、凭据事件、lease touch/release 都走这个函数。Redis/Postgres 慢时这些任务可能堆积，并与请求路径共享 runtime 和连接池资源。
 
@@ -388,15 +388,15 @@ v0.0.70 已经覆盖现网多个热路径问题。建议先把本地 HEAD 按下
 现有工具：
 
 - `docs/testing/loadtest.md`
-- `src/bin/kiro_loadtest.rs`
-- `scripts/loadtest/kiro-mock-upstream.mjs`
+- `src/bin/account_runtime_loadtest.rs`
+- `scripts/loadtest/account-runtime-mock-upstream.mjs`
 
 ### L0 静态与单测
 
 建议先跑：
 
 ```bash
-cargo test --locked --no-default-features --bin kiro_loadtest
+cargo test --locked --no-default-features --bin account_runtime_loadtest
 cargo test --locked --no-default-features local_latency_trace_records_markers_without_changing_first_output_semantics
 cargo test --locked --no-default-features scheduler_redis
 cargo test --locked --no-default-features selection_failure
@@ -427,7 +427,7 @@ cargo test --locked --no-default-features -- --skip test_scheduler_state_sync_ti
 - 新增外部池 retry cap 单测通过。
 - 新增 cached alternate credential 单测通过。
 - 全量 `cargo test --locked --no-default-features` 编译并执行，`778 passed / 2 failed`。失败项单独复跑仍失败：
-  - `kiro::token_manager::manager::tests::test_scheduler_state_sync_timeout_does_not_degrade_hot_path`：断言 `result.is_none()` 失败，测试位于未改动的 scheduler Redis timeout helper 附近。
+  - `account-runtime::token_manager::manager::tests::test_scheduler_state_sync_timeout_does_not_degrade_hot_path`：断言 `result.is_none()` 失败，测试位于未改动的 scheduler Redis timeout helper 附近。
   - `http_client::tests::response_text_with_body_timeout_expires_after_response_headers`：本地 loopback server 已写 response header 但 `send_with_response_header_timeout(..., 1)` 仍报 header timeout，测试位于未改动的 HTTP client helper。
 - 跳过上述两个已复现失败项后，其余 `778` 个主二进制测试和 `11` 个 loadtest 二进制测试全部通过。
 - 本次没有访问生产服务、没有对生产或 `9022` 发压测。
@@ -438,7 +438,7 @@ cargo test --locked --no-default-features -- --skip test_scheduler_state_sync_ti
 直接验证 fake server 和 loadtest parser：
 
 ```bash
-cargo run --bin kiro_loadtest -- \
+cargo run --bin account_runtime_loadtest -- \
   --fake-listen 127.0.0.1:19080 \
   --base-url http://127.0.0.1:19080 \
   --route /v1/messages \

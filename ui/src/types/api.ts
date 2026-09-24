@@ -150,7 +150,6 @@ export interface CredentialStatusItem {
   estimatedCostUsd: number
   originalCostUsd: number
   upstreamMeteringUnits: number
-  kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   rpm: number
@@ -253,7 +252,7 @@ export interface CredentialAccountInfoListResponse {
 
 export type CredentialUsageSummaryItem = Pick<
   CredentialStatusItem,
-  'id' | 'estimatedCostUsd' | 'originalCostUsd' | 'upstreamMeteringUnits' | 'kiroMeteringUsage' | 'pricedRequests' | 'unpricedRequests'
+  'id' | 'estimatedCostUsd' | 'originalCostUsd' | 'upstreamMeteringUnits' | 'upstreamMeteringUnits' | 'pricedRequests' | 'unpricedRequests'
 >
 
 export interface CredentialUsageSummaryResponse {
@@ -561,7 +560,6 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   proxyResourceId?: number | null
   apiKey?: string
-  kiroApiKey?: string
   endpoint?: string
   supportedModels?: string[]
   autoDiscoverSupportedModels?: boolean | null
@@ -787,7 +785,6 @@ export interface UsageRecord {
   estimatedCostUsd: number
   originalCostUsd: number
   upstreamMeteringUnits: number
-  kiroMeteringUsage: number
   pricingAvailable: boolean
   pricingModel?: string
   durationMs: number
@@ -954,7 +951,6 @@ export interface UsageSummary {
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
   totalUpstreamMeteringUnits: number
-  totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   localPromptCacheRequests: number
@@ -1317,7 +1313,6 @@ export interface UsageDashboardSummary {
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
   totalUpstreamMeteringUnits: number
-  totalKiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
   averageDurationMs: number
@@ -1360,7 +1355,6 @@ export interface UsageSeriesPoint {
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
   totalUpstreamMeteringUnits: number
-  totalKiroMeteringUsage: number
 }
 
 export interface UsageDashboardTop {
@@ -1384,7 +1378,6 @@ export interface UsageTopAggregate {
   totalEstimatedCostUsd: number
   totalOriginalCostUsd: number
   totalUpstreamMeteringUnits: number
-  totalKiroMeteringUsage: number
 }
 
 export interface UsageRecordsQuery {
@@ -1544,7 +1537,7 @@ export interface ClaudeCodeToolCachePolicyPatch {
   currentUserStablePrefixMaxTokens?: number
 }
 
-export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'claude_code_tool' | 'kiro_rs_tool'
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'claude_code_tool'
 
 export interface CacheRoutePolicyPatch {
   cacheType?: PromptCacheStrategyType
@@ -1555,14 +1548,12 @@ export interface CacheRoutePolicyPatch {
   cachePoint?: CachePointPolicyPatch
   bounds?: CacheBoundsPolicyPatch
   claudeCodeTool?: ClaudeCodeToolCachePolicyPatch
-  kiroRsTool?: ClaudeCodeToolCachePolicyPatch
 }
 
 export interface CachePolicyConfig {
   default: CacheRoutePolicyPatch
   currentHighCache: CacheRoutePolicyPatch
   claudeCodeTool?: CacheRoutePolicyPatch
-  kiroRsTool?: CacheRoutePolicyPatch
   pathOverrides: Record<string, CacheRoutePolicyPatch>
 }
 

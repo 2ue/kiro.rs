@@ -1,7 +1,7 @@
 //! 本地上游端点抽象
 //!
 //! 不同本地上游端点（如 `ide` / `cli`）在 URL、请求头、请求体上存在差异，
-//! 但共享凭据池、Token 刷新、重试逻辑和 AWS event-stream 响应解码。
+//! 但共享凭据池、Token 刷新、重试逻辑和流式响应解码。
 //!
 //! [`LocalUpstreamEndpoint`] 抽象了请求侧的差异点；`LocalUpstreamProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
@@ -231,7 +231,7 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
 
     /// API/MCP request content type.
     ///
-    /// IDE uses normal JSON. CLI runtime uses AWS JSON 1.0.
+    /// IDE uses normal JSON. CLI runtime uses JSON 1.0.
     fn content_type(&self) -> &'static str {
         "application/json"
     }
@@ -246,7 +246,7 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
     /// ListAvailableModels HTTP method.
     ///
     /// IDE-compatible endpoints use the legacy GET form. The CLI management
-    /// endpoint uses AWS JSON 1.0 POST with a JSON body.
+    /// endpoint uses JSON 1.0 POST with a JSON body.
     #[cfg(test)]
     fn models_method(&self, _ctx: &RequestContext<'_>) -> Method {
         Method::GET
@@ -275,7 +275,7 @@ pub trait LocalUpstreamEndpoint: Send + Sync {
     #[cfg(test)]
     fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder;
 
-    /// 对已序列化的 API 请求体做端点特有加工（如注入 profileArn）
+    /// 对已序列化的 API 请求体做端点特有加工（如根对象字段规范化）
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String;
 
     /// 对已序列化的 MCP 请求体做端点特有加工（默认不变）
@@ -312,7 +312,7 @@ pub struct RequestContext<'a> {
 
 /// 默认的额度用尽判断逻辑
 ///
-/// 同时识别顶层 `reason` 字段、嵌套 `error.reason` 字段和 Kiro overage 限制。
+/// 同时识别顶层 `reason` 字段、嵌套 `error.reason` 字段和上游配额限制。
 pub fn default_is_quota_exhausted(body: &str) -> bool {
     if body.contains("MONTHLY_REQUEST_COUNT") || body.contains("OVERAGE_REQUEST_LIMIT_EXCEEDED") {
         return true;

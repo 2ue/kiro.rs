@@ -70,11 +70,11 @@ export function AccountFormModal({
   onDiscoverSupportedModels?: () => Promise<string[]>
 }) {
   const isEdit = mode === 'edit'
-  const title = isEdit ? `编辑外部账号${account ? ` #${account.id}` : ''}` : '添加外部账号'
+  const title = isEdit ? `编辑账号${account ? ` #${account.id}` : ''}` : '添加账号'
   const keyLabel = isEdit ? '新请求 Key' : '请求 Key'
   const keyDescription = isEdit
     ? `留空表示不修改当前 Key。当前：${account?.maskedApiKey || '未显示 Key'}`
-    : '外部账号的请求密钥，保存后只显示脱敏值。'
+    : '账号的请求密钥，保存后只显示脱敏值。'
   const [quickImportText, setQuickImportText] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
@@ -136,13 +136,13 @@ export function AccountFormModal({
           <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={saving}>取消</Button>
           <Button type="button" size="sm" onClick={onSubmit} disabled={saving}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : isEdit ? <Save className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-            {isEdit ? '保存外部账号' : '添加外部账号'}
+            {isEdit ? '保存账号' : '添加账号'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
-        <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接外部账号。">
+        <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接账号。">
           <div className="grid gap-3 md:grid-cols-2">
             <TextBox label="名称" value={draft.name} disabled={saving} onChange={(v) => set('name', v)} />
             <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(v) => set('authType', v as AccountFormDraft['authType'])}>
@@ -155,11 +155,11 @@ export function AccountFormModal({
         </FormSection>
 
         <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
-          <FormSection title="调度设置" description="这些设置只影响当前外部账号，不改变全局排队和冷却策略。">
+          <FormSection title="调度设置" description="这些设置只影响当前账号，不改变全局排队和冷却策略。">
             <div className="grid gap-3 sm:grid-cols-2">
-              <NumberBox label="单账号最大并发" description="当前外部账号同时处理的最大请求数，不是 RPM。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(v) => set('maxConcurrentRequests', v)} />
+              <NumberBox label="单账号最大并发" description="当前账号同时处理的最大请求数，不是 RPM。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(v) => set('maxConcurrentRequests', v)} />
               <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" suffix="值" value={draft.priority} disabled={saving} onChange={(v) => set('priority', v)} />
-              <ToggleRow label={isEdit ? '启用外部账号' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(v) => set('enabled', v)} />
+              <ToggleRow label={isEdit ? '启用账号' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(v) => set('enabled', v)} />
               <ToggleRow label="保留请求路径" checked={Boolean(draft.preservePath)} disabled={saving} onChange={(v) => set('preservePath', v)} />
             </div>
             <div className="mt-2 text-xs leading-relaxed text-muted-foreground">
@@ -167,7 +167,7 @@ export function AccountFormModal({
             </div>
           </FormSection>
 
-          <FormSection title="下游 usage 口径" description="只决定当前外部账号返回给下游的 usage 是透传上游，还是按当前入口路径整理；非 usage 内容不受影响。">
+          <FormSection title="下游 usage 口径" description="只决定当前账号返回给下游的 usage 是透传上游，还是按当前入口路径整理；非 usage 内容不受影响。">
             <div className="space-y-3">
               <SelectBox label="下游 usage" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as AccountFormDraft['usageProjectionMode'])}>
                 <SelectItem value="pass_through">透传上游 usage</SelectItem>
@@ -192,7 +192,7 @@ export function AccountFormModal({
             </div>
           </FormSection>
 
-          <FormSection title="首输出前流式恢复" description="只覆盖当前外部账号在未提交内容前的 stream body 错误恢复。">
+          <FormSection title="首输出前流式恢复" description="只覆盖当前账号在未提交内容前的 stream body 错误恢复。">
             <div className="space-y-3">
               <SelectBox
                 label="首输出前流式恢复"
@@ -209,7 +209,7 @@ export function AccountFormModal({
           </FormSection>
         </div>
 
-        <FormSection title="调度资格" description="只决定该外部账号是否允许承接某些模型；不改变请求体里的 model，也不影响模型映射规则。">
+          <FormSection title="调度资格" description="只决定该账号是否允许承接某些模型；不改变请求体里的 model，也不影响模型映射规则。">
           <div className="space-y-3">
             <SupportedModelTagsEditor
               value={parseSupportedModelItems(draft.supportedModelsText)}
@@ -219,7 +219,7 @@ export function AccountFormModal({
             />
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs leading-5 text-muted-foreground">
-                空列表表示不限制；非空时，请求模型必须精确命中这里的标签才会调度到该外部账号。
+                空列表表示不限制；非空时，请求模型必须精确命中这里的标签才会调度到该账号。
               </div>
               <Button type="button" variant="outline" size="sm" disabled={saving || syncingModels || !onDiscoverSupportedModels} onClick={syncSupportedModels}>
                 {syncingModels && <Loader2 className="h-4 w-4 animate-spin" />}发现模型
@@ -228,7 +228,7 @@ export function AccountFormModal({
           </div>
         </FormSection>
 
-        <FormSection title="入口路由" description="只限制当前外部账号能承接哪些入口；仍会同时受全局外部池路由规则限制。">
+        <FormSection title="入口路由" description="只限制当前账号能承接哪些入口；仍会同时受全局路由规则限制。">
           <div className="grid gap-3 md:grid-cols-[240px_1fr]">
             <SelectBox
               label="单池路由模式"
@@ -250,7 +250,7 @@ export function AccountFormModal({
           </div>
         </FormSection>
 
-        <FormSection title="请求体处理" description="控制发往该外部账号前是否进入本系统 body 处理链路。">
+        <FormSection title="请求体处理" description="控制发往该账号前是否进入本系统 body 处理链路。">
           <div className="grid gap-3">
             <div className="space-y-3">
               <SelectBox
@@ -267,7 +267,7 @@ export function AccountFormModal({
           </div>
         </FormSection>
 
-        <FormSection title="模型处理" description="控制当前外部账号发出请求时的模型名称处理方式。">
+        <FormSection title="模型处理" description="控制当前账号发出请求时的模型名称处理方式。">
           <div className="grid gap-3 md:grid-cols-[240px_1fr]">
             <div className="space-y-3">
               {draft.requestBodyMode === 'raw_passthrough' && (
@@ -324,7 +324,7 @@ export function AccountFormModal({
           </div>
         </FormSection>
 
-        <FormSection title="错误处理和备注" description="自动禁用策略只决定当前外部账号是否继承全局自动禁用规则。">
+        <FormSection title="错误处理和备注" description="自动禁用策略只决定当前账号是否继承全局自动禁用规则。">
           <div className="grid gap-3 md:grid-cols-2">
             <SelectBox label="自动禁用策略" value={draft.autoDisablePolicy} disabled={saving} onChange={(v) => set('autoDisablePolicy', v as AccountFormDraft['autoDisablePolicy'])}>
               <SelectItem value="inherit">继承全局自动禁用</SelectItem>

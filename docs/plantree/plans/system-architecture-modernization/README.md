@@ -14,7 +14,7 @@ Related: [Greenfield AI Gateway](../greenfield-ai-gateway/README.md), [supersess
 
 ## Supersession Notice
 
-The user replaced this plan's Rust, two-frontend and fixed 50-module target with a new general AI Gateway implemented in a separate repository using Go plus one React/TypeScript/Tailwind Admin application. Kiro is now one complete provider module behind versioned contracts.
+The user replaced this plan's Rust, two-frontend and fixed 50-module target with a new general AI Gateway implemented in a separate repository using Go plus one React/TypeScript/Tailwind Admin application. Account Runtime is now one complete provider module behind versioned contracts.
 
 No source implementation started under this plan. All target-specific implementation statements below are preserved as a historical snapshot and must not be executed. The [Greenfield AI Gateway plan](../greenfield-ai-gateway/README.md) wins target architecture, technology, module, frontend, work-order, acceptance and cutover conflicts.
 
@@ -50,7 +50,7 @@ No intermediate module, dependency group or partial candidate is a delivered pro
 
 ## Product Boundary
 
-`kiro-rs` is a self-hosted, single-operator, single-trust-domain Anthropic/Claude Code compatibility gateway. Multiple API keys, Kiro credentials, external pools or replicas do not represent users or tenants.
+`account-runtime` is a self-hosted, single-operator, single-trust-domain Anthropic/Claude Code compatibility gateway. Multiple API keys, Account Runtime credentials, external pools or replicas do not represent users or tenants.
 
 The rewrite must not introduce tenant identity, tenant repositories, per-tenant authorization, billing, quotas or data partitioning. Multiple replicas are supported for availability/capacity inside the same trust domain. External clients/upstreams/URLs, PgSQL, Redis, logs and filesystem remain protocol, failure and security boundaries.
 
@@ -61,7 +61,7 @@ The rewrite must not introduce tenant identity, tenant repositories, per-tenant 
 - usage, prompt-cache evidence, credentials, proxy resources, external pools, model catalog, audit and maintenance jobs;
 - versioned secret encryption/key recovery, one weighted process resource governor, remote egress/media/PDF/tokenizer work, queues, bodies, caches, tasks, memory, FDs, connections, files, diagnostics and timeouts;
 - Admin command/query services, generated Rust-to-TypeScript contract, all eleven workflows in both maintained frontends and browser state/security/accessibility/responsive behavior;
-- bootstrap, producer-aware supervision/shutdown, honest readiness/health, real Claude Code, bounded real Kiro, contract/load/chaos/browser harnesses;
+- bootstrap, producer-aware supervision/shutdown, honest readiness/health, real Claude Code, bounded real Account Runtime, contract/load/chaos/browser harnesses;
 - Rust/frontend/dependency/Docker/CI artifacts, SBOM, signature/provenance, examples/runbooks, repository cleanup and release evidence;
 - removal of superseded Rust/UI/script/test/config/schema/key/artifact paths and post-deletion/post-contraction verification.
 
@@ -143,6 +143,6 @@ Three reviewed analysis-only documents were deleted with Git recovery records; t
 
 ## Current Evidence
 
-No modernization `EVID-*` record exists. No Rust/frontend build, Docker run, PgSQL/Redis drill, load/chaos test, real Kiro request, real Claude Code session, browser E2E, migration rehearsal, final cutover or rollback has been run for this accepted plan. Planning readiness is not implementation or performance evidence.
+No modernization `EVID-*` record exists. No Rust/frontend build, Docker run, PgSQL/Redis drill, load/chaos test, real Account Runtime request, real Claude Code session, browser E2E, migration rehearsal, final cutover or rollback has been run for this accepted plan. Planning readiness is not implementation or performance evidence.
 
 No modernization `implementation-status.md` exists while source implementation has not started. Create it when implementation actually begins and keep it as a short handoff for the one complete program.

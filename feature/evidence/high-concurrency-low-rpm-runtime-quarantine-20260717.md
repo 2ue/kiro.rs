@@ -29,9 +29,9 @@ reservation_released=true
 
 该 scope 的两个 test filter 使用了短名称并附带 `--exact`，实际均为 `running 0 tests`，不得记为行为通过。
 
-Scope `runtime-quarantine-focused-r2` 使用了错误模块前缀 `kiro::token_manager::manager_tests`，两个 filter 仍为 `running 0 tests`。该 scope 仅证明 test binary 可链接，`size_kib=1675412`，退出 `removed=true / reservation_released=true`。
+Scope `runtime-quarantine-focused-r2` 使用了错误模块前缀 `account-runtime::token_manager::manager_tests`，两个 filter 仍为 `running 0 tests`。该 scope 仅证明 test binary 可链接，`size_kib=1675412`，退出 `removed=true / reservation_released=true`。
 
-真实模块由 `src/kiro/token_manager/manager.rs` 的 `#[path = "manager_tests.rs"] mod tests;` 定义，所以精确前缀是 `kiro::token_manager::manager::tests`。
+真实模块由 `src/local_upstream_impl/token_manager/manager.rs` 的 `#[path = "manager_tests.rs"] mod tests;` 定义，所以精确前缀是 `account-runtime::token_manager::manager::tests`。
 
 ## 有效聚焦测试
 
@@ -39,11 +39,11 @@ Scope `runtime-quarantine-focused-r3`，Rust 1.92.0：
 
 | Exact filter | Cargo count | 内部轮次 | 结果 |
 | --- | ---: | ---: | --- |
-| `kiro::token_manager::manager::tests::non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five_rounds` | 1 | 5 | PASS |
-| `kiro::token_manager::manager::tests::forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_five_rounds` | 1 | 5 | PASS |
-| `kiro::token_manager::manager::tests::test_global_capacity_limits_dispatch_and_bounds_wait_queue` | 1 | 1 | PASS |
-| `kiro::token_manager::manager::tests::test_fail_fast_global_capacity_full_returns_without_queueing` | 1 | 1 | PASS |
-| `kiro::token_manager::manager::tests::test_local_pool_route_state_auto_heals_too_many_failures` | 1 | 1 | PASS |
+| `account-runtime::token_manager::manager::tests::non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five_rounds` | 1 | 5 | PASS |
+| `account-runtime::token_manager::manager::tests::forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_five_rounds` | 1 | 5 | PASS |
+| `account-runtime::token_manager::manager::tests::test_global_capacity_limits_dispatch_and_bounds_wait_queue` | 1 | 1 | PASS |
+| `account-runtime::token_manager::manager::tests::test_fail_fast_global_capacity_full_returns_without_queueing` | 1 | 1 | PASS |
+| `account-runtime::token_manager::manager::tests::test_local_pool_route_state_auto_heals_too_many_failures` | 1 | 1 | PASS |
 
 每个命令均明确输出：
 
@@ -80,7 +80,7 @@ Scope `runtime-quarantine-patch-semantics-r4`：
 | `non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five_rounds` | 1 | 5 | PASS；40 账号含自动健康 Patch |
 | `forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_five_rounds` | 1 | 5 | PASS |
 
-资源收尾：`size_kib=2017328`、`removed=true`、`reservation_released=true`。每个主 test binary 都明确输出 `running 1 test / 1 passed`；`kiro_loadtest` 的 `running 0 tests` 不计证据。
+资源收尾：`size_kib=2017328`、`removed=true`、`reservation_released=true`。每个主 test binary 都明确输出 `running 1 test / 1 passed`；`account_runtime_loadtest` 的 `running 0 tests` 不计证据。
 
 ## 2026-07-20 联合压力与 Redis chaos 补证
 

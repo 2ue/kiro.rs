@@ -18,7 +18,7 @@ Related: [Decision 009](../../decisions/009-single-program-modular-build-and-fin
 2. Module-focused evidence is produced during implementation, but only the complete target candidate can pass release/cutover gates.
 3. Legacy and target comparisons execute sequentially against independent state clones or consume the same immutable sanitized facts. They never duplicate a side effect.
 4. Production traffic mirroring to target code is prohibited. Deterministic fakes cover retry, partial-send, SSE, slow stream, faults, redirects and disconnects.
-5. Real Kiro operations are distinct bounded logical requests; real Claude Code sessions are isolated. Neither is used as high-volume load.
+5. Real Account Runtime operations are distinct bounded logical requests; real Claude Code sessions are isolated. Neither is used as high-volume load.
 6. Missing/unavailable metrics, skipped required cases, wrong process identity, incomplete task counts, corrupt artifacts or unexplained prior failures fail closed.
 7. Every run has source, binary, dependency, configuration, workload/corpus, isolated-resource, threshold, result, artifact, secret-scan and cleanup identity.
 8. A test is not accepted because it eventually passed after retries. Earlier failures remain and require adjudication.
@@ -110,7 +110,7 @@ Integration/fault/load tests cover:
 ## `G-A`: Request, Artifact, Media, Files, And Token Gate
 
 - Route/target selection occurs before target-specific heavy work.
-- Raw external paths execute zero full parse, media/PDF, Kiro conversion, payload guard and unconditional token-count operations.
+- Raw external paths execute zero full parse, media/PDF, Account Runtime conversion, payload guard and unconditional token-count operations.
 - Request facts and payload revisions invalidate correctly; parse/count/serialization/copy counts meet budgets.
 - Public/Admin transport obtains a governor admission handle before body allocation; `Content-Length` reservation, chunked incremental upgrades and `BoundedRawBody` rejection/release paths are exact.
 - JSON depth, tools/messages/content/schema cardinality, source count, per-source/aggregate/transform bytes and scoped handles follow decisions 010-011.
@@ -131,10 +131,10 @@ Integration/fault/load tests cover:
 
 ## `G-P`: Upstream, Retry, Protocol, Response, And Backpressure Gate
 
-- Kiro and external prepared request, URL/path, safe headers and response facts match golden vectors.
+- Account Runtime and external prepared request, URL/path, safe headers and response facts match golden vectors.
 - External raw retains accepted byte/header/event semantics; normalized paths retain accepted transformation semantics.
-- Kiro/external success/error/stream bodies enforce 32/64 MiB and 64 KiB error-prefix limits incrementally, including chunked/no-length/slow bodies.
-- Kiro client cache stays within 256 entries, 10-minute idle retirement, active protection and secret-safe keys under churn.
+- Account Runtime/external success/error/stream bodies enforce 32/64 MiB and 64 KiB error-prefix limits incrementally, including chunked/no-length/slow bodies.
+- Account Runtime client cache stays within 256 entries, 10-minute idle retirement, active protection and secret-safe keys under churn.
 - External destination/redirect/rebinding/proxy-DNS and cross-origin credential rules fail closed.
 - Connect-before-send, partial/unknown send, response, timeout/reset, malformed/truncated, cancellation and completion facts classify correctly.
 - Ambiguous POST is not retried; any idempotency claim is proven for key scope/retention/payload binding.
@@ -142,7 +142,7 @@ Integration/fault/load tests cover:
 - SSE content/event order, thinking/tools/cache/usage/errors and stream/non-stream behavior match fixtures.
 - Slow/stopped readers, disconnects and cancellation bound buffers/tasks/connections and still complete terminal obligations.
 
-## `G-KIRO`: Low-Volume Real Kiro Gate
+## `G-ACCOUNT_RUNTIME`: Low-Volume Real Account Runtime Gate
 
 Run only after deterministic fake transport gates pass. Use an isolated accepted profile, distinct logical requests/attempt IDs, sanitized metadata and decision-010 maximum 20 requests or a lower account cap.
 
@@ -224,7 +224,7 @@ There is one production activation boundary. Percentage or stable-hash selection
 ### Preconditions
 
 - all 50 modules are `Verified In Candidate`;
-- `G-S`, `G-C`, `G-SCH`, `G-U`, `G-A`, `G-DIAG`, `G-P`, `G-KIRO`, `G-CLI`, `G-UI`, `G-OPS`, `G-PERF`, `G-DEL`, `G-EVID` and `G-SUP` pass for one frozen digest;
+- `G-S`, `G-C`, `G-SCH`, `G-U`, `G-A`, `G-DIAG`, `G-P`, `G-ACCOUNT_RUNTIME`, `G-CLI`, `G-UI`, `G-OPS`, `G-PERF`, `G-DEL`, `G-EVID` and `G-SUP` pass for one frozen digest;
 - full migration and previous-binary profiles, backup/WAL checkpoint, Redis reconciliation, evidence manifest and rollback artifact are verified;
 - exact cutover and whole-system rollback dress rehearsal passes in a production-shaped isolated environment.
 
@@ -309,4 +309,4 @@ No reviewer name, accountable person, due date or calendar estimate is required.
 
 ## Current Verification State
 
-All gate specifications are accepted. No Rust/frontend build, storage drill, Docker run, browser test, load/chaos run, real Kiro request, real Claude Code session, migration rehearsal, cutover or rollback has been performed for this modernization plan. Every gate remains Not Run and production cutover remains Not Ready.
+All gate specifications are accepted. No Rust/frontend build, storage drill, Docker run, browser test, load/chaos run, real Account Runtime request, real Claude Code session, migration rehearsal, cutover or rollback has been performed for this modernization plan. Every gate remains Not Run and production cutover remains Not Ready.

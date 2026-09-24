@@ -11,6 +11,7 @@ use crate::local_upstream_impl::parser::error::ParseResult;
 use crate::local_upstream_impl::parser::frame::Frame;
 
 use super::base::EventPayload;
+pub use crate::anthropic::cache::MetadataTokenUsage;
 
 /// Native reasoning/thinking event.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -27,50 +28,6 @@ pub struct ReasoningContentEvent {
 impl EventPayload for ReasoningContentEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
         frame.payload_as_json()
-    }
-}
-
-/// Token usage details reported by `metadataEvent`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct MetadataTokenUsage {
-    #[serde(default)]
-    pub uncached_input_tokens: i32,
-    #[serde(default)]
-    pub output_tokens: i32,
-    #[serde(default)]
-    pub total_tokens: i32,
-    #[serde(default)]
-    pub cache_read_input_tokens: i32,
-    #[serde(default)]
-    pub cache_write_input_tokens: i32,
-}
-
-impl MetadataTokenUsage {
-    pub fn input_tokens(&self) -> i32 {
-        self.uncached_input_tokens
-    }
-
-    /// Metadata can arrive in both `metadataEvent` and
-    /// `messageMetadataEvent`. Some upstream versions only populate a subset
-    /// of fields in the later event, so zero values must not erase an earlier
-    /// positive measurement.
-    pub fn merge_positive_from(&mut self, newer: &Self) {
-        if newer.uncached_input_tokens > 0 {
-            self.uncached_input_tokens = newer.uncached_input_tokens;
-        }
-        if newer.output_tokens > 0 {
-            self.output_tokens = newer.output_tokens;
-        }
-        if newer.total_tokens > 0 {
-            self.total_tokens = newer.total_tokens;
-        }
-        if newer.cache_read_input_tokens > 0 {
-            self.cache_read_input_tokens = newer.cache_read_input_tokens;
-        }
-        if newer.cache_write_input_tokens > 0 {
-            self.cache_write_input_tokens = newer.cache_write_input_tokens;
-        }
     }
 }
 

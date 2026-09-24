@@ -111,11 +111,11 @@ Routing is a two-stage decision:
 
 The availability input is a batched scheduler snapshot, not a long-lived `local_available` boolean. Model eligibility, enabled state, cooldown, RPM, concurrency, exclusions, warmup, proxy validity, and queue limits remain explicit facts.
 
-Target selection precedes target-specific body processing. A local preflight failure that qualifies for external raw fallback must not first pay for Kiro conversion, remote media materialization, token counting, or payload shaping.
+Target selection precedes target-specific body processing. A local preflight failure that qualifies for external raw fallback must not first pay for Account Runtime conversion, remote media materialization, token counting, or payload shaping.
 
 ### Target-Specific Preparation
 
-#### Local Kiro
+#### Local Account Runtime
 
 ```text
 canonical Anthropic request
@@ -123,11 +123,11 @@ canonical Anthropic request
 -> thinking trigger and compatibility policy
 -> budgeted file/remote source materialization
 -> local model resolution
--> Anthropic-to-Kiro conversion
+-> Anthropic-to-Account Runtime conversion
 -> tool/schema/pairing compatibility stages
 -> protocol repair and configured payload shaping
 -> final serialization for the current payload revision
--> Kiro upstream adapter
+-> Account Runtime upstream adapter
 ```
 
 The current request-body capability modules remain the characterization source for compatibility defaults while the target-only candidate is built. The target plan changes orchestration and authority, not behavior by assumption.
@@ -193,7 +193,7 @@ sequenceDiagram
     participant Repo as Credential snapshot repository
     participant Redis as Redis scheduler state
     participant Core as Pure SchedulerCore
-    participant Upstream as Kiro upstream
+    participant Upstream as Account Runtime upstream
 
     App->>Coord: acquire DispatchRequest
     Coord->>Repo: read immutable eligible static snapshot
@@ -332,7 +332,7 @@ flowchart LR
     D -- remote --> F --> G
 ```
 
-Token counting is a distinct use case. It does not acquire a Kiro credential lease or enter Messages retry logic. Remote or blocking counters use their own concurrency, byte, queue, and timeout budgets. Client construction and body cloning are not request-local side effects when reuse is possible.
+Token counting is a distinct use case. It does not acquire a Account Runtime credential lease or enter Messages retry logic. Remote or blocking counters use their own concurrency, byte, queue, and timeout budgets. Client construction and body cloning are not request-local side effects when reuse is possible.
 
 ## Files Flow
 

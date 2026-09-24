@@ -63,7 +63,7 @@ Any recovered material remains historical until it is classified and linked from
 
 ## Inbound Reference Audit
 
-Before the move, the refactor plan had no repository inbound reference. The dashboard collection had one collection-external literal reference in `docs/prompt-cache-scope-and-kiro-rs-tool-parity.md`; it is updated to this archive index. Internal dashboard links remain relative within the preserved subdirectory.
+Before the move, the refactor plan had no repository inbound reference. The dashboard collection had one collection-external literal reference in `docs/prompt-cache-scope-and-account-runtime-tool-parity.md`; it is updated to this archive index. Internal dashboard links remain relative within the preserved subdirectory.
 
 The missing companion literals were replaced with this index rather than reviving deleted files. A post-move search must find old UI plan paths only in provenance or recovery text.
 

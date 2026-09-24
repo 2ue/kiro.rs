@@ -1,6 +1,6 @@
 # Feature Workspace
 
-Role: Active issue/evidence workspace for current `kiro.rs` investigations, validations, and release records
+Role: Active issue/evidence workspace for current `account-runtime` investigations, validations, and release records
 
 Status: Current workspace index as of 2026-07-28
 

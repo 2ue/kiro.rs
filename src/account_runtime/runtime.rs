@@ -5,11 +5,14 @@
 //! account runtime boundary instead of importing the legacy scheduler manager
 //! directly.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::response::Response;
 
-pub type AccountRuntimeManager = crate::external_pool::ExternalPoolManager;
+use crate::storage::{postgres::PostgresStore, redis_cache::RedisStore};
+
+#[derive(Clone)]
+pub struct AccountRuntimeManager(crate::external_pool::ExternalPoolManager);
 
 pub type AccountRuntimeConfig = crate::model::config::ExternalPoolsConfig;
 
@@ -51,6 +54,188 @@ pub type AccountLatencyTraceState = crate::external_pool::ExternalLatencyTraceSt
 
 pub(crate) type UpstreamAccountEligibility = crate::external_pool::ExternalPoolEligibility;
 
+pub type AccountReleaseDrainReport = crate::external_pool::ExternalPoolReleaseDrainReport;
+
+impl AccountRuntimeManager {
+    pub fn new(postgres: Arc<PostgresStore>, redis: Arc<RedisStore>) -> Self {
+        Self(crate::external_pool::ExternalPoolManager::new(
+            postgres, redis,
+        ))
+    }
+
+    pub async fn drain_release_intents(
+        &self,
+        drain_timeout: Duration,
+    ) -> AccountReleaseDrainReport {
+        self.0.drain_release_intents(drain_timeout).await
+    }
+
+    pub fn invalidate_account_runtime_policy_state(&self) {
+        self.0.invalidate_account_runtime_policy_state();
+    }
+
+    pub fn notify_account_runtime_data_changed_with_local_account(
+        &self,
+        reason: &'static str,
+        account: &UpstreamAccountStorageRecord,
+    ) {
+        self.0
+            .notify_account_runtime_data_changed_with_local_account(reason, account);
+    }
+
+    pub fn notify_account_runtime_account_deleted(&self, reason: &'static str, account_id: u64) {
+        self.0
+            .notify_account_runtime_account_deleted(reason, account_id);
+    }
+
+    pub fn observe_account_runtime_data_event(&self, payload: &str) -> bool {
+        self.0.observe_account_runtime_data_event(payload)
+    }
+
+    pub async fn status_records(
+        &self,
+        config: &AccountRuntimeConfig,
+    ) -> anyhow::Result<Vec<UpstreamAccountStatusRecord>> {
+        self.0.status(config).await
+    }
+
+    pub async fn clear_account_cooldowns(&self, account_id: u64) -> anyhow::Result<usize> {
+        self.0.clear_pool_cooldowns(account_id).await
+    }
+
+    pub fn cached_eligible_account_for_route_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        model: &str,
+    ) -> bool {
+        self.0
+            .has_cached_eligible_pool_for_route_and_model(config, endpoint, model)
+    }
+
+    pub async fn eligible_account_for_route_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        model: &str,
+    ) -> bool {
+        self.0
+            .has_eligible_pool_for_route_and_model(config, endpoint, model)
+            .await
+    }
+
+    pub fn cached_eligible_account_for_route_body_mode_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        body_mode: AccountRequestBodyMode,
+        model: &str,
+    ) -> bool {
+        self.0
+            .has_cached_eligible_pool_for_route_body_mode_and_model(
+                config, endpoint, body_mode, model,
+            )
+    }
+
+    pub async fn eligible_account_for_route_body_mode_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        body_mode: AccountRequestBodyMode,
+        model: &str,
+    ) -> bool {
+        self.0
+            .has_eligible_pool_for_route_body_mode_and_model(config, endpoint, body_mode, model)
+            .await
+    }
+
+    pub fn cached_immediately_available_account_for_route_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        model: &str,
+    ) -> bool {
+        self.0
+            .has_cached_immediately_available_pool_for_route_and_model(config, endpoint, model)
+    }
+
+    pub async fn immediately_available_account_for_route_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        model: &str,
+        max_wait: Duration,
+    ) -> bool {
+        self.0
+            .has_immediately_available_pool_for_route_and_model(config, endpoint, model, max_wait)
+            .await
+    }
+
+    pub fn cached_immediately_available_account_for_route_body_mode_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        body_mode: AccountRequestBodyMode,
+        model: &str,
+    ) -> bool {
+        self.0
+            .has_cached_immediately_available_pool_for_route_body_mode_and_model(
+                config, endpoint, body_mode, model,
+            )
+    }
+
+    pub async fn immediately_available_account_for_route_body_mode_and_model(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        body_mode: AccountRequestBodyMode,
+        model: &str,
+        max_wait: Duration,
+    ) -> bool {
+        self.0
+            .has_immediately_available_pool_for_route_body_mode_and_model(
+                config, endpoint, body_mode, model, max_wait,
+            )
+            .await
+    }
+
+    pub async fn account_direct_policy_reason(
+        &self,
+        config: &AccountRuntimeConfig,
+        endpoint: &str,
+        model: &str,
+    ) -> Option<String> {
+        self.0.direct_policy_reason(config, endpoint, model).await
+    }
+
+    pub async fn record_local_credential_source_failure(
+        &self,
+        config: &AccountRuntimeConfig,
+        credential_id: Option<u64>,
+        reason: &str,
+    ) -> Option<crate::storage::redis_cache::LocalPoolCircuitState> {
+        self.0
+            .record_local_pool_failure(config, credential_id, reason)
+            .await
+    }
+
+    pub async fn forward_account_with_failover(
+        &self,
+        config: AccountRuntimeConfig,
+        route: AccountRouteRequest,
+    ) -> Response {
+        self.0.forward_with_failover(config, route).await
+    }
+
+    pub async fn forward_account_with_failover_result(
+        &self,
+        config: AccountRuntimeConfig,
+        route: AccountRouteRequest,
+    ) -> AccountForwardOutcome {
+        self.0.forward_with_failover_result(config, route).await
+    }
+}
+
 pub(crate) fn mask_upstream_account_key(value: &str) -> String {
     crate::external_pool::mask_external_pool_key(value)
 }
@@ -65,14 +250,14 @@ pub async fn load_upstream_account_status_records(
     manager: &AccountRuntimeManager,
     config: &AccountRuntimeConfig,
 ) -> anyhow::Result<Vec<UpstreamAccountStatusRecord>> {
-    manager.status(config).await
+    manager.status_records(config).await
 }
 
 pub async fn clear_upstream_account_cooldowns(
     manager: &AccountRuntimeManager,
     account_id: u64,
 ) -> anyhow::Result<usize> {
-    manager.clear_pool_cooldowns(account_id).await
+    manager.clear_account_cooldowns(account_id).await
 }
 
 pub fn cached_eligible_account_for_route_and_model(
@@ -81,7 +266,7 @@ pub fn cached_eligible_account_for_route_and_model(
     endpoint: &str,
     model: &str,
 ) -> bool {
-    manager.has_cached_eligible_pool_for_route_and_model(config, endpoint, model)
+    manager.cached_eligible_account_for_route_and_model(config, endpoint, model)
 }
 
 pub async fn eligible_account_for_route_and_model(
@@ -91,7 +276,7 @@ pub async fn eligible_account_for_route_and_model(
     model: &str,
 ) -> bool {
     manager
-        .has_eligible_pool_for_route_and_model(config, endpoint, model)
+        .eligible_account_for_route_and_model(config, endpoint, model)
         .await
 }
 
@@ -103,7 +288,7 @@ pub fn cached_eligible_account_for_route_body_mode_and_model(
     model: &str,
 ) -> bool {
     manager
-        .has_cached_eligible_pool_for_route_body_mode_and_model(config, endpoint, body_mode, model)
+        .cached_eligible_account_for_route_body_mode_and_model(config, endpoint, body_mode, model)
 }
 
 pub async fn eligible_account_for_route_body_mode_and_model(
@@ -114,7 +299,7 @@ pub async fn eligible_account_for_route_body_mode_and_model(
     model: &str,
 ) -> bool {
     manager
-        .has_eligible_pool_for_route_body_mode_and_model(config, endpoint, body_mode, model)
+        .eligible_account_for_route_body_mode_and_model(config, endpoint, body_mode, model)
         .await
 }
 
@@ -124,7 +309,7 @@ pub fn cached_immediately_available_account_for_route_and_model(
     endpoint: &str,
     model: &str,
 ) -> bool {
-    manager.has_cached_immediately_available_pool_for_route_and_model(config, endpoint, model)
+    manager.cached_immediately_available_account_for_route_and_model(config, endpoint, model)
 }
 
 pub async fn immediately_available_account_for_route_and_model(
@@ -135,7 +320,7 @@ pub async fn immediately_available_account_for_route_and_model(
     max_wait: Duration,
 ) -> bool {
     manager
-        .has_immediately_available_pool_for_route_and_model(config, endpoint, model, max_wait)
+        .immediately_available_account_for_route_and_model(config, endpoint, model, max_wait)
         .await
 }
 
@@ -146,7 +331,7 @@ pub fn cached_immediately_available_account_for_route_body_mode_and_model(
     body_mode: AccountRequestBodyMode,
     model: &str,
 ) -> bool {
-    manager.has_cached_immediately_available_pool_for_route_body_mode_and_model(
+    manager.cached_immediately_available_account_for_route_body_mode_and_model(
         config, endpoint, body_mode, model,
     )
 }
@@ -160,7 +345,7 @@ pub async fn immediately_available_account_for_route_body_mode_and_model(
     max_wait: Duration,
 ) -> bool {
     manager
-        .has_immediately_available_pool_for_route_body_mode_and_model(
+        .immediately_available_account_for_route_body_mode_and_model(
             config, endpoint, body_mode, model, max_wait,
         )
         .await
@@ -172,7 +357,9 @@ pub async fn account_direct_policy_reason(
     endpoint: &str,
     model: &str,
 ) -> Option<String> {
-    manager.direct_policy_reason(config, endpoint, model).await
+    manager
+        .account_direct_policy_reason(config, endpoint, model)
+        .await
 }
 
 pub async fn forward_account_with_failover(
@@ -180,7 +367,7 @@ pub async fn forward_account_with_failover(
     config: AccountRuntimeConfig,
     route: AccountRouteRequest,
 ) -> Response {
-    manager.forward_with_failover(config, route).await
+    manager.forward_account_with_failover(config, route).await
 }
 
 pub async fn forward_account_with_failover_result(
@@ -188,7 +375,9 @@ pub async fn forward_account_with_failover_result(
     config: AccountRuntimeConfig,
     route: AccountRouteRequest,
 ) -> AccountForwardOutcome {
-    manager.forward_with_failover_result(config, route).await
+    manager
+        .forward_account_with_failover_result(config, route)
+        .await
 }
 
 pub fn upstream_account_models_url(base_url: &str) -> Result<reqwest::Url, url::ParseError> {

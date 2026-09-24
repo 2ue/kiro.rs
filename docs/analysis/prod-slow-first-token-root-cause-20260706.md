@@ -61,8 +61,8 @@
 | `dispatchMaxQueuedRequests` | `300` | 本地派发队列上限 |
 | `credentialRetryMaxAttempts` | `100` | 重试上限过高，容易放大上游压力 |
 | `credentialRateLimitCooldownSecs` | `30` | 429 后短冷却 |
-| `kiroUpstreamResponseTimeoutSecs` | `600` | 上游整体等待很长 |
-| `kiroUpstreamStreamIdleTimeoutSecs` | `180` | 流式 idle 等待很长 |
+| `localUpstreamResponseTimeoutSecs` | `600` | 上游整体等待很长 |
+| `localUpstreamStreamIdleTimeoutSecs` | `180` | 流式 idle 等待很长 |
 | `payloadGuardEnabled` | `true` | payload guard 开启 |
 | `payloadGuardMode` | `on_too_long` | 输入过长后裁剪重试 |
 | `payloadGuardMaxBytes` | `460800` | 裁剪预算 |
@@ -77,7 +77,7 @@
 
 代码里账号级 `maxConcurrentRequests` 会覆盖全局值，而不是取全局和账号配置的较小值：
 
-- `src/kiro/token_manager/capacity.rs`
+- `src/local_upstream_impl/token_manager/capacity.rs`
   - `effective_max_concurrent_requests(entry, global)` 返回 `entry.credentials.max_concurrent_requests.unwrap_or(global)`。
   - `entry_has_concurrency_capacity` 只判断当前账号 in-flight 是否小于该有效并发。
 
@@ -239,7 +239,7 @@ Payload guard 是高并发大 body 下的 CPU 风险点，尤其生产里存在�
 - 本地凭据/外部池调度等待。
 - 本地构造上游请求。
 - 代理到上游的连接、TLS、HTTP/2/HTTP/1.1 请求发送等待。
-- 上游网关、Kiro 服务或模型服务在返回 HTTP response header 前的排队和预处理。
+- 上游网关、Account Runtime 服务或模型服务在返回 HTTP response header 前的排队和预处理。
 - 如果本次请求前面发生过 retry，这个值可能包含前面失败 attempt 的累计等待，具体要结合 `credentialAttempts` 看。
 
 它通常不包含：
@@ -336,7 +336,7 @@ Payload guard 是高并发大 body 下的 CPU 风险点，尤其生产里存在�
 - 本地调度排队。
 - 凭据或外部池容量等待。
 - 上游连接建立和请求发送。
-- 上游 Kiro 网关排队。
+- 上游 Account Runtime 网关排队。
 - 模型服务预填充、cache 处理、工具 schema/context 处理。
 - 如果有 retry，则还可能包含之前失败 attempt 的时间。
 

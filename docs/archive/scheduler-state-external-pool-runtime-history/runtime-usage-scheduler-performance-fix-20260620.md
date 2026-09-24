@@ -4,12 +4,12 @@
 
 本次处理覆盖三类已经在现网和本地代码中确认的问题：
 
-1. `kiro.rs` usage 页面展示的模拟 cache 数字，与下游 `sub2api` 看到的 Claude 标准 `usage` 字段不一致。
+1. `account-runtime` usage 页面展示的模拟 cache 数字，与下游 `sub2api` 看到的 Claude 标准 `usage` 字段不一致。
 2. 运行一段时间后出现内存/Redis 压力，服务变慢甚至卡死。
 3. 调度与 usage 写入路径存在同步等待 Redis/PgSQL 的热路径，突发并发、凭据异常、队列堆积时会放大阻塞。
 4. 0.0.55 现网回滚监控后确认 Redis 不是主故障点，日志压力集中在 `payload_guard` 和 `Invalid tool use format`，说明大历史 payload 修复链路仍有 CPU 放大。
 
-本次只改 `kiro.rs`，不改 `sub2api`。
+本次只改 `account-runtime`，不改 `sub2api`。
 
 ## usage 下游口径
 
@@ -20,7 +20,7 @@
 - `cache_creation_input_tokens`
 - `cache_read_input_tokens`
 
-因此 `kiro.rs` 对下游返回的 SSE/HTTP usage 必须与本系统最终记录/页面展示的模拟 cache 口径一致。不能让页面记录一套数字、返回给下游另一套数字。
+因此 `account-runtime` 对下游返回的 SSE/HTTP usage 必须与本系统最终记录/页面展示的模拟 cache 口径一致。不能让页面记录一套数字、返回给下游另一套数字。
 
 改造后：
 
@@ -58,7 +58,7 @@
 
 验证点：
 
-- `KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379 cargo test storage::redis_cache::tests -- --nocapture`
+- `ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379 cargo test storage::redis_cache::tests -- --nocapture`
 - 新增/覆盖测试：`redis_usage_record_snapshot_trims_orphan_items_with_index`
 
 ## 调度热路径阻塞
@@ -161,7 +161,7 @@
 
 已修复点：
 
-- 本地 `/v1/messages` 和 `/cc/v1/messages` 不再对每个请求无条件执行 `breakdown_kiro_request`。
+- 本地 `/v1/messages` 和 `/cc/v1/messages` 不再对每个请求无条件执行 `breakdown_account-runtime_request`。
 - 小且未被 payload guard 修改的成功请求只保留基础 guard report，不再额外遍历并 JSON 序列化大历史来生成 payload breakdown。
 - 大包、被修改、仍超限、接近阈值的请求仍会生成 payload breakdown，用于日志和 usage 诊断。
 - 外部池 guarded route 同样改成按需生成 `breakdown_anthropic_messages_request`。
@@ -196,7 +196,7 @@ CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test recorder_
 CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test token_manager
 CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test payload_guard
 CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test validate_tool_pairing
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379 CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test storage::redis_cache::tests -- --nocapture
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379 CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test storage::redis_cache::tests -- --nocapture
 CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test
 ```
 
@@ -219,8 +219,8 @@ CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test
 - `同步 usage 存储操作耗时较长`
 - `PgSQL usage 批量写入耗时较长`
 - `Redis 调度热路径不可用，本进程暂时降级为本地调度`
-- `Kiro payload guard timing`
-- `Kiro payload byte breakdown skipped for small unmodified request`
+- `Account Runtime payload guard timing`
+- `Account Runtime payload byte breakdown skipped for small unmodified request`
 
 重点观察指标：
 
@@ -244,4 +244,4 @@ CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo test
 6. 突发高并发下 Redis 暂停或变慢，确认请求不会长时间卡在调度。
 7. 突发凭据不可用，确认本地状态立即禁用/冷却，PgSQL 后台落库。
 8. usage 高速写入，确认 PgSQL rollup 和 usage dashboard 数字一致。
-9. 下游 `sub2api` 读取 SSE/HTTP usage，确认四个 Claude 标准字段等于 `kiro.rs` usage 页面最终口径。
+9. 下游 `sub2api` 读取 SSE/HTTP usage，确认四个 Claude 标准字段等于 `account-runtime` usage 页面最终口径。

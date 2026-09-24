@@ -11,7 +11,7 @@ Status: `pass / current-project isolated Redis / latest accepted r6 / release bl
   latency, disable/re-enable, bounded control bodies, and signal cleanup.
 - `feature/tests/run-scheduler-redis-chaos-validation.mjs` requires an explicit
   loopback Redis URL naming an empty nonzero DB (`1..15`) and
-  `KIRO_RS_TEST_REDIS_ISOLATED=1`. It refuses port `9022`, refuses a nonempty
+  `ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1`. It refuses port `9022`, refuses a nonempty
   database, runs each Cargo command through `run-cargo-scoped.sh`, and flushes
   only the confirmed empty DB after the run.
 - This validation started no Docker container and never inspected or touched the
@@ -21,9 +21,9 @@ Status: `pass / current-project isolated Redis / latest accepted r6 / release bl
 ## Command and identity
 
 ```text
-KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL=redis://127.0.0.1:26379/15 \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
-KIRO_SCHEDULER_CHAOS_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL=redis://127.0.0.1:26379/15 \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS=3 \
 node feature/tests/run-scheduler-redis-chaos-validation.mjs
 ```
 
@@ -163,8 +163,8 @@ live Redis checks opt-in. Without live URLs it ran 16/16 pure Node cases and
 skipped 12 live cases. With these caller-confirmed current-project databases:
 
 ```text
-KIRO_SCHEDULER_CHAOS_CONTRACT_EMPTY_REDIS_URL=redis://127.0.0.1:26379/15
-KIRO_SCHEDULER_CHAOS_CONTRACT_NONEMPTY_REDIS_URL=redis://127.0.0.1:26379/14
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_CONTRACT_EMPTY_REDIS_URL=redis://127.0.0.1:26379/15
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_CONTRACT_NONEMPTY_REDIS_URL=redis://127.0.0.1:26379/14
 node --test feature/tests/run-scheduler-redis-chaos-validation.contract.test.mjs
 ```
 
@@ -183,7 +183,7 @@ the complete contract passed 28/28:
 
 The contract invokes no Cargo command, creates no scoped target/reservation,
 does not start Docker, and does not probe the existing 9022 listener. The final
-residue check found no `kiro-scheduler-chaos-*`/`kiro-chaos-contract-*` temp
+residue check found no `account-runtime-scheduler-chaos-*`/`account-runtime-chaos-contract-*` temp
 directory and no `redis-chaos-proxy` or scheduler-chaos runner process. On this
 macOS host the final post-hardening live rerun took 126.3 seconds because repeated `lsof`
 ownership/release checks take roughly 1.5 seconds each; that is harness wall
@@ -196,5 +196,5 @@ lease-cleanup, and simultaneous usage-writer/scheduler fault matrix represented
 above. It also closes the deterministic Redis response-error
 commit-unknown-amplification bug found in `r5`. It does not close
 multi-instance Redis/PG fencing, external-pool takeover attribution,
-production-cardinality Redis contention, official Kiro upstream, UI/browser,
+production-cardinality Redis contention, official Account Runtime upstream, UI/browser,
 upgrade, or final release inventory.

@@ -60,7 +60,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
   - 内置默认只在路径没有显式配置时补齐；显式 `/na` 配置不会被迁移覆盖。
   - `migrate_builtin_no_cache_routes()` 不再把 `/na` 写回无缓存，也不再删除显式 usage 覆盖。
 - `ui/src/features/runtime/runtime-sections.tsx` 与 `admin-ui/src/components/runtime-config-panel.tsx`
-  - `/na` 的页面策略由当前配置合并结果决定，可切换无缓存、高缓存或 Kiro-RS Tool。
+  - `/na` 的页面策略由当前配置合并结果决定，可切换无缓存、高缓存或 Account Runtime-RS Tool。
 
 ### P1: 内置路径缓存命名空间特判（已修复）
 
@@ -124,7 +124,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 
 ### 前端修复
 
-1. “缓存策略与路径绑定”允许 `/na` 切换到高缓存或 Kiro-RS Tool。
+1. “缓存策略与路径绑定”允许 `/na` 切换到高缓存或 Account Runtime-RS Tool。
 2. 默认策略仍可展示内置建议，但不把建议作为不可变行为。
 3. “提示词引导”文案从“仅 /cc 路径”改为“按路径规则”，并暴露路径规则配置。
 4. 路径归一化和别名处理集中到通用规则，避免每个内置路径散落判断。
@@ -177,7 +177,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 - `cargo fmt --check`：通过。
 - `cargo check --all-targets --locked`：通过。
 - `feature/tests/run-cargo-scoped.sh route-policy-handler-matrix -- cargo test --all-targets --locked builtin_routes_follow_runtime_cache_and_prompt_config_matrix -- --nocapture`：`1 passed / 0 failed`。
-- `cargo test --all-targets --locked`：主套件 `1864 passed / 0 failed / 6 ignored`，`kiro_loadtest` `31 passed / 0 failed`。
+- `cargo test --all-targets --locked`：主套件 `1864 passed / 0 failed / 6 ignored`，`account_runtime_loadtest` `31 passed / 0 failed`。
 - `pnpm --dir ui check && pnpm --dir ui build`：通过；仅保留既有 chunk size warning。
 - `pnpm --dir admin-ui build`：通过。
 - `node feature/tests/check-feature-docs.mjs`：`70` 份问题文档、`280` 条相对链接通过。
@@ -194,7 +194,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 - `routeNamespace` 显式开关决定缓存空间是否按入口独立，不由 `/v1`、`/cc`、`/ha`、`/na` 名称决定。
 - 提示词路径规则可命中 `/v1`、`/cc`、`/ha`、`/na` 和自定义 `/dfcache/team`，`messages` 与 `count_tokens` 使用同一规则。
 - 内置入口仍由 Axum 固定注册，但 handler wrapper 只传递真实入口，缓存、usage、提示词和外部池策略在运行时按配置解析。
-- `builtin_routes_follow_runtime_cache_and_prompt_config_matrix` 通过同一个 Axum handler + 假 Kiro 上游验证了配置矩阵：`/cc -> no_cache`、`/na -> current_high_cache` 且共享缓存空间、`/ha -> current_high_cache` 且独立缓存空间；只有 `/ha` 命中提示词引导；四个内置入口的 `count_tokens` 均保持本地处理。
+- `builtin_routes_follow_runtime_cache_and_prompt_config_matrix` 通过同一个 Axum handler + 假 Account Runtime 上游验证了配置矩阵：`/cc -> no_cache`、`/na -> current_high_cache` 且共享缓存空间、`/ha -> current_high_cache` 且独立缓存空间；只有 `/ha` 命中提示词引导；四个内置入口的 `count_tokens` 均保持本地处理。
 
 ## 回滚
 

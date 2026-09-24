@@ -16,9 +16,9 @@ Status: `v0.0.131` 已发布；post-release observation remains open
 当前明确阻断已解除。最终门禁：
 
 - Work commit: `b528ead` (`fix: harden runtime protocol and scheduler gates`)。
-- Final frozen `kiro-rs` SHA-256: `925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee`。
-- Final frozen `kiro_loadtest` SHA-256: `90babda7388aa93854cbbdb81c132cc436c07f46b0ea22973531b0a7ffb3aff1`。
-- Rust C0/release: `cargo +1.92.0 fmt --all -- --check`、`cargo +1.92.0 test --all-targets`（main `1750/0/6`，`kiro_loadtest 31/31`）和 `cargo +1.92.0 build --release --bins` 通过。
+- Final frozen `account-runtime` SHA-256: `925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee`。
+- Final frozen `account_runtime_loadtest` SHA-256: `90babda7388aa93854cbbdb81c132cc436c07f46b0ea22973531b0a7ffb3aff1`。
+- Rust C0/release: `cargo +1.92.0 fmt --all -- --check`、`cargo +1.92.0 test --all-targets`（main `1750/0/6`，`account_runtime_loadtest 31/31`）和 `cargo +1.92.0 build --release --bins` 通过。
 - Non-Cargo gates: feature docs 47 issue docs / 115 links、Node contracts `283 tests / 261 pass / 22 explicit skips / 0 fail`、`git diff --check` 均通过。
 - Build inventory: 删除可再生 repo `target/` 后最终 `targets=0 reservations=0 target_processes=0 blockers=0`。
 - Docker 动态验证按用户要求豁免，不记为 pass；既有 `127.0.0.1:9022` 未停止、重启或压测。

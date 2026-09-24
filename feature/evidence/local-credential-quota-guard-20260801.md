@@ -8,7 +8,7 @@ Related issue:
 
 ## Scope
 
-This evidence covers the focused fix for exhausted local Kiro API-key credentials that still had `disabled=false` while `credential_account_info` showed:
+This evidence covers the focused fix for exhausted local Account Runtime API-key credentials that still had `disabled=false` while `credential_account_info` showed:
 
 - `remaining <= 0`
 - `credit_remaining <= 0`
@@ -28,11 +28,11 @@ The validation was local and did not restart or modify the existing `127.0.0.1:9
 ## Commands
 
 ```bash
-feature/tests/run-cargo-scoped.sh quota-guard -- cargo test --bin kiro-rs quota_guard_
-KIRO_RS_REQUIRE_STORAGE_TESTS=1 KIRO_RS_TEST_POSTGRES_URL="<local config PgSQL URL>" feature/tests/run-cargo-scoped.sh reload-quota-guard-pg -- cargo test --bin kiro-rs reload_account_info_quota_guard_reselects_healthy_credential -- --nocapture
-feature/tests/run-cargo-scoped.sh provider-bad-request -- cargo test --bin kiro-rs bad_request_retry_matrix_bounds_real_provider_http_hits
-feature/tests/run-cargo-scoped.sh postgres-account-info -- cargo test --bin kiro-rs postgres_persists_runtime_config_credentials_stats_usage_and_pricing
-feature/tests/run-cargo-scoped.sh token-manager -- cargo test --bin kiro-rs kiro::token_manager
+feature/tests/run-cargo-scoped.sh quota-guard -- cargo test --bin account-runtime quota_guard_
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 ACCOUNT_RUNTIME_TEST_POSTGRES_URL="<local config PgSQL URL>" feature/tests/run-cargo-scoped.sh reload-quota-guard-pg -- cargo test --bin account-runtime reload_account_info_quota_guard_reselects_healthy_credential -- --nocapture
+feature/tests/run-cargo-scoped.sh provider-bad-request -- cargo test --bin account-runtime bad_request_retry_matrix_bounds_real_provider_http_hits
+feature/tests/run-cargo-scoped.sh postgres-account-info -- cargo test --bin account-runtime postgres_persists_runtime_config_credentials_stats_usage_and_pricing
+feature/tests/run-cargo-scoped.sh token-manager -- cargo test --bin account-runtime account-runtime::token_manager
 feature/tests/run-cargo-scoped.sh all-targets-test -- cargo test --all-targets --locked
 node --test feature/tests/*.test.mjs
 cd ui && npm run check
@@ -45,11 +45,11 @@ git diff --check
 ## Results
 
 - `quota_guard_`: `2 passed / 0 failed`.
-- `reload_account_info_quota_guard_reselects_healthy_credential`: `1 passed / 0 failed` with `KIRO_RS_REQUIRE_STORAGE_TESTS=1` against the local PgSQL endpoint through `PostgresStore::connect_test`, which creates and drops an isolated random `kiro_rs_test_<uuid>` schema.
+- `reload_account_info_quota_guard_reselects_healthy_credential`: `1 passed / 0 failed` with `ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1` against the local PgSQL endpoint through `PostgresStore::connect_test`, which creates and drops an isolated random `account_runtime_test_<uuid>` schema.
 - `bad_request_retry_matrix_bounds_real_provider_http_hits`: `1 passed / 0 failed`; the existing bad-request matrix still issues exactly bounded hits and does not retry generic, tool, image, malformed, or invalid-model 400s.
 - `postgres_persists_runtime_config_credentials_stats_usage_and_pricing`: `1 passed / 0 failed`; the joint credentials/runtime/account-info load contract is covered.
-- `kiro::token_manager`: `308 passed / 0 failed / 1541 filtered out`.
-- `cargo test --all-targets --locked`: main `1843 passed / 0 failed / 6 ignored`; `kiro_loadtest` `31 passed / 0 failed`.
+- `account-runtime::token_manager`: `308 passed / 0 failed / 1541 filtered out`.
+- `cargo test --all-targets --locked`: main `1843 passed / 0 failed / 6 ignored`; `account_runtime_loadtest` `31 passed / 0 failed`.
 - Node feature tests: `283 tests / 261 pass / 22 skipped / 0 fail`.
 - `ui` typecheck: passed.
 - `admin-ui` production build: passed.

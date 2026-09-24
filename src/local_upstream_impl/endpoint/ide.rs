@@ -1,11 +1,11 @@
 //! Local-upstream IDE-compatible endpoint.
 //!
-//! Matches the IDE-compatible AWS CodeWhisperer endpoints currently used by the
+//! Matches the IDE-compatible account-runtime endpoints currently used by the
 //! local upstream protocol:
-//! - API: `https://q.{api_region}.amazonaws.com/generateAssistantResponse`
-//! - MCP: `https://q.{api_region}.amazonaws.com/mcp`
+//! - API: `https://q.{api_region}.account-runtime.local/generateAssistantResponse`
+//! - MCP: `https://q.{api_region}.account-runtime.local/mcp`
 //!
-//! Request headers use the aws-sdk-js User-Agent shape. The request body may
+//! Request headers use the account-runtime-js User-Agent shape. The request body may
 //! receive a root-level `profileArn`.
 
 use reqwest::RequestBuilder;
@@ -36,7 +36,7 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        format!("q.{}.account-runtime.local", self.api_region(ctx))
     }
 
     fn base_url(&self, ctx: &RequestContext<'_>) -> String {
@@ -51,14 +51,14 @@ impl IdeEndpoint {
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+            "account-runtime-js/1.0.34 AccountRuntimeIDE-{}-{}",
             ctx.config.local_upstream_client_version, ctx.machine_id
         )
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            "account-runtime-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/account-runtime-streaming#1.0.34 m/E AccountRuntimeIDE-{}-{}",
             ctx.config.system_version,
             ctx.config.node_version,
             ctx.config.local_upstream_client_version,
@@ -103,16 +103,19 @@ impl LocalUpstreamEndpoint for IdeEndpoint {
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
-            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-account-runtime-optout", "true")
             .header(
-                "x-amzn-kiro-agent-mode",
+                "x-account-runtime-agent-mode",
                 resolve_agent_mode(ctx.credentials, ctx.config),
             )
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("x-account-runtime-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
+            .header(
+                "account-runtime-sdk-invocation-id",
+                Uuid::new_v4().to_string(),
+            )
+            .header("account-runtime-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if ctx.credentials.is_api_key_credential() {
@@ -126,15 +129,18 @@ impl LocalUpstreamEndpoint for IdeEndpoint {
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("x-account-runtime-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
+            .header(
+                "account-runtime-sdk-invocation-id",
+                Uuid::new_v4().to_string(),
+            )
+            .header("account-runtime-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
-            req = req.header("x-amzn-kiro-profile-arn", arn);
+            req = req.header("x-account-runtime-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
@@ -148,16 +154,19 @@ impl LocalUpstreamEndpoint for IdeEndpoint {
     fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
             .header("accept", "application/json")
-            .header("x-amzn-codewhisperer-optout", "true")
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("x-account-runtime-optout", "true")
+            .header("x-account-runtime-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
+            .header(
+                "account-runtime-sdk-invocation-id",
+                Uuid::new_v4().to_string(),
+            )
+            .header("account-runtime-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
-            req = req.header("x-amzn-kiro-profile-arn", arn);
+            req = req.header("x-account-runtime-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
@@ -272,12 +281,12 @@ mod tests {
     #[test]
     fn test_inject_profile_arn_with_some() {
         let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
+        let arn = Some("arn:account-runtime:us-east-1:123:profile/ABC".to_string());
         let result = inject_profile_arn(body, &arn);
         let json: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             json["profileArn"],
-            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+            "arn:account-runtime:us-east-1:123:profile/ABC"
         );
         assert_eq!(json["conversationState"]["conversationId"], "c1");
     }
@@ -618,7 +627,7 @@ mod tests {
         let json: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             json["profileArn"],
-            "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN"
+            "arn:account-runtime:eu-central-1:610548660232:profile/VNECVYCYYAWN"
         );
 
         let models_req = endpoint
@@ -628,7 +637,7 @@ mod tests {
         assert!(
             models_req
                 .headers()
-                .get("x-amzn-kiro-profile-arn")
+                .get("x-account-runtime-profile-arn")
                 .is_none()
         );
     }
@@ -659,7 +668,7 @@ mod tests {
 
         assert_eq!(
             headers
-                .get("x-amzn-kiro-agent-mode")
+                .get("x-account-runtime-agent-mode")
                 .and_then(|v| v.to_str().ok()),
             Some("vibe")
         );
@@ -668,17 +677,17 @@ mod tests {
             Some("EXTERNAL_IDP")
         );
         let expected_x_amz_user_agent = format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-machine",
+            "account-runtime-js/1.0.34 AccountRuntimeIDE-{}-machine",
             config.local_upstream_client_version
         );
         assert_eq!(
             headers
-                .get("x-amz-user-agent")
+                .get("x-account-runtime-user-agent")
                 .and_then(|v| v.to_str().ok()),
             Some(expected_x_amz_user_agent.as_str())
         );
         let expected_user_agent = format!(
-            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-machine",
+            "account-runtime-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/account-runtime-streaming#1.0.34 m/E AccountRuntimeIDE-{}-machine",
             config.system_version, config.node_version, config.local_upstream_client_version
         );
         assert_eq!(
@@ -694,7 +703,7 @@ mod tests {
             auth_method: Some("api key".to_string()),
             api_key: Some("ksk_test".to_string()),
             provider: Some("Enterprise".to_string()),
-            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/STALE".to_string()),
+            profile_arn: Some("arn:account-runtime:us-east-1:123:profile/STALE".to_string()),
             ..Default::default()
         };
         let config = Config::default();
@@ -712,7 +721,7 @@ mod tests {
         assert!(
             models_req
                 .headers()
-                .get("x-amzn-kiro-profile-arn")
+                .get("x-account-runtime-profile-arn")
                 .is_none()
         );
         assert_eq!(
@@ -727,7 +736,12 @@ mod tests {
             .decorate_mcp(Client::new().post("https://example.com"), &ctx)
             .build()
             .unwrap();
-        assert!(mcp_req.headers().get("x-amzn-kiro-profile-arn").is_none());
+        assert!(
+            mcp_req
+                .headers()
+                .get("x-account-runtime-profile-arn")
+                .is_none()
+        );
         assert_eq!(
             mcp_req
                 .headers()
@@ -799,7 +813,7 @@ mod tests {
             req.headers()
                 .get("host")
                 .and_then(|value| value.to_str().ok()),
-            Some("q.us-east-1.amazonaws.com")
+            Some("q.us-east-1.account-runtime.local")
         );
     }
 }

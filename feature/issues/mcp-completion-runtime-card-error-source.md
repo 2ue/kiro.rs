@@ -20,21 +20,21 @@ Last verified: 2026-07-26
 
 前端位置：
 
-- [ui/src/features/credentials/credential-card.tsx](/Users/yuanfeijie/Desktop/procode/kiro.rs/ui/src/features/credentials/credential-card.tsx)
+- [ui/src/features/credentials/credential-card.tsx](/Users/yuanfeijie/Desktop/procode/account-runtime/ui/src/features/credentials/credential-card.tsx)
   - 卡片读取 `lastErrorKind` / `lastErrorReason` 并拼成最近错误。
 
 Admin API：
 
-- [ui/src/api/credentials.ts](/Users/yuanfeijie/Desktop/procode/kiro.rs/ui/src/api/credentials.ts)
+- [ui/src/api/credentials.ts](/Users/yuanfeijie/Desktop/procode/account-runtime/ui/src/api/credentials.ts)
   - `GET /api/admin/credentials/runtime`
-- [src/admin/handlers.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/admin/handlers.rs)
+- [src/admin/handlers.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/admin/handlers.rs)
   - `get_credentials_runtime`
-- [src/admin/service.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/admin/service.rs)
+- [src/admin/service.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/admin/service.rs)
   - 从 token manager runtime snapshot 映射 `last_error_kind` / `last_error_reason`。
 
 旧写入来源：
 
-- [src/kiro/provider.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/kiro/provider.rs)
+- [src/local_upstream_impl/provider.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/local_upstream_impl/provider.rs)
   - MCP completion failure 曾调用 `report_transient_failure_kind(...)`，reason 格式：
 
 ```rust
@@ -81,7 +81,7 @@ targeted app logs last 2h grep:
 
 - 本次用户请求失败；
 - 凭据被持久禁用；
-- Kiro token 刷新失败；
+- Account Runtime token 刷新失败；
 - usage 计费异常。
 
 ## 复现方案
@@ -128,7 +128,7 @@ last_error_reason=mcp_completion upstream_error
 
 代码变更：
 
-- [src/kiro/provider.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/kiro/provider.rs)
+- [src/local_upstream_impl/provider.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/local_upstream_impl/provider.rs)
   - 移除 `McpCallFailureKind::transient_failure_kind()` 对主调度 cooldown 的映射。
   - `McpCallCompletion::report_failure(...)` 不再调用 `token_manager.report_transient_failure_kind(...)`。
   - `call_mcp_with_retry(...)` 的普通发送失败、非 2xx body 读取失败、408/429/5xx、协议兜底错误不再写全局 credential cooldown；只在本次请求内排除当前 credential 并按显式分类换号重试。

@@ -6,7 +6,7 @@ Source: HEAD `401473ca1649997bdeccf4468e3add1bdb187248` (`v0.0.109`) plus the cu
 
 Related issue: [Upstream HTTP Deadline Under Runtime Starvation](../issues/upstream-http-deadline-runtime-starvation.md)
 
-Toolchain: Rust `1.92.0`. Every Cargo command used `feature/tests/run-cargo-scoped.sh`. No Docker validation ran, no request targeted `127.0.0.1:9022`, and no `kiro_idc_users*.txt` file was read or staged.
+Toolchain: Rust `1.92.0`. Every Cargo command used `feature/tests/run-cargo-scoped.sh`. No Docker validation ran, no request targeted `127.0.0.1:9022`, and no `account-runtime_idc_users*.txt` file was read or staged.
 
 ## Red Evidence
 

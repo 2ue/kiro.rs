@@ -19,7 +19,7 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 冻结候选：
 
 - Git HEAD: `401473ca1649997bdeccf4468e3add1bdb187248`
-- Frozen `kiro-rs` binary SHA-256: `31b8c4749201b0f7666b63a9c268c0b75e21f6c1600b18c77bf39a7c6c249c2e`
+- Frozen `account-runtime` binary SHA-256: `31b8c4749201b0f7666b63a9c268c0b75e21f6c1600b18c77bf39a7c6c249c2e`
 - Claude Code CLI: `2.1.197`
 - Release build batch also ran `cargo fmt --all -- --check` and `git diff --check`.
 - Scoped target cleanup for release build: `scope=long-session-release-20260722 size_kib=798496 removed=true reservation_released=true`
@@ -35,7 +35,7 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 | Protocol contamination source contracts | PASS: 30/30 | `user Continue`、`Tool results provided`、`function_results`、`*Hash<8hex>` 等泄漏形态；Hash-shaped text 不作为任意内部工具名；marker-free raw body byte-identical |
 | Prompt/UI control contracts | PASS | Rust/UI/Admin UI 默认 task-quality prompt byte-equal 且无内部 marker；两套 UI 的 prompt master 与 bodyConversion 控制面独立 |
 | Real Claude CLI thinking capture | PASS: 30 message requests = 6 efforts × 5 rounds | Claude CLI 原始请求体包含 `thinking: {type:"adaptive"}`；`output_config.effort` absent→`high`，`low/medium/high/xhigh/max` 均按原值出现 |
-| Real kiro.rs thinking wire | PASS: 60/60 = 2 endpoints × 6 efforts × 5 rounds | `additionalModelRequestFields.output_config.effort` 在 CLI/IDE 两入口均保持 `low/medium/high/xhigh/max`，`max` 未被截断为 `high`；当前 OutputConfig schema 下 final Kiro wire 不注入未广告的 `thinking` 字段 |
+| Real account-runtime thinking wire | PASS: 60/60 = 2 endpoints × 6 efforts × 5 rounds | `additionalModelRequestFields.output_config.effort` 在 CLI/IDE 两入口均保持 `low/medium/high/xhigh/max`，`max` 未被截断为 `high`；当前 OutputConfig schema 下 final Account Runtime wire 不注入未广告的 `thinking` 字段 |
 | Real Claude CLI long session | PASS: 5 sessions × 20 tool cycles | 110 CLI turns、105 `--continue` turns、100 tool turns、50 Bash / 50 Read、210 inference hits、100 tool_use/tool_result pairs、leakMatches=0、unknown upstream requests=0 |
 | Real Claude CLI bare invoke | PASS: 20 cases | 15 negative text cases 不升级为工具；5 structured ToolUseEvent cases 正常工具执行；25 inference hits、5 tool_use/tool_result pairs、unknown upstream requests=0 |
 | Rust reasoning/body focused tests | PASS: 8/8 exact | provider max effort no truncation/no invented thinking、provider endpoint/compression byte-exact、raw reasoning accepted/rejected forms、clean raw body zero-copy 100 rounds、raw sanitizer clean body byte-identical、prompt master disables auto thinking、tool-result continuation keeps thinking signal |
@@ -53,15 +53,15 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 - xhigh → `xhigh`；
 - max → `max`。
 
-真实 `kiro.rs -> fake Kiro upstream` capture：
+真实 `account-runtime -> fake Account Runtime upstream` capture：
 
 - CLI endpoint: absent/low/medium/high/xhigh/max 分别转成 wire effort `high/low/medium/high/xhigh/max`；
 - IDE endpoint: 同样保持 `high/low/medium/high/xhigh/max`；
 - `max` 5/5 × 2 endpoints 均保持 `max`，没有降级为 `high`。
 
-### 2. 当前 Kiro upstream wire 不传 `thinking.type=adaptive` 是设计行为，不是本轮发现的丢字段
+### 2. 当前 Account Runtime upstream wire 不传 `thinking.type=adaptive` 是设计行为，不是本轮发现的丢字段
 
-本项目的最终 Kiro wire 行为是：
+本项目的最终 Account Runtime wire 行为是：
 
 ```json
 {
@@ -71,14 +71,14 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 }
 ```
 
-在当前 model-discovery 广告 `output_config.effort` schema 时，converter 将 Anthropic/Claude Code 的 `thinking: {type:"adaptive"}` 和 `output_config.effort` 收敛为 Kiro 侧的 `additionalModelRequestFields.output_config.effort`。源码合同明确要求“不 invent unadvertised thinking field”。如果上游 discovery 将能力路径广告为 `reasoning`，代码支持写 `additionalModelRequestFields.reasoning.effort`；当前 OutputConfig path 下不写 `thinking`。
+在当前 model-discovery 广告 `output_config.effort` schema 时，converter 将 Anthropic/Claude Code 的 `thinking: {type:"adaptive"}` 和 `output_config.effort` 收敛为 Account Runtime 侧的 `additionalModelRequestFields.output_config.effort`。源码合同明确要求“不 invent unadvertised thinking field”。如果上游 discovery 将能力路径广告为 `reasoning`，代码支持写 `additionalModelRequestFields.reasoning.effort`；当前 OutputConfig path 下不写 `thinking`。
 
 对应源码合同：
 
-- `src/anthropic/converter/model.rs` 的 `build_additional_model_request_fields()` 在 `KiroReasoningFieldPath::OutputConfig` 下只写 `output_config`，`thinking: None`。
-- `src/kiro/provider.rs` 的 `provider_sends_converter_max_effort_without_inventing_thinking_for_five_rounds` 断言 final wire 为 `{"output_config":{"effort":"max"}}`，并断言不生成未广告 `thinking`。
+- `src/anthropic/converter/model.rs` 的 `build_additional_model_request_fields()` 在 `Account RuntimeReasoningFieldPath::OutputConfig` 下只写 `output_config`，`thinking: None`。
+- `src/local_upstream_impl/provider.rs` 的 `provider_sends_converter_max_effort_without_inventing_thinking_for_five_rounds` 断言 final wire 为 `{"output_config":{"effort":"max"}}`，并断言不生成未广告 `thinking`。
 
-因此结论是：`max` 没被截断；`thinking.type=adaptive` 不出现在 final Kiro wire 是当前 Kiro schema 映射策略。若以后官方 schema 明确要求 `thinking` 字段，本项目应通过 discovery path / schema 切换，而不是无条件注入。
+因此结论是：`max` 没被截断；`thinking.type=adaptive` 不出现在 final Account Runtime wire 是当前 Account Runtime schema 映射策略。若以后官方 schema 明确要求 `thinking` 字段，本项目应通过 discovery path / schema 切换，而不是无条件注入。
 
 ### 3. Transcript/hash 泄漏的已知和相邻形态本轮均未复现
 
@@ -141,9 +141,9 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 ### Runtime quarantine
 
 ```text
-KIRO_RS_TEST_POSTGRES_URL=<loopback-postgres-current-project>
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379/0
-KIRO_RUNTIME_QUARANTINE_STORAGE_SCOPE=runtime-quarantine-storage-20260722-r1
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=<loopback-postgres-current-project>
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379/0
+ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_SCOPE=runtime-quarantine-storage-20260722-r1
 feature/tests/run-runtime-quarantine-storage-validation.sh
 ```
 
@@ -169,14 +169,14 @@ node feature/tests/thinking-effort-claude-cli-capture.mjs
 
 Result: `observation_complete`, total message requests `30`, unknown requests `0`, invalid JSON `0`, cleanup true.
 
-### Real Kiro thinking wire
+### Real Account Runtime thinking wire
 
 ```text
-KIRO_RS_BINARY=<frozen-sha-31b8c...>
-KIRO_CLAUDE_BINARY=<canonical Claude package binary>
-KIRO_PSQL_BINARY=<temporary Node pg psql-wrapper>
-KIRO_THINKING_WIRE_DATABASE_OWNER=codex_20260722
-node feature/tests/thinking-effort-kiro-wire.mjs
+ACCOUNT_RUNTIME_BINARY=<frozen-sha-31b8c...>
+ACCOUNT_RUNTIME_CLAUDE_BINARY=<canonical Claude package binary>
+ACCOUNT_RUNTIME_PSQL_BINARY=<temporary Node pg psql-wrapper>
+ACCOUNT_RUNTIME_THINKING_WIRE_DATABASE_OWNER=codex_20260722
+node feature/tests/thinking-effort-account-runtime-wire.mjs
 ```
 
 Result: `pass`, total cases `60`, inference hits `60`, discovery hits `2`, protocol violations `0`.
@@ -186,8 +186,8 @@ Report SHA-256: `df9a2fe3e07a41fd9df5cd8716ab6270d8902e3a09f1c9f0a749fff7487170a
 ### Real Claude CLI long session
 
 ```text
-KIRO_RS_BINARY=<frozen-sha-31b8c...>
-KIRO_LONG_SESSION_TOOL_CYCLES=20
+ACCOUNT_RUNTIME_BINARY=<frozen-sha-31b8c...>
+ACCOUNT_RUNTIME_LONG_SESSION_TOOL_CYCLES=20
 node feature/tests/claude-cli-long-session-continue.mjs
 ```
 
@@ -210,7 +210,7 @@ Report SHA-256: `2342ef2f3c66ed84ecbeb45fb9cad471a0307e05f0de7a0fbeb85cdc289df7f
 ### Real Claude CLI bare invoke
 
 ```text
-KIRO_RS_BINARY=<frozen-sha-31b8c...>
+ACCOUNT_RUNTIME_BINARY=<frozen-sha-31b8c...>
 node feature/tests/bare-invoke-claude-cli.mjs
 ```
 
@@ -231,9 +231,9 @@ Report SHA-256: `cc8ce4446006d071e75ccc89594af04518138e05a0b428725af087855443989
 
 ```text
 node --test feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs
-KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/8
-KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/2
-KIRO_RS_TEST_REDIS_ISOLATED=1
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/8
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/2
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1
 node feature/tests/run-redis-fault-domain-product-validation.mjs
 ```
 
@@ -244,8 +244,8 @@ Product: 3 outer × 1 exact × 3 internal rounds, pass.
 ### Scheduler Redis chaos
 
 ```text
-KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL=redis://127.0.0.1:26379/7
-KIRO_RS_TEST_REDIS_ISOLATED=1
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL=redis://127.0.0.1:26379/7
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1
 node feature/tests/run-scheduler-redis-chaos-validation.mjs
 ```
 
@@ -261,7 +261,7 @@ git diff --check
 node --test \
   feature/tests/protocol-marker-inventory-source-contract.test.mjs \
   feature/tests/protocol-contamination-source-contract.test.mjs \
-  feature/tests/thinking-effort-kiro-wire-contract.test.mjs \
+  feature/tests/thinking-effort-account-runtime-wire-contract.test.mjs \
   feature/tests/runtime-validation-paths.test.mjs \
   feature/tests/thinking-effort-claude-cli-capture-signal.test.mjs
 node feature/tests/prompt-default-parity.mjs
@@ -290,21 +290,21 @@ Final artifact inventory was rerun:
 node feature/tests/inventory-build-artifacts.mjs --gate
 ```
 
-Result: fail, because an existing live `kiro-rs` process PID 84264 references the repository root `target/`:
+Result: fail, because an existing live `account-runtime` process PID 84264 references the repository root `target/`:
 
 ```text
 targets=1 reservations=0 target_processes=1 blockers=2
 target classification=unmanaged-repo-cargo-target size_kib=933260
-target-process pid=84264 classification=kiro-runtime
+target-process pid=84264 classification=account-runtime-runtime
 ```
 
 Process evidence:
 
 ```text
-PID 84264 COMMAND ./target/release/kiro-rs -c config.json --credentials credentials.json
+PID 84264 COMMAND ./target/release/account-runtime -c config.json --credentials credentials.json
 LISTEN 127.0.0.1:9022
-txt /Users/yuanfeijie/Desktop/procode/kiro.rs/target/release/kiro-rs
-stdout/stderr /Users/yuanfeijie/Desktop/procode/kiro.rs/target/local-verify/kiro-rs-9022.log
+txt /Users/yuanfeijie/Desktop/procode/account-runtime/target/release/account-runtime
+stdout/stderr /Users/yuanfeijie/Desktop/procode/account-runtime/target/local-verify/account-runtime-9022.log
 ```
 
 This is not a scoped validation target leak. The target was not deleted because it is still referenced by a live process. Disk after cleanup: filesystem free space about `98GiB`; repo `target/` about `911MiB`.
@@ -313,19 +313,19 @@ This is not a scoped validation target leak. The target was not deleted because 
 
 本轮创建的以下临时对象已在记录本证据后删除；复核未发现这些路径继续存在：
 
-- frozen candidate root `/tmp/kiro-long-session-candidate.pbCgoR`
+- frozen candidate root `/tmp/account-runtime-long-session-candidate.pbCgoR`
 - report roots:
-  - `/tmp/kiro-long-session-artifacts.seedHs`
-  - `/tmp/kiro-bare-invoke-artifacts.AXUxeq`
-  - `/tmp/kiro-thinking-wire-artifacts.ZiJSNA`（失败的 Volta shim 尝试）
-  - `/tmp/kiro-thinking-wire-artifacts.CsRitR`
-- temporary pg client `/tmp/kiro-pgclient.zOQeyV`
-- temporary psql wrapper `/tmp/kiro-psql-wrapper.dIkU0r`
+  - `/tmp/account-runtime-long-session-artifacts.seedHs`
+  - `/tmp/account-runtime-bare-invoke-artifacts.AXUxeq`
+  - `/tmp/account-runtime-thinking-wire-artifacts.ZiJSNA`（失败的 Volta shim 尝试）
+  - `/tmp/account-runtime-thinking-wire-artifacts.CsRitR`
+- temporary pg client `/tmp/account-runtime-pgclient.zOQeyV`
+- temporary psql wrapper `/tmp/account-runtime-psql-wrapper.dIkU0r`
 - caller-owned PostgreSQL databases:
-  - `kiro_long_session_codex_20260722`
-  - `kiro_bare_invoke_codex_20260722`
-  - `kiro_thinking_wire_codex_20260722_cli`
-  - `kiro_thinking_wire_codex_20260722_ide`
+  - `account-runtime_long_session_codex_20260722`
+  - `account-runtime_bare_invoke_codex_20260722`
+  - `account-runtime_thinking_wire_codex_20260722_cli`
+  - `account-runtime_thinking_wire_codex_20260722_ide`
 
 删除边界：只删除本轮明确创建的 caller-owned 对象，不清理 live `9022` 服务、不清理未知 Docker 资源、不清理用户/其他分支产物。
 
@@ -333,5 +333,5 @@ This is not a scoped validation target leak. The target was not deleted because 
 
 - 本轮没有执行 Docker validation。
 - 本轮没有跑 5×100 长会话；2026-07-20 旧 frozen 证据有 5×100 pass，本轮当前 candidate 做了 5×20。
-- Real upstream validation 使用 fake Kiro upstream 捕获协议 wire，避免消耗真实官方账号；它证明本项目 final wire 的字段映射，不证明官方服务在所有生产模型/region 上的运行质量。
+- Real upstream validation 使用 fake Account Runtime upstream 捕获协议 wire，避免消耗真实官方账号；它证明本项目 final wire 的字段映射，不证明官方服务在所有生产模型/region 上的运行质量。
 - UI browser smoke、旧版本升级 smoke、最终 build artifact inventory 和版本发布仍需作为发版前最后门禁执行；Docker 动态验证按用户当前要求豁免，不作为 pass 记入。

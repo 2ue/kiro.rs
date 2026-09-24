@@ -12,9 +12,9 @@ postgres_url="${ACCOUNT_RUNTIME_TEST_POSTGRES_URL:-}"
 redis_url="${ACCOUNT_RUNTIME_TEST_REDIS_URL:-}"
 postgres_isolated="${ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED:-0}"
 redis_isolated="${ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED:-0}"
-allow_non_loopback="${KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
-outer_rounds="${KIRO_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS:-3}"
-scope="${KIRO_EXTERNAL_DISPATCH_STORAGE_SCOPE:-external-dispatch-storage-real}"
+allow_non_loopback="${ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
+outer_rounds="${ACCOUNT_RUNTIME_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS:-3}"
+scope="${ACCOUNT_RUNTIME_EXTERNAL_DISPATCH_STORAGE_SCOPE:-external-dispatch-storage-real}"
 
 [[ -n "$postgres_url" ]] || {
   printf 'ACCOUNT_RUNTIME_TEST_POSTGRES_URL is required; no storage test was run\n' >&2
@@ -33,17 +33,17 @@ scope="${KIRO_EXTERNAL_DISPATCH_STORAGE_SCOPE:-external-dispatch-storage-real}"
   exit 64
 }
 [[ "$outer_rounds" =~ ^[1-9][0-9]*$ ]] && (( outer_rounds <= 5 )) || {
-  printf 'KIRO_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS must be between 1 and 5\n' >&2
+  printf 'ACCOUNT_RUNTIME_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS must be between 1 and 5\n' >&2
   exit 64
 }
 [[ "$scope" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || {
-  printf 'KIRO_EXTERNAL_DISPATCH_STORAGE_SCOPE has an invalid format\n' >&2
+  printf 'ACCOUNT_RUNTIME_EXTERNAL_DISPATCH_STORAGE_SCOPE has an invalid format\n' >&2
   exit 64
 }
 
 ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
 ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
-KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
+ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
 node <<'NODE'
 const net = require('node:net');
 
@@ -79,7 +79,7 @@ function parseTarget(target) {
   const loopback = networkHostname === '127.0.0.1'
     || networkHostname === '::1'
     || networkHostname === 'localhost';
-  if (!loopback && process.env.KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS !== '1') {
+  if (!loopback && process.env.ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS !== '1') {
     throw new Error(`${target.name} requires an explicit non-loopback opt-in`);
   }
   const port = parsed.port === '' ? target.defaultPort : Number(parsed.port);
@@ -127,19 +127,19 @@ NODE
 ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
 ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
 ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
-KIRO_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS="$outer_rounds" \
-KIRO_VALIDATION_RESERVE_KIB="${KIRO_VALIDATION_RESERVE_KIB:-10485760}" \
+ACCOUNT_RUNTIME_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS="$outer_rounds" \
+ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB="${ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB:-10485760}" \
 feature/tests/run-cargo-scoped.sh "$scope" -- \
   env RUSTUP_TOOLCHAIN=1.92.0 \
   ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
   ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
   ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
-  KIRO_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS="$outer_rounds" \
+  ACCOUNT_RUNTIME_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS="$outer_rounds" \
   bash -lc '
     set -euo pipefail
     cargo fmt --all -- --check
     git diff --check
-    for ((round = 1; round <= KIRO_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS; round += 1)); do
+    for ((round = 1; round <= ACCOUNT_RUNTIME_EXTERNAL_DISPATCH_STORAGE_OUTER_ROUNDS; round += 1)); do
       printf "external-dispatch-storage outer_round=%s\n" "$round"
       cargo test external_pool::tests::external_pool_static_eligibility_snapshot_singleflights_models_and_body_modes -- --exact --nocapture --test-threads=1
       cargo test external_pool::tests::external_pool_fallback_body_mode_eligibility_is_raw_normalized_symmetric -- --exact --nocapture --test-threads=1

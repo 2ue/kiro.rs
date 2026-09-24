@@ -12,11 +12,11 @@ Status: `runtime pass / 52-of-52 safety contracts pass / frozen-candidate 3 oute
 
 当前已完成：
 
-- 新增两个真实 kiro.rs 进程的独立 runner；
+- 新增两个真实 account-runtime 进程的独立 runner；
 - 新增纯 Node 早拒绝、无副作用和信号清理合同；
 - runner 不调用 Cargo，不读取仓库 `target/debug` 或 `target/release`；
 - runner 不启动、不检查 Docker，也不创建或删除数据库；调用方必须在当前项目
-  已运行的 PostgreSQL 实例中预先创建每个 outer round 的空 `kiro_e03_*` 数据库，
+  已运行的 PostgreSQL 实例中预先创建每个 outer round 的空 `account-runtime_e03_*` 数据库，
   runner 只连接这些 caller-owned 数据库并在退出时保留它们，数据库清理由调用方
   的外层 `trap/finally` 负责；
 - Redis 使用调用方指定的非零 loopback DB 和随机 `keyPrefix`，只扫描、删除该
@@ -35,15 +35,15 @@ UI 或最终 release inventory 门禁已经关闭。
 
 ## 真实运行矩阵
 
-每个 outer round 使用一个调用方预先创建的、独立的 `kiro_e03_*` PostgreSQL
-database，并启动两个不同临时端口的真实 kiro.rs 进程。两进程共享同一
+每个 outer round 使用一个调用方预先创建的、独立的 `account-runtime_e03_*` PostgreSQL
+database，并启动两个不同临时端口的真实 account-runtime 进程。两进程共享同一
 PostgreSQL authority、同一 Redis URL 和同一随机 Redis prefix；三个数据库仍由
 同一套当前项目 PostgreSQL 服务承载，不启动第二套基础设施。
 
 | 阶段 | 真实动作 | 必须满足的断言 |
 | --- | --- | --- |
 | startup | 先后启动 service A/B，共享数据库、凭据和 prefix | 两进程健康；第二进程看到两条凭据和同一个外部池 |
-| local baseline | A/B 各发一条真实 `/v1/messages` | 都命中 fake Kiro local upstream；external hit 不增加 |
+| local baseline | A/B 各发一条真实 `/v1/messages` | 都命中 fake Account Runtime local upstream；external hit 不增加 |
 | acquire + renew | A 持有 credential 1 的流式请求超过 `credentialInFlightLeaseMaxSecs=3` | Redis `last_seen` lease 仍为一条且 score 前移超过 1 秒 |
 | shared capacity | renew holder 存活时 B 再请求同模型 | B 不得进入 local fake upstream；不得错误 fallback external |
 | release | 释放 holder 后 B 再请求 | Redis lease 清零；B 立即恢复 local 200 |
@@ -83,7 +83,7 @@ duration_ms=3965.746833
 - 缺 PostgreSQL template、Redis URL、Redis prefix：每类 3/3；
 - PostgreSQL 缺 `{database}`、远程 PG、远程 Redis、Redis DB0：每类 3/3；
 - PostgreSQL/Redis 指向 `9022`：每类 3/3，且不做 listener probe；
-- 生产 `kiro_rs:local` prefix、数据库数量/所有权不满足、非法 outer rounds：每类 3/3；
+- 生产 `account_runtime:local` prefix、数据库数量/所有权不满足、非法 outer rounds：每类 3/3；
 - `SIGHUP`、`SIGINT`、`SIGTERM`：各 3/3，退出码分别为 129/130/143；
 - 每轮信号测试确认 ready file、temp root 删除，且 fake Docker/Cargo marker 未创建；
 - 静态合同确认没有 Cargo invocation、默认 target 查找、任何 Docker invocation 或
@@ -98,20 +98,20 @@ duration_ms=3965.746833
 候选：
 
 ```text
-binary=/tmp/kiro-e03-candidate.T2iG7N/kiro-rs
+binary=/tmp/account-runtime-e03-candidate.T2iG7N/account-runtime
 sha256=98e0f79328b49925dc940faaa3b1e8b0c8ae8ef7b9975725eb219635c8957ee7
 ```
 
 正式命令使用当前项目隔离 PostgreSQL/Redis，不启动 Docker，不触碰 `9022`：
 
 ```text
-KIRO_RS_BINARY=/tmp/kiro-e03-candidate.T2iG7N/kiro-rs
-KIRO_VALIDATION_ARTIFACT_DIR=/tmp/kiro-e03-artifacts-20260721-rpm-r2-formal
-KIRO_E03_POSTGRES_URL_TEMPLATE='postgres://kiro_rs:<redacted>@127.0.0.1:25432/{database}'
-KIRO_E03_POSTGRES_DATABASES='kiro_e03_20260721_rpm_r2_1,kiro_e03_20260721_rpm_r2_2,kiro_e03_20260721_rpm_r2_3'
-KIRO_E03_REDIS_URL=redis://127.0.0.1:26379/12
-KIRO_E03_REDIS_PREFIX=kiro_rs:e03:runtime:20260721:rpm_r2_formal
-KIRO_E03_OUTER_ROUNDS=3
+ACCOUNT_RUNTIME_BINARY=/tmp/account-runtime-e03-candidate.T2iG7N/account-runtime
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/tmp/account-runtime-e03-artifacts-20260721-rpm-r2-formal
+ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE='postgres://account_runtime:<redacted>@127.0.0.1:25432/{database}'
+ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES='account-runtime_e03_20260721_rpm_r2_1,account-runtime_e03_20260721_rpm_r2_2,account-runtime_e03_20260721_rpm_r2_3'
+ACCOUNT_RUNTIME_E03_REDIS_URL=redis://127.0.0.1:26379/12
+ACCOUNT_RUNTIME_E03_REDIS_PREFIX=account_runtime:e03:runtime:20260721:rpm_r2_formal
+ACCOUNT_RUNTIME_E03_OUTER_ROUNDS=3
 node feature/tests/e03-real-two-process-scheduler.mjs
 ```
 
@@ -121,7 +121,7 @@ node feature/tests/e03-real-two-process-scheduler.mjs
 result=pass
 runId=e03-20260721013242272-88844-36667d
 outerRounds=3
-reportPath=/private/tmp/kiro-e03-artifacts-20260721-rpm-r2-formal/reports/e03-real-two-process-scheduler/e03-20260721013242272-88844-36667d.json
+reportPath=/private/tmp/account-runtime-e03-artifacts-20260721-rpm-r2-formal/reports/e03-real-two-process-scheduler/e03-20260721013242272-88844-36667d.json
 cleanup.childGroupsStopped=true
 cleanup.serversStopped=true
 cleanup.redisPrefixKeysRemaining=[]
@@ -134,9 +134,9 @@ cleanup.tempRemoved=true
 
 | Round | DB | renewal pending | release recovery | SIGKILL immediate | TTL recovery | RPM first | RPM post-restart | external hits | disabled |
 | --- | --- | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: |
-| 1 | `kiro_e03_20260721_rpm_r2_1` | 1250 ms | 200 | 1250 ms pending | 200 | `[200,200]` | `[429,429]` | 0 | 0 |
-| 2 | `kiro_e03_20260721_rpm_r2_2` | 1250 ms | 200 | 1250 ms pending | 200 | `[200,200]` | `[429,429]` | 0 | 0 |
-| 3 | `kiro_e03_20260721_rpm_r2_3` | 1250 ms | 200 | 1250 ms pending | 200 | `[200,200]` | `[429,429]` | 0 | 0 |
+| 1 | `account-runtime_e03_20260721_rpm_r2_1` | 1250 ms | 200 | 1250 ms pending | 200 | `[200,200]` | `[429,429]` | 0 | 0 |
+| 2 | `account-runtime_e03_20260721_rpm_r2_2` | 1250 ms | 200 | 1250 ms pending | 200 | `[200,200]` | `[429,429]` | 0 | 0 |
+| 3 | `account-runtime_e03_20260721_rpm_r2_3` | 1250 ms | 200 | 1250 ms pending | 200 | `[200,200]` | `[429,429]` | 0 | 0 |
 
 资源回收：
 
@@ -153,7 +153,7 @@ cleanup.tempRemoved=true
 RPM 请求仍 local `200` 的 fail-open，failure report 为：
 
 ```text
-/private/tmp/kiro-e03-artifacts-20260721-probe1/reports/e03-real-two-process-scheduler/e03-20260720200151931-93095-24fa20.failure.json
+/private/tmp/account-runtime-e03-artifacts-20260721-probe1/reports/e03-real-two-process-scheduler/e03-20260720200151931-93095-24fa20.failure.json
 ```
 
 失败根因是旧 `record_scheduler_selection()` 先本地记录、再异步 best-effort 写 Redis；
@@ -164,18 +164,18 @@ shared deadline；manager 侧不再双计数 Redis，并把 RPM-only 候选等�
 
 ## 复现命令模板
 
-先由调用方预创建 caller-owned `kiro_e03_*` 数据库，再执行：
+先由调用方预创建 caller-owned `account-runtime_e03_*` 数据库，再执行：
 
 ```text
-mkdir -p /tmp/kiro-e03-artifacts
+mkdir -p /tmp/account-runtime-e03-artifacts
 
-KIRO_RS_BINARY=/absolute/outside/repo/frozen/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/tmp/kiro-e03-artifacts \
-KIRO_E03_POSTGRES_URL_TEMPLATE='postgres://kiro_rs:<redacted>@127.0.0.1:25432/{database}' \
-KIRO_E03_POSTGRES_DATABASES='kiro_e03_r1,kiro_e03_r2,kiro_e03_r3' \
-KIRO_E03_REDIS_URL=redis://127.0.0.1:26379/12 \
-KIRO_E03_REDIS_PREFIX=kiro_rs:e03:real_two_process_r1 \
-KIRO_E03_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_BINARY=/absolute/outside/repo/frozen/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/tmp/account-runtime-e03-artifacts \
+ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE='postgres://account_runtime:<redacted>@127.0.0.1:25432/{database}' \
+ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES='account-runtime_e03_r1,account-runtime_e03_r2,account-runtime_e03_r3' \
+ACCOUNT_RUNTIME_E03_REDIS_URL=redis://127.0.0.1:26379/12 \
+ACCOUNT_RUNTIME_E03_REDIS_PREFIX=account_runtime:e03:real_two_process_r1 \
+ACCOUNT_RUNTIME_E03_OUTER_ROUNDS=3 \
 node feature/tests/e03-real-two-process-scheduler.mjs
 ```
 

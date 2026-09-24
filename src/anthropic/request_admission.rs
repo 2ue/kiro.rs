@@ -140,9 +140,9 @@ pub(crate) enum RequestRejectionReason {
     #[cfg_attr(not(test), allow(dead_code))]
     LocalBodyPrepare,
     #[cfg_attr(not(test), allow(dead_code))]
-    LocalPoolUnavailable,
+    AccountUnavailable,
     #[cfg_attr(not(test), allow(dead_code))]
-    LocalPoolTemporaryUnavailable,
+    AccountTemporaryUnavailable,
     AdmissionLocalTemporaryBackoff,
 }
 
@@ -170,8 +170,8 @@ impl RequestRejectionReason {
             Self::ModelUnsupported => "model_unsupported",
             Self::WebSearchUnsupported => "websearch_unsupported",
             Self::LocalBodyPrepare => "local_body_prepare",
-            Self::LocalPoolUnavailable => "local_pool_unavailable",
-            Self::LocalPoolTemporaryUnavailable => "local_pool_temporary_unavailable",
+            Self::AccountUnavailable => "account_unavailable",
+            Self::AccountTemporaryUnavailable => "account_temporary_unavailable",
             Self::AdmissionLocalTemporaryBackoff => "admission_local_temporary_backoff",
         }
     }
@@ -1948,8 +1948,8 @@ mod tests {
             RequestRejectionReason::ModelUnsupported,
             RequestRejectionReason::WebSearchUnsupported,
             RequestRejectionReason::LocalBodyPrepare,
-            RequestRejectionReason::LocalPoolUnavailable,
-            RequestRejectionReason::LocalPoolTemporaryUnavailable,
+            RequestRejectionReason::AccountUnavailable,
+            RequestRejectionReason::AccountTemporaryUnavailable,
             RequestRejectionReason::AdmissionLocalTemporaryBackoff,
         ];
 

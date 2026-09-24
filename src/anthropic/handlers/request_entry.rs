@@ -65,27 +65,14 @@ pub(super) async fn handle_messages_endpoint(
         return error.to_response(&request_id);
     }
 
-    let mut request_history_contaminated = false;
     let raw_history_sanitization =
         super::super::transcript_sanitizer::sanitize_raw_request_assistant_history_with_probe(
             &raw_body, &raw_probe,
         );
-    let raw_history_sanitization = match raw_history_sanitization {
-        Ok(sanitization) => sanitization,
-        Err(error) => {
-            let request_id = envelope::request_id();
-            let error = EntryRequestError::invalid(
-                format!("Invalid JSON body: {error}"),
-                "request_history_inspection_failed",
-            );
-            record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
-            return error.to_response(&request_id);
-        }
-    };
     let effective_raw_probe = Arc::new(raw_probe);
     let mut parsed_raw_probe = effective_raw_probe.clone();
-    if let Some((sanitized_body, _report)) = raw_history_sanitization {
-        if runtime_config.compat_profile.is_strict() {
+    match raw_history_sanitization {
+        Ok(Some((_sanitized_body, _report))) if runtime_config.compat_profile.is_strict() => {
             let request_id = envelope::request_id();
             let error = EntryRequestError::invalid(
                 envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
@@ -100,12 +87,25 @@ pub(super) async fn handle_messages_endpoint(
                 [("x-error-id", request_id.clone())],
             );
         }
-        raw_body = Bytes::from(sanitized_body);
-        parsed_raw_probe = Arc::new(probe_raw_messages_body(&raw_body));
-        request_history_contaminated = true;
+        Ok(Some((_sanitized_body, _report))) => {
+            tracing::debug!(
+                endpoint = %endpoint,
+                "raw account request history inspection detected contamination but preserved the original body"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let request_id = envelope::request_id();
+            let error = EntryRequestError::invalid(
+                format!("Invalid JSON body: {error}"),
+                "request_history_inspection_failed",
+            );
+            record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+            return error.to_response(&request_id);
+        }
     }
 
-    if should_try_raw_account_routes(request_history_contaminated) {
+    if should_try_raw_account_routes(false) {
         if let Some(response) = maybe_raw_account_direct_response(
             &state,
             headers.clone(),
@@ -148,7 +148,7 @@ pub(super) async fn handle_messages_endpoint(
             endpoint,
             inference_attempt_budget,
             request_api_key_id,
-            request_history_contaminated,
+            false,
             attribution,
             raw_preflight_failure,
         )
@@ -164,7 +164,7 @@ pub(super) async fn handle_messages_endpoint(
         endpoint,
         inference_attempt_budget,
         request_api_key_id,
-        request_history_contaminated,
+        false,
         attribution,
         None,
     )
@@ -187,7 +187,7 @@ async fn continue_messages_endpoint_after_raw_account_routes(
     raw_preflight_failure: Option<RawAccountPreflightFailure>,
 ) -> Response {
     let runtime_config = request_runtime_config_for_state(&state);
-    if let Some(response) = maybe_local_pool_unavailable_fast_fail_response(
+    if let Some(response) = maybe_account_unavailable_fast_fail_response(
         &state,
         &runtime_config,
         &endpoint,
@@ -222,11 +222,11 @@ async fn continue_messages_endpoint_after_raw_account_routes(
     .await
 }
 
-fn should_try_raw_account_routes(request_history_contaminated: bool) -> bool {
-    !request_history_contaminated
+fn should_try_raw_account_routes(_request_history_contaminated: bool) -> bool {
+    true
 }
 
-fn maybe_local_pool_unavailable_fast_fail_response(
+fn maybe_account_unavailable_fast_fail_response(
     state: &AppState,
     runtime_config: &RequestRuntimeConfig,
     endpoint: &str,
@@ -256,9 +256,9 @@ fn maybe_local_pool_unavailable_fast_fail_response(
             return None;
         }
 
-        let local_state = provider.local_pool_route_state_cached(Some(model));
+        let local_state = provider.account_route_state_cached(Some(model));
         let (status, error_type, message, reason, retry_after_secs) =
-            local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)?;
+            account_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)?;
 
         if let (Some(attribution), Some(retry_after_secs)) = (attribution, retry_after_secs) {
             attribution.apply_local_temporary_backoff(retry_after_secs);
@@ -275,7 +275,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
             local_dispatchable = local_state.dispatchable,
             local_usable = local_state.usable,
             retry_after_secs = ?retry_after_secs,
-            "local credential pool is unavailable and no upstream account takeover is available; rejecting before full body processing"
+            "account route is unavailable and no upstream account takeover is available; rejecting before full body processing"
         );
         let response = match retry_after_secs {
             Some(retry_after_secs) => envelope::error_response_with_id_and_headers(
@@ -293,7 +293,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
 }
 
 #[cfg(test)]
-fn local_pool_fast_fail_response_parts(
+fn account_fast_fail_response_parts(
     kind: LocalUpstreamRouteStateKind,
     retry_after_secs: Option<u64>,
 ) -> Option<(
@@ -310,7 +310,7 @@ fn local_pool_fast_fail_response_parts(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE.to_string(),
-            RequestRejectionReason::LocalPoolUnavailable,
+            RequestRejectionReason::AccountUnavailable,
             None,
         ),
         LocalUpstreamRouteStateKind::SchedulerRedisDegraded => {
@@ -319,7 +319,7 @@ fn local_pool_fast_fail_response_parts(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 envelope::public_rate_limit_message(Some(retry_after_secs)),
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                RequestRejectionReason::AccountTemporaryUnavailable,
                 Some(retry_after_secs),
             )
         }
@@ -329,7 +329,7 @@ fn local_pool_fast_fail_response_parts(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",
                 envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE.to_string(),
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                RequestRejectionReason::AccountTemporaryUnavailable,
                 Some(retry_after_secs),
             )
         }
@@ -564,7 +564,7 @@ mod tests {
     use crate::anthropic::request_admission::RequestAdmissionController;
     use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder};
     use crate::common::auth::RequestApiKeyStore;
-    use crate::model::config::{DEFAULT_MISSING_MAX_TOKENS_VALUE, RequestAdmissionConfig};
+    use crate::model::config::RequestAdmissionConfig;
 
     fn test_state(recorder: Arc<UsageRecorder>) -> AppState {
         AppState::new(
@@ -601,51 +601,49 @@ mod tests {
     }
 
     #[test]
-    fn missing_max_tokens_default_value_rewrites_body_for_typed_parse() {
+    fn missing_max_tokens_default_policy_rejects_without_rewriting_body() {
         let state = test_state(Arc::new(UsageRecorder::new(10)));
         let runtime_config = RequestRuntimeConfig::from_app_state(&state);
         let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
         let client = Bytes::from_static(
             br#" {"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}],"stream":false} "#,
         );
-        let expected = Bytes::from_static(
-            br#" {"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}],"stream":false,"max_tokens":20480} "#,
-        );
 
         for _round in 0..5 {
             let mut effective = client.clone();
             let mut defaulted = None;
-            apply_missing_max_tokens_policy(
+            let error = apply_missing_max_tokens_policy(
                 &mut effective,
                 MissingMaxTokensConfig::default(),
                 &mut defaulted,
             )
-            .expect("default missing max_tokens");
-            let parsed = parse_messages_payload(&effective, "req_test_missing_default")
-                .expect("typed parse");
+            .expect_err("default missing max_tokens should be rejected");
 
-            assert_eq!(effective, expected, "only max_tokens may be appended");
-            assert_eq!(defaulted, Some(DEFAULT_MISSING_MAX_TOKENS_VALUE));
-            assert_eq!(parsed.max_tokens, DEFAULT_MISSING_MAX_TOKENS_VALUE);
-            assert_eq!(parsed.model, "claude-sonnet-4-5");
+            assert_eq!(
+                effective, client,
+                "default policy must not rewrite the body"
+            );
+            assert_eq!(defaulted, None);
+            assert_eq!(error.reason, "missing_max_tokens");
+            assert_eq!(error.message, "max_tokens: field is required");
 
             let route = raw_account_route_request(
                 &state,
                 &runtime_config,
                 &cache_route,
                 HeaderMap::new(),
-                effective,
+                client.clone(),
                 "/cc/v1/messages",
                 "req_missing_max_raw_route".to_string(),
                 UsageRouteSubtype::AccountFallbackPreflight,
-                Some("local_capacity_full".to_string()),
+                Some("account_capacity_full".to_string()),
                 None,
                 Some(json!({"preflightStage": "before_parse"})),
                 Arc::new(InferenceAttemptBudget::new(4)),
                 None,
             );
-            assert_eq!(route.effective_raw_body, expected);
-            assert_eq!(route.raw_body, expected);
+            assert_eq!(route.effective_raw_body, client);
+            assert_eq!(route.raw_body, client);
         }
     }
 
@@ -667,7 +665,7 @@ mod tests {
                     .expect("assistant history inspection succeeds")
                     .is_some()
                 );
-                assert!(!should_try_raw_account_routes(true));
+                assert!(should_try_raw_account_routes(true));
             }
         }
     }
@@ -980,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn local_pool_fast_fail_maps_only_terminal_or_temporary_pool_states_for_five_rounds() {
+    fn account_fast_fail_maps_only_terminal_or_temporary_account_states_for_five_rounds() {
         for round in 0..5 {
             for kind in [
                 LocalUpstreamRouteStateKind::NoCredentials,
@@ -988,7 +986,7 @@ mod tests {
                 LocalUpstreamRouteStateKind::ProxyBlocked,
             ] {
                 let (status, error_type, message, reason, retry_after) =
-                    local_pool_fast_fail_response_parts(kind, None)
+                    account_fast_fail_response_parts(kind, None)
                         .unwrap_or_else(|| panic!("round {round}: {kind:?} should fast-fail"));
                 assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "round {round}");
                 assert_eq!(error_type, "api_error", "round {round}");
@@ -999,14 +997,14 @@ mod tests {
                 );
                 assert_eq!(
                     reason,
-                    RequestRejectionReason::LocalPoolUnavailable,
+                    RequestRejectionReason::AccountUnavailable,
                     "round {round}"
                 );
                 assert_eq!(retry_after, None, "round {round}");
             }
 
             let (status, error_type, message, reason, retry_after) =
-                local_pool_fast_fail_response_parts(
+                account_fast_fail_response_parts(
                     LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
                     Some(4),
                 )
@@ -1019,13 +1017,13 @@ mod tests {
             );
             assert_eq!(
                 reason,
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                RequestRejectionReason::AccountTemporaryUnavailable,
                 "round {round}"
             );
             assert_eq!(retry_after, Some(4), "round {round}");
 
             let (status, error_type, message, reason, retry_after) =
-                local_pool_fast_fail_response_parts(
+                account_fast_fail_response_parts(
                     LocalUpstreamRouteStateKind::RiskCircuitOpen,
                     None,
                 )
@@ -1039,7 +1037,7 @@ mod tests {
             );
             assert_eq!(
                 reason,
-                RequestRejectionReason::LocalPoolTemporaryUnavailable,
+                RequestRejectionReason::AccountTemporaryUnavailable,
                 "round {round}"
             );
             assert_eq!(retry_after, Some(1), "round {round}");
@@ -1047,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn local_pool_fast_fail_does_not_preempt_waitable_or_model_states_for_five_rounds() {
+    fn account_fast_fail_does_not_preempt_waitable_or_model_states_for_five_rounds() {
         for round in 0..5 {
             for kind in [
                 LocalUpstreamRouteStateKind::Ready,
@@ -1056,7 +1054,7 @@ mod tests {
                 LocalUpstreamRouteStateKind::CapacityFull,
             ] {
                 assert!(
-                    local_pool_fast_fail_response_parts(kind, Some(2)).is_none(),
+                    account_fast_fail_response_parts(kind, Some(2)).is_none(),
                     "round {round}: {kind:?} must continue through normal parsing/routing"
                 );
             }

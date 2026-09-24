@@ -9,16 +9,16 @@ import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
-const THINKING_RUNNER = path.join(import.meta.dirname, 'thinking-effort-kiro-wire.mjs')
+const THINKING_RUNNER = path.join(import.meta.dirname, 'thinking-effort-account-wire.mjs')
 const RUNNERS = [
   'bare-invoke-claude-cli.mjs',
   'claude-cli-long-session-continue.mjs',
   'request-api-key-admission-multi-instance.mjs',
   'scheduler-fairness-sticky-race.mjs',
   'strict-local-first-routing.mjs',
-  'aws-api-key-region-lifecycle.mjs',
+  'account-api-key-region-lifecycle.mjs',
   'frozen-load-chaos-runner.mjs',
-  'thinking-effort-kiro-wire.mjs',
+  'thinking-effort-account-wire.mjs',
 ]
 
 function withEnvironment(values, callback) {
@@ -39,8 +39,8 @@ function withEnvironment(values, callback) {
 }
 
 function externalFixture(callback) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-runtime-paths-'))
-  const binary = path.join(root, 'kiro-rs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-paths-'))
+  const binary = path.join(root, 'account-runtime')
   const artifacts = path.join(root, 'artifacts')
   fs.writeFileSync(binary, 'frozen fixture', { mode: 0o700 })
   fs.mkdirSync(artifacts)
@@ -55,8 +55,8 @@ test('accepts only owned external binary and artifact roots for five rounds', ()
   for (let round = 0; round < 5; round += 1) {
     externalFixture(({ binary, artifacts }) => {
       const resolved = withEnvironment({
-        KIRO_RS_BINARY: binary,
-        KIRO_VALIDATION_ARTIFACT_DIR: artifacts,
+        ACCOUNT_RUNTIME_BINARY: binary,
+        ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts,
       }, () => resolveRuntimeValidationPaths(ROOT))
       assert.equal(resolved.binary, fs.realpathSync(binary))
       assert.equal(resolved.artifactRoot, fs.realpathSync(artifacts))
@@ -68,32 +68,32 @@ test('rejects missing, relative, nonexistent, and wrong-type paths for five roun
   externalFixture(({ root, binary, artifacts }) => {
     const cases = [
       {
-        env: { KIRO_RS_BINARY: undefined, KIRO_VALIDATION_ARTIFACT_DIR: artifacts },
-        message: /KIRO_RS_BINARY is required/,
+        env: { ACCOUNT_RUNTIME_BINARY: undefined, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts },
+        message: /ACCOUNT_RUNTIME_BINARY is required/,
       },
       {
-        env: { KIRO_RS_BINARY: binary, KIRO_VALIDATION_ARTIFACT_DIR: undefined },
-        message: /KIRO_VALIDATION_ARTIFACT_DIR is required/,
+        env: { ACCOUNT_RUNTIME_BINARY: binary, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: undefined },
+        message: /ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR is required/,
       },
       {
-        env: { KIRO_RS_BINARY: './kiro-rs', KIRO_VALIDATION_ARTIFACT_DIR: artifacts },
-        message: /KIRO_RS_BINARY must be an absolute path/,
+        env: { ACCOUNT_RUNTIME_BINARY: './account-runtime', ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts },
+        message: /ACCOUNT_RUNTIME_BINARY must be an absolute path/,
       },
       {
-        env: { KIRO_RS_BINARY: binary, KIRO_VALIDATION_ARTIFACT_DIR: './reports' },
-        message: /KIRO_VALIDATION_ARTIFACT_DIR must be an absolute path/,
+        env: { ACCOUNT_RUNTIME_BINARY: binary, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: './reports' },
+        message: /ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR must be an absolute path/,
       },
       {
-        env: { KIRO_RS_BINARY: path.join(root, 'missing'), KIRO_VALIDATION_ARTIFACT_DIR: artifacts },
-        message: /KIRO_RS_BINARY does not exist/,
+        env: { ACCOUNT_RUNTIME_BINARY: path.join(root, 'missing'), ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts },
+        message: /ACCOUNT_RUNTIME_BINARY does not exist/,
       },
       {
-        env: { KIRO_RS_BINARY: artifacts, KIRO_VALIDATION_ARTIFACT_DIR: artifacts },
-        message: /KIRO_RS_BINARY must reference a file/,
+        env: { ACCOUNT_RUNTIME_BINARY: artifacts, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts },
+        message: /ACCOUNT_RUNTIME_BINARY must reference a file/,
       },
       {
-        env: { KIRO_RS_BINARY: binary, KIRO_VALIDATION_ARTIFACT_DIR: binary },
-        message: /KIRO_VALIDATION_ARTIFACT_DIR must reference an existing directory/,
+        env: { ACCOUNT_RUNTIME_BINARY: binary, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: binary },
+        message: /ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR must reference an existing directory/,
       },
     ]
     for (let round = 0; round < 5; round += 1) {
@@ -114,10 +114,10 @@ test('rejects lexical and symlink paths that resolve into the repository for fiv
     fs.symlinkSync(path.join(ROOT, 'Cargo.toml'), binaryLink)
     fs.symlinkSync(path.join(ROOT, 'feature'), artifactLink)
     const cases = [
-      { KIRO_RS_BINARY: path.join(ROOT, 'Cargo.toml'), KIRO_VALIDATION_ARTIFACT_DIR: artifacts },
-      { KIRO_RS_BINARY: binary, KIRO_VALIDATION_ARTIFACT_DIR: path.join(ROOT, 'feature') },
-      { KIRO_RS_BINARY: binaryLink, KIRO_VALIDATION_ARTIFACT_DIR: artifacts },
-      { KIRO_RS_BINARY: binary, KIRO_VALIDATION_ARTIFACT_DIR: artifactLink },
+      { ACCOUNT_RUNTIME_BINARY: path.join(ROOT, 'Cargo.toml'), ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts },
+      { ACCOUNT_RUNTIME_BINARY: binary, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: path.join(ROOT, 'feature') },
+      { ACCOUNT_RUNTIME_BINARY: binaryLink, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts },
+      { ACCOUNT_RUNTIME_BINARY: binary, ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifactLink },
     ]
     for (let round = 0; round < 5; round += 1) {
       for (const environment of cases) {
@@ -138,8 +138,8 @@ test('canonicalizes external symlinks and rejects an artifact ancestor of the re
       fs.symlinkSync(binary, binaryLink)
       fs.symlinkSync(artifacts, artifactLink)
       const resolved = withEnvironment({
-        KIRO_RS_BINARY: binaryLink,
-        KIRO_VALIDATION_ARTIFACT_DIR: artifactLink,
+        ACCOUNT_RUNTIME_BINARY: binaryLink,
+        ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifactLink,
       }, () => resolveRuntimeValidationPaths(ROOT))
       assert.equal(path.isAbsolute(resolved.binary), true)
       assert.equal(path.isAbsolute(resolved.artifactRoot), true)
@@ -147,8 +147,8 @@ test('canonicalizes external symlinks and rejects an artifact ancestor of the re
       assert.equal(resolved.artifactRoot, fs.realpathSync(artifacts))
       assert.throws(
         () => withEnvironment({
-          KIRO_RS_BINARY: binary,
-          KIRO_VALIDATION_ARTIFACT_DIR: path.dirname(ROOT),
+          ACCOUNT_RUNTIME_BINARY: binary,
+          ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: path.dirname(ROOT),
         }, () => resolveRuntimeValidationPaths(ROOT)),
         /must not contain the repository/,
       )
@@ -161,7 +161,7 @@ test('rejects direct debug and release Cargo outputs even when they are outside 
     externalFixture(({ root, artifacts }) => {
       for (const profile of ['debug', 'release']) {
         const targetDirectory = path.join(root, 'target', profile)
-        const targetBinary = path.join(targetDirectory, 'kiro-rs')
+        const targetBinary = path.join(targetDirectory, 'account-runtime')
         const targetLink = path.join(root, `${profile}-candidate-link`)
         fs.mkdirSync(targetDirectory, { recursive: true })
         fs.writeFileSync(targetBinary, 'direct Cargo output fixture', { mode: 0o700 })
@@ -169,8 +169,8 @@ test('rejects direct debug and release Cargo outputs even when they are outside 
         for (const candidate of [targetBinary, targetLink]) {
           assert.throws(
             () => withEnvironment({
-              KIRO_RS_BINARY: candidate,
-              KIRO_VALIDATION_ARTIFACT_DIR: artifacts,
+              ACCOUNT_RUNTIME_BINARY: candidate,
+              ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts,
             }, () => resolveRuntimeValidationPaths(ROOT)),
             /copied frozen candidate, not target\/debug or target\/release/,
           )
@@ -191,15 +191,15 @@ test('treats two-dot-prefixed names as inside a synthetic repository for five ro
       fs.mkdirSync(internalArtifacts)
       assert.throws(
         () => withEnvironment({
-          KIRO_RS_BINARY: internalBinary,
-          KIRO_VALIDATION_ARTIFACT_DIR: artifacts,
+          ACCOUNT_RUNTIME_BINARY: internalBinary,
+          ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts,
         }, () => resolveRuntimeValidationPaths(syntheticRepo)),
         /resolves inside the repository/,
       )
       assert.throws(
         () => withEnvironment({
-          KIRO_RS_BINARY: binary,
-          KIRO_VALIDATION_ARTIFACT_DIR: internalArtifacts,
+          ACCOUNT_RUNTIME_BINARY: binary,
+          ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: internalArtifacts,
         }, () => resolveRuntimeValidationPaths(syntheticRepo)),
         /resolves inside the repository/,
       )
@@ -211,7 +211,7 @@ test('all runtime runners share the fail-closed external path contract', () => {
   for (const runner of RUNNERS) {
     const source = fs.readFileSync(path.join(import.meta.dirname, runner), 'utf8')
     assert.match(source, /resolveRuntimeValidationPaths\(ROOT\)/)
-    assert.doesNotMatch(source, /target\/(?:debug|release)\/kiro-rs/)
+    assert.doesNotMatch(source, /target\/(?:debug|release)\/account-runtime/)
     assert.doesNotMatch(source, /path\.join\(ROOT, ['"]target['"]/)
   }
 })
@@ -280,8 +280,8 @@ test('thinking wire runner rejects a non-executable external candidate before ru
         env: {
           PATH: process.env.PATH || '/usr/bin:/bin',
           TMPDIR: os.tmpdir(),
-          KIRO_RS_BINARY: binary,
-          KIRO_VALIDATION_ARTIFACT_DIR: artifacts,
+        ACCOUNT_RUNTIME_BINARY: binary,
+        ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifacts,
         },
         encoding: 'utf8',
         timeout: 5_000,

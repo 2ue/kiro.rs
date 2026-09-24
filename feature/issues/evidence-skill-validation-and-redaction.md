@@ -32,7 +32,7 @@ quick validation 可从干净环境一条命令通过；打包同一 fixture 3 �
 ## 2026-07-16 当前实现与证据
 
 - 新增 skill 自带的零第三方依赖 validator：检查 frontmatter allowed keys、name/description、目录名、`agents/openai.yaml` 三个 interface 字段、`$skill-name` 引用和必需 references/scripts。
-- `python3 .../scripts/quick_validate.py .codex/skills/kiro-prod-evidence-audit` 已通过。
+- `python3 .../scripts/quick_validate.py .codex/skills/account-runtime-prod-evidence-audit` 已通过。
 - 官方 skill-creator `quick_validate.py` 仍在 import 阶段因宿主缺少 PyYAML 失败；这属于官方脚本环境依赖，未伪装成已通过。
 - 打包器已修复 manifest 自引用、旧 archive 嵌套、symlink 越界和通用 URL credential 脱敏，并在 `SOURCE_DATE_EPOCH` 下规范化 gzip/tar 元数据。
 - JSON/JSONL 先按规范化敏感 key 清理，再执行文本模式；第一次 archive 扫描曾发现带引号 JSON Authorization 未脱敏，修复后从头重跑。

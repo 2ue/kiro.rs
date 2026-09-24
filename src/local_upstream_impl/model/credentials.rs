@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{fmt, fs};
 
+#[cfg(test)]
 use base64::{
     Engine as _,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
@@ -50,7 +51,8 @@ pub struct LocalUpstreamCredentials {
     #[serde(skip_serializing_if = "Option::is_none", alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
-    /// Profile ARN
+    /// Legacy profile ARN retained only in test builds for compatibility.
+    #[cfg(test)]
     #[serde(skip_serializing_if = "Option::is_none", alias = "profile_arn")]
     pub profile_arn: Option<String>,
 
@@ -181,12 +183,7 @@ pub struct LocalUpstreamCredentials {
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken。
     /// 新写出字段为 `apiKey`；旧字段名只作为兼容读取。
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        alias = "kiroApiKey",
-        alias = "kiro_api_key",
-        alias = "api_key"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "api_key")]
     pub api_key: Option<String>,
 
     /// 端点名称（可选）
@@ -199,15 +196,19 @@ pub struct LocalUpstreamCredentials {
 
 impl fmt::Debug for LocalUpstreamCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalUpstreamCredentials")
+        let mut debug = formatter.debug_struct("LocalUpstreamCredentials");
+        debug
             .field("id", &self.id)
             .field("created_at_present", &self.created_at.is_some())
             .field("updated_at_present", &self.updated_at.is_some())
             .field("storage_revision", &self.storage_revision)
             .field("access_token_present", &self.access_token.is_some())
-            .field("refresh_token_present", &self.refresh_token.is_some())
-            .field("profile_arn_present", &self.profile_arn.is_some())
+            .field("refresh_token_present", &self.refresh_token.is_some());
+        #[cfg(test)]
+        {
+            debug.field("profile_arn_present", &self.profile_arn.is_some());
+        }
+        debug
             .field("expires_at_present", &self.expires_at.is_some())
             .field("auth_method_present", &self.auth_method.is_some())
             .field("provider_present", &self.provider.is_some())
@@ -377,7 +378,7 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     match compact_protocol_value(value).as_str() {
         "builderid" | "iam" | "idc" => "idc",
         "apikey" => "api_key",
-        "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal" => "external_idp",
+        "externalidp" | "enterprise" | "iamsso" | "internal" => "external_idp",
         "social" => "social",
         _ => value,
     }
@@ -390,6 +391,7 @@ fn trimmed_non_empty(value: &Option<String>) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(test)]
 fn microsoft_token_endpoint_from_issuer(issuer: &str) -> Option<String> {
     let parsed = url::Url::parse(issuer.trim()).ok()?;
     if parsed.scheme() != "https" {
@@ -412,6 +414,7 @@ fn microsoft_token_endpoint_from_issuer(issuer: &str) -> Option<String> {
     ))
 }
 
+#[cfg(test)]
 fn jwt_issuer(token: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
     let decoded = URL_SAFE_NO_PAD
@@ -425,24 +428,17 @@ fn jwt_issuer(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 fn looks_like_microsoft_refresh_token(refresh_token: &str) -> bool {
     let trimmed = refresh_token.trim();
     trimmed.starts_with("1.") || trimmed.starts_with("0.")
 }
 
+#[cfg(test)]
 fn default_external_idp_scopes(client_id: &str) -> String {
     format!(
-        "api://{client_id}/codewhisperer:conversations api://{client_id}/codewhisperer:completions offline_access"
+        "api://{client_id}/account-runtime:conversations api://{client_id}/account-runtime:completions offline_access"
     )
-}
-
-pub(crate) fn profile_arn_region(profile_arn: &str) -> Option<&str> {
-    let parts: Vec<&str> = profile_arn.trim().splitn(6, ':').collect();
-    if parts.len() < 6 || parts[0] != "arn" || parts[2] != "codewhisperer" {
-        return None;
-    }
-    let region = parts[3].trim();
-    (!region.is_empty()).then_some(region)
 }
 
 /// 凭据配置（支持单对象或数组格式）
@@ -554,7 +550,6 @@ impl LocalUpstreamCredentials {
         self.id == other.id
             && self.access_token == other.access_token
             && self.refresh_token == other.refresh_token
-            && self.profile_arn == other.profile_arn
             && self.expires_at == other.expires_at
             && self.auth_method == other.auth_method
             && self.provider == other.provider
@@ -603,11 +598,10 @@ impl LocalUpstreamCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > profileArn region > config.api_region > config.region
+    /// 优先级：凭据.api_region > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
-            .or_else(|| self.profile_arn.as_deref().and_then(profile_arn_region))
             .unwrap_or(config.effective_api_region())
     }
 
@@ -708,7 +702,10 @@ impl LocalUpstreamCredentials {
         self.scopes = None;
         self.access_token = None;
         self.expires_at = None;
-        self.profile_arn = None;
+        #[cfg(test)]
+        {
+            self.profile_arn = None;
+        }
 
         if self.auth_region.as_deref().is_none_or(str::is_empty) {
             self.auth_region = self.region.clone();
@@ -727,14 +724,24 @@ impl LocalUpstreamCredentials {
         self.endpoint = normalized_optional(self.endpoint.take());
     }
 
-    /// 补齐 external_idp 账号的可推导字段。
+    /// 旧 external_idp 导入兼容入口。
     ///
-    /// 企业 SSO 导出格式经常没有 AWS SSO device-flow 的 clientSecret。Microsoft
-    /// Entra ID 这类 public-client refresh token 只需要 clientId、refreshToken
-    /// 和 token endpoint；当导入 JSON 只带 issuerUrl 或 accessToken 时，可以安全
-    /// 推导 token endpoint。缺 scopes 时按当前上游 CodeWhisperer scope 补齐。
+    /// 生产账号运行时不再派生专用 OAuth/provider 字段；旧派生逻辑只保留在测试兼容路径，
+    /// 用于验证历史导入数据的解析行为。
     pub fn normalize_external_idp_defaults(&mut self) {
         self.canonicalize_auth_method();
+        #[cfg(not(test))]
+        {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.normalize_external_idp_defaults_test_compat();
+        }
+    }
+
+    #[cfg(test)]
+    fn normalize_external_idp_defaults_test_compat(&mut self) {
         if !self.is_external_idp_refresh_credential() {
             return;
         }
@@ -786,7 +793,7 @@ impl LocalUpstreamCredentials {
                 .unwrap_or(false)
     }
 
-    /// 检查是否应使用 AWS SSO OIDC refresh token 协议刷新。
+    /// 检查是否应使用 OIDC refresh token 协议刷新。
     ///
     /// Enterprise / external IdP 与 Builder ID 一样走 OIDC 刷新，但请求本地上游
     /// 时仍保留 external_idp 语义以附加 TokenType。
@@ -809,8 +816,8 @@ impl LocalUpstreamCredentials {
     /// 检查是否应使用外部 IdP 自带 token endpoint 刷新。
     ///
     /// 这类凭证来自企业 SSO，例如 Microsoft Entra ID，通常只有 public
-    /// clientId、refreshToken、tokenEndpoint 和 scopes，不存在 AWS SSO
-    /// OIDC device-flow 的 clientSecret。
+    /// clientId、refreshToken、tokenEndpoint 和 scopes，不存在 OIDC device-flow 的
+    /// clientSecret。
     pub fn is_external_idp_refresh_credential(&self) -> bool {
         if self.is_api_key_credential() {
             return false;
@@ -819,12 +826,12 @@ impl LocalUpstreamCredentials {
         self.auth_method.as_deref().is_some_and(|m| {
             matches!(
                 compact_protocol_value(m).as_str(),
-                "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
+                "externalidp" | "enterprise" | "iamsso" | "internal"
             )
         }) || self.provider.as_deref().is_some_and(|p| {
             matches!(
                 compact_protocol_value(p).as_str(),
-                "enterprise" | "externalidp" | "iamsso" | "awsidc" | "internal"
+                "enterprise" | "externalidp" | "iamsso" | "internal"
             )
         })
     }
@@ -927,7 +934,7 @@ mod tests {
         let json = r#"{
             "accessToken": "test_token",
             "refreshToken": "test_refresh",
-            "profileArn": "arn:aws:test",
+            "profileArn": "arn:account-runtime:test",
             "expiresAt": "2024-01-01T00:00:00Z",
             "authMethod": "social"
         }"#;
@@ -935,7 +942,10 @@ mod tests {
         let creds = LocalUpstreamCredentials::from_json(json).unwrap();
         assert_eq!(creds.access_token, Some("test_token".to_string()));
         assert_eq!(creds.refresh_token, Some("test_refresh".to_string()));
-        assert_eq!(creds.profile_arn, Some("arn:aws:test".to_string()));
+        assert_eq!(
+            creds.profile_arn,
+            Some("arn:account-runtime:test".to_string())
+        );
         assert_eq!(creds.expires_at, Some("2024-01-01T00:00:00Z".to_string()));
         assert_eq!(creds.auth_method, Some("social".to_string()));
     }
@@ -945,7 +955,7 @@ mod tests {
         let json = r#"{
             "access_token": "test_access",
             "refresh_token": "test_refresh",
-            "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
+            "profile_arn": "arn:example:account-runtime:us-east-1:123456789012:profile/FAKE",
             "expires_at": "2026-06-10T15:53:19.000Z",
             "auth_method": "idc",
             "provider": "Enterprise",
@@ -953,7 +963,7 @@ mod tests {
             "client_secret": "fake-client-secret",
             "token_endpoint": "https://login.example.com/oauth2/v2.0/token",
             "issuer_url": "https://login.example.com/tenant/v2.0",
-            "scopes": "offline_access codewhisperer:conversations",
+            "scopes": "offline_access account-runtime:conversations",
             "region": "us-east-1",
             "auth_region": "us-west-2",
             "api_region": "eu-west-1",
@@ -966,7 +976,7 @@ mod tests {
         assert_eq!(creds.refresh_token.as_deref(), Some("test_refresh"));
         assert_eq!(
             creds.profile_arn.as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+            Some("arn:example:account-runtime:us-east-1:123456789012:profile/FAKE")
         );
         assert_eq!(
             creds.expires_at.as_deref(),
@@ -986,7 +996,7 @@ mod tests {
         );
         assert_eq!(
             creds.scopes.as_deref(),
-            Some("offline_access codewhisperer:conversations")
+            Some("offline_access account-runtime:conversations")
         );
         assert_eq!(creds.region.as_deref(), Some("us-east-1"));
         assert_eq!(creds.auth_region.as_deref(), Some("us-west-2"));
@@ -1116,8 +1126,6 @@ mod tests {
             "externalidp",
             "iam_sso",
             "IAMSSO",
-            "aws-idc",
-            "AWS_IDC",
             "Internal",
         ] {
             let mut creds = LocalUpstreamCredentials {
@@ -1142,11 +1150,11 @@ mod tests {
             "refresh_token": "refresh",
             "auth_method": "external_idp",
             "client_id": "client123",
-            "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL",
+            "profile_arn": "arn:example:account-runtime:us-east-1:123456789012:profile/REAL",
             "expired": "2026-06-27T07:49:39Z",
             "token_endpoint": "https://login.example.com/oauth2/v2.0/token",
             "issuer_url": "https://login.example.com/tenant/v2.0",
-            "scopes": "api://client123/codewhisperer:conversations offline_access"
+            "scopes": "api://client123/account-runtime:conversations offline_access"
         }"#;
 
         let mut creds = LocalUpstreamCredentials::from_json(json).unwrap();
@@ -1160,7 +1168,7 @@ mod tests {
         );
         assert_eq!(
             creds.scopes.as_deref(),
-            Some("api://client123/codewhisperer:conversations offline_access")
+            Some("api://client123/account-runtime:conversations offline_access")
         );
         assert!(creds.is_external_idp_refresh_credential());
         assert!(!creds.is_idc_refresh_credential());
@@ -1186,7 +1194,7 @@ mod tests {
         assert_eq!(
             creds.scopes.as_deref(),
             Some(
-                "api://client-123/codewhisperer:conversations api://client-123/codewhisperer:completions offline_access"
+                "api://client-123/account-runtime:conversations api://client-123/account-runtime:completions offline_access"
             )
         );
         assert!(creds.client_secret.is_none());
@@ -1216,7 +1224,7 @@ mod tests {
         assert_eq!(
             creds.scopes.as_deref(),
             Some(
-                "api://client-456/codewhisperer:conversations api://client-456/codewhisperer:completions offline_access"
+                "api://client-456/account-runtime:conversations api://client-456/account-runtime:completions offline_access"
             )
         );
         assert!(creds.client_secret.is_none());
@@ -1240,7 +1248,7 @@ mod tests {
         assert_eq!(
             creds.scopes.as_deref(),
             Some(
-                "api://client-789/codewhisperer:conversations api://client-789/codewhisperer:completions offline_access"
+                "api://client-789/account-runtime:conversations api://client-789/account-runtime:completions offline_access"
             )
         );
         assert!(creds.client_secret.is_none());
@@ -1252,7 +1260,9 @@ mod tests {
             auth_method: Some("API KEY".to_string()),
             api_key: Some("ksk_test_key".to_string()),
             provider: Some("Enterprise".to_string()),
-            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/STALE".to_string()),
+            profile_arn: Some(
+                "arn:example:account-runtime:us-east-1:123:profile/STALE".to_string(),
+            ),
             ..Default::default()
         };
 
@@ -1297,10 +1307,7 @@ mod tests {
 
         let value = serde_json::to_value(&credentials).unwrap();
         assert_eq!(value["apiKey"], "ksk_primary");
-        assert!(value.get("kiroApiKey").is_none());
-        assert!(value.get("kiro_api_key").is_none());
-
-        for legacy_field in ["kiroApiKey", "kiro_api_key", "api_key"] {
+        for legacy_field in ["api_key"] {
             let mut object = serde_json::Map::new();
             object.insert("authMethod".to_string(), serde_json::json!("api_key"));
             object.insert(legacy_field.to_string(), serde_json::json!("ksk_legacy"));
@@ -1667,7 +1674,7 @@ mod tests {
             "id": 1,
             "accessToken": "access",
             "refreshToken": "refresh",
-            "profileArn": "arn:aws:test",
+            "profileArn": "arn:account-runtime:test",
             "expiresAt": "2025-12-31T00:00:00Z",
             "authMethod": "idc",
             "clientId": "client123",
@@ -1680,7 +1687,10 @@ mod tests {
         assert_eq!(creds.id, Some(1));
         assert_eq!(creds.access_token, Some("access".to_string()));
         assert_eq!(creds.refresh_token, Some("refresh".to_string()));
-        assert_eq!(creds.profile_arn, Some("arn:aws:test".to_string()));
+        assert_eq!(
+            creds.profile_arn,
+            Some("arn:account-runtime:test".to_string())
+        );
         assert_eq!(creds.expires_at, Some("2025-12-31T00:00:00Z".to_string()));
         assert_eq!(creds.auth_method, Some("idc".to_string()));
         assert_eq!(creds.client_id, Some("client123".to_string()));
@@ -1847,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_effective_api_region_credential_api_region_highest() {
-        // 凭据.api_region > profileArn region > config.api_region > config.region
+        // 凭据.api_region > config.api_region > config.region
         let mut config = Config::default();
         config.region = "config-region".to_string();
         config.api_region = Some("config-api-region".to_string());
@@ -1855,22 +1865,22 @@ mod tests {
         let mut creds = LocalUpstreamCredentials::default();
         creds.api_region = Some("cred-api-region".to_string());
         creds.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/FAKE".to_string());
+            Some("arn:example:account-runtime:eu-central-1:123456789012:profile/FAKE".to_string());
 
         assert_eq!(creds.effective_api_region(&config), "cred-api-region");
     }
 
     #[test]
-    fn test_effective_api_region_fallback_to_profile_arn_region() {
+    fn test_effective_api_region_ignores_profile_arn_region() {
         let mut config = Config::default();
         config.region = "config-region".to_string();
         config.api_region = Some("config-api-region".to_string());
 
         let mut creds = LocalUpstreamCredentials::default();
         creds.profile_arn =
-            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/FAKE".to_string());
+            Some("arn:example:account-runtime:eu-central-1:123456789012:profile/FAKE".to_string());
 
-        assert_eq!(creds.effective_api_region(&config), "eu-central-1");
+        assert_eq!(creds.effective_api_region(&config), "config-api-region");
     }
 
     #[test]

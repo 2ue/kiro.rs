@@ -17,12 +17,12 @@ The earlier violation detector was too broad because it treated arbitrary loadte
 
 ## Environment
 
-- Product binary: `/tmp/kiro-frozen-20260719-r8/kiro-rs`
+- Product binary: `/tmp/account-runtime-frozen-20260719-r8/account-runtime`
 - Product SHA-256: `131696bd81e1cdaeceaac6a45f9c76bf698eb559785b379a82fd77e2f742e631`
-- Loadtest binary: `/tmp/kiro-frozen-20260719-r5/kiro_loadtest`
+- Loadtest binary: `/tmp/account-runtime-frozen-20260719-r5/account_runtime_loadtest`
 - Loadtest SHA-256: `23c04221deb72dde601d491452d8cc9a99211df99b2cd39a386272141f2db8e3`
-- PostgreSQL: current-project isolated `kiro-final-20260718-pg`, loopback `127.0.0.1:50891`
-- Redis: current-project isolated `kiro-final-20260718-redis`, loopback `127.0.0.1:50892/0`
+- PostgreSQL: current-project isolated `account-runtime-final-20260718-pg`, loopback `127.0.0.1:50891`
+- Redis: current-project isolated `account-runtime-final-20260718-redis`, loopback `127.0.0.1:50892/0`
 - Protected port `9022`: skipped by numeric exclusion; not probed or touched.
 - Raw temp roots: deleted after summary capture.
 
@@ -31,20 +31,20 @@ The earlier violation detector was too broad because it treated arbitrary loadte
 Summary file:
 
 ```text
-/tmp/kiro-long-history-tool-result-probe-20260719-r1.json
+/tmp/account-runtime-long-history-tool-result-probe-20260719-r1.json
 sha256 927f33fecebf18e358f5fc7e27a1a86c4deb08bf9535a02d13351a3ed183f578
 ```
 
 Cases:
 
-| Case | Mode | Payload | Requests | Status | p95 TTFB ms | Max Kiro body bytes | Max history | Tool uses/results | Internal marker hits | Synthetic tool text present | Result |
+| Case | Mode | Payload | Requests | Status | p95 TTFB ms | Max Account Runtime body bytes | Max history | Tool uses/results | Internal marker hits | Synthetic tool text present | Result |
 | --- | --- | --- | ---: | --- | ---: | ---: | ---: | --- | ---: | --- | --- |
 | `preemptive_large_tool_results` | `preemptive` | `large-tool-results` | 5 | `{"200":5}` | 37 | 37,985 | 12 | 4 / 4 | 0 | yes | pass |
 | `preemptive_mixed_pathological` | `preemptive` | `mixed-pathological` | 5 | `{"200":5}` | 77 | 240,122 | 0 | 0 / 0 | 0 | no | pass |
 | `preemptive_schema_key_mapping` | `preemptive` | `schema-key-mapping` | 5 | `{"200":5}` | 13 | 4,801 | 2 | 0 / 0 | 0 | no | pass |
 | `on_too_long_large_tool_results` | `on_too_long` | `large-tool-results` | 5 | `{"200":5}` | 24 | 554,537 | 12 | 4 / 4 | 0 | yes | pass |
 
-Forbidden markers scanned across captured Kiro text fields:
+Forbidden markers scanned across captured Account Runtime text fields:
 
 ```text
 user Continue
@@ -64,11 +64,11 @@ All four cases had `0` forbidden marker hits and `0` orphan tool results. The sy
 Summary file:
 
 ```text
-/tmp/kiro-on-too-long-retry-capture-20260719-r1.json
+/tmp/account-runtime-on-too-long-retry-capture-20260719-r1.json
 sha256 f85b3f9ad3282389fed10e079740f10417009732bc813d3c378d94d14036e513
 ```
 
-The fake Kiro upstream returned `400 {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}` for the first inference request, then accepted the retry.
+The fake Account Runtime upstream returned `400 {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}` for the first inference request, then accepted the retry.
 
 Observed:
 
@@ -87,7 +87,7 @@ The long-history red item is not a product leak on the r8 frozen candidate. It w
 
 - `old_history_entry_with_large_tool_result` and `summarized_history_entry_with_hash_and_excerpt` are synthetic loadtest text inside valid tool results.
 - The proxy correctly preserves/truncates those as user-owned tool output.
-- Actual internal transcript markers remained absent from upstream Kiro bodies across preemptive, on-too-long, mixed pathological and schema-key cases.
+- Actual internal transcript markers remained absent from upstream Account Runtime bodies across preemptive, on-too-long, mixed pathological and schema-key cases.
 
 The release gate still remains open for real Claude Code long-session/resume/tool/search/image/MCP scenarios. This record only closes the fake-upstream long-history oracle correction and on-too-long retry capture for the frozen r8 binary.
 

@@ -10,7 +10,7 @@ Last updated: 2026-07-22
 
 ## 现象与影响
 
-Kiro can occasionally return its internal tool XML as `assistantResponseEvent.content` instead of a structured `toolUseEvent`. The compatibility recovery in `src/anthropic/stream.rs` previously treated any non-fenced, line-start `<invoke name="...">` whose name appeared in the request tool table as executable evidence.
+Account Runtime can occasionally return its internal tool XML as `assistantResponseEvent.content` instead of a structured `toolUseEvent`. The compatibility recovery in `src/anthropic/stream.rs` previously treated any non-fenced, line-start `<invoke name="...">` whose name appeared in the request tool table as executable evidence.
 
 That rule crossed the text/action boundary. Ordinary model text such as the following could become an Anthropic `tool_use`, and Claude Code could execute it:
 
@@ -64,7 +64,7 @@ The reproducer must vary all of the following because the old behavior depended 
 
 ### Real Claude Code CLI
 
-Use [bare-invoke-claude-cli.mjs](../tests/bare-invoke-claude-cli.mjs) with a repository-external frozen binary and artifact root, a caller-owned empty PostgreSQL database, isolated Redis prefix, fake Kiro API key and localhost fake upstream. It runs exactly five rounds each of:
+Use [bare-invoke-claude-cli.mjs](../tests/bare-invoke-claude-cli.mjs) with a repository-external frozen binary and artifact root, a caller-owned empty PostgreSQL database, isolated Redis prefix, fake Account Runtime API key and localhost fake upstream. It runs exactly five rounds each of:
 
 - bare Bash invoke text: zero CLI tool uses/results and no owned sentinel;
 - fenced Bash invoke text: zero CLI tool uses/results and no owned sentinel;
@@ -96,7 +96,7 @@ The stream hot path now searches for two exact function-call opening tags. It no
 
 Only a plausible function-calls prefix, a short split corruption marker, or an eligible unclosed complete opening wrapper is retained. The existing 256 KiB hard bound remains for an eligible wrapper; crossing it emits the original text rather than dropping it or inventing a tool.
 
-The tradeoff is intentional: legacy Kiro output where `<function_calls>` was fully lost and only a bare invoke remains is no longer auto-executed. It becomes visible text. Executing weak, model-forgeable text is not an acceptable compatibility fallback.
+The tradeoff is intentional: legacy Account Runtime output where `<function_calls>` was fully lost and only a bare invoke remains is no longer auto-executed. It becomes visible text. Executing weak, model-forgeable text is not an acceptable compatibility fallback.
 
 A complete root protocol wrapper is still a compatibility recovery, not cryptographic provenance. The parser therefore does not establish that arbitrary upstream text can never imitate the wrapper. The primary trustworthy path remains the structured upstream `ToolUseEvent`, and final claims must be limited to the tested contexts and protocol grammar.
 
@@ -123,13 +123,13 @@ Focused component evidence is recorded in [bare invoke protocol evidence](../evi
 - cleanup all true: child groups, service, fake server, temp root, owned Redis prefix and owned ports;
 - protected `9022` was skipped by runner logic.
 
-The same run also confirmed the strict boundary with real Claude CLI 2.1.197: literal bare/fenced/explanatory Bash XML did not create the owned sentinel, while structured Kiro `toolUseEvent` still executed the controlled `printf structured-ok` loop. Full details are in [2026-07-19 frozen Claude CLI thinking and bare-invoke gate](../evidence/frozen-claude-cli-thinking-and-bare-invoke-20260719.md).
+The same run also confirmed the strict boundary with real Claude CLI 2.1.197: literal bare/fenced/explanatory Bash XML did not create the owned sentinel, while structured Account Runtime `toolUseEvent` still executed the controlled `printf structured-ok` loop. Full details are in [2026-07-19 frozen Claude CLI thinking and bare-invoke gate](../evidence/frozen-claude-cli-thinking-and-bare-invoke-20260719.md).
 
 This closes the fake-upstream C2 runner for this issue. It does not close C3/C4 long interactive sessions, MCP/search/image combinations, contamination retry fault injection, L1-L5 load, or final release inventory.
 
 ### 2026-07-22 当前候选复跑
 
-当前仓库外 frozen `kiro-rs` 候选 SHA-256
+当前仓库外 frozen `account-runtime` 候选 SHA-256
 `31b8c4749201b0f7666b63a9c268c0b75e21f6c1600b18c77bf39a7c6c249c2e`
 再次通过 `feature/tests/bare-invoke-claude-cli.mjs`，Claude Code CLI 版本为
 `2.1.197 (Claude Code)`。
@@ -153,7 +153,7 @@ Claude CLI 可执行工具，同时没有削弱真实结构化 `ToolUseEvent` �
 ## 残余风险与回滚
 
 - A model that emits an exact protocol-root wrapper can still enter the compatibility recovery. Removing literal wrapper recovery entirely is the stricter future option if production evidence shows structured events are sufficient.
-- The strict grammar may textify a future Kiro XML variant with additional attributes or namespaces. That is a visible compatibility failure, not silent execution; support must be added with an explicit fixture.
+- The strict grammar may textify a future Account Runtime XML variant with additional attributes or namespaces. That is a visible compatibility failure, not silent execution; support must be added with an explicit fixture.
 - Tool parameter values are legacy XML text, not a general XML parser. Nested protocol-looking tags fail closed or use the documented last-close compatibility rule inside an otherwise strict element.
 - Long-session C3/C4, contamination retry fault injection, L1-L5 load and final release inventory remain release blockers.
 - Do not roll back by restoring line-start bare invoke execution. If a production regression requires rollback, deploy the previously recorded binary/tag while retaining this issue as a P0 blocker for any forward release.

@@ -1,13 +1,13 @@
-//! AWS Event Stream 头部解析
+//! Binary event stream 头部解析
 //!
-//! 实现 AWS Event Stream 协议的头部解析功能
+//! 实现二进制事件流协议的头部解析功能
 
 use super::error::{ParseError, ParseResult};
 use std::collections::HashMap;
 
 /// 头部值类型标识
 ///
-/// AWS Event Stream 协议定义的 10 种值类型
+/// 二进制事件流协议定义的 10 种值类型
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderValueType {
@@ -45,7 +45,7 @@ impl TryFrom<u8> for HeaderValueType {
 
 /// 头部值
 ///
-/// 支持 AWS Event Stream 协议定义的所有值类型
+/// 支持二进制事件流协议定义的所有值类型
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeaderValue {
     Bool(bool),

@@ -20,11 +20,11 @@ These clauses are binding through accepted decisions 001 and 003-014. Decision 0
 1. The system MUST remain a single-user, single-trust-domain product unless a future product decision explicitly changes that model.
 2. The design MUST NOT introduce tenant IDs, tenant repositories, per-tenant data partitioning, tenant billing, or tenant schedulers.
 3. Multiple request API keys MUST be treated as equivalent access credentials for the same operator, with rotation and revocation support but no user identity semantics.
-4. Multiple Kiro credentials and external pools MUST be treated as operator-owned capacity resources.
+4. Multiple Account Runtime credentials and external pools MUST be treated as operator-owned capacity resources.
 5. Single-process development and supported multi-replica production profiles MUST preserve the accepted semantics. Cross-replica behavior is an HA concern, not user isolation.
 6. The complete first-party implementation MUST be rewritten using the 50 target authority modules. Modules integrate only into the target-only candidate; production activates and rolls back the complete system once, and the target release contains no legacy selector/fallback.
 7. The product SHOULD remain a modular monolith and single deployable binary during this rewrite. A microservice split requires separate evidence and decision.
-8. Current successful Anthropic, Claude Code, Kiro, external-pool, Admin, PgSQL, and Redis contracts MUST be preserved unless an accepted decision explicitly changes a documented defect.
+8. Current successful Anthropic, Claude Code, Account Runtime, external-pool, Admin, PgSQL, and Redis contracts MUST be preserved unless an accepted decision explicitly changes a documented defect.
 
 ## Functional Requirements
 
@@ -115,7 +115,7 @@ Additional rules:
 - `FUN-042`: Request body, remote sources, transformed payloads, decoded media, PDFs, tokenization, and blocking work MUST consume explicit request-level and global resource budgets.
 - `FUN-043`: Request-body diagnostic capture MUST be disabled by default.
 - `FUN-044`: Explicit diagnostic capture MUST apply field allowlists/redaction, file permission restrictions, root/symlink validation, single-record limits, total bytes, file count, retention age, automatic expiry, and dropped-record metrics.
-- `FUN-045`: Kiro/local and explicitly normalized external tool definitions MUST treat missing/blank description and absent/explicit-null input schema according to the accepted profile policy, while raw external passthrough remains byte-identical and performs no tool repair.
+- `FUN-045`: Account Runtime/local and explicitly normalized external tool definitions MUST treat missing/blank description and absent/explicit-null input schema according to the accepted profile policy, while raw external passthrough remains byte-identical and performs no tool repair.
 - `FUN-046`: A target-specific tool property-name repair MUST be deterministic, collision-free and reversible through streaming/non-streaming `tool_use.input`, update every applicable property-reference keyword, and reject locally when semantic round-trip proof is unavailable. Silent lossy renaming is prohibited.
 - `FUN-047`: Public/Admin connection, header, body and structured traversal work MUST acquire the accepted global resource budget before retention/traversal, enforce count/depth/edge/string and slow-read limits with cancellation, and hand downstream only a budget-bound body/artifact. A byte limit alone is not a CPU/object-cardinality limit.
 
@@ -129,7 +129,7 @@ Additional rules:
 - `INV-006`: Runtime config concurrent writers either serialize successfully or receive an explicit conflict; no field is silently lost.
 - `INV-007`: Redis/PgSQL retries cannot apply the same usage or runtime mutation twice.
 - `INV-008`: Reported usage fields are non-negative and satisfy the centrally defined cache/input accounting relation.
-- `INV-009`: Raw body mode does not execute full parse, Kiro conversion, media materialization, payload guard, or unconditional token counting.
+- `INV-009`: Raw body mode does not execute full parse, Account Runtime conversion, media materialization, payload guard, or unconditional token counting.
 - `INV-010`: No default log or diagnostic path records prompts, tool results, images, tokens, secrets, API keys, cookies, or credentials.
 - `INV-011`: A terminal cause is selected once; retries of terminal persistence, lease completion, credential outcome, usage, or projection effects converge by stable terminal/owner idempotency keys, and any unacknowledged residue remains visible and recoverable. Separately accepted audit events converge through `MOD-AUDIT` owner-defined stable event IDs; a request terminal does not implicitly create an audit obligation.
 - `INV-012`: For one prepared tool-definition revision, every mapped upstream property name resolves to exactly one original property/path and every returned mapped tool argument is reversed before downstream delivery; an ambiguous or incomplete map never reaches an upstream attempt.
@@ -234,7 +234,7 @@ Validation MUST include more than short synthetic success calls:
 - large stale Redis queue/lease populations that prove per-acquire cleanup is batch-bounded and backlog converges without blocking unrelated work;
 - repeated endpoint/proxy/credential rotation that proves reusable client-cache bounds, invalidation, and timely release of retained secret-bearing entries;
 - local and external admission/queue saturation under finite production ceilings, including rejection of zero/unset unbounded production defaults;
-- local Kiro, external raw, external normalized, direct, preflight, fallback, and local-rescue routes;
+- local Account Runtime, external raw, external normalized, direct, preflight, fallback, and local-rescue routes;
 - prompt-cache creation, read, eviction, shaping, no-cache, and usage projection transitions;
 - Admin secret create/rotate/read/export behavior plus reload and multi-tab browser checks proving neither maintained UI persists a reusable credential in long-lived JavaScript-readable storage;
 - process restart and SIGTERM while requests and background writes are active.

@@ -2,14 +2,14 @@
 
 /*
  * Product-level external takeover gate for SchedulerRedisDegraded without
- * Docker or Cargo. The caller must provide a frozen kiro.rs binary, an owned
+ * Docker or Cargo. The caller must provide a frozen account runtime binary, an owned
  * artifact directory, a pre-created caller-owned PostgreSQL database, and a
  * loopback Redis DB/prefix. The runner starts only:
  *
- * - fake local Kiro upstream;
+ * - fake local account runtime upstream;
  * - fake external OpenAI/Anthropic-compatible upstream;
  * - the repository's loopback redis-chaos-proxy;
- * - one temporary kiro.rs process on a random non-9022 port.
+ * - one temporary account runtime process on a random non-9022 port.
  */
 
 import assert from 'node:assert/strict'
@@ -27,22 +27,22 @@ import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
-const POSTGRES_URL = String(process.env.KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL || '').trim()
+const POSTGRES_URL = String(process.env.ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL || '').trim()
 const POSTGRES_URL_TEMPLATE = String(
-  process.env.KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE || '',
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE || '',
 ).trim()
-const POSTGRES_DATABASES = String(process.env.KIRO_EXTERNAL_TAKEOVER_POSTGRES_DATABASES || '')
+const POSTGRES_DATABASES = String(process.env.ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_DATABASES || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean)
-const REDIS_URL = requiredEnvironment('KIRO_EXTERNAL_TAKEOVER_REDIS_URL')
-const REDIS_PREFIX = requiredEnvironment('KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX')
-const OUTER_ROUNDS = boundedInteger('KIRO_EXTERNAL_TAKEOVER_OUTER_ROUNDS', 3, 1, 5)
-const REQUESTS_PER_ROUND = boundedInteger('KIRO_EXTERNAL_TAKEOVER_REQUESTS', 5, 3, 10)
-const RECOVERY_REQUESTS = boundedInteger('KIRO_EXTERNAL_TAKEOVER_RECOVERY_REQUESTS', 5, 5, 20)
-const LATENCY_MS = boundedInteger('KIRO_EXTERNAL_TAKEOVER_REDIS_LATENCY_MS', 500, 251, 2_000)
-const FALLBACK_ENABLED = process.env.KIRO_EXTERNAL_TAKEOVER_FALLBACK_ENABLED !== 'false'
-const VALIDATE_ONLY = process.env.KIRO_EXTERNAL_TAKEOVER_VALIDATE_ONLY === '1'
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL')
+const REDIS_PREFIX = requiredEnvironment('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX')
+const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_OUTER_ROUNDS', 3, 1, 5)
+const REQUESTS_PER_ROUND = boundedInteger('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REQUESTS', 5, 3, 10)
+const RECOVERY_REQUESTS = boundedInteger('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_RECOVERY_REQUESTS', 5, 5, 20)
+const LATENCY_MS = boundedInteger('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_LATENCY_MS', 500, 251, 2_000)
+const FALLBACK_ENABLED = process.env.ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_FALLBACK_ENABLED !== 'false'
+const VALIDATE_ONLY = process.env.ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_VALIDATE_ONLY === '1'
 const REQUEST_KEY = 'sk-external-takeover-request'
 const ADMIN_KEY = 'sk-external-takeover-admin'
 const EXTERNAL_KEY = 'sk-external-takeover-fake-external'
@@ -170,10 +170,10 @@ function validateInputs() {
   const postgresUrls = resolvePostgresUrls()
   const postgres = new URL(postgresUrls[0])
   if (!['postgres:', 'postgresql:'].includes(postgres.protocol)) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER PostgreSQL URL must use PostgreSQL')
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER PostgreSQL URL must use PostgreSQL')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(postgres.hostname)) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER PostgreSQL URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER PostgreSQL URL must target loopback')
   }
   if (Number(postgres.port || 5432) === 9022) throw new Error('port 9022 is protected')
   for (const postgresUrl of postgresUrls) {
@@ -182,36 +182,36 @@ function validateInputs() {
       || parsedPostgres.hostname !== postgres.hostname
       || Number(parsedPostgres.port || 5432) !== Number(postgres.port || 5432)
       || parsedPostgres.username !== postgres.username) {
-      throw new Error('KIRO_EXTERNAL_TAKEOVER PostgreSQL round databases must share one loopback authority')
+      throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER PostgreSQL round databases must share one loopback authority')
     }
     const database = decodeURIComponent(parsedPostgres.pathname.replace(/^\//, ''))
-    if (!/^kiro_external_takeover_[a-z0-9_]{3,80}$/.test(database)) {
-      throw new Error('KIRO_EXTERNAL_TAKEOVER PostgreSQL inputs must name caller-owned kiro_external_takeover_* databases')
+    if (!/^account_runtime_external_takeover_[a-z0-9_]{3,80}$/.test(database)) {
+      throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER PostgreSQL inputs must name caller-owned account_runtime_external_takeover_* databases')
     }
   }
 
   const redis = new URL(REDIS_URL)
-  if (redis.protocol !== 'redis:') throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_URL must use redis://')
+  if (redis.protocol !== 'redis:') throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL must use redis://')
   if (redis.username || redis.password) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_URL must not contain Redis auth material')
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL must not contain Redis auth material')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(redis.hostname)) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL must target loopback')
   }
-  if (redis.search || redis.hash) throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_URL must not contain query or fragment data')
+  if (redis.search || redis.hash) throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL must not contain query or fragment data')
   const redisPort = Number(redis.port || 6379)
   if (redisPort === 9022) throw new Error('port 9022 is protected')
   const dbText = redis.pathname.replace(/^\//, '')
-  if (!/^\d+$/.test(dbText)) throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_URL must name a Redis database')
+  if (!/^\d+$/.test(dbText)) throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL must name a Redis database')
   const redisDatabase = Number(dbText)
   if (!Number.isSafeInteger(redisDatabase) || redisDatabase < 1 || redisDatabase > 15) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_URL must use an isolated nonzero database in 1..15')
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL must use an isolated nonzero database in 1..15')
   }
-  if (REDIS_PREFIX.includes('kiro_rs:local')) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX must be a caller-owned temporary prefix')
+  if (REDIS_PREFIX.includes('account_runtime:local')) {
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX must be a caller-owned temporary prefix')
   }
   if (!/^[a-z0-9][a-z0-9:._-]{7,95}$/.test(REDIS_PREFIX)) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX has an invalid format')
   }
   return {
     postgres,
@@ -227,26 +227,26 @@ function resolvePostgresUrls() {
   if (POSTGRES_URL_TEMPLATE) {
     const placeholderCount = (POSTGRES_URL_TEMPLATE.match(/\{database\}/g) || []).length
     if (placeholderCount !== 1) {
-      throw new Error('KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
+      throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
     }
     if (POSTGRES_URL) {
-      throw new Error('provide either KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL or KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE, not both')
+      throw new Error('provide either ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL or ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE, not both')
     }
     if (POSTGRES_DATABASES.length !== OUTER_ROUNDS) {
-      throw new Error(`KIRO_EXTERNAL_TAKEOVER_POSTGRES_DATABASES must contain exactly ${OUTER_ROUNDS} pre-created database names`)
+      throw new Error(`ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_DATABASES must contain exactly ${OUTER_ROUNDS} pre-created database names`)
     }
     return POSTGRES_DATABASES.map((database) => {
-      if (!/^kiro_external_takeover_[a-z0-9_]{3,80}$/.test(database)) {
-        throw new Error('KIRO_EXTERNAL_TAKEOVER_POSTGRES_DATABASES must contain caller-owned kiro_external_takeover_* names')
+      if (!/^account_runtime_external_takeover_[a-z0-9_]{3,80}$/.test(database)) {
+        throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_DATABASES must contain caller-owned account_runtime_external_takeover_* names')
       }
       return POSTGRES_URL_TEMPLATE.replace('{database}', encodeURIComponent(database))
     })
   }
   if (!POSTGRES_URL) {
-    throw new Error('KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL or KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE is required')
+    throw new Error('ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL or ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL_TEMPLATE is required')
   }
   if (OUTER_ROUNDS !== 1) {
-    throw new Error('single KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL is only valid with KIRO_EXTERNAL_TAKEOVER_OUTER_ROUNDS=1; provide URL_TEMPLATE plus DATABASES for multi-round isolation')
+    throw new Error('single ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL is only valid with ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_OUTER_ROUNDS=1; provide URL_TEMPLATE plus DATABASES for multi-round isolation')
   }
   return [POSTGRES_URL]
 }
@@ -297,7 +297,7 @@ function eventFrame(eventType, payload) {
   return frame
 }
 
-function writeKiroSuccess(response, text) {
+function writeAccountRuntimeSuccess(response, text) {
   const body = Buffer.concat([
     eventFrame('assistantResponseEvent', {
       content: text,
@@ -347,7 +347,7 @@ function createFakeUpstreams() {
   const local = http.createServer(async (request, response) => {
     await consumeRequest(request)
     const url = new URL(request.url || '/', 'http://127.0.0.1')
-    const target = String(request.headers['x-amz-target'] || '')
+    const target = String(request.headers['x-account-runtime-target'] || '')
     const kind = target.endsWith('.ListAvailableModels')
       || url.pathname.toLowerCase().endsWith('/listavailablemodels')
       ? 'auxiliary'
@@ -366,7 +366,7 @@ function createFakeUpstreams() {
       return
     }
     state.localInferenceHits += 1
-    writeKiroSuccess(response, 'local-ok')
+    writeAccountRuntimeSuccess(response, 'local-ok')
   })
   const external = http.createServer(async (request, response) => {
     await consumeRequest(request)
@@ -450,7 +450,7 @@ async function timedRequest(url, options = {}) {
 async function waitForHealth(baseUrl, handle, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (handle.exitCode !== null) throw new Error(`kiro-rs exited before health check: ${handle.exitCode}`)
+    if (handle.exitCode !== null) throw new Error(`account-runtime service exited before health check: ${handle.exitCode}`)
     try {
       const response = await fetch(`${baseUrl}/healthz`)
       if (response.ok) return
@@ -540,7 +540,7 @@ async function startRedisProxy(target) {
 
 function startService(configPath, credentialsPath, logPath, servicePort) {
   const log = fs.openSync(logPath, 'a')
-  const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
     env: validationChildEnvironment({
       RUST_LOG: 'info',
@@ -733,8 +733,8 @@ async function runRound(round, target) {
     apiKey: REQUEST_KEY,
     adminApiKey: ADMIN_KEY,
     defaultEndpoint: 'ide',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${localPort}/kiro`,
-    kiroUpstreamResponseTimeoutSecs: 5,
+    upstreamBaseUrl: `http://127.0.0.1:${localPort}/account-runtime`,
+    upstreamResponseTimeoutSecs: 5,
     credentialRetryMaxAttempts: 2,
     inferenceUpstreamMaxAttempts: 2,
     credentialPromptLogicRetryEnabled: false,
@@ -870,7 +870,7 @@ async function runRound(round, target) {
   }
 
   const resourcesEnd = processResources(service.pid)
-  await stopChild(service, 'kiro-rs')
+  await stopChild(service, 'account-runtime service')
   service = null
   await stopChild(proxyProcess, 'redis proxy')
   proxyProcess = null
@@ -900,7 +900,7 @@ async function cleanup() {
   if (cleanupStarted) return { alreadyStarted: true }
   cleanupStarted = true
   const errors = []
-  try { await stopChild(service, 'kiro-rs') } catch (error) { errors.push(String(error?.message || error)) }
+  try { await stopChild(service, 'account-runtime service') } catch (error) { errors.push(String(error?.message || error)) }
   try { await stopChild(proxyProcess, 'redis proxy') } catch (error) { errors.push(String(error?.message || error)) }
   if (fake) {
     try { await fake.close() } catch (error) { errors.push(String(error?.message || error)) }

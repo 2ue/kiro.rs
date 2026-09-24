@@ -70,7 +70,7 @@ Every stateful or end-to-end work unit uses isolated target resources:
 - dedicated PgSQL database/schema and Redis namespace/instance;
 - dedicated Files and diagnostic roots;
 - dedicated ports, browser profile/storage, Claude CLI HOME/config, logs and artifact manifest;
-- deterministic fake Kiro, external-pool, media and fault endpoints by default;
+- deterministic fake Account Runtime, external-pool, media and fault endpoints by default;
 - network deny-by-default except explicit loopback fixtures and separately authorized low-volume real validation;
 - bounded process tree, memory, FD, task, disk, duration and cleanup watchdog.
 
@@ -79,10 +79,10 @@ Legacy and target comparisons use two independent state clones derived from the 
 ## No Duplicate Side Effects
 
 - Production traffic mirroring to the target candidate is prohibited.
-- Legacy and target implementations never execute the same logical Kiro/external POST, media fetch, Admin mutation, Files mutation, lease acquisition or durable write.
+- Legacy and target implementations never execute the same logical Account Runtime/external POST, media fetch, Admin mutation, Files mutation, lease acquisition or durable write.
 - Pure comparison consumes immutable sanitized facts or one captured outcome; it cannot call a real dependency.
 - Deterministic fakes own retry, partial-send, SSE, slow stream, redirect, disconnect and malformed-response scenarios.
-- Real Kiro A/B uses distinct sequential logical operations and request/attempt IDs under decision-010 caps. It is compatibility evidence, not byte-for-byte model-output equivalence.
+- Real Account Runtime A/B uses distinct sequential logical operations and request/attempt IDs under decision-010 caps. It is compatibility evidence, not byte-for-byte model-output equivalence.
 - A possibly transmitted POST is not retried without proven idempotency; downstream header commitment prohibits rerouting.
 
 ## Final-Code Requirements

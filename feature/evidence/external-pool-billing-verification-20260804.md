@@ -41,26 +41,26 @@ pnpm --dir admin-ui build
 ```text
 feature/tests/run-cargo-scoped.sh usage-billing-external-pool -- cargo test --locked external_pool::tests
 => external_pool::tests: 214 passed / 0 failed
-=> kiro_loadtest filtered target: 0 tests run / 0 failed
+=> account_runtime_loadtest filtered target: 0 tests run / 0 failed
 ```
 
 ```text
-KIRO_RS_REQUIRE_STORAGE_TESTS=1
-KIRO_RS_TEST_POSTGRES_URL=<local loopback postgres>
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=<local loopback postgres>
 feature/tests/run-cargo-scoped.sh usage-billing-storage-pg -- cargo test --locked postgres_persists_runtime_config_credentials_stats_usage_and_pricing -- --nocapture --test-threads=1
 => storage::postgres::tests::postgres_persists_runtime_config_credentials_stats_usage_and_pricing: 1 passed / 0 failed
 ```
 
 ```text
-KIRO_RS_REQUIRE_STORAGE_TESTS=1
-KIRO_RS_TEST_POSTGRES_URL=<local loopback postgres>
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=<local loopback postgres>
 feature/tests/run-cargo-scoped.sh usage-billing-storage-pg-rollup -- cargo test --locked postgres_rolls_up_external_pool_billing_for_large_samples_and_removes_after_cleanup -- --nocapture --test-threads=1
 => storage::postgres::tests::postgres_rolls_up_external_pool_billing_for_large_samples_and_removes_after_cleanup: 1 passed / 0 failed
 ```
 
 ```text
-KIRO_RS_REQUIRE_STORAGE_TESTS=1
-KIRO_RS_TEST_REDIS_URL=<local loopback redis>
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1
+ACCOUNT_RUNTIME_TEST_REDIS_URL=<local loopback redis>
 feature/tests/run-cargo-scoped.sh usage-billing-storage-redis -- cargo test --locked redis_usage_summary_and_dashboard_are_materialized -- --nocapture --test-threads=1
 => storage::redis_cache::tests::redis_usage_summary_and_dashboard_are_materialized: 1 passed / 0 failed
 ```
@@ -73,7 +73,7 @@ cargo fmt --check
 ## 边界
 
 - 本轮没有重新发起三台生产服务的 Messages 请求；生产复发观察仍待升级后确认。
-- “原始成本”仍是 `kiro.rs` 本地价格目录按上游 usage 估算出的参考成本，不是
+- “原始成本”仍是 `account-runtime` 本地价格目录按上游 usage 估算出的参考成本，不是
   外部供应商返回的美元账单字段。
 - 如果外部供应商未来返回真实金额或账单接口，应新增“外部供应商真实费用”字段，
   不应把当前“原始成本”改名后继续使用本地价格目录。

@@ -38,7 +38,7 @@ payload repair、history pairing、trim、图片归一化和最终 size check �
 
 2026-07-16 当前工作树已修正 5 MiB 图片判断为 decoded bytes，并把同一 Anthropic 消息内多个超限图片收敛为一条有序汇总占位。红绿测试和边界结果见 [Payload 图片 decoded-byte 证据](../evidence/payload-image-decoded-boundary-20260716.md)。
 
-历史 trim 已从逐逻辑 turn 全量 repair/serialize 改为增量计算完整 turn 前缀后批量删除。第一次批量实现仍因反复计算整个前缀而在 2,000 条历史测试中耗时约 `7.23s`；修正为每条 message 只计数一次后，同一两项测试执行部分为 `0.06s`。当前结构化报告记录 `guardSerializations/historyTrimPasses`；1,000 user + 1,000 assistant 的 Anthropic/Kiro fixture 均为一个 trim pass，完整序列化分别不超过 2/3 次。1 KiB、100 KiB、1 MiB、5 MiB clean raw 各 3 轮保持 byte-identical、未知字段保留且 guard 内 0 次序列化。详见 [Payload 历史性能与 raw identity](../evidence/payload-history-performance-and-identity-20260716.md)。
+历史 trim 已从逐逻辑 turn 全量 repair/serialize 改为增量计算完整 turn 前缀后批量删除。第一次批量实现仍因反复计算整个前缀而在 2,000 条历史测试中耗时约 `7.23s`；修正为每条 message 只计数一次后，同一两项测试执行部分为 `0.06s`。当前结构化报告记录 `guardSerializations/historyTrimPasses`；1,000 user + 1,000 assistant 的 Anthropic/Account Runtime fixture 均为一个 trim pass，完整序列化分别不超过 2/3 次。1 KiB、100 KiB、1 MiB、5 MiB clean raw 各 3 轮保持 byte-identical、未知字段保留且 guard 内 0 次序列化。详见 [Payload 历史性能与 raw identity](../evidence/payload-history-performance-and-identity-20260716.md)。
 
 后续又发现 transcript raw prefilter 对任意 `\\u` escape 都进入 JSON DOM；正常转义中文长 body 会无污染也 parse/clone。当前已改成固定状态的 escape-aware marker scanner：四类 marker 每个字符转义位置仍可识别，约 1 MiB clean `\\u4E2D` body 不进 DOM；聚焦 5/5 通过。最终 B05 仍需用 release candidate 测实际分位。
 
@@ -59,9 +59,9 @@ cargo test file_upload_route_accepts_exact_file_limit_and_rejects_one_byte_over_
 
 ### 2026-07-17 Body / Payload 合并复核
 
-修复后使用 Rust `1.92.0` 在唯一 scoped target 中合并执行 debug 与 release 矩阵。payload guard 模块为 `67/67` 通过、1 个 release probe 在普通发现中 ignored；其中 clean Anthropic/Kiro 的 1 KiB、100 KiB、1 MiB、5 MiB 各 100 轮，leading assistant 的 1,000/4,000/16,000 条各 5 轮，20/100 tool cycles、decoded image 三边界、current 四图批量裁剪及 tool result/document/schema 均按用例至少 5 轮。clean Anthropic 保持 exact bytes、同一 `Bytes` pointer、未知字段和 0 serialization；clean Kiro 固定 1 serialization；Kiro/Anthropic 四图裁一图均固定 3 serializations 且只有一个汇总占位。
+修复后使用 Rust `1.92.0` 在唯一 scoped target 中合并执行 debug 与 release 矩阵。payload guard 模块为 `67/67` 通过、1 个 release probe 在普通发现中 ignored；其中 clean Anthropic/Account Runtime 的 1 KiB、100 KiB、1 MiB、5 MiB 各 100 轮，leading assistant 的 1,000/4,000/16,000 条各 5 轮，20/100 tool cycles、decoded image 三边界、current 四图批量裁剪及 tool result/document/schema 均按用例至少 5 轮。clean Anthropic 保持 exact bytes、同一 `Bytes` pointer、未知字段和 0 serialization；clean Account Runtime 固定 1 serialization；Account Runtime/Anthropic 四图裁一图均固定 3 serializations 且只有一个汇总占位。
 
-同一批次还通过 body processing `20/20`、request body `3/3`、router `5/5`、十路由多模态 handler、external raw/normalized、provider 80/80 wire capture 和 CLI/IDE endpoint 语义模块。release payload size probe 覆盖 clean/dirty Anthropic 与 clean Kiro 的四档尺寸、每格 5 轮并通过。完整命令、精确计数和 `size_kib=2410696 removed=true reservation_released=true` 的清理证据见 [Body / Payload identity matrix](../evidence/body-payload-identity-matrix-20260717.md)。
+同一批次还通过 body processing `20/20`、request body `3/3`、router `5/5`、十路由多模态 handler、external raw/normalized、provider 80/80 wire capture 和 CLI/IDE endpoint 语义模块。release payload size probe 覆盖 clean/dirty Anthropic 与 clean Account Runtime 的四档尺寸、每格 5 轮并通过。完整命令、精确计数和 `size_kib=2410696 removed=true reservation_released=true` 的清理证据见 [Body / Payload identity matrix](../evidence/body-payload-identity-matrix-20260717.md)。
 
 本轮 3,600 行输出的中段被执行器截断，所以不能从本轮完整回收并宣称一套新的精确 p50/p95/p99；没有为补显示日志再制造一个冷构建。既有精确性能数字仍只归属于原证据记录的 binary。真实 Claude CLI C2-C4、50 MiB 并发 RSS/event-loop 与 L5 仍未完成，因此本专题保持部分关闭。
 

@@ -49,7 +49,7 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh scheduler-target-exter
 
 合计：`9 passed / 0 failed`。
 
-本轮未设置 `KIRO_RS_TEST_POSTGRES_URL`，因此依赖真实外部备用池 PostgreSQL 的集成测试按测试设计跳过；这不是集成通过证据。
+本轮未设置 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL`，因此依赖真实外部备用池 PostgreSQL 的集成测试按测试设计跳过；这不是集成通过证据。
 
 ## Node 合同结果
 

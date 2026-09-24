@@ -4,7 +4,7 @@ Status: `focused-real-http-harness-pass / cli-and-load-gates-pending`
 
 Date: 2026-07-16
 
-Source authority: HEAD `401473c` (`v0.0.109`) plus the dirty-tree remediation changes. Current test binary: `target/debug/deps/kiro_rs-d0eac30c038749e6`, SHA-256 `c8de4b66d935a89d0378598e28ce775b5212dfbb94e55ac5cab98b1fc77e4d61`. This hash identifies a test binary, not a release artifact.
+Source authority: HEAD `401473c` (`v0.0.109`) plus the dirty-tree remediation changes. Current test binary: `target/debug/deps/account_runtime-d0eac30c038749e6`, SHA-256 `c8de4b66d935a89d0378598e28ce775b5212dfbb94e55ac5cab98b1fc77e4d61`. This hash identifies a test binary, not a release artifact.
 
 ## Reproduced Defect
 
@@ -18,7 +18,7 @@ The implementation does not parse or rewrite successful request bodies. These ch
 
 ## Executed Matrix
 
-The test starts an Axum server on a random localhost port and sends through the real `MultiTokenManager -> KiroProvider -> reqwest -> /generateAssistantResponse` path.
+The test starts an Axum server on a random localhost port and sends through the real `MultiTokenManager -> Account RuntimeProvider -> reqwest -> /generateAssistantResponse` path.
 
 ```text
 cargo test bad_request_retry_matrix_bounds_real_provider_http_hits -- --nocapture
@@ -44,10 +44,10 @@ PASS: 40 policy assertions
 cargo check --tests
 PASS
 
-rustfmt --edition 2024 --check src/kiro/provider.rs
+rustfmt --edition 2024 --check src/local_upstream_impl/provider.rs
 PASS
 
-git diff --check -- src/kiro/provider.rs
+git diff --check -- src/local_upstream_impl/provider.rs
 PASS
 ```
 
@@ -55,4 +55,4 @@ The first full matrix run found the final-action bug on `invalid_tool`, pool 20,
 
 ## Remaining Gates
 
-This is a real local HTTP provider harness, not official Kiro or Claude Code CLI evidence. D05 still requires the same classes through the isolated release service and real CLI, followed by recovery requests. Unknown future model-unavailable wording intentionally fails conservatively instead of rotating accounts. Client-originated retries, request-key multi-instance admission, auxiliary-call attribution, 429/500/partial failures, and load amplification remain separate gates.
+This is a real local HTTP provider harness, not official Account Runtime or Claude Code CLI evidence. D05 still requires the same classes through the isolated release service and real CLI, followed by recovery requests. Unknown future model-unavailable wording intentionally fails conservatively instead of rotating accounts. Client-originated retries, request-key multi-instance admission, auxiliary-call attribution, 429/500/partial failures, and load amplification remain separate gates.

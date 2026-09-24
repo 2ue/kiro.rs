@@ -343,7 +343,7 @@ Do not force a shared component library merely to remove duplicated CSS. Share o
 | Credential lifecycle | add/delete, import/export, batch update, delete disabled | valid/invalid batches, duplicate identity, secret redaction, partial failure, rollback |
 | Credential authentication | `/{id}/auth`, validation existing/external, force refresh | `social`, `idc`, `external_idp`, `api_key`; expiry, refresh winner, permanent failure, masked output |
 | Credential scheduling controls | disabled, priority, concurrency, RPM, rate-limit auto-disable, models, regions, warmup, proxy, in-flight clear, reset | persisted patch, scheduler eligibility effect, conflict, cross-replica reload if supported |
-| Credential account operations | balance, info, credit/usage summary, overage, refresh info, test | Kiro response/error mapping, stale state, timeout, proxy/region choice, no secret logging |
+| Credential account operations | balance, info, credit/usage summary, overage, refresh info, test | Account Runtime response/error mapping, stale state, timeout, proxy/region choice, no secret logging |
 | Model support | set/sync/discover supported models | IDE/CLI discovery, allowed/blocked dispatch, empty means unrestricted, error/recovery |
 | Proxy resources | CRUD and test config/resource | HTTP/SOCKS, auth redaction, connect failure, credential/global precedence |
 | External pools | CRUD, enabled, models set/sync/discover, auto-disable clear, test/status | raw/normalized, preservePath, auth/header boundary, capacity/cooldown, auto-disable/recovery |
@@ -359,7 +359,7 @@ R5/R8 characterization must cover supported combinations, not only one happy-pat
 
 | Dimension | Required values |
 | --- | --- |
-| Kiro endpoint | IDE, CLI |
+| Account Runtime endpoint | IDE, CLI |
 | Authentication | `social`, `idc`, `external_idp`, `api_key` |
 | Proxy | direct, global fallback, credential override, proxy-resource reference; HTTP/SOCKS where supported |
 | Region | global default, credential auth region, credential API region |

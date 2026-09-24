@@ -18,7 +18,7 @@ Scope: 防止 `feature/tests/strict-local-first-routing.mjs` 在当前用户明�
 
 - 默认执行会在 runtime work 之前失败。
 - 错误文案明确说明这是 legacy Docker/Toxiproxy-backed runner。
-- 只有显式 `KIRO_E05_ALLOW_DOCKER=1` 才会进入旧路径。
+- 只有显式 `ACCOUNT_RUNTIME_E05_ALLOW_DOCKER=1` 才会进入旧路径。
 - 当前计划下不使用这个 opt-in；后续应改写为 caller-owned PG/Redis + `redis-chaos-proxy.mjs` 后再动态执行。
 
 ## 修改文件
@@ -50,14 +50,14 @@ git diff --check: pass
 
 - JavaScript 语法有效。
 - legacy runner 默认在 runtime work 前失败，不触发 Docker 错误路径。
-- 源码包含显式 `KIRO_E05_ALLOW_DOCKER` opt-in 与 `disabled by default` 文案。
+- 源码包含显式 `ACCOUNT_RUNTIME_E05_ALLOW_DOCKER` opt-in 与 `disabled by default` 文案。
 - runtime runners 仍共享仓库外 binary/artifact path 合同，并且不探测已有 `9022` listener。
 
 ## 后续动态要求
 
 E05 全矩阵仍需一个真正非 Docker runner 或重写当前 runner：
 
-- 使用 caller-owned PostgreSQL URL template 和预创建 `kiro_e05_*` database。
+- 使用 caller-owned PostgreSQL URL template 和预创建 `account-runtime_e05_*` database。
 - 使用 caller-owned loopback Redis DB1..15 与 per-case Redis `keyPrefix`。
 - 使用现有 `feature/tests/redis-chaos-proxy.mjs` 替代 Toxiproxy 容器。
 - 不 `FLUSHDB`，只清理 owned prefix。

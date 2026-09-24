@@ -4,14 +4,14 @@
 
 Each route target should be represented by a small profile:
 
-- `LocalCredential`: parsed Anthropic preprocessing, local Kiro conversion, local payload guard, local token counting, local diagnostics.
+- `LocalCredential`: parsed Anthropic preprocessing, local Account Runtime conversion, local payload guard, local token counting, local diagnostics.
 - `ExternalNormalized`: parsed Anthropic payload, external payload guard when enabled, external model processing, external thinking normalization, external usage projection.
 - `ExternalRaw`: raw bytes, optional raw model processing, external usage projection, no parsed body processing unless explicitly enabled later.
 
 ## Modules
 
 - `ParsedAnthropicBodyPipeline`: implemented as `src/anthropic/handlers/parsed_body_pipeline.rs`; owns thinking and multimodal preprocessing for parsed requests.
-- `LocalKiroBodyPipeline`: implemented as `src/anthropic/handlers/local_body_pipeline.rs`; owns Anthropic-to-Kiro conversion, Kiro payload guard, local token count, warnings, retry payloads.
+- `LocalAccount RuntimeBodyPipeline`: implemented as `src/anthropic/handlers/local_body_pipeline.rs`; owns Anthropic-to-Account Runtime conversion, Account Runtime payload guard, local token count, warnings, retry payloads.
 - `ExternalBodyPipeline`: implemented as `src/external_pool/body_pipeline.rs`; owns raw/normalized outbound bytes after a concrete external pool is selected.
 - `ExternalModelPipeline`: implemented as `src/external_pool/model_pipeline.rs`; owns external pool model mapping and raw top-level model probe/rewrite.
 - `ExternalRetryPipeline`: implemented as `src/external_pool/retry_pipeline.rs`; owns normalized-only payload-too-long retry.
@@ -39,7 +39,7 @@ Each route target should be represented by a small profile:
 
 ## Current Configuration Boundary
 
-- `BodyConversionConfig` controls local Kiro converter compatibility capabilities only.
+- `BodyConversionConfig` controls local Account Runtime converter compatibility capabilities only.
 - External raw `rawModelMode` controls whether raw bytes are probed or top-level `model` is rewritten.
 - External `requestBodyMode` controls raw vs normalized body bytes.
 - External `usageProjectionMode` controls usage projection and billing independently from `requestBodyMode`.

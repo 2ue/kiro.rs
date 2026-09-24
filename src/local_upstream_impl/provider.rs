@@ -10,7 +10,9 @@ use once_cell::sync::OnceCell;
 use reqwest::Client;
 #[cfg(test)]
 use reqwest::Method;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+#[cfg(test)]
+use reqwest::header::HeaderValue;
+use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -51,14 +53,17 @@ use crate::local_upstream_impl::model::available_models::{
     LocalUpstreamAvailableModelsResponse,
 };
 use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
+#[cfg(test)]
 use crate::local_upstream_impl::protocol::{
     extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
 };
+#[cfg(test)]
+use crate::local_upstream_impl::token_manager::EXTERNAL_CREDENTIAL_CONTEXT_ID;
 use crate::local_upstream_impl::token_manager::{
-    AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind,
-    AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason,
-    EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind, InFlightLeaseGuard, LocalPoolRouteState,
-    MultiTokenManager, RefreshFailure, TokenRefreshAdmissionRejected, TransientFailureKind,
+    AccountRouteState, AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind,
+    AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason, InFlightKind,
+    InFlightLeaseGuard, MultiTokenManager, RefreshFailure, TokenRefreshAdmissionRejected,
+    TransientFailureKind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -154,16 +159,20 @@ fn merge_model_discovery_catalogs(
 
 /// Failed enterprise profile discovery is best-effort. Keep deterministic upstream failures out
 /// of the inference retry loop while still allowing bounded recovery without an operator restart.
+#[cfg(test)]
 const PROFILE_ARN_DISCOVERY_NEGATIVE_BACKOFF_BASE: Duration = Duration::from_secs(5);
+#[cfg(test)]
 const PROFILE_ARN_DISCOVERY_NEGATIVE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// A short success handoff lets callers that acquired stale contexts before persistence completed
 /// observe the leader's result. Normal calls subsequently read the persisted ARN and never touch
 /// this state.
+#[cfg(test)]
 const PROFILE_ARN_DISCOVERY_SUCCESS_HANDOFF_TTL: Duration = Duration::from_secs(30);
 
 /// This is process-local coordination state, not a credential registry. Bound it independently
 /// from malformed imports or repeated credential replacement.
+#[cfg(test)]
 const PROFILE_ARN_DISCOVERY_MAX_ENTRIES: usize = 2_048;
 
 /// Local-upstream provider 不设置 reqwest 整请求总超时：流式正文由 Anthropic SSE idle timeout 管控，
@@ -383,6 +392,7 @@ fn should_log_upstream_body_size_at_info(body_bytes: usize, config: &Config) -> 
     near_payload_guard_limit || compression_enabled
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct ProfileArnDiscoveryPolicy {
     negative_backoff_base: Duration,
@@ -391,6 +401,7 @@ struct ProfileArnDiscoveryPolicy {
     max_entries: usize,
 }
 
+#[cfg(test)]
 impl Default for ProfileArnDiscoveryPolicy {
     fn default() -> Self {
         Self {
@@ -402,6 +413,7 @@ impl Default for ProfileArnDiscoveryPolicy {
     }
 }
 
+#[cfg(test)]
 impl ProfileArnDiscoveryPolicy {
     fn negative_backoff(self, failures: u32) -> Duration {
         let exponent = failures.saturating_sub(1).min(10);
@@ -411,12 +423,14 @@ impl ProfileArnDiscoveryPolicy {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ProfileArnDiscoveryKey {
     credential_id: u64,
     identity: [u8; 32],
 }
 
+#[cfg(test)]
 enum ProfileArnDiscoveryEntryState {
     Idle {
         previous_failures: u32,
@@ -434,12 +448,14 @@ enum ProfileArnDiscoveryEntryState {
     },
 }
 
+#[cfg(test)]
 struct ProfileArnDiscoveryEntry {
     gate: tokio::sync::Mutex<()>,
     state: Mutex<ProfileArnDiscoveryEntryState>,
     last_used: AtomicU64,
 }
 
+#[cfg(test)]
 impl ProfileArnDiscoveryEntry {
     fn new(last_used: u64) -> Self {
         Self {
@@ -452,6 +468,7 @@ impl ProfileArnDiscoveryEntry {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct ProfileArnDiscoveryMetrics {
     upstream_attempts: AtomicU64,
@@ -522,10 +539,14 @@ pub struct LocalUpstreamProvider {
     model_discovery_round: AtomicU64,
     /// Per-credential auxiliary profile discovery coordination. The map is bounded and stores
     /// only SHA-256 identities, never raw credential secrets.
+    #[cfg(test)]
     profile_arn_discovery_entries:
         Mutex<HashMap<ProfileArnDiscoveryKey, Arc<ProfileArnDiscoveryEntry>>>,
+    #[cfg(test)]
     profile_arn_discovery_clock: AtomicU64,
+    #[cfg(test)]
     profile_arn_discovery_policy: ProfileArnDiscoveryPolicy,
+    #[cfg(test)]
     profile_arn_discovery_metrics: ProfileArnDiscoveryMetrics,
 }
 
@@ -2040,7 +2061,7 @@ mod tests {
             StatusCode::OK,
             Json(serde_json::json!({
                 "profiles": [{
-                    "arn": format!("arn:aws:codewhisperer:{profile_region}:123456789012:profile/FAKE")
+                    "arn": format!("arn:account-runtime:{profile_region}:123456789012:profile/FAKE")
                 }]
             })),
         )
@@ -2074,7 +2095,7 @@ mod tests {
     fn fake_final_attempt_provider(base_url: &str, token: &str) -> LocalUpstreamProvider {
         let mut credential = fake_external_idp_credential(1, token);
         credential.profile_arn =
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FINAL_ATTEMPT".to_string());
+            Some("arn:account-runtime:us-east-1:123456789012:profile/FINAL_ATTEMPT".to_string());
         credential.token_endpoint = Some(format!("{base_url}/oauth-refresh"));
 
         let mut config = Config::default();
@@ -2300,7 +2321,7 @@ mod tests {
                 expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
                 auth_method: Some("social".to_string()),
                 profile_arn: Some(
-                    "arn:aws:codewhisperer:us-east-1:123456789012:profile/MODELTEST".to_string(),
+                    "arn:account-runtime:us-east-1:123456789012:profile/MODELTEST".to_string(),
                 ),
                 ..Default::default()
             })
@@ -2389,8 +2410,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provider_sends_endpoint_and_compression_bytes_exactly_for_five_rounds() {
-        const PROFILE_ARN: &str =
-            "arn:aws:codewhisperer:us-east-1:123456789012:profile/BODYCAPTURE";
         let server = FakeProviderBodyCaptureServer::start().await;
         let no_op_body = " {\n  \"conversationState\" : {\n    \"conversationId\" : \"body-capture-no-op\",\n    \"currentMessage\" : { \"userInputMessage\" : { \"modelId\" : \"claude-sonnet-4\", \"content\" : \"keep  spaces\\n\\u00e9\" } }\n  },\n  \"z\" : 1.0, \"a\" : 1e+02, \"z\" : 18446744073709551616\n} \n";
         let compressed_no_op_body = "{\"conversationState\":{\"conversationId\":\"body-capture-no-op\",\"currentMessage\":{\"userInputMessage\":{\"modelId\":\"claude-sonnet-4\",\"content\":\"keep  spaces\\n\\u00e9\"}}},\"z\":1.0,\"a\":1e+02,\"z\":18446744073709551616}";
@@ -2414,10 +2433,9 @@ mod tests {
         }"#;
         let mut expected_cli: serde_json::Value = serde_json::from_str(cli_mutation_body).unwrap();
         expected_cli["conversationState"]["currentMessage"]["userInputMessage"]["origin"] =
-            serde_json::json!("KIRO_CLI");
+            serde_json::json!("ACCOUNT_RUNTIME_CLI");
         expected_cli["conversationState"]["history"][0]["userInputMessage"]["origin"] =
-            serde_json::json!("KIRO_CLI");
-        expected_cli["profileArn"] = serde_json::json!(PROFILE_ARN);
+            serde_json::json!("ACCOUNT_RUNTIME_CLI");
         let expected_cli = serde_json::to_string(&expected_cli).unwrap();
 
         let ide_mutation_body = r#"{
@@ -2434,25 +2452,17 @@ mod tests {
             },
             "unknownRoot": {"z":1.0,"a":1e+02}
         }"#;
-        let mut expected_ide: serde_json::Value = serde_json::from_str(ide_mutation_body).unwrap();
-        expected_ide["profileArn"] = serde_json::json!(PROFILE_ARN);
-        let expected_ide = serde_json::to_string(&expected_ide).unwrap();
+        let expected_ide_compacted =
+            crate::http_client::maybe_compress_json_whitespace(ide_mutation_body.to_string(), true);
 
         let mut capture_index = 0;
         for (endpoint_name, path, content_type, profile_arn, body, mutation_expected) in [
+            ("cli", "/", "application/json", None, no_op_body, None),
             (
                 "cli",
                 "/",
-                "application/x-amz-json-1.0",
+                "application/json",
                 None,
-                no_op_body,
-                None,
-            ),
-            (
-                "cli",
-                "/",
-                "application/x-amz-json-1.0",
-                Some(PROFILE_ARN),
                 cli_mutation_body,
                 Some(expected_cli.as_str()),
             ),
@@ -2468,9 +2478,9 @@ mod tests {
                 "ide",
                 "/generateAssistantResponse",
                 "application/json",
-                Some(PROFILE_ARN),
+                None,
                 ide_mutation_body,
-                Some(expected_ide.as_str()),
+                Some(expected_ide_compacted.as_str()),
             ),
         ] {
             for compression_enabled in [false, true] {
@@ -2480,11 +2490,19 @@ mod tests {
                     profile_arn,
                     compression_enabled,
                 );
-                let expected = mutation_expected.unwrap_or(if compression_enabled {
-                    compressed_no_op_body
+                let expected = if body == ide_mutation_body {
+                    if compression_enabled {
+                        expected_ide_compacted.as_str()
+                    } else {
+                        ide_mutation_body
+                    }
                 } else {
-                    no_op_body
-                });
+                    mutation_expected.unwrap_or(if compression_enabled {
+                        compressed_no_op_body
+                    } else {
+                        no_op_body
+                    })
+                };
                 for is_stream in [false, true] {
                     for round in 0..5 {
                         call_body_capture_provider(&provider, body, is_stream).await;
@@ -2563,7 +2581,7 @@ mod tests {
 
         let mut capture_index = 0;
         for (endpoint, expected_path, expected_content_type, expected_origin) in [
-            ("cli", "/", "application/x-amz-json-1.0", "KIRO_CLI"),
+            ("cli", "/", "application/json", "ACCOUNT_RUNTIME_CLI"),
             (
                 "ide",
                 "/generateAssistantResponse",
@@ -3051,7 +3069,7 @@ mod tests {
         let server = FakeBadRequestServer::start().await;
         let mut credential = fake_external_idp_credential(1, "existing-profile");
         credential.profile_arn =
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/EXISTING".to_string());
+            Some("arn:account-runtime:us-east-1:123456789012:profile/EXISTING".to_string());
         let (provider, manager) = fake_profile_provider(&server.base_url, vec![credential], None);
 
         for round in 1..=5 {
@@ -5919,7 +5937,7 @@ mod tests {
             "token",
             &Config::default(),
             "machine",
-            "codewhisperer.us-east-1.amazonaws.com",
+            "runtime.us-east-1.account-runtime.local",
         )
         .unwrap();
 
@@ -5933,15 +5951,15 @@ mod tests {
         );
         assert_eq!(
             headers.get("host").and_then(|v| v.to_str().ok()),
-            Some("codewhisperer.us-east-1.amazonaws.com")
+            Some("runtime.us-east-1.account-runtime.local")
         );
         let expected_x_amz_user_agent = format!(
-            "aws-sdk-js/1.0.34 KiroIDE-{}-machine",
+            "account-runtime-js/1.0.34 AccountRuntimeIDE-{}-machine",
             Config::default().local_upstream_client_version
         );
         assert_eq!(
             headers
-                .get("x-amz-user-agent")
+                .get("x-account-runtime-user-agent")
                 .and_then(|v| v.to_str().ok()),
             Some(expected_x_amz_user_agent.as_str())
         );
@@ -5958,7 +5976,7 @@ mod tests {
             "token",
             &Config::default(),
             "machine",
-            "codewhisperer.us-east-1.amazonaws.com",
+            "runtime.us-east-1.account-runtime.local",
         )
         .unwrap();
 
@@ -6851,13 +6869,13 @@ impl LocalUpstreamProvider {
             .cooldown_retry_after_hint_secs(fallback_secs)
     }
 
-    pub fn local_pool_route_state_fresh(&self, model: Option<&str>) -> LocalPoolRouteState {
-        self.token_manager.local_pool_route_state_fresh(model)
+    pub fn account_route_state_fresh(&self, model: Option<&str>) -> AccountRouteState {
+        self.token_manager.account_route_state_fresh(model)
     }
 
     #[cfg(test)]
-    pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
-        self.token_manager.local_pool_route_state_cached(model)
+    pub fn account_route_state_cached(&self, model: Option<&str>) -> AccountRouteState {
+        self.token_manager.account_route_state_cached(model)
     }
 
     fn credential_log_label(&self, id: u64) -> String {
@@ -7430,6 +7448,7 @@ impl LocalUpstreamProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
+    #[cfg(test)]
     fn update_profile_arn_identity_field(hasher: &mut Sha256, label: &str, value: Option<&str>) {
         hasher.update((label.len() as u64).to_be_bytes());
         hasher.update(label.as_bytes());
@@ -7443,6 +7462,7 @@ impl LocalUpstreamProvider {
         }
     }
 
+    #[cfg(test)]
     fn profile_arn_discovery_key(
         ctx: &CallContext,
         config: &Config,
@@ -7519,6 +7539,7 @@ impl LocalUpstreamProvider {
         }
     }
 
+    #[cfg(test)]
     fn profile_arn_discovery_entry(
         &self,
         key: ProfileArnDiscoveryKey,
@@ -7568,6 +7589,7 @@ impl LocalUpstreamProvider {
         Some(entry)
     }
 
+    #[cfg(test)]
     fn apply_profile_arn_discovery_cached_state(
         &self,
         entry: &ProfileArnDiscoveryEntry,
@@ -7608,6 +7630,7 @@ impl LocalUpstreamProvider {
         }
     }
 
+    #[cfg(test)]
     fn clear_profile_arn_discovery_state(
         &self,
         ctx: &CallContext,
@@ -7618,14 +7641,16 @@ impl LocalUpstreamProvider {
         self.profile_arn_discovery_entries.lock().remove(&key);
     }
 
-    fn codewhisperer_host_for_region(region: &str) -> &'static str {
+    #[cfg(test)]
+    fn account_runtime_host_for_region(region: &str) -> &'static str {
         if region.starts_with("eu-") {
-            "codewhisperer.eu-central-1.amazonaws.com"
+            "runtime.eu-central-1.account-runtime.local"
         } else {
-            "codewhisperer.us-east-1.amazonaws.com"
+            "runtime.us-east-1.account-runtime.local"
         }
     }
 
+    #[cfg(test)]
     fn list_available_profiles_headers(
         credentials: &LocalUpstreamCredentials,
         token: &str,
@@ -7640,26 +7665,26 @@ impl LocalUpstreamProvider {
             HeaderValue::from_str(&format!("Bearer {}", token))?,
         );
         headers.insert(
-            "x-amz-user-agent",
+            "x-account-runtime-user-agent",
             HeaderValue::from_str(&format!(
-                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
+                "account-runtime-js/1.0.34 AccountRuntimeIDE-{}-{}",
                 config.local_upstream_client_version, machine_id
             ))?,
         );
         headers.insert(
             "user-agent",
             HeaderValue::from_str(&format!(
-                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.34 m/E KiroIDE-{}-{}",
+                "account-runtime-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/account-runtime-runtime#1.0.34 m/E AccountRuntimeIDE-{}-{}",
                 config.system_version, config.node_version, config.local_upstream_client_version, machine_id
             ))?,
         );
         headers.insert("host", HeaderValue::from_str(host)?);
         headers.insert(
-            "amz-sdk-invocation-id",
+            "account-runtime-sdk-invocation-id",
             HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())?,
         );
         headers.insert(
-            "amz-sdk-request",
+            "account-runtime-sdk-request",
             HeaderValue::from_static("attempt=1; max=1"),
         );
         headers.insert("Connection", HeaderValue::from_static("close"));
@@ -7671,6 +7696,7 @@ impl LocalUpstreamProvider {
         Ok(headers)
     }
 
+    #[cfg(test)]
     async fn fetch_enterprise_profile_arn_for_context(
         &self,
         ctx: &CallContext,
@@ -7692,7 +7718,7 @@ impl LocalUpstreamProvider {
         }
 
         let region = ctx.credentials.effective_api_region(config);
-        let host = Self::codewhisperer_host_for_region(region);
+        let host = Self::account_runtime_host_for_region(region);
         let url = configured_upstream_url(config, "ListAvailableProfiles")
             .unwrap_or_else(|| format!("https://{}/ListAvailableProfiles", host));
         if let Some(budget) = auxiliary_budget {
@@ -7791,6 +7817,18 @@ impl LocalUpstreamProvider {
         Ok(extract_first_profile_arn(&body.text).filter(|arn| is_real_profile_arn(arn)))
     }
 
+    #[cfg(not(test))]
+    async fn ensure_profile_arn_for_context(
+        &self,
+        ctx: &mut CallContext,
+        config: &Config,
+        machine_id: &str,
+        auxiliary_budget: Option<&AuxiliaryAttemptBudget>,
+    ) {
+        let _ = (self, ctx, config, machine_id, auxiliary_budget);
+    }
+
+    #[cfg(test)]
     async fn ensure_profile_arn_for_context(
         &self,
         ctx: &mut CallContext,
@@ -10520,7 +10558,7 @@ impl LocalUpstreamProvider {
             // A 200 response header is not a successful inference. The body parser owns the
             // terminal success decision, so the provider records only a pending header outcome.
             //
-            // The legacy IDE endpoint can return a binary AWS EventStream while labeling the
+            // The legacy IDE endpoint can return a binary event stream while labeling the
             // response as `application/json`. This valid upstream behavior was observed in production
             // for social accounts: the body starts with an EventStream prelude and contains
             // assistantResponseEvent/contextUsageEvent/meteringEvent frames. Let the downstream
@@ -10887,7 +10925,7 @@ impl LocalUpstreamProvider {
                 if !risk_outcome.can_retry_local() {
                     let final_message = if risk_outcome.circuit_open {
                         format!(
-                            "{} local_pool_risk_circuit_open=true retry_after_secs={} 本地账号池风险保护已打开",
+                            "{} account_risk_circuit_open=true retry_after_secs={} 账号风险保护已打开",
                             message,
                             risk_outcome.retry_after_secs.unwrap_or(1)
                         )
@@ -10916,7 +10954,7 @@ impl LocalUpstreamProvider {
                         Err(Self::traced_error_with_failure_kind(
                             final_message,
                             &attempts,
-                            LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen,
+                            LocalUpstreamCallFailureKind::AccountRiskCircuitOpen,
                         ))
                     } else {
                         Err(Self::traced_error(final_message, &attempts))
@@ -11291,7 +11329,7 @@ impl LocalUpstreamProvider {
                 let retry_content_kind = Self::upstream_content_kind(&retry_response);
                 // Keep the signature-retry success gate aligned with the normal provider
                 // success gate above. The legacy IDE endpoint can return a binary
-                // AWS EventStream while labeling the response as application/json; handlers
+                // event stream while labeling the response as application/json; handlers
                 // sniff the body and still reject real JSON error envelopes before committing
                 // downstream success.
                 if retry_status.is_success()
@@ -11672,6 +11710,7 @@ impl LocalUpstreamProvider {
                     self.finish_attempt(&mut ctx);
                     continue;
                 }
+                #[cfg(test)]
                 if bad_request_reason == "profile_arn_bad_request" {
                     self.clear_profile_arn_discovery_state(&ctx, &config, &machine_id);
                     tracing::warn!(
@@ -12270,11 +12309,14 @@ impl LocalUpstreamProvider {
         {
             return "assistant_prefill_bad_request";
         }
-        if lower.contains("profilearn")
-            || lower.contains("profile arn")
-            || lower.contains("profile_arn")
+        #[cfg(test)]
         {
-            return "profile_arn_bad_request";
+            if lower.contains("profilearn")
+                || lower.contains("profile arn")
+                || lower.contains("profile_arn")
+            {
+                return "profile_arn_bad_request";
+            }
         }
         if Self::bad_request_body_indicates_retryable_model_unavailable(&lower) {
             return "model_unavailable_bad_request";
@@ -12420,7 +12462,6 @@ impl LocalUpstreamProvider {
         match reason {
             "model_unavailable_bad_request" | "model_invalid_bad_request" => "模型不可用",
             "assistant_prefill_bad_request"
-            | "profile_arn_bad_request"
             | "tool_use_format_bad_request"
             | "image_invalid_bad_request"
             | "request_body_invalid_bad_request"

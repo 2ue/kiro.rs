@@ -6,7 +6,7 @@ Severity: P0
 
 ## 2026-07-20 真实 CLI 长会话复核
 
-在 frozen kiro.rs binary + fake Kiro EventStream 下，真实 Claude Code CLI
+在 frozen account-runtime binary + fake Account Runtime EventStream 下，真实 Claude Code CLI
 2.1.197 完成 5x20 与 5x100 `--continue` session。测试同时覆盖本项目的
 `bashHash...`/`readHash...` wire 映射：fake upstream 使用 wire 名称回调，CLI
 侧必须恢复为公开 `Bash`/`Read`。逐 turn 对账 history、tool_result、session ID
@@ -16,12 +16,12 @@ Severity: P0
 [长会话证据](../evidence/claude-cli-long-session-continue-20260720.md)。
 
 这证明修复后的长历史/继续会话路径没有在该 fake-upstream 合同下重放内部
-transcript；它不替代真实 Kiro upstream、thinking signed/redacted、MCP/search/
+transcript；它不替代真实 Account Runtime upstream、thinking signed/redacted、MCP/search/
 image/agent 和错误恢复矩阵。
 
 ## 2026-07-22 当前候选复跑
 
-当前仓库外 frozen `kiro-rs` 候选 SHA-256
+当前仓库外 frozen `account-runtime` 候选 SHA-256
 `31b8c4749201b0f7666b63a9c268c0b75e21f6c1600b18c77bf39a7c6c249c2e`
 再次通过真实 Claude Code CLI 2.1.197 长会话验证。本轮重点不是只扫
 `bashHash...`/`readHash...`，而是同时覆盖旧占位、非 hash marker、function
@@ -43,7 +43,7 @@ scaffold、普通 `Bash`/`Read` 可见名和未知上游请求。
 
 - `protocol-marker-inventory-source-contract.test.mjs`
 - `protocol-contamination-source-contract.test.mjs`
-- `thinking-effort-kiro-wire-contract.test.mjs`
+- `thinking-effort-account-runtime-wire-contract.test.mjs`
 - `runtime-validation-paths.test.mjs`
 - `thinking-effort-claude-cli-capture-signal.test.mjs`
 
@@ -56,9 +56,9 @@ scaffold、普通 `Bash`/`Read` 可见名和未知上游请求。
 - marker-free raw body 在清理路径上保持 byte-identical；
 - signed/redacted thinking 污染按整块 fail closed，不重组签名块。
 
-结论：当前候选在“真实 Claude CLI + fake Kiro EventStream + 长 `--continue`
+结论：当前候选在“真实 Claude CLI + fake Account Runtime EventStream + 长 `--continue`
 工具历史”合同下，未复现用户报告的内部 transcript/tool leakage。该结论仍限定在本轮
-fake-upstream 可观测模型内；如果未来官方 Kiro upstream 改变事件形态或新增 scaffold，
+fake-upstream 可观测模型内；如果未来官方 Account Runtime upstream 改变事件形态或新增 scaffold，
 应由 fail-closed、attempt 上限和 marker inventory 合同捕获，而不是承诺绝不会出现任何未知
 新形态。
 
@@ -75,7 +75,7 @@ Git 历史还说明“hash 映射”和当前 `Hash` 指纹不是同一时点引
 3. 后续模型把这些内容当可见对话正文复述。
 4. response sanitizer 只能删除已知形状，不能恢复结构，也无法覆盖所有 block/profile。
 
-修复前 `payload_guard.rs` 的 Anthropic 和 Kiro repair 包含原始 tool result 到普通 text 的转换；历史 trim 每次删除后再 align/repair，可自行制造 orphan。修复前 sanitizer 又接受任意合法形状的 `*Hash<8hex>`，因此同时存在 false positive 风险。
+修复前 `payload_guard.rs` 的 Anthropic 和 Account Runtime repair 包含原始 tool result 到普通 text 的转换；历史 trim 每次删除后再 align/repair，可自行制造 orphan。修复前 sanitizer 又接受任意合法形状的 `*Hash<8hex>`，因此同时存在 false positive 风险。
 
 ### 占位文本是跨版本稳定注入源
 
@@ -87,9 +87,9 @@ Git 历史把“旧指纹”和“新指纹”连接为同一根因类，而不�
 - 同一 `ef70aef` 还把 `readHash/editHash/bashHash` 等字面量写进默认 task-quality prompt，进一步向模型提示了项目私有标记；当前迁移会只对字节级匹配旧内置默认值的配置换成无指纹版本，自定义 prompt 不会被覆盖。
 
 选定修复不再继续使用会被模型误解的命令型占位词。真正空的 user 内容仍使用最小无语义占位 `.`；只有结构化
-`tool_results` 的当前/历史 user turn 使用 `Tool result received.`，用于让 Kiro 消费结构化结果，
+`tool_results` 的当前/历史 user turn 使用 `Tool result received.`，用于让 Account Runtime 消费结构化结果，
 但不注入 `Continue` 或旧的 `Tool results provided.` transcript。结构化 `tool_results` 仍是事实载体；
-占位只满足 Kiro 的非空 content 约束。旧两代占位仍保留在 sanitizer 的 legacy 检测中，以清理已经存在的会话历史。
+占位只满足 Account Runtime 的非空 content 约束。旧两代占位仍保留在 sanitizer 的 legacy 检测中，以清理已经存在的会话历史。
 
 ## 稳定复现
 
@@ -109,23 +109,23 @@ Git 历史把“旧指纹”和“新指纹”连接为同一根因类，而不�
 
 - converter 与 payload guard 已禁止 orphan、mismatch、duplicate、空 ID tool result 原文 textify；duplicate 只保留第一条合法结构化结果。
 - converter 在 payload guard 关闭时也会清理历史非法结果，避免安全性依赖可选 guard。
-- Kiro 与 Anthropic trim 已改为按完整逻辑 turn 原子删除，并保护 current tool-result 对应的历史 tool-use turn。
+- Account Runtime 与 Anthropic trim 已改为按完整逻辑 turn 原子删除，并保护 current tool-result 对应的历史 tool-use turn。
 - sanitizer 只信任当前请求真实工具原名和使用 converter 同一算法得到的确定性映射名；`artifactHashdeadbeef` 之类普通正文不再仅因形状被删除。
 - raw marker-free 请求走单遍预筛后保持原始 bytes；不会为清理逻辑无条件 parse/serialize body。
 - raw prefilter 对 JSON escape 做固定状态扫描；不再因任意正常 `\\uXXXX` 出现就 parse/clone 整棵 DOM，同时保留 marker 任意字符被 escape 时的检测能力。
 - 空 user 正文占位保持为 `.`；tool-result-only current/history turn 使用 `Tool result received.`，
-  解决 Kiro 忽略结构化结果的兼容性问题，同时不恢复 transcript 命令型文本。
+  解决 Account Runtime 忽略结构化结果的兼容性问题，同时不恢复 transcript 命令型文本。
 
 当前聚焦代码测试：converter `113/113`、payload guard `55/55`、旧 sanitizer 合同 `20/20`，并新增 2026-07-21 源码合同 `10/10` 与生产 marker inventory 源码合同 `4/4`。这些结果不替代修复后的真实 Claude CLI、长会话和 fault-injection 证据。
 
-2026-07-21/22 C0d 当前候选继续复跑了完整 Node 源码/runner 合同批次：`node --test feature/tests/*.test.mjs` 为 `280 tests / 258 pass / 22 explicit skips / 0 fail`，其中 protocol contamination source contract 和 marker inventory contract 仍通过；feature docs 47/47 与 108 links 也通过。C0d 还通过 all-target Rust tests 与 release build，但没有完成真实 Kiro upstream、native MCP/search/image/agent 或 fault-injection service runner，因此本专题仍是 `partial / release-blocking`。
+2026-07-21/22 C0d 当前候选继续复跑了完整 Node 源码/runner 合同批次：`node --test feature/tests/*.test.mjs` 为 `280 tests / 258 pass / 22 explicit skips / 0 fail`，其中 protocol contamination source contract 和 marker inventory contract 仍通过；feature docs 47/47 与 108 links 也通过。C0d 还通过 all-target Rust tests 与 release build，但没有完成真实 Account Runtime upstream、native MCP/search/image/agent 或 fault-injection service runner，因此本专题仍是 `partial / release-blocking`。
 
 ### 2026-07-21 源码合同补证：不局限 Hash 指纹
 
 新增纯 Node 源码合同
 [`protocol-contamination-source-contract.test.mjs`](../tests/protocol-contamination-source-contract.test.mjs)，
 用于锁定“全类协议污染”而不是只锁定当前 `Hash<8hex>` 可见指纹。合同直接读取源码，不启动
-Docker、不启动 `kiro.rs`、不调用 Cargo。
+Docker、不启动 `account-runtime`、不调用 Cargo。
 
 已通过：
 
@@ -151,7 +151,7 @@ Docker、不启动 `kiro.rs`、不调用 Cargo。
 新增纯 Node 源码合同
 [`protocol-marker-inventory-source-contract.test.mjs`](../tests/protocol-marker-inventory-source-contract.test.mjs)，
 用于回答“是否还有其他特征不是 `Hash` 的类似泄漏入口”。合同排除 Rust test modules 与
-`*/tests.rs` fixtures 后扫描生产源码，不启动 Docker、不启动 `kiro.rs`、不调用 Cargo。
+`*/tests.rs` fixtures 后扫描生产源码，不启动 Docker、不启动 `account-runtime`、不调用 Cargo。
 
 已通过：`4 tests / 4 pass / 0 fail`。
 
@@ -211,9 +211,9 @@ Let me continue
 实际禁止项仍是内部 transcript scaffold。复核结果见 [长历史 tool_result 边界证据](../evidence/long-history-tool-result-boundary-20260719.md)：
 
 - `preemptive_large_tool_results`、`preemptive_mixed_pathological`、`preemptive_schema_key_mapping`、`on_too_long_large_tool_results` 共 20/20 请求成功；
-- captured Kiro text fields 中 `user Continue`、`user Tool results provided`、`Tool results provided`、`<function_results>`、`</function_results>`、`[previous output]`、`[trimmed output]`、`[duplicate output]` 均为 0；
+- captured Account Runtime text fields 中 `user Continue`、`user Tool results provided`、`Tool results provided`、`<function_results>`、`</function_results>`、`[previous output]`、`[trimmed output]`、`[duplicate output]` 均为 0；
 - structured tool_use/tool_result 无 orphan；
-- `on_too_long` 另有故障注入：首个 554 KiB inference 被 fake Kiro 返回 `Input is too long`，代理 exactly 1 次 retry，retry body 约 37 KiB，仍无内部 transcript 指纹。
+- `on_too_long` 另有故障注入：首个 554 KiB inference 被 fake Account Runtime 返回 `Input is too long`，代理 exactly 1 次 retry，retry body 约 37 KiB，仍无内部 transcript 指纹。
 
 当前残余项是实际 HTTP 首输出前 retry、真实 CLI 20/100 tool cycle、120k history/resume、MCP/agent 混合和最终性能。回滚不得恢复命令型 placeholder、原文 textify、任意 `Hashxxxxxxxx` matcher 或 suppression 后 success；未知未来 scaffold 应 fail closed，并以结构化观测支持后续扩展。
 

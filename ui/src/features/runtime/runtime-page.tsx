@@ -822,7 +822,7 @@ export function RuntimePage() {
                 <TogField label="静默超时可换号" desc="上游流在首输出前长时间无内容时允许换号。" checked={draft.localUpstreamStreamRetryOnIdleTimeout} disabled={!draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryOnIdleTimeout')} />
                 <TogField label="读取错误可换号" desc="首输出前连接中断、流读取失败时允许换号。" checked={draft.localUpstreamStreamRetryOnReadError} disabled={!draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryOnReadError')} />
                 <TogField label="状态错误可换号" desc="首输出前收到 2xx JSON 错误体或上游错误状态事件时允许换号；请求体 400 仍按请求错误处理。" checked={draft.localUpstreamStreamRetryOnStatusError} disabled={!draft.localUpstreamStreamRetryEnabled} onChange={set('localUpstreamStreamRetryOnStatusError')} />
-                <NumField label="本地 provider 尝试上限" desc="单次本地调用最多尝试多少个凭据；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
+                <NumField label="本地账号尝试上限" desc="单次本地调用最多尝试多少个账号；0 表示默认 3，且仍受共享硬上限约束。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
                 <TogField label="提示逻辑错误换号" desc="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。" checked={draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryEnabled')} />
                 <NumField label="提示逻辑最多换号" desc="仅在上方开关开启时生效；0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={set('credentialPromptLogicRetryMaxAttempts')} />
                 <NumField label="异常并发自动回收" desc="请求长时间没有结束时自动释放占用，避免账号并发数被卡住；0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={set('credentialInFlightLeaseMaxSecs')} />
@@ -834,7 +834,7 @@ export function RuntimePage() {
                 <TwoCol>
                   <TogField
                     label="启用上游账号"
-                    desc="允许请求在本地凭据不可调度或策略命中时进入上游账号；下方路由规则会继续限制入口。"
+                    desc="允许请求在本地账号不可调度或策略命中时进入上游账号；下方路由规则会继续限制入口。"
                     checked={draft.externalPools.externalPoolsEnabled}
                     onChange={setExternalPools('externalPoolsEnabled')}
                   />
@@ -852,7 +852,7 @@ export function RuntimePage() {
                   />
                   <TogField
                     label="上游账号失败后本地救援"
-                    desc="上游账号作为兜底路径失败后，允许最后再尝试一次本地凭据；外部直连策略命中时不会启用该救援。"
+                    desc="上游账号作为兜底路径失败后，允许最后再尝试一次本地账号；外部直连策略命中时不会启用该救援。"
                     checked={draft.externalPools.externalPoolLocalRescueEnabled}
                     onChange={setExternalPools('externalPoolLocalRescueEnabled')}
                   />
@@ -1367,7 +1367,7 @@ export function RuntimePage() {
                   <div>
                     <div className="text-sm font-semibold">本地协议转换</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      这些开关会改变本地凭据路径最终发往本地上游的请求体；上游账号 raw body 透传不会进入这些阶段。
+                      这些开关会改变本地账号路径最终发往本地上游的请求体；上游账号 raw body 透传不会进入这些阶段。
                     </div>
                   </div>
                   <TwoCol>

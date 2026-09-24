@@ -9,15 +9,15 @@ Status: `pass / shared isolated Redis namespace / post-fix r3 regression pass / 
 This gate verifies the Redis coordination contract across independent
 `ConnectionManager` and `MultiTokenManager` instances. It is deliberately
 separate from the single-process scheduler chaos runner and does not claim that
-two real kiro.rs HTTP processes have been killed and restarted yet.
+two real account-runtime HTTP processes have been killed and restarted yet.
 
 ## Command and isolation
 
 ```text
-KIRO_MULTI_INSTANCE_REDIS_URL=redis://127.0.0.1:26379/15 \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
-KIRO_MULTI_INSTANCE_REDIS_OUTER_ROUNDS=3 \
-KIRO_MULTI_INSTANCE_REDIS_SCOPE=multi-instance-redis-coordination-r1 \
+ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_URL=redis://127.0.0.1:26379/15 \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_SCOPE=multi-instance-redis-coordination-r1 \
 node feature/tests/run-multi-instance-redis-coordination-validation.mjs
 ```
 
@@ -55,10 +55,10 @@ same runner was rerun to make sure the `commit_unknown=false` path did not
 weaken cross-manager lease/RPM coordination:
 
 ```text
-KIRO_MULTI_INSTANCE_REDIS_URL=redis://127.0.0.1:26379/7
-KIRO_RS_TEST_REDIS_ISOLATED=1
-KIRO_MULTI_INSTANCE_REDIS_OUTER_ROUNDS=3
-KIRO_MULTI_INSTANCE_REDIS_SCOPE=multi-instance-redis-coordination-20260721-r3
+ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_URL=redis://127.0.0.1:26379/7
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1
+ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_OUTER_ROUNDS=3
+ACCOUNT_RUNTIME_MULTI_INSTANCE_REDIS_SCOPE=multi-instance-redis-coordination-20260721-r3
 node feature/tests/run-multi-instance-redis-coordination-validation.mjs
 ```
 

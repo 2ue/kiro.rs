@@ -40,7 +40,7 @@ unlimited when set to `0`.
 
 ## Token manager
 
-`src/kiro/token_manager.rs` implements the new scheduler behavior:
+`src/local_upstream_impl/token_manager.rs` implements the new scheduler behavior:
 
 - `TransientFailureKind` classifies rate-limit, server, network, stream, protocol, and auth
   scheduler failures.
@@ -84,7 +84,7 @@ Important Redis behaviors:
 
 ## Provider integration
 
-`src/kiro/provider.rs` reports structured scheduler outcomes:
+`src/local_upstream_impl/provider.rs` reports structured scheduler outcomes:
 
 - network send failures report `Network`;
 - `429` reports `RateLimit`;
@@ -176,7 +176,7 @@ Rust coverage includes:
 - Postgres total scheduler selection count persistence;
 - Redis global lease capacity state.
 
-Redis integration tests continue to skip unless `KIRO_RS_TEST_REDIS_URL` is configured.
+Redis integration tests continue to skip unless `ACCOUNT_RUNTIME_TEST_REDIS_URL` is configured.
 
 ## Operational rollout
 

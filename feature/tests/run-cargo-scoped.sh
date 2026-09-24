@@ -16,9 +16,9 @@ the target while any recorded command-process-group member remains alive and
 reclaims it only after the complete group exits.
 
 Defaults:
-  KIRO_VALIDATION_RESERVE_KIB=12582912   # 12 GiB per active batch
-  KIRO_VALIDATION_MIN_FREE_KIB=20971520  # preserve a 20 GiB floor
-  KIRO_VALIDATION_MAX_BUILD_KIB=12582912 # fail if one target exceeds 12 GiB
+  ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB=12582912   # 12 GiB per active batch
+  ACCOUNT_RUNTIME_VALIDATION_MIN_FREE_KIB=20971520  # preserve a 20 GiB floor
+  ACCOUNT_RUNTIME_VALIDATION_MAX_BUILD_KIB=12582912 # fail if one target exceeds 12 GiB
 EOF
 }
 
@@ -102,7 +102,7 @@ owned_command_state() {
 }
 
 repo_root="$(git rev-parse --show-toplevel)"
-target_root="${KIRO_VALIDATION_TARGET_ROOT:-$repo_root/target}"
+target_root="${ACCOUNT_RUNTIME_VALIDATION_TARGET_ROOT:-$repo_root/target}"
 mkdir -p "$target_root"
 target_root="$(cd "$target_root" && pwd -P)"
 
@@ -111,7 +111,7 @@ if [[ "$git_common_dir" != /* ]]; then
   git_common_dir="$repo_root/$git_common_dir"
 fi
 git_common_dir="$(cd "$git_common_dir" && pwd -P)"
-state_dir="${KIRO_VALIDATION_STATE_DIR:-$git_common_dir/kiro-validation-build-state}"
+state_dir="${ACCOUNT_RUNTIME_VALIDATION_STATE_DIR:-$git_common_dir/account-runtime-validation-build-state}"
 mkdir -p "$state_dir"
 state_dir="$(cd "$state_dir" && pwd -P)"
 
@@ -132,9 +132,9 @@ lock_file="$state_dir/.mutation.lock"
 lock_owner_file="$state_dir/.mutation-lock-owner"
 lock_backend=""
 lock_held=0
-lock_timeout_secs="${KIRO_VALIDATION_LOCK_TIMEOUT_SECS:-15}"
+lock_timeout_secs="${ACCOUNT_RUNTIME_VALIDATION_LOCK_TIMEOUT_SECS:-15}"
 [[ "$lock_timeout_secs" =~ ^[1-9][0-9]*$ ]] || \
-  die "KIRO_VALIDATION_LOCK_TIMEOUT_SECS must be a positive integer" 64
+  die "ACCOUNT_RUNTIME_VALIDATION_LOCK_TIMEOUT_SECS must be a positive integer" 64
 
 release_state_lock() {
   (( lock_held == 1 )) || return 0
@@ -214,9 +214,9 @@ acquire_state_lock() {
 }
 
 available_kib_now() {
-  if [[ "${KIRO_VALIDATION_TEST_MODE:-0}" == "1" && \
-        -n "${KIRO_VALIDATION_TEST_AVAILABLE_KIB:-}" ]]; then
-    printf '%s\n' "$KIRO_VALIDATION_TEST_AVAILABLE_KIB"
+  if [[ "${ACCOUNT_RUNTIME_VALIDATION_TEST_MODE:-0}" == "1" && \
+        -n "${ACCOUNT_RUNTIME_VALIDATION_TEST_AVAILABLE_KIB:-}" ]]; then
+    printf '%s\n' "$ACCOUNT_RUNTIME_VALIDATION_TEST_AVAILABLE_KIB"
     return 0
   fi
   df -Pk "$target_root" | awk 'END {print $4}'
@@ -466,19 +466,19 @@ if [[ ! "$scope" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
   exit 64
 fi
 
-min_free_kib="${KIRO_VALIDATION_MIN_FREE_KIB:-20971520}"
-reserve_kib="${KIRO_VALIDATION_RESERVE_KIB:-12582912}"
-max_build_kib="${KIRO_VALIDATION_MAX_BUILD_KIB:-12582912}"
+min_free_kib="${ACCOUNT_RUNTIME_VALIDATION_MIN_FREE_KIB:-20971520}"
+reserve_kib="${ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB:-12582912}"
+max_build_kib="${ACCOUNT_RUNTIME_VALIDATION_MAX_BUILD_KIB:-12582912}"
 for threshold in "$min_free_kib" "$reserve_kib" "$max_build_kib"; do
   [[ "$threshold" =~ ^[0-9]+$ ]] || \
     die "validation disk thresholds must be non-negative KiB integers" 64
 done
-(( reserve_kib > 0 )) || die "KIRO_VALIDATION_RESERVE_KIB must be greater than zero" 64
+(( reserve_kib > 0 )) || die "ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB must be greater than zero" 64
 
-if [[ "${KIRO_VALIDATION_TEST_MODE:-0}" == "1" && \
-      -n "${KIRO_VALIDATION_TEST_AVAILABLE_KIB:-}" && \
-      ! "$KIRO_VALIDATION_TEST_AVAILABLE_KIB" =~ ^[0-9]+$ ]]; then
-  die "KIRO_VALIDATION_TEST_AVAILABLE_KIB must be a non-negative KiB integer" 64
+if [[ "${ACCOUNT_RUNTIME_VALIDATION_TEST_MODE:-0}" == "1" && \
+      -n "${ACCOUNT_RUNTIME_VALIDATION_TEST_AVAILABLE_KIB:-}" && \
+      ! "$ACCOUNT_RUNTIME_VALIDATION_TEST_AVAILABLE_KIB" =~ ^[0-9]+$ ]]; then
+  die "ACCOUNT_RUNTIME_VALIDATION_TEST_AVAILABLE_KIB must be a non-negative KiB integer" 64
 fi
 
 reap_local_stale_builds

@@ -35,9 +35,9 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [当前问题状态索引与文档维护规则](current-issue-status-index-20260731.md) - 2026-07-31 当前 open/fix-pending/NO-GO/验证缺口汇总；代码或状态改动必须同步更新 owning issue、该索引和必要的 plan-tree 状态。
 - [当前问题逐项分析优先级队列](issue-analysis-priority-queue-20260731.md) - 2026-07-31 按紧急度和难度排序的问题分析执行顺序；先处理本地账号 Claude Code/WebSearch/tools/image，再推进协议、调度、存储和 UI/release gates。
 - [Claude Code 本地账号 WebSearch/tools/image 真实调用分析](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md) - 2026-07-29/31 本地账号 7/8 + `claude-sonnet-4.5` 的当前权威记录；direct native `web_search_YYYYMMDD`、mixed native WebSearch、当前 Claude CLI `WebSearch`、工具命名/schema key 映射和 tool-result-only follow-up focused path 已验证，图片来源矩阵、模型报告和复杂工具历史仍 open；旧 external-pool 调试结论不能替代此本地账号诊断。
-- [下游标准 usage 单字段超过 1m](downstream-usage-standard-field-over-1m-20260731.md) - 2026-07-31 三台生产部署只读证据显示 `input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens` 可单字段超过 1m；标准字段 focused fix 已实现并测试：reported-usage cache creation 使用 `finalCacheCreationMaxTokens=400000` 与 `20000..45000` deterministic jitter，无 full `reportedUsage` 的本地 prompt-cache/`kiro_rs_tool` 路径也会 cap 标准 cache read/write，local credential 与 external pool failure 记录保留诊断估算并将标准字段归零；仍需 frozen/isolated usage-shape smoke、dashboard/API rollup 区分和生产复发观察。
+- [下游标准 usage 单字段超过 1m](downstream-usage-standard-field-over-1m-20260731.md) - 2026-07-31 三台生产部署只读证据显示 `input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens` 可单字段超过 1m；标准字段 focused fix 已实现并测试：reported-usage cache creation 使用 `finalCacheCreationMaxTokens=400000` 与 `20000..45000` deterministic jitter，无 full `reportedUsage` 的本地 prompt-cache/`account_runtime_tool` 路径也会 cap 标准 cache read/write，local credential 与 external pool failure 记录保留诊断估算并将标准字段归零；仍需 frozen/isolated usage-shape smoke、dashboard/API rollup 区分和生产复发观察。
 - [Pro Max 账号卡片套餐显示](subscription-pro-max-card-label-20260801.md) - 根因确认不是截图：UI 套餐 helper 与后端 `subscription_key`/`subscription_rank` 缺少 `Pro Max` 分支，已补齐 `Pro Max` 标签、`pro_max` 筛选键和等级排序，并补充 Power/Pro Max 筛选项；focused Rust/UI/admin-ui 验证通过，最终候选浏览器门禁仍随 release gate 进行。
-- [2026-08-01 生产外部池两类错误根因补充](20260801-production-external-errors-root-cause.md) - 外部池“输入上限预检”发送前硬拒绝绕过“请求大小保护”，以及外部池 route 缺少本地 Kiro 发送链路的兼容模型处理导致部分“模型处理”模式无法按配置生效；当前修复是取消内容长度发送前拒绝、保留调度/安全预检，并让直接外部池和本地失败 fallback 路径携带“模型（本地解析）”。
+- [2026-08-01 生产外部池两类错误根因补充](20260801-production-external-errors-root-cause.md) - 外部池“输入上限预检”发送前硬拒绝绕过“请求大小保护”，以及外部池 route 缺少本地 Account Runtime 发送链路的兼容模型处理导致部分“模型处理”模式无法按配置生效；当前修复是取消内容长度发送前拒绝、保留调度/安全预检，并让直接外部池和本地失败 fallback 路径携带“模型（本地解析）”。
 - [内置路由策略必须完全由配置决定](route-policy-config-authority-20260802.md) - 2026-08-02 P0 配置权威问题已完成后端与两套 UI focused 修复：`/cc`、`/v1`、`/ha`、`/na` 仍是内置入口，但缓存、usage、提示词、外部池等运行策略均由运行配置解析；`/cc` 可配置成无缓存，`/na` 可配置成高缓存，提示词引导按路径规则命中任意内置或自定义入口；全量 Rust、UI/admin-ui build、文档合同和提示词配置独立性测试通过，真实服务热加载/浏览器交互/生产复发观察仍作为后续门禁。
 - [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) - 2026-08-02 新登记；短/长历史、真实 Claude Code CLI 基础会话、模拟压缩摘要和相反首语言并发矩阵均未复现首语言锁定，真实自动 compact 阈值和异常样本仍待证据。
 - [usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md) - 2026-08-02/03 用户体验问题；后端安全合同、新旧 UI 语义、真实浏览器交互、Admin cache 写入竞态修复、`每批数量` 上限 5,000、PostgreSQL 约束迁移和迁移关闭时 schema compatibility guard 已有 focused pass，但动态多实例一致性、生产规模性能和 Redis chaos 仍未关闭，不能把已有 focused 证据当成完整修复。
@@ -45,7 +45,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [HTML `<br>` 输出标签污染](html-br-output-tag-contamination-20260731.md) - 2026-07-31 记录 assistant 在正常 prose 中疑似输出 raw `<br>` / HTML-like tag 的复现边界；direct/stream/tool-result/history/CLI 正常场景未复现，web-display 与显式 standalone `<br>` 仅作为合法透传对照；过滤策略仍需真实异常样本或产品规则。
 - [协议 transcript 与工具历史泄漏](protocol-transcript-and-tool-history-leak.md)
 - [thinking 与签名内容安全](thinking-and-signed-content-safety.md)
-- [thinking effort、adaptive mode 与 Kiro 上游映射](thinking-effort-adaptive-upstream-mapping.md)
+- [thinking effort、adaptive mode 与 Account Runtime 上游映射](thinking-effort-adaptive-upstream-mapping.md)
 - [裸 invoke 正文被升级为可执行工具调用](bare-invoke-text-upgraded-to-executable-tool-use.md)
 - [payload guard 语义、上限与性能](payload-guard-semantics-limits-and-performance.md)
 - [远程图片/文档辅助请求、资源上限与 SSRF 连接绑定](remote-multimodal-resource-and-ssrf-bounds.md)
@@ -73,7 +73,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [两套 UI 费用精度与配置权威](two-ui-cost-precision-and-config-authority.md)
 - [PostgreSQL 启动迁移全链原子性与确定性失败放大](postgres-startup-migration-atomicity.md)
 - [v0.0.101/v0.0.102/v0.0.103 升级 smoke](upgrade-v101-v102-v103-smoke.md)
-- [AWS Kiro API Key 与 region 生命周期](aws-kiro-api-key-region-lifecycle.md)
+- [AWS Account Runtime API Key 与 region 生命周期](aws-account-runtime-api-key-region-lifecycle.md)
 - [生产证据 skill 校验与脱敏](evidence-skill-validation-and-redaction.md)
 - [协议能力回归矩阵](protocol-capability-regression-matrix.md)
 - [WebSearch/MCP 协议、错误、usage、attempt 与隐私边界](websearch-mcp-protocol-usage-and-privacy.md)
@@ -101,14 +101,14 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - MCP/WebSearch 辅助失败：普通 MCP completion、429/5xx/body-read/protocol 不再写主模型凭据 cooldown；只在本次请求内换号，避免凭据卡片 `mcp_completion upstream_error` 与主调度假不可用。
 - PgSQL usage/dashboard 隔离：新增 `postgres.usageMaxConnections` 与独立 usage pool；旧表缺 114+ dashboard/usage/计费列的迁移已补齐并加入 schema guard。
 - 已通过聚焦回归：WebSearch 全量 29 tests、thinking/output_config、thinking signature、pricing、PG schema/usage pool、request admission、local_pool fast-fail、scheduler degraded/external fallback、MCP 辅助健康隔离。
-- 已完成冻结候选二进制验证：`kiro-rs` SHA-256 `7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec`。C0 静态/全量 Rust/release build/clippy baseline 已通过且 scoped target 清理完成。
+- 已完成冻结候选二进制验证：`account-runtime` SHA-256 `7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec`。C0 静态/全量 Rust/release build/clippy baseline 已通过且 scoped target 清理完成。
 - 已完成真实 Claude Code CLI fake-upstream 协议验证：bare invoke `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire `60/60`；证据见 [candidate-c0-claude-cli-real-protocol-20260726](../evidence/candidate-c0-claude-cli-real-protocol-20260726.md)。
 - 已完成 fake-upstream 负载/异常恢复验证：L3 `9/9`、L4 `12/12`、L5 `60s soak + recovery` 全部通过；证据见 [candidate-c0-load-chaos-20260726](../evidence/candidate-c0-load-chaos-20260726.md)。
 - 真实上游成功 smoke 当前受环境阻塞：本地 `9022` 的持久化凭据全部处于 disabled/runtime bad state（TemporarilySuspended/Manual/QuotaExceeded），继续真实调用会增加账号风险；不把该环境阻塞伪装为产品 pass。
 
 ## 2026-07-27 runtime/storage 发布候选状态
 
-- 当前冻结候选：`kiro-rs` SHA-256 `40ec70c7036826807f3d59701fe02de8eada7c8d88f265ad4a68fde55ff3c9d3`，`kiro_loadtest` SHA-256 `a9b03d0dbe3f4456939641b434fcc3781ea6f6909a31dff393100d2bcbcc81c8`。
+- 当前冻结候选：`account-runtime` SHA-256 `40ec70c7036826807f3d59701fe02de8eada7c8d88f265ad4a68fde55ff3c9d3`，`account_runtime_loadtest` SHA-256 `a9b03d0dbe3f4456939641b434fcc3781ea6f6909a31dff393100d2bcbcc81c8`。
 - 已通过 full Rust all-target：main `1816 passed / 0 failed / 6 ignored`，loadtest `31 passed / 0 failed`。
 - 已通过真实 Claude Code CLI fake-upstream：bare `20` cases，long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`，thinking-wire `60/60`，Claude Code CLI `2.1.220`。
 - 已通过负载/异常：L3 `9/9`、L4 `12/12`、L5 第二轮 `461/461` 长流 + recovery `12/12`，RSS/FD 在 60 秒 idle 后回落。

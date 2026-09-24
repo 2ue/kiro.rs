@@ -35,7 +35,8 @@ use super::conversation::ConversationState;
 pub struct LocalUpstreamRequest {
     /// 对话状态
     pub conversation_state: ConversationState,
-    /// Optional upstream identity selector for the current compatibility path.
+    /// Optional upstream identity selector retained only in test builds.
+    #[cfg(test)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
     /// Local-upstream native model extension fields, such as reasoning effort.

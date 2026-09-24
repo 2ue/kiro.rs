@@ -1,4 +1,4 @@
-# kiro.rs 控制台 — 前端完全重构方案
+# account-runtime 控制台 — 前端完全重构方案
 
 > Archive status: Historical, partially landed frontend plan; not current authority.
 >

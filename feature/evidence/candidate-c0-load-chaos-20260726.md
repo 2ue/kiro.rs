@@ -14,16 +14,16 @@ The run used fake local upstreams only. It did not send load to production and d
 
 ## Candidate
 
-- Product binary: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-cli-candidate.c0-20260726035013.8MWRn4/kiro-rs`
+- Product binary: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-cli-candidate.c0-20260726035013.8MWRn4/account-runtime`
 - Product SHA-256: `7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec`
-- Load runner binary: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-final-candidate.current.ITUNUQ/kiro_loadtest`
+- Load runner binary: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-final-candidate.current.ITUNUQ/account_runtime_loadtest`
 - Load runner SHA-256: `9bcfd4fe05f5ee476664c626dbb97cb3abf95f77cdee056d67ce8227eaea3654`
 
 ## Local dependencies
 
-- PostgreSQL: local Docker container `kiro-rs-postgres-local`, port `25432`.
-- Redis: local Docker container `kiro-rs-redis-local`, port `26379`, DB `15`.
-- Temporary PostgreSQL databases used a `kiro_load_chaos_1785011475_*` prefix and were dropped after the run.
+- PostgreSQL: local Docker container `account-runtime-postgres-local`, port `25432`.
+- Redis: local Docker container `account-runtime-redis-local`, port `26379`, DB `15`.
+- Temporary PostgreSQL databases used a `account-runtime_load_chaos_1785011475_*` prefix and were dropped after the run.
 - Redis test prefixes were removed by the runner.
 - The active local service on `9022` was not load-tested.
 

@@ -159,9 +159,9 @@ pub struct PayloadGuardReport {
     pub dropped_historical_images: usize,
     #[serde(default)]
     pub dropped_historical_image_bytes: usize,
-    #[serde(default, alias = "kiroCachePointsPlanned")]
+    #[serde(default)]
     pub local_upstream_cache_points_planned: usize,
-    #[serde(default, alias = "kiroCachePointsInserted")]
+    #[serde(default)]
     pub local_upstream_cache_points_inserted: usize,
     #[serde(default)]
     pub cache_point_retry_without_cache_point: bool,
@@ -2035,13 +2035,6 @@ fn apply_anthropic_current_payload_safety_shaping(
     stats.dropped_current_images += result.0;
     stats.dropped_current_image_bytes += result.1;
     stats
-}
-
-pub fn sanitize_anthropic_messages_for_account_forwarding(
-    request: &mut MessagesRequest,
-    config: PayloadShapingConfig,
-) -> bool {
-    apply_anthropic_payload_safety_shaping(request, config).was_modified()
 }
 
 fn apply_payload_shaping(
@@ -6905,26 +6898,14 @@ mod tests {
     }
 
     #[test]
-    fn payload_guard_report_uses_local_upstream_cache_point_fields_with_legacy_aliases() {
+    fn payload_guard_report_uses_local_upstream_cache_point_fields() {
         let mut report = PayloadGuardReport::disabled(128, 2);
         report.local_upstream_cache_points_planned = 4;
         report.local_upstream_cache_points_inserted = 2;
 
-        let mut value = serde_json::to_value(&report).expect("serialize report");
+        let value = serde_json::to_value(&report).expect("serialize report");
         assert_eq!(value["localUpstreamCachePointsPlanned"], 4);
         assert_eq!(value["localUpstreamCachePointsInserted"], 2);
-        assert!(value.get("kiroCachePointsPlanned").is_none());
-        assert!(value.get("kiroCachePointsInserted").is_none());
-
-        let object = value.as_object_mut().expect("report object");
-        object.insert("kiroCachePointsPlanned".to_string(), Value::from(7));
-        object.insert("kiroCachePointsInserted".to_string(), Value::from(3));
-        object.remove("localUpstreamCachePointsPlanned");
-        object.remove("localUpstreamCachePointsInserted");
-
-        let legacy = serde_json::from_value::<PayloadGuardReport>(value).expect("legacy report");
-        assert_eq!(legacy.local_upstream_cache_points_planned, 7);
-        assert_eq!(legacy.local_upstream_cache_points_inserted, 3);
     }
 
     #[test]

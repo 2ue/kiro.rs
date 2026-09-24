@@ -51,7 +51,7 @@ Technical authority area: runtime configuration, Admin control plane, PgSQL
 
 ### Evidence
 
-`MultiTokenManager::update_runtime_config` clones the complete current `Config`, mutates it, persists a complete clone, and then replaces local state: `src/kiro/token_manager/manager.rs:1246-1268`.
+`MultiTokenManager::update_runtime_config` clones the complete current `Config`, mutates it, persists a complete clone, and then replaces local state: `src/local_upstream_impl/token_manager/manager.rs:1246-1268`.
 
 `PostgresStore::save_runtime_config_returning_version` increments `version` on conflict but has no `WHERE version = expected_version` predicate: `src/storage/postgres.rs:390-408`.
 
@@ -176,7 +176,7 @@ Technical authority area: public protocol parsing, profile-specific payload norm
 
 - `Tool.description` defaults a missing field to an empty string and `input_schema` is a non-optional map with only `#[serde(default)]`: `src/anthropic/types.rs:314-326`.
 - Explicit JSON `null` therefore fails map deserialization, while a missing `input_schema` becomes an empty map.
-- The Kiro converter copies description unchanged and performs only suffix/length handling before sending it upstream: `src/anthropic/converter/tools.rs:293-337`.
+- The Account Runtime converter copies description unchanged and performs only suffix/length handling before sending it upstream: `src/anthropic/converter/tools.rs:293-337`.
 - [The retained reproduction report](../../../../../../feature/issues/empty-tool-description-400-invalid-tool-use-format.md) records deterministic empty/missing-description and explicit-null cases plus a recent production sample summary. Its remediation proposal is non-binding; decision 012 owns the accepted behavior.
 
 The defect is shared by every route that enters the same typed request parser. It is distinct from payload-size failures: small requests can fail before or at the first upstream attempt solely because a boundary value was not given a profile-specific meaning.
@@ -184,7 +184,7 @@ The defect is shared by every route that enters the same typed request parser. I
 ### Required Target
 
 - preserve raw external request bytes and do not parse/repair tool definitions for that profile;
-- after target/profile selection, normalize a missing/blank description to a deterministic neutral nonempty value for Kiro/local and explicitly normalized external profiles;
+- after target/profile selection, normalize a missing/blank description to a deterministic neutral nonempty value for Account Runtime/local and explicitly normalized external profiles;
 - treat absent and explicit-null `input_schema` identically as the accepted empty object schema for those normalized profiles, while rejecting other malformed non-map values locally;
 - record bounded repair/rejection reason counters without raw schema/description content;
 - ensure the public parser does not force normalized semantics on raw passthrough.
@@ -200,12 +200,12 @@ The defect is shared by every route that enters the same typed request parser. I
 
 Severity: P1/P2 conditional on client schema; upstream rejection and current pass-through are verified, while traffic frequency depends on tool providers
 
-Technical authority area: Anthropic/Kiro/external tool schema codecs, payload policy and response reverse translation
+Technical authority area: Anthropic/Account Runtime/external tool schema codecs, payload policy and response reverse translation
 
 ### Evidence
 
 - `normalize_properties` recursively normalizes property values but never validates or maps object property names: `src/anthropic/converter/schema.rs:287-311`.
-- [The retained reproduction report](../../../../../../feature/issues/tool-property-key-invalid-400-tool-schema-invalid.md) records Kiro/Anthropic-compatible upstream rejection for names outside `^[a-zA-Z0-9_.-]{1,64}$`.
+- [The retained reproduction report](../../../../../../feature/issues/tool-property-key-invalid-400-tool-schema-invalid.md) records Account Runtime/Anthropic-compatible upstream rejection for names outside `^[a-zA-Z0-9_.-]{1,64}$`.
 - The report's original blanket replacement suggestion is unsafe as written: two names may collide, `required`/dependency keywords may diverge, and returned `tool_use.input` keys may no longer match the downstream client's names. `patternProperties` keys are regular expressions and `$defs` keys are definition identifiers, not ordinary property names.
 
 ### Required Target
@@ -331,12 +331,12 @@ This corrects the earlier broad statement that the complete Files store was boun
 
 Severity: P1
 
-Technical authority area: Kiro/external upstream adapters, response processing, request resource governance
+Technical authority area: Account Runtime/external upstream adapters, response processing, request resource governance
 
 ### Evidence
 
 - The shared helpers apply only a body-read timeout before calling reqwest `text()` or `bytes()`: `src/http_client.rs:107-131`.
-- The Kiro non-stream path collects the complete response before event-stream decoding: `src/anthropic/handlers.rs:6317-6347`.
+- The Account Runtime non-stream path collects the complete response before event-stream decoding: `src/anthropic/handlers.rs:6317-6347`.
 - External-pool error responses are collected completely before classification: `src/external_pool.rs:1753-1758`.
 - External-pool successful non-stream responses are collected completely before HTML/error detection and usage projection: `src/external_pool.rs:1994-2049`.
 
@@ -352,26 +352,26 @@ The inbound request limit and remote-media source limit do not bound bytes retur
 
 ### Acceptance
 
-- Fake-upstream tests cover oversized success/error bodies, chunked/no-length bodies, slow bodies, declared-length mismatch and cancellation for Kiro and external profiles.
+- Fake-upstream tests cover oversized success/error bodies, chunked/no-length bodies, slow bodies, declared-length mismatch and cancellation for Account Runtime and external profiles.
 - Rejection occurs at the accepted byte boundary and returns a stable normalized error without echoing body content.
 - Peak/end/idle RSS, FD, task, connection and lease metrics remain inside the accepted absolute/recovery envelope.
 - Normal long Claude Code streams within the accepted profile remain compatible.
 
-## `RES-004`: Kiro HTTP Client Cache Retains Every Proxy Configuration
+## `RES-004`: Account Runtime HTTP Client Cache Retains Every Proxy Configuration
 
 Severity: P1/P2 conditional on proxy/configuration churn
 
-Technical authority area: Kiro upstream transport and reusable-client lifecycle
+Technical authority area: Account Runtime upstream transport and reusable-client lifecycle
 
 ### Evidence
 
-- `KiroProvider` stores `HashMap<Option<ProxyConfig>, Client>` behind a mutex: `src/kiro/provider.rs:76-83`.
-- `client_for` inserts a client for every previously unseen effective proxy and has no capacity, TTL, idle retirement or credential-deletion path: `src/kiro/provider.rs:947-960`.
+- `Account RuntimeProvider` stores `HashMap<Option<ProxyConfig>, Client>` behind a mutex: `src/local_upstream_impl/provider.rs:76-83`.
+- `client_for` inserts a client for every previously unseen effective proxy and has no capacity, TTL, idle retirement or credential-deletion path: `src/local_upstream_impl/provider.rs:947-960`.
 - `ProxyConfig` is the map key, so obsolete usernames/passwords remain reachable with their old connection pools until process exit.
 
 ### Required Target
 
-- own clients in `MOD-KIRO-UPSTREAM` behind a bounded cache with capacity, idle TTL, active-reference protection and deterministic eviction;
+- own clients in `MOD-ACCOUNT_RUNTIME-UPSTREAM` behind a bounded cache with capacity, idle TTL, active-reference protection and deterministic eviction;
 - key clients by a non-secret canonical transport identity while keeping credentials in secret/redacted types;
 - deduplicate concurrent construction for the same identity and retire clients after proxy rotation or credential deletion when no active request references them;
 - expose entry, active, idle, construction, hit/miss, eviction and retirement metrics without proxy credentials or URLs as labels.
@@ -393,7 +393,7 @@ Technical authority area: request resource admission and local/external schedule
 - Local dispatch global concurrency and queue fields define `0` as unlimited: `src/model/config.rs:2703-2709`.
 - Their defaults are both zero: `src/model/config.rs:3668-3670`.
 - External-pool global concurrency and maximum queued requests also default to zero: `src/model/config.rs:2294-2307`, `2390-2397`.
-- Local admission rejects only when `max_queued > 0`: `src/kiro/token_manager/manager.rs:2027-2040`; the Redis admission script uses the same condition: `src/storage/redis_cache.rs:178-201`.
+- Local admission rejects only when `max_queued > 0`: `src/local_upstream_impl/token_manager/manager.rs:2027-2040`; the Redis admission script uses the same condition: `src/storage/redis_cache.rs:178-201`.
 
 A finite wait timeout is not a finite admission bound. Under a burst or slow upstream, request tasks, parsed bodies, queue/lease metadata and connections can accumulate until an unrelated downstream or host limit fails first.
 

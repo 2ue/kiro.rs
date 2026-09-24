@@ -82,7 +82,7 @@ function formatMeteringUsage(value: number | undefined | null): string {
 }
 
 function upstreamMetering(record: UsageRecord | undefined): number {
-  return record?.upstreamMeteringUnits ?? record?.kiroMeteringUsage ?? 0
+  return record?.upstreamMeteringUnits ?? record?.upstreamMeteringUnits ?? 0
 }
 
 function formatLatency(value?: number): string {
@@ -187,7 +187,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.cacheCreationInputTokens,
     formatUsdCsv(record.estimatedCostUsd),
     formatUsdCsv(record.originalCostUsd),
-    record.upstreamMeteringUnits ?? record.kiroMeteringUsage,
+    record.upstreamMeteringUnits ?? record.upstreamMeteringUnits,
     record.pricingModel,
     record.durationMs,
     record.firstTokenLatencyMs,

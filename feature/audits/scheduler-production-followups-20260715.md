@@ -26,7 +26,7 @@
 
 代码证据：
 
-- `src/kiro/provider.rs`：`max_retry_attempts` 中 `credentialRetryMaxAttempts > 0` 时直接使用显式上限。
+- `src/local_upstream_impl/provider.rs`：`max_retry_attempts` 中 `credentialRetryMaxAttempts > 0` 时直接使用显式上限。
 - `src/anthropic/handlers.rs`：`classify_local_error_for_external_fallback` 允许 transient 错误进入 `local_transient_exhausted`。
 - `src/anthropic/handlers.rs`：`fallback_after_local_error_outcome_with_diagnostics` 没有重新检查本地 route state 是否还有 dispatchable 账号。
 
@@ -225,8 +225,8 @@
 
 代码证据：
 
-- `src/kiro/provider.rs` 从 Kiro request body 的 `conversationState.conversationId` 提取会话 ID，用于账号粘性调度。
-- `src/kiro/token_manager/manager.rs` 的 `acquire_context_for_session_with_mode` 先执行 `bound_credential_id` / `get_bound_credential`，命中后直接 `AcquireDecision::Selected(... sticky_bound=true ...)`。
+- `src/local_upstream_impl/provider.rs` 从 Account Runtime request body 的 `conversationState.conversationId` 提取会话 ID，用于账号粘性调度。
+- `src/local_upstream_impl/token_manager/manager.rs` 的 `acquire_context_for_session_with_mode` 先执行 `bound_credential_id` / `get_bound_credential`，命中后直接 `AcquireDecision::Selected(... sticky_bound=true ...)`。
 - `src/anthropic/converter.rs` 在 high-cache 模式下，缺少 `metadata.user_id` 时也会基于稳定请求锚点派生确定性 `conversationId`，这会让没有显式 metadata 的请求也可能进入 sticky。
 
 影响：
@@ -503,7 +503,7 @@ COMMIT;
 2026-07-15 17:15 CST 重新登录取证后，进一步确认：
 
 - 当前容器仍是 `0.0.109` / `401473ca1649997bdeccf4468e3add1bdb187248`，app 当前容器 11:58 CST 启动。
-- 当前 runtime `redis.keyPrefix=kiro_rs:59137`，不是代码默认的 `kiro_rs:local`。
+- 当前 runtime `redis.keyPrefix=account_runtime:59137`，不是代码默认的 `account_runtime:local`。
 - 最近 5 分钟窗口内仍出现 82 条 Redis degraded；代表样本 `globalInFlight=63..66`，本地配置总并发约 625，`queueDepth=0`、`sampledAccounts=[]`、`rejectedAccountCount=0`、`waitableAccountCount=0`。
 - targeted app logs 在 17:05 CST 捕获到当前版本实际触发点：`原子写入 Redis 会话绑定超过 75ms`、`原子清理 Redis 会话软失败超过 75ms`。
 - Redis 当前 prefix 下仍有 `usage:summary:cache_read` 约 30212 bucket、`usage:records:index` 约 72283、scheduler key sample 约 15579，其中 session key 约 14650。

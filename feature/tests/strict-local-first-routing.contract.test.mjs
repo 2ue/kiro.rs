@@ -11,30 +11,30 @@ const ROOT = path.resolve(import.meta.dirname, '../..')
 const SCRIPT = path.join(ROOT, 'feature/tests/strict-local-first-routing.mjs')
 
 function fixtureEnv(overrides = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-e05-contract-'))
-  const binary = path.join(root, 'kiro-rs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-e05-contract-'))
+  const binary = path.join(root, 'account-runtime')
   const artifact = path.join(root, 'artifacts')
   fs.writeFileSync(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   fs.mkdirSync(artifact, { recursive: true, mode: 0o700 })
-  const modes = overrides.KIRO_E05_MODES || 'no_credentials,scheduler_redis_chaos'
-  const rounds = Number.parseInt(overrides.KIRO_E05_ROUNDS || '3', 10)
+  const modes = overrides.ACCOUNT_RUNTIME_E05_MODES || 'no_credentials,scheduler_redis_chaos'
+  const rounds = Number.parseInt(overrides.ACCOUNT_RUNTIME_E05_ROUNDS || '3', 10)
   const databaseCount = modes.split(',').filter(Boolean).length * rounds
   const databases = Array.from({ length: databaseCount }, (_, index) => (
-    `kiro_e05_contract_${String(index + 1).padStart(2, '0')}`
+    `account_runtime_e05_contract_${String(index + 1).padStart(2, '0')}`
   )).join(',')
   return {
     root,
     env: {
       ...process.env,
-      KIRO_RS_BINARY: binary,
-      KIRO_VALIDATION_ARTIFACT_DIR: artifact,
-      KIRO_E05_VALIDATE_ONLY: '1',
-      KIRO_E05_MODES: modes,
-      KIRO_E05_ROUNDS: String(rounds),
-      KIRO_E05_POSTGRES_URL_TEMPLATE: 'postgres://e05:e05-password@127.0.0.1:15432/{database}',
-      KIRO_E05_POSTGRES_DATABASES: databases,
-      KIRO_E05_REDIS_URL: 'redis://127.0.0.1:16379/5',
-      KIRO_E05_REDIS_PREFIX: 'kiro_rs:e05_contract',
+      ACCOUNT_RUNTIME_BINARY: binary,
+      ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifact,
+      ACCOUNT_RUNTIME_E05_VALIDATE_ONLY: '1',
+      ACCOUNT_RUNTIME_E05_MODES: modes,
+      ACCOUNT_RUNTIME_E05_ROUNDS: String(rounds),
+      ACCOUNT_RUNTIME_E05_POSTGRES_URL_TEMPLATE: 'postgres://e05:e05-password@127.0.0.1:15432/{database}',
+      ACCOUNT_RUNTIME_E05_POSTGRES_DATABASES: databases,
+      ACCOUNT_RUNTIME_E05_REDIS_URL: 'redis://127.0.0.1:16379/5',
+      ACCOUNT_RUNTIME_E05_REDIS_PREFIX: 'account_runtime:e05_contract',
       ...overrides,
     },
   }
@@ -75,23 +75,23 @@ test('validate-only accepts caller-owned PostgreSQL and Redis inputs', () => {
 })
 
 test('rejects missing or non-owned PostgreSQL database list before runtime work', () => {
-  const result = run({ KIRO_E05_POSTGRES_DATABASES: 'postgres,kiro_e05_good_001' })
+  const result = run({ ACCOUNT_RUNTIME_E05_POSTGRES_DATABASES: 'postgres,account_runtime_e05_good_001' })
   assert.notEqual(result.status, 0)
-  assert.match(result.stderr, /exactly 6 pre-created database names|caller-owned kiro_e05_/)
+  assert.match(result.stderr, /exactly 6 pre-created database names|caller-owned account_runtime_e05_/)
 })
 
 test('rejects Redis DB0 and protected port before runtime work', () => {
-  const db0 = run({ KIRO_E05_REDIS_URL: 'redis://127.0.0.1:16379/0' })
+  const db0 = run({ ACCOUNT_RUNTIME_E05_REDIS_URL: 'redis://127.0.0.1:16379/0' })
   assert.notEqual(db0.status, 0)
   assert.match(db0.stderr, /isolated nonzero database/)
 
-  const protectedPort = run({ KIRO_E05_REDIS_URL: 'redis://127.0.0.1:9022/5' })
+  const protectedPort = run({ ACCOUNT_RUNTIME_E05_REDIS_URL: 'redis://127.0.0.1:9022/5' })
   assert.notEqual(protectedPort.status, 0)
   assert.match(protectedPort.stderr, /port 9022 is protected/)
 })
 
 test('rejects unsafe Redis prefix before runtime work', () => {
-  const result = run({ KIRO_E05_REDIS_PREFIX: 'kiro_rs:local:e05' })
+  const result = run({ ACCOUNT_RUNTIME_E05_REDIS_PREFIX: 'account_runtime:local:e05' })
   assert.notEqual(result.status, 0)
   assert.match(result.stderr, /caller-owned temporary prefix/)
 })
@@ -101,10 +101,10 @@ test('source is non-Docker and uses redis-chaos-proxy plus bounded prefix cleanu
   assert.doesNotMatch(source, /spawnSync\(['"]docker['"]/)
   assert.doesNotMatch(source, /CREATE DATABASE/)
   assert.doesNotMatch(source, /FLUSHDB/)
-  assert.doesNotMatch(source, /KIRO_E05_ALLOW_DOCKER/)
+  assert.doesNotMatch(source, /ACCOUNT_RUNTIME_E05_ALLOW_DOCKER/)
   assert.doesNotMatch(source, /\.\.\.process\.env/)
   assert.match(source, /minimalChildEnv/)
   assert.match(source, /redis-chaos-proxy\.mjs/)
   assert.match(source, /cleanupOwnedRedisKeys/)
-  assert.match(source, /KIRO_E05_VALIDATE_ONLY/)
+  assert.match(source, /ACCOUNT_RUNTIME_E05_VALIDATE_ONLY/)
 })

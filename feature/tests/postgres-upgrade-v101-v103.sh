@@ -5,9 +5,9 @@ set -euo pipefail
 # the current release binary. All infrastructure is temporary and uniquely named.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SMOKE_ROOT="${SMOKE_ROOT:-/tmp/kiro-upgrade-smoke-20260716-a}"
+SMOKE_ROOT="${SMOKE_ROOT:-/tmp/account-runtime-upgrade-smoke-20260716-a}"
 RESULT_ROOT="${RESULT_ROOT:-$PROJECT_ROOT/target/validation/f04-upgrade-20260716}"
-CURRENT_BINARY="${CURRENT_BINARY:-$SMOKE_ROOT/bin/kiro-rs-current-fixed}"
+CURRENT_BINARY="${CURRENT_BINARY:-$SMOKE_ROOT/bin/account-runtime-current-fixed}"
 ROUNDS="${ROUNDS:-3}"
 VERSIONS="${VERSIONS:-v101 v102 v103}"
 RUN_ID="${RUN_ID:-$$}"
@@ -66,7 +66,7 @@ make_fixture_files() {
   local version=$1 scenario=$2 round=$3 service_port=$4
   FIXTURE_DIR="$RESULT_ROOT/runtime/${version}-${scenario}-r${round}"
   mkdir -p "$FIXTURE_DIR"
-  PREFIX="kiro_f04:${version}:${scenario}:r${round}"
+  PREFIX="account_runtime_f04:${version}:${scenario}:r${round}"
 
   cat >"$FIXTURE_DIR/config.json" <<EOF
 {
@@ -108,14 +108,14 @@ start_ready() {
   local started finished response=""
   started=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
   env -u LOCAL_UPSTREAM_API_KEY \
-    KIRO_RS_POSTGRES_URL="$POSTGRES_URL" \
-    KIRO_RS_REDIS_URL="$REDIS_URL" \
+    ACCOUNT_RUNTIME_POSTGRES_URL="$POSTGRES_URL" \
+    ACCOUNT_RUNTIME_REDIS_URL="$REDIS_URL" \
     ACCOUNT_RUNTIME_HOST=127.0.0.1 \
     ACCOUNT_RUNTIME_PORT="$service_port" \
-    KIRO_RS_POSTGRES_MIGRATE_ON_START=true \
-    KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
+    ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=true \
+    ACCOUNT_RUNTIME_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
     RUST_LOG=info \
-    "$binary" -c "$FIXTURE_DIR/config.json" --credentials "$FIXTURE_DIR/credentials.json" >"$log_file" 2>&1 &
+    "$binary" -c "$FIXTURE_DIR/config.json" >"$log_file" 2>&1 &
   CURRENT_PID=$!
 
   for _ in $(seq 1 600); do
@@ -151,14 +151,14 @@ start_expected_checksum_failure() {
   local started finished rc
   started=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
   env -u LOCAL_UPSTREAM_API_KEY \
-    KIRO_RS_POSTGRES_URL="$POSTGRES_URL" \
-    KIRO_RS_REDIS_URL="$REDIS_URL" \
+    ACCOUNT_RUNTIME_POSTGRES_URL="$POSTGRES_URL" \
+    ACCOUNT_RUNTIME_REDIS_URL="$REDIS_URL" \
     ACCOUNT_RUNTIME_HOST=127.0.0.1 \
     ACCOUNT_RUNTIME_PORT="$service_port" \
-    KIRO_RS_POSTGRES_MIGRATE_ON_START=true \
-    KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
+    ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=true \
+    ACCOUNT_RUNTIME_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START=false \
     RUST_LOG=info \
-    "$CURRENT_BINARY" -c "$FIXTURE_DIR/config.json" --credentials "$FIXTURE_DIR/credentials.json" >"$log_file" 2>&1 &
+    "$CURRENT_BINARY" -c "$FIXTURE_DIR/config.json" >"$log_file" 2>&1 &
   CURRENT_PID=$!
 
   for _ in $(seq 1 200); do
@@ -387,8 +387,8 @@ hold_migration_lock() {
 
 create_infra() {
   local version=$1
-  PG_CONTAINER="kiro-f04-${version}-pg-${RUN_ID}"
-  REDIS_CONTAINER="kiro-f04-${version}-redis-${RUN_ID}"
+  PG_CONTAINER="account-runtime-f04-${version}-pg-${RUN_ID}"
+  REDIS_CONTAINER="account-runtime-f04-${version}-redis-${RUN_ID}"
   docker run -d --name "$PG_CONTAINER" \
     -e POSTGRES_USER=upgrade_fixture \
     -e POSTGRES_PASSWORD="$PG_PASSWORD" \
@@ -516,7 +516,7 @@ ON CONFLICT(version) DO UPDATE SET checksum=EXCLUDED.checksum, applied_at=EXCLUD
 
 require_file "$CURRENT_BINARY"
 for version in $VERSIONS; do
-  old_binary="$SMOKE_ROOT/bin/kiro-rs-${version}"
+  old_binary="$SMOKE_ROOT/bin/account-runtime-${version}"
   require_file "$old_binary"
   case "$version" in
     v101) service_port=19131 ;;

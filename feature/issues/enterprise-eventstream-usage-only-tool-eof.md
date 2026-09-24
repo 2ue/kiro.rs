@@ -6,8 +6,8 @@ Severity: P0/P1
 
 ## 影响
 
-- 影响对象：企业/API-key 类 Kiro 凭据（生产 usage 中以 `ksk_...` 形态脱敏出现）。
-- 影响路径：`/cc/v1/messages`、`/ha/v1/messages`，以及共享的 Kiro EventStream → Anthropic stream/non-stream 转换路径。
+- 影响对象：企业/API-key 类 Account Runtime 凭据（生产 usage 中以 `ksk_...` 形态脱敏出现）。
+- 影响路径：`/cc/v1/messages`、`/ha/v1/messages`，以及共享的 Account Runtime EventStream → Anthropic stream/non-stream 转换路径。
 - 用户可见表现：
   - 请求上游 HTTP 状态是 `200 OK`；
   - usage 记录仍显示失败，route 多为 `local_credential | local_error_no_fallback`；
@@ -57,7 +57,7 @@ Severity: P0/P1
 
 ## 根因
 
-根因是本项目近期为防止 silent truncation / fake success 加强 EventStream EOF 校验时，和官方 Kiro 客户端的兼容边界不一致。
+根因是本项目近期为防止 silent truncation / fake success 加强 EventStream EOF 校验时，和官方 Account Runtime 客户端的兼容边界不一致。
 
 本项目旧逻辑：
 
@@ -81,13 +81,13 @@ Severity: P0/P1
 
 - `meteringEvent` 实际可能携带 `inputTokens/outputTokens`；
 - 本项目原 `MeteringEvent` 只解析 `usage`，没有解析 token 字段；
-- 因此 usage 只能走 context/local estimate，导致“上游扣费/计量存在，但本地输出 tokens 或 Kiro metering 不完整”的诊断盲区。
+- 因此 usage 只能走 context/local estimate，导致“上游扣费/计量存在，但本地输出 tokens 或 Account Runtime metering 不完整”的诊断盲区。
 
 ## 官方/参考实现对照
 
-本地复核了官方 Kiro 扩展和参考 Go 实现：
+本地复核了官方 Account Runtime 扩展和参考 Go 实现：
 
-- 官方 Kiro extension：
+- 官方 Account Runtime extension：
   - `metadataEvent`、`contextUsageEvent`、`meteringEvent` 都作为正常流事件处理；
   - streaming 路径可以 yield 空 content usage chunk；
   - non-stream 路径聚合 assistant content，若没有 assistant content 也不会仅因此抛出 protocol error。
@@ -127,7 +127,7 @@ Severity: P0/P1
 
 ### 3. 解析 `meteringEvent.inputTokens/outputTokens`
 
-`src/kiro/model/events/additional.rs`：
+`src/local_upstream_impl/model/events/additional.rs`：
 
 - `MeteringEvent` 新增 `input_tokens`、`output_tokens`；
 - 对应上游 camelCase 字段 `inputTokens/outputTokens`；
@@ -176,7 +176,7 @@ non-stream：
 
 ## 修改文件
 
-- `src/kiro/model/events/additional.rs`
+- `src/local_upstream_impl/model/events/additional.rs`
   - `MeteringEvent` 解析 `inputTokens/outputTokens`。
 - `src/anthropic/stream.rs`
   - usage-only terminal signal；
@@ -202,7 +202,7 @@ non-stream：
 
 ### A. usage-only EventStream
 
-fake Kiro upstream 返回：
+fake Account Runtime upstream 返回：
 
 ```text
 HTTP 200
@@ -222,12 +222,12 @@ EOF
 - 返回 success；
 - downstream `stop_reason=end_turn`；
 - usage 记录 success；
-- `kiro_metering_usage=0.24`；
+- `account-runtime_metering_usage=0.24`；
 - output tokens 保持 `0`，不会由空 content 本地估算成 `1`。
 
 ### B. tool input 完整但缺 stop
 
-fake Kiro upstream 返回：
+fake Account Runtime upstream 返回：
 
 ```text
 HTTP 200
@@ -256,7 +256,7 @@ EOF
 
 ### C. 坏 tool JSON 仍 fail-closed
 
-fake Kiro upstream 返回：
+fake Account Runtime upstream 返回：
 
 ```text
 toolUseEvent {"input":"{","stop":false}
@@ -267,7 +267,7 @@ EOF
 
 ### D. unknown-only 仍 fail-closed
 
-fake Kiro upstream 只返回未知事件：
+fake Account Runtime upstream 只返回未知事件：
 
 ```text
 futureUnknownEvent {"opaque":"..."}
@@ -286,7 +286,7 @@ EOF
 cargo fmt
 git diff --check
 feature/tests/run-cargo-scoped.sh eventstream-urgent-check3 -- \
-  bash -lc 'cargo check --locked --bin kiro-rs'
+  bash -lc 'cargo check --locked --bin account-runtime'
 ```
 
 结果：通过。
@@ -310,12 +310,12 @@ Clippy emitted 817 warnings; the checked-in baseline allows 849.
 
 ```text
 feature/tests/run-cargo-scoped.sh eventstream-urgent-tests-final -- bash -lc '
-  cargo test --locked --bin kiro-rs metering_and_code_events_deserialize_without_extra_requirements -- --nocapture &&
-  cargo test --locked --bin kiro-rs trusted_terminal_contract_rejects_silent_eof_and_keeps_legacy_terminals_for_five_rounds -- --nocapture &&
-  cargo test --locked --bin kiro-rs handler_legacy_metadata_metering_and_complete_tool_are_trusted_terminals_for_five_rounds -- --nocapture &&
-  cargo test --locked --bin kiro-rs handler_non_stream_untrusted_eof_fails_closed_for_five_rounds -- --nocapture &&
-  cargo test --locked --bin kiro-rs handler_eventstream_postcommit_faults_never_retry_or_fake_success_for_five_rounds -- --nocapture &&
-  cargo test --locked --bin kiro-rs websearch -- --nocapture
+  cargo test --locked --bin account-runtime metering_and_code_events_deserialize_without_extra_requirements -- --nocapture &&
+  cargo test --locked --bin account-runtime trusted_terminal_contract_rejects_silent_eof_and_keeps_legacy_terminals_for_five_rounds -- --nocapture &&
+  cargo test --locked --bin account-runtime handler_legacy_metadata_metering_and_complete_tool_are_trusted_terminals_for_five_rounds -- --nocapture &&
+  cargo test --locked --bin account-runtime handler_non_stream_untrusted_eof_fails_closed_for_five_rounds -- --nocapture &&
+  cargo test --locked --bin account-runtime handler_eventstream_postcommit_faults_never_retry_or_fake_success_for_five_rounds -- --nocapture &&
+  cargo test --locked --bin account-runtime websearch -- --nocapture
 '
 ```
 
@@ -373,6 +373,6 @@ feature/tests/run-cargo-scoped.sh external-billing-final -- bash -lc '
 - `upstream eventstream ended without a meaningful assistant, reasoning, or tool event` 是否下降；
 - `upstream eventstream ended with ... incomplete tool input buffer(s)` 是否下降；
 - 企业/API-key 类 credential 是否仍出现 `upstream_status=200 public_status=200` 但 usage error；
-- `kiro_metering_usage` 是否保留；
+- `account-runtime_metering_usage` 是否保留；
 - usage-only success 是否 output tokens 为 `0`，不再虚增；
 - unknown-only / JSON error envelope 是否仍保持失败，而不是空成功。

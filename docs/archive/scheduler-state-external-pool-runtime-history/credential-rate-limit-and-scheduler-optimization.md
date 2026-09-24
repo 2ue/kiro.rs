@@ -1,8 +1,8 @@
-# Kiro 凭据调度、并发限制与 429 优化分析
+# Account Runtime 凭据调度、并发限制与 429 优化分析
 
 更新日期：2026-06-05
 
-本文用于记录 `kiro.rs` 当前凭据调度系统在高频请求、账号 429、粘性会话、并发限制、冷却退避方面的背景、原因分析和无歧义落地方案。本文应当能够脱离当前对话独立阅读。
+本文用于记录 `account-runtime` 当前凭据调度系统在高频请求、账号 429、粘性会话、并发限制、冷却退避方面的背景、原因分析和无歧义落地方案。本文应当能够脱离当前对话独立阅读。
 
 ## 0. 快速结论
 
@@ -57,7 +57,7 @@ dispatchGlobalMaxConcurrentRequests = min(可用账号数, 20)
 
 ## 1. 背景
 
-系统通过多个 Kiro 账号凭据向上游发起 Claude Code / Anthropic 兼容请求。生产使用中出现了以下问题：
+系统通过多个 Account Runtime 账号凭据向上游发起 Claude Code / Anthropic 兼容请求。生产使用中出现了以下问题：
 
 1. 某些账号被连续调度，导致请求过于集中。
 2. 同一账号请求太频繁时，上游返回 `429`、`high traffic`、`rate limit` 或其他瞬态错误。
@@ -172,7 +172,7 @@ fallback 成功不应破坏原 sticky 绑定，除非后续策略明确要求改
 
 ### 3.2 调度入口
 
-主要调度入口位于 `src/kiro/token_manager.rs`：
+主要调度入口位于 `src/local_upstream_impl/token_manager.rs`：
 
 1. `acquire_context_for_session`：获取可调度凭据，支持模型过滤、sticky 会话和本次请求临时排除列表。
 2. `credential_is_dispatchable`：判断凭据是否可调度。

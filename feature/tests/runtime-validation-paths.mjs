@@ -32,11 +32,11 @@ function requireExternalRealPath(repoRoot, configuredPath, name, expectedType) {
     throw new Error(`${name} does not exist; provide an owned external validation path`)
   }
   const realPath = fs.realpathSync(configuredPath)
-  if (name === 'KIRO_RS_BINARY' && (
+  if (name === 'ACCOUNT_RUNTIME_BINARY' && (
     isDirectCargoOutputPath(configuredPath) || isDirectCargoOutputPath(realPath)
   )) {
     throw new Error(
-      'KIRO_RS_BINARY must be a copied frozen candidate, not target/debug or target/release output',
+      'ACCOUNT_RUNTIME_BINARY must be a copied frozen candidate, not target/debug or target/release output',
     )
   }
   const stat = fs.statSync(realPath)
@@ -58,14 +58,14 @@ export function resolveRuntimeValidationPaths(root) {
   return {
     binary: requireExternalRealPath(
       repoRoot,
-      requiredAbsolutePath('KIRO_RS_BINARY'),
-      'KIRO_RS_BINARY',
+      requiredAbsolutePath('ACCOUNT_RUNTIME_BINARY'),
+      'ACCOUNT_RUNTIME_BINARY',
       'file',
     ),
     artifactRoot: requireExternalRealPath(
       repoRoot,
-      requiredAbsolutePath('KIRO_VALIDATION_ARTIFACT_DIR'),
-      'KIRO_VALIDATION_ARTIFACT_DIR',
+      requiredAbsolutePath('ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR'),
+      'ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR',
       'directory',
     ),
   }

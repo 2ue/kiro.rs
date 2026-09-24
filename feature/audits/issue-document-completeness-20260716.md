@@ -34,7 +34,7 @@ Status: `structure-contract-pass / dynamic-evidence-open`；结构门禁已通�
 | `09-intent-preamble-end-turn-no-tool-use.md` | `OK`（usage 观测有证据；长会话统计 pending） |
 | `10-stream-end-turn-vs-silent-truncation.md` | `OK`（观测盲区已修；silent truncation 本身未证实，fault gate pending） |
 | `11-stream-observability-and-trivial-text-optimization.md` | `OK`（实现存在；统一候选 CLI/load pending） |
-| `aws-kiro-api-key-region-lifecycle.md` | `OK`（核心链路已有 provisional build 证据；最终构建、双 UI 和多实例门禁仍未关闭） |
+| `aws-account-runtime-api-key-region-lifecycle.md` | `OK`（核心链路已有 provisional build 证据；最终构建、双 UI 和多实例门禁仍未关闭） |
 | `empty-tool-description-400-invalid-tool-use-format.md` | `OK`（历史 fix 有证据；统一候选 CLI/MCP pending） |
 | `evidence-skill-validation-and-redaction.md` | `OK`（本地 deterministic redaction 有证据；发布总门禁重跑 pending） |
 | `external-pool-profiles-and-sse-safety.md` | `OK`（聚焦 response state machine 有证据；handler/CLI/长历史/load 仍 pending） |

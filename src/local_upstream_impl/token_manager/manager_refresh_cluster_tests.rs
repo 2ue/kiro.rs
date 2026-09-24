@@ -95,7 +95,7 @@ async fn cluster_refresh_endpoint(
     let mut body = serde_json::json!({
         "access_token": access_token,
         "expires_in": 3600,
-        "scope": "offline_access codewhisperer:conversations",
+        "scope": "offline_access account-runtime:conversations",
     });
     if let Some(refresh_token) = refresh_token {
         body["refresh_token"] = serde_json::Value::String(refresh_token);
@@ -190,7 +190,7 @@ fn expired_cluster_credential(endpoint: String, marker: &str) -> LocalUpstreamCr
         client_id: Some(format!("cluster-client-{marker}")),
         machine_id: Some("0".repeat(64)),
         token_endpoint: Some(endpoint),
-        scopes: Some("offline_access codewhisperer:conversations".to_string()),
+        scopes: Some("offline_access account-runtime:conversations".to_string()),
         expires_at: Some((Utc::now() - Duration::hours(1)).to_rfc3339()),
         ..Default::default()
     }

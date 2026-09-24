@@ -24,7 +24,7 @@ The provider may read a bounded response body locally to classify an error, but 
 The exact current test is:
 
 ```text
-kiro::provider::tests::provider_status_and_json_error_matrix_is_private_typed_and_bounded
+account-runtime::provider::tests::provider_status_and_json_error_matrix_is_private_typed_and_bounded
 ```
 
 It covers 13 response classes:
@@ -51,7 +51,7 @@ After the test-only internal concurrency was bounded at four, the focused matrix
 The exact current test is:
 
 ```text
-kiro::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded
+account-runtime::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded
 ```
 
 It covers header timeout, declared Content-Length over limit, chunked over limit, body timeout, mid-body disconnect and malformed UTF-8. Stream/non-stream, pool 1/20/60 and five rounds produce `6 x 2 x 3 x 5 = 180` independent outcomes and 540 budgeted sends.

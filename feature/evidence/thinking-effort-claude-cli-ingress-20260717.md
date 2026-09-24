@@ -4,13 +4,13 @@ Date: 2026-07-17
 
 Last updated: 2026-07-18
 
-Role: A09/D07 第一层证据，回答 Claude Code CLI 实际发送什么；不替代 kiro.rs 最终 Kiro wire 或真实上游 thinking 输出
+Role: A09/D07 第一层证据，回答 Claude Code CLI 实际发送什么；不替代 account-runtime 最终 Account Runtime wire 或真实上游 thinking 输出
 
 Status: `pass / ingress-closed / final-wire-and-upstream-open / no-9022-probe-regression-closed`
 
 ## 范围
 
-本证据使用真实 Claude Code CLI 连接 loopback fake Anthropic server，捕获顶层字段的结构化摘要。它不启动 kiro.rs，不连接 PostgreSQL、Redis 或 Kiro 上游，不读取任何真实 credential，也不触碰现有 `127.0.0.1:9022`。
+本证据使用真实 Claude Code CLI 连接 loopback fake Anthropic server，捕获顶层字段的结构化摘要。它不启动 account-runtime，不连接 PostgreSQL、Redis 或 Account Runtime 上游，不读取任何真实 credential，也不触碰现有 `127.0.0.1:9022`。
 
 捕获器只保留 model、stream、thinking、output_config、顶层 key、body 大小和 SHA-256。原始 system prompt、messages、metadata value 和假 API key 均不落盘、不进入报告。
 
@@ -62,7 +62,7 @@ node feature/tests/thinking-effort-claude-cli-capture.mjs
 - 输出的隔离字段为 `forbiddenPorts:[9022]`、`protected9022ProbeSkipped:true`；cleanup 字段为 `childrenStopped:true`、`portReleased:true`、`tempRemoved:true`、`protected9022ProbeSkipped:true`。
 - 当前轮字段矩阵与历史三次完全一致：adaptive 恒存在，absent 默认 high，显式 `max` 原样发送为 `output_config.effort=max`。
 
-因此 cleanup 修复没有改变本节的产品字段结论，也没有通过延长等待掩盖残留。该结果仍只证明 Claude CLI 入站，不证明 kiro.rs final wire。
+因此 cleanup 修复没有改变本节的产品字段结论，也没有通过延长等待掩盖残留。该结果仍只证明 Claude CLI 入站，不证明 account-runtime final wire。
 
 ## 入站字段矩阵
 
@@ -82,7 +82,7 @@ node feature/tests/thinking-effort-claude-cli-capture.mjs
 1. 当前 Claude CLI 并未把 `max` 截断成 `high`；显式五档逐值原样发送。
 2. 当前 Claude CLI 并未遗漏 adaptive；六档都发送 `thinking.type=adaptive`，未显式给 effort 时默认 `high`。
 
-这不证明 kiro.rs 后续映射正确，也不证明 Kiro 上游要求同时收到两个字段。
+这不证明 account-runtime 后续映射正确，也不证明 Account Runtime 上游要求同时收到两个字段。
 
 ## 当前项目静态链路
 
@@ -96,13 +96,13 @@ node feature/tests/thinking-effort-claude-cli-capture.mjs
 
 这形成了需要 final wire runner 验证的 endpoint 差异，但“CLI 不带 thinking”本身尚不能定性为 bug。
 
-## 官方 Kiro IDE Bundle 交叉证据
+## 官方 Account Runtime IDE Bundle 交叉证据
 
-本机安装的官方 Kiro IDE：
+本机安装的官方 Account Runtime IDE：
 
 - extension version：`1.0.165`。
 - app product commit：`fe9e4a263ce2dbc2c52128a05e44f1336297dee9`。
-- bundle：`/Applications/Kiro.app/Contents/Resources/app/extensions/kiro.kiro-agent/dist/extension.js`。
+- bundle：`/Applications/Account Runtime.app/Contents/Resources/app/extensions/account-runtime.account-runtime-agent/dist/extension.js`。
 
 该 bundle 从 `ListAvailableModels.additionalModelRequestFieldsSchema` 动态读取 effort enum、default 和 schema path，并只构造以下二选一字段：
 
@@ -113,7 +113,7 @@ node feature/tests/thinking-effort-claude-cli-capture.mjs
 
 在模型调用点，它把这个对象作为 `additionalModelRequestFields` 传给 GenerateAssistantResponse。当前 bundle 中没有找到模型请求用的字面 `{"type":"adaptive"}` 注入。
 
-这是一条强静态交叉证据：当前 Kiro IDE 把 adaptive effort 的上游能力视为动态 schema path + effort，不足以支持“必须总是注入 thinking.type=adaptive”的预设。它仍不是网络抓包，最终事实必须由 fake Kiro wire 和受控真实上游小样本确认。
+这是一条强静态交叉证据：当前 Account Runtime IDE 把 adaptive effort 的上游能力视为动态 schema path + effort，不足以支持“必须总是注入 thinking.type=adaptive”的预设。它仍不是网络抓包，最终事实必须由 fake Account Runtime wire 和受控真实上游小样本确认。
 
 该交叉证据同时指出本项目的漂移风险：本项目使用硬编码 model/effort 表，而官方客户端使用上游 `ListAvailableModels` schema。模型新增、默认变化或 schema 从 `output_config` 切到 `reasoning` 时，硬编码可能静默回退、clamp 或丢能力。
 
@@ -129,12 +129,12 @@ node feature/tests/thinking-effort-claude-cli-capture.mjs
 
 ## 未关闭项
 
-- 真实 Claude CLI 经当前 kiro.rs 后，CLI/IDE endpoint 最终 Kiro body 六档各 5 轮。
+- 真实 Claude CLI 经当前 account-runtime 后，CLI/IDE endpoint 最终 Account Runtime body 六档各 5 轮。
 - converter 动态使用上游 effort schema，还是继续维护硬编码兼容表。
 - `thinking` absent/disabled/enabled+budget/adaptive、未知/空白/大小写等 API 组合。
 - tool 前决策、thinking alias、`think hard`/`ultrathink`、长会话和自动触发。
 - 最终 response thinking block/delta、signed/redacted history 和 `thinking_tokens`。
-- Kiro 400/429/500/partial、恢复与 attempt/RPM 上限。
-- 受控真实 Kiro 上游对各 schema/value 的支持矩阵。
+- Account Runtime 400/429/500/partial、恢复与 attempt/RPM 上限。
+- 受控真实 Account Runtime 上游对各 schema/value 的支持矩阵。
 
 这些项目关闭前，A09/D07 及发布状态继续为 `NO-GO`。

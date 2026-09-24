@@ -69,7 +69,7 @@
 
 ### 反思 4：没有备用池时不应影响本地凭据链路
 
-实现只在 `UsageRouteKind::ExternalPool` 的记录路径生效。本地凭据调用仍按现有 Kiro usage、缓存模拟和 pricing 逻辑记录，不读取外部池字段，不改变调度、不改变并发、不改变 payload 处理。
+实现只在 `UsageRouteKind::ExternalPool` 的记录路径生效。本地凭据调用仍按现有 Account Runtime usage、缓存模拟和 pricing 逻辑记录，不读取外部池字段，不改变调度、不改变并发、不改变 payload 处理。
 
 ## 最终方案
 
@@ -254,7 +254,7 @@ costFloorDelta = 0
    - `cargo test -q`
 
 2. PostgreSQL 集成测试：
-   - 使用 `KIRO_RS_TEST_POSTGRES_URL` 跑完整测试。
+   - 使用 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL` 跑完整测试。
    - 新增测试模拟至少 1000 条外部池成功 usage record：
      - 一部分 rawCost > upliftedCost，验证亏损标记。
      - 一部分 upliftedCost >= rawCost，验证盈利/持平。

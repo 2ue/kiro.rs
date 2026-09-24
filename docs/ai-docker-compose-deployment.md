@@ -1,8 +1,8 @@
-# Kiro.rs Docker Compose 部署文档（给 AI 执行）
+# Account Runtime.rs Docker Compose 部署文档（给 AI 执行）
 
 > **权威警告（2026-07-12）：** 本文档仅是旧系统/当前已发布版本的运维参考。目标系统改造以 `docs/plantree/plans/system-architecture-modernization/` 及已接受的 ADR 001、003-014 为准；本文档不是目标部署运行手册。下文中的 `latest` 和 `0.0.19` 仅为历史示例，不得作为最终候选版本的发布身份、部署依据或验收证据。
 
-本文档用于让 AI 或自动化脚本按 Docker Compose 方式部署 Kiro.rs。所有解释使用中文；JSON 字段名、环境变量名、命令参数保持真实名称，便于直接复制执行。
+本文档用于让 AI 或自动化脚本按 Docker Compose 方式部署 Account Runtime.rs。所有解释使用中文；JSON 字段名、环境变量名、命令参数保持真实名称，便于直接复制执行。
 
 ## 1. 部署目标
 
@@ -29,8 +29,8 @@
 
 - Docker
 - Docker Compose v2（命令是 `docker compose`）
-- 能访问镜像仓库 `ghcr.io/2ue/kiro-rs`
-- 能访问 Kiro 上游服务
+- 能访问镜像仓库 `ghcr.io/2ue/account-runtime`
+- 能访问 Account Runtime 上游服务
 
 检查命令：
 
@@ -44,7 +44,7 @@ docker compose version
 建议部署目录：
 
 ```text
-/opt/kiro-rs/
+/opt/account-runtime/
 ├── docker-compose.yml
 └── config/
     ├── config.json
@@ -54,38 +54,38 @@ docker compose version
 创建目录：
 
 ```bash
-mkdir -p /opt/kiro-rs/config
-cd /opt/kiro-rs
+mkdir -p /opt/account-runtime/config
+cd /opt/account-runtime
 ```
 
 ## 4. docker-compose.yml
 
-在 `/opt/kiro-rs/docker-compose.yml` 写入：
+在 `/opt/account-runtime/docker-compose.yml` 写入：
 
 ```yaml
 services:
-  kiro-rs-postgres:
+  account-runtime-postgres:
     image: postgres:18-alpine
-    container_name: kiro-rs-postgres
+    container_name: account-runtime-postgres
     environment:
-      POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}
-      POSTGRES_USER: ${KIRO_RS_POSTGRES_USER:-kiro_rs}
-      POSTGRES_PASSWORD: ${KIRO_RS_POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${ACCOUNT_RUNTIME_POSTGRES_DB:-account_runtime}
+      POSTGRES_USER: ${ACCOUNT_RUNTIME_POSTGRES_USER:-account_runtime}
+      POSTGRES_PASSWORD: ${ACCOUNT_RUNTIME_POSTGRES_PASSWORD:-change-me}
     volumes:
-      - kiro-rs-postgres-data:/var/lib/postgresql
+      - account-runtime-postgres-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${KIRO_RS_POSTGRES_USER:-kiro_rs} -d ${KIRO_RS_POSTGRES_DB:-kiro_rs}"]
+      test: ["CMD-SHELL", "pg_isready -U ${ACCOUNT_RUNTIME_POSTGRES_USER:-account_runtime} -d ${ACCOUNT_RUNTIME_POSTGRES_DB:-account_runtime}"]
       interval: 10s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
-  kiro-rs-redis:
+  account-runtime-redis:
     image: redis:7-alpine
-    container_name: kiro-rs-redis
+    container_name: account-runtime-redis
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - kiro-rs-redis-data:/data
+      - account-runtime-redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -93,18 +93,18 @@ services:
       retries: 10
     restart: unless-stopped
 
-  kiro-rs:
-    image: ${KIRO_RS_IMAGE:-ghcr.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
-    container_name: kiro-rs
+  account-runtime:
+    image: ${ACCOUNT_RUNTIME_IMAGE:-ghcr.io/2ue/account-runtime}:${ACCOUNT_RUNTIME_VERSION:-latest}
+    container_name: account-runtime
     depends_on:
-      kiro-rs-postgres:
+      account-runtime-postgres:
         condition: service_healthy
-      kiro-rs-redis:
+      account-runtime-redis:
         condition: service_healthy
     environment:
-      ACCOUNT_RUNTIME_POSTGRES_URL: postgres://${KIRO_RS_POSTGRES_USER:-kiro_rs}:${KIRO_RS_POSTGRES_PASSWORD:-change-me}@kiro-rs-postgres:5432/${KIRO_RS_POSTGRES_DB:-kiro_rs}
+      ACCOUNT_RUNTIME_POSTGRES_URL: postgres://${ACCOUNT_RUNTIME_POSTGRES_USER:-account_runtime}:${ACCOUNT_RUNTIME_POSTGRES_PASSWORD:-change-me}@account-runtime-postgres:5432/${ACCOUNT_RUNTIME_POSTGRES_DB:-account_runtime}
       ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START: ${ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START:-true}
-      ACCOUNT_RUNTIME_REDIS_URL: redis://kiro-rs-redis:6379/0
+      ACCOUNT_RUNTIME_REDIS_URL: redis://account-runtime-redis:6379/0
     ports:
       - "${ACCOUNT_RUNTIME_PORT:-8990}:8990"
     volumes:
@@ -114,8 +114,8 @@ services:
     restart: unless-stopped
 
 volumes:
-  kiro-rs-postgres-data:
-  kiro-rs-redis-data:
+  account-runtime-postgres-data:
+  account-runtime-redis-data:
 ```
 
 PostgreSQL 18 官方镜像默认使用版本化的数据目录，compose 中挂载父目录
@@ -128,38 +128,38 @@ PostgreSQL 18 官方镜像默认使用版本化的数据目录，compose 中挂�
 
 | 变量名 | 默认值 | 控制什么 |
 | --- | --- | --- |
-| `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | 控制使用哪个镜像仓库。一般不需要改。 |
-| `KIRO_RS_VERSION` | `latest` | 控制镜像版本。生产建议固定为具体版本，例如 `0.0.19`。 |
+| `ACCOUNT_RUNTIME_IMAGE` | `ghcr.io/2ue/account-runtime` | 控制使用哪个镜像仓库。一般不需要改。 |
+| `ACCOUNT_RUNTIME_VERSION` | `latest` | 控制镜像版本。生产建议固定为具体版本，例如 `0.0.19`。 |
 | `ACCOUNT_RUNTIME_PORT` | `8990` | 控制宿主机暴露端口。容器内端口固定是 `8990`。 |
-| `KIRO_RS_POSTGRES_DB` | `kiro_rs` | 控制 PgSQL 数据库名。 |
-| `KIRO_RS_POSTGRES_USER` | `kiro_rs` | 控制 PgSQL 用户名。 |
-| `KIRO_RS_POSTGRES_PASSWORD` | `change-me` | 控制 PgSQL 密码，生产必须改成强密码。 |
+| `ACCOUNT_RUNTIME_POSTGRES_DB` | `account_runtime` | 控制 PgSQL 数据库名。 |
+| `ACCOUNT_RUNTIME_POSTGRES_USER` | `account_runtime` | 控制 PgSQL 用户名。 |
+| `ACCOUNT_RUNTIME_POSTGRES_PASSWORD` | `change-me` | 控制 PgSQL 密码，生产必须改成强密码。 |
 | `ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START` | `true` | 覆盖 `postgres.migrateOnStart`；生产升级必须保持 `true`，除非已经通过其它维护流程完成当前镜像要求的 schema 迁移。启动迁移只做轻量 schema 补齐和小表修复，不会自动扫描历史 `usage_records`。 |
 | `ACCOUNT_RUNTIME_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START` | 配置文件默认值 | 覆盖 `postgres.compressUsageRollupsOnStart`；历史 usage rollup 压缩只在低峰维护窗口设为 `true`。普通升级保持 `false`。 |
 
 固定版本启动示例：
 
 ```bash
-KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
+ACCOUNT_RUNTIME_VERSION=0.0.19 ACCOUNT_RUNTIME_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
 ```
 
 如果宿主机想用 `9022` 端口：
 
 ```bash
-ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
+ACCOUNT_RUNTIME_PORT=9022 ACCOUNT_RUNTIME_VERSION=0.0.19 ACCOUNT_RUNTIME_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
 ```
 
 ## 5. config.json
 
-在 `/opt/kiro-rs/config/config.json` 写入下面内容，并按实际情况修改密钥：
+在 `/opt/account-runtime/config/config.json` 写入下面内容，并按实际情况修改密钥：
 
 ```json
 {
   "postgres": {
-    "url": "postgres://kiro_rs:change-me@kiro-rs-postgres:5432/kiro_rs"
+    "url": "postgres://account_runtime:change-me@account-runtime-postgres:5432/account_runtime"
   },
   "redis": {
-    "url": "redis://kiro-rs-redis:6379/0"
+    "url": "redis://account-runtime-redis:6379/0"
   },
   "host": "0.0.0.0",
   "port": 8990,
@@ -202,7 +202,7 @@ ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替�
 
 ## 6. 旧 credentials.json 兼容说明
 
-当前账号运行时启动不再读取 `/opt/kiro-rs/config/credentials.json` 自动导入凭据。下面格式只保留给离线诊断、旧数据迁移或兼容说明；新上游账号请通过 Admin 账号接口配置。
+当前账号运行时启动不再读取 `/opt/account-runtime/config/credentials.json` 自动导入凭据。下面格式只保留给离线诊断、旧数据迁移或兼容说明；新上游账号请通过 Admin 账号接口配置。
 
 单个 OAuth 凭据示例：
 
@@ -230,7 +230,7 @@ ACCOUNT_RUNTIME_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替�
   },
   {
     "id": 2,
-    "kiroApiKey": "ksk_xxxxxxxx",
+    "apiKey": "ksk_xxxxxxxx",
     "authMethod": "api_key",
     "priority": 10,
     "email": "account2@example.com"
@@ -265,19 +265,19 @@ docker compose up -d
 默认启动迁移不会回填历史 `usage_records`，也不会在大表上无条件创建缺失索引。如果历史 usage 表很大且缺少 usage/rollup 索引，服务会跳过启动创建并写出 warning。需要补齐时，应在低峰期手动运行：
 
 ```bash
-docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance usage-indexes
+docker compose run --rm account-runtime ./account-runtime -c /app/config/config.json maintenance usage-indexes
 ```
 
 如果需要显式回填旧版本成本字段，可在低峰期手动运行：
 
 ```bash
-docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance usage-legacy-cost-backfill
+docker compose run --rm account-runtime ./account-runtime -c /app/config/config.json maintenance usage-legacy-cost-backfill
 ```
 
 如果需要压缩历史 usage rollup 小桶，可在低峰期手动运行：
 
 ```bash
-docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance usage-rollup-compression
+docker compose run --rm account-runtime ./account-runtime -c /app/config/config.json maintenance usage-rollup-compression
 ```
 
 这些维护命令都不应作为普通版本升级的必需步骤。运行前建议先做 PostgreSQL 备份，并监控 PgSQL CPU、IO、WAL 和锁等待。
@@ -293,14 +293,14 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 | `adminApiKey` | 强随机字符串 | 控制管理后台和 `/api/admin/*` 的认证密钥。 |
 | `tlsBackend` | `rustls` | 控制 HTTP 客户端 TLS 实现。Docker 镜像推荐 `rustls`。 |
 
-### Kiro 上游环境模拟
+### Account Runtime 上游环境模拟
 
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
-| `region` | `us-east-1` | 控制默认 Kiro 区域。未单独配置 `authRegion` / `apiRegion` 时会用它。 |
+| `region` | `us-east-1` | 控制默认 Account Runtime 区域。未单独配置 `authRegion` / `apiRegion` 时会用它。 |
 | `authRegion` | 可不填 | 控制刷新 OAuth / IdC Token 的区域。 |
-| `apiRegion` | 可不填 | 控制请求 Kiro API 的区域。 |
-| `kiroVersion` | `0.11.107` | 控制请求上游时模拟的 Kiro IDE 版本。 |
+| `apiRegion` | 可不填 | 控制请求 Account Runtime API 的区域。 |
+| `account-runtimeVersion` | `0.11.107` | 控制请求上游时模拟的 Account Runtime IDE 版本。 |
 | `nodeVersion` | `22.22.0` | 控制请求上游时模拟的 Node 版本。 |
 | `machineId` | 可不填 | 控制全局机器 ID。通常建议让系统根据每个凭据自动派生。 |
 | `systemVersion` | 可不填 | 控制请求上游时模拟的系统版本。 |
@@ -318,15 +318,15 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 | `credentialInFlightLeaseMaxSecs` | `900` | 控制单个并发占用超过多久未活跃时自动释放。 |
 | `credentialWarmupRequests` | `3` | 控制新凭据预热剩余请求数。预热不会伪造成功次数，只降低被选中的概率。 |
 | `credentialWarmupSelectionPercent` | `5` | 控制 `balanced` 模式下预热凭据参与真实请求调度的概率百分比。 |
-| `defaultEndpoint` | `ide` | 控制凭据未单独指定 `endpoint` 时走哪个 Kiro 端点；当前可选 `ide` / `cli`。 |
+| `defaultEndpoint` | `ide` | 控制凭据未单独指定 `endpoint` 时走哪个 Account Runtime 端点；当前可选 `ide` / `cli`。 |
 
 ### 上游请求体防护
 
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
-| `payloadGuardEnabled` | `true` | 是否在发送 Kiro 上游前按最终 JSON 字节数检查请求体。 |
+| `payloadGuardEnabled` | `true` | 是否在发送 Account Runtime 上游前按最终 JSON 字节数检查请求体。 |
 | `payloadGuardMaxBytes` | `460800` | 本地 payload 经验预算，不是模型上下文上限；`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复。 |
-| `payloadGuardTrimHistory` | `true` | 请求体超出本地预算时是否裁剪最旧历史；关闭后仍超预算会标记后透传给 Kiro。 |
+| `payloadGuardTrimHistory` | `true` | 请求体超出本地预算时是否裁剪最旧历史；关闭后仍超预算会标记后透传给 Account Runtime。 |
 | `payloadShaping.enabled` | `true` | 超出本地预算时先执行历史内容和 tools 低风险整形。 |
 | `payloadShaping.truncateHistoricalToolResults` | `true` | 对普通历史 `tool_result` 做头尾保留截断；默认上限 `8000` 字符。 |
 | `payloadShaping.discardHistoricalThinking` | `true` | 移除旧 assistant 历史中的 `<thinking>` 块。 |
@@ -342,7 +342,7 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 | `payloadShaping.truncateCurrentImages` | `false` | 是否允许在仍超预算时丢弃当前图片；图片不会本地重编码压缩。 |
 | `payloadShaping.currentImagesMaxBytes` | `180000` | 当前 images 数组允许保留的 JSON 字节预算。 |
 
-默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Kiro JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务记录 `still_oversized=true` 并透传请求，由 Kiro 返回真实错误。
+默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Account Runtime JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务记录 `still_oversized=true` 并透传请求，由 Account Runtime 返回真实错误。
 
 ### 路径缓存行为
 
@@ -393,15 +393,15 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 启动：
 
 ```bash
-cd /opt/kiro-rs
-KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
+cd /opt/account-runtime
+ACCOUNT_RUNTIME_VERSION=0.0.19 ACCOUNT_RUNTIME_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
 ```
 
 查看状态：
 
 ```bash
 docker compose ps
-docker compose logs -f kiro-rs
+docker compose logs -f account-runtime
 ```
 
 验证模型列表：
@@ -462,23 +462,23 @@ config/credentials.json
 停止：
 
 ```bash
-cd /opt/kiro-rs
+cd /opt/account-runtime
 docker compose down
 ```
 
 重启：
 
 ```bash
-cd /opt/kiro-rs
-docker compose restart kiro-rs
+cd /opt/account-runtime
+docker compose restart account-runtime
 ```
 
 升级版本：
 
 ```bash
-cd /opt/kiro-rs
-KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose pull
-KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
+cd /opt/account-runtime
+ACCOUNT_RUNTIME_VERSION=0.0.19 ACCOUNT_RUNTIME_POSTGRES_PASSWORD='替换成强密码' docker compose pull
+ACCOUNT_RUNTIME_VERSION=0.0.19 ACCOUNT_RUNTIME_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
 ```
 
 ## 12. 常见问题
@@ -489,12 +489,12 @@ KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker com
 
 ```bash
 docker compose ps
-docker compose logs kiro-rs-postgres
-docker compose logs kiro-rs-redis
-docker compose logs kiro-rs
+docker compose logs account-runtime-postgres
+docker compose logs account-runtime-redis
+docker compose logs account-runtime
 ```
 
-确认 `KIRO_RS_POSTGRES_PASSWORD` 在启动命令、数据库容器和应用容器中一致。
+确认 `ACCOUNT_RUNTIME_POSTGRES_PASSWORD` 在启动命令、数据库容器和应用容器中一致。
 
 ### 修改 config.json 后为什么不生效
 

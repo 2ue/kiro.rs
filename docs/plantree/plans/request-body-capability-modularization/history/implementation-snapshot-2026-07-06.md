@@ -28,6 +28,6 @@ There is no active TODO under this completed plan. Compatibility defaults and la
 - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo build --release`
 - Temporary proxy on `127.0.0.1:19022` against fake upstream on `127.0.0.1:19080`.
 - Historical raw reports: `target/loadtest/modular-20260706160929/` and `final-validation-summary.json`; these ignored artifacts are supporting data, not durable current authority.
-- Historical result: 904 main tests and 19 `kiro_loadtest` tests passed; release build passed in 3m39s.
+- Historical result: 904 main tests and 19 `account_runtime_loadtest` tests passed; release build passed in 3m39s.
 - Historical fake-upstream result: normalized and raw external pools passed normal, non-stream, thinking/tool, slow-first-byte, long-context long-stream, burst, error/cooldown/recovery, and mixed-chaos coverage.
 - Cleanup recorded: temporary proxy stopped, ports released, isolated database dropped, and Redis prefix deleted.

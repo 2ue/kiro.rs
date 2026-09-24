@@ -45,6 +45,7 @@ use tokio::time::{Instant, interval, sleep, sleep_until};
 
 use super::body_capabilities::ParsedAnthropicBodyPlan;
 use super::body_processing;
+use super::cache::MetadataTokenUsage;
 use super::converter::{
     ConversionError, ConverterOptions, ProxyWarnings, convert_request_with_resolved_model,
     extract_stable_conversation_id, map_model,
@@ -111,19 +112,25 @@ use crate::account_runtime::{
     immediately_available_account_for_route_body_mode_and_model,
 };
 use crate::http_client::response_bytes_with_limit_and_body_timeout;
+use crate::local_upstream::call_trace::LocalUpstreamCredentialAttempt;
+#[cfg(test)]
 use crate::local_upstream::call_trace::{
     AccountRejectReason, LocalAuxiliaryMcpAttributionSink, LocalUpstreamCallFailureKind,
-    LocalUpstreamCredentialAttempt, SelectionFailureStage,
+    SelectionFailureStage,
 };
+#[cfg(test)]
 use crate::local_upstream::dispatch::{
     LocalUpstreamAcquireMode, LocalUpstreamRouteState, LocalUpstreamRouteStateKind,
 };
-use crate::local_upstream::event::{LocalUpstreamEvent, LocalUpstreamMetadataTokenUsage};
+#[cfg(test)]
+use crate::local_upstream::event::LocalUpstreamEvent;
+#[cfg(test)]
 use crate::local_upstream::provider::{
     LocalAuxiliaryMcpAttribution, LocalUpstreamApiResponse, LocalUpstreamProvider,
     LocalUpstreamStreamCompletion, LocalUpstreamStreamResponse,
 };
 use crate::local_upstream::request::LocalUpstreamRequest;
+#[cfg(test)]
 use crate::local_upstream::stream::LocalUpstreamEventStreamDecoder;
 
 #[path = "handlers/local_body_pipeline.rs"]
@@ -769,6 +776,7 @@ fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
 
 #[derive(Clone)]
 struct AccountFallbackContext {
+    #[cfg(test)]
     provider: Option<Arc<LocalUpstreamProvider>>,
     manager: Arc<AccountRuntimeManager>,
     config: AccountRuntimeConfig,
@@ -810,7 +818,7 @@ struct AccountFallbackContext {
     raw_preflight_failure: Option<RawAccountPreflightFailure>,
 }
 
-struct LocalPoolPreflightAccountOutcome {
+struct AccountPreflightOutcome {
     outcome: AccountForwardOutcome,
     local_reason: String,
 }
@@ -1433,7 +1441,7 @@ async fn maybe_raw_account_preflight_response(
             return None;
         }
 
-        let (reason, local_state) = local_pool_preflight_reason_after_capacity_grace(
+        let (reason, local_state) = account_preflight_reason_after_capacity_grace(
             provider.as_ref(),
             &config,
             raw_probe.model.as_deref(),
@@ -1463,7 +1471,7 @@ async fn maybe_raw_account_preflight_response(
             local_dispatchable = local_state.dispatchable,
             local_usable = local_state.usable,
             retry_after_secs = ?local_state.retry_after_secs,
-            "local credential pool is not immediately schedulable; routing raw request directly to upstream account before parsing body"
+            "account route is not immediately schedulable; routing raw request directly to upstream account before parsing body"
         );
         let route = raw_account_route_request_with_hints(
             state,
@@ -1494,7 +1502,7 @@ async fn maybe_raw_account_preflight_response(
             }
             AccountForwardOutcome::FinalError(err) => {
                 let current_local_dispatchable = provider
-                    .local_pool_route_state_fresh(raw_probe.model.as_deref())
+                    .account_route_state_fresh(raw_probe.model.as_deref())
                     .dispatchable;
                 if let Some(rescue_reason) = budgeted_local_rescue_reason_after_account_route_error(
                     UsageRouteSubtype::AccountFallbackPreflight,
@@ -1512,7 +1520,7 @@ async fn maybe_raw_account_preflight_response(
                         account_status = err.status.as_u16(),
                         account_error_type = %err.route_error_type,
                         account_attempt_count = err.attempts.len(),
-                        "raw account preflight failed with a rescuable error; continuing into parsed local rescue path"
+                        "raw account preflight failed with a rescuable error; continuing into parsed account rescue path"
                     );
                     RawAccountPreflightDecision::ContinueWithLocalRescue(
                         RawAccountPreflightFailure {
@@ -1561,7 +1569,7 @@ async fn raw_upstream_account_ready_for_route_reason(
     endpoint: &str,
     model: Option<&str>,
 ) -> bool {
-    if local_route_reason_requires_immediate_account_capacity(route_reason) {
+    if account_route_reason_requires_immediate_capacity(route_reason) {
         let Some(model) = model else {
             return false;
         };
@@ -1716,14 +1724,11 @@ fn build_account_fallback_context(
     if !account_runtime_enabled_for_endpoint(&config, endpoint) {
         return None;
     }
-    #[cfg(test)]
-    let provider = state.local_upstream_provider.clone();
-    #[cfg(not(test))]
-    let provider = None;
     let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
     let policy = &effective_cache_route.policy;
     Some(AccountFallbackContext {
-        provider,
+        #[cfg(test)]
+        provider: state.local_upstream_provider.clone(),
         manager,
         config,
         effective_raw_body,
@@ -1767,10 +1772,11 @@ fn build_account_fallback_context(
 }
 
 impl AccountFallbackContext {
+    #[cfg(test)]
     fn current_local_dispatchable(&self, model: Option<&str>) -> Option<usize> {
         let provider = self.provider.as_ref()?;
         let model = model.or(Some(self.payload.model.as_str()));
-        let state = provider.local_pool_route_state_fresh(model);
+        let state = provider.account_route_state_fresh(model);
         Some(
             if matches!(state.kind, LocalUpstreamRouteStateKind::Ready) {
                 state.dispatchable
@@ -1811,12 +1817,13 @@ impl AccountFallbackContext {
         self.request_input_tokens = original_input_tokens.max(normalized_input_tokens);
     }
 
+    #[cfg(test)]
     async fn local_attempt_policy(&self) -> (LocalUpstreamAcquireMode, bool) {
         if self.provider.is_none() {
             return (LocalUpstreamAcquireMode::FailFastOnCapacity, false);
         }
         if self.has_cached_immediately_available_account_for_model(&self.payload.model) {
-            let acquire_mode = local_pool_acquire_mode(&self.config);
+            let acquire_mode = account_acquire_mode(&self.config);
             if acquire_mode != LocalUpstreamAcquireMode::WaitForCapacity {
                 return (
                     clamp_acquire_mode_to_dispatch_deadline(
@@ -1836,7 +1843,7 @@ impl AccountFallbackContext {
             return (
                 clamp_acquire_mode_to_dispatch_deadline(
                     LocalUpstreamAcquireMode::WaitForCapacityRedisDegradedMax(
-                        local_scheduler_redis_degraded_fallback_wait(&self.config),
+                        account_scheduler_redis_degraded_fallback_wait(&self.config),
                     ),
                     self.inference_attempt_budget.as_ref(),
                 ),
@@ -1846,6 +1853,7 @@ impl AccountFallbackContext {
         (LocalUpstreamAcquireMode::WaitForCapacity, false)
     }
 
+    #[cfg(test)]
     fn has_cached_eligible_account_for_model(&self, model: &str) -> bool {
         cached_eligible_account_for_route_and_model(
             &self.manager,
@@ -1855,6 +1863,7 @@ impl AccountFallbackContext {
         )
     }
 
+    #[cfg(test)]
     async fn has_eligible_account_for_model(&self, model: &str) -> bool {
         self.has_cached_eligible_account_for_model(model)
             || eligible_account_for_route_and_model(
@@ -1866,6 +1875,7 @@ impl AccountFallbackContext {
             .await
     }
 
+    #[cfg(test)]
     fn has_cached_immediately_available_account_for_model(&self, model: &str) -> bool {
         cached_immediately_available_account_for_route_and_model(
             &self.manager,
@@ -1875,6 +1885,7 @@ impl AccountFallbackContext {
         )
     }
 
+    #[cfg(test)]
     async fn has_immediately_available_account_for_model(&self, model: &str) -> bool {
         self.has_cached_immediately_available_account_for_model(model)
             || immediately_available_account_for_route_and_model(
@@ -1887,8 +1898,9 @@ impl AccountFallbackContext {
             .await
     }
 
+    #[cfg(test)]
     async fn account_ready_for_route_reason(&self, route_reason: &str, model: &str) -> bool {
-        if local_route_reason_requires_immediate_account_capacity(route_reason) {
+        if account_route_reason_requires_immediate_capacity(route_reason) {
             self.has_immediately_available_account_for_model(model)
                 .await
         } else {
@@ -1901,6 +1913,7 @@ impl AccountFallbackContext {
         request_id: &str,
         model_resolution: Option<ModelResolution>,
     ) -> Option<Response> {
+        #[cfg(test)]
         let reason = if self.provider.is_none() {
             "account_route".to_string()
         } else {
@@ -1912,6 +1925,8 @@ impl AccountFallbackContext {
             )
             .await?
         };
+        #[cfg(not(test))]
+        let reason = "account_route".to_string();
         let mut account = self.clone();
         account.model_resolution = model_resolution;
         let route = match account.route_request(
@@ -1929,16 +1944,17 @@ impl AccountFallbackContext {
         Some(forward_account_with_failover(&self.manager, self.config.clone(), route).await)
     }
 
-    async fn local_pool_preflight_outcome(
+    #[cfg(test)]
+    async fn account_preflight_outcome(
         &self,
         request_id: &str,
         model: Option<&str>,
-    ) -> Option<LocalPoolPreflightAccountOutcome> {
+    ) -> Option<AccountPreflightOutcome> {
         let provider = self.provider.as_ref()?;
         if !self.config.local_pool_preflight_enabled {
             return None;
         }
-        let (reason, state) = local_pool_preflight_reason_after_capacity_grace(
+        let (reason, state) = account_preflight_reason_after_capacity_grace(
             provider.as_ref(),
             &self.config,
             model,
@@ -1963,7 +1979,7 @@ impl AccountFallbackContext {
             local_dispatchable = state.dispatchable,
             local_usable = state.usable,
             retry_after_secs = ?state.retry_after_secs,
-            "local credential pool is not immediately schedulable; routing request directly to upstream account"
+            "account route is not immediately schedulable; routing request directly to upstream account"
         );
         let route = match self.route_request(
             request_id.to_string(),
@@ -1979,13 +1995,13 @@ impl AccountFallbackContext {
         ) {
             Ok(route) => route,
             Err(err) => {
-                return Some(LocalPoolPreflightAccountOutcome {
+                return Some(AccountPreflightOutcome {
                     outcome: AccountForwardOutcome::Response(payload_guard_error_response(err)),
                     local_reason: reason,
                 });
             }
         };
-        Some(LocalPoolPreflightAccountOutcome {
+        Some(AccountPreflightOutcome {
             outcome: forward_account_with_failover_result(
                 &self.manager,
                 self.config.clone(),
@@ -1996,6 +2012,7 @@ impl AccountFallbackContext {
         })
     }
 
+    #[cfg(test)]
     async fn fallback_after_local_error(
         &self,
         request_id: &str,
@@ -2011,6 +2028,7 @@ impl AccountFallbackContext {
         }
     }
 
+    #[cfg(test)]
     async fn fallback_after_local_error_outcome(
         &self,
         request_id: &str,
@@ -2029,6 +2047,7 @@ impl AccountFallbackContext {
         .await
     }
 
+    #[cfg(test)]
     async fn fallback_after_local_error_outcome_with_diagnostics(
         &self,
         request_id: &str,
@@ -2037,7 +2056,7 @@ impl AccountFallbackContext {
         classification_attempts: Vec<LocalUpstreamCredentialAttempt>,
         diagnostic_attempts: Vec<LocalUpstreamCredentialAttempt>,
     ) -> Option<AccountForwardOutcome> {
-        let Some(classified_reason) = classify_local_error_for_account_fallback_with_kind(
+        let Some(classified_reason) = classify_account_error_for_account_fallback_with_kind(
             error_message,
             &classification_attempts,
             &self.config,
@@ -2053,22 +2072,22 @@ impl AccountFallbackContext {
         let local_state = self
             .provider
             .as_ref()?
-            .local_pool_route_state_fresh(Some(&self.payload.model));
+            .account_route_state_fresh(Some(&self.payload.model));
         let typed_auxiliary_route_reason = match call_failure_kind {
             Some(LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted) => {
-                Some("local_auxiliary_attempts_exhausted")
+                Some("account_auxiliary_attempts_exhausted")
             }
             Some(LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated) => {
-                Some("local_auxiliary_concurrency_saturated")
+                Some("account_auxiliary_concurrency_saturated")
             }
             _ => None,
         };
         let classified_route_reason =
-            classified_local_error_route_reason(classified_reason.as_str());
+            classified_account_error_route_reason(classified_reason.as_str());
         let route_reason = typed_auxiliary_route_reason
             .or(classified_route_reason)
             .or_else(|| {
-                local_pool_fallback_reason_for_fresh_state(
+                account_fallback_reason_for_fresh_state(
                     local_state.kind,
                     local_state.dispatchable,
                     &self.config,
@@ -2083,7 +2102,7 @@ impl AccountFallbackContext {
                 local_available = local_state.available,
                 local_dispatchable = local_state.dispatchable,
                 local_usable = local_state.usable,
-                "account fallback suppressed because the fresh local pool remains dispatchable or its fallback policy is disabled"
+                "account fallback suppressed because the fresh account route remains dispatchable or its fallback policy is disabled"
             );
             return None;
         };
@@ -2110,7 +2129,7 @@ impl AccountFallbackContext {
                     recorded = true;
                     let _ = self
                         .manager
-                        .record_local_pool_failure(
+                        .record_local_credential_source_failure(
                             &self.config,
                             Some(attempt.credential_id),
                             &classified_reason,
@@ -2121,7 +2140,7 @@ impl AccountFallbackContext {
             if !recorded {
                 let _ = self
                     .manager
-                    .record_local_pool_failure(&self.config, None, &classified_reason)
+                    .record_local_credential_source_failure(&self.config, None, &classified_reason)
                     .await;
             }
         }
@@ -2244,24 +2263,27 @@ impl AccountFallbackContext {
 fn account_route_body_mode_filter(
     requires_normalized_body: bool,
 ) -> Option<AccountRequestBodyMode> {
-    requires_normalized_body.then_some(AccountRequestBodyMode::Normalized)
+    let _ = requires_normalized_body;
+    None
 }
 
-fn local_pool_capacity_fail_fast_enabled(config: &AccountRuntimeConfig) -> bool {
+fn account_capacity_fail_fast_enabled(config: &AccountRuntimeConfig) -> bool {
     config.local_pool_preflight_enabled && config.fallback_on_local_capacity_exhausted
 }
 
-fn local_pool_acquire_mode(config: &AccountRuntimeConfig) -> LocalUpstreamAcquireMode {
-    if local_pool_capacity_fail_fast_enabled(config) {
+#[cfg(test)]
+fn account_acquire_mode(config: &AccountRuntimeConfig) -> LocalUpstreamAcquireMode {
+    if account_capacity_fail_fast_enabled(config) {
         LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(
-            local_scheduler_redis_degraded_fallback_wait(config),
+            account_scheduler_redis_degraded_fallback_wait(config),
         )
     } else {
         LocalUpstreamAcquireMode::WaitForCapacity
     }
 }
 
-fn local_scheduler_redis_degraded_fallback_wait(config: &AccountRuntimeConfig) -> Duration {
+#[cfg(test)]
+fn account_scheduler_redis_degraded_fallback_wait(config: &AccountRuntimeConfig) -> Duration {
     let configured = Duration::from_secs(config.effective_account_dispatch_max_wait_secs());
     if config.fallback_on_scheduler_redis_degraded {
         configured.min(Duration::from_millis(
@@ -2272,6 +2294,7 @@ fn local_scheduler_redis_degraded_fallback_wait(config: &AccountRuntimeConfig) -
     }
 }
 
+#[cfg(test)]
 fn clamp_acquire_mode_to_dispatch_deadline(
     mode: LocalUpstreamAcquireMode,
     budget: &InferenceAttemptBudget,
@@ -2298,7 +2321,8 @@ fn clamp_acquire_mode_to_dispatch_deadline(
     }
 }
 
-fn capacity_weight_units_for_local_request(
+#[cfg(test)]
+fn capacity_weight_units_for_account_request(
     provider: &LocalUpstreamProvider,
     input_tokens: i32,
 ) -> u32 {
@@ -2312,7 +2336,8 @@ fn capacity_weight_units_for_local_request(
         .clamp(1, 64)
 }
 
-fn local_pool_route_fallback_reason(
+#[cfg(test)]
+fn account_route_fallback_reason(
     kind: LocalUpstreamRouteStateKind,
     config: &AccountRuntimeConfig,
 ) -> Option<&'static str> {
@@ -2321,42 +2346,43 @@ fn local_pool_route_fallback_reason(
         LocalUpstreamRouteStateKind::NoCredentials
             if config.fallback_on_no_available_credentials =>
         {
-            Some("local_no_credentials")
+            Some("account_no_credentials")
         }
         LocalUpstreamRouteStateKind::AllDisabled if config.fallback_on_no_available_credentials => {
-            Some("local_all_disabled")
+            Some("account_all_disabled")
         }
         LocalUpstreamRouteStateKind::ProxyBlocked
             if config.fallback_on_no_available_credentials =>
         {
-            Some("local_proxy_blocked")
+            Some("account_proxy_blocked")
         }
         LocalUpstreamRouteStateKind::NoModelCompatible if config.fallback_on_unsupported_model => {
-            Some("local_no_model_compatible")
+            Some("account_no_model_compatible")
         }
         LocalUpstreamRouteStateKind::AllCoolingDown
             if config.fallback_on_local_transient_exhausted =>
         {
-            Some("local_all_cooling_down")
+            Some("account_all_cooling_down")
         }
         LocalUpstreamRouteStateKind::CapacityFull
             if config.fallback_on_local_capacity_exhausted =>
         {
-            Some("local_capacity_full")
+            Some("account_capacity_full")
         }
         LocalUpstreamRouteStateKind::SchedulerRedisDegraded
             if config.fallback_on_scheduler_redis_degraded =>
         {
-            Some("local_scheduler_redis_degraded")
+            Some("account_scheduler_redis_degraded")
         }
         LocalUpstreamRouteStateKind::RiskCircuitOpen if config.local_pool_circuit_enabled => {
-            Some("local_pool_risk_circuit_open")
+            Some("account_risk_circuit_open")
         }
         _ => None,
     }
 }
 
-fn local_pool_fallback_reason_for_fresh_state(
+#[cfg(test)]
+fn account_fallback_reason_for_fresh_state(
     kind: LocalUpstreamRouteStateKind,
     dispatchable: usize,
     config: &AccountRuntimeConfig,
@@ -2372,11 +2398,11 @@ fn local_pool_fallback_reason_for_fresh_state(
     if !degraded_state_overrides_dispatchable && dispatchable > 0 {
         return None;
     }
-    local_pool_route_fallback_reason(kind, config)
+    account_route_fallback_reason(kind, config)
 }
 
-fn local_preflight_capacity_reason(reason: &str) -> bool {
-    matches!(reason, "local_capacity_full")
+fn account_preflight_capacity_reason(reason: &str) -> bool {
+    matches!(reason, "account_capacity_full")
 }
 
 fn bounded_preflight_capacity_wait(
@@ -2391,7 +2417,8 @@ fn bounded_preflight_capacity_wait(
         .unwrap_or(configured)
 }
 
-async fn local_pool_preflight_reason_after_capacity_grace(
+#[cfg(test)]
+async fn account_preflight_reason_after_capacity_grace(
     provider: &LocalUpstreamProvider,
     config: &AccountRuntimeConfig,
     model: Option<&str>,
@@ -2399,10 +2426,10 @@ async fn local_pool_preflight_reason_after_capacity_grace(
     stage: &'static str,
     request_id: Option<&str>,
 ) -> Option<(String, LocalUpstreamRouteState)> {
-    let mut state = provider.local_pool_route_state_fresh(model);
+    let mut state = provider.account_route_state_fresh(model);
     let mut reason =
-        local_pool_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)?;
-    if !local_preflight_capacity_reason(reason) || max_wait.is_zero() {
+        account_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)?;
+    if !account_preflight_capacity_reason(reason) || max_wait.is_zero() {
         return Some((reason.to_string(), state));
     }
 
@@ -2423,15 +2450,15 @@ async fn local_pool_preflight_reason_after_capacity_grace(
                 local_queued = state.queued_requests,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 max_wait_ms = max_wait.as_millis() as u64,
-                "local capacity preflight wait expired; account fallback remains eligible"
+                "account capacity preflight wait expired; account fallback remains eligible"
             );
             return Some((reason.to_string(), state));
         }
 
         sleep((deadline - now).min(Duration::from_millis(50))).await;
-        state = provider.local_pool_route_state_fresh(model);
+        state = provider.account_route_state_fresh(model);
         let Some(next_reason) =
-            local_pool_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)
+            account_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)
         else {
             tracing::debug!(
                 request_id = request_id.unwrap_or(""),
@@ -2443,59 +2470,63 @@ async fn local_pool_preflight_reason_after_capacity_grace(
                 local_in_flight = state.global_in_flight_requests,
                 local_queued = state.queued_requests,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "local capacity recovered during preflight wait; keeping request on local credentials"
+                "account capacity recovered during preflight wait; keeping request on account credentials"
             );
             return None;
         };
         reason = next_reason;
-        if !local_preflight_capacity_reason(reason) {
+        if !account_preflight_capacity_reason(reason) {
             return Some((reason.to_string(), state));
         }
     }
 }
 
-fn local_route_reason_requires_immediate_account_capacity(reason: &str) -> bool {
+fn account_route_reason_requires_immediate_capacity(reason: &str) -> bool {
     matches!(
         reason,
-        "local_capacity_full"
-            | "local_all_cooling_down"
-            | "local_pool_risk_circuit_open"
-            | "local_transient_exhausted"
-            | "local_auxiliary_attempts_exhausted"
-            | "local_auxiliary_concurrency_saturated"
-            | "local_attempt_reserved_for_fallback"
+        "account_capacity_full"
+            | "account_all_cooling_down"
+            | "account_risk_circuit_open"
+            | "account_transient_exhausted"
+            | "account_auxiliary_attempts_exhausted"
+            | "account_auxiliary_concurrency_saturated"
+            | "account_attempt_reserved_for_fallback"
     )
 }
 
-fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
+#[cfg(test)]
+fn classified_account_error_route_reason(reason: &str) -> Option<&'static str> {
     match reason {
         // The local attempt already observed a distributed scheduler failure.
         // A subsequent fresh route snapshot may still look locally
         // dispatchable because it is based on in-memory capacity or stale
         // breaker state; do not let that suppress the explicitly classified
         // degraded fallback path.
-        "local_scheduler_redis_degraded" => Some("local_scheduler_redis_degraded"),
+        "account_scheduler_redis_degraded" => Some("account_scheduler_redis_degraded"),
         // These classifications are tied to the actual local attempt outcome,
         // not to a fresh local capacity estimate.
-        "local_attempt_reserved_for_fallback" => Some("local_attempt_reserved_for_fallback"),
+        "account_attempt_reserved_for_fallback" => Some("account_attempt_reserved_for_fallback"),
         "unsupported_model" => Some("unsupported_model"),
-        "local_auxiliary_attempts_exhausted" => Some("local_auxiliary_attempts_exhausted"),
-        "local_auxiliary_concurrency_saturated" => Some("local_auxiliary_concurrency_saturated"),
-        "local_pool_risk_circuit_open" => Some("local_pool_risk_circuit_open"),
+        "account_auxiliary_attempts_exhausted" => Some("account_auxiliary_attempts_exhausted"),
+        "account_auxiliary_concurrency_saturated" => {
+            Some("account_auxiliary_concurrency_saturated")
+        }
+        "account_risk_circuit_open" => Some("account_risk_circuit_open"),
         _ => None,
     }
 }
 
 #[cfg(test)]
-fn classify_local_error_for_account_fallback(
+fn classify_account_error_for_account_fallback(
     message: &str,
     attempts: &[LocalUpstreamCredentialAttempt],
     config: &AccountRuntimeConfig,
 ) -> Option<String> {
-    classify_local_error_for_account_fallback_with_kind(message, attempts, config, None)
+    classify_account_error_for_account_fallback_with_kind(message, attempts, config, None)
 }
 
-fn classify_local_error_for_account_fallback_with_kind(
+#[cfg(test)]
+fn classify_account_error_for_account_fallback_with_kind(
     message: &str,
     attempts: &[LocalUpstreamCredentialAttempt],
     config: &AccountRuntimeConfig,
@@ -2507,35 +2538,35 @@ fn classify_local_error_for_account_fallback_with_kind(
             | LocalUpstreamCallFailureKind::ThinkingSignatureRetryFailed,
         ) => return None,
         Some(LocalUpstreamCallFailureKind::InferenceAttemptReservedForFallback) => {
-            return Some("local_attempt_reserved_for_fallback".to_string());
+            return Some("account_attempt_reserved_for_fallback".to_string());
         }
         Some(LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted)
             if config.fallback_on_local_transient_exhausted =>
         {
-            return Some("local_auxiliary_attempts_exhausted".to_string());
+            return Some("account_auxiliary_attempts_exhausted".to_string());
         }
         Some(LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated)
             if config.fallback_on_local_transient_exhausted =>
         {
-            return Some("local_auxiliary_concurrency_saturated".to_string());
+            return Some("account_auxiliary_concurrency_saturated".to_string());
         }
-        Some(LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen)
+        Some(LocalUpstreamCallFailureKind::AccountRiskCircuitOpen)
             if config.local_pool_circuit_enabled =>
         {
-            return Some("local_pool_risk_circuit_open".to_string());
+            return Some("account_risk_circuit_open".to_string());
         }
         Some(
             LocalUpstreamCallFailureKind::InferenceAttemptsExhausted
             | LocalUpstreamCallFailureKind::DownstreamCommitted
             | LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted
             | LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated
-            | LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen,
+            | LocalUpstreamCallFailureKind::AccountRiskCircuitOpen,
         )
         | None => {}
     }
     let lower = message.to_ascii_lowercase();
-    if lower.contains("local inference attempt reserved for fallback") {
-        return Some("local_attempt_reserved_for_fallback".to_string());
+    if lower.contains("account inference attempt reserved for fallback") {
+        return Some("account_attempt_reserved_for_fallback".to_string());
     }
     if config.fallback_on_unsupported_model && is_unsupported_model_error(&lower, attempts) {
         return Some("unsupported_model".to_string());
@@ -2546,7 +2577,7 @@ fn classify_local_error_for_account_fallback_with_kind(
     if lower.contains("redis 调度协调状态不可用") {
         return config
             .fallback_on_scheduler_redis_degraded
-            .then(|| "local_scheduler_redis_degraded".to_string());
+            .then(|| "account_scheduler_redis_degraded".to_string());
     }
     if config.fallback_on_local_capacity_exhausted
         && (lower.contains("本地账号调度容量暂不可用")
@@ -2558,7 +2589,7 @@ fn classify_local_error_for_account_fallback_with_kind(
             || lower.contains("临时可调度: 0")
             || lower.contains("max_concurrent_requests"))
     {
-        return Some("local_capacity_exhausted".to_string());
+        return Some("account_capacity_exhausted".to_string());
     }
     if config.fallback_on_local_transient_exhausted
         && (lower.contains("临时冷却")
@@ -2574,7 +2605,7 @@ fn classify_local_error_for_account_fallback_with_kind(
             || lower.contains("503")
             || lower.contains("504"))
     {
-        return Some("local_transient_exhausted".to_string());
+        return Some("account_transient_exhausted".to_string());
     }
     if config.fallback_on_no_available_credentials
         && (lower.contains("所有账号")
@@ -2599,7 +2630,7 @@ fn classify_local_error_for_account_fallback_with_kind(
         "transient_error" | "send_error" | "server_error" | "non_eventstream"
             if config.fallback_on_local_transient_exhausted =>
         {
-            Some("local_transient_exhausted".to_string())
+            Some("account_transient_exhausted".to_string())
         }
         "quota_exhausted" | "risk_control" | "credential_failure"
             if config.fallback_on_no_available_credentials =>
@@ -2778,6 +2809,7 @@ impl RequestUsageContext {
         saturating_fetch_add_u32(&self.latency.upstream_frames_before_first_output, 1);
     }
 
+    #[cfg(test)]
     fn mark_upstream_event_before_first_output(
         &self,
         event: &LocalUpstreamEvent,
@@ -3268,6 +3300,7 @@ impl RequestUsageContext {
         self.external_attempts = external_attempts;
     }
 
+    #[cfg(test)]
     fn attach_provider_error_credential(
         self,
         provider: &LocalUpstreamProvider,
@@ -3447,6 +3480,7 @@ fn is_first_token_output_event(event: &SseEvent) -> bool {
     }
 }
 
+#[cfg(test)]
 fn local_upstream_event_latency_kind(event: &LocalUpstreamEvent) -> &'static str {
     match event {
         LocalUpstreamEvent::AssistantResponse(_) => "assistant_response",
@@ -3591,7 +3625,7 @@ fn usage_snapshot(usage: super::cache::CacheUsage) -> ExternalPoolUsageSnapshot 
 }
 
 fn raw_usage_from_metadata_or_estimate(
-    metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
+    metadata_usage: Option<&MetadataTokenUsage>,
     input_tokens: i32,
     output_tokens: i32,
 ) -> super::cache::CacheUsage {
@@ -3774,7 +3808,7 @@ impl CredentialUsageContext {
     fn usage_source(
         &self,
         usage: &super::cache::CacheUsage,
-        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
+        metadata_usage: Option<&MetadataTokenUsage>,
         context_estimated: bool,
     ) -> UsageSource {
         if self.uses_local_prompt_cache_fallback(metadata_usage, usage) {
@@ -3902,7 +3936,7 @@ impl CredentialUsageContext {
 
     fn uses_local_prompt_cache_fallback(
         &self,
-        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
+        metadata_usage: Option<&MetadataTokenUsage>,
         usage: &super::cache::CacheUsage,
     ) -> bool {
         matches!(
@@ -3979,7 +4013,7 @@ impl CredentialUsageContext {
     fn final_reported_usage_for_stream(
         &self,
         final_usage: super::cache::CacheUsage,
-        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
+        metadata_usage: Option<&MetadataTokenUsage>,
         context_estimated: bool,
         estimated_input_tokens: i32,
     ) -> super::cache::CacheUsage {
@@ -3997,7 +4031,7 @@ impl CredentialUsageContext {
         status: UsageRecordStatus,
         usage: Option<super::cache::CacheUsage>,
         error_detail: Option<(String, String)>,
-        metadata_usage: Option<&LocalUpstreamMetadataTokenUsage>,
+        metadata_usage: Option<&MetadataTokenUsage>,
         context_input_tokens: Option<i32>,
         upstream_metering_units: Option<f64>,
     ) {
@@ -4403,7 +4437,6 @@ impl CredentialUsageContext {
                 .map(|estimate| estimate.cost_usd)
                 .unwrap_or(pricing.cost_usd),
             upstream_metering_units,
-            kiro_metering_usage: upstream_metering_units,
             pricing_available: pricing.available,
             pricing_model: Some(pricing.model),
             duration_ms,
@@ -4476,6 +4509,7 @@ fn standard_usage_for_status(
     }
 }
 
+#[cfg(test)]
 fn provider_error_metadata(err: &Error) -> Option<serde_json::Value> {
     let selection_failure = LocalUpstreamProvider::selection_failure_from_error(err);
     let call_failure_kind = LocalUpstreamProvider::call_failure_kind_from_error(err);
@@ -4511,6 +4545,7 @@ fn merge_error_metadata_values(
     }
 }
 
+#[cfg(test)]
 fn websearch_error_metadata(
     attribution: &LocalAuxiliaryMcpAttribution,
     internal_reason: &'static str,
@@ -4547,11 +4582,13 @@ struct StreamUsageGuard {
     completed: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 struct WebSearchPreResponseUsageGuard {
     usage_context: Option<RequestUsageContext>,
     attribution_sink: Arc<LocalAuxiliaryMcpAttributionSink>,
 }
 
+#[cfg(test)]
 impl WebSearchPreResponseUsageGuard {
     fn new(
         usage_context: RequestUsageContext,
@@ -4570,6 +4607,7 @@ impl WebSearchPreResponseUsageGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for WebSearchPreResponseUsageGuard {
     fn drop(&mut self) {
         let Some(usage_context) = self.usage_context.take() else {
@@ -4619,6 +4657,7 @@ impl Drop for StreamUsageGuard {
     }
 }
 
+#[cfg(test)]
 fn wrap_websearch_stream_usage_record(
     response: Response,
     usage_context: CredentialUsageContext,
@@ -4693,6 +4732,7 @@ fn wrap_websearch_stream_usage_record(
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+#[cfg(test)]
 fn credential_label(provider: &LocalUpstreamProvider, id: u64) -> Option<String> {
     provider.credential_label(id)
 }
@@ -4924,6 +4964,7 @@ fn build_simulated_usage(
     }
 }
 
+#[cfg(test)]
 fn prepare_credential_usage_context(
     usage_context: RequestUsageContext,
     provider: &LocalUpstreamProvider,
@@ -4976,6 +5017,7 @@ fn prepare_credential_usage_context(
 }
 
 /// 将 legacy local provider 错误映射为 HTTP 响应
+#[cfg(test)]
 fn cooldown_retry_after_secs(provider: Option<&LocalUpstreamProvider>, fallback_secs: u64) -> u64 {
     let fallback_secs = fallback_secs.max(1);
     let Some(provider) = provider else {
@@ -5011,7 +5053,7 @@ fn usage_public_error(
 fn provider_public_error_for_message(
     err_str: &str,
     error_id: Option<&str>,
-    provider: Option<&LocalUpstreamProvider>,
+    retry_after_hint_secs: Option<u64>,
 ) -> UsagePublicError {
     if err_str.contains("reason=THINKING_SIGNATURE_INVALID") {
         return usage_public_error(
@@ -5085,7 +5127,8 @@ fn provider_public_error_for_message(
     {
         let retry_after_secs = retry_after_secs_from_error(err_str)
             .map(|secs| secs.max(1))
-            .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1));
+            .or_else(|| retry_after_hint_secs.map(|secs| secs.max(1)))
+            .unwrap_or(1);
         return usage_public_error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
@@ -5158,18 +5201,19 @@ fn is_local_temporary_scheduler_error(value: &str) -> bool {
         || value.contains("账号调度排队等待超时")
         || value.contains("凭据调度排队等待超时")
         || value.contains("并发槽位已满")
-        || lower.contains("local_pool_risk_circuit_open")
-        || lower.contains("local_scheduler_redis_degraded")
+        || lower.contains("account_risk_circuit_open")
+        || lower.contains("account_scheduler_redis_degraded")
         || lower.contains("schedulerredisdegraded")
 }
 
+#[cfg(test)]
 fn local_temporary_admission_backoff_secs(
     err: &Error,
     provider: Option<&LocalUpstreamProvider>,
 ) -> Option<u64> {
     if matches!(
         LocalUpstreamProvider::call_failure_kind_from_error(err),
-        Some(LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen)
+        Some(LocalUpstreamCallFailureKind::AccountRiskCircuitOpen)
     ) {
         return Some(
             retry_after_secs_from_error(&err.to_string())
@@ -5189,6 +5233,7 @@ fn local_temporary_admission_backoff_secs(
     )
 }
 
+#[cfg(test)]
 fn apply_local_temporary_admission_backoff(
     attribution: Option<&RequestRejectionAttribution>,
     err: &Error,
@@ -5203,6 +5248,7 @@ fn apply_local_temporary_admission_backoff(
     attribution.apply_local_temporary_backoff(retry_after_secs);
 }
 
+#[cfg(test)]
 fn map_provider_error_with_admission_feedback(
     err: Error,
     request_id: Option<&str>,
@@ -5214,6 +5260,7 @@ fn map_provider_error_with_admission_feedback(
     map_provider_error(err, request_id, error_id, provider)
 }
 
+#[cfg(test)]
 fn map_provider_error(
     err: Error,
     request_id: Option<&str>,
@@ -5226,7 +5273,7 @@ fn map_provider_error(
             | LocalUpstreamCallFailureKind::InferenceAttemptReservedForFallback
             | LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted
             | LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated
-            | LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen => {
+            | LocalUpstreamCallFailureKind::AccountRiskCircuitOpen => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             LocalUpstreamCallFailureKind::DownstreamCommitted => StatusCode::BAD_GATEWAY,
@@ -5245,7 +5292,7 @@ fn map_provider_error(
             _ => ("api_error", envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE),
         };
         let retry_after_headers = match failure_kind {
-            LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen => {
+            LocalUpstreamCallFailureKind::AccountRiskCircuitOpen => {
                 retry_after_secs_from_error(&err.to_string())
                     .map(|secs| vec![("retry-after", secs.max(1).to_string())])
                     .unwrap_or_default()
@@ -5508,6 +5555,7 @@ fn should_retry_without_cache_point_after_error(value: &str) -> bool {
         || is_upstream_bad_request_error(value)
 }
 
+#[cfg(test)]
 fn attach_and_log_tool_use_format_diagnostics(
     message: &str,
     attempted_body: &str,
@@ -5570,6 +5618,7 @@ fn attach_and_log_tool_use_format_diagnostics(
     );
 }
 
+#[cfg(test)]
 fn merge_credential_attempts(
     mut prefix: Vec<LocalUpstreamCredentialAttempt>,
     attempts: Vec<LocalUpstreamCredentialAttempt>,
@@ -6301,7 +6350,7 @@ async fn post_messages_inner(
                     .upstream_model
                     .as_deref()
                     .unwrap_or(payload.model.as_str());
-                if let Some(response) = maybe_local_pool_preflight_account_response(
+                if let Some(response) = maybe_account_preflight_response(
                     Some(external),
                     &request_id,
                     Some(preflight_model),
@@ -6312,7 +6361,7 @@ async fn post_messages_inner(
                         request_id,
                         model = %payload.model,
                         upstream_model = %preflight_model,
-                        "native WebSearch MCP skipped because local pool preflight routed request to upstream account"
+                        "native WebSearch MCP skipped because account preflight routed request to upstream account"
                     );
                     return response;
                 }
@@ -6501,7 +6550,7 @@ async fn post_messages_inner(
             usage_context.mark_payload_guard_latency(elapsed);
         }
         let capacity_weight_units =
-            capacity_weight_units_for_local_request(provider.as_ref(), input_tokens);
+            capacity_weight_units_for_account_request(provider.as_ref(), input_tokens);
         usage_context.set_capacity_weight_units(capacity_weight_units);
 
         if payload.stream {
@@ -6569,6 +6618,7 @@ async fn post_messages_inner(
     }
 }
 
+#[cfg(test)]
 async fn call_api_stream_maybe_fail_fast(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
@@ -6616,6 +6666,7 @@ async fn call_api_stream_maybe_fail_fast(
         .await
 }
 
+#[cfg(test)]
 async fn call_api_maybe_fail_fast(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
@@ -6663,6 +6714,7 @@ async fn call_api_maybe_fail_fast(
         .await
 }
 
+#[cfg(test)]
 fn build_thinking_signature_retry_body(request: &LocalUpstreamRequest) -> anyhow::Result<String> {
     let mut retry_request = request.clone();
     let removed = retry_request
@@ -6675,6 +6727,7 @@ fn build_thinking_signature_retry_body(request: &LocalUpstreamRequest) -> anyhow
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+#[cfg(test)]
 async fn maybe_forward_account_after_local_error(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
@@ -6686,6 +6739,7 @@ async fn maybe_forward_account_after_local_error(
         .await
 }
 
+#[cfg(test)]
 async fn maybe_account_fallback_after_local_error_outcome(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
@@ -6698,6 +6752,7 @@ async fn maybe_account_fallback_after_local_error_outcome(
         .await
 }
 
+#[cfg(test)]
 async fn maybe_account_fallback_after_local_error_outcome_with_diagnostics(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
@@ -6717,34 +6772,36 @@ async fn maybe_account_fallback_after_local_error_outcome_with_diagnostics(
         .await
 }
 
-async fn maybe_local_pool_preflight_account_response(
+#[cfg(test)]
+async fn maybe_account_preflight_response(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     model: Option<&str>,
 ) -> Option<Response> {
-    let preflight =
-        maybe_local_pool_preflight_account_outcome(account_fallback, request_id, model).await?;
+    let preflight = maybe_account_preflight_outcome(account_fallback, request_id, model).await?;
     Some(match preflight.outcome {
         AccountForwardOutcome::Response(response) => response,
         AccountForwardOutcome::FinalError(err) => err.into_response(request_id),
     })
 }
 
-async fn maybe_local_pool_preflight_account_outcome(
+#[cfg(test)]
+async fn maybe_account_preflight_outcome(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     model: Option<&str>,
-) -> Option<LocalPoolPreflightAccountOutcome> {
+) -> Option<AccountPreflightOutcome> {
     account_fallback?
-        .local_pool_preflight_outcome(request_id, model)
+        .account_preflight_outcome(request_id, model)
         .await
 }
 
-async fn maybe_local_pool_preflight_account_outcome_for_local_request(
+#[cfg(test)]
+async fn maybe_account_preflight_outcome_for_local_request(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
     model: Option<&str>,
-) -> Option<LocalPoolPreflightAccountOutcome> {
+) -> Option<AccountPreflightOutcome> {
     if let Some(failure) =
         account_fallback.and_then(|account| account.raw_preflight_failure.as_ref())
     {
@@ -6754,16 +6811,17 @@ async fn maybe_local_pool_preflight_account_outcome_for_local_request(
             account_status = failure.error.status.as_u16(),
             account_error_type = %failure.error.route_error_type,
             account_attempt_count = failure.error.attempts.len(),
-            "using raw account preflight final error to drive parsed local rescue"
+            "using raw account preflight final error to drive parsed account rescue"
         );
-        return Some(LocalPoolPreflightAccountOutcome {
+        return Some(AccountPreflightOutcome {
             outcome: AccountForwardOutcome::FinalError(failure.error.clone()),
             local_reason: failure.local_reason.clone(),
         });
     }
-    maybe_local_pool_preflight_account_outcome(account_fallback, request_id, model).await
+    maybe_account_preflight_outcome(account_fallback, request_id, model).await
 }
 
+#[cfg(test)]
 fn websearch_mcp_account_fallback_signal(
     internal_reason: &str,
     attribution: &LocalAuxiliaryMcpAttribution,
@@ -6787,7 +6845,7 @@ fn websearch_mcp_account_fallback_signal(
                 | AccountRejectReason::RefreshFailed => Some(("临时冷却", None)),
                 AccountRejectReason::RiskCircuitOpen => Some((
                     "本地账号池风险保护已打开",
-                    Some(LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen),
+                    Some(LocalUpstreamCallFailureKind::AccountRiskCircuitOpen),
                 )),
                 AccountRejectReason::StickyTargetUnavailable => Some(("临时排除", None)),
                 AccountRejectReason::Unknown
@@ -6819,6 +6877,7 @@ fn websearch_mcp_account_fallback_signal(
     }
 }
 
+#[cfg(test)]
 async fn maybe_account_fallback_after_websearch_mcp_failure(
     account_fallback: Option<&AccountFallbackContext>,
     request_id: &str,
@@ -6927,22 +6986,22 @@ fn local_fallback_reason_blocks_local_rescue(
     matches!(
         reason,
         Some(
-            "local_no_credentials"
-                | "local_all_disabled"
-                | "local_proxy_blocked"
-                | "local_no_model_compatible"
-                | "local_all_cooling_down"
-                | "local_scheduler_redis_degraded"
-                | "local_pool_risk_circuit_open"
-                | "local_transient_exhausted"
+            "account_no_credentials"
+                | "account_all_disabled"
+                | "account_proxy_blocked"
+                | "account_no_model_compatible"
+                | "account_all_cooling_down"
+                | "account_scheduler_redis_degraded"
+                | "account_risk_circuit_open"
+                | "account_transient_exhausted"
                 | "no_available_credentials"
                 | "unsupported_model"
         )
     ) || match reason {
         Some(
-            "local_capacity_full"
-            | "local_capacity_exhausted"
-            | "local_attempt_reserved_for_fallback",
+            "account_capacity_full"
+            | "account_capacity_exhausted"
+            | "account_attempt_reserved_for_fallback",
         ) => false,
         None => true,
         _ => false,
@@ -6992,6 +7051,7 @@ fn budgeted_local_rescue_reason_after_account_error(
 /// This deliberately calls the provider-local `*_max_wait` entrypoint directly. Do not route this
 /// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
 /// `AccountFallbackContext::*fallback*`; those paths can choose an upstream account again.
+#[cfg(test)]
 async fn call_stream_local_rescue_after_account_error(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
@@ -7043,6 +7103,7 @@ async fn call_stream_local_rescue_after_account_error(
 /// This deliberately calls the provider-local `*_max_wait` entrypoint directly. Do not route this
 /// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
 /// `AccountFallbackContext::*fallback*`; those paths can choose an upstream account again.
+#[cfg(test)]
 async fn call_non_stream_local_rescue_after_account_error(
     provider: &Arc<LocalUpstreamProvider>,
     request_body: &str,
@@ -7134,6 +7195,7 @@ impl StreamContextTemplate {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct StreamRetryPlan {
     config: LocalStreamRetryConfig,
@@ -7148,6 +7210,7 @@ struct StreamRetryPlan {
     context_template: StreamContextTemplate,
 }
 
+#[cfg(test)]
 struct SseStreamState {
     body_stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     ctx: StreamContext,
@@ -7166,6 +7229,7 @@ struct SseStreamState {
     prior_attempts: Vec<LocalUpstreamCredentialAttempt>,
 }
 
+#[cfg(test)]
 impl SseStreamState {
     fn from_attempt(
         response: reqwest::Response,
@@ -7258,6 +7322,7 @@ fn account_rescue_preflight(reason: &str, err: &AccountFinalError) -> serde_json
 }
 
 /// 处理流式请求
+#[cfg(test)]
 async fn handle_stream_request(
     provider: std::sync::Arc<LocalUpstreamProvider>,
     request_body: &str,
@@ -7289,13 +7354,12 @@ async fn handle_stream_request(
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<LocalUpstreamCredentialAttempt> = Vec::new();
     let mut successful_derived_request: Option<(String, LocalUpstreamRequest)> = None;
-    let response = if let Some(outcome) =
-        maybe_local_pool_preflight_account_outcome_for_local_request(
-            account_fallback.as_ref(),
-            &request_id,
-            Some(model),
-        )
-        .await
+    let response = if let Some(outcome) = maybe_account_preflight_outcome_for_local_request(
+        account_fallback.as_ref(),
+        &request_id,
+        Some(model),
+    )
+    .await
     {
         let local_reason = outcome.local_reason;
         match outcome.outcome {
@@ -7314,7 +7378,7 @@ async fn handle_stream_request(
                             request_id,
                             reason,
                             max_wait_secs = external.config.account_local_rescue_max_wait_secs(),
-                            "account preflight fallback failed with a rescuable error; retrying local credentials once"
+                            "account preflight fallback failed with a rescuable error; retrying account credentials once"
                         );
                         usage_context.mark_local_rescue_after_account(
                             reason,
@@ -7604,7 +7668,7 @@ async fn handle_stream_request(
                                     AccountForwardOutcome::FinalError(err) => {
                                         if let Some(external) = account_fallback.as_ref() {
                                             let local_fallback_reason =
-                                                classify_local_error_for_account_fallback_with_kind(
+                                                classify_account_error_for_account_fallback_with_kind(
                                                     &retry_message,
                                                     &classification_attempts,
                                                     &external.config,
@@ -7630,7 +7694,7 @@ async fn handle_stream_request(
                                                     reason,
                                                     max_wait_secs = external
                                                         .config.account_local_rescue_max_wait_secs(),
-                                                    "account route failed with a rescuable error; retrying local credentials once"
+                                                    "account route failed with a rescuable error; retrying account credentials once"
                                                 );
                                                 usage_context.mark_local_rescue_after_account(
                                                     reason,
@@ -7744,7 +7808,7 @@ async fn handle_stream_request(
                             AccountForwardOutcome::FinalError(err) => {
                                 if let Some(external) = account_fallback.as_ref() {
                                     let local_fallback_reason =
-                                        classify_local_error_for_account_fallback_with_kind(
+                                        classify_account_error_for_account_fallback_with_kind(
                                             &message,
                                             &attempts,
                                             &external.config,
@@ -7766,7 +7830,7 @@ async fn handle_stream_request(
                                             max_wait_secs = external
                                                 .config
                                                 .account_local_rescue_max_wait_secs(),
-                                            "account route failed with a rescuable error; retrying local credentials once"
+                                            "account route failed with a rescuable error; retrying account credentials once"
                                         );
                                         usage_context.mark_local_rescue_after_account(
                                             reason,
@@ -7957,9 +8021,7 @@ async fn handle_stream_request(
     // 返回 SSE 响应
     let mut builder = envelope::sse_builder_with_id(&response_request_id);
     if let Some(warnings) = warnings_header {
-        builder = builder
-            .header(envelope::ACCOUNT_RUNTIME_WARNINGS_HEADER, warnings.clone())
-            .header(envelope::LEGACY_KIRO_RS_WARNINGS_HEADER, warnings);
+        builder = builder.header(envelope::ACCOUNT_RUNTIME_WARNINGS_HEADER, warnings);
     }
     builder.body(Body::from_stream(stream)).unwrap()
 }
@@ -8454,6 +8516,7 @@ fn inspect_complete_upstream_body(
     }
 }
 
+#[cfg(test)]
 fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<LocalUpstreamEvent>, String> {
     let mut decoder = LocalUpstreamEventStreamDecoder::new();
     decoder
@@ -8525,6 +8588,7 @@ fn sse_bytes_from_events(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>
         .collect()
 }
 
+#[cfg(test)]
 fn mark_stream_downstream_committed(state: &mut SseStreamState) {
     state
         .usage_guard
@@ -8536,6 +8600,7 @@ fn mark_stream_downstream_committed(state: &mut SseStreamState) {
     state.downstream_committed = true;
 }
 
+#[cfg(test)]
 fn prepend_initial_bytes_if_needed(
     state: &mut SseStreamState,
     mut bytes: Vec<Result<Bytes, Infallible>>,
@@ -8554,6 +8619,7 @@ fn prepend_initial_bytes_if_needed(
     bytes
 }
 
+#[cfg(test)]
 fn sse_bytes_from_events_with_initial(
     state: &mut SseStreamState,
     events: Vec<SseEvent>,
@@ -8563,11 +8629,13 @@ fn sse_bytes_from_events_with_initial(
     prepend_initial_bytes_if_needed(state, bytes, commit_initial)
 }
 
+#[cfg(test)]
 enum StreamRetryOutcome {
     Retried(SseStreamState),
     NotRetried(SseStreamState),
 }
 
+#[cfg(test)]
 async fn retry_stream_before_downstream_commit(
     mut state: SseStreamState,
     reason: StreamRetryReason,
@@ -8704,6 +8772,7 @@ async fn retry_stream_before_downstream_commit(
 }
 
 /// 创建 SSE 事件流
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn create_sse_stream(
     response: reqwest::Response,
@@ -9516,6 +9585,7 @@ fn sanitize_complete_thinking_segment<'a>(
 }
 
 /// 处理非流式请求
+#[cfg(test)]
 async fn handle_non_stream_request(
     provider: std::sync::Arc<LocalUpstreamProvider>,
     request_body: &str,
@@ -9541,13 +9611,12 @@ async fn handle_non_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<LocalUpstreamCredentialAttempt> = Vec::new();
-    let api_response = if let Some(outcome) =
-        maybe_local_pool_preflight_account_outcome_for_local_request(
-            account_fallback.as_ref(),
-            &request_id,
-            Some(model),
-        )
-        .await
+    let api_response = if let Some(outcome) = maybe_account_preflight_outcome_for_local_request(
+        account_fallback.as_ref(),
+        &request_id,
+        Some(model),
+    )
+    .await
     {
         let local_reason = outcome.local_reason;
         match outcome.outcome {
@@ -9566,7 +9635,7 @@ async fn handle_non_stream_request(
                             request_id,
                             reason,
                             max_wait_secs = external.config.account_local_rescue_max_wait_secs(),
-                            "account preflight fallback failed with a rescuable error; retrying local credentials once"
+                            "account preflight fallback failed with a rescuable error; retrying account credentials once"
                         );
                         usage_context.mark_local_rescue_after_account(
                             reason,
@@ -9848,7 +9917,7 @@ async fn handle_non_stream_request(
                                     AccountForwardOutcome::FinalError(err) => {
                                         if let Some(external) = account_fallback.as_ref() {
                                             let local_fallback_reason =
-                                                classify_local_error_for_account_fallback_with_kind(
+                                                classify_account_error_for_account_fallback_with_kind(
                                                     &retry_message,
                                                     &classification_attempts,
                                                     &external.config,
@@ -9874,7 +9943,7 @@ async fn handle_non_stream_request(
                                                     reason,
                                                     max_wait_secs = external
                                                         .config.account_local_rescue_max_wait_secs(),
-                                                    "account route failed with a rescuable error; retrying local credentials once"
+                                                    "account route failed with a rescuable error; retrying account credentials once"
                                                 );
                                                 usage_context.mark_local_rescue_after_account(
                                                     reason,
@@ -9979,7 +10048,7 @@ async fn handle_non_stream_request(
                             AccountForwardOutcome::FinalError(err) => {
                                 if let Some(external) = account_fallback.as_ref() {
                                     let local_fallback_reason =
-                                        classify_local_error_for_account_fallback_with_kind(
+                                        classify_account_error_for_account_fallback_with_kind(
                                             &message,
                                             &attempts,
                                             &external.config,
@@ -10001,7 +10070,7 @@ async fn handle_non_stream_request(
                                             max_wait_secs = external
                                                 .config
                                                 .account_local_rescue_max_wait_secs(),
-                                            "account route failed with a rescuable error; retrying local credentials once"
+                                            "account route failed with a rescuable error; retrying account credentials once"
                                         );
                                         usage_context.mark_local_rescue_after_account(
                                             reason,
@@ -10207,7 +10276,7 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
-    let mut metadata_usage: Option<LocalUpstreamMetadataTokenUsage> = None;
+    let mut metadata_usage: Option<MetadataTokenUsage> = None;
     let mut upstream_metering_units: Option<f64> = None;
     let mut native_thinking_content = String::new();
     let mut native_thinking_signature: Option<String> = None;

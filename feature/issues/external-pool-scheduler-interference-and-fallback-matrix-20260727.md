@@ -181,7 +181,7 @@ Related production machines:
 - `ExternalFallbackContext::local_pool_preflight_outcome`
 - `maybe_local_pool_preflight_external_outcome`
 - stream: `handle_stream_request`
-- non-stream: `handle_kiro_response`
+- non-stream: `handle_account-runtime_response`
 
 历史缺口：
 
@@ -199,7 +199,7 @@ Related production machines:
 仍保持不 rescue 的 preflight：
 
 - body 解析之前的 raw passthrough preflight 仍保持外部失败即返回。
-- 原因是此时没有可靠的规范化 `KiroRequest` / 本地请求体上下文，强行二次解析再本地调用会引入更大的协议风险。
+- 原因是此时没有可靠的规范化 `Account RuntimeRequest` / 本地请求体上下文，强行二次解析再本地调用会引入更大的协议风险。
 
 ### 2.1.4 外部池内部 failover
 
@@ -404,25 +404,25 @@ Related production machines:
   - `external_fallback_classifier_*`: `5/5` 通过。
   - `local_pool_preflight_*`: `2/2` 通过。
 - 外部池完整 Rust 分组：
-  - `cargo test --locked --bin kiro-rs external_pool -- --test-threads=1`
+  - `cargo test --locked --bin account-runtime external_pool -- --test-threads=1`
   - `222 passed / 0 failed`
   - 覆盖外部池 Redis、capacity、model mapping、billing、raw/normalized、SSE、fallback、release、atomic acquire、coordinator restart/fault 等。
 - 本轮新增和重跑：
-  - `cargo test --locked --bin kiro-rs local_rescue -- --test-threads=1`
+  - `cargo test --locked --bin account-runtime local_rescue -- --test-threads=1`
     - `4 passed / 0 failed`
     - 覆盖 direct policy 禁止本地 rescue、rescue 分类、budget 限制、provider-local rescue 真实发送次数。
-  - `cargo test --locked --bin kiro-rs preflight_external_error -- --test-threads=1`
+  - `cargo test --locked --bin account-runtime preflight_external_error -- --test-threads=1`
     - `1 passed / 0 failed`
     - 覆盖 parsed preflight external error 可以 rescue 一次，且 external+local rescue 消耗完 2-send budget 后阻止第二轮 cycle。
-  - `cargo test --locked --bin kiro-rs external_fallback -- --test-threads=1`
+  - `cargo test --locked --bin account-runtime external_fallback -- --test-threads=1`
     - `9 passed / 0 failed`
     - 覆盖 fallback 分类、route-reason availability gate、thinking signature 不进入 external fallback、usage/profile 相关回归。
-  - `cargo test --locked --bin kiro-rs external_pool -- --test-threads=1`
+  - `cargo test --locked --bin account-runtime external_pool -- --test-threads=1`
     - `222 passed / 0 failed`
     - 本轮再次通过。
 - 静态质量：
   - `cargo fmt --check`: 通过。
-  - `cargo check --locked --bin kiro-rs`: 通过。
+  - `cargo check --locked --bin account-runtime`: 通过。
   - `cargo check --all-targets --locked`: 通过，第三阶段修复后无新增 warning。
   - `rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs`: 通过，`813 warnings <= 849 baseline`。
   - 第三阶段修复后 clippy baseline：通过，`811 warnings <= 849 baseline`。
@@ -432,10 +432,10 @@ Related production machines:
   - 修复 commit: `dcff076 fix: gate external fallback on current pool availability`
   - release commit: `6e4d801 chore(release): 0.0.122`
   - tag: `v0.0.122`
-  - 后续发布 `v0.0.123` 前已确认 `ghcr.io/2ue/kiro-rs:0.0.122` 镜像存在。
+  - 后续发布 `v0.0.123` 前已确认 `ghcr.io/2ue/account-runtime:0.0.122` 镜像存在。
   - 本轮 second-stage preflight rescue 修复尚未单独发布新 tag。
 - 本轮第三阶段测试命令：
-  - `KIRO_RS_TEST_POSTGRES_URL='postgres://<local-kiro-rs-postgres>:25432/kiro_rs' KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:26379/0' RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh external_pool_fix_tests_real -- cargo test external_pool_cached_immediate_availability -- --nocapture --test-threads=1`
+  - `ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://<local-account-runtime-postgres>:25432/account_runtime' ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:26379/0' RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh external_pool_fix_tests_real -- cargo test external_pool_cached_immediate_availability -- --nocapture --test-threads=1`
   - 结果：`2 passed / 0 failed`。
   - 同一测试在 `#[cfg(test)]` 收窄旧阻塞方法后重跑：`2 passed / 0 failed`。
   - `RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh external_pool_fix_handler_external_fallback -- cargo test external_fallback -- --nocapture`
@@ -444,7 +444,7 @@ Related production machines:
     - 结果：`2 passed / 0 failed`。
   - `RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh external_pool_fix_preflight_rescue -- cargo test preflight_external_error -- --nocapture`
     - 结果：`1 passed / 0 failed`。
-  - `KIRO_RS_TEST_POSTGRES_URL='postgres://<local-kiro-rs-postgres>:25432/kiro_rs' KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:26379/0' RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh external_pool_fix_immediate_real -- cargo test external_pool_immediate_availability_requires_current_capacity_and_recovers -- --nocapture --test-threads=1`
+  - `ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://<local-account-runtime-postgres>:25432/account_runtime' ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:26379/0' RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh external_pool_fix_immediate_real -- cargo test external_pool_immediate_availability_requires_current_capacity_and_recovers -- --nocapture --test-threads=1`
     - 结果：`1 passed / 0 failed`。
   - scoped target 已清理：`removed=true reservation_released=true`。
 

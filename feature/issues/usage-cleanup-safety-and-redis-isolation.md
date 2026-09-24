@@ -205,16 +205,16 @@ rg -n "UsageRecorder::clear|usage_recorder\.clear|UPDATE usage_records SET delet
 设置隔离测试库，不得指向生产：
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL='postgres://.../isolated-test' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://.../isolated-test' \
   cargo test postgres_usage_cleanup_job_is_persistent_exclusive_and_recoverable -- --nocapture
 
-KIRO_RS_TEST_POSTGRES_URL='postgres://.../isolated-test' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://.../isolated-test' \
   cargo test postgres_usage_cleanup_batches_are_bounded_idempotent_and_skip_locked -- --nocapture
 
-KIRO_RS_TEST_POSTGRES_URL='postgres://.../isolated-test' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://.../isolated-test' \
   cargo test cleanup -- --nocapture --test-threads=1
 
-KIRO_RS_TEST_POSTGRES_URL='postgres://.../isolated-test' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://.../isolated-test' \
   cargo test postgres_persists_runtime_config_credentials_stats_usage_and_pricing \
   -- --nocapture --test-threads=1
 ```
@@ -224,7 +224,7 @@ KIRO_RS_TEST_POSTGRES_URL='postgres://.../isolated-test' \
 ### R3：Redis 有界删除与零残留
 
 ```bash
-KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:<isolated-port>/' \
+ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:<isolated-port>/' \
   cargo test redis_pattern_delete_is_bounded_and_cancellable -- --nocapture
 ```
 

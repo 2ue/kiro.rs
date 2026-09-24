@@ -24,7 +24,7 @@ The left value is the encoded base64 length for a `5 MiB - 1` byte source. This 
 - Compute exact decoded length in one scan without allocating a decoded copy.
 - Support standard padded/unpadded base64, ASCII whitespace and inline `data:*;base64,` payloads.
 - Keep invalid input fail-closed by falling back to encoded source size; normal local conversion already rejects invalid base64 and malformed image bytes before routing.
-- Apply the same decoded-byte contract to normalized Anthropic and converted Kiro image sources.
+- Apply the same decoded-byte contract to normalized Anthropic and converted Account Runtime image sources.
 - Collapse multiple oversized images in one Anthropic message to one ordered singular/plural summary placeholder while preserving surrounding text blocks.
 - Keep `payloadGuardMaxBytes` as the documented soft shaping target; this change does not turn it into an unrelated hard reject.
 
@@ -42,7 +42,7 @@ Covered in the focused suite:
 
 - decoded `5 MiB - 1`, exactly `5 MiB`, and `5 MiB + 1`;
 - plain base64 and data URL with whitespace;
-- Anthropic and Kiro source representations;
+- Anthropic and Account Runtime source representations;
 - exact 5 MiB acceptance for three rounds;
 - oversized history/current drop and reject policies;
 - two oversized current images produce one plural summary while text before/after remains.

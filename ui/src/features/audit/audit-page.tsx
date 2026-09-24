@@ -71,11 +71,11 @@ const ACTION_LABELS: Record<string, string> = {
   create_proxy_resource: '新增代理资源',
   update_proxy_resource: '更新代理资源',
   delete_proxy_resource: '删除代理资源',
-  create_external_pool: '新增外部账号池',
-  update_external_pool: '更新外部账号池',
-  delete_external_pool: '删除外部账号池',
-  set_external_pool_enabled: '设置账号池启用状态',
-  clear_external_pool_auto_disabled: '清除账号池自动禁用',
+  create_external_pool: '新增账号',
+  update_external_pool: '更新账号',
+  delete_external_pool: '删除账号',
+  set_external_pool_enabled: '设置账号启用状态',
+  clear_external_pool_auto_disabled: '清除账号自动禁用',
 }
 
 const OBJECT_LABELS: Record<string, string> = {
@@ -90,7 +90,7 @@ const OBJECT_LABELS: Record<string, string> = {
   admin_api_key: '登录 Key',
   security_keys: '密钥配置',
   proxy_resource: '代理资源',
-  external_pool: '外部账号池',
+  external_pool: '账号',
   load_balancing: '负载均衡',
 }
 
@@ -102,7 +102,7 @@ const ACTION_CATEGORIES = [
   { value: 'pricing', label: '价格同步' },
   { value: 'usage', label: '用量操作' },
   { value: 'proxy', label: '代理资源' },
-  { value: 'external_pool', label: '外部账号池' },
+  { value: 'external_pool', label: '账号' },
 ]
 
 const ACTION_TO_CATEGORY: Record<string, string> = {

@@ -24,7 +24,7 @@ Status: `execute-ready`；P0 事实、修复边界和验收合同已明确，正
 - 建立 `feature/evidence/<run-id>/` 清单，原始大文件继续放忽略目录，只提交摘要和哈希。
 - 所有 Rust 验证批次执行磁盘 preflight，并通过 scoped target wrapper 保证成功、失败、中断后自动清理；每批以 `removed=true`、目标路径不存在和全局残留扫描为零作为独立退出条件。
 - 并发构建通过 Git common dir reservation 原子准入，默认每批 12 GiB、保留 20 GiB floor；每批结束立即释放，不以“所有支线结束”为清理时点。
-- 将仍回退 `target/debug/kiro-rs` 或固定写根 `target/<reports>` 的 runtime runner 改为冻结绝对 binary 必填、报告目录显式注入、runner 退出后清理。完成前相关 F/E gate 保持 open。
+- 将仍回退 `target/debug/account-runtime` 或固定写根 `target/<reports>` 的 runtime runner 改为冻结绝对 binary 必填、报告目录显式注入、runner 退出后清理。完成前相关 F/E gate 保持 open。
 
 Exit：P0 每个缺陷至少一个稳定失败测试，且 clean-body/performance baseline 已记录。
 
@@ -32,7 +32,7 @@ Exit：P0 每个缺陷至少一个稳定失败测试，且 clean-body/performanc
 
 - 以逻辑 turn 为单位规范化和裁剪 tool history；默认不把 malformed tool output 原文转普通 text。
 - 定义 thinking 策略：无签名可由同一增量状态机安全过滤；signed/redacted 内容不可局部改写，命中污染时整块抑制或返回规范错误。
-- 在完整 CLI 门禁前完成请求侧 thinking 能力审计：对账 Claude CLI 原始 `output_config.effort`/`thinking`、所有相关开关与 alias、converter/endpoint 映射和最终 Kiro wire body；`max` clamp 或 adaptive drop 只有在 fake capture、公开协议与受控真实调用证据齐全后才能定性和修复。
+- 在完整 CLI 门禁前完成请求侧 thinking 能力审计：对账 Claude CLI 原始 `output_config.effort`/`thinking`、所有相关开关与 alias、converter/endpoint 映射和最终 Account Runtime wire body；`max` clamp 或 adaptive drop 只有在 fake capture、公开协议与受控真实调用证据齐全后才能定性和修复。
 - 将 sanitizer policy 放入 request scope，覆盖 local/external、raw/normalized、stream/non-stream、direct/fallback/retry。
 - 用真实 SSE event parser 处理 CRLF、多 data line、start content、EOF/error；缺 terminal 不能合成成功。
 - 收敛 WebSearch/MCP 平行路径：canonical capability 识别、last-user query、shared attempt/usage context、stream/non-stream renderer、typed failure、limited body 和无原文 tracing。
@@ -92,6 +92,6 @@ Exit：所有适用矩阵为 pass，无 skipped/unknown，发布记录完整。
 - 不声明“以后不会再泄漏”；只能在矩阵全部通过后声明已覆盖的故障模型。
 - 不把 `Hashxxxxxxxx` 作为唯一 matcher 或唯一验收关键词。
 - 不用单次 happy path、单元测试总数或历史报告代替当前构建多轮验证。
-- 不触碰现有 `9022`；不读取或暂存 `kiro_idc_users*.txt`。
+- 不触碰现有 `9022`；不读取或暂存 `account-runtime_idc_users*.txt`。
 - 不把 Cargo `deps/build/incremental` 当作测试证据长期保留；不允许没有 owner、清理动作和空间复核的验证构建目录。
 - 不把“限制并发”写成磁盘事故根因；串行不清理同样会耗尽磁盘。也不在 inventory 中自动 prune Docker、删除 unknown target 或终止非本批 owner 进程。

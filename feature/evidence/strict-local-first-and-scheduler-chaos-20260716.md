@@ -10,7 +10,7 @@ Status: `historical-focused-pass / latest-fixed-binary-revalidation-red / releas
 
 脚本：`feature/tests/strict-local-first-routing.mjs`
 
-每个模式至少 3 轮，每轮 5 个独立 Messages 请求。runner 启动当前 binary、隔离 PostgreSQL/Redis、fake Kiro、fake external，并记录每请求 local inference、local auxiliary、external hit、HTTP 状态、延迟、RSS/FD、Git revision、dirty diff hash、binary hash 和清理结果。现有 `127.0.0.1:9022` 不在测试端口集合内。
+每个模式至少 3 轮，每轮 5 个独立 Messages 请求。runner 启动当前 binary、隔离 PostgreSQL/Redis、fake Account Runtime、fake external，并记录每请求 local inference、local auxiliary、external hit、HTTP 状态、延迟、RSS/FD、Git revision、dirty diff hash、binary hash 和清理结果。现有 `127.0.0.1:9022` 不在测试端口集合内。
 
 CapacityFull 使用一个真实 holder 请求占住唯一 local credential 槽，再发送 5 个探测请求。SchedulerRedisDegraded 使用独立 Toxiproxy 在服务 ready 后给 Redis downstream response 注入 150 ms 延迟，超过 75 ms scheduler hot-path timeout；移除 toxic 并等待 breaker 后再发恢复请求。
 
@@ -90,7 +90,7 @@ local inference hits=0, external hits=0
 
 ## 清理与安全
 
-三个 pass 报告均为：`containersRemoved=true`、`tempSecretsRemoved=true`、`portsReleased=true`。早期报告曾用现有 `9022` PID 不变作为隔离证明；该探针已按当前安全合同作废，当前 runner 不应读取既有 9022 listener，只按数值排除该端口并报告 `protectedPortProbeSkipped:true`。runner 只使用 fixture key/token；不读取 `kiro_idc_users*.txt`。
+三个 pass 报告均为：`containersRemoved=true`、`tempSecretsRemoved=true`、`portsReleased=true`。早期报告曾用现有 `9022` PID 不变作为隔离证明；该探针已按当前安全合同作废，当前 runner 不应读取既有 9022 listener，只按数值排除该端口并报告 `protectedPortProbeSkipped:true`。runner 只使用 fixture key/token；不读取 `account-runtime_idc_users*.txt`。
 
 ## 未关闭项
 
@@ -106,6 +106,6 @@ cargo +1.92.0 build
 node feature/tests/strict-local-first-routing.mjs
 
 # 聚焦模式仍强制至少 3 轮、每轮至少 5 请求
-KIRO_E05_MODES=local_capacity_full node feature/tests/strict-local-first-routing.mjs
-KIRO_E05_MODES=scheduler_redis_degraded node feature/tests/strict-local-first-routing.mjs
+ACCOUNT_RUNTIME_E05_MODES=local_capacity_full node feature/tests/strict-local-first-routing.mjs
+ACCOUNT_RUNTIME_E05_MODES=scheduler_redis_degraded node feature/tests/strict-local-first-routing.mjs
 ```

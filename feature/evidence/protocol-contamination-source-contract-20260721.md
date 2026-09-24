@@ -4,7 +4,7 @@ Status: `source-contract-pass / dynamic-native-gates-still-open`
 
 Date: 2026-07-21
 
-Source authority: current dirty tree on HEAD `401473c` (`v0.0.109`) plus local remediation changes. This evidence is source-contract evidence only: it does not start `kiro.rs`, does not invoke Claude Code CLI, does not run Cargo, and does not replace the native upstream/fault/load gates.
+Source authority: current dirty tree on HEAD `401473c` (`v0.0.109`) plus local remediation changes. This evidence is source-contract evidence only: it does not start `account-runtime`, does not invoke Claude Code CLI, does not run Cargo, and does not replace the native upstream/fault/load gates.
 
 ## Purpose
 
@@ -92,7 +92,7 @@ It also proves the cleanup path is not a blanket body-normalization pass: clean 
 
 This does not close the release-blocking dynamic gates:
 
-- real native Kiro upstream with current upstream protocol;
+- real native Account Runtime upstream with current upstream protocol;
 - active/passive thinking long sessions;
 - MCP/search/image/agent tool histories;
 - 429/500/partial/malformed recovery with real Claude Code CLI;

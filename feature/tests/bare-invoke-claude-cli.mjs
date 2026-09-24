@@ -14,18 +14,18 @@ import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '../..')
-const SIGNAL_FIXTURE_MODE = process.env.KIRO_BARE_INVOKE_SIGNAL_FIXTURE === '1'
+const SIGNAL_FIXTURE_MODE = process.env.ACCOUNT_RUNTIME_BARE_INVOKE_SIGNAL_FIXTURE === '1'
 const runtimePaths = SIGNAL_FIXTURE_MODE ? null : resolveRuntimeValidationPaths(ROOT)
 const BINARY = runtimePaths?.binary || ''
 const ARTIFACT_ROOT = runtimePaths?.artifactRoot || ''
 const POSTGRES_URL = SIGNAL_FIXTURE_MODE
   ? 'postgres://signal-fixture.invalid/owned'
-  : requiredEnvironment('KIRO_BARE_INVOKE_POSTGRES_URL')
-let REDIS_URL = SIGNAL_FIXTURE_MODE ? '' : requiredEnvironment('KIRO_BARE_INVOKE_REDIS_URL')
+  : requiredEnvironment('ACCOUNT_RUNTIME_BARE_INVOKE_POSTGRES_URL')
+let REDIS_URL = SIGNAL_FIXTURE_MODE ? '' : requiredEnvironment('ACCOUNT_RUNTIME_BARE_INVOKE_REDIS_URL')
 const ROUNDS = SIGNAL_FIXTURE_MODE
   ? 5
-  : Number.parseInt(process.env.KIRO_BARE_INVOKE_ROUNDS || '5', 10)
-const CLAUDE = process.env.KIRO_CLAUDE_BINARY || 'claude'
+  : Number.parseInt(process.env.ACCOUNT_RUNTIME_BARE_INVOKE_ROUNDS || '5', 10)
+const CLAUDE = process.env.ACCOUNT_RUNTIME_CLAUDE_BINARY || 'claude'
 const RUN_ID = `bare-invoke-${Date.now()}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `${RUN_ID}-`))
 const REPORT_ROOT = SIGNAL_FIXTURE_MODE
@@ -34,14 +34,14 @@ const REPORT_ROOT = SIGNAL_FIXTURE_MODE
 const REPORT_PATH = SIGNAL_FIXTURE_MODE ? '' : path.join(REPORT_ROOT, `${RUN_ID}.json`)
 const REQUEST_KEY = `sk-request-${RUN_ID}`
 const ADMIN_KEY = `sk-admin-${RUN_ID}`
-const KIRO_KEY = `ksk_${crypto.randomBytes(24).toString('hex')}|us-east-1`
-const REDIS_PREFIX = `kiro_rs:validation:${RUN_ID}`
+const ACCOUNT_RUNTIME_KEY = `ksk_${crypto.randomBytes(24).toString('hex')}|us-east-1`
+const REDIS_PREFIX = `account_runtime:validation:${RUN_ID}`
 const ACTIVE_CHILDREN = new Set()
 const ACTIVE_FAKE_SERVERS = new Set()
 let ownedCleanupPromise = null
 
 if (ROUNDS !== 5) {
-  throw new Error('KIRO_BARE_INVOKE_ROUNDS must be exactly 5 for the C2 gate')
+  throw new Error('ACCOUNT_RUNTIME_BARE_INVOKE_ROUNDS must be exactly 5 for the C2 gate')
 }
 
 function requiredEnvironment(name) {
@@ -75,7 +75,7 @@ function commandOutput(command, args, options = {}) {
 
 function redactDiagnosticText(value) {
   let text = String(value || '')
-  for (const forbidden of [REQUEST_KEY, ADMIN_KEY, KIRO_KEY, POSTGRES_URL, REDIS_URL]) {
+  for (const forbidden of [REQUEST_KEY, ADMIN_KEY, ACCOUNT_RUNTIME_KEY, POSTGRES_URL, REDIS_URL]) {
     if (!forbidden) continue
     text = text.split(forbidden).join('<redacted>')
   }
@@ -119,7 +119,7 @@ async function waitForHealth(baseUrl, child, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
-      throw new Error(`kiro-rs exited before health check with status ${child.exitCode}`)
+      throw new Error(`account-runtime service exited before health check with status ${child.exitCode}`)
     }
     try {
       const response = await fetch(`${baseUrl}/healthz`)
@@ -127,7 +127,7 @@ async function waitForHealth(baseUrl, child, timeoutMs = 60_000) {
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
-  throw new Error('timed out waiting for isolated kiro-rs health check')
+  throw new Error('timed out waiting for isolated account-runtime health check')
 }
 
 async function stopChild(child) {
@@ -233,7 +233,7 @@ function createFakeUpstream() {
     const chunks = []
     request.on('data', (chunk) => chunks.push(chunk))
     request.on('end', () => {
-      const target = String(request.headers['x-amz-target'] || '')
+      const target = String(request.headers['x-account-runtime-target'] || '')
       const url = new URL(request.url || '/', 'http://127.0.0.1')
       if (target.endsWith('.ListAvailableModels')) {
         records.push({ kind: 'model_discovery', scenario: activeScenario?.id || null })
@@ -636,8 +636,8 @@ function isolatedConfig({ servicePort, upstreamPort }) {
     apiKey: REQUEST_KEY,
     adminApiKey: ADMIN_KEY,
     defaultEndpoint: 'cli',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/fixture`,
-    kiroUpstreamResponseTimeoutSecs: 10,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/fixture`,
+    upstreamResponseTimeoutSecs: 10,
     credentialRetryMaxAttempts: 1,
     inferenceUpstreamMaxAttempts: 1,
     credentialWarmupRequests: 0,
@@ -646,7 +646,7 @@ function isolatedConfig({ servicePort, upstreamPort }) {
 }
 
 async function runSignalFixture() {
-  const ackPath = requiredEnvironment('KIRO_SIGNAL_ACK_PATH')
+  const ackPath = requiredEnvironment('ACCOUNT_RUNTIME_SIGNAL_ACK_PATH')
   const fakePort = await reservePort()
   const redisPort = await reservePort()
   const fakeServer = http.createServer((_request, response) => {
@@ -726,10 +726,10 @@ async function main() {
     fs.mkdirSync(projectRoot, { recursive: true, mode: 0o700 })
     fs.writeFileSync(configPath, `${JSON.stringify(isolatedConfig({ servicePort, upstreamPort }), null, 2)}\n`, { mode: 0o600 })
     const serviceLog = fs.openSync(serviceLogPath, 'a', 0o600)
-    service = spawn(BINARY, ['--config', configPath, '--credentials', missingCredentialsPath], {
+    service = spawn(BINARY, ['--config', configPath], {
       cwd: ROOT,
       env: validationChildEnvironment({
-        LOCAL_UPSTREAM_API_KEY: KIRO_KEY,
+        LOCAL_UPSTREAM_API_KEY: ACCOUNT_RUNTIME_KEY,
         ACCOUNT_RUNTIME_HOST: '127.0.0.1',
         ACCOUNT_RUNTIME_PORT: String(servicePort),
         RUST_LOG: 'warn',
@@ -846,7 +846,7 @@ async function main() {
         isolatedHome: true,
         isolatedClaudeConfigDir: true,
         isolatedProject: true,
-        fakeKiroCredential: true,
+        fakeCredential: true,
         callerOwnedPostgresDatabase: true,
       },
       callerResponsibilities: {
@@ -871,7 +871,7 @@ async function main() {
       report.result = Object.values(cleanup).every(Boolean) ? 'pass' : 'fail'
       fs.mkdirSync(REPORT_ROOT, { recursive: true })
       const serialized = `${JSON.stringify(report, null, 2)}\n`
-      for (const forbidden of [REQUEST_KEY, ADMIN_KEY, KIRO_KEY, POSTGRES_URL, REDIS_URL]) {
+      for (const forbidden of [REQUEST_KEY, ADMIN_KEY, ACCOUNT_RUNTIME_KEY, POSTGRES_URL, REDIS_URL]) {
         assert.equal(serialized.includes(forbidden), false, 'report contains a secret or connection URL')
       }
       fs.writeFileSync(REPORT_PATH, serialized, { mode: 0o600 })

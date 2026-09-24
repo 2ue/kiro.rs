@@ -4,7 +4,7 @@ Status: `analysis-confirmed / implementation-complete / focused-verified / relea
 
 Severity: `High`
 
-Scope: 三台现网 `kiro.rs` 的外部池费用计算、usage 捕获、UsageRecord、PostgreSQL rollup、Redis Dashboard、两套 UI 展示，以及“单条明细多数原始计费低于展示计费，但 Dashboard 汇总原始成本明显更高”的现象。
+Scope: 三台现网 `account-runtime` 的外部池费用计算、usage 捕获、UsageRecord、PostgreSQL rollup、Redis Dashboard、两套 UI 展示，以及“单条明细多数原始计费低于展示计费，但 Dashboard 汇总原始成本明显更高”的现象。
 
 Analysis date: `2026-08-03`（Asia/Shanghai）
 
@@ -20,7 +20,7 @@ Affected deployments:
 
 当前现象不是一个单一的“Dashboard 加总错误”，而是四个因素叠加：
 
-1. 页面“上游原始成本”并不是外部供应商实际扣款。当前代码使用外部池的原始 usage（有时是本地估算 usage）乘以 `kiro.rs` 本地价格目录计算，属于“渠道参考成本”。
+1. 页面“上游原始成本”并不是外部供应商实际扣款。当前代码使用外部池的原始 usage（有时是本地估算 usage）乘以 `account-runtime` 本地价格目录计算，属于“渠道参考成本”。
 2. 大部分外部池配置使用“按当前路径策略”的用量整理。它会把原始普通输入重新分配为缓存读取/缓存创建，并再次应用缓存和输出补偿。由于缓存价格低于普通输入，长输入请求可能从数美元降到几角钱。
 3. 单条明细是重尾分布。大量短请求可以出现“原始成本低于展示计费”，但少量几十万 token 的请求会贡献远高于普通请求的原始成本，最终把汇总方向反转。
 4. 历史 `jinnyapi` 流式请求存在大量 `missing_stream_usage` / `unrecognized_success_body`，旧版本代码会使用本地请求输入和本地输出估算填充“原始 usage”。这会进一步降低“上游原始成本”字段作为供应商真实账单的可信度；当前修复已补齐流式 OpenAI 兼容 usage 的归一化，但历史记录不会被回写成真实上游费用。
@@ -32,7 +32,7 @@ Affected deployments:
 | 页面中文字段 | 记录字段 | 当前真实含义 |
 | --- | --- | --- |
 | 上游原始 usage | `externalPoolBilling.rawUsage` | 外部池捕获的原始 usage；可能是真实上游 usage，也可能是本地估算 |
-| 上游原始成本 | `rawCostUsd` | `rawUsage × kiro.rs 本地价格目录` 的参考成本，不等于供应商账单 |
+| 上游原始成本 | `rawCostUsd` | `rawUsage × account-runtime 本地价格目录` 的参考成本，不等于供应商账单 |
 | 展示计费 | `shapedCostUsd` | 按当前路径 usage 整理后的 usage 计算的成本 |
 | 补偿后计费 | `upliftedCostUsd` | 展示 usage 再应用缓存/输出补偿后的成本 |
 | 上报费用 | `reportedCostUsd` | 最终上报 usage 的本地价格估算 |
@@ -95,7 +95,7 @@ rollup 分池相加：
 
 ### 4. 外部池 usage 不是“整体没有返回”
 
-绕过 `kiro.rs`，直接调用三台机器当前配置的外部池 `kkkkyue`：
+绕过 `account-runtime`，直接调用三台机器当前配置的外部池 `kkkkyue`：
 
 - 每台 25 次，共 75 次；
 - 非流式、独立流式、连续三轮追问均覆盖；
@@ -228,7 +228,7 @@ usageCandidatePath = $stream.estimated
 4. 错误记录的标准费用字段保持为零。
 
 不会再因为本地价格不可用，就把“展示计费/上报费用”偷换成“原始成本”。
-“原始成本”仍是 `kiro.rs` 本地价格目录下的参考成本，不等于供应商实际扣款；
+“原始成本”仍是 `account-runtime` 本地价格目录下的参考成本，不等于供应商实际扣款；
 只有供应商明确返回金额或账单接口时，才可以另设“外部供应商真实费用”。
 
 ### 3. 本地 usage 整形保持独立
@@ -322,7 +322,7 @@ cost_floor_applied = 原始成本 > 补偿后计费
 ### 尚未证实
 
 - `jinnyapi` 的具体 SSE usage 字段是否为 OpenAI 风格、增量格式或某些事件根本不带 usage；
-- 外部供应商真实美元账单是否与 `kiro.rs` 本地价格目录一致；
+- 外部供应商真实美元账单是否与 `account-runtime` 本地价格目录一致；
 - Redis writer 延迟/丢观测是否在实时窗口造成额外差异；
 - 历史版本中旧字段回退是否在某些记录上重复使用“上报费用”替代“展示计费”。
 

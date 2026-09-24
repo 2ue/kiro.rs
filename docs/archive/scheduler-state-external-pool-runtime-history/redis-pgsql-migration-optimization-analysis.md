@@ -48,8 +48,8 @@
 - 启动和 bootstrap：`src/main.rs`、`src/model/config.rs`
 - PgSQL 存储层：`src/storage/postgres.rs`
 - Redis 存储层：`src/storage/redis_cache.rs`
-- 凭据调度与持久化：`src/kiro/token_manager.rs`
-- 上游调用与失败兜底：`src/kiro/provider.rs`
+- 凭据调度与持久化：`src/local_upstream_impl/token_manager.rs`
+- 上游调用与失败兜底：`src/local_upstream_impl/provider.rs`
 - usage 记录和统计：`src/anthropic/usage.rs`
 - 模型价格：`src/anthropic/pricing.rs`
 - cache usage 和路径上报策略：`src/anthropic/cache.rs`、`src/anthropic/handlers.rs`、`src/model/config.rs`
@@ -1093,7 +1093,7 @@ migrations/
 - reported usage path override 测试。
 - prompt cache 测试。
 - Redis scheduler 测试。
-- PgSQL store 测试，依赖 `KIRO_RS_TEST_POSTGRES_URL`。
+- PgSQL store 测试，依赖 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL`。
 
 ### 需要补的测试
 

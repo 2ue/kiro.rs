@@ -29,22 +29,22 @@ did not send load to production and did not consume real accounts.
 - Git HEAD at validation start: `57d8c1ed1cff3fcd0f49935f1415294c9f0f13f9`
 - Working tree: dirty by design; this evidence is for the candidate diff before the release commit.
 - Product binary:
-  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-runtime-candidate.dCozQP/kiro-rs`
+  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-runtime-candidate.dCozQP/account-runtime`
 - Product SHA-256: `03001d96b835ecd60a4c07e9910d3027d31c87b0c70fc74a66e8d406b5db5e2c`
 - Load runner:
-  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-runtime-candidate.dCozQP/kiro_loadtest`
+  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-runtime-candidate.dCozQP/account_runtime_loadtest`
 - Load runner SHA-256: `264b6b3bb57e15bedcf28c11946ec335b7d5d275a6db4d4136b0c8354ac655b8`
 - Rust toolchain: `1.92.0`
 - Claude Code CLI: `2.1.197`
 
 ## Local dependency isolation
 
-- PostgreSQL container: `kiro-load-chaos-20260727032138-63939-pg`
+- PostgreSQL container: `account-runtime-load-chaos-20260727032138-63939-pg`
 - PostgreSQL host port: `127.0.0.1:32768`
-- Redis container: `kiro-load-chaos-20260727032138-63939-redis`
+- Redis container: `account-runtime-load-chaos-20260727032138-63939-redis`
 - Redis host port: `127.0.0.1:32769`
 - Redis prefixes used by runners:
-  `kiro-load-chaos:kiro-load-chaos-20260727032138-63939:*`
+  `account-runtime-load-chaos:account-runtime-load-chaos-20260727032138-63939:*`
 - Real production instances were used only for earlier read-only evidence, not for load.
 - The user's active local `9022` service was not restarted or loaded.
 
@@ -52,7 +52,7 @@ did not send load to production and did not consume real accounts.
 
 ### Request-safe token manager persistence
 
-Added or used request-safe variants in `src/kiro/token_manager/manager.rs`:
+Added or used request-safe variants in `src/local_upstream_impl/token_manager/manager.rs`:
 
 - `report_failure_deferred`
 - `report_quota_exhausted_deferred`
@@ -69,7 +69,7 @@ paths now call the deferred variants.
 
 ### Provider hot path changes
 
-`src/kiro/provider.rs` now routes real request paths through deferred state changes:
+`src/local_upstream_impl/provider.rs` now routes real request paths through deferred state changes:
 
 - API/MCP failure reporting no longer blocks the handler on PgSQL failure-counter mutation.
 - Quota/risk/invalid-refresh-token disable paths update local runtime state immediately, clear
@@ -81,8 +81,8 @@ paths now call the deferred variants.
 
 ### Test performance hardening
 
-`kiro::provider::tests::auxiliary_focus_provider_client_cache_is_bounded_and_reuses_hot_keys_for_five_rounds`
-previously built `KIRO_CLIENT_CACHE_MAX_ENTRIES + 2` real `reqwest::Client` instances per round.
+`account-runtime::provider::tests::auxiliary_focus_provider_client_cache_is_bounded_and_reuses_hot_keys_for_five_rounds`
+previously built `ACCOUNT_RUNTIME_CLIENT_CACHE_MAX_ENTRIES + 2` real `reqwest::Client` instances per round.
 On macOS this repeatedly scanned the system Keychain and dominated full-test runtime. The test now
 pre-fills cache cells and only builds the hot keys needed to verify LRU eviction and OnceCell
 singleflight. Production cache size and production `build_client` behavior were not changed.
@@ -91,7 +91,7 @@ Focused result:
 
 ```text
 running 1 test
-test kiro::provider::tests::auxiliary_focus_provider_client_cache_is_bounded_and_reuses_hot_keys_for_five_rounds ... ok
+test account-runtime::provider::tests::auxiliary_focus_provider_client_cache_is_bounded_and_reuses_hot_keys_for_five_rounds ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 2.20s
 validation-build-cleanup scope=provider-client-cache-focused size_kib=1726756 removed=true reservation_released=true
 ```
@@ -110,7 +110,7 @@ During the post-fix all-target rerun, four integration tests exposed pressure-se
 - `storage::redis_cache::tests::redis_scheduler_cooldown_and_rate_limit_round_trip`
   - failure: a test-only 50ms rate-limit key expired after earlier Redis high-cardinality pressure; production scheduler deadlines are much longer.
   - change: use a 5s test-only interval for this round-trip assertion.
-- `kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds`
+- `account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds`
   - failure: the old test and implementation mixed true shared upstream failure waves with pre-send PgSQL/Redis setup failures.
   - implementation change: `complete_or_cancel_distributed_refresh_failure_until` now writes Redis failure outcome only for shareable failures. Non-shareable `send_committed=false` setup failures cancel the Redis refresh lease instead of poisoning the distributed wave.
   - test change: the cluster fixture uses a realistic small PgSQL pool of 4 instead of 2, waits for critical cancelled-leader cleanup, and verifies send amplification by relative hit increments instead of a fixed absolute counter.
@@ -119,7 +119,7 @@ Focused validation after these changes:
 
 ```text
 RUN anthropic::usage::tests::persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds ... ok
-RUN kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds ... ok
+RUN account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds ... ok
 RUN storage::postgres::tests::postgres_usage_cleanup_batches_return_contention_signal_while_writer_guard_is_held_for_three_rounds ... ok
 RUN storage::redis_cache::tests::redis_scheduler_cooldown_and_rate_limit_round_trip ... ok
 
@@ -156,7 +156,7 @@ validation-build-cleanup scope=focused-usage-postgres-cache-revision size_kib=17
 
 RUN anthropic::usage::tests::persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds ... ok
 RUN anthropic::usage::tests::production_postgres_only_usage_never_materializes_redis_for_five_rounds ... ok
-RUN kiro::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds ... ok
+RUN account-runtime::token_manager::manager::tests::refresh_cluster_tests::token_refresh_two_manager_failure_replay_and_cancelled_leader_recover_without_send_amplification_for_five_rounds ... ok
 RUN storage::postgres::tests::postgres_usage_cleanup_batches_return_contention_signal_while_writer_guard_is_held_for_three_rounds ... ok
 RUN storage::redis_cache::tests::redis_scheduler_cooldown_and_rate_limit_round_trip ... ok
 validation-build-cleanup scope=focused-current-full-failures-final-combo-3 size_kib=1738868 removed=true reservation_released=true
@@ -172,11 +172,11 @@ Already passed in this candidate before the final all-target rerun:
   - reservations: 0
   - target processes: 0
 - Frozen release binary build:
-  - `feature/tests/run-cargo-scoped.sh runtime-release-binaries -- cargo +1.92.0 build --release --bin kiro-rs --bin kiro_loadtest`
+  - `feature/tests/run-cargo-scoped.sh runtime-release-binaries -- cargo +1.92.0 build --release --bin account-runtime --bin account_runtime_loadtest`
   - result: pass
   - scoped target removed
 - PgSQL deferred/storage focused tests:
-  - `feature/tests/run-cargo-scoped.sh pg-deferred-tests -- cargo +1.92.0 test --locked --bin kiro-rs deferred -- --nocapture --test-threads=1`
+  - `feature/tests/run-cargo-scoped.sh pg-deferred-tests -- cargo +1.92.0 test --locked --bin account-runtime deferred -- --nocapture --test-threads=1`
   - result: `7/7` passed with real PostgreSQL URL
 - PgSQL release smoke tests:
   - `storage::postgres::tests::postgres_cleanup_watermark`: `2/2` passed
@@ -335,9 +335,9 @@ Status: rerun in progress at the time this document was first written.
 Command:
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL=postgres://postgres:<redacted>@127.0.0.1:32768/kiro_test_rtval20260727 \
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:32769/10 \
-KIRO_RS_REQUIRE_STORAGE_TESTS=1 \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=postgres://postgres:<redacted>@127.0.0.1:32768/account-runtime_test_rtval20260727 \
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:32769/10 \
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
 RUSTUP_TOOLCHAIN=1.92.0 \
 feature/tests/run-cargo-scoped.sh full-default-tests-rerun -- \
   cargo +1.92.0 test --locked --all-targets -- --test-threads=1
@@ -345,7 +345,7 @@ feature/tests/run-cargo-scoped.sh full-default-tests-rerun -- \
 
 Log:
 
-- `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-runtime-artifacts.YbheSc/reports/full-default-tests-rerun.log`
+- `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-runtime-artifacts.YbheSc/reports/full-default-tests-rerun.log`
 
 The previous all-target run was interrupted after it proved the provider client-cache test could
 finish but before a final `test result` line was emitted; it is not counted as a pass. The rerun is
@@ -357,7 +357,7 @@ the release evidence source for this gate.
 - A tool-level timeout during the first focused provider-cache run orphaned one wrapper reservation;
   the exact generated target and reservation were removed:
   - `target/.validation-build-provider-client-cache-focused.pid-57829.SXGAPl`
-  - `.git/kiro-validation-build-state/.reservation-1785096470-57829-3275717450`
+  - `.git/account-runtime-validation-build-state/.reservation-1785096470-57829-3275717450`
 - Post-cleanup inventory showed:
 
 ```text

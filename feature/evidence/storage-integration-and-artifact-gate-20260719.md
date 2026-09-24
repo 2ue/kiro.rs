@@ -23,8 +23,8 @@ HEAD: `401473c` (`v0.0.109`), dirty tree `118 files changed, 66763 insertions(+)
 - Redis：当前仓库专属本地测试实例，loopback 端口 `50892`。
 - 所有 Cargo 命令均通过 `feature/tests/run-cargo-scoped.sh <scope> -- ...`。
 - 未触碰、探测、重启或压测 `127.0.0.1:9022`。
-- 未读取、改写或删除 `kiro_idc_users*.txt`。
-- 原始 `/tmp/kiro-validation-20260719-*` 日志仅用于提取本摘要和 SHA-256；摘要落盘后删除原始目录。
+- 未读取、改写或删除 `account-runtime_idc_users*.txt`。
+- 原始 `/tmp/account-runtime-validation-20260719-*` 日志仅用于提取本摘要和 SHA-256；摘要落盘后删除原始目录。
 
 ## 命令摘要
 
@@ -32,10 +32,10 @@ HEAD: `401473c` (`v0.0.109`), dirty tree `118 files changed, 66763 insertions(+)
 
 ```bash
 RUSTUP_TOOLCHAIN=1.92.0
-KIRO_RS_TEST_POSTGRES_URL=postgres://kirotest:<redacted>@127.0.0.1:50891/postgres
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:50892
-KIRO_RS_TEST_POSTGRES_ISOLATED=1
-KIRO_RS_TEST_REDIS_ISOLATED=1
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=postgres://account-runtimetest:<redacted>@127.0.0.1:50891/postgres
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:50892
+ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED=1
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1
 ```
 
 运行项：
@@ -96,21 +96,21 @@ storage suite 先执行 `cargo fmt --all -- --check` 与 `git diff --check`，�
 
 ### Runtime quarantine storage, 3 outer rounds
 
-- `kiro::token_manager::manager::tests::postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds`
-- `kiro::token_manager::manager::tests::postgres_pending_runtime_mutations_replay_in_order_and_unquarantine`
-- `kiro::token_manager::manager::tests::postgres_reset_generation_fences_pending_failure_and_disable_replay`
-- `kiro::token_manager::manager::tests::finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_interval`
-- `kiro::token_manager::manager::tests::redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades`
-- `kiro::token_manager::manager::tests::redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease`
+- `account-runtime::token_manager::manager::tests::postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds`
+- `account-runtime::token_manager::manager::tests::postgres_pending_runtime_mutations_replay_in_order_and_unquarantine`
+- `account-runtime::token_manager::manager::tests::postgres_reset_generation_fences_pending_failure_and_disable_replay`
+- `account-runtime::token_manager::manager::tests::finite_redis_dispatch_queue_lease_deadline_does_not_move_after_renew_interval`
+- `account-runtime::token_manager::manager::tests::redis_dispatch_queue_waiter_fails_closed_after_coordination_degrades`
+- `account-runtime::token_manager::manager::tests::redis_dispatch_queue_cancelled_waiter_releases_local_and_remote_lease`
 
 ## 构建残留与磁盘复核
 
-storage suite 完成后，第一次只读 artifact inventory 报告根目录 `target/` 为 unmanaged target，大小约 `727872 KiB`，并发现一个 19 天前的 `kiro_cli_repro` Claude CLI/MCP tmux 复现会话仍以 `target/claude-cli-tests/...` 为工作目录；另有一个用户本地 `kiro-rs` 运行进程引用 `target/release/kiro-rs` 与 `target/local-verify/kiro-rs-9022.log`。
+storage suite 完成后，第一次只读 artifact inventory 报告根目录 `target/` 为 unmanaged target，大小约 `727872 KiB`，并发现一个 19 天前的 `account-runtime_cli_repro` Claude CLI/MCP tmux 复现会话仍以 `target/claude-cli-tests/...` 为工作目录；另有一个用户本地 `account-runtime` 运行进程引用 `target/release/account-runtime` 与 `target/local-verify/account-runtime-9022.log`。
 
 处理动作：
 
-1. 关闭旧的 `kiro_cli_repro` tmux 验证会话及其 Claude/MCP 子进程。
-2. 未杀正在运行的 `kiro-rs` 服务。
+1. 关闭旧的 `account-runtime_cli_repro` tmux 验证会话及其 Claude/MCP 子进程。
+2. 未杀正在运行的 `account-runtime` 服务。
 3. 确认没有进程引用 `target/debug` 或 `target/flycheck0` 后，仅删除可再生的 `target/debug`、`target/flycheck0` 和 `.rustc_info.json`。
 
 复核结果：
@@ -123,7 +123,7 @@ build-artifact-inventory version=2 mode=read-only targets=0 reservations=0 targe
 release-gate result=pass
 ```
 
-删除 `/tmp/kiro-validation-20260719-*` 原始日志目录后，编辑器/flycheck 再次重建可见的 `target/debug`/`target/flycheck0`，约 `710 MiB`。复核显示仍无进程引用这些可见子目录；唯一 target 相关运行进程是已有的 `kiro-rs` 服务，引用不可见的 `target/release`/`target/local-verify` 路径。随后再次只删除 `debug`/`flycheck0`/`.rustc_info.json`，最终 `du -sh target -> 0B`，`inventory-build-artifacts --gate` 再次为 `targets=0 reservations=0 target_processes=0 blockers=0`。
+删除 `/tmp/account-runtime-validation-20260719-*` 原始日志目录后，编辑器/flycheck 再次重建可见的 `target/debug`/`target/flycheck0`，约 `710 MiB`。复核显示仍无进程引用这些可见子目录；唯一 target 相关运行进程是已有的 `account-runtime` 服务，引用不可见的 `target/release`/`target/local-verify` 路径。随后再次只删除 `debug`/`flycheck0`/`.rustc_info.json`，最终 `du -sh target -> 0B`，`inventory-build-artifacts --gate` 再次为 `targets=0 reservations=0 target_processes=0 blockers=0`。
 
 本轮 artifact gate pass 只证明当前验证残留已清；它不是最终 release gate，因为 frozen binary、CLI/load raw captures、UI/upgrade 等后续批次还会产生新的临时资产，必须逐批复核。
 

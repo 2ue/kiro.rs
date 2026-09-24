@@ -7,8 +7,8 @@ Scope: repository-owned dependency-free skill validation and synthetic-secret pa
 ## Validator
 
 ```text
-python3 .codex/skills/kiro-prod-evidence-audit/scripts/quick_validate.py \
-  .codex/skills/kiro-prod-evidence-audit
+python3 .codex/skills/account-runtime-prod-evidence-audit/scripts/quick_validate.py \
+  .codex/skills/account-runtime-prod-evidence-audit
 Skill is valid (dependency-free repository validator).
 ```
 
@@ -20,7 +20,7 @@ The isolated fixture contained fake examples of API key, Bearer token, JWT, emai
 
 ```text
 SOURCE_DATE_EPOCH=1784131200 python3 \
-  .codex/skills/kiro-prod-evidence-audit/scripts/package_evidence.py \
+  .codex/skills/account-runtime-prod-evidence-audit/scripts/package_evidence.py \
   --root tmp/evidence-skill-validation-fixture
 ```
 

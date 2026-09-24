@@ -14,13 +14,14 @@ pub struct RefreshResponse {
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
+    #[cfg(test)]
     #[serde(default)]
     pub profile_arn: Option<String>,
     #[serde(default)]
     pub expires_in: Option<i64>,
 }
 
-/// IdC Token 刷新请求体 (AWS SSO OIDC)
+/// IdC Token 刷新请求体 (OIDC)
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdcRefreshRequest {
@@ -30,7 +31,7 @@ pub struct IdcRefreshRequest {
     pub grant_type: String,
 }
 
-/// IdC Token 刷新响应体 (AWS SSO OIDC)
+/// IdC Token 刷新响应体 (OIDC)
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdcRefreshResponse {
@@ -41,6 +42,7 @@ pub struct IdcRefreshResponse {
     // pub token_type: Option<String>,
     #[serde(default)]
     pub expires_in: Option<i64>,
+    #[cfg(test)]
     #[serde(default)]
     pub profile_arn: Option<String>,
 }

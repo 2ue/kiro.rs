@@ -52,7 +52,7 @@ Related:
 
 不照搬：
 
-- sub2api 的账号和协议模型不同；kiro.rs 仍必须保留外部直连、本地优先、本地到外部 fallback、一次本地救援和 usage 独立边界。
+- sub2api 的账号和协议模型不同；account-runtime 仍必须保留外部直连、本地优先、本地到外部 fallback、一次本地救援和 usage 独立边界。
 
 ### CLIProxyAPI
 
@@ -65,7 +65,7 @@ Related:
 
 不照搬：
 
-- CLIProxyAPI 的 key 调度和 kiro.rs 的外部池、Redis 容量、PgSQL 配置、usage 记录结构不同；只能借鉴调度思想。
+- CLIProxyAPI 的 key 调度和 account-runtime 的外部池、Redis 容量、PgSQL 配置、usage 记录结构不同；只能借鉴调度思想。
 
 ## 4. 复现定义
 
@@ -226,7 +226,7 @@ Related:
 
 ### 第一层：本地 fake upstream 真实 HTTP
 
-启动本地临时 kiro.rs 服务、隔离 PostgreSQL、隔离 Redis、fake 本地上游和 3-5 个 fake 外部池。
+启动本地临时 account-runtime 服务、隔离 PostgreSQL、隔离 Redis、fake 本地上游和 3-5 个 fake 外部池。
 
 必须通过：
 

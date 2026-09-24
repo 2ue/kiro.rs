@@ -57,7 +57,7 @@ function runnerEnvironment(overrides = {}) {
 }
 
 function runRunner(overrides = {}, options = {}) {
-  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-chaos-contract-sync-'))
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-chaos-contract-sync-'))
   try {
     const result = spawnSync(process.execPath, [RUNNER], {
       cwd: ROOT,
@@ -275,7 +275,7 @@ for (const [signal, expectedCode] of [['SIGHUP', 129], ['SIGINT', 130], ['SIGTER
     test(`${signal} cleans the owned proxy, ports, temporary root, and ready file, round ${round}`, {
       skip: !LIVE_EMPTY_REDIS_URL,
     }, async () => {
-      const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-chaos-contract-${signal.toLowerCase()}-`))
+      const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), `account-runtime-chaos-contract-${signal.toLowerCase()}-`))
       const readyFile = path.join(fixtureRoot, 'ready.json')
       const child = spawn(process.execPath, [RUNNER], {
         cwd: ROOT,

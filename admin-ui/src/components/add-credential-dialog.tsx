@@ -139,7 +139,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     authMethod?: AuthMethod
     refreshToken?: string
     apiKey?: string
-    kiroApiKey?: string
     profileArn?: string
     region?: string
     authRegion?: string
@@ -162,7 +161,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     endpoint?: string
     enableOverageAfterImport?: boolean | null
   }) => {
-    const credentialApiKey = credential.apiKey || credential.kiroApiKey || ''
+    const credentialApiKey = credential.apiKey || ''
     setAuthMethod(credential.authMethod || (credentialApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
     setRefreshToken(credential.refreshToken || '')
     setApiKey(credentialApiKey)

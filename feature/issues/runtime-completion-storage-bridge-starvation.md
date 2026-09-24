@@ -6,7 +6,7 @@ Severity: `critical`
 
 ## 现象
 
-`docs/kiro-rs-root-cause-package-20260726T170519+0800` 记录了 2026-07-26 的生产事故：
+`docs/account-runtime-root-cause-package-20260726T170519+0800` 记录了 2026-07-26 的生产事故：
 
 - Docker health 显示 healthy，但 `/healthz`、`/readyz`、业务 API 超时。
 - app 进程仍存活，CPU/内存/FD 没有打满。
@@ -18,10 +18,10 @@ Severity: `critical`
 
 ## 权威证据
 
-- `docs/kiro-rs-root-cause-package-20260726T170519+0800/ROOT_CAUSE_ANALYSIS.md`
-- `docs/kiro-rs-root-cause-package-20260726T170519+0800/EVIDENCE_CLAIM_MAP.md`
-- `docs/kiro-rs-root-cause-package-20260726T170519+0800/170-live-evidence-summary.md`
-- `docs/kiro-rs-root-cause-package-20260726T170519+0800/incident-evidence-20260726T161622+0800/`
+- `docs/account-runtime-root-cause-package-20260726T170519+0800/ROOT_CAUSE_ANALYSIS.md`
+- `docs/account-runtime-root-cause-package-20260726T170519+0800/EVIDENCE_CLAIM_MAP.md`
+- `docs/account-runtime-root-cause-package-20260726T170519+0800/170-live-evidence-summary.md`
+- `docs/account-runtime-root-cause-package-20260726T170519+0800/incident-evidence-20260726T161622+0800/`
 
 关键证据链：
 
@@ -74,7 +74,7 @@ Severity: `critical`
 4. Redis scheduler success health 保持 best-effort task。
 5. session soft-failure / clear 先更新本地 sticky cache，再异步 best-effort 写 Redis。
 6. 请求 retry/error 中的 session soft-failure / unbind 同样改为本地 sticky cache 先行，Redis affinity 异步 best-effort。
-7. storage executor 默认使用 dedicated `kiro-storage-task` runtime，不再把 best-effort/critical worker 绑定到 HTTP runtime。
+7. storage executor 默认使用 dedicated `account-runtime-storage-task` runtime，不再把 best-effort/critical worker 绑定到 HTTP runtime。
 8. 保留直接 `report_success`、凭据禁用/强一致错误状态写的同步语义，避免破坏跨 manager 顺序依赖；生产请求 completion 和 session affinity 不再走这些同步等待版本。
 
 ## 兼容性
@@ -123,19 +123,19 @@ Severity: `critical`
 
 2026-07-26 当前工作树已完成代码修复与聚焦验证：
 
-- `KiroApiCompletion` / `KiroStreamCompletion` / `McpCallCompletion` success path 改为 deferred success report。
+- `Account RuntimeApiCompletion` / `Account RuntimeStreamCompletion` / `McpCallCompletion` success path 改为 deferred success report。
 - stream success / soft failure / upstream stream failure 均先释放 in-flight lease，再处理本地状态和异步存储副作用。
 - session soft-failure / clear 增加 deferred 版本，先更新本地 sticky cache，Redis 写入改为 best-effort。
 - provider 请求 retry/error 中的 session soft-failure / unbind 改为 deferred，真实请求链路不再同步等待 Redis affinity。
-- storage executor 默认固定使用 dedicated `kiro-storage-task` runtime。
+- storage executor 默认固定使用 dedicated `account-runtime-storage-task` runtime。
 
 验证结果：
 
 - `cargo +1.92.0 fmt --all -- --check`：通过。
-- `cargo +1.92.0 test --locked --bin kiro-rs completion -- --test-threads=1`：`11 passed / 0 failed`。
-- `cargo +1.92.0 test --locked --bin kiro-rs terminal_deferred_success_does_not_wait_for_pgsql_pool_pressure_for_five_rounds -- --test-threads=1`：`1 passed / 0 failed`。
-- `cargo +1.92.0 test --locked --bin kiro-rs postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds -- --test-threads=1`：`1 passed / 0 failed`，确认保留的直接同步 success 仍维持 FIFO/backlog 语义。
-- `cargo +1.92.0 test --locked --bin kiro-rs test_deferred_session_soft_failure_and_unbind_use_local_state -- --test-threads=1`：`1 passed / 0 failed`。
+- `cargo +1.92.0 test --locked --bin account-runtime completion -- --test-threads=1`：`11 passed / 0 failed`。
+- `cargo +1.92.0 test --locked --bin account-runtime terminal_deferred_success_does_not_wait_for_pgsql_pool_pressure_for_five_rounds -- --test-threads=1`：`1 passed / 0 failed`。
+- `cargo +1.92.0 test --locked --bin account-runtime postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds -- --test-threads=1`：`1 passed / 0 failed`，确认保留的直接同步 success 仍维持 FIFO/backlog 语义。
+- `cargo +1.92.0 test --locked --bin account-runtime test_deferred_session_soft_failure_and_unbind_use_local_state -- --test-threads=1`：`1 passed / 0 failed`。
 - `cargo +1.92.0 check --locked --all-targets --no-default-features`：通过。
 - `rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs`：通过，warning count `815`，低于 baseline `849`。
 - `node feature/tests/inventory-build-artifacts.mjs --gate`：通过，`targets=0 reservations=0 target_processes=0 blockers=0`。

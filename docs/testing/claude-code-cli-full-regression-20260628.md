@@ -1,9 +1,9 @@
-# Claude Code CLI 与 Kiro 代理回归测试报告（2026-06-28）
+# Claude Code CLI 与 Account Runtime 代理回归测试报告（2026-06-28）
 
 本文记录 2026-06-28 对当前未提交工作区的协议、调度、cachePoint、thinking、tool-use、MCP、异常和资源压力验证。测试只使用隔离端口：
 
 - 本地代理：`127.0.0.1:19022`
-- fake Kiro upstream：`127.0.0.1:19080`
+- fake Account Runtime upstream：`127.0.0.1:19080`
 - 管理密钥：`admin123`
 
 本轮没有启动或重启日常开发端口 `9022`。
@@ -13,9 +13,9 @@
 - 当前代码下，Claude Code CLI 能通过 `/cc/v1/messages` 收到真实 `thinking_delta`、`signature_delta`、`text_delta` 和非零 usage。
 - `sonnet-thinking`、完整 `claude-sonnet-4-6-thinking`、以及 Claude Code CLI 的 `--effort high` 都能触发 thinking 链路。
 - Claude Code CLI Bash tool-use、MCP tool-use 成功回传、MCP tool-use 错误回传均能完成 round-trip。
-- cachePoint 开启后能按工具 `cache_control` 插入 Kiro `cachePoint`；上游拒绝 cachePoint 时会自动去掉 cachePoint 并重试一次。
+- cachePoint 开启后能按工具 `cache_control` 插入 Account Runtime `cachePoint`；上游拒绝 cachePoint 时会自动去掉 cachePoint 并重试一次。
 - 高并发、突发异常、异常恢复、stream idle、client drop、RPM、dfcache 的隔离压测没有发现进程卡死或持续 FD 泄漏。
-- 真实 Claude Code CLI 客户端已经验证；真实 Kiro 上游模型质量、图片识别、大文档理解、真实上游长会话智商效果没有在本轮跑，因为那会消耗真实账号并影响真实账号状态。
+- 真实 Claude Code CLI 客户端已经验证；真实 Account Runtime 上游模型质量、图片识别、大文档理解、真实上游长会话智商效果没有在本轮跑，因为那会消耗真实账号并影响真实账号状态。
 
 ## 关键注意事项
 
@@ -38,13 +38,13 @@ SDKROOT=$(xcrun --show-sdk-path)
 CC="$CLANG" CC_aarch64_apple_darwin="$CLANG" CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="$CLANG" cargo test --locked --no-default-features
 pnpm --dir ui check
 pnpm --dir ui build
-CC="$CLANG" CC_aarch64_apple_darwin="$CLANG" CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="$CLANG" cargo build --locked --no-default-features --bin kiro-rs --bin kiro_loadtest
+CC="$CLANG" CC_aarch64_apple_darwin="$CLANG" CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="$CLANG" cargo build --locked --no-default-features --bin account-runtime --bin account_runtime_loadtest
 ```
 
 结果：
 
 - Rust 主测试：`732 passed`
-- `kiro_loadtest` 单测：先前 `9 passed`；新增 MCP fake 工具选择回归后当前为 `11 passed`
+- `account_runtime_loadtest` 单测：先前 `9 passed`；新增 MCP fake 工具选择回归后当前为 `11 passed`
 - UI check：通过
 - UI build：通过，仅 Vite chunk size 警告
 - 二进制构建：通过
@@ -54,7 +54,7 @@ CC="$CLANG" CC_aarch64_apple_darwin="$CLANG" CARGO_TARGET_AARCH64_APPLE_DARWIN_L
 代理：
 
 ```bash
-target/debug/kiro-rs \
+target/debug/account-runtime \
   --config .local-run/loadtest-config-20260627215353.json \
   --credentials .local-run/empty-credentials-20260627215353.json
 ```
@@ -62,10 +62,10 @@ target/debug/kiro-rs \
 fake upstream 常规启动：
 
 ```bash
-target/debug/kiro_loadtest \
+target/debug/account_runtime_loadtest \
   --fake-listen 127.0.0.1:19080 \
   --fake-only true \
-  --fake-kiro-eventstream true \
+  --fake-account-runtime-eventstream true \
   --scenario normal-stream \
   --fake-delay-ms 120 \
   --fake-capture-dir .local-run/fake-captures-final-normal-current
@@ -124,7 +124,7 @@ claude --bare --setting-sources project,local \
 
 - CLI 使用普通模型 `claude-sonnet-4-6`
 - 请求仍携带 adaptive thinking 配置
-- 代理保留该配置并转换到 Kiro history
+- 代理保留该配置并转换到 Account Runtime history
 - 结果 usage 非 0：`input_tokens=22`、`output_tokens=9`
 
 ## Claude Code CLI Tool Use
@@ -172,20 +172,20 @@ claude --bare --setting-sources project,local \
   --strict-mcp-config \
   --mcp-config .local-run/cc-real-tests/mcp-config.json \
   --tools "" \
-  --allowedTools mcp__kiro-local-test__ping \
+  --allowedTools mcp__account-runtime-local-test__ping \
   --dangerously-skip-permissions \
   -p --verbose --output-format stream-json --include-partial-messages \
   --debug-file .local-run/claude-cli-current/mcp-ping-current-fixed.debug.log \
   --model sonnet \
-  "Use the kiro-local-test MCP ping tool, then reply with exactly: current mcp ok" \
+  "Use the account-runtime-local-test MCP ping tool, then reply with exactly: current mcp ok" \
   > .local-run/claude-cli-current/mcp-ping-current-fixed.stream.jsonl
 ```
 
 证据：
 
 - `.local-run/claude-cli-current/mcp-ping-current-fixed.stream.jsonl`
-- 实际 tool_use：`mcp__kiro-local-test__ping`
-- 实际 tool_result：`mcp-pong-kiro-local`
+- 实际 tool_use：`mcp__account-runtime-local-test__ping`
+- 实际 tool_result：`mcp-pong-account-runtime-local`
 - debug log 记录 `Tool 'ping' completed successfully in 4ms`
 - 第二轮正常完成
 - `num_turns=2`
@@ -200,8 +200,8 @@ claude --bare --setting-sources project,local \
 
 证据：
 
-- fake upstream 首次选择 `mcp__kiro-local-test__fail`
-- MCP server 返回 `mcp-fail-kiro-local`
+- fake upstream 首次选择 `mcp__account-runtime-local-test__fail`
+- MCP server 返回 `mcp-fail-account-runtime-local`
 - CLI 将错误作为 `tool_result` 回传给代理
 - 第二轮正常完成
 - 结果 usage 非 0
@@ -214,9 +214,9 @@ claude --bare --setting-sources project,local \
 
 ```json
 {
-  "kiroCachePointEnabled": true,
-  "kiroCachePointToolsOnly": true,
-  "kiroCachePointRecordPlan": true
+  "localUpstreamCachePointEnabled": true,
+  "localUpstreamCachePointToolsOnly": true,
+  "localUpstreamCachePointRecordPlan": true
 }
 ```
 
@@ -247,7 +247,7 @@ claude --bare --setting-sources project,local \
 
 - 下游输出：`.local-run/cachepoint-current.sse`
 - fake capture：`.local-run/fake-captures-mcp-current-fixed/fake_req_3.json`
-- fake Kiro 收到的最终 body 中 `cachePointCount=1`
+- fake Account Runtime 收到的最终 body 中 `cachePointCount=1`
 - 下游仍收到正常 tool-use stream
 
 ### 拒绝后重试
@@ -380,7 +380,7 @@ fake upstream 使用 `cache-point-reject` 场景。
 当前代理实现边界：
 
 - 普通 `adaptive`：只作为 Claude Code 兼容控制处理，不强制生成可见 `thinking_delta`，避免普通请求增加可见 thinking 块和额外输出 token。
-- 显式 `*-thinking` 模型名：在 Kiro 上游没有原生 thinking 模型 ID 时，映射到基础模型，并加强上游提示，让输出中包含 `<thinking>...</thinking>`，再转换成 Anthropic SSE 的 `thinking_delta`。
+- 显式 `*-thinking` 模型名：在 Account Runtime 上游没有原生 thinking 模型 ID 时，映射到基础模型，并加强上游提示，让输出中包含 `<thinking>...</thinking>`，再转换成 Anthropic SSE 的 `thinking_delta`。
 - 显式 `thinking.type=enabled`：无论模型名是否带 `-thinking`，都按可见 thinking 处理。
 - 显式 `thinking.type=disabled`：即使模型名带 `-thinking`，也不注入 thinking 控制，不输出 `thinking_delta`。
 
@@ -406,8 +406,8 @@ fake upstream 使用 `cache-point-reject` 场景。
 
 兼容限制：
 
-- 当前 Kiro 上游不接受 `claude-sonnet-4-6-thinking` 作为真实 `modelId`，会返回 `INVALID_MODEL_ID`。因此本系统不能把 `*-thinking` 原样交给 Kiro，而是使用基础模型加控制提示实现兼容。
-- 由于这是通过 Kiro 文本输出中的 `<thinking>` 片段转换出来的 unsigned thinking，没有原生 Anthropic `signature_delta`。当前验证中 `signature_delta=false` 是预期结果。
+- 当前 Account Runtime 上游不接受 `claude-sonnet-4-6-thinking` 作为真实 `modelId`，会返回 `INVALID_MODEL_ID`。因此本系统不能把 `*-thinking` 原样交给 Account Runtime，而是使用基础模型加控制提示实现兼容。
+- 由于这是通过 Account Runtime 文本输出中的 `<thinking>` 片段转换出来的 unsigned thinking，没有原生 Anthropic `signature_delta`。当前验证中 `signature_delta=false` 是预期结果。
 
 ## SSO external_idp 无 clientSecret 验证
 
@@ -439,7 +439,7 @@ fake upstream 使用 `cache-point-reject` 场景。
 
 ## 当前仍未覆盖的真实能力
 
-以下能力本轮没有用真实 Kiro 上游验证：
+以下能力本轮没有用真实 Account Runtime 上游验证：
 
 - 真实模型智商效果。
 - 图片识别。
@@ -464,7 +464,7 @@ fake upstream 使用 `cache-point-reject` 场景。
 验证对象：
 
 - 本地服务：`127.0.0.1:9022`。
-- 服务进程：`target/release/kiro-rs -c config.json --credentials credentials.json`。
+- 服务进程：`target/release/account-runtime -c config.json --credentials credentials.json`。
 - Claude Code CLI：`2.1.156`。
 - CLI 代理方式：单次命令环境变量 `ANTHROPIC_BASE_URL=http://127.0.0.1:9022/cc` 和运行态请求 key；没有改 `ccman` 持久配置。
 - 管理 key：`admin123`。
@@ -503,7 +503,7 @@ fake upstream 使用 `cache-point-reject` 场景。
 
 Claude Code CLI `Bash` 工具调用通过：
 
-- prompt 要求执行 `printf kiro-tool-ok`。
+- prompt 要求执行 `printf account-runtime-tool-ok`。
 - stream-json 中出现 `tool_use`、`tool_result`、第二轮 `assistant`。
 - 工具名：`Bash`。
 - `num_turns` 对应两轮请求，最终 `resultSubtype=success`。
@@ -513,8 +513,8 @@ Claude Code CLI `Bash` 工具调用通过：
 
 使用项目现有 `.local-run/cc-real-tests/mcp-ping-server.js` 和 `.local-run/cc-real-tests/mcp-config.json` 复测 9022：
 
-- MCP `ping` 工具：成功返回 `mcp-pong-kiro-local`，随后模型返回 `current mcp ok`。
-- MCP `fail` 工具：工具返回错误 `mcp-fail-kiro-local`，CLI 将错误作为 `tool_result` 回传，随后模型返回 `current mcp fail ok`。
+- MCP `ping` 工具：成功返回 `mcp-pong-account-runtime-local`，随后模型返回 `current mcp ok`。
+- MCP `fail` 工具：工具返回错误 `mcp-fail-account-runtime-local`，CLI 将错误作为 `tool_result` 回传，随后模型返回 `current mcp fail ok`。
 - 两个场景 exit code 均为 `0`。
 - 两个场景最终 `result.usage` 均非 0。
 - debug log 记录 MCP server connected、tool dispatch start/end、tool completed 或 failed。

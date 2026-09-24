@@ -152,17 +152,17 @@ FIFO 重放、operation ID 幂等、generation fencing、显式禁用和管理�
 2026-07-21 在 E03 真实双进程 scheduler gate 中追加关闭跨实例 shared RPM fail-open。旧实现的第三次快速跨实例请求可能在另一个进程尚未同步到 Redis selection/rate-limit 前继续 local `200`；新实现通过 Redis Lua `try_record_scheduler_selection()` 同步/原子记录 selection 并设置 `scheduler:rate_limit:<id>` deadline。聚焦测试：
 
 ```text
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379/15
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379/15
 RUSTUP_TOOLCHAIN=1.92.0
 feature/tests/run-cargo-scoped.sh rpm-reservation-focused-20260721-r4 -- \
   cargo fmt --check
   cargo test storage::redis_cache::tests::redis_scheduler_cooldown_and_rate_limit_round_trip -- --exact
-  cargo test kiro::token_manager::manager::tests::redis_backed_rpm_reservation_blocks_third_cross_instance_selection -- --exact
+  cargo test account-runtime::token_manager::manager::tests::redis_backed_rpm_reservation_blocks_third_cross_instance_selection -- --exact
 ```
 
 结果为两个 exact tests 均 `1 passed`，`cargo fmt --check` 通过，scope `removed=true / reservation_released=true`。随后 `rpm-reservation-check-all-20260721-r4` 的 `cargo check --all-targets` 通过并清理 target。
 
-同日用仓库外冻结候选 `/tmp/kiro-e03-candidate.T2iG7N/kiro-rs`（sha256 `98e0f79328b49925dc940faaa3b1e8b0c8ae8ef7b9975725eb219635c8957ee7`）执行 E03 三轮真实双进程：
+同日用仓库外冻结候选 `/tmp/account-runtime-e03-candidate.T2iG7N/account-runtime`（sha256 `98e0f79328b49925dc940faaa3b1e8b0c8ae8ef7b9975725eb219635c8957ee7`）执行 E03 三轮真实双进程：
 
 ```text
 runId=e03-20260721013242272-88844-36667d
@@ -196,7 +196,7 @@ v0.0.117 冻结候选再次以 fake-upstream load/chaos 覆盖高并发、低 RP
 
 1. PgSQL 主业务连接池与 usage/dashboard 连接池拆分：
    - `postgres.usageMaxConnections` 默认 4；
-   - env 支持 `KIRO_RS_POSTGRES_MAX_CONNECTIONS` 与 `KIRO_RS_POSTGRES_USAGE_MAX_CONNECTIONS`；
+   - env 支持 `ACCOUNT_RUNTIME_POSTGRES_MAX_CONNECTIONS` 与 `ACCOUNT_RUNTIME_POSTGRES_USAGE_MAX_CONNECTIONS`；
    - `main` 中 `PostgresUsageStore` 使用 `PostgresStore::connect_usage()` 的独立 sqlx pool；
    - 验证 `postgres_usage_pool_isolated_from_exhausted_main_pool_for_three_rounds`：主 pool max=1 被长事务占满时，usage 写入仍通过 usage pool 成功。
 
@@ -241,7 +241,7 @@ postgres_persists_runtime_config_credentials_stats_usage_and_pricing ... ok
 当前冻结候选：
 
 ```text
-kiro-rs sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
+account-runtime sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
 ```
 
 已补齐发布前 runtime 验证：

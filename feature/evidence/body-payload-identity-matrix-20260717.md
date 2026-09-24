@@ -2,7 +2,7 @@
 
 Status: `dirty-tree-focused-and-release-probes-pass / final-frozen-candidate-pending`
 
-Scope: body ownership and byte/value identity across payload guard, JSON whitespace compression, request-body limits, remote multimodal preprocessing, external raw/normalized bodies, provider wire bytes, and Kiro CLI/IDE endpoint transforms.
+Scope: body ownership and byte/value identity across payload guard, JSON whitespace compression, request-body limits, remote multimodal preprocessing, external raw/normalized bodies, provider wire bytes, and Account Runtime CLI/IDE endpoint transforms.
 
 ## Build And Safety Boundary
 
@@ -15,10 +15,10 @@ Scope: body ownership and byte/value identity across payload guard, JSON whitesp
 ## Implementation Reverified
 
 - Clean Anthropic requests reuse the original `Bytes` allocation when repair/shaping is unnecessary; the guard performs zero serialization and preserves exact bytes and unknown fields.
-- Clean Kiro requests reuse the first required serialization when repair is unnecessary; the guard reports exactly one serialization instead of serializing the same body twice.
+- Clean Account Runtime requests reuse the first required serialization when repair is unnecessary; the guard reports exactly one serialization instead of serializing the same body twice.
 - Every full serialization performed by current-fit shaping contributes to `guardSerializations` and serialization timing.
 - Leading assistant-only prefixes are counted once and removed with one `drain`, avoiding repeated `remove(0)` moves.
-- Current image fitting drops the required batch before the next full serialization. Kiro and Anthropic paths emit one singular/plural summary placeholder rather than one placeholder per image or two placeholders for the final image.
+- Current image fitting drops the required batch before the next full serialization. Account Runtime and Anthropic paths emit one singular/plural summary placeholder rather than one placeholder per image or two placeholders for the final image.
 - Lexical JSON whitespace compression preserves key order, duplicate keys, number and escape spellings, and unknown fields. Disabled, invalid, and already compact paths preserve exact bytes; the compacting path reuses the input allocation.
 
 ## Debug Matrix
@@ -27,7 +27,7 @@ The corrected scoped batch exited `0`. Exact Rust test-function counts from the 
 
 | Group | Result | Repeated behavior covered |
 | --- | ---: | --- |
-| `anthropic::payload_guard::tests` | 67 passed, 1 ignored | clean Anthropic/Kiro sizes, repair, logical tool turns, documents, schemas, tool results, image decoded-byte boundaries, current-fit and serialization counts |
+| `anthropic::payload_guard::tests` | 67 passed, 1 ignored | clean Anthropic/Account Runtime sizes, repair, logical tool turns, documents, schemas, tool results, image decoded-byte boundaries, current-fit and serialization counts |
 | `http_client::tests` | 17 passed, 3 ignored | lexical tokens/escapes, invalid/disabled/compact identity, pointer/capacity, 5 MiB, deep/malformed recovery, bounded/timeout response bodies |
 | `anthropic::body_processing::tests` | 20 passed | image normalization, clean text, URL/SSRF, redirects, aggregate limits, admission, timeout/cancel and recovery |
 | `anthropic::request_body::tests` | 3 passed | exact/chunked request boundary and RPM attribution, each boundary scenario repeated five rounds where specified |
@@ -42,11 +42,11 @@ Total debug test functions executed successfully: `149`; normal debug discovery 
 
 Important repeated payload cases include:
 
-- clean Anthropic and Kiro at 1 KiB, 100 KiB, 1 MiB and 5 MiB, 100 rounds per size;
+- clean Anthropic and Account Runtime at 1 KiB, 100 KiB, 1 MiB and 5 MiB, 100 rounds per size;
 - clean Anthropic exact `Bytes` pointer identity, zero guard serializations and unknown-field preservation;
 - leading-assistant repair at 1,000, 4,000 and 16,000 messages, five rounds per size;
 - converted 20-cycle and 100-cycle tool histories, five rounds each;
-- current four-image fitting for Kiro and Anthropic, five rounds, dropping three images, retaining one, producing one placeholder and reporting three serializations;
+- current four-image fitting for Account Runtime and Anthropic, five rounds, dropping three images, retaining one, producing one placeholder and reporting three serializations;
 - decoded image sizes `5 MiB - 1`, `5 MiB`, and `5 MiB + 1`, plus exact-5-MiB acceptance, five rounds;
 - tool result, document and tool-schema compression ON/OFF, five rounds.
 
@@ -56,7 +56,7 @@ The same scoped target then executed `35` ignored probes explicitly under `--rel
 
 | Probe | Matrix |
 | --- | --- |
-| payload guard size/serialization | clean Anthropic, dirty Anthropic and clean Kiro; 1 KiB, 100 KiB, 1 MiB and 5 MiB; five rounds per cell |
+| payload guard size/serialization | clean Anthropic, dirty Anthropic and clean Account Runtime; 1 KiB, 100 KiB, 1 MiB and 5 MiB; five rounds per cell |
 | JSON whitespace size/mode | 1 KiB, 100 KiB, 1 MiB and 5 MiB x valid/invalid/disabled/compact x five rounds |
 | JSON whitespace burst/recovery | 5 MiB x concurrency 8 x five rounds = 40 concurrent transforms, then five recovery transforms |
 | JSON whitespace abort/recovery | 5 MiB x five abort observations, each followed by recovery |
@@ -75,7 +75,7 @@ validation-build-cleanup scope=body-payload-identity size_kib=2410696 available_
 Independent checks after wrapper exit showed:
 
 - `target/.validation-build-body-payload-identity*`: no matching path;
-- `.git/kiro-validation-build-state`: no reservation file;
+- `.git/account-runtime-validation-build-state`: no reservation file;
 - wrapper/batch/Cargo/rustc PIDs `34875`, `34929`, `11354`, and `36197`: absent;
 - data-volume available space: `50,213,760 KiB`;
 - focused `git diff --check`: pass.

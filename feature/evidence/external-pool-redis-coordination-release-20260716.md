@@ -20,23 +20,23 @@ Status: `focused isolated PASS / non-frozen dirty candidate / final release gate
 Secrets are intentionally represented as placeholders:
 
 ```bash
-export KIRO_RS_TEST_POSTGRES_URL='postgresql://<isolated-user>:<redacted>@127.0.0.1:47432/<isolated-db>'
-export KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:47379/'
+export ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgresql://<isolated-user>:<redacted>@127.0.0.1:47432/<isolated-db>'
+export ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:47379/'
 cargo test external_pool_one_malformed_runtime_isolated_from_fifty_nine_healthy_for_five_rounds -- --nocapture --test-threads=1
 
-export KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:47380/'
-export KIRO_RS_TEST_REDIS_RESTART_CONTAINER='kiro-rs-validation-redis-restart-20260716'
+export ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:47380/'
+export ACCOUNT_RUNTIME_TEST_REDIS_RESTART_CONTAINER='account-runtime-validation-redis-restart-20260716'
 cargo test external_pool_redis_restart_fails_closed_and_recovers_five_of_five -- --nocapture --test-threads=1
 cargo test external_pool_redis_data_loss_fences_active_confirmed_lease_before_reacquire -- --nocapture --test-threads=1
 cargo test external_pool_redis_restart_fences_multiple_active_leases_across_managers_for_five_rounds -- --nocapture --test-threads=1
 
-export KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:46380/'
-export KIRO_RS_TEST_REDIS_DIRECT_URL='redis://127.0.0.1:47379/'
-export KIRO_RS_TEST_TOXIPROXY_API='http://127.0.0.1:48474'
-export KIRO_RS_TEST_TOXIPROXY_NAME='scheduler'
+export ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:46380/'
+export ACCOUNT_RUNTIME_TEST_REDIS_DIRECT_URL='redis://127.0.0.1:47379/'
+export ACCOUNT_RUNTIME_TEST_TOXIPROXY_API='http://127.0.0.1:48474'
+export ACCOUNT_RUNTIME_TEST_TOXIPROXY_NAME='scheduler'
 cargo test external_pool_release_dispatcher_drains_10k_real_leases_after_commit_unknown_for_five_rounds -- --nocapture --test-threads=1
 
-export KIRO_RS_RUN_EXTERNAL_REDIS_RTT_MATRIX=1
+export ACCOUNT_RUNTIME_RUN_EXTERNAL_REDIS_RTT_MATRIX=1
 cargo test external_pool_redis_rtt_and_concurrency_matrix_five_outer_rounds -- --nocapture --test-threads=1
 ```
 

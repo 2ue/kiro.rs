@@ -43,8 +43,8 @@ Last updated: 2026-07-22
 
 ```json
 {
-  "redis": { "url": "redis://127.0.0.1:26379/0", "keyPrefix": "kiro_rs" },
-  "observabilityRedis": { "url": "redis://127.0.0.1:26379/15", "keyPrefix": "kiro_rs:observability" }
+  "redis": { "url": "redis://127.0.0.1:26379/0", "keyPrefix": "account_runtime" },
+  "observabilityRedis": { "url": "redis://127.0.0.1:26379/15", "keyPrefix": "account_runtime:observability" }
 }
 ```
 
@@ -59,17 +59,17 @@ Last updated: 2026-07-22
 使用两个真实 Redis authority 和两个本地 chaos proxy：
 
 ```bash
-KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/15 \
-KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/15 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
 node feature/tests/run-redis-fault-domain-product-validation.mjs
 ```
 
-该 runner 会强制 `KIRO_RS_REQUIRE_STORAGE_TESTS=1`，通过 `feature/tests/run-cargo-scoped.sh` 运行真实 Rust 产品测试。每次 exact invocation 内部再执行三轮：observability latency `50/150/500 ms`、observability disconnect、business disconnect、recovery。缺 URL、DB0、9022、同 authority、未设置 isolation marker 时必须在 proxy/Cargo 前 fail closed。
+该 runner 会强制 `ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1`，通过 `feature/tests/run-cargo-scoped.sh` 运行真实 Rust 产品测试。每次 exact invocation 内部再执行三轮：observability latency `50/150/500 ms`、observability disconnect、business disconnect、recovery。缺 URL、DB0、9022、同 authority、未设置 isolation marker 时必须在 proxy/Cargo 前 fail closed。
 
 ### R4：基础物理隔离与 namespace cleanup
 
-`node feature/tests/run-redis-fault-domain-validation.mjs` 只验证两个 Redis 端点、`run_id`、prefix bounded cleanup 和基础 proxy 行为。它不启动 kiro.rs、不调用 Cargo、不证明产品 `RedisStore`/`UsageRecorder` 路径，因此只能作为辅助证据。
+`node feature/tests/run-redis-fault-domain-validation.mjs` 只验证两个 Redis 端点、`run_id`、prefix bounded cleanup 和基础 proxy 行为。它不启动 account-runtime、不调用 Cargo、不证明产品 `RedisStore`/`UsageRecorder` 路径，因此只能作为辅助证据。
 
 ### R5：多轮/长会话边界
 
@@ -104,7 +104,7 @@ node feature/tests/run-redis-fault-domain-product-validation.mjs
 当前补充证据：
 
 - 纯 Node contract 默认运行初始为 37 tests，28 passed，9 skipped（live signal cases 未给 Redis URL），0 failed。2026-07-21 后续新增生产源码合同、RedisStore role guard 和主/观测 Redis 路径隔离合同后，默认合同为 46 tests，37 passed，9 skipped，0 failed；新增合同锁定 `main.rs`、`UsageRecorder`、`AdminService`、`RedisStoreRole`、Redis usage materialization entrypoint guard、config env/authority guard、scheduler/external/runtime-event/health 的 business Redis 专用路径、observability Redis 启动失败不回落 business Redis、以及 UsageRecorder 主请求路径只入队观测 writer 且压力下丢弃 summary 以避免阻塞。
-- 新增底层 production guard 后，`feature/tests/run-cargo-scoped.sh redis-observability-role-guard-20260721 -- cargo +1.92.0 check --bin kiro-rs` 通过，wrapper cleanup `size_kib=446876 removed=true reservation_released=true`。最新 scheduler chaos + fault-domain 合批合同为 74 tests：53 passed，21 live-fixture skips，0 failed。随后只删除无引用 root `target/debug`/`target/flycheck0` 可再生产物，inventory 复核 `targets=0 reservations=0 target_processes=0 blockers=0`。
+- 新增底层 production guard 后，`feature/tests/run-cargo-scoped.sh redis-observability-role-guard-20260721 -- cargo +1.92.0 check --bin account-runtime` 通过，wrapper cleanup `size_kib=446876 removed=true reservation_released=true`。最新 scheduler chaos + fault-domain 合批合同为 74 tests：53 passed，21 live-fixture skips，0 failed。随后只删除无引用 root `target/debug`/`target/flycheck0` 可再生产物，inventory 复核 `targets=0 reservations=0 target_processes=0 blockers=0`。
 - 纯 Node contract 使用当前项目两个 loopback Redis URL 后：37/37 passed，覆盖 HUP/INT/TERM 各三轮 proxy/temp/port cleanup。
 - 基础 Redis fault-domain runner：3 outer rounds passed，确认两个 Redis `run_id` 不同、observability 250ms latency/disconnect 不影响 business 基础操作、business fault fail closed、bounded cleanup 不用 `FLUSHDB`。
 - 产品 runner `redis-fault-domain-product-r1` 先红于 business Redis fault 后立即 recovery acquire；该红项是测试合同过严。business Redis fault 后保留 `retry_after` 退避是防 spin 保护，已改为使用 `recover_capacity_breaker_five_times()` 验证 5/5 恢复。

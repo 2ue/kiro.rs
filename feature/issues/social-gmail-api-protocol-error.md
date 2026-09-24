@@ -25,7 +25,7 @@ content_type=json
 reason=api_protocol_error
 ```
 
-也就是：HTTP 层成功，但响应不是服务端正式推理链路期望的 Kiro eventstream 响应。
+也就是：HTTP 层成功，但响应不是服务端正式推理链路期望的 Account Runtime eventstream 响应。
 
 ## 生产证据
 
@@ -41,7 +41,7 @@ tmp/prod-evidence/20260725-004125-152-53-194-142-gmail-api-protocol
 - 3 个 gmail 凭据 id：`448`、`449`、`450`。
 - 三个凭据当前都是 `disabled=true`，`disabled_reason=Manual`，禁用时间约 `2026-07-25 00:39:40~00:39:44 +08`。
 - `failure_count=0`、`refresh_failure_count=0`；没有证据表明系统自动禁用或 refresh token 失败。
-- 三个凭据都是 `auth_kind=social`，订阅显示 `KIRO PRO+`，`region/api_region=us-east-1`。
+- 三个凭据都是 `auth_kind=social`，订阅显示 `ACCOUNT_RUNTIME PRO+`，`region/api_region=us-east-1`。
 - 三个凭据没有持久化模型限制；当前生产 schema/记录里没有可用于调度过滤的 `supported_models` 限制。
 - 最近 24 小时内，这组三个凭据相关 usage 记录：`16` 条，其中 `1` 条成功、`15` 条错误；记录到的上游尝试共 `44` 次。
 - 失败样本显示单个正式请求会轮询 3 个 gmail 凭据，三次上游均返回 `200`，三次均被归类为 `protocol_error`，最终失败：
@@ -55,7 +55,7 @@ tmp/prod-evidence/20260725-004125-152-53-194-142-gmail-api-protocol
 
 ## 源码解释
 
-正式推理链路在 `src/kiro/provider.rs` 中把响应分为：
+正式推理链路在 `src/local_upstream_impl/provider.rs` 中把响应分为：
 
 - `2xx + eventstream`：交给下游解析，可能成功。
 - `2xx + json/other/missing content-type`：不是成功推理响应，读 body 后进入 `classify_non_eventstream_body`。
@@ -91,7 +91,7 @@ tmp/prod-evidence/20260725-004125-152-53-194-142-gmail-api-protocol
 当前能确认的根因有两层：
 
 1. 生产记录只保存了脱敏后的 `upstream_status=200 content_type=json reason=api_protocol_error`，没有保存 JSON body fingerprint/top-level keys，因此历史样本无法区分“真实 JSON 错误 envelope”和“content-type 标错但 body 是 binary EventStream”。
-2. 旧 provider header 阶段过早信任 `content-type: application/json`，会把部分 Kiro 合法的 JSON-labeled binary EventStream 当作非 eventstream 成功体并归类为协议错误。当前工作树已改为交给 handler body sniff。
+2. 旧 provider header 阶段过早信任 `content-type: application/json`，会把部分 Account Runtime 合法的 JSON-labeled binary EventStream 当作非 eventstream 成功体并归类为协议错误。当前工作树已改为交给 handler body sniff。
 
 ## 为什么手动禁用是合理止血
 
@@ -109,7 +109,7 @@ tmp/prod-evidence/20260725-004125-152-53-194-142-gmail-api-protocol
 
 ### 2026-07-25 已补充的协议兼容修复
 
-生产只读证据只能看到 `upstream_status=200 content_type=json reason=api_protocol_error`，没有保存原始 body。结合后续本地协议复核，发现一种真实 Kiro 行为不能按 header 直接判失败：
+生产只读证据只能看到 `upstream_status=200 content_type=json reason=api_protocol_error`，没有保存原始 body。结合后续本地协议复核，发现一种真实 Account Runtime 行为不能按 header 直接判失败：
 
 ```text
 HTTP 200
@@ -119,14 +119,14 @@ body: 实际是 AWS binary EventStream frames
 
 旧逻辑把 `2xx + application/json` 视为非 eventstream 成功体，进而按 `api_protocol_error` 处理。当前修复改为：
 
-- `src/kiro/provider.rs`
+- `src/local_upstream_impl/provider.rs`
   - 对 `2xx + application/json` 不再在 provider header 阶段直接判定终局失败；
   - 只记录 `response_headers_received`，把 response body 交给 stream/non-stream handler；
   - handler 通过 body sniff 区分“JSON 错误 envelope”和“JSON header 标错的 binary EventStream”。
 - `src/anthropic/handlers/tests.rs`
   - 新增 `BinaryEventStreamWithJsonContentType` fixture；
   - stream/non-stream 各 5 轮，确认 JSON-labeled binary EventStream 会成功解析，不输出 error event。
-- `src/kiro/provider.rs` tests
+- `src/local_upstream_impl/provider.rs` tests
   - 新增 `json_content_type_response_headers_remain_for_handler_sniffing_for_five_rounds`；
   - 确认 provider 对 JSON content-type 的 2xx response 只释放给 handler sniff，不提前写 success，也不增加 credential success count。
 
@@ -188,7 +188,7 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh protocol-billing-focus
 
 最小本地复现不需要真实 Gmail 账号：
 
-1. fake Kiro upstream 返回 `HTTP 200`。
+1. fake Account Runtime upstream 返回 `HTTP 200`。
 2. response header 写 `content-type: application/json`。
 3. body 写入合法 AWS binary EventStream frames，包含正常 assistant response/context usage/metering frames。
 4. 修复前 provider 在 header 阶段把它归类为 `api_protocol_error`。
@@ -214,7 +214,7 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh protocol-billing-focus
 最终候选二进制：
 
 ```text
-kiro-rs sha256=25ea01fb741bdffb103fa95397f0fb29b60c8bffee9267741f563f388ae237a4
+account-runtime sha256=25ea01fb741bdffb103fa95397f0fb29b60c8bffee9267741f563f388ae237a4
 local service=existing 127.0.0.1:9022
 Claude Code CLI=2.1.197
 ```
@@ -225,18 +225,18 @@ Claude Code CLI=2.1.197
 - feature docs：`50 issue documents / 123 relative links` 通过。
 - Node contract：`261 passed / 22 skipped / 0 failed`。
 - build artifact inventory：`targets=0 reservations=0 target_processes=0 blockers=0`。
-- direct stream：真实本地 social/IDE 凭据成功，`status=success`，`routeSubtype=local_success`，`pricingModel=claude-haiku-4-5`，`kiroMeteringUsage=0.006603686633499171`。
-- direct non-stream：真实本地 social/IDE 凭据成功，`status=success`，`routeSubtype=local_success`，`pricingModel=claude-haiku-4-5`，`kiroMeteringUsage=0.003777497379767828`。
+- direct stream：真实本地 social/IDE 凭据成功，`status=success`，`routeSubtype=local_success`，`pricingModel=claude-haiku-4-5`，`upstreamMeteringUnits=0.006603686633499171`。
+- direct non-stream：真实本地 social/IDE 凭据成功，`status=success`，`routeSubtype=local_success`，`pricingModel=claude-haiku-4-5`，`upstreamMeteringUnits=0.003777497379767828`。
 - direct `thinking.adaptive + output_config.effort=max`：真实 thinking block/delta 和 `thinking_tokens=4`，usage success，`pricingModel=claude-sonnet-4-6`，metering 非零。
 - Claude Code CLI simple/tool/thinking/multi-turn/MCP：均通过，usage 非零，没有 `Tool results provided`、`<function_results>`、`*Hashxxxxxxxx`、`user Continue` 等内部泄漏指纹。
-- 图片：标准 RGB PNG 成功；伪 PNG 本地拒绝且 `kiroMeteringUsage=0`；1x1 gray+alpha PNG 被上游 400 拒绝但 payload guard 显示未被本地改写。
+- 图片：标准 RGB PNG 成功；伪 PNG 本地拒绝且 `upstreamMeteringUnits=0`；1x1 gray+alpha PNG 被上游 400 拒绝但 payload guard 显示未被本地改写。
 - WebSearch：server_tool_use 和 web_search_tool_result 正常，message_stop 和 usage 正常。
 - fake-upstream load/chaos：L1 fake smoke、L3 9/9、L4 12/12、L5 60s+60s idle 全部通过；错误爆发、429/500、invalid-tool、client-drop、mixed-chaos 后均能恢复。
 
 本轮结论：
 
 1. 已确认并修复一个足以解释大量 `upstream_status=200 content_type=json reason=api_protocol_error` 的代理侧 bug：旧 provider 在 header 阶段把 `2xx + application/json` 直接当作非 EventStream 协议错误；新逻辑把 body 交给 handler sniff，能够正确处理 JSON-labeled binary EventStream。
-2. 已确认 EOF 无 `messageStatus` 但有 `contextUsageEvent`/`meteringEvent` 的 Kiro 成功响应不再被误判为 protocol error。
+2. 已确认 EOF 无 `messageStatus` 但有 `contextUsageEvent`/`meteringEvent` 的 Account Runtime 成功响应不再被误判为 protocol error。
 3. 本地使用真实 social/IDE 凭据的 stream、non-stream、thinking、CLI、tool、MCP、图片、WebSearch 均没有复现“上游成功但 usage 全错误”的问题。
 4. 如果生产再次出现 `2xx JSON api_protocol_error`，优先看 body fingerprint/top-level keys。若 body 是合法 EventStream，应由本修复解决；若 body 是真实 JSON 错误 envelope，则属于账号 capability/profile/region/订阅/路径组合问题，需要按 body fingerprint 继续分型，不应再盲目换号重试整组账号。
 
@@ -245,7 +245,7 @@ Claude Code CLI=2.1.197
 当前冻结候选：
 
 ```text
-kiro-rs sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
+account-runtime sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
 ```
 
 补充验证：

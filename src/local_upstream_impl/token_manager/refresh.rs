@@ -1,28 +1,40 @@
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
+#[cfg(test)]
 use reqwest::header::HeaderMap;
+#[cfg(test)]
 use serde::de::DeserializeOwned;
-use serde_json::json;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 use crate::anthropic::inference_attempt_budget::{AuxiliaryAttemptBudget, AuxiliaryAttemptKind};
-use crate::http_client::{
-    HttpSendError, ProxyConfig, build_client, execute_with_response_header_timeout,
-    response_bytes_with_limit_and_body_timeout, send_with_response_header_timeout,
-};
-use crate::local_upstream_impl::endpoint::configured_upstream_url;
-use crate::local_upstream_impl::machine_id;
+use crate::http_client::ProxyConfig;
 use crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
+use crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
+use crate::model::config::Config;
+
+#[cfg(test)]
+use crate::http_client::HttpSendError;
+#[cfg(test)]
+use crate::http_client::{
+    build_client, execute_with_response_header_timeout, response_bytes_with_limit_and_body_timeout,
+    send_with_response_header_timeout,
+};
+#[cfg(test)]
+use crate::local_upstream_impl::endpoint::configured_upstream_url;
+#[cfg(test)]
+use crate::local_upstream_impl::machine_id;
+#[cfg(test)]
 use crate::local_upstream_impl::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
 };
-use crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
+#[cfg(test)]
 use crate::local_upstream_impl::protocol::{is_external_idp_credentials, resolve_profile_arn};
-use crate::model::config::Config;
+#[cfg(test)]
+use serde_json::json;
 
 use super::auxiliary::{
     AuxiliaryConcurrencyController, AuxiliaryConcurrencyKind, AuxiliaryConcurrencyPermit,
@@ -32,13 +44,15 @@ use super::auxiliary::{
 
 const TOKEN_SERVICE_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 const TOKEN_SERVICE_RESPONSE_TIMEOUT_SECS: u64 = 60;
+pub(crate) const LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE: &str =
+    "旧本地凭据上游接口已移除，请使用上游账号接口配置账号";
 #[cfg(test)]
 // Test-only timeout used by fake OAuth endpoints. Keep it short enough to prove bounded
 // failure recovery, but not so tight that full-suite parallel scheduling starves recovery
 // success requests before the local fake server can send headers.
 const CONTROLLED_TEST_RESPONSE_HEADER_TIMEOUT: StdDuration = StdDuration::from_millis(1000);
 #[cfg(test)]
-const CONTROLLED_TEST_RESPONSE_HEADER_TIMEOUT_MARKER: &str = "kiro_test_timeout_ms=1000";
+const CONTROLLED_TEST_RESPONSE_HEADER_TIMEOUT_MARKER: &str = "test_timeout_ms=1000";
 
 fn uses_controlled_test_response_header_timeout(token_endpoint: &str) -> bool {
     #[cfg(test)]
@@ -337,6 +351,7 @@ pub(super) fn is_invalid_grant_response(status: reqwest::StatusCode, body_text: 
         && oauth_error_code_matches(body_text.as_bytes(), "invalid_grant")
 }
 
+#[cfg(test)]
 fn oauth_error_code_matches(body: &[u8], expected: &str) -> bool {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -349,6 +364,7 @@ fn oauth_error_code_matches(body: &[u8], expected: &str) -> bool {
         .is_some_and(|code| code == expected)
 }
 
+#[cfg(test)]
 fn retry_after_duration(headers: &HeaderMap) -> Option<StdDuration> {
     let value = headers.get("retry-after")?.to_str().ok()?.trim();
     if value.is_empty() {
@@ -364,6 +380,7 @@ fn retry_after_duration(headers: &HeaderMap) -> Option<StdDuration> {
     Some(StdDuration::from_secs(seconds.max(1) as u64))
 }
 
+#[cfg(test)]
 fn request_error_kind(error: &reqwest::Error) -> RefreshFailureKind {
     if error.is_timeout() {
         RefreshFailureKind::Timeout
@@ -374,6 +391,7 @@ fn request_error_kind(error: &reqwest::Error) -> RefreshFailureKind {
     }
 }
 
+#[cfg(test)]
 fn refresh_failure_from_http_send(
     error: HttpSendError,
     default_stage: RefreshFailureStage,
@@ -415,6 +433,7 @@ fn refresh_failure_from_http_send(
     }
 }
 
+#[cfg(test)]
 async fn send_token_refresh_request(
     client: &reqwest::Client,
     request: reqwest::Request,
@@ -455,6 +474,7 @@ async fn send_token_refresh_request(
         })
 }
 
+#[cfg(test)]
 fn build_token_refresh_request(
     request: reqwest::RequestBuilder,
 ) -> Result<reqwest::Request, RefreshFailure> {
@@ -469,12 +489,14 @@ fn build_token_refresh_request(
     })
 }
 
+#[cfg(test)]
 struct TokenRefreshHttpResponse {
     status: reqwest::StatusCode,
     headers: HeaderMap,
     body: bytes::Bytes,
 }
 
+#[cfg(test)]
 async fn read_token_refresh_response(
     response: reqwest::Response,
 ) -> Result<TokenRefreshHttpResponse, RefreshFailure> {
@@ -491,7 +513,7 @@ async fn read_token_refresh_response(
         }));
     }
     #[cfg(test)]
-    if headers.contains_key("x-kiro-test-body-timeout") {
+    if headers.contains_key("x-account-runtime-test-body-timeout") {
         let body = tokio::time::timeout(
             StdDuration::from_millis(25),
             response_bytes_with_limit_and_body_timeout(
@@ -541,6 +563,7 @@ async fn read_token_refresh_response(
     })
 }
 
+#[cfg(test)]
 fn token_refresh_status_failure(response: &TokenRefreshHttpResponse) -> RefreshFailure {
     let status = response.status;
     let kind = if status == reqwest::StatusCode::BAD_REQUEST
@@ -570,6 +593,7 @@ fn token_refresh_status_failure(response: &TokenRefreshHttpResponse) -> RefreshF
     )
 }
 
+#[cfg(test)]
 fn decode_token_refresh_response<T: DeserializeOwned>(
     body: &[u8],
     access_token_field: &str,
@@ -626,6 +650,18 @@ pub(crate) async fn refresh_token(
     refresh_token_with_client(credentials, config, client, None).await
 }
 
+#[cfg(not(test))]
+pub(crate) async fn refresh_token_with_client(
+    credentials: &LocalUpstreamCredentials,
+    config: &Config,
+    client: Arc<reqwest::Client>,
+    admission: Option<RefreshSendAdmission>,
+) -> anyhow::Result<LocalUpstreamCredentials> {
+    let _ = (&credentials, &config, &client, &admission);
+    bail!("{}", LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE);
+}
+
+#[cfg(test)]
 pub(crate) async fn refresh_token_with_client(
     credentials: &LocalUpstreamCredentials,
     config: &Config,
@@ -675,6 +711,7 @@ pub(crate) async fn refresh_token_with_client(
 }
 
 /// 刷新 Social Token
+#[cfg(test)]
 async fn refresh_social_token(
     credentials: &LocalUpstreamCredentials,
     config: &Config,
@@ -687,8 +724,8 @@ async fn refresh_social_token(
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
 
-    let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
-    let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
+    let refresh_url = format!("https://auth.{}.example.com/refresh-token", region);
+    let refresh_domain = format!("auth.{}.example.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let local_upstream_client_version = &config.local_upstream_client_version;
 
@@ -702,7 +739,10 @@ async fn refresh_social_token(
         .header("Content-Type", "application/json")
         .header(
             "User-Agent",
-            format!("KiroIDE-{}-{}", local_upstream_client_version, machine_id),
+            format!(
+                "AccountRuntime-{}-{}",
+                local_upstream_client_version, machine_id
+            ),
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
@@ -738,6 +778,7 @@ async fn refresh_social_token(
 }
 
 /// 刷新外部 IdP Token（Microsoft Entra ID 等 OAuth v2 token endpoint）
+#[cfg(test)]
 async fn refresh_external_idp_token(
     credentials: &LocalUpstreamCredentials,
     config: &Config,
@@ -785,7 +826,7 @@ async fn refresh_external_idp_token(
         .header("Accept", "application/json")
         .header(
             "User-Agent",
-            format!("KiroIDE-{}", config.local_upstream_client_version),
+            format!("AccountRuntime-{}", config.local_upstream_client_version),
         )
         .header("Connection", "close")
         .form(&form);
@@ -824,7 +865,8 @@ async fn refresh_external_idp_token(
     Ok(new_credentials)
 }
 
-/// 刷新 IdC Token (AWS SSO OIDC)
+/// 刷新 IdC Token (OIDC)
+#[cfg(test)]
 async fn refresh_idc_token(
     credentials: &LocalUpstreamCredentials,
     config: &Config,
@@ -855,13 +897,13 @@ async fn refresh_idc_token(
 
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
-    let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
+    let refresh_url = format!("https://oidc.{}.example.com/token", region);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    let x_amz_user_agent = "aws-sdk-js/3.980.0 KiroIDE";
+    let x_client_user_agent = "account-runtime-js/3.980.0 AccountRuntime";
     let user_agent = format!(
-        "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
+        "account-runtime-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/token-service#3.980.0 m/E AccountRuntime",
         os_name, node_version
     );
 
@@ -875,11 +917,14 @@ async fn refresh_idc_token(
     let request = client
         .post(&refresh_url)
         .header("content-type", "application/json")
-        .header("x-amz-user-agent", x_amz_user_agent)
+        .header("x-account-runtime-user-agent", x_client_user_agent)
         .header("user-agent", &user_agent)
-        .header("host", format!("oidc.{}.amazonaws.com", region))
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=4")
+        .header("host", format!("oidc.{}.example.com", region))
+        .header(
+            "x-account-runtime-invocation-id",
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .header("x-account-runtime-request", "attempt=1; max=4")
         .header("Connection", "close")
         .json(&body);
     let request = build_token_refresh_request(request)?;
@@ -913,6 +958,18 @@ async fn refresh_idc_token(
 }
 
 /// 获取使用额度信息
+#[cfg(not(test))]
+pub(crate) async fn get_usage_limits(
+    credentials: &LocalUpstreamCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<UsageLimitsResponse> {
+    let _ = (&credentials, &config, &token, &proxy);
+    bail!("{}", LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE);
+}
+
+#[cfg(test)]
 pub(crate) async fn get_usage_limits(
     credentials: &LocalUpstreamCredentials,
     config: &Config,
@@ -921,9 +978,9 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > profileArn region > config.api_region > config.region
+    // 优先级：凭据.api_region > config.api_region > config.region
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let host = format!("usage.{}.example.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let local_upstream_client_version = &config.local_upstream_client_version;
     let os_name = &config.system_version;
@@ -943,7 +1000,7 @@ pub(crate) async fn get_usage_limits(
 
     if let Some(profile_arn) = resolve_profile_arn(credentials, config) {
         url.push_str(&format!(
-            "&profileArn={}",
+            "&accountArn={}",
             urlencoding::encode(&profile_arn)
         ));
     }
@@ -955,17 +1012,20 @@ pub(crate) async fn get_usage_limits(
         local_upstream_client_version,
         &machine_id,
     );
-    let amz_user_agent = usage_limits_amz_user_agent(local_upstream_client_version, &machine_id);
+    let amz_user_agent = usage_limits_client_user_agent(local_upstream_client_version, &machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     let mut request = client
         .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
+        .header("x-account-runtime-user-agent", &amz_user_agent)
         .header("user-agent", &user_agent)
         .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
+        .header(
+            "x-account-runtime-invocation-id",
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .header("x-account-runtime-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", token))
         .header("Connection", "close");
 
@@ -992,7 +1052,7 @@ pub(crate) async fn get_usage_limits(
             401 => "认证失败，Token 无效或已过期",
             403 => "权限不足，无法获取使用额度",
             429 => "请求过于频繁，已被限流",
-            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            500..=599 => "服务器错误，上游服务暂时不可用",
             _ => "获取使用额度失败",
         };
         bail!("{}: {}", error_msg, status);
@@ -1002,7 +1062,20 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
-/// 设置 Kiro/AWS Q Overages 开关。
+/// 设置账号 Overages 开关。
+#[cfg(not(test))]
+pub(crate) async fn set_overage_status(
+    credentials: &LocalUpstreamCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let _ = (&credentials, &config, &token, &proxy, enabled);
+    bail!("{}", LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE);
+}
+
+#[cfg(test)]
 pub(crate) async fn set_overage_status(
     credentials: &LocalUpstreamCredentials,
     config: &Config,
@@ -1011,14 +1084,14 @@ pub(crate) async fn set_overage_status(
     enabled: bool,
 ) -> anyhow::Result<()> {
     let region = credentials.effective_api_region(config);
-    let host = format!("q.{}.amazonaws.com", region);
+    let host = format!("usage.{}.example.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let local_upstream_client_version = &config.local_upstream_client_version;
     let os_name = &config.system_version;
     let node_version = &config.node_version;
     let status = if enabled { "ENABLED" } else { "DISABLED" };
     let profile_arn = resolve_profile_arn(credentials, config)
-        .ok_or_else(|| anyhow::anyhow!("当前凭据缺少可用于设置超额的 profileArn"))?;
+        .ok_or_else(|| anyhow::anyhow!("当前凭据缺少可用于设置超额的账号标识"))?;
 
     let url = configured_upstream_url(config, "setUserPreference")
         .unwrap_or_else(|| format!("https://{}/setUserPreference", host));
@@ -1028,12 +1101,12 @@ pub(crate) async fn set_overage_status(
         local_upstream_client_version,
         &machine_id,
     );
-    let amz_user_agent = usage_limits_amz_user_agent(local_upstream_client_version, &machine_id);
+    let amz_user_agent = usage_limits_client_user_agent(local_upstream_client_version, &machine_id);
     let payload = json!({
         "overageConfiguration": {
             "overageStatus": status,
         },
-        "profileArn": profile_arn,
+        "accountArn": profile_arn,
     });
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -1041,11 +1114,14 @@ pub(crate) async fn set_overage_status(
         .post(&url)
         .header("accept", "application/json")
         .header("content-type", "application/json")
-        .header("x-amz-user-agent", &amz_user_agent)
+        .header("x-account-runtime-user-agent", &amz_user_agent)
         .header("user-agent", &user_agent)
         .header("host", &host)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=1")
+        .header(
+            "x-account-runtime-invocation-id",
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .header("x-account-runtime-request", "attempt=1; max=1")
         .header("Authorization", format!("Bearer {}", token))
         .header("Connection", "close")
         .json(&payload);
@@ -1073,6 +1149,7 @@ pub(crate) async fn set_overage_status(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn usage_limits_user_agent(
     os_name: &str,
     node_version: &str,
@@ -1080,19 +1157,28 @@ pub(super) fn usage_limits_user_agent(
     machine_id: &str,
 ) -> String {
     format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        "account-runtime-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/token-service#1.0.0 m/N,E AccountRuntime-{}-{}",
         os_name, node_version, local_upstream_client_version, machine_id
     )
 }
 
-pub(super) fn usage_limits_amz_user_agent(
+#[cfg(test)]
+pub(super) fn usage_limits_client_user_agent(
     local_upstream_client_version: &str,
     machine_id: &str,
 ) -> String {
     format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
+        "account-runtime-js/1.0.0 AccountRuntime-{}-{}",
         local_upstream_client_version, machine_id
     )
+}
+
+#[cfg(test)]
+pub(super) fn usage_limits_amz_user_agent(
+    local_upstream_client_version: &str,
+    machine_id: &str,
+) -> String {
+    usage_limits_client_user_agent(local_upstream_client_version, machine_id)
 }
 
 #[cfg(test)]
@@ -1394,7 +1480,7 @@ mod tests {
                                 }
                             }
                             FakeOAuthScenario::BodyTimeout => {
-                                let partial = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Kiro-Test-Body-Timeout: 1\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{\"access_token\":";
+                                let partial = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Account-Runtime-Test-Body-Timeout: 1\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{\"access_token\":";
                                 let _ = socket.write_all(partial).await;
                                 let mut eof_probe = [0_u8; 1];
                                 tokio::select! {
@@ -1463,7 +1549,7 @@ mod tests {
                 }
             });
             let token_endpoint = if scenario == FakeOAuthScenario::Timeout {
-                format!("http://{address}/token?kiro_test_timeout_ms=1000")
+                format!("http://{address}/token?test_timeout_ms=1000")
             } else {
                 format!("http://{address}/token")
             };
@@ -1697,7 +1783,7 @@ mod tests {
             "access_token": "new-access-token",
             "refresh_token": "new-refresh-token",
             "expires_in": 3600,
-            "scope": "offline_access codewhisperer:conversations"
+            "scope": "offline_access account-runtime:conversations"
         }))
     }
 
@@ -1777,7 +1863,7 @@ mod tests {
 
         assert_eq!(usage.subscription_title(), Some("UPSTREAM TEST"));
         let (host, authorization, token_type, uri) = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(host, "q.ap-south-2.amazonaws.com");
+        assert_eq!(host, "usage.ap-south-2.example.com");
         assert_eq!(authorization, "Bearer ksk_fake_balance");
         assert_eq!(token_type, "API_KEY");
         assert_eq!(
@@ -1806,9 +1892,9 @@ mod tests {
             refresh_token: Some("r".repeat(150)),
             client_id: Some("client-123".to_string()),
             token_endpoint: Some(format!("http://{addr}/token")),
-            scopes: Some("offline_access codewhisperer:conversations".to_string()),
+            scopes: Some("offline_access account-runtime:conversations".to_string()),
             profile_arn: Some(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL".to_string(),
+                "arn:example:account-runtime:us-east-1:123456789012:profile/REAL".to_string(),
             ),
             ..Default::default()
         };
@@ -1826,7 +1912,7 @@ mod tests {
         );
         assert_eq!(
             refreshed.scopes.as_deref(),
-            Some("offline_access codewhisperer:conversations")
+            Some("offline_access account-runtime:conversations")
         );
         assert_eq!(refreshed.profile_arn, credentials.profile_arn);
         assert!(refreshed.expires_at.is_some());
@@ -1842,7 +1928,7 @@ mod tests {
         );
         assert_eq!(
             form.get("scope").map(String::as_str),
-            Some("offline_access codewhisperer:conversations")
+            Some("offline_access account-runtime:conversations")
         );
         assert!(!form.contains_key("client_secret"));
     }

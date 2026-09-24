@@ -13,7 +13,7 @@ const WRAPPER = path.join(REPO_ROOT, 'feature/tests/run-cargo-scoped.sh')
 const ROUNDS = 3
 
 function createFixture(label) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-build-lifecycle-${label}-`))
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `account-runtime-build-lifecycle-${label}-`))
   const targetRoot = path.join(root, 'targets')
   const stateDir = path.join(root, 'state')
   fs.mkdirSync(targetRoot)
@@ -24,14 +24,14 @@ function createFixture(label) {
     stateDir,
     env: {
       ...process.env,
-      KIRO_VALIDATION_TARGET_ROOT: targetRoot,
-      KIRO_VALIDATION_STATE_DIR: stateDir,
-      KIRO_VALIDATION_TEST_MODE: '1',
-      KIRO_VALIDATION_TEST_AVAILABLE_KIB: '1048576',
-      KIRO_VALIDATION_MIN_FREE_KIB: '1',
-      KIRO_VALIDATION_RESERVE_KIB: '1',
-      KIRO_VALIDATION_MAX_BUILD_KIB: '1024',
-      KIRO_VALIDATION_LOCK_TIMEOUT_SECS: '2',
+      ACCOUNT_RUNTIME_VALIDATION_TARGET_ROOT: targetRoot,
+      ACCOUNT_RUNTIME_VALIDATION_STATE_DIR: stateDir,
+      ACCOUNT_RUNTIME_VALIDATION_TEST_MODE: '1',
+      ACCOUNT_RUNTIME_VALIDATION_TEST_AVAILABLE_KIB: '1048576',
+      ACCOUNT_RUNTIME_VALIDATION_MIN_FREE_KIB: '1',
+      ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB: '1',
+      ACCOUNT_RUNTIME_VALIDATION_MAX_BUILD_KIB: '1024',
+      ACCOUNT_RUNTIME_VALIDATION_LOCK_TIMEOUT_SECS: '2',
     },
   }
 }

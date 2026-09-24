@@ -31,11 +31,11 @@ import {
   useSyncModelPricing,
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
-import { getAccounts, getCredentialList } from '@/api/credentials'
+import { getAccounts } from '@/api/credentials'
 import { formatDate, formatCompact, formatNumber, formatPercent, formatUsdCsv, formatUsdFixed2, ratio } from '@/lib/format'
 import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import type { CredentialListItem, ExternalPool, UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageRecordsQuery, UsageRouteKindFilter, UsageSource, UsageSeriesPoint } from '@/types/api'
+import type { ExternalPool, UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageRecordsQuery, UsageRouteKindFilter, UsageSource, UsageSeriesPoint } from '@/types/api'
 import {
   PageContainer,
   PageHeader,
@@ -94,11 +94,10 @@ const ROUTE_OPTION_LIMIT = 50
 const REQUEST_ID_PATTERN = /req_[A-Za-z0-9_-]+/
 const SLOW_FIRST_TOKEN_MS = 10_000
 
-type RouteSelectionValue = 'all' | `credential:${number}` | `account:${number}`
+type RouteSelectionValue = 'all' | `account:${number}`
 
 type ParsedRouteSelection =
   | { kind: 'all' }
-  | { kind: 'credential'; id: number }
   | { kind: 'account'; id: number }
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -127,7 +126,7 @@ function routeAccountLabel(record: UsageRecord, credentialLabel?: string): strin
     return `上游账号 #${accountId ?? '-'}${name}`
   }
   const label = credentialLabel ? ` ${credentialLabel}` : ''
-  return `账号 #${record.credentialId ?? '-'}${label}`
+  return `本地 #${record.credentialId ?? '-'}${label}`
 }
 
 function parseRouteSelection(value: RouteSelectionValue): ParsedRouteSelection {
@@ -135,24 +134,8 @@ function parseRouteSelection(value: RouteSelectionValue): ParsedRouteSelection {
   const [kind, rawId] = value.split(':')
   const id = Number(rawId)
   if (!Number.isFinite(id) || id <= 0) return { kind: 'all' }
-  if (kind === 'credential') return { kind: 'credential', id }
   if (kind === 'account') return { kind: 'account', id }
   return { kind: 'all' }
-}
-
-function credentialOptionLabel(credential: CredentialListItem): string {
-  const identity = credential.email || credential.maskedApiKey || credential.refreshTokenHash || credential.apiKeyHash || '未命名账号'
-  return `账号 #${credential.id} ${identity}`
-}
-
-function credentialOptionMeta(credential: CredentialListItem): string {
-  const parts = [
-    credential.subscriptionTitle,
-    credential.provider,
-    credential.effectiveApiRegion ? `api ${credential.effectiveApiRegion}` : undefined,
-    credential.disabled ? '已禁用' : undefined,
-  ].filter(Boolean)
-  return parts.join(' · ')
 }
 
 function accountOptionLabel(pool: ExternalPool): string {
@@ -164,14 +147,13 @@ function accountOptionMeta(pool: ExternalPool): string {
 }
 
 function routeSelectionAllLabel(routeKind: UsageRouteKindFilter | '__all__'): string {
-  if (routeKind === 'local_credential') return '全部本地账号'
+  if (routeKind === 'local_credential') return '全部本地'
   if (routeKind === 'account' || routeKind === 'external_pool') return '全部上游账号'
   return '全部账号'
 }
 
 function routeSelectionFallbackLabel(value: RouteSelectionValue, routeKind: UsageRouteKindFilter | '__all__'): string {
   const parsed = parseRouteSelection(value)
-  if (parsed.kind === 'credential') return `账号 #${parsed.id}`
   if (parsed.kind === 'account') return `上游账号 #${parsed.id}`
   return routeSelectionAllLabel(routeKind)
 }
@@ -275,7 +257,7 @@ function usageRecordsToCsv(records: UsageRecord[]): string {
     record.cacheCreationInputTokens,
     formatUsdCsv(record.estimatedCostUsd),
     formatUsdCsv(record.originalCostUsd),
-    record.upstreamMeteringUnits ?? record.kiroMeteringUsage,
+    record.upstreamMeteringUnits ?? record.upstreamMeteringUnits,
     record.pricingModel,
     record.durationMs,
     record.firstTokenLatencyMs,
@@ -327,19 +309,7 @@ function RouteTargetSelect({
   const [search, setSearch] = useState('')
   const debouncedSearch = useDebouncedValue(search, 250)
   const searchText = debouncedSearch.trim()
-  const showCredentials = routeKind !== 'account' && routeKind !== 'external_pool'
   const showExternalPools = routeKind !== 'local_credential'
-
-  const credentials = useQuery({
-    queryKey: ['usage-route-target-credentials', searchText],
-    queryFn: () => getCredentialList({
-      page: 1,
-      limit: ROUTE_OPTION_LIMIT,
-      q: searchText || undefined,
-    }),
-    enabled: open && showCredentials,
-    staleTime: 30_000,
-  })
 
   const accounts = useQuery({
     queryKey: ['usage-route-target-accounts'],
@@ -368,25 +338,19 @@ function RouteTargetSelect({
 
   const selectedLabel = useMemo(() => {
     const parsed = parseRouteSelection(value)
-    if (parsed.kind === 'credential') {
-      const credential = credentials.data?.items.find((item) => item.id === parsed.id)
-      return credential ? credentialOptionLabel(credential) : routeSelectionFallbackLabel(value, routeKind)
-    }
     if (parsed.kind === 'account') {
       const account = accounts.data?.accounts.find((item) => item.id === parsed.id)
       return account ? accountOptionLabel(account) : routeSelectionFallbackLabel(value, routeKind)
     }
     return routeSelectionAllLabel(routeKind)
-  }, [accounts.data?.accounts, credentials.data?.items, routeKind, value])
+  }, [accounts.data?.accounts, routeKind, value])
 
   const selectValue = (next: RouteSelectionValue) => {
     onChange(next)
     setOpen(false)
   }
 
-  const credentialsLoading = showCredentials && credentials.isFetching
   const accountsLoading = showExternalPools && accounts.isFetching
-  const hasCredentialItems = (credentials.data?.items.length ?? 0) > 0
   const hasAccountItems = filteredAccounts.length > 0
 
   return (
@@ -419,42 +383,6 @@ function RouteTargetSelect({
             <span>{routeSelectionAllLabel(routeKind)}</span>
             {value === 'all' && <Check className="h-3.5 w-3.5" />}
           </button>
-
-          {showCredentials && (
-            <div className="mt-1">
-              <div className="px-2 py-1 text-[0.65rem] font-medium text-muted-foreground">本地账号</div>
-              {credentialsLoading && (
-                <div className="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
-                  <Spinner size="sm" />加载账号...
-                </div>
-              )}
-              {!credentialsLoading && !hasCredentialItems && (
-                <div className="px-2 py-2 text-xs text-muted-foreground">没有匹配账号</div>
-              )}
-              {(credentials.data?.items ?? []).map((credential) => {
-                const itemValue = `credential:${credential.id}` as RouteSelectionValue
-                return (
-                  <button
-                    key={itemValue}
-                    type="button"
-                    className={cn(
-                      'flex w-full items-start justify-between gap-2 rounded-md px-2 py-2 text-left hover:bg-muted',
-                      value === itemValue && 'bg-muted text-primary'
-                    )}
-                    onClick={() => selectValue(itemValue)}
-                  >
-                    <span className="min-w-0">
-                      <span className="block truncate text-xs font-medium">{credentialOptionLabel(credential)}</span>
-                      <span className="block truncate text-[0.65rem] text-muted-foreground">
-                        {credentialOptionMeta(credential) || credential.endpoint}
-                      </span>
-                    </span>
-                    {value === itemValue && <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
-                  </button>
-                )
-              })}
-            </div>
-          )}
 
           {showExternalPools && (
             <div className="mt-1">
@@ -630,7 +558,6 @@ function RecordsView({
     if (endpointD.trim()) next.endpoint = endpointD.trim()
     if (conversationIdD.trim()) next.conversationId = conversationIdD.trim()
     if (routeKind !== '__all__') next.routeKind = routeKind
-    if (selectedRouteTarget.kind === 'credential') next.credentialId = selectedRouteTarget.id
     if (selectedRouteTarget.kind === 'account') next.accountId = selectedRouteTarget.id
     if (status !== '__all__') next.status = status
     if (source !== '__all__') next.source = source
@@ -684,9 +611,6 @@ function RecordsView({
   }
 
   const updateRouteKind = (value: UsageRouteKindFilter | '__all__') => {
-    const selected = parseRouteSelection(routeSelection)
-    if (value === 'local_credential' && selected.kind === 'account') setRouteSelection('all')
-    if ((value === 'account' || value === 'external_pool') && selected.kind === 'credential') setRouteSelection('all')
     setRouteKind(value)
     setPage(1)
   }
@@ -694,7 +618,6 @@ function RecordsView({
   const updateRouteSelection = (value: RouteSelectionValue) => {
     setRouteSelection(value)
     const selected = parseRouteSelection(value)
-    if (selected.kind === 'credential') setRouteKind('local_credential')
     if (selected.kind === 'account') setRouteKind('account')
     setPage(1)
   }
@@ -797,7 +720,7 @@ function RecordsView({
                   <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__all__">全部路由</SelectItem>
-                    <SelectItem value="local_credential">本地账号</SelectItem>
+                    <SelectItem value="local_credential">本地</SelectItem>
                     <SelectItem value="account">上游账号</SelectItem>
                   </SelectContent>
                 </Select>

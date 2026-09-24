@@ -2,7 +2,7 @@
 
 ## Current Facts
 
-- Local Kiro API retry is handled by `KiroProvider::call_api_with_retry` in `src/kiro/provider.rs`.
+- Local Account Runtime API retry is handled by `Account RuntimeProvider::call_api_with_retry` in `src/local_upstream_impl/provider.rs`.
 - The retry loop already tracks `excluded_ids`, and `acquire_context_for_session_with_mode` receives that exclusion set.
 - 400 responses are classified by `classify_bad_request_reason`.
 - Current classes include `assistant_prefill_bad_request`, `profile_arn_bad_request`, `tool_use_format_bad_request`, `malformed_request`, and `bad_request`.

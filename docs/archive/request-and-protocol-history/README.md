@@ -1,6 +1,6 @@
 # Request And Protocol History Archive
 
-Role: Historical archive for request conversion, Claude/Kiro protocol compatibility, malformed payload, image, thinking/tool-signature, and local test-runbook analysis
+Role: Historical archive for request conversion, Claude/Account Runtime protocol compatibility, malformed payload, image, thinking/tool-signature, and local test-runbook analysis
 
 Status: Archived on 2026-07-28
 
@@ -15,17 +15,17 @@ Current authority: current source, [Rust Runtime Scheduler Stabilization](../../
 | Original path | Archived file |
 | --- | --- |
 | `docs/anthropic-tools-signature-compatibility-analysis.md` | [anthropic-tools-signature-compatibility-analysis.md](anthropic-tools-signature-compatibility-analysis.md) |
-| `docs/claude-code-kiro-dialogue-disconnect-investigation-20260630.md` | [claude-code-kiro-dialogue-disconnect-investigation-20260630.md](claude-code-kiro-dialogue-disconnect-investigation-20260630.md) |
-| `docs/claude-code-kiro-dialogue-observability-and-optimization-plan-20260630.md` | [claude-code-kiro-dialogue-observability-and-optimization-plan-20260630.md](claude-code-kiro-dialogue-observability-and-optimization-plan-20260630.md) |
-| `docs/kiro-400-improperly-formed-request-analysis.md` | [kiro-400-improperly-formed-request-analysis.md](kiro-400-improperly-formed-request-analysis.md) |
-| `docs/kiro-cli-capture-protocol-completeness-analysis-20260702.md` | [kiro-cli-capture-protocol-completeness-analysis-20260702.md](kiro-cli-capture-protocol-completeness-analysis-20260702.md) |
-| `docs/kiro-compatible-image-passthrough-analysis-20260705.md` | [kiro-compatible-image-passthrough-analysis-20260705.md](kiro-compatible-image-passthrough-analysis-20260705.md) |
-| `docs/kiro-context-window-payload-threshold-full-analysis.md` | [kiro-context-window-payload-threshold-full-analysis.md](kiro-context-window-payload-threshold-full-analysis.md) |
-| `docs/kiro-official-image-5mb-multimage-investigation-20260702.md` | [kiro-official-image-5mb-multimage-investigation-20260702.md](kiro-official-image-5mb-multimage-investigation-20260702.md) |
-| `docs/kiro-protocol-local-before-after-test-runbook.md` | [kiro-protocol-local-before-after-test-runbook.md](kiro-protocol-local-before-after-test-runbook.md) |
-| `docs/kiro-small-payload-improperly-formed-fix-plan.md` | [kiro-small-payload-improperly-formed-fix-plan.md](kiro-small-payload-improperly-formed-fix-plan.md) |
-| `docs/kiro-upstream-protocol-refactor-analysis-and-test-plan.md` | [kiro-upstream-protocol-refactor-analysis-and-test-plan.md](kiro-upstream-protocol-refactor-analysis-and-test-plan.md) |
-| `docs/kiro-upstream-real-protocol-malformed-and-context-20260617.md` | [kiro-upstream-real-protocol-malformed-and-context-20260617.md](kiro-upstream-real-protocol-malformed-and-context-20260617.md) |
+| `docs/claude-code-account-runtime-dialogue-disconnect-investigation-20260630.md` | [claude-code-account-runtime-dialogue-disconnect-investigation-20260630.md](claude-code-account-runtime-dialogue-disconnect-investigation-20260630.md) |
+| `docs/claude-code-account-runtime-dialogue-observability-and-optimization-plan-20260630.md` | [claude-code-account-runtime-dialogue-observability-and-optimization-plan-20260630.md](claude-code-account-runtime-dialogue-observability-and-optimization-plan-20260630.md) |
+| `docs/account-runtime-400-improperly-formed-request-analysis.md` | [account-runtime-400-improperly-formed-request-analysis.md](account-runtime-400-improperly-formed-request-analysis.md) |
+| `docs/account-runtime-cli-capture-protocol-completeness-analysis-20260702.md` | [account-runtime-cli-capture-protocol-completeness-analysis-20260702.md](account-runtime-cli-capture-protocol-completeness-analysis-20260702.md) |
+| `docs/account-runtime-compatible-image-passthrough-analysis-20260705.md` | [account-runtime-compatible-image-passthrough-analysis-20260705.md](account-runtime-compatible-image-passthrough-analysis-20260705.md) |
+| `docs/account-runtime-context-window-payload-threshold-full-analysis.md` | [account-runtime-context-window-payload-threshold-full-analysis.md](account-runtime-context-window-payload-threshold-full-analysis.md) |
+| `docs/account-runtime-official-image-5mb-multimage-investigation-20260702.md` | [account-runtime-official-image-5mb-multimage-investigation-20260702.md](account-runtime-official-image-5mb-multimage-investigation-20260702.md) |
+| `docs/account-runtime-protocol-local-before-after-test-runbook.md` | [account-runtime-protocol-local-before-after-test-runbook.md](account-runtime-protocol-local-before-after-test-runbook.md) |
+| `docs/account-runtime-small-payload-improperly-formed-fix-plan.md` | [account-runtime-small-payload-improperly-formed-fix-plan.md](account-runtime-small-payload-improperly-formed-fix-plan.md) |
+| `docs/account-runtime-upstream-protocol-refactor-analysis-and-test-plan.md` | [account-runtime-upstream-protocol-refactor-analysis-and-test-plan.md](account-runtime-upstream-protocol-refactor-analysis-and-test-plan.md) |
+| `docs/account-runtime-upstream-real-protocol-malformed-and-context-20260617.md` | [account-runtime-upstream-real-protocol-malformed-and-context-20260617.md](account-runtime-upstream-real-protocol-malformed-and-context-20260617.md) |
 | `docs/request-entry-errors-and-missing-max-tokens.md` | [request-entry-errors-and-missing-max-tokens.md](request-entry-errors-and-missing-max-tokens.md) |
 
 ## Current Interpretation

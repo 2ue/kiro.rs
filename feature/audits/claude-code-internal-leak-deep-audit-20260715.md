@@ -7,10 +7,10 @@
 ## 1. 安全边界与测试环境
 
 - 未访问、停止或重启现有 `127.0.0.1:9022` 服务。
-- 未读取或修改五个 `kiro_idc_users*.txt` 文件。
-- 未使用真实凭据做负载；上游全部为本地 fake Kiro 或 fake Anthropic server。
+- 未读取或修改五个 `account-runtime_idc_users*.txt` 文件。
+- 未使用真实凭据做负载；上游全部为本地 fake Account Runtime 或 fake Anthropic server。
 - 隔离代理：`127.0.0.1:49022`。
-- fake Kiro：`127.0.0.1:49080`。
+- fake Account Runtime：`127.0.0.1:49080`。
 - fake external Anthropic：`127.0.0.1:49180`。
 - 隔离 PostgreSQL：`127.0.0.1:45432`。
 - 隔离 Redis：`127.0.0.1:46379`。
@@ -40,7 +40,7 @@
 4. `Hashxxxxxxxx` 只是其中一种容易识别的工具名；无 hash 的 `[previous output]`、`[trimmed output]`、`[duplicate output]` 同样会泄漏内部工具内容。
 5. v0.0.108 的默认 task prompt 持续注入 `readHash/editHash/bashHash` 字面 token，增加了回显这些指纹的概率；已有持久化配置没有 migration，会在升级后继续注入旧 prompt。
 
-工具短名 hash 不是 v0.0.95 后才引入，但需要区分两次变化：`551b91f`（2026-03-31）首次引入“截断前缀 + `_` + 8 位 SHA-256”的可逆短名；`df60bef`（2026-05-29）才把格式改成当前项目特有的“截断前缀 + `Hash` + 8 位 SHA-256”，并扩大到包含分隔符等不符合 Kiro 约束的名称。Git ancestry 与 tag 内容复核表明 `v0.0.94`、`v0.0.95` 均已包含当前 `Hash` marker。因此 95 之后频率上升不能解释为 hash 映射首次出现，更接近占位文本、prompt steering、历史处理和重试链路后续变化的叠加结果。
+工具短名 hash 不是 v0.0.95 后才引入，但需要区分两次变化：`551b91f`（2026-03-31）首次引入“截断前缀 + `_` + 8 位 SHA-256”的可逆短名；`df60bef`（2026-05-29）才把格式改成当前项目特有的“截断前缀 + `Hash` + 8 位 SHA-256”，并扩大到包含分隔符等不符合 Account Runtime 约束的名称。Git ancestry 与 tag 内容复核表明 `v0.0.94`、`v0.0.95` 均已包含当前 `Hash` marker。因此 95 之后频率上升不能解释为 hash 映射首次出现，更接近占位文本、prompt steering、历史处理和重试链路后续变化的叠加结果。
 
 ## 3. 阻断级问题
 

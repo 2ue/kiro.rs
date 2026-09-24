@@ -4,7 +4,7 @@
 
 - Service URL: `http://127.0.0.1:9022`
 - Admin UI: `http://127.0.0.1:9020/admin`
-- Observed process: `target/debug/kiro-rs`
+- Observed process: `target/debug/account-runtime`
 - Active local config: `config.json`
 
 ## Current Cache Mode
@@ -104,7 +104,7 @@ If no valid UUID can be extracted, the converter generates a random conversation
 Admin balance caching is separate from prompt-cache usage simulation.
 
 - TTL: `300` seconds.
-- Persisted in Redis with the service key prefix; the old `kiro_balance_cache.json` file is no longer used by the service runtime.
+- Persisted in Redis with the service key prefix; the old `account-runtime_balance_cache.json` file is no longer used by the service runtime.
 - Invalidated by credential disable/enable, priority changes, failure reset, credential add/delete, and token refresh.
 
 ## Static / Client Caches

@@ -67,8 +67,8 @@ pub struct UsageBreakdown {
     #[serde(default)]
     pub bonuses: Vec<Bonus>,
 
-    /// Trial credit details from legacy usage-limit payloads.
-    #[serde(default, alias = "freeTrialInfo")]
+    /// Trial credit details from usage-limit payloads.
+    #[serde(default)]
     pub trial_credit_info: Option<TrialCreditInfo>,
 
     /// 下次重置日期 (Unix 时间戳)
@@ -123,7 +123,7 @@ impl Bonus {
     }
 }
 
-/// Trial credit details from legacy usage-limit payloads.
+/// Trial credit details from usage-limit payloads.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -137,11 +137,11 @@ pub struct TrialCreditInfo {
     pub current_usage_with_precision: f64,
 
     /// 过期时间 (Unix 时间戳)
-    #[serde(default, alias = "freeTrialExpiry")]
+    #[serde(default)]
     pub trial_expiry: Option<f64>,
 
     /// 状态 (ACTIVE / EXPIRED)
-    #[serde(default, alias = "freeTrialStatus")]
+    #[serde(default)]
     pub trial_status: Option<String>,
 
     /// 使用限额
@@ -335,15 +335,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_trial_credit_fields_are_read_as_neutral_usage_credit() {
+    fn trial_credit_fields_are_read_as_neutral_usage_credit() {
         let raw = r#"{
             "usageBreakdownList": [{
                 "currentUsageWithPrecision": 10.0,
                 "usageLimitWithPrecision": 100.0,
-                "freeTrialInfo": {
+                "trialCreditInfo": {
                     "currentUsageWithPrecision": 2.5,
                     "usageLimitWithPrecision": 25.0,
-                    "freeTrialStatus": "ACTIVE"
+                    "trialStatus": "ACTIVE"
                 }
             }]
         }"#;

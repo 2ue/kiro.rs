@@ -13,9 +13,9 @@ Related: [Business context](business-context.md), [Module map](module-map.md), [
 flowchart LR
     Client[Claude Code / Anthropic-compatible client]
     Operator[Single operator]
-    Gateway[kiro-rs Axum process]
+    Gateway[account-runtime Axum process]
     Admin[Embedded Admin UIs and Admin API]
-    Kiro[Kiro IDE / CLI upstream]
+    Account Runtime[Account Runtime IDE / CLI upstream]
     External[External compatible pools]
     PG[(PgSQL)]
     Redis[(Redis)]
@@ -24,14 +24,14 @@ flowchart LR
     Client -->|Messages, Models, Files, count_tokens| Gateway
     Operator --> Admin
     Admin --> Gateway
-    Gateway -->|translated requests| Kiro
+    Gateway -->|translated requests| Account Runtime
     Gateway -->|raw or normalized requests| External
     Gateway -->|durable config, credentials, usage, audit| PG
     Gateway -->|leases, sticky state, cooldown, derived cache| Redis
     Gateway -->|bootstrap, bounded file staging, diagnostics| FS
 ```
 
-The diagram has one operator trust domain. Client API keys do not create separate users. Kiro, external pools, PgSQL, Redis, remote URLs, and the filesystem remain separate operational or security boundaries.
+The diagram has one operator trust domain. Client API keys do not create separate users. Account Runtime, external pools, PgSQL, Redis, remote URLs, and the filesystem remain separate operational or security boundaries.
 
 ## Runtime Composition
 
@@ -42,7 +42,7 @@ The diagram has one operator trust domain. Client API keys do not create separat
 3. connect to mandatory PgSQL and Redis dependencies with bounded startup retry;
 4. bootstrap runtime configuration and credentials into PgSQL when absent;
 5. load runtime configuration, credentials, runtime state, model capabilities, and pricing;
-6. construct `MultiTokenManager`, `KiroProvider`, `ExternalPoolManager`, `UsageRecorder`, caches, catalogs, and request-key state;
+6. construct `MultiTokenManager`, `Account RuntimeProvider`, `ExternalPoolManager`, `UsageRecorder`, caches, catalogs, and request-key state;
 7. spawn runtime-event, statistics, catalog, and storage/usage background work;
 8. mount Anthropic, Admin, UI, health, and readiness routes;
 9. serve until termination, then drain selected background components.
@@ -63,10 +63,10 @@ Important construction evidence:
 | HTTP composition | `src/main.rs`, `src/anthropic/router.rs`, `src/admin/router.rs` | Route mounting, middleware, dependency construction, lifecycle |
 | Request application state | `src/anthropic/middleware.rs::AppState` | Request keys, provider, cache policy, conversion flags, catalogs, file store, usage, external manager |
 | Messages orchestration | `src/anthropic/handlers.rs` and `handlers/*` | Parse, policy resolution, local/external routing, retry, stream/non-stream response, usage |
-| Request conversion | `src/anthropic/converter.rs` and `converter/*` | Anthropic-to-Kiro body conversion, tools, thinking, schema, content, history |
+| Request conversion | `src/anthropic/converter.rs` and `converter/*` | Anthropic-to-Account Runtime body conversion, tools, thinking, schema, content, history |
 | Body/resource processing | `src/anthropic/body_processing.rs`, `payload_guard*.rs` | Remote/file materialization, media normalization, shaping, size guard |
-| Local credential scheduling | `src/kiro/token_manager/manager.rs` and submodules | Eligibility, priority/balancing, sticky sessions, RPM, cooldown, concurrency, refresh, persistence |
-| Kiro transport | `src/kiro/provider.rs`, `src/kiro/endpoint/*`, `src/kiro/parser/*` | Endpoint-specific envelopes, HTTP, retries, streaming parser, completion reporting |
+| Local credential scheduling | `src/local_upstream_impl/token_manager/manager.rs` and submodules | Eligibility, priority/balancing, sticky sessions, RPM, cooldown, concurrency, refresh, persistence |
+| Account Runtime transport | `src/local_upstream_impl/provider.rs`, `src/local_upstream_impl/endpoint/*`, `src/local_upstream_impl/parser/*` | Endpoint-specific envelopes, HTTP, retries, streaming parser, completion reporting |
 | External routing | `src/external_pool.rs` and `external_pool/*` | Pool selection, body mode, leases, transport, failover, usage projection |
 | Cache policy | `src/anthropic/prompt_cache.rs`, `prompt_cache_creation_control.rs`, config policy types | Prefix tracking, bounds, creation frequency, reported cache usage |
 | Usage and cost | `src/anthropic/usage.rs`, pricing/model catalogs | In-memory recent records, async writers, dashboards, pricing, diagnostics |
@@ -80,10 +80,10 @@ Important construction evidence:
 
 The minimum supported server deployment is:
 
-- one `kiro-rs` process;
+- one `account-runtime` process;
 - one reachable PgSQL database;
 - one reachable Redis instance;
-- network access to Kiro and any configured external/remote-content upstreams.
+- network access to Account Runtime and any configured external/remote-content upstreams.
 
 The code also contains cross-process Redis leases, sticky bindings, refresh locks, runtime events, and PgSQL compare-and-swap mechanisms for selected credential state. These mechanisms show multi-replica intent, but the formal supported-production-mode decision remains open. Any replicas still serve the same single-user product.
 
@@ -94,7 +94,7 @@ The current Compose deployment mounts `./config` and `./logs`, publishes the app
 | Data | Durable authority | Coordination or derived state | Process-local copy |
 | --- | --- | --- | --- |
 | Runtime configuration | PgSQL `runtime_config` | Redis change notification | `Config` clones in token manager, app state, request state |
-| Kiro credentials | PgSQL `credentials` | Redis refresh locks, leases, sticky/cooldown state | `CredentialEntry` collection |
+| Account Runtime credentials | PgSQL `credentials` | Redis refresh locks, leases, sticky/cooldown state | `CredentialEntry` collection |
 | Credential runtime state | PgSQL runtime/mutation tables | Redis capacity and transient state | token-manager entries and pending mutations |
 | External pool definitions | PgSQL | Redis leases, cooldown, availability hints | manager availability cache |
 | Usage records and rollups | PgSQL | Redis realtime summaries/cache | bounded recent-record deque |
@@ -123,7 +123,7 @@ Large files are therefore a symptom of wide responsibility and dependency direct
 
 - Anthropic-compatible HTTP and SSE contract;
 - Claude Code-specific behavior on `/cc/v1`;
-- Kiro IDE/CLI request and event protocols;
+- Account Runtime IDE/CLI request and event protocols;
 - external pool raw/normalized HTTP behavior;
 - PgSQL durable schema and Redis key/lease semantics;
 - Admin API and both maintained UI contracts.

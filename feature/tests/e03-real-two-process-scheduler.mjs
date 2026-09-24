@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /*
- * E03: two real kiro.rs processes sharing one PostgreSQL authority and one
+ * E03: two real account runtime processes sharing one PostgreSQL authority and one
  * Redis scheduler namespace. This runner never invokes Docker or Cargo. The
  * caller must provide a frozen candidate binary plus pre-created, empty
  * caller-owned PostgreSQL databases on the already-running project's isolated
@@ -23,13 +23,13 @@ import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
-const POSTGRES_URL_TEMPLATE = requiredEnvironment('KIRO_E03_POSTGRES_URL_TEMPLATE')
-const REDIS_URL = requiredEnvironment('KIRO_E03_REDIS_URL')
-const REDIS_PREFIX = requiredEnvironment('KIRO_E03_REDIS_PREFIX')
-const OUTER_ROUNDS = boundedInteger('KIRO_E03_OUTER_ROUNDS', 1, 1, 3)
-const VALIDATE_ONLY = process.env.KIRO_E03_VALIDATE_ONLY === '1'
-const CONTRACT_HOLD = process.env.KIRO_E03_CONTRACT_HOLD === '1'
-const POSTGRES_DATABASES = String(process.env.KIRO_E03_POSTGRES_DATABASES || '')
+const POSTGRES_URL_TEMPLATE = requiredEnvironment('ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE')
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_E03_REDIS_URL')
+const REDIS_PREFIX = requiredEnvironment('ACCOUNT_RUNTIME_E03_REDIS_PREFIX')
+const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_E03_OUTER_ROUNDS', 1, 1, 3)
+const VALIDATE_ONLY = process.env.ACCOUNT_RUNTIME_E03_VALIDATE_ONLY === '1'
+const CONTRACT_HOLD = process.env.ACCOUNT_RUNTIME_E03_CONTRACT_HOLD === '1'
+const POSTGRES_DATABASES = String(process.env.ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean)
@@ -49,16 +49,16 @@ let services = []
 let signalHandling = false
 
 function optionalReadyFile() {
-  const value = String(process.env.KIRO_E03_READY_FILE || '').trim()
+  const value = String(process.env.ACCOUNT_RUNTIME_E03_READY_FILE || '').trim()
   if (!value) return null
-  if (!path.isAbsolute(value)) throw new Error('KIRO_E03_READY_FILE must be an absolute path')
+  if (!path.isAbsolute(value)) throw new Error('ACCOUNT_RUNTIME_E03_READY_FILE must be an absolute path')
   const parent = path.dirname(value)
-  if (!fs.existsSync(parent)) throw new Error('KIRO_E03_READY_FILE parent must exist')
+  if (!fs.existsSync(parent)) throw new Error('ACCOUNT_RUNTIME_E03_READY_FILE parent must exist')
   const parentReal = fs.realpathSync(parent)
   if (parentReal === ROOT || parentReal.startsWith(`${ROOT}${path.sep}`)) {
-    throw new Error('KIRO_E03_READY_FILE must be outside the repository')
+    throw new Error('ACCOUNT_RUNTIME_E03_READY_FILE must be outside the repository')
   }
-  if (fs.existsSync(value)) throw new Error('KIRO_E03_READY_FILE must not already exist')
+  if (fs.existsSync(value)) throw new Error('ACCOUNT_RUNTIME_E03_READY_FILE must not already exist')
   return value
 }
 
@@ -94,48 +94,48 @@ function redact(value) {
 
 function validateInputs() {
   if (!POSTGRES_URL_TEMPLATE.includes('{database}')) {
-    throw new Error('KIRO_E03_POSTGRES_URL_TEMPLATE must contain the literal {database} placeholder')
+    throw new Error('ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE must contain the literal {database} placeholder')
   }
   if ((POSTGRES_URL_TEMPLATE.match(/\{database\}/g) || []).length !== 1) {
-    throw new Error('KIRO_E03_POSTGRES_URL_TEMPLATE must contain exactly one {database} placeholder')
+    throw new Error('ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE must contain exactly one {database} placeholder')
   }
-  const postgres = new URL(POSTGRES_URL_TEMPLATE.replace('{database}', 'kiro_e03_validation'))
+  const postgres = new URL(POSTGRES_URL_TEMPLATE.replace('{database}', 'account_runtime_e03_validation'))
   if (!['postgres:', 'postgresql:'].includes(postgres.protocol)) {
-    throw new Error('KIRO_E03_POSTGRES_URL_TEMPLATE must use PostgreSQL')
+    throw new Error('ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE must use PostgreSQL')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(postgres.hostname)) {
-    throw new Error('KIRO_E03_POSTGRES_URL_TEMPLATE must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE must target loopback')
   }
   if (Number(postgres.port || 5432) === 9022) throw new Error('port 9022 is protected')
   if (!VALIDATE_ONLY) {
     if (POSTGRES_DATABASES.length !== OUTER_ROUNDS) {
-      throw new Error(`KIRO_E03_POSTGRES_DATABASES must contain exactly ${OUTER_ROUNDS} pre-created database names`)
+      throw new Error(`ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES must contain exactly ${OUTER_ROUNDS} pre-created database names`)
     }
     for (const database of POSTGRES_DATABASES) {
-      if (!/^kiro_e03_[a-z0-9_]{3,80}$/.test(database)) {
-        throw new Error('KIRO_E03_POSTGRES_DATABASES must contain caller-owned kiro_e03_* names')
+      if (!/^account_runtime_e03_[a-z0-9_]{3,80}$/.test(database)) {
+        throw new Error('ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES must contain caller-owned account_runtime_e03_* names')
       }
     }
   }
   const redis = new URL(REDIS_URL)
-  if (redis.protocol !== 'redis:') throw new Error('KIRO_E03_REDIS_URL must use redis://')
+  if (redis.protocol !== 'redis:') throw new Error('ACCOUNT_RUNTIME_E03_REDIS_URL must use redis://')
   if (!['127.0.0.1', 'localhost', '::1'].includes(redis.hostname)) {
-    throw new Error('KIRO_E03_REDIS_URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_E03_REDIS_URL must target loopback')
   }
-  if (redis.search || redis.hash) throw new Error('KIRO_E03_REDIS_URL must not contain query or fragment data')
+  if (redis.search || redis.hash) throw new Error('ACCOUNT_RUNTIME_E03_REDIS_URL must not contain query or fragment data')
   const dbText = redis.pathname.replace(/^\//, '')
-  if (!/^\d+$/.test(dbText)) throw new Error('KIRO_E03_REDIS_URL must name a Redis database')
+  if (!/^\d+$/.test(dbText)) throw new Error('ACCOUNT_RUNTIME_E03_REDIS_URL must name a Redis database')
   const database = Number(dbText)
   if (!Number.isSafeInteger(database) || database < 1 || database > 15) {
-    throw new Error('KIRO_E03_REDIS_URL must use an isolated nonzero database in 1..15')
+    throw new Error('ACCOUNT_RUNTIME_E03_REDIS_URL must use an isolated nonzero database in 1..15')
   }
   const port = Number(redis.port || 6379)
   if (port === 9022) throw new Error('port 9022 is protected')
-  if (REDIS_PREFIX.includes('kiro_rs:local')) {
-    throw new Error('KIRO_E03_REDIS_PREFIX must be a caller-owned temporary prefix')
+  if (REDIS_PREFIX.includes('account_runtime:local')) {
+    throw new Error('ACCOUNT_RUNTIME_E03_REDIS_PREFIX must be a caller-owned temporary prefix')
   }
   if (!/^[a-z0-9][a-z0-9:._-]{7,95}$/.test(REDIS_PREFIX)) {
-    throw new Error('KIRO_E03_REDIS_PREFIX has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_E03_REDIS_PREFIX has an invalid format')
   }
   return { postgres, redis, database, redisPort: port }
 }
@@ -276,7 +276,7 @@ async function waitFor(predicate, description, timeoutMs = 30_000, intervalMs = 
 }
 
 function traceStep(label, details = {}) {
-  if (process.env.KIRO_E03_TRACE_STEPS !== '1') return
+  if (process.env.ACCOUNT_RUNTIME_E03_TRACE_STEPS !== '1') return
   process.stderr.write(`${JSON.stringify({
     trace: 'e03',
     at: new Date().toISOString(),
@@ -438,7 +438,7 @@ function createFakeUpstreams() {
   const local = http.createServer(async (request, response) => {
     const raw = await readBody(request)
     const marker = raw.match(/E03-[A-Za-z0-9_-]+/)?.[0] || 'E03-unknown'
-    const target = String(request.headers['x-amz-target'] || '')
+    const target = String(request.headers['x-account-runtime-target'] || '')
     const url = new URL(request.url || '/', 'http://127.0.0.1')
     if (target.endsWith('.ListAvailableModels') || url.pathname.endsWith('/ListAvailableModels')) {
       writeJson(response, 200, modelDiscoveryResponse())
@@ -560,12 +560,12 @@ function credentialsFixture() {
   return [
     {
       id: 1, accessToken: 'e03-token-1', machineId: deterministicSession('e03-machine-1'), expiresAt: '2099-01-01T00:00:00Z',
-      authMethod: 'social', endpoint: 'ide', profileArn: 'arn:aws:codewhisperer:us-east-1:123456789012:profile/E03_ONE',
+      authMethod: 'social', endpoint: 'ide', profileArn: 'arn:account-runtime:us-east-1:123456789012:profile/E03_ONE',
       maxConcurrentRequests: 1, rpm: 0, supportedModels: ['claude-sonnet-4'], disabled: false,
     },
     {
       id: 2, accessToken: 'e03-token-2', machineId: deterministicSession('e03-machine-2'), expiresAt: '2099-01-01T00:00:00Z',
-      authMethod: 'social', endpoint: 'ide', profileArn: 'arn:aws:codewhisperer:us-east-1:123456789012:profile/E03_TWO',
+      authMethod: 'social', endpoint: 'ide', profileArn: 'arn:account-runtime:us-east-1:123456789012:profile/E03_TWO',
       maxConcurrentRequests: 8, rpm: 2, supportedModels: ['claude-haiku-4.5'], disabled: false,
     },
   ]
@@ -578,10 +578,10 @@ function serviceConfig({ databaseUrl, redisUrl, port, localPort }) {
     host: '127.0.0.1', port,
     apiKey: 'sk-e03-request', adminApiKey: 'sk-e03-admin',
     defaultEndpoint: 'ide',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${localPort}/kiro`,
-    kiroUpstreamResponseTimeoutSecs: 30,
-    kiroUpstreamStreamIdleTimeoutSecs: 15,
-    kiroUpstreamStreamRetryEnabled: false,
+    upstreamBaseUrl: `http://127.0.0.1:${localPort}/account-runtime`,
+    upstreamResponseTimeoutSecs: 30,
+    upstreamStreamIdleTimeoutSecs: 15,
+    upstreamStreamRetryEnabled: false,
     credentialRetryMaxAttempts: 0,
     inferenceUpstreamMaxAttempts: 1,
     credentialWarmupRequests: 0,
@@ -609,11 +609,11 @@ function serviceConfig({ databaseUrl, redisUrl, port, localPort }) {
 
 async function startService(configPath, credentialsPath, logPath, port) {
   const logFd = fs.openSync(logPath, 'a')
-  const child = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const child = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
     env: validationChildEnvironment({
       LOCAL_UPSTREAM_API_KEY: '', ACCOUNT_RUNTIME_HOST: '127.0.0.1', ACCOUNT_RUNTIME_PORT: String(port),
-      RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs::anthropic::handlers=info,kiro_rs=info',
+      RUST_LOG: 'account_runtime::token_manager=debug,account_runtime::anthropic::handlers=info,account_runtime=info',
     }),
     stdio: ['ignore', logFd, logFd], detached: true,
   })

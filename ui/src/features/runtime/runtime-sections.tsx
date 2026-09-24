@@ -490,7 +490,7 @@ function NonStreamCacheToggle({
     <div className="rounded-md border bg-muted/20 p-3">
       <TogField
         label="非流式 Usage 透传"
-        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
+        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；上游账号同步响应保持上游 usage 原样，本地账号使用上游原始 metadata usage。"
         checked={Boolean(policy.skipNonStreamUsageProjection)}
         onChange={(skipNonStreamUsageProjection) =>
           onChange({ ...policy, skipNonStreamUsageProjection })
@@ -763,7 +763,7 @@ function PathStrategyBindingCard({
           <div className="text-sm font-semibold">本路径策略参数</div>
           <TogField
             label="独立路径缓存空间"
-            desc="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一凭据、会话、模型的默认缓存空间共享。"
+            desc="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一账号、会话、模型的默认缓存空间共享。"
             checked={Boolean(effectivePolicy.routeNamespace)}
             onChange={(routeNamespace) => patch({ routeNamespace })}
           />
@@ -1440,7 +1440,7 @@ function PathPolicyEditor({
       />
       <TogField
         label="非流式 Usage 透传"
-        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
+        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；上游账号同步响应保持上游 usage 原样，本地账号使用上游原始 metadata usage。"
         checked={Boolean(policy.skipNonStreamUsageProjection)}
         onChange={set('skipNonStreamUsageProjection')}
       />

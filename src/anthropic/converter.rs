@@ -370,7 +370,7 @@ fn derive_fallback_conversation_id(req: &MessagesRequest) -> Option<String> {
 
 fn deterministic_conversation_id(seed: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"kiro.rs:anthropic:conversation-id:v1:");
+    hasher.update(b"account-runtime:anthropic:conversation-id:v1:");
     hasher.update(seed.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];

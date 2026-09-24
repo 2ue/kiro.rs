@@ -184,7 +184,7 @@ HTTP 200
 
 - focused fake-upstream、storage、正常 stream/non-stream、direct/fallback/rescue 调度回归、Rust check/fmt、UI check/build、admin-ui build、artifact inventory 和 diff hygiene 已通过。
 - 2026-08-07 按用户要求复跑正常输出和调度矩阵：`cargo +1.92.0` scoped focused scheduler/output batch、external normal output/usage batch、Rust fmt/check、UI/admin-ui build、文档链接、diff hygiene 和 artifact inventory 均通过；结果已追加到 focused evidence。
-- 2026-08-07 最终冻结候选已通过真实 Claude Code CLI fake-upstream gate 和 L3-L5 load/chaos：`kiro-rs` SHA-256 `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688`，`kiro_loadtest` SHA-256 `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d`；CLI bare `20/20`、long-session `110 turns`、thinking-wire rerun `60/60`，L3 `9/9`、L4 `12/12`、L5 `900s` soak `6820/6820` 成功并在 `300s` idle 后 RSS/FD 回落。
+- 2026-08-07 最终冻结候选已通过真实 Claude Code CLI fake-upstream gate 和 L3-L5 load/chaos：`account-runtime` SHA-256 `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688`，`account_runtime_loadtest` SHA-256 `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d`；CLI bare `20/20`、long-session `110 turns`、thinking-wire rerun `60/60`，L3 `9/9`、L4 `12/12`、L5 `900s` soak `6820/6820` 成功并在 `300s` idle 后 RSS/FD 回落。
 - 生产 rollout 后观察和真实 `yuenan` / `yuenan-1` 复核仍是发布后的观察 gate。
 - 不能把本轮写成已完成生产观察；发版前最后一次 docs/diff/artifact/UI gate 已通过。
 
@@ -276,7 +276,7 @@ HTTP 200
 
 测试代码补强：
 
-- `normalized_external_direct_policy_skips_raw_preparse_without_raw_pool` 已从只覆盖 non-stream 扩展为同时覆盖 `stream=false` 和 `stream=true`；两种模式都断言 route subtype 为 `external_direct_policy`、外部池 hit、模型重写、attempt 计数和本地 Kiro upstream hit 为 0。
+- `normalized_external_direct_policy_skips_raw_preparse_without_raw_pool` 已从只覆盖 non-stream 扩展为同时覆盖 `stream=false` 和 `stream=true`；两种模式都断言 route subtype 为 `external_direct_policy`、外部池 hit、模型重写、attempt 计数和本地 Account Runtime upstream hit 为 0。
 
 最终候选动态 gate：
 
@@ -334,6 +334,6 @@ HTTP 200
 
 1. 先读本文件、[Stream terminal errors and precommit retry](../../../../../feature/issues/stream-terminal-errors-and-precommit-retry.md) 和 [focused validation evidence](../../../../../feature/evidence/external-pool-stream-pre-output-retry-validation-20260806.md)。
 2. 检查当前工作树 diff，确认后续改动没有和 `v0.0.133` 外部池 HA 冷却回归混在一起。
-3. 若要重新绑定发版候选，仍按 `kiro-claude-cli-validation` 和 `kiro-load-chaos-validation` 重新冻结二进制并重跑 CLI/load gate；不要复用旧 SHA。
+3. 若要重新绑定发版候选，仍按 `account-runtime-claude-cli-validation` 和 `account-runtime-load-chaos-validation` 重新冻结二进制并重跑 CLI/load gate；不要复用旧 SHA。
 4. 发布后再做只读生产观察和真实 `yuenan` / `yuenan-1` 复核。
 5. 不要把本问题改成本地 rescue；外部直连必须保持 external-only。

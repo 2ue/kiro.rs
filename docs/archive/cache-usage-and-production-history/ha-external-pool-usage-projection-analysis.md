@@ -47,7 +47,7 @@ usageProjectionMode = current_path_policy
 生产服务版本：
 
 ```text
-kiro-rs 0.0.48
+account-runtime 0.0.48
 ```
 
 运行时配置中 `/ha` 的关键 usage 策略为：

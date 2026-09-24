@@ -20,7 +20,7 @@ Agent 会话中，助手输出一句"意图开场白"（如"先摸清楚当前�
 
 ## 现网证据（已坐实，非推断）
 
-线上库 `usage_records`（部署 `kiro-rs-2ue-59137`），本次会话 `conversation_id = 4633d467-317c-4620-9545-a26f2d81eb66`，145+ 条记录 **全部 `status=success`**，无一条 error/stream_error/upstream_timeout。
+线上库 `usage_records`（部署 `account-runtime-2ue-59137`），本次会话 `conversation_id = 4633d467-317c-4620-9545-a26f2d81eb66`，145+ 条记录 **全部 `status=success`**，无一条 error/stream_error/upstream_timeout。
 
 断流轮（15:36:55）`data` 关键字段：
 ```
@@ -127,7 +127,7 @@ ORDER BY created_at;
 
 - 代理/上游各类错误归档：`feature/README.md`。
 - 流式终止路径：`feature/issues/02-stream-upstream-idle-timeout.md`（同为流式，但那是真超时错误，本文是正常 end_turn）。
-- 现网证据：`usage_records`，`conversation_id=4633d467-317c-4620-9545-a26f2d81eb66`（部署 `kiro-rs-2ue-59137`）。
+- 现网证据：`usage_records`，`conversation_id=4633d467-317c-4620-9545-a26f2d81eb66`（部署 `account-runtime-2ue-59137`）。
 
 ## 残余风险与回滚
 

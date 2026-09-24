@@ -14,9 +14,9 @@ Related: [Plan Tree](../../README.md), [current business context](../../baseline
 
 ## Purpose
 
-Build a new extensible, high-performance, highly available AI model gateway in a new repository. This is not an incremental refactor of `kiro.rs`, a mechanical Rust-to-Go translation, or a repackaging of the current large files.
+Build a new extensible, high-performance, highly available AI model gateway in a new repository. This is not an incremental refactor of `account-runtime`, a mechanical Rust-to-Go translation, or a repackaging of the current large files.
 
-The current repository is retained as a behavioral oracle for Kiro, Anthropic and Claude Code compatibility, scheduling semantics, usage/cache behavior, error normalization, fixtures, failure cases, and real-client validation. New production code must not import or embed the current Rust runtime.
+The current repository is retained as a behavioral oracle for Account Runtime, Anthropic and Claude Code compatibility, scheduling semantics, usage/cache behavior, error normalization, fixtures, failure cases, and real-client validation. New production code must not import or embed the current Rust runtime.
 
 ## Final Goal
 
@@ -24,7 +24,7 @@ Deliver one complete greenfield system with:
 
 - a Go data plane and control plane built as a domain-oriented modular monolith;
 - stable, typed and versioned contracts between client-protocol modules, the execution core, provider modules, and platform services;
-- Kiro as the first fully implemented provider module rather than the architectural center of the system;
+- Account Runtime as the first fully implemented provider module rather than the architectural center of the system;
 - Anthropic Messages and real Claude Code compatibility as the mandatory first client protocol surface;
 - a module model in which future upstream APIs or API gateways may reuse shared scheduling, usage and conversion implementations or provide their own implementations behind the same contracts;
 - one modern React, TypeScript and Tailwind CSS Admin application based on a reviewed open-source template and open-source icons;
@@ -42,8 +42,8 @@ The planning defaults are deliberately conservative and may be changed only by a
 | --- | --- |
 | Product model | Self-hosted, single operator and single trust domain; multiple API keys, accounts and replicas are not tenants |
 | First client protocols | Anthropic Messages plus the Claude Code compatibility profile; Models, Files and count-tokens behavior retained where required by current compatibility |
-| First provider | Complete Kiro IDE and CLI integration, including all currently supported authentication and scheduling behavior |
-| Generic proof | A deterministic mock provider and one simple OpenAI/Anthropic-compatible HTTP provider exercise the same contracts without importing Kiro types |
+| First provider | Complete Account Runtime IDE and CLI integration, including all currently supported authentication and scheduling behavior |
+| Generic proof | A deterministic mock provider and one simple OpenAI/Anthropic-compatible HTTP provider exercise the same contracts without importing Account Runtime types |
 | Module loading | Compile-time registration in the first release; optional future out-of-process modules use Protobuf plus Connect/gRPC |
 | Admin surface | One new React application; neither current frontend is retained as an implementation base |
 | Deployment | One codebase with selectable data-plane, control-plane and worker roles; all-in-one Compose and separated Kubernetes deployments |
@@ -88,7 +88,7 @@ Control plane
 
 ## Plan Documents
 
-- [Complete reconstruction plan](topics/complete-reconstruction-plan.md): goals, final behavior, architecture, modules, contracts, Kiro scope, technology stack, HA, performance, security, UI, validation and cutover.
+- [Complete reconstruction plan](topics/complete-reconstruction-plan.md): goals, final behavior, architecture, modules, contracts, Account Runtime scope, technology stack, HA, performance, security, UI, validation and cutover.
 - [Reference projects and template selection](topics/reference-projects-and-template-selection.md): reviewed open-source gateways, reusable architectural patterns, license constraints, Admin template comparison and selected frontend baseline.
 - [Complete implementation work graph](roadmap.md): dependency-ordered module construction inside one final candidate, without phased product delivery.
 - [Decision 001](decisions/001-greenfield-go-modular-ai-gateway.md): accepted replacement of the Rust modernization target with a greenfield Go modular gateway.

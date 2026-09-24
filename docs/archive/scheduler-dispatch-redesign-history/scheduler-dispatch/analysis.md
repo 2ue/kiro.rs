@@ -3,7 +3,7 @@
 ## Problem statement
 
 The service acts as a downstream-facing Anthropic-compatible gateway and dispatches requests to
-Kiro credentials upstream. The production requirement is that an unhealthy credential must stop
+Account Runtime credentials upstream. The production requirement is that an unhealthy credential must stop
 receiving new requests as soon as scheduler-relevant errors are observed, especially under high
 concurrency.
 
@@ -24,9 +24,9 @@ The scheduler should not punish credentials for pure downstream cancellation, bu
 HTTP status, network send, protocol, or stream-read failure is confirmed, the credential must be
 cooled down and excluded from selection for other concurrent requests.
 
-## Existing kiro.rs foundations
+## Existing account-runtime foundations
 
-Before this redesign, `kiro.rs` already had useful scheduler primitives:
+Before this redesign, `account-runtime` already had useful scheduler primitives:
 
 - disabled credentials are excluded;
 - model-incompatible credentials are excluded;
@@ -80,7 +80,7 @@ useful patterns:
 - candidate scoring should include priority, load, error rate, and latency;
 - selecting from the top K candidates reduces concentration when many requests arrive at once.
 
-The implemented `kiro.rs` design adopts those ideas while keeping its existing Redis lease and
+The implemented `account-runtime` design adopts those ideas while keeping its existing Redis lease and
 sticky-session architecture.
 
 ## Error classification requirements
@@ -132,7 +132,7 @@ The redesigned scheduler must maintain these invariants:
 
 ## Quota and cost signals
 
-Official Kiro quota is measured in credits. Local usage cost is estimated in dollars. Those are
+Official Account Runtime quota is measured in credits. Local usage cost is estimated in dollars. Those are
 different dimensions and should not be mixed in card labels or scheduler scoring.
 
 The current scheduler implementation does not use official quota credits or local estimated dollar

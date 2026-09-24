@@ -2,7 +2,7 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocalPoolRouteStateKind {
+pub enum AccountRouteStateKind {
     Ready,
     NoCredentials,
     AllDisabled,
@@ -14,7 +14,7 @@ pub enum LocalPoolRouteStateKind {
     RiskCircuitOpen,
 }
 
-impl LocalPoolRouteStateKind {
+impl AccountRouteStateKind {
     pub fn should_route_external(self) -> bool {
         !matches!(self, Self::Ready)
     }
@@ -22,8 +22,8 @@ impl LocalPoolRouteStateKind {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LocalPoolRouteState {
-    pub kind: LocalPoolRouteStateKind,
+pub struct AccountRouteState {
+    pub kind: AccountRouteStateKind,
     pub total: usize,
     pub available: usize,
     pub model_usable: usize,

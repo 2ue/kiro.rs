@@ -154,7 +154,7 @@ test('history converter builds sanitizer scope from all current and historical t
 
   const mergeDefense = sourceWindow(
     source,
-    'A Kiro assistant history item flattens every Anthropic visible text block',
+    'An account runtime assistant history item flattens every Anthropic visible text block',
     4_500,
   )
   assert.match(mergeDefense, /final_known_tool_names\.extend\(tool_name_map\.keys\(\)\.cloned\(\)\)/)

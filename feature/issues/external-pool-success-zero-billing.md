@@ -46,7 +46,7 @@ externalPoolBilling missing/null
 - `/api/admin/usage-records` 与 usage detail；
 - Dashboard / summary / external pool billing 聚合；
 - Redis summary / PostgreSQL usage rollup；
-- 按 kiro.rs usage 字段结算的下游账单。
+- 按 account-runtime usage 字段结算的下游账单。
 
 ## 修复前源码链
 
@@ -212,9 +212,9 @@ feature/tests/run-cargo-scoped.sh external-billing-fmt -- cargo +1.92.0 fmt --al
 feature/tests/run-cargo-scoped.sh external-billing-tests -- cargo +1.92.0 test --locked non_stream_ -- --nocapture
 feature/tests/run-cargo-scoped.sh external-billing-fmt-2 -- cargo +1.92.0 fmt --all -- --check
 feature/tests/run-cargo-scoped.sh external-billing-tests-2 -- cargo +1.92.0 test --locked openai_usage_is_normalized_for_non_stream_external_pool_body -- --nocapture
-feature/tests/run-cargo-scoped.sh provider-fault-rerun -- cargo +1.92.0 test --locked kiro::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded -- --nocapture
-feature/tests/run-cargo-scoped.sh claude-cli-release -- bash -lc 'cargo +1.92.0 build --release && install -m 755 "$CARGO_TARGET_DIR/release/kiro-rs" "$KIRO_FROZEN_BINARY"'
-feature/tests/run-cargo-scoped.sh external-billing-warning-check -- cargo +1.92.0 check --locked --bin kiro-rs
+feature/tests/run-cargo-scoped.sh provider-fault-rerun -- cargo +1.92.0 test --locked account-runtime::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded -- --nocapture
+feature/tests/run-cargo-scoped.sh claude-cli-release -- bash -lc 'cargo +1.92.0 build --release && install -m 755 "$CARGO_TARGET_DIR/release/account-runtime" "$ACCOUNT_RUNTIME_FROZEN_BINARY"'
+feature/tests/run-cargo-scoped.sh external-billing-warning-check -- cargo +1.92.0 check --locked --bin account-runtime
 git diff --check
 ```
 
@@ -224,7 +224,7 @@ git diff --check
 - 精确 OpenAI usage 归一化过滤：`1 passed / 0 failed`
 - provider fault matrix 初次出现在全量 C0 中红一次，精确复跑 `1 passed / 0 failed`；该红项不是外部池 success billing 路径，但发布前不能伪装为“全量一次绿”。
 - release binary build 通过，sha256 `fe97dd089671af009a1e59f54d976f043d6c5e0cc778a744ed504c44d50f1f31`。
-- `cargo check --bin kiro-rs` 通过；test-only helper 已加 `#[cfg(test)]`，消除了 release build 暴露的新 dead-code warning。
+- `cargo check --bin account-runtime` 通过；test-only helper 已加 `#[cfg(test)]`，消除了 release build 暴露的新 dead-code warning。
 - 所有 Cargo scoped target 均 `removed=true / reservation_released=true`
 - `git diff --check` 通过
 

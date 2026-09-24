@@ -30,7 +30,7 @@ fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
         "accessToken": "fake-access-token",
         "clientId": "fake-client-id",
         "clientSecret": "fake-client-secret",
-        "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE"
+        "profileArn": "arn:account-runtime:us-east-1:123456789012:profile/FAKE"
     }))
     .unwrap();
 
@@ -336,7 +336,6 @@ fn credential_item(
         api_region: None,
         effective_auth_region: "us-east-1".to_string(),
         effective_api_region: "us-east-1".to_string(),
-        has_profile_arn: false,
         refresh_token_hash: None,
         api_key_hash: None,
         masked_api_key: None,
@@ -405,7 +404,6 @@ fn credential_item(
         scheduler_score: 0.0,
         estimated_cost_usd,
         upstream_metering_units: 0.0,
-        kiro_metering_usage: 0.0,
         priced_requests: 0,
         unpriced_requests: 0,
     }

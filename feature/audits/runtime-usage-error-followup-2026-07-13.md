@@ -15,7 +15,7 @@
 | `prompt is too long` | 真实外部池上限问题 | 已修复分类与 public message；parsed external route 不再把 request input tokens 恒置 0；新增 `externalPoolMaxInputTokens` 预检，默认 1,000,000，超过时本地拒绝、不发外部池 |
 | `messageStatus` 丢失 | 真实观测盲区 | 已解析 `messageStatus`，usage latencyTrace 写入 `upstreamMessageStatus`、`sawUpstreamCompleted`、`stopReasonSource` |
 | “开场白后 end_turn 空转” | 模型/CLI 时序行为，代理只能观测 | 新增 `suspectedIntentPreambleEndTurn` usage-only 诊断，不改变 SSE |
-| 错误归一化过度 | 真实下游体验问题 | 允许 Kiro 官方上游结构化 JSON message 经敏感词过滤后透出；外部池、本地调度、账号和内部错误继续脱敏 |
+| 错误归一化过度 | 真实下游体验问题 | 允许 Account Runtime 官方上游结构化 JSON message 经敏感词过滤后透出；外部池、本地调度、账号和内部错误继续脱敏 |
 | 坏图/伪图 `IMAGE_FORMAT_UNSUPPORTED` | 客户端输入错误，但代理可提前拦截 | 新增 base64 图片轻量结构校验：必须可解码并符合 PNG/JPEG/GIF/WebP 最低结构；伪图/截断 PNG 本地拒绝 |
 
 ## 2. 仍然待办
@@ -29,7 +29,7 @@
 
 ## 3. 错误提示策略
 
-### Kiro 官方上游
+### Account Runtime 官方上游
 
 允许把官方上游结构化 JSON 里的 message/reason/code 透给下游，但必须先做安全过滤：
 
@@ -77,7 +77,7 @@
 4. 真正的 reported usage bug 在策略应用：`/cc` 与 `/ha` 默认策略是 `input sample-max 96`。旧实现为了避免首轮伪造 cache read，在 `moveDeltaToCacheRead=true` 且没有 cache-read 证据时，直接跳过 input sampling，导致 `317,054` / `104,005` 这种本地估算值被当成“上报输入”展示给下游。
 5. 当前修复后：只要路径策略启用 `sample-max`，展示 input 都会被压到配置上限内；响应已有 cache-read 证据时，少掉的 input delta 转入 `cache_read_input_tokens`；没有 cache-read 证据时，`cache_read_input_tokens` 保持 0，delta 转入 `cache_creation_input_tokens`，并同步进入 `cache_creation_5m_input_tokens`。这样既不伪造首轮缓存读取，也不会把本轮真实输入差额直接丢掉。
 6. 原始大输入不会丢：usage 诊断字段仍保留本地估算 / raw usage。也就是说页面应该能同时表达“本地估算输入很大”和“返回给下游的展示 input 已按策略压低”。
-7. `内部成本输入 = 上报输入 + cache write` 是本系统历史兼容/费用估算口径，不是 Anthropic/Kiro 响应中的独立字段。样本 A 中 `317,054 + 28,779 = 345,833`，与页面一致；修复后该公式仍成立，但 `上报输入` 不应再是 317,054，缺少 cache-read 证据的差额会进入 cache writer 口径。
+7. `内部成本输入 = 上报输入 + cache write` 是本系统历史兼容/费用估算口径，不是 Anthropic/Account Runtime 响应中的独立字段。样本 A 中 `317,054 + 28,779 = 345,833`，与页面一致；修复后该公式仍成立，但 `上报输入` 不应再是 317,054，缺少 cache-read 证据的差额会进入 cache writer 口径。
 8. `output=1` 只表示该轮最终上报的输出 token 很少；`max_tokens=64,000` 是上限，不代表模型一定输出 64k。
 
 验证重点：
@@ -137,7 +137,7 @@ schema key 清洗/映射的成本：
 
 - [x] `cargo test tool_schema_key_diagnostics_ignore_schema_map_keys`
 - [x] `cargo test prompt_too_long_error_maps_to_input_length_message`
-- [x] `cargo test official_kiro_upstream_400_message_is_exposed_without_internal_prefix`
+- [x] `cargo test official_account-runtime_upstream_400_message_is_exposed_without_internal_prefix`
 - [x] `cargo test malformed_upstream_error_exposes_safe_official_message`
 - [x] `cargo test assistant_message_status_marks_upstream_completion_without_changing_sse_shape`
 - [x] `cargo test end_turn_with_tools_and_short_visible_text_sets_intent_preamble_diagnostic`
@@ -169,8 +169,8 @@ schema key 清洗/映射的成本：
 - `git diff --check` 通过。
 - `rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs` 通过；本轮修复后 Clippy warning 为 683，低于 baseline 711。
 - `rustup run 1.92.0 cargo check --all-targets` 通过；当前仍有少量 dead-code warning，不影响 CI baseline。
-- `rustup run 1.92.0 cargo test --locked --all-targets --no-default-features` 通过：主程序 1134/1134，`kiro_loadtest` 26/26。
-- `rustup run 1.92.0 cargo test --locked --all-targets` 通过：主程序 1134/1134，`kiro_loadtest` 26/26。
+- `rustup run 1.92.0 cargo test --locked --all-targets --no-default-features` 通过：主程序 1134/1134，`account_runtime_loadtest` 26/26。
+- `rustup run 1.92.0 cargo test --locked --all-targets` 通过：主程序 1134/1134，`account_runtime_loadtest` 26/26。
 - `rustup run 1.92.0 cargo test usage_projection -- --nocapture` 通过：35 个 external pool usage projection 相关测试通过，覆盖外部池 output uplift 后再次应用 final output cap。
 - `pnpm build` 通过：`ui/` 与 `admin-ui/` 两套生产构建均通过。
 - `cargo build --release --locked` 通过，release binary 成功构建并可启动；当前保留 2 个既有 dead-code warning。
@@ -185,7 +185,7 @@ schema key 清洗/映射的成本：
   - `/cc/v1/messages`：`req_01TnQjvbtN5sSsggukgKpLRW`，final usage `input_tokens=13/cache_read=0/cache_creation=18524/output=1`；落库 `total_input_tokens=18537`、`compat_input_tokens=13`、`cache_creation_input_tokens=18524`、`cache_read_input_tokens=0`。
   - 4 并发真实 smoke：`req_011ZRg5wY3AQB4tWNQYgWsy4`、`req_01NkT6o92NxknQmyhR5xpo6V`、`req_01GmGAe2cPx4udfhvbKP2Jn2`、`req_011prP1fhAN8Y26QnwARfYLX`，全部 HTTP 200；final `input_tokens <= 96`，`cache_read=0`，`cache_creation > 1000`。
   - 资源观测：RSS `22176KB -> 38304KB -> 37616KB`，FD `30 -> 38 -> 31`，未见 FD 泄漏或线性 RSS 失控。
-- output uplift/final cap 真实调用使用隔离数据库 `kiro_rs_output_uplift_validation` 和独立 Redis key prefix，避免污染当前运行态配置。`/ha/v1/messages` 请求 `req_01uxhatXzFF7DCfvLCLKuhEQ`：配置 `outputUpliftMinTokens=1`、`outputUpliftPercent=50`、`finalOutputMaxTokens=80`、`finalOutputJitterMinTokens=10`、`finalOutputJitterMaxTokens=10`；raw output `73`，先放大为 `ceil(73 * 1.5)=110`，再按有效上限 `80-10=70` 裁剪，最终响应和落库 output 均为 `70`。验证后已停止临时服务并删除隔离数据库。
+- output uplift/final cap 真实调用使用隔离数据库 `account_runtime_output_uplift_validation` 和独立 Redis key prefix，避免污染当前运行态配置。`/ha/v1/messages` 请求 `req_01uxhatXzFF7DCfvLCLKuhEQ`：配置 `outputUpliftMinTokens=1`、`outputUpliftPercent=50`、`finalOutputMaxTokens=80`、`finalOutputJitterMinTokens=10`、`finalOutputJitterMaxTokens=10`；raw output `73`，先放大为 `ceil(73 * 1.5)=110`，再按有效上限 `80-10=70` 裁剪，最终响应和落库 output 均为 `70`。验证后已停止临时服务并删除隔离数据库。
 - `/cc/v1/messages` 非流式真实工具调用：`req_01nU6gYLh2NKnNTLzJJd5Djv`，非法 schema key `"foo-bar"`、`"中文 key"` 与合法 key `"legal_key"` 均按原始 key 返回，未泄漏内部 `key<hash>`。
 - `/cc/v1/messages` 流式真实工具调用：`req_01D6LGwpSJiP8LzCXVcjqGky`，SSE `input_json_delta` 为 `{"foo-bar":"ok","legal_key":"legal","中文 key":"cn"}`，未泄漏内部 `key<hash>`；落库 `stopReasonSource=local_inferred_tool_use`。
 - 坏图真实调用：`req_01ppmFifaRP5MYu2jBQH8s2N` 返回 HTTP 400 / `invalid_request_error`，message 为 `invalid image data for media_type: image/png`，未暴露账号/凭据/外部池/调度等内部词。

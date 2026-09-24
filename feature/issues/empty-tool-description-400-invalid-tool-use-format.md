@@ -17,7 +17,7 @@ Severity: P1
 
 ## 现象
 
-请求里任一工具的 `description` 为空字符串（或客户端未传，`#[serde(default)]` 后为空串）时，上游 Kiro/Bedrock 以 `Invalid tool use format / REQUEST_BODY_INVALID` 拒绝**整个请求**，返回 HTTP 400。
+请求里任一工具的 `description` 为空字符串（或客户端未传，`#[serde(default)]` 后为空串）时，上游 Account Runtime/Bedrock 以 `Invalid tool use format / REQUEST_BODY_INVALID` 拒绝**整个请求**，返回 HTTP 400。
 
 代理对外返回：
 ```json
@@ -53,14 +53,14 @@ HTTP 400
 
 ## 复现 case
 
-前置：本地服务已启动（示例 `127.0.0.1:9022`），API Key 见 `config.json`（示例 `sk-kiro-rs-local-debug`）。本地测试账号仅支持 sonnet，模型用 `claude-sonnet-4-20250514`。
+前置：本地服务已启动（示例 `127.0.0.1:9022`），API Key 见 `config.json`（示例 `sk-account-runtime-local-debug`）。本地测试账号仅支持 sonnet，模型用 `claude-sonnet-4-20250514`。
 
 ### Case 1：空 description，必现 400
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -76,7 +76,7 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 ```bash
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -166,7 +166,7 @@ pub input_schema: HashMap<String, serde_json::Value>,
 ```bash
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -182,7 +182,7 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 ```bash
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -205,7 +205,7 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 
 # 关联
 
-- `docs/archive/request-and-protocol-history/kiro-400-improperly-formed-request-analysis.md`、`docs/archive/request-and-protocol-history/kiro-small-payload-improperly-formed-fix-plan.md`（同为上游 400，根因不同）。
+- `docs/archive/request-and-protocol-history/account-runtime-400-improperly-formed-request-analysis.md`、`docs/archive/request-and-protocol-history/account-runtime-small-payload-improperly-formed-fix-plan.md`（同为上游 400，根因不同）。
 - 生产证据目录：`tmp/analysis-usage-llm-errors/`（app `0.0.101` / revision `737f9f1`）。
 
 ## 残余风险与回滚

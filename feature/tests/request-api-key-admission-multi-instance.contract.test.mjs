@@ -12,13 +12,13 @@ const SCRIPT = path.join(ROOT, 'feature/tests/request-api-key-admission-multi-in
 
 function databases(count = 3) {
   return Array.from({ length: count }, (_, index) => (
-    `kiro_request_admission_contract_${String(index + 1).padStart(2, '0')}`
+    `account_runtime_request_admission_contract_${String(index + 1).padStart(2, '0')}`
   )).join(',')
 }
 
 function fixtureEnv(overrides = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-request-admission-contract-'))
-  const binary = path.join(root, 'kiro-rs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-request-admission-contract-'))
+  const binary = path.join(root, 'account-runtime')
   const artifact = path.join(root, 'artifacts')
   fs.writeFileSync(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   fs.mkdirSync(artifact, { recursive: true, mode: 0o700 })
@@ -26,15 +26,15 @@ function fixtureEnv(overrides = {}) {
     root,
     env: {
       ...process.env,
-      KIRO_RS_BINARY: binary,
-      KIRO_VALIDATION_ARTIFACT_DIR: artifact,
-      KIRO_REQUEST_ADMISSION_ROUNDS: '3',
-      KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE:
+      ACCOUNT_RUNTIME_BINARY: binary,
+      ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifact,
+      ACCOUNT_RUNTIME_REQUEST_ADMISSION_ROUNDS: '3',
+      ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE:
         'postgres://request_admission:isolated@127.0.0.1:25432/{database}',
-      KIRO_REQUEST_ADMISSION_POSTGRES_DATABASES: databases(),
-      KIRO_REQUEST_ADMISSION_REDIS_URL: 'redis://127.0.0.1:26379/7',
-      KIRO_REQUEST_ADMISSION_REDIS_PREFIX: `kiro_rs:request_admission_contract:${process.pid}`,
-      KIRO_REQUEST_ADMISSION_VALIDATE_ONLY: '1',
+      ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_DATABASES: databases(),
+      ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL: 'redis://127.0.0.1:26379/7',
+      ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_PREFIX: `account_runtime:request_admission_contract:${process.pid}`,
+      ACCOUNT_RUNTIME_REQUEST_ADMISSION_VALIDATE_ONLY: '1',
       ...overrides,
     },
   }
@@ -78,39 +78,39 @@ test('validate-only accepts caller-owned loopback PostgreSQL and Redis inputs', 
 })
 
 test('database list must match rounds and use caller-owned names', () => {
-  const count = run({ KIRO_REQUEST_ADMISSION_POSTGRES_DATABASES: databases(2) })
+  const count = run({ ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_DATABASES: databases(2) })
   assert.notEqual(count.status, 0)
   assert.match(count.stderr, /exactly 3 pre-created database names/)
 
-  const unsafe = run({ KIRO_REQUEST_ADMISSION_POSTGRES_DATABASES: 'postgres,postgres,postgres' })
+  const unsafe = run({ ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_DATABASES: 'postgres,postgres,postgres' })
   assert.notEqual(unsafe.status, 0)
-  assert.match(unsafe.stderr, /caller-owned kiro_request_admission_\* names/)
+  assert.match(unsafe.stderr, /caller-owned account_runtime_request_admission_\* names/)
 })
 
 test('rejects unsafe PostgreSQL and Redis dependencies before runtime work', () => {
   const pgHost = run({
-    KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE:
+    ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE:
       'postgres://request_admission:isolated@example.com:25432/{database}',
   })
   assert.notEqual(pgHost.status, 0)
   assert.match(pgHost.stderr, /must target loopback/)
 
   const pgPort = run({
-    KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE:
+    ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE:
       'postgres://request_admission:isolated@127.0.0.1:9022/{database}',
   })
   assert.notEqual(pgPort.status, 0)
   assert.match(pgPort.stderr, /port 9022 is protected/)
 
-  const redisDb0 = run({ KIRO_REQUEST_ADMISSION_REDIS_URL: 'redis://127.0.0.1:26379/0' })
+  const redisDb0 = run({ ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL: 'redis://127.0.0.1:26379/0' })
   assert.notEqual(redisDb0.status, 0)
   assert.match(redisDb0.stderr, /isolated nonzero database/)
 
-  const redisHost = run({ KIRO_REQUEST_ADMISSION_REDIS_URL: 'redis://example.com:26379/7' })
+  const redisHost = run({ ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL: 'redis://example.com:26379/7' })
   assert.notEqual(redisHost.status, 0)
   assert.match(redisHost.stderr, /must target loopback/)
 
-  const redisPrefix = run({ KIRO_REQUEST_ADMISSION_REDIS_PREFIX: 'kiro_rs:local' })
+  const redisPrefix = run({ ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_PREFIX: 'account_runtime:local' })
   assert.notEqual(redisPrefix.status, 0)
   assert.match(redisPrefix.stderr, /caller-owned temporary prefix/)
 })

@@ -1,6 +1,6 @@
 # Account Runtime Upstream Accounts
 
-Role: Current Rust refactor plan for removing Kiro concepts and making upstream accounts the scheduling unit
+Role: Current Rust refactor plan for removing Account Runtime concepts and making upstream accounts the scheduling unit
 
 Status: In Progress; implementation branch created
 
@@ -12,9 +12,9 @@ Related: [Plan Tree](../../README.md), [current module map](../../baseline/modul
 
 ## Purpose
 
-Turn the current Rust service into a Kiro-independent account scheduling and usage shaping runtime.
+Turn the current Rust service into a Account Runtime-independent account scheduling and usage shaping runtime.
 
-The target system has no Kiro account, Kiro provider, Kiro upstream protocol, Kiro endpoint, Kiro credential refresh, Kiro model/quota/subscription, Kiro EventStream, or Kiro body-envelope concept. Current Kiro-named code may be mined only for generic scheduler, lease, usage, body, stream, and observability behavior. It must not remain as product terminology or runtime dependency in the target implementation.
+The target system has no Account Runtime account, Account Runtime provider, Account Runtime upstream protocol, Account Runtime endpoint, Account Runtime credential refresh, Account Runtime model/quota/subscription, Account Runtime EventStream, or Account Runtime body-envelope concept. Current Account Runtime-named code may be mined only for generic scheduler, lease, usage, body, stream, and observability behavior. It must not remain as product terminology or runtime dependency in the target implementation.
 
 ## Final Target
 
@@ -46,6 +46,7 @@ Implementation must not start on the current feature branch.
 ## Plan Documents
 
 - [Final target plan](topics/final-target-plan.md): scope, deletion boundary, retained generic behavior, module shape, implementation order, and acceptance checks.
+- [Claude Code base URL + API key passthrough analysis](topics/claude-code-base-url-apikey-passthrough-analysis.md): comparison with `../sub2api`, current body/response processing inventory, and the raw-compatible account forwarding boundary.
 
 ## Current State
 
@@ -57,7 +58,7 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - account attempt trace, delivery evidence and normalized upstream error classes;
 - raw usage facts with explicit confidence;
 - a minimal dispatch candidate/selection primitive for later scheduler extraction.
-- a migration bridge from the old `ExternalPool` record into the new `UpstreamAccount` boundary, proving the former external pool can be treated as an upstream account without exposing Kiro concepts.
+- a migration bridge from the old `ExternalPool` record into the new `UpstreamAccount` boundary, proving the former external pool can be treated as an upstream account without exposing Account Runtime concepts.
 - `/api/admin/accounts` aliases for the existing external-pool Admin handlers and matching frontend account API aliases, giving new callers an account-named boundary while the old UI is migrated.
 - the Admin UI resource navigation now exposes the upstream account page at `/accounts`, with the old `/external-pools` route redirecting to it.
 - the upstream account page now calls the account-named Admin API aliases for list, status, create, update, enable, cooldown, supported-model discovery, delete and test actions.
@@ -97,53 +98,53 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - New upstream account usage records now write `routeKind: "account"` as the primary route kind. Query, Redis summary, Postgres rollup/dashboard and maintained usage UIs treat `account` and historical `external_pool` route kinds as the same upstream-account class while preserving the old value only for stored-record/filter compatibility.
 - Usage records now expose `accountBilling` as the primary upstream-account billing detail while retaining `externalPoolBilling` as a compatibility copy. Recorder/storage write paths fill both fields, historical records are normalized on read, and maintained usage detail/cost UI reads account billing first with fallback to old records.
 - Usage summary and dashboard window summary now expose `accountBilling` and `accountBillingByAccount` as account-facing aggregate fields while retaining `externalPoolBilling` and `externalPoolBillingByPool` for compatibility. Redis/Postgres dashboard materialization fills both shapes, and the maintained overview UI reads the account fields first.
-- Usage record, summary, dashboard and credential usage APIs now expose account-neutral `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` fields while retaining old `kiroMeteringUsage` / `totalKiroMeteringUsage` compatibility copies. Recorder, Redis and Postgres read/write boundaries normalize old-only and new-only metering records into both fields, and maintained usage UI surfaces now show "上游计量" instead of Kiro metering wording.
-- Stream and handler code now pass upstream metering values through `upstream_metering_units` naming. The old Kiro-named field remains only where a usage record writes the legacy compatibility copy, and downstream SSE still excludes both upstream and compatibility metering fields.
+- Usage record, summary, dashboard and credential usage APIs now expose account-neutral `upstreamMeteringUnits` / `totalUpstreamMeteringUnits` fields while retaining old `upstreamMeteringUnits` / `totalAccount RuntimeMeteringUsage` compatibility copies. Recorder, Redis and Postgres read/write boundaries normalize old-only and new-only metering records into both fields, and maintained usage UI surfaces now show "上游计量" instead of Account Runtime metering wording.
+- Stream and handler code now pass upstream metering values through `upstream_metering_units` naming. The old Account Runtime-named field remains only where a usage record writes the legacy compatibility copy, and downstream SSE still excludes both upstream and compatibility metering fields.
 - New upstream account usage records now write account-named route subtypes (`account_fallback_preflight`, `account_fallback_after_local_attempts`, `account_direct_policy`, `account_error`, `local_rescue_after_account`). Legacy `external_*` subtype values remain deserializable and accepted by compatibility route checks, and maintained UIs label both old and new values as upstream-account routes.
 - Anthropic handler fallback routing now uses `AccountFallbackContext` and account-named local-preflight/fallback helper methods. The old external-pool terminology remains only in compatibility subtype values, legacy usage fields and delegated storage/runtime internals, and local rescue preflight metadata now double-writes account fields with old `external*` copies.
 - Account local-rescue decisions now enter account-named runtime config accessors and write account-named fallback reasons (`account_rate_limit`, `account_timeout`, `account_capacity`, `account_bad_request`, `account_error`). Request-entry dispatch deadlines and pre-body rejection logs also use account runtime terminology while persisted config fields remain compatibility storage details.
-- Anthropic router/AppState/request runtime now names the account-route payload guard switch as `payload_guard_account_enabled`; it still reads and writes the persisted `payloadGuardExternalEnabled` compatibility field when crossing existing config and legacy route boundaries. Maintained runtime UIs now describe the control as upstream-account payload shaping rather than Kiro/external-pool payload handling.
+- Anthropic router/AppState/request runtime now names the account-route payload guard switch as `payload_guard_account_enabled`; it still reads and writes the persisted `payloadGuardExternalEnabled` compatibility field when crossing existing config and legacy route boundaries. Maintained runtime UIs now describe the control as upstream-account payload shaping rather than Account Runtime/external-pool payload handling.
 - Maintained runtime configuration UIs now label the old external-pool runtime section as upstream-account routing, including routing mode/rules, retry/failover/cooldown, local rescue, usage diagnostics, prompt steering and payload/body shaping text. Compatibility state keys such as `externalPools` and `payloadGuardExternalEnabled` remain unchanged internally.
-- Local parsed body planning now uses local-upstream type names (`LocalUpstreamConverterPlan`, `LocalUpstreamBodyPlan`, `PreparedLocalUpstreamBody`) and local-upstream conversion logs. The concrete legacy `KiroRequest` payload type remains at the current local-provider boundary until the provider/body implementation is replaced.
+- Local parsed body planning now uses local-upstream type names (`LocalUpstreamConverterPlan`, `LocalUpstreamBodyPlan`, `PreparedLocalUpstreamBody`) and local-upstream conversion logs. The concrete legacy `Account RuntimeRequest` payload type remains at the current local-provider boundary until the provider/body implementation is replaced.
 - Account-route body capability planning now uses account body plan names (`AccountBodyPlan`, `AccountBodyBytesPlan`, `AccountRaw`, `AccountNormalized`). The delegated legacy route executor still lives in `external_pool`, but body processing decisions no longer expose external-pool names at the capability-plan boundary.
 - Anthropic upstream error-envelope helpers now use account-neutral official-upstream naming (`official_upstream_public_message` / `official_upstream_public_error`) while retaining the existing sensitive/internal-term filtering behavior.
-- Payload guard runtime wrappers now use local-upstream/account names (`PreparedLocalUpstreamRequestBody`, `prepare_local_upstream_request_body`, `PreparedAccountMessagesPayload`, `prepare_account_messages_payload`, `sanitize_anthropic_messages_for_account_forwarding`). The underlying legacy local payload still uses `KiroRequest` until the provider/body implementation is replaced.
-- Anthropic handler call sites now enter local-upstream payload guard wrappers (`guard_local_upstream_request` / `serialize_local_upstream_request`) instead of calling legacy Kiro-named guard functions directly. The old guard functions remain inside the concrete legacy local payload implementation while request handling, cache-point retry and thinking-signature retry use local-upstream naming.
-- Local-upstream payload diagnostics now enter through `breakdown_local_upstream_request` and `diagnose_local_upstream_tool_use_format`, so handler and local body pipeline diagnostics no longer call Kiro-named payload breakdown/tool-format helpers directly.
+- Payload guard runtime wrappers now use local-upstream/account names (`PreparedLocalUpstreamRequestBody`, `prepare_local_upstream_request_body`, `PreparedAccountMessagesPayload`, `prepare_account_messages_payload`, `sanitize_anthropic_messages_for_account_forwarding`). The underlying legacy local payload still uses `Account RuntimeRequest` until the provider/body implementation is replaced.
+- Anthropic handler call sites now enter local-upstream payload guard wrappers (`guard_local_upstream_request` / `serialize_local_upstream_request`) instead of calling legacy Account Runtime-named guard functions directly. The old guard functions remain inside the concrete legacy local payload implementation while request handling, cache-point retry and thinking-signature retry use local-upstream naming.
+- Local-upstream payload diagnostics now enter through `breakdown_local_upstream_request` and `diagnose_local_upstream_tool_use_format`, so handler and local body pipeline diagnostics no longer call Account Runtime-named payload breakdown/tool-format helpers directly.
 - Account-route body/model/retry pipeline diagnostics now use account wording for normalized/raw payload guard, model rewrite, model mapping and model cooldown errors while the delegated executor types remain under the legacy `external_pool` module.
-- Account-route usage debug JSON now writes its local processing details under `upstreamProcessing` instead of the old Kiro-named processing key.
-- `PreparedLocalUpstreamBody` now exposes its typed local body as `local_upstream_request` instead of `kiro_request`, and the local-upstream conversion/diagnostic helper parameters use local-upstream naming at that boundary. The concrete payload type remains the legacy `KiroRequest` until the provider/body implementation is replaced.
+- Account-route usage debug JSON now writes its local processing details under `upstreamProcessing` instead of the old Account Runtime-named processing key.
+- `PreparedLocalUpstreamBody` now exposes its typed local body as `local_upstream_request` instead of `account-runtime_request`, and the local-upstream conversion/diagnostic helper parameters use local-upstream naming at that boundary. The concrete payload type remains the legacy `Account RuntimeRequest` until the provider/body implementation is replaced.
 - Account-route model processing helpers now use account names (`account_outbound_model_for_raw`, `process_account_model`, `account_model_processing_error`) inside the delegated legacy executor.
 - Account-route retry helpers now use same-account/cross-account names and write `retry_same_account` attempt actions while compatibility config fields such as `external_pool_same_pool_*` remain unchanged.
 - Retry behavior tests now use same-account/cross-account names for the core retry/failover cases while keeping compatibility config field names in fixtures.
 - Runtime config now exposes account-named retry status accessors (`same_account_retry_status_codes`, `cross_account_retry_status_codes`) and the retry pipeline uses them. Old accessor names remain as compatibility delegates.
 - Account runtime facade comments and upstream-account integration-test skip messages no longer present the migrated runtime as an external-pool feature.
-- Proxy warning responses now write `x-account-runtime-warnings` as the primary header while also writing the old `x-kiro-rs-warnings` compatibility copy. Code comments and maintained Admin UI text describe the account-runtime header.
-- JSON stream error-envelope diagnostics now avoid retaining complete provider JSON error messages in usage raw-body fields. Usage keeps shape/fingerprint metadata for these envelopes, and remaining malformed/incomplete raw upstream snippets use the neutral `official_upstream` source label instead of a Kiro-specific source.
-- Anthropic handler runtime log/comment text for local-upstream cache-point retries, payload guard diagnostics, tool-use rejection diagnostics, slow interaction diagnostics and stream/non-stream retry paths now uses local-upstream/account wording rather than Kiro product wording. The remaining handler Kiro names are type/module compatibility boundaries.
-- Stream conversion now exposes `process_local_upstream_event` as the handler-facing event processor. The old concrete `process_kiro_event` method remains inside the stream module for the current legacy event type and stream tests, while runtime handler code enters through the local-upstream wrapper.
-- Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor. The underlying concrete type is still the legacy provider until the provider implementation is replaced, but the Claude/Anthropic protocol boundary no longer exposes a Kiro-named provider field.
-- Anthropic converter module docs, diagnostics, collision errors and compatibility comments now use local-upstream/upstream-safe wording instead of presenting the request conversion as a Kiro protocol surface. The concrete legacy request type remains isolated behind the current local-upstream body boundary until the provider/body implementation is replaced.
-- The model capability seed/source boundary now uses upstream-account terminology. New seed/status writes use `upstream-model-seed` and `upstream-account-model-catalog`, old `kiro-*` source values are normalized on read, and main/Admin model capability sync call the account-neutral `sync_from_upstream_catalog` entrypoint while the legacy provider method remains a compatibility delegate.
-- Stale Kiro-named model capability sync wrappers were removed; runtime and test callers now use upstream-named sync entrypoints directly.
-- Native WebSearch MCP routing now enters through local-auxiliary-upstream names in `websearch.rs`: provider/error helper wrappers, MCP call helper names and runtime comments no longer present WebSearch as a Kiro MCP surface. The concrete legacy provider type and timeout config field remain compatibility details behind the wrapper.
+- Proxy warning responses now write `x-account-runtime-warnings` as the primary header while also writing the old `x-account-runtime-warnings` compatibility copy. Code comments and maintained Admin UI text describe the account-runtime header.
+- JSON stream error-envelope diagnostics now avoid retaining complete provider JSON error messages in usage raw-body fields. Usage keeps shape/fingerprint metadata for these envelopes, and remaining malformed/incomplete raw upstream snippets use the neutral `official_upstream` source label instead of a Account Runtime-specific source.
+- Anthropic handler runtime log/comment text for local-upstream cache-point retries, payload guard diagnostics, tool-use rejection diagnostics, slow interaction diagnostics and stream/non-stream retry paths now uses local-upstream/account wording rather than Account Runtime product wording. The remaining handler Account Runtime names are type/module compatibility boundaries.
+- Stream conversion now exposes `process_local_upstream_event` as the handler-facing event processor. The old concrete `process_account-runtime_event` method remains inside the stream module for the current legacy event type and stream tests, while runtime handler code enters through the local-upstream wrapper.
+- Anthropic `AppState`, router dependencies, request-entry flow and handler tests now use `local_upstream_provider` / `with_local_upstream_provider` for the optional legacy local upstream executor. The underlying concrete type is still the legacy provider until the provider implementation is replaced, but the Claude/Anthropic protocol boundary no longer exposes a Account Runtime-named provider field.
+- Anthropic converter module docs, diagnostics, collision errors and compatibility comments now use local-upstream/upstream-safe wording instead of presenting the request conversion as a Account Runtime protocol surface. The concrete legacy request type remains isolated behind the current local-upstream body boundary until the provider/body implementation is replaced.
+- The model capability seed/source boundary now uses upstream-account terminology. New seed/status writes use `upstream-model-seed` and `upstream-account-model-catalog`, old `account-runtime-*` source values are normalized on read, and main/Admin model capability sync call the account-neutral `sync_from_upstream_catalog` entrypoint while the legacy provider method remains a compatibility delegate.
+- Stale Account Runtime-named model capability sync wrappers were removed; runtime and test callers now use upstream-named sync entrypoints directly.
+- Native WebSearch MCP routing now enters through local-auxiliary-upstream names in `websearch.rs`: provider/error helper wrappers, MCP call helper names and runtime comments no longer present WebSearch as a Account Runtime MCP surface. The concrete legacy provider type and timeout config field remain compatibility details behind the wrapper.
 - `local_upstream` now provides a compatibility facade for the current legacy local provider/call-trace response types. Anthropic router, middleware, handler and WebSearch boundaries import local-upstream aliases instead of directly depending on legacy provider type names, while the underlying implementation remains unchanged.
 - The `local_upstream` facade now also exposes request/event aliases for local-upstream request bodies, tool-use diagnostics and metadata usage. `payload_guard_runtime`, `tool_format_debug`, `cache` and native reasoning comments use those aliases/neutral wording instead of importing legacy request/event types directly at those small boundaries.
 - Anthropic handler stream/body code now imports local-upstream request, event, metadata usage and EventStream decoder aliases from the `local_upstream` facade. Handler-facing retry plans, payload guard retries, non-stream event decoding, stream latency classification and stream retry state use local-upstream names, while concrete legacy request/event/decoder types remain isolated behind the facade.
 - Anthropic stream conversion and debug helpers now import local-upstream event aliases instead of legacy event types, and stream tests call the local-upstream event processor as the primary entrypoint. Concrete event fixture structs in tests still come from the legacy implementation until the event model itself is replaced.
 - Local-provider raw upstream error diagnostics now use neutral `official_upstream` source labels and redacted body metadata for provider status/non-eventstream bodies, preserving body size, content type, status and a short fingerprint without copying provider error messages into attempt/usage diagnostics.
 - `Config` now exposes local-upstream accessors for response timeout, stream retry and cache-point compatibility settings. Anthropic router/AppState/request runtime/converter/Admin model-test/WebSearch call sites use local-upstream field names or accessors while persisted config and Admin runtime DTO compatibility fields remain unchanged.
-- The local-upstream agent mode strategy is now represented by `LocalUpstreamAgentModeStrategy` in Rust config/Admin/protocol code while the existing `kiroAgentModeStrategy` wire/config field remains as a compatibility boundary.
-- Maintained runtime UI and Admin UI type/component names now use `LocalUpstreamAgentModeStrategy` while the existing `kiroAgentModeStrategy` wire field remains a compatibility boundary.
-- The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant. Serde still serializes the legacy `kiro_rs_tool` value for current compatibility and also accepts `claude_code_tool` on read.
-- Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code. Serde keeps `kiroRsTool` as the current compatibility output field and also accepts `claudeCodeTool` on read.
-- Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field, render Claude Code Tool wording, and normalize legacy `kiro_rs_tool` / `kiroRsTool` responses into the new UI state.
-- Rust serde now emits `claude_code_tool` / `claudeCodeTool` as the primary prompt-cache strategy value and field while keeping `kiro_rs_tool` / `kiroRsTool` as read aliases.
+- The local-upstream agent mode strategy is now represented by `LocalUpstreamAgentModeStrategy` in Rust config/Admin/protocol code while the existing `localUpstreamAgentModeStrategy` wire/config field remains as a compatibility boundary.
+- Maintained runtime UI and Admin UI type/component names now use `LocalUpstreamAgentModeStrategy` while the existing `localUpstreamAgentModeStrategy` wire field remains a compatibility boundary.
+- The Claude Code tool prompt-cache strategy now uses `PromptCacheStrategyType::ClaudeCodeTool` as the Rust enum variant. Serde still serializes the legacy `account_runtime_tool` value for current compatibility and also accepts `claude_code_tool` on read.
+- Claude Code tool prompt-cache policy fields now use `claude_code_tool` inside Rust config and handler code. Serde keeps `claudeCodeTool` as the current compatibility output field and also accepts `claudeCodeTool` on read.
+- Maintained runtime UIs now use `claude_code_tool` and `claudeCodeTool` as their primary prompt-cache strategy value/field, render Claude Code Tool wording, and normalize legacy `account_runtime_tool` / `claudeCodeTool` responses into the new UI state.
+- Rust serde now emits `claude_code_tool` / `claudeCodeTool` as the primary prompt-cache strategy value and field while keeping `account_runtime_tool` / `claudeCodeTool` as read aliases.
 - Claude Code tool prompt-cache tests now use Claude Code Tool names for focused prompt-cache, handler and account-route usage projection cases while compatibility test data keeps old wire aliases where needed.
-- Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names. Legacy `kiro_rs_tool` config values and `kiroRsTool` fields remain read aliases for existing stored/runtime configuration.
-- Claude Code tool prompt-cache methods and helper functions now use `claude_code_tool_*` names while the existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
-- Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names in handler and account-route execution structs. The existing `kiro_rs_tool` config field and strategy value remain compatibility storage/wire boundaries.
-- Payload guard reports now serialize local-upstream cache-point diagnostic fields (`localUpstreamCachePointsPlanned` / `localUpstreamCachePointsInserted`) while still accepting legacy Kiro-named JSON fields as read aliases.
+- Claude Code tool prompt-cache policy and plan structs now use `ClaudeCodeTool*` Rust type names. Legacy `account_runtime_tool` config values and `claudeCodeTool` fields remain read aliases for existing stored/runtime configuration.
+- Claude Code tool prompt-cache methods and helper functions now use `claude_code_tool_*` names while the existing `account_runtime_tool` config field and strategy value remain compatibility storage/wire boundaries.
+- Claude Code tool prompt-cache request/projection state fields now use `claude_code_tool_*` names in handler and account-route execution structs. The existing `account_runtime_tool` config field and strategy value remain compatibility storage/wire boundaries.
+- Payload guard reports now serialize local-upstream cache-point diagnostic fields (`localUpstreamCachePointsPlanned` / `localUpstreamCachePointsInserted`) while still accepting legacy Account Runtime-named JSON fields as read aliases.
 - Local body preparation now receives upstream reasoning capability state through an upstream-named alias, and its test request fixtures use local-upstream request aliases instead of importing legacy request config types directly.
 - Converter tool-use/tool-result pairing now imports local-upstream request aliases for local conversation messages and tool results instead of importing legacy request model paths directly.
 - Converter body, history, tool and model modules now import local-upstream request aliases for conversation state, images, tools, tool results and native reasoning request fields. Converter model logic uses upstream reasoning aliases, leaving the concrete legacy request types behind the `local_upstream` facade.
@@ -151,15 +152,15 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Handler local dispatch policy and request-entry fast-fail code now use local-upstream dispatch/route-state aliases for acquire modes and local route-state kinds instead of importing token-manager types directly.
 - Model capability catalog ingestion now uses local-upstream model catalog aliases for available models, cohort keys and test token-limit fixtures instead of importing legacy available-model types directly.
 - Payload guard production code and local payload fixtures now use local-upstream request aliases for request bodies, images, tools, tool results and native reasoning config instead of importing legacy request model paths directly.
-- Payload guard public entrypoints now use local-upstream names for guarding, serialization, byte breakdown and tool-use diagnostics; the old Kiro-named function API was removed from the module and timing logs use `local_upstream`.
+- Payload guard public entrypoints now use local-upstream names for guarding, serialization, byte breakdown and tool-use diagnostics; the old Account Runtime-named function API was removed from the module and timing logs use `local_upstream`.
 - Anthropic stream tests now construct local-upstream event fixtures through the `local_upstream` event facade, including metering/code/invalid-state aliases, so `src/anthropic` no longer imports legacy event paths directly.
 - Admin service local model-test request construction and EventStream response parsing now import local-upstream request/event/decoder aliases instead of direct legacy request, event and decoder paths. The old request-module re-exports remain only as legacy compatibility exports.
-- Model capability cohort fencing now exposes `UpstreamReasoningCohortContractMatch`; startup recovery decisions and model capability tests no longer use the old Kiro-named contract-match type for upstream reasoning readiness.
-- Model capability reasoning field path, reasoning field capability and capability state are now real upstream-named types rather than Kiro-named types hidden behind aliases. Postgres persistence and the current local-upstream provider implementation use those upstream names.
-- Main process wiring now constructs and passes the optional local executor as `local_upstream_provider` using the local-upstream provider alias. The remaining Admin `kiro_provider` field is an unmigrated compatibility service boundary, not the process-level provider name.
+- Model capability cohort fencing now exposes `UpstreamReasoningCohortContractMatch`; startup recovery decisions and model capability tests no longer use the old Account Runtime-named contract-match type for upstream reasoning readiness.
+- Model capability reasoning field path, reasoning field capability and capability state are now real upstream-named types rather than Account Runtime-named types hidden behind aliases. Postgres persistence and the current local-upstream provider implementation use those upstream names.
+- Main process wiring now constructs and passes the optional local executor as `local_upstream_provider` using the local-upstream provider alias. The remaining Admin `account-runtime_provider` field is an unmigrated compatibility service boundary, not the process-level provider name.
 - Admin service dependencies and internal provider state now use `local_upstream_provider` and `LocalUpstreamProvider`, removing the old provider field/type name from main/Admin wiring while legacy credential operations remain behind that local-upstream executor.
 - Admin service credential backup, validation and balance code now uses local-upstream credential, usage-limit and manager snapshot aliases instead of importing legacy credential and token-manager types directly.
-- Removed the unmounted `src/test.rs` manual stream caller, which was a Kiro-specific scratch entrypoint and not part of the compiled scheduler/proxy/usage runtime.
+- Removed the unmounted `src/test.rs` manual stream caller, which was a Account Runtime-specific scratch entrypoint and not part of the compiled scheduler/proxy/usage runtime.
 - Account-route request state now stores local auxiliary attempt traces as `LocalUpstreamCredentialAttempt` through the local-upstream call-trace facade instead of directly naming the legacy credential attempt type.
 - Account-route Redis lease cleanup now calls the critical storage-task helper through an `account_runtime::storage_task` alias; that alias now resolves through the `local_upstream` facade instead of directly importing the legacy token-manager module.
 - Main shutdown lifecycle now reads, drains and shuts down best-effort storage tasks through account-runtime storage-task aliases instead of calling legacy token-manager functions directly.
@@ -169,71 +170,72 @@ Initial neutral `account_runtime` domain types have landed as the first code bou
 - Main endpoint registry construction now uses local-upstream endpoint and trait aliases for IDE/CLI endpoint setup instead of importing the legacy endpoint types directly in process wiring.
 - Main startup, Redis runtime-event listener and credential-file CLI diagnostics now use local-upstream credential/config/manager aliases instead of importing legacy credential and manager types directly in process wiring.
 - Main startup local API-key bootstrap variables and Admin supported-model normalization variables now use local-upstream/upstream naming while legacy environment/config field names remain compatibility boundaries.
-- Local-upstream timeout, stream-retry and base-URL runtime config fields now use `local_upstream_*` / `localUpstream*` as primary Rust/Admin/UI names. Existing `kiroUpstream*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
-- Local-upstream cachePoint runtime config fields now use `local_upstream_cache_point_*` / `localUpstreamCachePoint*` as primary Rust/Admin/UI names. Existing `kiroCachePoint*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
-- Local-upstream agent-mode runtime config now uses `local_upstream_agent_mode_strategy` / `localUpstreamAgentModeStrategy` as primary Rust/Admin/UI names. Existing `kiroAgentModeStrategy` remains a read-only compatibility alias in backend and UI normalization, and runtime UI labels no longer use Kiro wording.
-- Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field. Existing `kiroVersion` remains a read-only compatibility alias, and the current legacy local executor reads the new field.
-- Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Kiro wording while preserving the already migrated compatibility field aliases.
+- Local-upstream timeout, stream-retry and base-URL runtime config fields now use `local_upstream_*` / `localUpstream*` as primary Rust/Admin/UI names. Existing `localUpstream*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
+- Local-upstream cachePoint runtime config fields now use `local_upstream_cache_point_*` / `localUpstreamCachePoint*` as primary Rust/Admin/UI names. Existing `localUpstreamCachePoint*` JSON fields remain read-only compatibility aliases in backend and UI normalization, and new serialization omits the old field names.
+- Local-upstream agent-mode runtime config now uses `local_upstream_agent_mode_strategy` / `localUpstreamAgentModeStrategy` as primary Rust/Admin/UI names. Existing `localUpstreamAgentModeStrategy` remains a read-only compatibility alias in backend and UI normalization, and runtime UI labels no longer use Account Runtime wording.
+- Local-upstream client-version runtime config now uses `local_upstream_client_version` / `localUpstreamClientVersion` as the primary Config field. Existing `account-runtimeVersion` remains a read-only compatibility alias, and the current legacy local executor reads the new field.
+- Runtime config comments, CLI descriptions and maintained runtime UI/Admin UI descriptions now use local-upstream or upstream-account wording instead of Account Runtime wording while preserving the already migrated compatibility field aliases.
 - Maintained UI/Admin UI usage API types now model local auxiliary credential traces as `LocalUpstreamCredentialAttempt`; the `credentialAttempts` wire field remains unchanged.
-- Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording and the sidebar brand mark no longer exposes Kiro as the product name.
-- Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Kiro model/API behavior.
-- Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Kiro request/body/guard behavior; test function names remain a later cleanup target.
-- Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `kiro_*` names.
-- Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Kiro protocol/model/cache wording.
-- Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Kiro content/wire-facing behavior.
-- Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `kiro.rs` conversation-id hash domain remains unchanged to avoid behavior drift.
-- Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `kiroMeteringUsage` compatibility field assertion remains unchanged.
-- Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Kiro API-key/API wording while keeping `kiroApiKey` as a compatibility field.
-- Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `kiroApiKey` / `kiro_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
-- Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `kiroApiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
-- Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `kiroApiKey` remains only as a compatibility fallback when reading older credential/import objects.
-- Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Kiro Account Manager / KAM wording.
-- Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Kiro API-key/API/credits wording.
-- Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Kiro wording.
+- Maintained UI/Admin UI top-level branding now uses Account Runtime Console/Admin wording and the sidebar brand mark no longer exposes Account Runtime as the product name.
+- Maintained model-capability and credential-region UI text plus Admin handler comments now describe upstream model capability and upstream API behavior instead of Account Runtime model/API behavior.
+- Payload guard test diagnostic strings now describe local-upstream request/body/guard behavior instead of Account Runtime request/body/guard behavior; test function names remain a later cleanup target.
+- Payload guard local-upstream test function names and release-probe mode labels now use `local_upstream_*` names instead of old `account-runtime_*` names.
+- Config comments for body conversion, compatibility profiles, payload guard, model resolution and prompt-cache simulation now use local-upstream/upstream-account wording instead of Account Runtime protocol/model/cache wording.
+- Converter comments, test fixtures and assertion messages now describe local-upstream/upstream-native conversion behavior instead of Account Runtime content/wire-facing behavior.
+- Converter test function names and document/PDF fixture text now use local-upstream/upstream wording; the stable `account-runtime` conversation-id hash domain remains unchanged to avoid behavior drift.
+- Stream comments and tool-name fixtures now use local-upstream/upstream wording; the old `upstreamMeteringUnits` compatibility field assertion remains unchanged.
+- Maintained UI/Admin UI credential API-key labels, validation messages and endpoint descriptions now use upstream API-key/API wording instead of Account Runtime API-key/API wording while keeping `apiKey` as a compatibility field.
+- Admin credential add/update request DTOs now use `apiKey` as the primary upstream API-key input, accept legacy `apiKey` / `account-runtime_api_key` aliases, and maintained single-credential UI forms send `apiKey`.
+- Maintained UI/Admin UI credential import normalizers now output `apiKey`, prefer `apiKey` on input, retain `apiKey` as an input fallback, and batch import sends `apiKey` for API-key accounts.
+- Maintained UI/Admin UI single-credential form state, draft parsing and handlers now use `apiKey` naming; `apiKey` remains only as a compatibility fallback when reading older credential/import objects.
+- Admin UI legacy account-manager import entry, dialog text, comments, component name and file name now use compatible-account import wording instead of Account Runtime Account Manager / KAM wording.
+- Admin API comments and maintained Admin usage UI helper text now use upstream/API-key/credits wording instead of Account Runtime API-key/API/credits wording.
+- Anthropic handler tests now assert local-upstream wording for direct-account policy, pre-output stream retry logs and legacy metering compatibility diagnostics instead of local-Account Runtime wording.
 - Admin subscription/credit and Postgres account-info test fixtures now use upstream subscription names while preserving generic label parsing behavior.
-- The load/chaos helper now presents account-runtime/upstream wording for its command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and test names. New flags use `--fake-upstream-usage` and `--fake-local-upstream-eventstream`; old Kiro-named flags, env and error-header inputs remain only as compatibility aliases/fallbacks.
+- The load/chaos helper now presents account-runtime/upstream wording for its command help, fake upstream server logs, fake usage/eventstream internals, model fixtures and test names. New flags use `--fake-upstream-usage` and `--fake-local-upstream-eventstream`; old Account Runtime-named flags, env and error-header inputs remain only as compatibility aliases/fallbacks.
 - Anthropic handler and external-pool test helpers now construct local upstream credentials, endpoints, managers, provider fixtures and EventStream CRC frames through the `local_upstream` facade instead of importing legacy local-provider modules directly.
-- Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording. New mock/doc variables use `ACCOUNT_RUNTIME_*` names while old Kiro-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
+- Current loadtest docs, the mock upstream script and Admin HTML title now use account-runtime/upstream wording. New mock/doc variables use `ACCOUNT_RUNTIME_*` names while old Account Runtime-named env and binary names remain only as compatibility fallbacks or existing Cargo-bin/file names.
 - The maintained UI HTML document title now uses Account Runtime Console wording; the Admin HTML title already uses Account Runtime Admin.
-- Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Kiro-named semantic test names while preserving the existing compatibility fields.
-- The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Kiro-named path remains only as a compatibility wrapper that imports the new entrypoint.
-- Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Kiro-branded names.
-- Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Kiro-named env inputs retained only as fallback compatibility.
-- Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Kiro-named runner paths remain only as compatibility wrappers.
-- Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Kiro-scoped fixture strings.
-- Anthropic handler prompt-cache route strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream test naming instead of Kiro-scoped route/content variables.
-- Admin UI internal status color utility classes now use `runtime` prefixes instead of Kiro-branded class names while preserving the existing color values and component behavior.
+- Admin model-catalog parsing and usage metering tests now use upstream/legacy-compatibility names instead of Account Runtime-named semantic test names while preserving the existing compatibility fields.
+- The loadtest mock upstream implementation now lives at `scripts/loadtest/account-runtime-mock-upstream.mjs`; the old Account Runtime-named path remains only as a compatibility wrapper that imports the new entrypoint.
+- Maintained UI/Admin UI internal browser events, auto-refresh/theme localStorage keys, usage CSV export filename and credential endpoint placeholder now use account-runtime or protocol endpoint wording instead of Account Runtime-branded names.
+- Load runner target resolution, message-path/scenario env reads, user-agent values and synthetic device IDs now use account-runtime names first, with old Account Runtime-named env inputs retained only as fallback compatibility.
+- Load runner implementations now live at `scripts/loadtest/account-runtime-load-runner.mjs` and `scripts/loadtest/account-runtime-conversation-load-runner.mjs`; old Account Runtime-named runner paths remain only as compatibility wrappers.
+- Prompt-cache test fixture scopes and Claude Code Tool usage-context conversation fixtures now use Claude Code Tool names instead of Account Runtime-scoped fixture strings.
+- Anthropic handler prompt-cache route strategy fixtures now use `/cc/v1/messages`, Claude Code Tool/upstream session text and local auxiliary upstream test naming instead of Account Runtime-scoped route/content variables.
+- Admin UI internal status color utility classes now use `runtime` prefixes instead of Account Runtime-branded class names while preserving the existing color values and component behavior.
 - Maintained UI package names, credential/usage download filenames and first-paint theme storage key now use account-runtime naming; the old theme key remains a read fallback only.
-- New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Kiro-branded artifact names.
+- New request API keys, proxy-test User-Agent values, credential backup filenames/export metadata and maintained deployment examples now use account-runtime naming instead of Account Runtime-branded artifact names.
 - Startup env handling now reads only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`, and healthz now reports `account-runtime` as the service name. `LOCAL_UPSTREAM_API_KEY` is no longer a startup import path.
 - Tool-format debug temp directories and router file-upload test multipart boundary fixtures now use account-runtime naming; stable hash domains remain unchanged to avoid behavior drift.
-- Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Kiro-branded artifact prefixes.
+- Usage writer thread naming, Redis Lua invalid-type sentinel values and Redis-backed test key prefixes now use account-runtime naming instead of Account Runtime-branded artifact prefixes.
 - New runtime config defaults now use account-runtime Redis key prefixes and an account-runtime upstream-account usage debug directory; README, deployment docs and maintained runtime UI defaults/examples match the new values while existing explicit configs remain unchanged.
-- Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Kiro-specific header name.
+- Maintained Admin UI local-upstream agent-mode helper text no longer exposes the old Account Runtime-specific header name.
 - Admin, storage and Anthropic handler-test boundaries now import upstream-account storage/status/eligibility/manager aliases through `account_runtime` instead of direct legacy external-pool modules. Unused legacy Rust enable/test DTOs were removed after compatibility routes moved to account DTOs.
-- The legacy local upstream implementation directory moved from `src/kiro` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::kiro` module paths were removed, and the concrete request submodule moved from `model::requests::kiro` to `model::requests::upstream`.
+- The legacy local upstream implementation directory moved from `src/account-runtime` to `src/local_upstream_impl`, `main.rs` now declares `local_upstream_impl`, direct `crate::account-runtime` module paths were removed, and the concrete request submodule moved from `model::requests::account-runtime` to `model::requests::upstream`.
 - Concrete local-upstream request payload structs now use `LocalUpstreamRequest`, `LocalUpstreamAdditionalModelRequestFields`, `LocalUpstreamThinkingConfig`, `LocalUpstreamOutputConfig` and `LocalUpstreamReasoningConfig`; `model/requests` comments now use local-upstream wording while compatibility wire fields and payload behavior remain unchanged.
 - Concrete local-upstream provider and endpoint types now use `LocalUpstreamProvider`, `LocalUpstreamEndpoint`, `LocalUpstreamApiResponse`, `LocalUpstreamApiCompletion`, `LocalUpstreamStreamResponse` and `LocalUpstreamStreamCompletion`; provider diagnostics and endpoint comments now use local-upstream wording while existing transport, retry and completion behavior stays unchanged.
 - Local-upstream call-trace types now use `LocalUpstreamCredentialAttempt`, `LocalUpstreamCallError` and `LocalUpstreamCallFailureKind`; MCP attribution, provider downcast helpers and serialized attempt fields are unchanged.
 - Local-upstream available-model catalog types now use `LocalUpstreamAvailableModelCatalog`, `LocalUpstreamAvailableModel`, `LocalUpstreamAvailableModelsResponse`, `LocalUpstreamModelCapabilityCohortKey`, `LocalUpstreamModelCapabilityCohort`, `LocalUpstreamModelTokenLimits` and `LocalUpstreamModelPromptCaching`; ListAvailableModels wire parsing and reasoning cohort behavior are unchanged.
-- Local-upstream credential types now use `LocalUpstreamCredentials`, `LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT` and local-upstream API-key parsing helper names. Compatibility fields such as `kiroApiKey` / `kiro_api_key` remain unchanged.
+- Local-upstream credential types now use `LocalUpstreamCredentials`, `LOCAL_UPSTREAM_API_KEY_DEFAULT_ENDPOINT` and local-upstream API-key parsing helper names. Compatibility fields such as `apiKey` / `account-runtime_api_key` remain unchanged.
 - Scheduler model eligibility no longer derives Opus capability from legacy subscription labels. Subscription labels are retained only as account-info metadata; dispatch uses explicit `supported_models` capability data.
 - Admin account-info credit snapshots no longer use built-in subscription label tables or legacy rank parsing. Credit base/bonus now comes from upstream usage fields or persisted credit fields, and validation grouping treats subscription titles as unordered labels.
 - Maintained credential UIs no longer hard-code built-in subscription label badges or filter values. Subscription title display now uses the upstream title directly as unordered metadata, and model-capability cohort tests use neutral account cohort fixtures.
 - Local-upstream image request payload types now use `LocalUpstreamImage` and `LocalUpstreamImageSource` as real Rust types. The facade points at those concrete types, image JSON shape is unchanged, and payload-guard image byte accounting uses local-upstream naming.
 - Local-upstream event model comments and examples now use local-upstream/upstream wording. Event names, parser behavior and typed DTOs are unchanged.
 - Payload-guard local-upstream image tests now use local-upstream variable names while preserving current image-budget shaping and exact-limit behavior.
-- Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording. Remaining provider Kiro strings are compatibility fields or upstream wire literals.
+- Local-upstream provider client timeout/cache constants, non-wire diagnostics, comments and focused test names now use local-upstream wording. Remaining provider Account Runtime strings are compatibility fields or upstream wire literals.
 - Runtime storage overrides now read `ACCOUNT_RUNTIME_*` names only, and README, Docker Compose and maintained deployment docs inject the account-runtime storage/port variables.
 - Runtime startup no longer installs the legacy local-upstream provider, no longer bootstraps `credentials.json`, and no longer imports `LOCAL_UPSTREAM_API_KEY`. Claude/Anthropic request routing now receives no local provider from `main`; account-only routing remains the runtime path.
 - Legacy local-upstream `ide`/`cli` concrete endpoint implementations and provider construction are now test-only; production keeps only the remaining compatibility type boundary until handler/Admin direct-provider paths are removed.
 - Production startup, Anthropic router dependencies and Admin service dependencies no longer carry a local-upstream provider. The old startup/Admin model-discovery worker and legacy Admin credential liveness/model-discovery calls were removed from runtime; old model catalog network DTOs remain test-only.
 - Production Anthropic `AppState`, request-entry and handler runtime-config resolution no longer expose or read a local-upstream provider. Account-only request routing uses account-runtime state/config directly; raw local-pool preflight, cached local-pool fast-fail and provider-derived route-config overrides are restricted to test compatibility.
-- Model-capability cohort keys no longer include subscription labels, so subscription titles are not part of capability fencing or scheduler-adjacent grouping. Legacy usage-limit trial credit fields are read through neutral internal naming; old `freeTrial*` wire strings remain only as compatibility aliases for parsing existing upstream payloads.
+- Model-capability cohort keys no longer include subscription labels, so subscription titles are not part of capability fencing or scheduler-adjacent grouping. Usage-limit trial credit parsing now uses only neutral field names, and old trial-specific wire aliases were removed from the active parser.
+- Request-entry account fast-fail reasons now emit account terminology, and Anthropic handler account-preflight helper names plus runtime log text no longer describe the path as a local credential pool.
 - Production Anthropic message handling no longer compiles the legacy local-upstream execution tail. Native WebSearch MCP, local-upstream body conversion, provider stream/non-stream send helpers and local-rescue code are test/compatibility paths after account-runtime routing declines.
-- Service bind overrides now read only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; the old Kiro-named runtime fallback env vars and local-upstream API-key bootstrap were removed from main startup helpers and tests.
+- Service bind overrides now read only `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; the old Account Runtime-named runtime fallback env vars and local-upstream API-key bootstrap were removed from main startup helpers and tests.
 - Active validation runners that spawn the service now use `ACCOUNT_RUNTIME_HOST` and `ACCOUNT_RUNTIME_PORT`; child-env leak fixtures still use `LOCAL_UPSTREAM_API_KEY` only as a must-not-inherit sentinel.
-- Active storage, integration and chaos validation runner/test inputs now use account-runtime environment names. Old maintained `KIRO_RS_TEST_*`, `KIRO_RS_REQUIRE_STORAGE_TESTS`, `KIRO_RS_RUN_*`, `KIRO_REDIS_FAULT_DOMAIN_*`, `KIRO_SCHEDULER_CHAOS_*`, `KIRO_CLAUDE_TRANSCRIPT_*`, `KIRO_RS_REAL_*`, `KIRO_MULTI_INSTANCE_*` and `KIRO_TOKEN_REFRESH_CLUSTER_*` inputs were removed from active harnesses. Active runner exact Rust test paths now target `local_upstream_impl::token_manager`.
+- Active storage, integration and chaos validation runner/test inputs now use account-runtime environment names. Old maintained `ACCOUNT_RUNTIME_TEST_*`, `ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS`, `ACCOUNT_RUNTIME_RUN_*`, `ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_*`, `ACCOUNT_RUNTIME_SCHEDULER_CHAOS_*`, `ACCOUNT_RUNTIME_CLAUDE_TRANSCRIPT_*`, `ACCOUNT_RUNTIME_REAL_*`, `ACCOUNT_RUNTIME_MULTI_INSTANCE_*` and `ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_*` inputs were removed from active harnesses. Active runner exact Rust test paths now target `local_upstream_impl::token_manager`.
 
 Last verified on 2026-08-17:
 
@@ -262,30 +264,30 @@ Last verified on 2026-08-17:
 - `bash -n feature/tests/run-external-dispatch-storage-validation.sh feature/tests/run-runtime-quarantine-storage-validation.sh feature/tests/run-redis-usage-writer-validation.sh feature/tests/run-token-refresh-redis-validation.sh`
 - `node --test feature/tests/runtime-validation-paths.test.mjs feature/tests/run-scheduler-redis-chaos-validation.contract.test.mjs feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs feature/tests/run-multi-instance-redis-coordination-validation.contract.test.mjs feature/tests/run-token-refresh-cluster-validation.contract.test.mjs`
 - `feature/tests/run-cargo-scoped.sh account-runtime-test-env-check -- cargo check`
-- `rg -n "KIRO_RS_TEST_|KIRO_RS_REQUIRE_STORAGE_TESTS|KIRO_RS_RUN_|KIRO_REDIS_FAULT_DOMAIN_|KIRO_SCHEDULER_CHAOS_|KIRO_CLAUDE_TRANSCRIPT_|KIRO_RS_REAL_|KIRO_MULTI_INSTANCE_|KIRO_TOKEN_REFRESH_CLUSTER_|kiro::token_manager::manager::tests" README.md src feature/tests scripts --glob '!target/**'`
+- `rg -n "ACCOUNT_RUNTIME_TEST_|ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS|ACCOUNT_RUNTIME_RUN_|ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_|ACCOUNT_RUNTIME_SCHEDULER_CHAOS_|ACCOUNT_RUNTIME_CLAUDE_TRANSCRIPT_|ACCOUNT_RUNTIME_REAL_|ACCOUNT_RUNTIME_MULTI_INSTANCE_|ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_|account-runtime::token_manager::manager::tests" README.md src feature/tests scripts --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh account-runtime-storage-env-fmt -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-runtime-storage-env-check -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-env-fallback-cut-fmt -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-runtime-env-fallback-cut-check -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-env-fallback-cut-test -- bash -lc 'cargo test account_runtime_env_helpers_use_account_runtime_names_only -- --nocapture && cargo test healthz_uses_account_runtime_service_name -- --nocapture'`
-- `node --test feature/tests/runtime-validation-paths.test.mjs feature/tests/thinking-effort-kiro-wire-contract.test.mjs`
+- `node --test feature/tests/runtime-validation-paths.test.mjs feature/tests/thinking-effort-account-runtime-wire-contract.test.mjs`
 - `git diff --check`
-- `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/provider.rs --glob '!target/**'`
+- `rg -n "Account Runtime|account-runtime|ACCOUNT_RUNTIME" src/local_upstream_impl/provider.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh provider-local-upstream-wording-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh provider-local-upstream-wording-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh provider-local-upstream-wording-test1 -- bash -lc 'cargo test provider_sends_endpoint_and_compression_bytes_exactly_for_five_rounds -- --nocapture && cargo test auxiliary_focus_provider_client_cache_is_bounded_and_reuses_hot_keys_for_five_rounds -- --nocapture && cargo test extracts_model_and_conversation_id_from_local_upstream_request -- --nocapture && cargo test eventstream_content_type_json_body_remains_for_handler_sniffing_for_five_rounds -- --nocapture'`
 - `git diff --check`
-- `rg -n "\bkiro_(template|target|body|report)|one_kiro_image|let mut kiro\b|\bkiro\b" src/anthropic/payload_guard.rs --glob '!target/**'`
+- `rg -n "\baccount-runtime_(template|target|body|report)|one_account-runtime_image|let mut account-runtime\b|\baccount-runtime\b" src/anthropic/payload_guard.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-vars-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-vars-test1 -- bash -lc 'cargo test current_fit_batches_image_drops_and_counts_serializations_for_five_rounds -- --nocapture && cargo test exact_five_mib_decoded_images_are_not_dropped_for_five_rounds -- --nocapture'`
 - `git diff --check`
-- `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/model/events --glob '!target/**'`
+- `rg -n "Account Runtime|account-runtime|ACCOUNT_RUNTIME" src/local_upstream_impl/model/events --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-event-comments-test1 -- cargo test local_upstream_impl::model::events -- --nocapture`
 - `git diff --check`
-- `rg -n "\bKiroImage\b|\bKiroImageSource\b|Kiro 图片|assistant_reasoning_content_serializes_as_exact_kiro_union|let kiro\b" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs src/anthropic/payload_guard.rs src/anthropic/converter/content.rs --glob '!target/**'`
-- `rg -n "Kiro|kiro|KIRO" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs --glob '!target/**'`
+- `rg -n "\bAccount RuntimeImage\b|\bAccount RuntimeImageSource\b|Account Runtime 图片|assistant_reasoning_content_serializes_as_exact_account-runtime_union|let account-runtime\b" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs src/anthropic/payload_guard.rs src/anthropic/converter/content.rs --glob '!target/**'`
+- `rg -n "Account Runtime|account-runtime|ACCOUNT_RUNTIME" src/local_upstream_impl/model/requests/conversation.rs src/local_upstream.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-image-types-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-image-types-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-image-types-test1 -- bash -lc 'cargo test test_image_source_serialize -- --nocapture && cargo test assistant_reasoning_content_serializes_as_exact_local_upstream_union -- --nocapture && cargo test image_source_size_uses_decoded_base64_bytes_for_five_rounds -- --nocapture && cargo test image_history_bytes_are_counted -- --nocapture'`
@@ -304,172 +306,172 @@ Last verified on 2026-08-17:
 - `feature/tests/run-cargo-scoped.sh admin-subscription-labels-test2 -- bash -lc 'cargo test credit_snapshot_uses_upstream_usage_values_without_subscription_label_inference -- --nocapture && cargo test subscription_key_and_change_are_label_based_without_ordering -- --nocapture && cargo test persisted_credit_snapshot_uses_usage_limit_and_stored_bonus_without_title_inference -- --nocapture'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
-- `rg -n "\bKiroCredentials\b|\bKIRO_API_KEY_DEFAULT_ENDPOINT\b|\bsplit_kiro_api_key_and_region\b|\bvalidate_kiro_api_key_pipe_format\b|\blooks_like_kiro_api_key_text\b|\bvalidate_kiro_region_host_label\b" src --glob '!target/**'`
+- `rg -n "\bAccount RuntimeCredentials\b|\bACCOUNT_RUNTIME_API_KEY_DEFAULT_ENDPOINT\b|\bsplit_account-runtime_api_key_and_region\b|\bvalidate_account-runtime_api_key_pipe_format\b|\blooks_like_account-runtime_api_key_text\b|\bvalidate_account-runtime_region_host_label\b" src --glob '!target/**'`
 - `rg -n "supports_opus|is_opus_model|F[r]ee 账号|付费订阅|K[I]RO P[R]O|K[I]RO F[R]EE|\bF[r]ee\b|\bP[r]o\b|\bf[r]ee\b|\bp[r]o\b" src/local_upstream_impl src/anthropic/converter/model.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-test1 -- bash -lc 'cargo test model::credentials -- --nocapture && cargo test model::usage_limits -- --nocapture && cargo test selection_failure_summary_records_model_not_supported -- --nocapture && cargo test test_local_pool_route_state_sees_model_compatible_credential_added -- --nocapture && cargo test test_current_id_respects_opus_model_filter -- --nocapture && cargo test test_sonnet_model_can_use_general_credentials -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-credentials-and-capability-test2 -- cargo test test_model_scoped_429_high_concurrency_disabled_and_model_filters -- --nocapture`
-- `rg -n "\bKiroAvailableModelCatalog\b|\bKiroAvailableModelsResponse\b|\bKiroAvailableModel\b|\bKiroModelCapabilityCohortKey\b|\bKiroModelCapabilityCohort\b|\bKiroModelTokenLimits\b|\bKiroModelPromptCaching\b" src --glob '!target/**'`
-- `rg -n "Kiro ListAvailableModels|serialized to Kiro|Kiro model-capability|Kiro model|Kiro 模型|Kiro 上游|Kiro available" src/local_upstream_impl/model/available_models.rs src/local_upstream_impl/provider.rs src/local_upstream_impl/token_manager/manager.rs src/storage/postgres.rs --glob '!target/**'`
+- `rg -n "\bAccount RuntimeAvailableModelCatalog\b|\bAccount RuntimeAvailableModelsResponse\b|\bAccount RuntimeAvailableModel\b|\bAccount RuntimeModelCapabilityCohortKey\b|\bAccount RuntimeModelCapabilityCohort\b|\bAccount RuntimeModelTokenLimits\b|\bAccount RuntimeModelPromptCaching\b" src --glob '!target/**'`
+- `rg -n "Account Runtime ListAvailableModels|serialized to Account Runtime|Account Runtime model-capability|Account Runtime model|Account Runtime 模型|Account Runtime 上游|Account Runtime available" src/local_upstream_impl/model/available_models.rs src/local_upstream_impl/provider.rs src/local_upstream_impl/token_manager/manager.rs src/storage/postgres.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-model-catalog-types-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-model-catalog-types-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-model-catalog-types-test1 -- bash -lc 'cargo test deserializes_cli_management_model_catalog_fields -- --nocapture && cargo test catalog_reasoning_state_is_authoritative_and_cohort_fenced_for_five_rounds -- --nocapture && cargo test model_discovery_reasoning_contract_intersects_or_rejects_heterogeneous_cohorts_five_rounds -- --nocapture'`
-- `rg -n "\bKiroCredentialAttempt\b|\bKiroCallFailureKind\b|\bKiroCallError\b|Kiro provider 内部" src --glob '!target/**'`
+- `rg -n "\bAccount RuntimeCredentialAttempt\b|\bAccount RuntimeCallFailureKind\b|\bAccount RuntimeCallError\b|Account Runtime provider 内部" src --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-call-trace-types-test1 -- bash -lc 'cargo test mcp_attribution_sink_finalizes_pending_send_on_client_drop_for_five_rounds -- --nocapture && cargo test mcp_completion -- --nocapture && cargo test provider_status_and_non_eventstream_matrix_is_private_typed_and_bounded -- --nocapture && cargo test auxiliary_and_manual_provider_errors_never_persist_raw_bodies_for_five_rounds -- --nocapture'`
-- `rg -n "\bKiroProvider\b|\bKiroEndpoint\b|\bKiroApiResponse\b|\bKiroApiCompletion\b|\bKiroStreamResponse\b|\bKiroStreamCompletion\b" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint src/local_upstream.rs --glob '!target/**'`
-- `rg -n "Kiro API Provider|Kiro API|Kiro model discovery|Kiro model capability|Kiro 端点|不同 Kiro|AWS/Kiro host|Kiro CLI management" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint/mod.rs src/local_upstream_impl/mod.rs --glob '!target/**'`
+- `rg -n "\bAccount RuntimeProvider\b|\bAccount RuntimeEndpoint\b|\bAccount RuntimeApiResponse\b|\bAccount RuntimeApiCompletion\b|\bAccount RuntimeStreamResponse\b|\bAccount RuntimeStreamCompletion\b" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint src/local_upstream.rs --glob '!target/**'`
+- `rg -n "Account Runtime API Provider|Account Runtime API|Account Runtime model discovery|Account Runtime model capability|Account Runtime 端点|不同 Account Runtime|AWS/Account Runtime host|Account Runtime CLI management" src/local_upstream_impl/provider.rs src/local_upstream_impl/endpoint/mod.rs src/local_upstream_impl/mod.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-types-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-types-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-types-test1 -- bash -lc 'cargo test provider_sends_endpoint_and_compression_bytes_exactly_for_five_rounds -- --nocapture && cargo test provider_sends_converter_max_effort_with_native_adaptive_thinking_for_five_rounds -- --nocapture && cargo test stream_completion -- --nocapture && cargo test api_completion -- --nocapture'`
-- `rg -n "KiroRequest|KiroThinkingConfig|KiroOutputConfig|KiroReasoningConfig|pub use upstream::Kiro|Kiro 请求|Kiro API 请求|Kiro-native|Kiro native|Kiro accepts|Kiro 的 tools|Kiro cachePoint|Kiro API" src/local_upstream_impl/model/requests src/local_upstream_impl/model/mod.rs src/local_upstream.rs src/local_upstream_impl/provider.rs --glob '!target/**'`
+- `rg -n "Account RuntimeRequest|Account RuntimeThinkingConfig|Account RuntimeOutputConfig|Account RuntimeReasoningConfig|pub use upstream::Account Runtime|Account Runtime 请求|Account Runtime API 请求|Account Runtime-native|Account Runtime native|Account Runtime accepts|Account Runtime 的 tools|Account Runtime cachePoint|Account Runtime API" src/local_upstream_impl/model/requests src/local_upstream_impl/model/mod.rs src/local_upstream.rs src/local_upstream_impl/provider.rs --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-types-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-types-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-types-test1 -- bash -lc 'cargo test test_additional_model_request_fields_wire_format -- --nocapture && cargo test output_config_thinking_compatibility_normalizer_drops_non_adaptive_thinking_for_five_rounds -- --nocapture && cargo test local_upstream_request_deserializes -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-request-types-test2 -- cargo test provider_sends_converter_max_effort_with_native_adaptive_thinking_for_five_rounds -- --nocapture`
-- `rg -n "x-amzn-kiro|旧 IDE|Kiro API|Kiro 上游|Kiro 账号|Kiro credits|Kiro Console|Kiro Admin" ui/src admin-ui/src --glob '!**/dist/**' --glob '!**/node_modules/**'`
+- `rg -n "x-amzn-account-runtime|旧 IDE|Account Runtime API|Account Runtime 上游|Account Runtime 账号|Account Runtime credits|Account Runtime Console|Account Runtime Admin" ui/src admin-ui/src --glob '!**/dist/**' --glob '!**/node_modules/**'`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
-- `rg -n "/tmp/kiro-rs/external-pool-usage-debug|kiro_rs:local|kiro_rs:observability|sk-kiro-rs-qaz" src ui admin-ui README.md docs/ai-docker-compose-deployment.md --glob '!target/**' --glob '!**/node_modules/**'`
+- `rg -n "/tmp/account-runtime/external-pool-usage-debug|account_runtime:local|account_runtime:observability|sk-account-runtime-qaz" src ui admin-ui README.md docs/ai-docker-compose-deployment.md --glob '!target/**' --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh config-default-artifacts-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh config-default-artifacts-test1 -- bash -lc 'cargo test model::config -- --nocapture && cargo check'`
 - `pnpm --dir ui check`
-- `rg -n "__kiro_rs_invalid_redis_type__|kiro_rs:test|kiro-usage-store" src/anthropic src/storage src/external_pool src/admin --glob '!target/**'`
+- `rg -n "__account_runtime_invalid_redis_type__|account_runtime:test|account-runtime-usage-store" src/anthropic src/storage src/external_pool src/admin --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh redis-prefix-artifacts-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh redis-prefix-artifacts-test1 -- bash -lc 'cargo test dashboard_windows_uses_redis_observability_without_postgres_for_three_rounds -- --nocapture && cargo test persistent_usage_cleanup_falls_back_to_postgres_and_survives_restart_for_three_rounds -- --nocapture && cargo test production_postgres_only_usage_never_materializes_redis_for_five_rounds -- --nocapture && cargo test redis_cache -- --nocapture'`
-- `rg -n "kiro-tool-format-debug|kiro-rs-file-limit-boundary|kiro\\.rs:anthropic:conversation-id|kiro\\.rs:tool-schema-key" src/anthropic src/model src/admin src/storage --glob '!target/**'`
+- `rg -n "account-runtime-tool-format-debug|account-runtime-file-limit-boundary|account-runtime\\.rs:anthropic:conversation-id|account-runtime\\.rs:tool-schema-key" src/anthropic src/model src/admin src/storage --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh fixture-artifact-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh fixture-artifact-names-test1 -- bash -lc 'cargo test recorder_writes_sampled_jsonl_and_rate_limits_same_fingerprint -- --nocapture && cargo test recorder_captures_attempted_body_only_within_body_limit -- --nocapture && cargo test writer_state_rolls_when_file_size_budget_would_be_exceeded -- --nocapture && cargo test file_upload_route_accepts_exact_file_limit_and_rejects_one_byte_over_for_five_rounds -- --nocapture'`
-- `rg -n "KIRO_API_KEY|KIRO_RS_HOST|KIRO_RS_PORT|\"service\": \"kiro-rs\"|service.*kiro-rs" src README.md docker-compose.deploy.yml docs/ai-docker-compose-deployment.md scripts/loadtest --glob '!target/**' --glob '!**/node_modules/**'`
+- `rg -n "ACCOUNT_RUNTIME_API_KEY|ACCOUNT_RUNTIME_HOST|ACCOUNT_RUNTIME_PORT|\"service\": \"account-runtime\"|service.*account-runtime" src README.md docker-compose.deploy.yml docs/ai-docker-compose-deployment.md scripts/loadtest --glob '!target/**' --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh startup-env-health-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh startup-env-health-test1 -- bash -lc 'cargo test account_runtime_env_helpers_prefer_neutral_names_and_fallback_to_legacy -- --nocapture && cargo test healthz_uses_account_runtime_service_name -- --nocapture && cargo check'`
-- `rg -n "sk-kiro-rs|kiro-credentials|kiro-rs-credentials-backup|kiro-rs-proxy-test" src ui admin-ui scripts docs --glob '!target/**' --glob '!**/node_modules/**'`
+- `rg -n "sk-account-runtime|account-runtime-credentials|account-runtime-credentials-backup|account-runtime-proxy-test" src ui admin-ui scripts docs --glob '!target/**' --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh api-key-artifacts-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh api-key-artifacts-check1 -- bash -lc 'cargo check && cargo test admin::service_tests -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh api-key-artifacts-service-test1 -- cargo test export_credentials_filter_keeps_selected_ids_and_rejects_missing_ids -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh api-key-prefix-test-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh api-key-prefix-test1 -- cargo test generated_request_api_key_uses_account_runtime_prefix -- --nocapture`
 - `pnpm --dir ui check && pnpm --dir admin-ui exec tsc -b --pretty false`
-- `rg -n "kiro-admin-ui|kiro-ui|kiro-credentials|kiro-usage|kiro-console:theme" ui admin-ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
+- `rg -n "account-runtime-admin-ui|account-runtime-ui|account-runtime-credentials|account-runtime-usage|account-runtime-console:theme" ui admin-ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
 - `pnpm --dir ui check && pnpm --dir admin-ui exec tsc -b --pretty false`
-- `rg -n "(text|bg|border)-kiro|kiro-(success|warning|error|info)" admin-ui ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
+- `rg -n "(text|bg|border)-account-runtime|account-runtime-(success|warning|error|info)" admin-ui ui --glob '!**/dist/**' --glob '!**/node_modules/**'`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
-- `rg -n "kiro" src/anthropic/handlers/tests.rs`
+- `rg -n "account-runtime" src/anthropic/handlers/tests.rs`
 - `feature/tests/run-cargo-scoped.sh handler-fixture-neutral-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh handler-fixture-neutral-names-test1 -- bash -lc 'cargo test path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_stream -- --nocapture && cargo test claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage -- --nocapture && cargo test claude_code_tool_route_strategy_misses_first_then_reads_after_success -- --nocapture && cargo test claude_code_tool_route_strategy_commits_without_credential_id -- --nocapture && cargo test normalized_external_direct_policy_skips_raw_preparse_without_raw_pool -- --nocapture'`
-- `rg -n "kiro-|conversation-kiro-strategy" src/anthropic/prompt_cache.rs src/anthropic/handlers/tests.rs`
+- `rg -n "account-runtime-|conversation-account-runtime-strategy" src/anthropic/prompt_cache.rs src/anthropic/handlers/tests.rs`
 - `feature/tests/run-cargo-scoped.sh prompt-cache-fixture-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh prompt-cache-fixture-names-test1 -- bash -lc 'cargo test claude_code_tool_first_miss_then_success_commit_hits -- --nocapture && cargo test claude_code_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage -- --nocapture'`
 - `git diff --check`
-- `rg -n "kiro-load-runner|kiro-conversation-load-runner|account-runtime-load-runner|account-runtime-conversation-load-runner" . --glob '!target/**' --glob '!**/node_modules/**'`
-- `node --check scripts/loadtest/account-runtime-load-runner.mjs && node --check scripts/loadtest/account-runtime-conversation-load-runner.mjs && node --check scripts/loadtest/kiro-load-runner.mjs && node --check scripts/loadtest/kiro-conversation-load-runner.mjs`
+- `rg -n "account-runtime-load-runner|account-runtime-conversation-load-runner|account-runtime-load-runner|account-runtime-conversation-load-runner" . --glob '!target/**' --glob '!**/node_modules/**'`
+- `node --check scripts/loadtest/account-runtime-load-runner.mjs && node --check scripts/loadtest/account-runtime-conversation-load-runner.mjs && node --check scripts/loadtest/account-runtime-load-runner.mjs && node --check scripts/loadtest/account-runtime-conversation-load-runner.mjs`
 - `node --test scripts/loadtest/validation-target.test.mjs`
 - `git diff --check`
-- `rg -n "KIRO_BASE_URL|KIRO_LOAD_ALLOW_REMOTE|KIRO_API_KEY|KIRO_MESSAGES_PATH|KIRO_MOCK_SCENARIO|kiro-loadtest|kiro-conversation-loadtest|kiro-sustained|kiro-load-runner|kiro-conversation-load-runner|KIRO_VALIDATION_ARTIFACT_DIR" scripts/loadtest docs/testing/loadtest.md`
-- `node --check scripts/loadtest/validation-target.mjs && node --check scripts/loadtest/kiro-load-runner.mjs && node --check scripts/loadtest/kiro-conversation-load-runner.mjs`
+- `rg -n "ACCOUNT_RUNTIME_BASE_URL|ACCOUNT_RUNTIME_LOAD_ALLOW_REMOTE|ACCOUNT_RUNTIME_API_KEY|ACCOUNT_RUNTIME_MESSAGES_PATH|ACCOUNT_RUNTIME_MOCK_SCENARIO|account-runtime-loadtest|account-runtime-conversation-loadtest|account-runtime-sustained|account-runtime-load-runner|account-runtime-conversation-load-runner|ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR" scripts/loadtest docs/testing/loadtest.md`
+- `node --check scripts/loadtest/validation-target.mjs && node --check scripts/loadtest/account-runtime-load-runner.mjs && node --check scripts/loadtest/account-runtime-conversation-load-runner.mjs`
 - `node --test scripts/loadtest/validation-target.test.mjs`
 - `git diff --check`
-- `rg -n "kiro-admin-auth-failed|kiro-admin-key-updated|kiro-console:theme|kiro-admin:auto-refresh|kiro-usage-records|placeholder=\"ide / kiro\"" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `rg -n "account-runtime-admin-auth-failed|account-runtime-admin-key-updated|account-runtime-console:theme|account-runtime-admin:auto-refresh|account-runtime-usage-records|placeholder=\"ide / account-runtime\"" ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "kiro-mock-upstream|account-runtime-mock-upstream" . --glob '!target/**' --glob '!**/node_modules/**'`
+- `rg -n "account-runtime-mock-upstream|account-runtime-mock-upstream" . --glob '!target/**' --glob '!**/node_modules/**'`
 - `node --check scripts/loadtest/account-runtime-mock-upstream.mjs`
-- `node --check scripts/loadtest/kiro-mock-upstream.mjs`
+- `node --check scripts/loadtest/account-runtime-mock-upstream.mjs`
 - `git diff --check`
-- `rg -n "fn .*kiro|includes_kiro|aggregates_kiro|with_kiro_compatibility|kiro compatible|Kiro compatible" src/admin/service_tests.rs src/anthropic/usage.rs`
+- `rg -n "fn .*account-runtime|includes_account-runtime|aggregates_account-runtime|with_account-runtime_compatibility|account-runtime compatible|Account Runtime compatible" src/admin/service_tests.rs src/anthropic/usage.rs`
 - `feature/tests/run-cargo-scoped.sh upstream-test-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh upstream-test-names-test1 -- bash -lc 'cargo test extracts_model_ids_from_upstream_model_catalog_response -- --nocapture && cargo test usage_metering_fields_serialize_upstream_with_legacy_compatibility -- --nocapture && cargo test credential_cost_summary_includes_upstream_metering_units -- --nocapture && cargo test credential_cost_summary_aggregates_upstream_metering_units -- --nocapture'`
 - `git diff --check`
-- `rg -n "<title>|Kiro Console|Kiro Admin|Kiro 控制台" ui/index.html admin-ui/index.html ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `rg -n "<title>|Account Runtime Console|Account Runtime Admin|Account Runtime 控制台" ui/index.html admin-ui/index.html ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `git diff --check`
-- `rg -n "Kiro|kiro|KIRO" docs/testing/loadtest.md scripts/loadtest/kiro-mock-upstream.mjs admin-ui/index.html`
-- `node --check scripts/loadtest/kiro-mock-upstream.mjs`
+- `rg -n "Account Runtime|account-runtime|ACCOUNT_RUNTIME" docs/testing/loadtest.md scripts/loadtest/account-runtime-mock-upstream.mjs admin-ui/index.html`
+- `node --check scripts/loadtest/account-runtime-mock-upstream.mjs`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "crate::kiro|kiro::|KiroCredentials|KiroProvider|MultiTokenManager|KiroEndpoint|IdeEndpoint|AcquireMode" src/anthropic/handlers/tests.rs src/external_pool/tests.rs`
+- `rg -n "crate::account-runtime|account-runtime::|Account RuntimeCredentials|Account RuntimeProvider|MultiTokenManager|Account RuntimeEndpoint|IdeEndpoint|AcquireMode" src/anthropic/handlers/tests.rs src/external_pool/tests.rs`
 - `feature/tests/run-cargo-scoped.sh facade-test-imports-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh facade-test-imports-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh facade-test-imports-test2 -- bash -lc 'cargo test local_acquire_mode_is_clamped_to_shared_request_deadline -- --nocapture && cargo test persisted_external_pool_enum_parsers_reject_unknown_values_for_five_rounds -- --nocapture'`
 - `git diff --check`
-- `rg -n "Kiro|kiro|KIRO|fake_kiro|FakeKiro|normal_kiro|kiro_loadtest|kiro_event|mcpKiro" src/bin/kiro_loadtest.rs`
+- `rg -n "Account Runtime|account-runtime|ACCOUNT_RUNTIME|fake_account-runtime|FakeAccount Runtime|normal_account-runtime|account_runtime_loadtest|account-runtime_event|mcpAccount Runtime" src/bin/account_runtime_loadtest.rs`
 - `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-fmt1 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-check1 -- cargo check --bin kiro_loadtest`
-- `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-test1 -- cargo test --bin kiro_loadtest -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-check1 -- cargo check --bin account_runtime_loadtest`
+- `feature/tests/run-cargo-scoped.sh loadtest-upstream-names-test1 -- cargo test --bin account_runtime_loadtest -- --nocapture`
 - `git diff --check`
 - `rg -n "built-in subscription label|subscription_rank|credit_snapshot_for_subscription" src/admin/service_tests.rs src/storage/postgres.rs`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh subscription-upstream-fixtures-test1 -- bash -lc 'cargo test subscription_ -- --nocapture && cargo test credit_snapshot -- --nocapture && cargo test account_info -- --nocapture'`
 - `git diff --check`
-- `rg -n "local Kiro|本地 Kiro|Kiro dispatch|legacy_kiro_metering_usage" src/anthropic/handlers/tests.rs`
+- `rg -n "local Account Runtime|本地 Account Runtime|Account Runtime dispatch|legacy_account-runtime_metering_usage" src/anthropic/handlers/tests.rs`
 - `feature/tests/run-cargo-scoped.sh handler-local-upstream-test-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh handler-local-upstream-test-text-test1 -- bash -lc 'cargo test direct_account_policy -- --nocapture && cargo test stream_pre_output -- --nocapture && cargo test metering -- --nocapture && cargo test official_upstream_message_with_internal_brand_term_is_masked -- --nocapture'`
 - `git diff --check`
-- `rg -n "Kiro 额度|Anthropic/Kiro|Kiro API|Kiro 上游|Kiro credits|kiroApiKey 的" admin-ui/src/types/api.ts admin-ui/src/components/usage-records-panel.tsx src/admin/types.rs`
+- `rg -n "Account Runtime 额度|Anthropic/Account Runtime|Account Runtime API|Account Runtime 上游|Account Runtime credits|apiKey 的" admin-ui/src/types/api.ts admin-ui/src/components/usage-records-panel.tsx src/admin/types.rs`
 - `feature/tests/run-cargo-scoped.sh admin-upstream-comment-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh admin-upstream-comment-text-test1 -- cargo test admin::types -- --nocapture`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "kam-import-dialog|KamImportDialog|kamImport|KAM|Kiro Account Manager|Kiro" admin-ui/src/components admin-ui/src --glob '!**/node_modules/**'`
+- `rg -n "kam-import-dialog|KamImportDialog|kamImport|KAM|Account Runtime Account Manager|Account Runtime" admin-ui/src/components admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "kiroApiKey|KiroApiKey|setKiroApiKey|handleKiroApiKey|splitKiroApiKey" ui/src/features/credentials/credential-dialogs.tsx admin-ui/src/components/add-credential-dialog.tsx`
+- `rg -n "apiKey|Account RuntimeApiKey|setAccount RuntimeApiKey|handleAccount RuntimeApiKey|splitAccount RuntimeApiKey" ui/src/features/credentials/credential-dialogs.tsx admin-ui/src/components/add-credential-dialog.tsx`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "splitKiro|parseKiro|parsePlainKiro|rawKiro|parsedKiro|kiroApiKey:|kiroApiKey hash|\\[\\{\\\"kiroApiKey\\\"|导出内容包含完整 refreshToken、kiroApiKey" ui/src/lib/credential-import.ts admin-ui/src/lib/credential-import.ts ui/src/features/credentials/credential-dialogs.tsx admin-ui/src/components/batch-import-dialog.tsx admin-ui/src/components/credential-export-dialog.tsx`
+- `rg -n "splitAccount Runtime|parseAccount Runtime|parsePlainAccount Runtime|rawAccount Runtime|parsedAccount Runtime|apiKey:|apiKey hash|\\[\\{\\\"apiKey\\\"|导出内容包含完整 refreshToken、apiKey" ui/src/lib/credential-import.ts admin-ui/src/lib/credential-import.ts ui/src/features/credentials/credential-dialogs.tsx admin-ui/src/components/batch-import-dialog.tsx admin-ui/src/components/credential-export-dialog.tsx`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "req\\.kiro_api_key|missing kiroApiKey|Kiro API Key（API Key 凭据|toast\\.error\\('请输入 Kiro API Key'\\)|label=\\\"Kiro API Key\\\"|kiroApiKey: isApiKey" src/admin src/main.rs ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `rg -n "req\\.account-runtime_api_key|missing apiKey|Account Runtime API Key（API Key 凭据|toast\\.error\\('请输入 Account Runtime API Key'\\)|label=\\\"Account Runtime API Key\\\"|apiKey: isApiKey" src/admin src/main.rs ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `feature/tests/run-cargo-scoped.sh credential-api-key-request-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh credential-api-key-request-test1 -- bash -lc 'cargo check && cargo test admin::types -- --nocapture && cargo test admin::service_tests -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh credential-api-key-request-test2 -- cargo test missing_auth_method_with_api_key_is_inferred_as_api_key -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "Kiro API Key|请输入 Kiro API Key|Kiro 凭据|Kiro API|缺少 kiroApiKey" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `rg -n "Account Runtime API Key|请输入 Account Runtime API Key|Account Runtime 凭据|Account Runtime API|缺少 apiKey" ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "Kiro|kiro" src/anthropic/stream.rs`
+- `rg -n "Account Runtime|account-runtime" src/anthropic/stream.rs`
 - `feature/tests/run-cargo-scoped.sh stream-local-upstream-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh stream-local-upstream-text-test1 -- cargo test stream -- --nocapture`
 - `git diff --check`
-- `rg -n "kiro|Kiro" src/anthropic/converter.rs`
+- `rg -n "account-runtime|Account Runtime" src/anthropic/converter.rs`
 - `feature/tests/run-cargo-scoped.sh converter-local-upstream-test-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh converter-local-upstream-test-names-test1 -- cargo test converter -- --nocapture`
 - `git diff --check`
-- `rg -n "Kiro|Kiro-facing|Kiro wire|Kiro content|KiroSixty|Kiro 400" src/anthropic/converter.rs`
+- `rg -n "Account Runtime|Account Runtime-facing|Account Runtime wire|Account Runtime content|Account RuntimeSixty|Account Runtime 400" src/anthropic/converter.rs`
 - `feature/tests/run-cargo-scoped.sh converter-upstream-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh converter-upstream-text-test1 -- cargo test converter -- --nocapture`
 - `git diff --check`
-- `rg -n "Kiro|Kiro/|Kiro 协议|Kiro 原生|Kiro 容易|Kiro 可用|Kiro metadata|Kiro upstream|外部池 raw body|外部池 normalized body" src/model/config.rs`
+- `rg -n "Account Runtime|Account Runtime/|Account Runtime 协议|Account Runtime 原生|Account Runtime 容易|Account Runtime 可用|Account Runtime metadata|Account Runtime upstream|外部池 raw body|外部池 normalized body" src/model/config.rs`
 - `feature/tests/run-cargo-scoped.sh config-local-upstream-comment-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh config-local-upstream-comment-test1 -- cargo test model::config -- --nocapture`
 - `git diff --check`
-- `rg -n "\\bkiro_(guard|history)|serialized_kiro_body|clean_kiro" src/anthropic/payload_guard.rs`
+- `rg -n "\\baccount-runtime_(guard|history)|serialized_account-runtime_body|clean_account-runtime" src/anthropic/payload_guard.rs`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-names-test1 -- cargo test payload_guard -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-text-fmt1 -- cargo fmt`
-- `rg -n "Kiro request|Kiro body|Kiro serialization|Kiro guard|Kiro perf|Kiro history|passed through to Kiro|serialized Kiro|Kiro current image|Kiro image" src/anthropic/payload_guard.rs`
+- `rg -n "Account Runtime request|Account Runtime body|Account Runtime serialization|Account Runtime guard|Account Runtime perf|Account Runtime history|passed through to Account Runtime|serialized Account Runtime|Account Runtime current image|Account Runtime image" src/anthropic/payload_guard.rs`
 - `feature/tests/run-cargo-scoped.sh payload-guard-local-upstream-text-test1 -- cargo test payload_guard -- --nocapture`
 - `git diff --check`
-- `rg -n "Kiro 模型能力目录|从 Kiro 上游|当前 Kiro 账号支持模型|请求 Kiro API|获取 Kiro 模型能力同步状态|手动同步 Kiro 模型能力" src/admin/handlers.rs ui/src/features/credentials/credential-card.tsx admin-ui/src/components/model-pricing-panel.tsx admin-ui/src/components/credential-card.tsx`
+- `rg -n "Account Runtime 模型能力目录|从 Account Runtime 上游|当前 Account Runtime 账号支持模型|请求 Account Runtime API|获取 Account Runtime 模型能力同步状态|手动同步 Account Runtime 模型能力" src/admin/handlers.rs ui/src/features/credentials/credential-card.tsx admin-ui/src/components/model-pricing-panel.tsx admin-ui/src/components/credential-card.tsx`
 - `feature/tests/run-cargo-scoped.sh upstream-model-text-fmt1 -- cargo fmt`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
-- `rg -n "Kiro Console|Kiro Admin|Kiro 控制台|Kiro Console 设计系统" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `rg -n "Account Runtime Console|Account Runtime Admin|Account Runtime 控制台|Account Runtime Console 设计系统" ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `git diff --check`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
-- `rg -n "KiroCredentialAttempt" ui/src admin-ui/src --glob '!**/node_modules/**'`
+- `rg -n "Account RuntimeCredentialAttempt" ui/src admin-ui/src --glob '!**/node_modules/**'`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-runtime-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-runtime-text-check1 -- cargo check`
@@ -499,12 +501,12 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-runtime-initial-check -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-bridge-test2 -- cargo test external_pool_projects_to_upstream_account_boundary`
 - `feature/tests/run-cargo-scoped.sh account-bridge-check2 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh account-only-normalized-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-only-normalized-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-body-mode-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-only-slice-fmt2 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-only-slice-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-startup-decision-test2 -- cargo test legacy_provider_is_not_required_when_upstream_accounts_are_enabled -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-startup-account-only-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-startup-account-only-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-startup-fmt3 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-startup-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-admin-boundary-fmt2 -- cargo fmt --check`
@@ -516,14 +518,14 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-usage-api-test2 -- cargo test usage_records_query_accepts_account_aliases -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-facade-fmt3 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-facade-check3 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh account-runtime-facade-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-facade-test1 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-admin-dto-fmt2 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-admin-dto-check3 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-admin-dto-test1 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-fmt3 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-check3 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-facade-test3 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `pnpm --dir ui check`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-migration-fmt1 -- cargo fmt --check`
@@ -535,15 +537,15 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-admin-dto-split-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-check1 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-wrapper-test1 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-fmt3 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-check2 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-test1 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-accessor-test2 -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh request-runtime-account-field-fmt2 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh request-runtime-account-field-check1 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh request-runtime-account-field-test4 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh request-runtime-account-field-test4 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh request-runtime-account-field-test3a -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh request-runtime-account-field-test5 -- cargo test account_runtime_endpoint_gate_applies_global_enable_and_route_policy -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh admin-account-bridge-fmt1 -- cargo fmt --check`
@@ -553,7 +555,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-test1 -- cargo test account_runtime_config_ext_applies_enablement_and_route_policy -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-config-ext-test3 -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-runtime-validation-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-validation-check1 -- cargo check`
@@ -567,16 +569,16 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-store-bridge-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-store-bridge-test1b -- cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-store-bridge-test2b -- cargo test account_status_response_serializes_account_boundary_names -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-store-bridge-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-store-bridge-test3 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-route-alias-fmt5 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-route-alias-check3 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh account-route-alias-test1b -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-alias-test1b -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-route-alias-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-manager-wrapper-fmt2 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-manager-wrapper-check1 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh account-manager-wrapper-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-manager-wrapper-test1 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-manager-wrapper-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-dto-alias-fmt2 -- cargo fmt --check`
@@ -600,20 +602,20 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-attempt-kind-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-attempt-kind-test1 -- cargo test legacy_external_pool_kind_counts_as_account_attempt -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-attempt-kind-test2 -- cargo test counts_channels_without_exceeding_limit_for_five_rounds -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-attempt-kind-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-attempt-kind-test3 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `git diff --check`
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-fmt2 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test1 -- cargo test account_snapshot_serializes_account_attempts_with_external_compatibility -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test2 -- cargo test counts_channels_without_exceeding_limit_for_five_rounds -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test3 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test3 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-attempt-snapshot-test4 -- cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-test1 -- cargo test body_capabilities -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh local-upstream-body-plan-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-body-plan-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-body-plan-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-body-plan-test1 -- cargo test body_capabilities -- --nocapture`
@@ -628,11 +630,11 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test1 -- cargo test account_guard -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test2 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test3 -- cargo test disabled_local_guard_serializes_without_report -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test4 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-payload-wrapper-test4 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-pipeline-errors-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-pipeline-errors-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-pipeline-errors-test1 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-pipeline-errors-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-pipeline-errors-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-usage-debug-processing-name-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-usage-debug-processing-name-test1 -- bash -lc 'cargo check && cargo test external_pool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh account-model-helper-fmt1 -- cargo fmt`
@@ -657,19 +659,19 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-test1b -- cargo test disabled_local_guard_serializes_without_report -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh local-upstream-guard-wrapper-body-tests -- bash -lc 'cargo test thinking_signature_retry_body_removes_only_native_reasoning_five_rounds -- --nocapture && cargo test cache_point_then_signature_retry_never_reintroduces_cache_point_five_rounds -- --nocapture && cargo test payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_rounds -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-test1 -- cargo test handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-test2 -- cargo test signature_retry -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh json-stream-usage-privacy-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-diagnostics-wrapper-fmt1 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh local-upstream-diagnostics-wrapper-test1 -- bash -lc 'cargo check && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-diagnostics-wrapper-test1 -- bash -lc 'cargo check && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-log-text-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-log-text-check2 -- cargo check`
-- `feature/tests/run-cargo-scoped.sh local-upstream-log-text-test1 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh local-upstream-log-text-test1 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh local-upstream-body-field-fmt1 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh local-upstream-body-field-test1 -- bash -lc 'cargo check && cargo test body_capabilities -- --nocapture && cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh local-upstream-body-field-test1 -- bash -lc 'cargo check && cargo test body_capabilities -- --nocapture && cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-stream-event-wrapper-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-stream-event-wrapper-test1 -- bash -lc 'cargo check && cargo test stream_success_records_requested_max_tokens_and_downstream_stop_reason -- --nocapture && cargo test test_requested_max_tokens_infers_max_tokens_stop_reason -- --nocapture && cargo test test_context_usage_percentage_uses_catalog_window_for_final_usage -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-provider-field-fmt1 -- cargo fmt`
@@ -701,13 +703,13 @@ Earlier verified on 2026-08-15:
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `feature/tests/run-cargo-scoped.sh local-upstream-agent-mode-ui-name-test1 -- bash -lc 'cargo check && cargo test claude_code_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-strategy-variant-fmt1 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh claude-code-tool-strategy-variant-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-strategy-variant-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test account_runtime_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-policy-field-fmt1 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh claude-code-tool-policy-field-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-policy-field-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test account_runtime_tool -- --nocapture'`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-wire-primary-fmt1 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh claude-code-tool-wire-primary-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-wire-primary-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test claude_code_tool -- --nocapture && cargo test account_runtime_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-test-names-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-test-names-test1 -- bash -lc 'cargo check && cargo test claude_code_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-types-fmt3 -- cargo fmt`
@@ -715,9 +717,9 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-methods-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-methods-test1 -- bash -lc 'cargo check && cargo test model::config -- --nocapture && cargo test prompt_cache -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-fields-fmt1 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-fields-test1 -- bash -lc 'cargo check && cargo test prompt_cache -- --nocapture && cargo test kiro_rs_tool -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh claude-code-tool-cache-fields-test1 -- bash -lc 'cargo check && cargo test prompt_cache -- --nocapture && cargo test account_runtime_tool -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh payload-report-local-upstream-fields-fmt2 -- cargo fmt`
-- `feature/tests/run-cargo-scoped.sh payload-report-local-upstream-fields-test2 -- bash -lc 'cargo check && cargo test payload_guard_report_uses_local_upstream_cache_point_fields_with_legacy_aliases -- --nocapture && cargo test cache_point_plan_inserts_markers_in_serialized_kiro_body -- --nocapture && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
+- `feature/tests/run-cargo-scoped.sh payload-report-local-upstream-fields-test2 -- bash -lc 'cargo check && cargo test payload_guard_report_uses_local_upstream_cache_point_fields_with_legacy_aliases -- --nocapture && cargo test cache_point_plan_inserts_markers_in_serialized_account-runtime_body -- --nocapture && cargo test payload_guard -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh local-body-upstream-alias-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-body-upstream-alias-test2 -- bash -lc 'cargo check && cargo test disabled_thinking_suppresses_downstream_thinking_even_with_native_effort_for_five_rounds -- --nocapture && cargo test adaptive_or_omitted_thinking_with_output_effort_exposes_downstream_thinking_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh converter-tool-pairing-alias-fmt1 -- cargo fmt`
@@ -749,7 +751,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh admin-provider-field-alias-test1 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture && cargo test native_reasoning_startup_decision_never_blocks_service_for_five_rounds -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh admin-credential-manager-alias-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh admin-credential-manager-alias-test2 -- bash -lc 'cargo check && cargo test admin::service::tests -- --nocapture'`
-- `feature/tests/run-cargo-scoped.sh remove-unused-kiro-scratch-test-check1 -- cargo check`
+- `feature/tests/run-cargo-scoped.sh remove-unused-account-runtime-scratch-test-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh external-route-local-attempt-alias-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh external-route-local-attempt-alias-test1 -- bash -lc 'cargo check && cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture && cargo test account_fallback -- --nocapture && cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh account-storage-task-alias-fmt1 -- cargo fmt`
@@ -775,7 +777,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-test1b -- cargo test usage_record_serializes_account_attempts_with_external_compatibility -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-usage-record-fields-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-usage-record-fields-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-usage-record-fields-test3 -- cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
@@ -788,7 +790,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-route-kind-test3 -- cargo test postgres_rollup_treats_account_and_legacy_external_pool_as_upstream_account -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-route-kind-test4 -- cargo test usage_record_serializes_account_attempts_with_external_compatibility -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-route-kind-test5 -- cargo test usage_records_query_accepts_account_aliases -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-route-kind-test6 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-kind-test6 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-route-kind-test7 -- cargo test external_usage_trace_preserves_local_auxiliary_attempts_for_five_rounds -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
@@ -798,7 +800,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-billing-field-fmt1 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh account-billing-field-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-billing-field-test1 -- cargo test usage_record_serializes_account_billing_with_external_compatibility -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-billing-field-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-billing-field-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-billing-field-test3 -- cargo test postgres_rollup_treats_account_and_legacy_external_pool_as_upstream_account -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
@@ -819,7 +821,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh upstream-metering-field-check2 -- cargo check`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
-- `feature/tests/run-cargo-scoped.sh upstream-metering-field-test2 -- cargo test usage_metering_fields_serialize_upstream_with_kiro_compatibility -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh upstream-metering-field-test2 -- cargo test usage_metering_fields_serialize_upstream_with_account-runtime_compatibility -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh upstream-metering-field-test3 -- cargo test usage_summaries_serialize_account_billing_with_external_compatibility -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh upstream-metering-field-fmt3 -- cargo fmt --check`
 - `feature/tests/run-cargo-scoped.sh upstream-metering-field-check3 -- cargo check`
@@ -836,7 +838,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-route-subtype-test1 -- cargo test usage_route_subtype_serializes_account_values_with_external_compatibility -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
-- `feature/tests/run-cargo-scoped.sh account-route-subtype-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-route-subtype-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-route-subtype-test3 -- cargo test normalized_external_direct_policy_skips_raw_preparse_without_raw_pool -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-route-subtype-test4 -- cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-route-subtype-test5 -- cargo test preflight_external_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds -- --nocapture`
@@ -846,17 +848,17 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-handler-fallback-rename-test1 -- cargo test account_fallback -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-handler-fallback-rename-test2 -- cargo test native_websearch_runs_local_pool_preflight_before_mcp_intercept -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-handler-fallback-rename-test3 -- cargo test direct_account_policy_resolves_model_before_route_request -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-handler-fallback-rename-test4 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-handler-fallback-rename-test4 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test1 -- cargo test account_fallback -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test2 -- cargo test preflight_account_error_can_rescue_once_then_attempt_budget_blocks_cycle_five_rounds -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test3 -- cargo test account_runtime_config_ext_applies_enablement_and_route_policy -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test4 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-local-rescue-reason-test4 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-fmt1 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-test1 -- cargo test payload_guard -- --nocapture`
-- `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-test2 -- cargo test account_only_routes_normalized_requests_without_kiro_provider -- --nocapture`
+- `feature/tests/run-cargo-scoped.sh account-payload-guard-runtime-test2 -- cargo test account_only_routes_normalized_requests_without_account-runtime_provider -- --nocapture`
 - `pnpm --dir ui check`
 - `pnpm --dir admin-ui exec tsc -b --pretty false`
 - `pnpm --dir ui check`
@@ -866,7 +868,7 @@ Earlier verified on 2026-08-15:
 - `feature/tests/run-cargo-scoped.sh account-runtime-boundary-check2 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh account-runtime-boundary-tests1 -- bash -lc 'cargo test account_request_dtos_deserialize_and_convert_to_storage_compat_requests -- --nocapture && cargo test run_account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture'`
 - `feature/tests/run-cargo-scoped.sh account-runtime-boundary-tests2 -- bash -lc 'cargo test account_only_routes_normalized_requests_without_local_upstream_provider -- --nocapture && cargo test postgres_external_pool_list_and_get_preserve_body_modes -- --nocapture'`
-- `rg -n "crate::kiro|\\bmod kiro\\b|model::requests::kiro" src --glob '!target/**'`
+- `rg -n "crate::account-runtime|\\bmod account-runtime\\b|model::requests::account-runtime" src --glob '!target/**'`
 - `feature/tests/run-cargo-scoped.sh local-upstream-impl-module-fmt2 -- cargo fmt`
 - `feature/tests/run-cargo-scoped.sh local-upstream-impl-module-check1 -- cargo check`
 - `feature/tests/run-cargo-scoped.sh local-upstream-impl-module-test1 -- cargo test no_available_credentials_error_uses_public_account_message -- --nocapture`

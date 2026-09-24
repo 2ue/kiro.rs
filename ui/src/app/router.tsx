@@ -9,9 +9,6 @@ import { LoadingState } from '@/components/patterns'
 const OverviewPage = React.lazy(() =>
   import('@/features/overview/overview-page').then((m) => ({ default: m.OverviewPage }))
 )
-const CredentialsPage = React.lazy(() =>
-  import('@/features/credentials/credentials-page').then((m) => ({ default: m.CredentialsPage }))
-)
 const AccountsPage = React.lazy(() =>
   import('@/features/accounts/accounts-page').then((m) => ({ default: m.AccountsPage }))
 )
@@ -35,9 +32,6 @@ const ModelsPage = React.lazy(() =>
 )
 const SecurityPage = React.lazy(() =>
   import('@/features/security/security-page').then((m) => ({ default: m.SecurityPage }))
-)
-const ValidationPage = React.lazy(() =>
-  import('@/features/validation/validation-page').then((m) => ({ default: m.ValidationPage }))
 )
 
 function ShellWithAuth() {
@@ -66,8 +60,8 @@ const router = createBrowserRouter(
         // 总览
         { path: 'overview', element: <Lazy><OverviewPage /></Lazy> },
         // 资源域
-        { path: 'credentials', element: <Lazy><CredentialsPage /></Lazy> },
-        { path: 'validation', element: <Lazy><ValidationPage /></Lazy> },
+        { path: 'credentials', element: <Navigate to="/accounts" replace /> },
+        { path: 'validation', element: <Navigate to="/accounts" replace /> },
         { path: 'accounts', element: <Lazy><AccountsPage /></Lazy> },
         { path: 'external-pools', element: <Navigate to="/accounts" replace /> },
         { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },

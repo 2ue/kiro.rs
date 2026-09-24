@@ -32,7 +32,7 @@ Current conclusion:
 - Error cases are a separate class: failure records store request-estimated input in the standard `input_tokens` column even though downstream error responses normally do not include a normal Anthropic `usage` object.
 - 2026-07-31 focused fix: `cache_creation_input_tokens` now has a reported-usage final guard, parallel to the existing cache-read guard. The config fields are `finalCacheCreationMaxTokens`, `finalCacheCreationJitterMinTokens`, and `finalCacheCreationJitterMaxTokens`; defaults are `400000`, `20000`, and `45000`, so the effective cap is deterministic per usage shape and never above 400k.
 - The focused fix covers current-high-cache success projection where input sampling moves the removed input delta into `cache_creation_input_tokens`, including stream, non-stream/record shaping, and external-pool `current_path_policy` uplift re-guarding.
-- 2026-08-01 residual fix: routes with no full `reportedUsage` policy now still apply final standard cache read/write guards on local prompt-cache projected usage for `CurrentHighCache` and `KiroRsTool`; this covers the observed `/dfcache/team` `kiro_rs_tool` class without forcing full reported-usage projection.
+- 2026-08-01 residual fix: routes with no full `reportedUsage` policy now still apply final standard cache read/write guards on local prompt-cache projected usage for `CurrentHighCache` and `Account RuntimeRsTool`; this covers the observed `/dfcache/team` `account_runtime_tool` class without forcing full reported-usage projection.
 - 2026-08-01 residual fix: local credential failure records and external pool failure records now keep large request estimates in diagnostic fields (`total_input_tokens`, raw/original usage where present) and write zero into downstream-standard usage fields for non-success statuses.
 - 2026-08-01 scoped release gate passed in [Final release gate - 2026-08-01](../evidence/final-release-gate-20260801.md): full Rust default/no-default all-target tests, release build, UI/admin-ui build, Node contracts, real Claude CLI fake-upstream suite, feature docs, diff hygiene, fmt, and artifact inventory all passed for the current batch.
 - No production writes, restarts, migrations, Redis writes, or broad container logs were used during analysis.
@@ -90,18 +90,18 @@ Observed example:
 - Final standard usage: `input_tokens=24`, `cache_creation_input_tokens=1,012,902`.
 - `rawUsage.cacheCreationInputTokens=0`, so the large cache creation field is local projection, not upstream cache metadata.
 
-### Class 2: `/dfcache/team` `kiro_rs_tool` uncapped projection
+### Class 2: `/dfcache/team` `account_runtime_tool` uncapped projection
 
 Runtime route policy:
 
-- `/dfcache/team` uses `cacheType=kiro_rs_tool`.
+- `/dfcache/team` uses `cacheType=account_runtime_tool`.
 - `reportedUsage` is null for that route.
 
 Effect:
 
 - The normal `/cc` and `/ha` reported-usage guard does not apply.
 - Tool-cache simulated usage can directly produce final `cache_creation_input_tokens` or `cache_read_input_tokens` above 1m.
-- Fixed on 2026-08-01 for local handler/stream downstream-standard fields: `apply_final_standard_cache_guards_for_standard_fields()` applies the default final cache-read and cache-creation caps even when full reported-usage projection is disabled, but only for local prompt-cache usage with cache fields under `CurrentHighCache` or `KiroRsTool`.
+- Fixed on 2026-08-01 for local handler/stream downstream-standard fields: `apply_final_standard_cache_guards_for_standard_fields()` applies the default final cache-read and cache-creation caps even when full reported-usage projection is disabled, but only for local prompt-cache usage with cache fields under `CurrentHighCache` or `Account RuntimeRsTool`.
 
 Observed examples:
 
@@ -144,7 +144,7 @@ For the `/cc` / `/ha` class:
 
 For the `/dfcache/team` class:
 
-1. Use `cacheType=kiro_rs_tool`.
+1. Use `cacheType=account_runtime_tool`.
 2. Do not configure `reportedUsage` for that route.
 3. Use a large stable tool/prompt prefix so tool-cache coverage is high.
 4. Expected final usage can preserve large cache creation/read values directly.
@@ -163,7 +163,7 @@ Selected focused fix, implemented 2026-07-31:
 Selected residual fix, implemented 2026-08-01:
 
 1. Add a standard-field-only cache guard that is independent of full reported-usage projection. This deliberately ignores `reportedUsage.enabled`, clips only downstream-standard cache read/write fields, and preserves raw/diagnostic usage snapshots.
-2. Apply that guard to local handler and stream paths when the usage is local prompt-cache projected, has cache fields, and the strategy is `CurrentHighCache` or `KiroRsTool`.
+2. Apply that guard to local handler and stream paths when the usage is local prompt-cache projected, has cache fields, and the strategy is `CurrentHighCache` or `Account RuntimeRsTool`.
 3. Split failure request estimates from downstream-standard fields for local credential records. Non-success rows keep the request estimate in `total_input_tokens` and raw/original diagnostic fields, while standard usage fields are zero.
 4. Apply the same failure standard-field split to external pool records, so external failures cannot persist a large request estimate into `compat_input_tokens` or `billable_input_tokens`.
 5. Keep `output_tokens` under the existing output final guard; no production row had `output_tokens > 1m` in the sampled evidence.
@@ -196,7 +196,7 @@ Validation still needed after code changes:
 - Stream final `message_delta.usage` creation-cap test: done 2026-07-31.
 - Non-stream/record policy test for creation-cap-only rewrite: done 2026-07-31.
 - External-pool `current_path_policy` usage-uplift re-guard test for cache creation: done 2026-07-31.
-- `/dfcache/team` / `kiro_rs_tool` style unreported cache-field standard guard test: done 2026-08-01.
+- `/dfcache/team` / `account_runtime_tool` style unreported cache-field standard guard test: done 2026-08-01.
 - Local failure-record test proving diagnostic estimates are not confused with final downstream usage: done 2026-08-01.
 - External pool failure-record standard field split test: done 2026-08-01.
 - Full isolated service/fake-upstream usage-shape smoke for `/cc`, `/ha`, and `/dfcache/team`.
@@ -214,11 +214,11 @@ Focused validation completed on 2026-07-31:
 Focused validation completed on 2026-08-01:
 
 - [Usage standard field guard focused validation](../evidence/usage-standard-field-guard-20260801.md) records the local command matrix and results.
-- `feature/tests/run-cargo-scoped.sh usage-standard-cache-field-final -- cargo test --bin kiro-rs standard_cache_field -- --nocapture`: `3 passed / 0 failed`.
-- `feature/tests/run-cargo-scoped.sh usage-record-filter-final -- cargo test --bin kiro-rs usage_record`: `13 passed / 0 failed`.
-- `feature/tests/run-cargo-scoped.sh usage-projection-final-cache-final -- cargo test --bin kiro-rs usage_projection_final_cache`: `2 passed / 0 failed`.
-- `feature/tests/run-cargo-scoped.sh external-failure-standard-usage -- cargo test --bin kiro-rs external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuses -- --nocapture`: `1 passed / 0 failed`.
-- `feature/tests/run-cargo-scoped.sh external-error-filter-final -- cargo test --bin kiro-rs external_error`: `4 passed / 0 failed`.
+- `feature/tests/run-cargo-scoped.sh usage-standard-cache-field-final -- cargo test --bin account-runtime standard_cache_field -- --nocapture`: `3 passed / 0 failed`.
+- `feature/tests/run-cargo-scoped.sh usage-record-filter-final -- cargo test --bin account-runtime usage_record`: `13 passed / 0 failed`.
+- `feature/tests/run-cargo-scoped.sh usage-projection-final-cache-final -- cargo test --bin account-runtime usage_projection_final_cache`: `2 passed / 0 failed`.
+- `feature/tests/run-cargo-scoped.sh external-failure-standard-usage -- cargo test --bin account-runtime external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuses -- --nocapture`: `1 passed / 0 failed`.
+- `feature/tests/run-cargo-scoped.sh external-error-filter-final -- cargo test --bin account-runtime external_error`: `4 passed / 0 failed`.
 - `feature/tests/run-cargo-scoped.sh usage-standard-guard-fmt-final -- cargo fmt --check`: passed.
 - `git diff --check`: passed before documentation edits.
 
@@ -229,7 +229,7 @@ Residual risk:
 - The 24h grouped query timed out on two large deployments, so exact 24h counts are not recorded for all hosts. The 2h bounded window and request-id samples are sufficient to prove the issue class.
 - `usage_records` raw JSON can contain sensitive operational details. The redacted archive excludes raw evidence by default.
 - The 2026-07-31 and 2026-08-01 focused fixes have not been rolled out to production; recurrence evidence is still pending.
-- Focused unit tests cover the known local `/dfcache/team` `kiro_rs_tool` no-reportedUsage shape, but full isolated service/fake-upstream smoke is still pending.
+- Focused unit tests cover the known local `/dfcache/team` `account_runtime_tool` no-reportedUsage shape, but full isolated service/fake-upstream smoke is still pending.
 - Local credential and external pool failure records now zero downstream-standard fields for non-success statuses, but dashboard/API consumers still need a rollup check to verify diagnostic `total_input_tokens` is not displayed as final response usage.
 - External-pool success paths are covered for `current_path_policy` creation/read uplift re-guarding; any external-pool route that intentionally bypasses that projection policy still needs route-specific validation before it can be claimed safe.
 

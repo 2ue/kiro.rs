@@ -2,17 +2,17 @@
 
 ## Current Facts
 
-- Local credential dispatch eligibility is checked in `src/kiro/token_manager/capacity.rs`.
+- Local credential dispatch eligibility is checked in `src/local_upstream_impl/token_manager/capacity.rs`.
 - `credential_is_usable_for_model` currently rejects disabled credentials and rejects Opus requests for credentials whose subscription title looks Free.
 - `MultiTokenManager` passes the request model into acquire/selection and uses this eligibility function in local preflight, selection, summaries, and failure breakdown.
 - External pool selection is in `src/external_pool.rs`. It filters enabled pools, auto-disabled pools, body-mode filter, capacity, and cooldown.
 - External pools currently have model mapping configuration, but no supported-model eligibility list.
-- `KiroProvider::list_available_models` can list upstream models, but it loops over enabled credentials and stops at the first non-empty result. There is no per-credential model-sync API.
+- `Account RuntimeProvider::list_available_models` can list upstream models, but it loops over enabled credentials and stops at the first non-empty result. There is no per-credential model-sync API.
 - External pools have `/v1/models` test URL support, but the requested requirement is also to sync an external pool's support list by selecting a local account.
 
 ## Target Data Model
 
-- Add `supported_models: Vec<String>` to `KiroCredentials`.
+- Add `supported_models: Vec<String>` to `Account RuntimeCredentials`.
 - Add `supported_models: Vec<String>` to `ExternalPool`.
 - Empty list means unrestricted.
 - Normalize model ids by trimming, lowercasing for comparison, removing duplicates, and preserving a readable stored value.
@@ -47,7 +47,7 @@
 ## Implemented Notes
 
 - `src/model/model_support.rs` owns normalization and matching helpers.
-- `KiroCredentials.supported_models` is persisted inside credential JSON and normalized on load/import/update.
+- `Account RuntimeCredentials.supported_models` is persisted inside credential JSON and normalized on load/import/update.
 - External pool `supported_models` is stored as JSONB and normalized on create/update/read.
 - Local credential eligibility checks the supported-model list before Opus/free gating.
 - External pool selection filters supported-model lists before capacity/cooldown selection when a route has model candidates.

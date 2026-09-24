@@ -29,7 +29,7 @@ Validated contracts:
 
 ## Release size/allocation/RSS matrix
 
-Binary: `target/release/deps/kiro_rs-8e21067b2ccc5c02`
+Binary: `target/release/deps/account_runtime-8e21067b2ccc5c02`
 
 SHA-256: `375f682c19462aae922d6fe0a7b9c947bb293f10e5745c30ebc7bfd2937e4bec`
 

@@ -1,11 +1,11 @@
-# kiro-rs
+# account-runtime
 
-一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
+一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Account Runtime API 请求。
 
 ## 免责声明
 
 本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
-本项目与 AWS/KIRO/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
+本项目与 AWS/ACCOUNT_RUNTIME/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
 
 ## 注意！
 
@@ -94,7 +94,7 @@ PR、main 分支和发布 tag 共用同一套质量门禁。门禁构建 `admin-
 本地执行存储集成测试时必须显式提供测试实例；测试会在 PgSQL 中创建临时 schema，并在 Redis 中使用随机 key prefix：
 
 ```bash
-export ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/kiro_rs_test'
+export ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://user:password@127.0.0.1:5432/account_runtime_test'
 export ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:6379/0'
 cargo +1.92.0 test --locked --all-targets --no-default-features
 ```
@@ -108,7 +108,7 @@ CI 用 [scripts/ci/clippy-baseline.json](scripts/ci/clippy-baseline.json) 锁定
 ```json
 {
    "postgres": {
-      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
+      "url": "postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime"
    },
    "redis": {
       "url": "redis://127.0.0.1:26379/0"
@@ -142,11 +142,11 @@ Social 认证：
 }
 ```
 
-Kiro API Key / headless 认证：
+Account Runtime API Key / headless 认证：
 ```json
 {
    "authMethod": "api_key",
-   "kiroApiKey": "ksk_xxxxxxxx",
+   "apiKey": "ksk_xxxxxxxx",
    "region": "eu-central-1",
    "authRegion": "eu-central-1",
    "apiRegion": "eu-central-1",
@@ -159,7 +159,7 @@ Kiro API Key / headless 认证：
 ksk_xxxxxxxx|eu-central-1
 ```
 
-API Key 凭据会直接作为 Kiro Bearer token 使用，不需要 `refreshToken`，默认走 `cli` endpoint。使用 `ksk_xxx|region` 形式导入时，服务会自动把 `region/authRegion/apiRegion` 补齐为同一个区域。
+API Key 凭据会直接作为 Account Runtime Bearer token 使用，不需要 `refreshToken`，默认走 `cli` endpoint。使用 `ksk_xxx|region` 形式导入时，服务会自动把 `region/authRegion/apiRegion` 补齐为同一个区域。
 
 IdC 认证：
 ```json
@@ -175,13 +175,13 @@ IdC 认证：
 ### 3. 启动
 
 ```bash
-./target/release/kiro-rs
+./target/release/account-runtime
 ```
 
 或指定配置文件路径：
 
 ```bash
-./target/release/kiro-rs -c /path/to/config.json --credentials /path/to/credentials.json
+./target/release/account-runtime -c /path/to/config.json --credentials /path/to/credentials.json
 ```
 
 本地开发时，仓库里的 `config.json` 当前监听 `127.0.0.1:9022`。这个端口只作为后端 API 使用；前端页面使用 Vite 热更新地址预览。
@@ -218,13 +218,13 @@ docker compose -f docker-compose.database.yml up -d
 docker compose -f docker-compose.deploy.yml up -d
 ```
 
-部署版默认使用 `ghcr.io/2ue/kiro-rs:latest`，可通过环境变量固定版本：
+部署版默认使用 `ghcr.io/2ue/account-runtime:latest`，可通过环境变量固定版本：
 
 ```bash
-KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
+ACCOUNT_RUNTIME_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 ```
 
-如需改用 Docker Hub 镜像，可通过 `KIRO_RS_IMAGE` 覆盖镜像仓库。
+如需改用 Docker Hub 镜像，可通过 `ACCOUNT_RUNTIME_IMAGE` 覆盖镜像仓库。
 
 容器端口固定为 `8990`，请确保挂载的 `config/config.json` 中 `host` 配置为 `0.0.0.0`，否则宿主机端口映射后可能无法访问服务。
 
@@ -241,7 +241,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.11.107` | Kiro 版本号 |
+| `account-runtimeVersion` | string | `0.11.107` | Account Runtime 版本号 |
 | `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.22.0` | Node.js 版本标识 |
@@ -270,10 +270,10 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `credentialWarmupSelectionPercent` | number | `5` | balanced 模式下预热凭据参与真实业务请求调度的概率百分比 |
 | `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
-| `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Kiro 上游前的最终 payload 防护 |
+| `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Account Runtime 上游前的最终 payload 防护 |
 | `payloadGuardMode` | string | `on_too_long` | payload 防护触发模式。`on_too_long` 首次请求只做协议修复、不按大小预裁剪；仅在上游返回输入过长/请求体过大后按预算裁剪并重试一次。`preemptive` 保持旧行为，发送前超过预算即裁剪 |
-| `payloadGuardMaxBytes` | number | `460800` | 本地 payload 经验预算，按最终发送的 Kiro JSON body 字节数计算；它不是模型上下文上限。`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复 |
-| `payloadGuardTrimHistory` | boolean | `true` | payload 超出本地预算时是否允许裁剪最旧历史；关闭后只做协议修复，仍超预算会标记后透传给 Kiro |
+| `payloadGuardMaxBytes` | number | `460800` | 本地 payload 经验预算，按最终发送的 Account Runtime JSON body 字节数计算；它不是模型上下文上限。`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复 |
+| `payloadGuardTrimHistory` | boolean | `true` | payload 超出本地预算时是否允许裁剪最旧历史；关闭后只做协议修复，仍超预算会标记后透传给 Account Runtime |
 | `payloadShaping.enabled` | boolean | `true` | 超出本地预算时是否先执行低风险内容整形 |
 | `payloadShaping.truncateHistoricalToolResults` | boolean | `true` | 是否对历史 `tool_result` 做头尾保留截断；当前合法 `tool_result` 不受影响 |
 | `payloadShaping.historicalToolResultMaxChars` | number | `8000` | 单个普通历史 `tool_result` 最多保留字符数 |
@@ -293,7 +293,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `payloadShaping.currentImagesMaxBytes` | number | `180000` | 当前 images 数组允许保留的 JSON 字节预算 |
 | `payloadShaping.oversizedImageHandling` | string | `drop-with-placeholder` | 单张图片超过上游 5 MB 限制时的处理方式：`drop-with-placeholder` 移除图片并给模型占位说明；`reject` 直接返回 400 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
-| `kiroAgentModeStrategy` | string | `vibe` | Kiro IDE `x-amzn-kiro-agent-mode` 策略：`vibe` 保持当前成功链路，`spec` 强制规格模式，`auto` 按账号协议自动判定 |
+| `localUpstreamAgentModeStrategy` | string | `vibe` | Account Runtime IDE `x-amzn-account-runtime-agent-mode` 策略：`vibe` 保持当前成功链路，`spec` 强制规格模式，`auto` 按账号协议自动判定 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 的目标 cache read 中心比例；`/na/v1/messages` 默认是 no-cache，不进入本地缓存模拟 |
 | `promptCacheTokenScale` | number | `1.6` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 模拟专用的 total input 放大倍数，只影响本地模拟 cache usage |
@@ -317,15 +317,15 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `reportedUsage.*.finalOutputJitterMaxTokens` | number | `12000` | 最终输出上限的确定性扣减上限，避免稳定撞到模型或展示硬上限 |
 | `usageRecordLimit` | number | `5000` | 内存中保留的最近 usage 记录数量；完整 usage 记录写入 PgSQL |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
-| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide`、`cli` |
-| `exposeProxyWarnings` | boolean | `false` | 是否通过 `x-kiro-rs-warnings` 暴露代理侧兜底改写。`anthropic-strict` 下会强制关闭 |
+| `defaultEndpoint` | string | `ide` | 默认 Account Runtime 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide`、`cli` |
+| `exposeProxyWarnings` | boolean | `false` | 是否通过 `x-account-runtime-warnings` 暴露代理侧兜底改写。`anthropic-strict` 下会强制关闭 |
 
 最小配置示例：
 
 ```json
 {
    "postgres": {
-      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
+      "url": "postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime"
    },
    "redis": {
       "url": "redis://127.0.0.1:26379/0"
@@ -364,7 +364,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 
 未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、payload 防护、本地模拟缓存和路径级 usage 上报策略。
 
-`payloadShaping` 默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Kiro JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务会记录 `still_oversized=true` 并继续请求 Kiro，让上游返回真实错误。
+`payloadShaping` 默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Account Runtime JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务会记录 `still_oversized=true` 并继续请求 Account Runtime，让上游返回真实错误。
 
 缓存模式由路径固定选择：
 
@@ -400,7 +400,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
-| `kiroApiKey`   | string | Kiro API Key / headless 凭据，格式 `ksk_xxx`；也支持 `ksk_xxx|region` 便捷写法 |
+| `apiKey`   | string | Account Runtime API Key / headless 凭据，格式 `ksk_xxx`；也支持 `ksk_xxx|region` 便捷写法 |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
@@ -532,22 +532,22 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 服务运行时主要使用配置文件和启动参数。以下环境变量可选：
 
 ```bash
-RUST_LOG=debug ./target/release/kiro-rs
+RUST_LOG=debug ./target/release/account-runtime
 ```
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
-| `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
-| `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
+| `ACCOUNT_RUNTIME_IMAGE` | `ghcr.io/2ue/account-runtime` | `docker-compose.deploy.yml` 使用的镜像仓库 |
+| `ACCOUNT_RUNTIME_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `ACCOUNT_RUNTIME_HOST` | 配置文件值 | 服务监听地址 |
 | `ACCOUNT_RUNTIME_PORT` | `8990` | Docker 部署时映射到宿主机的端口，也是服务监听端口覆盖值 |
-| `KIRO_ADMIN_UI_MODE` | debug: `redirect`; release: `embedded` | 旧版 `/admin` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
-| `KIRO_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_ADMIN_UI_DEV_SERVER` | debug: `http://127.0.0.1:9025/admin` | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
-| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
-| `KIRO_NEW_UI_DIR` / `KIRO_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | debug: `http://127.0.0.1:9023/ui` | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
+| `ACCOUNT_RUNTIME_ADMIN_UI_MODE` | debug: `redirect`; release: `embedded` | 旧版 `/admin` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `ACCOUNT_RUNTIME_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
+| `ACCOUNT_RUNTIME_ADMIN_UI_DEV_SERVER` | debug: `http://127.0.0.1:9025/admin` | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
+| `ACCOUNT_RUNTIME_NEW_UI_MODE` / `ACCOUNT_RUNTIME_UI_MODE` | debug: `redirect`; release: `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `ACCOUNT_RUNTIME_NEW_UI_DIR` / `ACCOUNT_RUNTIME_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
+| `ACCOUNT_RUNTIME_NEW_UI_DEV_SERVER` / `ACCOUNT_RUNTIME_UI_DEV_SERVER` | debug: `http://127.0.0.1:9023/ui` | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
 
 生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/admin` 和 `/ui` 会重定向到对应 Vite 服务；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
 
@@ -562,7 +562,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ```bash
 # 当前本地 config.json 监听 9022；config.example.json 的默认示例是 8990
-./target/release/kiro-rs -c config.json --credentials credentials.json
+./target/release/account-runtime -c config.json --credentials credentials.json
 ```
 
 前端默认把 `/api` 代理到 `http://127.0.0.1:9022`。如果后端不是 9022，用 `VITE_API_PROXY_TARGET` 覆盖：
@@ -647,7 +647,7 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
+| Anthropic 模型 | Account Runtime 模型 |
 |----------------|-----------|
 | `*sonnet*` | `claude-sonnet-4.5` |
 | `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
@@ -689,7 +689,7 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 ## 项目结构
 
 ```
-kiro-rs/
+account-runtime/
 ├── src/
 │   ├── main.rs                 # 程序入口
 │   ├── http_client.rs          # HTTP 客户端构建
@@ -707,7 +707,7 @@ kiro-rs/
 │   │   ├── converter.rs        # 协议转换器
 │   │   ├── stream.rs           # 流式响应处理
 │   │   └── websearch.rs        # WebSearch 工具处理
-│   ├── kiro/                   # Kiro API 客户端
+│   ├── account-runtime/                   # Account Runtime API 客户端
 │   │   ├── provider.rs         # API 提供者
 │   │   ├── token_manager.rs    # Token 管理
 │   │   ├── machine_id.rs       # 设备指纹生成
@@ -766,7 +766,7 @@ MIT
 ## 致谢
 
 本项目的实现离不开前辈的努力:  
- - [kiro2api](https://github.com/caidaoli/kiro2api)
+ - [account-runtime2api](https://github.com/caidaoli/account-runtime2api)
  - [proxycast](https://github.com/aiclientproxy/proxycast)
 
 本项目部分逻辑参考了以上的项目, 再次由衷的感谢!

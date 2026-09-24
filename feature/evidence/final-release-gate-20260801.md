@@ -12,7 +12,7 @@ Release target: `v0.0.126` after a dedicated Cargo package version bump.
 - Upstream: `origin/main`, `0 ahead / 0 behind` before the work commit.
 - Base release tag before this batch: `v0.0.125`.
 - Candidate binary used for real Claude CLI validation:
-  - Path: `/tmp/kiro-cli-candidate.NZWBnG/kiro-rs`.
+  - Path: `/tmp/account-runtime-cli-candidate.NZWBnG/account-runtime`.
   - SHA-256: `bca03a67e3744685e19f95e49b7601fd7d744575e421f140a9d895b1a7c8f3a6`.
   - Built through scoped Cargo wrapper, copied outside repository `target`, then all scoped build artifacts were removed.
 - Claude Code CLI:
@@ -25,12 +25,12 @@ The candidate binary was built before the release version bump while `Cargo.toml
 
 - Native WebSearch accepts the official `web_search_YYYYMMDD` family, including current and future-looking date suffixes, and routes server-side WebSearch instead of treating it as an ordinary client tool.
 - Tool-name/schema-key mapping covers invalid names, overlong names, normalized collisions, and reversible schema input mapping.
-- Tool-result-only turns use a semantic Kiro placeholder instead of an inert dot that could cause upstream to ignore the tool result.
+- Tool-result-only turns use a semantic Account Runtime placeholder instead of an inert dot that could cause upstream to ignore the tool result.
 - Local API-key credentials with fresh exhausted `remaining<=0`, `credit_remaining<=0`, and `overage_status=DISABLED` snapshots are guarded out of dispatch/fallback selection.
 - Downstream standard usage fields apply cache read/write caps in both full `reportedUsage` and no-full-reported local prompt-cache paths; non-success local/external records keep request estimates in diagnostics and zero standard fields.
 - Usage detail surfaces retain upstream/processing diagnostics instead of showing only normalized errors.
 - Account cards and backend sorting/filtering distinguish `Pro Max` from generic `Pro`; `Power` and `Pro Max` filter options are exposed.
-- `feature/tests/thinking-effort-kiro-wire.mjs` no longer hard-codes Claude CLI `2.1.197` as the only accepted default. It now records the actual CLI version, enforces an optional exact `KIRO_EXPECTED_CLAUDE_VERSION`, and otherwise requires a recognizable version at or above the supported minimum `2.1.197`.
+- `feature/tests/thinking-effort-account-runtime-wire.mjs` no longer hard-codes Claude CLI `2.1.197` as the only accepted default. It now records the actual CLI version, enforces an optional exact `ACCOUNT_RUNTIME_EXPECTED_CLAUDE_VERSION`, and otherwise requires a recognizable version at or above the supported minimum `2.1.197`.
 
 ## Validation Matrix
 
@@ -38,16 +38,16 @@ The candidate binary was built before the release version bump while `Cargo.toml
 
 - `feature/tests/run-cargo-scoped.sh final-full-default-20260801 -- cargo test --locked --all-targets -- --test-threads=1`
   - Main tests: `1850 passed / 0 failed / 6 ignored`.
-  - `kiro_loadtest`: `31 passed / 0 failed`.
+  - `account_runtime_loadtest`: `31 passed / 0 failed`.
   - Scoped target cleanup: `removed=true / reservation_released=true`.
 - `feature/tests/run-cargo-scoped.sh final-full-no-default-20260801 -- cargo test --locked --all-targets --no-default-features -- --test-threads=1`
   - Main tests: `1850 passed / 0 failed / 6 ignored`.
-  - `kiro_loadtest`: `31 passed / 0 failed`.
+  - `account_runtime_loadtest`: `31 passed / 0 failed`.
   - Scoped target cleanup: `removed=true / reservation_released=true`.
 - `feature/tests/run-cargo-scoped.sh final-release-build-20260801 -- cargo build --release --bins --locked`
   - Passed.
   - Scoped target cleanup: `removed=true / reservation_released=true`.
-- `feature/tests/run-cargo-scoped.sh final-cli-candidate-build-20260801 -- cargo build --release --bin kiro-rs --locked`
+- `feature/tests/run-cargo-scoped.sh final-cli-candidate-build-20260801 -- cargo build --release --bin account-runtime --locked`
   - Passed.
   - Copied frozen binary SHA-256 `bca03a67e3744685e19f95e49b7601fd7d744575e421f140a9d895b1a7c8f3a6`.
   - Scoped target cleanup: `removed=true / reservation_released=true`.
@@ -71,7 +71,7 @@ The candidate binary was built before the release version bump while `Cargo.toml
   - `261 passed`.
   - `22 skipped`.
   - `0 failed`.
-- `node --test feature/tests/thinking-effort-kiro-wire-contract.test.mjs`
+- `node --test feature/tests/thinking-effort-account-runtime-wire-contract.test.mjs`
   - `3 passed / 0 failed`.
   - Covers the updated Claude CLI version policy.
 - `node feature/tests/check-feature-docs.mjs`
@@ -92,10 +92,10 @@ The candidate binary was built before the release version bump while `Cargo.toml
 Runner:
 
 ```bash
-KIRO_RS_BINARY=/tmp/kiro-cli-candidate.NZWBnG/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/tmp/kiro-cli-artifacts.1DsCpM \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
-KIRO_VALIDATION_PROGRESS=1 \
+ACCOUNT_RUNTIME_BINARY=/tmp/account-runtime-cli-candidate.NZWBnG/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/tmp/account-runtime-cli-artifacts.1DsCpM \
+ACCOUNT_RUNTIME_CLAUDE_BINARY=/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
+ACCOUNT_RUNTIME_VALIDATION_PROGRESS=1 \
 feature/tests/run-claude-cli-release-suite-local.sh
 ```
 
@@ -104,11 +104,11 @@ The first full suite invocation passed `bare-invoke` and `long-session`, then st
 After the version-policy fix:
 
 ```bash
-KIRO_RS_BINARY=/tmp/kiro-cli-candidate.NZWBnG/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/tmp/kiro-cli-artifacts.1DsCpM \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
-KIRO_VALIDATION_PROGRESS=1 \
-KIRO_CLI_SUITE_ONLY=thinking \
+ACCOUNT_RUNTIME_BINARY=/tmp/account-runtime-cli-candidate.NZWBnG/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/tmp/account-runtime-cli-artifacts.1DsCpM \
+ACCOUNT_RUNTIME_CLAUDE_BINARY=/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude \
+ACCOUNT_RUNTIME_VALIDATION_PROGRESS=1 \
+ACCOUNT_RUNTIME_CLI_SUITE_ONLY=thinking \
 feature/tests/run-claude-cli-release-suite-local.sh
 ```
 
@@ -120,9 +120,9 @@ Results:
 
 Report files:
 
-- `/tmp/kiro-cli-artifacts.1DsCpM/reports/bare-invoke-claude-cli/bare-invoke-1785575901588-75231-251c3d.json`
-- `/tmp/kiro-cli-artifacts.1DsCpM/reports/claude-cli-long-session-continue/long-session-1785575919331-76320-2ca2d6.json`
-- `/tmp/kiro-cli-artifacts.1DsCpM/reports/thinking-effort-wire/thinking-effort-wire-1785576266349-660-569e8b.json`
+- `/tmp/account-runtime-cli-artifacts.1DsCpM/reports/bare-invoke-claude-cli/bare-invoke-1785575901588-75231-251c3d.json`
+- `/tmp/account-runtime-cli-artifacts.1DsCpM/reports/claude-cli-long-session-continue/long-session-1785575919331-76320-2ca2d6.json`
+- `/tmp/account-runtime-cli-artifacts.1DsCpM/reports/thinking-effort-wire/thinking-effort-wire-1785576266349-660-569e8b.json`
 
 The real CLI suite used caller-owned temporary PostgreSQL databases, isolated Redis DB/prefixes, isolated Claude config/home directories, temporary non-`9022` service ports, and fake upstream. Existing local `127.0.0.1:9022` was not restarted or probed by the runner.
 

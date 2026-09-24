@@ -948,7 +948,7 @@ export function CredentialCard({
             </div>
             <div>
               <span className="text-muted-foreground">上游计量：</span>
-              <span className="font-medium">{formatMeteringUsage(credential.upstreamMeteringUnits ?? credential.kiroMeteringUsage ?? 0)}</span>
+              <span className="font-medium">{formatMeteringUsage(credential.upstreamMeteringUnits ?? credential.upstreamMeteringUnits ?? 0)}</span>
             </div>
             {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
               <div>

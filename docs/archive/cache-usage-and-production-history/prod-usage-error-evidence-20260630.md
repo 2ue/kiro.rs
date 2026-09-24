@@ -17,30 +17,30 @@
 远端服务形态:
 
 - Docker 部署。
-- 主服务容器: `kiro-rs-app`
-- 镜像: `ghcr.io/2ue/kiro-rs:latest`
+- 主服务容器: `account-runtime-app`
+- 镜像: `ghcr.io/2ue/account-runtime:latest`
 - 端口映射: `0.0.0.0:40182->8990/tcp`
 - 应用进程:
 
 ```text
-./kiro-rs -c /app/config/config.json --credentials /app/config/credentials.json
+./account-runtime -c /app/config/config.json --credentials /app/config/credentials.json
 ```
 
 数据库容器:
 
-- Postgres 容器: `kiro-rs-postgres`
+- Postgres 容器: `account-runtime-postgres`
 - Postgres 镜像: `postgres:18-alpine`
-- Redis 容器: `kiro-rs-redis`
+- Redis 容器: `account-runtime-redis`
 - Redis 镜像: `redis:7-alpine`
 
 数据库:
 
-- database: `kiro_db_5c0aca87`
-- user: `kiro_u_b8e7b551`
+- database: `account-runtime_db_5c0aca87`
+- user: `account-runtime_u_b8e7b551`
 
 同机还存在其他服务:
 
-- `kiro-go-app`
+- `account-runtime-go-app`
 - `codex2api-app`
 - `sub2api-app`
 - `caddy`
@@ -174,7 +174,7 @@ thinking_signature_invalid | /v1/messages    | 1
 
 - `thinking_signature_invalid` 主要集中在 `/cc/v1/messages`。
 - `image_too_large` 主要集中在 `/na/v1/messages`，但 `/cc` 和 `/ha` 也有，说明不是单一路径独有。
-- `invalid_tool_use_format` 分布在 `/cc` 和 `/ha`，更像通用 Claude Code/Kiro payload 兼容问题。
+- `invalid_tool_use_format` 分布在 `/cc` 和 `/ha`，更像通用 Claude Code/Account Runtime payload 兼容问题。
 
 ## 6. 模型分布证据
 
@@ -251,8 +251,8 @@ endpoint=/cc/v1/messages 或 /ha/v1/messages
 
 判断:
 
-- 这是 Kiro 上游返回的 400。
-- 这不是本地 Claude Code CLI 的 `Invalid tool parameters`。本地 CLI 的 ask-user-question 参数问题已经在当前本地提交 `451602a fix: repair Claude Code ask user question tool input` 中修过，但它不等价于所有 Kiro 上游 `Invalid tool use format`。
+- 这是 Account Runtime 上游返回的 400。
+- 这不是本地 Claude Code CLI 的 `Invalid tool parameters`。本地 CLI 的 ask-user-question 参数问题已经在当前本地提交 `451602a fix: repair Claude Code ask user question tool input` 中修过，但它不等价于所有 Account Runtime 上游 `Invalid tool use format`。
 - 当前主线已有 `tool_format_debug` 异步写盘诊断能力，但现网版本不一定包含，且远端样本中没有直接看到可用于定位的完整诊断引用。
 
 ### 7.3 `tool_schema_top_level_union`
@@ -291,7 +291,7 @@ fallbackReason=local_capacity_exhausted 等
 关键特征:
 
 - 最新抽样中，这类错误至少有一部分来自外部池 fallback/preflight 路径。
-- 错误不是 Kiro 本地账号返回，而是外部池链路里上游拒绝了 Anthropic thinking block 的 signature。
+- 错误不是 Account Runtime 本地账号返回，而是外部池链路里上游拒绝了 Anthropic thinking block 的 signature。
 
 初步结论:
 
@@ -331,7 +331,7 @@ messages.13.content.1.tool_use.id: String should match pattern '^[a-zA-Z0-9_-]+$
 
 初步结论:
 
-- 这是可低风险修复项。历史 assistant `tool_use.id` 进入 Kiro history 前应做合法化或丢弃处理。
+- 这是可低风险修复项。历史 assistant `tool_use.id` 进入 Account Runtime history 前应做合法化或丢弃处理。
 
 ## 8. 远端运行配置证据
 
@@ -578,9 +578,9 @@ thinking_signature_invalid 的抽样路由是 external_pool/external_fallback_pr
   - root `oneOf` 输入，输出不包含 root `oneOf/anyOf/allOf`，仍是 object。
   - root `anyOf` 输入，输出不包含 root 组合关键字。
   - root `allOf` 输入，properties 合并，required 取并集。
-  - nested property 里的 `oneOf/anyOf/allOf` 是否保留需要按 Kiro 实测决定，至少不能破坏已有测试。
+  - nested property 里的 `oneOf/anyOf/allOf` 是否保留需要按 Account Runtime 实测决定，至少不能破坏已有测试。
 - 协议集成测试:
-  - 构造带 root `oneOf` 的 tool input_schema，通过本地 `/cc/v1/messages` 走转换，确认发给 Kiro/mock 的 schema 不含顶层组合关键字。
+  - 构造带 root `oneOf` 的 tool input_schema，通过本地 `/cc/v1/messages` 走转换，确认发给 Account Runtime/mock 的 schema 不含顶层组合关键字。
 - 真实验证:
   - Claude Code CLI 场景触发 MCP 工具 schema 中 root union，确认不再出现 `TOOL_SCHEMA_INVALID`。
 
@@ -665,7 +665,7 @@ thinking_signature_invalid 的抽样路由是 external_pool/external_fallback_pr
 风险:
 
 - 如果外部池本身支持 Anthropic signed thinking，删除 signature 可能降低官方 thinking 连续性。
-- 但现网证据中的外部池上游不接受该 signature。建议按 pool compat profile 做配置，默认对 Kiro/代理池清理。
+- 但现网证据中的外部池上游不接受该 signature。建议按 pool compat profile 做配置，默认对 Account Runtime/代理池清理。
 
 ### 候选 D: `tool_use.id` 合法化
 
@@ -678,7 +678,7 @@ thinking_signature_invalid 的抽样路由是 external_pool/external_fallback_pr
 
 建议修复:
 
-1. 增加 `sanitize_tool_use_id_for_kiro_history`。
+1. 增加 `sanitize_tool_use_id_for_account-runtime_history`。
 2. 规则:
    - 保留 `[a-zA-Z0-9_-]`
    - 其他字符替换为 `_`
@@ -730,7 +730,7 @@ thinking_signature_invalid 的抽样路由是 external_pool/external_fallback_pr
   - debug recorder 采样限流和 channel full 不阻塞。
   - max record bytes 生效。
 - 集成测试:
-  - 构造 mock Kiro 返回 `Invalid tool use format`，确认 usage 有诊断引用。
+  - 构造 mock Account Runtime 返回 `Invalid tool use format`，确认 usage 有诊断引用。
 - 真实验证:
   - Claude Code CLI 多轮工具调用、agent、MCP 场景运行 20 轮，确认若再出现错误，有可追踪诊断。
 
@@ -901,7 +901,7 @@ public error 检查
 
 基于 24 小时 133 条错误，最值得转化为代码优化的不是调度容量，而是请求体协议兼容:
 
-1. 工具 schema root union 被 Kiro/Bedrock 明确拒绝，当前主线代码仍有保留 root union 的风险。
+1. 工具 schema root union 被 Account Runtime/Bedrock 明确拒绝，当前主线代码仍有保留 root union 的风险。
 2. 历史图片超过 5 MB 会直接 400，当前 current-image-only 的裁剪思路不够。
 3. 外部池 fallback 路径出现 thinking signature invalid，当前 external guard failure 转发 original body 是风险点。
 4. `tool_use.id` 非法字符是低频但明确的问题，应修。
@@ -956,7 +956,7 @@ public error 检查
 
 - `src/anthropic/payload_guard.rs`
 - 新增历史图片安全处理阈值 `UPSTREAM_IMAGE_SOURCE_MAX_BYTES = 5 * 1024 * 1024`。
-- Kiro 请求历史中的 oversized image 会从 `conversation_state.history` 移除，并向历史用户文本追加简短占位说明。
+- Account Runtime 请求历史中的 oversized image 会从 `conversation_state.history` 移除，并向历史用户文本追加简短占位说明。
 - Anthropic external forwarding 请求历史中的 oversized image block 会替换为 text block，占位说明保留被移除 source 字节数和阈值。
 - `PayloadGuardReport` 增加:
   - `dropped_historical_images`
@@ -965,7 +965,7 @@ public error 检查
 
 验证:
 
-- `kiro_guard_drops_oversized_historical_images_even_when_body_fits`
+- `account-runtime_guard_drops_oversized_historical_images_even_when_body_fits`
 - `anthropic_guard_drops_oversized_historical_images_even_when_body_fits`
 - `cargo test anthropic::payload_guard::tests`
 - `cargo test --locked`
@@ -1006,7 +1006,7 @@ public error 检查
 
 风险边界:
 
-- 默认 `discard_historical_thinking=true`，与当前系统的 Kiro/代理池兼容策略一致。
+- 默认 `discard_historical_thinking=true`，与当前系统的 Account Runtime/代理池兼容策略一致。
 - 只处理历史 thinking，不处理当前响应流中的 thinking 输出。
 - 外部池如果未来明确支持 signed thinking，可以再按 pool compat profile 做更细粒度配置；当前生产证据支持默认清理。
 
@@ -1078,8 +1078,8 @@ public error 检查
 已验证相关测试:
 
 - `cargo test external_pool::tests`
-- `kiro::token_manager::manager::tests::test_scheduler_handles_500_daily_credentials_1000_rpm_simulation`
-- `kiro::token_manager::manager::tests::test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load`
+- `account-runtime::token_manager::manager::tests::test_scheduler_handles_500_daily_credentials_1000_rpm_simulation`
+- `account-runtime::token_manager::manager::tests::test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load`
 - `cargo test --locked`
 - `cargo test --locked --no-default-features`
 
@@ -1115,10 +1115,10 @@ cargo test external_pool::tests
 65 passed
 
 cargo test --locked --no-default-features
-783 main tests passed, 11 kiro_loadtest tests passed
+783 main tests passed, 11 account_runtime_loadtest tests passed
 
 cargo test --locked
-783 main tests passed, 11 kiro_loadtest tests passed
+783 main tests passed, 11 account_runtime_loadtest tests passed
 
 git diff --check
 passed

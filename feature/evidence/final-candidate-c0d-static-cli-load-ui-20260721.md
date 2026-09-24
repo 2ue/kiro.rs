@@ -6,10 +6,10 @@ Date: 2026-07-21 UTC (`2026-07-22 00:47-00:57` Asia/Shanghai for the local file 
 
 Candidate:
 
-- `kiro-rs`: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T//kiro-final-candidate-d.KBNESC/kiro-rs`
-- `kiro-rs` SHA-256: `fefd6204c1851c9795ae16fb006115997f7884570988622a77200c3e438cd7ec`
-- `kiro_loadtest`: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T//kiro-final-candidate-d.KBNESC/kiro_loadtest`
-- `kiro_loadtest` SHA-256: `f92e91b4f9c2d669e29e6bbb9e4d4b58f38d2f8bfac3f4bd51260c0d2edd6782`
+- `account-runtime`: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T//account-runtime-final-candidate-d.KBNESC/account-runtime`
+- `account-runtime` SHA-256: `fefd6204c1851c9795ae16fb006115997f7884570988622a77200c3e438cd7ec`
+- `account_runtime_loadtest`: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T//account-runtime-final-candidate-d.KBNESC/account_runtime_loadtest`
+- `account_runtime_loadtest` SHA-256: `f92e91b4f9c2d669e29e6bbb9e4d4b58f38d2f8bfac3f4bd51260c0d2edd6782`
 - C0 log SHA-256: `89bc66f8f262b08b1322baf47b91c9a733b2b5eec53b686cac13755ef109435e`
 - C0 log lines: `2322`
 
@@ -20,14 +20,14 @@ Candidate:
 Command:
 
 ```bash
-KIRO_FROZEN_BINARY="$candidate_root/kiro-rs" \
-KIRO_FROZEN_LOADTEST="$candidate_root/kiro_loadtest" \
+ACCOUNT_RUNTIME_FROZEN_BINARY="$candidate_root/account-runtime" \
+ACCOUNT_RUNTIME_FROZEN_LOADTEST="$candidate_root/account_runtime_loadtest" \
 feature/tests/run-cargo-scoped.sh final-candidate-c0d -- bash -lc '
   cargo fmt --check &&
   cargo test --all-targets &&
   cargo build --release --bins &&
-  install -m 755 "$CARGO_TARGET_DIR/release/kiro-rs" "$KIRO_FROZEN_BINARY" &&
-  install -m 755 "$CARGO_TARGET_DIR/release/kiro_loadtest" "$KIRO_FROZEN_LOADTEST"
+  install -m 755 "$CARGO_TARGET_DIR/release/account-runtime" "$ACCOUNT_RUNTIME_FROZEN_BINARY" &&
+  install -m 755 "$CARGO_TARGET_DIR/release/account_runtime_loadtest" "$ACCOUNT_RUNTIME_FROZEN_LOADTEST"
 '
 ```
 
@@ -36,7 +36,7 @@ Result:
 - `cargo fmt --check`: pass.
 - `cargo test --all-targets`: pass.
   - main test binary: `1742 passed; 0 failed; 6 ignored; finished in 405.86s`.
-  - `kiro_loadtest` tests: `31 passed; 0 failed; finished in 2.39s`.
+  - `account_runtime_loadtest` tests: `31 passed; 0 failed; finished in 2.39s`.
 - `cargo build --release --bins`: pass, `Finished release profile [optimized] target(s) in 7m 57s`.
 - scoped target cleanup: `validation-build-cleanup scope=final-candidate-c0d size_kib=2446284 available_kib=82943832 removed=true reservation_released=true`.
 
@@ -107,8 +107,8 @@ This confirms the current installed Claude CLI itself does not clamp `max` to `h
 
 The external documentation used for this check is current as of the crawl/search on 2026-07-21:
 
-- Kiro CLI `/effort` docs describe the effort command and effort levels for reasoning behavior: <https://kiro.dev/docs/cli/chat/effort/>.
-- Kiro model docs describe Opus adaptive thinking availability in Kiro IDE/CLI: <https://kiro.dev/docs/cli/models/>.
+- Account Runtime CLI `/effort` docs describe the effort command and effort levels for reasoning behavior: <https://account-runtime.dev/docs/cli/chat/effort/>.
+- Account Runtime model docs describe Opus adaptive thinking availability in Account Runtime IDE/CLI: <https://account-runtime.dev/docs/cli/models/>.
 - AWS Bedrock Claude adaptive thinking docs state that `effort` belongs in a separate `output_config` object and not inside `thinking`: <https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html>.
 - Claude Platform effort/adaptive thinking docs describe `output_config.effort` and `thinking: { "type": "adaptive" }` as related but separate controls: <https://platform.claude.com/docs/en/build-with-claude/effort> and <https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking>.
 
@@ -135,9 +135,9 @@ Result:
 
 Browser/UI interaction gates are still open; this evidence only closes local TypeScript/Vite build for both UI packages.
 
-### `kiro_loadtest` fake-upstream smoke/matrix
+### `account_runtime_loadtest` fake-upstream smoke/matrix
 
-The C0d frozen `kiro_loadtest` was run directly against its own loopback fake Kiro server. This does not prove the `kiro-rs` proxy runtime because it does not start the proxy or use PG/Redis. It does bind the current loadtest parser/reporting binary and fake upstream fixtures to the C0d candidate.
+The C0d frozen `account_runtime_loadtest` was run directly against its own loopback fake Account Runtime server. This does not prove the `account-runtime` proxy runtime because it does not start the proxy or use PG/Redis. It does bind the current loadtest parser/reporting binary and fake upstream fixtures to the C0d candidate.
 
 Single normal stream smoke:
 
@@ -188,7 +188,7 @@ After C0d:
 node feature/tests/inventory-build-artifacts.mjs --gate
 ```
 
-Initial inventory failed because root `target/` had been recreated by editor/flycheck artifacts and PID `84264` still referenced a historical `./target/release/kiro-rs` executable/log for the protected `9022` service. The active service was not stopped and its referenced files were not deleted.
+Initial inventory failed because root `target/` had been recreated by editor/flycheck artifacts and PID `84264` still referenced a historical `./target/release/account-runtime` executable/log for the protected `9022` service. The active service was not stopped and its referenced files were not deleted.
 
 Read-only inspection showed the visible root target contents were only:
 
@@ -199,7 +199,7 @@ Read-only inspection showed the visible root target contents were only:
 `lsof` showed PID `84264` as an existing user/historical service on `127.0.0.1:9022`:
 
 ```text
-./target/release/kiro-rs -c config.json --credentials credentials.json
+./target/release/account-runtime -c config.json --credentials credentials.json
 ```
 
 No live references existed to the visible `target/debug`, `target/flycheck0`, or `.rustc_info.json`, so only those visible, reproducible artifacts were removed. The protected service was not touched.
@@ -229,9 +229,9 @@ Still open / not counted as pass:
   - E05 strict-local-first full matrix,
   - F06 lifecycle dynamic,
   - request API key admission multi-instance dynamic,
-  - final L3/L4/L5 `kiro-rs` proxy load/chaos rebind,
+  - final L3/L4/L5 `account-runtime` proxy load/chaos rebind,
   - token-refresh cluster and multi-instance Redis coordination reruns.
-- real Kiro upstream thinking delta/usage and active/passive thinking long-session gates.
+- real Account Runtime upstream thinking delta/usage and active/passive thinking long-session gates.
 - native Claude CLI MCP/search/image/agent capability gates.
 - UI browser interaction gates.
 - v101/v102/v103 upgrade smoke on a release-bound candidate.

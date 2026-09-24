@@ -110,4 +110,4 @@ These remain visible documentation/release work. They do not reopen the target a
 
 ## Evidence Non-Claim
 
-This review is documentation-only. It does not assert that any Rust/frontend build, test, Docker run, PgSQL/Redis drill, load/chaos run, browser workflow, real Kiro request, real Claude Code session, migration rehearsal, backup/restore, final cutover or rollback has passed. No production code, release artifact, commit or push is created by this review.
+This review is documentation-only. It does not assert that any Rust/frontend build, test, Docker run, PgSQL/Redis drill, load/chaos run, browser workflow, real Account Runtime request, real Claude Code session, migration rehearsal, backup/restore, final cutover or rollback has passed. No production code, release artifact, commit or push is created by this review.

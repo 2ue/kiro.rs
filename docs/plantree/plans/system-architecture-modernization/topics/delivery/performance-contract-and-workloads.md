@@ -36,7 +36,7 @@ An accepted correctness tradeoff may justify additional I/O or latency only thro
 - The dated production observations are workload-shape evidence, not accepted SLOs or maximum capacity.
 - The relative limits of throughput `-5%`, p95 `+10%`, p99 `+15%`, and peak RSS `+15%` are binding minima under decision 010.
 - Concurrency values in the requirements are test dimensions, not a promise that every host, route, payload, or upstream sustains the largest value.
-- Real Kiro and real Claude Code runs prove compatibility and low-volume behavior. They do not establish general capacity because upstream latency, quota, model behavior, and cost are not deterministic.
+- Real Account Runtime and real Claude Code runs prove compatibility and low-volume behavior. They do not establish general capacity because upstream latency, quota, model behavior, and cost are not deterministic.
 - No module work unit or complete candidate currently has a passing modernization performance evidence record.
 
 ## Reference Host Identity
@@ -83,7 +83,7 @@ Before any result can count as `G-PERF` evidence, the harness must prove:
 11. observed membership, generation/digests and shared dependency topology match the immutable workload and release-generation manifests;
 12. the report schema is versioned and validated before threshold evaluation.
 
-Until the verified `TEST-004` defects are fixed, `kiro_loadtest` output may support investigation but must not independently pass `G-PERF`.
+Until the verified `TEST-004` defects are fixed, `account_runtime_loadtest` output may support investigation but must not independently pass `G-PERF`.
 
 ## Canonical Workload Manifest
 
@@ -131,8 +131,8 @@ The following IDs define required workload families. Decisions 010/011/014 fix r
 
 | Workload | Purpose and fixed dimensions | Binding minimum or specialization rule |
 | --- | --- | --- |
-| `PW-RAW-001` | External raw stream/non-stream; original bytes; 10 ms deterministic fake upstream; asserts zero full parse/media/Kiro conversion/payload guard/unconditional token count | Concurrency 64, >=200 success/s, >=99.9% success, 0 unexpected failure, local overhead p95/p99 <=25/75 ms |
-| `PW-MSG-001` | Local Kiro and external normalized stream/non-stream; 4 KiB ordinary payload; concurrency `1/16/64/128` | Concurrency 64, >=100 success/s, >=99.9% success, 0 unexpected failure, local overhead p95/p99 <=25/75 ms |
+| `PW-RAW-001` | External raw stream/non-stream; original bytes; 10 ms deterministic fake upstream; asserts zero full parse/media/Account Runtime conversion/payload guard/unconditional token count | Concurrency 64, >=200 success/s, >=99.9% success, 0 unexpected failure, local overhead p95/p99 <=25/75 ms |
+| `PW-MSG-001` | Local Account Runtime and external normalized stream/non-stream; 4 KiB ordinary payload; concurrency `1/16/64/128` | Concurrency 64, >=100 success/s, >=99.9% success, 0 unexpected failure, local overhead p95/p99 <=25/75 ms |
 | `PW-SCHED-001` | Pure scheduler and coordinated acquire lifecycle; `10/100/1,000` candidates; finite admission saturation; `1/1,000/100,000` stale leases; concurrency `32/128` | Pure 1,000-candidate p95/p99 <=2/5 ms; Redis script p95/p99 <=5/10 ms; <=128 stale members/call |
 | `PW-PAYLOAD-001` | 4 KiB, 1 MiB and representative 20 MiB edge; long histories, tools/results, nested schemas and thinking | Corpus hash is versioned; decision-010 byte/depth limits and relative CPU/RSS/latency gates apply |
 | `PW-INGRESS-001` | Slowloris/slow headers, honest/missing/dishonest `Content-Length`, chunked upload, slow/stopped body, keepalive churn, HTTP/2 concurrent-stream saturation and unauthorized body-before-auth attempts | Decision-011 listener/header/body/idle/age/HTTP2 limits; reserve before retained bytes, no unauthorized body retention, stable overload, reserved health/control progress and recovery within 60 seconds |
@@ -145,7 +145,7 @@ The following IDs define required workload families. Decisions 010/011/014 fix r
 | `PW-STABILITY-001` | Sustained stream/non-stream mix with proxy/client rotation, cache/queue/stale cleanup and dependency fault/recovery | At least 60 minutes and 100,000 completed requests, three process restarts, Redis restart/rebuild and PgSQL loss/recovery |
 | `PW-MULTI-001` | One-replica control, exactly-two equivalent replicas and the actual release-generation replica count; identical corpus/config/generation, shared PgSQL/Redis and measured load-balancer distribution; replica loss/partition/rejoin | Exactly two at twice the single offered load: aggregate capacity >=1.7x, p95 <=single +15%, p99 <=single +20%, per-launched-request PgSQL/Redis operations <=single +5%; actual release count passes its manifest-specific absolute gate without oversold shared limits |
 | `PW-CLI-001` | Real Claude Code compatibility | Three independent sessions, at least 20 turns each, predeclared request/token/duration cap; not capacity evidence |
-| `PW-KIRO-001` | Low-volume real Kiro compatibility using independent logical operations | At most 20 requests or lower account cap, with request/token/duration/cost/error stops; not capacity evidence |
+| `PW-ACCOUNT_RUNTIME-001` | Low-volume real Account Runtime compatibility using independent logical operations | At most 20 requests or lower account cap, with request/token/duration/cost/error stops; not capacity evidence |
 
 Development validation may run a documented reduced member, but it cannot replace the complete-candidate release manifest. The reduction and omitted dimensions remain visible.
 
@@ -210,7 +210,7 @@ Resource time series uses explicit units and source validity:
 
 ### Cost And Real-Upstream Safety
 
-Every real Kiro or real Claude Code workload declares before execution:
+Every real Account Runtime or real Claude Code workload declares before execution:
 
 - maximum requests and sessions;
 - maximum input/output/cache tokens when observable;
@@ -238,7 +238,7 @@ Decisions 010/011/014 fix the release minima:
 | multi-replica deployment | both `REF-HOST-MULTI` cases pass `PW-MULTI-001`; exactly-two meets the numeric scaling gate and the actual production count meets its manifest-specific absolute offered-load/capacity gate |
 | recovery | <=60 seconds and exact residual bands defined above |
 | stability | >=60 minutes and >=100,000 completions plus required restart/fault cycles |
-| real upstream | Kiro <=20 requests or lower account limit; Claude Code 3 sessions x >=20 turns; all runs predeclare request/token/duration/cost/error stops |
+| real upstream | Account Runtime <=20 requests or lower account limit; Claude Code 3 sessions x >=20 turns; all runs predeclare request/token/duration/cost/error stops |
 
 Binding request-path operation budgets are:
 

@@ -29,37 +29,37 @@ local error 分类后，external fallback 路径没有重新读取当前 local r
 E05 strict local-first runner 已改成非 Docker 入口，保留 10 类全矩阵模式，但要求调用方提供 caller-owned PostgreSQL/Redis：
 
 ```bash
-KIRO_RS_BINARY=/abs/outside/repo/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
-KIRO_E05_POSTGRES_URL_TEMPLATE='postgres://...@127.0.0.1:<pg-port>/{database}' \
-KIRO_E05_POSTGRES_DATABASES='kiro_e05_run_01,kiro_e05_run_02,...' \
-KIRO_E05_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db>' \
-KIRO_E05_REDIS_PREFIX='kiro_rs:e05:<unique>' \
+ACCOUNT_RUNTIME_BINARY=/abs/outside/repo/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
+ACCOUNT_RUNTIME_E05_POSTGRES_URL_TEMPLATE='postgres://...@127.0.0.1:<pg-port>/{database}' \
+ACCOUNT_RUNTIME_E05_POSTGRES_DATABASES='account-runtime_e05_run_01,account-runtime_e05_run_02,...' \
+ACCOUNT_RUNTIME_E05_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db>' \
+ACCOUNT_RUNTIME_E05_REDIS_PREFIX='account_runtime:e05:<unique>' \
 node feature/tests/strict-local-first-routing.mjs
 ```
 
-默认 10 modes × 3 rounds 需要 30 个预创建 `kiro_e05_*` database。脚本不启动 Docker、不创建 database、不 `FLUSHDB`、不调用 Cargo、不探测 `9022`；Redis fault 使用 `feature/tests/redis-chaos-proxy.mjs`，结束只清理 `KIRO_E05_REDIS_PREFIX:*`。
+默认 10 modes × 3 rounds 需要 30 个预创建 `account-runtime_e05_*` database。脚本不启动 Docker、不创建 database、不 `FLUSHDB`、不调用 Cargo、不探测 `9022`；Redis fault 使用 `feature/tests/redis-chaos-proxy.mjs`，结束只清理 `ACCOUNT_RUNTIME_E05_REDIS_PREFIX:*`。
 
 当前可执行的非 Docker 子项是 SchedulerRedisDegraded external takeover runner：
 
 ```bash
-KIRO_RS_BINARY=/abs/outside/repo/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
-KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/kiro_external_takeover_<owned_empty_db>' \
-KIRO_EXTERNAL_TAKEOVER_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db>' \
-KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX='kiro_rs:external_takeover:<unique>' \
+ACCOUNT_RUNTIME_BINARY=/abs/outside/repo/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/account-runtime_external_takeover_<owned_empty_db>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX='account_runtime:external_takeover:<unique>' \
 node feature/tests/external-takeover-scheduler-degraded-nondocker.mjs
 ```
 
 E01/E02 分布公平 runner 也已改成非 Docker 入口，但动态仍需调用者预创建空 PostgreSQL databases：
 
 ```bash
-KIRO_RS_BINARY=/abs/outside/repo/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
-KIRO_E01_E02_POSTGRES_URL_TEMPLATE='postgres://...@127.0.0.1:<pg-port>/{database}' \
-KIRO_E01_E02_POSTGRES_DATABASES='kiro_e0102_run_01,...' \
-KIRO_E01_E02_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db>' \
-KIRO_E01_E02_REDIS_PREFIX='kiro_rs:e0102:<unique>' \
+ACCOUNT_RUNTIME_BINARY=/abs/outside/repo/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
+ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE='postgres://...@127.0.0.1:<pg-port>/{database}' \
+ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES='account-runtime_e0102_run_01,...' \
+ACCOUNT_RUNTIME_E01_E02_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db>' \
+ACCOUNT_RUNTIME_E01_E02_REDIS_PREFIX='account_runtime:e0102:<unique>' \
 node feature/tests/scheduler-fairness-sticky-race.mjs
 ```
 
@@ -104,7 +104,7 @@ E01-E05。不得超卖；本地仍有可用容量时 external calls=0；错误/�
 
 当前协调层 E03 已在当前项目隔离 Redis 完成 3 outer × 5 internal，即 15/15：独立连接/manager 的 lease 唯一性、交叉 release、touch、崩溃 TTL recovery、共享 queue `4/16` 与 RPM reservations 均通过，最终 queue/lease=0。2026-07-21 scheduler Redis failure classification 修复后又用空 DB7 重跑 `multi-instance-redis-coordination-20260721-r3`，再次 3 outer × 5 internal（15/15）通过，scope `1708432 KiB removed=true reservation_released=true`。详见 [两实例协调证据](../evidence/multi-instance-redis-coordination-20260720.md)。
 
-2026-07-21 真实服务进程 E03 也已通过：用冻结候选 `/tmp/kiro-e03-candidate.T2iG7N/kiro-rs`（sha256 `98e0f79328b49925dc940faaa3b1e8b0c8ae8ef7b9975725eb219635c8957ee7`）跑 3 outer rounds。每轮两个真实 kiro.rs 进程共享同一 caller-owned PostgreSQL database、Redis DB12 和独立 prefix，覆盖 holder renewal、B 进程 shared capacity pending、holder release 后 local 200、A 进程组 SIGKILL、stale lease TTL recovery、A restart、shared RPM 和 B restart 后 RPM fence。三轮均为：
+2026-07-21 真实服务进程 E03 也已通过：用冻结候选 `/tmp/account-runtime-e03-candidate.T2iG7N/account-runtime`（sha256 `98e0f79328b49925dc940faaa3b1e8b0c8ae8ef7b9975725eb219635c8957ee7`）跑 3 outer rounds。每轮两个真实 account-runtime 进程共享同一 caller-owned PostgreSQL database、Redis DB12 和独立 prefix，覆盖 holder renewal、B 进程 shared capacity pending、holder release 后 local 200、A 进程组 SIGKILL、stale lease TTL recovery、A restart、shared RPM 和 B restart 后 RPM fence。三轮均为：
 
 ```text
 renew.blockedPendingMs=1250
@@ -120,10 +120,10 @@ cleanup.redisPrefixKeysRemaining=[]
 cleanup.occupiedPorts=[]
 ```
 
-报告见 [E03 真实双进程证据](../evidence/e03-real-two-process-scheduler-runner-20260720.md)。这关闭“真实 kiro.rs 进程 SIGKILL/restart 和共享 RPM 未执行”的缺口，但不能关闭 E01/E02 分布、公平性、E05 degraded external takeover、生产高基数和最终发布候选全矩阵。scheduler degraded 转 external 的异常路径在 fault + usage writer 联合压力下仍需复核首字延迟。
+报告见 [E03 真实双进程证据](../evidence/e03-real-two-process-scheduler-runner-20260720.md)。这关闭“真实 account-runtime 进程 SIGKILL/restart 和共享 RPM 未执行”的缺口，但不能关闭 E01/E02 分布、公平性、E05 degraded external takeover、生产高基数和最终发布候选全矩阵。scheduler degraded 转 external 的异常路径在 fault + usage writer 联合压力下仍需复核首字延迟。
 
 2026-07-21 external takeover 的 focused 代码路径与非 Docker runner 合同已补齐：四个 handler/fallback exact tests 通过，runner contract 8/8 通过，并明确验证 enabled 模式应由 external 接管、disabled 模式应规范失败、恢复后应回 local。由于本轮没有可确认独占空 PostgreSQL database URL，动态 service runner 仍未执行；该项不能替代 E05 产品门禁。详见 [SchedulerRedisDegraded 外部池接管验证程序](../evidence/external-takeover-scheduler-degraded-20260721.md)。
 
-同日 E01/E02 runner 自身也做了安全合同修正：`scheduler-fairness-sticky-race.mjs` 不再启动 Docker、不再 `FLUSHDB`、不再创建 PostgreSQL database，改为要求 caller-owned PG URL template、`modes × rounds` 个预创建 `kiro_e0102_*` database、loopback nonzero Redis DB 和 caller-owned Redis prefix；每 case 使用独立 `redis.keyPrefix`。`scheduler-fairness-sticky-race.contract.test.mjs` 7/7 通过，`runtime-validation-paths.test.mjs` 9/9 通过，证明不会误用 Docker/Cargo、不会探测 `9022`、不会使用仓库内 binary/artifact。详见 [E01/E02 scheduler fairness runner contract](../evidence/scheduler-fairness-nondocker-runner-contract-20260721.md)。这只关闭 runner 安全合同，不关闭 E01/E02 动态分布公平。回滚不得重新允许 local-memory fail-open 或绕过 strict local-first。
+同日 E01/E02 runner 自身也做了安全合同修正：`scheduler-fairness-sticky-race.mjs` 不再启动 Docker、不再 `FLUSHDB`、不再创建 PostgreSQL database，改为要求 caller-owned PG URL template、`modes × rounds` 个预创建 `account-runtime_e0102_*` database、loopback nonzero Redis DB 和 caller-owned Redis prefix；每 case 使用独立 `redis.keyPrefix`。`scheduler-fairness-sticky-race.contract.test.mjs` 7/7 通过，`runtime-validation-paths.test.mjs` 9/9 通过，证明不会误用 Docker/Cargo、不会探测 `9022`、不会使用仓库内 binary/artifact。详见 [E01/E02 scheduler fairness runner contract](../evidence/scheduler-fairness-nondocker-runner-contract-20260721.md)。这只关闭 runner 安全合同，不关闭 E01/E02 动态分布公平。回滚不得重新允许 local-memory fail-open 或绕过 strict local-first。
 
-同日又把 `strict-local-first-routing.mjs` 改成非 Docker 全矩阵入口：调用方必须提供仓库外冻结 binary、owned artifact root、`modes × rounds` 个预创建 `kiro_e05_*` database、loopback Redis DB1..15 和 caller-owned Redis prefix；脚本不启动 Docker、不创建 database、不 `FLUSHDB`、不调用 Cargo、不探测 `9022`，Redis fault 使用 `redis-chaos-proxy.mjs`。`strict-local-first-routing.contract.test.mjs` 6/6 通过，且同批 `runtime-validation-paths` 9/9、external takeover contract 8/8、E01/E02 contract 7/7，合计 30/30 通过；`git diff --check` 通过。inventory 仍因用户服务 PID `84264` 引用根 `target/` 预期失败，不是本轮产物。详见 [strict local-first E05 non-Docker runner contract](../evidence/strict-local-first-nondocker-runner-contract-20260721.md)。这仍不是 E05 动态 PASS；后续需要冻结 binary 与预创建空 PG databases 执行全矩阵。
+同日又把 `strict-local-first-routing.mjs` 改成非 Docker 全矩阵入口：调用方必须提供仓库外冻结 binary、owned artifact root、`modes × rounds` 个预创建 `account-runtime_e05_*` database、loopback Redis DB1..15 和 caller-owned Redis prefix；脚本不启动 Docker、不创建 database、不 `FLUSHDB`、不调用 Cargo、不探测 `9022`，Redis fault 使用 `redis-chaos-proxy.mjs`。`strict-local-first-routing.contract.test.mjs` 6/6 通过，且同批 `runtime-validation-paths` 9/9、external takeover contract 8/8、E01/E02 contract 7/7，合计 30/30 通过；`git diff --check` 通过。inventory 仍因用户服务 PID `84264` 引用根 `target/` 预期失败，不是本轮产物。详见 [strict local-first E05 non-Docker runner contract](../evidence/strict-local-first-nondocker-runner-contract-20260721.md)。这仍不是 E05 动态 PASS；后续需要冻结 binary 与预创建空 PG databases 执行全矩阵。

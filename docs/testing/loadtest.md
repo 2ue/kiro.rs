@@ -1,6 +1,6 @@
 # Account Runtime Loadtest 使用说明
 
-`kiro_loadtest` 仍是当前 Cargo 兼容二进制名；工具本身面向 account runtime / upstream account 压测和异常复现，不会随主服务启动。它用于验证本地代理、fake upstream server、streaming、thinking、tool-use、高缓存路由、错误归一化、延迟和资源占用。
+`account_runtime_loadtest` 是当前 Cargo 兼容二进制名；工具本身面向 account runtime / upstream account 压测和异常复现，不会随主服务启动。它用于验证本地代理、fake upstream server、streaming、thinking、tool-use、高缓存路由、错误归一化、延迟和资源占用。
 
 ## 编译环境注意
 
@@ -24,15 +24,13 @@ cleanup_loadtest() {
 trap cleanup_loadtest EXIT INT TERM HUP
 mkdir -p "$artifact_root/reports"
 
-ACCOUNT_RUNTIME_FROZEN_LOADTEST="$candidate_root/kiro_loadtest" \
+ACCOUNT_RUNTIME_FROZEN_LOADTEST="$candidate_root/account_runtime_loadtest" \
 CC=/usr/bin/cc \
 CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
   feature/tests/run-cargo-scoped.sh loadtest-binary -- \
-  bash -lc 'cargo +1.92.0 build --release --bin kiro_loadtest && install -m 755 "$CARGO_TARGET_DIR/release/kiro_loadtest" "$ACCOUNT_RUNTIME_FROZEN_LOADTEST"'
-export ACCOUNT_RUNTIME_LOADTEST_BINARY="$candidate_root/kiro_loadtest"
-export KIRO_LOADTEST_BINARY="$ACCOUNT_RUNTIME_LOADTEST_BINARY"
+  bash -lc 'cargo +1.92.0 build --release --bin account_runtime_loadtest && install -m 755 "$CARGO_TARGET_DIR/release/account_runtime_loadtest" "$ACCOUNT_RUNTIME_FROZEN_LOADTEST"'
+export ACCOUNT_RUNTIME_LOADTEST_BINARY="$candidate_root/account_runtime_loadtest"
 export ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR="$artifact_root"
-export KIRO_VALIDATION_ARTIFACT_DIR="$ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR"
 shasum -a 256 "$ACCOUNT_RUNTIME_LOADTEST_BINARY"
 ```
 

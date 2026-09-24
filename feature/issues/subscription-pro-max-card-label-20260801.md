@@ -10,7 +10,7 @@ Last observed: 2026-08-01 Asia/Shanghai
 
 The issue is not caused by screenshot masking or image cropping. The subscription title reaches the UI as a normal string, but both UI and backend classifiers lacked an explicit `Pro Max` branch:
 
-- UI `subscriptionBadgeMeta()` checked generic `pro` after `Pro+`, so `Kiro Pro Max` fell through to `Pro`.
+- UI `subscriptionBadgeMeta()` checked generic `pro` after `Pro+`, so `Account Runtime Pro Max` fell through to `Pro`.
 - Backend `subscription_key()` recognized `pro` and `pro_plus` but not `pro_max`, so filtering and validation grouping could classify the same account as generic `pro` or fail to group it correctly.
 - Backend `subscription_rank()` had no `pro_max` rank, so subscription change comparison could lose the intended order.
 
@@ -20,7 +20,7 @@ The fix now recognizes `Pro Max` before generic `Pro` in the UI, adds `pro_max` 
 
 ## 用户可见现象与影响
 
-- An account whose upstream/account-info title is `KIRO PRO MAX`, `Kiro Pro Max`, `pro-max`, `pro_max`, or `promax` can show the card badge `Pro`.
+- An account whose upstream/account-info title is `ACCOUNT_RUNTIME PRO MAX`, `Account Runtime Pro Max`, `pro-max`, `pro_max`, or `promax` can show the card badge `Pro`.
 - The API still retains the raw title, so this is a classification/display issue rather than evidence that the upstream account was downgraded.
 - Filtering by subscription has no `Pro Max` option and can therefore mix it with generic `Pro` behavior.
 - Subscription validation/upgrade-downgrade grouping can rank `Pro Max` as unknown or generic `Pro`.
@@ -39,7 +39,7 @@ This chain is deterministic and independent of screenshots, rasterization, or br
 UI classifier input:
 
 ```text
-subscriptionTitle = "KIRO PRO MAX"
+subscriptionTitle = "ACCOUNT_RUNTIME PRO MAX"
 ```
 
 Before the fix:
@@ -56,13 +56,13 @@ subscriptionBadgeMeta(...).label == "Pro Max"
 
 Backend classifier inputs covered by the regression:
 
-- `Kiro Pro Max`
-- `KIRO PRO_MAX`
+- `Account Runtime Pro Max`
+- `ACCOUNT_RUNTIME PRO_MAX`
 - `pro-max`
 - `promax`
-- `Kiro Pro`
-- `Kiro Pro+`
-- `Kiro Power`
+- `Account Runtime Pro`
+- `Account Runtime Pro+`
+- `Account Runtime Power`
 
 ## 修复
 
@@ -78,8 +78,8 @@ Backend classifier inputs covered by the regression:
 
 ## 验证与证据
 
-- `feature/tests/run-cargo-scoped.sh subscription-tier-focused -- cargo test --bin kiro-rs subscription_key_and_rank_distinguish_pro_max_from_pro -- --nocapture`: `1 passed / 0 failed`.
-- `feature/tests/run-cargo-scoped.sh admin-service-focused -- cargo test --bin kiro-rs admin::service::tests -- --nocapture`: `31 passed / 0 failed` (PgSQL integration test skipped because no test URL was provided).
+- `feature/tests/run-cargo-scoped.sh subscription-tier-focused -- cargo test --bin account-runtime subscription_key_and_rank_distinguish_pro_max_from_pro -- --nocapture`: `1 passed / 0 failed`.
+- `feature/tests/run-cargo-scoped.sh admin-service-focused -- cargo test --bin account-runtime admin::service::tests -- --nocapture`: `31 passed / 0 failed` (PgSQL integration test skipped because no test URL was provided).
 - `feature/tests/run-cargo-scoped.sh fmt-subscription -- cargo fmt --check`: passed.
 - `npm run check` in `ui`: passed.
 - `npm run build` in `admin-ui`: passed.

@@ -6,9 +6,9 @@ Status: `source-fixed / non-storage-focused-pass / isolated-storage-dynamic-pass
 
 - Repository HEAD: `401473ca1649997bdeccf4468e3add1bdb187248` (`v0.0.109`)；工作树有大量未提交用户与本轮变更。
 - Rust toolchain: `1.92.0`。
-- 本轮 2026-07-18 使用当前仓库专属隔离 Docker PostgreSQL/Redis 执行 storage dynamic，不访问/探测/停止 `127.0.0.1:9022`，未读取或暂存 `kiro_idc_users*.txt`。
+- 本轮 2026-07-18 使用当前仓库专属隔离 Docker PostgreSQL/Redis 执行 storage dynamic，不访问/探测/停止 `127.0.0.1:9022`，未读取或暂存 `account-runtime_idc_users*.txt`。
 - 所有 Cargo 命令均由 `feature/tests/run-cargo-scoped.sh` 执行；每个 scope 都要求并观察到 `removed=true` 和 `reservation_released=true`。
-- 本机 `KIRO_RS_TEST_POSTGRES_URL`、`KIRO_RS_TEST_REDIS_URL` 及两个 isolated confirmation 均未设置。本文不把 storage test 的正文早退记为动态成功。
+- 本机 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL`、`ACCOUNT_RUNTIME_TEST_REDIS_URL` 及两个 isolated confirmation 均未设置。本文不把 storage test 的正文早退记为动态成功。
 
 ## 已确认的修复前源码事实
 
@@ -72,7 +72,7 @@ external_pool_outbound_body_require_mapping_match_rejects_miss_before_send
 
 严格 parser、omitted effort 与 raw probe 测试各自内部 5 轮；其余本次为单次 exact 执行，最终 release 前还需用统一 outer-round runner重复。所有 raw/normalized/thinking/effort 测试证明本轮 scheduler/selection refactor 没有改变这些已有单点合同。
 
-以下四个 test function 被测试 harness 匹配并编译，但正文打印“未设置 KIRO_RS_TEST_POSTGRES_URL”后返回，耗时 0.00s：
+以下四个 test function 被测试 harness 匹配并编译，但正文打印“未设置 ACCOUNT_RUNTIME_TEST_POSTGRES_URL”后返回，耗时 0.00s：
 
 ```text
 external_pool_authoritative_snapshot_singleflights_c32_c128_for_five_rounds
@@ -100,14 +100,14 @@ reservation_released=true
 
 ```text
 exit=64
-KIRO_RS_TEST_POSTGRES_URL is required; no storage test was run
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL is required; no storage test was run
 ```
 
 以 PG URL 端口值 9022、Redis dummy URL 和两个 isolated flag 执行：
 
 ```text
 exit=64
-KIRO_RS_TEST_POSTGRES_URL cannot use protected port 9022
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL cannot use protected port 9022
 ```
 
 runner 先解析所有 target 并检查端口，再进行任何 TCP probe；因此上述 protected-port case 没有访问 9022。两次负向运行后 `.validation-build-*` 为 0，未进入 Cargo。
@@ -116,12 +116,12 @@ runner 先解析所有 target 并检查端口，再进行任何 TCP probe；因�
 
 2026-07-18 在当前仓库专属隔离 PostgreSQL/Redis 上重跑 `feature/tests/run-external-dispatch-storage-validation.sh`。依赖边界：
 
-- PostgreSQL 容器：`kiro-final-20260718-pg`；
-- Redis 容器：`kiro-final-20260718-redis`；
+- PostgreSQL 容器：`account-runtime-final-20260718-pg`；
+- Redis 容器：`account-runtime-final-20260718-redis`；
 - 每轮测试使用独立临时 database；失败/通过后 drop database；
 - Redis 使用当前隔离 DB，并在本批开始前清空；
 - 未使用、探测或影响 `127.0.0.1:9022`；
-- 未清理另一个本机同名项目 `/Users/yuanfeijie/Desktop/project/kiro.rs` 正在使用的 `kiro-rs-scheduler-gate-*-a1` 容器。
+- 未清理另一个本机同名项目 `/Users/yuanfeijie/Desktop/project/account-runtime` 正在使用的 `account-runtime-scheduler-gate-*-a1` 容器。
 
 有效最终门禁：
 
@@ -166,10 +166,10 @@ cleanup=size_kib=1691008 removed=true reservation_released=true
 显式提供 caller-owned、非生产、隔离 PG/Redis 后运行：
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL=<isolated-postgres> \
-KIRO_RS_TEST_REDIS_URL=<isolated-redis> \
-KIRO_RS_TEST_POSTGRES_ISOLATED=1 \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=<isolated-postgres> \
+ACCOUNT_RUNTIME_TEST_REDIS_URL=<isolated-redis> \
+ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED=1 \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
 feature/tests/run-external-dispatch-storage-validation.sh
 ```
 

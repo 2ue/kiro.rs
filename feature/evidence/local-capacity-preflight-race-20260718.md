@@ -54,7 +54,7 @@ preflight_ready_acquire_full_race_never_enters_default_local_queue_for_five_roun
 
 ## Skipped Storage Filters
 
-以下三个 filter 均编译并进入 `running 1`，但 fixture 输出“未设置 `KIRO_RS_TEST_POSTGRES_URL`”后提前返回：
+以下三个 filter 均编译并进入 `running 1`，但 fixture 输出“未设置 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL`”后提前返回：
 
 ```text
 external_pool_manager_distinguishes_global_capacity_from_no_pool

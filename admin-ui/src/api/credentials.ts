@@ -73,63 +73,26 @@ type LocalUpstreamRuntimeConfigKeys =
   | 'localUpstreamCachePointRecordPlan'
   | 'localUpstreamAgentModeStrategy'
 
-type LegacyLocalUpstreamRuntimeConfigWire = {
-  kiroUpstreamResponseTimeoutSecs?: number
-  kiroUpstreamStreamIdleTimeoutSecs?: number
-  kiroUpstreamStreamRetryEnabled?: boolean
-  kiroUpstreamStreamRetryMaxAttempts?: number
-  kiroUpstreamStreamRetryOnIdleTimeout?: boolean
-  kiroUpstreamStreamRetryOnReadError?: boolean
-  kiroUpstreamStreamRetryOnStatusError?: boolean
-  kiroCachePointEnabled?: boolean
-  kiroCachePointToolsOnly?: boolean
-  kiroCachePointRecordPlan?: boolean
-  kiroAgentModeStrategy?: RuntimeConfig['localUpstreamAgentModeStrategy']
-}
-
 type RuntimeConfigWire = Omit<RuntimeConfig, LocalUpstreamRuntimeConfigKeys> &
-  Partial<Pick<RuntimeConfig, LocalUpstreamRuntimeConfigKeys>> &
-  LegacyLocalUpstreamRuntimeConfigWire
+  Partial<Pick<RuntimeConfig, LocalUpstreamRuntimeConfigKeys>>
 
 function normalizeRuntimeConfig(data: RuntimeConfigWire): RuntimeConfig {
-  const {
-    kiroUpstreamResponseTimeoutSecs,
-    kiroUpstreamStreamIdleTimeoutSecs,
-    kiroUpstreamStreamRetryEnabled,
-    kiroUpstreamStreamRetryMaxAttempts,
-    kiroUpstreamStreamRetryOnIdleTimeout,
-    kiroUpstreamStreamRetryOnReadError,
-    kiroUpstreamStreamRetryOnStatusError,
-    kiroCachePointEnabled,
-    kiroCachePointToolsOnly,
-    kiroCachePointRecordPlan,
-    kiroAgentModeStrategy,
-    ...current
-  } = data
+  const { externalPools, ...current } = data
+  const runtimeExternalPools = externalPools ?? ({} as RuntimeConfig['externalPools'])
   return {
     ...current,
-    localUpstreamResponseTimeoutSecs:
-      data.localUpstreamResponseTimeoutSecs ?? kiroUpstreamResponseTimeoutSecs ?? 180,
-    localUpstreamStreamIdleTimeoutSecs:
-      data.localUpstreamStreamIdleTimeoutSecs ?? kiroUpstreamStreamIdleTimeoutSecs ?? 180,
-    localUpstreamStreamRetryEnabled:
-      data.localUpstreamStreamRetryEnabled ?? kiroUpstreamStreamRetryEnabled ?? true,
-    localUpstreamStreamRetryMaxAttempts:
-      data.localUpstreamStreamRetryMaxAttempts ?? kiroUpstreamStreamRetryMaxAttempts ?? 2,
-    localUpstreamStreamRetryOnIdleTimeout:
-      data.localUpstreamStreamRetryOnIdleTimeout ?? kiroUpstreamStreamRetryOnIdleTimeout ?? true,
-    localUpstreamStreamRetryOnReadError:
-      data.localUpstreamStreamRetryOnReadError ?? kiroUpstreamStreamRetryOnReadError ?? true,
-    localUpstreamStreamRetryOnStatusError:
-      data.localUpstreamStreamRetryOnStatusError ?? kiroUpstreamStreamRetryOnStatusError ?? true,
-    localUpstreamCachePointEnabled:
-      data.localUpstreamCachePointEnabled ?? kiroCachePointEnabled ?? false,
-    localUpstreamCachePointToolsOnly:
-      data.localUpstreamCachePointToolsOnly ?? kiroCachePointToolsOnly ?? true,
-    localUpstreamCachePointRecordPlan:
-      data.localUpstreamCachePointRecordPlan ?? kiroCachePointRecordPlan ?? true,
-    localUpstreamAgentModeStrategy:
-      data.localUpstreamAgentModeStrategy ?? kiroAgentModeStrategy ?? 'vibe',
+    localUpstreamResponseTimeoutSecs: data.localUpstreamResponseTimeoutSecs ?? 180,
+    localUpstreamStreamIdleTimeoutSecs: data.localUpstreamStreamIdleTimeoutSecs ?? 180,
+    localUpstreamStreamRetryEnabled: data.localUpstreamStreamRetryEnabled ?? true,
+    localUpstreamStreamRetryMaxAttempts: data.localUpstreamStreamRetryMaxAttempts ?? 2,
+    localUpstreamStreamRetryOnIdleTimeout: data.localUpstreamStreamRetryOnIdleTimeout ?? true,
+    localUpstreamStreamRetryOnReadError: data.localUpstreamStreamRetryOnReadError ?? true,
+    localUpstreamStreamRetryOnStatusError: data.localUpstreamStreamRetryOnStatusError ?? true,
+    localUpstreamCachePointEnabled: data.localUpstreamCachePointEnabled ?? false,
+    localUpstreamCachePointToolsOnly: data.localUpstreamCachePointToolsOnly ?? true,
+    localUpstreamCachePointRecordPlan: data.localUpstreamCachePointRecordPlan ?? true,
+    localUpstreamAgentModeStrategy: data.localUpstreamAgentModeStrategy ?? 'vibe',
+    externalPools: runtimeExternalPools,
   } as RuntimeConfig
 }
 
@@ -202,7 +165,6 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     estimatedCostUsd: 0,
     originalCostUsd: 0,
     upstreamMeteringUnits: 0,
-    kiroMeteringUsage: 0,
     pricedRequests: 0,
     unpricedRequests: 0,
   }

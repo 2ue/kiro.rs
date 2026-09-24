@@ -8,13 +8,13 @@ Scope: F06 `aws-api-key-region-lifecycle.mjs` 验证程序的运行时安全边�
 
 `feature/tests/aws-api-key-region-lifecycle.mjs` 已从旧的 Docker-managed PostgreSQL/Redis runner 改为 caller-owned runtime runner：
 
-- 要求 `KIRO_RS_BINARY` 和 `KIRO_VALIDATION_ARTIFACT_DIR` 为仓库外绝对真实路径，由 `runtime-validation-paths.mjs` 统一 fail closed。
-- 要求 `KIRO_F06_POSTGRES_URL` 指向 loopback、端口非 `9022`、database 名称匹配 `kiro_f06_*`。
-- 要求 `KIRO_F06_REDIS_URL` 指向 loopback Redis DB1..15，拒绝 DB0、auth、query、fragment 和 `9022`。
-- 要求 `KIRO_F06_REDIS_PREFIX` 为调用方临时 owned prefix，拒绝 `kiro_rs:local`。
+- 要求 `ACCOUNT_RUNTIME_BINARY` 和 `ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR` 为仓库外绝对真实路径，由 `runtime-validation-paths.mjs` 统一 fail closed。
+- 要求 `ACCOUNT_RUNTIME_F06_POSTGRES_URL` 指向 loopback、端口非 `9022`、database 名称匹配 `account-runtime_f06_*`。
+- 要求 `ACCOUNT_RUNTIME_F06_REDIS_URL` 指向 loopback Redis DB1..15，拒绝 DB0、auth、query、fragment 和 `9022`。
+- 要求 `ACCOUNT_RUNTIME_F06_REDIS_PREFIX` 为调用方临时 owned prefix，拒绝 `account_runtime:local`。
 - 不启动 Docker、不创建 PostgreSQL database、不 `FLUSHDB`/`FLUSHALL`、不调用 Cargo、不探测已有 `9022` listener。
-- 服务子进程使用最小环境，只传入 `RUST_LOG`、`KIRO_API_KEY`、`KIRO_RS_HOST`、`KIRO_RS_PORT`，不继承 caller `process.env` 中的 PG/Redis/secret 变量。
-- Redis 清理只扫描和删除 `${KIRO_F06_REDIS_PREFIX}:*`，不清空调用方 database。
+- 服务子进程使用最小环境，只传入 `RUST_LOG`、`ACCOUNT_RUNTIME_API_KEY`、`ACCOUNT_RUNTIME_HOST`、`ACCOUNT_RUNTIME_PORT`，不继承 caller `process.env` 中的 PG/Redis/secret 变量。
+- Redis 清理只扫描和删除 `${ACCOUNT_RUNTIME_F06_REDIS_PREFIX}:*`，不清空调用方 database。
 - PostgreSQL 查询改为调用本机 `psql`，用于动态 gate 时只检查/读取 caller-owned database；runner 自身不创建或删除 database。
 
 ## 本轮测试命令与结果
@@ -36,8 +36,8 @@ Result: `6/6` pass.
 - JavaScript syntax。
 - validate-only 接受 caller-owned loopback PostgreSQL/Redis，输出 `dockerUsed=false`、`cargoUsed=false`、`createsPostgresDatabase=false`、`flushesRedisDatabase=false`。
 - 早拒绝 PostgreSQL/Redis `9022`。
-- 早拒绝 Redis DB0 和共享 `kiro_rs:local` prefix。
-- 早拒绝非 loopback dependency 和非 `kiro_f06_*` database。
+- 早拒绝 Redis DB0 和共享 `account_runtime:local` prefix。
+- 早拒绝非 loopback dependency 和非 `account-runtime_f06_*` database。
 - source contract 禁止 Docker/Cargo 调用、`CREATE DATABASE`、`FLUSHDB/FLUSHALL`、`...process.env` 继承。
 
 ```bash
@@ -51,7 +51,7 @@ node --test \
 
 Result: `36/36` pass.
 
-该合批确认 F06 与现有 runtime path、external takeover、E01/E02、E05 runner 合同兼容。测试不启动 Docker、不运行 Cargo、不启动 kiro.rs 服务、不触碰 `9022`。
+该合批确认 F06 与现有 runtime path、external takeover、E01/E02、E05 runner 合同兼容。测试不启动 Docker、不运行 Cargo、不启动 account-runtime 服务、不触碰 `9022`。
 
 ```bash
 git diff --check -- \
@@ -66,12 +66,12 @@ Result: pass.
 完整 F06 动态门禁仍需要调用方提供：
 
 ```bash
-KIRO_RS_BINARY=/abs/outside/repo/frozen/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
-KIRO_F06_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/kiro_f06_<owned_empty_db>' \
-KIRO_F06_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db-1-15>' \
-KIRO_F06_REDIS_PREFIX='kiro_rs:f06:<unique-owned-prefix>' \
-KIRO_F06_ROUNDS=3 \
+ACCOUNT_RUNTIME_BINARY=/abs/outside/repo/frozen/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
+ACCOUNT_RUNTIME_F06_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/account-runtime_f06_<owned_empty_db>' \
+ACCOUNT_RUNTIME_F06_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-db-1-15>' \
+ACCOUNT_RUNTIME_F06_REDIS_PREFIX='account_runtime:f06:<unique-owned-prefix>' \
+ACCOUNT_RUNTIME_F06_ROUNDS=3 \
 node feature/tests/aws-api-key-region-lifecycle.mjs
 ```
 
@@ -83,4 +83,4 @@ node feature/tests/aws-api-key-region-lifecycle.mjs
 - 未绑定最终 frozen release candidate SHA。
 - 未完成两套 UI browser import/export warning gate。
 - 未完成多实例同时重复导入的 auxiliary admission gate。
-- 未覆盖真实 AWS/Kiro 官方 upstream；F06 核心 lifecycle 仍以 fake upstream 验证 region Host、Bearer 和 `tokentype=API_KEY`。
+- 未覆盖真实 AWS/Account Runtime 官方 upstream；F06 核心 lifecycle 仍以 fake upstream 验证 region Host、Bearer 和 `tokentype=API_KEY`。

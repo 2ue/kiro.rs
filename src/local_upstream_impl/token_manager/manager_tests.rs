@@ -762,8 +762,8 @@ async fn assert_capacity_breaker_fail_fast_without_redis_spin(
     let elapsed = started.elapsed();
     let after = manager.scheduler_redis_breaker.stats_snapshot();
     assert_eq!(
-        manager.local_pool_route_state(None).kind,
-        LocalPoolRouteStateKind::SchedulerRedisDegraded,
+        manager.account_route_state(None).kind,
+        AccountRouteStateKind::SchedulerRedisDegraded,
         "{scenario}: breaker-open requests must not be reported as AllDisabled"
     );
     assert_eq!(
@@ -1058,7 +1058,7 @@ async fn force_refresh_token_endpoint(
         "access_token": "force-refreshed-access-token",
         "refresh_token": "n".repeat(150),
         "expires_in": 3600,
-        "scope": "offline_access codewhisperer:conversations",
+        "scope": "offline_access account-runtime:conversations",
     }))
 }
 
@@ -1117,7 +1117,7 @@ fn force_refresh_test_credential(token_endpoint: String) -> LocalUpstreamCredent
         refresh_token: Some("r".repeat(150)),
         client_id: Some("force-refresh-test-client".to_string()),
         token_endpoint: Some(token_endpoint),
-        scopes: Some("offline_access codewhisperer:conversations".to_string()),
+        scopes: Some("offline_access account-runtime:conversations".to_string()),
         expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
         ..Default::default()
     }
@@ -3292,8 +3292,8 @@ async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
         "snapshot/state-sync timeout must leave only the local snapshot stale; it must not create a fail-fast breaker window"
     );
     assert_eq!(
-        manager.local_pool_route_state(None).kind,
-        LocalPoolRouteStateKind::Ready,
+        manager.account_route_state(None).kind,
+        AccountRouteStateKind::Ready,
         "a snapshot timeout must not route a locally dispatchable pool to external fallback"
     );
     assert_eq!(
@@ -3482,8 +3482,8 @@ async fn test_scheduler_affinity_timeout_does_not_degrade_capacity_coordination(
     assert!(skipped.is_none());
     assert!(second_started.elapsed() < StdDuration::from_millis(20));
 
-    let route_state = manager.local_pool_route_state(None);
-    assert_eq!(route_state.kind, LocalPoolRouteStateKind::Ready);
+    let route_state = manager.account_route_state(None);
+    assert_eq!(route_state.kind, AccountRouteStateKind::Ready);
     let mut context = manager
         .acquire_context(None)
         .await
@@ -4022,14 +4022,14 @@ fn test_sha256_hex() {
 }
 
 #[test]
-fn usage_limits_user_agents_match_kiro_rest_shape() {
+fn usage_limits_user_agents_match_account_runtime_rest_shape() {
     assert_eq!(
         usage_limits_amz_user_agent("0.12.155", "machine"),
-        "aws-sdk-js/1.0.0 KiroIDE-0.12.155-machine"
+        "account-runtime-js/1.0.0 AccountRuntimeIDE-0.12.155-machine"
     );
     assert_eq!(
         usage_limits_user_agent("macos#23.4.0", "22.22.0", "0.12.155", "machine"),
-        "aws-sdk-js/1.0.0 ua/2.1 os/macos#23.4.0 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-0.12.155-machine"
+        "account-runtime-js/1.0.0 ua/2.1 os/macos#23.4.0 lang/js md/nodejs#22.22.0 api/account-runtime-runtime#1.0.0 m/N,E AccountRuntimeIDE-0.12.155-machine"
     );
 }
 
@@ -4736,8 +4736,8 @@ async fn postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine
                 assert!(!entry.disabled, "round {round}");
                 assert!(entry.disabled_reason.is_none(), "round {round}");
             }
-            let route_state = manager.local_pool_route_state(None);
-            assert_eq!(route_state.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+            let route_state = manager.account_route_state(None);
+            assert_eq!(route_state.kind, AccountRouteStateKind::Ready, "round {round}");
             assert_eq!(route_state.available, 1, "round {round}");
             assert_eq!(route_state.dispatchable, 1, "round {round}");
 
@@ -4827,8 +4827,8 @@ async fn terminal_deferred_success_does_not_wait_for_pgsql_pool_pressure_for_fiv
                 assert_eq!(entry.failure_count, 0, "round {round}");
                 assert_eq!(entry.success_count, round, "round {round}");
             }
-            let route_state = manager.local_pool_route_state(None);
-            assert_eq!(route_state.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+            let route_state = manager.account_route_state(None);
+            assert_eq!(route_state.kind, AccountRouteStateKind::Ready, "round {round}");
             assert_eq!(route_state.available, 1, "round {round}");
             assert_eq!(route_state.dispatchable, 1, "round {round}");
 
@@ -4958,8 +4958,8 @@ fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five
             assert!(manager.enqueue_pending_runtime_mutation(id, mutation));
         }
 
-        let state = manager.local_pool_route_state(None);
-        assert_eq!(state.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+        let state = manager.account_route_state(None);
+        assert_eq!(state.kind, AccountRouteStateKind::Ready, "round {round}");
         assert_eq!(state.total, 40, "round {round}");
         assert_eq!(state.available, 40, "round {round}");
         assert_eq!(state.dispatchable, 40, "round {round}");
@@ -5022,10 +5022,10 @@ fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five
                 "round {round}"
             );
         }
-        let partially_quarantined = manager.local_pool_route_state(None);
+        let partially_quarantined = manager.account_route_state(None);
         assert_eq!(
             partially_quarantined.kind,
-            LocalPoolRouteStateKind::Ready,
+            AccountRouteStateKind::Ready,
             "round {round}"
         );
         assert_eq!(partially_quarantined.available, 38, "round {round}");
@@ -5563,7 +5563,7 @@ fn profile_arn_deferred_updates_local_state_without_store() {
     manager
         .update_credential_profile_arn_deferred(
             1,
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/test".to_string()),
+            Some("arn:account-runtime:us-east-1:123456789012:profile/test".to_string()),
         )
         .unwrap();
     assert!(
@@ -7095,8 +7095,8 @@ async fn test_rate_limiter_blocks_after_window_capacity_is_full() {
     let mut first = manager.acquire_context(None).await.unwrap();
     first.release_in_flight();
 
-    let state = manager.local_pool_route_state(None);
-    assert_eq!(state.kind, LocalPoolRouteStateKind::AllCoolingDown);
+    let state = manager.account_route_state(None);
+    assert_eq!(state.kind, AccountRouteStateKind::AllCoolingDown);
     assert_eq!(state.rate_limit_blocked, 1);
     assert!(state.retry_after_secs.is_some());
 }
@@ -7525,10 +7525,10 @@ async fn forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_
             );
         }
 
-        let full = manager.local_pool_route_state(None);
+        let full = manager.account_route_state(None);
         assert_eq!(
             full.kind,
-            LocalPoolRouteStateKind::CapacityFull,
+            AccountRouteStateKind::CapacityFull,
             "round {round}"
         );
         assert_eq!(full.total, CREDENTIALS, "round {round}");
@@ -7587,10 +7587,10 @@ async fn forty_by_fifteen_with_global_five_hundred_queues_without_disabling_for_
                     .unwrap_or_else(|| panic!("round {round}, unlimited slot {idx} should fit")),
             );
         }
-        let still_ready = unlimited_global.local_pool_route_state(None);
+        let still_ready = unlimited_global.account_route_state(None);
         assert_eq!(
             still_ready.kind,
-            LocalPoolRouteStateKind::Ready,
+            AccountRouteStateKind::Ready,
             "round {round}"
         );
         assert_eq!(
@@ -7828,17 +7828,17 @@ async fn test_weighted_rpm_consumes_capacity_units() {
         .unwrap();
     ctx.release_in_flight();
 
-    let state = manager.local_pool_route_state(None);
-    assert_eq!(state.kind, LocalPoolRouteStateKind::AllCoolingDown);
+    let state = manager.account_route_state(None);
+    assert_eq!(state.kind, AccountRouteStateKind::AllCoolingDown);
     assert_eq!(state.rate_limit_blocked, 1);
     assert!(manager.snapshot().entries[0].rate_limited);
 }
 
 #[test]
-fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
+fn test_account_route_state_reports_no_credentials_and_all_disabled() {
     let empty = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
-    let empty_state = empty.local_pool_route_state(None);
-    assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
+    let empty_state = empty.account_route_state(None);
+    assert_eq!(empty_state.kind, AccountRouteStateKind::NoCredentials);
     assert_eq!(empty_state.total, 0);
     assert_eq!(empty_state.available, 0);
 
@@ -7846,14 +7846,14 @@ fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
     disabled.disabled = true;
     let disabled_manager =
         MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
-    let disabled_state = disabled_manager.local_pool_route_state(None);
-    assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
+    let disabled_state = disabled_manager.account_route_state(None);
+    assert_eq!(disabled_state.kind, AccountRouteStateKind::AllDisabled);
     assert_eq!(disabled_state.total, 1);
     assert_eq!(disabled_state.available, 0);
 }
 
 #[tokio::test]
-async fn test_local_pool_route_state_reports_capacity_full_without_queueing_for_five_rounds() {
+async fn test_account_route_state_reports_capacity_full_without_queueing_for_five_rounds() {
     for round in 1..=5 {
         let mut config = Config::default();
         config.credential_max_concurrent_requests = 1;
@@ -7867,15 +7867,15 @@ async fn test_local_pool_route_state_reports_capacity_full_without_queueing_for_
         )
         .unwrap();
 
-        let ready = manager.local_pool_route_state(None);
-        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready, "round {round}");
+        let ready = manager.account_route_state(None);
+        assert_eq!(ready.kind, AccountRouteStateKind::Ready, "round {round}");
         assert_eq!(ready.dispatchable, 1, "round {round}");
 
         let mut ctx = manager.acquire_context(None).await.unwrap();
-        let full = manager.local_pool_route_state(None);
+        let full = manager.account_route_state(None);
         assert_eq!(
             full.kind,
-            LocalPoolRouteStateKind::CapacityFull,
+            AccountRouteStateKind::CapacityFull,
             "round {round}"
         );
         assert_eq!(full.dispatchable, 0, "round {round}");
@@ -7883,10 +7883,10 @@ async fn test_local_pool_route_state_reports_capacity_full_without_queueing_for_
         assert_eq!(full.queued_requests, 0, "round {round}");
 
         ctx.release_in_flight();
-        let ready_again = manager.local_pool_route_state(None);
+        let ready_again = manager.account_route_state(None);
         assert_eq!(
             ready_again.kind,
-            LocalPoolRouteStateKind::Ready,
+            AccountRouteStateKind::Ready,
             "round {round}"
         );
         assert_eq!(ready_again.dispatchable, 1, "round {round}");
@@ -8056,64 +8056,64 @@ fn selection_failure_summary_can_disable_account_samples() {
 }
 
 #[tokio::test]
-async fn test_local_pool_route_state_sees_added_credential_after_empty_pool() {
+async fn test_account_route_state_sees_added_credential_after_empty_pool() {
     let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
-    let empty_state = manager.local_pool_route_state(None);
-    assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
+    let empty_state = manager.account_route_state(None);
+    assert_eq!(empty_state.kind, AccountRouteStateKind::NoCredentials);
 
     manager
         .add_credential(api_key_credential("ksk_dynamic_added"))
         .await
         .unwrap();
 
-    let ready = manager.local_pool_route_state(None);
-    assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+    let ready = manager.account_route_state(None);
+    assert_eq!(ready.kind, AccountRouteStateKind::Ready);
     assert_eq!(ready.total, 1);
     assert_eq!(ready.dispatchable, 1);
 }
 
 #[test]
-fn test_local_pool_route_state_sees_manual_enable_after_all_disabled() {
+fn test_account_route_state_sees_manual_enable_after_all_disabled() {
     let mut disabled = api_key_credential("ksk_dynamic_disabled");
     disabled.disabled = true;
     let manager =
         MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
 
-    let disabled_state = manager.local_pool_route_state(None);
-    assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
+    let disabled_state = manager.account_route_state(None);
+    assert_eq!(disabled_state.kind, AccountRouteStateKind::AllDisabled);
 
     manager.set_disabled(1, false).unwrap();
 
-    let ready = manager.local_pool_route_state(None);
-    assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+    let ready = manager.account_route_state(None);
+    assert_eq!(ready.kind, AccountRouteStateKind::Ready);
     assert_eq!(ready.available, 1);
     assert_eq!(ready.dispatchable, 1);
 }
 
 #[tokio::test]
-async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
+async fn test_account_route_state_sees_model_compatible_credential_added() {
     let mut limited = api_key_credential("ksk_model_limited");
     limited.subscription_title = Some("account-class-b".to_string());
     limited.supported_models = vec![SONNET_MODEL.to_string()];
     let manager =
         MultiTokenManager::new(Config::default(), vec![limited], None, None, false).unwrap();
 
-    let unsupported = manager.local_pool_route_state(Some("claude-opus-4-8"));
-    assert_eq!(unsupported.kind, LocalPoolRouteStateKind::NoModelCompatible);
+    let unsupported = manager.account_route_state(Some("claude-opus-4-8"));
+    assert_eq!(unsupported.kind, AccountRouteStateKind::NoModelCompatible);
 
     let mut capable = api_key_credential("ksk_model_capable");
     capable.subscription_title = Some("account-class-a".to_string());
     capable.supported_models = vec!["claude-opus-4-8".to_string()];
     manager.add_credential(capable).await.unwrap();
 
-    let ready = manager.local_pool_route_state(Some("claude-opus-4-8"));
-    assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+    let ready = manager.account_route_state(Some("claude-opus-4-8"));
+    assert_eq!(ready.kind, AccountRouteStateKind::Ready);
     assert_eq!(ready.model_usable, 1);
     assert_eq!(ready.dispatchable, 1);
 }
 
 #[test]
-fn test_local_pool_route_state_auto_heals_too_many_failures() {
+fn test_account_route_state_auto_heals_too_many_failures() {
     let manager = MultiTokenManager::new(
         Config::default(),
         vec![api_key_credential("ksk_auto_heal_preflight")],
@@ -8133,8 +8133,8 @@ fn test_local_pool_route_state_auto_heals_too_many_failures() {
         Some(DisabledReason::TooManyFailures.as_str())
     );
 
-    let ready = manager.local_pool_route_state(None);
-    assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+    let ready = manager.account_route_state(None);
+    assert_eq!(ready.kind, AccountRouteStateKind::Ready);
     assert_eq!(ready.available, 1);
     assert_eq!(ready.dispatchable, 1);
 
@@ -8145,7 +8145,7 @@ fn test_local_pool_route_state_auto_heals_too_many_failures() {
 }
 
 #[tokio::test]
-async fn test_local_pool_route_state_proxy_blocked_recovers_after_resource_enabled() {
+async fn test_account_route_state_proxy_blocked_recovers_after_resource_enabled() {
     let mut credential = api_key_credential("ksk_proxy_dynamic");
     credential.proxy_resource_id = Some(7);
     let manager =
@@ -8161,13 +8161,13 @@ async fn test_local_pool_route_state_proxy_blocked_recovers_after_resource_enabl
             enabled: false,
         },
     );
-    let blocked = manager.local_pool_route_state(None);
-    assert_eq!(blocked.kind, LocalPoolRouteStateKind::ProxyBlocked);
+    let blocked = manager.account_route_state(None);
+    assert_eq!(blocked.kind, AccountRouteStateKind::ProxyBlocked);
     assert_eq!(blocked.proxy_blocked, 1);
 
     manager.proxy_resources.lock().get_mut(&7).unwrap().enabled = true;
-    let ready = manager.local_pool_route_state(None);
-    assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+    let ready = manager.account_route_state(None);
+    assert_eq!(ready.kind, AccountRouteStateKind::Ready);
     assert_eq!(ready.dispatchable, 1);
 
     let mut ctx = manager.acquire_context(None).await.unwrap();
@@ -9261,10 +9261,10 @@ async fn redis_backed_in_flight_limit_does_not_fail_open_while_degraded() {
     manager.scheduler_redis_breaker.state.lock().phase = SchedulerRedisBreakerPhase::Open {
         until: Instant::now() + StdDuration::from_secs(1),
     };
-    let route_state = manager.local_pool_route_state(None);
+    let route_state = manager.account_route_state(None);
     assert_eq!(
         route_state.kind,
-        LocalPoolRouteStateKind::SchedulerRedisDegraded
+        AccountRouteStateKind::SchedulerRedisDegraded
     );
     assert!(route_state.retry_after_secs.is_some());
 
@@ -9688,8 +9688,8 @@ async fn redis_affinity_latency_does_not_degrade_capacity_coordination() {
     );
     assert!(affinity_degraded);
     assert_eq!(
-        manager.local_pool_route_state(None).kind,
-        LocalPoolRouteStateKind::Ready
+        manager.account_route_state(None).kind,
+        AccountRouteStateKind::Ready
     );
     let mut context = manager
         .acquire_context(None)
@@ -9822,8 +9822,8 @@ async fn redis_capacity_latency_boundary_and_recovery_matrix() {
                 drop(lease);
             } else {
                 assert_ne!(
-                    manager.local_pool_route_state(None).kind,
-                    LocalPoolRouteStateKind::AllDisabled,
+                    manager.account_route_state(None).kind,
+                    AccountRouteStateKind::AllDisabled,
                     "a capacity timeout must not be reported as all credentials disabled"
                 );
                 tokio::time::sleep(StdDuration::from_millis(latency_ms.saturating_add(150))).await;
@@ -9877,8 +9877,8 @@ async fn redis_capacity_consecutive_timeouts_open_breaker_without_all_disabled()
             "slow Redis attempt {attempt} must not open breaker before the consecutive threshold"
         );
         assert_ne!(
-            manager.local_pool_route_state(None).kind,
-            LocalPoolRouteStateKind::AllDisabled,
+            manager.account_route_state(None).kind,
+            AccountRouteStateKind::AllDisabled,
             "slow Redis attempt {attempt} must not be reported as all credentials disabled"
         );
     }
@@ -9893,8 +9893,8 @@ async fn redis_capacity_consecutive_timeouts_open_breaker_without_all_disabled()
         "capacity breaker must open after repeated consecutive timeout failures"
     );
     assert_eq!(
-        manager.local_pool_route_state(None).kind,
-        LocalPoolRouteStateKind::SchedulerRedisDegraded
+        manager.account_route_state(None).kind,
+        AccountRouteStateKind::SchedulerRedisDegraded
     );
 
     clear_test_redis_latency_toxic().await;
@@ -9972,7 +9972,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                             breaker.failures,
                             breaker.fail_fast,
                             redis_store.usage_summary_write_round_trips(),
-                            manager.local_pool_route_state(None).kind,
+                            manager.account_route_state(None).kind,
                         )
                     })
                     .unwrap_or_else(|| {
@@ -9980,7 +9980,7 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                             "{scenario}: scheduler unexpectedly had no capacity; \
                              elapsed={scheduler_elapsed:?}; usage_round_trips={}; route_state={:?}",
                             redis_store.usage_summary_write_round_trips(),
-                            manager.local_pool_route_state(None).kind,
+                            manager.account_route_state(None).kind,
                         )
                     });
                 drop(scheduler_lease);
@@ -10010,8 +10010,8 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                     "{scenario}: sub-deadline latency must not open the capacity breaker"
                 );
                 assert_ne!(
-                    manager.local_pool_route_state(None).kind,
-                    LocalPoolRouteStateKind::AllDisabled,
+                    manager.account_route_state(None).kind,
+                    AccountRouteStateKind::AllDisabled,
                     "{scenario}: Redis latency must never impersonate credential disablement"
                 );
                 crate::local_upstream_impl::token_manager::drain_best_effort_storage_tasks(
@@ -10062,8 +10062,8 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                     "{scenario}: attempt {attempt} exceeded the hot-path deadline"
                 );
                 assert_ne!(
-                    manager.local_pool_route_state(None).kind,
-                    LocalPoolRouteStateKind::AllDisabled,
+                    manager.account_route_state(None).kind,
+                    AccountRouteStateKind::AllDisabled,
                     "{scenario}: attempt {attempt} must not report AllDisabled"
                 );
             }
@@ -10145,8 +10145,8 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
             );
             assert!(manager.scheduler_redis_breaker.is_degraded(), "{scenario}");
             assert_ne!(
-                manager.local_pool_route_state(None).kind,
-                LocalPoolRouteStateKind::AllDisabled,
+                manager.account_route_state(None).kind,
+                AccountRouteStateKind::AllDisabled,
                 "{scenario}: Redis protocol/type errors must not disable the credential"
             );
             assert_capacity_breaker_fail_fast_without_redis_spin(&manager, &scenario).await;
@@ -10228,8 +10228,8 @@ async fn redis_usage_writer_and_scheduler_joint_fault_matrix_recovers_without_sp
                     "{scenario}: disconnected scheduler attempt {attempts} must fail closed"
                 );
                 assert_ne!(
-                    manager.local_pool_route_state(None).kind,
-                    LocalPoolRouteStateKind::AllDisabled,
+                    manager.account_route_state(None).kind,
+                    AccountRouteStateKind::AllDisabled,
                     "{scenario}: disconnect must not report AllDisabled"
                 );
             }
@@ -10493,8 +10493,8 @@ async fn redis_business_and_observability_fault_domains_are_independent_for_thre
                 "round {round} business Redis fault must never report a successful lease"
             );
             assert_ne!(
-                fault_manager.local_pool_route_state(None).kind,
-                LocalPoolRouteStateKind::AllDisabled,
+                fault_manager.account_route_state(None).kind,
+                AccountRouteStateKind::AllDisabled,
                 "round {round} business Redis fault must not impersonate credential disablement"
             );
             let observer_record = sampled_request_rejection_usage_record(
@@ -10714,8 +10714,8 @@ async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
                 "disconnect round {round} attempt {attempts} must fail closed"
             );
             assert_ne!(
-                manager.local_pool_route_state(None).kind,
-                LocalPoolRouteStateKind::AllDisabled,
+                manager.account_route_state(None).kind,
+                AccountRouteStateKind::AllDisabled,
                 "disconnect round {round} attempt {attempts} must not be reported as all disabled"
             );
         }
@@ -10735,8 +10735,8 @@ async fn redis_capacity_disconnect_reconnect_recovers_same_manager() {
             "disconnect round {round} must respect hot-path deadline: {elapsed:?}"
         );
         assert_eq!(
-            manager.local_pool_route_state(None).kind,
-            LocalPoolRouteStateKind::SchedulerRedisDegraded
+            manager.account_route_state(None).kind,
+            AccountRouteStateKind::SchedulerRedisDegraded
         );
 
         let retry_after = manager
@@ -12528,7 +12528,7 @@ fn test_report_risk_controlled_disables_with_specific_reason() {
 }
 
 #[tokio::test]
-async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
+async fn account_risk_circuit_stops_burning_remaining_credentials() {
     let mut config = Config::default();
     config.external_pools.local_pool_circuit_enabled = true;
     config.external_pools.local_pool_circuit_open_after_failures = 2;
@@ -12573,8 +12573,8 @@ async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
     assert!(second.retry_after_secs.is_some());
     assert_eq!(manager.available_count(), 1);
 
-    let state = manager.local_pool_route_state(None);
-    assert_eq!(state.kind, LocalPoolRouteStateKind::RiskCircuitOpen);
+    let state = manager.account_route_state(None);
+    assert_eq!(state.kind, AccountRouteStateKind::RiskCircuitOpen);
     assert_eq!(state.available, 1);
     assert_eq!(state.dispatchable, 0);
     assert!(state.retry_after_secs.is_some());
@@ -12587,7 +12587,7 @@ async fn local_pool_risk_circuit_stops_burning_remaining_credentials() {
         Err(error) => error.to_string(),
     };
     assert!(
-        error.contains("本地账号池风险保护已打开"),
+        error.contains("本地账号风险保护已打开"),
         "unexpected error: {error}"
     );
     let snapshot = manager.snapshot();
@@ -12734,9 +12734,12 @@ fn test_idc_oidc_endpoint_uses_credential_auth_region() {
     credentials.auth_region = Some("eu-central-1".to_string());
 
     let region = credentials.effective_auth_region(&config);
-    let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
+    let refresh_url = format!("https://oidc.{}.account-runtime.local/token", region);
 
-    assert_eq!(refresh_url, "https://oidc.eu-central-1.amazonaws.com/token");
+    assert_eq!(
+        refresh_url,
+        "https://oidc.eu-central-1.account-runtime.local/token"
+    );
 }
 
 #[test]
@@ -12749,11 +12752,14 @@ fn test_social_refresh_endpoint_uses_credential_auth_region() {
     credentials.auth_region = Some("ap-southeast-1".to_string());
 
     let region = credentials.effective_auth_region(&config);
-    let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
+    let refresh_url = format!(
+        "https://prod.{}.auth.desktop.account-runtime.local/refreshToken",
+        region
+    );
 
     assert_eq!(
         refresh_url,
-        "https://prod.ap-southeast-1.auth.desktop.kiro.dev/refreshToken"
+        "https://prod.ap-southeast-1.auth.desktop.account-runtime.local/refreshToken"
     );
 }
 
@@ -12768,9 +12774,9 @@ fn test_api_call_uses_effective_api_region() {
 
     // 凭据.region 不参与 api_region 回退链
     let api_region = credentials.effective_api_region(&config);
-    let api_host = format!("q.{}.amazonaws.com", api_region);
+    let api_host = format!("q.{}.account-runtime.local", api_region);
 
-    assert_eq!(api_host, "q.us-west-2.amazonaws.com");
+    assert_eq!(api_host, "q.us-west-2.account-runtime.local");
 }
 
 #[test]
@@ -12783,9 +12789,9 @@ fn test_api_call_uses_credential_api_region() {
     credentials.api_region = Some("eu-central-1".to_string());
 
     let api_region = credentials.effective_api_region(&config);
-    let api_host = format!("q.{}.amazonaws.com", api_region);
+    let api_host = format!("q.{}.account-runtime.local", api_region);
 
-    assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    assert_eq!(api_host, "q.eu-central-1.account-runtime.local");
 }
 
 #[test]
@@ -12794,9 +12800,7 @@ fn test_region_update_preserves_matching_profile_arn() {
         auth_method: Some("idc".to_string()),
         access_token: Some("access".to_string()),
         expires_at: Some("2099-01-01T00:00:00Z".to_string()),
-        profile_arn: Some(
-            "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL".to_string(),
-        ),
+        profile_arn: Some("arn:account-runtime:eu-central-1:123456789012:profile/REAL".to_string()),
         ..Default::default()
     };
     credential.id = Some(1);
@@ -12823,9 +12827,7 @@ fn test_region_update_preserves_matching_profile_arn() {
 fn test_region_update_clears_conflicting_profile_arn() {
     let mut credential = LocalUpstreamCredentials {
         auth_method: Some("idc".to_string()),
-        profile_arn: Some(
-            "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL".to_string(),
-        ),
+        profile_arn: Some("arn:account-runtime:eu-central-1:123456789012:profile/REAL".to_string()),
         ..Default::default()
     };
     credential.id = Some(1);

@@ -88,7 +88,7 @@ dispatch linearization point 定义为 prepare 后的 revision query。mutation 
 | ES08 | static SWR/body-mode/cross-instance invalidation | runner 3 outer | stale/fresh 合同、raw/normalized parity、Redis RTT 0 | isolated PG/Redis dynamic PASS |
 | ES09 | frozen release c32/c128、PG/Redis latency/failure | 每档 3 轮 | 0 false capacity error；PG query/attempt 有界；恢复 5/5 | pending |
 
-Rust 1.92.0 `cargo check --all-targets` 已三次零 warning。`external-dispatch-focused-r1` 实际运行 11 个无存储测试并通过；四个早期 storage exact filters 曾因没有 `KIRO_RS_TEST_POSTGRES_URL` 提前返回，只计 compile-only。2026-07-18 当前仓库隔离 PostgreSQL/Redis 三轮执行 17 个 external storage filters，即 51/51 passed；2026-07-19 合批 storage suite 再次执行同一 17 filters × 3 outer，也为 51/51 passed。最新 scope `storage-suite-real-20260719` 清理 `size_kib=1690164 removed=true reservation_released=true`。完整命令与边界见 [专项证据](../evidence/external-pool-authoritative-dispatch-20260718.md) 和 [2026-07-19 storage evidence](../evidence/storage-integration-and-artifact-gate-20260719.md)。
+Rust 1.92.0 `cargo check --all-targets` 已三次零 warning。`external-dispatch-focused-r1` 实际运行 11 个无存储测试并通过；四个早期 storage exact filters 曾因没有 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL` 提前返回，只计 compile-only。2026-07-18 当前仓库隔离 PostgreSQL/Redis 三轮执行 17 个 external storage filters，即 51/51 passed；2026-07-19 合批 storage suite 再次执行同一 17 filters × 3 outer，也为 51/51 passed。最新 scope `storage-suite-real-20260719` 清理 `size_kib=1690164 removed=true reservation_released=true`。完整命令与边界见 [专项证据](../evidence/external-pool-authoritative-dispatch-20260718.md) 和 [2026-07-19 storage evidence](../evidence/storage-integration-and-artifact-gate-20260719.md)。
 
 ## 性能、兼容性与回滚风险
 

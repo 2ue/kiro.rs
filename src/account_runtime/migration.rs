@@ -70,7 +70,7 @@ mod tests {
             max_concurrent_requests: 4,
             usage_projection_mode: ExternalPoolUsageProjectionMode::CurrentPathPolicy,
             stream_response_mode: None,
-            request_body_mode: ExternalPoolRequestBodyMode::Normalized,
+            request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
             raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
             pre_output_stream_retry_mode: ExternalPoolStreamRetryMode::Inherit,

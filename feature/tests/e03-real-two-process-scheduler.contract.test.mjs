@@ -8,14 +8,14 @@ import { spawn } from 'node:child_process'
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const RUNNER = path.join(ROOT, 'feature/tests/e03-real-two-process-scheduler.mjs')
 const E03_ENV_KEYS = [
-  'KIRO_RS_BINARY', 'KIRO_VALIDATION_ARTIFACT_DIR',
-  'KIRO_E03_POSTGRES_URL_TEMPLATE', 'KIRO_E03_REDIS_URL', 'KIRO_E03_REDIS_PREFIX',
-  'KIRO_E03_POSTGRES_DATABASES', 'KIRO_E03_OUTER_ROUNDS',
-  'KIRO_E03_VALIDATE_ONLY', 'KIRO_E03_CONTRACT_HOLD', 'KIRO_E03_READY_FILE',
+  'ACCOUNT_RUNTIME_BINARY', 'ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR',
+  'ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE', 'ACCOUNT_RUNTIME_E03_REDIS_URL', 'ACCOUNT_RUNTIME_E03_REDIS_PREFIX',
+  'ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES', 'ACCOUNT_RUNTIME_E03_OUTER_ROUNDS',
+  'ACCOUNT_RUNTIME_E03_VALIDATE_ONLY', 'ACCOUNT_RUNTIME_E03_CONTRACT_HOLD', 'ACCOUNT_RUNTIME_E03_READY_FILE',
 ]
 
 function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-e03-contract-'))
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-e03-contract-'))
   const bin = path.join(root, 'candidate')
   const artifacts = path.join(root, 'artifacts')
   const fakeBin = path.join(root, 'bin')
@@ -41,13 +41,13 @@ function cleanEnvironment(extra = {}, owned) {
     PATH: `${owned.fakeBin}${path.delimiter}${process.env.PATH || '/usr/bin:/bin'}`,
     HOME: process.env.HOME || os.homedir(),
     TMPDIR: owned.root,
-    KIRO_RS_BINARY: owned.bin,
-    KIRO_VALIDATION_ARTIFACT_DIR: owned.artifacts,
-    KIRO_E03_POSTGRES_URL_TEMPLATE: 'postgres://kiro_rs:isolated@127.0.0.1:25432/{database}',
-    KIRO_E03_POSTGRES_DATABASES: 'kiro_e03_contract_r1',
-    KIRO_E03_REDIS_URL: 'redis://127.0.0.1:26379/15',
-    KIRO_E03_REDIS_PREFIX: `kiro_rs.e03.contract.${process.pid}`,
-    KIRO_E03_VALIDATE_ONLY: '1',
+    ACCOUNT_RUNTIME_BINARY: owned.bin,
+    ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: owned.artifacts,
+    ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE: 'postgres://account_runtime:isolated@127.0.0.1:25432/{database}',
+    ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES: 'account_runtime_e03_contract_r1',
+    ACCOUNT_RUNTIME_E03_REDIS_URL: 'redis://127.0.0.1:26379/15',
+    ACCOUNT_RUNTIME_E03_REDIS_PREFIX: `account_runtime.e03.contract.${process.pid}`,
+    ACCOUNT_RUNTIME_E03_VALIDATE_ONLY: '1',
     ...extra,
   }
 }
@@ -101,62 +101,62 @@ for (let round = 1; round <= 3; round += 1) {
   })
 
   test(`missing PostgreSQL template rejects before side effects round ${round}`, async () => {
-    await rejects({ KIRO_E03_POSTGRES_URL_TEMPLATE: '' }, /KIRO_E03_POSTGRES_URL_TEMPLATE is required/)
+    await rejects({ ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE: '' }, /ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE is required/)
   })
 
   test(`missing Redis URL rejects before side effects round ${round}`, async () => {
-    await rejects({ KIRO_E03_REDIS_URL: '' }, /KIRO_E03_REDIS_URL is required/)
+    await rejects({ ACCOUNT_RUNTIME_E03_REDIS_URL: '' }, /ACCOUNT_RUNTIME_E03_REDIS_URL is required/)
   })
 
   test(`missing Redis prefix rejects before side effects round ${round}`, async () => {
-    await rejects({ KIRO_E03_REDIS_PREFIX: '' }, /KIRO_E03_REDIS_PREFIX is required/)
+    await rejects({ ACCOUNT_RUNTIME_E03_REDIS_PREFIX: '' }, /ACCOUNT_RUNTIME_E03_REDIS_PREFIX is required/)
   })
 
   test(`PostgreSQL template placeholder is mandatory round ${round}`, async () => {
-    await rejects({ KIRO_E03_POSTGRES_URL_TEMPLATE: 'postgres://kiro_rs:x@127.0.0.1:25432/static' }, /literal \{database\} placeholder/)
+    await rejects({ ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE: 'postgres://account_runtime:x@127.0.0.1:25432/static' }, /literal \{database\} placeholder/)
   })
 
   test(`remote PostgreSQL rejects round ${round}`, async () => {
-    await rejects({ KIRO_E03_POSTGRES_URL_TEMPLATE: 'postgres://kiro_rs:x@example.com:25432/{database}' }, /must target loopback/)
+    await rejects({ ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE: 'postgres://account_runtime:x@example.com:25432/{database}' }, /must target loopback/)
   })
 
   test(`remote Redis rejects round ${round}`, async () => {
-    await rejects({ KIRO_E03_REDIS_URL: 'redis://example.com:26379/15' }, /must target loopback/)
+    await rejects({ ACCOUNT_RUNTIME_E03_REDIS_URL: 'redis://example.com:26379/15' }, /must target loopback/)
   })
 
   test(`Redis DB0 rejects round ${round}`, async () => {
-    await rejects({ KIRO_E03_REDIS_URL: 'redis://127.0.0.1:26379/0' }, /nonzero database in 1\.\.15/)
+    await rejects({ ACCOUNT_RUNTIME_E03_REDIS_URL: 'redis://127.0.0.1:26379/0' }, /nonzero database in 1\.\.15/)
   })
 
   test(`Redis protected 9022 rejects without probing round ${round}`, async () => {
-    await rejects({ KIRO_E03_REDIS_URL: 'redis://127.0.0.1:9022/15' }, /port 9022 is protected/)
+    await rejects({ ACCOUNT_RUNTIME_E03_REDIS_URL: 'redis://127.0.0.1:9022/15' }, /port 9022 is protected/)
   })
 
   test(`PostgreSQL protected 9022 rejects without probing round ${round}`, async () => {
-    await rejects({ KIRO_E03_POSTGRES_URL_TEMPLATE: 'postgres://kiro_rs:x@127.0.0.1:9022/{database}' }, /port 9022 is protected/)
+    await rejects({ ACCOUNT_RUNTIME_E03_POSTGRES_URL_TEMPLATE: 'postgres://account_runtime:x@127.0.0.1:9022/{database}' }, /port 9022 is protected/)
   })
 
   test(`production Redis prefix rejects round ${round}`, async () => {
-    await rejects({ KIRO_E03_REDIS_PREFIX: 'kiro_rs:local' }, /caller-owned temporary prefix/)
+    await rejects({ ACCOUNT_RUNTIME_E03_REDIS_PREFIX: 'account_runtime:local' }, /caller-owned temporary prefix/)
   })
 
   test(`PostgreSQL database count mismatch rejects before side effects round ${round}`, async () => {
     await rejects({
-      KIRO_E03_VALIDATE_ONLY: '0',
-      KIRO_E03_OUTER_ROUNDS: '2',
-      KIRO_E03_POSTGRES_DATABASES: 'kiro_e03_contract_r1',
+      ACCOUNT_RUNTIME_E03_VALIDATE_ONLY: '0',
+      ACCOUNT_RUNTIME_E03_OUTER_ROUNDS: '2',
+      ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES: 'account_runtime_e03_contract_r1',
     }, /must contain exactly 2 pre-created database names/)
   })
 
   test(`non-owned PostgreSQL database name rejects before side effects round ${round}`, async () => {
     await rejects({
-      KIRO_E03_VALIDATE_ONLY: '0',
-      KIRO_E03_POSTGRES_DATABASES: 'postgres',
-    }, /caller-owned kiro_e03_\* names/)
+      ACCOUNT_RUNTIME_E03_VALIDATE_ONLY: '0',
+      ACCOUNT_RUNTIME_E03_POSTGRES_DATABASES: 'postgres',
+    }, /caller-owned account_runtime_e03_\* names/)
   })
 
   test(`out-of-range rounds reject before side effects round ${round}`, async () => {
-    await rejects({ KIRO_E03_OUTER_ROUNDS: round === 1 ? '0' : '4' }, /must be an integer in 1\.\.3/)
+    await rejects({ ACCOUNT_RUNTIME_E03_OUTER_ROUNDS: round === 1 ? '0' : '4' }, /must be an integer in 1\.\.3/)
   })
 }
 
@@ -168,8 +168,8 @@ for (const [signal, code] of [['SIGHUP', 129], ['SIGINT', 130], ['SIGTERM', 143]
       const child = spawn(process.execPath, [RUNNER], {
         cwd: ROOT,
         env: cleanEnvironment({
-          KIRO_E03_CONTRACT_HOLD: '1',
-          KIRO_E03_READY_FILE: readyFile,
+          ACCOUNT_RUNTIME_E03_CONTRACT_HOLD: '1',
+          ACCOUNT_RUNTIME_E03_READY_FILE: readyFile,
         }, owned),
         stdio: ['ignore', 'pipe', 'pipe'],
       })

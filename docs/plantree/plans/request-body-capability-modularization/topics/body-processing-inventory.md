@@ -10,9 +10,9 @@
   - Safe mode can decode inline base64 images to correct media types.
   - Light mode rejects non-inline sources.
 
-## Local Kiro Body Stages
+## Local Account Runtime Body Stages
 
-- Anthropic-to-Kiro conversion, now split into focused modules:
+- Anthropic-to-Account Runtime conversion, now split into focused modules:
   - conversation state construction
   - system/history/current message mapping
   - image/document conversion
@@ -50,7 +50,7 @@
   - keep inbound bytes as outbound bytes by default
   - optionally probe top-level model
   - optionally rewrite top-level model
-  - never enters external normalized payload guard or local Kiro converter stages
+  - never enters external normalized payload guard or local Account Runtime converter stages
 - Normalized:
   - start from parsed `MessagesRequest`
   - optionally apply external payload guard

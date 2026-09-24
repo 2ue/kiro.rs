@@ -1,6 +1,6 @@
 //! CRC32 校验实现
 //!
-//! AWS Event Stream 使用 CRC32 (ISO-HDLC/以太网/ZIP 标准)
+//! Binary event stream 使用 CRC32 (ISO-HDLC/以太网/ZIP 标准)
 
 use crc::{CRC_32_ISO_HDLC, Crc};
 

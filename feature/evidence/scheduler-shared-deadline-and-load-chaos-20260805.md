@@ -22,7 +22,7 @@ Toxiproxy/Redis/测试编译与进程调度的瞬时边界抖动，而不是调�
 - 源码基线：`82a1c9922b8f7e79237436c526ff1dfe16684878`
 - 外部池动态验证候选（生产代码包含半开放恢复修复）：
   `c957027d7bf85da9631111c8dd7e47d9daa6be2083ce42b7089900d92aaaa8fa`
-- Redis：本地 Docker `kiro-rs-redis-local`，通过 loopback `127.0.0.1:26379`
+- Redis：本地 Docker `account-runtime-redis-local`，通过 loopback `127.0.0.1:26379`
 - 使用数据库：Redis DB5、DB7、DB9，均在测试前为空；每轮结束为 0 keys
 - Toxiproxy：测试 runner 自有 loopback proxy；没有访问或停止现有 `9022` 服务（PID
   `13048`）
@@ -32,20 +32,20 @@ Toxiproxy/Redis/测试编译与进程调度的瞬时边界抖动，而不是调�
 单轮诊断矩阵：
 
 ```bash
-KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL='redis://127.0.0.1:26379/9' \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
-KIRO_SCHEDULER_CHAOS_OUTER_ROUNDS=1 \
-KIRO_SCHEDULER_CHAOS_SCOPE=scheduler-redis-diagnostics-20260805 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL='redis://127.0.0.1:26379/9' \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS=1 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE=scheduler-redis-diagnostics-20260805 \
 node feature/tests/run-scheduler-redis-chaos-validation.mjs
 ```
 
 完整 3 轮矩阵：
 
 ```bash
-KIRO_SCHEDULER_CHAOS_REDIS_DIRECT_URL='redis://127.0.0.1:26379/7' \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
-KIRO_SCHEDULER_CHAOS_OUTER_ROUNDS=3 \
-KIRO_SCHEDULER_CHAOS_SCOPE=scheduler-redis-chaos-3round-20260805 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_REDIS_DIRECT_URL='redis://127.0.0.1:26379/7' \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE=scheduler-redis-chaos-3round-20260805 \
 node feature/tests/run-scheduler-redis-chaos-validation.mjs
 ```
 
@@ -107,9 +107,9 @@ rescue；外部直连全部失败阶段没有新增本地请求。高优先级�
 
 最终候选二进制：
 
-- `kiro-rs` SHA-256：
+- `account-runtime` SHA-256：
   `881bca30a2dbef5f38c0b6e3ce8386a0cb7d0fecb93e9505d6256b2c805556f4`
-- `kiro_loadtest` SHA-256：
+- `account_runtime_loadtest` SHA-256：
   `be3a43e51b6e946c13e6d6698b42eeb7c538b44ef223ba32ca66c917f0f3cf48`
 
 为排除旧 PostgreSQL 凭据/运行态污染，L3、L4、L5 均使用本轮新建的 caller-owned

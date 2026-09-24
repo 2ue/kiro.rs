@@ -64,7 +64,7 @@ maybe_raw_external_preflight_response(...)
 3. typed parse 成 `MessagesRequest`；
 4. 检测到 `tools` 只有一个原生 `web_search_20250305`；
 5. 直接进入 `websearch::handle_websearch_request(...)`；
-6. WebSearch MCP 需要本地 Kiro 凭据；
+6. WebSearch MCP 需要本地 Account Runtime 凭据；
 7. 本地凭据池不可调度时，MCP 分支返回 `websearch_mcp_scheduler_unavailable`；
 8. 由于 WebSearch 分支提前 `return`，后续 normalized external fallback 没有机会执行。
 
@@ -102,12 +102,12 @@ maybe_local_pool_preflight_external_response(
 
 ## 代码变更
 
-- [src/anthropic/handlers.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/anthropic/handlers.rs): native WebSearch MCP 分支前新增 typed local-pool preflight external takeover。
-- [src/anthropic/handlers.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/anthropic/handlers.rs): WebSearch MCP failure 后置 external fallback 新增 `selectionFailure` 分类，避免把 no-credentials/all-disabled/capacity full 误写成 Redis degraded。
-- [src/anthropic/handlers/tests.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/anthropic/handlers/tests.rs): 新增 handler 级真实 HTTP 回归：
-  - fake Kiro MCP upstream；
+- [src/anthropic/handlers.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/anthropic/handlers.rs): native WebSearch MCP 分支前新增 typed local-pool preflight external takeover。
+- [src/anthropic/handlers.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/anthropic/handlers.rs): WebSearch MCP failure 后置 external fallback 新增 `selectionFailure` 分类，避免把 no-credentials/all-disabled/capacity full 误写成 Redis degraded。
+- [src/anthropic/handlers/tests.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/anthropic/handlers/tests.rs): 新增 handler 级真实 HTTP 回归：
+  - fake Account Runtime MCP upstream；
   - fake external Anthropic `/v1/messages` upstream；
-  - 本地 Kiro credentials 为空；
+  - 本地 Account Runtime credentials 为空；
   - 外部池 `requestBodyMode=normalized`；
   - `/ha/v1/messages` + `web_search_20250305`；
   - stream/non-stream 各 5 轮。
@@ -162,8 +162,8 @@ LOG_HAS routing raw request directly to external pool before parsing body False
 命令均通过 `feature/tests/run-cargo-scoped.sh` 执行，结束后 target 自动清理。
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL='postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs' \
-KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:26379/0' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime' \
+ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:26379/0' \
 feature/tests/run-cargo-scoped.sh websearch-normalized-test -- \
   cargo test -q native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds -- --nocapture
 ```
@@ -275,7 +275,7 @@ output_config={"effort":"high","format":{"type":"json_schema",...}}
 - 本地池 Ready 时不外部转发，不增加 MCP 请求；
 - 本地池不可调度时减少一次必失败的 MCP 调度路径，并避免下游 503。
 
-该路径不会引入额外上游 Kiro 调用；相反，在 normalized external pool 可用时，它会跳过本来会失败的 MCP 调度。
+该路径不会引入额外上游 Account Runtime 调用；相反，在 normalized external pool 可用时，它会跳过本来会失败的 MCP 调度。
 
 ## 后续生产验证
 

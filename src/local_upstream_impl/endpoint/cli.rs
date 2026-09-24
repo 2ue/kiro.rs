@@ -1,9 +1,9 @@
 //! Local-upstream CLI-compatible endpoint.
 //!
 //! This matches the current CLI-compatible local-upstream runtime protocol:
-//! - API: `https://runtime.{api_region}.kiro.dev/`
-//! - content type: `application/x-amz-json-1.0`
-//! - target header: `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
+//! - API: `https://runtime.{api_region}.account-runtime.local/`
+//! - content type: `application/json`
+//! - target header: `AccountRuntimeStreamingService.GenerateAssistantResponse`
 //! - request body origin: the upstream-required CLI wire value
 
 use reqwest::{Method, RequestBuilder};
@@ -20,7 +20,7 @@ use crate::local_upstream_impl::protocol::{
 };
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
-const CLI_REQUEST_ORIGIN_WIRE_VALUE: &str = "KIRO_CLI";
+const CLI_REQUEST_ORIGIN_WIRE_VALUE: &str = "ACCOUNT_RUNTIME_CLI";
 
 pub struct CliEndpoint;
 
@@ -34,15 +34,15 @@ impl CliEndpoint {
     }
 
     fn runtime_host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        format!("runtime.{}.account-runtime.local", self.api_region(ctx))
     }
 
     fn q_host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        format!("q.{}.account-runtime.local", self.api_region(ctx))
     }
 
     fn management_host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("management.{}.kiro.dev", self.api_region(ctx))
+        format!("management.{}.account-runtime.local", self.api_region(ctx))
     }
 
     fn q_base_url(&self, ctx: &RequestContext<'_>) -> String {
@@ -55,28 +55,28 @@ impl CliEndpoint {
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+            "account-runtime-rust/1.3.15 ua/2.1 api/account-runtime-streaming/0.1.16551 os/{} lang/rust/1.92.0 md/appVersion-{} app/AccountRuntime-For-CLI",
             ctx.config.system_version, ctx.config.local_upstream_client_version,
         )
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/{} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
+            "account-runtime-rust/1.3.15 ua/2.1 api/account-runtime-streaming/0.1.16551 os/{} lang/rust/1.92.0 m/F app/AccountRuntime-For-CLI",
             ctx.config.system_version,
         )
     }
 
     fn management_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+            "account-runtime-rust/1.3.15 ua/2.1 api/account-runtime-runtime/0.1.16551 os/{} lang/rust/1.92.0 md/appVersion-{} app/AccountRuntime-For-CLI",
             ctx.config.system_version, ctx.config.local_upstream_client_version,
         )
     }
 
     fn management_x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.16551 os/{} lang/rust/1.92.0 m/F,C app/AmazonQ-For-CLI",
+            "account-runtime-rust/1.3.15 ua/2.1 api/account-runtime-runtime/0.1.16551 os/{} lang/rust/1.92.0 m/F,C app/AccountRuntime-For-CLI",
             ctx.config.system_version,
         )
     }
@@ -94,7 +94,7 @@ impl LocalUpstreamEndpoint for CliEndpoint {
     }
 
     fn content_type(&self) -> &'static str {
-        "application/x-amz-json-1.0"
+        "application/json"
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
@@ -143,15 +143,18 @@ impl LocalUpstreamEndpoint for CliEndpoint {
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
             .header(
-                "x-amz-target",
-                "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+                "x-account-runtime-target",
+                "AccountRuntimeStreamingService.GenerateAssistantResponse",
             )
-            .header("x-amzn-codewhisperer-optout", "false")
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("x-account-runtime-optout", "false")
+            .header("x-account-runtime-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.runtime_host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
+            .header(
+                "account-runtime-sdk-invocation-id",
+                Uuid::new_v4().to_string(),
+            )
+            .header("account-runtime-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if ctx.credentials.is_api_key_credential() {
@@ -165,15 +168,18 @@ impl LocalUpstreamEndpoint for CliEndpoint {
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
-            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("x-account-runtime-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.q_host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
+            .header(
+                "account-runtime-sdk-invocation-id",
+                Uuid::new_v4().to_string(),
+            )
+            .header("account-runtime-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
-            req = req.header("x-amzn-kiro-profile-arn", arn);
+            req = req.header("x-account-runtime-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
@@ -187,21 +193,27 @@ impl LocalUpstreamEndpoint for CliEndpoint {
     fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
             .header("accept", "*/*")
-            .header("content-type", "application/x-amz-json-1.0")
+            .header("content-type", "application/json")
             .header(
-                "x-amz-target",
-                "AmazonCodeWhispererService.ListAvailableModels",
+                "x-account-runtime-target",
+                "AccountRuntimeService.ListAvailableModels",
             )
-            .header("x-amzn-codewhisperer-optout", "false")
-            .header("x-amz-user-agent", self.management_x_amz_user_agent(ctx))
+            .header("x-account-runtime-optout", "false")
+            .header(
+                "x-account-runtime-user-agent",
+                self.management_x_amz_user_agent(ctx),
+            )
             .header("user-agent", self.management_user_agent(ctx))
             .header("host", self.management_host(ctx))
-            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
-            .header("amz-sdk-request", "attempt=1; max=3")
+            .header(
+                "account-runtime-sdk-invocation-id",
+                Uuid::new_v4().to_string(),
+            )
+            .header("account-runtime-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
         if let Some(arn) = resolve_profile_arn(ctx.credentials, ctx.config) {
-            req = req.header("x-amzn-kiro-profile-arn", arn);
+            req = req.header("x-account-runtime-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
@@ -370,9 +382,9 @@ mod tests {
 
         assert_eq!(
             endpoint.api_url(&ctx(&credentials, &config, "token")),
-            "https://runtime.us-east-1.kiro.dev/"
+            "https://runtime.us-east-1.account-runtime.local/"
         );
-        assert_eq!(endpoint.content_type(), "application/x-amz-json-1.0");
+        assert_eq!(endpoint.content_type(), "application/json");
     }
 
     #[test]
@@ -380,7 +392,7 @@ mod tests {
         let endpoint = CliEndpoint::new();
         let mut config = Config::default();
         config.local_upstream_base_url =
-            Some(" http://127.0.0.1:39091/aws-lifecycle/ ".to_string());
+            Some(" http://127.0.0.1:39091/runtime-lifecycle/ ".to_string());
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("api_key".to_string()),
             api_key: Some("ksk_fake_lifecycle".to_string()),
@@ -391,15 +403,17 @@ mod tests {
 
         assert_eq!(
             endpoint.api_url(&rctx),
-            "http://127.0.0.1:39091/aws-lifecycle/"
+            "http://127.0.0.1:39091/runtime-lifecycle/"
         );
         assert_eq!(
             endpoint.mcp_url(&rctx),
-            "http://127.0.0.1:39091/aws-lifecycle/mcp"
+            "http://127.0.0.1:39091/runtime-lifecycle/mcp"
         );
         assert_eq!(
             endpoint.models_url(&rctx, None),
-            format!("http://127.0.0.1:39091/aws-lifecycle/?origin={CLI_REQUEST_ORIGIN_WIRE_VALUE}")
+            format!(
+                "http://127.0.0.1:39091/runtime-lifecycle/?origin={CLI_REQUEST_ORIGIN_WIRE_VALUE}"
+            )
         );
 
         let api = endpoint
@@ -410,7 +424,7 @@ mod tests {
             api.headers()
                 .get("host")
                 .and_then(|value| value.to_str().ok()),
-            Some("runtime.eu-west-3.kiro.dev")
+            Some("runtime.eu-west-3.account-runtime.local")
         );
         assert_eq!(
             api.headers()
@@ -437,7 +451,7 @@ mod tests {
                 .headers()
                 .get("host")
                 .and_then(|value| value.to_str().ok()),
-            Some("management.eu-west-3.kiro.dev")
+            Some("management.eu-west-3.account-runtime.local")
         );
         assert_eq!(
             models
@@ -453,7 +467,7 @@ mod tests {
         let endpoint = CliEndpoint::new();
         let config = Config::default();
         let credentials = LocalUpstreamCredentials {
-            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string()),
+            profile_arn: Some("arn:account-runtime:us-east-1:123:profile/ABC".to_string()),
             ..Default::default()
         };
         let rctx = ctx(&credentials, &config, "token");
@@ -462,7 +476,7 @@ mod tests {
         assert_eq!(
             url,
             format!(
-                "https://management.us-east-1.kiro.dev/?origin={CLI_REQUEST_ORIGIN_WIRE_VALUE}&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123%3Aprofile%2FABC&nextToken=next-token"
+                "https://management.us-east-1.account-runtime.local/?origin={CLI_REQUEST_ORIGIN_WIRE_VALUE}&profileArn=arn%3Aaccount-runtime%3Aus-east-1%3A123%3Aprofile%2FABC&nextToken=next-token"
             )
         );
         assert_eq!(endpoint.models_method(&rctx), Method::POST);
@@ -471,7 +485,7 @@ mod tests {
         assert_eq!(body["origin"], CLI_REQUEST_ORIGIN_WIRE_VALUE);
         assert_eq!(
             body["profileArn"],
-            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+            "arn:account-runtime:us-east-1:123:profile/ABC"
         );
         assert_eq!(body["nextToken"], "next-token");
 
@@ -487,24 +501,26 @@ mod tests {
         let headers = request.headers();
         assert_eq!(headers.get_all("content-type").iter().count(), 1);
         assert_eq!(
-            headers.get("x-amz-target").and_then(|v| v.to_str().ok()),
-            Some("AmazonCodeWhispererService.ListAvailableModels")
+            headers
+                .get("x-account-runtime-target")
+                .and_then(|v| v.to_str().ok()),
+            Some("AccountRuntimeService.ListAvailableModels")
         );
         assert_eq!(
             headers.get("content-type").and_then(|v| v.to_str().ok()),
-            Some("application/x-amz-json-1.0")
+            Some("application/json")
         );
         assert_eq!(
             headers.get("host").and_then(|v| v.to_str().ok()),
-            Some("management.us-east-1.kiro.dev")
+            Some("management.us-east-1.account-runtime.local")
         );
         assert!(
             headers
-                .get("x-amz-user-agent")
+                .get("x-account-runtime-user-agent")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|value| {
-                    value.contains("api/codewhispererruntime/")
-                        && value.contains("m/F,C app/AmazonQ-For-CLI")
+                    value.contains("api/account-runtime-runtime/")
+                        && value.contains("m/F,C app/AccountRuntime-For-CLI")
                 })
         );
     }
@@ -828,8 +844,10 @@ mod tests {
         let headers = request.headers();
 
         assert_eq!(
-            headers.get("x-amz-target").and_then(|v| v.to_str().ok()),
-            Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
+            headers
+                .get("x-account-runtime-target")
+                .and_then(|v| v.to_str().ok()),
+            Some("AccountRuntimeStreamingService.GenerateAssistantResponse")
         );
         assert_eq!(
             headers.get("tokentype").and_then(|v| v.to_str().ok()),
@@ -837,7 +855,7 @@ mod tests {
         );
         assert_eq!(
             headers.get("host").and_then(|v| v.to_str().ok()),
-            Some("runtime.us-east-1.kiro.dev")
+            Some("runtime.us-east-1.account-runtime.local")
         );
     }
 }

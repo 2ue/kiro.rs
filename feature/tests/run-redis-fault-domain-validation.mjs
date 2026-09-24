@@ -3,7 +3,7 @@
 /*
  * Live, non-Docker Redis fault-domain validation.
  *
- * This runner deliberately does not start kiro.rs or any build/application stack.
+ * This runner deliberately does not start account runtime or any build/application stack.
  * It drives only the two deployment-owned Redis tunnels and short-lived local chaos proxies.
  * Every key is under a random prefix and cleanup uses bounded cursor scans plus async deletion.
  */
@@ -26,7 +26,7 @@ const OUTER_ROUNDS = Math.max(
   3,
   Number.parseInt(process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS || '3', 10) || 3,
 )
-const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-redis-fault-domain-${process.pid}-`))
+const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `account-runtime-redis-fault-domain-${process.pid}-`))
 const CHILDREN = new Set()
 const PROXIES = new Set()
 const DEBUG = process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_DEBUG === '1'
@@ -520,8 +520,8 @@ async function main() {
     for (let round = 1; round <= OUTER_ROUNDS; round += 1) {
       const token = `${process.pid}-${Date.now()}-${round}-${Math.random().toString(16).slice(2)}`
       const prefixes = {
-        businessPrefix: `kiro_rs:test:redis-fault-domain:business:${token}`,
-        observabilityPrefix: `kiro_rs:test:redis-fault-domain:observability:${token}`,
+        businessPrefix: `account_runtime:test:redis-fault-domain:business:${token}`,
+        observabilityPrefix: `account_runtime:test:redis-fault-domain:observability:${token}`,
       }
       trace(`round ${round}: start`)
       try {

@@ -11,10 +11,10 @@ Status: `contract-pass / release-gate-still-no-go`
 ## 执行约束
 
 - 未启动 Docker。
-- 轻量合同主体未运行 Cargo；RedisStore role guard 后续补证单独通过 `run-cargo-scoped.sh` 执行 `cargo +1.92.0 check --bin kiro-rs`，并立即清理 scoped target。
-- 未启动 kiro.rs 服务。
+- 轻量合同主体未运行 Cargo；RedisStore role guard 后续补证单独通过 `run-cargo-scoped.sh` 执行 `cargo +1.92.0 check --bin account-runtime`，并立即清理 scoped target。
+- 未启动 account-runtime 服务。
 - 未触碰 `127.0.0.1:9022`。
-- 未读取或暂存 `kiro_idc_users*.txt`。
+- 未读取或暂存 `account-runtime_idc_users*.txt`。
 - `run-cargo-scoped-lifecycle.test.mjs` 只测试 wrapper 清理协议，不调用 Cargo；产生的临时 scoped target 已清理。
 
 ## 结果
@@ -56,8 +56,8 @@ node --test \
   feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs
 
 node --test \
-  feature/tests/thinking-effort-kiro-wire-contract.test.mjs \
-  feature/tests/thinking-effort-kiro-wire-signal.test.mjs
+  feature/tests/thinking-effort-account-runtime-wire-contract.test.mjs \
+  feature/tests/thinking-effort-account-runtime-wire-signal.test.mjs
 
 node --test \
   feature/tests/thinking-effort-claude-cli-capture-signal.test.mjs \
@@ -69,7 +69,7 @@ node --test \
 - E03 + token-refresh cluster + multi-instance coordination contracts：71 tests total；70 pass、1 skipped。
 - 修改旧测试标题后单独复跑 E03 contract：52/52 pass。
 - Scheduler Redis chaos + business/observability fault-domain contracts：初始 65 tests total，44 pass、21 skipped；业务/观测 Redis 生产源码合同补证后，合批为 70 tests total，49 pass、21 skipped、0 failed；RedisStore production role guard 合同补证后，合批为 71 tests total，50 pass、21 skipped、0 failed；追加主/观测 Redis 路径隔离合同后，合批为 74 tests total，53 pass、21 skipped、0 failed。
-- Thinking effort Kiro wire contract/signal：45/45 pass。
+- Thinking effort Account Runtime wire contract/signal：45/45 pass。
 - Claude CLI thinking capture signal + bare invoke signal：5/5 pass。
 
 Skip 说明：
@@ -109,7 +109,7 @@ node feature/tests/inventory-build-artifacts.mjs --gate
   - `targets=1`。
   - `reservations=0`。
   - `target_processes=1`。
-- blocker 为 `<repo>/target`，约 `725148-725612 KiB`，当时由 PID `84264` 的 `kiro-runtime` 引用。
+- blocker 为 `<repo>/target`，约 `725148-725612 KiB`，当时由 PID `84264` 的 `account-runtime-runtime` 引用。
 
 判断：
 
@@ -157,14 +157,14 @@ node feature/tests/inventory-build-artifacts.mjs --gate
 - `rg "...process.env"` 只剩 `.test.mjs` fixture launcher；非测试 validation runner 无匹配。
 - 清理无引用的可再生 `target/debug`、`target/flycheck0` 和 `target/.rustc_info.json` 后，`find . -maxdepth 3 -type d -name target` 无输出。
 - inventory：`targets=0 reservations=0 target_processes=0 blockers=0`，release-gate result=pass。Docker 只读盘点超时，仍为 `manual-only` hint，未执行 Docker 清理。
-- RedisStore role guard 后 scoped `cargo +1.92.0 check --bin kiro-rs` 通过，wrapper cleanup `size_kib=446876 removed=true reservation_released=true`。该 Cargo 验证使用独立 scoped target，结束后又清理了无引用 root `target/debug`/`target/flycheck0`，inventory 仍为 pass。
+- RedisStore role guard 后 scoped `cargo +1.92.0 check --bin account-runtime` 通过，wrapper cleanup `size_kib=446876 removed=true reservation_released=true`。该 Cargo 验证使用独立 scoped target，结束后又清理了无引用 root `target/debug`/`target/flycheck0`，inventory 仍为 pass。
 - 磁盘可用空间复核约 `71-73 GiB`。
 
 判断：
 
 - 本轮补证没有新增 scoped target/reservation 残留。
 - 当前文件系统 inventory 已从此前的 root target/PID 阻断恢复为 pass；这只是当前时点的零残留证据，不替代最终冻结候选后的 release inventory。
-- 运行中的用户服务未被停止；未触碰 `127.0.0.1:9022`，未读取或暂存 `kiro_idc_users*.txt`。
+- 运行中的用户服务未被停止；未触碰 `127.0.0.1:9022`，未读取或暂存 `account-runtime_idc_users*.txt`。
 
 ### 6. Continuation rerun: protocol, runner and signal contracts
 
@@ -202,8 +202,8 @@ node --test \
   feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs
 
 node --test \
-  feature/tests/thinking-effort-kiro-wire-contract.test.mjs \
-  feature/tests/thinking-effort-kiro-wire-signal.test.mjs \
+  feature/tests/thinking-effort-account-runtime-wire-contract.test.mjs \
+  feature/tests/thinking-effort-account-runtime-wire-signal.test.mjs \
   feature/tests/thinking-effort-claude-cli-capture-signal.test.mjs \
   feature/tests/bare-invoke-claude-cli-signal.test.mjs
 ```
@@ -217,8 +217,8 @@ node --test \
 - non-Docker runner/path 合批：49 tests total；49 pass、0 skipped、0 failed。
 - E03/token-refresh/multi-instance/scheduler/fault-domain 合批：146 tests total；124 pass、22 explicit fixture skips、0 failed。
 - thinking/Claude signal 合批：首次 30 秒工具超时只截断正在通过的长信号矩阵；以 120 秒上限复跑完整通过，50 tests total；50 pass、0 skipped、0 failed。
-- 复跑后无匹配的 `thinking-effort`、`bare-invoke`、`kiro-wire`、`claude-cli-capture`、`validation-build`、`redis-chaos-proxy` 或 `node --test` 残留进程。
-- 只清理了 5 个明确本轮测试前缀且无打开文件的小型临时目录：`thinking-wire-signal_race-*`、`kiro-cost-format-*`、`kiro-request-api-key-id-*`、`kiro-redis-fault-domain-[0-9]*-*`；总量约 4 KiB，未触碰不确定历史证据目录。
+- 复跑后无匹配的 `thinking-effort`、`bare-invoke`、`account-runtime-wire`、`claude-cli-capture`、`validation-build`、`redis-chaos-proxy` 或 `node --test` 残留进程。
+- 只清理了 5 个明确本轮测试前缀且无打开文件的小型临时目录：`thinking-wire-signal_race-*`、`account-runtime-cost-format-*`、`account-runtime-request-api-key-id-*`、`account-runtime-redis-fault-domain-[0-9]*-*`；总量约 4 KiB，未触碰不确定历史证据目录。
 - 复核 build artifact inventory：`targets=0 reservations=0 target_processes=0 blockers=0`。
 
 边界：
@@ -250,7 +250,7 @@ node feature/tests/inventory-build-artifacts.mjs --gate
 
 - feature docs：47/47 issue documents pass；106 relative links resolve。
 - `git diff --check`：通过。
-- 首次 inventory 复核为 fail：`targets=1 reservations=0 target_processes=1 blockers=2`，root `target/` 约 `710 MiB`，PID `84264` 为已存在的 `./target/release/kiro-rs -c config.json --credentials credentials.json`，并有 `target/local-verify/kiro-rs-9022.log` 写入句柄。
+- 首次 inventory 复核为 fail：`targets=1 reservations=0 target_processes=1 blockers=2`，root `target/` 约 `710 MiB`，PID `84264` 为已存在的 `./target/release/account-runtime -c config.json --credentials credentials.json`，并有 `target/local-verify/account-runtime-9022.log` 写入句柄。
 - 按用户磁盘清理要求，只检查并删除无引用的可再生产物：`target/debug` 约 `709 MiB`、`target/flycheck0` 约 `1.1 MiB`、`target/.rustc_info.json`。`lsof` 未发现这些路径有打开引用。
 - 未停止或 kill PID `84264`，未清理不确定用户服务资产。
 - 清理后 `target/` 为 `0B`，inventory 重新通过：`targets=0 reservations=0 target_processes=0 blockers=0`。
@@ -282,7 +282,7 @@ find . -maxdepth 3 -type d -name target -print
 - Protocol contamination + marker inventory source contracts 合批：14 tests total；14 pass、0 skipped、0 failed。
 - Feature docs：47/47 issue documents pass；108 relative links resolve。
 - `git diff --check`：通过。
-- 第一次 inventory 复核又发现 root `target/` 被 rust-analyzer/flycheck 类任务重建：`targets=1 reservations=0 target_processes=1 blockers=2`，目录约 `710 MiB`。PID `84264` 仍是既有 `./target/release/kiro-rs -c config.json --credentials credentials.json` 服务；当前可见 `target/` 只剩 `debug`、`flycheck0` 和 `.rustc_info.json`，`lsof +D target` 对这些当前目录项无打开引用。
+- 第一次 inventory 复核又发现 root `target/` 被 rust-analyzer/flycheck 类任务重建：`targets=1 reservations=0 target_processes=1 blockers=2`，目录约 `710 MiB`。PID `84264` 仍是既有 `./target/release/account-runtime -c config.json --credentials credentials.json` 服务；当前可见 `target/` 只剩 `debug`、`flycheck0` 和 `.rustc_info.json`，`lsof +D target` 对这些当前目录项无打开引用。
 - 只删除无引用、可再生的 `target/debug`、`target/flycheck0`、`target/.rustc_info.json` 并尝试删除空 `target/`；未停止 PID `84264`，未删除不确定用户服务资产。
 - 清理后 inventory 重新通过：`targets=0 reservations=0 target_processes=0 blockers=0`，release-gate result=pass。
 - 磁盘可用空间约 `69 GiB`。Docker 只读盘点本次超时，仍是 `manual-only` hint，未执行 Docker 清理。

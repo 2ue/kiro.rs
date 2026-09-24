@@ -24,7 +24,7 @@ Optional low-volume real-upstream smoke remains evidence that may be collected o
 ## Historical Verification
 
 - `git diff --check`: passed.
-- `cargo test --locked --no-default-features`: passed with the recorded temporary Xcode toolchain environment; 920 main tests and 19 `kiro_loadtest` tests passed.
+- `cargo test --locked --no-default-features`: passed with the recorded temporary Xcode toolchain environment; 920 main tests and 19 `account_runtime_loadtest` tests passed.
 - `pnpm --dir ui build`: passed.
 - Historical fake-upstream summaries included normal stream/non-stream, approximately 22-second slow-first-byte, long stream, and mixed chaos cases.
 - Raw reports under `target/loadtest/admin-routing-*` are ignored supporting artifacts, not durable current authority.

@@ -25,7 +25,6 @@ pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "The request body is inv
 pub(crate) const PUBLIC_RATE_LIMIT_MESSAGE: &str =
     "No account is ready for this request right now. Please retry shortly.";
 pub(crate) const ACCOUNT_RUNTIME_WARNINGS_HEADER: &str = "x-account-runtime-warnings";
-pub(crate) const LEGACY_KIRO_RS_WARNINGS_HEADER: &str = "x-kiro-rs-warnings";
 
 pub(crate) fn public_message_with_error_id(message: &str, error_id: &str) -> String {
     format!("{message} If this continues, contact the administrator with error ID: {error_id}")
@@ -121,7 +120,6 @@ fn normalize_public_upstream_text(raw: &str) -> Option<String> {
 fn public_upstream_message_has_forbidden_content(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
-        "kiro",
         "credential",
         "external pool",
         "external_pool",
@@ -193,8 +191,7 @@ pub(crate) fn insert_optional_warnings_header(headers: &mut HeaderMap, warnings:
         return;
     };
     if let Ok(value) = HeaderValue::from_str(&warnings) {
-        headers.insert(ACCOUNT_RUNTIME_WARNINGS_HEADER, value.clone());
-        headers.insert(LEGACY_KIRO_RS_WARNINGS_HEADER, value);
+        headers.insert(ACCOUNT_RUNTIME_WARNINGS_HEADER, value);
     }
 }
 
@@ -290,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn warnings_header_writes_account_header_with_legacy_copy() {
+    fn warnings_header_writes_account_header() {
         let mut headers = HeaderMap::new();
 
         insert_optional_warnings_header(&mut headers, Some("prefill-dropped=1".to_string()));
@@ -299,7 +296,6 @@ mod tests {
             headers[ACCOUNT_RUNTIME_WARNINGS_HEADER],
             "prefill-dropped=1"
         );
-        assert_eq!(headers[LEGACY_KIRO_RS_WARNINGS_HEADER], "prefill-dropped=1");
     }
 
     #[test]
@@ -325,7 +321,6 @@ mod tests {
         ] {
             let lower = message.to_ascii_lowercase();
             for forbidden in [
-                "kiro",
                 "credential",
                 "external pool",
                 "external_pool",
@@ -401,7 +396,7 @@ mod tests {
     fn official_upstream_public_message_rejects_internal_branded_json_message() {
         assert!(
             official_upstream_public_message(
-                r#"{"message":"Kiro service rejected this model request"}"#
+                r#"{"message":"Internal service rejected this model request"}"#
             )
             .is_none()
         );
@@ -410,11 +405,11 @@ mod tests {
     #[test]
     fn official_upstream_public_message_drops_forbidden_reason_without_leaking_it() {
         let message = official_upstream_public_message(
-            r#"{"message":"The requested model is temporarily unavailable.","reason":"KIRO_MODEL_GATEWAY"}"#,
+            r#"{"message":"The requested model is temporarily unavailable.","reason":"MODEL_GATEWAY"}"#,
         )
         .expect("safe message remains available");
 
         assert_eq!(message, "The requested model is temporarily unavailable.");
-        assert!(!message.to_ascii_lowercase().contains("kiro"));
+        assert!(!message.to_ascii_lowercase().contains("model_gateway"));
     }
 }

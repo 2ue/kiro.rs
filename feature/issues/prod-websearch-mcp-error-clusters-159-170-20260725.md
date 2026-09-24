@@ -14,8 +14,8 @@ Last verified: 2026-07-26
 
 只读取证机器：
 
-- 152.53.243.159，服务容器 `kiro-rs-2ue-59137-app`，镜像 `ghcr.io/2ue/kiro-rs:latest`。
-- 152.53.194.170，服务容器 `kiro-rs-2ue-59137-app`，镜像 `ghcr.io/2ue/kiro-rs:latest`。
+- 152.53.243.159，服务容器 `account-runtime-2ue-59137-app`，镜像 `ghcr.io/2ue/account-runtime:latest`。
+- 152.53.194.170，服务容器 `account-runtime-2ue-59137-app`，镜像 `ghcr.io/2ue/account-runtime:latest`。
 
 取证根目录：
 
@@ -75,7 +75,7 @@ credentials:
 1. 入口 raw external preflight 只覆盖 raw-passthrough 外部池。
 2. 外部池只有 normalized 可用时，raw preflight 不 eligible。
 3. typed parse 后检测到 `web_search_20250305`，旧代码直接进入 WebSearch MCP。
-4. MCP 只能使用本地 Kiro 凭据；本地 MCP 凭据全 disabled/不可调度。
+4. MCP 只能使用本地 Account Runtime 凭据；本地 MCP 凭据全 disabled/不可调度。
 5. WebSearch 分支提前返回 `local_error_no_fallback`，后续 normalized external fallback 没机会执行。
 
 ### 当前修复
@@ -162,7 +162,7 @@ Some(McpCallFailureKind::Upstream) | None
 
 本地隔离环境：
 
-- 无本地 Kiro credentials；
+- 无本地 Account Runtime credentials；
 - external pool `requestBodyMode=normalized` 且 enabled；
 - 请求 `/ha/v1/messages`；
 - body 包含唯一 `web_search_20250305` server tool；
@@ -285,7 +285,7 @@ external_pool scheduler degraded fallback/config/migration selected tests ... ok
 当前冻结候选：
 
 ```text
-kiro-rs sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
+account-runtime sha256=7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec
 ```
 
 补充验证：

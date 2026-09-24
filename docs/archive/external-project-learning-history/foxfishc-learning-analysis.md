@@ -1,23 +1,23 @@
 # Foxfishc Fork Learning Analysis
 
-本文档记录当前仓库与 `~/Desktop/procode/kiro.rs-foxfishc` 的对比分析，目标是判断哪些设计值得学习、哪些不适合直接迁移，以及迁移时需要守住哪些边界。
+本文档记录当前仓库与 `~/Desktop/procode/account-runtime-foxfishc` 的对比分析，目标是判断哪些设计值得学习、哪些不适合直接迁移，以及迁移时需要守住哪些边界。
 
 分析时间：2026-05-23
 
 分析对象：
 
-1. 当前仓库：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+1. 当前仓库：`/Users/yuanfeijie/Desktop/procode/account-runtime`
    - branch：`main`
    - version：`v0.0.15`
    - commit：`3a7c99d`
-2. 对比仓库：`/Users/yuanfeijie/Desktop/procode/kiro.rs-foxfishc`
+2. 对比仓库：`/Users/yuanfeijie/Desktop/procode/account-runtime-foxfishc`
    - branch：`master`
    - version：`v1.1.34`
    - commit：`cf86b1f`
 
 ## 结论
 
-`kiro.rs-foxfishc` 值得学习，但不适合整仓 merge 到当前仓库。
+`account-runtime-foxfishc` 值得学习，但不适合整仓 merge 到当前仓库。
 
 foxfishc 的优势主要在账号池运营：
 
@@ -50,8 +50,8 @@ foxfishc 的 `cache_tracker` 更贴近 Anthropic prompt cache 的 TTL 语义：T
 
 参考实现：
 
-1. `kiro.rs-foxfishc/src/anthropic/cache_tracker.rs:190`
-2. `kiro.rs-foxfishc/src/anthropic/cache_tracker.rs:231`
+1. `account-runtime-foxfishc/src/anthropic/cache_tracker.rs:190`
+2. `account-runtime-foxfishc/src/anthropic/cache_tracker.rs:231`
 
 当前仓库差异：
 
@@ -87,9 +87,9 @@ foxfishc 在所有启用凭据都只是临时冷却或限速，且最短等待�
 
 参考实现：
 
-1. `kiro.rs-foxfishc/src/kiro/token_manager.rs:1263`
-2. `kiro.rs-foxfishc/src/kiro/token_manager.rs:1280`
-3. `kiro.rs-foxfishc/src/anthropic/handlers.rs:493`
+1. `account-runtime-foxfishc/src/local_upstream_impl/token_manager.rs:1263`
+2. `account-runtime-foxfishc/src/local_upstream_impl/token_manager.rs:1280`
+3. `account-runtime-foxfishc/src/anthropic/handlers.rs:493`
 
 价值：
 
@@ -103,8 +103,8 @@ foxfishc 在所有启用凭据都只是临时冷却或限速，且最短等待�
 
 当前实现位置：
 
-1. `src/kiro/token_manager.rs:1045`
-2. `src/kiro/provider.rs:811`
+1. `src/local_upstream_impl/token_manager.rs:1045`
+2. `src/local_upstream_impl/provider.rs:811`
 
 建议：
 
@@ -141,7 +141,7 @@ foxfishc 的 README 明确说明：新凭据加入时如果 `recent_usage = 0`�
 
 参考说明：
 
-1. `kiro.rs-foxfishc/README.md:14`
+1. `account-runtime-foxfishc/README.md:14`
 
 价值：
 
@@ -179,7 +179,7 @@ foxfishc 在回写 credentials 时使用临时文件加 rename，并处理 runti
 
 ### 1. 请求压缩和截断管道
 
-foxfishc 在 Anthropic 请求转换为 Kiro 请求后、发送上游前执行压缩：
+foxfishc 在 Anthropic 请求转换为 Account Runtime 请求后、发送上游前执行压缩：
 
 1. 空白压缩。
 2. thinking 丢弃或截断。
@@ -191,8 +191,8 @@ foxfishc 在 Anthropic 请求转换为 Kiro 请求后、发送上游前执行压
 
 参考实现：
 
-1. `kiro.rs-foxfishc/src/anthropic/compressor.rs:41`
-2. `kiro.rs-foxfishc/src/anthropic/compressor.rs:82`
+1. `account-runtime-foxfishc/src/anthropic/compressor.rs:41`
+2. `account-runtime-foxfishc/src/anthropic/compressor.rs:82`
 
 价值：
 
@@ -225,9 +225,9 @@ foxfishc 在 handler 层对错误做了更细映射：
 
 参考实现：
 
-1. `kiro.rs-foxfishc/src/anthropic/handlers.rs:481`
-2. `kiro.rs-foxfishc/src/anthropic/handlers.rs:493`
-3. `kiro.rs-foxfishc/src/anthropic/handlers.rs:527`
+1. `account-runtime-foxfishc/src/anthropic/handlers.rs:481`
+2. `account-runtime-foxfishc/src/anthropic/handlers.rs:493`
+3. `account-runtime-foxfishc/src/anthropic/handlers.rs:527`
 
 价值：
 
@@ -241,8 +241,8 @@ foxfishc 在 handler 层对错误做了更细映射：
 
 当前实现位置：
 
-1. `src/kiro/provider.rs:811`
-2. `src/kiro/provider.rs:823`
+1. `src/local_upstream_impl/provider.rs:811`
+2. `src/local_upstream_impl/provider.rs:823`
 
 建议：
 

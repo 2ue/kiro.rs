@@ -8,7 +8,7 @@
 - Confirmed Redis model filtering only compares `record.model`, while memory and PgSQL also check upstream/external outbound model fields.
 - Confirmed local credential model eligibility is currently only the Opus/free heuristic in `credential_is_usable_for_model`.
 - Confirmed external pool selection currently filters enabled/auto-disabled/body-mode/capacity/cooldown, but not supported models.
-- Confirmed `KiroProvider::list_available_models` can list upstream models, but it chooses any enabled credential; a per-credential sync entrypoint is needed.
+- Confirmed `Account RuntimeProvider::list_available_models` can list upstream models, but it chooses any enabled credential; a per-credential sync entrypoint is needed.
 - Confirmed API 400 handling only retries `profile_arn_bad_request`; prompt/tool/body logic bad requests fail immediately.
 - Confirmed request/body backend is partially modularized, but config UI still mixes switches and subordinate settings across large sections.
 - Implemented exact `requestId` query handling in admin DTOs, usage recorder, Redis cache, and PgSQL.

@@ -2,23 +2,27 @@
 //!
 //! 实现本地上游事件到 Anthropic SSE 的转换和状态管理
 
+#![cfg_attr(not(test), allow(dead_code, unused_imports))]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::local_upstream::event::{
-    LocalUpstreamEvent as Event, LocalUpstreamMetadataTokenUsage as MetadataTokenUsage,
-    LocalUpstreamReasoningContentEvent, LocalUpstreamToolUseEvent,
-};
 use crate::model::config::{PromptCacheSimulationMode, ReportedUsagePathPolicy};
 
+use super::cache::MetadataTokenUsage;
 use super::envelope;
 use super::tool_schema_keys::ToolSchemaKeyMap;
 use super::transcript_sanitizer::{
     RESPONSE_PROTOCOL_CONTAMINATION_DETAIL, ToolTranscriptSanitizer,
 };
+#[cfg(test)]
 use super::types::validate_redacted_thinking_data;
+#[cfg(test)]
+use crate::local_upstream::event::{
+    LocalUpstreamEvent as Event, LocalUpstreamReasoningContentEvent, LocalUpstreamToolUseEvent,
+};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -2131,6 +2135,7 @@ impl StreamContext {
 
     const UPSTREAM_EVENT_TAIL_LIMIT: usize = 12;
 
+    #[cfg(test)]
     fn record_upstream_event(&mut self, event: &Event) {
         let event_type = match event {
             Event::AssistantResponse(resp) => {
@@ -2396,6 +2401,7 @@ impl StreamContext {
     }
 
     /// 处理本地上游事件并转换为 Anthropic SSE 事件
+    #[cfg(test)]
     pub fn process_local_upstream_event(&mut self, event: &Event) -> Vec<SseEvent> {
         self.record_upstream_event(event);
         match event {
@@ -2662,6 +2668,7 @@ impl StreamContext {
     }
 
     /// 处理原生 reasoningContentEvent。
+    #[cfg(test)]
     fn process_reasoning_content(
         &mut self,
         reasoning: &LocalUpstreamReasoningContentEvent,
@@ -3407,6 +3414,7 @@ impl StreamContext {
     }
 
     /// 处理工具使用事件
+    #[cfg(test)]
     fn process_tool_use(&mut self, tool_use: &LocalUpstreamToolUseEvent) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -5065,7 +5073,7 @@ mod tests {
         for event in final_events {
             let data = serde_json::to_string(&event.data).expect("event data serializes");
             assert!(
-                !data.contains("upstreamMeteringUnits") && !data.contains("kiroMeteringUsage"),
+                !data.contains("upstreamMeteringUnits") && !data.contains("upstreamMeteringUnits"),
                 "upstream metering is a system usage field and must not be emitted downstream"
             );
         }

@@ -17,7 +17,7 @@ Status: `release-gate-pass-with-local-9022-inventory-exception / publish-pending
 
 - 未执行 Docker 动态验证；这是用户明确要求的豁免项，不能记为 Docker pass。
 - 未停止、重启或压测既有 `127.0.0.1:9022` 服务。
-- 未读取、暂存或提交 `kiro_idc_users*.txt` 和根目录未跟踪 `package.json`。
+- 未读取、暂存或提交 `account-runtime_idc_users*.txt` 和根目录未跟踪 `package.json`。
 - 所有 Cargo 命令均通过 `RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh <scope> -- ...` 执行。
 - 冻结候选二进制位于仓库外临时目录；scoped Cargo target 已由 wrapper 删除。
 
@@ -31,14 +31,14 @@ Status: `release-gate-pass-with-local-9022-inventory-exception / publish-pending
 冻结候选目录：
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-release-117-candidate.0BZyt1
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-release-117-candidate.0BZyt1
 ```
 
 冻结候选 SHA-256：
 
 ```text
-760345d76b3d2ea70694cc420cfde5078ebc8056c7a31a6d7df135d714509839  kiro-rs
-3fbaa97a1e0556f38546393068b3afd47caaa48280620c6c8dec3d55d7828ada  kiro_loadtest
+760345d76b3d2ea70694cc420cfde5078ebc8056c7a31a6d7df135d714509839  account-runtime
+3fbaa97a1e0556f38546393068b3afd47caaa48280620c6c8dec3d55d7828ada  account_runtime_loadtest
 ```
 
 ## Rust / Cargo release gate
@@ -57,7 +57,7 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh release-117-no-default
 Result:
 
 - main tests: `1757 passed / 0 failed / 6 ignored`。
-- `kiro_loadtest`: `31 passed / 0 failed`。
+- `account_runtime_loadtest`: `31 passed / 0 failed`。
 - scoped cleanup: `size_kib=1702964 removed=true reservation_released=true`。
 - PostgreSQL test DB dropped after run。
 
@@ -75,7 +75,7 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh release-117-default-fi
 Result:
 
 - main tests: `1757 passed / 0 failed / 6 ignored`。
-- `kiro_loadtest`: `31 passed / 0 failed`。
+- `account_runtime_loadtest`: `31 passed / 0 failed`。
 - scoped cleanup: `size_kib=1713348 removed=true reservation_released=true`。
 - PostgreSQL test DB dropped after run。
 
@@ -152,29 +152,29 @@ Result on this workstation:
 ```text
 build-artifact-inventory version=2 mode=read-only targets=1 reservations=0 target_processes=1 blockers=2
 target id=d61e6fde19e5 location=<repo>/target classification=unmanaged-repo-cargo-target size_kib=1222296
-target-process target_id=d61e6fde19e5 pid=84264 classification=kiro-runtime
+target-process target_id=d61e6fde19e5 pid=84264 classification=account-runtime-runtime
 docker status=timed-out cleanup=manual-only
 release-gate result=fail
 ```
 
 Interpretation:
 
-- This is a pre-existing local `127.0.0.1:9022` service running `./target/release/kiro-rs -c config.json --credentials credentials.json` from the repository root target.
+- This is a pre-existing local `127.0.0.1:9022` service running `./target/release/account-runtime -c config.json --credentials credentials.json` from the repository root target.
 - It is not a scoped validation target, reservation, or temp artifact created by this final run.
 - The service was not stopped, restarted, or modified because the validation safety contract and user instruction both excluded touching the live 9022 service.
 - This local inventory blocker is recorded as a workstation/service-owner exception and does not change the code/test/CLI/load release result. It should be resolved separately by the service owner if a strict “repo target absent” local inventory is required.
 
 ## Claude Code CLI / protocol validation
 
-All CLI validations used isolated temp home/config/project directories and temporary kiro.rs ports. Existing `9022` was not touched.
+All CLI validations used isolated temp home/config/project directories and temporary account-runtime ports. Existing `9022` was not touched.
 
 ### Raw Claude CLI thinking capture
 
 Command:
 
 ```text
-KIRO_THINKING_CAPTURE_ROUNDS=5 \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/bin/claude \
+ACCOUNT_RUNTIME_THINKING_CAPTURE_ROUNDS=5 \
+ACCOUNT_RUNTIME_CLAUDE_BINARY=/Users/yuanfeijie/.volta/bin/claude \
 node feature/tests/thinking-effort-claude-cli-capture.mjs
 ```
 
@@ -194,12 +194,12 @@ Result:
   - xhigh => `xhigh`
   - max => `max`
 
-### Kiro thinking wire
+### Account Runtime thinking wire
 
 Report:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-release-117-artifacts.y8Pf6v/reports/thinking-effort-wire/thinking-effort-wire-1784827106118-84644-ddf3e3.json
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-release-117-artifacts.y8Pf6v/reports/thinking-effort-wire/thinking-effort-wire-1784827106118-84644-ddf3e3.json
 sha256=f85e5aeee4e0642c06a3f9f0b0719ca0e88b24a32df97ec810550b4cbd76d18c
 ```
 
@@ -235,7 +235,7 @@ Environment issue encountered and resolved:
 Report:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-release-117-artifacts.y8Pf6v/reports/bare-invoke-claude-cli/bare-invoke-1784827271700-10309-cc643e.json
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-release-117-artifacts.y8Pf6v/reports/bare-invoke-claude-cli/bare-invoke-1784827271700-10309-cc643e.json
 sha256=f8bbefc22687ffdcb60ee4ff1c7d3c134b321bee30da5c27d0c32b985edecd80
 ```
 
@@ -257,7 +257,7 @@ Result:
 Report:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-release-117-artifacts.y8Pf6v/reports/claude-cli-long-session-continue/long-session-1784827473253-32945-7d0b22.json
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-release-117-artifacts.y8Pf6v/reports/claude-cli-long-session-continue/long-session-1784827473253-32945-7d0b22.json
 sha256=198c12d20c5bdb838f2e7a30e6bb671c1ccec91ef900e5108fdec04d2da6acec
 ```
 
@@ -292,14 +292,14 @@ Leak patterns checked include:
 
 ## Load / chaos / scheduler validation
 
-All load runs used frozen `kiro-rs` and `kiro_loadtest`, caller-owned temporary PostgreSQL databases, Redis DB 12 with owned prefixes, fake upstreams, and temporary ports. Docker dynamic validation was not run.
+All load runs used frozen `account-runtime` and `account_runtime_loadtest`, caller-owned temporary PostgreSQL databases, Redis DB 12 with owned prefixes, fake upstreams, and temporary ports. Docker dynamic validation was not run.
 
 ### L3 burst and recovery
 
 Summary:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro_release_117_load_l3_summary.json
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime_release_117_load_l3_summary.json
 sha256=e63a0023b98c61f3003f2a54b30c2acdae00596241510dbe5ffd459b7af26ce2
 ```
 
@@ -324,7 +324,7 @@ Result:
 Summary:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro_release_117_load_l4_summary.json
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime_release_117_load_l4_summary.json
 sha256=c01bf645ec90ad79225c9cd7e65c47e92b222fda3eb37e9bbcb46d6f15bccb9e
 ```
 
@@ -349,7 +349,7 @@ Two l5 runs were executed because the first run exposed a validation-window issu
 First run:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro_release_117_load_l5_summary.json
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime_release_117_load_l5_summary.json
 sha256=3ec551142688dc248f3b53079fceda0cc2c79b06220388db675eecb2801e8b8b
 ```
 
@@ -369,7 +369,7 @@ Interpretation: request correctness and recovery passed, but a 15s idle window w
 Second run:
 
 ```text
-/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro_release_117_load_l5b_summary.json
+/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime_release_117_load_l5b_summary.json
 sha256=71cd463a9639f9aa225c7464ea6bace238646b5907a3b0bc6d19be4741290235
 ```
 
@@ -410,7 +410,7 @@ The passing default/no-default gates include current code changes for:
 - Docker CLI became intermittently slow/unresponsive during test dependency recovery. Final protocol/load validations therefore used local temporary PostgreSQL/Redis services on the same reserved ports (`50891`/`50892`) with caller-owned DBs/prefixes.
 - Homebrew temporarily installed local `postgresql@16` and `redis` to provide the services after Docker became unavailable. After validation, the temporary PG/Redis processes, data directories, raw artifact root, candidate binaries, temporary PG client and the two Homebrew formulae were removed. Redis config files created by that temporary install were also removed.
 - No Cargo target was retained from final validation batches. Earlier scoped build cleanup messages all reported `removed=true reservation_released=true`。
-- The existing long-running `./target/release/kiro-rs -c config.json --credentials credentials.json` process for `9022` was not stopped。
+- The existing long-running `./target/release/account-runtime -c config.json --credentials credentials.json` process for `9022` was not stopped。
 
 ## Release judgment
 
@@ -431,4 +431,4 @@ Remaining limitations:
 
 - Docker dynamic validation was intentionally not run。
 - Production `9022` was not modified or load-tested。
-- Native live Kiro upstream credentials were not used for high-volume pressure; fake upstream validation proves proxy behavior and scheduler/resource contracts without consuming real accounts。
+- Native live Account Runtime upstream credentials were not used for high-volume pressure; fake upstream validation proves proxy behavior and scheduler/resource contracts without consuming real accounts。

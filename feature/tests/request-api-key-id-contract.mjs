@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
-const compiledRoot = mkdtempSync(join(tmpdir(), 'kiro-request-api-key-id-'))
+const compiledRoot = mkdtempSync(join(tmpdir(), 'account-runtime-request-api-key-id-'))
 
 try {
   execFileSync(

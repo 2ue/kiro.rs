@@ -69,7 +69,7 @@ Result:
 ```text
 running 27 tests
 27 passed; 0 failed; 0 ignored
-kiro_loadtest: 0 tests for this filter
+account_runtime_loadtest: 0 tests for this filter
 validation-build-cleanup scope=external-billing-tests size_kib=1713712 removed=true reservation_released=true
 ```
 
@@ -111,7 +111,7 @@ Result:
 ```text
 running 1 test
 1 passed; 0 failed; 0 ignored
-kiro_loadtest: 0 tests for this filter
+account_runtime_loadtest: 0 tests for this filter
 validation-build-cleanup scope=external-billing-tests-2 size_kib=1711096 removed=true reservation_released=true
 ```
 
@@ -135,7 +135,7 @@ Command:
 
 ```bash
 feature/tests/run-cargo-scoped.sh claude-cli-c0 -- \
-  bash -lc 'cargo +1.92.0 fmt --check && cargo +1.92.0 test && cargo +1.92.0 build --release && install -m 755 "$CARGO_TARGET_DIR/release/kiro-rs" "$KIRO_FROZEN_BINARY"'
+  bash -lc 'cargo +1.92.0 fmt --check && cargo +1.92.0 test && cargo +1.92.0 build --release && install -m 755 "$CARGO_TARGET_DIR/release/account-runtime" "$ACCOUNT_RUNTIME_FROZEN_BINARY"'
 ```
 
 Result:
@@ -143,7 +143,7 @@ Result:
 ```text
 cargo fmt --check: passed
 cargo test: 1754 passed / 1 failed / 6 ignored
-failed test: kiro::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded
+failed test: account-runtime::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded
 failure symptom: provider_error_chunked_over_limit was classified as upstream_timeout in one run
 validation-build-cleanup scope=claude-cli-c0 removed=true reservation_released=true
 ```
@@ -152,7 +152,7 @@ Focused rerun:
 
 ```bash
 feature/tests/run-cargo-scoped.sh provider-fault-rerun -- \
-  cargo +1.92.0 test --locked kiro::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded -- --nocapture
+  cargo +1.92.0 test --locked account-runtime::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded -- --nocapture
 ```
 
 Result:
@@ -174,7 +174,7 @@ Command:
 
 ```bash
 feature/tests/run-cargo-scoped.sh claude-cli-release -- \
-  bash -lc 'cargo +1.92.0 build --release && install -m 755 "$CARGO_TARGET_DIR/release/kiro-rs" "$KIRO_FROZEN_BINARY"'
+  bash -lc 'cargo +1.92.0 build --release && install -m 755 "$CARGO_TARGET_DIR/release/account-runtime" "$ACCOUNT_RUNTIME_FROZEN_BINARY"'
 ```
 
 Result:
@@ -201,7 +201,7 @@ Command:
 
 ```bash
 feature/tests/run-cargo-scoped.sh external-billing-warning-check -- \
-  cargo +1.92.0 check --locked --bin kiro-rs
+  cargo +1.92.0 check --locked --bin account-runtime
 ```
 
 Result:
@@ -266,7 +266,7 @@ Purpose: prove the full request path writes correct PostgreSQL usage records, no
 
 Runtime setup:
 
-- Kiro service: frozen release binary, `127.0.0.1:19122`.
+- Account Runtime service: frozen release binary, `127.0.0.1:19122`.
 - PostgreSQL: temporary `postgres:18-alpine` container, `127.0.0.1:39432`, no persistent volume, stopped after validation.
 - Redis: existing loopback Redis authority, isolated DB `redis://127.0.0.1:26379/14`.
 - Fake external upstream: local Node HTTP server, `127.0.0.1:39221`, stopped after validation.

@@ -2,7 +2,7 @@
 
 日期：2026-07-01
 
-范围：基于当前本地 `kiro.rs` 代码，只分析“当前已经在运行的缓存策略”里实际需要处理的问题。本文不强行把所有设计差异都说成 bug；当前策略已经在现网运行，能正常工作的部分要保留。
+范围：基于当前本地 `account-runtime` 代码，只分析“当前已经在运行的缓存策略”里实际需要处理的问题。本文不强行把所有设计差异都说成 bug；当前策略已经在现网运行，能正常工作的部分要保留。
 
 ---
 
@@ -334,9 +334,9 @@ external pool 会基于 raw / shaped / reported 分别估算成本：
 
 - `src/anthropic/prompt_cache.rs:509`
 
-Kiro-RS-Tool 会跳过首个 `cache_control` 前面的动态 system 头，避免每轮变化的系统头污染稳定前缀：
+Account Runtime-RS-Tool 会跳过首个 `cache_control` 前面的动态 system 头，避免每轮变化的系统头污染稳定前缀：
 
-- `~/Desktop/procode/Kiro-RS-Tool/src/anthropic/cache_metering.rs:540`
+- `~/Desktop/procode/Account Runtime-RS-Tool/src/anthropic/cache_metering.rs:540`
 
 这可能导致当前项目“该命中时不命中”。  
 但是否已经影响现网，需要用真实 Claude Code 请求样本确认。
@@ -347,12 +347,12 @@ Kiro-RS-Tool 会跳过首个 `cache_control` 前面的动态 system 头，避免
 
 - `src/anthropic/prompt_cache.rs:515`
 
-Kiro-RS-Tool 的自动前缀链默认不把最后一条 message 切成自动缓存段，除非它显式带 `cache_control`：
+Account Runtime-RS-Tool 的自动前缀链默认不把最后一条 message 切成自动缓存段，除非它显式带 `cache_control`：
 
-- `~/Desktop/procode/Kiro-RS-Tool/src/anthropic/cache_metering.rs:641`
+- `~/Desktop/procode/Account Runtime-RS-Tool/src/anthropic/cache_metering.rs:641`
 
 这是策略差异，但不一定是当前策略 bug。  
-如果当前高缓存策略本来就是更激进的模拟策略，那它可以是现有行为的一部分。后续如果要做 Kiro-RS-Tool 对齐，应放在新策略里处理，不要直接判定当前策略错误。
+如果当前高缓存策略本来就是更激进的模拟策略，那它可以是现有行为的一部分。后续如果要做 Account Runtime-RS-Tool 对齐，应放在新策略里处理，不要直接判定当前策略错误。
 
 ### 6.3 本地缓存 entry 存的是加工后的 token
 
@@ -430,7 +430,7 @@ external pool 按路径策略做 usage projection 是现网能力的一部分。
 2. 当前策略改成 session 维度缓存，同时处理 scope 和 fingerprint 两层。
 3. 梳理职责边界：缓存策略产出 usage，记录模块保存 raw/shaped/reported，billing 模块基于 usage 计算成本。
 
-暂时不要把所有和 Kiro-RS-Tool 不一致的地方都当成当前 bug。  
+暂时不要把所有和 Account Runtime-RS-Tool 不一致的地方都当成当前 bug。
 当前策略已经在现网运行，改造目标应该是修明确问题、保留现有可用能力，再为后续新增策略留出干净边界。
 
 ---
@@ -477,19 +477,19 @@ cacheType
 
 这样现网已经针对 `/cc`、`/ha`、`/na` 或其他路径设置过的缓存参数，不需要迁移，也不会因为新增字段丢失。
 
-### 10.3 再增加 Kiro-RS-Tool 策略
+### 10.3 再增加 Account Runtime-RS-Tool 策略
 
-`Kiro-RS-Tool` 策略作为新的策略类型加入。它和当前策略不是同一组参数：
+`Account Runtime-RS-Tool` 策略作为新的策略类型加入。它和当前策略不是同一组参数：
 
 ```text
 当前策略：
     主要使用 targetReadRatio / tokenScale / creationControl / reportedUsage 等参数。
 
-Kiro-RS-Tool 策略：
+Account Runtime-RS-Tool 策略：
     重点是按 cache_control / 自动历史前缀 / session 隔离 / 成功后提交缓存来模拟。
 ```
 
-如果某个 Kiro-RS-Tool 行为本身不是自然参数，就不要为了“看起来可配置”强行做成配置项。  
+如果某个 Account Runtime-RS-Tool 行为本身不是自然参数，就不要为了“看起来可配置”强行做成配置项。
 可以参数化的边界，例如容量、TTL、是否使用路径 namespace，可以作为该策略自己的参数。
 
 ### 10.4 UI 和 admin-ui 必须支持回显
@@ -503,7 +503,7 @@ Kiro-RS-Tool 策略：
     保存后旧参数不丢。
 
 新路径：
-    可以选择 Kiro-RS-Tool 策略。
+    可以选择 Account Runtime-RS-Tool 策略。
     页面只展示该策略真正需要的参数。
 ```
 
@@ -523,8 +523,8 @@ Kiro-RS-Tool 策略：
 2. 当前策略同一会话换凭证、换模型仍能复用缓存。
 3. 旧路径配置没有 `cacheType` 时仍走当前策略。
 4. 旧路径配置的 `simulation`、`creationControl`、`reportedUsage`、`cachePoint`、`bounds` 仍能解析和回显。
-5. Kiro-RS-Tool 策略第一次 miss 不出现 cache read。
-6. Kiro-RS-Tool 策略成功响应后才提交缓存，失败请求不能污染下一次缓存。
+5. Account Runtime-RS-Tool 策略第一次 miss 不出现 cache read。
+6. Account Runtime-RS-Tool 策略成功响应后才提交缓存，失败请求不能污染下一次缓存。
 7. external pool 仍保留 raw / shaped / reported 三层 usage，成本计算输入不断。
 
 ### 11.2 资源安全
@@ -542,7 +542,7 @@ Kiro-RS-Tool 策略：
 至少要证明：
 
 1. 当前策略默认路径没有因为新增策略字段多走重逻辑。
-2. Kiro-RS-Tool 策略只在被路径选中时运行。
+2. Account Runtime-RS-Tool 策略只在被路径选中时运行。
 3. 缓存 hash / canonical 计算仍然和请求大小线性相关，没有额外的全局扫描。
 4. 路径策略选择仍使用现有最长前缀匹配，不引入新的慢查询。
 

@@ -68,8 +68,8 @@ POST /external-pools/{id}/cooldown/clear
 ### 同池重试与跨池顺序
 
 ```text
-KIRO_RS_TEST_POSTGRES_URL=postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379/0
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379/0
 feature/tests/run-cargo-scoped.sh external-pool-same-pool-retry-real-infra \
   -- cargo test --locked external_pool_same_pool_retry -- --nocapture
 ```
@@ -90,8 +90,8 @@ feature/tests/run-cargo-scoped.sh external-pool-same-pool-retry-real-infra \
 ### 冷却、坏状态与清除恢复
 
 ```text
-KIRO_RS_TEST_POSTGRES_URL=postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379/0
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379/0
 feature/tests/run-cargo-scoped.sh external-pool-cooldown-clear-real-infra \
   -- cargo test --locked \
   external_pool_atomic_acquire_honors_pool_cooldown_and_fails_closed_on_bad_state \
@@ -117,8 +117,8 @@ feature/tests/run-cargo-scoped.sh external-pool-cooldown-clear-real-infra \
 以下测试只证明旧实现会按上游等待提示写池级冷却；新策略不能依赖上游一定返回等待时间，也不能把该行为作为发版标准。
 
 ```text
-KIRO_RS_TEST_POSTGRES_URL=postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379/0
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379/0
 feature/tests/run-cargo-scoped.sh external-pool-retry-after-real \
   -- cargo test --locked external_pool_retry_after -- --nocapture
 ```
@@ -139,8 +139,8 @@ feature/tests/run-cargo-scoped.sh external-pool-retry-after-real \
 ### 跨池重试配置、终态错误与连续瞬态冷却
 
 ```text
-KIRO_RS_TEST_POSTGRES_URL=postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs
-KIRO_RS_TEST_REDIS_URL=redis://127.0.0.1:26379/0
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL=postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime
+ACCOUNT_RUNTIME_TEST_REDIS_URL=redis://127.0.0.1:26379/0
 feature/tests/run-cargo-scoped.sh external-pool-retry-full-focused \
   -- cargo test --locked external_pool_ -- --nocapture
 ```

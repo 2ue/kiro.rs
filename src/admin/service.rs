@@ -48,7 +48,6 @@ use crate::account_runtime::{
     AccountAuthType, AccountRuntimeConfig, AccountRuntimeConfigExt, AccountRuntimeManager,
     AccountRuntimeStatusCompatibilityResponse, CreateUpstreamAccountStorageRequest,
     UpdateUpstreamAccountStorageRequest, UpstreamAccountStatusRecord, UpstreamAccountStorageRecord,
-    clear_upstream_account_cooldowns, load_upstream_account_status_records,
     upstream_account_messages_url, upstream_account_models_url,
 };
 use crate::anthropic::{
@@ -75,12 +74,11 @@ use crate::http_client::{
     ProxyConfig, build_client, response_text_with_limit_and_body_timeout,
     send_with_response_header_timeout,
 };
-use crate::local_upstream::credentials::{LocalUpstreamCredentials, local_upstream_profile_region};
+use crate::local_upstream::credentials::LocalUpstreamCredentials;
 use crate::local_upstream::manager::{
     LocalUpstreamCredentialAuthUpdate, LocalUpstreamCredentialBaseSnapshot,
     LocalUpstreamCredentialEntrySnapshot, LocalUpstreamCredentialManager,
 };
-use crate::local_upstream::usage_limits::LocalUpstreamUsageLimitsResponse;
 use crate::model::config::{
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
     MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
@@ -95,6 +93,8 @@ use crate::storage::redis_cache::{RedisPatternDeleteStats, RedisStore};
 
 /// 账号信息缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+const LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE: &str =
+    "旧本地凭据上游接口已移除，请使用上游账号接口配置账号";
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 const CREDENTIAL_INFO_REFRESH_CONCURRENCY: usize = 16;
@@ -1491,8 +1491,9 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
         let manager = self.account_runtime_manager.clone();
-        let deleted = block_on_admin_store(async move { manager.clear_pool_cooldowns(id).await })
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let deleted =
+            block_on_admin_store(async move { manager.clear_account_cooldowns(id).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.audit(
             "clear_external_pool_cooldown",
             "external_pool",
@@ -1513,10 +1514,8 @@ impl AdminService {
                 .ok_or(AdminServiceError::NotFound { id })?;
         let manager = self.account_runtime_manager.clone();
         let deleted =
-            block_on_admin_store(
-                async move { clear_upstream_account_cooldowns(&manager, id).await },
-            )
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+            block_on_admin_store(async move { manager.clear_account_cooldowns(id).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.audit(
             "clear_account_cooldown",
             "account",
@@ -1545,7 +1544,7 @@ impl AdminService {
             .runtime_config()
             .account_runtime_config()
             .clone();
-        let pools = block_on_admin_store(async move { manager.status(&config).await })
+        let pools = block_on_admin_store(async move { manager.status_records(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         let response = AccountRuntimeStatusCompatibilityResponse { pools };
         self.write_admin_cache(
@@ -1572,10 +1571,8 @@ impl AdminService {
             .runtime_config()
             .account_runtime_config()
             .clone();
-        let accounts = block_on_admin_store(async move {
-            load_upstream_account_status_records(&manager, &config).await
-        })
-        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let accounts = block_on_admin_store(async move { manager.status_records(&config).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
         self.write_admin_cache(
             cache_key.to_string(),
             AccountRuntimeStatusCompatibilityResponse {
@@ -1912,7 +1909,8 @@ impl AdminService {
             storage_revision: 0,
             access_token: req.access_token,
             refresh_token: req.refresh_token,
-            profile_arn: req.profile_arn,
+            #[cfg(test)]
+            profile_arn: None,
             expires_at: req.expires_at,
             auth_method: Some(auth_method),
             provider: req.provider,
@@ -1951,15 +1949,6 @@ impl AdminService {
         credentials.normalize_supported_models();
         credentials.normalize_api_key_defaults();
         credentials.normalize_external_idp_defaults();
-        if credentials.api_region.as_deref().is_none_or(str::is_empty) {
-            if let Some(region) = credentials
-                .profile_arn
-                .as_deref()
-                .and_then(local_upstream_profile_region)
-            {
-                credentials.api_region = Some(region.to_string());
-            }
-        }
         if let Some(ref name) = credentials.endpoint {
             if !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
@@ -2264,7 +2253,6 @@ impl AdminService {
                         estimated_cost_usd: summary.estimated_cost_usd,
                         original_cost_usd: summary.original_cost_usd,
                         upstream_metering_units: summary.upstream_metering_units,
-                        kiro_metering_usage: summary.upstream_metering_units,
                         priced_requests: summary.priced_requests,
                         unpriced_requests: summary.unpriced_requests,
                     })
@@ -2419,7 +2407,6 @@ impl AdminService {
                 item.account_info = info;
                 item.estimated_cost_usd = cost.estimated_cost_usd;
                 item.upstream_metering_units = cost.upstream_metering_units;
-                item.kiro_metering_usage = cost.upstream_metering_units;
                 item.priced_requests = cost.priced_requests;
                 item.unpriced_requests = cost.unpriced_requests;
                 item
@@ -2730,11 +2717,6 @@ impl AdminService {
         Ok(balance)
     }
 
-    /// 兼容旧调用名。
-    pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        self.get_account_info(id, false).await
-    }
-
     pub async fn refresh_credentials_info(
         &self,
         req: RefreshCredentialInfoRequest,
@@ -2978,21 +2960,10 @@ impl AdminService {
                 }
             };
 
-            let mut current: Option<CredentialValidationInfo> = None;
+            let current: Option<CredentialValidationInfo> = None;
             let mut usage_error: Option<String> = None;
             if query_account_info {
-                match self
-                    .token_manager
-                    .probe_usage_limits_for_credentials(credential.clone())
-                    .await
-                {
-                    Ok(usage) => {
-                        current = Some(validation_info_from_usage(&usage));
-                    }
-                    Err(err) => {
-                        usage_error = Some(err.to_string());
-                    }
-                }
+                usage_error = Some(LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE.to_string());
             }
 
             let mut liveness_error: Option<String> = None;
@@ -3112,13 +3083,10 @@ impl AdminService {
 
     /// 从上游获取账号信息（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
-            .token_manager
-            .get_usage_limits_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
-
-        Ok(balance_response_from_usage(id, usage))
+        Err(AdminServiceError::InvalidCredential(format!(
+            "{}: {}",
+            LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE, id
+        )))
     }
 
     pub async fn set_credential_overage(
@@ -3126,15 +3094,11 @@ impl AdminService {
         id: u64,
         req: SetCredentialOverageRequest,
     ) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
-            .token_manager
-            .set_overage_status_for(id, req.enabled)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
-        let balance = balance_response_from_usage(id, usage);
-        self.save_account_info_snapshot(&balance).await?;
-        self.invalidate_balance_cache(id);
-        Ok(balance)
+        let _requested_enabled = req.enabled;
+        Err(AdminServiceError::InvalidCredential(format!(
+            "{}: {}",
+            LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE, id
+        )))
     }
 
     async fn save_account_info_snapshot(
@@ -3252,24 +3216,19 @@ impl AdminService {
                 Some("API Key 凭据未自动发现支持模型，请在保存后手动同步支持模型".to_string());
         }
         if enable_overage_after_import {
-            if let Err(err) = self
-                .set_credential_overage(
-                    credential_id,
-                    SetCredentialOverageRequest { enabled: true },
-                )
-                .await
-            {
-                warning = Some(match warning.take() {
-                    Some(existing) => format!("{}；超额开启失败: {}", existing, err),
-                    None => format!("超额开启失败: {}", err),
-                });
-            }
+            warning = Some(match warning.take() {
+                Some(existing) => format!(
+                    "{}；{}，已跳过旧凭据 overage 开启",
+                    existing, LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE
+                ),
+                None => format!(
+                    "{}，已跳过旧凭据 overage 开启",
+                    LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE
+                ),
+            });
         }
 
-        // 主动获取上游账号信息快照，后续列表和用量展示直接读取缓存元数据。
-        if let Err(e) = self.get_balance(credential_id).await {
-            tracing::warn!("添加凭据后获取账号信息失败（不影响凭据添加）: {}", e);
-        }
+        // 旧本地凭据不再主动访问专用上游协议；账号信息由上游账号运行时维护。
         self.audit(
             "add_credential",
             "credential",
@@ -5560,20 +5519,10 @@ impl AdminService {
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .force_refresh_token_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
-        self.invalidate_balance_cache(id);
-        self.audit(
-            "force_refresh_token",
-            "credential",
-            Some(id.to_string()),
-            true,
-            None,
-            json!({}),
-        );
-        Ok(())
+        Err(AdminServiceError::InvalidCredential(format!(
+            "{}: {}",
+            LEGACY_CREDENTIAL_UPSTREAM_REMOVED_MESSAGE, id
+        )))
     }
 
     // ============ 错误分类 ============
@@ -5584,47 +5533,6 @@ impl AdminService {
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
         } else {
-            AdminServiceError::InternalError(msg)
-        }
-    }
-
-    /// 分类账号信息查询错误（可能涉及上游 API 调用）
-    fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
-        let msg = e.to_string();
-
-        // 1. 凭据不存在
-        if msg.contains("不存在") {
-            return AdminServiceError::NotFound { id };
-        }
-
-        // 2. API Key 凭据不支持刷新：客户端请求错误，映射为 400
-        if msg.contains("API Key 凭据不支持刷新") {
-            return AdminServiceError::InvalidCredential(msg);
-        }
-        if msg.contains("refreshToken 已失效") || msg.contains("invalid_grant") {
-            return AdminServiceError::InvalidCredential(msg);
-        }
-
-        // 3. 上游服务错误特征：HTTP 响应错误或网络错误
-        let is_upstream_error =
-            // HTTP 响应错误（来自 refresh_*_token 的错误消息）
-            msg.contains("凭证已过期或无效") ||
-            msg.contains("权限不足") ||
-            msg.contains("已被限流") ||
-            msg.contains("服务器错误") ||
-            msg.contains("Token 刷新失败") ||
-            msg.contains("暂时不可用") ||
-            // 网络错误（reqwest 错误）
-            msg.contains("error trying to connect") ||
-            msg.contains("connection") ||
-            msg.contains("timeout") ||
-            msg.contains("timed out");
-
-        if is_upstream_error {
-            AdminServiceError::UpstreamError(msg)
-        } else {
-            // 4. 默认归类为内部错误（本地验证失败、配置错误等）
-            // 包括：缺少 refreshToken、refreshToken 已被截断、无法生成 machineId 等
             AdminServiceError::InternalError(msg)
         }
     }
@@ -6148,7 +6056,7 @@ fn add_request_looks_external_idp(req: &AddCredentialRequest) -> bool {
         || req.provider.as_deref().is_some_and(|provider| {
             matches!(
                 compact_auth_value(provider).as_str(),
-                "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
+                "externalidp" | "enterprise" | "iamsso" | "internal"
             )
         })
 }
@@ -6249,7 +6157,6 @@ fn credential_status_item_from_snapshot(
         api_region: entry.api_region,
         effective_auth_region: entry.effective_auth_region,
         effective_api_region: entry.effective_api_region,
-        has_profile_arn: entry.has_profile_arn,
         refresh_token_hash: entry.refresh_token_hash,
         api_key_hash: entry.api_key_hash,
         masked_api_key: entry.masked_api_key,
@@ -6303,7 +6210,6 @@ fn credential_status_item_from_snapshot(
         scheduler_score: entry.scheduler_score,
         estimated_cost_usd: 0.0,
         upstream_metering_units: 0.0,
-        kiro_metering_usage: 0.0,
         priced_requests: 0,
         unpriced_requests: 0,
     }
@@ -6327,7 +6233,6 @@ fn credential_list_item_from_base(
         api_region: credential.api_region,
         effective_auth_region: credential.effective_auth_region,
         effective_api_region: credential.effective_api_region,
-        has_profile_arn: credential.has_profile_arn,
         refresh_token_hash: credential.refresh_token_hash,
         api_key_hash: credential.api_key_hash,
         masked_api_key: credential.masked_api_key,
@@ -6428,41 +6333,6 @@ fn credential_account_info_item_from_row(
         current_overages: info.current_overages,
         next_reset_at: info.next_reset_at,
         checked_at: info.checked_at,
-    }
-}
-
-fn balance_response_from_usage(
-    id: u64,
-    usage: LocalUpstreamUsageLimitsResponse,
-) -> BalanceResponse {
-    let current_usage = usage.current_usage();
-    let usage_limit = usage.usage_limit();
-    let remaining = (usage_limit - current_usage).max(0.0);
-    let usage_percentage = if usage_limit > 0.0 {
-        (current_usage / usage_limit * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-    let credit =
-        credit_snapshot_for_account_usage(current_usage, usage_limit, usage.active_bonus_limit());
-    BalanceResponse {
-        id,
-        checked_at: Utc::now().to_rfc3339(),
-        subscription_title: usage.subscription_title().map(|s| s.to_string()),
-        current_usage,
-        usage_limit,
-        remaining,
-        usage_percentage,
-        credit_limit: credit.limit,
-        credit_remaining: credit.remaining,
-        credit_base: credit.base,
-        credit_bonus: credit.bonus,
-        overage_status: usage.overage_status(),
-        overage_capability: usage.overage_capability().map(str::to_string),
-        overage_cap: usage.overage_cap(),
-        overage_rate: usage.overage_rate(),
-        current_overages: usage.current_overages(),
-        next_reset_at: usage.next_date_reset,
     }
 }
 
@@ -7122,25 +6992,6 @@ fn validation_info_from_balance(balance: &BalanceResponse) -> CredentialValidati
         usage_limit: balance.usage_limit,
         usage_percentage: balance.usage_percentage,
         checked_at: balance.checked_at.clone(),
-    }
-}
-
-fn validation_info_from_usage(
-    usage: &LocalUpstreamUsageLimitsResponse,
-) -> CredentialValidationInfo {
-    let current_usage = usage.current_usage();
-    let usage_limit = usage.usage_limit();
-    let usage_percentage = if usage_limit > 0.0 {
-        (current_usage / usage_limit * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-    CredentialValidationInfo {
-        subscription_title: usage.subscription_title().map(|value| value.to_string()),
-        current_usage,
-        usage_limit,
-        usage_percentage,
-        checked_at: Utc::now().to_rfc3339(),
     }
 }
 

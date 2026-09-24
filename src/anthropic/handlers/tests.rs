@@ -628,7 +628,7 @@ fn multimodal_handler_test_provider(config: Config) -> Arc<LocalUpstreamProvider
         id: Some(1),
         access_token: Some("multimodal-handler-test-token".to_string()),
         profile_arn: Some(
-            "arn:aws:codewhisperer:us-east-1:123456789012:profile/HANDLER_TEST".to_string(),
+            "arn:account-runtime:us-east-1:123456789012:profile/HANDLER_TEST".to_string(),
         ),
         expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
         auth_method: Some("social".to_string()),
@@ -867,7 +867,7 @@ fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>)
             id: Some(id),
             access_token: Some(format!("websearch-handler-test-token-{id}")),
             profile_arn: Some(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/WEBSEARCH_TEST".to_string(),
+                "arn:account-runtime:us-east-1:123456789012:profile/WEBSEARCH_TEST".to_string(),
             ),
             expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             auth_method: Some("social".to_string()),
@@ -949,7 +949,7 @@ async fn test_external_pool_manager_for_handlers(
     );
 
     let manager = Arc::new(AccountRuntimeManager::new(postgres.clone(), redis));
-    postgres
+    let account = postgres
         .create_external_pool(CreateUpstreamAccountStorageRequest {
             name: format!("handler-websearch-{body_mode:?}"),
             base_url: base_url.to_string(),
@@ -976,7 +976,10 @@ async fn test_external_pool_manager_for_handlers(
         })
         .await
         .expect("create handler account fallback pool");
-    manager.invalidate_static_pool_snapshot();
+    manager.notify_account_runtime_data_changed_with_local_account(
+        "handler_account_fallback_test_setup",
+        &account,
+    );
     Some(manager)
 }
 
@@ -1514,7 +1517,7 @@ async fn run_native_websearch_normalized_external_preflight_precedes_mcp_for_fiv
             );
             assert_eq!(
                 record.fallback_reason.as_deref(),
-                Some("local_no_credentials"),
+                Some("account_no_credentials"),
                 "stream={stream} round={round}"
             );
             assert_eq!(
@@ -1806,7 +1809,7 @@ async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp
             );
             assert_eq!(
                 record.fallback_reason.as_deref(),
-                Some("local_no_credentials"),
+                Some("account_no_credentials"),
                 "stream={stream} round={round}: scheduler failure must keep the real local-pool reason"
             );
             assert_eq!(
@@ -3546,7 +3549,7 @@ fn handler_eventstream_fault_router_with_limits(
             id: Some(id),
             access_token: Some(format!("handler-eventstream-fault-token-{id}")),
             profile_arn: Some(format!(
-                "arn:aws:codewhisperer:us-east-1:123456789012:profile/HANDLER_FAULT_{id}"
+                "arn:account-runtime:us-east-1:123456789012:profile/HANDLER_FAULT_{id}"
             )),
             expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             auth_method: Some("social".to_string()),
@@ -4686,10 +4689,10 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
                     record.upstream_metering_units
                 );
                 assert!(
-                    (record.kiro_metering_usage - expected_upstream_metering_units).abs()
+                    (record.upstream_metering_units - expected_upstream_metering_units).abs()
                         < 0.000_001,
                     "fault={fault:?} stream={stream} round={round} legacy_metering_usage={}",
-                    record.kiro_metering_usage
+                    record.upstream_metering_units
                 );
                 if matches!(fault, HandlerEventStreamFault::UsageOnlyMeteringNoStatus) {
                     assert_eq!(record.output_tokens, 0);
@@ -5264,7 +5267,7 @@ fn raw_account_route_request_is_preparse_raw_only() {
         "/cc/v1/messages",
         "req_raw_preparse_test".to_string(),
         UsageRouteSubtype::ExternalFallbackPreflight,
-        Some("local_capacity_full".to_string()),
+        Some("account_capacity_full".to_string()),
         None,
         Some(json!({"preflightStage":"before_parse"})),
         Arc::new(InferenceAttemptBudget::new(4)),
@@ -5293,13 +5296,10 @@ fn raw_account_route_request_is_preparse_raw_only() {
 }
 
 #[test]
-fn contaminated_fallback_requires_normalized_pool_for_five_rounds() {
+fn contaminated_fallback_never_uses_body_mode_filter_for_five_rounds() {
     for _round in 0..5 {
         assert_eq!(account_route_body_mode_filter(false), None);
-        assert_eq!(
-            account_route_body_mode_filter(true),
-            Some(AccountRequestBodyMode::Normalized)
-        );
+        assert_eq!(account_route_body_mode_filter(true), None);
     }
 }
 
@@ -5331,7 +5331,7 @@ fn all_parsed_account_fallback_entrypoints_share_route_and_model_eligibility() {
         source.contains(
             "body_mode_filter: account_route_body_mode_filter(self.requires_normalized_body)"
         ),
-        "body mode remains a route body-processing hint, not an external-pool candidate filter"
+        "body mode remains a compatibility hint only and must not influence account selection"
     );
     assert!(
         !source.contains("has_eligible_pool_for_body_mode_and_model"),
@@ -5389,7 +5389,7 @@ fn native_websearch_runs_local_pool_preflight_before_mcp_intercept() {
         .nth(1)
         .expect("native WebSearch block exists");
     let preflight = websearch_block
-        .find("maybe_local_pool_preflight_account_response")
+        .find("maybe_account_preflight_response")
         .expect("native WebSearch must run local-pool preflight before MCP");
     let mcp_call = websearch_block
         .find("websearch::handle_websearch_request")
@@ -5847,7 +5847,7 @@ fn thinking_signature_typed_failures_never_enter_account_fallback_five_rounds() 
                 "invalid model not available",
             ] {
                 assert_eq!(
-                    classify_local_error_for_account_fallback_with_kind(
+                    classify_account_error_for_account_fallback_with_kind(
                         misleading_message,
                         &[],
                         &config,
@@ -5930,13 +5930,13 @@ async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_
             LocalUpstreamCallFailureKind::DownstreamCommitted,
             LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted,
             LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated,
-            LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen,
+            LocalUpstreamCallFailureKind::AccountRiskCircuitOpen,
         ] {
             let error_message =
-                if failure_kind == LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen {
+                if failure_kind == LocalUpstreamCallFailureKind::AccountRiskCircuitOpen {
                     "本地账号池风险保护已打开（retry_after_secs=7）"
                 } else {
-                    "local inference attempt reserved for fallback"
+                    "account inference attempt reserved for fallback"
                 };
             let err: anyhow::Error = LocalUpstreamCallError::new(error_message, Vec::new())
                 .with_failure_kind(failure_kind)
@@ -5954,7 +5954,7 @@ async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_
                     StatusCode::SERVICE_UNAVAILABLE
                 };
             assert_eq!(response.status(), expected_status);
-            if failure_kind == LocalUpstreamCallFailureKind::LocalPoolRiskCircuitOpen {
+            if failure_kind == LocalUpstreamCallFailureKind::AccountRiskCircuitOpen {
                 assert_eq!(
                     response
                         .headers()
@@ -5978,14 +5978,14 @@ async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_
 
 #[test]
 fn fallback_reservation_has_a_dedicated_internal_classification() {
-    let reason = classify_local_error_for_account_fallback(
-        "local inference attempt reserved for fallback",
+    let reason = classify_account_error_for_account_fallback(
+        "account inference attempt reserved for fallback",
         &[],
         &AccountRuntimeConfig::default(),
     );
     assert_eq!(
         reason.as_deref(),
-        Some("local_attempt_reserved_for_fallback")
+        Some("account_attempt_reserved_for_fallback")
     );
 }
 
@@ -5997,14 +5997,14 @@ fn auxiliary_focus_typed_failures_use_local_transient_fallback_policy_for_five_r
         for (kind, expected) in [
             (
                 LocalUpstreamCallFailureKind::AuxiliaryAttemptsExhausted,
-                "local_auxiliary_attempts_exhausted",
+                "account_auxiliary_attempts_exhausted",
             ),
             (
                 LocalUpstreamCallFailureKind::AuxiliaryConcurrencySaturated,
-                "local_auxiliary_concurrency_saturated",
+                "account_auxiliary_concurrency_saturated",
             ),
         ] {
-            let reason = classify_local_error_for_account_fallback_with_kind(
+            let reason = classify_account_error_for_account_fallback_with_kind(
                 "misleading deterministic request body error",
                 &[],
                 &config,
@@ -6014,7 +6014,7 @@ fn auxiliary_focus_typed_failures_use_local_transient_fallback_policy_for_five_r
 
             config.fallback_on_local_transient_exhausted = false;
             assert_eq!(
-                classify_local_error_for_account_fallback_with_kind(
+                classify_account_error_for_account_fallback_with_kind(
                     "misleading 503 transient text",
                     &[],
                     &config,
@@ -6565,7 +6565,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
 
     for round in 1..=5 {
         assert_eq!(
-            local_pool_acquire_mode(&config),
+            account_acquire_mode(&config),
             LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_millis(
                 LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS
             )),
@@ -6574,7 +6574,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
 
         config.fallback_on_scheduler_redis_degraded = false;
         assert_eq!(
-            local_pool_acquire_mode(&config),
+            account_acquire_mode(&config),
             LocalUpstreamAcquireMode::FailFastOnCapacityWaitForRedis(Duration::from_secs(7)),
             "round {round}: disabling Redis degraded fallback keeps the configured local dispatch wait"
         );
@@ -6582,7 +6582,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
 
         config.fallback_on_local_capacity_exhausted = false;
         assert_eq!(
-            local_pool_acquire_mode(&config),
+            account_acquire_mode(&config),
             LocalUpstreamAcquireMode::WaitForCapacity,
             "round {round}: the capacity fallback toggle remains authoritative"
         );
@@ -6590,7 +6590,7 @@ fn preflight_ready_acquire_full_race_uses_bounded_local_wait_for_five_rounds() {
 
         config.local_pool_preflight_enabled = false;
         assert_eq!(
-            local_pool_acquire_mode(&config),
+            account_acquire_mode(&config),
             LocalUpstreamAcquireMode::WaitForCapacity,
             "round {round}: the operator preflight switch remains authoritative"
         );
@@ -8478,7 +8478,7 @@ async fn official_upstream_message_with_internal_brand_term_is_masked() {
     let response = map_provider_error(
         anyhow::anyhow!(
             "{}",
-            r#"流式 API 请求失败（账号 #7 secret-user）: 500 Internal Server Error {"message":"Kiro service rejected the request","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+            r#"流式 API 请求失败（账号 #7 secret-user）: 500 Internal Server Error {"message":"Fallback service rejected this model request","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
         ),
         Some("req_test_official_internal_term"),
         Some("req_01official_term"),
@@ -8662,7 +8662,7 @@ async fn provider_error_response_exposes_matching_public_error_id() {
 fn assert_public_error_message_is_normalized(message: &str) {
     let lower = message.to_ascii_lowercase();
     for forbidden in [
-        "kiro",
+        "account-runtime",
         "credential",
         "upstream account",
         "external_pool",
@@ -9767,7 +9767,7 @@ fn account_fallback_classifier_rejects_request_errors() {
     let config = AccountRuntimeConfig::default();
 
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             r#"400 Bad Request {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
             &[],
             &config,
@@ -9775,7 +9775,7 @@ fn account_fallback_classifier_rejects_request_errors() {
         None
     );
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             "JSON schema is invalid for tool input_schema",
             &[],
             &config,
@@ -9794,7 +9794,7 @@ fn account_fallback_classifier_rejects_request_errors() {
         10,
     )];
     assert_eq!(
-        classify_local_error_for_account_fallback("429 Too Many Requests", &attempts, &config),
+        classify_account_error_for_account_fallback("429 Too Many Requests", &attempts, &config),
         None
     );
 }
@@ -9804,17 +9804,18 @@ fn account_fallback_classifier_allows_capacity_and_transient_errors() {
     let config = AccountRuntimeConfig::default();
 
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             "本地凭据调度容量暂不可用，并发槽位已满",
             &[],
             &config,
         )
         .as_deref(),
-        Some("local_capacity_exhausted")
+        Some("account_capacity_exhausted")
     );
     assert_eq!(
-        classify_local_error_for_account_fallback("429 Too Many Requests", &[], &config).as_deref(),
-        Some("local_transient_exhausted")
+        classify_account_error_for_account_fallback("429 Too Many Requests", &[], &config)
+            .as_deref(),
+        Some("account_transient_exhausted")
     );
 }
 
@@ -9838,19 +9839,23 @@ fn account_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard_
     let diagnostic_attempts =
         merge_credential_attempts(vec![prior_too_long_attempt.clone()], Vec::new());
     assert_eq!(
-        classify_local_error_for_account_fallback(capacity_message, &diagnostic_attempts, &config,),
+        classify_account_error_for_account_fallback(
+            capacity_message,
+            &diagnostic_attempts,
+            &config,
+        ),
         None
     );
 
     let retry_stage_attempts = Vec::new();
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             capacity_message,
             &retry_stage_attempts,
             &config,
         )
         .as_deref(),
-        Some("local_capacity_exhausted")
+        Some("account_capacity_exhausted")
     );
 
     let retry_bad_request_attempt = vec![LocalUpstreamCredentialAttempt::new(
@@ -9864,7 +9869,7 @@ fn account_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard_
         10,
     )];
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             capacity_message,
             &retry_bad_request_attempt,
             &config,
@@ -9882,7 +9887,7 @@ fn account_fallback_classifier_respects_scheduler_fallback_toggles() {
     };
 
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             "本地凭据调度容量暂不可用，并发槽位已满",
             &[],
             &config,
@@ -9890,7 +9895,7 @@ fn account_fallback_classifier_respects_scheduler_fallback_toggles() {
         None
     );
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
             &[],
             &config,
@@ -9900,17 +9905,17 @@ fn account_fallback_classifier_respects_scheduler_fallback_toggles() {
 
     config = AccountRuntimeConfig::default();
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
             &[],
             &config,
         )
         .as_deref(),
-        Some("local_scheduler_redis_degraded")
+        Some("account_scheduler_redis_degraded")
     );
     config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）",
             &[],
             &config,
@@ -9921,11 +9926,11 @@ fn account_fallback_classifier_respects_scheduler_fallback_toggles() {
     config = AccountRuntimeConfig::default();
     config.fallback_on_local_transient_exhausted = false;
     assert_eq!(
-        classify_local_error_for_account_fallback("429 Too Many Requests", &[], &config),
+        classify_account_error_for_account_fallback("429 Too Many Requests", &[], &config),
         None
     );
     assert_eq!(
-        classify_local_error_for_account_fallback(
+        classify_account_error_for_account_fallback(
             "upstream server_error",
             &[LocalUpstreamCredentialAttempt::new(
                 0,
@@ -9945,13 +9950,13 @@ fn account_fallback_classifier_respects_scheduler_fallback_toggles() {
     config = AccountRuntimeConfig::default();
     config.fallback_on_no_available_credentials = false;
     assert_eq!(
-        classify_local_error_for_account_fallback("所有凭据均已禁用（0/2）", &[], &config),
+        classify_account_error_for_account_fallback("所有凭据均已禁用（0/2）", &[], &config),
         None
     );
 
     config.fallback_on_no_available_credentials = true;
     assert_eq!(
-        classify_local_error_for_account_fallback("所有凭据均已禁用（0/2）", &[], &config)
+        classify_account_error_for_account_fallback("所有凭据均已禁用（0/2）", &[], &config)
             .as_deref(),
         Some("no_available_credentials")
     );
@@ -9961,117 +9966,111 @@ fn account_fallback_classifier_respects_scheduler_fallback_toggles() {
 fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
     let mut config = AccountRuntimeConfig::default();
 
-    assert!(local_pool_capacity_fail_fast_enabled(&config));
+    assert!(account_capacity_fail_fast_enabled(&config));
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoCredentials, &config),
-        Some("local_no_credentials")
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::NoCredentials, &config),
+        Some("account_no_credentials")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllDisabled, &config),
-        Some("local_all_disabled")
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::AllDisabled, &config),
+        Some("account_all_disabled")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::ProxyBlocked, &config),
-        Some("local_proxy_blocked")
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::ProxyBlocked, &config),
+        Some("account_proxy_blocked")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllCoolingDown, &config),
-        Some("local_all_cooling_down")
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::AllCoolingDown, &config),
+        Some("account_all_cooling_down")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::CapacityFull, &config),
-        Some("local_capacity_full")
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::CapacityFull, &config),
+        Some("account_capacity_full")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(
-            LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
-            &config
-        ),
-        Some("local_scheduler_redis_degraded")
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::SchedulerRedisDegraded, &config),
+        Some("account_scheduler_redis_degraded")
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoModelCompatible, &config),
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::NoModelCompatible, &config),
         None
     );
 
     config.fallback_on_no_available_credentials = false;
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoCredentials, &config),
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::NoCredentials, &config),
         None
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllDisabled, &config),
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::AllDisabled, &config),
         None
     );
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::ProxyBlocked, &config),
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::ProxyBlocked, &config),
         None
     );
 
     config = AccountRuntimeConfig::default();
     config.fallback_on_local_transient_exhausted = false;
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::AllCoolingDown, &config),
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::AllCoolingDown, &config),
         None
     );
 
     config = AccountRuntimeConfig::default();
     config.fallback_on_local_capacity_exhausted = false;
-    assert!(!local_pool_capacity_fail_fast_enabled(&config));
+    assert!(!account_capacity_fail_fast_enabled(&config));
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::CapacityFull, &config),
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::CapacityFull, &config),
         None
     );
 
     config = AccountRuntimeConfig::default();
     config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
-        local_pool_route_fallback_reason(
-            LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
-            &config
-        ),
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::SchedulerRedisDegraded, &config),
         None
     );
 
     config = AccountRuntimeConfig::default();
     config.fallback_on_unsupported_model = true;
     assert_eq!(
-        local_pool_route_fallback_reason(LocalUpstreamRouteStateKind::NoModelCompatible, &config),
-        Some("local_no_model_compatible")
+        account_route_fallback_reason(LocalUpstreamRouteStateKind::NoModelCompatible, &config),
+        Some("account_no_model_compatible")
     );
 
     config.local_pool_preflight_enabled = false;
-    assert!(!local_pool_capacity_fail_fast_enabled(&config));
+    assert!(!account_capacity_fail_fast_enabled(&config));
 }
 
 #[test]
 fn local_account_fallback_capacity_gate_reason_matrix_is_explicit() {
     for reason in [
-        "local_capacity_full",
-        "local_all_cooling_down",
-        "local_pool_risk_circuit_open",
-        "local_transient_exhausted",
-        "local_auxiliary_attempts_exhausted",
-        "local_auxiliary_concurrency_saturated",
-        "local_attempt_reserved_for_fallback",
+        "account_capacity_full",
+        "account_all_cooling_down",
+        "account_risk_circuit_open",
+        "account_transient_exhausted",
+        "account_auxiliary_attempts_exhausted",
+        "account_auxiliary_concurrency_saturated",
+        "account_attempt_reserved_for_fallback",
     ] {
         assert!(
-            local_route_reason_requires_immediate_account_capacity(reason),
+            account_route_reason_requires_immediate_capacity(reason),
             "{reason} must not push local requests into account fallback unless an upstream account can immediately accept"
         );
     }
 
     for reason in [
-        "local_scheduler_redis_degraded",
-        "local_no_credentials",
-        "local_all_disabled",
-        "local_proxy_blocked",
-        "local_no_model_compatible",
+        "account_scheduler_redis_degraded",
+        "account_no_credentials",
+        "account_all_disabled",
+        "account_proxy_blocked",
+        "account_no_model_compatible",
         "no_available_credentials",
         "unsupported_model",
     ] {
         assert!(
-            !local_route_reason_requires_immediate_account_capacity(reason),
+            !account_route_reason_requires_immediate_capacity(reason),
             "{reason} may use the upstream account's own capacity policy instead of the local preflight immediate-capacity gate"
         );
     }
@@ -10082,11 +10081,11 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     let mut config = AccountRuntimeConfig::default();
 
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(LocalUpstreamRouteStateKind::Ready, 1, &config,),
+        account_fallback_reason_for_fresh_state(LocalUpstreamRouteStateKind::Ready, 1, &config,),
         None
     );
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::AllCoolingDown,
             1,
             &config,
@@ -10094,7 +10093,7 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
         None
     );
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::CapacityFull,
             1,
             &config,
@@ -10103,52 +10102,52 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
     );
 
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::AllCoolingDown,
             0,
             &config,
         ),
-        Some("local_all_cooling_down")
+        Some("account_all_cooling_down")
     );
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::CapacityFull,
             0,
             &config,
         ),
-        Some("local_capacity_full")
+        Some("account_capacity_full")
     );
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
             0,
             &config,
         ),
-        Some("local_scheduler_redis_degraded")
+        Some("account_scheduler_redis_degraded")
     );
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
             1,
             &config,
         ),
-        Some("local_scheduler_redis_degraded"),
+        Some("account_scheduler_redis_degraded"),
         "Redis scheduler degraded means distributed lease state is not trustworthy; stale in-memory dispatchable capacity must not suppress account fallback"
     );
 
     config.fallback_on_unsupported_model = true;
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::NoModelCompatible,
             0,
             &config,
         ),
-        Some("local_no_model_compatible")
+        Some("account_no_model_compatible")
     );
 
     config.fallback_on_scheduler_redis_degraded = false;
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::SchedulerRedisDegraded,
             1,
             &config,
@@ -10160,24 +10159,24 @@ fn fresh_local_pool_state_blocks_external_while_dispatchable_except_degraded_sta
 #[test]
 fn classified_scheduler_degraded_fallback_is_not_suppressed_by_stale_ready_snapshot() {
     assert_eq!(
-        classified_local_error_route_reason("local_scheduler_redis_degraded"),
-        Some("local_scheduler_redis_degraded")
+        classified_account_error_route_reason("account_scheduler_redis_degraded"),
+        Some("account_scheduler_redis_degraded")
     );
     assert_eq!(
-        classified_local_error_route_reason("local_attempt_reserved_for_fallback"),
-        Some("local_attempt_reserved_for_fallback")
+        classified_account_error_route_reason("account_attempt_reserved_for_fallback"),
+        Some("account_attempt_reserved_for_fallback")
     );
     assert_eq!(
-        classified_local_error_route_reason("unsupported_model"),
+        classified_account_error_route_reason("unsupported_model"),
         Some("unsupported_model")
     );
     assert_eq!(
-        classified_local_error_route_reason("local_capacity_exhausted"),
+        classified_account_error_route_reason("account_capacity_exhausted"),
         None,
         "capacity fallback still uses fresh route state to preserve strict local-first"
     );
     assert_eq!(
-        local_pool_fallback_reason_for_fresh_state(
+        account_fallback_reason_for_fresh_state(
             LocalUpstreamRouteStateKind::Ready,
             1,
             &AccountRuntimeConfig::default(),
@@ -10194,18 +10193,18 @@ fn account_fallback_classifier_gates_unsupported_model() {
         ..Default::default()
     };
     assert_eq!(
-        classify_local_error_for_account_fallback("模型不支持: claude-future", &[], &config,),
+        classify_account_error_for_account_fallback("模型不支持: claude-future", &[], &config,),
         None
     );
 
     config.fallback_on_unsupported_model = true;
     assert_eq!(
-        classify_local_error_for_account_fallback("模型不支持: claude-future", &[], &config,)
+        classify_account_error_for_account_fallback("模型不支持: claude-future", &[], &config,)
             .as_deref(),
         Some("unsupported_model")
     );
     assert_eq!(
-            classify_local_error_for_account_fallback(
+            classify_account_error_for_account_fallback(
                 r#"非流式 API 请求失败: 400 Bad Request {"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#,
                 &[LocalUpstreamCredentialAttempt::new(
                     0,
@@ -10244,7 +10243,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         Some("account_rate_limit")
@@ -10262,7 +10261,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_capacity_exhausted"),
+            Some("account_capacity_exhausted"),
             Some(0),
         ),
         Some("account_rate_limit")
@@ -10271,7 +10270,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_attempt_reserved_for_fallback"),
+            Some("account_attempt_reserved_for_fallback"),
             Some(1),
         ),
         Some("account_rate_limit")
@@ -10292,7 +10291,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &config,
             &timeout,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         Some("account_timeout")
@@ -10313,7 +10312,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &config,
             &capacity,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         Some("account_capacity")
@@ -10334,7 +10333,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &config,
             &bad_request,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         Some("account_bad_request")
@@ -10353,7 +10352,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &direct,
             &rate_limit,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         None
@@ -10365,7 +10364,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &no_rate_limit,
             &rate_limit,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         None
@@ -10377,7 +10376,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &no_capacity,
             &capacity,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         None
@@ -10398,7 +10397,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &no_capacity,
             &server_error,
-            Some("local_transient_exhausted"),
+            Some("account_transient_exhausted"),
             Some(1),
         ),
         None
@@ -10407,7 +10406,7 @@ fn account_local_rescue_classifier_respects_error_type_and_toggles() {
         local_rescue_reason_after_account_error(
             &no_capacity,
             &server_error,
-            Some("local_capacity_exhausted"),
+            Some("account_capacity_exhausted"),
             Some(0),
         ),
         Some("account_error")
@@ -10430,14 +10429,14 @@ fn account_local_rescue_is_blocked_after_terminal_local_route_reasons() {
     };
 
     for reason in [
-        "local_no_credentials",
-        "local_all_disabled",
-        "local_proxy_blocked",
-        "local_no_model_compatible",
-        "local_all_cooling_down",
-        "local_scheduler_redis_degraded",
-        "local_pool_risk_circuit_open",
-        "local_transient_exhausted",
+        "account_no_credentials",
+        "account_all_disabled",
+        "account_proxy_blocked",
+        "account_no_model_compatible",
+        "account_all_cooling_down",
+        "account_scheduler_redis_degraded",
+        "account_risk_circuit_open",
+        "account_transient_exhausted",
         "no_available_credentials",
         "unsupported_model",
     ] {
@@ -10468,7 +10467,7 @@ fn account_local_rescue_waits_for_capacity_based_local_fallbacks() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(1),
         ),
         Some("account_rate_limit")
@@ -10477,7 +10476,7 @@ fn account_local_rescue_waits_for_capacity_based_local_fallbacks() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_capacity_exhausted"),
+            Some("account_capacity_exhausted"),
             Some(1),
         ),
         Some("account_rate_limit")
@@ -10486,7 +10485,7 @@ fn account_local_rescue_waits_for_capacity_based_local_fallbacks() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_attempt_reserved_for_fallback"),
+            Some("account_attempt_reserved_for_fallback"),
             Some(1),
         ),
         Some("account_rate_limit")
@@ -10495,7 +10494,7 @@ fn account_local_rescue_waits_for_capacity_based_local_fallbacks() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_capacity_full"),
+            Some("account_capacity_full"),
             Some(0),
         ),
         Some("account_rate_limit")
@@ -10504,7 +10503,7 @@ fn account_local_rescue_waits_for_capacity_based_local_fallbacks() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_capacity_exhausted"),
+            Some("account_capacity_exhausted"),
             Some(0),
         ),
         Some("account_rate_limit")
@@ -10513,7 +10512,7 @@ fn account_local_rescue_waits_for_capacity_based_local_fallbacks() {
         local_rescue_reason_after_account_error(
             &config,
             &rate_limit,
-            Some("local_attempt_reserved_for_fallback"),
+            Some("account_attempt_reserved_for_fallback"),
             Some(0),
         ),
         Some("account_rate_limit")
@@ -10547,7 +10546,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
             budgeted_local_rescue_reason_after_account_error(
                 &config,
                 &rate_limit,
-                Some("local_capacity_full"),
+                Some("account_capacity_full"),
                 Some(1),
                 &remaining,
             ),
@@ -10566,7 +10565,7 @@ fn local_rescue_requires_remaining_shared_attempt_budget_for_five_rounds() {
             budgeted_local_rescue_reason_after_account_error(
                 &config,
                 &rate_limit,
-                Some("local_capacity_full"),
+                Some("account_capacity_full"),
                 Some(1),
                 &exhausted,
             ),
@@ -10650,7 +10649,7 @@ fn direct_account_policy_disables_local_rescue_for_all_error_classes_five_rounds
                 local_rescue_reason_after_account_error(
                     &config,
                     err,
-                    Some("local_capacity_full"),
+                    Some("account_capacity_full"),
                     Some(1),
                 ),
                 None,
@@ -10663,7 +10662,7 @@ fn direct_account_policy_disables_local_rescue_for_all_error_classes_five_rounds
                 budgeted_local_rescue_reason_after_account_error(
                     &config,
                     err,
-                    Some("local_capacity_full"),
+                    Some("account_capacity_full"),
                     Some(1),
                     &budget,
                 ),
@@ -10706,7 +10705,7 @@ fn direct_account_route_subtype_blocks_local_rescue_even_without_global_direct_f
                     route_subtype,
                     &config,
                     &server_error,
-                    Some("local_capacity_full"),
+                    Some("account_capacity_full"),
                     Some(4),
                 ),
                 None,
@@ -10725,7 +10724,7 @@ fn direct_account_route_subtype_blocks_local_rescue_even_without_global_direct_f
                     route_subtype,
                     &config,
                     &server_error,
-                    Some("local_capacity_full"),
+                    Some("account_capacity_full"),
                     Some(4),
                     &budget,
                 ),
@@ -10739,7 +10738,7 @@ fn direct_account_route_subtype_blocks_local_rescue_even_without_global_direct_f
                 UsageRouteSubtype::AccountFallbackAfterLocalAttempts,
                 &config,
                 &server_error,
-                Some("local_capacity_full"),
+                Some("account_capacity_full"),
                 Some(4),
                 &budget,
             ),
@@ -10773,7 +10772,7 @@ fn preflight_account_error_can_rescue_once_then_attempt_budget_blocks_cycle_five
             budgeted_local_rescue_reason_after_account_error(
                 &config,
                 &capacity,
-                Some("local_capacity_full"),
+                Some("account_capacity_full"),
                 Some(1),
                 &budget,
             ),
@@ -10788,7 +10787,7 @@ fn preflight_account_error_can_rescue_once_then_attempt_budget_blocks_cycle_five
             budgeted_local_rescue_reason_after_account_error(
                 &config,
                 &capacity,
-                Some("local_capacity_full"),
+                Some("account_capacity_full"),
                 Some(1),
                 &budget,
             ),

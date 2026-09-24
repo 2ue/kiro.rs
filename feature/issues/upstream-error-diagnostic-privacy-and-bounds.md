@@ -6,7 +6,7 @@ Severity: P0/P1
 
 ## 问题、现象与影响
 
-本地 Kiro provider 已把诊断响应体限制为 1 MiB，但多条普通 API 失败路径仍将完整 body 拼入 warning/error 日志、`KiroCredentialAttempt.error_message`、transient scheduler reason 和最终 provider error。handler 随后可能把该字符串保存为 usage `error_message/error_detail`，管理 UI、数据库和证据归档因此可看到上游返回的 prompt/tool/schema 片段、内部异常或动态 secret。
+本地 Account Runtime provider 已把诊断响应体限制为 1 MiB，但多条普通 API 失败路径仍将完整 body 拼入 warning/error 日志、`Account RuntimeCredentialAttempt.error_message`、transient scheduler reason 和最终 provider error。handler 随后可能把该字符串保存为 usage `error_message/error_detail`，管理 UI、数据库和证据归档因此可看到上游返回的 prompt/tool/schema 片段、内部异常或动态 secret。
 
 该问题不需要 `bashHash...`、`Tool results provided` 或 thinking 指纹。它通常表现为错误详情/日志异常，不是正常 assistant content；但同样违反“不把内部协议和内容带到用户可见/持久化诊断面”的要求。
 
@@ -18,7 +18,7 @@ HTTP 200 JSON exception 和 MCP 已开始使用 fixed classification/body byte c
 
 ## 复现方法
 
-fake Kiro upstream 对每个状态/Content-Type 返回唯一 marker，并让 marker 同时出现在 JSON code/message、plain text、HTML、分块 body 和接近 1 MiB 边界。stream/non-stream、1/20/60 credentials 各 5 轮，捕获：公开响应、DEBUG/INFO/WARN 日志、UsageRecord JSON、credential attempt chain、scheduler state、PostgreSQL/Redis usage snapshot。
+fake Account Runtime upstream 对每个状态/Content-Type 返回唯一 marker，并让 marker 同时出现在 JSON code/message、plain text、HTML、分块 body 和接近 1 MiB 边界。stream/non-stream、1/20/60 credentials 各 5 轮，捕获：公开响应、DEBUG/INFO/WARN 日志、UsageRecord JSON、credential attempt chain、scheduler state、PostgreSQL/Redis usage snapshot。
 
 另测 body read timeout、Content-Length 超限、chunked 超限和 malformed UTF-8；错误后正常请求恢复 5/5。实际 HTTP hits 必须受共享 inference budget 约束，隐私修复不能引入额外读取、重试或账号扫描。
 

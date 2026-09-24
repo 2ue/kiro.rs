@@ -33,10 +33,10 @@ absolute-latency run.
 
 ## Safety And Isolation
 
-- Two real `kiro-rs` processes were started on temporary loopback ports.
+- Two real `account-runtime` processes were started on temporary loopback ports.
 - Both processes shared one isolated PostgreSQL database and one isolated Redis instance through
   Toxiproxy.
-- The Kiro endpoint was a local fake Amazon EventStream server; all credentials and request keys
+- The Account Runtime endpoint was a local fake Amazon EventStream server; all credentials and request keys
   were generated fixtures.
 - No production host, real credential, or real API key was read.
 - Early runs snapshotted `127.0.0.1:9022` before and after every run. That probe is now deprecated for release validation; the current runner must not inspect the existing listener and instead reports `protectedPortProbeSkipped:true` while excluding port 9022 by value.

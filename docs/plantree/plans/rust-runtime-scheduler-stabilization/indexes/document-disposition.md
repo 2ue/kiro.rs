@@ -4,7 +4,7 @@ Last reviewed: 2026-07-28 Asia/Shanghai
 
 Scope:
 
-- 只包含当前项目 `/Users/yuanfeijie/Desktop/procode/kiro.rs` 内的文档。
+- 只包含当前项目 `/Users/yuanfeijie/Desktop/procode/account-runtime` 内的文档。
 - 不扫描整台机器，不处理其他项目文档。
 - 本文已经升级为当前计划的文档处置索引。当前变更迁移了当前有效 TODO 到本 plan，并已按批次归档明确过时的历史分析/旧专题目录；不删除任何文件。
 
@@ -36,8 +36,8 @@ Scope:
   - `docs/plantree/**`：已有长期 plan-tree。
   - `docs/archive/**`：已归档历史文档。
   - `docs/analysis/**`：近期/历史分析混合。
-  - `docs/kiro-rs-root-cause-package-20260726T170519+0800/**`：生产事故证据包。
-  - `docs/archive/kiro-proxy-study-and-optimization-20260626/**`、`docs/archive/scheduler-dispatch-redesign-history/**`：本轮已归档的旧专题研究/计划。
+  - `docs/account-runtime-root-cause-package-20260726T170519+0800/**`：生产事故证据包。
+  - `docs/archive/account-runtime-proxy-study-and-optimization-20260626/**`、`docs/archive/scheduler-dispatch-redesign-history/**`：本轮已归档的旧专题研究/计划。
   - `docs/archive/request-and-protocol-history/**`、`docs/archive/cache-usage-and-production-history/**`、`docs/archive/scheduler-state-external-pool-runtime-history/**`、`docs/archive/external-project-learning-history/**`：本轮已归档的 root-level 历史分析。
   - `feature/issues/**`：当前和历史问题文档。
   - `feature/evidence/**`：可追溯验证证据。
@@ -97,7 +97,7 @@ Scope:
 
 ### 3.3 当前证据包，不应当成未来执行计划
 
-- `docs/kiro-rs-root-cause-package-20260726T170519+0800/**`
+- `docs/account-runtime-root-cause-package-20260726T170519+0800/**`
   - 状态：`current/historical-evidence`
   - 动作：保留为证据包；需要在 plan-tree runtime/scheduler plan 的 history/evidence index 中登记。
   - 不应直接作为“最新设计方案”；设计结论应抽到 issue/todo/plan。
@@ -114,7 +114,7 @@ Scope:
 - `docs/archive/request-body-modularization-20260706/**`
 - `docs/archive/ui-planning-2026-06-to-07/**`
 - `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/**`
-- `docs/archive/kiro-proxy-study-and-optimization-20260626/**`
+- `docs/archive/account-runtime-proxy-study-and-optimization-20260626/**`
 - `docs/archive/scheduler-dispatch-redesign-history/**`
 - `docs/archive/request-and-protocol-history/**`
 - `docs/archive/cache-usage-and-production-history/**`
@@ -128,11 +128,11 @@ Scope:
 | --- | --- | --- |
 | `docs/analysis/slow-first-token-20260629.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/slow-first-token-20260629.md` | archived historical reference |
 | `docs/analysis/prod-slow-first-token-12h-factual-analysis-20260706.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/prod-slow-first-token-12h-factual-analysis-20260706.md` | archived historical production analysis |
-| `docs/analysis/kiro-vs-sub2api-first-token-correlation-20260707.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/kiro-vs-sub2api-first-token-correlation-20260707.md` | archived historical comparison |
+| `docs/analysis/account-runtime-vs-sub2api-first-token-correlation-20260707.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/account-runtime-vs-sub2api-first-token-correlation-20260707.md` | archived historical comparison |
 | `docs/analysis/claude-code-stream-fluidity-and-abrupt-stop-analysis-20260709.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/claude-code-stream-fluidity-and-abrupt-stop-analysis-20260709.md` | archived historical stream-fluidity analysis |
 | `docs/analysis/external-pool-cache-ttl-split-20260708.md` | `docs/archive/cache-usage-and-production-history/external-pool-cache-ttl-split-20260708.md` | archived historical external-pool cache/usage billing analysis |
-| `docs/kiro-proxy-study-20260626/**` | `docs/archive/kiro-proxy-study-and-optimization-20260626/kiro-proxy-study-20260626/**` | archived historical external-project comparison |
-| `docs/kiro-optimization-plans-20260626/**` | `docs/archive/kiro-proxy-study-and-optimization-20260626/kiro-optimization-plans-20260626/**` | archived historical optimization plan and implementation record |
+| `docs/account-runtime-proxy-study-20260626/**` | `docs/archive/account-runtime-proxy-study-and-optimization-20260626/account-runtime-proxy-study-20260626/**` | archived historical external-project comparison |
+| `docs/account-runtime-optimization-plans-20260626/**` | `docs/archive/account-runtime-proxy-study-and-optimization-20260626/account-runtime-optimization-plans-20260626/**` | archived historical optimization plan and implementation record |
 | `docs/scheduler-dispatch/**` | `docs/archive/scheduler-dispatch-redesign-history/scheduler-dispatch/**` | archived historical implemented scheduler strategy |
 | root-level request/protocol history | `docs/archive/request-and-protocol-history/**` | archived historical request/protocol analysis |
 | root-level cache/usage/production history | `docs/archive/cache-usage-and-production-history/**` | archived historical cache/usage/production analysis |
@@ -230,7 +230,7 @@ Status: `done / initial plan root created`
 - 生成 `indexes/document-disposition.md`。
 - 初始覆盖：
   - `docs/analysis/**`
-  - `docs/kiro-rs-root-cause-package-20260726T170519+0800/**`
+  - `docs/account-runtime-root-cause-package-20260726T170519+0800/**`
   - `feature/issues/**`
   - `feature/evidence/**`
   - `docs/*.md` 中旧分析文档。
@@ -253,7 +253,7 @@ Status: `in-progress / first archive batches completed`
 建议批次：
 
 1. `done`: slow-first-token / stream-fluidity 历史。
-2. `done`: 2026-06-26 Kiro proxy study / optimization plans。
+2. `done`: 2026-06-26 Account Runtime proxy study / optimization plans。
 3. `done`: old scheduler-dispatch redesign。
 4. `done`: root-level request/body/protocol 历史。
 5. `done`: scheduler/external-pool/runtime root-level 历史。

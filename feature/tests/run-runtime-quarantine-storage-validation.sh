@@ -12,9 +12,9 @@ postgres_url="${ACCOUNT_RUNTIME_TEST_POSTGRES_URL:-}"
 redis_url="${ACCOUNT_RUNTIME_TEST_REDIS_URL:-}"
 postgres_isolated="${ACCOUNT_RUNTIME_TEST_POSTGRES_ISOLATED:-0}"
 redis_isolated="${ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED:-0}"
-allow_non_loopback="${KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
-outer_rounds="${KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS:-3}"
-scope="${KIRO_RUNTIME_QUARANTINE_STORAGE_SCOPE:-runtime-quarantine-storage-real}"
+allow_non_loopback="${ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
+outer_rounds="${ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS:-3}"
+scope="${ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_SCOPE:-runtime-quarantine-storage-real}"
 
 [[ -n "$postgres_url" ]] || {
   printf 'ACCOUNT_RUNTIME_TEST_POSTGRES_URL is required; no storage test was run\n' >&2
@@ -33,17 +33,17 @@ scope="${KIRO_RUNTIME_QUARANTINE_STORAGE_SCOPE:-runtime-quarantine-storage-real}
   exit 64
 }
 [[ "$outer_rounds" =~ ^[1-9][0-9]*$ ]] && (( outer_rounds <= 5 )) || {
-  printf 'KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS must be between 1 and 5\n' >&2
+  printf 'ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS must be between 1 and 5\n' >&2
   exit 64
 }
 [[ "$scope" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || {
-  printf 'KIRO_RUNTIME_QUARANTINE_STORAGE_SCOPE has an invalid format\n' >&2
+  printf 'ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_SCOPE has an invalid format\n' >&2
   exit 64
 }
 
 ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
 ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
-KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
+ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
 node <<'NODE'
 const net = require('node:net');
 
@@ -79,7 +79,7 @@ function parseTarget(target) {
   const loopback = networkHostname === '127.0.0.1'
     || networkHostname === '::1'
     || networkHostname === 'localhost';
-  if (!loopback && process.env.KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS !== '1') {
+  if (!loopback && process.env.ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS !== '1') {
     throw new Error(`${target.name} requires an explicit non-loopback opt-in`);
   }
   const port = parsed.port === '' ? target.defaultPort : Number(parsed.port);
@@ -127,18 +127,18 @@ NODE
 ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
 ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
 ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
-KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS="$outer_rounds" \
+ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS="$outer_rounds" \
 feature/tests/run-cargo-scoped.sh "$scope" -- \
   env RUSTUP_TOOLCHAIN=1.92.0 \
   ACCOUNT_RUNTIME_TEST_POSTGRES_URL="$postgres_url" \
   ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
   ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
-  KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS="$outer_rounds" \
+  ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS="$outer_rounds" \
   bash -lc '
     set -euo pipefail
     cargo fmt --all -- --check
     git diff --check
-    for ((round = 1; round <= KIRO_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS; round += 1)); do
+    for ((round = 1; round <= ACCOUNT_RUNTIME_RUNTIME_QUARANTINE_STORAGE_OUTER_ROUNDS; round += 1)); do
       printf "runtime-quarantine-storage outer_round=%s\n" "$round"
       cargo test local_upstream_impl::token_manager::manager::tests::postgres_pool_pressure_backlogs_non_terminal_success_without_quarantine_for_five_rounds -- --exact --nocapture --test-threads=1
       cargo test local_upstream_impl::token_manager::manager::tests::postgres_pending_runtime_mutations_replay_in_order_and_unquarantine -- --exact --nocapture --test-threads=1

@@ -307,7 +307,7 @@ current code path. The old red capture remains authoritative for the pre-fix bui
 source shows PgSQL-only dashboard authorities and weighted nearest-rank P95.
 
 Runtime re-execution of the 1..100, weighted, cross-hour, cleanup and plan-shape matrices against
-the corrected build is still pending in this environment because `KIRO_RS_TEST_POSTGRES_URL` is not
+the corrected build is still pending in this environment because `ACCOUNT_RUNTIME_TEST_POSTGRES_URL` is not
 available here.
 
 ## Residual Boundaries

@@ -55,15 +55,15 @@ Date: 2026-07-16
 - 服务只监听 `127.0.0.1:19131/19132/19133`；没有访问 `9022`、`19422` 或生产服务。
 - 凭据、external pool URL/API key 都是不可用 fixture 值，不会发起真实模型请求。
 - 每个版本结束即删除自己的 PostgreSQL/Redis 容器；最终三个服务端口监听数为 0。
-- 没有读取、复制或写入 `kiro_idc_users*.txt`。
+- 没有读取、复制或写入 `account-runtime_idc_users*.txt`。
 
 ## 可执行复现
 
 权威脚本：`feature/tests/postgres-upgrade-v101-v103.sh`。
 
 ```bash
-SMOKE_ROOT=/tmp/kiro-upgrade-smoke-20260716-a \
-CURRENT_BINARY=/tmp/kiro-upgrade-smoke-20260716-a/bin/kiro-rs-current-fixed \
+SMOKE_ROOT=/tmp/account-runtime-upgrade-smoke-20260716-a \
+CURRENT_BINARY=/tmp/account-runtime-upgrade-smoke-20260716-a/bin/account-runtime-current-fixed \
 ROUNDS=3 \
 VERSIONS='v101 v102 v103' \
 RESULT_ROOT="$PWD/target/validation/f04-upgrade-20260716" \

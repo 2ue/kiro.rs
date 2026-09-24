@@ -4,7 +4,7 @@ Status: `source-contract-pass / dynamic-native-gates-still-open`
 
 Date: 2026-07-21
 
-Source authority: current dirty tree on HEAD `401473c` (`v0.0.109`) plus local remediation changes. This evidence is a static source contract only. It does not start Docker, does not start `kiro.rs`, does not call Cargo, and does not invoke Claude Code CLI.
+Source authority: current dirty tree on HEAD `401473c` (`v0.0.109`) plus local remediation changes. This evidence is a static source contract only. It does not start Docker, does not start `account-runtime`, does not call Cargo, and does not invoke Claude Code CLI.
 
 ## Purpose
 
@@ -81,7 +81,7 @@ It also proves the old “tool result textified into prose” class is not activ
 
 This does not close release-blocking dynamic gates:
 
-- real native Kiro upstream;
+- real native Account Runtime upstream;
 - Claude Code CLI active/passive thinking long sessions;
 - WebSearch/MCP/image/agent native capability matrix;
 - 429/500/partial/malformed EventStream recovery;

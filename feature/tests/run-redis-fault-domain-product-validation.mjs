@@ -16,7 +16,7 @@ const OBSERVABILITY_URL = requiredEnvironment('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAI
 const ISOLATED = process.env.ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED === '1'
 const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS', 3, 1, 5)
 const SCOPE = String(process.env.ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE || 'redis-fault-domain-product')
-const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-redis-fault-domain-product-${process.pid}-`))
+const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `account-runtime-redis-fault-domain-product-${process.pid}-`))
 
 const ACTIVE_CHILDREN = new Set()
 const PROXIES = new Set()

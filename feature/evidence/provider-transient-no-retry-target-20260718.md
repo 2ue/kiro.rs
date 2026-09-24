@@ -20,7 +20,7 @@ that can wait for cooldown/capacity.
 Command:
 
 ```bash
-env KIRO_VALIDATION_RESERVE_KIB=10485760 \
+env ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB=10485760 \
   feature/tests/run-cargo-scoped.sh all-target-tests-20260718-r1-devreserve -- \
   env RUSTUP_TOOLCHAIN=1.92.0 bash -lc 'cargo test --all-targets'
 ```
@@ -28,7 +28,7 @@ env KIRO_VALIDATION_RESERVE_KIB=10485760 \
 Result:
 
 ```text
-FAILED: kiro::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded
+FAILED: account-runtime::provider::tests::provider_transport_and_body_fault_matrix_is_private_typed_and_bounded
 panic: provider failure call timed out: provider_header_timeout
 1723 passed; 1 failed; 6 ignored
 scoped target size_kib=1688040 removed=true reservation_released=true
@@ -39,7 +39,7 @@ for the default 12 GiB reservation plus 20 GiB floor. This is not a release gate
 
 ## Fix
 
-Changed `KiroProvider::maybe_exclude_after_transient_failure` to return whether a retry target is
+Changed `Account RuntimeProvider::maybe_exclude_after_transient_failure` to return whether a retry target is
 actually available after the transient failure is recorded.
 
 Applied that return value to API and MCP transient branches:
@@ -67,7 +67,7 @@ scenario=<scenario> stream=<bool> pool=<n> round=<n>
 Focused provider fault matrix:
 
 ```bash
-env KIRO_VALIDATION_RESERVE_KIB=7340032 \
+env ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB=7340032 \
   feature/tests/run-cargo-scoped.sh provider-fault-focused-20260718-r2-dev7g -- \
   env RUSTUP_TOOLCHAIN=1.92.0 \
   bash -lc 'cargo test provider_transport_and_body_fault_matrix_is_private_typed_and_bounded -- --nocapture --test-threads=1'
@@ -84,7 +84,7 @@ scoped target size_kib=1696156 removed=true reservation_released=true
 Static all-target check:
 
 ```bash
-env KIRO_VALIDATION_RESERVE_KIB=7340032 \
+env ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB=7340032 \
   feature/tests/run-cargo-scoped.sh provider-retry-target-check-20260718-r6-dev7g -- \
   env RUSTUP_TOOLCHAIN=1.92.0 bash -lc 'cargo fmt --all -- --check && cargo check --all-targets'
 ```
@@ -99,7 +99,7 @@ scoped target size_kib=447308 removed=true reservation_released=true
 Full all-target development pass:
 
 ```bash
-env KIRO_VALIDATION_RESERVE_KIB=7340032 \
+env ACCOUNT_RUNTIME_VALIDATION_RESERVE_KIB=7340032 \
   feature/tests/run-cargo-scoped.sh all-target-tests-20260718-r2-dev7g -- \
   env RUSTUP_TOOLCHAIN=1.92.0 bash -lc 'cargo test --all-targets'
 ```
@@ -108,7 +108,7 @@ Result:
 
 ```text
 src/main.rs unit tree: 1724 passed; 0 failed; 6 ignored; finished in 291.45s
-src/bin/kiro_loadtest.rs unit tree: 27 passed; 0 failed; finished in 2.01s
+src/bin/account_runtime_loadtest.rs unit tree: 27 passed; 0 failed; finished in 2.01s
 scoped target size_kib=1696704 removed=true reservation_released=true
 ```
 
@@ -134,7 +134,7 @@ floor after root target cleanup. These Rust runs therefore used a reduced develo
 of 7-10 GiB and must not be recorded as final release gates.
 
 No Docker-backed dynamic storage tests were run. No production or `127.0.0.1:9022` service was
-touched. `kiro_idc_users*.txt` files were not read or staged.
+touched. `account-runtime_idc_users*.txt` files were not read or staged.
 
 Final release still requires a frozen binary, default-reservation C0, real isolated PG/Redis
 storage runners, C1-C4 Claude CLI gates, L1-L5 load/chaos, browser gates, upgrade smoke, inventory

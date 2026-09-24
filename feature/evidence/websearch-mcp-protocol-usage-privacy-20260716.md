@@ -30,7 +30,7 @@ Status: `focused-pass / native-cli-gate-open / auxiliary-attribution-open`
 - Claude Code CLI：`2.1.197`，本轮只记录版本，没有把 MCP fake fixture 写成 native CLI pass。
 - 上游：进程内 fake MCP/fake inference，随机监听端口，80 个假 credential。
 - 未访问、重启或修改 `127.0.0.1:9022`。
-- 未读取或修改任何 `kiro_idc_users*.txt`。
+- 未读取或修改任何 `account-runtime_idc_users*.txt`。
 - 无真实 token、cookie、Authorization、账号或生产服务调用。
 
 ## 修复前红项
@@ -40,7 +40,7 @@ Status: `focused-pass / native-cli-gate-open / auxiliary-attribution-open`
 红测：
 
 ```bash
-cargo test --bin kiro-rs \
+cargo test --bin account-runtime \
   latest_user_turn_without_text_never_reuses_a_stale_query_for_five_rounds \
   -- --nocapture --test-threads=1
 ```
@@ -59,7 +59,7 @@ right: None
 红测：
 
 ```bash
-cargo test --bin kiro-rs \
+cargo test --bin account-runtime \
   websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds \
   -- --nocapture --test-threads=1
 ```
@@ -83,7 +83,7 @@ right: 1
 命令：
 
 ```bash
-cargo test --bin kiro-rs anthropic::websearch::tests:: \
+cargo test --bin account-runtime anthropic::websearch::tests:: \
   -- --nocapture --test-threads=1
 ```
 
@@ -106,7 +106,7 @@ cargo test --bin kiro-rs anthropic::websearch::tests:: \
 命令：
 
 ```bash
-cargo test --bin kiro-rs anthropic::handlers::tests::websearch_ \
+cargo test --bin account-runtime anthropic::handlers::tests::websearch_ \
   -- --nocapture --test-threads=1
 ```
 
@@ -147,11 +147,11 @@ header/body cancel 扩展后的最终运行：`8/8`，测试体 `12.06s`，wall 
 命令与结果：
 
 ```text
-cargo test --bin kiro-rs websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds -- --nocapture --test-threads=1
 初次 body-only：PASS 1/1；内部 5/5；test 0.71s；wall 76.2s，其中约 74s 为 build lock/编译
 扩展 header/body 后：PASS 1/1；内部 10/10；test 0.56s；wall 66.4s，其中约 64s 为编译
 
-cargo test --bin kiro-rs mcp_attribution_sink -- --nocapture --test-threads=1
+cargo test --bin account-runtime mcp_attribution_sink -- --nocapture --test-threads=1
 PASS 1/1；内部 5/5；test <0.01s；wall 1.3s
 ```
 
@@ -162,9 +162,9 @@ PASS 1/1；内部 5/5；test <0.01s；wall 1.3s
 命令：
 
 ```bash
-cargo test --bin kiro-rs anthropic::inference_attempt_budget::tests:: \
+cargo test --bin account-runtime anthropic::inference_attempt_budget::tests:: \
   -- --nocapture --test-threads=1
-cargo test --bin kiro-rs kiro::provider::tests::mcp_ \
+cargo test --bin account-runtime account-runtime::provider::tests::mcp_ \
   -- --nocapture --test-threads=1
 ```
 
@@ -196,7 +196,7 @@ PASS；Vite build 7.60s；存在既有 >500 kB chunk warning
 (cd admin-ui && npm run build)
 PASS；Vite build 7.08s
 
-CARGO_TARGET_DIR=/tmp/kiro-rs-protocol-matrix-target cargo check --all-targets
+CARGO_TARGET_DIR=/tmp/account-runtime-protocol-matrix-target cargo check --all-targets
 PASS；111.6s clean compile；0 warning
 ```
 

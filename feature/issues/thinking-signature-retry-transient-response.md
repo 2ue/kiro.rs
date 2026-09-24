@@ -52,7 +52,7 @@ thinking_signature_retry_failed upstream_status=500 body_bytes=202: 14
 
 ## 根因
 
-`src/kiro/provider.rs::call_api_with_retry` 在处理 `THINKING_SIGNATURE_INVALID` 时有一个兼容 retry 分支：
+`src/local_upstream_impl/provider.rs::call_api_with_retry` 在处理 `THINKING_SIGNATURE_INVALID` 时有一个兼容 retry 分支：
 
 1. 首次正式请求返回 `400 {"reason":"THINKING_SIGNATURE_INVALID"}`；
 2. provider 构造移除历史 reasoningContent 的 retry body；
@@ -84,7 +84,7 @@ public_status=502
 
 在签名 retry 第二响应读 body 后，按普通 provider 响应分类：
 
-- `400 THINKING_SIGNATURE_INVALID`：保持 `KiroCallFailureKind::ThinkingSignatureInvalid`，不 fallback，不冷却。
+- `400 THINKING_SIGNATURE_INVALID`：保持 `Account RuntimeCallFailureKind::ThinkingSignatureInvalid`，不 fallback，不冷却。
 - `408/429/5xx`：
   - 使用 `api_failure_diagnostic` 生成普通 `class=timeout/rate_limit/server_error`；
   - 调用 `token_manager.report_transient_failure_kind(...)` 写入对应 transient cooldown；
@@ -98,7 +98,7 @@ public_status=502
 
 ## 代码变更
 
-- [src/kiro/provider.rs](/Users/yuanfeijie/Desktop/procode/kiro.rs/src/kiro/provider.rs)
+- [src/local_upstream_impl/provider.rs](/Users/yuanfeijie/Desktop/procode/account-runtime/src/local_upstream_impl/provider.rs)
   - 签名 retry 第二响应新增 `retry_after` 提取。
   - 第二响应 `408/429/5xx` 改为普通 transient 分类与冷却。
   - 第二响应其他 client error 改为普通 invalid request。
@@ -108,7 +108,7 @@ public_status=502
 
 最小复现不需要真实上游：
 
-1. fake Kiro upstream 第一次返回：
+1. fake Account Runtime upstream 第一次返回：
 
 ```json
 {"reason":"THINKING_SIGNATURE_INVALID"}

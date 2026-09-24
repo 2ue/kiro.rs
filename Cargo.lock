@@ -3,6 +3,46 @@
 version = 4
 
 [[package]]
+name = "account-runtime"
+version = "0.0.149"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "crc",
+ "fastrand",
+ "flate2",
+ "futures",
+ "hex",
+ "http",
+ "http-body",
+ "mime_guess",
+ "once_cell",
+ "parking_lot",
+ "pdf-extract",
+ "redis",
+ "regex",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1200,46 +1240,6 @@ checksum = "464a3709c7f55f1f721e5389aa6ea4e3bc6aba669353300af094b29ffbdde1d8"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "kiro-rs"
-version = "0.0.149"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "crc",
- "fastrand",
- "flate2",
- "futures",
- "hex",
- "http",
- "http-body",
- "mime_guess",
- "once_cell",
- "parking_lot",
- "pdf-extract",
- "redis",
- "regex",
- "reqwest",
- "rust-embed",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "subtle",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
 ]
 
 [[package]]

@@ -1880,14 +1880,14 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
 function normalizeCacheStrategyType(
   cacheType?: CacheRoutePolicyPatch['cacheType']
 ): CacheRoutePolicyPatch['cacheType'] {
-  return cacheType === 'kiro_rs_tool' ? 'claude_code_tool' : cacheType
+  return cacheType
 }
 
 function normalizeCacheRoutePolicyPatch(policy?: CacheRoutePolicyPatch): CacheRoutePolicyPatch {
   const source = policy ?? {}
-  const { kiroRsTool: _legacyClaudeCodeTool, ...rest } = source
+  const { claudeCodeTool: _legacyClaudeCodeTool, ...rest } = source
   const cacheType = normalizeCacheStrategyType(source.cacheType)
-  const claudeCodeTool = source.claudeCodeTool ?? source.kiroRsTool
+  const claudeCodeTool = source.claudeCodeTool
   return {
     ...rest,
     ...(cacheType ? { cacheType } : {}),
@@ -1896,7 +1896,7 @@ function normalizeCacheRoutePolicyPatch(policy?: CacheRoutePolicyPatch): CacheRo
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.claudeCodeTool && !policy.kiroRsTool
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.claudeCodeTool
 }
 
 function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -1914,7 +1914,7 @@ function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
   return {
     default: normalizeCacheRoutePolicyPatch(source.default),
     currentHighCache: normalizeCacheRoutePolicyPatch(source.currentHighCache),
-    claudeCodeTool: normalizeCacheRoutePolicyPatch(source.claudeCodeTool ?? source.kiroRsTool),
+    claudeCodeTool: normalizeCacheRoutePolicyPatch(source.claudeCodeTool),
     pathOverrides,
   }
 }

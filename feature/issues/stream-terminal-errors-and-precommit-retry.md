@@ -14,7 +14,7 @@ Last updated: 2026-08-07
 
 ## 当前协议所有权
 
-标准 `HTTP 200 + application/json` exception 现在由 `KiroProvider` 在把 body 交给 EventStream handler 前识别、分类和有限换号：
+标准 `HTTP 200 + application/json` exception 现在由 `Account RuntimeProvider` 在把 body 交给 EventStream handler 前识别、分类和有限换号：
 
 - 双账号 fixture 使用 `credential_retry_max_attempts=2`，第一次 typed JSON exception 后换另一账号，第二次成功。
 - 单账号 fixture 使用 `credential_retry_max_attempts=1`，只发一次并返回 typed 429。
@@ -26,7 +26,7 @@ Last updated: 2026-08-07
 
 ## 2026-08-06 外部池流式首语义输出前错误子问题
 
-本文件原先主要覆盖本地 Kiro/AWS EventStream handler 的 precommit retry 和 postcommit fail-closed。2026-08-06 新增的现网问题来自外部池 `event_passthrough` / SSE 路径：
+本文件原先主要覆盖本地 Account Runtime/AWS EventStream handler 的 precommit retry 和 postcommit fail-closed。2026-08-06 新增的现网问题来自外部池 `event_passthrough` / SSE 路径：
 
 - 页面样本：`req_01KaWrDY5oZkY13XQqdJB9PH`，入口 `/cc/v1/messages`，路由 `外部直连 · external_pool · external_direct_policy`，外部账号 `#18 yuenan-1`，状态 `流错误`，错误阶段 `external_account_stream`，内部错误信息 `external upstream emitted an error event`，客户端状态码 `200`。
 - 真实采样：`yuenan` stream `12` 次中 `5` 次为空回/协议前置流错误，`7` 次正常；`yuenan-1` stream `12` 次中 `2` 次为空回/协议前置流错误，`10` 次正常。两个池 non-stream 各 `5/5` 成功。
@@ -65,7 +65,7 @@ focused validation 已通过，但 final release gate 仍未关闭：
 - 正常外部 stream：`external_pool_stream_` 在显式注入本地 Docker PgSQL/Redis 后 `6 passed`，覆盖 pre-output 恢复、禁用开关和 post-commit 不重放。
 - 正常外部 non-stream / stream usage：OpenAI-compatible non-stream usage、stream billing、raw-vs-shaped usage separation、clean non-stream byte identity、missing usage estimate 共 6 个 targeted 测试通过。
 - 正常本地 stream/non-stream：`stream_success_records_requested_max_tokens_and_downstream_stop_reason` 与 `local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds` 通过。
-- 外部 direct 正常 stream/non-stream：`normalized_external_direct_policy_skips_raw_preparse_without_raw_pool` 已扩展为同时覆盖 `stream=false` / `stream=true`，断言 route subtype 为 `external_direct_policy`、模型发出值为 `claude-opus-4.6`、外部尝试为 1、本地 Kiro upstream hit 为 0。
+- 外部 direct 正常 stream/non-stream：`normalized_external_direct_policy_skips_raw_preparse_without_raw_pool` 已扩展为同时覆盖 `stream=false` / `stream=true`，断言 route subtype 为 `external_direct_policy`、模型发出值为 `claude-opus-4.6`、外部尝试为 1、本地 Account Runtime upstream hit 为 0。
 - 本地优先/外部 fallback/rescue 配置：`external_fallback`、`direct_external`、`local_pool_preflight_reason`、`local_external_fallback_capacity_gate`、`fresh_local_pool_state`、`classified_scheduler_degraded`、`external_local_rescue`、`local_rescue_requires` 等 focused 组合通过。
 - Router 级正常路径：normalized external preflight stream/non-stream、scheduler failure 后 external fallback、WebSearch stream/non-stream success、stream completion/client drop usage ownership、route config authority 矩阵均通过。
 - 最终 `cargo check --all-targets --locked`、`cargo fmt --all -- --check`、`git diff --check` 和 build artifact inventory 均通过。
@@ -75,7 +75,7 @@ focused validation 已通过，但 final release gate 仍未关闭：
   - `normal-routing-static-final-20260807`：`cargo +1.92.0 fmt --all -- --check` 与 `cargo +1.92.0 check --all-targets --locked` 通过。
   - `git diff --check`、feature docs、artifact inventory、`pnpm --dir ui check/build`、`pnpm --dir admin-ui build` 通过；本机 pnpm 为 `10.33.4`，因此该前端结果是本地复验，不替代 baseline pnpm `11.11.0` CI gate。
 
-2026-08-07 最终冻结候选动态 gate 也已通过：`kiro-rs` SHA-256 `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688`，`kiro_loadtest` SHA-256 `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d`；真实 Claude Code CLI `2.1.221` fake-upstream gate 为 bare `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire rerun `60/60`；load/chaos 为 L3 `9/9`、L4 `12/12`、L5 `900s` soak `6820/6820` success，`300s` idle 后 RSS/FD 回落并通过 post-soak recovery。生产 rollout 观察和必要的 `yuenan` / `yuenan-1` 复核仍留给发布后执行；本状态不冒领生产观察。详细实现/验证状态见 [外部池流式首语义输出前错误恢复](../../docs/plantree/plans/rust-runtime-scheduler-stabilization/topics/external-pool-stream-pre-output-retry-20260806.md)。采样摘要见 [Yuenan stream-error sampling 2026-08-06](../evidence/external-pool-stream-error-yuenan-sampling-20260806.md)，focused/final candidate evidence 见 [External-pool stream pre-output retry focused validation 2026-08-06](../evidence/external-pool-stream-pre-output-retry-validation-20260806.md)。
+2026-08-07 最终冻结候选动态 gate 也已通过：`account-runtime` SHA-256 `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688`，`account_runtime_loadtest` SHA-256 `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d`；真实 Claude Code CLI `2.1.221` fake-upstream gate 为 bare `20/20`、long-session `5 sessions / 110 turns / 100 tool pairs / leakMatches=0`、thinking-wire rerun `60/60`；load/chaos 为 L3 `9/9`、L4 `12/12`、L5 `900s` soak `6820/6820` success，`300s` idle 后 RSS/FD 回落并通过 post-soak recovery。生产 rollout 观察和必要的 `yuenan` / `yuenan-1` 复核仍留给发布后执行；本状态不冒领生产观察。详细实现/验证状态见 [外部池流式首语义输出前错误恢复](../../docs/plantree/plans/rust-runtime-scheduler-stabilization/topics/external-pool-stream-pre-output-retry-20260806.md)。采样摘要见 [Yuenan stream-error sampling 2026-08-06](../evidence/external-pool-stream-error-yuenan-sampling-20260806.md)，focused/final candidate evidence 见 [External-pool stream pre-output retry focused validation 2026-08-06](../evidence/external-pool-stream-pre-output-retry-validation-20260806.md)。
 
 首次远端 `v0.0.134` tag 发布触发的 GitHub Actions `Publish Docker Images #165` 在 `quality / Frontend and Rust quality gate` 失败，原因是新增代码触发 Clippy baseline bucket：`ExternalPoolStreamRetryMode` 的手写 `Default` 和 SSE commit classifier 的单分支 `match`。本轮已用无行为变化的 lint 修复恢复 release-quality baseline，`feature/tests/run-cargo-scoped.sh release-clippy-baseline-fix-20260807 -- rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs` 通过，当前 `813 <= 849`。
 

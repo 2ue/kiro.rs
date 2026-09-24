@@ -1,7 +1,7 @@
 services:
-  kiro-rs:
-    image: ${KIRO_RS_IMAGE:-ghcr.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
-    container_name: kiro-rs
+  account-runtime:
+    image: ${ACCOUNT_RUNTIME_IMAGE:-ghcr.io/2ue/account-runtime}:${ACCOUNT_RUNTIME_VERSION:-latest}
+    container_name: account-runtime
     restart: unless-stopped
     ports:
       - "${ACCOUNT_RUNTIME_PORT:-8990}:8990"

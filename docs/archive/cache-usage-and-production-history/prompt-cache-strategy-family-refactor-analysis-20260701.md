@@ -4,11 +4,11 @@
 
 范围：仅分析和方案设计，不做实现代码修改。
 
-这份文档修正前一版分析里的一个重点：不是“当前策略参数化，`Kiro-RS-Tool` 策略硬编码”。正确方向应该是：
+这份文档修正前一版分析里的一个重点：不是“当前策略参数化，`Account Runtime-RS-Tool` 策略硬编码”。正确方向应该是：
 
 - 所有缓存策略都参数化。
 - 当前策略是策略族 A。
-- `Kiro-RS-Tool` 是策略族 B。
+- `Account Runtime-RS-Tool` 是策略族 B。
 - A-1、A-2、B-1、B-2 是同一策略族下不同参数实例或 preset。
 - 路径只绑定“某个策略实例”，而不是直接散落一堆参数。
 
@@ -24,7 +24,7 @@
 2. 当前策略继续存在，但它也要修正明显问题：
    - 第一次请求不能对外显示 cache read。
    - 缓存 scope 改成基于会话，不考虑凭证、模型等维度。
-3. `Kiro-RS-Tool` 作为另一种策略族加入。
+3. `Account Runtime-RS-Tool` 作为另一种策略族加入。
 4. 所有策略族都有自己的参数模型。
 5. 路由只选择策略实例，比如：
    - `/cc/v1/messages` 用 `B-1`
@@ -164,7 +164,7 @@ external pool 构造 scope 的地方：
 - 同一会话换模型不命中。
 - 不同 route namespace 不命中。
 
-你这次明确要求：当前缓存策略也要改成“基于会话做缓存，不考虑凭证、模型等”。所以 scope 需要收敛，不只是 `Kiro-RS-Tool` 策略要改。
+你这次明确要求：当前缓存策略也要改成“基于会话做缓存，不考虑凭证、模型等”。所以 scope 需要收敛，不只是 `Account Runtime-RS-Tool` 策略要改。
 
 ---
 
@@ -189,10 +189,10 @@ A-1 = current_weighted + 默认参数
 A-2 = current_weighted + 更保守参数
 A-test = current_weighted + 小 bounds + raw usage
 
-B = kiro_rs_tool
-B-1 = kiro_rs_tool + 默认参数
-B-2 = kiro_rs_tool + 更小容量 + 关闭动态 system 跳过
-B-test = kiro_rs_tool + 低 TTL + 测试容量
+B = account_runtime_tool
+B-1 = account_runtime_tool + 默认参数
+B-2 = account_runtime_tool + 更小容量 + 关闭动态 system 跳过
+B-test = account_runtime_tool + 低 TTL + 测试容量
 ```
 
 这样后面再加策略 C，不会继续污染 A/B 的参数。
@@ -201,7 +201,7 @@ B-test = kiro_rs_tool + 低 TTL + 测试容量
 
 策略 B 不能硬编码。
 
-`Kiro-RS-Tool` 风格也应该有参数，例如：
+`Account Runtime-RS-Tool` 风格也应该有参数，例如：
 
 - scope 使用 session-only 还是 session-then-client-key。
 - 是否跳过动态 system prelude。
@@ -270,7 +270,7 @@ src/anthropic/prompt_cache/
   strategies/
     mod.rs
     current_weighted.rs
-    kiro_rs_tool.rs
+    account_runtime_tool.rs
 ```
 
 ### 4.1 `types.rs`
@@ -359,7 +359,7 @@ conversation_id = session id
 ```rust
 pub enum PromptCacheProfileFamily {
     CurrentWeighted,
-    KiroRsTool,
+    Account RuntimeRsTool,
 }
 ```
 
@@ -500,16 +500,16 @@ scope = PromptCacheScopePolicy::SessionOnly
 
 注意：这会改变当前缓存命中范围。既然用户明确要求“不考虑凭证、模型等”，这里应写成目标行为，同时在实施时用测试保护。
 
-### 4.9 `strategies/kiro_rs_tool.rs`
+### 4.9 `strategies/account_runtime_tool.rs`
 
 策略 B。
 
 参数模型建议：
 
 ```rust
-pub struct KiroRsToolCacheParams {
+pub struct Account RuntimeRsToolCacheParams {
     pub enabled: bool,
-    pub scope: KiroRsToolScopePolicy,
+    pub scope: Account RuntimeRsToolScopePolicy,
     pub include_model_in_hash: bool,
     pub include_tool_choice_in_hash: bool,
     pub include_route_namespace: bool,
@@ -591,7 +591,7 @@ persistence = disabled first version
       }
     },
     "toolB": {
-      "family": "kiro_rs_tool",
+      "family": "account_runtime_tool",
       "preset": "default",
       "params": {
         "scope": {
@@ -604,7 +604,7 @@ persistence = disabled first version
       }
     },
     "toolBTest": {
-      "family": "kiro_rs_tool",
+      "family": "account_runtime_tool",
       "preset": "default",
       "params": {
         "scope": {
@@ -620,7 +620,7 @@ persistence = disabled first version
     "defaultStrategy": "defaultA",
     "pathStrategies": {
       "/cc/v1/messages": "toolB",
-      "/test/kiro-cache": "toolBTest"
+      "/test/account-runtime-cache": "toolBTest"
     }
   }
 }
@@ -675,10 +675,10 @@ current_weighted/test_small_bounds
 策略 B：
 
 ```text
-kiro_rs_tool/default
-kiro_rs_tool/session_only
-kiro_rs_tool/session_then_client_key
-kiro_rs_tool/test_small_bounds
+account_runtime_tool/default
+account_runtime_tool/session_only
+account_runtime_tool/session_then_client_key
+account_runtime_tool/test_small_bounds
 ```
 
 解析规则：
@@ -756,7 +756,7 @@ PromptCacheScopePolicy::SessionOnly {
 
 策略 A 可以继续使用这个 stable conversation id，因为它是当前项目已有行为。
 
-策略 B 如果要严格对齐 `Kiro-RS-Tool`，则不应该使用这个 fallback，而应使用 `_session_` 或 client key fallback。
+策略 B 如果要严格对齐 `Account Runtime-RS-Tool`，则不应该使用这个 fallback，而应使用 `_session_` 或 client key fallback。
 
 ### 6.3 route namespace 是否保留
 
@@ -799,7 +799,7 @@ includeStrategyNamespace = true
 
 ---
 
-## 7. 策略 B：Kiro-RS-Tool 参数化设计
+## 7. 策略 B：Account Runtime-RS-Tool 参数化设计
 
 ### 7.1 策略 B 的算法目标
 
@@ -814,18 +814,18 @@ includeStrategyNamespace = true
 5. 不做 targetReadRatio。
 6. 不做 tokenScale。
 7. 不做 reportedUsage 采样。
-8. 可选支持 `Kiro-RS-Tool` 的动态 system 跳过。
+8. 可选支持 `Account Runtime-RS-Tool` 的动态 system 跳过。
 
 ### 7.2 策略 B 参数
 
 建议：
 
 ```rust
-pub struct KiroRsToolStrategyParams {
+pub struct Account RuntimeRsToolStrategyParams {
     pub enabled: bool,
-    pub scope: KiroRsToolScopeParams,
-    pub fingerprint: KiroRsToolFingerprintParams,
-    pub accounting: KiroRsToolAccountingParams,
+    pub scope: Account RuntimeRsToolScopeParams,
+    pub fingerprint: Account RuntimeRsToolFingerprintParams,
+    pub accounting: Account RuntimeRsToolAccountingParams,
     pub bounds: CacheBoundsPolicy,
     pub persistence: PromptCachePersistencePolicy,
 }
@@ -834,12 +834,12 @@ pub struct KiroRsToolStrategyParams {
 #### scope 参数
 
 ```rust
-pub struct KiroRsToolScopeParams {
-    pub mode: KiroRsToolScopeMode,
+pub struct Account RuntimeRsToolScopeParams {
+    pub mode: Account RuntimeRsToolScopeMode,
     pub include_strategy_namespace: bool,
 }
 
-pub enum KiroRsToolScopeMode {
+pub enum Account RuntimeRsToolScopeMode {
     SessionThenClientKey,
     SessionOnly,
     ClientKeyOnly,
@@ -855,7 +855,7 @@ SessionThenClientKey
 #### fingerprint 参数
 
 ```rust
-pub struct KiroRsToolFingerprintParams {
+pub struct Account RuntimeRsToolFingerprintParams {
     pub skip_dynamic_system_before_cache_control: bool,
     pub include_model: bool,
     pub include_tool_choice: bool,
@@ -875,7 +875,7 @@ ignore_volatile_ids = true
 #### accounting 参数
 
 ```rust
-pub struct KiroRsToolAccountingParams {
+pub struct Account RuntimeRsToolAccountingParams {
     pub split_against_total: bool,
     pub commit_on_success_only: bool,
     pub forbid_first_miss_read: bool,
@@ -919,11 +919,11 @@ enabled = false
 {
   "promptCacheStrategies": {
     "B-1": {
-      "family": "kiro_rs_tool",
+      "family": "account_runtime_tool",
       "preset": "default"
     },
     "B-2": {
-      "family": "kiro_rs_tool",
+      "family": "account_runtime_tool",
       "preset": "default",
       "params": {
         "scope": {
@@ -935,12 +935,12 @@ enabled = false
       }
     },
     "B-persistent-test": {
-      "family": "kiro_rs_tool",
+      "family": "account_runtime_tool",
       "preset": "default",
       "params": {
         "persistence": {
           "enabled": true,
-          "path": "cache_dir/prompt_cache_kiro_tool.json",
+          "path": "cache_dir/prompt_cache_account-runtime_tool.json",
           "flushIntervalSecs": 60,
           "maxFileBytes": 10485760
         }
@@ -1146,7 +1146,7 @@ pub struct PromptCacheStrategyConfig {
 #[serde(tag = "family", rename_all = "snake_case")]
 pub enum PromptCacheStrategyConfig {
     CurrentWeighted(CurrentWeightedStrategyConfig),
-    KiroRsTool(KiroRsToolStrategyConfig),
+    Account RuntimeRsTool(Account RuntimeRsToolStrategyConfig),
 }
 ```
 
@@ -1154,7 +1154,7 @@ pub enum PromptCacheStrategyConfig {
 
 ### 阶段 6：实现策略 B
 
-实现 `kiro_rs_tool`。
+实现 `account_runtime_tool`。
 
 复用：
 
@@ -1258,7 +1258,7 @@ scope namespace = strategy instance id
 3. 引入策略实例注册表，让 A-1/A-2/B-1/B-2 都是配置实例。
 4. 修复 first-read 伪读，作为全局不变量。
 5. 把策略 A 默认 scope 改为 session-only，同时保留 legacy scope 参数用于回滚。
-6. 新增策略 B：`kiro_rs_tool`，参数化实现，不复用 A 的 target ratio / amplification / reported usage。
+6. 新增策略 B：`account_runtime_tool`，参数化实现，不复用 A 的 target ratio / amplification / reported usage。
 7. 路由绑定策略实例，而不是直接绑定散参数。
 
 一句话：
@@ -1378,7 +1378,7 @@ return !policy.simulation
       "preset": "default"
     },
     "B-1": {
-      "family": "kiro_rs_tool",
+      "family": "account_runtime_tool",
       "preset": "default"
     }
   },
@@ -1474,7 +1474,7 @@ path -> strategy id -> resolved strategy
 建议新增：
 
 ```ts
-export type PromptCacheStrategyFamily = 'current_weighted' | 'kiro_rs_tool'
+export type PromptCacheStrategyFamily = 'current_weighted' | 'account_runtime_tool'
 
 export interface PromptCacheStrategyConfig {
   family: PromptCacheStrategyFamily
@@ -1559,7 +1559,7 @@ cachePolicy: normalizeCachePolicy(draft.cachePolicy)
 显示：
 
 - 策略实例 ID。
-- 策略族：`current_weighted` / `kiro_rs_tool`。
+- 策略族：`current_weighted` / `account_runtime_tool`。
 - preset。
 - 参数摘要。
 - 被哪些路径引用。
@@ -1573,7 +1573,7 @@ A-1
   使用路径：/v1/messages, /ha
 
 B-1
-  类型：Kiro-RS-Tool
+  类型：Account Runtime-RS-Tool
   参数：scope=session_then_client_key, skipDynamicSystem=true
   使用路径：/cc/v1/messages
 ```

@@ -15,7 +15,7 @@ The repository is currently a binary crate. `src/main.rs` declares the top-level
 src/
   main.rs                 process composition and lifecycle
   anthropic/              downstream Anthropic/Claude Code compatibility
-  kiro/                   upstream Kiro protocol, transport, and credential scheduling
+  account-runtime/                   upstream Account Runtime protocol, transport, and credential scheduling
   external_pool.rs        external compatible pool orchestration
   external_pool/          extracted external body/model/retry/usage stages
   admin/                  Admin API, service, middleware, DTOs
@@ -25,7 +25,7 @@ src/
   common/                 shared request authentication
   http_client.rs          outbound serialization/compression helpers
   token.rs                local and optional remote token counting
-  bin/kiro_loadtest.rs    fake upstream plus load/chaos driver
+  bin/account_runtime_loadtest.rs    fake upstream plus load/chaos driver
 ```
 
 The project contains real submodules and is not literally unmodularized. The main issue is that dependency ownership remains broad: several extracted files still use parent-private state, and central objects directly depend on both domain logic and infrastructure.
@@ -39,10 +39,10 @@ The project contains real submodules and is not literally unmodularized. The mai
 | `src/anthropic/handlers/request_entry.rs` | Raw request entry, depth validation, raw external direct/preflight attempts, parsing | Fetches a dynamic runtime snapshot before main processing |
 | `src/anthropic/handlers.rs` | Main request orchestration, local/external routing, stream/non-stream handling, retry, usage | Approximately 7,025 lines plus 3,979-line sidecar tests; application responsibilities are mixed |
 | `src/anthropic/handlers/parsed_body_pipeline.rs` | Parsed-body capability staging | Uses parent orchestration state rather than a stable application contract |
-| `src/anthropic/handlers/local_body_pipeline.rs` | Local Kiro body preparation | Narrower file, but still compiled inside the large handler module boundary |
+| `src/anthropic/handlers/local_body_pipeline.rs` | Local Account Runtime body preparation | Narrower file, but still compiled inside the large handler module boundary |
 | `src/anthropic/types.rs` | Anthropic request/response DTOs | DTOs are imported by storage and other infrastructure modules |
 | `src/anthropic/envelope.rs` | Error and response envelope compatibility | Cross-cutting protocol dependency |
-| `src/anthropic/stream.rs` | Kiro event to Anthropic SSE state machine | Compatibility-critical and heavily stateful |
+| `src/anthropic/stream.rs` | Account Runtime event to Anthropic SSE state machine | Compatibility-critical and heavily stateful |
 
 ## Request Body And Conversion
 
@@ -57,7 +57,7 @@ The project contains real submodules and is not literally unmodularized. The mai
 | `src/anthropic/converter/schema.rs` | Tool input-schema normalization | Recursively walks untrusted JSON |
 | `src/anthropic/converter/thinking.rs` | Thinking normalization | Must stay aligned with stream and non-stream responses |
 | `src/anthropic/converter/tool_pairing.rs` | Tool use/result pairing repair | Client-visible mutation with diagnostic implications |
-| `src/anthropic/converter/tools.rs` | Tool conversion and built-ins | Handles WebSearch and Kiro tool constraints |
+| `src/anthropic/converter/tools.rs` | Tool conversion and built-ins | Handles WebSearch and Account Runtime tool constraints |
 | `src/anthropic/payload_guard.rs` | Body sizing, repair, shaping, trimming, diagnostics | Can clone and serialize large request structures repeatedly |
 | `src/anthropic/payload_guard_runtime.rs` | Runtime adapters for payload guard | Couples guard execution to current request/runtime structures |
 | `src/anthropic/request_facts.rs` | Lightweight facts from raw JSON bytes | Enables pre-parse routing/model decisions |
@@ -78,26 +78,26 @@ The project contains real submodules and is not literally unmodularized. The mai
 
 Usage currently crosses several semantic layers in the same types: raw upstream values, local cache evidence, downstream projection, billing, persistence, and dashboard DTOs.
 
-## Kiro Upstream And Scheduling
+## Account Runtime Upstream And Scheduling
 
 | Module | Current responsibility | Boundary concern |
 | --- | --- | --- |
-| `src/kiro/provider.rs` | Kiro HTTP calls, retries, credential attempt loop, client cache, completion guards | Transport and scheduler lifecycle are directly coupled |
-| `src/kiro/endpoint/ide.rs` | Kiro IDE request envelope | Parses and rewrites serialized JSON |
-| `src/kiro/endpoint/cli.rs` | Kiro CLI request envelope | Parses and rewrites serialized JSON |
-| `src/kiro/parser/*` | Event-stream framing, CRC, headers, decoder, errors | Low-level protocol implementation |
-| `src/kiro/protocol.rs` | Kiro protocol DTOs | Shared upstream contract |
-| `src/kiro/token_manager/manager.rs` | Credential catalog, selection, refresh coordination, sticky logic, mutations, Admin operations | Approximately 8,178 lines and 28 state fields; central God Object |
-| `src/kiro/token_manager/account_state.rs` | Per-credential mutable runtime record | Mixes durable and transient scheduler facts |
-| `src/kiro/token_manager/capacity.rs` | Capacity calculations | Mostly algorithmic extraction |
-| `src/kiro/token_manager/strategy.rs` | Candidate ordering/scoring | Mostly algorithmic extraction |
-| `src/kiro/token_manager/rpm.rs` | RPM window logic | State is still owned by manager entries |
-| `src/kiro/token_manager/sticky.rs` | Session-affinity helpers | Redis access remains coordinated by manager |
-| `src/kiro/token_manager/concurrency.rs` | Local/Redis leases, guards, release and renewal | Normal release can synchronously wait for Redis |
-| `src/kiro/token_manager/queue.rs` | Dispatch queue records and wait semantics | Manager owns orchestration |
-| `src/kiro/token_manager/refresh.rs` | Refresh result/state helpers | Manager/provider own actual refresh workflow |
-| `src/kiro/token_manager/storage_task.rs` | Bounded normal/critical storage executor and shutdown | Shared infrastructure hidden under token-manager namespace |
-| `src/kiro/token_manager/redis_runtime.rs` | Redis runtime helpers | Infrastructure-specific behavior inside scheduler module |
+| `src/local_upstream_impl/provider.rs` | Account Runtime HTTP calls, retries, credential attempt loop, client cache, completion guards | Transport and scheduler lifecycle are directly coupled |
+| `src/local_upstream_impl/endpoint/ide.rs` | Account Runtime IDE request envelope | Parses and rewrites serialized JSON |
+| `src/local_upstream_impl/endpoint/cli.rs` | Account Runtime CLI request envelope | Parses and rewrites serialized JSON |
+| `src/local_upstream_impl/parser/*` | Event-stream framing, CRC, headers, decoder, errors | Low-level protocol implementation |
+| `src/local_upstream_impl/protocol.rs` | Account Runtime protocol DTOs | Shared upstream contract |
+| `src/local_upstream_impl/token_manager/manager.rs` | Credential catalog, selection, refresh coordination, sticky logic, mutations, Admin operations | Approximately 8,178 lines and 28 state fields; central God Object |
+| `src/local_upstream_impl/token_manager/account_state.rs` | Per-credential mutable runtime record | Mixes durable and transient scheduler facts |
+| `src/local_upstream_impl/token_manager/capacity.rs` | Capacity calculations | Mostly algorithmic extraction |
+| `src/local_upstream_impl/token_manager/strategy.rs` | Candidate ordering/scoring | Mostly algorithmic extraction |
+| `src/local_upstream_impl/token_manager/rpm.rs` | RPM window logic | State is still owned by manager entries |
+| `src/local_upstream_impl/token_manager/sticky.rs` | Session-affinity helpers | Redis access remains coordinated by manager |
+| `src/local_upstream_impl/token_manager/concurrency.rs` | Local/Redis leases, guards, release and renewal | Normal release can synchronously wait for Redis |
+| `src/local_upstream_impl/token_manager/queue.rs` | Dispatch queue records and wait semantics | Manager owns orchestration |
+| `src/local_upstream_impl/token_manager/refresh.rs` | Refresh result/state helpers | Manager/provider own actual refresh workflow |
+| `src/local_upstream_impl/token_manager/storage_task.rs` | Bounded normal/critical storage executor and shutdown | Shared infrastructure hidden under token-manager namespace |
+| `src/local_upstream_impl/token_manager/redis_runtime.rs` | Redis runtime helpers | Infrastructure-specific behavior inside scheduler module |
 
 The extracted scheduler files improve navigation and isolate some algorithms, but most `impl MultiTokenManager` orchestration, state ownership, locks, storage calls, and Admin mutation behavior remain in `manager.rs`.
 
@@ -154,7 +154,7 @@ The infrastructure layer imports Anthropic usage, model, pricing, external-pool,
 - The repository contains extensive Rust unit and integration-style tests attached to modules.
 - Large sidecar suites exist for handlers, token manager, external pools, Admin service, and loadtest behavior.
 - Real PgSQL/Redis tests are required by current CI configuration.
-- `src/bin/kiro_loadtest.rs` provides fake-upstream, latency, error, load, chaos, and resource scenarios.
+- `src/bin/account_runtime_loadtest.rs` provides fake-upstream, latency, error, load, chaos, and resource scenarios.
 - There is no `benches/` performance suite or performance regression gate.
 - No frontend `test`/`spec` suites were found for either maintained React UI; current frontend gates are builds and a handwritten contract comparison.
 
@@ -165,7 +165,7 @@ File size alone is not a defect, but these files combine enough responsibilities
 | File | Current total lines | Main reason for high blast radius |
 | --- | ---: | --- |
 | `src/storage/postgres.rs` | 11,372 | All durable domains, migrations, queries, and embedded tests |
-| `src/kiro/token_manager/manager.rs` | 8,178 | Scheduler state, persistence, refresh, Admin, queues, cross-process coordination |
+| `src/local_upstream_impl/token_manager/manager.rs` | 8,178 | Scheduler state, persistence, refresh, Admin, queues, cross-process coordination |
 | `src/anthropic/handlers.rs` | 7,025 | Full Messages request lifecycle and both response modes |
 | `src/admin/service.rs` | 6,602 | Entire control plane behind one service |
 | `src/storage/redis_cache.rs` | 6,357 | All Redis coordination and derived data domains |

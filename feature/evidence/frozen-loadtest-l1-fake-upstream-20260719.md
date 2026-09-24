@@ -6,12 +6,12 @@ Status: `L1 fake-upstream small matrix passed / L3-L5, recovery/soak, real upstr
 
 ## Scope
 
-This evidence covers the first frozen fake-upstream load gate after the Claude CLI thinking/native-reasoning fixes. It validates that a repository-external frozen `kiro-rs` binary can handle representative `/cc/v1/messages` traffic through a Kiro-shaped fake upstream without touching the protected local `9022` service.
+This evidence covers the first frozen fake-upstream load gate after the Claude CLI thinking/native-reasoning fixes. It validates that a repository-external frozen `account-runtime` binary can handle representative `/cc/v1/messages` traffic through a Account Runtime-shaped fake upstream without touching the protected local `9022` service.
 
 The run intentionally used:
 
-- one temporary `kiro-rs` service per scenario;
-- one temporary fake Kiro upstream per scenario;
+- one temporary `account-runtime` service per scenario;
+- one temporary fake Account Runtime upstream per scenario;
 - one caller-owned PostgreSQL database per scenario;
 - one caller-owned Redis key prefix per scenario;
 - random loopback ports, excluding `9022`;
@@ -19,22 +19,22 @@ The run intentionally used:
 
 Docker dynamic validation was not run. The only Docker use was the current-project isolated PostgreSQL/Redis pair:
 
-- PostgreSQL: `kiro-final-20260718-pg`, loopback `127.0.0.1:50891`
-- Redis: `kiro-final-20260718-redis`, loopback `127.0.0.1:50892`
+- PostgreSQL: `account-runtime-final-20260718-pg`, loopback `127.0.0.1:50891`
+- Redis: `account-runtime-final-20260718-redis`, loopback `127.0.0.1:50892`
 
 ## Frozen binaries
 
 Product binary:
 
 ```text
-/tmp/kiro-frozen-20260719-r2/kiro-rs
+/tmp/account-runtime-frozen-20260719-r2/account-runtime
 sha256 e16df13a0ded4d53ac255f26ddc24056c4d385dde418a63944a2e00d122c642a
 ```
 
 Final loadtest binary:
 
 ```text
-/tmp/kiro-frozen-20260719-r5/kiro_loadtest
+/tmp/account-runtime-frozen-20260719-r5/account_runtime_loadtest
 sha256 23c04221deb72dde601d491452d8cc9a99211df99b2cd39a386272141f2db8e3
 ```
 
@@ -42,9 +42,9 @@ The loadtest binary was rebuilt through the scoped Cargo wrapper:
 
 ```bash
 env RUSTUP_TOOLCHAIN=1.92.0 \
-  KIRO_FROZEN_LOADTEST=/tmp/kiro-frozen-20260719-r5/kiro_loadtest \
+  ACCOUNT_RUNTIME_FROZEN_LOADTEST=/tmp/account-runtime-frozen-20260719-r5/account_runtime_loadtest \
   feature/tests/run-cargo-scoped.sh frozen-loadtest-20260719-r5 -- \
-  bash -lc 'cargo build --release --bin kiro_loadtest && install -m 755 "$CARGO_TARGET_DIR/release/kiro_loadtest" "$KIRO_FROZEN_LOADTEST"'
+  bash -lc 'cargo build --release --bin account_runtime_loadtest && install -m 755 "$CARGO_TARGET_DIR/release/account_runtime_loadtest" "$ACCOUNT_RUNTIME_FROZEN_LOADTEST"'
 ```
 
 Cleanup line:
@@ -57,23 +57,23 @@ validation-build-cleanup scope=frozen-loadtest-20260719-r5 size_kib=751344 avail
 
 The initial L1 attempts were red, but the evidence showed test fixture defects rather than product regressions:
 
-1. `kiro_loadtest --fake-only` did not emulate Kiro `ListAvailableModels`.
+1. `account_runtime_loadtest --fake-only` did not emulate Account Runtime `ListAvailableModels`.
    - Symptom: startup/background model discovery hit the fake server but got an empty model list; native reasoning remained `Unknown`.
-   - Fix: fake Kiro model discovery now returns `claude-sonnet-4`, `claude-sonnet-4-20250514`, and `claude-sonnet-4.6`, including `additionalModelRequestFieldsSchema.properties.output_config.properties.effort.enum = ["low", "medium", "high", "max"]`.
+   - Fix: fake Account Runtime model discovery now returns `claude-sonnet-4`, `claude-sonnet-4-20250514`, and `claude-sonnet-4.6`, including `additionalModelRequestFieldsSchema.properties.output_config.properties.effort.enum = ["low", "medium", "high", "max"]`.
 
 2. The fake server treated CLI `GenerateAssistantResponse` as JSON when the path was `/fixture/`.
-   - Real CLI-family Kiro requests use `x-amz-target=AmazonCodeWhispererStreamingService.GenerateAssistantResponse`; the path does not necessarily contain `generateAssistantResponse`.
+   - Real CLI-family Account Runtime requests use `x-amz-target=AmazonCodeWhispererStreamingService.GenerateAssistantResponse`; the path does not necessarily contain `generateAssistantResponse`.
    - Fix: fake stream detection now recognizes `x-amz-target` and `Accept: application/vnd.amazon.eventstream`, not only `text/event-stream` or path suffixes.
 
-3. `normal-non-stream` returned JSON even when the upstream protocol was Kiro EventStream.
-   - Real behavior is: Kiro upstream stays EventStream; `kiro.rs` aggregates it into Anthropic non-stream JSON for the downstream client.
-   - Fix: fake `normal-non-stream` returns Kiro EventStream when the request is a Kiro EventStream request.
+3. `normal-non-stream` returned JSON even when the upstream protocol was Account Runtime EventStream.
+   - Real behavior is: Account Runtime upstream stays EventStream; `account-runtime` aggregates it into Anthropic non-stream JSON for the downstream client.
+   - Fix: fake `normal-non-stream` returns Account Runtime EventStream when the request is a Account Runtime EventStream request.
 
 4. The loadtest `--thinking true` request was invalid.
    - Previous body used `max_tokens=256` with `thinking.budget_tokens=1024`; the proxy correctly rejected it at request entry as `thinking.budget_tokens must be less than max_tokens`.
    - Fix: loadtest now uses `max_tokens=4096` for thinking payloads.
 
-5. The fake server did not detect native Kiro reasoning controls.
+5. The fake server did not detect native Account Runtime reasoning controls.
    - Product wire body used `additionalModelRequestFields.output_config.effort`; the fake only detected Anthropic `thinking` or compatibility prompt tags.
    - Fix: fake thinking detection now recognizes `additionalModelRequestFields.output_config.effort` and `additionalModelRequestFields.reasoning.effort`.
 
@@ -88,9 +88,9 @@ Scoped test batch:
 env RUSTUP_TOOLCHAIN=1.92.0 \
   feature/tests/run-cargo-scoped.sh loadtest-fake-protocol-20260719-r2 -- \
   bash -lc '
-    cargo test --bin kiro_loadtest fake_kiro_server_detects_cli_eventstream_by_accept_and_target -- --nocapture
-    cargo test --bin kiro_loadtest fake_kiro_server_detects_model_discovery_and_reports_reasoning_schema -- --nocapture
-    cargo test --bin kiro_loadtest thinking_loadtest_payload_keeps_budget_below_max_tokens -- --nocapture
+    cargo test --bin account_runtime_loadtest fake_account-runtime_server_detects_cli_eventstream_by_accept_and_target -- --nocapture
+    cargo test --bin account_runtime_loadtest fake_account-runtime_server_detects_model_discovery_and_reports_reasoning_schema -- --nocapture
+    cargo test --bin account_runtime_loadtest thinking_loadtest_payload_keeps_budget_below_max_tokens -- --nocapture
   '
 ```
 
@@ -107,8 +107,8 @@ Additional scoped test batch:
 env RUSTUP_TOOLCHAIN=1.92.0 \
   feature/tests/run-cargo-scoped.sh loadtest-native-thinking-fake-20260719 -- \
   bash -lc '
-    cargo test --bin kiro_loadtest fake_server_detects_native_kiro_reasoning_fields -- --nocapture
-    cargo test --bin kiro_loadtest thinking_loadtest_payload_keeps_budget_below_max_tokens -- --nocapture
+    cargo test --bin account_runtime_loadtest fake_server_detects_native_account-runtime_reasoning_fields -- --nocapture
+    cargo test --bin account_runtime_loadtest thinking_loadtest_payload_keeps_budget_below_max_tokens -- --nocapture
   '
 ```
 
@@ -167,10 +167,10 @@ PostgreSQL cleanup:
 ```sql
 SELECT datname
 FROM pg_database
-WHERE datname LIKE 'kiro_l1_%'
-   OR datname LIKE 'kiro_l1_debug_%'
-   OR datname LIKE 'kiro_l1_focus_%'
-   OR datname LIKE 'kiro_l1_full_%';
+WHERE datname LIKE 'account-runtime_l1_%'
+   OR datname LIKE 'account-runtime_l1_debug_%'
+   OR datname LIKE 'account-runtime_l1_focus_%'
+   OR datname LIKE 'account-runtime_l1_full_%';
 ```
 
 Result: no rows.
@@ -178,7 +178,7 @@ Result: no rows.
 Redis cleanup:
 
 ```bash
-docker exec kiro-final-20260718-redis redis-cli --scan --pattern 'kiro_l1*'
+docker exec account-runtime-final-20260718-redis redis-cli --scan --pattern 'account-runtime_l1*'
 ```
 
 Result: no keys.
@@ -188,11 +188,11 @@ Build artifact inventory:
 ```text
 build-artifact-inventory version=2 mode=read-only targets=1 reservations=0 target_processes=1 blockers=2
 target id=d61e6fde19e5 location=<repo>/target classification=unmanaged-repo-cargo-target size_kib=728088
-target-process target_id=d61e6fde19e5 pid=84264 classification=kiro-runtime
+target-process target_id=d61e6fde19e5 pid=84264 classification=account-runtime-runtime
 release-gate result=fail
 ```
 
-This fail is expected and not counted as validation residue: PID `84264` is the user’s existing `./target/release/kiro-rs -c config.json --credentials credentials.json` process. It was not started by this validation and was not stopped. No scoped Cargo target or reservation remained.
+This fail is expected and not counted as validation residue: PID `84264` is the user’s existing `./target/release/account-runtime -c config.json --credentials credentials.json` process. It was not started by this validation and was not stopped. No scoped Cargo target or reservation remained.
 
 ## Remaining release blockers
 

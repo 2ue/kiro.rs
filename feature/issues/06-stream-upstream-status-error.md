@@ -25,7 +25,7 @@ terminalReason: upstream_status_error
 
 ## 根因与性质判定：上游瞬态
 
-上游文案 `please try again` 是明确的可重试信号，属于 Bedrock/Kiro 侧的瞬态内部错误，不由请求内容决定。
+上游文案 `please try again` 是明确的可重试信号，属于 Bedrock/Account Runtime 侧的瞬态内部错误，不由请求内容决定。
 
 ## 程序可规避性：有限，当前策略正确
 

@@ -1,27 +1,27 @@
 services:
-  kiro-rs-postgres:
+  account-runtime-postgres:
     image: postgres:18-alpine
-    container_name: kiro-rs-postgres
+    container_name: account-runtime-postgres
     environment:
-      POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}
-      POSTGRES_USER: ${KIRO_RS_POSTGRES_USER:-kiro_rs}
-      POSTGRES_PASSWORD: ${KIRO_RS_POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${ACCOUNT_RUNTIME_POSTGRES_DB:-account_runtime}
+      POSTGRES_USER: ${ACCOUNT_RUNTIME_POSTGRES_USER:-account_runtime}
+      POSTGRES_PASSWORD: ${ACCOUNT_RUNTIME_POSTGRES_PASSWORD:-change-me}
     volumes:
-      - kiro-rs-postgres-data:/var/lib/postgresql
+      - account-runtime-postgres-data:/var/lib/postgresql
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U ${KIRO_RS_POSTGRES_USER:-kiro_rs} -d ${KIRO_RS_POSTGRES_DB:-kiro_rs}"
+          "pg_isready -U ${ACCOUNT_RUNTIME_POSTGRES_USER:-account_runtime} -d ${ACCOUNT_RUNTIME_POSTGRES_DB:-account_runtime}"
         ]
       interval: 10s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
-  kiro-rs-redis:
+  account-runtime-redis:
     image: redis:7-alpine
-    container_name: kiro-rs-redis
+    container_name: account-runtime-redis
     command:
       [
         "redis-server",
@@ -29,7 +29,7 @@ services:
         "yes"
       ]
     volumes:
-      - kiro-rs-redis-data:/data
+      - account-runtime-redis-data:/data
     healthcheck:
       test:
         [
@@ -42,18 +42,18 @@ services:
       retries: 10
     restart: unless-stopped
 
-  kiro-rs-app:
-    image: ${KIRO_RS_IMAGE:-ghcr.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
-    container_name: kiro-rs-app
+  account-runtime-app:
+    image: ${ACCOUNT_RUNTIME_IMAGE:-ghcr.io/2ue/account-runtime}:${ACCOUNT_RUNTIME_VERSION:-latest}
+    container_name: account-runtime-app
     depends_on:
-      kiro-rs-postgres:
+      account-runtime-postgres:
         condition: service_healthy
-      kiro-rs-redis:
+      account-runtime-redis:
         condition: service_healthy
     environment:
-      ACCOUNT_RUNTIME_POSTGRES_URL: postgres://${KIRO_RS_POSTGRES_USER:-kiro_rs}:${KIRO_RS_POSTGRES_PASSWORD:-change-me}@kiro-rs-postgres:5432/${KIRO_RS_POSTGRES_DB:-kiro_rs}
+      ACCOUNT_RUNTIME_POSTGRES_URL: postgres://${ACCOUNT_RUNTIME_POSTGRES_USER:-account_runtime}:${ACCOUNT_RUNTIME_POSTGRES_PASSWORD:-change-me}@account-runtime-postgres:5432/${ACCOUNT_RUNTIME_POSTGRES_DB:-account_runtime}
       ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START: ${ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START:-true}
-      ACCOUNT_RUNTIME_REDIS_URL: redis://kiro-rs-redis:6379/0
+      ACCOUNT_RUNTIME_REDIS_URL: redis://account-runtime-redis:6379/0
     ports:
       - "${ACCOUNT_RUNTIME_PORT:-8990}:8990"
     volumes:
@@ -64,5 +64,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  kiro-rs-postgres-data:
-  kiro-rs-redis-data:
+  account-runtime-postgres-data:
+  account-runtime-redis-data:

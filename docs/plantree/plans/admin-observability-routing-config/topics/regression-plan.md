@@ -47,7 +47,7 @@ Run only after local regression passes and only with low volume:
 Static and unit:
 
 - `git diff --check`: pass.
-- `cargo test --locked --no-default-features`: pass with local Xcode toolchain env; 920 main tests and 19 `kiro_loadtest` tests passed.
+- `cargo test --locked --no-default-features`: pass with local Xcode toolchain env; 920 main tests and 19 `account_runtime_loadtest` tests passed.
 
 Frontend:
 

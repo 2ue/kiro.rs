@@ -68,7 +68,7 @@ contracts, architecture checks, and trustworthy harnesses
   -> kernel, protocols, runtime views, observability, diagnostics, secret envelope, resource governor
   -> migration foundation, domain state ports, CAS, auth, catalogs, terminal journal
   -> usage/cache and scheduler/credential/pool/proxy authorities
-  -> Kiro/external upstream adapters and replay policy
+  -> Account Runtime/external upstream adapters and replay policy
   -> request planning, artifacts, payload, Files, media, token count, public endpoints
   -> SSE, response, terminal lifecycle, Messages transport
   -> Admin command/query transport, generated contract, both frontend applications
@@ -95,7 +95,7 @@ Final cutover is prohibited until all of the following are true:
 3. target source/import searches prove legacy execution paths, selectors, compatibility facades, duplicate frontend implementations, obsolete schema writers, and obsolete harness paths are removed;
 4. all decisions required by the target behavior are Accepted and no blocking open question remains;
 5. fresh, legacy-adoption, partial/interrupted, drift/corruption, concurrent-start, backup/restore, Redis rebuild, and previous-binary migration rehearsals pass;
-6. static, Rust, storage, protocol, real Claude Code, low-volume real Kiro, frontend/browser, load/chaos, performance, shutdown/restart, Docker, supply-chain, secret-scan, and artifact-cleanup gates pass where applicable;
+6. static, Rust, storage, protocol, real Claude Code, low-volume real Account Runtime, frontend/browser, load/chaos, performance, shutdown/restart, Docker, supply-chain, secret-scan, and artifact-cleanup gates pass where applicable;
 7. absolute capacity/SLO, relative regression, resource ceiling, idle recovery, operation budget, and whole-system soak requirements pass on the accepted reference profile;
 8. both frontend artifacts and the backend generated contract share one release identity;
 9. the target image, SBOM, signature/provenance, configuration/schema hashes, migration plan, evidence manifest, backup checkpoint, rollback artifact, and rollback commands are immutable and verified;

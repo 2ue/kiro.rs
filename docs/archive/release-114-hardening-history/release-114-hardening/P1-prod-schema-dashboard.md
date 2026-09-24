@@ -53,7 +53,7 @@
 - 只查 `information_schema.columns`；
 - 不扫描业务数据；
 - 缺表/缺列时直接拒绝启动；
-- 错误信息明确提示设置 `KIRO_RS_POSTGRES_MIGRATE_ON_START=true` 或 `postgres.migrateOnStart=true`。
+- 错误信息明确提示设置 `ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=true` 或 `postgres.migrateOnStart=true`。
 
 这样其它现网实例如果仍挂载旧配置关闭迁移，不会再以 healthy 状态带旧 schema 提供服务。
 
@@ -62,7 +62,7 @@
 `docker-compose.database.yml` 增加：
 
 ```yaml
-KIRO_RS_POSTGRES_MIGRATE_ON_START: ${KIRO_RS_POSTGRES_MIGRATE_ON_START:-true}
+ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START: ${ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START:-true}
 ```
 
 部署文档和 README 同步说明生产升级必须开启启动迁移，除非已通过其它维护流程完成当前镜像要求的 schema 迁移。

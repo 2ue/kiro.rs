@@ -13,24 +13,24 @@ import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
-const ROUNDS = Number.parseInt(process.env.KIRO_REQUEST_ADMISSION_ROUNDS || '5', 10)
+const ROUNDS = Number.parseInt(process.env.ACCOUNT_RUNTIME_REQUEST_ADMISSION_ROUNDS || '5', 10)
 const PROBES_PER_INSTANCE = Number.parseInt(
-  process.env.KIRO_REQUEST_ADMISSION_PROBES || '32',
+  process.env.ACCOUNT_RUNTIME_REQUEST_ADMISSION_PROBES || '32',
   10,
 )
 const STABILITY_WAVES = Number.parseInt(
-  process.env.KIRO_REQUEST_ADMISSION_STABILITY_WAVES || '5',
+  process.env.ACCOUNT_RUNTIME_REQUEST_ADMISSION_STABILITY_WAVES || '5',
   10,
 )
 const MAX_REJECTION_P95_MS = Number.parseFloat(
-  process.env.KIRO_REQUEST_ADMISSION_MAX_P95_MS || '250',
+  process.env.ACCOUNT_RUNTIME_REQUEST_ADMISSION_MAX_P95_MS || '250',
 )
-const POSTGRES_URL_TEMPLATE = requiredEnvironment('KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE')
-const REDIS_URL = requiredEnvironment('KIRO_REQUEST_ADMISSION_REDIS_URL')
-const REDIS_PREFIX = requiredEnvironment('KIRO_REQUEST_ADMISSION_REDIS_PREFIX')
-const VALIDATE_ONLY = process.env.KIRO_REQUEST_ADMISSION_VALIDATE_ONLY === '1'
+const POSTGRES_URL_TEMPLATE = requiredEnvironment('ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE')
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL')
+const REDIS_PREFIX = requiredEnvironment('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_PREFIX')
+const VALIDATE_ONLY = process.env.ACCOUNT_RUNTIME_REQUEST_ADMISSION_VALIDATE_ONLY === '1'
 const REQUIRED_DATABASE_COUNT = ROUNDS
-const POSTGRES_DATABASES = String(process.env.KIRO_REQUEST_ADMISSION_POSTGRES_DATABASES || '')
+const POSTGRES_DATABASES = String(process.env.ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_DATABASES || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean)
@@ -96,18 +96,18 @@ const ACCEPTANCE = Object.freeze({
 })
 
 if (!Number.isInteger(ROUNDS) || ROUNDS < 3 || ROUNDS > 5) {
-  throw new Error('KIRO_REQUEST_ADMISSION_ROUNDS must be an integer between 3 and 5')
+  throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_ROUNDS must be an integer between 3 and 5')
 }
 if (!Number.isInteger(PROBES_PER_INSTANCE) || PROBES_PER_INSTANCE < 16
   || PROBES_PER_INSTANCE > 128) {
-  throw new Error('KIRO_REQUEST_ADMISSION_PROBES must be an integer between 16 and 128')
+  throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_PROBES must be an integer between 16 and 128')
 }
 if (!Number.isInteger(STABILITY_WAVES) || STABILITY_WAVES < 3 || STABILITY_WAVES > 10) {
-  throw new Error('KIRO_REQUEST_ADMISSION_STABILITY_WAVES must be an integer between 3 and 10')
+  throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_STABILITY_WAVES must be an integer between 3 and 10')
 }
 if (!Number.isFinite(MAX_REJECTION_P95_MS) || MAX_REJECTION_P95_MS < 25
   || MAX_REJECTION_P95_MS > 2_000) {
-  throw new Error('KIRO_REQUEST_ADMISSION_MAX_P95_MS must be between 25 and 2000')
+  throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_MAX_P95_MS must be between 25 and 2000')
 }
 
 function requiredEnvironment(name) {
@@ -142,50 +142,50 @@ function minimalEnvironment(extra = {}) {
 function validateInputs() {
   const placeholderCount = (POSTGRES_URL_TEMPLATE.match(/\{database\}/g) || []).length
   if (placeholderCount !== 1) {
-    throw new Error('KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
   }
-  const sampleDatabase = POSTGRES_DATABASES[0] || 'kiro_request_admission_contract_sample'
+  const sampleDatabase = POSTGRES_DATABASES[0] || 'account_runtime_request_admission_contract_sample'
   const postgres = new URL(POSTGRES_URL_TEMPLATE.replace('{database}', sampleDatabase))
   if (!['postgres:', 'postgresql:'].includes(postgres.protocol)) {
-    throw new Error('KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must use PostgreSQL')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must use PostgreSQL')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(postgres.hostname)) {
-    throw new Error('KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must target loopback')
   }
   if (Number(postgres.port || 5432) === 9022) throw new Error('port 9022 is protected')
-  if (postgres.hash) throw new Error('KIRO_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must not contain a fragment')
+  if (postgres.hash) throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_URL_TEMPLATE must not contain a fragment')
   if (POSTGRES_DATABASES.length !== REQUIRED_DATABASE_COUNT) {
-    throw new Error(`KIRO_REQUEST_ADMISSION_POSTGRES_DATABASES must contain exactly ${REQUIRED_DATABASE_COUNT} pre-created database names`)
+    throw new Error(`ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_DATABASES must contain exactly ${REQUIRED_DATABASE_COUNT} pre-created database names`)
   }
   for (const database of POSTGRES_DATABASES) {
-    if (!/^kiro_request_admission_[a-z0-9_]{3,80}$/.test(database)) {
-      throw new Error('KIRO_REQUEST_ADMISSION_POSTGRES_DATABASES must contain caller-owned kiro_request_admission_* names')
+    if (!/^account_runtime_request_admission_[a-z0-9_]{3,80}$/.test(database)) {
+      throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_POSTGRES_DATABASES must contain caller-owned account_runtime_request_admission_* names')
     }
   }
 
   const redis = new URL(REDIS_URL)
-  if (redis.protocol !== 'redis:') throw new Error('KIRO_REQUEST_ADMISSION_REDIS_URL must use redis://')
+  if (redis.protocol !== 'redis:') throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL must use redis://')
   if (redis.username || redis.password) {
-    throw new Error('KIRO_REQUEST_ADMISSION_REDIS_URL must not contain Redis auth material')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL must not contain Redis auth material')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(redis.hostname)) {
-    throw new Error('KIRO_REQUEST_ADMISSION_REDIS_URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL must target loopback')
   }
   if (Number(redis.port || 6379) === 9022) throw new Error('port 9022 is protected')
-  if (redis.search || redis.hash) throw new Error('KIRO_REQUEST_ADMISSION_REDIS_URL must not contain query or fragment data')
+  if (redis.search || redis.hash) throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL must not contain query or fragment data')
   const dbText = redis.pathname.replace(/^\//, '')
   if (!/^\d+$/.test(dbText)) {
-    throw new Error('KIRO_REQUEST_ADMISSION_REDIS_URL must name a Redis database')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL must name a Redis database')
   }
   const redisDatabase = Number(dbText)
   if (!Number.isSafeInteger(redisDatabase) || redisDatabase < 1 || redisDatabase > 15) {
-    throw new Error('KIRO_REQUEST_ADMISSION_REDIS_URL must use an isolated nonzero database in 1..15')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_URL must use an isolated nonzero database in 1..15')
   }
-  if (REDIS_PREFIX.includes('kiro_rs:local')) {
-    throw new Error('KIRO_REQUEST_ADMISSION_REDIS_PREFIX must be a caller-owned temporary prefix')
+  if (REDIS_PREFIX.includes('account_runtime:local')) {
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_PREFIX must be a caller-owned temporary prefix')
   }
   if (!/^[a-z0-9][a-z0-9:._-]{7,95}$/.test(REDIS_PREFIX)) {
-    throw new Error('KIRO_REQUEST_ADMISSION_REDIS_PREFIX has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_PREFIX has an invalid format')
   }
   redisTarget = {
     redis,
@@ -408,7 +408,7 @@ function createFakeUpstream() {
   const server = http.createServer(async (request, response) => {
     const raw = await readBody(request)
     const marker = extractMarker(raw)
-    const target = String(request.headers['x-amz-target'] || '')
+    const target = String(request.headers['x-account-runtime-target'] || '')
     const kind = target.endsWith('.ListAvailableModels')
       || String(request.url || '').toLowerCase().includes('listavailablemodels')
       ? 'auxiliary'
@@ -509,13 +509,13 @@ function createFakeUpstream() {
 
 function startService({ configPath, credentialsPath, logPath, port }) {
   const log = fs.openSync(logPath, 'a')
-  const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
     env: minimalEnvironment({
       LOCAL_UPSTREAM_API_KEY: '',
       ACCOUNT_RUNTIME_HOST: '127.0.0.1',
       ACCOUNT_RUNTIME_PORT: String(port),
-      RUST_LOG: 'kiro_rs::anthropic::request_admission=debug,kiro_rs=info',
+      RUST_LOG: 'account_runtime::anthropic::request_admission=debug,account_runtime=info',
     }),
     stdio: ['ignore', log, log],
   })
@@ -540,7 +540,7 @@ async function waitForHealth(baseUrl, handle, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (handle.exitCode !== null) {
-      throw new Error(`kiro-rs exited before health check: ${handle.exitCode}`)
+      throw new Error(`account-runtime service exited before health check: ${handle.exitCode}`)
     }
     try {
       const response = await fetch(`${baseUrl}/healthz`)
@@ -646,7 +646,7 @@ function credentialFixture() {
     expiresAt: '2099-01-01T00:00:00Z',
     authMethod: 'social',
     endpoint: 'ide',
-    profileArn: 'arn:aws:codewhisperer:us-east-1:123456789012:profile/REQUEST_ADMISSION',
+    profileArn: 'arn:account-runtime:us-east-1:123456789012:profile/REQUEST_ADMISSION',
     maxConcurrentRequests: 64,
     rpm: 0,
     supportedModels: ['claude-sonnet-4'],
@@ -665,10 +665,10 @@ function serviceConfig({ databaseUrl, redisUrl, redisKeyPrefix, servicePort, ups
     adminApiKey: ADMIN_KEY,
     requestAdmission: INITIAL_ADMISSION,
     defaultEndpoint: 'ide',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/kiro`,
-    kiroUpstreamResponseTimeoutSecs: 120,
-    kiroUpstreamStreamIdleTimeoutSecs: 30,
-    kiroUpstreamStreamRetryEnabled: false,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}/account-runtime`,
+    upstreamResponseTimeoutSecs: 120,
+    upstreamStreamIdleTimeoutSecs: 30,
+    upstreamStreamRetryEnabled: false,
     credentialRetryMaxAttempts: 1,
     inferenceUpstreamMaxAttempts: 1,
     credentialWarmupRequests: 0,

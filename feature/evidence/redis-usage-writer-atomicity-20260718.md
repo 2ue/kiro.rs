@@ -2,7 +2,7 @@
 
 Status: `focused PASS / isolated-Redis and normal scheduler-burst PASS / faulted-combined-chaos and release NO-GO`
 
-Repository: `/Users/yuanfeijie/Desktop/procode/kiro.rs`
+Repository: `/Users/yuanfeijie/Desktop/procode/account-runtime`
 
 HEAD: `401473ca1649997bdeccf4468e3add1bdb187248` (`v0.0.109`, dirty tree)
 
@@ -76,7 +76,7 @@ removed=true
 reservation_released=true
 ```
 
-Each test contains five internal rounds. The additional `running 0 tests` lines came from the unrelated `kiro_loadtest` test binary after Cargo applied the exact filter; they are not counted as passes and do not invalidate the main test binary's explicit `running 1 test` results.
+Each test contains five internal rounds. The additional `running 0 tests` lines came from the unrelated `account_runtime_loadtest` test binary after Cargo applied the exact filter; they are not counted as passes and do not invalidate the main test binary's explicit `running 1 test` results.
 
 ## Verified Contracts
 
@@ -90,7 +90,7 @@ Each test contains five internal rounds. The additional `running 0 tests` lines 
 
 ## Isolated Redis Dynamic Gate
 
-2026-07-18 使用当前仓库专属隔离 Redis 容器 `kiro-final-20260718-redis` 执行真实 Redis 动态门禁。该容器只服务本轮验证；未使用生产 Redis，未访问 `127.0.0.1:9022`。
+2026-07-18 使用当前仓库专属隔离 Redis 容器 `account-runtime-final-20260718-redis` 执行真实 Redis 动态门禁。该容器只服务本轮验证；未使用生产 Redis，未访问 `127.0.0.1:9022`。
 
 初次组合 storage 批次在 `redis_usage_summary_cache_read_cardinality_is_hard_capped_for_five_rounds` 第 2 轮红。根因不是产品错误：第 1 轮 overflow 正确设置 `USAGE_DERIVED_CACHE_INVALIDATED_KEY`，而 `clear_usage_summary()` 设计上不清这个 fail-closed sentinel；第 2 轮复用同一 Redis namespace 时继续 fail-closed。产品语义应保留这个 sentinel，不能为了测试清理而让 cleanup 后重新使用派生缓存。
 
@@ -153,13 +153,13 @@ luac
 luajit
 ```
 
-早期 discovery 没有发现本机非 Docker Redis 工具，因此当时保持 pending。随后按用户对当前项目隔离 Docker PG/Redis 的要求，使用 caller-owned `kiro-final-20260718-redis` 执行了上述动态门禁；没有猜测或复用生产 Redis。
+早期 discovery 没有发现本机非 Docker Redis 工具，因此当时保持 pending。随后按用户对当前项目隔离 Docker PG/Redis 的要求，使用 caller-owned `account-runtime-final-20260718-redis` 执行了上述动态门禁；没有猜测或复用生产 Redis。
 
 仍然 pending 的运行时矩阵：
 
 - combined usage-writer/scheduler latency, disconnect and recovery matrix
 
-The storage test harness calls `integration_test_url("KIRO_RS_TEST_REDIS_URL")`. With `KIRO_RS_REQUIRE_STORAGE_TESTS=1`, a missing URL panics instead of silently skipping. This is the required fail-closed development-program behavior, but it is not a dynamic Redis PASS.
+The storage test harness calls `integration_test_url("ACCOUNT_RUNTIME_TEST_REDIS_URL")`. With `ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1`, a missing URL panics instead of silently skipping. This is the required fail-closed development-program behavior, but it is not a dynamic Redis PASS.
 
 ## Performance Interpretation
 
@@ -177,6 +177,6 @@ This is a structural improvement, not a measured production latency claim. A lar
 
 - No usage/protocol/load validation request was sent to `127.0.0.1:9022`. During the separately requested root-target cleanup, one read-only `/health` liveness probe returned HTTP 404 after the protected process's backing path disappeared; the process was not stopped, restarted or reconfigured.
 - 本轮使用并保留当前仓库专属隔离 Docker Redis；未清理其他项目容器或 volume。
-- No credential file or `kiro_idc_users*.txt` file was read or staged.
+- No credential file or `account-runtime_idc_users*.txt` file was read or staged.
 - Every valid Cargo batch used the scoped wrapper and removed its owned target.
 - The root `target/` is independently recreated by the user's rust-analyzer and is not counted as scoped build output.

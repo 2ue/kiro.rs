@@ -12,7 +12,7 @@ Severity: P1
   `stopReasonSource=local_inferred_*`，说明仅凭 `success/end_turn/completed` 仍不能证明上游真完成。
 - 严重级别：中（潜在观测盲区 / 可能的误判，非已证实的线上故障）
 - 影响端点：全部 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1`、`/dfcache/*`（共用同一套流式处理逻辑）
-- 相关代码：`src/anthropic/stream.rs`、`src/anthropic/handlers.rs`、`src/kiro/model/events/assistant.rs`、`src/kiro/model/events/base.rs`
+- 相关代码：`src/anthropic/stream.rs`、`src/anthropic/handlers.rs`、`src/local_upstream_impl/model/events/assistant.rs`、`src/local_upstream_impl/model/events/base.rs`
 
 ---
 
@@ -22,7 +22,7 @@ Claude Code CLI 在与本服务的多轮对话中，偶发「助手输出一句�
 无后续、无报错」的现象。usage 记录显示这些轮次是 `status=success` / `stopReason=end_turn` /
 `terminalReason=completed`。
 
-**但经代码审查发现：Kiro 上游从不发送显式的 `end_turn`；代理的 `end_turn` 是一个「流结束且
+**但经代码审查发现：Account Runtime 上游从不发送显式的 `end_turn`；代理的 `end_turn` 是一个「流结束且
 无其它信号时」的兜底默认值；修复前上游真正的完成标志 `messageStatus:"COMPLETED"` 被代理丢弃、
 从不落库。**
 
@@ -71,7 +71,7 @@ Claude Code 会把会话落到本地 JSONL：
 
 2026-07-14 复核本次会话 JSONL：
 
-- 会话文件：`~/.claude/projects/-Users-yuanfeijie-Desktop-procode-kiro-rs/4633d467-317c-4620-9545-a26f2d81eb66.jsonl`
+- 会话文件：`~/.claude/projects/-Users-yuanfeijie-Desktop-procode-account-runtime/4633d467-317c-4620-9545-a26f2d81eb66.jsonl`
 - assistant 记录数：327。
 - `requestId` 缺失数：0。
 - 含日文假名的 assistant 文本：4 条，其中用户贴出的 `続けて本体を追記する。` 在第 875 行。
@@ -202,12 +202,12 @@ pub fn get_stop_reason(&self) -> String {
 - `model_context_window_exceeded`（1704）
 
 **没有任何一处把 `stop_reason` 设为 `end_turn`。** 结论：
-- Kiro 上游**从不发送显式 `end_turn`**。
+- Account Runtime 上游**从不发送显式 `end_turn`**。
 - 代理的 `end_turn` = 「流结束了 + 没 tool_use + 没 max_tokens/context 信号」时的默认兜底。
 
 ### 3.4 上游真正的完成信号 `messageStatus`（修复前被丢弃，现已记录）
 
-修复前 `src/kiro/model/events/assistant.rs` 只保留 `content`，其它字段都被吞进 `extra`：
+修复前 `src/local_upstream_impl/model/events/assistant.rs` 只保留 `content`，其它字段都被吞进 `extra`：
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,7 +238,7 @@ pub struct AssistantResponseEvent {
 
 ### 3.5 三条串起来 → 核心盲区
 
-1. Kiro 从不发显式 `end_turn`（3.3）。
+1. Account Runtime 从不发显式 `end_turn`（3.3）。
 2. 修复前上游真正的完成标志 `messageStatus:COMPLETED` 被丢弃、从不校验（3.4）；2026-07-13 起已记录为 usage 观测字段。
 3. 上游 EOF 且无显式 error → 一律 success + 兜底 `end_turn`（3.2 + 3.3）。
 
@@ -281,7 +281,7 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 
 - **下游（Claude Code ↔ 代理）**：本地是 **HTTP 明文**（`127.0.0.1:9022`），tcpdump 可抓。
   但下游看到的是代理**重新合成**的输出，截断也被补成「干净结束」→ **抓下游无法区分 H1/H2**。
-- **上游（代理 ↔ Kiro）**：**HTTPS**，tcpdump 抓到的是密文 → 看不了。而区分 H1/H2 恰恰
+- **上游（代理 ↔ Account Runtime）**：**HTTPS**，tcpdump 抓到的是密文 → 看不了。而区分 H1/H2 恰恰
   要看上游有没有发 `messageStatus:COMPLETED`、是否发完就 EOF。
 
 结论：**tcpdump 抓包解决不了本问题**，必须在代理内部对上游事件做观测插桩。
@@ -290,7 +290,7 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 
 在以下位置加临时 `tracing` 日志（仅本地分支，不影响线上）：
 
-1. **上游 assistant 事件解析处**（`src/kiro/model/events/assistant.rs` 或 `base.rs` 的
+1. **上游 assistant 事件解析处**（`src/local_upstream_impl/model/events/assistant.rs` 或 `base.rs` 的
    `EventType::AssistantResponse` 分支）：把 `extra` 里的 `messageStatus` 解析出来并记录。
    建议临时给 `AssistantResponseEvent` 增加 `pub message_status: Option<String>` 字段
    （从 flatten 提出来），只用于日志。
@@ -308,7 +308,7 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 
 1. 在本地分支实现 6.2 的插桩，`cargo build --release`。
 2. 起本地服务（示例，沿用现有本地配置）：
-   `./target/release/kiro-rs -c config.json --credentials credentials.json`（监听 `127.0.0.1:9022`）。
+   `./target/release/account-runtime -c config.json --credentials credentials.json`（监听 `127.0.0.1:9022`）。
    注意：本地账号仅支持 sonnet，长会话用 `claude-sonnet-4-20250514`。
 3. 让 Claude Code 指向本地服务，跑一段**长的、多工具轮次**的真实会话（模拟你遇到问题的场景：
    连续 bash/编辑/重启/校验，并在 agent 执行中途插话，以尽量复现「开场白后停住」）。
@@ -361,7 +361,7 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 解释：
 
 - 这证明“代理仍可能在未观察到上游 `COMPLETED` 的情况下记录 success/completed”是真实存在的。
-- 这不能进一步证明“发生了静默截断”。如果当前 Kiro 上游本来就经常不发送 `messageStatus`，
+- 这不能进一步证明“发生了静默截断”。如果当前 Account Runtime 上游本来就经常不发送 `messageStatus`，
   那 `sawUpstreamCompleted=false` 只能说明 `messageStatus` 不是可依赖的完成信号，不能单独判 H2。
 - 需要补强的不是下游抓包，而是上游事件观测：记录最后若干上游事件类型、是否见到明确完成/收尾事件、
   以及 EOF 前最后一次内容事件。
@@ -436,8 +436,8 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 - 代码位置索引：
   - `src/anthropic/handlers.rs` 流循环 `tokio::select!`（约 5584）、`None` EOF 分支（约 5738）。
   - `src/anthropic/stream.rs` `get_stop_reason`（1099-1107）、`set_stop_reason`（1054）。
-  - `src/kiro/model/events/assistant.rs` `AssistantResponseEvent`（已解析 `messageStatus`）。
-  - `src/kiro/model/events/base.rs` 事件分发（`parse_event`）。
+  - `src/local_upstream_impl/model/events/assistant.rs` `AssistantResponseEvent`（已解析 `messageStatus`）。
+  - `src/local_upstream_impl/model/events/base.rs` 事件分发（`parse_event`）。
 
 ## 10. 结论（当前阶段，诚实陈述）
 
@@ -448,7 +448,7 @@ usage 记录是**由同一套流处理代码写入的**。若终止判定本身�
 - **已补强（观测层）**：2026-07-14 起，工具上下文/函数结果标签泄漏型长文本 `end_turn` 会单独记录
   anomaly reason、risk 和 marker 分类；该补强不保存完整文本、不改变协议输出。
 - **未确证（需进一步上游事件观测）**：本次会话那些 `end_turn` 轮**究竟**是 H1（模型主动真结束）
-  还是 H2（静默截断）。`sawUpstreamCompleted=false` 是必要证据之一，但如果 Kiro 当前协议经常不发送
+  还是 H2（静默截断）。`sawUpstreamCompleted=false` 是必要证据之一，但如果 Account Runtime 当前协议经常不发送
   `messageStatus`，它不是充分证据。
 - **已拆分（语言串台）**：日文/葡语等偶发外语输出是真实存在的模型输出问题，但用户贴出的
   `続けて本体を追記する。` 有 `requestId` 且后续正常 `tool_use=Edit`，不属于本问题的

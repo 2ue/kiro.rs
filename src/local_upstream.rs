@@ -23,7 +23,6 @@ pub(crate) mod call_trace {
 }
 
 pub(crate) mod credentials {
-    pub(crate) use crate::local_upstream_impl::model::credentials::profile_arn_region as local_upstream_profile_region;
     pub(crate) use crate::local_upstream_impl::model::credentials::split_local_upstream_api_key_and_region;
     pub(crate) type LocalUpstreamCredentials =
         crate::local_upstream_impl::model::credentials::LocalUpstreamCredentials;
@@ -35,12 +34,13 @@ pub(crate) mod dispatch {
     pub(crate) type LocalUpstreamAcquireMode =
         crate::local_upstream_impl::token_manager::AcquireMode;
     pub(crate) type LocalUpstreamRouteState =
-        crate::local_upstream_impl::token_manager::LocalPoolRouteState;
+        crate::local_upstream_impl::token_manager::AccountRouteState;
     pub(crate) type LocalUpstreamRouteStateKind =
-        crate::local_upstream_impl::token_manager::LocalPoolRouteStateKind;
+        crate::local_upstream_impl::token_manager::AccountRouteStateKind;
 }
 
 pub(crate) mod endpoint {
+    #[cfg(test)]
     pub(crate) use crate::local_upstream_impl::endpoint::DEFAULT_LOCAL_UPSTREAM_ENDPOINT_NAME as LOCAL_UPSTREAM_IDE_ENDPOINT_NAME;
     #[cfg(test)]
     pub(crate) use crate::local_upstream_impl::endpoint::IdeEndpoint as LocalUpstreamIdeEndpoint;
@@ -50,10 +50,10 @@ pub(crate) mod endpoint {
     pub(crate) type LocalUpstreamEndpoint = dyn LocalUpstreamEndpointTrait;
 }
 
+#[cfg(test)]
 pub(crate) mod provider {
     pub(crate) type LocalAuxiliaryMcpAttribution =
         crate::local_upstream_impl::provider::McpCallAttribution;
-    #[cfg(test)]
     pub(crate) type LocalAuxiliaryMcpFailureKind =
         crate::local_upstream_impl::provider::McpCallFailureKind;
     pub(crate) type LocalUpstreamApiResponse =
@@ -66,6 +66,7 @@ pub(crate) mod provider {
         crate::local_upstream_impl::provider::LocalUpstreamStreamResponse;
 }
 
+#[cfg(test)]
 pub(crate) mod event {
     #[cfg(test)]
     pub(crate) type LocalUpstreamAssistantResponseEvent =
@@ -121,11 +122,6 @@ pub(crate) mod manager {
         crate::local_upstream_impl::token_manager::MultiTokenManager;
 }
 
-pub(crate) mod usage_limits {
-    pub(crate) type LocalUpstreamUsageLimitsResponse =
-        crate::local_upstream_impl::model::usage_limits::UsageLimitsResponse;
-}
-
 pub(crate) mod request {
     pub(crate) type LocalUpstreamAdditionalModelRequestFields =
         crate::local_upstream_impl::model::requests::upstream::LocalUpstreamAdditionalModelRequestFields;
@@ -170,6 +166,7 @@ pub(crate) mod request {
         crate::local_upstream_impl::model::requests::conversation::UserMessage;
 }
 
+#[cfg(test)]
 pub(crate) mod stream {
     #[cfg(test)]
     pub(crate) use crate::local_upstream_impl::parser::crc::crc32 as local_upstream_eventstream_crc32;

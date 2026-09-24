@@ -4,8 +4,8 @@
 
 - Inventory current request body processing surfaces from code.
 - Register plan root and baseline links.
-- Added explicit request/body capability plan types for parsed Anthropic, local Kiro, and external body pipelines.
-- Routed parsed Anthropic preprocessing, local Kiro body preparation, and external raw/normalized body preparation through those plans with compatibility defaults.
+- Added explicit request/body capability plan types for parsed Anthropic, local Account Runtime, and external body pipelines.
+- Routed parsed Anthropic preprocessing, local Account Runtime body preparation, and external raw/normalized body preparation through those plans with compatibility defaults.
 - Split `converter.rs` internals into schema, model, content, tools, tool-pairing, and history modules.
 - Added `BodyConversionConfig` and wired it through runtime config, request config, local body planning, and both React admin surfaces.
 - Extended fake upstream loadtest scenarios with random, dense, tiered 3/10/22 second slow first byte, and mixed chaos.

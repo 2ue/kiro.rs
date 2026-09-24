@@ -4,7 +4,7 @@
  * Isolated product-level external-pool failover validation.
  *
  * The caller owns the PostgreSQL database and Redis database. This runner
- * starts only three loopback HTTP upstreams and one frozen kiro.rs process.
+ * starts only three loopback HTTP upstreams and one frozen account runtime process.
  * It deliberately keeps the local credential available so external-direct
  * requests can prove that a failed external pool does not silently return to
  * the local credential path.
@@ -23,9 +23,9 @@ import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
-const POSTGRES_URL = required('KIRO_EXTERNAL_FAILOVER_POSTGRES_URL')
-const REDIS_URL = required('KIRO_EXTERNAL_FAILOVER_REDIS_URL')
-const REDIS_PREFIX = required('KIRO_EXTERNAL_FAILOVER_REDIS_PREFIX')
+const POSTGRES_URL = required('ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_POSTGRES_URL')
+const REDIS_URL = required('ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_REDIS_URL')
+const REDIS_PREFIX = required('ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_REDIS_PREFIX')
 const REQUEST_KEY = 'sk-external-failover-request'
 const ADMIN_KEY = 'sk-external-failover-admin'
 const MODEL = 'claude-sonnet-4'
@@ -37,37 +37,37 @@ const CHILDREN = new Set()
 const SERVERS = new Set()
 const CLIENT_AGENT = new http.Agent({
   keepAlive: true,
-  maxSockets: boundedInteger(process.env.KIRO_EXTERNAL_FAILOVER_CLIENT_SOCKETS, 64, 8, 256),
+  maxSockets: boundedInteger(process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_CLIENT_SOCKETS, 64, 8, 256),
   maxFreeSockets: 32,
 })
 const BUSINESS_MARKER_RE = /\b(?:priority-failover-burst[12]|priority-recovery|rate-limit-failover|external-direct-no-local-rescue)-?\d*\b/
-const STRESS_ENABLED = process.env.KIRO_EXTERNAL_FAILOVER_STRESS === '1'
+const STRESS_ENABLED = process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_STRESS === '1'
 const STRESS_BURST_CONCURRENCY = boundedInteger(
-  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_BURST,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_STRESS_BURST,
   256,
   64,
   2048,
 )
-const STRESS_RPM = boundedInteger(process.env.KIRO_EXTERNAL_FAILOVER_STRESS_RPM, 1200, 120, 6000)
+const STRESS_RPM = boundedInteger(process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_STRESS_RPM, 1200, 120, 6000)
 const STRESS_DURATION_SECONDS = boundedInteger(
-  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_SECONDS,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_STRESS_SECONDS,
   900,
   60,
   3600,
 )
 const STRESS_MAX_IN_FLIGHT = boundedInteger(
-  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_IN_FLIGHT,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_STRESS_IN_FLIGHT,
   1024,
   64,
   4096,
 )
 const STRESS_SAME_POOL_RETRY_COUNT = boundedInteger(
-  process.env.KIRO_EXTERNAL_FAILOVER_STRESS_SAME_POOL_RETRY,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_STRESS_SAME_POOL_RETRY,
   1,
   0,
   3,
 )
-const KEEP_TEMP = process.env.KIRO_EXTERNAL_FAILOVER_KEEP_TEMP === '1'
+const KEEP_TEMP = process.env.ACCOUNT_RUNTIME_EXTERNAL_FAILOVER_KEEP_TEMP === '1'
 
 function required(name) {
   const value = String(process.env[name] || '').trim()
@@ -264,10 +264,10 @@ function createLocalUpstream() {
 
 function spawnService(configPath, credentialsPath, logPath) {
   const fd = fs.openSync(logPath, 'a')
-  const child = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const child = spawn(BINARY, ['--config', configPath], {
     cwd: TEMP_ROOT,
     env: validationChildEnvironment({
-      RUST_LOG: 'kiro_rs::external_pool=debug,kiro_rs::anthropic=debug,kiro_rs=info',
+      RUST_LOG: 'account_runtime::external_pool=debug,account_runtime::anthropic=debug,account_runtime=info',
       LOCAL_UPSTREAM_API_KEY: '',
     }),
     stdio: ['ignore', fd, fd],
@@ -481,8 +481,8 @@ async function main() {
     adminApiKey: ADMIN_KEY,
     requestAdmission: { rpm: 0, maxConcurrentRequests: 0, maxQueuedRequests: 0, queueTimeoutMs: 0 },
     defaultEndpoint: 'ide',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${localPort}/kiro`,
-    kiroUpstreamResponseTimeoutSecs: 5,
+    upstreamBaseUrl: `http://127.0.0.1:${localPort}/account-runtime`,
+    upstreamResponseTimeoutSecs: 5,
     credentialRetryMaxAttempts: 0,
     inferenceUpstreamMaxAttempts: 8,
     credentialWarmupRequests: 0,

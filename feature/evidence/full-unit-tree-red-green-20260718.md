@@ -4,7 +4,7 @@ Status: `current dirty-tree default-bin unit pass / broader release gates pendin
 
 Source: HEAD `401473ca1649997bdeccf4468e3add1bdb187248` (`v0.0.109`) plus the unreleased working-tree changes described below.
 
-Toolchain: Rust `1.92.0`. Every Cargo command ran through `feature/tests/run-cargo-scoped.sh`; no Docker validation ran, no request targeted `127.0.0.1:9022`, and no `kiro_idc_users*.txt` file was read or staged.
+Toolchain: Rust `1.92.0`. Every Cargo command ran through `feature/tests/run-cargo-scoped.sh`; no Docker validation ran, no request targeted `127.0.0.1:9022`, and no `account-runtime_idc_users*.txt` file was read or staged.
 
 ## Scope
 
@@ -17,7 +17,7 @@ This record covers the current default binary unit-test tree, `cargo check --all
 | `full-unit-current-r1` | process abort | default debug Tokio worker overflowed in `all_multimodal_handlers_reject_21_remote_sources_before_upstream_for_five_rounds` | `removed=true`, `reservation_released=true` |
 | exact multimodal rerun | `1/1`, 150 internal handler calls | moving only the heavy test fixture to the existing 4 MiB test thread removed the debug-only abort | cleaned |
 | `full-unit-current-r2` | process abort | another real Router fixture, `local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds`, still used the default worker stack | `removed=true`, `reservation_released=true` |
-| `full-unit-current-r4` | `1702 passed / 4 failed / 6 ignored` | exposed one real external Kiro usage-policy conflict and three stale refresh/lease fixtures | `size_kib=1677744`, cleaned |
+| `full-unit-current-r4` | `1702 passed / 4 failed / 6 ignored` | exposed one real external Account Runtime usage-policy conflict and three stale refresh/lease fixtures | `size_kib=1677744`, cleaned |
 | `full-unit-failures-r1` | format-only red | rustfmt rejected one closure layout before compilation | `size_kib=28`, cleaned |
 | `full-unit-current-r5` | `1705 passed / 1 failed / 6 ignored` | invalid refresh configuration still built an HTTP client before local validation; full-tree pressure broke the 500 ms wall-clock fixture | `size_kib=1678768`, cleaned |
 | `invalid-refresh-config-r1` | format-only red | rustfmt rejected one assertion layout before compilation | `size_kib=28`, cleaned |
@@ -40,17 +40,17 @@ The earlier `full-unit-current-r3`/quiet diagnostic sequence, `full-unit-current
 
 Heavy real Router/loopback tests now run their async bodies through the existing test-only 4 MiB OS-thread/current-thread Tokio helper. Production runtime stack configuration and production handler futures were not changed. The wrapped set includes multimodal admission, local non-stream shared-budget, contamination, all WebSearch handler matrices, and provider JSON fault handler paths.
 
-### External Kiro-RS Tool Usage
+### External Account Runtime-RS Tool Usage
 
-`KiroRsToolCachePolicy.reportedInputMinTokens/MaxTokens` was previously overwritten by the generic external `input=raw` policy in a manually constructed fixture. The old test passed only because it mutated the request body without refreshing `request_input_tokens` and the preparation cache.
+`Account RuntimeRsToolCachePolicy.reportedInputMinTokens/MaxTokens` was previously overwritten by the generic external `input=raw` policy in a manually constructed fixture. The old test passed only because it mutated the request body without refreshing `request_input_tokens` and the preparation cache.
 
 The repaired contract is:
 
-- a resolved Kiro-RS Tool route still performs its own usage/cache projection when generic reported-usage shaping is disabled;
+- a resolved Account Runtime-RS Tool route still performs its own usage/cache projection when generic reported-usage shaping is disabled;
 - generic shaping remains authoritative only when explicitly enabled;
 - a failed attempt does not commit prompt-cache state;
 - a successful attempt commits state and the next turn can report cache read;
-- the Kiro-RS Tool input range remains `32..=4096` in the default strategy fixture.
+- the Account Runtime-RS Tool input range remains `32..=4096` in the default strategy fixture.
 
 ### Refresh Fixtures And Local Invalid Configuration
 
@@ -87,7 +87,7 @@ The shared HTTP helper now uses monotonic deadline-first biased selection for he
 
 `full-unit-failures-r2` ran the original four failures exactly:
 
-- external Kiro-RS Tool projection: `1/1`;
+- external Account Runtime-RS Tool projection: `1/1`;
 - Redis lease touch interval: `1/1`;
 - refresh client-builder failure: `1/1`;
 - OAuth shared success: `1/1`, with `c1/c8/c16/c32 x 5` internal rounds and HTTP hits exactly equal to caller count.
@@ -137,7 +137,7 @@ The final full-tree run did not suppress warnings. The separate `cargo check --a
 After the accepted run:
 
 - no `.validation-build-*` directory remained;
-- no `kiro-full-unit-r*.??????` temporary report directory remained;
+- no `account-runtime-full-unit-r*.??????` temporary report directory remained;
 - free disk was about `32 GiB`;
 - root `target/` remained about `708 MiB` and was not deleted because it is editor-owned;
 - `git diff --check` passed for the changed source set.

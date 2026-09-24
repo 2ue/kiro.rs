@@ -14,14 +14,14 @@ Last reviewed: 2026-07-28 Asia/Shanghai
 
 - 新 UI `OverviewPage` 把页面拆成了 `实时 / 流量 / 费用 / 异常` 四个 Tab，并把部分查询按 Tab 延迟加载。
 - 后端把 `/usage-dashboard/top` 做成了可按 `windowKey` 查询。
-- UI 补了一些费用、Kiro metering/积分、本地账号质量字段。
+- UI 补了一些费用、Account Runtime metering/积分、本地账号质量字段。
 
 但这些不等于 dashboard 设计完成。核心缺口是：
 
 1. 没有先定义 dashboard 要回答的运维问题。
 2. 没有定义每个指标的数据时间语义：实时、当前窗口、趋势范围、累计、库存状态、后台统计健康。
 3. 没有定义新旧 UI 能力一致性边界。
-4. 没有定义费用口径：本地估算、本地实际/原始、Kiro 积分、外部池 raw/shaped/uplifted/billable/profit。
+4. 没有定义费用口径：本地估算、本地实际/原始、Account Runtime 积分、外部池 raw/shaped/uplifted/billable/profit。
 5. 没有定义账号质量视角：账号能不能调度、是否正在卡队列、错误率、延迟、成本、积分、余额、模型限制、选中压力。
 6. 没有定义统计查询和主业务之间的硬隔离验收。
 
@@ -33,7 +33,7 @@ Dashboard/UI 问题的根因不是单个接口慢或单张卡片缺字段，而�
 
 - 实时运行态、选定窗口统计、趋势范围、累计费用、账号库存和统计系统健康被混在同一个总览页面。
 - 新旧 UI 没有共用能力矩阵，导致同名指标可能口径不同。
-- 成本口径只局部覆盖外部池，未把本地账号成本、Kiro 积分、返回下游 usage、未计价请求统一起来。
+- 成本口径只局部覆盖外部池，未把本地账号成本、Account Runtime 积分、返回下游 usage、未计价请求统一起来。
 - 账号质量被简化成 Top credentials，无法解释调度质量、错误率、余额、模型覆盖和 selection pressure。
 - dashboard/usage 聚合查询的性能故障域没有在 UI/API 合同里和主业务隔离。
 
@@ -130,7 +130,7 @@ Dashboard/UI 问题的根因不是单个接口慢或单张卡片缺字段，而�
 
 - 本地估算费用：本系统按价格表、usage、整形逻辑估算出来的费用。
 - 本地原始/实际费用：上游原始 usage 或原始成本口径，用于和本地估算对账。
-- Kiro metering / 积分：上游 meteringEvent 累积积分，用于判断真实 Kiro 消耗。
+- Account Runtime metering / 积分：上游 meteringEvent 累积积分，用于判断真实 Account Runtime 消耗。
 - 外部池 raw cost：外部池上游真实 cost。
 - 外部池 shaped/reported/uplifted/billable：整形、返回下游、放大计费、最终可计费口径。
 - 未计价请求：价格表没匹配、模型别名没匹配、usage 缺失、错误请求不应计费等导致的计价空洞。
@@ -142,7 +142,7 @@ Dashboard/UI 问题的根因不是单个接口慢或单张卡片缺字段，而�
   ├─ 本地账号成本/积分消耗
   │    ├─ estimatedCostUsd
   │    ├─ originalCostUsd
-  │    └─ kiroMeteringUsage
+  │    └─ upstreamMeteringUnits
   └─ 外部池成本/利润
        ├─ rawCostUsd
        ├─ shapedCostUsd
@@ -180,7 +180,7 @@ Dashboard/UI 问题的根因不是单个接口慢或单张卡片缺字段，而�
    - latency p50/p95 或 average/p95
    - input/output/cache tokens
    - estimated/original cost
-   - Kiro metering usage
+   - Account Runtime metering usage
    - priced/unpriced
 3. 账号库存/余额：
    - email / masked key
@@ -271,7 +271,7 @@ Dashboard 的设计应该从运维问题反推，而不是从已有字段反推�
 - high cache requests
 - average duration / p95 duration / first token latency
 - estimated/original cost
-- Kiro metering usage
+- Account Runtime metering usage
 - priced/unpriced
 - local/external route split
 - cache source / usage source
@@ -306,7 +306,7 @@ Dashboard 的设计应该从运维问题反推，而不是从已有字段反推�
 - 本地账号：
   - estimated cost
   - original/upstream cost
-  - Kiro metering usage
+  - Account Runtime metering usage
   - credit remaining / limit
   - cost by credential / model / endpoint / API key
 - 外部池：
@@ -327,7 +327,7 @@ Dashboard 的设计应该从运维问题反推，而不是从已有字段反推�
 
 至少支持：
 
-- 按当前窗口排名：请求、错误率、p95、费用、Kiro 积分、未计价。
+- 按当前窗口排名：请求、错误率、p95、费用、Account Runtime 积分、未计价。
 - 按实时运行态排名：in-flight、oldest lease age、selection pressure、recent error EWMA、cooldown/rate-limit。
 - 按库存/余额排名：remaining credits、subscription、overage、last checked、supported model coverage。
 - 过滤：启用/禁用、provider、region、endpoint、proxy、model support、错误账号。
@@ -396,7 +396,7 @@ Overview 首屏应该轻量，不做重 SQL，不加载大排行。
    - global in-flight / max。
    - scheduler degraded 状态。
 4. 当前窗口摘要：
-   - 请求、错误率、P95、费用、Kiro 积分、未计价。
+   - 请求、错误率、P95、费用、Account Runtime 积分、未计价。
    - 明确标注“受时间窗口控制”。
 5. 统计健康：
    - dashboard cache freshness。
@@ -427,7 +427,7 @@ Cost 页面/Tab 展示：
 - 当前窗口总览：
   - estimated cost
   - original/upstream cost
-  - Kiro metering usage
+  - Account Runtime metering usage
   - priced/unpriced
   - successful-but-zero-cost
   - errored-but-costed / credited
@@ -671,7 +671,7 @@ Dashboard/Usage 统计不能影响主业务。
 | Top 模型/账号/入口/错误 | 有，在流量 Tab | 有，在底部 | 名称和口径一致 |
 | 本地账号质量 | 有，但不完整 | 缺 | 独立账号质量视角 |
 | 外部池成本 | 有 | 有 | 费用页完整展示，口径一致 |
-| 本地成本/Kiro积分 | 有局部卡片 | 有局部卡片 | 成本关系图和账号维度齐全 |
+| 本地成本/Account Runtime积分 | 有局部卡片 | 有局部卡片 | 成本关系图和账号维度齐全 |
 | 错误诊断 | 有摘要 | 有摘要 | 增加 phase/route/status/reason/grouping |
 | 统计系统健康 | 基本缺 | 缺 | 必须新增 |
 | 积分查询刷新 | 新旧行为不一致 | 旧 UI 另有逻辑 | 统一刷新 contract |
@@ -684,7 +684,7 @@ Dashboard/Usage 统计不能影响主业务。
 
 - Top 查询支持 `windowKey` 是对的，维度排行必须能随窗口变化。
 - 分接口加载比原来的大接口更好。
-- Kiro metering/积分进入 summary/series/top 是必要的。
+- Account Runtime metering/积分进入 summary/series/top 是必要的。
 - 外部池计费拆分应该保留。
 - 新 UI 已经从单页堆叠收敛为 5 个明确区块：实时、流量、费用、账号质量、异常诊断。
 - 新 UI 已补 `usage-writer-stats` 统计健康入口，避免 dashboard 完全看不到观测持久化状态。
@@ -801,7 +801,7 @@ Dashboard/Usage 统计不能影响主业务。
 - today/yesterday/last7d/last30d/thisMonth/lifetime 都有不同请求数。
 - 本地账号和外部池都有成功/失败。
 - priced/unpriced 都存在。
-- Kiro metering usage 非 0。
+- Account Runtime metering usage 非 0。
 - 不同模型/endpoint/credential/error reason 分布不同。
 
 验收：
@@ -884,7 +884,7 @@ Dashboard/Usage 统计不能影响主业务。
 - 不要把“加 Tab”当成信息架构完成。
 - 不要让一个时间切换器隐式控制一部分卡片、另一部分不控制。
 - 不要把实时状态、历史窗口、累计成本、账号库存混在一个卡片组里。
-- 不要只展示外部池费用，忽略本地账号成本和 Kiro 积分。
+- 不要只展示外部池费用，忽略本地账号成本和 Account Runtime 积分。
 - 不要把账号质量降级成 Top credentials。
 - 不要让新旧 UI 同名能力不同口径。
 - 不要用“查询繁忙/数据库错误”掩盖 dashboard 自身健康问题。

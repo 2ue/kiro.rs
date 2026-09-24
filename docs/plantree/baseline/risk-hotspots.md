@@ -21,7 +21,7 @@ No current finding has enough evidence for P0. The service has successful protoc
 | Finding | Current behavior | Primary evidence |
 | --- | --- | --- |
 | `COR-001` | Tool-format diagnostics and request-body capture default on; files roll but directory retention is unbounded | `src/model/config.rs:3374-3431`, `src/anthropic/tool_format_debug.rs:369-492` |
-| `COR-002` | Runtime config is cloned and stored as a full document without expected-version CAS | `src/kiro/token_manager/manager.rs:1246-1268`, `src/storage/postgres.rs:390-408` |
+| `COR-002` | Runtime config is cloned and stored as a full document without expected-version CAS | `src/local_upstream_impl/token_manager/manager.rs:1246-1268`, `src/storage/postgres.rs:390-408` |
 | `COR-003` | Redis usage snapshot, seen marker, and aggregate update are separate operations | `src/storage/redis_cache.rs:685-716` |
 | `COR-004` | External `preservePath` is exposed but `_endpoint` is ignored | `src/external_pool.rs:3400-3405` |
 | `SEC-001` | DNS safety lookup is independent from reqwest's actual connection lookup | `src/anthropic/body_processing.rs:317-325`, `557` onward |
@@ -35,9 +35,9 @@ No current finding has enough evidence for P0. The service has successful protoc
 
 | Finding | Severity | Current behavior | Primary evidence |
 | --- | --- | --- | --- |
-| `RES-003` | P1 | Kiro/external non-stream and error paths can collect a complete upstream response with a time limit but no response-byte ceiling | `src/http_client.rs:107-131`, `src/anthropic/handlers.rs:6317-6347`, `src/external_pool.rs:1753-1758`, `1994-2049` |
-| `RES-004` | P1/P2 conditional on proxy/config churn | Kiro clients are cached by complete proxy configuration without capacity, TTL, idle retirement, or deletion invalidation, retaining old pools and proxy secrets until exit | `src/kiro/provider.rs:76-83`, `947-960` |
-| `RES-005` | P1/P2 conditional on workload/host | Local and external global concurrency/wait-queue defaults use `0 = unlimited`, so a burst or slow upstream can make the host the admission limit | `src/model/config.rs:2294-2307`, `2390-2397`, `2703-2709`, `3668-3670`; `src/kiro/token_manager/manager.rs:2027-2040` |
+| `RES-003` | P1 | Account Runtime/external non-stream and error paths can collect a complete upstream response with a time limit but no response-byte ceiling | `src/http_client.rs:107-131`, `src/anthropic/handlers.rs:6317-6347`, `src/external_pool.rs:1753-1758`, `1994-2049` |
+| `RES-004` | P1/P2 conditional on proxy/config churn | Account Runtime clients are cached by complete proxy configuration without capacity, TTL, idle retirement, or deletion invalidation, retaining old pools and proxy secrets until exit | `src/local_upstream_impl/provider.rs:76-83`, `947-960` |
+| `RES-005` | P1/P2 conditional on workload/host | Local and external global concurrency/wait-queue defaults use `0 = unlimited`, so a burst or slow upstream can make the host the admission limit | `src/model/config.rs:2294-2307`, `2390-2397`, `2703-2709`, `3668-3670`; `src/local_upstream_impl/token_manager/manager.rs:2027-2040` |
 | `SEC-004` | P1/P2 conditional on enabled pool destinations | External-pool URLs accept HTTP(S), but no owner binds DNS/IP approval to the actual connection or defines safe redirect and cross-origin credential behavior | `src/storage/postgres.rs:6083-6101`, `src/external_pool.rs:1235-1243`, `1698-1727`, `3380-3415` |
 | `SEC-005` | P2 | Ordinary Admin reads return reusable keys/proxy passwords and both maintained UIs retain the reusable Admin key in JavaScript-readable `localStorage` | `src/admin/types.rs:393-403`, `987-1000`, `1366-1386`, `1410-1418`; `src/admin/service.rs:432-456`; `admin-ui/src/lib/storage.ts`, `ui/src/lib/storage.ts` |
 | `OPS-005` | P2; release-blocking before the first modernization schema slice | Normal startup runs mutable inline schema, semicolon-split non-atomic statements, checksum overwrite, and table-wide backfill work | `src/model/config.rs:2455-2474`, `src/storage/postgres.rs:200-220`, `280-353`, `3437-3447`, `6793-6810`, `7032-7283` |
@@ -56,14 +56,14 @@ The conditional classifications identify where production magnitude still needs 
 | Payload/cache | Repeated JSON cloning, canonicalization, sizing, tokenization, serialization | CPU/RSS for 1/20-MiB and tool-heavy requests |
 | Usage | Batches still perform substantial per-record/per-rollup work | SQL statements/event, pool wait, writer backlog and request tail |
 | PDF/tokenizer | PDF work is serialized by a standard mutex; configured remote tokenizer uses a blocking bridge | Tokio heartbeat, unrelated request p99, cancellation |
-| Kiro HTTP | Explicit `Connection: close` prevents ordinary HTTP/1.1 reuse | Real Kiro compatibility and handshake A/B |
+| Account Runtime HTTP | Explicit `Connection: close` prevents ordinary HTTP/1.1 reuse | Real Account Runtime compatibility and handshake A/B |
 
 These costs are not evidence that the current service is universally slow. They are evidence that dependency latency and higher scale can be amplified by the current architecture.
 
 ## Compatibility Hotspots
 
 - Claude Code requires stable SSE event order, final non-zero usage, thinking/signature behavior, tool pairing, Files, MCP/tool/search workflows, model aliases, and normalized errors.
-- Kiro IDE and CLI have distinct envelopes and parser behavior.
+- Account Runtime IDE and CLI have distinct envelopes and parser behavior.
 - External raw passthrough must remain byte-preserving and must not enter normalized/local processing.
 - Cache simulation, actual upstream usage, downstream projection, and billable usage must remain distinguishable.
 - Payload shaping must invalidate token/cache facts derived from an older body revision.

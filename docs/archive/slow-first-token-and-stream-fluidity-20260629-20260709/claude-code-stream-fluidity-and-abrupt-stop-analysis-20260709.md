@@ -12,7 +12,7 @@
 - 有时只输出一句后就结束，或者执行到中途突兀停止，但没有明确错误。
 - 同一上游经过不同系统时，用户主观体验差异明显，所以不能只用“上游慢”解释。
 
-本分析要回答的是：协议上什么情况会天然无可见输出，当前 `kiro.rs` 哪些处理会额外放大这种体验，对比 `sub2api` / `kiro-go` 有哪些具体差异，下一步应该如何做事实验证。
+本分析要回答的是：协议上什么情况会天然无可见输出，当前 `account-runtime` 哪些处理会额外放大这种体验，对比 `sub2api` / `account-runtime-go` 有哪些具体差异，下一步应该如何做事实验证。
 
 ## 资料与证据来源
 
@@ -26,9 +26,9 @@
 
 本地代码：
 
-- 当前项目：`/Users/yuanfeijie/Desktop/procode/kiro.rs`
+- 当前项目：`/Users/yuanfeijie/Desktop/procode/account-runtime`
 - 对比项目：`../sub2api`，已 `git pull --ff-only` 到 `6f43986c`
-- 对比项目：`../kiro-go`，已确认 up to date
+- 对比项目：`../account-runtime-go`，已确认 up to date
 - 当前本机 Claude Code CLI：`2.1.197 (Claude Code)`
 - 当前 VSCode 扩展：`anthropic.claude-code-2.1.145-darwin-arm64`，扩展内置 `resources/native-binary/claude`
 
@@ -93,14 +93,14 @@ SDK 运行时会以 `--output-format stream-json --input-format stream-json` 启
 - 但交互式 TUI / VSCode WebView 是否把 `ping`、空 delta、thinking signature、tool input delta 显示成“用户感觉有输出”，是客户端 UI 决策。
 - 用户截图里的红点或状态点不能直接等同于上游错误；它也可能代表 busy、pending、permission mode、插件状态或当前 block 状态。需要用同一请求的 stream-json 时间线验证。
 
-## 当前 kiro.rs 流式路径
+## 当前 account-runtime 流式路径
 
-当前 `kiro.rs` 有两条主要流式链路：
+当前 `account-runtime` 有两条主要流式链路：
 
-1. 本地 Kiro 凭证路径：`src/anthropic/handlers.rs` + `src/anthropic/stream.rs`
+1. 本地 Account Runtime 凭证路径：`src/anthropic/handlers.rs` + `src/anthropic/stream.rs`
 2. 外部池路径：`src/external_pool.rs`
 
-### 本地 Kiro 凭证路径
+### 本地 Account Runtime 凭证路径
 
 入口会创建 `StreamContext`，然后立即生成初始 SSE 事件：
 
@@ -120,11 +120,11 @@ SDK 运行时会以 `--output-format stream-json --input-format stream-json` 启
 - `src/anthropic/handlers.rs:5467` 使用 `response.bytes_stream()` 读上游。
 - `src/anthropic/handlers.rs:5540` 先 feed 到 AWS eventstream decoder。
 - `src/anthropic/handlers.rs:5552` 到 `src/anthropic/handlers.rs:5584` 只有解出完整 frame，才能转换为 Anthropic SSE event。
-- `src/kiro/parser/decoder.rs:134` 到 `src/kiro/parser/decoder.rs:190` 表明 decoder 在数据不足时返回 `Ok(None)`，需要等更多字节。
+- `src/local_upstream_impl/parser/decoder.rs:134` 到 `src/local_upstream_impl/parser/decoder.rs:190` 表明 decoder 在数据不足时返回 `Ok(None)`，需要等更多字节。
 
 这意味着：
 
-- 上游 TCP chunk 到了，不代表 `kiro.rs` 能立刻产出下游 SSE。
+- 上游 TCP chunk 到了，不代表 `account-runtime` 能立刻产出下游 SSE。
 - 如果上游 chunk 边界不等于 AWS frame 边界，`chunks_before_first_output` 会增加，`stream_gap_to_first_output_ms` 会变大。
 - 这种等待是 binary eventstream 解帧要求带来的，但是否过大需要看真实日志。
 
@@ -143,7 +143,7 @@ SSE 响应头：
 
 如果部署链路上有 Nginx 或兼容代理，缺这个头会增加被代理缓冲的风险。它不是唯一原因，但它是和 `sub2api` 的明确差异。
 
-### 本地 Kiro 路径的文本缓冲风险
+### 本地 Account Runtime 路径的文本缓冲风险
 
 `src/anthropic/stream.rs` 为了识别上游泄漏出的字面 `<invoke>` 工具调用，有一个统一明文出口：
 
@@ -155,7 +155,7 @@ SSE 响应头：
 
 它不是无界内存风险，因为有 256KiB 上限；但 256KiB 对交互流畅度已经非常大。如果模型普通文本里出现类似工具协议前缀，或者上游把 tool leak 分多段吐出，文本可能被本地嗅探逻辑滞留到闭合或超过 256KiB 后才放出。
 
-### 本地 Kiro 路径的突然结束风险
+### 本地 Account Runtime 路径的突然结束风险
 
 `StreamContext::generate_final_events()` 里当前顺序值得警惕：
 
@@ -197,21 +197,21 @@ SSE 响应头：
 
 - 普通 text/thinking/tool 事件如果已经是完整 SSE event，基本按 event 原样下发。
 - 它不会等整段 assistant 完成，但会等一个完整 SSE event 结束。
-- 如果上游本身迟迟不发 `\n\n`，或者上游工具参数使用标准 buffered 模式，`kiro.rs` 也不会有可见 delta。
+- 如果上游本身迟迟不发 `\n\n`，或者上游工具参数使用标准 buffered 模式，`account-runtime` 也不会有可见 delta。
 - 如果目标是保留错误屏蔽和 usage 整形，纯 raw byte passthrough 不能直接替代现有逻辑；更合理的是保持 event boundary flush，并只在 usage/error 事件做轻处理。
 
-## 对比 kiro-go
+## 对比 account-runtime-go
 
-`../kiro-go` 当前流式实现的几个差异：
+`../account-runtime-go` 当前流式实现的几个差异：
 
-- SSE header 设置了 `Content-Type`、`Cache-Control`、`Connection`，见 `../kiro-go/proxy/handler.go:847` 到 `../kiro-go/proxy/handler.go:850`。没有看到 `X-Accel-Buffering: no`。
-- `ensureMessageStart()` 是延迟调用的，不是一开始就发，见 `../kiro-go/proxy/handler.go:869` 到 `../kiro-go/proxy/handler.go:887`。
-- text/thinking delta 会在 `sendText()` 中立即发 SSE，见 `../kiro-go/proxy/handler.go:966` 到 `../kiro-go/proxy/handler.go:1046`。
-- 工具调用前会强制 flush 文本：`processClaudeText("", false, true)`，见 `../kiro-go/proxy/handler.go:1164` 到 `../kiro-go/proxy/handler.go:1167`。
-- 每个 SSE event 后 `flusher.Flush()`，见 `../kiro-go/proxy/handler.go:1290` 到 `../kiro-go/proxy/handler.go:1293`。
-- AWS binary eventstream 解析处注释明确直接读，避免 streaming response 被 bufio 增加延迟，见 `../kiro-go/proxy/kiro.go:416` 到 `../kiro-go/proxy/kiro.go:450`。
+- SSE header 设置了 `Content-Type`、`Cache-Control`、`Connection`，见 `../account-runtime-go/proxy/handler.go:847` 到 `../account-runtime-go/proxy/handler.go:850`。没有看到 `X-Accel-Buffering: no`。
+- `ensureMessageStart()` 是延迟调用的，不是一开始就发，见 `../account-runtime-go/proxy/handler.go:869` 到 `../account-runtime-go/proxy/handler.go:887`。
+- text/thinking delta 会在 `sendText()` 中立即发 SSE，见 `../account-runtime-go/proxy/handler.go:966` 到 `../account-runtime-go/proxy/handler.go:1046`。
+- 工具调用前会强制 flush 文本：`processClaudeText("", false, true)`，见 `../account-runtime-go/proxy/handler.go:1164` 到 `../account-runtime-go/proxy/handler.go:1167`。
+- 每个 SSE event 后 `flusher.Flush()`，见 `../account-runtime-go/proxy/handler.go:1290` 到 `../account-runtime-go/proxy/handler.go:1293`。
+- AWS binary eventstream 解析处注释明确直接读，避免 streaming response 被 bufio 增加延迟，见 `../account-runtime-go/proxy/account-runtime.go:416` 到 `../account-runtime-go/proxy/account-runtime.go:450`。
 
-`kiro-go` 的取向更偏“等到真实输出再开始 message，并尽快 flush 每个输出事件”。这可能让用户主观上更少看到“状态开始但没字”的阶段。
+`account-runtime-go` 的取向更偏“等到真实输出再开始 message，并尽快 flush 每个输出事件”。这可能让用户主观上更少看到“状态开始但没字”的阶段。
 
 ## 对比 sub2api
 
@@ -237,10 +237,10 @@ SSE 响应头：
 
 可能来源按优先级：
 
-1. `kiro.rs` 本地 Kiro 路径立即发 `message_start`，但后续长时间没有可见 `content_block_delta`。这会让 UI 进入 busy 状态，但用户看不到文字。
+1. `account-runtime` 本地 Account Runtime 路径立即发 `message_start`，但后续长时间没有可见 `content_block_delta`。这会让 UI 进入 busy 状态，但用户看不到文字。
 2. 官方标准工具流在生成完整 key/value 前可能不发 `input_json_delta`。工具调用多或工具参数大时，这是协议层天然等待。
 3. thinking `display: omitted` 时不会有 `thinking_delta`，只会有签名和 block 开闭。用户看到状态但没有正文，符合协议。
-4. 当前 `kiro.rs` 只发 `ping` 保活，Claude Code UI 不一定把 ping 当作可见进度。`sub2api` 对 Claude Code 2.1.193+ 的 noop delta keepalive 是明确差异。
+4. 当前 `account-runtime` 只发 `ping` 保活，Claude Code UI 不一定把 ping 当作可见进度。`sub2api` 对 Claude Code 2.1.193+ 的 noop delta keepalive 是明确差异。
 5. 缺 `X-Accel-Buffering: no` 时，中间代理可能缓冲 SSE event，尤其在 Nginx 或类似反代路径下。
 
 ### 症状 2：输出一块一块、一大坨出现
@@ -248,7 +248,7 @@ SSE 响应头：
 可能来源按优先级：
 
 1. `invoke_sniff_buffer` 对疑似 `<invoke>` 的明文最大可持有 256KiB，这是当前代码中最明确的本地攒输出机制。
-2. 外部池 event 级透传必须等完整 SSE event delimiter。一般 event 很小，这不是问题；但如果上游把很大的 data event 一次性写完，或者迟迟不发空行，kiro.rs 只能等完整 event。
+2. 外部池 event 级透传必须等完整 SSE event delimiter。一般 event 很小，这不是问题；但如果上游把很大的 data event 一次性写完，或者迟迟不发空行，account-runtime 只能等完整 event。
 3. 官方标准工具流可能在完整参数 value 形成后才集中发多个 `input_json_delta`，这会表现为工具参数阶段一坨输出。
 4. 代理缓冲或客户端 UI 批量渲染也会把已到达的事件集中展示。需要 raw SSE timeline 和 Claude Code stream-json timeline 对照。
 
@@ -273,7 +273,7 @@ SSE 响应头：
 
 ## 当前 observability 能支撑的分类
 
-当前 `kiro.rs` 已经有一些关键字段：
+当前 `account-runtime` 已经有一些关键字段：
 
 - `first_token_latency_ms`
 - `upstream_header_ms`
@@ -287,7 +287,7 @@ SSE 响应头：
 
 相关代码：
 
-- 本地 Kiro latency trace：`src/anthropic/handlers.rs:1673` 到 `src/anthropic/handlers.rs:1930`
+- 本地 Account Runtime latency trace：`src/anthropic/handlers.rs:1673` 到 `src/anthropic/handlers.rs:1930`
 - 慢流日志字段：`src/anthropic/handlers.rs:2941` 到 `src/anthropic/handlers.rs:2985`
 - 外部池 first output 判断：`src/external_pool.rs:2829` 到 `src/external_pool.rs:2855`
 
@@ -302,20 +302,20 @@ SSE 响应头：
 不足：
 
 - 当前没有直接记录 `invoke_sniff_buffer` 持有时长/最大持有字节，这会让“一坨输出”类问题难以闭环。
-- 也没有记录 ping keepalive 与 noop delta keepalive 的客户端差异，因为目前 `kiro.rs` 没有 noop delta keepalive。
+- 也没有记录 ping keepalive 与 noop delta keepalive 的客户端差异，因为目前 `account-runtime` 没有 noop delta keepalive。
 - 外部池 event boundary 等待时间没有独立字段，只能从 chunk 与 first output 间接推断。
 
 ## 初步结论
 
 不能把所有卡顿都归因于上游慢。当前代码和对比项目已经给出几个足够具体的本地候选原因：
 
-1. **本地 Kiro 路径提前发送 `message_start`**  
+1. **本地 Account Runtime 路径提前发送 `message_start`**
    这符合协议，但会让 Claude Code UI 很早进入“正在响应”状态；如果后续还在 thinking/tool/key-value buffering 或上游未出可见 delta，用户就会感觉卡住。
 
 2. **当前缺 `X-Accel-Buffering: no`**  
-   `sub2api` 两条 stream 路径都加了该头，`kiro.rs` SSE builder 当前没有。在线上反代存在缓冲时，这会直接影响“持续流出”的体验。
+   `sub2api` 两条 stream 路径都加了该头，`account-runtime` SSE builder 当前没有。在线上反代存在缓冲时，这会直接影响“持续流出”的体验。
 
-3. **`kiro.rs` 只有 ping keepalive，没有 Claude Code 2.1.193+ 的 active-block 空 delta keepalive**  
+3. **`account-runtime` 只有 ping keepalive，没有 Claude Code 2.1.193+ 的 active-block 空 delta keepalive**
    `sub2api` 已经针对 Claude Code 新版本做了这个兼容。当前用户本机 CLI 是 2.1.197，正处在该兼容范围内。这是非常值得验证的体验差异。
 
 4. **`invoke_sniff_buffer` 最多可滞留 256KiB 明文**  
@@ -361,7 +361,7 @@ SSE 响应头：
 - 上游中途 stream error，确认 buffer 是否丢文本，客户端是否看到标准 error。
 - 反代缓冲开/关，对比 `X-Accel-Buffering: no` 效果。
 
-### 3. 对比 sub2api / kiro-go 的体验变量
+### 3. 对比 sub2api / account-runtime-go 的体验变量
 
 只改变一个变量做 A/B：
 
@@ -375,7 +375,7 @@ SSE 响应头：
 
 对最近慢请求做只读分析，不增加主路径压力：
 
-- 按外部池 / 本地 Kiro 路径分开。
+- 按外部池 / 本地 Account Runtime 路径分开。
 - 按 `stream_gap_to_first_output_ms` 大于 10s 分类。
 - 统计 `events_before_first_output` 的事件类型分布。
 - 重点找：chunk 很早到但 visible text 很晚的请求。
@@ -386,7 +386,7 @@ SSE 响应头：
 这些是分析后的候选方向，不代表本轮已经实施：
 
 1. SSE builder 增加 `X-Accel-Buffering: no`。
-2. 评估本地 Kiro 路径是否延迟 `message_start`，或至少避免在长时间无 delta 时只靠 `message_start` 让客户端进入空忙状态。
+2. 评估本地 Account Runtime 路径是否延迟 `message_start`，或至少避免在长时间无 delta 时只靠 `message_start` 让客户端进入空忙状态。
 3. 针对 Claude Code 2.1.193+ 增加 active content block 空 delta keepalive，保留 ping 作为无活动 block 时的保活。
 4. 重构 `invoke_sniff_buffer`：降低最大持有量，或者可以先 flush 安全部分，只保留短 tail 做协议嗅探。
 5. 在 stream error 前先 flush 已确认安全的 buffered text / invoke buffer，再发送标准 error event。
@@ -398,7 +398,7 @@ SSE 响应头：
 - 初始分析阶段没有修改代码；后续已按下方“落地修复”实施代码变更。
 - 没有运行现网请求。
 - 没有对用户真实 Claude Code 会话做侵入式抓取。
-- 已完成官方资料、本地 CLI/扩展、本项目、`sub2api`、`kiro-go` 的只读对比分析。
+- 已完成官方资料、本地 CLI/扩展、本项目、`sub2api`、`account-runtime-go` 的只读对比分析。
 
 ## 2026-07-09 落地修复
 
@@ -413,13 +413,13 @@ SSE 响应头：
 
 事实依据：
 
-- 当前项目本地 Kiro SSE builder 只设置了 `Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: keep-alive`，缺少 `X-Accel-Buffering: no`。
+- 当前项目本地 Account Runtime SSE builder 只设置了 `Content-Type: text/event-stream`、`Cache-Control: no-cache`、`Connection: keep-alive`，缺少 `X-Accel-Buffering: no`。
 - `sub2api` 的流式响应路径设置了 `X-Accel-Buffering: no`。
 - 如果部署链路中存在 Nginx 或兼容反向代理，缺少该头会增加 SSE event 被代理缓冲后成块下发的风险。
 
 实现：
 
-- 本地 Kiro SSE builder 固定增加 `x-accel-buffering: no`。
+- 本地 Account Runtime SSE builder 固定增加 `x-accel-buffering: no`。
 - 外部池 stream 分支在转发响应头后增加 `x-accel-buffering: no`。
 - 非流式外部池响应不额外增加该头。
 
@@ -515,13 +515,13 @@ SSE 响应头：
 
 验证环境：
 
-- 本地 release 二进制：`./target/release/kiro-rs`
+- 本地 release 二进制：`./target/release/account-runtime`
 - 临时服务端口：`127.0.0.1:19095`
-- 启动参数：`KIRO_RS_HOST=127.0.0.1 KIRO_RS_PORT=19095 ./target/release/kiro-rs -c config.json --credentials credentials.json`
+- 启动参数：`ACCOUNT_RUNTIME_HOST=127.0.0.1 ACCOUNT_RUNTIME_PORT=19095 ./target/release/account-runtime -c config.json --credentials credentials.json`
 - Claude Code CLI：`2.1.197 (Claude Code)`
 - Claude 配置隔离：
-  - `HOME=/tmp/kiro-claude-home-19095`
-  - `CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-19095`
+  - `HOME=/tmp/account-runtime-claude-home-19095`
+  - `CLAUDE_CONFIG_DIR=/tmp/account-runtime-claude-config-19095`
 - `ccman` 已在隔离 HOME 下切换到 `http://127.0.0.1:19095/cc`
 - 测试模型固定为 `claude-sonnet-4-5`，服务端日志显示按 alias 解析为 `claude-sonnet-4.5`
 - 未使用 `auto` 模型。
@@ -553,7 +553,7 @@ SSE 响应头：
 
 结论：
 
-- 本地 Kiro SSE builder 的禁缓冲头已在真实 HTTP 响应中生效。
+- 本地 Account Runtime SSE builder 的禁缓冲头已在真实 HTTP 响应中生效。
 - 基础流式事件顺序满足 Anthropic-compatible 客户端预期。
 
 ### Claude Code CLI 复杂任务 1
@@ -653,7 +653,7 @@ SSE 响应头：
 - 多次 `/cc/v1/messages` 命中本地路径。
 - requested model 均为 `claude-sonnet-4-5`。
 - upstream model 均为 `claude-sonnet-4.5`。
-- 多个 request id 的 Kiro API 凭据调用链路结果为 `success`。
+- 多个 request id 的 Account Runtime API 凭据调用链路结果为 `success`。
 - 长上下文工具回合触发 payload guard，但 `still_oversized=false`，且最终 CLI 成功完成。
 
 这说明本轮验证不是只跑了 trivial prompt，而是覆盖了：

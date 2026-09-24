@@ -221,7 +221,7 @@ export function modelMappingDescription(mode: Account['modelMappingMode'] | unde
 
 export function requestBodyModeDescription(mode: Account['requestBodyMode'] | undefined): string {
   if (mode === 'raw_passthrough') {
-    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。下游 usage 是透传上游还是按入口路径整理，由当前外部账号的下游 usage 口径决定；是否改写顶层 model 由下方模型处理配置单独控制。'
+    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。下游 usage 是透传上游还是按入口路径整理，由当前账号的下游 usage 口径决定；是否改写顶层 model 由下方模型处理配置单独控制。'
   }
   return '按当前系统的标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
 }
@@ -273,24 +273,24 @@ export function usageProjectionDescription(mode: Account['usageProjectionMode'] 
   if (mode === 'current_path_policy') {
     return '返回给下游的 usage 按当前入口路径的缓存策略整理；如果该路径是 no-cache 或非流式 Usage 透传，则保持上游原始 usage。'
   }
-  return '返回给下游的 usage 保持外部账号上游原始值；不按当前入口路径整理。'
+  return '返回给下游的 usage 保持上游原始值；不按当前入口路径整理。'
 }
 
 export function streamResponseDescription(mode: AccountStreamResponseDraft): string {
   if (mode === 'event_passthrough') {
     return '仅控制 stream=true 的 SSE 事件转发方式。文本、thinking、tool 等普通事件按上游事件级转发；usage 是否透传上游或按路径整理，由上面的下游 usage 口径决定。'
   }
-  return '当前外部账号不单独指定流式 SSE 转发方式，使用外部池全局默认值；usage 口径仍由上面的下游 usage 口径决定。'
+  return '当前账号不单独指定流式 SSE 转发方式，使用全局默认值；usage 口径仍由上面的下游 usage 口径决定。'
 }
 
 export function streamRetryDescription(mode: AccountStreamRetryDraft): string {
   if (mode === 'enabled') {
-    return '当前外部账号强制启用：stream 在 message_start、ping 等协议前缀后遇到 error、断流、EOF 或空闲超时时，可在未提交内容前换其他外部账号。'
+    return '当前账号强制启用：stream 在 message_start、ping 等协议前缀后遇到 error、断流、EOF 或空闲超时时，可在未提交内容前换其他账号。'
   }
   if (mode === 'disabled') {
-    return '当前外部账号强制关闭：stream body 内错误保持现有流错误行为，不把本次请求重放到其他外部账号。'
+    return '当前账号强制关闭：stream body 内错误保持现有流错误行为，不把本次请求重放到其他账号。'
   }
-  return '当前外部账号继承全局“流式首输出前错误换池”开关。'
+  return '当前账号继承全局“流式首输出前错误换号”开关。'
 }
 
 export function streamRetrySummary(account: Account, config: AccountRuntimeConfig): string {

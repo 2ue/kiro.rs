@@ -18,14 +18,14 @@ Related: [Business context](../../../baseline/business-context.md), [Requirement
 
 Earlier analysis inferred a possible multi-user or tenant boundary from multiple request API keys, multiple credentials, and Files-compatible objects. The operator explicitly confirmed that the product has no multi-user model.
 
-The service can still have multiple clients, API keys, Kiro credentials, external pools, and process replicas. Those are access, capacity, provider, and availability concepts within one operator-owned trust domain.
+The service can still have multiple clients, API keys, Account Runtime credentials, external pools, and process replicas. Those are access, capacity, provider, and availability concepts within one operator-owned trust domain.
 
 ## Decision
 
-`kiro-rs` is a single-user, single-operator, single-trust-domain product.
+`account-runtime` is a single-user, single-operator, single-trust-domain product.
 
 - Request API keys authenticate access to the same service and do not identify a user or tenant.
-- Kiro credentials and external pools are operator-owned capacity resources.
+- Account Runtime credentials and external pools are operator-owned capacity resources.
 - Usage, Files, caches, credentials, and configuration are not partitioned by request key or tenant.
 - The architecture will not introduce `UserId`, `TenantId`, tenant repositories, tenant quotas, tenant billing, or tenant routing.
 - Replica count is independent from user count. Decisions 010/014 fix multi-replica production as a supported mode inside the same trust domain, with shared operator state, one attested release generation and explicit convergence/recovery contracts; it is not conditional on a future product decision.

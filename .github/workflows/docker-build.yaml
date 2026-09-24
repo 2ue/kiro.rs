@@ -14,7 +14,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: kiro-rs
+  IMAGE_NAME: account-runtime
 
 jobs:
   quality:
@@ -113,7 +113,7 @@ jobs:
             type=image,name=${{ steps.images.outputs.dockerhub_image }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=Kiro.rs Docker Image
+            org.opencontainers.image.description=Account Runtime.rs Docker Image
             org.opencontainers.image.version=${{ steps.version.outputs.version_without_v }}
             org.opencontainers.image.revision=${{ github.sha }}
 

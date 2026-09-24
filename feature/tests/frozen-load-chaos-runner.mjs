@@ -244,11 +244,11 @@ function parseDatabaseList(value, expectedCount) {
     .map((item) => item.trim())
     .filter(Boolean);
   if (databases.length !== expectedCount) {
-    throw new Error(`KIRO_LOAD_CHAOS_POSTGRES_DATABASES must contain exactly ${expectedCount} pre-created database names`);
+    throw new Error(`ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES must contain exactly ${expectedCount} pre-created database names`);
   }
   for (const database of databases) {
-    if (!/^kiro_load_chaos_[a-z0-9_]{3,80}$/.test(database)) {
-      throw new Error("KIRO_LOAD_CHAOS_POSTGRES_DATABASES must contain caller-owned kiro_load_chaos_* names");
+    if (!/^account_runtime_load_chaos_[a-z0-9_]{3,80}$/.test(database)) {
+      throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES must contain caller-owned account_runtime_load_chaos_* names");
     }
   }
   return databases;
@@ -257,18 +257,18 @@ function parseDatabaseList(value, expectedCount) {
 function validatePostgresTemplate(template, databases) {
   const placeholderCount = (template.match(/\{database\}/g) || []).length;
   if (placeholderCount !== 1) {
-    throw new Error("KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder");
   }
-  const parsed = new URL(template.replace("{database}", databases[0] || "kiro_load_chaos_contract_sample"));
+  const parsed = new URL(template.replace("{database}", databases[0] || "account_runtime_load_chaos_contract_sample"));
   if (!["postgres:", "postgresql:"].includes(parsed.protocol)) {
-    throw new Error("KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must use PostgreSQL");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must use PostgreSQL");
   }
   if (!isLoopback(parsed.hostname)) {
-    throw new Error("KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must target loopback");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must target loopback");
   }
   if (Number(parsed.port || 5432) === PROTECTED_PORT) throw new Error("port 9022 is protected");
   if (parsed.hash) {
-    throw new Error("KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must not contain a fragment");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE must not contain a fragment");
   }
   return {
     host: parsed.hostname,
@@ -278,7 +278,7 @@ function validatePostgresTemplate(template, databases) {
 }
 
 function dbUrlFromTemplate(template, database) {
-  if (!/^kiro_load_chaos_[a-z0-9_]{3,80}$/.test(database)) {
+  if (!/^account_runtime_load_chaos_[a-z0-9_]{3,80}$/.test(database)) {
     throw new Error(`unsafe load-chaos database name: ${database}`);
   }
   return template.replace("{database}", database);
@@ -286,30 +286,30 @@ function dbUrlFromTemplate(template, database) {
 
 function validateRedisInput(redisUrl, redisPrefix) {
   const redis = new URL(redisUrl);
-  if (redis.protocol !== "redis:") throw new Error("KIRO_LOAD_CHAOS_REDIS_URL must use redis://");
+  if (redis.protocol !== "redis:") throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL must use redis://");
   if (redis.username || redis.password) {
-    throw new Error("KIRO_LOAD_CHAOS_REDIS_URL must not contain Redis auth material");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL must not contain Redis auth material");
   }
   if (!isLoopback(redis.hostname)) {
-    throw new Error("KIRO_LOAD_CHAOS_REDIS_URL must target loopback");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL must target loopback");
   }
   if (Number(redis.port || 6379) === PROTECTED_PORT) throw new Error("port 9022 is protected");
   if (redis.search || redis.hash) {
-    throw new Error("KIRO_LOAD_CHAOS_REDIS_URL must not contain query or fragment data");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL must not contain query or fragment data");
   }
   const databaseText = redis.pathname.replace(/^\//, "");
   if (!/^\d+$/.test(databaseText)) {
-    throw new Error("KIRO_LOAD_CHAOS_REDIS_URL must name a Redis database");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL must name a Redis database");
   }
   const database = Number(databaseText);
   if (!Number.isSafeInteger(database) || database < 1 || database > 15) {
-    throw new Error("KIRO_LOAD_CHAOS_REDIS_URL must use an isolated nonzero database in 1..15");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL must use an isolated nonzero database in 1..15");
   }
-  if (redisPrefix.includes("kiro_rs:local")) {
-    throw new Error("KIRO_LOAD_CHAOS_REDIS_PREFIX must be a caller-owned temporary prefix");
+  if (redisPrefix.includes("account_runtime:local")) {
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_PREFIX must be a caller-owned temporary prefix");
   }
   if (!/^[a-z0-9][a-z0-9:._-]{7,95}$/.test(redisPrefix)) {
-    throw new Error("KIRO_LOAD_CHAOS_REDIS_PREFIX has an invalid format");
+    throw new Error("ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_PREFIX has an invalid format");
   }
   return {
     redis,
@@ -451,7 +451,7 @@ function serviceConfig({ pgUrl, redisUrl, redisPrefix, proxyPort, fakePort, apiK
       maxQueuedRequests: 1_000,
       queueTimeoutMs: 5_000,
     },
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${fakePort}`,
+    localUpstreamBaseUrl: `http://127.0.0.1:${fakePort}`,
     defaultEndpoint: "cli",
     credentialRpm: 0,
     credentialMaxConcurrentRequests: 500,
@@ -467,8 +467,8 @@ function serviceConfig({ pgUrl, redisUrl, redisPrefix, proxyPort, fakePort, apiK
     credentialProbationSecs: 1,
     credentialMaxCooldownSecs: 3,
     credentialDispatchMaxWaitSecs: 5,
-    kiroUpstreamResponseTimeoutSecs: 30,
-    kiroUpstreamStreamIdleTimeoutSecs: 8,
+    localUpstreamResponseTimeoutSecs: 30,
+    localUpstreamStreamIdleTimeoutSecs: 8,
     credentialRetryMaxAttempts: 0,
     inferenceUpstreamMaxAttempts: 4,
     auxiliaryUpstreamMaxAttempts: 2,
@@ -511,13 +511,13 @@ function serviceConfig({ pgUrl, redisUrl, redisPrefix, proxyPort, fakePort, apiK
       fallbackOnLocalCapacityExhausted: true,
       fallbackOnLocalTransientExhausted: true,
     },
-    kiroAgentModeStrategy: "vibe",
+    localUpstreamAgentModeStrategy: "vibe",
   };
 }
 
 function fakeCredentials(count = 4) {
   return Array.from({ length: count }, (_, index) => ({
-    kiroApiKey: `ksk_loadtest_fake_${index + 1}_${crypto.randomBytes(6).toString("hex")}`,
+    apiKey: `sk_loadtest_fake_${index + 1}_${crypto.randomBytes(6).toString("hex")}`,
     authMethod: "api_key",
     endpoint: "cli",
     priority: index,
@@ -538,7 +538,7 @@ async function startFake(ctx, scenario, options = {}) {
     `127.0.0.1:${port}`,
     "--scenario",
     scenario,
-    "--fake-kiro-eventstream",
+    "--fake-local-upstream-eventstream",
     "true",
     "--fake-delay-ms",
     String(options.delayMs ?? 500),
@@ -587,7 +587,7 @@ async function startProxy(ctx, fakePort, options = {}) {
   const log = path.join(ctx.logsDir, `proxy-${database}.log`);
   const child = spawnLogged(
     ctx.productBinary,
-    ["-c", configPath, "--credentials", credentialsPath],
+    ["-c", configPath],
     log,
     {
       env: minimalEnvironment({
@@ -609,12 +609,12 @@ async function restartProxy(ctx, proxy, fakePort) {
   const configPath = path.join(ctx.root, `${proxy.database}.config.json`);
   const credentialsPath = path.join(ctx.root, `${proxy.database}.credentials.json`);
   const existingConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  existingConfig.kiroUpstreamBaseUrl = `http://127.0.0.1:${fakePort}`;
+  existingConfig.localUpstreamBaseUrl = `http://127.0.0.1:${fakePort}`;
   writeJson(configPath, existingConfig);
   const log = path.join(ctx.logsDir, `proxy-${proxy.database}-restart-${ctx.sequence++}.log`);
   const child = spawnLogged(
     ctx.productBinary,
-    ["-c", configPath, "--credentials", credentialsPath],
+    ["-c", configPath],
     log,
     {
       env: minimalEnvironment({
@@ -1085,22 +1085,22 @@ async function main() {
   const productBinary = DEFAULT_PRODUCT_BINARY;
   const loadtestBinary = requirePath(
     "loadtest-binary",
-    args["loadtest-binary"] || process.env.KIRO_LOADTEST_BINARY,
+    args["loadtest-binary"] || process.env.ACCOUNT_RUNTIME_LOADTEST_BINARY,
   );
   const pgUrlTemplate = String(
-    args["postgres-url-template"] || process.env.KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE || "",
+    args["postgres-url-template"] || process.env.ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE || "",
   );
   const postgresDatabases = parseDatabaseList(
-    args["postgres-databases"] || process.env.KIRO_LOAD_CHAOS_POSTGRES_DATABASES || "",
+    args["postgres-databases"] || process.env.ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES || "",
     requiredDatabases,
   );
   const postgresTarget = validatePostgresTemplate(pgUrlTemplate, postgresDatabases);
-  const redisUrl = String(args["redis-url"] || process.env.KIRO_LOAD_CHAOS_REDIS_URL || "");
+  const redisUrl = String(args["redis-url"] || process.env.ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL || "");
   const redisPrefix = String(
-    args["redis-prefix"] || process.env.KIRO_LOAD_CHAOS_REDIS_PREFIX || "",
+    args["redis-prefix"] || process.env.ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_PREFIX || "",
   );
   const redisTarget = validateRedisInput(redisUrl, redisPrefix);
-  const validateOnly = args["validate-only"] === true || process.env.KIRO_LOAD_CHAOS_VALIDATE_ONLY === "1";
+  const validateOnly = args["validate-only"] === true || process.env.ACCOUNT_RUNTIME_LOAD_CHAOS_VALIDATE_ONLY === "1";
   const summaryPath = args.summary ? path.resolve(String(args.summary)) : null;
   const runId = `${tier}_${Date.now().toString(36)}_${process.pid}`;
   if (validateOnly) {
@@ -1126,7 +1126,7 @@ async function main() {
   }
   const runtimeRoot = path.join(ARTIFACT_ROOT, "runtime");
   fs.mkdirSync(runtimeRoot, { recursive: true });
-  const root = fs.mkdtempSync(path.join(runtimeRoot, `kiro-${tier}-load-chaos-`));
+  const root = fs.mkdtempSync(path.join(runtimeRoot, `account-runtime-${tier}-load-chaos-`));
   const logsDir = path.join(root, "logs");
   const reportsDir = path.join(root, "reports");
   fs.mkdirSync(logsDir, { recursive: true });

@@ -5,7 +5,7 @@ Last reviewed: 2026-07-28 Asia/Shanghai
 Related:
 
 - [Thinking Signature 官方机制与改造方案](../../../../../docs/analysis/thinking-signature-remediation-plan-20260728.md)
-- [Kiro 上游“签名”与设备指纹全链路分析](../../../../../docs/analysis/kiro-upstream-signature-and-fingerprint-analysis-20260727.md)
+- [Account Runtime 上游“签名”与设备指纹全链路分析](../../../../../docs/analysis/account-runtime-upstream-signature-and-fingerprint-analysis-20260727.md)
 
 ## 当前状态
 
@@ -50,12 +50,12 @@ Related:
 
 待决策：
 
-- Branch A：如果 Kiro 接受数组/位置化 reasoning，则实现 Vec 或位置化内容模型。
-- Branch B：如果 Kiro 只接受单值，则对受保护最新 assistant 的多块 thinking fail-closed，不伪造、不合并、不丢弃。
+- Branch A：如果 Account Runtime 接受数组/位置化 reasoning，则实现 Vec 或位置化内容模型。
+- Branch B：如果 Account Runtime 只接受单值，则对受保护最新 assistant 的多块 thinking fail-closed，不伪造、不合并、不丢弃。
 
 阻塞证据：
 
-- 需要真实抓包确认 Kiro 是否接受：
+- 需要真实抓包确认 Account Runtime 是否接受：
   - 1 元素数组。
   - 2 元素数组。
   - thinking → tool_use → thinking → tool_use 交错顺序。
@@ -141,10 +141,10 @@ Related:
 7. 模型不匹配。
 8. 更老工具回合 thinking 省略、最新保留。
 9. `display:"omitted"` + 空 thinking + signature。
-10. 捕获 Kiro 响应 shape，确认 object/array 反序列化需求。
+10. 捕获 Account Runtime 响应 shape，确认 object/array 反序列化需求。
 
 验收：
 
 - 抓包请求和响应必须脱敏。
-- 不把抓包结论写成官方事实；只标注 Kiro 当前行为。
+- 不把抓包结论写成官方事实；只标注 Account Runtime 当前行为。
 - Branch A/B 选择必须引用抓包证据。

@@ -217,7 +217,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
-        const candidateApiKey = cred.apiKey?.trim() || cred.kiroApiKey?.trim() || ''
+        const candidateApiKey = cred.apiKey?.trim() || cred.apiKey?.trim() || ''
         const isApiKeyCred = !!candidateApiKey || cred.authMethod === 'api_key'
 
         // 更新状态为检查中

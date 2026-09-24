@@ -14,10 +14,10 @@ import { validationChildEnvironment } from './validation-child-env.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '../..')
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
-const ROUNDS = Number.parseInt(process.env.KIRO_E01_E02_ROUNDS || '3', 10)
+const ROUNDS = Number.parseInt(process.env.ACCOUNT_RUNTIME_E01_E02_ROUNDS || '3', 10)
 const ALL_MODES = ['priority', 'balanced', 'health_balanced', 'weighted_least_inflight']
-const MODES = process.env.KIRO_E01_E02_MODES
-  ? process.env.KIRO_E01_E02_MODES.split(',').map((mode) => mode.trim()).filter(Boolean)
+const MODES = process.env.ACCOUNT_RUNTIME_E01_E02_MODES
+  ? process.env.ACCOUNT_RUNTIME_E01_E02_MODES.split(',').map((mode) => mode.trim()).filter(Boolean)
   : ALL_MODES
 const ACCOUNT_COUNT = 60
 const SHORT_REQUESTS = 120
@@ -30,17 +30,17 @@ const RACE_REQUESTS_PER_INSTANCE = 12
 const WEIGHTED_REQUESTS = 90
 const REQUEST_KEY = 'sk-request-e0102-isolated-validation'
 const ADMIN_KEY = 'sk-admin-e0102-isolated-validation'
-const POSTGRES_URL_TEMPLATE = requiredEnvironment('KIRO_E01_E02_POSTGRES_URL_TEMPLATE')
-const REDIS_URL = requiredEnvironment('KIRO_E01_E02_REDIS_URL')
-const REDIS_PREFIX = requiredEnvironment('KIRO_E01_E02_REDIS_PREFIX')
-const VALIDATE_ONLY = process.env.KIRO_E01_E02_VALIDATE_ONLY === '1'
-const EXTRA_LOCAL_MATRIX = process.env.KIRO_E01_E02_EXTRA_LOCAL_MATRIX === '1'
+const POSTGRES_URL_TEMPLATE = requiredEnvironment('ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE')
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_E01_E02_REDIS_URL')
+const REDIS_PREFIX = requiredEnvironment('ACCOUNT_RUNTIME_E01_E02_REDIS_PREFIX')
+const VALIDATE_ONLY = process.env.ACCOUNT_RUNTIME_E01_E02_VALIDATE_ONLY === '1'
+const EXTRA_LOCAL_MATRIX = process.env.ACCOUNT_RUNTIME_E01_E02_EXTRA_LOCAL_MATRIX === '1'
 const RUN_ID = `e0102-${new Date().toISOString().replace(/[-:.TZ]/g, '')}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = path.join(ARTIFACT_ROOT, 'runtime', 'e01-e02', RUN_ID)
 const REPORT_ROOT = path.join(ARTIFACT_ROOT, 'reports', 'e01-e02')
 const REPORT_PATH = path.join(REPORT_ROOT, `${RUN_ID}.json`)
 const REQUIRED_DATABASE_COUNT = MODES.length * ROUNDS
-const POSTGRES_DATABASES = String(process.env.KIRO_E01_E02_POSTGRES_DATABASES || '')
+const POSTGRES_DATABASES = String(process.env.ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean)
@@ -103,10 +103,10 @@ const ACCEPTANCE_CONTRACT = Object.freeze({
 })
 
 if (!Number.isInteger(ROUNDS) || ROUNDS < 3 || ROUNDS > 5) {
-  throw new Error('KIRO_E01_E02_ROUNDS must be an integer between 3 and 5')
+  throw new Error('ACCOUNT_RUNTIME_E01_E02_ROUNDS must be an integer between 3 and 5')
 }
 if (MODES.length === 0 || MODES.some((mode) => !ALL_MODES.includes(mode))) {
-  throw new Error(`KIRO_E01_E02_MODES must contain only: ${ALL_MODES.join(',')}`)
+  throw new Error(`ACCOUNT_RUNTIME_E01_E02_MODES must contain only: ${ALL_MODES.join(',')}`)
 }
 
 function requiredEnvironment(name) {
@@ -118,48 +118,48 @@ function requiredEnvironment(name) {
 function validateInputs() {
   const placeholderCount = (POSTGRES_URL_TEMPLATE.match(/\{database\}/g) || []).length
   if (placeholderCount !== 1) {
-    throw new Error('KIRO_E01_E02_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
   }
-  const sampleDatabase = POSTGRES_DATABASES[0] || 'kiro_e0102_contract_sample'
+  const sampleDatabase = POSTGRES_DATABASES[0] || 'account_runtime_e0102_contract_sample'
   const postgres = new URL(POSTGRES_URL_TEMPLATE.replace('{database}', sampleDatabase))
   if (!['postgres:', 'postgresql:'].includes(postgres.protocol)) {
-    throw new Error('KIRO_E01_E02_POSTGRES_URL_TEMPLATE must use PostgreSQL')
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE must use PostgreSQL')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(postgres.hostname)) {
-    throw new Error('KIRO_E01_E02_POSTGRES_URL_TEMPLATE must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE must target loopback')
   }
   if (Number(postgres.port || 5432) === 9022) throw new Error('port 9022 is protected')
   if (POSTGRES_DATABASES.length !== REQUIRED_DATABASE_COUNT) {
-    throw new Error(`KIRO_E01_E02_POSTGRES_DATABASES must contain exactly ${REQUIRED_DATABASE_COUNT} pre-created database names`)
+    throw new Error(`ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES must contain exactly ${REQUIRED_DATABASE_COUNT} pre-created database names`)
   }
   for (const database of POSTGRES_DATABASES) {
-    if (!/^kiro_e0102_[a-z0-9_]{3,80}$/.test(database)) {
-      throw new Error('KIRO_E01_E02_POSTGRES_DATABASES must contain caller-owned kiro_e0102_* names')
+    if (!/^account_runtime_e0102_[a-z0-9_]{3,80}$/.test(database)) {
+      throw new Error('ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES must contain caller-owned account_runtime_e0102_* names')
     }
   }
 
   const redis = new URL(REDIS_URL)
-  if (redis.protocol !== 'redis:') throw new Error('KIRO_E01_E02_REDIS_URL must use redis://')
+  if (redis.protocol !== 'redis:') throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_URL must use redis://')
   if (redis.username || redis.password) {
-    throw new Error('KIRO_E01_E02_REDIS_URL must not contain Redis auth material')
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_URL must not contain Redis auth material')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(redis.hostname)) {
-    throw new Error('KIRO_E01_E02_REDIS_URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_URL must target loopback')
   }
-  if (redis.search || redis.hash) throw new Error('KIRO_E01_E02_REDIS_URL must not contain query or fragment data')
+  if (redis.search || redis.hash) throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_URL must not contain query or fragment data')
   const redisPort = Number(redis.port || 6379)
   if (redisPort === 9022) throw new Error('port 9022 is protected')
   const dbText = redis.pathname.replace(/^\//, '')
-  if (!/^\d+$/.test(dbText)) throw new Error('KIRO_E01_E02_REDIS_URL must name a Redis database')
+  if (!/^\d+$/.test(dbText)) throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_URL must name a Redis database')
   const redisDatabase = Number(dbText)
   if (!Number.isSafeInteger(redisDatabase) || redisDatabase < 1 || redisDatabase > 15) {
-    throw new Error('KIRO_E01_E02_REDIS_URL must use an isolated nonzero database in 1..15')
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_URL must use an isolated nonzero database in 1..15')
   }
-  if (REDIS_PREFIX.includes('kiro_rs:local')) {
-    throw new Error('KIRO_E01_E02_REDIS_PREFIX must be a caller-owned temporary prefix')
+  if (REDIS_PREFIX.includes('account_runtime:local')) {
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_PREFIX must be a caller-owned temporary prefix')
   }
   if (!/^[a-z0-9][a-z0-9:._-]{7,95}$/.test(REDIS_PREFIX)) {
-    throw new Error('KIRO_E01_E02_REDIS_PREFIX has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_E01_E02_REDIS_PREFIX has an invalid format')
   }
   redisTarget = { redis, redisPort, redisDatabase }
   return {
@@ -575,7 +575,7 @@ function createFakeUpstreams() {
   const local = http.createServer(async (request, response) => {
     const raw = await readBody(request)
     const marker = extractMarker(raw)
-    const target = String(request.headers['x-amz-target'] || '')
+    const target = String(request.headers['x-account-runtime-target'] || '')
     const authorization = String(request.headers.authorization || '')
     const selectedCredential = Number.parseInt(
       authorization.match(/e0102-token-(\d+)/)?.[1] || '0',
@@ -745,13 +745,13 @@ function listenerSnapshot(port) {
 
 function startService(configPath, credentialsPath, logPath, servicePort) {
   const log = fs.openSync(logPath, 'a')
-  const handle = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = spawn(BINARY, ['--config', configPath], {
     cwd: ROOT,
     env: validationChildEnvironment({
       LOCAL_UPSTREAM_API_KEY: '',
       ACCOUNT_RUNTIME_HOST: '127.0.0.1',
       ACCOUNT_RUNTIME_PORT: String(servicePort),
-      RUST_LOG: 'kiro_rs::kiro::token_manager=debug,kiro_rs=info',
+      RUST_LOG: 'account_runtime::token_manager=debug,account_runtime=info',
     }),
     stdio: ['ignore', log, log],
   })
@@ -776,7 +776,7 @@ async function waitForHealth(baseUrl, processHandle, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (processHandle.exitCode !== null) {
-      throw new Error(`kiro-rs exited before health check: ${processHandle.exitCode}`)
+      throw new Error(`account-runtime service exited before health check: ${processHandle.exitCode}`)
     }
     try {
       const response = await fetch(`${baseUrl}/healthz`)
@@ -856,7 +856,7 @@ function credentialsFor(mode) {
       expiresAt: '2099-01-01T00:00:00Z',
       authMethod: 'social',
       endpoint: 'ide',
-      profileArn: `arn:aws:codewhisperer:us-east-1:123456789012:profile/E0102_${id}`,
+      profileArn: `arn:account-runtime:us-east-1:123456789012:profile/E0102_${id}`,
       priority: mode === 'priority' && id > PRIORITY_PREFERRED_COUNT ? 10 : 0,
       maxConcurrentRequests: 1,
       rpm: 0,
@@ -885,10 +885,10 @@ function serviceConfig({ databaseUrl, redisUrl, redisPrefix, servicePort, localP
       queueTimeoutMs: 0,
     },
     defaultEndpoint: 'ide',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${localPort}/kiro`,
-    kiroUpstreamResponseTimeoutSecs: 120,
-    kiroUpstreamStreamIdleTimeoutSecs: 8,
-    kiroUpstreamStreamRetryEnabled: false,
+    upstreamBaseUrl: `http://127.0.0.1:${localPort}/account-runtime`,
+    upstreamResponseTimeoutSecs: 120,
+    upstreamStreamIdleTimeoutSecs: 8,
+    upstreamStreamRetryEnabled: false,
     credentialRetryMaxAttempts: 1,
     inferenceUpstreamMaxAttempts: 1,
     credentialWarmupRequests: 0,

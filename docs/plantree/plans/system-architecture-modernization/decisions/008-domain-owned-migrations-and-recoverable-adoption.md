@@ -79,7 +79,7 @@ Schema evolution uses expand, bounded backfill, one final whole-system target ac
 
 ## Previous-Binary Compatibility
 
-Before final cutover, the accepted rollback profile must prove the immutable previous binary starts with `KIRO_RS_POSTGRES_MIGRATE_ON_START=false`, rollup compression disabled, and every legacy conditional repair/backfill either disabled or isolated from target history. If any old startup writer cannot be disabled and cannot prove compatibility, cutover is blocked. Decision 014 fixes the complete previous-state matrix; an assumption that both runners will coexist is not evidence.
+Before final cutover, the accepted rollback profile must prove the immutable previous binary starts with `ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=false`, rollup compression disabled, and every legacy conditional repair/backfill either disabled or isolated from target history. If any old startup writer cannot be disabled and cannot prove compatibility, cutover is blocked. Decision 014 fixes the complete previous-state matrix; an assumption that both runners will coexist is not evidence.
 
 Rollback selects the previous compatible application reader/writer against additive schema. It does not delete target ledger rows, rewrite target checksums, or run destructive reverse DDL.
 

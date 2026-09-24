@@ -14,7 +14,7 @@ Replacement plan: [Greenfield AI Gateway](../../greenfield-ai-gateway/README.md)
 
 The source plan was completed as a specification for a different target: a complete first-party Rust rewrite, two retained Admin frontends, a fixed 50-module technical-authority ledger, legacy-compatible schema/state migration and one final Rust-system cutover.
 
-The user replaced that target with a new general AI model gateway implemented in a separate repository using Go plus one React/TypeScript/Tailwind Admin application. Kiro remains mandatory in the first release but becomes one vertical provider module. Future upstream providers or API gateway integrations may reuse default scheduling/usage/conversion implementations or supply their own implementations behind versioned contracts.
+The user replaced that target with a new general AI model gateway implemented in a separate repository using Go plus one React/TypeScript/Tailwind Admin application. Account Runtime remains mandatory in the first release but becomes one vertical provider module. Future upstream providers or API gateway integrations may reuse default scheduling/usage/conversion implementations or supply their own implementations behind versioned contracts.
 
 No production implementation had started under the source modernization plan, so no target source or migration artifact is abandoned by this authority change.
 

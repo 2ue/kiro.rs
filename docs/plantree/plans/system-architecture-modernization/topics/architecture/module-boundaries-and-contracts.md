@@ -91,7 +91,7 @@ flowchart LR
 - `usage projection -> response transport`, scheduler mutation, or concrete storage.
 - `Admin service -> MultiTokenManager` fields, broad locks, or process-local job maps.
 - one target module -> another module's private domain implementation, adapter records, worker queues, repository implementation, or state handles.
-- target runtime -> `AppState`, `MultiTokenManager`, `KiroProvider`, `ExternalPoolManager`, `UsageRecorder`, broad legacy stores, handlers, or any legacy implementation adapter.
+- target runtime -> `AppState`, `MultiTokenManager`, `Account RuntimeProvider`, `ExternalPoolManager`, `UsageRecorder`, broad legacy stores, handlers, or any legacy implementation adapter.
 - downstream target modules -> the complete `RuntimeSnapshot` or `RuntimeSnapshotProvider`; they receive a narrow typed view or derived plan from the captured version.
 - any target module -> a service locator, arbitrary dependency map, mega context, mega prelude, or root re-export that hides undeclared module edges.
 - cross-module contracts -> `serde_json::Value`, `Box<dyn Any>`, arbitrary maps, or stringly typed commands as the normal extension mechanism.
@@ -134,7 +134,7 @@ pub trait MessagesUseCase: Send + Sync {
 }
 ```
 
-The transport layer applies inbound connection/header/body/stream limits, authentication, endpoint-profile resolution, one runtime capture, pre-body `MOD-RESOURCE-GOVERNOR` admission, chunk-by-chunk reservation, structural preflight, CORS, and public error encoding. It does not select credentials, build Kiro payloads, query usage storage, or know Redis keys.
+The transport layer applies inbound connection/header/body/stream limits, authentication, endpoint-profile resolution, one runtime capture, pre-body `MOD-RESOURCE-GOVERNOR` admission, chunk-by-chunk reservation, structural preflight, CORS, and public error encoding. It does not select credentials, build Account Runtime payloads, query usage storage, or know Redis keys.
 
 Admin transport maps validated commands and queries to Admin application services. Admin authentication is a separate control-plane concern from Request API Key authentication, but it uses the same governor ledger with the smaller Admin body sublimit.
 
@@ -280,7 +280,7 @@ pub trait BodyPipeline: Send + Sync {
 }
 
 pub enum PreparedRequest {
-    Kiro(KiroPreparedRequest),
+    Account Runtime(Account RuntimePreparedRequest),
     ExternalRaw(ExternalRawRequest),
     ExternalNormalized(ExternalNormalizedRequest),
 }
@@ -288,7 +288,7 @@ pub enum PreparedRequest {
 
 Required invariants:
 
-- Local Kiro performs only the accepted Anthropic-to-Kiro compatibility stages.
+- Local Account Runtime performs only the accepted Anthropic-to-Account Runtime compatibility stages.
 - External normalized performs only stages allowed by the selected pool and runtime policy.
 - External raw preserves original bytes except an explicitly planned top-level model rewrite.
 - Usage projection is not a body stage.
@@ -407,10 +407,10 @@ External pool scheduling uses the same separation but a distinct domain and port
 This section defines the accepted contract boundary for `RES-003`/`FUN-018`, `RES-004`/`QA-RES-004`, and `SEC-004`/`QA-SEC-006`; it is not evidence that current adapters satisfy those findings or requirements.
 
 ```rust
-pub trait KiroUpstream: Send + Sync {
+pub trait Account RuntimeUpstream: Send + Sync {
     async fn execute(
         &self,
-        request: KiroPreparedRequest,
+        request: Account RuntimePreparedRequest,
         context: AttemptContext,
     ) -> Result<UpstreamResponse, TransportFailure>;
 }
@@ -427,7 +427,7 @@ pub trait ExternalUpstream: Send + Sync {
 
 Adapters own client reuse, TLS/proxy selection, authentication injection, DNS/connect behavior, redirect validation, response streaming, and safe header allowlists. They return transport facts; they do not decide fallback, scheduler punishment, public errors, or usage projection.
 
-The captured `AttemptContext` carries an immutable upstream response budget derived from the request's one `ResourcePolicyView`. `MOD-KIRO-UPSTREAM` and `MOD-EXTERNAL-UPSTREAM` enforce that budget while reading rather than after materialization:
+The captured `AttemptContext` carries an immutable upstream response budget derived from the request's one `ResourcePolicyView`. `MOD-ACCOUNT_RUNTIME-UPSTREAM` and `MOD-EXTERNAL-UPSTREAM` enforce that budget while reading rather than after materialization:
 
 - success, error, and streaming profiles have explicit byte ceilings; `Content-Length` is only an early-rejection hint, and compressed, chunked, missing-length, dishonest-length, and event-frame accumulation are counted incrementally;
 - an error path retains only the accepted bounded classification prefix, never a complete arbitrary body, and limit errors contain no body content;
@@ -511,7 +511,7 @@ Upstream execution possibility and upstream response progress are separate facts
 
 ```rust
 pub enum ResponsePlan {
-    TranslateKiro(ResponseProfile),
+    TranslateAccount Runtime(ResponseProfile),
     ExternalPassthrough(ExternalResponsePolicy),
 }
 
@@ -539,7 +539,7 @@ pub trait ResponseEngine: Send + Sync {
 
 `ResponseUsageSession` is a public `MOD-USAGE` port. It encapsulates the authority-private request accumulator and accepts only bounded canonical response-usage facts. The response engine may request incremental/final wire projections, but it cannot construct, inspect, own, finalize or persist `UsageAccumulator`, choose an accounting formula, or emit a durable usage event.
 
-The response engine owns stream state and backpressure. Kiro events become canonical response events and then Anthropic wire events. External passthrough filters headers and may transform only the usage-bearing terminal representation returned by the selected usage session.
+The response engine owns stream state and backpressure. Account Runtime events become canonical response events and then Anthropic wire events. External passthrough filters headers and may transform only the usage-bearing terminal representation returned by the selected usage session.
 
 ## Terminal Outcome Contracts
 
@@ -711,7 +711,7 @@ pub trait ExternalPoolRepository: Send + Sync {
 
 Repositories expose row or aggregate operations. They do not accept a complete process-memory snapshot as a save command, and absence from a supplied list never implies deletion. The traits shown in this catalog are owned by their corresponding `MOD-*` modules and live behind separate public contracts; they do not form one broad `repositories.rs`, generic unit-of-work service, or store facade through which unrelated modules reach PgSQL.
 
-`MOD-PROXY-RESOURCES` owns the complete reusable-proxy command/query/test and immutable publication contract. Its repository returns redacted records; secret replacement uses a separate typed `Keep`/`Replace`/`Clear` command and never round-trips plaintext through an ordinary query model. Credentials retain a versioned proxy-resource reference, schedulers consume a narrow availability/binding view, and Kiro transport receives one resolved transport fact. Those consumers cannot query proxy rows or own a second mutable catalog.
+`MOD-PROXY-RESOURCES` owns the complete reusable-proxy command/query/test and immutable publication contract. Its repository returns redacted records; secret replacement uses a separate typed `Keep`/`Replace`/`Clear` command and never round-trips plaintext through an ordinary query model. Credentials retain a versioned proxy-resource reference, schedulers consume a narrow availability/binding view, and Account Runtime transport receives one resolved transport fact. Those consumers cannot query proxy rows or own a second mutable catalog.
 
 ### Migration Contract Boundary
 
@@ -770,7 +770,7 @@ Every significant task is registered at bootstrap under one module ID. A bounded
 
 ## Legacy Characterization Boundary
 
-Existing `AppState`, `KiroProvider`, `MultiTokenManager`, `ExternalPoolManager`, `UsageRecorder` and broad stores remain in the legacy baseline only. Test-only characterization adapters may expose one narrow black-box contract, but they are excluded from release features and deleted before final candidate freeze. Target composition never selects or imports them.
+Existing `AppState`, `Account RuntimeProvider`, `MultiTokenManager`, `ExternalPoolManager`, `UsageRecorder` and broad stores remain in the legacy baseline only. Test-only characterization adapters may expose one narrow black-box contract, but they are excluded from release features and deleted before final candidate freeze. Target composition never selects or imports them.
 
 Offline comparison invokes the legacy artifact and target candidate separately against immutable facts or independent state clones. New responsibilities are not added to legacy code except a separately authorized incident hotfix.
 

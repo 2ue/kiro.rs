@@ -8,9 +8,9 @@ use crate::model::config::Config;
 use crate::model::config::LocalUpstreamAgentModeStrategy;
 
 pub const BUILDER_ID_PLACEHOLDER_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+    "arn:account-runtime:us-east-1:638616132270:profile/AAAACCCCXXXX";
 pub const SOCIAL_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+    "arn:account-runtime:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 
 const ENTERPRISE_FALLBACK_PROFILE_ID: &str = "VNECVYCYYAWN";
 const ENTERPRISE_FALLBACK_ACCOUNT_ID: &str = "610548660232";
@@ -43,7 +43,7 @@ pub fn enterprise_fallback_profile_arn(region: &str) -> String {
         "us-east-1"
     };
     format!(
-        "arn:aws:codewhisperer:{}:{}:profile/{}",
+        "arn:account-runtime:{}:{}:profile/{}",
         region, ENTERPRISE_FALLBACK_ACCOUNT_ID, ENTERPRISE_FALLBACK_PROFILE_ID
     )
 }
@@ -66,14 +66,14 @@ pub fn is_external_idp_credentials(credentials: &LocalUpstreamCredentials) -> bo
 pub fn is_external_idp_auth_method(value: &str) -> bool {
     matches!(
         compact_protocol_value(value).as_str(),
-        "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
+        "externalidp" | "enterprise" | "iamsso" | "internal"
     )
 }
 
 pub fn is_external_idp_provider(value: &str) -> bool {
     matches!(
         compact_protocol_value(value).as_str(),
-        "enterprise" | "externalidp" | "iamsso" | "awsidc" | "internal"
+        "enterprise" | "externalidp" | "iamsso" | "internal"
     )
 }
 
@@ -228,12 +228,12 @@ mod tests {
     fn real_profile_arn_wins_over_fallbacks() {
         let credentials = LocalUpstreamCredentials {
             auth_method: Some("external_idp".to_string()),
-            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL".to_string()),
+            profile_arn: Some("arn:account-runtime:us-east-1:123:profile/REAL".to_string()),
             ..Default::default()
         };
         assert_eq!(
             resolve_profile_arn(&credentials, &Config::default()).as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123:profile/REAL")
+            Some("arn:account-runtime:us-east-1:123:profile/REAL")
         );
     }
 
@@ -246,8 +246,6 @@ mod tests {
             "external_idp",
             "IAM_SSO",
             "IAMSSO",
-            "AWSIdC",
-            "AWS_IDC",
             "Internal",
         ] {
             let credentials = LocalUpstreamCredentials {
@@ -279,8 +277,6 @@ mod tests {
             "externalidp",
             "iam_sso",
             "IAMSSO",
-            "aws-idc",
-            "AWS_IDC",
             "Internal",
         ] {
             let credentials = LocalUpstreamCredentials {
@@ -331,7 +327,7 @@ mod tests {
         };
         assert_eq!(
             resolve_streaming_profile_arn(&credentials, &Config::default()).as_deref(),
-            Some("arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN")
+            Some("arn:account-runtime:eu-central-1:610548660232:profile/VNECVYCYYAWN")
         );
     }
 
@@ -359,7 +355,7 @@ mod tests {
             auth_method: Some("api_key".to_string()),
             api_key: Some("ksk_test".to_string()),
             provider: Some("Enterprise".to_string()),
-            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/STALE".to_string()),
+            profile_arn: Some("arn:account-runtime:us-east-1:123:profile/STALE".to_string()),
             ..Default::default()
         };
         assert_eq!(resolve_profile_arn(&credentials, &Config::default()), None);

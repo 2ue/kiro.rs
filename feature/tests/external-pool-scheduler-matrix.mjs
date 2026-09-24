@@ -3,7 +3,7 @@
 /*
  * Product-level external-pool scheduler matrix.
  *
- * This is not a unit test oracle. It starts one frozen kiro.rs process, three
+ * This is not a unit test oracle. It starts one frozen account runtime process, three
  * loopback Anthropic-compatible mock upstreams, and drives real HTTP requests
  * through the service. Each scenario changes the mock upstream behavior and,
  * where needed, the per-pool scheduler config through the admin API.
@@ -25,53 +25,53 @@ import { validationChildEnvironment } from './validation-child-env.mjs'
 const ROOT = fs.realpathSync(path.resolve(import.meta.dirname, '../..'))
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
 
-const POSTGRES_URL = requiredEnvironment('KIRO_EXTERNAL_MATRIX_POSTGRES_URL')
-const REDIS_URL = requiredEnvironment('KIRO_EXTERNAL_MATRIX_REDIS_URL')
-const REDIS_PREFIX = requiredEnvironment('KIRO_EXTERNAL_MATRIX_REDIS_PREFIX')
+const POSTGRES_URL = requiredEnvironment('ACCOUNT_RUNTIME_EXTERNAL_MATRIX_POSTGRES_URL')
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_EXTERNAL_MATRIX_REDIS_URL')
+const REDIS_PREFIX = requiredEnvironment('ACCOUNT_RUNTIME_EXTERNAL_MATRIX_REDIS_PREFIX')
 
 const REQUEST_KEY = 'sk-external-matrix-request'
 const ADMIN_KEY = 'sk-external-matrix-admin'
-const MODEL = process.env.KIRO_EXTERNAL_MATRIX_MODEL || 'claude-sonnet-4'
-const ROUTE = process.env.KIRO_EXTERNAL_MATRIX_ROUTE || '/v1/messages'
+const MODEL = process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_MODEL || 'claude-sonnet-4'
+const ROUTE = process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_ROUTE || '/v1/messages'
 const ROUTE_RULE = ROUTE.replace(/\/v1\/messages$/i, '') || '/v1'
 const REQUESTS_PER_SCENARIO = boundedInteger(
-  process.env.KIRO_EXTERNAL_MATRIX_REQUESTS_PER_SCENARIO,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_REQUESTS_PER_SCENARIO,
   16,
   4,
   1000,
 )
 const MAX_CONCURRENCY = boundedInteger(
-  process.env.KIRO_EXTERNAL_MATRIX_MAX_CONCURRENCY,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_MAX_CONCURRENCY,
   8,
   1,
   256,
 )
-const TARGET_RPM = boundedInteger(process.env.KIRO_EXTERNAL_MATRIX_RPM, 240, 1, 6000)
+const TARGET_RPM = boundedInteger(process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_RPM, 240, 1, 6000)
 const CLIENT_TIMEOUT_MS = boundedInteger(
-  process.env.KIRO_EXTERNAL_MATRIX_CLIENT_TIMEOUT_MS,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_CLIENT_TIMEOUT_MS,
   15_000,
   1000,
   120_000,
 )
 const STREAM_CHUNK_DELAY_MS = boundedInteger(
-  process.env.KIRO_EXTERNAL_MATRIX_STREAM_CHUNK_DELAY_MS,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_STREAM_CHUNK_DELAY_MS,
   35,
   0,
   5000,
 )
 const STREAM_CHUNKS = boundedInteger(
-  process.env.KIRO_EXTERNAL_MATRIX_STREAM_CHUNKS,
+  process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_STREAM_CHUNKS,
   4,
   1,
   128,
 )
 const SCENARIO_FILTER = new Set(
-  String(process.env.KIRO_EXTERNAL_MATRIX_SCENARIOS || '')
+  String(process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_SCENARIOS || '')
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean),
 )
-const KEEP_TEMP = process.env.KIRO_EXTERNAL_MATRIX_KEEP_TEMP === '1'
+const KEEP_TEMP = process.env.ACCOUNT_RUNTIME_EXTERNAL_MATRIX_KEEP_TEMP === '1'
 
 const RUN_ID = `external-matrix-${Date.now()}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `${RUN_ID}-`))
@@ -85,6 +85,9 @@ let lastScenarioReport = null
 const BEHAVIOR = {
   jsonSuccess: { type: 'json_success' },
   streamSuccess: { type: 'stream_success' },
+  thinkingSuccess: { type: 'thinking_stream' },
+  toolUseSuccess: { type: 'tool_use_stream' },
+  malformedStream: { type: 'malformed_sse' },
   success: { type: 'success' },
 }
 
@@ -279,6 +282,113 @@ const SCENARIOS = [
     expect: { all200: true, primaryHitsMin: 1, noLocal: true },
   },
   {
+    id: 'thinking_stream_primary',
+    stream: true,
+    requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+    concurrency: Math.min(MAX_CONCURRENCY, 4),
+    behaviors: {
+      primary: {
+        ...BEHAVIOR.thinkingSuccess,
+        delayMs: 120,
+        thinkingDelayMs: 160,
+        textChunkDelayMs: 30,
+        thinkingChunks: 3,
+        textChunks: 2,
+      },
+      backup_a: { type: 'stream_success' },
+      backup_b: { type: 'stream_success' },
+    },
+    expect: {
+      all200: true,
+      primaryHitsMin: 1,
+      noLocal: true,
+      firstThinkingP95MinMs: 120,
+      firstTextP95MinMs: 200,
+    },
+  },
+  {
+    id: 'tool_use_stream_primary',
+    stream: true,
+    requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+    concurrency: Math.min(MAX_CONCURRENCY, 4),
+    behaviors: {
+      primary: {
+        ...BEHAVIOR.toolUseSuccess,
+        delayMs: 80,
+      },
+      backup_a: { type: 'stream_success' },
+      backup_b: { type: 'stream_success' },
+    },
+    expect: { all200: true, primaryHitsMin: 1, noLocal: true },
+  },
+  {
+    id: 'slow_thinking_then_text',
+    stream: true,
+    requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+    concurrency: Math.min(MAX_CONCURRENCY, 3),
+    behaviors: {
+      primary: {
+        ...BEHAVIOR.thinkingSuccess,
+        delayMs: 500,
+        thinkingDelayMs: 420,
+        textChunkDelayMs: 40,
+        thinkingChunks: 2,
+        textChunks: 2,
+      },
+      backup_a: { type: 'stream_success' },
+      backup_b: { type: 'stream_success' },
+    },
+    expect: {
+      all200: true,
+      primaryHitsMin: 1,
+      noLocal: true,
+      firstThinkingP95MinMs: 350,
+      firstTextP95MinMs: 450,
+    },
+  },
+  {
+    id: 'invalid_tool_format_retry',
+    stream: false,
+    requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+    concurrency: Math.min(MAX_CONCURRENCY, 3),
+    behaviors: {
+      primary: { type: 'json_error', status: 502, message: 'Invalid tool use format.' },
+      backup_a: { type: 'json_success' },
+      backup_b: { type: 'json_success' },
+    },
+    expect: { all200: true, primaryHitsMin: 1, backupHitsMin: 1, noLocal: true },
+  },
+  {
+    id: 'malformed_sse_retry',
+    stream: true,
+    requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+    concurrency: Math.min(MAX_CONCURRENCY, 3),
+    behaviors: {
+      primary: { ...BEHAVIOR.malformedStream, delayMs: 40 },
+      backup_a: { type: 'stream_success' },
+      backup_b: { type: 'stream_success' },
+    },
+    expect: { all200: true, primaryHitsMin: 1, backupHitsMin: 1, noLocal: true },
+  },
+  {
+    id: 'client_drop_after_first_chunk',
+    stream: true,
+    requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+    concurrency: Math.min(MAX_CONCURRENCY, 2),
+    clientDrop: { afterFirstChunk: true },
+    behaviors: {
+      primary: { type: 'stream_success' },
+      backup_a: { type: 'stream_success' },
+      backup_b: { type: 'stream_success' },
+    },
+    expect: {
+      primaryHitsMin: 1,
+      backupHitsMax: 0,
+      abortedMin: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
+      noLocal: true,
+    },
+  },
+  {
     id: 'single_pool_route_block_falls_to_backup',
     stream: false,
     requestCount: Math.max(8, Math.floor(REQUESTS_PER_SCENARIO / 2)),
@@ -319,7 +429,7 @@ const SCENARIOS = [
     requestCount: 8,
     concurrency: 1,
     clearState: false,
-    waitBeforeMs: 35_000,
+    waitBeforeMs: 40_000,
     behaviors: {
       primary: { type: 'json_success' },
       backup_a: { type: 'json_success' },
@@ -622,6 +732,14 @@ function sseFrame(event, payload) {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`
 }
 
+function startStreamResponse(response) {
+  response.writeHead(200, {
+    'content-type': 'text/event-stream',
+    connection: 'close',
+    'cache-control': 'no-cache',
+  })
+}
+
 async function writeJsonSuccess(response, name, state, behavior = {}) {
   if (behavior.delayMs) await sleep(behavior.delayMs)
   state.nonStreamHits += 1
@@ -644,11 +762,7 @@ async function writeJsonSuccess(response, name, state, behavior = {}) {
 async function writeStreamSuccess(response, name, state, behavior = {}) {
   if (behavior.delayMs) await sleep(behavior.delayMs)
   state.streamHits += 1
-  response.writeHead(200, {
-    'content-type': 'text/event-stream',
-    connection: 'close',
-    'cache-control': 'no-cache',
-  })
+  startStreamResponse(response)
   response.write(sseFrame('message_start', {
     type: 'message_start',
     message: {
@@ -692,6 +806,154 @@ async function writeStreamSuccess(response, name, state, behavior = {}) {
   }))
   response.write(sseFrame('message_stop', { type: 'message_stop' }))
   response.end()
+}
+
+async function writeThinkingStream(response, name, state, behavior = {}) {
+  if (behavior.delayMs) await sleep(behavior.delayMs)
+  state.streamHits += 1
+  startStreamResponse(response)
+  response.write(sseFrame('message_start', {
+    type: 'message_start',
+    message: {
+      id: `msg_${name}_${state.hits}`,
+      type: 'message',
+      role: 'assistant',
+      model: MODEL,
+      content: [],
+      stop_reason: null,
+      usage: {
+        input_tokens: behavior.inputTokens ?? 19,
+        output_tokens: 0,
+        cache_read_input_tokens: behavior.cacheReadTokens ?? 0,
+        cache_creation_input_tokens: behavior.cacheCreationTokens ?? 0,
+      },
+    },
+  }))
+  response.write(sseFrame('content_block_start', {
+    type: 'content_block_start',
+    index: 0,
+    content_block: { type: 'thinking', thinking: '' },
+  }))
+  const thinkingChunks = behavior.thinkingChunks ?? 3
+  const thinkingDelay = behavior.thinkingChunkDelayMs ?? behavior.chunkDelayMs ?? 35
+  for (let index = 0; index < thinkingChunks; index += 1) {
+    response.write(sseFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'thinking_delta', thinking: `${name}-thinking-${index}` },
+    }))
+    if (thinkingDelay > 0) await sleep(thinkingDelay)
+  }
+  response.write(sseFrame('content_block_stop', {
+    type: 'content_block_stop',
+    index: 0,
+  }))
+  response.write(sseFrame('content_block_start', {
+    type: 'content_block_start',
+    index: 1,
+    content_block: { type: 'text', text: '' },
+  }))
+  const textChunks = behavior.textChunks ?? 2
+  const textDelay = behavior.textChunkDelayMs ?? behavior.chunkDelayMs ?? 35
+  for (let index = 0; index < textChunks; index += 1) {
+    response.write(sseFrame('content_block_delta', {
+      type: 'content_block_delta',
+      index: 1,
+      delta: { type: 'text_delta', text: `${name}-text-${index}` },
+    }))
+    if (textDelay > 0) await sleep(textDelay)
+  }
+  response.write(sseFrame('content_block_stop', {
+    type: 'content_block_stop',
+    index: 1,
+  }))
+  response.write(sseFrame('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: behavior.stopReason ?? 'end_turn', stop_sequence: null },
+    usage: { output_tokens: behavior.outputTokens ?? 5 },
+  }))
+  response.write(sseFrame('message_stop', { type: 'message_stop' }))
+  response.end()
+}
+
+async function writeToolUseStream(response, name, state, behavior = {}) {
+  if (behavior.delayMs) await sleep(behavior.delayMs)
+  state.streamHits += 1
+  startStreamResponse(response)
+  response.write(sseFrame('message_start', {
+    type: 'message_start',
+    message: {
+      id: `msg_${name}_${state.hits}`,
+      type: 'message',
+      role: 'assistant',
+      model: MODEL,
+      content: [],
+      stop_reason: null,
+      usage: {
+        input_tokens: behavior.inputTokens ?? 19,
+        output_tokens: 0,
+        cache_read_input_tokens: behavior.cacheReadTokens ?? 0,
+        cache_creation_input_tokens: behavior.cacheCreationTokens ?? 0,
+      },
+    },
+  }))
+  response.write(sseFrame('content_block_start', {
+    type: 'content_block_start',
+    index: 0,
+    content_block: {
+      type: 'tool_use',
+      id: behavior.toolId ?? `toolu_${name}_${state.hits}`,
+      name: behavior.toolName ?? 'Bash',
+      input: {},
+    },
+  }))
+  response.write(sseFrame('content_block_delta', {
+    type: 'content_block_delta',
+    index: 0,
+    delta: {
+      type: 'input_json_delta',
+      partial_json: behavior.partialJson ?? '{"command":"echo tool-use"}',
+    },
+  }))
+  response.write(sseFrame('content_block_stop', {
+    type: 'content_block_stop',
+    index: 0,
+  }))
+  response.write(sseFrame('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: behavior.stopReason ?? 'tool_use', stop_sequence: null },
+    usage: { output_tokens: behavior.outputTokens ?? 0 },
+  }))
+  response.write(sseFrame('message_stop', { type: 'message_stop' }))
+  response.end()
+}
+
+async function writeMalformedStream(response, name, state, behavior = {}) {
+  if (behavior.delayMs) await sleep(behavior.delayMs)
+  state.streamHits += 1
+  state.errors += 1
+  startStreamResponse(response)
+  response.write(sseFrame('message_start', {
+    type: 'message_start',
+    message: {
+      id: `msg_${name}_${state.hits}`,
+      type: 'message',
+      role: 'assistant',
+      model: MODEL,
+      content: [],
+      stop_reason: null,
+      usage: {
+        input_tokens: behavior.inputTokens ?? 19,
+        output_tokens: 0,
+      },
+    },
+  }))
+  response.write('event: content_block_start\n')
+  response.write('data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n')
+  response.write('event: content_block_delta\n')
+  response.write('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"broken')
+  if (behavior.holdMs) await sleep(behavior.holdMs)
+  response.destroy(new Error(`${name} malformed sse`))
 }
 
 function createMockUpstream(name, initialBehavior) {
@@ -751,6 +1013,21 @@ function createMockUpstream(name, initialBehavior) {
       await sleep(behavior.delayMs || 900)
       if (body?.stream) await writeStreamSuccess(response, name, state, behavior)
       else await writeJsonSuccess(response, name, state, behavior)
+      return
+    }
+
+    if (behavior.type === 'thinking_stream') {
+      await writeThinkingStream(response, name, state, behavior)
+      return
+    }
+
+    if (behavior.type === 'tool_use_stream') {
+      await writeToolUseStream(response, name, state, behavior)
+      return
+    }
+
+    if (behavior.type === 'malformed_sse') {
+      await writeMalformedStream(response, name, state, behavior)
       return
     }
 
@@ -966,7 +1243,7 @@ function createLocalUpstream() {
   }
   const server = http.createServer(async (request, response) => {
     const body = await readBody(request)
-    const target = String(request.headers['x-amz-target'] || '')
+    const target = String(request.headers['x-account-runtime-target'] || '')
     const isAuxiliary = target.endsWith('.ListAvailableModels')
       || String(request.url || '').toLowerCase().includes('listavailablemodels')
     const business = body.includes('external scheduler matrix')
@@ -1074,27 +1351,33 @@ function requestTimed(url, options = {}) {
   const parsed = new URL(url)
   const started = performance.now()
   const textLimit = Number.isFinite(options.textLimit) ? options.textLimit : 4000
+  const abortAfterFirstChunk = Boolean(options.abortAfterFirstChunk)
   return new Promise((resolve) => {
     let settled = false
     let responseStatus = null
     let responseHeaders = {}
+    let responseRequestId = null
+    let responseErrorId = null
     let firstChunkMs = null
     let firstTextMs = null
     let firstThinkingMs = null
     let sseBuffer = ''
     let bodyText = ''
+    let clientAbortTriggered = false
     const eventTypes = {}
     let downstreamErrorEvents = 0
 
     const finish = (result) => {
       if (settled) return
       settled = true
-      resolve({
-        status: responseStatus ?? result.status ?? 'network_error',
-        headers: responseHeaders,
-        text: bodyText.slice(0, textLimit),
-        totalMs: Number((performance.now() - started).toFixed(2)),
-        ttfbMs: result.ttfbMs ?? null,
+        resolve({
+          status: responseStatus ?? result.status ?? 'network_error',
+          headers: responseHeaders,
+          requestId: responseRequestId,
+          errorId: responseErrorId,
+          text: bodyText.slice(0, textLimit),
+          totalMs: Number((performance.now() - started).toFixed(2)),
+          ttfbMs: result.ttfbMs ?? null,
         firstChunkMs,
         firstTextMs,
         firstThinkingMs,
@@ -1153,6 +1436,10 @@ function requestTimed(url, options = {}) {
     }, (response) => {
       responseStatus = response.statusCode || 0
       responseHeaders = response.headers || {}
+      const requestIdHeader = responseHeaders['x-request-id'] ?? responseHeaders['request-id']
+      const errorIdHeader = responseHeaders['x-error-id'] ?? responseHeaders['error-id']
+      responseRequestId = requestIdHeader == null ? null : String(requestIdHeader).trim() || null
+      responseErrorId = errorIdHeader == null ? null : String(errorIdHeader).trim() || null
       const ttfbMs = Number((performance.now() - started).toFixed(2))
       response.on('data', (chunk) => {
         if (firstChunkMs === null) firstChunkMs = Number((performance.now() - started).toFixed(2))
@@ -1161,19 +1448,35 @@ function requestTimed(url, options = {}) {
         if (String(responseHeaders['content-type'] || '').includes('text/event-stream')) {
           feedSse(text)
         }
+        if (abortAfterFirstChunk && !clientAbortTriggered) {
+          clientAbortTriggered = true
+          request.destroy(new Error('client_aborted'))
+        }
       })
       response.once('end', () => {
         if (sseBuffer.trim()) handleSseFrame(sseBuffer)
         finish({ ttfbMs })
       })
       response.once('aborted', () => finish({ ttfbMs, aborted: true, error: 'response_aborted' }))
-      response.once('error', (error) => finish({ ttfbMs, error: String(error?.message || error) }))
+      response.once('error', (error) => {
+        const message = String(error?.message || error)
+        finish({
+          ttfbMs,
+          aborted: clientAbortTriggered || message === 'client_aborted' || message === 'response_aborted',
+          error: message,
+        })
+      })
     })
     request.setTimeout(options.timeoutMs || CLIENT_TIMEOUT_MS, () => {
       request.destroy(new Error('client_timeout'))
     })
     request.once('error', (error) => {
-      finish({ status: error?.message === 'client_timeout' ? 'client_timeout' : 'network_error', error: String(error?.message || error) })
+      const message = String(error?.message || error)
+      finish({
+        status: message === 'client_timeout' ? 'client_timeout' : message === 'client_aborted' ? 'client_aborted' : 'network_error',
+        error: message,
+        aborted: clientAbortTriggered || message === 'client_aborted' || message === 'response_aborted',
+      })
     })
     if (options.body !== undefined) request.write(options.body)
     request.end()
@@ -1235,6 +1538,7 @@ function postMessage(baseUrl, marker, stream, options = {}) {
     },
     body: JSON.stringify(requestBody(marker, stream)),
     timeoutMs: options.timeoutMs || CLIENT_TIMEOUT_MS,
+    abortAfterFirstChunk: options.abortAfterFirstChunk,
   })
 }
 
@@ -1262,13 +1566,15 @@ function processMetrics(pid) {
   }
 }
 
-function spawnService(configPath, credentialsPath, logPath) {
+function spawnService(configPath, credentialsPath, logPath, servicePort) {
   const fd = fs.openSync(logPath, 'a')
-  const child = spawn(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const child = spawn(BINARY, ['--config', configPath], {
     cwd: TEMP_ROOT,
     env: validationChildEnvironment({
-      RUST_LOG: 'kiro_rs::external_pool=debug,kiro_rs::anthropic=info,kiro_rs=info',
+      RUST_LOG: 'account_runtime::external_pool=debug,account_runtime::anthropic=info,account_runtime=info',
       LOCAL_UPSTREAM_API_KEY: '',
+      ACCOUNT_RUNTIME_HOST: '127.0.0.1',
+      ACCOUNT_RUNTIME_PORT: String(servicePort),
     }),
     stdio: ['ignore', fd, fd],
     detached: true,
@@ -1330,9 +1636,9 @@ function baseConfig(servicePort, localPort) {
     adminApiKey: ADMIN_KEY,
     requestAdmission: { rpm: 0, maxConcurrentRequests: 0, maxQueuedRequests: 0, queueTimeoutMs: 0 },
     defaultEndpoint: 'ide',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${localPort}/kiro`,
-    kiroUpstreamResponseTimeoutSecs: 10,
-    kiroUpstreamStreamIdleTimeoutSecs: 10,
+    upstreamBaseUrl: `http://127.0.0.1:${localPort}/account-runtime`,
+    upstreamResponseTimeoutSecs: 10,
+    upstreamStreamIdleTimeoutSecs: 10,
     credentialRetryMaxAttempts: 1,
     inferenceUpstreamMaxAttempts: 8,
     credentialWarmupRequests: 0,
@@ -1439,22 +1745,39 @@ function metricSummary(values) {
 function summarizeResponses(responses) {
   const statusCounts = {}
   const ttfb = []
+  const firstThinking = []
   const firstText = []
   const total = []
   let downstreamErrorEvents = 0
+  let abortedCount = 0
+  let successCount = 0
   for (const response of responses) {
     statusCounts[String(response.status)] = (statusCounts[String(response.status)] || 0) + 1
     if (typeof response.ttfbMs === 'number') ttfb.push(response.ttfbMs)
+    if (typeof response.firstThinkingMs === 'number') firstThinking.push(response.firstThinkingMs)
     if (typeof response.firstTextMs === 'number') firstText.push(response.firstTextMs)
     if (typeof response.totalMs === 'number') total.push(response.totalMs)
     downstreamErrorEvents += response.downstreamErrorEvents || 0
+    if (response.aborted) abortedCount += 1
+    if (
+      !response.aborted
+      && !response.error
+      && (response.downstreamErrorEvents || 0) === 0
+      && String(response.status) === '200'
+    ) {
+      successCount += 1
+    }
   }
   return {
     statusCounts,
     ttfb: metricSummary(ttfb),
+    firstThinking: metricSummary(firstThinking),
     firstText: metricSummary(firstText),
     total: metricSummary(total),
     downstreamErrorEvents,
+    abortedCount,
+    successCount,
+    errorCount: responses.length - successCount,
   }
 }
 
@@ -1507,7 +1830,10 @@ async function runScenario(baseUrl, scenario, upstreams, localUpstream, serviceP
   let nextAt = Date.now()
 
   const launch = (index) => {
-    const task = postMessage(baseUrl, `${scenario.id}-${index}`, scenario.stream)
+    const task = postMessage(baseUrl, `${scenario.id}-${index}`, scenario.stream, {
+      timeoutMs: scenario.timeoutMs || CLIENT_TIMEOUT_MS,
+      abortAfterFirstChunk: scenario.clientDrop?.afterFirstChunk || false,
+    })
       .finally(() => inFlight.delete(task))
     inFlight.add(task)
     tasks.push(task)
@@ -1573,10 +1899,13 @@ async function runScenario(baseUrl, scenario, upstreams, localUpstream, serviceP
       status: response.status,
       totalMs: response.totalMs,
       ttfbMs: response.ttfbMs,
+      firstThinkingMs: response.firstThinkingMs,
       firstTextMs: response.firstTextMs,
       downstreamErrorEvents: response.downstreamErrorEvents,
       aborted: response.aborted,
       error: response.error,
+      requestId: response.requestId,
+      errorId: response.errorId,
       text: redact(response.text || '').slice(0, 500),
     })),
     localHolder: localHolderResponse ? {
@@ -1586,6 +1915,7 @@ async function runScenario(baseUrl, scenario, upstreams, localUpstream, serviceP
     } : null,
     poolStatus,
     resources,
+    abortedCount: summary.abortedCount,
   }
   lastScenarioReport = report
   evaluateScenario(report, scenario)
@@ -1595,7 +1925,7 @@ async function runScenario(baseUrl, scenario, upstreams, localUpstream, serviceP
 function evaluateScenario(report, scenario) {
   const expect = scenario.expect || {}
   const statusCounts = report.summary.statusCounts
-  const ok = statusCounts['200'] || 0
+  const ok = report.summary.successCount || 0
   const totalResponses = report.completed
   const backupHits = (report.upstreamHits.backup_a || 0) + (report.upstreamHits.backup_b || 0)
   const totalExternalHits = Object.values(report.upstreamHits).reduce((sum, value) => sum + value, 0)
@@ -1661,6 +1991,18 @@ function evaluateScenario(report, scenario) {
       `${scenario.id} expected downstream error events: ${JSON.stringify(report.summary)}`,
     )
   }
+  if (expect.abortedMin !== undefined) {
+    assert.ok(
+      report.summary.abortedCount >= expect.abortedMin,
+      `${scenario.id} aborted count too low: ${JSON.stringify(report.summary)}`,
+    )
+  }
+  if (expect.firstThinkingP95MinMs !== undefined) {
+    assert.ok(
+      report.summary.firstThinking.p95 >= expect.firstThinkingP95MinMs,
+      `${scenario.id} first thinking p95 too low for thinking case: ${JSON.stringify(report.summary.firstThinking)}`,
+    )
+  }
   if (expect.firstTextP95MinMs !== undefined) {
     assert.ok(
       report.summary.firstText.p95 >= expect.firstTextP95MinMs,
@@ -1721,7 +2063,7 @@ async function main() {
   fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
   fs.writeFileSync(credentialsPath, `${JSON.stringify(credentials(), null, 2)}\n`, { mode: 0o600 })
 
-  const service = spawnService(configPath, credentialsPath, logPath)
+  const service = spawnService(configPath, credentialsPath, logPath, servicePort)
   const baseUrl = `http://127.0.0.1:${servicePort}`
   const scenarioReports = []
   let pools = null

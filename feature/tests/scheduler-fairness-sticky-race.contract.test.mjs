@@ -12,13 +12,13 @@ const SCRIPT = path.join(ROOT, 'feature/tests/scheduler-fairness-sticky-race.mjs
 
 function databases(count = 12) {
   return Array.from({ length: count }, (_, index) => (
-    `kiro_e0102_contract_${process.pid}_${index + 1}`
+    `account_runtime_e0102_contract_${process.pid}_${index + 1}`
   )).join(',')
 }
 
 function fixtureEnv(overrides = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-e0102-contract-'))
-  const binary = path.join(root, 'kiro-rs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-e0102-contract-'))
+  const binary = path.join(root, 'account-runtime')
   const artifact = path.join(root, 'artifacts')
   fs.writeFileSync(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   fs.mkdirSync(artifact, { recursive: true, mode: 0o700 })
@@ -26,15 +26,15 @@ function fixtureEnv(overrides = {}) {
     root,
     env: {
       ...process.env,
-      KIRO_RS_BINARY: binary,
-      KIRO_VALIDATION_ARTIFACT_DIR: artifact,
-      KIRO_E01_E02_VALIDATE_ONLY: '1',
-      KIRO_E01_E02_ROUNDS: '3',
-      KIRO_E01_E02_POSTGRES_URL_TEMPLATE:
+      ACCOUNT_RUNTIME_BINARY: binary,
+      ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifact,
+      ACCOUNT_RUNTIME_E01_E02_VALIDATE_ONLY: '1',
+      ACCOUNT_RUNTIME_E01_E02_ROUNDS: '3',
+      ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE:
         'postgres://user:pass@127.0.0.1:50891/{database}',
-      KIRO_E01_E02_POSTGRES_DATABASES: databases(),
-      KIRO_E01_E02_REDIS_URL: 'redis://127.0.0.1:26379/6',
-      KIRO_E01_E02_REDIS_PREFIX: `kiro_rs:e0102_contract:${process.pid}`,
+      ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES: databases(),
+      ACCOUNT_RUNTIME_E01_E02_REDIS_URL: 'redis://127.0.0.1:26379/6',
+      ACCOUNT_RUNTIME_E01_E02_REDIS_PREFIX: `account_runtime:e0102_contract:${process.pid}`,
       ...overrides,
     },
   }
@@ -77,15 +77,15 @@ test('validate-only accepts caller-owned loopback PG/Redis and records no Docker
 })
 
 test('database list must match modes times rounds', () => {
-  const result = run({ KIRO_E01_E02_POSTGRES_DATABASES: databases(11) })
+  const result = run({ ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES: databases(11) })
   assert.notEqual(result.status, 0)
   assert.match(result.stderr, /exactly 12 pre-created database names/)
 })
 
 test('mode subset changes required database count', () => {
   const result = run({
-    KIRO_E01_E02_MODES: 'balanced,weighted_least_inflight',
-    KIRO_E01_E02_POSTGRES_DATABASES: databases(6),
+    ACCOUNT_RUNTIME_E01_E02_MODES: 'balanced,weighted_least_inflight',
+    ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES: databases(6),
   })
   assert.equal(result.status, 0, result.stderr)
   const value = JSON.parse(result.stdout)
@@ -95,45 +95,45 @@ test('mode subset changes required database count', () => {
 
 test('rejects unsafe PostgreSQL configuration before runtime work', () => {
   const noPlaceholder = run({
-    KIRO_E01_E02_POSTGRES_URL_TEMPLATE:
-      'postgres://user:pass@127.0.0.1:50891/kiro_e0102_static',
+    ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE:
+      'postgres://user:pass@127.0.0.1:50891/account_runtime_e0102_static',
   })
   assert.notEqual(noPlaceholder.status, 0)
   assert.match(noPlaceholder.stderr, /literal \{database\} placeholder/)
 
   const nonLoopback = run({
-    KIRO_E01_E02_POSTGRES_URL_TEMPLATE:
+    ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE:
       'postgres://user:pass@example.com:5432/{database}',
   })
   assert.notEqual(nonLoopback.status, 0)
   assert.match(nonLoopback.stderr, /must target loopback/)
 
   const protectedPort = run({
-    KIRO_E01_E02_POSTGRES_URL_TEMPLATE:
+    ACCOUNT_RUNTIME_E01_E02_POSTGRES_URL_TEMPLATE:
       'postgres://user:pass@127.0.0.1:9022/{database}',
   })
   assert.notEqual(protectedPort.status, 0)
   assert.match(protectedPort.stderr, /port 9022 is protected/)
 
-  const unsafeDb = run({ KIRO_E01_E02_POSTGRES_DATABASES: 'postgres,'.repeat(12).replace(/,$/, '') })
+  const unsafeDb = run({ ACCOUNT_RUNTIME_E01_E02_POSTGRES_DATABASES: 'postgres,'.repeat(12).replace(/,$/, '') })
   assert.notEqual(unsafeDb.status, 0)
-  assert.match(unsafeDb.stderr, /caller-owned kiro_e0102_\* names/)
+  assert.match(unsafeDb.stderr, /caller-owned account_runtime_e0102_\* names/)
 })
 
 test('rejects unsafe Redis configuration before runtime work', () => {
-  const db0 = run({ KIRO_E01_E02_REDIS_URL: 'redis://127.0.0.1:26379/0' })
+  const db0 = run({ ACCOUNT_RUNTIME_E01_E02_REDIS_URL: 'redis://127.0.0.1:26379/0' })
   assert.notEqual(db0.status, 0)
   assert.match(db0.stderr, /nonzero database in 1\.\.15/)
 
-  const nonLoopback = run({ KIRO_E01_E02_REDIS_URL: 'redis://example.com:26379/6' })
+  const nonLoopback = run({ ACCOUNT_RUNTIME_E01_E02_REDIS_URL: 'redis://example.com:26379/6' })
   assert.notEqual(nonLoopback.status, 0)
   assert.match(nonLoopback.stderr, /must target loopback/)
 
-  const protectedPort = run({ KIRO_E01_E02_REDIS_URL: 'redis://127.0.0.1:9022/6' })
+  const protectedPort = run({ ACCOUNT_RUNTIME_E01_E02_REDIS_URL: 'redis://127.0.0.1:9022/6' })
   assert.notEqual(protectedPort.status, 0)
   assert.match(protectedPort.stderr, /port 9022 is protected/)
 
-  const unsafePrefix = run({ KIRO_E01_E02_REDIS_PREFIX: 'kiro_rs:local' })
+  const unsafePrefix = run({ ACCOUNT_RUNTIME_E01_E02_REDIS_PREFIX: 'account_runtime:local' })
   assert.notEqual(unsafePrefix.status, 0)
   assert.match(unsafePrefix.stderr, /caller-owned temporary prefix/)
 })

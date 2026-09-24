@@ -12,14 +12,14 @@ const SCRIPT = path.join(ROOT, 'feature/tests/frozen-load-chaos-runner.mjs')
 
 function databases(count) {
   return Array.from({ length: count }, (_, index) => (
-    `kiro_load_chaos_contract_${String(index + 1).padStart(2, '0')}`
+    `account_runtime_load_chaos_contract_${String(index + 1).padStart(2, '0')}`
   )).join(',')
 }
 
 function fixtureEnv(overrides = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-load-chaos-contract-'))
-  const binary = path.join(root, 'kiro-rs')
-  const loadtest = path.join(root, 'kiro-loadtest')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-load-chaos-contract-'))
+  const binary = path.join(root, 'account-runtime')
+  const loadtest = path.join(root, 'account-runtime-loadtest')
   const artifact = path.join(root, 'artifacts')
   fs.writeFileSync(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   fs.writeFileSync(loadtest, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
@@ -28,15 +28,15 @@ function fixtureEnv(overrides = {}) {
     root,
     env: {
       ...process.env,
-      KIRO_RS_BINARY: binary,
-      KIRO_LOADTEST_BINARY: loadtest,
-      KIRO_VALIDATION_ARTIFACT_DIR: artifact,
-      KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE:
+      ACCOUNT_RUNTIME_BINARY: binary,
+      ACCOUNT_RUNTIME_LOADTEST_BINARY: loadtest,
+      ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR: artifact,
+      ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE:
         'postgres://load_chaos:isolated@127.0.0.1:25432/{database}',
-      KIRO_LOAD_CHAOS_POSTGRES_DATABASES: databases(3),
-      KIRO_LOAD_CHAOS_REDIS_URL: 'redis://127.0.0.1:26379/8',
-      KIRO_LOAD_CHAOS_REDIS_PREFIX: `kiro_rs:load_chaos_contract:${process.pid}`,
-      KIRO_LOAD_CHAOS_VALIDATE_ONLY: '1',
+      ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES: databases(3),
+      ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL: 'redis://127.0.0.1:26379/8',
+      ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_PREFIX: `account_runtime:load_chaos_contract:${process.pid}`,
+      ACCOUNT_RUNTIME_LOAD_CHAOS_VALIDATE_ONLY: '1',
       ...overrides,
     },
   }
@@ -83,58 +83,58 @@ test('validate-only accepts caller-owned l3 inputs without side effects', () => 
 })
 
 test('tier determines exact caller-owned database count', () => {
-  const l4Bad = run({ KIRO_LOAD_CHAOS_POSTGRES_DATABASES: databases(3) }, ['--tier', 'l4'])
+  const l4Bad = run({ ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES: databases(3) }, ['--tier', 'l4'])
   assert.notEqual(l4Bad.status, 0)
   assert.match(l4Bad.stderr, /exactly 6 pre-created database names/)
 
-  const l4 = run({ KIRO_LOAD_CHAOS_POSTGRES_DATABASES: databases(6) }, ['--tier', 'l4'])
+  const l4 = run({ ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES: databases(6) }, ['--tier', 'l4'])
   assert.equal(l4.status, 0, l4.stderr)
   assert.equal(JSON.parse(l4.stdout).requiredDatabaseCount, 6)
 
-  const l5 = run({ KIRO_LOAD_CHAOS_POSTGRES_DATABASES: databases(1) }, ['--tier', 'l5'])
+  const l5 = run({ ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES: databases(1) }, ['--tier', 'l5'])
   assert.equal(l5.status, 0, l5.stderr)
   assert.equal(JSON.parse(l5.stdout).requiredDatabaseCount, 1)
 })
 
 test('rejects unsafe PostgreSQL and Redis dependencies before runtime work', () => {
   const pgHost = run({
-    KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE:
+    ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE:
       'postgres://load_chaos:isolated@example.com:25432/{database}',
   })
   assert.notEqual(pgHost.status, 0)
   assert.match(pgHost.stderr, /must target loopback/)
 
   const pgPort = run({
-    KIRO_LOAD_CHAOS_POSTGRES_URL_TEMPLATE:
+    ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_URL_TEMPLATE:
       'postgres://load_chaos:isolated@127.0.0.1:9022/{database}',
   })
   assert.notEqual(pgPort.status, 0)
   assert.match(pgPort.stderr, /port 9022 is protected/)
 
-  const pgName = run({ KIRO_LOAD_CHAOS_POSTGRES_DATABASES: 'postgres,postgres,postgres' })
+  const pgName = run({ ACCOUNT_RUNTIME_LOAD_CHAOS_POSTGRES_DATABASES: 'postgres,postgres,postgres' })
   assert.notEqual(pgName.status, 0)
-  assert.match(pgName.stderr, /caller-owned kiro_load_chaos_\* names/)
+  assert.match(pgName.stderr, /caller-owned account_runtime_load_chaos_\* names/)
 
-  const redisDb0 = run({ KIRO_LOAD_CHAOS_REDIS_URL: 'redis://127.0.0.1:26379/0' })
+  const redisDb0 = run({ ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL: 'redis://127.0.0.1:26379/0' })
   assert.notEqual(redisDb0.status, 0)
   assert.match(redisDb0.stderr, /isolated nonzero database/)
 
-  const redisAuth = run({ KIRO_LOAD_CHAOS_REDIS_URL: 'redis://:secret@127.0.0.1:26379/8' })
+  const redisAuth = run({ ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_URL: 'redis://:secret@127.0.0.1:26379/8' })
   assert.notEqual(redisAuth.status, 0)
   assert.match(redisAuth.stderr, /must not contain Redis auth material/)
 
-  const redisPrefix = run({ KIRO_LOAD_CHAOS_REDIS_PREFIX: 'kiro_rs:local' })
+  const redisPrefix = run({ ACCOUNT_RUNTIME_LOAD_CHAOS_REDIS_PREFIX: 'account_runtime:local' })
   assert.notEqual(redisPrefix.status, 0)
   assert.match(redisPrefix.stderr, /caller-owned temporary prefix/)
 })
 
 test('rejects direct Cargo target binaries even when outside the repository', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-load-chaos-target-contract-'))
-  const targetBinary = path.join(root, 'target', 'release', 'kiro-loadtest')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'account-runtime-load-chaos-target-contract-'))
+  const targetBinary = path.join(root, 'target', 'release', 'account-runtime-loadtest')
   fs.mkdirSync(path.dirname(targetBinary), { recursive: true })
   fs.writeFileSync(targetBinary, '#!/bin/sh\nexit 0\n', { mode: 0o700 })
   try {
-    const result = run({ KIRO_LOADTEST_BINARY: targetBinary })
+    const result = run({ ACCOUNT_RUNTIME_LOADTEST_BINARY: targetBinary })
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /not target\/debug or target\/release output/)
   } finally {

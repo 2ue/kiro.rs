@@ -1,6 +1,6 @@
 # 凭据调度热路径性能分析与最终改造记录
 
-本文档记录 `src/kiro/token_manager.rs` 的请求时凭据调度路径，以及外部备用号池在本次优化后的验证范围。
+本文档记录 `src/local_upstream_impl/token_manager.rs` 的请求时凭据调度路径，以及外部备用号池在本次优化后的验证范围。
 
 目标不是只修某一个禁用清理按钮，也不是只优化某个单测，而是把“凭据列表展示”和“请求调度”两类数据面分开后，继续把调度热路径里会随凭据数量和请求量放大的成本收敛掉。
 
@@ -144,8 +144,8 @@ Redis 模式仍走 Redis 全局容量读取，用于跨实例运行态。
 
 补充了外部池 manager 集成测试。该组测试需要同时配置：
 
-- `KIRO_RS_TEST_POSTGRES_URL`
-- `KIRO_RS_TEST_REDIS_URL`
+- `ACCOUNT_RUNTIME_TEST_POSTGRES_URL`
+- `ACCOUNT_RUNTIME_TEST_REDIS_URL`
 
 未配置时会跳过，不影响无外部依赖的单元测试。
 
@@ -300,8 +300,8 @@ CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test balanced_mode 
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test capacity -- --nocapture --test-threads=1
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test high_concurrency -- --nocapture --test-threads=1
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test credential -- --nocapture --test-threads=1
-CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test kiro::token_manager::tests -- --nocapture --test-threads=1
-CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test kiro::provider::tests -- --nocapture --test-threads=1
+CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test account-runtime::token_manager::tests -- --nocapture --test-threads=1
+CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test account-runtime::provider::tests -- --nocapture --test-threads=1
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test reported_usage -- --nocapture --test-threads=1
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test sub2api -- --nocapture --test-threads=1
 (cd admin-ui && npm run build)
@@ -319,8 +319,8 @@ CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test sub2api -- --n
 - `cargo test capacity` 通过：8 个测试。
 - `cargo test high_concurrency` 通过：2 个测试。
 - `cargo test credential` 通过：111 个测试。
-- `cargo test kiro::token_manager::tests` 通过：106 个测试。
-- `cargo test kiro::provider::tests` 通过：16 个测试。
+- `cargo test account-runtime::token_manager::tests` 通过：106 个测试。
+- `cargo test account-runtime::provider::tests` 通过：16 个测试。
 - `cargo test reported_usage` 通过：23 个测试。
 - `cargo test sub2api` 通过：2 个测试。
 - `admin-ui` production build 通过。
@@ -333,8 +333,8 @@ CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test sub2api -- --n
 
 环境说明：
 
-- 当前本机未设置 `KIRO_RS_TEST_POSTGRES_URL`，外部备用池真实 PgSQL+Redis manager 集成测试以跳过方式执行。
-- 当前本机未设置 `KIRO_RS_TEST_REDIS_URL`，Redis 集成测试以跳过方式执行。
+- 当前本机未设置 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL`，外部备用池真实 PgSQL+Redis manager 集成测试以跳过方式执行。
+- 当前本机未设置 `ACCOUNT_RUNTIME_TEST_REDIS_URL`，Redis 集成测试以跳过方式执行。
 - 无外部依赖的备用池开关、多池选择和容量分类测试已实际执行并通过。
 - `reported_usage` 与 `sub2api` 过滤测试已验证本地模拟缓存最终按 Claude 标准四字段向下游输出；流式 `message_start` 不提前写入非零 input/cache，最终 `message_delta.usage` 承担权威上报。
 

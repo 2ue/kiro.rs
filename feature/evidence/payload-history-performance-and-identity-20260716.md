@@ -6,7 +6,7 @@ Status: `focused-local-pass / release-gates-pending`
 
 ## 问题与修复前机制
 
-Anthropic 和 Kiro payload guard 的历史裁剪都按“删除一个逻辑 turn -> repair 整个历史 -> 序列化整个请求 -> 再判断大小”循环。需要删除 `N` 个 turn 时，处理量接近剩余 body 大小之和，长历史下呈近二次增长。该问题没有固定的 tool hash 指纹；它表现为大 body 的 CPU/分配增长、请求入口延迟和突发流量下的队列压力。
+Anthropic 和 Account Runtime payload guard 的历史裁剪都按“删除一个逻辑 turn -> repair 整个历史 -> 序列化整个请求 -> 再判断大小”循环。需要删除 `N` 个 turn 时，处理量接近剩余 body 大小之和，长历史下呈近二次增长。该问题没有固定的 tool hash 指纹；它表现为大 body 的 CPU/分配增长、请求入口延迟和突发流量下的队列压力。
 
 第一次批量实现仍有一个隐藏的二次路径：每选择下一个逻辑 turn，都会重新计算整个已选前缀的 JSON 字节。2,000 条历史的两项 debug 测试合计约 `7.23s`，因此没有把第一次实现判为完成。
 
@@ -22,7 +22,7 @@ cargo test large_history_uses_one_trim_pass_and_constant_serializations -- --noc
 2/2 passed; 每条路径 1,000 user + 1,000 assistant history
 test execution: 0.06s
 Anthropic: history_trim_passes=1, guard_serializations<=2, final<=40,000 bytes
-Kiro:      history_trim_passes=1, guard_serializations<=3, final<=40,000 bytes
+Account Runtime:      history_trim_passes=1, guard_serializations<=3, final<=40,000 bytes
 
 cargo test anthropic::payload_guard::tests:: -- --nocapture
 60/60 passed（批量实现后第一次聚焦；新增后需在最终共享 revision 重跑）

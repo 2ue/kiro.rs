@@ -6,7 +6,7 @@ Severity: P0/P1
 
 ## 问题、现象与影响
 
-修复 JSON whitespace helper 后继续逐阶段审计发现，CLI endpoint 的 `rewrite_cli_body` 即使没有任何 `origin` 或 unsupported thinking 字段需要改变，也会把完整 Kiro JSON 解析成 `serde_json::Value` 再序列化。真实红测中对象 `z,a` 被重排为 `a,z`，`1e+02` 变成 `100.0`，`\u00e9` 变成 literal `é`。因此即使关闭 whitespace compression，无操作的 endpoint stage 仍会改变 body bytes。
+修复 JSON whitespace helper 后继续逐阶段审计发现，CLI endpoint 的 `rewrite_cli_body` 即使没有任何 `origin` 或 unsupported thinking 字段需要改变，也会把完整 Account Runtime JSON 解析成 `serde_json::Value` 再序列化。真实红测中对象 `z,a` 被重排为 `a,z`，`1e+02` 变成 `100.0`，`\u00e9` 变成 literal `é`。因此即使关闭 whitespace compression，无操作的 endpoint stage 仍会改变 body bytes。
 
 当确实需要修改字段且同时需要注入 profile ARN 时，CLI 和 IDE 原实现还会连续执行两个完整 parse/serialize pass。大请求、长工具历史或异常接近 50 MiB 上限时，这会放大 CPU、临时内存和 tail latency。
 
@@ -16,9 +16,9 @@ Severity: P0/P1
 
 ## 根因与源码链
 
-[`src/kiro/endpoint/cli.rs`](../../src/kiro/endpoint/cli.rs) 的 `rewrite_cli_body` 无条件 parse/serialize，随后 `inject_profile_arn` 再做一次。[`src/kiro/endpoint/ide.rs`](../../src/kiro/endpoint/ide.rs) 先运行 `inject_ide_thinking_fields`，随后独立运行 profile 注入，同样最多两次。
+[`src/local_upstream_impl/endpoint/cli.rs`](../../src/local_upstream_impl/endpoint/cli.rs) 的 `rewrite_cli_body` 无条件 parse/serialize，随后 `inject_profile_arn` 再做一次。[`src/local_upstream_impl/endpoint/ide.rs`](../../src/local_upstream_impl/endpoint/ide.rs) 先运行 `inject_ide_thinking_fields`，随后独立运行 profile 注入，同样最多两次。
 
-这与 Anthropic raw body passthrough 不同：本地路径已经把请求转换成 Kiro JSON，确实需要按 endpoint 修改 origin、thinking wrapper 或 profile。正确合同是“无实际字段变更时 exact identity；有变更时只改变声明字段并保持其他 JSON Value 语义”，而不是要求所有本地转换保持原始 Anthropic 字节。
+这与 Anthropic raw body passthrough 不同：本地路径已经把请求转换成 Account Runtime JSON，确实需要按 endpoint 修改 origin、thinking wrapper 或 profile。正确合同是“无实际字段变更时 exact identity；有变更时只改变声明字段并保持其他 JSON Value 语义”，而不是要求所有本地转换保持原始 Anthropic 字节。
 
 ## 复现方法
 

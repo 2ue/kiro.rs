@@ -6,7 +6,7 @@ Archived: 2026-07-28
 
 Authority:
 
-- These files preserve historical observations and reasoning about slow first token, stream fluidity, and Kiro/sub2api correlation.
+- These files preserve historical observations and reasoning about slow first token, stream fluidity, and Account Runtime/sub2api correlation.
 - They do not own current runtime/scheduler behavior, current validation status, or current implementation order.
 - Current authority for Rust runtime/scheduler stabilization is [Rust Runtime Scheduler Stabilization](../../plantree/plans/rust-runtime-scheduler-stabilization/README.md).
 
@@ -16,7 +16,7 @@ Authority:
 | --- | --- | --- |
 | `docs/analysis/slow-first-token-20260629.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/slow-first-token-20260629.md` | historical evidence/reference |
 | `docs/analysis/prod-slow-first-token-12h-factual-analysis-20260706.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/prod-slow-first-token-12h-factual-analysis-20260706.md` | historical production analysis |
-| `docs/analysis/kiro-vs-sub2api-first-token-correlation-20260707.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/kiro-vs-sub2api-first-token-correlation-20260707.md` | historical comparison/reference |
+| `docs/analysis/account-runtime-vs-sub2api-first-token-correlation-20260707.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/account-runtime-vs-sub2api-first-token-correlation-20260707.md` | historical comparison/reference |
 | `docs/analysis/claude-code-stream-fluidity-and-abrupt-stop-analysis-20260709.md` | `docs/archive/slow-first-token-and-stream-fluidity-20260629-20260709/claude-code-stream-fluidity-and-abrupt-stop-analysis-20260709.md` | historical stream-fluidity analysis |
 
 ## Why archived

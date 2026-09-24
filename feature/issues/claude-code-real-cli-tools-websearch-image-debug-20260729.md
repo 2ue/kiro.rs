@@ -1,6 +1,6 @@
 # Claude Code 真实调用：tools / WebSearch / image 调试初步分析
 
-> 2026-07-29 修正：本文记录的是一次 external-pool-heavy 的历史排查，不能作为当前“只用本地账号 7/8 调试”的权威结论。当前本地账号专项证据见 [Claude Code local-account WebSearch/tools/image analysis - 2026-07-29](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md)。本地账号 7/8 当前均可用 `claude-sonnet-4.5` 返回成功；旧文中“本地 Kiro social 凭据不可用 / tools 尚未成功闭环 / 图片缺真实证据”等判断已被后续本地账号测试修正或细化。
+> 2026-07-29 修正：本文记录的是一次 external-pool-heavy 的历史排查，不能作为当前“只用本地账号 7/8 调试”的权威结论。当前本地账号专项证据见 [Claude Code local-account WebSearch/tools/image analysis - 2026-07-29](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md)。本地账号 7/8 当前均可用 `claude-sonnet-4.5` 返回成功；旧文中“本地 Account Runtime social 凭据不可用 / tools 尚未成功闭环 / 图片缺真实证据”等判断已被后续本地账号测试修正或细化。
 
 Status: `historical-external-pool-pass / superseded-for-local-account-diagnosis / retained-for-misdiagnosis-history`
 
@@ -12,9 +12,9 @@ Last observed: 2026-07-29 Asia/Shanghai
 
 本节是对本文历史外部池结论的修正。当前用户要求的是本地账号真实调用，不再使用外部池判定三类问题。
 
-- 当前 `ccman cc current` 为 `local-kiro-rs-9022-current`，URL `http://127.0.0.1:9022/cc`；Claude CLI 版本为 `2.1.220 (Claude Code)`；服务监听 `127.0.0.1:9022`。
-- 运行时 external pools 已为本轮本地账号测试关闭；关闭前备份为 `/tmp/kiro-runtime-before-local-only-9022.json`。
-- 本地可用账号不是旧文中的“全部 disabled”。当前确认可用的是 credential `7` 和 credential `8`，均为 `social` / `KIRO FREE` / not disabled，且测试端点均可调用 `claude-sonnet-4.5` 返回 `local-ok`。
+- 当前 `ccman cc current` 为 `local-account-runtime-9022-current`，URL `http://127.0.0.1:9022/cc`；Claude CLI 版本为 `2.1.220 (Claude Code)`；服务监听 `127.0.0.1:9022`。
+- 运行时 external pools 已为本轮本地账号测试关闭；关闭前备份为 `/tmp/account-runtime-runtime-before-local-only-9022.json`。
+- 本地可用账号不是旧文中的“全部 disabled”。当前确认可用的是 credential `7` 和 credential `8`，均为 `social` / `ACCOUNT_RUNTIME FREE` / not disabled，且测试端点均可调用 `claude-sonnet-4.5` 返回 `local-ok`。
 - 模型层必须按 usage/log 中的 upstream model 判定。`claude-sonnet-4.5`、`sonnet`、`claude-sonnet-4.6` 当前都能成功，但 `sonnet` 和 `4.6` 实际 upstream 均解析/回退到 `claude-sonnet-4.5`；响应体 echo 的 `model` 不能单独作为真实上游模型依据。
 - WebSearch 不是“完全不可用”：纯 Anthropic native `web_search_20250305` 单工具请求成功，request `req_01yPTQ3uUhHq89z8FGZQycZ9` 返回 `server_tool_use` 和 `web_search_tool_result`。这段描述是 2026-07-29 的历史状态；2026-07-31 的本地账号 focused 验证已经证明 `web_search_YYYYMMDD` 泛化、mixed native server-side 执行和当前 Claude CLI `WebSearch` 都能工作，当前权威结论见 [Claude Code local-account WebSearch/tools/image analysis - 2026-07-29](claude-code-local-accounts-websearch-tools-image-analysis-20260729.md)。
 - tools 不是最小路径解析全坏：直接 forced tool request `req_017oazMg5ptjHU64BX1CSYAW` 成功返回 `tool_use echo_value`；真实 Claude CLI `Bash` 与 `Read` 工具也能完成 tool_use/tool_result 闭环。剩余风险集中在工具名规范化/反向映射、tool_choice、长历史 pairing、schema 边界和 prefill 丢弃后的调试可观测性。
@@ -24,9 +24,9 @@ Last observed: 2026-07-29 Asia/Shanghai
 
 ## 历史运行态（external-pool-heavy pass）
 
-- `ccman cc current` 已切到 `local-kiro-rs-9022-current`，URL 为 `http://127.0.0.1:9022/cc`。
+- `ccman cc current` 已切到 `local-account-runtime-9022-current`，URL 为 `http://127.0.0.1:9022/cc`。
 - Claude Code CLI 版本：`2.1.220 (Claude Code)`。
-- 本地服务：`kiro-rs` PID `59668` 监听 `127.0.0.1:9022`。
+- 本地服务：`account-runtime` PID `59668` 监听 `127.0.0.1:9022`。
 - 当前冻结二进制 SHA-256：`bd45abee44102e20176d1985fb10c2663f52728b8aae38a6a160ec98caae3f9d`。
 - 本地 Postgres `public.credentials` 中 6 个 social 凭据均为 disabled，runtime reason 均为 `TemporarilySuspended`。
 - 临时 external pool `#1 ccman-mygoband-kkk-debug` 当前 enabled、`requestBodyMode=normalized`、`streamResponseMode=event_passthrough`、`autoDisablePolicy=disabled`、status endpoint 显示 `dispatchable=true`。
@@ -34,7 +34,7 @@ Last observed: 2026-07-29 Asia/Shanghai
 
 ## 当时已确认现象
 
-### 1. 本地 Kiro social 凭据不可用
+### 1. 本地 Account Runtime social 凭据不可用
 
 已对多个 DB 中 enabled 候选做真实 `/cc/v1/messages` 调用，结果均为上游 403 `temporarily_suspended`，服务自动禁用。当前所有本地凭据 `disabled=true`，后续任何本地路线失败都可能先被这个环境问题放大。
 
@@ -145,7 +145,7 @@ Claude Code CLI 请求中出现的是客户端工具 `WebSearch`，且通常和 
 
 ### A. 环境凭据问题是确定存在的阻塞
 
-本地 Kiro social credentials 全部 disabled 且 runtime reason 为 `TemporarilySuspended`。任何没有被 external pool 接住的请求都会直接变成 `local_error_no_fallback` 或 rescue 后 503。
+本地 Account Runtime social credentials 全部 disabled 且 runtime reason 为 `TemporarilySuspended`。任何没有被 external pool 接住的请求都会直接变成 `local_error_no_fallback` 或 rescue 后 503。
 
 影响：
 
@@ -155,7 +155,7 @@ Claude Code CLI 请求中出现的是客户端工具 `WebSearch`，且通常和 
 
 处理方向：
 
-- 继续真实调用时优先走 external pool 或找真正可用的 Kiro 凭据；
+- 继续真实调用时优先走 external pool 或找真正可用的 Account Runtime 凭据；
 - 记录 usage 时必须区分 `localAttempts=0`、`externalAttempts=0/1`。
 
 ### B. 带 tools 的 parsed fallback readiness 可能误判 external pool 不可用
@@ -192,14 +192,14 @@ Claude Code CLI 请求中出现的是客户端工具 `WebSearch`，且通常和 
 - 约 80KB 原始请求；
 - 有尾部 assistant prefill；
 - 有 output_config / 其他 Claude Code 字段；
-- 工具名很长，需要本地 Kiro 路径缩短映射。
+- 工具名很长，需要本地 Account Runtime 路径缩短映射。
 
 外部 provider 对最小 no-tool 和最小 tool 直连可用，不代表它接受完整 Claude Code stream-json payload。可能原因：
 
 1. provider 对 `claude-sonnet-5` 的工具/流式/大 payload 组合做了权限限制，返回 403。
 2. external normalized body 保留了 Claude Code 原始未建模字段，provider 将其判为无权限或不支持。
 3. `event_passthrough` 对该 provider 的 SSE 形态不匹配，但当前失败发生在 HTTP 403，尚未进入 SSE 解码阶段。
-4. 尾部 assistant prefill 在 local Kiro conversion 被丢弃，但 external normalized 路径可能仍保留 typed payload 中的 assistant prefill；需要抓取脱敏 body hash/shape 确认。
+4. 尾部 assistant prefill 在 local Account Runtime conversion 被丢弃，但 external normalized 路径可能仍保留 typed payload 中的 assistant prefill；需要抓取脱敏 body hash/shape 确认。
 5. external pool mapping 没有显式 `claude-sonnet-5` 规则，虽然当前 fallback 会保留 processed model，但加规则可减少歧义。
 
 ### D. WebSearch 不是“原生 WebSearch MCP”单一问题
@@ -223,7 +223,7 @@ Claude Code CLI 请求中出现的是客户端工具 `WebSearch`，且通常和 
 可能原因不能只看旧的 `IMAGE_FORMAT_UNSUPPORTED`：
 
 1. 输入坏图/伪图：应在本地被明确拒绝或由上游 400，旧专题已有结构校验。
-2. 合法 inline base64：应由 `body_processing` 修正 media_type，再由 `converter/content.rs` 生成 Kiro image 或 external normalized body。
+2. 合法 inline base64：应由 `body_processing` 修正 media_type，再由 `converter/content.rs` 生成 Account Runtime image 或 external normalized body。
 3. remote/file source：safe mode 会下载/materialize，受 DNS/redirect/大小/并发/45s deadline 影响。
 4. tool_result image：路径在 `converter/content.rs` 单独处理，可能和普通 user image 行为不同。
 

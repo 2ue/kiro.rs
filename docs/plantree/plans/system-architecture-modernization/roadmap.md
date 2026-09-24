@@ -48,7 +48,7 @@ The following are dependency groups inside one implementation, not phased releas
 | 2 | R2 migrations/state/config/auth/catalog/journal | Separate migration runner and recovery authorities, exact domain manifests/repositories/Redis classes, CAS/auth/catalog/terminal journal/shared Files store |
 | 3 | R3 usage/prompt cache | Distinct usage facts, idempotent batching/rebuild and bounded shared cache evidence |
 | 4 | R4 proxy/scheduler/credential/pool lifecycles | Final finite local/external schedulers and separated resource/secret/outcome authorities |
-| 5 | R5 upstream protocols/adapters/replay | Secure bounded Kiro/external attempts and conservative replay/commitment policy |
+| 5 | R5 upstream protocols/adapters/replay | Secure bounded Account Runtime/external attempts and conservative replay/commitment policy |
 | 6 | R6 planning/artifacts/payload/Files/media/endpoints | Route-before-work, lazy revisioned artifacts, exact body profiles, shared Files, bounded media/token and thin endpoints |
 | 7 | R7 SSE/response/terminal/Messages transport | Canonical response profiles, one terminal lifecycle and thin public Messages transport |
 | 8 | R8 Admin/generated contract/browser/both UIs | Nine backend domains and eleven complete workflows in each maintained app |

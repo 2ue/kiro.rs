@@ -37,12 +37,7 @@ use crate::{
             InferenceAttemptBudget, InferenceAttemptKind, InferenceAttemptRejection,
         },
         model_capabilities::ModelCapabilitiesCatalog,
-        payload_guard::{
-            PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
-            breakdown_anthropic_messages_request, guard_anthropic_messages_request_reusing_body,
-            sanitize_anthropic_messages_for_account_forwarding,
-        },
-        payload_guard_runtime::{PreparedAccountMessagesPayload, prepare_account_messages_payload},
+        payload_guard::{PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardReport},
         pricing::PricingCatalog,
         prompt_cache::{
             ClaudeCodeToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
@@ -261,7 +256,7 @@ pub enum ExternalPoolRequestBodyMode {
 
 impl Default for ExternalPoolRequestBodyMode {
     fn default() -> Self {
-        Self::Normalized
+        Self::RawPassthrough
     }
 }
 
@@ -296,7 +291,7 @@ pub enum ExternalPoolRawModelMode {
 
 impl Default for ExternalPoolRawModelMode {
     fn default() -> Self {
-        Self::None
+        Self::RewriteTopLevel
     }
 }
 
@@ -508,6 +503,7 @@ pub(crate) struct ExternalPoolEligibility {
     pub(crate) enabled: bool,
     pub(crate) auto_disabled: bool,
     pub(crate) auto_disabled_until: Option<DateTime<Utc>>,
+    #[allow(dead_code)]
     pub(crate) request_body_mode: ExternalPoolRequestBodyMode,
     pub(crate) supported_models: Arc<HashSet<String>>,
     pub(crate) route_mode: ExternalPoolRouteMode,
@@ -694,7 +690,6 @@ pub struct ExternalPoolsStatusResponse {
 
 #[derive(Default)]
 pub(crate) struct ExternalRouteRequestPreparationCache {
-    normalized_base: OnceLock<Result<Arc<body_pipeline::NormalizedRequestBase>, PayloadGuardError>>,
     raw_projection_payload: OnceLock<Option<Arc<MessagesRequest>>>,
     known_tool_names: OnceLock<Arc<Vec<String>>>,
     usage_projection_template:
@@ -707,10 +702,6 @@ pub(crate) struct ExternalRouteRequestPreparationCache {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ExternalRequestPreparationOperationCounts {
     pub(crate) raw_payload_parses: u64,
-    pub(crate) normalized_base_builds: u64,
-    pub(crate) normalized_original_value_parses: u64,
-    pub(crate) normalized_json_serializations: u64,
-    pub(crate) payload_guard_serializations: u64,
     pub(crate) known_tool_name_builds: u64,
     pub(crate) usage_projection_builds: u64,
 }
@@ -719,10 +710,6 @@ pub(crate) struct ExternalRequestPreparationOperationCounts {
 #[derive(Default)]
 struct ExternalRequestPreparationOperationCountState {
     raw_payload_parses: AtomicU64,
-    normalized_base_builds: AtomicU64,
-    normalized_original_value_parses: AtomicU64,
-    normalized_json_serializations: AtomicU64,
-    payload_guard_serializations: AtomicU64,
     known_tool_name_builds: AtomicU64,
     usage_projection_builds: AtomicU64,
 }
@@ -733,36 +720,6 @@ impl ExternalRouteRequestPreparationCache {
         self.operation_counts
             .raw_payload_parses
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_normalized_base_build(&self) {
-        #[cfg(test)]
-        self.operation_counts
-            .normalized_base_builds
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_normalized_original_value_parse(&self) {
-        #[cfg(test)]
-        self.operation_counts
-            .normalized_original_value_parses
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_normalized_json_serialization(&self) {
-        #[cfg(test)]
-        self.operation_counts
-            .normalized_json_serializations
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_payload_guard_serializations(&self, count: usize) {
-        #[cfg(test)]
-        self.operation_counts
-            .payload_guard_serializations
-            .fetch_add(count as u64, Ordering::Relaxed);
-        #[cfg(not(test))]
-        let _ = count;
     }
 
     fn record_known_tool_name_build(&self) {
@@ -785,22 +742,6 @@ impl ExternalRouteRequestPreparationCache {
             raw_payload_parses: self
                 .operation_counts
                 .raw_payload_parses
-                .load(Ordering::Relaxed),
-            normalized_base_builds: self
-                .operation_counts
-                .normalized_base_builds
-                .load(Ordering::Relaxed),
-            normalized_original_value_parses: self
-                .operation_counts
-                .normalized_original_value_parses
-                .load(Ordering::Relaxed),
-            normalized_json_serializations: self
-                .operation_counts
-                .normalized_json_serializations
-                .load(Ordering::Relaxed),
-            payload_guard_serializations: self
-                .operation_counts
-                .payload_guard_serializations
                 .load(Ordering::Relaxed),
             known_tool_name_builds: self
                 .operation_counts
@@ -3621,10 +3562,8 @@ impl PoolAvailabilitySnapshot {
         self.temporary_unavailable_pools > 0
     }
 
-    fn default_retry_attempts(&self, payload_guard_retry_enabled: bool) -> usize {
-        self.eligible_pools
-            .max(1)
-            .saturating_add(usize::from(payload_guard_retry_enabled))
+    fn default_retry_attempts(&self) -> usize {
+        self.eligible_pools.max(1)
     }
 
     fn mark_cooldown(
@@ -4172,7 +4111,7 @@ impl ExternalPoolManager {
         self.invalidate_static_pool_snapshot();
         let generation = self
             .redis
-            .publish_external_pool_data_changed(reason, pool_id)
+            .publish_account_runtime_data_changed(reason, pool_id)
             .await?;
         self.observed_pool_data_generation
             .fetch_max(generation, Ordering::AcqRel);
@@ -4185,7 +4124,7 @@ impl ExternalPoolManager {
         let origin = self.instance_id.clone();
         tokio::spawn(async move {
             match redis
-                .publish_external_pool_data_changed_with_origin(
+                .publish_account_runtime_data_changed_with_origin(
                     reason,
                     pool_id,
                     Some(origin.as_str()),
@@ -4199,7 +4138,7 @@ impl ExternalPoolManager {
                     reason,
                     pool_id = ?pool_id,
                     error = %err,
-                    "发布外部池数据跨实例失效通知失败"
+                    "发布账号运行时数据跨实例失效通知失败"
                 ),
             }
         });
@@ -5339,7 +5278,7 @@ impl ExternalPoolManager {
         config: ExternalPoolsConfig,
         route: ExternalRouteRequest,
     ) -> ExternalPoolForwardOutcome {
-        let mut route = route;
+        let route = route;
         if !config.external_pools_enabled {
             self.record_external_failure(
                 &route,
@@ -5392,14 +5331,10 @@ impl ExternalPoolManager {
             });
         }
 
-        let payload_guard_retry_enabled = route.payload_guard_retry_config.is_some();
         let mut max_pool_attempts = if config.external_pool_retry_max_attempts == 0 {
             None
         } else {
-            Some(
-                (config.external_pool_retry_max_attempts as usize)
-                    .saturating_add(usize::from(payload_guard_retry_enabled)),
-            )
+            Some(config.external_pool_retry_max_attempts as usize)
         };
 
         let mut excluded = HashSet::new();
@@ -5496,11 +5431,7 @@ impl ExternalPoolManager {
                 selection = degraded_selection;
             }
             if max_pool_attempts.is_none() {
-                max_pool_attempts = Some(
-                    selection
-                        .availability
-                        .default_retry_attempts(payload_guard_retry_enabled),
-                );
+                max_pool_attempts = Some(selection.availability.default_retry_attempts());
             }
             let Some(pool) = selection.selected_pool else {
                 let snapshot = selection.availability;
@@ -5745,21 +5676,6 @@ impl ExternalPoolManager {
                         error_message: Some(err.message.clone()),
                         raw_upstream_error: err.raw_upstream_error.clone(),
                     });
-                    if let Some(retry_route) = (pool.request_body_mode
-                        == ExternalPoolRequestBodyMode::Normalized
-                        && should_retry_external_payload_guard(&route, &err))
-                    .then(|| external_payload_guard_retry_route(&route))
-                    .flatten()
-                    {
-                        if let Some(last) = attempts.last_mut() {
-                            last.action = "payload_guard_retry".to_string();
-                        }
-                        route = retry_route;
-                        excluded.clear();
-                        same_account_retry_counts.clear();
-                        last_error = None;
-                        continue;
-                    }
                     let cooldown_hint = err.cooldown.clone();
                     let mut soft_failure_cooldown = false;
                     let mut soft_failure_streak = None;
@@ -8483,7 +8399,6 @@ impl ExternalPoolManager {
                 0.0
             },
             upstream_metering_units: 0.0,
-            kiro_metering_usage: 0.0,
             pricing_available,
             pricing_model,
             duration_ms,
@@ -9546,7 +9461,8 @@ fn external_pool_matches_body_mode_filter(
     pool: &ExternalPool,
     filter: Option<ExternalPoolRequestBodyMode>,
 ) -> bool {
-    filter.is_none_or(|mode| pool.request_body_mode == mode)
+    let _ = (pool, filter);
+    true
 }
 
 fn normalize_external_pool_support_candidates<'a>(
@@ -9612,7 +9528,8 @@ fn external_pool_eligibility_matches_body_mode(
     pool: &ExternalPoolEligibility,
     filter: Option<ExternalPoolRequestBodyMode>,
 ) -> bool {
-    filter.is_none_or(|mode| pool.request_body_mode == mode)
+    let _ = (pool, filter);
+    true
 }
 
 fn external_pool_eligibility_matches_supported_models(
@@ -9828,24 +9745,6 @@ pub fn normalize_external_pool_model_mapping_rules(
 #[cfg(test)]
 fn normalize_external_pool_outbound_model(model: &str) -> String {
     model_pipeline::normalize_outbound_model(model)
-}
-
-fn normalize_external_pool_thinking_value(value: &mut serde_json::Value) -> bool {
-    let Some(thinking) = value
-        .get_mut("thinking")
-        .and_then(|value| value.as_object_mut())
-    else {
-        return false;
-    };
-    let thinking_type = thinking
-        .get("type")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(thinking_type.as_str(), "adaptive" | "disabled") {
-        return false;
-    }
-    thinking.remove("budget_tokens").is_some()
 }
 
 fn should_forward_header(name: &HeaderName) -> bool {
@@ -10590,19 +10489,6 @@ fn classify_external_error(
         None,
     )
     .with_raw_upstream_error(Some(raw_upstream_error))
-}
-
-fn should_retry_external_payload_guard(
-    route: &ExternalRouteRequest,
-    err: &ExternalPoolError,
-) -> bool {
-    retry_pipeline::should_retry_payload_guard(route, err)
-}
-
-fn external_payload_guard_retry_route(
-    route: &ExternalRouteRequest,
-) -> Option<ExternalRouteRequest> {
-    retry_pipeline::payload_guard_retry_route(route)
 }
 
 fn should_retry_external_cross_account(

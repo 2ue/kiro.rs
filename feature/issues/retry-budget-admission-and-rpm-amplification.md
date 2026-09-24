@@ -23,7 +23,7 @@ Token refresh 的短 TTL、失败波、invalid-bearer 自动恢复、Redis/PgSQL
 
 ### 单请求放大
 
-隔离启动 fake Kiro、fake external、PostgreSQL 与 Redis，配置 1/20/60 个可选择账号。对同一个下游 request 依次让上游返回 400 model-unavailable、invalid model、invalid tool、空图/body invalid、普通 malformed、429、500、首字节前断流和首字节后 partial。记录 inference/refresh/catalog/external hit、credential 数、每层 reason/action 与最终 usage。
+隔离启动 fake Account Runtime、fake external、PostgreSQL 与 Redis，配置 1/20/60 个可选择账号。对同一个下游 request 依次让上游返回 400 model-unavailable、invalid model、invalid tool、空图/body invalid、普通 malformed、429、500、首字节前断流和首字节后 partial。记录 inference/refresh/catalog/external hit、credential 数、每层 reason/action 与最终 usage。
 
 修复前红灯判定：任一请求的 inference hit 随账号数线性增长；确定性 400 换号；首字节后仍发新请求；或 local/payload/stream/external 各自重置计数。已有历史真实 CLI 证据中 500/429 最高 30x、partial disconnect 9x；这些数字只是修复前基线，必须由最终候选重跑。
 
@@ -80,7 +80,7 @@ cargo test prompt_logic_retry_only_applies_to_enabled_protocol_reasons -- --noca
 - inference 前 enterprise profile discovery 已增加 per-credential singleflight、negative backoff、认证身份 ID-reuse 隔离和 2048-entry 硬上限。红测中 16 个同账号 caller 为 16 hit；修复后成功/403/500 每轮严格 1 hit、失败窗口的 32 个追发为 0。1/20/60 账号 x 5 轮矩阵共 810 caller、405 auxiliary HTTP，严格每账号每轮 1 次且不同账号并行；已有 ARN 5000 次检查为 0 state/0 HTTP。auxiliary 原子计数和日志不消耗 inference budget。证据见 [profile ARN auxiliary RPM bound](../evidence/profile-arn-auxiliary-rpm-bound-20260716.md)。
 - legacy external capacity wait 的 `0` 已解释为 30 秒有界等待；最终 `external_pool_wait_timeout` 现为 non-retryable，避免客户端在已经耗尽服务端等待后立即形成反馈回路。真实 PG/Redis 聚焦用例连续 3 轮通过；仍需统一候选上的 burst/recovery 证明。
 - OAuth refresh 的跨账号 request-scoped hard budget 已接入真实 send admission。20-account 独立 manager 的 12 类失败 x c1/c8/c32 x 5 轮严格保持每请求最多 2 hits；128-account shared manager 同矩阵保持 process peak <=16、无持久禁用并完成每格 16/16 恢复；32-waiter 同 credential 四类失败每轮严格 1 hit。取消 permit 泄漏在修复前 21/22 红、结构化取消修复后 23/23 绿。详见 [2026-07-18 evidence](../evidence/oauth-auxiliary-budget-and-cancellation-20260718.md)。
-- 2026-07-18 又关闭一类 provider/MCP 瞬态失败后的无意义等待：full `cargo test --all-targets` 曾在 `provider_transport_and_body_fault_matrix_is_private_typed_and_bounded` 的 `provider_header_timeout` 场景触发 30 秒测试超时。根因不是 private marker 泄漏，而是瞬态失败写入冷却后，下一轮在真正 HTTP send 前还会进入 scheduler acquire；当没有可立即调度的备选凭据时，这会把 request-scoped send budget 保护变成容量/冷却等待。当前 `maybe_exclude_after_transient_failure` 返回实际 retry target 是否存在，API 与 MCP 的 transport/body/non-eventstream/429/402/408/5xx/protocol fallback 分支只有存在备选凭据才继续重试，否则立即返回 typed error 并把 attempt action 改为 `fail`。复核结果：focused provider fault matrix `1/1` 通过，`cargo fmt --check + cargo check --all-targets` 通过，完整 all-target development run 为 `1724 passed / 0 failed / 6 ignored` 加 `kiro_loadtest 27/27`。证据见 [provider transient retry target guard](../evidence/provider-transient-no-retry-target-20260718.md)。这些运行因本机磁盘不足使用 7-10 GiB development reservation，不替代最终 release gate。
+- 2026-07-18 又关闭一类 provider/MCP 瞬态失败后的无意义等待：full `cargo test --all-targets` 曾在 `provider_transport_and_body_fault_matrix_is_private_typed_and_bounded` 的 `provider_header_timeout` 场景触发 30 秒测试超时。根因不是 private marker 泄漏，而是瞬态失败写入冷却后，下一轮在真正 HTTP send 前还会进入 scheduler acquire；当没有可立即调度的备选凭据时，这会把 request-scoped send budget 保护变成容量/冷却等待。当前 `maybe_exclude_after_transient_failure` 返回实际 retry target 是否存在，API 与 MCP 的 transport/body/non-eventstream/429/402/408/5xx/protocol fallback 分支只有存在备选凭据才继续重试，否则立即返回 typed error 并把 attempt action 改为 `fail`。复核结果：focused provider fault matrix `1/1` 通过，`cargo fmt --check + cargo check --all-targets` 通过，完整 all-target development run 为 `1724 passed / 0 failed / 6 ignored` 加 `account_runtime_loadtest 27/27`。证据见 [provider transient retry target guard](../evidence/provider-transient-no-retry-target-20260718.md)。这些运行因本机磁盘不足使用 7-10 GiB development reservation，不替代最终 release gate。
 - 这些批次封住服务端多层 attempt、确定性 400 换号、模型目录账号数 fan-out、同进程 profile discovery 风暴和 process-local OAuth 跨账号/同账号放大，不等价于内部 RPM 已完全根治。持久 usage channel attribution、live Redis/PG、跨实例 aggregate admission、真实 handler/CLI、客户端重试、429/500/partial 与 L3-L5 recovery 仍未完成。
 
 ### 2026-07-17：refresh peer coordination deadline 边界修复与复核
@@ -88,7 +88,7 @@ cargo test prompt_logic_retry_only_applies_to_enabled_protocol_reasons -- --noca
 隔离 PostgreSQL `127.0.0.1:47432`、Redis `127.0.0.1:47379` 上，原样执行
 `ordinary_refresh_peer_wait_respects_coordination_deadline` 可稳定复现失败：期望
 `RefreshFailureKind::Timeout`，实际为 `RefreshFailureKind::Coordination`，失败断言位于
-`src/kiro/token_manager/manager_tests.rs:1485`（修复前行号）。这不是 Redis
+`src/local_upstream_impl/token_manager/manager_tests.rs:1485`（修复前行号）。这不是 Redis
 `SET NX` 竞争失败，也不是应放宽测试期望。
 
 根因在 peer 已持有 Redis refresh lock 的分支：本实例先执行
@@ -117,7 +117,7 @@ PgSQL refresh failure 健康中立、取消 ordinary refresh 后的 critical Red
 `1,634,796 KiB`；退出记录为 `removed=true / reservation_released=true`。随后按 scope 检查
 `target/.validation-build-refresh-coordination-*` 与对应 reservation 均为零。全局检查当时可见另一个
 PID 明确归属的 `external-usage-attribution-2` 活跃 target；它不是本批产物，未删除。容器内 Redis
-扫描 `kiro_rs:test:*:scheduler:refresh_lock:*` 为空，两个改动文件的 `rustfmt --check` 和
+扫描 `account_runtime:test:*:scheduler:refresh_lock:*` 为空，两个改动文件的 `rustfmt --check` 和
 `git diff --check` 均通过。基线失败批次 `1,634,120 KiB`、一次被其他支线中间态阻断的批次
 `1,126,220 KiB` 也分别由 wrapper 当轮删除并释放 reservation，没有跨批次累计。
 

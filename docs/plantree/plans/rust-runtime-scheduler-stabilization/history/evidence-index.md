@@ -25,7 +25,7 @@ Last reviewed: 2026-08-07 Asia/Shanghai
 
 ## Related evidence packages
 
-- `docs/kiro-rs-root-cause-package-20260726T170519+0800/`
+- `docs/account-runtime-root-cause-package-20260726T170519+0800/`
 - `feature/evidence/runtime-completion-storage-coupling-validation-20260727.md`
 - `feature/evidence/final-runtime-storage-cli-load-validation-20260727.md`
 - `feature/evidence/protocol-thinking-cli-live-20260725.md`

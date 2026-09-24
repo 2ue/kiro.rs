@@ -4,13 +4,13 @@ Status: `core-and-malformed-harness-pass / final-candidate-and-browser-pending`
 
 Date: 2026-07-16
 
-Scope: F06 Admin API, JSON file and plain file credential ingestion through PostgreSQL, reload, scheduler-selected inference, region request decoration, duplicate handling, explicit backup, audit, delete and cleanup. This is not UI browser, real AWS/Kiro, multi-instance import or release evidence.
+Scope: F06 Admin API, JSON file and plain file credential ingestion through PostgreSQL, reload, scheduler-selected inference, region request decoration, duplicate handling, explicit backup, audit, delete and cleanup. This is not UI browser, real AWS/Account Runtime, multi-instance import or release evidence.
 
-Issue authority: [AWS Kiro API key and region credential lifecycle](../issues/aws-kiro-api-key-region-lifecycle.md)
+Issue authority: [AWS Account Runtime API key and region credential lifecycle](../issues/aws-account-runtime-api-key-region-lifecycle.md)
 
 ## Problems Reproduced During Harness Construction
 
-The first safe end-to-end design could not cover API-key credentials because their normalized `cli` endpoint ignored `kiroUpstreamBaseUrl` for inference, MCP, model discovery and balance/overage calls. Direct source inspection confirmed hard-coded official URL construction. The fix makes the configured URL the transport destination while retaining region-derived logical `Host` headers.
+The first safe end-to-end design could not cover API-key credentials because their normalized `cli` endpoint ignored `localUpstreamBaseUrl` for inference, MCP, model discovery and balance/overage calls. Direct source inspection confirmed hard-coded official URL construction. The fix makes the configured URL the transport destination while retaining region-derived logical `Host` headers.
 
 The first duplicate design also showed that model discovery ran before the eventual DB uniqueness failure. A process-local import lock plus hash/snapshot preflight now rejects sequential same-instance duplicates before auxiliary work. PostgreSQL remains the final uniqueness authority.
 
@@ -20,12 +20,12 @@ After the first lifecycle passes, static review found that a failed `key|region`
 
 ## Implementation Under Test
 
-- `src/kiro/endpoint/mod.rs`: shared transport override resolver.
-- `src/kiro/endpoint/cli.rs`: CLI inference, MCP and model discovery use the override and preserve logical region headers.
-- `src/kiro/token_manager/refresh.rs`: balance and overage calls use the override and preserve `q.<region>.amazonaws.com`, Bearer and `tokentype`.
+- `src/local_upstream_impl/endpoint/mod.rs`: shared transport override resolver.
+- `src/local_upstream_impl/endpoint/cli.rs`: CLI inference, MCP and model discovery use the override and preserve logical region headers.
+- `src/local_upstream_impl/token_manager/refresh.rs`: balance and overage calls use the override and preserve `q.<region>.amazonaws.com`, Bearer and `tokentype`.
 - `src/admin/service.rs`: canonical hash duplicate preflight under a process-local async import lock; conflict maps to HTTP 409.
-- `src/kiro/model/credentials.rs`: bounded pipe-envelope validation and JSON-file rejection before bootstrap persistence; no fixed key prefix or AWS-region allowlist.
-- `src/kiro/model/credentials.rs`: the same bounded label rule covers explicit API-key `region`, `authRegion` and `apiRegion`; plain-text parsing keeps its existing `ksk_` entry rule.
+- `src/local_upstream_impl/model/credentials.rs`: bounded pipe-envelope validation and JSON-file rejection before bootstrap persistence; no fixed key prefix or AWS-region allowlist.
+- `src/local_upstream_impl/model/credentials.rs`: the same bounded label rule covers explicit API-key `region`, `authRegion` and `apiRegion`; plain-text parsing keeps its existing `ksk_` entry rule.
 - `src/admin/service.rs`: malformed Admin API input is rejected before model discovery, balance or storage.
 - `src/admin/handlers.rs`: sensitive backup response headers.
 - `feature/tests/aws-api-key-region-lifecycle.mjs`: isolated executable lifecycle runner.
@@ -35,8 +35,8 @@ After the first lifecycle passes, static review found that a failed `key|region`
 - All credentials were randomly generated fake `ksk_f06_*` values. No real credential file was read.
 - Each full run created a unique `postgres:16-alpine` and `redis:7-alpine` container and random localhost ports.
 - Every service port was dynamically selected and asserted not to equal 9022.
-- `kiroUpstreamBaseUrl` pointed only to an in-process localhost fake server.
-- The runner did not configure a real AWS/Kiro endpoint or usable key. Schema v2 reports distinguish `realAwsOrKiroConfigured=false`, `realAwsOrKiroAccessObserved=false` and `outboundFirewallEnforced=false`; the safety claim is configuration/capture based rather than packet-firewall evidence.
+- `localUpstreamBaseUrl` pointed only to an in-process localhost fake server.
+- The runner did not configure a real AWS/Account Runtime endpoint or usable key. Schema v2 reports distinguish `realAwsOrAccount RuntimeConfigured=false`, `realAwsOrAccount RuntimeAccessObserved=false` and `outboundFirewallEnforced=false`; the safety claim is configuration/capture based rather than packet-firewall evidence.
 - Reports store only truncated SHA-256 key digests and authorization schemes, never reusable fake keys.
 
 ## Commands
@@ -44,8 +44,8 @@ After the first lifecycle passes, static review found that a failed `key|region`
 Red command against the old fixed binary:
 
 ```bash
-KIRO_RS_BINARY=target/f06-binaries/kiro-rs-8bf11e5864bf6ab1 \
-  KIRO_F06_ROUNDS=3 \
+ACCOUNT_RUNTIME_BINARY=target/f06-binaries/account-runtime-8bf11e5864bf6ab1 \
+  ACCOUNT_RUNTIME_F06_ROUNDS=3 \
   node feature/tests/aws-api-key-region-lifecycle.mjs
 ```
 
@@ -54,10 +54,10 @@ Observed result: fail at `json_file_invalid_empty_key_1` because startup was not
 Green schema-v2 command, executed three independent times:
 
 ```bash
-cargo build --bin kiro-rs
-cp target/debug/kiro-rs target/f06-binaries/kiro-rs-56232fd937c0cb3b
-KIRO_RS_BINARY=target/f06-binaries/kiro-rs-56232fd937c0cb3b \
-  KIRO_F06_ROUNDS=3 \
+cargo build --bin account-runtime
+cp target/debug/account-runtime target/f06-binaries/account-runtime-56232fd937c0cb3b
+ACCOUNT_RUNTIME_BINARY=target/f06-binaries/account-runtime-56232fd937c0cb3b \
+  ACCOUNT_RUNTIME_F06_ROUNDS=3 \
   node feature/tests/aws-api-key-region-lifecycle.mjs
 ```
 
@@ -70,12 +70,12 @@ cargo test sensitive_credential_export_is_not_cacheable_or_content_sniffable -- 
 cargo test api_key_pipe -- --nocapture
 cargo test explicit_api_key_regions_reject_host_unsafe_values_for_three_rounds -- --nocapture
 cargo test plain_credentials_reject_malformed_pipe_forms_for_three_rounds -- --nocapture
-cargo test kiro::model::credentials::tests:: -- --nocapture
+cargo test account-runtime::model::credentials::tests:: -- --nocapture
 node --check feature/tests/aws-api-key-region-lifecycle.mjs
 git diff --check
 ```
 
-Current provisional-source result: transport 1/1, usage-limit transport/header 1/1, export headers 1/1, `api_key_pipe` 4/4, explicit region 1/1, plain malformed 1/1, and the complete credential module 61/61. Critical invalid/compatible test bodies each run three rounds and assert load errors do not echo input. `cargo build --bin kiro-rs`, runner syntax, scoped rustfmt, Node syntax and diff checks passed. All must still be rerun against the frozen final candidate; provisional success is not substituted for that gate.
+Current provisional-source result: transport 1/1, usage-limit transport/header 1/1, export headers 1/1, `api_key_pipe` 4/4, explicit region 1/1, plain malformed 1/1, and the complete credential module 61/61. Critical invalid/compatible test bodies each run three rounds and assert load errors do not echo input. `cargo build --bin account-runtime`, runner syntax, scoped rustfmt, Node syntax and diff checks passed. All must still be rerun against the frozen final candidate; provisional success is not substituted for that gate.
 
 ## Report Identity
 
@@ -140,8 +140,8 @@ Every captured fake-upstream request required `valid=true` and recorded only the
 
 | Call | Logical Host | Authorization | `tokentype` |
 | --- | --- | --- | --- |
-| model discovery | `management.<region>.kiro.dev` | Bearer | `API_KEY` |
-| inference | `runtime.<region>.kiro.dev` | Bearer | `API_KEY` |
+| model discovery | `management.<region>.account-runtime.dev` | Bearer | `API_KEY` |
+| inference | `runtime.<region>.account-runtime.dev` | Bearer | `API_KEY` |
 | balance | `q.<region>.amazonaws.com` | Bearer | `API_KEY` |
 
 Unknown request count was zero in every report. The transport destination remained the localhost fake upstream even though the logical Host reflected the imported region.
@@ -181,5 +181,5 @@ A report-content scan found zero `ksk_` markers, admin/request test secrets, sta
 - All report binaries are provisional. The schema-v3 report includes pipe, explicit-region and plain-file fixes, but PostgreSQL migration and final formatting/Clippy work were still changing the tree. F06 must run again against the frozen release-candidate SHA.
 - The import lock is process local. A two-instance simultaneous duplicate can still produce auxiliary calls before PostgreSQL rejects one insert.
 - No browser interaction was performed. Static parser/API evidence must not be represented as `ui` or `admin-ui` browser evidence.
-- No real AWS/Kiro call was performed, and none is needed for the fake-upstream contract. Official-service behavior remains outside this evidence.
+- No real AWS/Account Runtime call was performed, and none is needed for the fake-upstream contract. Official-service behavior remains outside this evidence.
 - No high-concurrency import burst, outbound-firewall proof, L5 soak or multi-instance auxiliary-admission test was performed.

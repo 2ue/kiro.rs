@@ -84,7 +84,7 @@ Related:
 
 不能照抄点：
 
-- sub2api 面向不同协议和账号模型，kiro.rs 仍要保留外部直连、本地优先、本地到外部 fallback、一次本地救援的边界。
+- sub2api 面向不同协议和账号模型，account-runtime 仍要保留外部直连、本地优先、本地到外部 fallback、一次本地救援的边界。
 
 ### CLIProxyAPI
 
@@ -97,7 +97,7 @@ Related:
 
 不能照抄点：
 
-- CLIProxyAPI 的外部 key/auth 调度与 kiro.rs 的外部池、Redis 全局容量和 usage 记录结构不同，不能直接搬状态类型。
+- CLIProxyAPI 的外部 key/auth 调度与 account-runtime 的外部池、Redis 全局容量和 usage 记录结构不同，不能直接搬状态类型。
 
 ## 目标策略
 
@@ -282,7 +282,7 @@ Redis 事件竞态：当前进程发布自己的变更事件后又消费该事�
 修复后的最终候选已完成真实 HTTP 多池验证、256 并发与 1800 RPM/60 秒持续到达率
 验证、外部直连不回本地验证、失败池恢复回流验证，以及隔离 PostgreSQL/Redis
 存储回归。全量 Rust 门禁为主程序 `1896 passed / 0 failed / 6 ignored`，
-`kiro_loadtest 31/31`，格式、差异和构建产物库存门禁均通过。详细命令、候选二进制
+`account_runtime_loadtest 31/31`，格式、差异和构建产物库存门禁均通过。详细命令、候选二进制
 哈希和资源采样见[专项证据](../evidence/external-pool-ha-scheduler-validation-20260805.md)。
 
 `v0.0.133` 已通过 GitHub Actions `Publish Docker Images #164` 的质量门禁、amd64/arm64

@@ -8,7 +8,7 @@ Severity: `P0 production-impact / local-credential-routing`
 
 Three production hosts showed repeated `/ha/v1/messages` local credential failures with public `invalid_request_error` and message `The request body is invalid`.
 
-The root cause is not a general request-body, image, or tools serialization failure. Old local KIRO POWER API-key credentials are exhausted and have overage disabled, but remain dispatchable because scheduler admission does not include credential account balance/overage state. The upstream returns an opaque 400 Bad Request for those credentials. Current provider error handling treats generic 400 as caller/request invalid, so it does not disable the credential, increment failure count, or retry another healthy local credential.
+The root cause is not a general request-body, image, or tools serialization failure. Old local ACCOUNT_RUNTIME POWER API-key credentials are exhausted and have overage disabled, but remain dispatchable because scheduler admission does not include credential account balance/overage state. The upstream returns an opaque 400 Bad Request for those credentials. Current provider error handling treats generic 400 as caller/request invalid, so it does not disable the credential, increment failure count, or retry another healthy local credential.
 
 2026-08-01 scoped release gate: this fix is included in [Final release gate - 2026-08-01](../evidence/final-release-gate-20260801.md). Full Rust default/no-default all-target tests, release build, UI/admin-ui build, Node contracts, real Claude CLI fake-upstream suite, feature docs, diff hygiene, fmt, and artifact inventory passed for the current batch. Production recurrence remains open after rollout.
 
@@ -56,7 +56,7 @@ The state shown in the account usage page and the state used by the scheduler ar
 
 Therefore a credential can be visibly exhausted in the UI while still enabled and dispatchable after a process restart.
 
-Generic Kiro API 400 handling then makes the incident persistent:
+Generic Account Runtime API 400 handling then makes the incident persistent:
 
 - quota disable/failover is only triggered for `status == 402` plus quota markers such as `MONTHLY_REQUEST_COUNT` or `OVERAGE_REQUEST_LIMIT_EXCEEDED`;
 - generic 400 is classified as `bad_request`;
@@ -86,7 +86,7 @@ The durable fix needs both scheduler and provider changes:
 
 - scheduler admission must consult fresh enough account-info state, or a derived runtime quarantine state, before dispatching local API-key credentials;
 - an account-info row with no remaining credit and overage disabled must become non-dispatchable until refresh/reset/manual enable proves it is usable again;
-- provider 400 handling must recognize known Kiro account-state/quota fingerprints when account-info already proves exhaustion;
+- provider 400 handling must recognize known Account Runtime account-state/quota fingerprints when account-info already proves exhaustion;
 - generic request-body 400s must still fail fast without broad retry to avoid amplifying real malformed requests.
 
 ## Implemented in this change
@@ -114,7 +114,7 @@ Scheduler admission now has a freshness-bounded account-info quota guard:
 - The guard applies only to API-key credentials when account info is fresh, `remaining <= 0`, `credit_remaining <= 0`, and `overage_status` is case-insensitive `DISABLED`.
 - Missing, stale, malformed, non-disabled-overage, or OAuth account-info snapshots do not block dispatch.
 - `credential_is_usable_for_model()`, all dispatchability helpers built on it, startup current credential selection, reload selection, `switch_to_next()`, and automatic terminal-failure fallback checks now exclude quota-guarded credentials.
-- Kiro API and MCP 400 handling still fail fast for generic request/tool/image/malformed errors, but if the selected credential is already quota-guarded and the 400 is opaque `bad_request` or `request_body_invalid`, that credential is treated as quota-exhausted and local retry may continue to a genuinely available alternate.
+- Account Runtime API and MCP 400 handling still fail fast for generic request/tool/image/malformed errors, but if the selected credential is already quota-guarded and the 400 is opaque `bad_request` or `request_body_invalid`, that credential is treated as quota-exhausted and local retry may continue to a genuinely available alternate.
 
 The selected policy is intentionally a derived scheduler guard rather than a persisted runtime disable. A stale usage snapshot must not permanently strand a credential; a fresh account-info refresh that shows remaining credit or overage enabled clears the guard on reload/startup.
 
@@ -136,11 +136,11 @@ Commands run locally:
 ```bash
 cd ui && npm run check
 cd admin-ui && npm run build
-feature/tests/run-cargo-scoped.sh quota-guard -- cargo test --bin kiro-rs quota_guard_
-KIRO_RS_REQUIRE_STORAGE_TESTS=1 KIRO_RS_TEST_POSTGRES_URL="<local config PgSQL URL>" feature/tests/run-cargo-scoped.sh reload-quota-guard-pg -- cargo test --bin kiro-rs reload_account_info_quota_guard_reselects_healthy_credential -- --nocapture
-feature/tests/run-cargo-scoped.sh provider-bad-request -- cargo test --bin kiro-rs bad_request_retry_matrix_bounds_real_provider_http_hits
-feature/tests/run-cargo-scoped.sh postgres-account-info -- cargo test --bin kiro-rs postgres_persists_runtime_config_credentials_stats_usage_and_pricing
-feature/tests/run-cargo-scoped.sh token-manager -- cargo test --bin kiro-rs kiro::token_manager
+feature/tests/run-cargo-scoped.sh quota-guard -- cargo test --bin account-runtime quota_guard_
+ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 ACCOUNT_RUNTIME_TEST_POSTGRES_URL="<local config PgSQL URL>" feature/tests/run-cargo-scoped.sh reload-quota-guard-pg -- cargo test --bin account-runtime reload_account_info_quota_guard_reselects_healthy_credential -- --nocapture
+feature/tests/run-cargo-scoped.sh provider-bad-request -- cargo test --bin account-runtime bad_request_retry_matrix_bounds_real_provider_http_hits
+feature/tests/run-cargo-scoped.sh postgres-account-info -- cargo test --bin account-runtime postgres_persists_runtime_config_credentials_stats_usage_and_pricing
+feature/tests/run-cargo-scoped.sh token-manager -- cargo test --bin account-runtime account-runtime::token_manager
 feature/tests/run-cargo-scoped.sh all-targets-test -- cargo test --all-targets --locked
 node --test feature/tests/*.test.mjs
 cd ui && npm run check
@@ -150,7 +150,7 @@ feature/tests/run-cargo-scoped.sh fmt-check -- cargo fmt --check
 git diff --check
 ```
 
-All listed commands passed in the local workspace. The PgSQL reload regression used `PostgresStore::connect_test`, which creates a random isolated test schema and drops it after the run. The `token_manager` suite covered `308` tests before the reload regression was added; focused reload coverage adds `1 passed / 0 failed`. The broad Rust run covered main `1843 passed / 0 failed / 6 ignored` plus `kiro_loadtest` `31 passed / 0 failed`; Node feature tests covered `283 tests / 261 pass / 22 skipped / 0 fail`.
+All listed commands passed in the local workspace. The PgSQL reload regression used `PostgresStore::connect_test`, which creates a random isolated test schema and drops it after the run. The `token_manager` suite covered `308` tests before the reload regression was added; focused reload coverage adds `1 passed / 0 failed`. The broad Rust run covered main `1843 passed / 0 failed / 6 ignored` plus `account_runtime_loadtest` `31 passed / 0 failed`; Node feature tests covered `283 tests / 261 pass / 22 skipped / 0 fail`.
 
 ## Residual risk
 

@@ -11,7 +11,7 @@ Related:
 - [外部池高可用调度执行计划](external-pool-ha-scheduler-execution-plan-20260805.md)
 - [验证与发版门禁](validation-and-release-gates.md)
 - [整体调度架构分析](../../../../../feature/issues/scheduler-architecture-analysis-purpose-and-plan.md)
-- [kiro-load-chaos-validation 技能约束](../../../../../.codex/skills/kiro-load-chaos-validation/SKILL.md)
+- [account-runtime-load-chaos-validation 技能约束](../../../../../.codex/skills/account-runtime-load-chaos-validation/SKILL.md)
 
 ## 1. 验证原则
 
@@ -36,9 +36,9 @@ Related:
 load generator(s)
         |
         v
-  kiro.rs instance A ----\
+  account-runtime instance A ----\
                            +---- isolated PostgreSQL
-  kiro.rs instance B ----/      isolated Redis scheduler
+  account-runtime instance B ----/      isolated Redis scheduler
         |
         +---- fake local upstream
         +---- fake external pool A (优先级 1)

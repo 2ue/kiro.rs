@@ -1,4 +1,4 @@
-//! AWS Event Stream 消息帧解析
+//! Binary event stream 消息帧解析
 //!
 //! ## 消息格式
 //!

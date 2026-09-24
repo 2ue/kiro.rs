@@ -12,7 +12,7 @@ const DIRECT_REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_RE
 const ISOLATED = process.env.ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED === '1'
 const OUTER_ROUNDS = boundedInteger('ACCOUNT_RUNTIME_SCHEDULER_CHAOS_OUTER_ROUNDS', 3, 1, 5)
 const SCOPE = process.env.ACCOUNT_RUNTIME_SCHEDULER_CHAOS_SCOPE || 'scheduler-redis-chaos-real'
-const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `kiro-scheduler-chaos-${process.pid}-`))
+const TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), `account-runtime-scheduler-chaos-${process.pid}-`))
 let testReadyFile = null
 const ACTIVE_CHILDREN = new Set()
 let proxy = null

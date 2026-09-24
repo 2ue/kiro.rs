@@ -4,7 +4,7 @@ Status: `focused-state-machine-pass / cli-and-fault-injection-pending`
 
 Date: 2026-07-16
 
-Source authority: HEAD `401473c` (`v0.0.109`) plus dirty-tree remediation changes. Current test binary: `target/debug/deps/kiro_rs-d0eac30c038749e6`, SHA-256 `c8de4b66d935a89d0378598e28ce775b5212dfbb94e55ac5cab98b1fc77e4d61`. This is not a release build.
+Source authority: HEAD `401473c` (`v0.0.109`) plus dirty-tree remediation changes. Current test binary: `target/debug/deps/account_runtime-d0eac30c038749e6`, SHA-256 `c8de4b66d935a89d0378598e28ce775b5212dfbb94e55ac5cab98b1fc77e4d61`. This is not a release build.
 
 ## Reproduced Defect
 

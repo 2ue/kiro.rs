@@ -10,7 +10,7 @@
 
 日期：2026-07-06
 
-状态：当前工作区已在已发布的 raw/normalized 行为边界修正基础上，继续完成文件级模块化重构：入口解析、raw request facts、本地 Kiro body pipeline、外部池 body/model/retry/usage projection 已拆分为独立模块。本文仍保留后续可选的 trait/plugin 化和更深层 route planner 规划。
+状态：当前工作区已在已发布的 raw/normalized 行为边界修正基础上，继续完成文件级模块化重构：入口解析、raw request facts、本地 Account Runtime body pipeline、外部池 body/model/retry/usage projection 已拆分为独立模块。本文仍保留后续可选的 trait/plugin 化和更深层 route planner 规划。
 
 工作模式：execute-ready。本文记录目标、现状分析、阶段规划和本阶段落地状态。
 
@@ -20,7 +20,7 @@
 
 当前已完成的核心内容：
 
-1. **目标选择先于 body 处理**：raw 外部池的显式直连和本地池预检 fallback 都在 parse 前处理，不进入标准 Anthropic body parse、图片处理、Kiro 转换或 payload guard。
+1. **目标选择先于 body 处理**：raw 外部池的显式直连和本地池预检 fallback 都在 parse 前处理，不进入标准 Anthropic body parse、图片处理、Account Runtime 转换或 payload guard。
 2. **外部池按已选 pool 配置分支**：raw pool 走 raw body，normalized pool 才走 normalized body 和外部 payload guard。
 3. **payload guard 下沉到 normalized body pipeline**：外部 route 构造不再先跑 payload guard；raw route 不进入外部 guard；payload guard retry 只筛 normalized pool。
 4. **token counting lazy 化到外部 usage 需要时**：外部 route 构造不再无条件 `count_all_tokens(...)`；usage projection 需要 input tokens 时再计算。
@@ -28,13 +28,13 @@
 6. **usage 与 body mode 解耦**：raw body 仍可按 `usageProjectionMode=current_path_policy` 做 usage projection，路径级同步禁用仍是上层拦截。
 7. **入口路径去重**：`/v1/messages`、`/na/v1/messages`、`/ha/v1/messages`、`/dfcache/.../v1/messages`、`/cc/v1/messages` 统一进入 `request_entry::handle_messages_endpoint(...)`，避免不同路径漂移。
 8. **raw facts 独立**：raw 顶层 `model`/`stream` 探测和可选顶层 model rewrite 已迁移到 `src/anthropic/request_facts.rs`，不再属于外部池调度模块。
-9. **本地 body pipeline 独立**：Anthropic -> Kiro 转换、Kiro request 序列化、payload guard、payload diagnostics、warnings、cache-point retry 准备已迁移到 `src/anthropic/handlers/local_body_pipeline.rs`。
+9. **本地 body pipeline 独立**：Anthropic -> Account Runtime 转换、Account Runtime request 序列化、payload guard、payload diagnostics、warnings、cache-point retry 准备已迁移到 `src/anthropic/handlers/local_body_pipeline.rs`。
 10. **外部池处理拆分**：外部池 body、model、retry、usage projection 分别迁移到 `src/external_pool/body_pipeline.rs`、`model_pipeline.rs`、`retry_pipeline.rs`、`usage_projection.rs`。
 
 本轮仍不做的部分：
 
 - 不把当前模块强行抽成 trait/plugin 系统；当前先建立稳定文件边界和调用契约。
-- 不改变本地凭证默认 Kiro 处理链的行为。
+- 不改变本地凭证默认 Account Runtime 处理链的行为。
 - 不改 UI 配置结构，因为本轮后端语义兼容现有配置。
 - 不把容量等待、连接池 lease、外部池选择算法强拆；这块和 manager 状态强耦合，后续需要单独设计 scheduler trait。
 
@@ -49,12 +49,12 @@
 - `Normalized` 分支才调用外部 `prepare_external_messages_payload(...)` 和 payload guard。
 - payload guard retry route 明确筛选 `Normalized` pool，避免裁剪后的 normalized body 被发到 raw pool。
 - 普通 fallback route 不设置 body mode filter，raw pool 不会因为显式直连关闭而被过滤。
-- 新增 parse 前 raw 外部池预检 fallback：仅当 raw 外部池当前可用、本地池无模型无关的可调度能力时，在标准 body parse、图片处理、Kiro 转换、Kiro payload guard 之前转 raw 外部池。
+- 新增 parse 前 raw 外部池预检 fallback：仅当 raw 外部池当前可用、本地池无模型无关的可调度能力时，在标准 body parse、图片处理、Account Runtime 转换、Account Runtime payload guard 之前转 raw 外部池。
 - normalized 外部池仍走 parsed path，继续保留现有 source/image/schema 行为。
 - 外部 route 构造不再无条件进行 token counting，避免 raw/外部 fallback 在未命中 usage projection 时提前扫描长上下文。
 - 新增 `src/anthropic/request_facts.rs`：raw body 轻量 facts 和顶层 model rewrite，不反序列化完整 messages。
 - 新增 `src/anthropic/handlers/request_entry.rs`：所有 messages 路径共享 direct/preflight raw、parse、进入 inner pipeline 的入口。
-- 新增 `src/anthropic/handlers/local_body_pipeline.rs`：本地 Kiro body 准备独立于 handler 编排。
+- 新增 `src/anthropic/handlers/local_body_pipeline.rs`：本地 Account Runtime body 准备独立于 handler 编排。
 - 新增 `src/external_pool/body_pipeline.rs`：外部池 raw/normalized body 准备按已选 pool 配置分支。
 - 新增 `src/external_pool/model_pipeline.rs`：外部池模型映射、raw model 探测结果处理、Claude 点号版本兼容转换。
 - 新增 `src/external_pool/retry_pipeline.rs`：外部 normalized payload guard retry 条件和 retry route 构造。
@@ -65,7 +65,7 @@
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo check`
-- `cargo test`：主服务 896 个测试、`kiro_loadtest` 15 个测试通过。
+- `cargo test`：主服务 896 个测试、`account_runtime_loadtest` 15 个测试通过。
 - `cargo build --release`
 - `pnpm --dir ui build`
 - `cargo test raw_hints_ignore_nested_model_without_top_level_model -- --nocapture`
@@ -100,7 +100,7 @@
 
 这意味着：
 
-- 选择本地凭证时，默认进入本地 Kiro 兼容处理链，包括 Anthropic -> Kiro 转换、图片/schema/tool/thinking 处理、payload guard、Kiro 请求序列化、usage 记录。
+- 选择本地凭证时，默认进入本地 Account Runtime 兼容处理链，包括 Anthropic -> Account Runtime 转换、图片/schema/tool/thinking 处理、payload guard、Account Runtime 请求序列化、usage 记录。
 - 选择外部池时，必须按这个外部池自己的配置决定 body 是 normalized 还是 raw passthrough。
 - 外部池配置为 raw passthrough 时，狭义 body 处理链不能运行，包括图片物化、media type 修正、schema 修复、payload guard、正文裁剪、深度内容扫描等。
 - raw passthrough 不等于禁用模型处理。模型处理应该是独立模块，可以按配置选择不写 body、只探测、或只改顶层 `model`。
@@ -116,7 +116,7 @@
 
 - 不把外部池统一改成 raw。
 - 不把 raw body 透传强制绑定模型 rewrite。
-- 不为了 raw 透传牺牲当前本地凭证的 Kiro 协议兼容能力。
+- 不为了 raw 透传牺牲当前本地凭证的 Account Runtime 协议兼容能力。
 - 不为了模块化新增与现有配置冲突的第二套配置语义。
 - 不在没有测试矩阵前发布大范围重构。
 - 不把 `/cc/v1/messages` 单独当成唯一标准；`/v1/messages`、`/ha/v1/messages`、`/na/v1/messages`、`/dfcache/.../v1/messages` 都必须共享同一套原则。
@@ -143,7 +143,7 @@
 - 一旦没有命中 pre-parse raw direct，handler 会解析完整 `MessagesRequest`，然后进入 `post_messages_inner` 或 `post_claude_code_messages_inner`。
 - 在 normal parsed handler 内，`override_thinking_from_model_name`、`apply_thinking_trigger_mode`、`body_processing::prepare_multimodal_sources` 会先运行，随后才调用 `ExternalFallbackContext::direct_policy_response(...)`。
 - 因此，显式 direct policy 如果没有走 pre-parse raw 入口，仍会先付出 thinking 和多模态处理成本；如果多模态处理提前报错，外部池 raw 目标没有机会接管。
-- 本地 preflight fallback 在 `handle_stream_request` / `handle_non_stream_request` 内触发，此时 Kiro 请求已经完成转换和 `prepare_kiro_request_body`，所以“本地明显不可调度时直接外部池”当前仍会提前消耗本地 body 处理、payload guard、token 估算等成本。
+- 本地 preflight fallback 在 `handle_stream_request` / `handle_non_stream_request` 内触发，此时 Account Runtime 请求已经完成转换和 `prepare_account-runtime_request_body`，所以“本地明显不可调度时直接外部池”当前仍会提前消耗本地 body 处理、payload guard、token 估算等成本。
 
 ### 外部池现状
 
@@ -158,7 +158,7 @@
 
 ### 仍存在的主要耦合
 
-- handler 在知道最终目标之前就做了 thinking、多模态 source、模型解析、Kiro 转换、payload guard、token 估算。
+- handler 在知道最终目标之前就做了 thinking、多模态 source、模型解析、Account Runtime 转换、payload guard、token 估算。
 - `ExternalFallbackContext::route_request(...)` 会无条件 `count_all_tokens(...)`，即使最终外部池 raw 透传也会计算输入 token。
 - model、body、usage、错误分类、重试、日志诊断大多仍散落在 `handlers.rs` 和 `external_pool.rs`。
 - `external_pool_prepare_request(...)` 虽然有 raw/normalized 分支，但 model rewrite、thinking 归一化、payload guard、序列化仍在同一个函数附近聚合，模块边界还不清晰。
@@ -177,7 +177,7 @@
 但不足也很明确：
 
 - 它只把外部池 payload guard 的位置往后挪了一段，没有建立“先选目标，再生成 ProcessingPlan”的统一入口。
-- 它没有解决本地 preflight 之前已经做完整 Kiro body 处理的问题。
+- 它没有解决本地 preflight 之前已经做完整 Account Runtime body 处理的问题。
 - 它没有把 facts/token counting 变成 lazy，也没有减少高并发长上下文下的重复 CPU 消耗。
 - 它没有把 model、body、usage、error、retry、diagnostics 拆成可复用模块。
 - 它没有消除 `/v1`、`/cc/v1` 等路径之间的重复逻辑。
@@ -218,7 +218,7 @@
    - 组合行为由管线编排决定，不应该藏在某个配置项里。
 
 7. **先选择目标，再执行目标允许的处理**
-   - target 是本地凭证时，执行本地 Kiro body pipeline。
+   - target 是本地凭证时，执行本地 Account Runtime body pipeline。
    - target 是外部 normalized pool 时，执行外部 normalized body pipeline。
    - target 是外部 raw pool 时，执行 raw body pipeline。
    - 未选中的分支不能提前运行重处理逻辑。
@@ -229,7 +229,7 @@
    - 但 facts 提取不能隐式修改 body，也不能触发图片物化、payload guard、schema 修复。
 
 9. **性能热路径必须可控**
-   - token 估算、图片尺寸识别、base64 decode、深层 JSON 遍历、payload guard 裁剪、Kiro 序列化都不能默认对所有分支运行。
+   - token 估算、图片尺寸识别、base64 decode、深层 JSON 遍历、payload guard 裁剪、Account Runtime 序列化都不能默认对所有分支运行。
    - 每个重处理步骤都必须能回答：是谁需要它、在什么配置下运行、无法运行时怎么降级。
 
 ## 当前需要修正的耦合点
@@ -307,7 +307,7 @@ Body 模块自己决定是否应用 `optional_body_patch`。
 
 - explicit raw direct：只需要 raw body hints + direct policy + raw pool 调度。
 - explicit any direct：先根据 direct policy 选外部目标，再按目标 body mode 决定是否解析和处理 body。
-- local preflight fallback：如果本地池已经明确不可调度，应先选外部目标，再按目标配置准备 body；不能先完整构造 Kiro body。
+- local preflight fallback：如果本地池已经明确不可调度，应先选外部目标，再按目标配置准备 body；不能先完整构造 Account Runtime body。
 - after-local-attempt fallback：因为已经选择并尝试过本地，前面做过本地 body 处理是合理的；切到外部池后仍必须按外部池自己的 body mode 生成出站 body。
 
 ### 5. `RequestFacts` 必须 lazy，不能把 token counting 当作 route 构造副作用
@@ -326,12 +326,12 @@ Body 模块自己决定是否应用 `optional_body_patch`。
 
 图片处理分两类：
 
-- 协议必需处理：本地 Kiro 凭证必须把 Anthropic 图片 block 转成 Kiro `images[].source.bytes`。
+- 协议必需处理：本地 Account Runtime 凭证必须把 Anthropic 图片 block 转成 Account Runtime `images[].source.bytes`。
 - 兼容增强处理：file_id 物化、远程 URL 物化、media type 修正、图片尺寸 token 估算、oversized 检查。
 
 这些处理不能在入口 handler 无条件运行。合理做法是：
 
-- 本地 Kiro body pipeline 默认启用协议必需处理，并按配置启用增强处理。
+- 本地 Account Runtime body pipeline 默认启用协议必需处理，并按配置启用增强处理。
 - 外部 normalized body pipeline 按外部池配置启用增强处理。
 - 外部 raw body pipeline 默认不做图片处理，只允许 raw hints 或显式配置的轻量 top-level patch。
 
@@ -355,7 +355,7 @@ Body 模块自己决定是否应用 `optional_body_patch`。
 ```text
 target = LocalCredential
 model = local model resolution
-body = LocalKiroBodyPipeline
+body = LocalAccount RuntimeBodyPipeline
 usage = LocalUsagePipeline
 retry = local credential retry + cache point retry + payload too long retry
 error = local Anthropic-compatible error normalization
@@ -366,8 +366,8 @@ error = local Anthropic-compatible error normalization
 - 解析标准 Anthropic Messages body。
 - thinking 触发和本地兼容处理。
 - 多模态 source 处理。
-- Anthropic -> Kiro schema 转换。
-- Kiro payload guard 和 too-long retry。
+- Anthropic -> Account Runtime schema 转换。
+- Account Runtime payload guard 和 too-long retry。
 - token 估算和 usage 上报记录。
 - 本地凭证调度、冷却、429/风控/禁用逻辑。
 
@@ -400,8 +400,8 @@ error = external error policy
 
 不应该运行：
 
-- 本地 Kiro schema 转换。
-- 本地 profileArn、machineId、Kiro endpoint transform。
+- 本地 Account Runtime schema 转换。
+- 本地 profileArn、machineId、Account Runtime endpoint transform。
 - 本地凭证 token refresh。
 
 ### 外部池 raw passthrough 目标
@@ -433,8 +433,8 @@ error = external error policy
 - base64 media type decode/修正。
 - payload guard 裁剪。
 - schema/tool/thinking 的 normalized body 修复。
-- Anthropic -> Kiro 转换。
-- Kiro payload guard。
+- Anthropic -> Account Runtime 转换。
+- Account Runtime payload guard。
 
 ### 外部池 raw + usage projection
 
@@ -900,7 +900,7 @@ trait RequestProcessor {
 验收：
 
 - 显式 raw direct 命中时，不解析完整 `MessagesRequest`。
-- 本地池 preflight 明确不可调度且外部 raw 池可用时，不先构造 Kiro request body。
+- 本地池 preflight 明确不可调度且外部 raw 池可用时，不先构造 Account Runtime request body。
 - 计划日志能看到 target、body_mode、model_mode、usage_mode、payload_guard_enabled。
 
 ### 阶段 3：抽 `RequestFacts`
@@ -935,14 +935,14 @@ trait RequestProcessor {
 - Raw 和 Normalized 变成两个 processor。
 - 图片处理、payload guard、schema 修正成为 Normalized processor 的子步骤。
 - Raw processor 只允许显式配置的轻量 patch，例如顶层 model patch。
-- 本地 Kiro body pipeline 与外部 normalized Anthropic body pipeline 分开。
+- 本地 Account Runtime body pipeline 与外部 normalized Anthropic body pipeline 分开。
 - 图片处理配置拆成现有模式和轻量转发模式，并挂在具体 body pipeline 上。
 
 验收：
 
 - raw body 不调用 `prepare_multimodal_sources`。
 - normalized body 按配置调用图片处理和 payload guard。
-- 本地凭证图片请求仍能转成 Kiro 兼容格式。
+- 本地凭证图片请求仍能转成 Account Runtime 兼容格式。
 - raw 外部池图片请求不做本地 decode、物化、修正。
 
 ### 阶段 6：抽 `ModelPipeline`
@@ -995,7 +995,7 @@ trait RequestProcessor {
 - 显式直连关闭 + 本地失败 + Raw 池：Raw 池不能被忽略。
 - 显式直连关闭 + 本地失败 + Normalized 池：仍正常 fallback。
 - Raw 池和 Normalized 池共存：按优先级/并发/冷却正常选择。
-- 本地 preflight 明确不可调度 + Raw 池：不应提前构造 Kiro request body。
+- 本地 preflight 明确不可调度 + Raw 池：不应提前构造 Account Runtime request body。
 - after-local-attempt fallback + Raw 池：允许前面已做本地处理，但发外部池时必须使用原始 raw body。
 - `/v1/messages`、`/ha/v1/messages`、`/na/v1/messages`、`/dfcache/.../v1/messages`、`/cc/v1/messages` 都必须覆盖同一语义。
 
@@ -1006,7 +1006,7 @@ trait RequestProcessor {
 - Raw body + 嵌套 model：不能误改嵌套字段。
 - Normalized body：图片处理、schema 修正、payload guard 正常生效。
 - Raw body + 图片：不调用 file store、不下载远程图片、不 decode base64、不修正 media type。
-- Local credential + 图片：仍转成 Kiro 兼容 `images[].source.bytes`。
+- Local credential + 图片：仍转成 Account Runtime 兼容 `images[].source.bytes`。
 - Normalized external + payload guard disabled：不进入 payload guard。
 - Normalized external + payload guard enabled：只对 normalized branch 生效。
 - tool_result.content[] 内图片、文件、大 schema、深层 nested JSON 都要覆盖。
@@ -1047,7 +1047,7 @@ trait RequestProcessor {
 
 ### 性能
 
-- raw passthrough 分支不应做完整 JSON parse、图片 decode、payload guard、Kiro serialization。
+- raw passthrough 分支不应做完整 JSON parse、图片 decode、payload guard、Account Runtime serialization。
 - normalized 分支关闭 payload guard 时不能进入 payload guard scan/crop。
 - token counting 只能在 usage、payload guard、诊断明确需要时运行。
 - 多图长上下文、大 tool_result、深层 JSON、慢首字长流式、上游 429/5xx/timeout 都要有针对性压测。
@@ -1071,7 +1071,7 @@ trait RequestProcessor {
 - raw body 不是标准 Anthropic Messages JSON 时，usage projection 降级是否只记录日志，还是也要在 usage record 中显式展示。
 - 本地 preflight 提前后，如果请求 body 本身非法，是优先返回本地 400，还是在本地不可用且外部 raw 可用时允许 raw 外部池处理。建议按 target-first：如果已明确选 raw 外部池，非法标准 body 不应阻断 raw。
 - raw 请求是否需要可选的最大 body bytes 硬限制。这个限制不是 payload guard，但可能是网关级 DoS 保护。
-- 是否需要为 normalized external 和 local Kiro 分别配置图片处理 profile，避免一个全局图片配置影响不同上游。
+- 是否需要为 normalized external 和 local Account Runtime 分别配置图片处理 profile，避免一个全局图片配置影响不同上游。
 
 ## 当前结论
 
@@ -1083,6 +1083,6 @@ trait RequestProcessor {
 - 显式 Raw 直连仍只使用 Raw 池。
 - usage 整形继续由外部池 usage 设置和路径 usage 设置决定，不被 body mode 隐式覆盖。
 - 外部池 normalized 的 payload guard 只在选中 normalized pool 后执行。
-- raw 外部池不会提前进入图片、schema、payload guard、Kiro 转换等 body 处理。
+- raw 外部池不会提前进入图片、schema、payload guard、Account Runtime 转换等 body 处理。
 
 中长期应落到 `RequestEnvelope + RoutePlanner + ProcessingPlan + RequestFacts + BodyPipeline + ModelPipeline + UsageProjectionEngine + Scheduler + RetryPipeline + ErrorPipeline + ResponsePipeline` 这组边界。这样配置会更聚焦，也更容易证明“一个配置只影响它所属的模块”，同时避免高并发长上下文场景下未命中分支也提前消耗 CPU 和内存。

@@ -78,7 +78,8 @@ test('loadtest documentation uses frozen binaries and external report roots', ()
     path.resolve(import.meta.dirname, '../../docs/testing/loadtest.md'),
     'utf8',
   )
-  assert.doesNotMatch(source, /cargo run --bin kiro_loadtest/)
+  assert.doesNotMatch(source, /cargo run --bin account_runtime_loadtest/)
+  assert.doesNotMatch(source, /cargo run --bin account_runtime_loadtest/)
   assert.doesNotMatch(source, /--report target\//)
   assert.doesNotMatch(source, /--base-url http:\/\/(?:127\.0\.0\.1|localhost):9022/)
   assert.match(source, /feature\/tests\/run-cargo-scoped\.sh/)

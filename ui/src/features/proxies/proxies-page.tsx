@@ -24,7 +24,6 @@ export function ProxiesPage() {
   const list = resources.data?.resources || []
 
   const enabledCount = React.useMemo(() => list.filter((r) => r.enabled).length, [list])
-  const boundCount = React.useMemo(() => list.reduce((sum, r) => sum + r.credentialCount, 0), [list])
 
   const openCreate = () => { setEditing(null); setEditorOpen(true) }
   const openEdit = (resource: ProxyResource) => { setEditing(resource); setEditorOpen(true) }
@@ -50,7 +49,6 @@ export function ProxiesPage() {
       <StatGrid>
         <StatCard title="代理资源" value={list.length} icon={<Network className="h-5 w-5" />} tone="info" />
         <StatCard title="启用资源" value={enabledCount} tone={enabledCount > 0 ? 'success' : 'warning'} />
-        <StatCard title="绑定账号" value={boundCount} tone="default" />
       </StatGrid>
 
       <SectionCard

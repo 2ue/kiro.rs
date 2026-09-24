@@ -36,7 +36,7 @@ HTTP 400
 
 ## 根因
 
-Anthropic/MCP 客户端允许的 JSON Schema property key 空间比 Kiro 上游正则更宽，旧 converter 没有在 request scope 建立可逆 schema-key map，也没有同步更新 `required`/dependency 引用与 response `tool_use.input`。只做单向字符串替换会让请求返回 200 但客户端拿不到原始参数，比直接 400 更隐蔽。
+Anthropic/MCP 客户端允许的 JSON Schema property key 空间比 Account Runtime 上游正则更宽，旧 converter 没有在 request scope 建立可逆 schema-key map，也没有同步更新 `required`/dependency 引用与 response `tool_use.input`。只做单向字符串替换会让请求返回 200 但客户端拿不到原始参数，比直接 400 更隐蔽。
 
 ## 上游约束（实测结论）
 
@@ -183,14 +183,14 @@ hash 输入包含固定版本前缀、映射后的上游工具名、schema path�
 
 ## 复现 case
 
-前置：本地服务已启动（示例 `127.0.0.1:9022`），API Key 见 `config.json`（示例 `sk-kiro-rs-local-debug`）。本地测试账号仅支持 sonnet，模型用 `claude-sonnet-4-20250514`。
+前置：本地服务已启动（示例 `127.0.0.1:9022`），API Key 见 `config.json`（示例 `sk-account-runtime-local-debug`）。本地测试账号仅支持 sonnet，模型用 `claude-sonnet-4-20250514`。
 
 ### Case 1：非法属性键（空格）
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -223,7 +223,7 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 ```bash
 curl -sS -X POST http://127.0.0.1:9022/v1/messages \
   -H 'content-type: application/json' \
-  -H 'x-api-key: sk-kiro-rs-local-debug' \
+  -H 'x-api-key: sk-account-runtime-local-debug' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
     "model": "claude-sonnet-4-20250514",
@@ -242,9 +242,9 @@ curl -sS -X POST http://127.0.0.1:9022/v1/messages \
 验证使用本地 release 二进制启动临时服务：
 
 ```text
-KIRO_RS_HOST=127.0.0.1
-KIRO_RS_PORT=19022
-binary=./target/release/kiro-rs
+ACCOUNT_RUNTIME_HOST=127.0.0.1
+ACCOUNT_RUNTIME_PORT=19022
+binary=./target/release/account-runtime
 ```
 
 验证后已停止临时服务，未触碰既有 `9022` 服务。

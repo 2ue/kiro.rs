@@ -92,7 +92,7 @@ function dollarsPerMillion(value?: number): string {
 
 function sourceVariant(source?: string): 'outline' | 'secondary' | 'success' | 'warning' {
   if (source === 'manual') return 'warning'
-  if (source?.includes('kiro')) return 'success'
+  if (source?.includes('upstream') || source?.includes('account') || source?.includes('runtime')) return 'success'
   if (source === 'litellm' || source?.includes('seed') || source === 'built-in') return 'secondary'
   return 'outline'
 }
@@ -100,7 +100,7 @@ function sourceVariant(source?: string): 'outline' | 'secondary' | 'success' | '
 function sourceLabel(source?: string): string {
   if (!source) return '-'
   if (source === 'manual') return '手动'
-  if (source.includes('kiro')) return '上游'
+  if (source.includes('upstream') || source.includes('account') || source.includes('runtime')) return '上游'
   if (source === 'litellm') return '价格源'
   if (source.includes('seed')) return 'Seed'
   if (source === 'built-in') return '内置'

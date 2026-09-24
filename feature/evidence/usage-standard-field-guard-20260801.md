@@ -22,7 +22,7 @@ The validation was local. It did not restart or modify the existing `127.0.0.1:9
 - Local handler non-stream and persisted-record paths apply that standard cache guard when:
   - `usage_source == LocalPromptCache`
   - cache fields are present
-  - strategy is `CurrentHighCache` or `KiroRsTool`
+  - strategy is `CurrentHighCache` or `Account RuntimeRsTool`
   - the route has no full reported-usage policy.
 - Stream final `message_delta.usage` applies the same standard cache guard when local prompt-cache projection is enabled but no reported-usage policy exists.
 - Local credential failure records now keep the request input estimate in diagnostic `total_input_tokens` / `rawUsage` paths and write zero to downstream-standard fields.
@@ -32,11 +32,11 @@ The validation was local. It did not restart or modify the existing `127.0.0.1:9
 ## Commands
 
 ```bash
-feature/tests/run-cargo-scoped.sh usage-standard-cache-field-final -- cargo test --bin kiro-rs standard_cache_field -- --nocapture
-feature/tests/run-cargo-scoped.sh usage-record-filter-final -- cargo test --bin kiro-rs usage_record
-feature/tests/run-cargo-scoped.sh usage-projection-final-cache-final -- cargo test --bin kiro-rs usage_projection_final_cache
-feature/tests/run-cargo-scoped.sh external-failure-standard-usage -- cargo test --bin kiro-rs external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuses -- --nocapture
-feature/tests/run-cargo-scoped.sh external-error-filter-final -- cargo test --bin kiro-rs external_error
+feature/tests/run-cargo-scoped.sh usage-standard-cache-field-final -- cargo test --bin account-runtime standard_cache_field -- --nocapture
+feature/tests/run-cargo-scoped.sh usage-record-filter-final -- cargo test --bin account-runtime usage_record
+feature/tests/run-cargo-scoped.sh usage-projection-final-cache-final -- cargo test --bin account-runtime usage_projection_final_cache
+feature/tests/run-cargo-scoped.sh external-failure-standard-usage -- cargo test --bin account-runtime external_failure_standard_usage_fields_are_zeroed_for_all_non_success_statuses -- --nocapture
+feature/tests/run-cargo-scoped.sh external-error-filter-final -- cargo test --bin account-runtime external_error
 feature/tests/run-cargo-scoped.sh usage-standard-guard-fmt-final -- cargo fmt --check
 git diff --check
 ```
@@ -44,17 +44,17 @@ git diff --check
 Earlier focused usage guard commands from the same work sequence:
 
 ```bash
-feature/tests/run-cargo-scoped.sh usage-cache-module -- cargo test --bin kiro-rs anthropic::cache
-feature/tests/run-cargo-scoped.sh usage-reported-filter -- cargo test --bin kiro-rs reported_usage
-feature/tests/run-cargo-scoped.sh usage-failure-standard-zero -- cargo test --bin kiro-rs large_request_estimate -- --nocapture
-feature/tests/run-cargo-scoped.sh usage-failure-record-focused -- cargo test --bin kiro-rs failure_usage_record -- --nocapture
+feature/tests/run-cargo-scoped.sh usage-cache-module -- cargo test --bin account-runtime anthropic::cache
+feature/tests/run-cargo-scoped.sh usage-reported-filter -- cargo test --bin account-runtime reported_usage
+feature/tests/run-cargo-scoped.sh usage-failure-standard-zero -- cargo test --bin account-runtime large_request_estimate -- --nocapture
+feature/tests/run-cargo-scoped.sh usage-failure-record-focused -- cargo test --bin account-runtime failure_usage_record -- --nocapture
 ```
 
 ## Results
 
 - `standard_cache_field`: `3 passed / 0 failed`, covering:
   - standard cache field caps without full reported-usage projection;
-  - local handler `/dfcache` / `kiro_rs_tool` style unreported cache usage;
+  - local handler `/dfcache` / `account_runtime_tool` style unreported cache usage;
   - stream final usage with local prompt-cache projection and no reported-usage policy.
 - `usage_record`: `13 passed / 0 failed`, including `failure_usage_record_keeps_large_request_estimate_out_of_standard_fields`.
 - `usage_projection_final_cache`: `2 passed / 0 failed`, covering cache-read and cache-creation guards after external-pool uplift.
@@ -75,7 +75,7 @@ Earlier focused usage guard results:
 
 This closes the known code residuals recorded in the issue for:
 
-- unreported local prompt-cache cache fields, including `kiro_rs_tool` standard cache read/write caps;
+- unreported local prompt-cache cache fields, including `account_runtime_tool` standard cache read/write caps;
 - local credential failure rows using request estimates as downstream-standard fields;
 - external pool failure rows using request estimates as downstream-standard fields.
 

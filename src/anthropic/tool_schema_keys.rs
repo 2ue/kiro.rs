@@ -232,7 +232,7 @@ impl SchemaKeyMapper {
 
 fn generated_key(tool_name: &str, path: &str, key: &str, attempt: usize) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"kiro.rs:tool-schema-key:v1\0");
+    hasher.update(b"account-runtime:tool-schema-key:v1\0");
     hasher.update(tool_name.as_bytes());
     hasher.update(b"\0");
     hasher.update(path.as_bytes());

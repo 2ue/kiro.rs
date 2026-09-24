@@ -65,7 +65,7 @@ Severity: P0
 
 `queue-refresh-integration-r3` 又执行三条 manager 合同，各自 `running 1 / passed 1` 且内部 5 轮：global capacity full 立即返回并保持 queue 0；单账号从 Ready 到 CapacityFull 时 queue 0、release 后恢复 Ready；slot race 重选另一健康账号且 queue 0。该 scope 同时通过 policy、refresh/API/MCP 和 all-targets check，`size_kib=2016724`，结束时 `removed=true`、`reservation_released=true`。
 
-三个 external storage filter 虽显示 test function `ok`，正文明确输出缺少 `KIRO_RS_TEST_POSTGRES_URL` 并提前返回；它们只计编译/入口证据，不计 available/full/cooling/coordinator 动态 PASS。第一次 `queue-preflight-race-r1` 因错误使用 `cargo test --lib` 在编译前退出 101，`size_kib=32` 且完整清理，也不计行为证据。详细边界见 [专项证据](../evidence/local-capacity-preflight-race-20260718.md)。
+三个 external storage filter 虽显示 test function `ok`，正文明确输出缺少 `ACCOUNT_RUNTIME_TEST_POSTGRES_URL` 并提前返回；它们只计编译/入口证据，不计 available/full/cooling/coordinator 动态 PASS。第一次 `queue-preflight-race-r1` 因错误使用 `cargo test --lib` 在编译前退出 101，`size_kib=32` 且完整清理，也不计行为证据。详细边界见 [专项证据](../evidence/local-capacity-preflight-race-20260718.md)。
 
 ## 残余风险
 

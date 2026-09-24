@@ -64,7 +64,7 @@ The resumed source review promoted seven problems that were absent from the earl
 | `SEC-005` plaintext Admin reads and long-lived browser key storage | Auth, runtime-config, credential and proxy-resource owner repositories/lifecycles plus R4.0, four exact R8 backend domains, generated contract, eight exact two-app workflows and thin Admin transport |
 | `OPS-005` mutable delimiter-split startup migration/backfill | Exact `R2.0.migration-foundation`, proposed decision 008, a fresh/legacy/partial/corrupt/concurrent adoption contract, domain-owned immutable migrations, bounded owner jobs and R9 recovery/bootstrap integration |
 | `PERF-009` unbounded stale-lease Lua work | R0.9/R0.10 bounded cleanup and R4.2/R4.5 scheduler ownership |
-| `RES-004` unbounded proxy-keyed Kiro client cache | R0.7 containment and R5.1 bounded client lifecycle |
+| `RES-004` unbounded proxy-keyed Account Runtime client cache | R0.7 containment and R5.1 bounded client lifecycle |
 | `RES-005` unlimited supported-profile admission/queues | R0.9/R0.10 finite ceilings and R4.2/R4.5 lifecycle ownership |
 
 These findings extend the plan without adding a horizontal HTTP-client, migration, resource-manager or service-locator God module. Their policy belongs to the domain/upstream/scheduler owner that performs the work.
@@ -123,4 +123,4 @@ This review is document-only. The final working-tree audit checks:
 
 The only allowed unresolved relative target is the root `README.md` link to `docs/claude-code-cli-local-testing.md`, tracked as `DOC-002`. Exact final command results are part of this same local checkpoint review, not modernization gate evidence.
 
-Not run in this documentation task: Rust build/test, frontend build/test, Docker, PgSQL/Redis migration drills, load/chaos, real Kiro, real Claude Code CLI, browser E2E, release build or deployment. No production code was changed, and no commit or push was performed.
+Not run in this documentation task: Rust build/test, frontend build/test, Docker, PgSQL/Redis migration drills, load/chaos, real Account Runtime, real Claude Code CLI, browser E2E, release build or deployment. No production code was changed, and no commit or push was performed.

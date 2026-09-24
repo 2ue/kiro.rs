@@ -86,8 +86,8 @@ for (const [signal, expectedCode] of CASES) {
       cwd: ROOT,
       env: {
         ...process.env,
-        KIRO_BARE_INVOKE_SIGNAL_FIXTURE: '1',
-        KIRO_SIGNAL_ACK_PATH: ackPath,
+        ACCOUNT_RUNTIME_BARE_INVOKE_SIGNAL_FIXTURE: '1',
+        ACCOUNT_RUNTIME_SIGNAL_ACK_PATH: ackPath,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })

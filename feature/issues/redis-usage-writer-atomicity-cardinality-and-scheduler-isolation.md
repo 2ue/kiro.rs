@@ -86,7 +86,7 @@ Redis batch 仍最多 64 条、总 deadline 仍为 2 秒，但不再用 `join_al
 
 程序：`redis_usage_summary_cache_read_cardinality_is_hard_capped_for_five_rounds`。
 
-非 Docker runner：`feature/tests/run-redis-usage-writer-validation.sh`。它必须显式接收隔离 Redis URL 和 `KIRO_RS_TEST_REDIS_ISOLATED=1`；默认执行 3 个 outer rounds，缺环境时在 Cargo 前 fail closed。
+非 Docker runner：`feature/tests/run-redis-usage-writer-validation.sh`。它必须显式接收隔离 Redis URL 和 `ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1`；默认执行 3 个 outer rounds，缺环境时在 Cargo 前 fail closed。
 
 ### R3：无 Redis 的提交顺序合同
 
@@ -138,7 +138,7 @@ Redis usage writer 原子性不能覆盖 PgSQL 连接池拥塞。生产 113->114
 当前工作树新增：
 
 - `postgres.usageMaxConnections`，默认 4；
-- `KIRO_RS_POSTGRES_USAGE_MAX_CONNECTIONS` 环境变量；
+- `ACCOUNT_RUNTIME_POSTGRES_USAGE_MAX_CONNECTIONS` 环境变量；
 - `PostgresStore::connect_usage(&Config)`；
 - `main` 中 usage recorder 使用独立 `PostgresUsageStore` pool；
 - `PostgresStore::connect_test` 不再固定 2 连接，测试可按配置模拟主 pool 耗尽。

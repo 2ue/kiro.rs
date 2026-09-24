@@ -43,7 +43,7 @@ R0 produces final reusable validation assets. It does not patch or activate temp
 | `R0.4` | `MOD-ARCH-FITNESS` | Final module/import/cycle/public-surface/legacy/stub/artifact rules | Decisions 007-014 and both ledgers | self-tests that reject known forbidden graphs and false plan states | Ready |
 | `R0.5` | `MOD-LOAD-CHAOS-HARNESS` | Final valid manifest/report engine, process identity, result accounting, metric validity, watchdog and cleanup | Current harness characterization and `TEST-004` | harness self-test, wrong/dead PID rejection, missing-is-invalid, exact counts, cooldown/recovery | Ready |
 | `R0.6` | `MOD-CONTRACT-HARNESS` | Final sanitized black-box contract manifest and fixture provenance system | Public invariant inventory | deterministic replay, corpus hashes, secret scan, complete pass/fail/skip/error accounting | Ready |
-| `R0.7` | `MOD-CONTRACT-HARNESS` for `MOD-KIRO-UPSTREAM` | Kiro oversized/chunked/slow response and proxy-client churn corpus | Current Kiro transport characterization | body limits, error-prefix limit, 1k-10k proxy identities, RSS/FD/connection recovery | Ready |
+| `R0.7` | `MOD-CONTRACT-HARNESS` for `MOD-ACCOUNT_RUNTIME-UPSTREAM` | Account Runtime oversized/chunked/slow response and proxy-client churn corpus | Current Account Runtime transport characterization | body limits, error-prefix limit, 1k-10k proxy identities, RSS/FD/connection recovery | Ready |
 | `R0.8` | `MOD-CONTRACT-HARNESS` for `MOD-EXTERNAL-UPSTREAM` | External destination/redirect/header/response corpus | Current external-pool characterization | SSRF/rebinding/proxy-DNS, redirects, credentials, oversized success/error/stream vectors | Ready |
 | `R0.9` | `MOD-CONTRACT-HARNESS` for `MOD-SCHEDULER-LOCAL` | Local admission/queue/lease/stale-set workload corpus | Current local scheduler characterization | finite overload, 1/1k/100k stale entries, cancel/grant races, recovery | Ready |
 | `R0.10` | `MOD-CONTRACT-HARNESS` for `MOD-SCHEDULER-EXTERNAL` | External admission/fallback/rescue/lease/stale-set workload corpus | Current external scheduler characterization | finite overload, fallback/rescue bounds, cancel/grant races, recovery | Ready |
@@ -113,9 +113,9 @@ R0 produces final reusable validation assets. It does not patch or activate temp
 
 | Work unit | Technical authority | Final output and integration boundary | Depends on | Required evidence | State |
 | --- | --- | --- | --- | --- | --- |
-| `R5.0.kiro` | `MOD-PROTO-KIRO` | Kiro prepared-request and transport-outcome contract/codecs | `R1.1`, `R1.5` | compile/static and golden vectors | Ready |
+| `R5.0.account-runtime` | `MOD-PROTO-ACCOUNT_RUNTIME` | Account Runtime prepared-request and transport-outcome contract/codecs | `R1.1`, `R1.5` | compile/static and golden vectors | Ready |
 | `R5.0.external` | `MOD-PROTO-EXTERNAL` | External prepared-request, raw/normalized boundary and outcome contract | `R1.1`, `R1.5` | compile/static and golden vectors | Ready |
-| `R5.1` | `MOD-KIRO-UPSTREAM` | One bounded client/cache/endpoint/proxy/auth/connect/response/stream adapter per logical attempt using only scoped governor connection/response handles | `R0.7`, `R1.9`, `R4.0`, `R4.3`, `R5.0.kiro` | fake upstream, limits/cache churn/proxy rotation and low-volume independent real Kiro operations | Ready |
+| `R5.1` | `MOD-ACCOUNT_RUNTIME-UPSTREAM` | One bounded client/cache/endpoint/proxy/auth/connect/response/stream adapter per logical attempt using only scoped governor connection/response handles | `R0.7`, `R1.9`, `R4.0`, `R4.3`, `R5.0.account-runtime` | fake upstream, limits/cache churn/proxy rotation and low-volume independent real Account Runtime operations | Ready |
 | `R5.2` | `MOD-EXTERNAL-UPSTREAM` | One safe destination/redirect/path/header/client/response adapter for raw and normalized attempts using only scoped governor connection/response handles | `R0.8`, `R1.9`, `R4.4`, `R5.0.external` | egress/SSRF, redirect/header/proxy, limits, stream and recovery | Ready |
 | `R5.3` | `MOD-ATTEMPT-POLICY` | One conservative execution-possibility/replay/commitment/retry/fallback classifier | `R5.1`, `R5.2`, decision 003 | ambiguous send, stable idempotency, bounded attempts and no post-commit reroute | Ready |
 
@@ -123,11 +123,11 @@ R0 produces final reusable validation assets. It does not patch or activate temp
 
 | Work unit | Technical authority | Final output and integration boundary | Depends on | Required evidence | State |
 | --- | --- | --- | --- | --- | --- |
-| `R6.1` | `MOD-MESSAGES` | Route intent, target selection sequence, resource cost plan/admission and processing plan before heavy work | `R1.9`, `R4.0`-`R4.5`, `R5.0.kiro`, `R5.0.external` | offline plan parity, weighted admission and zero unselected work | Ready |
+| `R6.1` | `MOD-MESSAGES` | Route intent, target selection sequence, resource cost plan/admission and processing plan before heavy work | `R1.9`, `R4.0`-`R4.5`, `R5.0.account-runtime`, `R5.0.external` | offline plan parity, weighted admission and zero unselected work | Ready |
 | `R6.2` | `MOD-REQUEST-ARTIFACTS` | Lazy raw/parsed/revisioned facts, token facts and serialized artifact cache | `R1.3`, `R6.1` | parse/copy/count/serialize operation budgets and invalidation | Ready |
 | `R6.3.external-raw` | `MOD-PAYLOAD` | Raw path with zero forbidden parse/media/conversion/token work | `R6.2`, `R5.0.external` | byte golden, zero-heavy-stage and resource gates | Ready |
 | `R6.3.external-normalized` | `MOD-PAYLOAD` | External normalized validation/repair/shaping plan, including target-specific reversible tool-schema policy | `R6.2`, `R5.0.external`, decision 012 | semantic golden, tool schema round trip/local reject, revision, limits and allocation | Ready |
-| `R6.3.kiro-local` | `MOD-PAYLOAD` | Local Kiro validation/repair/shaping plan, including empty/null tool boundaries and reversible property mapping | `R6.2`, `R5.0.kiro`, decision 012 | semantic golden, tool schema/response round trip, tools/thinking/media/cache and allocation | Ready |
+| `R6.3.account-runtime-local` | `MOD-PAYLOAD` | Local Account Runtime validation/repair/shaping plan, including empty/null tool boundaries and reversible property mapping | `R6.2`, `R5.0.account-runtime`, decision 012 | semantic golden, tool schema/response round trip, tools/thinking/media/cache and allocation | Ready |
 | `R6.4` | `MOD-FILES` | Complete shared `BoundedRawBody` upload/list/get/delete/materialize/retention implementation using only scoped governor streaming handles | `R0.3`, `R1.9`, `R2.4.files`, decision 010 | all routes, restart/failover, churn, streaming copy/bytes and backup/restore | Ready |
 | `R6.5` | `MOD-MEDIA` | Complete bounded remote media/PDF clients and executors using only scoped governor byte/task/connection handles | `R0.2`, `R1.3`, `R1.9` | slow/large/cancel, SSRF/rebinding, allocator/RSS/task/FD recovery | Ready |
 | `R6.6.models` | `MOD-MODEL-CATALOG` | Public Models/resolve/capability/pricing use case | `R2.7` | API parity and refresh convergence | Ready |
@@ -140,10 +140,10 @@ R0 produces final reusable validation assets. It does not patch or activate temp
 
 | Work unit | Technical authority | Final output and integration boundary | Depends on | Required evidence | State |
 | --- | --- | --- | --- | --- | --- |
-| `R7.0` | `MOD-PROTO-SSE` | Canonical SSE/content-block codec and transition state machine | `R0.6`, `R1.5`, `R5.0.kiro` | event-order golden, malformed/truncated stream and allocation | Ready |
+| `R7.0` | `MOD-PROTO-SSE` | Canonical SSE/content-block codec and transition state machine | `R0.6`, `R1.5`, `R5.0.account-runtime` | event-order golden, malformed/truncated stream and allocation | Ready |
 | `R7.1` | `MOD-RESPONSE` | Canonical response session, commitment, backpressure, tool-argument reverse mapping and neutral terminal facts | `R5.1`, `R5.2`, `R6.1`, `R6.3.*`, `R7.0`, decision 012 | response properties, tool schema round trip, protocol golden, slow client and cancellation | Ready |
-| `R7.2.kiro-nonstream` | `MOD-RESPONSE` | Kiro non-stream response profile | `R7.1` | headers/body/error/usage and body limits | Ready |
-| `R7.2.kiro-stream` | `MOD-RESPONSE` | Kiro Anthropic-compatible SSE profile | `R7.1` | event order, thinking/tools/usage, slow reader and disconnect | Ready |
+| `R7.2.account-runtime-nonstream` | `MOD-RESPONSE` | Account Runtime non-stream response profile | `R7.1` | headers/body/error/usage and body limits | Ready |
+| `R7.2.account-runtime-stream` | `MOD-RESPONSE` | Account Runtime Anthropic-compatible SSE profile | `R7.1` | event order, thinking/tools/usage, slow reader and disconnect | Ready |
 | `R7.2.claude-code-stream` | `MOD-RESPONSE` | Claude Code `/cc` streaming profile | `R7.1` | exact CLI events, usage/cache/thinking/tools and disconnect | Ready |
 | `R7.2.external-raw` | `MOD-RESPONSE` | External raw response passthrough profile | `R7.1` | byte/header/event passthrough, limits and commitment | Ready |
 | `R7.2.external-normalized` | `MOD-RESPONSE` | External normalized response profile | `R7.1` | event/body/error/usage parity and limits | Ready |
@@ -198,7 +198,7 @@ Both applications are mandatory. Every row depends on `R8.2`, `R8.3`, and the na
 | `R9.2` | `MOD-RECOVERY` | Backup/restore verification, expected-instance Redis rebuild/epoch barrier, previous-binary state matrix and forward-recovery orchestration through the public readiness generation-registry view | `MOD-MIGRATIONS`, `R9.1.readiness`, all state authorities, decisions 010-011/014 | isolated RPO/RTO restore, missing/partitioned replica rebuild, generation-registry failure, per-authority rollback and forward-reconcile drills | Ready |
 | `R9.3.contract` | `MOD-CONTRACT-HARNESS` | Final-candidate invocation manifests; harness implementation remains the R0 version | stable public contracts | complete deterministic compatibility matrix and cleanup | Ready |
 | `R9.3.load-chaos` | `MOD-LOAD-CHAOS-HARNESS` | Final-candidate load/chaos manifests; harness implementation remains the R0 version | all performance-affecting modules | absolute/relative/resource/recovery/stability gates | Ready |
-| `R9.3.real-client` | `MOD-REAL-CLIENT-HARNESS` | Real Claude Code and bounded independent real Kiro validation | public target candidate, R0 fixtures | 3x20-turn Claude sessions, request/token/cost-capped Kiro, sanitized artifacts | Ready |
+| `R9.3.real-client` | `MOD-REAL-CLIENT-HARNESS` | Real Claude Code and bounded independent real Account Runtime validation | public target candidate, R0 fixtures | 3x20-turn Claude sessions, request/token/cost-capped Account Runtime, sanitized artifacts | Ready |
 | `R9.3.browser` | `MOD-BROWSER-HARNESS` | Complete two-app system browser manifest including readiness | both final apps, `R9.1.readiness` | workflows, cross-page state, accessibility, responsive and cleanup | Ready |
 | `R9.4` | `MOD-RELEASE-HARNESS` | Produce and sign one `ReleaseGenerationManifest` binding backend/image, both frontends, schema/migration/config hashes, expected instances/resource profiles, previous artifact and transition identity; replace/register the obsolete deployment guide and missing secret-safe Claude Code local-testing runbook with supported target runbooks | all target modules and harness summaries, decision 014 | clean build/export/signature/consumer verification, target deployment and Claude Code runbook command/link checks from a clean checkout, secret scan and artifact budget | Ready |
 

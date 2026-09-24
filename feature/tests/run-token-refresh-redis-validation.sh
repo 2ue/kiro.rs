@@ -10,9 +10,9 @@ repo_root="$(git rev-parse --show-toplevel)"
 
 redis_url="${ACCOUNT_RUNTIME_TEST_REDIS_URL:-}"
 isolated="${ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED:-0}"
-allow_non_loopback="${KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
-outer_rounds="${KIRO_TOKEN_REFRESH_REDIS_OUTER_ROUNDS:-3}"
-scope="${KIRO_TOKEN_REFRESH_REDIS_SCOPE:-token-refresh-redis-real}"
+allow_non_loopback="${ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS:-0}"
+outer_rounds="${ACCOUNT_RUNTIME_TOKEN_REFRESH_REDIS_OUTER_ROUNDS:-3}"
+scope="${ACCOUNT_RUNTIME_TOKEN_REFRESH_REDIS_SCOPE:-token-refresh-redis-real}"
 
 [[ -n "$redis_url" ]] || {
   printf 'ACCOUNT_RUNTIME_TEST_REDIS_URL is required; no Redis test was run\n' >&2
@@ -23,15 +23,15 @@ scope="${KIRO_TOKEN_REFRESH_REDIS_SCOPE:-token-refresh-redis-real}"
   exit 64
 }
 [[ "$outer_rounds" =~ ^[1-9][0-9]*$ ]] && (( outer_rounds <= 10 )) || {
-  printf 'KIRO_TOKEN_REFRESH_REDIS_OUTER_ROUNDS must be between 1 and 10\n' >&2
+  printf 'ACCOUNT_RUNTIME_TOKEN_REFRESH_REDIS_OUTER_ROUNDS must be between 1 and 10\n' >&2
   exit 64
 }
 [[ "$scope" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || {
-  printf 'KIRO_TOKEN_REFRESH_REDIS_SCOPE has an invalid format\n' >&2
+  printf 'ACCOUNT_RUNTIME_TOKEN_REFRESH_REDIS_SCOPE has an invalid format\n' >&2
   exit 64
 }
 
-KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
+ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS="$allow_non_loopback" \
 ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
 node <<'NODE'
 const raw = process.env.ACCOUNT_RUNTIME_TEST_REDIS_URL;
@@ -51,9 +51,9 @@ const loopback = hostname === '127.0.0.1'
   || hostname === '::1'
   || hostname === '[::1]'
   || hostname === 'localhost';
-if (!loopback && process.env.KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS !== '1') {
+if (!loopback && process.env.ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS !== '1') {
   process.stderr.write(
-    'non-loopback Redis requires KIRO_RS_ALLOW_NON_LOOPBACK_STORAGE_TESTS=1\n',
+    'non-loopback Redis requires ACCOUNT_RUNTIME_ALLOW_NON_LOOPBACK_STORAGE_TESTS=1\n',
   );
   process.exit(64);
 }
@@ -65,18 +65,18 @@ NODE
 
 ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
 ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
-KIRO_TOKEN_REFRESH_REDIS_OUTER_ROUNDS="$outer_rounds" \
+ACCOUNT_RUNTIME_TOKEN_REFRESH_REDIS_OUTER_ROUNDS="$outer_rounds" \
 feature/tests/run-cargo-scoped.sh "$scope" -- \
   env RUSTUP_TOOLCHAIN=1.92.0 \
   ACCOUNT_RUNTIME_TEST_REDIS_URL="$redis_url" \
   ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1 \
-  KIRO_TOKEN_REFRESH_REDIS_OUTER_ROUNDS="$outer_rounds" \
+  ACCOUNT_RUNTIME_TOKEN_REFRESH_REDIS_OUTER_ROUNDS="$outer_rounds" \
   bash -lc '
     set -euo pipefail
     cargo fmt --all -- --check
     git diff --check
-    cargo test kiro::provider::tests::api_and_mcp_final_attempt_fixtures_do_not_start_oauth_refresh_for_five_rounds -- --exact --nocapture --test-threads=1
-    for ((round = 1; round <= KIRO_TOKEN_REFRESH_REDIS_OUTER_ROUNDS; round += 1)); do
+    cargo test local_upstream_impl::provider::tests::api_and_mcp_final_attempt_fixtures_do_not_start_oauth_refresh_for_five_rounds -- --exact --nocapture --test-threads=1
+    for ((round = 1; round <= ACCOUNT_RUNTIME_TOKEN_REFRESH_REDIS_OUTER_ROUNDS; round += 1)); do
       printf "token-refresh-redis outer_round=%s\n" "$round"
       cargo test storage::redis_cache::tests::token_refresh_redis_concurrent_begin_elects_one_leader_for_five_rounds -- --exact --nocapture --test-threads=1
       cargo test storage::redis_cache::tests::token_refresh_redis_failure_replay_health_claim_and_identity_are_fenced_for_five_rounds -- --exact --nocapture --test-threads=1

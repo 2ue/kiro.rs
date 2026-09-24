@@ -24,7 +24,7 @@
 3. 本地优先；只有本地容量 fail-fast、无可用凭据、瞬态错误耗尽、可选的不支持模型等场景才会 fallback。
 4. 本地容量预检不是长期缓存状态，而是在外部池可用时对本地调度执行 fail-fast acquire；本地可调度时仍走本地凭据。
 5. 不引入 `localPoolFallbackGraceMs`，不会等待一段时间后再 fallback。
-6. 外部池请求保持原始 Anthropic body 透传，不执行本地 Kiro payload guard、模型映射、profileArn 注入、machineId 逻辑。
+6. 外部池请求保持原始 Anthropic body 透传，不执行本地 Account Runtime payload guard、模型映射、profileArn 注入、machineId 逻辑。
 7. 外部池响应默认严格透传；单池 `usageProjectionMode=current_path_policy` 时才按当前路径的 `reportedUsage` 策略改写 usage/cache 上报。
 8. 外部池非 2xx 响应先用于换池、冷却、自动禁用判断；如果最终需要把该错误返回给下游，必须透传最后一个外部上游的 status/body/主要响应 header，不能包装成本网关的错误 envelope。
 9. 外部池按优先级和当前 in-flight 占比选择；相同优先级和占用率的候选随机分散。
@@ -47,7 +47,7 @@
 
 数据保护与备份硬约束：
 
-1. 本地 Kiro 凭据和外部备用号池配置都属于生产核心数据，后续任何升级、发版、迁移、默认配置填充、模型映射规则生成，都不能覆盖、删除或重建这两类数据。
+1. 本地 Account Runtime 凭据和外部备用号池配置都属于生产核心数据，后续任何升级、发版、迁移、默认配置填充、模型映射规则生成，都不能覆盖、删除或重建这两类数据。
 2. 当前存储边界是三套独立数据：运行配置写入 `runtime_config`，本地凭据写入 `credentials`，外部备用号池写入 `external_upstream_pools`。修改 `runtime_config` 时不能隐式改写 `credentials` 或 `external_upstream_pools`。
 3. 后续代码变更必须保持凭据保存的非破坏性语义：`save_credentials()` 只能 upsert 传入凭据，不能因为当前进程内存快照缺少某些 ID 就软删除或覆盖数据库里的其他凭据。
 4. 外部池更新必须保持局部更新语义：编辑某个外部池只能更新该 `id` 对应行；空 `apiKey` 更新请求必须表示保留原 key，不能把密钥写空。
@@ -62,7 +62,7 @@
 
 ## 1. 背景
 
-当前 `kiro.rs` 主要通过本地维护的 Kiro 凭据池承接下游 `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` 请求。系统会在本地凭据池内执行模型映射、Anthropic 请求到 Kiro 请求的转换、payload guard、缓存用量上报模拟、账号并发控制、冷却、失败重试、粘性调度和 usage 记录。
+当前 `account-runtime` 主要通过本地维护的 Account Runtime 凭据池承接下游 `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` 请求。系统会在本地凭据池内执行模型映射、Anthropic 请求到 Account Runtime 请求的转换、payload guard、缓存用量上报模拟、账号并发控制、冷却、失败重试、粘性调度和 usage 记录。
 
 现有本地池在以下情况下可能无法继续承接流量：
 
@@ -80,9 +80,9 @@
 ### 2.1 核心需求
 
 1. 新增外部备用号池能力。
-2. 外部号池独立配置，不混入现有 Kiro 凭据。
+2. 外部号池独立配置，不混入现有 Account Runtime 凭据。
 3. 外部号池可配置多个，每个号池包含 `baseUrl`、`key`、认证方式、启用状态、优先级、并发上限等。
-4. 请求优先走当前系统本地 Kiro 凭据池。
+4. 请求优先走当前系统本地 Account Runtime 凭据池。
 5. 备用池必须有全局总开关，只有总开关开启时才允许 fallback 到备用池。
 6. 备用池还需要按场景配置 fallback 开关，例如本地容量不足、本地无可用凭据、本地瞬态错误耗尽、本地不支持模型。
 7. 只有本地池明确负载不了、不可用、或本地瞬态错误耗尽，且对应 fallback 开关开启时，才进入外部备用号池。
@@ -108,13 +108,13 @@
 
 ### 2.2 明确不需要的能力
 
-1. 不需要外部号池参与 Kiro 凭据 token 刷新。
+1. 不需要外部号池参与 Account Runtime 凭据 token 刷新。
 2. 不需要外部号池参与 machineId 生成。
 3. 不需要外部号池注入 profileArn。
 4. 不需要外部号池进入本地凭据余额查询。
-5. 不需要外部号池接入当前 Kiro endpoint transform。
+5. 不需要外部号池接入当前 Account Runtime endpoint transform。
 6. 不需要为了 fallback 新增一个“本地池等待时间”配置。
-7. 默认不对外部号池请求执行本地 Kiro payload guard。
+7. 默认不对外部号池请求执行本地 Account Runtime payload guard。
 8. 默认不修改外部号池响应 usage，除非显式开启“用量上报投影”。
 9. 默认不自动禁用外部号池，除非显式开启自动禁用策略。
 
@@ -134,7 +134,7 @@
 
 语义：
 
-- `false`：完全关闭外部备用号池能力。所有请求只走本地 Kiro 凭据池，保持现有行为。
+- `false`：完全关闭外部备用号池能力。所有请求只走本地 Account Runtime 凭据池，保持现有行为。
 - `true`：允许在满足场景开关和外部池可用条件时 fallback 到外部备用号池。
 
 该开关必须优先于所有其他外部池配置。即使配置了外部池条目，只要总开关关闭，也不能 fallback。
@@ -267,11 +267,11 @@ autoDisabled == false 或 autoDisabledUntil 已过期
 
 2. `ExternalPoolManager`
    - 管理外部池配置、状态、并发、冷却、调度、单池启停。
-   - 不依赖本地 Kiro credentials。
+   - 不依赖本地 Account Runtime credentials。
 
 3. `ExternalPoolClient`
    - 负责原始请求透传、header 清洗、认证替换、stream/non-stream 转发。
-   - 不参与本地 Kiro payload 转换。
+   - 不参与本地 Account Runtime payload 转换。
 
 4. `ExternalPoolRetryPolicy`
    - 决定外部池哪些错误可以换池。
@@ -290,7 +290,7 @@ autoDisabled == false 或 autoDisabledUntil 已过期
    - 负责外部池响应 usage/cache 上报整形。
    - 默认不启用，只有 `usageProjectionMode=current_path_policy` 时执行。
 
-该拆分的目标是：外部备用号池能力可以独立启停、独立测试、独立观测，并且不污染现有 Kiro 凭据调度核心逻辑。
+该拆分的目标是：外部备用号池能力可以独立启停、独立测试、独立观测，并且不污染现有 Account Runtime 凭据调度核心逻辑。
 
 ## 3. 当前代码链路分析
 
@@ -319,19 +319,19 @@ Anthropic 兼容 API 入口在：
 `post_messages_inner` 当前流程大致为：
 
 1. 读取 `Json<MessagesRequest>`。
-2. 获取 `KiroProvider`。
+2. 获取 `Account RuntimeProvider`。
 3. 应用 runtime config。
 4. 处理 thinking 模型名后缀。
 5. materialize 远程多模态资源。
 6. 检查 web_search。
 7. 解析模型映射。
-8. Anthropic 请求转换成 Kiro request。
-9. 构造 `KiroRequest`。
+8. Anthropic 请求转换成 Account Runtime request。
+9. 构造 `Account RuntimeRequest`。
 10. payload guard / payload shaping。
 11. token 估算。
 12. 构造 usage context。
 13. 调用 `handle_stream_request` 或 `handle_non_stream_request`。
-14. 通过 `KiroProvider` 调用上游。
+14. 通过 `Account RuntimeProvider` 调用上游。
 15. 解析响应并转换成下游 Anthropic 兼容响应。
 16. 写 usage 记录。
 
@@ -339,14 +339,14 @@ Anthropic 兼容 API 入口在：
 
 本地凭据调度主要在：
 
-- `src/kiro/provider.rs`
-- `src/kiro/token_manager.rs`
+- `src/local_upstream_impl/provider.rs`
+- `src/local_upstream_impl/token_manager.rs`
 
 关键方法：
 
-- `KiroProvider::call_api_with_retry`
-- `KiroProvider::call_api_stream_with_request_id`
-- `KiroProvider::call_api_with_context_with_request_id`
+- `Account RuntimeProvider::call_api_with_retry`
+- `Account RuntimeProvider::call_api_stream_with_request_id`
+- `Account RuntimeProvider::call_api_with_context_with_request_id`
 - `MultiTokenManager::acquire_context_for_session`
 - `MultiTokenManager::record_session_soft_failure`
 - `MultiTokenManager::report_transient_failure_kind`
@@ -428,13 +428,13 @@ enum LocalPoolFailureKind {
 }
 ```
 
-并让 `KiroProvider` 返回结构化错误：
+并让 `Account RuntimeProvider` 返回结构化错误：
 
 ```rust
-struct KiroProviderError {
+struct Account RuntimeProviderError {
     kind: LocalPoolFailureKind,
     message: String,
-    attempts: Vec<KiroCredentialAttempt>,
+    attempts: Vec<Account RuntimeCredentialAttempt>,
     retry_after: Option<Duration>,
 }
 ```
@@ -445,22 +445,22 @@ struct KiroProviderError {
 
 外部号池是一个独立上游，通常是 Anthropic-compatible API 服务，例如：
 
-- 另一个 `kiro.rs` 网关。
+- 另一个 `account-runtime` 网关。
 - 另一个 Claude/Anthropic 兼容网关。
 - 其他兼容 `/v1/messages` 的号池系统。
 
-外部号池不是本地 Kiro 凭据，不能进入本地 credentials 表，也不能参与本地 Kiro 凭据调度。
+外部号池不是本地 Account Runtime 凭据，不能进入本地 credentials 表，也不能参与本地 Account Runtime 凭据调度。
 
 ### 4.2 默认“透传”的定义
 
 默认透传模式必须满足：
 
 1. 使用原始下游请求 body。
-2. 不执行 Anthropic -> Kiro payload 转换。
+2. 不执行 Anthropic -> Account Runtime payload 转换。
 3. 不注入 machineId。
 4. 不注入 profileArn。
-5. 不执行 Kiro endpoint transform。
-6. 不执行 Kiro payload guard。
+5. 不执行 Account Runtime endpoint transform。
+6. 不执行 Account Runtime payload guard。
 7. 不修改 request 中的 model、messages、tools、system、metadata 等字段。
 8. 不修改 response body。
 9. 只替换认证 header。
@@ -489,14 +489,14 @@ async fn post_messages_raw(
 
 1. 先保留 `raw_body`。
 2. 只做基础 JSON 解析、客户端认证、路径合法性等最小校验。
-3. 显式直连外部池命中时，直接使用 `raw_body` 转发，不进入 Anthropic -> Kiro 转换。
-4. 本地状态预检 fallback 命中时，直接使用 `raw_body` 转发，不进入 Anthropic -> Kiro 转换。
-5. 只有确定要走本地 Kiro 凭据时，才执行 Kiro payload 转换、payload guard、machineId/profileArn 注入等本地专用逻辑。
+3. 显式直连外部池命中时，直接使用 `raw_body` 转发，不进入 Anthropic -> Account Runtime 转换。
+4. 本地状态预检 fallback 命中时，直接使用 `raw_body` 转发，不进入 Anthropic -> Account Runtime 转换。
+5. 只有确定要走本地 Account Runtime 凭据时，才执行 Account Runtime payload 转换、payload guard、machineId/profileArn 注入等本地专用逻辑。
 6. 本地转换错误、payload guard 错误、tool schema 错误不应 fallback 到外部池，除非该请求一开始就由显式直连策略命中。
 
 这能避免两个问题：
 
-- 外部池路径被本地 Kiro 转换污染，破坏严格透传。
+- 外部池路径被本地 Account Runtime 转换污染，破坏严格透传。
 - 本地请求自身错误被误判成本地池不可承接，从而错误消耗外部池。
 
 ### 4.3 路径透传
@@ -540,9 +540,9 @@ external_error
 语义：
 
 - `local_success`
-  - 请求走本地 Kiro 凭据并成功。
+  - 请求走本地 Account Runtime 凭据并成功。
 - `local_error_no_fallback`
-  - 请求走本地 Kiro 凭据或本地转换流程失败，且错误不允许 fallback。
+  - 请求走本地 Account Runtime 凭据或本地转换流程失败，且错误不允许 fallback。
 - `external_fallback_preflight`
   - 系统策略仍然是本地优先，但本地池预检已经明确当前不可承接，所以没有真实请求本地上游，直接转外部池。
   - 这仍然是 fallback，因为路由原因来自本地池不可承接。
@@ -1613,7 +1613,7 @@ API 要求：
 备用号池
 ```
 
-不要放入 `凭据` tab，因为外部号池不是本地 Kiro 凭据。
+不要放入 `凭据` tab，因为外部号池不是本地 Account Runtime 凭据。
 
 ### 12.2 顶部全局设置
 
@@ -1761,9 +1761,9 @@ if let LocalPreflightDecision::FallbackPreflight(kind) = preflight.decision {
     }
 }
 
-let local_result = kiro_provider
+let local_result = account-runtime_provider
     .call_api_with_policy(
-        converted_kiro_body,
+        converted_account-runtime_body,
         LocalDispatchMode::UseExistingPreflightReservationOrWaitNormally(preflight.reservation),
         RetrySwitchPolicy::exclude_failed_credential_immediately(),
     )
@@ -2049,7 +2049,7 @@ external_pool_attempt pool_id=3 status=200 action=success
 ### 阶段 3：本地池结构化错误和 fail-fast
 
 1. 新增 `LocalPoolFailureKind`。
-2. `KiroProvider` 返回结构化错误。
+2. `Account RuntimeProvider` 返回结构化错误。
 3. 新增本地 acquire fail-fast 模式。
 4. 启用外部池时，本地容量不足不等待。
 5. 增加本地凭据失败后当前请求内立即排除策略。
@@ -2058,7 +2058,7 @@ external_pool_attempt pool_id=3 status=200 action=success
 ### 阶段 4：请求透传
 
 1. handler 改为保留 raw body。
-2. 本地 Kiro 流程继续使用 parse 后的 `MessagesRequest`。
+2. 本地 Account Runtime 流程继续使用 parse 后的 `MessagesRequest`。
 3. 外部池 fallback 使用 raw body。
 4. 实现 header 清洗和认证替换。
 5. 实现 stream / non-stream 外部池转发。
@@ -2222,7 +2222,7 @@ external_pool_attempt pool_id=3 status=200 action=success
 
 最终行为应满足：
 
-1. 默认只使用本地 Kiro 凭据池。
+1. 默认只使用本地 Account Runtime 凭据池。
 2. 启用外部备用号池后，本地池仍然优先。
 3. 本地池可调度时，不调用外部池。
 4. 本地池明确不可承接时，立即调用外部池，不新增等待时间开关。

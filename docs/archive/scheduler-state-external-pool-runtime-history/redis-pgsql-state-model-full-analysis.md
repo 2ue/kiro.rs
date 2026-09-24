@@ -6,11 +6,11 @@
 
 - 启动与 bootstrap：`src/main.rs`
 - 配置模型：`src/model/config.rs`
-- 凭据模型：`src/kiro/model/credentials.rs`
+- 凭据模型：`src/local_upstream_impl/model/credentials.rs`
 - PgSQL 存储：`src/storage/postgres.rs`
 - Redis 存储：`src/storage/redis_cache.rs`
-- 凭据调度与运行态：`src/kiro/token_manager.rs`
-- 上游调用、重试、错误兜底：`src/kiro/provider.rs`
+- 凭据调度与运行态：`src/local_upstream_impl/token_manager.rs`
+- 上游调用、重试、错误兜底：`src/local_upstream_impl/provider.rs`
 - Anthropic 路由与 usage 构建：`src/anthropic/router.rs`、`src/anthropic/handlers.rs`、`src/anthropic/cache.rs`、`src/anthropic/prompt_cache.rs`
 - usage 记录与价格目录：`src/anthropic/usage.rs`、`src/anthropic/pricing.rs`
 - Admin API 与 UI：`src/admin/*`、`admin-ui/src/*`
@@ -51,13 +51,13 @@
 `src/main.rs` 当前启动逻辑如下：
 
 1. 从 `config.json` 加载 `file_config`。
-2. 应用 `KIRO_RS_POSTGRES_URL` 和 `KIRO_RS_REDIS_URL` 环境变量覆盖。
+2. 应用 `ACCOUNT_RUNTIME_POSTGRES_URL` 和 `ACCOUNT_RUNTIME_REDIS_URL` 环境变量覆盖。
 3. 连接 PgSQL，必要时执行 schema 初始化。
 4. 连接 Redis。
 5. 如果 PgSQL 没有 `runtime_config`，从 `config.json` bootstrap。
 6. 如果 PgSQL 没有凭据，从 `credentials.json` bootstrap。
 7. 从 PgSQL 加载运行配置和凭据。
-8. 如果存在 `KIRO_API_KEY` 环境变量，把 API Key 凭据插入 `credentials_list`。
+8. 如果存在 `ACCOUNT_RUNTIME_API_KEY` 环境变量，把 API Key 凭据插入 `credentials_list`。
 9. 构建 `UsageRecorder`、`PromptCacheTracker`、`PricingCatalog`。
 10. 从 PgSQL 加载模型价格，然后启动一次后台同步。
 11. 构建 `MultiTokenManager`，并传入 PgSQL/Redis store。
@@ -67,7 +67,7 @@
 
 - PgSQL 和 Redis 是启动硬依赖，符合用户之前“不需要兼容写文件”的方向。
 - 文件只做首次导入，这是合理的。
-- `KIRO_API_KEY` 环境变量插入的是无 ID 凭据，随后 `MultiTokenManager::new_with_stores` 会分配 ID 并触发 `persist_credentials()`，这会把环境变量注入的 API Key 持久化进 PgSQL。这个行为需要明确：如果期望环境变量只是临时覆盖，就不应该持久化；如果期望是自动导入，就需要文档写清楚。
+- `ACCOUNT_RUNTIME_API_KEY` 环境变量插入的是无 ID 凭据，随后 `MultiTokenManager::new_with_stores` 会分配 ID 并触发 `persist_credentials()`，这会把环境变量注入的 API Key 持久化进 PgSQL。这个行为需要明确：如果期望环境变量只是临时覆盖，就不应该持久化；如果期望是自动导入，就需要文档写清楚。
 - `load_runtime_config()` 从 PgSQL 读出的配置不会再应用环境变量覆盖。连接 PgSQL/Redis 用的是 `file_config`，但运行时配置来自 DB。这个做法基本合理，但如果后续要让端口、proxy、compat 等运行参数都以 DB 为准，就需要明确哪些配置是“启动前配置”，哪些是“运行时热配置”。
 
 ## PgSQL 当前职责和表结构
@@ -227,7 +227,7 @@ Admin 操作应该变成：
 
 ### 重复凭据检测仍是内存扫描
 
-新增凭据时，当前用内存扫描 `refresh_token` 或 `kiro_api_key` 的 SHA-256 判断重复。
+新增凭据时，当前用内存扫描 `refresh_token` 或 `account-runtime_api_key` 的 SHA-256 判断重复。
 
 风险：
 
@@ -251,7 +251,7 @@ WHERE deleted_at IS NULL AND api_key_hash IS NOT NULL;
 
 ### 凭据 JSONB 需要列化
 
-现在 `credentials.data` 保存完整 `KiroCredentials`，只冗余了 `priority` 和 `disabled`。
+现在 `credentials.data` 保存完整 `Account RuntimeCredentials`，只冗余了 `priority` 和 `disabled`。
 
 这适合快速迁移，但长期问题明显：
 
@@ -276,7 +276,7 @@ WHERE deleted_at IS NULL AND api_key_hash IS NOT NULL;
 - `access_token_expires_at`
 - `created_at/updated_at/deleted_at`
 
-敏感字段如 `access_token`、`refresh_token`、`kiro_api_key`、`client_secret`、代理密码，建议独立字段加密存储，或者放到单独 secret 表。
+敏感字段如 `access_token`、`refresh_token`、`account-runtime_api_key`、`client_secret`、代理密码，建议独立字段加密存储，或者放到单独 secret 表。
 
 ## 调度策略与 Redis 化后的改进空间
 
@@ -423,7 +423,7 @@ RETURNING version;
 3. Redis publish：
 
 ```text
-channel: kiro_rs:config_changed
+channel: account_runtime:config_changed
 payload: {"version":123}
 ```
 
@@ -682,7 +682,7 @@ CREATE TABLE credential_secrets (
   credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
   access_token_enc BYTEA,
   refresh_token_enc BYTEA,
-  kiro_api_key_enc BYTEA,
+  account-runtime_api_key_enc BYTEA,
   client_secret_enc BYTEA,
   proxy_password_enc BYTEA,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -775,9 +775,9 @@ validate -> PgSQL transaction -> commit -> update local snapshot -> clear Redis 
 建议 Redis channels：
 
 ```text
-kiro_rs:config_changed
-kiro_rs:credentials_changed
-kiro_rs:dispatch_wakeup
+account_runtime:config_changed
+account_runtime:credentials_changed
+account_runtime:dispatch_wakeup
 ```
 
 payload：

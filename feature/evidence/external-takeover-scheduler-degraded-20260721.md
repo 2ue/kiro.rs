@@ -12,9 +12,9 @@ Scope: 证明 `SchedulerRedisDegraded` 分类在配置允许时会进入外部�
 
 1. `SchedulerRedisDegraded` 不再被普通 local-memory `dispatchable > 0` 估计压制 fallback；只有真实 local ready/dispatchable 状态才保持 strict local-first。
 2. 是否 fallback 由独立开关 `fallbackOnSchedulerRedisDegraded` 决定；关闭时应返回脱敏的本地不可用错误，开启且存在 eligible external pool 时才进入 external。
-3. external 接管验证程序已就绪，且静态/合同测试证明它不会调用 Docker/Cargo、不会探测既有 `9022`、不会使用 Redis DB0 或共享 `kiro_rs:local` prefix。
+3. external 接管验证程序已就绪，且静态/合同测试证明它不会调用 Docker/Cargo、不会探测既有 `9022`、不会使用 Redis DB0 或共享 `account_runtime:local` prefix。
 
-2026-07-22 追加了真实临时服务动态验证：使用仓库外冻结 `kiro-rs` binary、loopback PostgreSQL 临时库、loopback Redis DB13、fake local Kiro upstream、fake external upstream 与 Redis chaos proxy。开启 `fallbackOnSchedulerRedisDegraded` 时，Redis 500ms 延迟下注入的 degraded 请求由 external pool 接管；关闭该开关时，请求按预期 fail closed，且不打本地或外部 upstream；移除延迟后恢复到本地账号路由。
+2026-07-22 追加了真实临时服务动态验证：使用仓库外冻结 `account-runtime` binary、loopback PostgreSQL 临时库、loopback Redis DB13、fake local Account Runtime upstream、fake external upstream 与 Redis chaos proxy。开启 `fallbackOnSchedulerRedisDegraded` 时，Redis 500ms 延迟下注入的 degraded 请求由 external pool 接管；关闭该开关时，请求按预期 fail closed，且不打本地或外部 upstream；移除延迟后恢复到本地账号路由。
 
 这仍不是最终发布通过证据。它关闭的是“单实例、fake upstream、scheduler Redis degraded 外部接管正/负向动态路径”。两实例联合故障、真实上游/CLI 全能力、生产高基数和最终 release inventory 仍需独立通过。
 
@@ -76,20 +76,20 @@ git diff --check
 
 设计约束：
 
-- 调用者必须传入仓库外冻结 binary：`KIRO_RS_BINARY`。
-- 调用者必须传入仓库外 artifact root：`KIRO_VALIDATION_ARTIFACT_DIR`。
-- 调用者必须传入预创建、空、独占的 loopback PostgreSQL database：`KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL`，数据库名必须匹配 `kiro_external_takeover_*`。
-- 调用者必须传入 loopback Redis URL，DB 必须为 `1..15` 的非零 DB：`KIRO_EXTERNAL_TAKEOVER_REDIS_URL`。
-- 调用者必须传入临时 Redis prefix，且不能包含 `kiro_rs:local`：`KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX`。
-- runner 只启动 fake local Kiro upstream、fake external upstream、loopback Redis chaos proxy 和一个临时 `kiro-rs` 进程。
+- 调用者必须传入仓库外冻结 binary：`ACCOUNT_RUNTIME_BINARY`。
+- 调用者必须传入仓库外 artifact root：`ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR`。
+- 调用者必须传入预创建、空、独占的 loopback PostgreSQL database：`ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL`，数据库名必须匹配 `account-runtime_external_takeover_*`。
+- 调用者必须传入 loopback Redis URL，DB 必须为 `1..15` 的非零 DB：`ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL`。
+- 调用者必须传入临时 Redis prefix，且不能包含 `account_runtime:local`：`ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX`。
+- runner 只启动 fake local Account Runtime upstream、fake external upstream、loopback Redis chaos proxy 和一个临时 `account-runtime` 进程。
 - runner 不调用 Docker，不调用 Cargo，不使用 `target/debug` 或 `target/release` fallback，不读取/探测既有 `9022` listener。
 
 动态 runner 预期验证：
 
 | 模式 | 注入 | 期望 |
 | --- | --- | --- |
-| `KIRO_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=true` | Redis proxy latency 默认 500ms，超过 capacity hot deadline | 请求 HTTP 200，文本 `external-ok`，local inference hit 为 0，external hit 为 1 |
-| `KIRO_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=false` | 同上 | 请求失败但公开错误脱敏，local/external hit 均为 0，返回含 request/error id |
+| `ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=true` | Redis proxy latency 默认 500ms，超过 capacity hot deadline | 请求 HTTP 200，文本 `external-ok`，local inference hit 为 0，external hit 为 1 |
+| `ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=false` | 同上 | 请求失败但公开错误脱敏，local/external hit 均为 0，返回含 request/error id |
 | 恢复阶段 | 移除 Redis latency | 后续请求恢复 local 路由，稳定恢复请求均 `local-ok` |
 
 ## Runner contract 证据
@@ -118,7 +118,7 @@ node --test feature/tests/external-takeover-scheduler-degraded-nondocker.contrac
 - Redis port `9022` 预拒绝。
 - Redis DB0 预拒绝。
 - 非 loopback PG/Redis 预拒绝。
-- 非 `kiro_external_takeover_*` database 和共享 `kiro_rs:local` prefix 预拒绝。
+- 非 `account-runtime_external_takeover_*` database 和共享 `account_runtime:local` prefix 预拒绝。
 - 源码扫描确认 runner 不调用 Docker/Cargo。
 
 ## 2026-07-22 动态 service 证据
@@ -126,32 +126,32 @@ node --test feature/tests/external-takeover-scheduler-degraded-nondocker.contrac
 候选 binary：
 
 ```text
-/var/folders/.../kiro-ext-takeover.J4ohDc/candidate-release-r12/kiro-rs
+/var/folders/.../account-runtime-ext-takeover.J4ohDc/candidate-release-r12/account-runtime
 SHA-256: eca8ce4eb1ebb4c1657d1894dc69d0624313b6ff28e0cba095bf845c0914d13e
 ```
 
 共同边界：
 
-- PostgreSQL：loopback `127.0.0.1:25433`，临时库名 `kiro_external_takeover_codex_20260722_r1`，每轮前由调用方 drop/create 保证空库。
+- PostgreSQL：loopback `127.0.0.1:25433`，临时库名 `account-runtime_external_takeover_codex_20260722_r1`，每轮前由调用方 drop/create 保证空库。
 - Redis：loopback `127.0.0.1:26379` DB13，runner 只清理 owned prefix，不 `FLUSHDB`。
 - Docker：未使用。
 - Cargo：runner 未使用。
 - 受保护端口 `9022`：未探测、未触碰。
-- Raw artifact：仅保留在 `/var/folders/.../kiro-ext-takeover.J4ohDc/artifacts-*`，文档记录脱敏摘要。
+- Raw artifact：仅保留在 `/var/folders/.../account-runtime-ext-takeover.J4ohDc/artifacts-*`，文档记录脱敏摘要。
 
 ### Enabled 正向接管
 
 命令形态：
 
 ```bash
-KIRO_RS_BINARY=<frozen-r12-kiro-rs> \
-KIRO_VALIDATION_ARTIFACT_DIR=<owned-temp-artifact-root> \
-KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL=<owned-empty-loopback-db> \
-KIRO_EXTERNAL_TAKEOVER_REDIS_URL=redis://127.0.0.1:26379/13 \
-KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX=kiro_rs:external_takeover:codex_20260722_r16_<round> \
-KIRO_EXTERNAL_TAKEOVER_OUTER_ROUNDS=1 \
-KIRO_EXTERNAL_TAKEOVER_REQUESTS=5 \
-KIRO_EXTERNAL_TAKEOVER_RECOVERY_REQUESTS=5 \
+ACCOUNT_RUNTIME_BINARY=<frozen-r12-account-runtime> \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=<owned-temp-artifact-root> \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL=<owned-empty-loopback-db> \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL=redis://127.0.0.1:26379/13 \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX=account_runtime:external_takeover:codex_20260722_r16_<round> \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_OUTER_ROUNDS=1 \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REQUESTS=5 \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_RECOVERY_REQUESTS=5 \
 node feature/tests/external-takeover-scheduler-degraded-nondocker.mjs
 ```
 
@@ -170,15 +170,15 @@ node feature/tests/external-takeover-scheduler-degraded-nondocker.mjs
 命令形态：
 
 ```bash
-KIRO_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=false \
-KIRO_RS_BINARY=<frozen-r12-kiro-rs> \
-KIRO_VALIDATION_ARTIFACT_DIR=<owned-temp-artifact-root> \
-KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL=<owned-empty-loopback-db> \
-KIRO_EXTERNAL_TAKEOVER_REDIS_URL=redis://127.0.0.1:26379/13 \
-KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX=kiro_rs:external_takeover:codex_20260722_r17_disabled \
-KIRO_EXTERNAL_TAKEOVER_OUTER_ROUNDS=1 \
-KIRO_EXTERNAL_TAKEOVER_REQUESTS=5 \
-KIRO_EXTERNAL_TAKEOVER_RECOVERY_REQUESTS=5 \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=false \
+ACCOUNT_RUNTIME_BINARY=<frozen-r12-account-runtime> \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=<owned-temp-artifact-root> \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL=<owned-empty-loopback-db> \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL=redis://127.0.0.1:26379/13 \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX=account_runtime:external_takeover:codex_20260722_r17_disabled \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_OUTER_ROUNDS=1 \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REQUESTS=5 \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_RECOVERY_REQUESTS=5 \
 node feature/tests/external-takeover-scheduler-degraded-nondocker.mjs
 ```
 
@@ -197,27 +197,27 @@ node feature/tests/external-takeover-scheduler-degraded-nondocker.mjs
 
 ## 动态 runner 多轮注意事项
 
-早期用 `KIRO_EXTERNAL_TAKEOVER_OUTER_ROUNDS=3` 在同一个 PostgreSQL database 上连续跑时出现过假红：round 2 健康检查命中新生成端口，但服务从持久 runtime config 读取了 round 1 的旧端口并监听旧端口，导致 health check timeout。该问题是 runner 隔离合同问题，不是产品请求路径红灯。
+早期用 `ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_OUTER_ROUNDS=3` 在同一个 PostgreSQL database 上连续跑时出现过假红：round 2 健康检查命中新生成端口，但服务从持久 runtime config 读取了 round 1 的旧端口并监听旧端口，导致 health check timeout。该问题是 runner 隔离合同问题，不是产品请求路径红灯。
 
 当前有效证据使用“每轮前调用方 drop/create 独占临时库”的方式执行 3 个 enabled clean round；disabled 负向也在 clean DB 上执行。后续若继续使用多 outer runner，应先扩展 runner 支持每 outer round 独立 database 或显式重写 runtime persisted port。
 
 可重复模板：
 
 ```bash
-KIRO_RS_BINARY=/abs/outside/repo/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
-KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/kiro_external_takeover_<owned_empty_db>' \
-KIRO_EXTERNAL_TAKEOVER_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-empty-db>' \
-KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX='kiro_rs:external_takeover:<unique>' \
-KIRO_EXTERNAL_TAKEOVER_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_BINARY=/abs/outside/repo/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/account-runtime_external_takeover_<owned_empty_db>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-empty-db>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX='account_runtime:external_takeover:<unique>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_OUTER_ROUNDS=3 \
 node feature/tests/external-takeover-scheduler-degraded-nondocker.mjs
 
-KIRO_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=false \
-KIRO_RS_BINARY=/abs/outside/repo/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
-KIRO_EXTERNAL_TAKEOVER_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/kiro_external_takeover_<owned_empty_db_2>' \
-KIRO_EXTERNAL_TAKEOVER_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-empty-db>' \
-KIRO_EXTERNAL_TAKEOVER_REDIS_PREFIX='kiro_rs:external_takeover:<unique-disabled>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_FALLBACK_ENABLED=false \
+ACCOUNT_RUNTIME_BINARY=/abs/outside/repo/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/abs/outside/repo/artifacts \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_POSTGRES_URL='postgres://...@127.0.0.1:<pg-port>/account-runtime_external_takeover_<owned_empty_db_2>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_URL='redis://127.0.0.1:<redis-port>/<nonzero-empty-db>' \
+ACCOUNT_RUNTIME_EXTERNAL_TAKEOVER_REDIS_PREFIX='account_runtime:external_takeover:<unique-disabled>' \
 node feature/tests/external-takeover-scheduler-degraded-nondocker.mjs
 ```
 

@@ -241,7 +241,7 @@ pub enum LocalUpstreamCallFailureKind {
     DownstreamCommitted,
     AuxiliaryAttemptsExhausted,
     AuxiliaryConcurrencySaturated,
-    LocalPoolRiskCircuitOpen,
+    AccountRiskCircuitOpen,
     ThinkingSignatureInvalid,
     ThinkingSignatureRetryFailed,
 }

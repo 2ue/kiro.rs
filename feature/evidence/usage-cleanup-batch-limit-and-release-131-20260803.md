@@ -29,7 +29,7 @@ Remote Actions evidence:
 
 - Workflow: `Publish Docker Images`
 - Run ID: `30757990049`
-- URL: `https://github.com/2ue/kiro.rs/actions/runs/30757990049`
+- URL: `https://github.com/2ue/account-runtime/actions/runs/30757990049`
 - Head: `v0.0.131` / `59b4c26f081438e59adc1507278f2591f6ce10b6`
 - Result: failed in `quality / Frontend and Rust quality gate`; Docker `build` and `manifest` jobs were skipped.
 
@@ -58,7 +58,7 @@ Recovery and successful republish:
 - The recreated annotated tag `v0.0.131` peels to `511cebb60e26d970b77b33a3638ec8d9806505de`.
 - GitHub Actions workflow `Publish Docker Images`, run `30800052601` (`#162`),
   was triggered by the recreated tag:
-  `https://github.com/2ue/kiro.rs/actions/runs/30800052601`.
+  `https://github.com/2ue/account-runtime/actions/runs/30800052601`.
 - Run `#162` completed successfully in `25m 36s`. The quality gate, both
   architecture Docker builds, and the multi-architecture manifest job all
   completed successfully.
@@ -75,19 +75,19 @@ pnpm --dir admin-ui build
 rustup run 1.92.0 node scripts/ci/check-clippy-baseline.mjs
 rustup run 1.92.0 cargo check --locked --all-targets
 
-KIRO_RS_TEST_POSTGRES_URL='<local config postgres url>' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='<local config postgres url>' \
   rustup run 1.92.0 cargo test --locked usage_cleanup_request -- --nocapture
 
-KIRO_RS_TEST_POSTGRES_URL='<local config postgres url>' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='<local config postgres url>' \
   rustup run 1.92.0 cargo test --locked \
   postgres_startup_migration_expands_usage_cleanup_batch_size_constraint -- --nocapture
 
-KIRO_RS_TEST_POSTGRES_URL='<local config postgres url>' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='<local config postgres url>' \
   rustup run 1.92.0 cargo test --locked \
   required_postgres_schema_columns_cover_known_upgrade_breakers -- --nocapture
 
-KIRO_RS_TEST_POSTGRES_URL='<local config postgres url>' \
-KIRO_RS_TEST_REDIS_URL='<local config redis url>' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='<local config postgres url>' \
+ACCOUNT_RUNTIME_TEST_REDIS_URL='<local config redis url>' \
   rustup run 1.92.0 cargo test --locked cleanup -- --nocapture --test-threads=1
 ```
 

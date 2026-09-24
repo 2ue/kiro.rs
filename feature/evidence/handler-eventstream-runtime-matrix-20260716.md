@@ -8,7 +8,7 @@ Status: `focused-matrix-and-release-2mib-pass / final-cli-http-load-pending`
 
 - Source baseline: `401473ca1649997bdeccf4468e3add1bdb187248` plus the recorded dirty remediation tree.
 - Claude Code CLI: `2.1.197`.
-- Test shape: real Axum Anthropic Router + reqwest `KiroProvider` + loopback fake upstream + synthetic credentials.
+- Test shape: real Axum Anthropic Router + reqwest `Account RuntimeProvider` + loopback fake upstream + synthetic credentials.
 - No production port, account, API credential, Redis namespace or upstream was used.
 - The protected `127.0.0.1:9022` service was not contacted or restarted.
 
@@ -52,7 +52,7 @@ WebSearch 的 90 轮由 complete、never-polled drop、partial drop、non-stream
 Historical interim release test binary content:
 
 ```text
-target/release/deps/kiro_rs-8e21067b2ccc5c02
+target/release/deps/account_runtime-8e21067b2ccc5c02
 sha256 4cf63c759a39d1f1987dbdf7ecc0b1da3bca3c7c622d7902cc2a7d9d51e96d15
 ```
 
@@ -62,7 +62,7 @@ The current checkpoint rebuilt the same Cargo artifact path with different conte
 
 ```text
 build completed 2026-07-16 17:23:59 +0800 (9m01s)
-target/release/deps/kiro_rs-8e21067b2ccc5c02
+target/release/deps/account_runtime-8e21067b2ccc5c02
 size 28293904 bytes
 sha256 3b7825c33ff1c4fde3d3856a239852af7f36882f14bcf22a7d4ff7b168243a2e
 explicit 2 MiB Tokio worker, bad-CRC handler retry: 1/1 PASS
@@ -92,18 +92,18 @@ cargo fmt --all -- --check
 git diff --check
 cargo check --all-targets
 
-cargo test --bin kiro-rs handler_eventstream_precommit_faults_retry_once_and_recover_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs eventstream_content_type_with_json_bytes_uses_protocol_retry_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs handler_single_credential_precommit_retry_is_bounded_and_fails_closed_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs handler_eventstream_postcommit_faults_never_retry_or_fake_success_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs handler_unknown_event_only_retries_before_empty_success_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs handler_missing_completion_after_text_fails_closed_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs handler_non_stream_untrusted_eof_fails_closed_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs handler_legacy_metadata_and_complete_tool_are_trusted_terminals_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs handler_non_stream_response_body_limit_and_recovery_hold_for_five_rounds -- --nocapture --test-threads=1
-cargo test --bin kiro-rs websearch -- --test-threads=1
-cargo test --bin kiro-rs kiro::provider::tests::mcp_ -- --test-threads=1
+cargo test --bin account-runtime handler_eventstream_precommit_faults_retry_once_and_recover_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime eventstream_content_type_with_json_bytes_uses_protocol_retry_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime handler_single_credential_precommit_retry_is_bounded_and_fails_closed_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime handler_eventstream_postcommit_faults_never_retry_or_fake_success_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime handler_unknown_event_only_retries_before_empty_success_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime handler_missing_completion_after_text_fails_closed_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime handler_non_stream_untrusted_eof_fails_closed_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime handler_legacy_metadata_and_complete_tool_are_trusted_terminals_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime handler_non_stream_response_body_limit_and_recovery_hold_for_five_rounds -- --nocapture --test-threads=1
+cargo test --bin account-runtime websearch -- --test-threads=1
+cargo test --bin account-runtime account-runtime::provider::tests::mcp_ -- --test-threads=1
 ```
 
 ## Pending release evidence

@@ -28,7 +28,7 @@ raw request
   -> independent usage projection, pricing, logs, errors
 ```
 
-The important distinction is that "body processing" is not one thing. It currently contains thinking controls, multimodal materialization, Anthropic-to-Kiro conversion, tool/schema cleanup, payload guard, token counting, and diagnostics. These should be named stages, with existing defaults kept intact.
+The important distinction is that "body processing" is not one thing. It currently contains thinking controls, multimodal materialization, Anthropic-to-Account Runtime conversion, tool/schema cleanup, payload guard, token counting, and diagnostics. These should be named stages, with existing defaults kept intact.
 
 ## Current Inventory
 
@@ -53,9 +53,9 @@ This preserves current behavior, but it means parsed external direct/normalized 
 `local_body_pipeline::prepare` currently owns:
 
 - `convert_request_with_resolved_model`
-- Kiro request construction
+- Account Runtime request construction
 - too-long retry body capture
-- `prepare_kiro_request_body`
+- `prepare_account-runtime_request_body`
 - payload guard report logging and byte breakdown
 - local token counting
 - warning header construction
@@ -83,9 +83,9 @@ Default enabled stages:
 - parsed thinking preprocessing
 - multimodal preprocessing from current `imageProcessing`
 - model resolution from local capabilities
-- Anthropic-to-Kiro conversion
+- Anthropic-to-Account Runtime conversion
 - tool/schema/thinking/doc/image compatibility conversion
-- Kiro payload guard according to current runtime config
+- Account Runtime payload guard according to current runtime config
 - token counting
 - diagnostics and retry body capture
 
@@ -110,7 +110,7 @@ Default enabled stages:
 Default disabled stages:
 
 - parsed multimodal materialization
-- Anthropic-to-Kiro conversion
+- Anthropic-to-Account Runtime conversion
 - tool/schema cleanup
 - payload guard
 - token counting unless usage projection explicitly needs it
@@ -118,14 +118,14 @@ Default disabled stages:
 ## Refactor Phases
 
 1. Documentation and plan-tree registration. Done.
-2. Add explicit capability plan types for parsed Anthropic, local Kiro, and external body pipelines. Done.
+2. Add explicit capability plan types for parsed Anthropic, local Account Runtime, and external body pipelines. Done.
 3. Wire existing functions through these plans with defaults matching existing behavior. Done.
 4. Add branch tests proving. Done:
    - raw external stays raw
    - raw model probe does not mutate body
    - raw model rewrite mutates only top-level `model`
    - normalized external still runs payload guard when enabled
-   - local default still builds Kiro body and retry payloads
+   - local default still builds Account Runtime body and retry payloads
 5. Run static gates and fake upstream load/chaos. Done.
 6. Record validation results in the plan status. Done.
 
@@ -170,7 +170,7 @@ Resource evidence:
 - Usage shaping must follow usage settings, not body mode.
 - Payload guard disabled must avoid guard work.
 - `/cc/v1/messages` behavior must not diverge from the shared messages entry path.
-- Kiro local conversion stays compatible with current tool-use, thinking, image, document, and cache semantics.
+- Account Runtime local conversion stays compatible with current tool-use, thinking, image, document, and cache semantics.
 
 ## 2026-07-06 Landing Summary
 
@@ -181,7 +181,7 @@ Implemented files:
 - `src/anthropic/handlers.rs`
 - `src/anthropic/handlers/local_body_pipeline.rs`
 - `src/external_pool/body_pipeline.rs`
-- `src/bin/kiro_loadtest.rs`
+- `src/bin/account_runtime_loadtest.rs`
 - `docs/testing/loadtest.md`
 
 Validation:
@@ -198,7 +198,7 @@ The second pass completed the deeper converter split and runtime/UI configuratio
 Implemented converter modules:
 
 - `src/anthropic/converter/schema.rs`: JSON schema normalization and unsupported field cleanup.
-- `src/anthropic/converter/model.rs`: model mapping and Kiro native reasoning fields.
+- `src/anthropic/converter/model.rs`: model mapping and Account Runtime native reasoning fields.
 - `src/anthropic/converter/content.rs`: text, image, document, tool_use, and tool_result content conversion.
 - `src/anthropic/converter/tools.rs`: tool schema conversion, tool-name mapping, tool-choice steering, and chunked tool policy.
 - `src/anthropic/converter/tool_pairing.rs`: tool_use/tool_result pairing repair.
@@ -208,7 +208,7 @@ Implemented configuration surfaces:
 
 - `BodyConversionConfig` in `src/model/config.rs`, defaulting all compatibility capabilities on to preserve current behavior.
 - Runtime admin response/update wiring in `src/admin/types.rs` and `src/admin/service.rs`.
-- Request-time wiring through `AppState`, `RequestRuntimeConfig`, `LocalKiroBodyPlan`, and `ConverterOptions`.
+- Request-time wiring through `AppState`, `RequestRuntimeConfig`, `LocalAccount RuntimeBodyPlan`, and `ConverterOptions`.
 - UI toggles in both frontends:
   - `ui/src/features/runtime/runtime-page.tsx`
   - `admin-ui/src/components/runtime-config-panel.tsx`
@@ -216,7 +216,7 @@ Implemented configuration surfaces:
 Current boundaries:
 
 - Scheduler/route selection remains separate from body preparation.
-- Local credentials use `LocalKiroBodyPlan` and `BodyConversionConfig`.
+- Local credentials use `LocalAccount RuntimeBodyPlan` and `BodyConversionConfig`.
 - External normalized pools use normalized body processing and external payload guard/model/thinking stages.
 - External raw pools use raw bytes, with only optional raw model probe/rewrite.
 - External usage projection and billing remain independent from body mode.
@@ -230,7 +230,7 @@ Final validation run:
   - `git diff --check`: pass.
   - `pnpm check` in `ui/`: pass.
   - `pnpm exec tsc -b --pretty false` in `admin-ui/`: pass.
-  - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test`: pass, 904 main tests and 19 `kiro_loadtest` tests.
+  - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test`: pass, 904 main tests and 19 `account_runtime_loadtest` tests.
   - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo build --release`: pass, 3m39s.
 
 Representative fake-upstream proxy results:

@@ -18,18 +18,18 @@ Current status: component gates pass; real Claude Code CLI C2 awaits a repositor
 All Cargo commands used Rust 1.92.0 through the scoped build runner.
 
 ```text
-feature/tests/run-cargo-scoped.sh bare-invoke-compile-2 -- cargo +1.92.0 check --bin kiro-rs
+feature/tests/run-cargo-scoped.sh bare-invoke-compile-2 -- cargo +1.92.0 check --bin account-runtime
 result: pass
 cleanup: size_kib=447264 removed=true reservation_released=true
 
 feature/tests/run-cargo-scoped.sh bare-invoke-tests-2 -- \
-  cargo +1.92.0 test --bin kiro-rs literal_tool_protocol_ -- --nocapture
+  cargo +1.92.0 test --bin account-runtime literal_tool_protocol_ -- --nocapture
 result: 8 passed, 0 failed, 1530 filtered out
 test runtime: 0.02s (compilation excluded)
 cleanup: size_kib=1625528 removed=true reservation_released=true
 
 feature/tests/run-cargo-scoped.sh bare-invoke-stream-regression-1 -- \
-  cargo +1.92.0 test --bin kiro-rs anthropic::stream::tests -- --nocapture
+  cargo +1.92.0 test --bin account-runtime anthropic::stream::tests -- --nocapture
 result: 93 passed, 0 failed, 1445 filtered out
 test runtime: 0.03s (compilation excluded)
 cleanup: size_kib=1627988 removed=true reservation_released=true
@@ -55,11 +55,11 @@ An initial `bare-invoke-tests-1` command hit the outer 120-second execution time
 
 [bare-invoke-claude-cli.mjs](../tests/bare-invoke-claude-cli.mjs) passes `node --check` and requires:
 
-- `KIRO_RS_BINARY`: absolute repository-external frozen binary;
-- `KIRO_VALIDATION_ARTIFACT_DIR`: absolute repository-external owned artifact root;
-- `KIRO_BARE_INVOKE_POSTGRES_URL`: caller-owned empty isolated database;
-- `KIRO_BARE_INVOKE_REDIS_URL`: isolated Redis endpoint; the runner uses and deletes only a unique key prefix;
-- Claude Code CLI available as `claude` or `KIRO_CLAUDE_BINARY`.
+- `ACCOUNT_RUNTIME_BINARY`: absolute repository-external frozen binary;
+- `ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR`: absolute repository-external owned artifact root;
+- `ACCOUNT_RUNTIME_BARE_INVOKE_POSTGRES_URL`: caller-owned empty isolated database;
+- `ACCOUNT_RUNTIME_BARE_INVOKE_REDIS_URL`: isolated Redis endpoint; the runner uses and deletes only a unique key prefix;
+- Claude Code CLI available as `claude` or `ACCOUNT_RUNTIME_CLAUDE_BINARY`.
 
 It hard-requires five rounds and records binary SHA-256, Claude CLI version, JSONL tool/tool-result counts, final usage, fake-upstream inference hits, output hashes, sentinel state and cleanup. Raw JSONL, service logs, fake keys and connection URLs remain only in an owned temporary directory and are deleted.
 

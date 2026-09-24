@@ -74,8 +74,8 @@ export function AccountTestModal({
     try {
       const response = await testAccount(account.id, { model: trimmedModel, prompt: trimmedPrompt })
       setResult(response)
-      if (response.ok) toast.success(response.message || '外部账号模型调用测试通过')
-      else toast.error(response.message || '外部账号模型调用测试失败')
+      if (response.ok) toast.success(response.message || '账号模型调用测试通过')
+      else toast.error(response.message || '账号模型调用测试失败')
       onDone()
     } catch (err) {
       setError(extractErrorMessage(err))
@@ -87,7 +87,7 @@ export function AccountTestModal({
   return (
     <ModalShell
       open={open}
-      title="测试外部账号"
+      title="测试账号"
       width="max-w-2xl"
       onClose={onClose}
       footer={
@@ -131,7 +131,7 @@ export function AccountTestModal({
 
           <div className="rounded-lg bg-surface-subtle p-4 font-mono text-xs">
             <div className="space-y-1 text-muted-foreground">
-              <div><span className="text-info">外部账号：</span> #{account.id} {account.name}</div>
+              <div><span className="text-info">账号：</span> #{account.id} {account.name}</div>
               <div><span className="text-info">使用模型：</span> {model}</div>
               <div><span className="text-muted-foreground">发送消息：</span> "{prompt.trim() || DEFAULT_TEST_PROMPT}"</div>
             </div>
@@ -139,7 +139,7 @@ export function AccountTestModal({
               {running && (
                 <div className="flex items-center gap-2 text-info">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  正在等待外部账号模型响应...
+                  正在等待账号模型响应...
                 </div>
               )}
               {result && (

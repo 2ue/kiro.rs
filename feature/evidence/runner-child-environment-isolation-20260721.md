@@ -9,7 +9,7 @@ load, UI, upgrade, or release behavior.
 
 Several runtime and Claude CLI validation runners still started child processes with
 `...process.env`. That could silently pass caller-owned PostgreSQL/Redis URLs, API keys,
-Claude/OpenAI provider flags, or unrelated `KIRO_*` variables into temporary `kiro-rs`, Claude,
+Claude/OpenAI provider flags, or unrelated `ACCOUNT_RUNTIME_*` variables into temporary `account-runtime`, Claude,
 proxy, or scoped-Cargo child processes. The main risk is validation contamination: a runner could
 appear to validate an isolated fixture while a child actually reads a developer shell override.
 
@@ -20,7 +20,7 @@ Added `feature/tests/validation-child-env.mjs` and routed real runner child proc
 
 The helper allowlists only execution basics such as `PATH`, temp locale/user variables, `HOME`,
 `VOLTA_HOME`, `CARGO_HOME`, and `RUSTUP_HOME`, then overlays explicit per-child variables. It does
-not inherit storage URLs, Anthropic/OpenAI credentials, request keys, or generic `KIRO_*` state
+not inherit storage URLs, Anthropic/OpenAI credentials, request keys, or generic `ACCOUNT_RUNTIME_*` state
 unless the runner passes a specific variable in `extra`.
 
 Updated runner surfaces:
@@ -36,15 +36,15 @@ Updated runner surfaces:
 Contract tests now assert:
 
 - the helper does not inherit `DATABASE_URL`, `REDIS_URL`, `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`, `KIRO_API_KEY`, `KIRO_RS_TEST_REDIS_URL`, or arbitrary
-  `KIRO_*`-shaped fixture state;
+  `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`, `ACCOUNT_RUNTIME_API_KEY`, `ACCOUNT_RUNTIME_TEST_REDIS_URL`, or arbitrary
+  `ACCOUNT_RUNTIME_*`-shaped fixture state;
 - every non-test `feature/tests/*.mjs` validation runner source is free of `...process.env`;
 - the existing runtime path contract still rejects repository paths, direct `target/debug|release`
   outputs, symlink escapes, wrong types, missing paths, and protected `9022` listener probes.
 
 ## Commands Run
 
-No Docker, Cargo, or `kiro-rs` service was started.
+No Docker, Cargo, or `account-runtime` service was started.
 
 ```bash
 node --test feature/tests/runtime-validation-paths.test.mjs

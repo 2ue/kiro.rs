@@ -47,6 +47,7 @@ pub struct CredentialEntrySnapshot {
     /// 实际生效的 API Region。
     pub effective_api_region: String,
     /// 是否有 Profile ARN
+    #[cfg(test)]
     pub has_profile_arn: bool,
     /// Token 过期时间
     pub expires_at: Option<String>,
@@ -184,6 +185,7 @@ pub struct CredentialBaseSnapshot {
     pub api_region: Option<String>,
     pub effective_auth_region: String,
     pub effective_api_region: String,
+    #[cfg(test)]
     pub has_profile_arn: bool,
     pub refresh_token_hash: Option<String>,
     pub api_key_hash: Option<String>,
@@ -359,6 +361,7 @@ pub(super) fn base_snapshot_from_entry(
         api_region: entry.credentials.api_region.clone(),
         effective_auth_region: entry.credentials.effective_auth_region(config).to_string(),
         effective_api_region: entry.credentials.effective_api_region(config).to_string(),
+        #[cfg(test)]
         has_profile_arn: entry.credentials.profile_arn.is_some(),
         refresh_token_hash: if entry.credentials.is_api_key_credential() {
             None
@@ -449,6 +452,7 @@ pub(super) fn runtime_snapshot_from_entry(
         api_region: entry.credentials.api_region.clone(),
         effective_auth_region: entry.credentials.effective_auth_region(config).to_string(),
         effective_api_region: entry.credentials.effective_api_region(config).to_string(),
+        #[cfg(test)]
         has_profile_arn: entry.credentials.profile_arn.is_some(),
         expires_at: if entry.credentials.is_api_key_credential() {
             None

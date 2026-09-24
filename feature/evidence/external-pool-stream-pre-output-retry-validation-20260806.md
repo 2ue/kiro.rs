@@ -71,7 +71,7 @@ The focused matrix distilled from those docs was:
 | Normal external stream | Healthy external SSE stream still commits normally; pre-output retry does not replay after commit; disabled per-pool mode preserves old stream-error behavior | `external_pool_stream_` with real test PgSQL/Redis: `6 passed` |
 | Normal external non-stream | Clean non-stream external body remains byte-identical; OpenAI-compatible non-stream usage still normalizes; missing usage still estimates billing | targeted external-pool usage/body tests: `6 x 1 passed` |
 | Normal local output | Local stream success still records requested max tokens/downstream stop reason; local non-stream success still commits shared attempt budget before usage | handler tests: `2 x 1 passed` |
-| External direct, stream and non-stream | Direct policy routes both stream and non-stream requests to external pool, rewrites the resolved upstream model, records `external_direct_policy`, and does not hit local Kiro upstream | `normalized_external_direct_policy_skips_raw_preparse_without_raw_pool`: `1 passed`; this test now covers both modes |
+| External direct, stream and non-stream | Direct policy routes both stream and non-stream requests to external pool, rewrites the resolved upstream model, records `external_direct_policy`, and does not hit local Account Runtime upstream | `normalized_external_direct_policy_skips_raw_preparse_without_raw_pool`: `1 passed`; this test now covers both modes |
 | Local-first fallback | Request errors do not fall back; capacity/transient/no-credential/config toggle cases keep explicit reasons; normalized external preflight handles stream and non-stream | `external_fallback`: `9 passed`; `native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds`: `1 passed` |
 | Direct/local rescue boundary | External direct and `external_direct_policy` route subtype block local rescue for all error classes; local-first external failure may rescue only when the source and fresh local capacity allow it | `direct_external`: `5 passed`; `external_local_rescue`: `3 passed`; `local_rescue_requires`: `2 passed` |
 | Local preflight and fresh local state | Local Ready suppresses external fallback; Redis degraded and configured terminal reasons remain explicit; capacity-gated fallback requires immediate external capacity where documented | `local_pool_preflight_reason`, `local_external_fallback_capacity_gate`, `fresh_local_pool_state`, `classified_scheduler_degraded`: `4 x 1 passed` |
@@ -81,7 +81,7 @@ Additional validation commands:
 
 | Gate | Command | Result |
 | --- | --- | --- |
-| Real PgSQL/Redis external stream rerun | `feature/tests/run-cargo-scoped.sh normal-routing-external-stream-db-rerun -- cargo test external_pool_stream_ --locked` with `KIRO_RS_TEST_POSTGRES_URL` and `KIRO_RS_TEST_REDIS_URL` from existing local Docker containers | Passed: `6 passed` |
+| Real PgSQL/Redis external stream rerun | `feature/tests/run-cargo-scoped.sh normal-routing-external-stream-db-rerun -- cargo test external_pool_stream_ --locked` with `ACCOUNT_RUNTIME_TEST_POSTGRES_URL` and `ACCOUNT_RUNTIME_TEST_REDIS_URL` from existing local Docker containers | Passed: `6 passed` |
 | External normal output/usage batch | `feature/tests/run-cargo-scoped.sh normal-output-external-usage-rerun -- bash -lc 'cargo test ...'` | Passed: 8 targeted commands, each `1 passed` |
 | Routing/config classifier batch | `feature/tests/run-cargo-scoped.sh routing-config-classifiers-db -- bash -lc 'cargo test ...'` | Passed: 11 targeted commands, total asserted tests listed above |
 | Direct stream/non-stream Router batch | `feature/tests/run-cargo-scoped.sh normal-direct-stream-nonstream-router -- bash -lc 'cargo test ...'` | Passed: 4 targeted commands, each `1 passed` |
@@ -95,12 +95,12 @@ Notes:
 - Two early validation commands used multiple Cargo test filters in one invocation; Cargo rejected them before running tests. They were discarded and rerun as valid single-filter batches.
 - Two parallel compile-heavy batches timed out while waiting on build locks. The scoped wrapper later reaped their stale target/reservation entries, and the final artifact inventory passed.
 - An earlier inventory run was intentionally discarded because it ran concurrently with an active scoped `cargo check` and correctly reported the active target as a blocker. The final standalone inventory run passed.
-- The direct external handler regression was extended in this change to cover both `stream=false` and `stream=true`; it asserts external hits, route subtype, model rewrite, attempt count, and zero local Kiro upstream hits for both modes.
+- The direct external handler regression was extended in this change to cover both `stream=false` and `stream=true`; it asserts external hits, route subtype, model rewrite, attempt count, and zero local Account Runtime upstream hits for both modes.
 
 The real HTTP fake-upstream tests used pre-existing local Docker services:
 
-- PostgreSQL: `kiro-rs-postgres-local` on `127.0.0.1:25432`
-- Redis: `kiro-rs-redis-local` on `127.0.0.1:26379`
+- PostgreSQL: `account-runtime-postgres-local` on `127.0.0.1:25432`
+- Redis: `account-runtime-redis-local` on `127.0.0.1:26379`
 
 The tests use existing isolated test helpers to create and drop PostgreSQL schemas and random Redis prefixes. No production service was modified, no local `9022` service was restarted, and no new long-running process was left running by this validation.
 
@@ -111,8 +111,8 @@ The user asked for an additional check that the stream pre-output retry change d
 Environment:
 
 - Rust: `cargo +1.92.0`, through `feature/tests/run-cargo-scoped.sh`.
-- PostgreSQL integration container: `kiro-rs-postgres-local` on `127.0.0.1:25432`; password was read from Docker env and not printed.
-- Redis integration container: `kiro-rs-redis-local` on `127.0.0.1:26379/0`.
+- PostgreSQL integration container: `account-runtime-postgres-local` on `127.0.0.1:25432`; password was read from Docker env and not printed.
+- Redis integration container: `account-runtime-redis-local` on `127.0.0.1:26379/0`.
 - Node: `v22.23.1`; pnpm: `10.33.4`. This differs from the baseline pnpm `11.11.0`, so these frontend results are local rerun evidence, not a substitute for the pinned CI gate.
 
 Focused scheduler/output matrix:
@@ -147,7 +147,7 @@ Result: passed. The batch covered:
 - external direct policy and direct-to-local-rescue block: `5 passed`;
 - local preflight toggles, capacity fallback gate, fresh local Ready and Redis degraded classifier: `4 x 1 passed`;
 - external local rescue classifiers and shared-attempt constraints: `3 passed` plus `2 passed`;
-- normalized external direct Router path covers both `stream=false` and `stream=true`: `1 passed`, asserting external hits, rewritten upstream model, route subtype `external_direct_policy`, and zero local Kiro upstream hits;
+- normalized external direct Router path covers both `stream=false` and `stream=true`: `1 passed`, asserting external hits, rewritten upstream model, route subtype `external_direct_policy`, and zero local Account Runtime upstream hits;
 - normal local stream and non-stream output: `2 x 1 passed`;
 - normalized external preflight before WebSearch/MCP and built-in route config authority: `2 x 1 passed`.
 
@@ -193,8 +193,8 @@ The final local candidate was rebuilt outside Cargo target and bound to the foll
 
 | Binary | SHA-256 |
 | --- | --- |
-| `kiro-rs` | `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688` |
-| `kiro_loadtest` | `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d` |
+| `account-runtime` | `eec71c67ce49ee9003d2cd70fae0d8ebfef1d44f72ee56bda8bb7c7ee592b688` |
+| `account_runtime_loadtest` | `023f3e961cdbc56e32f46f896ac66494b1a92d0e182728ddaddbeb5b8ed90e4d` |
 
 Scoped C0 Rust gate:
 
@@ -203,13 +203,13 @@ feature/tests/run-cargo-scoped.sh final-candidate-003 -- bash -lc '
   cargo +1.92.0 fmt --all -- --check
   cargo +1.92.0 test --locked
   cargo +1.92.0 check --all-targets --locked
-  cargo +1.92.0 build --release --locked --bin kiro-rs --bin kiro_loadtest
+  cargo +1.92.0 build --release --locked --bin account-runtime --bin account_runtime_loadtest
 '
 ```
 
-Result: passed. The earlier `final-candidate-002` full test run failed only because an old local `9022` gateway process held the PostgreSQL runtime lifecycle fence; after verifying and stopping that exact local `kiro-rs` listener, `final-candidate-003` passed and the scoped target cleanup reported `removed=true` / `reservation_released=true`.
+Result: passed. The earlier `final-candidate-002` full test run failed only because an old local `9022` gateway process held the PostgreSQL runtime lifecycle fence; after verifying and stopping that exact local `account-runtime` listener, `final-candidate-003` passed and the scoped target cleanup reported `removed=true` / `reservation_released=true`.
 
-Real Claude Code CLI fake-upstream gates used Claude Code CLI `2.1.221` with an isolated HOME / `CLAUDE_CONFIG_DIR` and the frozen `kiro-rs` binary above:
+Real Claude Code CLI fake-upstream gates used Claude Code CLI `2.1.221` with an isolated HOME / `CLAUDE_CONFIG_DIR` and the frozen `account-runtime` binary above:
 
 | Gate | Result | Evidence summary |
 | --- | --- | --- |
@@ -217,7 +217,7 @@ Real Claude Code CLI fake-upstream gates used Claude Code CLI `2.1.221` with an 
 | Long session | Passed on rerun | `5` sessions, `110` turns, `105` continue turns, `100` tool turns, `100` tool_use / `100` tool_result, `leakMatches=0`; cleanup true. One earlier run timed out at `round=3 turn=9`; the rerun completed the same point successfully, with two slow turns around `41s` but below the gate timeout. |
 | Thinking wire | Passed on rerun | `60/60` cases across CLI/IDE endpoints and `absent/low/medium/high/xhigh/max` effort values; `violations=0`; cleanup true. One earlier run had `ide-max-4` time out before any ingress/wire record was captured; rerun with the same frozen binary passed all cases. |
 
-Load/chaos gates used the frozen `kiro-rs` and `kiro_loadtest` binaries above, caller-owned PostgreSQL databases, Redis DB `12` with random caller-owned prefixes, and the repository `frozen-load-chaos-runner.mjs`. The runner removed raw runtime/log/report trees after writing summary JSON; the outer harness dropped its PostgreSQL databases and the runner deleted owned Redis prefixes.
+Load/chaos gates used the frozen `account-runtime` and `account_runtime_loadtest` binaries above, caller-owned PostgreSQL databases, Redis DB `12` with random caller-owned prefixes, and the repository `frozen-load-chaos-runner.mjs`. The runner removed raw runtime/log/report trees after writing summary JSON; the outer harness dropped its PostgreSQL databases and the runner deleted owned Redis prefixes.
 
 | Gate | Result | Evidence summary |
 | --- | --- | --- |
@@ -228,7 +228,7 @@ Load/chaos gates used the frozen `kiro-rs` and `kiro_loadtest` binaries above, c
 Post-run cleanup checks:
 
 - no `9022` listener was left running;
-- no new `kiro-rs`, `kiro_loadtest`, release-suite, or load-chaos process remained, aside from the active Codex/Claude session itself;
+- no new `account-runtime`, `account_runtime_loadtest`, release-suite, or load-chaos process remained, aside from the active Codex/Claude session itself;
 - the runner deleted this run's Redis prefixes;
 - the outer harness dropped this run's PostgreSQL databases;
 - raw CLI/load artifact roots contained only small summary/report JSON after extraction and were removed before release.

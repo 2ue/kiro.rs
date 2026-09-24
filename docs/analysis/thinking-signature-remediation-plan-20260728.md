@@ -4,7 +4,7 @@
 范围：只读源码分析 + 两轮 codex CLI（`codex exec --sandbox read-only`）多 agent 头脑风暴与对抗式自检，**未修改任何代码，未运行 `cargo test`**。
 方法：主分析给出官方机制与项目缺陷断言 → 4 个 codex agent 分层拆解（A 阻断项修复 / B HIGH 项 / C 架构与配置 / D 红队风险与测试）→ 第二轮 codex 对 A 的设计做对抗式自检 → 主分析交叉核对全部引用的 file:line 与当前代码一致。
 关联文档：
-- 现状（签名怎么处理、session 是否一致）见 [`kiro-upstream-signature-and-fingerprint-analysis-20260727.md`](./kiro-upstream-signature-and-fingerprint-analysis-20260727.md)
+- 现状（签名怎么处理、session 是否一致）见 [`account-runtime-upstream-signature-and-fingerprint-analysis-20260727.md`](./account-runtime-upstream-signature-and-fingerprint-analysis-20260727.md)
 - 早期兼容性设计（**部分已过时**，见本文 §6）见 [`../archive/request-and-protocol-history/anthropic-tools-signature-compatibility-analysis.md`](../archive/request-and-protocol-history/anthropic-tools-signature-compatibility-analysis.md)
 
 > 本文只做分析与方案设计。任何代码改动前需再次确认。
@@ -68,7 +68,7 @@ signature 与**模型**绑定，不与**会话**绑定，可在 Claude API / Bed
 | P6 | `clear_history_reasoning_content`（`conversation.rs:91`）无差别 `.take()` 每个 assistant 的 reasoning | 配合 P5 修复，否则会毁掉受保护的最新 thinking | 配合修复 |
 | P1 | `ReasoningContent` 单值无标签联合（`conversation.rs:374`）；`AssistantMessage` 持单个 `reasoning_content`（345）+ 独立 `tool_uses`（342） | **未知——需抓包**，阻塞 BLOCKER 2 分支决策 | 阻塞 |
 
-> P1-unknown：Kiro 上游是否只接受单值 `reasoningContent`、是否校验 thinking↔tool_use 的交错顺序，目前**没有抓包证据**。整个 BLOCKER 2 的 Branch A/B 取舍都卡在这里。
+> P1-unknown：Account Runtime 上游是否只接受单值 `reasoningContent`、是否校验 thinking↔tool_use 的交错顺序，目前**没有抓包证据**。整个 BLOCKER 2 的 Branch A/B 取舍都卡在这里。
 
 ---
 
@@ -93,7 +93,7 @@ if is_tool_use_continuation(messages, last_asst):     // 靠 tool_use id ↔ 后
 discard_anthropic_history_thinking(&mut messages[..end])
 ```
 
-- `is_tool_use_continuation` 用**结构**（tool_use id ↔ 后续 tool_result id 配对）判断，而非相邻位置——因为 Kiro 把 `tool_uses` 建成独立顶层字段（`conversation.rs:342`），光看 role 分不清工具回合和普通 assistant 回合。该函数当前**不存在**，是待新增的。
+- `is_tool_use_continuation` 用**结构**（tool_use id ↔ 后续 tool_result id 配对）判断，而非相邻位置——因为 Account Runtime 把 `tool_uses` 建成独立顶层字段（`conversation.rs:342`），光看 role 分不清工具回合和普通 assistant 回合。该函数当前**不存在**，是待新增的。
 - 只保护一条 assistant（续写来源），不往前走。
 
 边界与边界情形：
@@ -122,32 +122,32 @@ discard_anthropic_history_thinking(&mut messages[..end])
 
 ---
 
-## 4. BLOCKER 2 — Kiro `reasoningContent` 单值；第二块报错
+## 4. BLOCKER 2 — Account Runtime `reasoningContent` 单值；第二块报错
 
 ### 4.1 根因（已确认）
 
-`set_native_reasoning_content`（`history.rs:397`）在遇到第二个 reasoning 块时返回 Err，文案（403 行）："assistant history contains multiple or mixed native reasoning blocks; Kiro accepts one reasoningContent union value per assistant message"。合并路径 `merge_assistant_messages_with_known_tools`（`history.rs:431`，调用 `set_native_reasoning_content` 在 470）同样报错。
+`set_native_reasoning_content`（`history.rs:397`）在遇到第二个 reasoning 块时返回 Err，文案（403 行）："assistant history contains multiple or mixed native reasoning blocks; Account Runtime accepts one reasoningContent union value per assistant message"。合并路径 `merge_assistant_messages_with_known_tools`（`history.rs:431`，调用 `set_native_reasoning_content` 在 470）同样报错。
 
 后端建模：`ReasoningContent` 是单值无标签枚举（`conversation.rs:374`），`AssistantMessage`（`conversation.rs:334-359`）持有一个 `reasoning_content: Option<ReasoningContent>`（345）**加一个独立** `tool_uses: Option<Vec<ToolUseEntry>>`（342）。因此一条合法 F13 assistant（`thinking, tool_use, thinking, tool_use`）无法被表示。
 
 ### 4.2 决定性发现（第二轮对抗自检，最严重的洞）
 
-**即使走 Branch A（把 `reasoning_content` 改成 Vec）也解决不了 F13。** 两个并行数组 `reasoningContent:[A,B]` + `toolUses:[1,2]` **丢失了 thinking 与 tool_use 之间的位置交错**。如果 Kiro 校验原始 `thinking→tool_use→thinking` 顺序，任何字段基数改动都无效——需要**位置化内容模型**，一个更深的 schema 变更。Kiro 是否校验交错顺序**未抓包验证**。因此 Branch A vs B 凭事实无法选定。
+**即使走 Branch A（把 `reasoning_content` 改成 Vec）也解决不了 F13。** 两个并行数组 `reasoningContent:[A,B]` + `toolUses:[1,2]` **丢失了 thinking 与 tool_use 之间的位置交错**。如果 Account Runtime 校验原始 `thinking→tool_use→thinking` 顺序，任何字段基数改动都无效——需要**位置化内容模型**，一个更深的 schema 变更。Account Runtime 是否校验交错顺序**未抓包验证**。因此 Branch A vs B 凭事实无法选定。
 
-### 4.3 Branch A — 数组/位置化（仅当抓包证明 Kiro 接受）
+### 4.3 Branch A — 数组/位置化（仅当抓包证明 Account Runtime 接受）
 
 - 最小：`reasoning_content: ReasoningContents(Vec<ReasoningContent>)` newtype。恰好 1 块时序列化为单 OBJECT（保留今天已验证的线格式），>1 块时为 ARRAY。
 - 内容相关的形状意味着一个请求里不同 assistant 消息序列化不同（object vs array），仅当上游字段 schema 是真正的 per-value 联合时安全；若 schema 是统一/生成式的则失败。
-- **必须同时实现自定义 Deserialize** 以在两种形状下 round-trip Kiro **响应**（第一轮只说了 serialize）。检查 reasoning 结构体的 `deny_unknown_fields` 不会拒绝上游不透明字段（F2/F12）。
+- **必须同时实现自定义 Deserialize** 以在两种形状下 round-trip Account Runtime **响应**（第一轮只说了 serialize）。检查 reasoning 结构体的 `deny_unknown_fields` 不会拒绝上游不透明字段（F2/F12）。
 - 两条转换路径（`history.rs:397` 与 `431`）都必须按源顺序 push；若跨两条 assistant 消息合并无法保序，须 **fail closed**，绝不静默重排。
-- 若交错顺序重要且 Kiro 无位置化形态 → Branch A **不可能靠字段微调实现**，需真正的 schema/模型改动。
+- 若交错顺序重要且 Account Runtime 无位置化形态 → Branch A **不可能靠字段微调实现**，需真正的 schema/模型改动。
 
-### 4.4 Branch B — 单值 fail-closed（若 Kiro 只接受单值）
+### 4.4 Branch B — 单值 fail-closed（若 Account Runtime 只接受单值）
 
 - 当受保护的最新 assistant 有 >1 个已签/redacted 块 → 返回 `ConversionError`（绝不合并/丢弃/伪造——F1/F2/F13）。
 - 仅在 `messages[..protected_history_end]` 内按配置丢弃 thinking。
 - 阻止 `THINKING_SIGNATURE_INVALID` 重试（P9：`provider.rs:10986`、`handlers.rs:6104`）剥离受保护的最新块。
-- **死角**：strip-all 不是安全兜底。F14 要求工具回合内必须回传 thinking，一个无 thinking 的工具回合很可能**同样 400**——把一个非法请求换成另一个。**Kiro 是否容忍无 thinking 的工具回合是关键未知**（抓包场景 #5），在证实之前不能声称有降级路径。
+- **死角**：strip-all 不是安全兜底。F14 要求工具回合内必须回传 thinking，一个无 thinking 的工具回合很可能**同样 400**——把一个非法请求换成另一个。**Account Runtime 是否容忍无 thinking 的工具回合是关键未知**（抓包场景 #5），在证实之前不能声称有降级路径。
 
 ### 4.5 取舍小结
 
@@ -196,24 +196,24 @@ Branch A = 广义正确，前提是上游支持数组/位置化且接受 schema 
 
 ## 7. 抓包前置矩阵（BLOCKING）
 
-第一轮的 3 请求测试（object / 1 元素数组 / 2 元素数组）只能回答"Kiro 是否接受数组"，不够。所需矩阵，除注明外均用**同模型、逐字捕获**的块：
+第一轮的 3 请求测试（object / 1 元素数组 / 2 元素数组）只能回答"Account Runtime 是否接受数组"，不够。所需矩阵，除注明外均用**同模型、逐字捕获**的块：
 
 | # | 请求形状 | 解决的问题 |
 | --- | --- | --- |
 | 1 | 单 object `reasoningContent` | 基线（今天可用） |
 | 2 | 1 元素数组 | 数组是否被接受 |
 | 3 | 2 元素数组 | 多块是否被接受？Branch A 可行？ |
-| 4 | **交错** thinking→tool_use→thinking→tool_use（分离的 `reasoningContent`+`toolUses` 数组） | Kiro 是否校验交错顺序？（定 Branch A 可行性，§4.2） |
+| 4 | **交错** thinking→tool_use→thinking→tool_use（分离的 `reasoningContent`+`toolUses` 数组） | Account Runtime 是否校验交错顺序？（定 Branch A 可行性，§4.2） |
 | 5 | 最新工具回合 thinking **完全省略** | strip-all 是有效降级还是也 400？（定 Branch B 死角，§4.4） |
-| 6 | 最新 thinking **重排** | 确认 F13 重排→400 在 Kiro 上成立 |
+| 6 | 最新 thinking **重排** | 确认 F13 重排→400 在 Account Runtime 上成立 |
 | 7 | **模型不匹配**：块来自模型 X，请求模型 Y | 确认 F3 → 400；量化溯源工作量（§5.1） |
 | 8 | 更老工具回合 thinking 省略、最新保留 | "只保护最新"是否充分？（定 BLOCKER 1 充分性，§3.5） |
-| 9 | `display:"omitted"` → `thinking:""` + signature | 确认 F14 合法性在 Kiro 上成立 |
-| 10 | 捕获 Kiro **响应**形状（object vs array；1 元素是否归一化） | Branch A Deserialize 需求（§4.3） |
+| 9 | `display:"omitted"` → `thinking:""` + signature | 确认 F14 合法性在 Account Runtime 上成立 |
+| 10 | 捕获 Account Runtime **响应**形状（object vs array；1 元素是否归一化） | Branch A Deserialize 需求（§4.3） |
 
-抓包端点：IDE `POST /generateAssistantResponse`（`kiro/endpoint/ide.rs`）或 CLI runtime（`kiro/endpoint/cli.rs`），全新 `conversationId`、同模型、同头部凭据。检查 HTTP 状态、AWS event-stream 帧头、`assistantResponseEvent`/`reasoningContentEvent`/`metadataEvent`/`invalidStateEvent`（`kiro/model/events/base.rs`）、reasoning 负载 `text`/`signature`/`redactedContent`（`kiro/model/events/additional.rs`）。
+抓包端点：IDE `POST /generateAssistantResponse`（`account-runtime/endpoint/ide.rs`）或 CLI runtime（`account-runtime/endpoint/cli.rs`），全新 `conversationId`、同模型、同头部凭据。检查 HTTP 状态、AWS event-stream 帧头、`assistantResponseEvent`/`reasoningContentEvent`/`metadataEvent`/`invalidStateEvent`（`account-runtime/model/events/base.rs`）、reasoning 负载 `text`/`signature`/`redactedContent`（`account-runtime/model/events/additional.rs`）。
 
-判定预期：F13/F14 下只有逐字/同模型通过；#4/#5/#8 任一通过都是 Kiro 特有容忍，必须显式 compat flag 门控，绝不默认假设。
+判定预期：F13/F14 下只有逐字/同模型通过；#4/#5/#8 任一通过都是 Account Runtime 特有容忍，必须显式 compat flag 门控，绝不默认假设。
 
 ---
 

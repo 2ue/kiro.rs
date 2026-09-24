@@ -5,13 +5,15 @@
 //! - `events`: 响应事件类型
 //! - `requests`: 请求类型
 //! - `credentials`: 上游凭据
-//! - `token_refresh`: Token 刷新
+//! - `token_refresh`: legacy token refresh fixtures (tests only)
 //! - `usage_limits`: 使用额度查询
 
 pub mod available_models;
 pub mod common;
 pub mod credentials;
+#[cfg(test)]
 pub mod events;
 pub mod requests;
+#[cfg(test)]
 pub mod token_refresh;
 pub mod usage_limits;

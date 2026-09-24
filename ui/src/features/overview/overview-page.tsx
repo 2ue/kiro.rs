@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   Activity,
   CheckCircle2,
@@ -22,7 +23,7 @@ import {
   useUsageSummary,
   useUsageWriterStats,
 } from '@/hooks/use-usage'
-import { useCredentialSummary, useCredentialUsageSummary } from '@/hooks/use-credentials'
+import { getAccountsStatus } from '@/api/credentials'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import { AccountBillingPanel } from '../usage/usage-billing'
@@ -33,7 +34,6 @@ import type {
   UsageAccountBillingSummary,
   UsageSeriesPoint,
   UsageTopAggregate,
-  CredentialUsageSummaryItem,
   UsageRecorderStats,
 } from '@/types/api'
 import {
@@ -122,12 +122,8 @@ function activeWindow(windows: UsageDashboardWindow[], key: string): UsageDashbo
   return windows.find((w) => w.key === key) ?? windows[0]
 }
 
-function totalUpstreamMetering(value: { totalUpstreamMeteringUnits?: number; totalKiroMeteringUsage?: number }): number {
-  return value.totalUpstreamMeteringUnits ?? value.totalKiroMeteringUsage ?? 0
-}
-
-function upstreamMetering(value?: { upstreamMeteringUnits?: number; kiroMeteringUsage?: number }): number {
-  return value?.upstreamMeteringUnits ?? value?.kiroMeteringUsage ?? 0
+function totalUpstreamMetering(value: { totalUpstreamMeteringUnits?: number }): number {
+  return value.totalUpstreamMeteringUnits ?? 0
 }
 
 function seriesPointToChartRow(p: UsageSeriesPoint): Record<string, number | string> {
@@ -219,8 +215,12 @@ function TrendSection({
 
 // ─── 子组件：账号池状态 ────────────────────────────────────────────────────────
 
-function CredentialPoolPanel() {
-  const { data, isLoading } = useCredentialSummary()
+function AccountPoolPanel() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['accounts-status-overview'],
+    queryFn: getAccountsStatus,
+    refetchInterval: 5000,
+  })
 
   if (isLoading || !data) {
     return (
@@ -230,13 +230,13 @@ function CredentialPoolPanel() {
     )
   }
 
-  const total = data.total ?? 0
-  const available = data.available ?? 0
-  const disabled = data.disabled ?? 0
-  const cooling = total - available - disabled
-  const concurrency = data.globalInFlightRequests ?? 0
-  const maxConcurrency = data.globalMaxConcurrentRequests ?? 0
-  const queued = data.queuedRequests ?? 0
+  const statuses = data.accounts ?? []
+  const total = statuses.length
+  const available = statuses.filter((item) => item.dispatchable).length
+  const disabled = statuses.filter((item) => !item.account.enabled).length
+  const cooling = Math.max(0, total - available - disabled)
+  const concurrency = statuses.reduce((sum, item) => sum + item.inFlight, 0)
+  const maxConcurrency = statuses.reduce((sum, item) => sum + (item.account.maxConcurrentRequests ?? 0), 0)
   const availRatio = total > 0 ? available / total : 0
   const concRatio = maxConcurrency > 0 ? concurrency / maxConcurrency : 0
 
@@ -281,12 +281,6 @@ function CredentialPoolPanel() {
                 className={cn('h-full rounded-full transition-all', concRatio > 0.8 ? 'bg-warning' : 'bg-primary')}
                 style={{ width: `${Math.min(100, concRatio * 100)}%` }}
               />
-            </div>
-          )}
-          {queued > 0 && (
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-warning">排队请求</span>
-              <span className="tabular-nums font-semibold text-warning">{formatNumber(queued)}</span>
             </div>
           )}
         </div>
@@ -510,7 +504,7 @@ function CostRelationshipPanel({
   return (
     <SectionCard
       title="费用关系"
-      description="当前窗口内本地账号、上游计量与上游账号成本口径"
+      description="当前窗口内账号、上游计量与上游账号成本口径"
       icon={<DollarSign />}
     >
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -542,17 +536,17 @@ function CostRelationshipPanel({
           title="上游 meteringEvent 计量单位统计"
         />
         <SignalRow
-          label="外部池原始成本"
+          label="上游账号原始成本"
           value={formatUsdFixed2(external.rawCostUsd)}
           ratio={external.billableCostUsd > 0 ? external.rawCostUsd / external.billableCostUsd : 0}
           barColor="bg-warning/80"
-          title="外部池上游真实或原始成本"
+          title="上游账号真实或原始成本"
         />
         <SignalRow
-          label="外部池可计费"
+          label="上游账号可计费"
           value={formatUsdFixed2(external.billableCostUsd)}
           ratio={external.billableCostUsd > 0 ? 1 : 0}
-          title="外部池最终 billable 口径"
+          title="上游账号最终 billable 口径"
         />
       </div>
     </SectionCard>
@@ -915,18 +909,18 @@ function RealtimeUsagePanel({
 
 function AccountQualityPanel({
   credentials,
-  usageItems,
+  billingItems,
   loading,
 }: {
   credentials: UsageTopAggregate[]
-  usageItems: CredentialUsageSummaryItem[]
+  billingItems: UsageAccountBillingByAccount[]
   loading: boolean
 }) {
-  const usageById = new Map(usageItems.map((item) => [item.id, item]))
+  const usageById = new Map(billingItems.map((item) => [item.accountId, item]))
 
   return (
     <SectionCard
-      title="本地账号质量"
+      title="账号质量"
       description="当前窗口账号贡献、计费与上游计量；用于发现高成本、低成功率或未计价账号"
       icon={<Users />}
       noPadding
@@ -937,11 +931,11 @@ function AccountQualityPanel({
         </div>
       ) : credentials.length === 0 ? (
         <div className="p-4">
-          <EmptyState title="暂无本地账号用量" className="py-8" />
+          <EmptyState title="暂无账号用量" className="py-8" />
         </div>
       ) : (
         <div className="scrollbar-thin overflow-x-auto">
-          <Table className="min-w-[980px]">
+          <Table className="min-w-[1040px]">
             <TableHeader>
               <TableRow>
                 <TableHead>账号</TableHead>
@@ -950,10 +944,12 @@ function AccountQualityPanel({
                 <TableHead className="text-right">当前估算</TableHead>
                 <TableHead className="text-right">当前实际</TableHead>
                 <TableHead className="text-right">当前积分</TableHead>
-                <TableHead className="text-right">累计估算</TableHead>
-                <TableHead className="text-right">累计实际</TableHead>
-                <TableHead className="text-right">累计积分</TableHead>
+                <TableHead className="text-right">累计原始</TableHead>
+                <TableHead className="text-right">累计展示</TableHead>
+                <TableHead className="text-right">累计补偿后</TableHead>
+                <TableHead className="text-right">累计差额</TableHead>
                 <TableHead className="text-right">未计价</TableHead>
+                <TableHead className="text-right">底线</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -961,6 +957,9 @@ function AccountQualityPanel({
                 const id = Number(credential.key)
                 const cumulative = Number.isFinite(id) ? usageById.get(id) : undefined
                 const errorRate = credential.requests > 0 ? credential.errorRequests / credential.requests : 0
+                const cumulativeShapedCost = cumulative?.shapedCostUsd ?? cumulative?.reportedCostUsd ?? 0
+                const cumulativeUpliftedCost = cumulative?.upliftedCostUsd ?? cumulative?.reportedCostUsd ?? cumulative?.billableCostUsd ?? 0
+                const cumulativeDelta = cumulative?.profitUsd ?? (cumulativeUpliftedCost - (cumulative?.rawCostUsd ?? 0))
                 return (
                   <TableRow key={credential.key}>
                     <TableCell>
@@ -981,14 +980,18 @@ function AccountQualityPanel({
                     <TableCell className="text-right font-mono text-xs" title={formatNumber(totalUpstreamMetering(credential))}>
                       {formatCompact(totalUpstreamMetering(credential))}
                     </TableCell>
-                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulative?.estimatedCostUsd ?? 0)}</TableCell>
-                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulative?.originalCostUsd ?? 0)}</TableCell>
-                    <TableCell className="text-right font-mono text-xs" title={formatNumber(upstreamMetering(cumulative))}>
-                      {formatCompact(upstreamMetering(cumulative))}
-                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulative?.rawCostUsd ?? 0)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulativeShapedCost)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulativeUpliftedCost)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(cumulativeDelta)}</TableCell>
                     <TableCell className="text-right font-mono text-xs">
                       <span className={(cumulative?.unpricedRequests ?? 0) > 0 ? 'text-warning' : 'text-muted-foreground'}>
                         {formatCompact(cumulative?.unpricedRequests ?? 0)}
+                      </span>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      <span className={(cumulative?.costFloorAppliedRequests ?? 0) > 0 ? 'text-warning' : 'text-muted-foreground'}>
+                        {formatCompact(cumulative?.costFloorAppliedRequests ?? 0)}
                       </span>
                     </TableCell>
                   </TableRow>
@@ -1042,16 +1045,6 @@ export function OverviewPage() {
     autoRefresh.refetchInterval,
     activeSection === 'billing'
   )
-  const topCredentialIds = useMemo(
-    () => (topQuery.data?.top.credentials ?? [])
-      .map((item) => Number(item.key))
-      .filter((id) => Number.isInteger(id) && id > 0),
-    [topQuery.data?.top.credentials]
-  )
-  const credentialUsageSummaryQuery = useCredentialUsageSummary(topCredentialIds, {
-    enabled: activeSection === 'accounts' && topCredentialIds.length > 0,
-    refetchInterval: autoRefresh.refetchInterval,
-  })
 
   // 加载态
   if (windowsQuery.isLoading) {
@@ -1103,7 +1096,6 @@ export function OverviewPage() {
     writerStatsQuery.error ? `统计健康：${extractErrorMessage(writerStatsQuery.error)}` : '',
     seriesQuery.error ? `趋势：${extractErrorMessage(seriesQuery.error)}` : '',
     topQuery.error ? `排行：${extractErrorMessage(topQuery.error)}` : '',
-    credentialUsageSummaryQuery.error ? `账号质量：${extractErrorMessage(credentialUsageSummaryQuery.error)}` : '',
     breakdownQuery.error ? `分布：${extractErrorMessage(breakdownQuery.error)}` : '',
     accountBillingQuery.error ? `上游账号计费：${extractErrorMessage(accountBillingQuery.error)}` : '',
   ].filter(Boolean)
@@ -1181,7 +1173,7 @@ export function OverviewPage() {
         <TabsContent value="operations" className="space-y-3">
           <div className="grid gap-3 xl:grid-cols-2">
             <RealtimeUsagePanel summary={usageSummaryQuery.data} error={usageSummaryQuery.error} />
-            <CredentialPoolPanel />
+            <AccountPoolPanel />
           </div>
           <div className="grid gap-3 xl:grid-cols-[1.1fr_0.9fr]">
             <RunSignalsPanel
@@ -1286,8 +1278,8 @@ export function OverviewPage() {
           </div>
           <AccountQualityPanel
             credentials={top.credentials ?? []}
-            usageItems={credentialUsageSummaryQuery.data?.items ?? []}
-            loading={topQuery.isLoading || credentialUsageSummaryQuery.isLoading}
+            billingItems={accountBillingByAccount}
+            loading={topQuery.isLoading || accountBillingQuery.isLoading}
           />
         </TabsContent>
 

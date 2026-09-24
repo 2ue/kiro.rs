@@ -20,16 +20,16 @@ Status: `product-focused-pass / broader-release-gates-open / NO-GO`
 - 初始观测 Redis：`redis://127.0.0.1:50892/15`。
 - 修复后回归业务 Redis：`redis://127.0.0.1:26379/8`。
 - 修复后回归观测 Redis：`redis://127.0.0.1:50892/2`。
-- 本轮未启动 Docker，未探测或触碰 `127.0.0.1:9022`，未读取 `kiro_idc_users*.txt`。
+- 本轮未启动 Docker，未探测或触碰 `127.0.0.1:9022`，未读取 `account-runtime_idc_users*.txt`。
 
 ## 验证程序
 
 新增/使用的验证程序：
 
 - `feature/tests/run-redis-fault-domain-validation.mjs`：基础端点与 namespace 级验证，只证明两个 Redis endpoint、`run_id` 和 bounded cleanup 行为，不证明产品 `RedisStore`/scheduler/usage 路径。
-- `feature/tests/run-redis-fault-domain-product-validation.mjs`：产品级 runner，要求两个 Redis URL 和 `KIRO_RS_TEST_REDIS_ISOLATED=1`，启动两个自有 loopback proxy，通过 `feature/tests/run-cargo-scoped.sh` 运行 Rust exact test。
+- `feature/tests/run-redis-fault-domain-product-validation.mjs`：产品级 runner，要求两个 Redis URL 和 `ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1`，启动两个自有 loopback proxy，通过 `feature/tests/run-cargo-scoped.sh` 运行 Rust exact test。
 - `feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs`：纯 Node 合同测试，默认不连接 Redis、不运行 Cargo；显式 live Redis URL 时覆盖 HUP/INT/TERM 清理合同。
-- Rust exact test：`kiro::token_manager::manager::tests::redis_business_and_observability_fault_domains_are_independent_for_three_rounds`。
+- Rust exact test：`account-runtime::token_manager::manager::tests::redis_business_and_observability_fault_domains_are_independent_for_three_rounds`。
 
 产品 runner 固定保护：
 
@@ -39,7 +39,7 @@ Status: `product-focused-pass / broader-release-gates-open / NO-GO`
 - 不把 Redis URL 放到 wrapper argv。
 - 不调用 Docker。
 - 不探测 9022。
-- 强制 `KIRO_RS_REQUIRE_STORAGE_TESTS=1`，避免集成体 skip 被算作 pass。
+- 强制 `ACCOUNT_RUNTIME_REQUIRE_STORAGE_TESTS=1`，避免集成体 skip 被算作 pass。
 
 ## 执行结果
 
@@ -82,7 +82,7 @@ node --test feature/tests/run-redis-fault-domain-product-validation.contract.tes
 - `src/admin/service.rs` 的 Admin cache、余额 cache 和 usage cleanup 只从 `observability_redis_store` 取 Redis；cleanup 缺观测 Redis 时不回落业务 scheduler Redis。
 - `src/storage/redis_cache.rs` 明确保留 `RedisStoreRole::Business / Observability` 两条连接路径。
 - `src/storage/redis_cache.rs` 的 usage materialization 专用入口有 `ensure_observability_usage_store(...)` 生产 guard；覆盖 cleanup watermark、derived-cache invalidation、summary write/read、usage record snapshots、dashboard series/top 和 usage summary cleanup，不依赖调用方“传对 Redis”的约定。
-- `src/model/config.rs` 继续拒绝仅靠 DB 或 keyPrefix 的伪隔离，并保留 `KIRO_RS_OBSERVABILITY_REDIS_URL` / `KIRO_RS_OBSERVABILITY_REDIS_KEY_PREFIX` 环境覆盖。
+- `src/model/config.rs` 继续拒绝仅靠 DB 或 keyPrefix 的伪隔离，并保留 `ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_URL` / `ACCOUNT_RUNTIME_OBSERVABILITY_REDIS_KEY_PREFIX` 环境覆盖。
 
 补证过程中的两次红项均为新测试正则过宽或截取窗口过短，分别误把 `postgres_store.clone()`/`observability_redis_store` 识别成 `redis_store`、以及未截到 cleanup 注释；收窄断言后通过。没有发现产品代码把业务 Redis 注入 usage/Admin/cleanup。
 
@@ -92,14 +92,14 @@ node --test feature/tests/run-redis-fault-domain-product-validation.contract.tes
 
 ```bash
 node --test feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs
-feature/tests/run-cargo-scoped.sh redis-observability-role-guard-20260721 -- cargo +1.92.0 check --bin kiro-rs
+feature/tests/run-cargo-scoped.sh redis-observability-role-guard-20260721 -- cargo +1.92.0 check --bin account-runtime
 node --test feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs feature/tests/run-scheduler-redis-chaos-validation.contract.test.mjs
 ```
 
 结果：
 
 - fault-domain 合同：46 tests，37 passed，9 skipped，0 failed。
-- scoped `cargo +1.92.0 check --bin kiro-rs`：passed；wrapper cleanup `size_kib=446876 available_kib=74694132 removed=true reservation_released=true`。
+- scoped `cargo +1.92.0 check --bin account-runtime`：passed；wrapper cleanup `size_kib=446876 available_kib=74694132 removed=true reservation_released=true`。
 - scheduler chaos + fault-domain 合批：74 tests，53 passed，21 explicit live-fixture skips，0 failed。
 - scoped check 后 root `target/debug`/`target/flycheck0` 曾由外部 rustc/flycheck 重新出现约 709 MiB；`lsof +D target` 为空后只删除无引用可再生产物，复核 `node feature/tests/inventory-build-artifacts.mjs --gate` 为 `targets=0 reservations=0 target_processes=0 blockers=0`。
 
@@ -108,8 +108,8 @@ node --test feature/tests/run-redis-fault-domain-product-validation.contract.tes
 命令：
 
 ```bash
-KIRO_REDIS_FAULT_DOMAIN_CONTRACT_BUSINESS_URL=redis://127.0.0.1:26379/15 \
-KIRO_REDIS_FAULT_DOMAIN_CONTRACT_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_CONTRACT_BUSINESS_URL=redis://127.0.0.1:26379/15 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_CONTRACT_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
 node --test feature/tests/run-redis-fault-domain-product-validation.contract.test.mjs
 ```
 
@@ -124,7 +124,7 @@ node --test feature/tests/run-redis-fault-domain-product-validation.contract.tes
 命令：
 
 ```bash
-KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
 node feature/tests/run-redis-fault-domain-validation.mjs
 ```
 
@@ -144,11 +144,11 @@ node feature/tests/run-redis-fault-domain-validation.mjs
 初始命令：
 
 ```bash
-KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/15 \
-KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
-KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
-KIRO_REDIS_FAULT_DOMAIN_SCOPE=redis-fault-domain-product-r1 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/15 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE=redis-fault-domain-product-r1 \
 node feature/tests/run-redis-fault-domain-product-validation.mjs
 ```
 
@@ -169,11 +169,11 @@ node feature/tests/run-redis-fault-domain-product-validation.mjs
 命令：
 
 ```bash
-KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/15 \
-KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
-KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
-KIRO_REDIS_FAULT_DOMAIN_SCOPE=redis-fault-domain-product-r2 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/15 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/15 \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE=redis-fault-domain-product-r2 \
 node feature/tests/run-redis-fault-domain-product-validation.mjs
 ```
 
@@ -208,11 +208,11 @@ Redis response/type error 不应按 commit-unknown 处理之后，重跑产品�
 fault-domain runner：
 
 ```bash
-KIRO_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/8 \
-KIRO_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/2 \
-KIRO_RS_TEST_REDIS_ISOLATED=1 \
-KIRO_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
-KIRO_REDIS_FAULT_DOMAIN_SCOPE=redis-fault-domain-product-20260721-r4 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_BUSINESS_URL=redis://127.0.0.1:26379/8 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OBSERVABILITY_URL=redis://127.0.0.1:50892/2 \
+ACCOUNT_RUNTIME_TEST_REDIS_ISOLATED=1 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_OUTER_ROUNDS=3 \
+ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_SCOPE=redis-fault-domain-product-20260721-r4 \
 node feature/tests/run-redis-fault-domain-product-validation.mjs
 ```
 
@@ -271,7 +271,7 @@ rustup run 1.92.0 cargo check --all-targets
 - `cargo fmt --all -- --check` passed。
 - `git diff --check` passed。
 - `cargo test observability_redis`：4/4 passed，0 failed，0 ignored。
-- `cargo test redis_business_and_observability_fault_domains_are_independent_for_three_rounds -- --exact`：该 filter 在本地未设置 `KIRO_REDIS_FAULT_DOMAIN_*` URL 时只作为 compile coverage，显示 `0 tests`；真实动态执行由产品 runner 第 5 节承担。
+- `cargo test redis_business_and_observability_fault_domains_are_independent_for_three_rounds -- --exact`：该 filter 在本地未设置 `ACCOUNT_RUNTIME_REDIS_FAULT_DOMAIN_*` URL 时只作为 compile coverage，显示 `0 tests`；真实动态执行由产品 runner 第 5 节承担。
 - `cargo check --all-targets` passed。
 - cleanup：`validation-build-cleanup scope=redis-fault-domain-c0-r2 size_kib=2051072 available_kib=73541112 removed=true reservation_released=true`。
 
@@ -280,7 +280,7 @@ rustup run 1.92.0 cargo check --all-targets
 产品 runner 和 C0 子集结束后复核：
 
 - `find target -maxdepth 1 -type d -name '.validation-build-*'`：无输出。
-- `find .git/kiro-validation-build-state -maxdepth 2`：只有 `.git/kiro-validation-build-state`。
+- `find .git/account-runtime-validation-build-state -maxdepth 2`：只有 `.git/account-runtime-validation-build-state`。
 - scoped Cargo/rustc 进程：无。
 - 根 `target/` 约 `708-711 MiB`，不包含本轮 scoped target；当前根 target 受用户已有服务/编辑器相关产物影响，未清理。
 

@@ -218,7 +218,6 @@ pub struct CredentialUsageSummaryItem {
     pub estimated_cost_usd: f64,
     pub original_cost_usd: f64,
     pub upstream_metering_units: f64,
-    pub kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
 }
@@ -279,7 +278,6 @@ pub struct CredentialListItem {
     pub api_region: Option<String>,
     pub effective_auth_region: String,
     pub effective_api_region: String,
-    pub has_profile_arn: bool,
     pub refresh_token_hash: Option<String>,
     pub api_key_hash: Option<String>,
     pub masked_api_key: Option<String>,
@@ -379,8 +377,6 @@ pub struct CredentialStatusItem {
     pub effective_auth_region: String,
     /// 实际生效的 API Region。
     pub effective_api_region: String,
-    /// 是否有 Profile ARN
-    pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
     /// API Key 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
@@ -497,8 +493,6 @@ pub struct CredentialStatusItem {
     pub estimated_cost_usd: f64,
     /// 上游 meteringEvent 累计上报的计量单位，仅用于和上游核对。
     pub upstream_metering_units: f64,
-    /// 旧版兼容字段，镜像 `upstream_metering_units`。
-    pub kiro_metering_usage: f64,
     /// 有价格表命中的请求数。
     pub priced_requests: usize,
     /// 无价格表命中的请求数。
@@ -663,12 +657,7 @@ pub struct UpdateCredentialAuthRequest {
     pub issuer_url: Option<String>,
     #[serde(default, alias = "scope")]
     pub scopes: Option<String>,
-    #[serde(
-        default,
-        alias = "kiroApiKey",
-        alias = "kiro_api_key",
-        alias = "api_key"
-    )]
+    #[serde(default, alias = "api_key")]
     pub api_key: Option<String>,
     #[serde(default)]
     pub region: Option<String>,
@@ -848,10 +837,6 @@ pub struct AddCredentialRequest {
     #[serde(alias = "scope")]
     pub scopes: Option<String>,
 
-    /// Profile ARN（IdC 凭据可选，用于 Amazon Q / CodeWhisperer profile）
-    #[serde(alias = "profile_arn")]
-    pub profile_arn: Option<String>,
-
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
@@ -928,12 +913,7 @@ pub struct AddCredentialRequest {
 
     /// 上游 API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
-    #[serde(
-        default,
-        alias = "kiroApiKey",
-        alias = "kiro_api_key",
-        alias = "api_key"
-    )]
+    #[serde(default, alias = "api_key")]
     pub api_key: Option<String>,
 
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
@@ -1932,13 +1912,13 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_max_cooldown_secs: u64,
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
-    #[serde(default, alias = "kiroUpstreamResponseTimeoutSecs")]
+    #[serde(default)]
     pub local_upstream_response_timeout_secs: Option<u64>,
-    #[serde(default, alias = "kiroUpstreamStreamIdleTimeoutSecs")]
+    #[serde(default)]
     pub local_upstream_stream_idle_timeout_secs: Option<u64>,
-    #[serde(default, alias = "kiroUpstreamStreamRetryEnabled")]
+    #[serde(default)]
     pub local_upstream_stream_retry_enabled: Option<bool>,
-    #[serde(default, alias = "kiroUpstreamStreamRetryMaxAttempts")]
+    #[serde(default)]
     pub local_upstream_stream_retry_max_attempts: Option<u32>,
     #[serde(default)]
     pub inference_upstream_max_attempts: Option<u32>,
@@ -1950,11 +1930,11 @@ pub struct UpdateRuntimeConfigRequest {
     pub token_refresh_max_rpm: Option<u32>,
     #[serde(default)]
     pub token_refresh_burst: Option<u32>,
-    #[serde(default, alias = "kiroUpstreamStreamRetryOnIdleTimeout")]
+    #[serde(default)]
     pub local_upstream_stream_retry_on_idle_timeout: Option<bool>,
-    #[serde(default, alias = "kiroUpstreamStreamRetryOnReadError")]
+    #[serde(default)]
     pub local_upstream_stream_retry_on_read_error: Option<bool>,
-    #[serde(default, alias = "kiroUpstreamStreamRetryOnStatusError")]
+    #[serde(default)]
     pub local_upstream_stream_retry_on_status_error: Option<bool>,
     #[serde(default)]
     pub credential_retry_max_attempts: Option<u32>,
@@ -2020,11 +2000,11 @@ pub struct UpdateRuntimeConfigRequest {
     pub payload_guard_trim_history: Option<bool>,
     #[serde(default)]
     pub payload_guard_external_enabled: Option<bool>,
-    #[serde(default, alias = "kiroCachePointEnabled")]
+    #[serde(default)]
     pub local_upstream_cache_point_enabled: Option<bool>,
-    #[serde(default, alias = "kiroCachePointToolsOnly")]
+    #[serde(default)]
     pub local_upstream_cache_point_tools_only: Option<bool>,
-    #[serde(default, alias = "kiroCachePointRecordPlan")]
+    #[serde(default)]
     pub local_upstream_cache_point_record_plan: Option<bool>,
     #[serde(default)]
     pub payload_shaping: Option<PayloadShapingConfigPatch>,
@@ -2064,7 +2044,7 @@ pub struct UpdateRuntimeConfigRequest {
     pub high_cache_threshold: Option<i32>,
     #[serde(default)]
     pub compat_profile: Option<CompatProfile>,
-    #[serde(default, alias = "kiroAgentModeStrategy")]
+    #[serde(default)]
     pub local_upstream_agent_mode_strategy: Option<LocalUpstreamAgentModeStrategy>,
     #[serde(default)]
     pub model_resolution_mode: Option<ModelResolutionMode>,
@@ -2295,8 +2275,7 @@ mod tests {
             "client_secret": "fake-client-secret",
             "token_endpoint": "https://login.example.com/oauth2/v2.0/token",
             "issuer_url": "https://login.example.com/tenant/v2.0",
-            "scopes": "offline_access codewhisperer:conversations",
-            "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
+            "scopes": "offline_access account-runtime:conversations",
             "region": "us-east-1",
             "auth_region": "us-west-2",
             "api_region": "eu-west-1",
@@ -2322,11 +2301,7 @@ mod tests {
         );
         assert_eq!(
             req.scopes.as_deref(),
-            Some("offline_access codewhisperer:conversations")
-        );
-        assert_eq!(
-            req.profile_arn.as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+            Some("offline_access account-runtime:conversations")
         );
         assert_eq!(req.region.as_deref(), Some("us-east-1"));
         assert_eq!(req.auth_region.as_deref(), Some("us-west-2"));
@@ -2347,8 +2322,7 @@ mod tests {
             "clientSecret": "fake-client-secret",
             "tokenEndpoint": "https://login.example.com/oauth2/v2.0/token",
             "issuerUrl": "https://login.example.com/tenant/v2.0",
-            "scopes": "offline_access codewhisperer:completions",
-            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
+            "scopes": "offline_access account-runtime:completions",
             "region": "us-east-1",
             "authRegion": "us-west-2",
             "apiRegion": "eu-west-1",
@@ -2374,11 +2348,7 @@ mod tests {
         );
         assert_eq!(
             req.scopes.as_deref(),
-            Some("offline_access codewhisperer:completions")
-        );
-        assert_eq!(
-            req.profile_arn.as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+            Some("offline_access account-runtime:completions")
         );
         assert_eq!(req.region.as_deref(), Some("us-east-1"));
         assert_eq!(req.auth_region.as_deref(), Some("us-west-2"));
@@ -2422,18 +2392,18 @@ mod tests {
     }
 
     #[test]
-    fn credential_auth_requests_accept_api_key_primary_and_legacy_aliases() {
+    fn credential_auth_requests_accept_current_api_key_fields() {
         let add_primary: AddCredentialRequest = serde_json::from_value(serde_json::json!({
             "apiKey": "ksk_primary"
         }))
         .unwrap();
         assert_eq!(add_primary.api_key.as_deref(), Some("ksk_primary"));
 
-        let add_legacy: AddCredentialRequest = serde_json::from_value(serde_json::json!({
-            "kiroApiKey": "ksk_legacy"
+        let add_snake_case: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "api_key": "ksk_snake_case"
         }))
         .unwrap();
-        assert_eq!(add_legacy.api_key.as_deref(), Some("ksk_legacy"));
+        assert_eq!(add_snake_case.api_key.as_deref(), Some("ksk_snake_case"));
 
         let update_primary: UpdateCredentialAuthRequest =
             serde_json::from_value(serde_json::json!({
@@ -2445,12 +2415,15 @@ mod tests {
             Some("ksk_update_primary")
         );
 
-        let update_legacy: UpdateCredentialAuthRequest =
+        let update_snake_case: UpdateCredentialAuthRequest =
             serde_json::from_value(serde_json::json!({
-                "kiroApiKey": "ksk_update_legacy"
+                "api_key": "ksk_update_snake_case"
             }))
             .unwrap();
-        assert_eq!(update_legacy.api_key.as_deref(), Some("ksk_update_legacy"));
+        assert_eq!(
+            update_snake_case.api_key.as_deref(),
+            Some("ksk_update_snake_case")
+        );
     }
 
     #[test]
@@ -2573,24 +2546,24 @@ mod tests {
     }
 
     #[test]
-    fn update_runtime_config_accepts_legacy_local_upstream_field_aliases() {
+    fn update_runtime_config_accepts_current_local_upstream_field_names() {
         let req: UpdateRuntimeConfigRequest = serde_json::from_value(serde_json::json!({
             "credentialRpm": 0,
             "credentialTransientCooldownSecs": 10,
             "credentialMaxCooldownSecs": 300,
             "credentialWarmupRequests": 3,
             "compressionEnabled": false,
-            "kiroUpstreamResponseTimeoutSecs": 41,
-            "kiroUpstreamStreamIdleTimeoutSecs": 42,
-            "kiroUpstreamStreamRetryEnabled": false,
-            "kiroUpstreamStreamRetryMaxAttempts": 4,
-            "kiroUpstreamStreamRetryOnIdleTimeout": false,
-            "kiroUpstreamStreamRetryOnReadError": false,
-            "kiroUpstreamStreamRetryOnStatusError": false,
-            "kiroCachePointEnabled": true,
-            "kiroCachePointToolsOnly": false,
-            "kiroCachePointRecordPlan": false,
-            "kiroAgentModeStrategy": "spec"
+            "localUpstreamResponseTimeoutSecs": 41,
+            "localUpstreamStreamIdleTimeoutSecs": 42,
+            "localUpstreamStreamRetryEnabled": false,
+            "localUpstreamStreamRetryMaxAttempts": 4,
+            "localUpstreamStreamRetryOnIdleTimeout": false,
+            "localUpstreamStreamRetryOnReadError": false,
+            "localUpstreamStreamRetryOnStatusError": false,
+            "localUpstreamCachePointEnabled": true,
+            "localUpstreamCachePointToolsOnly": false,
+            "localUpstreamCachePointRecordPlan": false,
+            "localUpstreamAgentModeStrategy": "spec"
         }))
         .unwrap();
 
@@ -2636,8 +2609,7 @@ mod tests {
             "refreshToken": "fake-refresh-token",
             "accessToken": "fake-access-token",
             "clientId": "fake-client-id",
-            "clientSecret": "fake-client-secret",
-            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE"
+            "clientSecret": "fake-client-secret"
         });
 
         let req: AddCredentialRequest = serde_json::from_value(json).unwrap();

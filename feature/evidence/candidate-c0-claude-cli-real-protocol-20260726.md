@@ -2,7 +2,7 @@
 
 ## Scope
 
-This evidence validates the current release candidate with the real Claude Code CLI binary, using fake local Kiro upstreams so the protocol behavior can be tested without consuming production accounts.
+This evidence validates the current release candidate with the real Claude Code CLI binary, using fake local Account Runtime upstreams so the protocol behavior can be tested without consuming production accounts.
 
 Covered user-reported failure classes:
 
@@ -10,13 +10,13 @@ Covered user-reported failure classes:
 - multi-turn Claude Code CLI continuation with repeated tool_use/tool_result pairing;
 - `thinking.disabled` / `output_config` compatibility;
 - thinking effort propagation for `absent`, `low`, `medium`, `high`, `xhigh`, and `max`;
-- CLI and IDE Kiro upstream wire-body shape;
+- CLI and IDE Account Runtime upstream wire-body shape;
 - cleanup of temporary services, Redis prefixes, ports, and caller-owned PostgreSQL databases.
 
 ## Candidate
 
 - Product binary SHA-256: `7268b3e722f03a40179d205e7b5917b86d696cd8bf1d5f6533d3b1347ea30bec`
-- Product binary path during validation: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-cli-candidate.c0-20260726035013.8MWRn4/kiro-rs`
+- Product binary path during validation: `/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-cli-candidate.c0-20260726035013.8MWRn4/account-runtime`
 - Claude Code CLI version: `2.1.197`
 - Claude executable used for the final thinking-wire gate: package binary `.../@anthropic-ai/claude-code/bin/claude.exe`, not the Volta shim.
 
@@ -24,8 +24,8 @@ The first full-suite attempt used the Volta shim path and failed only at the thi
 
 ## Local services
 
-- PostgreSQL: local Docker container `kiro-rs-postgres-local`, port `25432`.
-- Redis: local Docker container `kiro-rs-redis-local`, port `26379`.
+- PostgreSQL: local Docker container `account-runtime-postgres-local`, port `25432`.
+- Redis: local Docker container `account-runtime-redis-local`, port `26379`.
 - Test databases were caller-owned and dropped after each run.
 - Redis test prefixes were runner-owned and removed.
 - Port `9022` was not touched; the tests used isolated temporary service ports.
@@ -144,7 +144,7 @@ Purpose:
 - use the existing local Docker PostgreSQL/Redis test containers;
 - create and drop caller-owned databases for the CLI validation scripts;
 - provide a Docker-backed `psql` wrapper only for local validation when host `psql` is unavailable;
-- allow `KIRO_CLI_SUITE_ONLY=bare|long|thinking|all` for targeted reruns;
+- allow `ACCOUNT_RUNTIME_CLI_SUITE_ONLY=bare|long|thinking|all` for targeted reruns;
 - avoid touching the user's active `9022` service.
 
 ## Cleanup status

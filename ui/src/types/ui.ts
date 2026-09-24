@@ -9,7 +9,6 @@ import {
   SlidersHorizontal,
   Boxes as ModelsIcon,
   ShieldCheck,
-  FileCheck2,
   Gauge,
 } from 'lucide-react'
 
@@ -21,8 +20,6 @@ export type DomainKey = 'overview' | 'resources' | 'analytics' | 'settings'
 /** 页面 key(二级,或单页域本身) */
 export type PageKey =
   | 'overview'
-  | 'credentials'
-  | 'validation'
   | 'external'
   | 'proxies'
   | 'usage'
@@ -52,7 +49,7 @@ export interface NavDomain {
 
 export const navDomains: NavDomain[] = [
   { key: 'overview', label: '总览', icon: LayoutDashboard, path: 'overview' },
-  { key: 'resources', label: '资源', icon: Server, path: 'credentials' },
+  { key: 'resources', label: '资源', icon: Server, path: 'accounts' },
   { key: 'analytics', label: '分析', icon: BarChart3, path: 'usage' },
   { key: 'settings', label: '设置', icon: SlidersHorizontal, path: 'runtime' },
 ]
@@ -62,9 +59,7 @@ export const navPages: NavPage[] = [
   { key: 'overview', path: 'overview', label: '总览', description: '实时健康与关键指标', icon: LayoutDashboard, domain: 'overview' },
 
   // 资源域
-  { key: 'credentials', path: 'credentials', label: '账号', description: '本地账号池:筛选、批量、导入、校验', icon: Server, domain: 'resources' },
-  { key: 'validation', path: 'validation', label: '校验', description: '账号可用性与订阅校验', icon: FileCheck2, domain: 'resources' },
-  { key: 'external', path: 'accounts', label: '上游账号', description: '上游账号调度与计费', icon: Boxes, domain: 'resources' },
+  { key: 'external', path: 'accounts', label: '账号管理', description: 'Claude Code 兼容账号调度与 usage 整形', icon: Boxes, domain: 'resources' },
   { key: 'proxies', path: 'proxies', label: '代理', description: '网络代理资源', icon: Network, domain: 'resources' },
 
   // 分析域
@@ -84,9 +79,7 @@ export function pagesOfDomain(domain: DomainKey): NavPage[] {
 
 export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   overview: { title: '总览', subtitle: '实时健康状态与关键指标一览' },
-  credentials: { title: '账号', subtitle: '维护本地账号池,保持调度稳定' },
-  validation: { title: '校验', subtitle: '账号可用性、订阅与用量校验' },
-  external: { title: '上游账号', subtitle: '管理上游账号调度与计费拆分' },
+  external: { title: '账号管理', subtitle: '管理 Claude Code 兼容账号调度与 usage 整形' },
   proxies: { title: '代理', subtitle: '维护网络代理资源与连通状态' },
   usage: { title: '用量', subtitle: '请求趋势、Top 维度与明细记录' },
   accountRisk: { title: '账号风控', subtitle: '检查上游账号缓存分布与成本风险' },

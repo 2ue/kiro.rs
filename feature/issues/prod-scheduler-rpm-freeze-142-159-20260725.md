@@ -88,9 +88,9 @@ routeSubtype=local_error_no_fallback
   - `fallbackOnSchedulerRedisDegraded=false`
   - `localPoolCircuitEnabled=false`
 - Redis slowlog 仍显示 usage 统计高基数操作：
-  - `DEL kiro_rs:59137:usage:records:index`
-  - 大批量 `DEL kiro_rs:59137:usage:summary:top:conversation:*`
-  - `HMGET kiro_rs:59137:usage:summary:cache_read` 带数万参数
+  - `DEL account_runtime:59137:usage:records:index`
+  - 大批量 `DEL account_runtime:59137:usage:summary:top:conversation:*`
+  - `HMGET account_runtime:59137:usage:summary:cache_read` 带数万参数
 
 这说明 `.159` 当前没卡死只是暂时没踩中热点；代码/配置仍可复发。
 
@@ -183,7 +183,7 @@ Redis 调度协调状态不可用
 
 - 并发低：因为每个请求很快失败释放。
 - RPM 高：因为失败路径每秒能处理很多次快速失败。
-- 上游 RPM 低：因为大多数请求在本地失败，没真正发到 Kiro。
+- 上游 RPM 低：因为大多数请求在本地失败，没真正发到 Account Runtime。
 - 前端慢：同一时间 usage/dashboard 统计、错误写入、Redis/PG 统计聚合被大量错误记录放大。
 
 因此这不是全局并发限制失效，而是缺少“失败后按下游 API key / 本地账号池状态做 admission backoff”的设计缺口。
@@ -268,7 +268,7 @@ cargo test local_temporary_backoff
 
 ### 3. local pool risk circuit
 
-HEAD 在 `src/kiro/token_manager/manager.rs` 增加本地账号池风险 circuit：
+HEAD 在 `src/local_upstream_impl/token_manager/manager.rs` 增加本地账号池风险 circuit：
 
 - `localPoolCircuitEnabled`
 - 窗口默认 60 秒
@@ -335,14 +335,14 @@ merge-base：
 - usage status/error_type；
 - cooldown/risk circuit 语义。
 
-## Kiro social / personal / Gmail 链路差异
+## Account Runtime social / personal / Gmail 链路差异
 
 ### endpoint 选择
 
-- `v0.0.100`：没有 `KIRO_API_KEY_DEFAULT_ENDPOINT=cli`。
+- `v0.0.100`：没有 `ACCOUNT_RUNTIME_API_KEY_DEFAULT_ENDPOINT=cli`。
 - `v0.0.110` / `v0.0.113`：API key/headless 凭据默认 endpoint 为 `cli`。
 - social/OAuth/Gmail 个人账号如果 credential 没有显式 `endpoint`，仍使用 `Config.defaultEndpoint`，默认 `ide`。
-- 当前 `KiroProvider::endpoint_for` 逻辑仍是：
+- 当前 `Account RuntimeProvider::endpoint_for` 逻辑仍是：
 
 ```text
 credentials.endpoint.unwrap_or(config.defaultEndpoint)
@@ -355,11 +355,11 @@ credentials.endpoint.unwrap_or(config.defaultEndpoint)
 `v0.0.110` / `v0.0.113`：
 
 - CLI endpoint：
-  - URL：`https://runtime.{region}.kiro.dev/`
+  - URL：`https://runtime.{region}.account-runtime.dev/`
   - `content-type: application/x-amz-json-1.0`
   - `x-amz-target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
-  - `host: runtime.{region}.kiro.dev`
-  - body 重写 `origin=KIRO_CLI`
+  - `host: runtime.{region}.account-runtime.dev`
+  - body 重写 `origin=ACCOUNT_RUNTIME_CLI`
   - 会删除 `additionalModelRequestFields.thinking`
 
 `v0.0.114` / HEAD：
@@ -377,7 +377,7 @@ IDE endpoint 当前：
 - URL：`https://q.{region}.amazonaws.com/generateAssistantResponse`
 - `content-type: application/json`
 - `x-amzn-codewhisperer-optout: true`
-- `x-amzn-kiro-agent-mode` 由 `resolve_agent_mode` 决定
+- `x-amzn-account-runtime-agent-mode` 由 `resolve_agent_mode` 决定
 - body 只注入 `profileArn`，不主动注入 `thinking`，不主动裁剪 `output_config.effort`
 
 HEAD 中已有测试覆盖：
@@ -415,7 +415,7 @@ content_type=json reason=api_protocol_error
 
 ### 本地/测试环境复现调度放大
 
-1. 启动一套隔离 Postgres/Redis 和 kiro.rs。
+1. 启动一套隔离 Postgres/Redis 和 account-runtime。
 2. 配置：
    - credential pool 多账号；
    - `requestAdmission` 关闭或设置很高；
@@ -532,12 +532,12 @@ tmp/prod-evidence/20260725-023209-current-142-159/raw/current/
 
 修改范围：
 
-- `src/kiro/token_manager/manager.rs`
+- `src/local_upstream_impl/token_manager/manager.rs`
   - 新增 `local_pool_route_state_cached(model)`。
   - 该方法只使用本地内存快照，不做 scheduler Redis read/probe。
   - 保留 TooManyFailures 自动自愈，避免 fast-fail 让可自愈账号池永久停住。
-- `src/kiro/provider.rs`
-  - 暴露 `KiroProvider::local_pool_route_state_cached`。
+- `src/local_upstream_impl/provider.rs`
+  - 暴露 `Account RuntimeProvider::local_pool_route_state_cached`。
 - `src/anthropic/handlers/request_entry.rs`
   - 在 raw external direct/preflight 尝试之后、完整 typed parse 之前执行本地池 fast-fail。
   - 仅当外部池全局未启用或 manager 不存在时生效；如果存在外部池接管可能，仍让 normalized external fallback 正常工作。
@@ -598,7 +598,7 @@ RUSTUP_TOOLCHAIN=1.92.0 feature/tests/run-cargo-scoped.sh fastfail-focused -- \
 
 ## 2026-07-25 04:54 +08 当前态复核
 
-本轮按 `kiro-prod-evidence-audit` 只读流程重新连接两台机器，证据目录：
+本轮按 `account-runtime-prod-evidence-audit` 只读流程重新连接两台机器，证据目录：
 
 ```text
 tmp/prod-evidence/20260725-044228-rpm-slow-142-159
@@ -613,7 +613,7 @@ tmp/prod-evidence/20260725-044228-rpm-slow-142-159
 ```text
 version=0.0.113
 revision=36b65ce509809120ba53bb46c6b536e3658a6129
-compose=/root/docker-compose/kiro-rs-2ue-59137
+compose=/root/docker-compose/account-runtime-2ue-59137
 port=59137
 ```
 
@@ -674,7 +674,7 @@ disabled_reason TemporarilySuspended=15
 ```text
 version=0.0.114
 revision=18b286efa47759b95b581f76a465a2bd9cb02983
-compose=/root/docker-compose/kiro-rs
+compose=/root/docker-compose/account-runtime
 port=40182
 ```
 

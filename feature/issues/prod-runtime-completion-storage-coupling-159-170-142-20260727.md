@@ -136,7 +136,7 @@ Current validation summary:
 159：
 
 - app 版本：0.0.120
-- app image：`ghcr.io/2ue/kiro-rs:latest`
+- app image：`ghcr.io/2ue/account-runtime:latest`
 - Redis：`redis:8-alpine`
 - PgSQL：`postgres:18-alpine`
 - 当前探针：
@@ -147,7 +147,7 @@ Current validation summary:
 170：
 
 - app 版本：0.0.120
-- app image：`ghcr.io/2ue/kiro-rs:latest`
+- app image：`ghcr.io/2ue/account-runtime:latest`
 - Redis：`redis:8-alpine`
 - PgSQL：`postgres:18-alpine`
 - 当前探针：
@@ -240,10 +240,10 @@ Current validation summary:
 
 当前源码已存在以下改动：
 
-- `src/kiro/provider.rs`
-  - `KiroApiCompletion::report_success`
-  - `KiroStreamCompletion::report_success`
-- `src/kiro/token_manager/manager.rs`
+- `src/local_upstream_impl/provider.rs`
+  - `Account RuntimeApiCompletion::report_success`
+  - `Account RuntimeStreamCompletion::report_success`
+- `src/local_upstream_impl/token_manager/manager.rs`
   - `report_success_with_latency_deferred`
   - `report_success_for_session_with_latency_deferred`
   - `record_scheduler_success_health`
@@ -265,7 +265,7 @@ stream/API EOF or body parsed OK
 
 0.0.120 之前仍存在这些同步等待点：
 
-- `src/kiro/token_manager/manager.rs`
+- `src/local_upstream_impl/token_manager/manager.rs`
   - `block_on_storage`
   - `block_on_credential_pgsql`
   - `block_on_scheduler_redis_affinity`
@@ -379,7 +379,7 @@ block_on_credential_pgsql("原子记录 PgSQL 凭据 API 失败", ...)
 
 步骤：
 
-1. 构造本地 fake Kiro upstream，持续返回长流 EventStream。
+1. 构造本地 fake Account Runtime upstream，持续返回长流 EventStream。
 2. 配置 10–20 个本地凭据，每账号并发 5–20，入口 admission 关闭或较大。
 3. 发起 100–500 个长流请求，请求持续 60–300s。
 4. 在流集中结束阶段注入 PgSQL 慢写或 Redis 慢命令。

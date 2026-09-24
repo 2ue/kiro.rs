@@ -17,8 +17,8 @@ pub const SEED_SOURCE: &str = "upstream-model-seed";
 pub const UPSTREAM_CATALOG_SOURCE: &str = "upstream-account-model-catalog";
 pub const MANUAL_SOURCE: &str = "manual";
 pub const REASONING_CAPABILITY_CONTRACT_VERSION: u32 = 1;
-const LEGACY_SEED_SOURCE: &str = "kiro-upstream-seed";
-const LEGACY_KIRO_CATALOG_SOURCE: &str = "kiro-list-available-models";
+const LEGACY_UPSTREAM_SEED_SOURCE: &str = "legacy-upstream-seed";
+const LEGACY_UPSTREAM_CATALOG_SOURCE: &str = "legacy-list-available-models";
 const SEED_JSON: &str = include_str!("../../data/upstream-models.seed.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1104,15 +1104,15 @@ fn is_authoritative_upstream_source(source: Option<&str>) -> bool {
     source.is_some_and(|source| {
         let source = source.trim();
         source.eq_ignore_ascii_case(UPSTREAM_CATALOG_SOURCE)
-            || source.eq_ignore_ascii_case(LEGACY_KIRO_CATALOG_SOURCE)
+            || source.eq_ignore_ascii_case(LEGACY_UPSTREAM_CATALOG_SOURCE)
     })
 }
 
 fn normalize_capability_source(source: &str) -> String {
     let source = source.trim();
-    if source.eq_ignore_ascii_case(LEGACY_KIRO_CATALOG_SOURCE) {
+    if source.eq_ignore_ascii_case(LEGACY_UPSTREAM_CATALOG_SOURCE) {
         UPSTREAM_CATALOG_SOURCE.to_string()
-    } else if source.eq_ignore_ascii_case(LEGACY_SEED_SOURCE) {
+    } else if source.eq_ignore_ascii_case(LEGACY_UPSTREAM_SEED_SOURCE) {
         SEED_SOURCE.to_string()
     } else {
         source.to_string()
@@ -3076,7 +3076,7 @@ mod tests {
         let catalog = ModelCapabilitiesCatalog::new();
         catalog.load_persisted_status(ModelCapabilitiesStatus {
             available: true,
-            source: LEGACY_KIRO_CATALOG_SOURCE.to_string(),
+            source: LEGACY_UPSTREAM_CATALOG_SOURCE.to_string(),
             model_count: 1,
             last_synced_at: Some("2026-08-15T00:00:00Z".to_string()),
             last_error: None,
@@ -3088,7 +3088,7 @@ mod tests {
                 max_output_tokens: Some(128_000),
                 supports_prompt_caching: Some(true),
                 supported_input_types: vec!["TEXT".to_string()],
-                source: Some(LEGACY_KIRO_CATALOG_SOURCE.to_string()),
+                source: Some(LEGACY_UPSTREAM_CATALOG_SOURCE.to_string()),
             }],
             reasoning_fields: BTreeMap::new(),
             reasoning_capability_cohort_keys: Vec::new(),

@@ -162,7 +162,7 @@ Technical authority area: CI, loadtest, benchmark evidence
 
 ### Evidence
 
-- `src/bin/kiro_loadtest.rs` supports substantial fake-upstream load and chaos scenarios.
+- `src/bin/account_runtime_loadtest.rs` supports substantial fake-upstream load and chaos scenarios.
 - There is no `benches/` Criterion/Divan suite or checked performance threshold.
 - Historical load artifacts live mainly under ignored `target/loadtest`, so raw data is not durable.
 
@@ -211,12 +211,12 @@ Technical authority area: performance harness, metric validity, load/chaos evide
 
 ### Evidence
 
-- `--target-pid` is optional, and the default target is `std::process::id()`, which is the `kiro_loadtest` process rather than the proxy: `src/bin/kiro_loadtest.rs:88`, `335`.
-- Required RSS, FD, and CPU samples use `unwrap_or_default()`, so a missing/failed `ps`, `/proc`, or `lsof` measurement becomes numeric zero rather than an invalid run: `src/bin/kiro_loadtest.rs:1277-1282`.
-- When `execute_request` returns an error, the recorded request latency is `run_started.elapsed()` for the whole run instead of that request's elapsed time: `src/bin/kiro_loadtest.rs:410-426`.
-- A failed `JoinSet` task is logged but no `RequestResult` is appended, so launched work can disappear from completed/error counts: `src/bin/kiro_loadtest.rs:428-430`.
-- The resource sampler is aborted and `resource_end` is captured immediately after requests join; no idle cooldown proves that RSS/FD/tasks/connections return within a recovery band/deadline: `src/bin/kiro_loadtest.rs:434-436`.
-- Empty percentile populations are emitted as zero and the report does not record per-metric sample counts: `src/bin/kiro_loadtest.rs:218-223`, `1256-1265`.
+- `--target-pid` is optional, and the default target is `std::process::id()`, which is the `account_runtime_loadtest` process rather than the proxy: `src/bin/account_runtime_loadtest.rs:88`, `335`.
+- Required RSS, FD, and CPU samples use `unwrap_or_default()`, so a missing/failed `ps`, `/proc`, or `lsof` measurement becomes numeric zero rather than an invalid run: `src/bin/account_runtime_loadtest.rs:1277-1282`.
+- When `execute_request` returns an error, the recorded request latency is `run_started.elapsed()` for the whole run instead of that request's elapsed time: `src/bin/account_runtime_loadtest.rs:410-426`.
+- A failed `JoinSet` task is logged but no `RequestResult` is appended, so launched work can disappear from completed/error counts: `src/bin/account_runtime_loadtest.rs:428-430`.
+- The resource sampler is aborted and `resource_end` is captured immediately after requests join; no idle cooldown proves that RSS/FD/tasks/connections return within a recovery band/deadline: `src/bin/account_runtime_loadtest.rs:434-436`.
+- Empty percentile populations are emitted as zero and the report does not record per-metric sample counts: `src/bin/account_runtime_loadtest.rs:218-223`, `1256-1265`.
 
 ### Impact
 

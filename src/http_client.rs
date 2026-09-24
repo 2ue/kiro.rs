@@ -330,6 +330,7 @@ pub async fn send_with_response_header_timeout(
 ///
 /// Callers that account real HTTP sends can build first, then reserve their send budget, and
 /// finally execute here. A request-builder failure therefore cannot consume a send attempt.
+#[allow(dead_code)]
 pub async fn execute_with_response_header_timeout(
     client: &Client,
     request: Request,

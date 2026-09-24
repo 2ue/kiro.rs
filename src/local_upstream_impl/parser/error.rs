@@ -1,4 +1,4 @@
-//! AWS Event Stream 解析错误定义
+//! Binary event stream 解析错误定义
 
 use std::fmt;
 

@@ -153,7 +153,7 @@ async function runSignalCase(signal, expectedExitCode, round) {
     cwd: ROOT,
     env: {
       ...process.env,
-      KIRO_THINKING_CAPTURE_ROUNDS: '5',
+      ACCOUNT_RUNTIME_THINKING_CAPTURE_ROUNDS: '5',
     },
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],

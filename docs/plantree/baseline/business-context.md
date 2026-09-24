@@ -9,14 +9,14 @@ Related: [System context](system-context.md), [Runtime flows](runtime-flows.md),
 
 ## Product Definition
 
-`kiro-rs` is a self-hosted, single-operator compatibility gateway. It accepts Anthropic Messages API traffic from clients such as Claude Code CLI and Anthropic-compatible SDKs, translates eligible requests to Kiro upstream protocols, and can route selected traffic to configured external Anthropic-compatible pools.
+`account-runtime` is a self-hosted, single-operator compatibility gateway. It accepts Anthropic Messages API traffic from clients such as Claude Code CLI and Anthropic-compatible SDKs, translates eligible requests to Account Runtime upstream protocols, and can route selected traffic to configured external Anthropic-compatible pools.
 
 The product is not only a format converter. Its business responsibilities include:
 
 - preserving client-visible Anthropic and Claude Code protocol behavior;
-- managing multiple Kiro credentials owned by one operator;
+- managing multiple Account Runtime credentials owned by one operator;
 - selecting healthy capacity, refreshing tokens, applying retry and cooldown policy, and maintaining session affinity;
-- translating requests and responses between Anthropic, Claude Code, Kiro IDE/CLI, and external-compatible protocols;
+- translating requests and responses between Anthropic, Claude Code, Account Runtime IDE/CLI, and external-compatible protocols;
 - applying route-specific cache and reported-usage policy;
 - collecting operational usage, cost, latency, error, and audit data;
 - exposing an Admin API and two maintained Admin user interfaces;
@@ -26,17 +26,17 @@ The current public description and startup contract are in `README.md`. The exec
 
 ## Business Problem
 
-The gateway allows one operator to use Kiro-backed and external-backed model capacity through Anthropic-compatible clients without requiring those clients to understand:
+The gateway allows one operator to use Account Runtime-backed and external-backed model capacity through Anthropic-compatible clients without requiring those clients to understand:
 
-- Kiro authentication and token refresh;
-- Kiro IDE versus CLI request envelopes;
+- Account Runtime authentication and token refresh;
+- Account Runtime IDE versus CLI request envelopes;
 - credential health, cooldown, RPM, concurrency, and priority;
 - upstream model aliases and capability differences;
 - local versus external routing and failover;
 - cache simulation and route-specific usage projection;
 - usage persistence and operational diagnostics.
 
-The gateway therefore owns correctness at both boundaries: downstream Anthropic compatibility and upstream Kiro/external compatibility.
+The gateway therefore owns correctness at both boundaries: downstream Anthropic compatibility and upstream Account Runtime/external compatibility.
 
 ## Trust And Deployment Model
 
@@ -45,7 +45,7 @@ The gateway therefore owns correctness at both boundaries: downstream Anthropic 
 The supported product model has one owner/operator and no tenant or per-user data-isolation boundary.
 
 - Multiple request API keys are access credentials for the same operator-owned service. They are not tenant identifiers.
-- Multiple Kiro credentials and external pools are capacity resources owned by the same operator. They are not user accounts in the product-domain sense.
+- Multiple Account Runtime credentials and external pools are capacity resources owned by the same operator. They are not user accounts in the product-domain sense.
 - The Admin key grants a higher-privilege management surface, but Admin and request clients still belong to the same operator trust domain.
 - Files uploaded through the Anthropic Files-compatible API are not partitioned by user or tenant.
 
@@ -60,7 +60,7 @@ The service can be launched as one process or multiple replicas, and the current
 Single-user operation does not eliminate security boundaries:
 
 - downstream clients send untrusted request bodies and URLs;
-- Kiro and external pools are remote systems with independent failure behavior;
+- Account Runtime and external pools are remote systems with independent failure behavior;
 - remote image/document URLs may resolve to unsafe network destinations;
 - PgSQL, Redis, logs, and diagnostics contain operator-sensitive data;
 - external request and response headers cross a provider boundary and require explicit control; the current implementation is denylist-oriented and the proposed target uses allowlists.
@@ -73,7 +73,7 @@ Single-user operation does not eliminate security boundaries:
 | Anthropic-compatible client | Sends Messages, count-tokens, models, and Files requests | Authenticated but request content is untrusted |
 | Claude Code CLI | Exercises strict streaming, thinking, tool, usage, Files, and agent workflows | Authenticated compatibility client |
 | Admin UI/API | Manages the same operator-owned service state | Privileged operator surface |
-| Kiro upstream | Executes local-pool model requests and refreshes credential state | Remote dependency |
+| Account Runtime upstream | Executes local-pool model requests and refreshes credential state | Remote dependency |
 | External pool upstream | Executes configured fallback/direct Anthropic-compatible requests | Remote dependency with separate credential/header boundary |
 | PgSQL | Authoritative durable configuration, credentials, runtime state, catalogs, usage, and audit data | Required infrastructure |
 | Redis | Cross-process coordination, leases, sticky bindings, cooldowns, derived usage summaries, and invalidation | Required infrastructure |
@@ -83,7 +83,7 @@ Single-user operation does not eliminate security boundaries:
 
 1. A Claude Code or SDK client sends a streaming or non-streaming Messages request and receives Anthropic-compatible output.
 2. The gateway resolves the route policy, model, body-processing capabilities, and cache/usage behavior for the request path.
-3. The scheduler selects an eligible Kiro credential, applies session affinity and concurrency controls, refreshes authentication when needed, and retries bounded failures.
+3. The scheduler selects an eligible Account Runtime credential, applies session affinity and concurrency controls, refreshes authentication when needed, and retries bounded failures.
 4. A configured external pool can serve direct traffic or fallback traffic, using raw passthrough or normalized body preparation according to pool capability.
 5. Images, documents, and uploaded file references are materialized. Current per-file/per-source limits exist, while aggregate remote budgets and complete Files metadata bounds remain known gaps.
 6. Usage projection produces client-compatible usage while preserving separate raw-upstream and operator-reporting facts.
@@ -108,7 +108,7 @@ Single-user operation does not eliminate security boundaries:
 
 The business domain has three distinct fact layers:
 
-1. **Raw upstream usage** is what Kiro or an external upstream actually returned.
+1. **Raw upstream usage** is what Account Runtime or an external upstream actually returned.
 2. **Cache evidence and simulation state** describe local prefix creation/hit observations and route policy.
 3. **Reported usage** is the client-visible and operator-visible projection after route policy.
 
@@ -135,7 +135,7 @@ Runtime config CAS, immutable request snapshots, durable outbox semantics, exact
 These statements describe the current Rust product/maintenance boundary at the baseline revision. [Greenfield decision 001](../plans/greenfield-ai-gateway/decisions/001-greenfield-go-modular-ai-gateway.md) explicitly supersedes them where it defines a separate target repository, one new Admin application and one characterized whole-system cutover.
 
 - Multi-user or multi-tenant identity, authorization, billing, quotas, or data partitioning.
-- Replacing Kiro or external upstream business logic with an in-process model runtime.
+- Replacing Account Runtime or external upstream business logic with an in-process model runtime.
 - A public plugin ABI for every request stage before a second independently developed extension requires it.
 - An uncharacterized all-system cutover without complete compatibility, recovery and rollback gates. The greenfield target uses one fully characterized whole-system cutover.
 - Removing either maintained Admin UI from current Rust maintenance without a separate product decision. Greenfield decision 001 supplies that decision for the separate target only.
@@ -146,7 +146,7 @@ These statements describe the current Rust product/maintenance boundary at the b
 
 | Term | Meaning in this project |
 | --- | --- |
-| Local pool | Operator-owned Kiro credentials selected by `MultiTokenManager` |
+| Local pool | Operator-owned Account Runtime credentials selected by `MultiTokenManager` |
 | External pool | Operator-configured Anthropic-compatible upstream target |
 | Raw passthrough | Forwarding original request bytes, with only explicitly enabled lightweight transformations |
 | Normalized body | Parsed and normalized Anthropic request serialized for an external upstream |

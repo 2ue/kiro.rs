@@ -42,7 +42,7 @@ git log --all -S'readHash' -- src config.example.json
 
 ## 与根因的关系
 
-工具映射本身是 Kiro 63 字符/字符集兼容机制。只要请求/响应反向映射完整，mapped name 不应进入最终可见正文。真正把它变成用户可见文本的已确认路径包括：
+工具映射本身是 Account Runtime 63 字符/字符集兼容机制。只要请求/响应反向映射完整，mapped name 不应进入最终可见正文。真正把它变成用户可见文本的已确认路径包括：
 
 1. malformed/orphan/mismatch/duplicate tool result 被复制成普通正文；
 2. history trim 拆开 tool pair 后由 repair 再次 textify；

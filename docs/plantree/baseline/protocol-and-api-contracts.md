@@ -9,9 +9,9 @@ Related: [Business context](business-context.md), [Runtime flows](runtime-flows.
 
 ## Scope And Trust Model
 
-This document records the protocol behavior implemented by the current `kiro-rs` server. It is a revision-pinned baseline, not a target architecture and not a claim that every current behavior is desirable.
+This document records the protocol behavior implemented by the current `account-runtime` server. It is a revision-pinned baseline, not a target architecture and not a claim that every current behavior is desirable.
 
-The product has one operator and one trust domain. Multiple request API keys are equivalent ingress credentials for that operator's devices, clients, or key rotation. They do not identify users or tenants, do not select isolated data, and do not create separate authorization scopes. Kiro credentials and external pools are operator-owned upstream capacity, not product users.
+The product has one operator and one trust domain. Multiple request API keys are equivalent ingress credentials for that operator's devices, clients, or key rotation. They do not identify users or tenants, do not select isolated data, and do not create separate authorization scopes. Account Runtime credentials and external pools are operator-owned upstream capacity, not product users.
 
 ## Common HTTP Contract
 
@@ -106,8 +106,8 @@ For a parsed request, the current pipeline performs these logically ordered oper
 3. materialize supported `file_id`, image URL, and document URL sources when enabled;
 4. resolve the requested model through the current catalog and alias policy;
 5. detect the pure WebSearch special case;
-6. decide local Kiro execution, external direct execution, external fallback, or rejection;
-7. for local execution, convert Anthropic system/messages/tools/content into the selected Kiro IDE or CLI request envelope;
+6. decide local Account Runtime execution, external direct execution, external fallback, or rejection;
+7. for local execution, convert Anthropic system/messages/tools/content into the selected Account Runtime IDE or CLI request envelope;
 8. run the payload guard and enabled body-shaping operations;
 9. acquire upstream capacity, execute bounded retries/failover, and translate the result;
 10. project terminal usage and record the operational result.
@@ -116,9 +116,9 @@ Body materialization and shaping mean the effective request used for token/cache
 
 Evidence: `src/anthropic/handlers/parsed_body_pipeline.rs:13-64`, `src/anthropic/handlers/local_body_pipeline.rs:21-227`, `src/anthropic/handlers.rs:4277-4490,6936-7021`.
 
-## Local Kiro Protocol Contract
+## Local Account Runtime Protocol Contract
 
-Local execution converts the Anthropic request to either a Kiro IDE or Kiro CLI upstream envelope according to credential/endpoint configuration. Conversion covers:
+Local execution converts the Anthropic request to either a Account Runtime IDE or Account Runtime CLI upstream envelope according to credential/endpoint configuration. Conversion covers:
 
 - system and conversation history;
 - text, image, document, and materialized Files content;
@@ -132,7 +132,7 @@ The selected credential must support the resolved model and survive scheduler el
 
 WebSearch is a separate upstream capability only when the request contains exactly one tool and that tool is `web_search`. A request containing WebSearch plus any other tool does not enter the pure WebSearch path.
 
-Evidence: `src/anthropic/converter.rs`, `src/anthropic/converter/content.rs:263-328`, `src/anthropic/websearch.rs:103-109`, `src/kiro/provider.rs`.
+Evidence: `src/anthropic/converter.rs`, `src/anthropic/converter/content.rs:263-328`, `src/anthropic/websearch.rs:103-109`, `src/local_upstream_impl/provider.rs`.
 
 ## Claude Code Compatibility Contract
 
@@ -151,7 +151,7 @@ The terminal usage event is authoritative for the completed stream from the down
 
 This contract applies to compatibility behavior, not to latency. Slow upstream first byte and long total execution are normal operating cases; timeout and resource behavior are recorded in [Resource and concurrency model](resource-and-concurrency-model.md).
 
-Evidence: `src/anthropic/handlers.rs:6936-7021`, `src/anthropic/envelope.rs:52-142`, `src/kiro/parser/*`.
+Evidence: `src/anthropic/handlers.rs:6936-7021`, `src/anthropic/envelope.rs:52-142`, `src/local_upstream_impl/parser/*`.
 
 ## Model Catalog And Resolution
 
@@ -159,7 +159,7 @@ The model surface is assembled from multiple current sources:
 
 - an embedded seed catalog;
 - durable PgSQL model capability rows;
-- models learned by Kiro synchronization;
+- models learned by Account Runtime synchronization;
 - operator-managed additions and aliases.
 
 Resolution is affected by route, credential support, external-pool support, thinking capability, and the configured catalog mode:
@@ -238,13 +238,13 @@ Evidence: `src/token.rs:107-185`, `src/anthropic/body_processing.rs`.
 
 The local prompt cache is not a response cache. It does not store or replay model completions, and every successful Messages request still executes an upstream. It tracks stable prompt-prefix evidence and projects cache-related token fields according to route policy.
 
-Current route policy chooses among no-cache, current/high-cache, and `kiro-rs-tool`-oriented projection behavior. The prompt-cache tracker is bounded process-local state. Candidate cache state is committed only after a successful upstream completion; a failed attempt does not create a successful local cache observation.
+Current route policy chooses among no-cache, current/high-cache, and `account-runtime-tool`-oriented projection behavior. The prompt-cache tracker is bounded process-local state. Candidate cache state is committed only after a successful upstream completion; a failed attempt does not create a successful local cache observation.
 
 The following facts must be read separately when diagnosing a record:
 
 | Fact | Meaning |
 | --- | --- |
-| Raw upstream usage | Token/metering fields observed from Kiro or an external upstream |
+| Raw upstream usage | Token/metering fields observed from Account Runtime or an external upstream |
 | Compatibility usage | Fields normalized into Anthropic-compatible meanings before final route policy |
 | Effective/billable usage | Usage used for client reporting, cost, or operator accounting after policy |
 | Cache read | Tokens projected or observed as read from a stable prompt prefix |

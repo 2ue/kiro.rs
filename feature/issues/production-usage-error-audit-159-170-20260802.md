@@ -8,7 +8,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 
 ## 范围与目标
 
-审计以下两台现网 `kiro.rs` 服务的 usage 错误日志、部署代码版本和磁盘上的脱敏 JSONL/证据：
+审计以下两台现网 `account-runtime` 服务的 usage 错误日志、部署代码版本和磁盘上的脱敏 JSONL/证据：
 
 - `152.53.243.159`
 - `152.53.194.170`
@@ -24,7 +24,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 
 ## 用户可见现象与影响
 
-本轮已对两台机器完成只读 evidence pass。两台机器都运行 `ghcr.io/2ue/kiro-rs:0.0.123`，主要错误来自外部池 5xx/400，另有旧版本外部池超长预检和 usage 标准字段旧行为。
+本轮已对两台机器完成只读 evidence pass。两台机器都运行 `ghcr.io/2ue/account-runtime:0.0.123`，主要错误来自外部池 5xx/400，另有旧版本外部池超长预检和 usage 标准字段旧行为。
 
 关注的体验指标：
 
@@ -47,8 +47,8 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 
 | Host | Image | App status | Port |
 | --- | --- | --- | --- |
-| `152.53.243.159` | `ghcr.io/2ue/kiro-rs:0.0.123` | healthy | `59137 -> 8990` |
-| `152.53.194.170` | `ghcr.io/2ue/kiro-rs:0.0.123` | healthy | `59137 -> 8990` |
+| `152.53.243.159` | `ghcr.io/2ue/account-runtime:0.0.123` | healthy | `59137 -> 8990` |
+| `152.53.194.170` | `ghcr.io/2ue/account-runtime:0.0.123` | healthy | `59137 -> 8990` |
 
 6h usage fingerprint:
 

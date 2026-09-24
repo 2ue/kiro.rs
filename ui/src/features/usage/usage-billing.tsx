@@ -17,7 +17,6 @@ export interface UsageCostModel {
   estimatedCostUsd: number
   originalCostUsd: number
   upstreamMeteringUnits?: number
-  kiroMeteringUsage?: number
   pricingAvailable?: boolean
   pricingModel?: string
   accountBilling?: ExternalPoolBilling
@@ -28,8 +27,7 @@ export function usageRecordCostModel(record: UsageRecord): UsageCostModel {
   return {
     estimatedCostUsd: record.estimatedCostUsd,
     originalCostUsd: record.originalCostUsd,
-    upstreamMeteringUnits: record.upstreamMeteringUnits ?? record.kiroMeteringUsage,
-    kiroMeteringUsage: record.kiroMeteringUsage,
+    upstreamMeteringUnits: record.upstreamMeteringUnits,
     pricingAvailable: record.pricingAvailable,
     pricingModel: record.pricingModel,
     accountBilling: record.accountBilling ?? record.externalPoolBilling,
@@ -41,14 +39,10 @@ export function simpleUsageCostModel(input: {
   estimatedCostUsd: number
   originalCostUsd: number
   upstreamMeteringUnits?: number
-  kiroMeteringUsage?: number
   pricingAvailable?: boolean
   pricingModel?: string
 }): UsageCostModel {
-  return {
-    ...input,
-    upstreamMeteringUnits: input.upstreamMeteringUnits ?? input.kiroMeteringUsage,
-  }
+  return { ...input }
 }
 
 export function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
@@ -98,7 +92,7 @@ export function UsageCostInline({
   const pricingLabel = model.pricingAvailable
     ? model.pricingModel || '已计价'
     : '未计价'
-  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.kiroMeteringUsage
+  const upstreamMeteringUnits = model.upstreamMeteringUnits
 
   return (
     <div className="text-right font-mono text-xs tabular-nums">
@@ -140,7 +134,7 @@ export function UsageCostTiles({
   const pricingLabel = model.pricingAvailable
     ? `是（${model.pricingModel || 'priced'}）`
     : '否'
-  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.kiroMeteringUsage
+  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.upstreamMeteringUnits
 
   return (
     <div className={cn('grid grid-cols-2 gap-2 sm:grid-cols-3', className)}>
@@ -166,7 +160,7 @@ export function UsageCostBreakdown({
     ? billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
     : model.estimatedCostUsd - model.originalCostUsd
   const deltaTone = billingDeltaTone(delta)
-  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.kiroMeteringUsage
+  const upstreamMeteringUnits = model.upstreamMeteringUnits ?? model.upstreamMeteringUnits
 
   return (
     <div>

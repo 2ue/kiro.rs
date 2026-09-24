@@ -8,7 +8,7 @@ Date: 2026-07-12
 
 Authority: Binding attempt classification, replay safety, downstream commitment, retry, and fallback contract
 
-Scope: Local Kiro and external upstream attempts, stream and non-stream response selection, payload-changing retries, fallback, idempotency, and public error selection
+Scope: Local Account Runtime and external upstream attempts, stream and non-stream response selection, payload-changing retries, fallback, idempotency, and public error selection
 
 Affected requirements/findings: `FUN-007`, `FUN-014`, `INV-005`, `REL-002`, and the R5/R7 retry and response gates
 

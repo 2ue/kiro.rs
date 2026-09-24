@@ -5,7 +5,7 @@ Status: `root-cause-confirmed / implementation-focused-pass / frontend-contract-
 Severity: P0
 
 生产主机：`152.53.194.170`<br>
-部署：`ghcr.io/2ue/kiro-rs:0.0.123`<br>
+部署：`ghcr.io/2ue/account-runtime:0.0.123`<br>
 证据归档：[redacted production evidence](../../tmp/prod-evidence/20260801-224454-152.53.194.170/20260801-224454-152.53.194.170-redacted.tar.gz)
 
 本轮只读审计没有执行重启、Compose 写操作、数据库写入、Redis 写入、配置修改或远程文件删除。
@@ -44,7 +44,7 @@ Severity: P0
 - external attempts：空
 - `payloadGuardReport` / `payloadBreakdown`：空
 
-根因不是外部上游返回 400，而是页面“路由”显示为“预检 fallback”时，kiro.rs
+根因不是外部上游返回 400，而是页面“路由”显示为“预检 fallback”时，account-runtime
 在外部池选择和“请求体处理”之前直接用“输入上限预检”拒绝。这个拒绝发生在
 “Body 模式”进入“标准处理”或“Raw 透传”之前，因此也绕过了“请求大小保护”。
 
@@ -60,7 +60,7 @@ Severity: P0
 
 “失败后再处理并重试”的本地凭证语义是：首发不做大小裁剪；只有真实上游返回
 too-long/context-window 400 后，才按“请求大小保护”裁剪并重试。本请求没有发送到
-上游，因此不会触发该重试。`compression.enabled=true` 只是本地 Kiro provider 的
+上游，因此不会触发该重试。`compression.enabled=true` 只是本地 Account Runtime provider 的
 JSON whitespace 压缩，不是上下文语义压缩，也不减少估算 token。
 
 另外，日志中的 `local_no_credentials` 是真实状态：`credentials` 表 680 行
@@ -123,7 +123,7 @@ JSON whitespace 压缩，不是上下文语义压缩，也不减少估算 token�
 实现补充：显式直连外部账号时，现在也会先计算“模型（本地解析）”并传入外部池
 “模型处理”。如果本地能力目录判定模型不支持，则不会因此阻断显式直连；仍交给
 外部账号配置和外部上游处理。直接外部池和本地失败 fallback route 还会补齐本地
-Kiro 发送链路的兼容模型处理，避免只有内置 seed 或无本地账号时把
+Account Runtime 发送链路的兼容模型处理，避免只有内置 seed 或无本地账号时把
 `claude-opus-4-6-thinking` 误当成最终“模型（上游）”。这保证“映射后内部处理”
 和“内部处理后映射”在外部池路径上也有“模型（本地解析）”可用。
 

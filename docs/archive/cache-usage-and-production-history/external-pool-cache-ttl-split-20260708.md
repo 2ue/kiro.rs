@@ -6,9 +6,9 @@
 
 这次问题不是“配置上限显示异常”，也不是 sub2api UI 展示误差。sub2api 的 `usage_logs.cache_creation_5m_tokens` 和 `usage_logs.cache_creation_1h_tokens` 是真实写入日志并参与成本计算的字段。
 
-现网样本显示，sub2api 通过 kiro.rs 外部池调用同一个 Kiro 兼容上游时，出现了同一条流式请求里：
+现网样本显示，sub2api 通过 account-runtime 外部池调用同一个 Account Runtime 兼容上游时，出现了同一条流式请求里：
 
-- 聚合 `cache_creation_tokens` 已经是 kiro.rs 按路径整形后的小值；
+- 聚合 `cache_creation_tokens` 已经是 account-runtime 按路径整形后的小值；
 - 但 5m/1h 明细仍是上游 raw usage 里的大值；
 - sub2api 后续按 5m/1h 明细计费，造成异常高额 cache write 成本。
 
@@ -29,19 +29,19 @@ sub2api 高额样本：
 
 其中 `cache_ttl_overridden=false`，说明 sub2api 没有在记录阶段强制改写 TTL 类型。
 
-kiro.rs 与 sub2api 可对齐样本：
+account-runtime 与 sub2api 可对齐样本：
 
 - sub2api `14393941`：`14:00:50.525`，output `62`，`cache_creation=37202`，`5m=1300180`。
-- kiro.rs B 同秒请求 `req_01o4692sLMnGZoj6q4omWHKe`：`14:00:50.520`，output `62`，记录列 `rec_creation=37202`，`rec_5m=37202`，外部池 raw usage aggregate `1300180`，reported usage aggregate `37202`。
+- account-runtime B 同秒请求 `req_01o4692sLMnGZoj6q4omWHKe`：`14:00:50.520`，output `62`，记录列 `rec_creation=37202`，`rec_5m=37202`，外部池 raw usage aggregate `1300180`，reported usage aggregate `37202`。
 
-这说明 sub2api 记录的聚合字段对上了 kiro.rs reported usage，但 sub2api 的 5m 明细对上了上游 raw usage。
+这说明 sub2api 记录的聚合字段对上了 account-runtime reported usage，但 sub2api 的 5m 明细对上了上游 raw usage。
 
 另一个同样模式：
 
 - sub2api `14394019`：`14:01:03.269`，output `464`，`cache_creation=37224`，`1h=139594`。
-- kiro.rs B 同秒请求 `req_01rju2nSJajyNfmU2acM3odE`：output `464`，reported aggregate `37224`，raw aggregate `139594`。
+- account-runtime B 同秒请求 `req_01rju2nSJajyNfmU2acM3odE`：output `464`，reported aggregate `37224`，raw aggregate `139594`。
 
-因此，异常不是 sub2api 独立制造出来的；它是从 kiro.rs 下游响应里看到了一套混合 usage 口径后按字段计费。
+因此，异常不是 sub2api 独立制造出来的；它是从 account-runtime 下游响应里看到了一套混合 usage 口径后按字段计费。
 
 ## 代码机制
 
@@ -51,7 +51,7 @@ sub2api 的流式解析逻辑在 `../sub2api/backend/internal/service/gateway_se
 - `message_delta` 会读取 `usage.cache_creation.ephemeral_5m_input_tokens` 和 `ephemeral_1h_input_tokens`，只要大于 0 就覆盖。
 - `buildRecordUsageLog` 会把 `ForwardResult.Usage.CacheCreation5mTokens/CacheCreation1hTokens` 写入 `usage_logs`。
 
-kiro.rs 外部池流式逻辑在 `src/external_pool.rs`：
+account-runtime 外部池流式逻辑在 `src/external_pool.rs`：
 
 - `event_passthrough` 不是字节级完全透传；它会按完整 SSE event drain。
 - 如果当前外部池配置 `usage_projection_mode=current_path_policy`，usage event 会进入路径策略投影。
@@ -61,7 +61,7 @@ Anthropic Messages usage 支持 `cache_creation` nested TTL 明细；该明细�
 
 ## 修复策略
 
-本次修复不把问题处理成“删除 5m/1h 明细”。原因是下游确实可能需要 Kiro/Anthropic 兼容的 TTL split，而且用户要求外部池按入口路径整形后的 usage 返回给下游。
+本次修复不把问题处理成“删除 5m/1h 明细”。原因是下游确实可能需要 Account Runtime/Anthropic 兼容的 TTL split，而且用户要求外部池按入口路径整形后的 usage 返回给下游。
 
 修复后的规则：
 
@@ -82,7 +82,7 @@ Anthropic Messages usage 支持 `cache_creation` nested TTL 明细；该明细�
 
 `14394002` 贵，是因为 sub2api 真实记录并计费了约 199.8 万 1h cache write tokens。这个事实成立。
 
-问题不在“配置上限允许 2M”本身，而在下游看到了 raw 1h split 与 shaped aggregate 的混合 usage。即使某个上游 raw 请求真的写入了约 199.8 万 1h cache tokens，只要 kiro.rs 配置要求按入口路径整形，就不应该把 raw 1h split 和整形后的 aggregate 同时返回给下游。
+问题不在“配置上限允许 2M”本身，而在下游看到了 raw 1h split 与 shaped aggregate 的混合 usage。即使某个上游 raw 请求真的写入了约 199.8 万 1h cache tokens，只要 account-runtime 配置要求按入口路径整形，就不应该把 raw 1h split 和整形后的 aggregate 同时返回给下游。
 
 修复后，如果路径整形结果只有 7,782 cache creation，那么 nested 5m/1h 明细之和也必须是 7,782；如果路径整形结果没有 cache creation，则 nested `cache_creation` 会被移除。
 

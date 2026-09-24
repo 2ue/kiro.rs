@@ -2,7 +2,7 @@
 
 ## Fake Upstream Scenarios
 
-Use `src/bin/kiro_loadtest.rs` with temp ports and reports under `target/loadtest/`.
+Use `src/bin/account_runtime_loadtest.rs` with temp ports and reports under `target/loadtest/`.
 
 Required scenarios:
 
@@ -54,7 +54,7 @@ Static gates:
 - `cargo fmt --check`: pass.
 - `git diff --check`: pass.
 - `pnpm check` in `ui/`: pass.
-- `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test`: pass, 904 main tests and 19 `kiro_loadtest` tests.
+- `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test`: pass, 904 main tests and 19 `account_runtime_loadtest` tests.
 - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo build --release`: pass, 3m39s.
 
 Fake upstream proxy setup:
@@ -65,7 +65,7 @@ Fake upstream proxy setup:
 - Temporary database and Redis namespace were isolated and cleaned after validation.
 - Run directory: `target/loadtest/modular-20260706160929`.
 - Final summary: `target/loadtest/modular-20260706160929/final-validation-summary.json`.
-- Cleanup: temp proxy stopped, `19022/19080` released, database `kiro_rs_loadtest_modular_20260706160929` dropped, Redis prefix `kiro_rs:loadtest:modular-20260706160929:*` deleted.
+- Cleanup: temp proxy stopped, `19022/19080` released, database `account_runtime_loadtest_modular_20260706160929` dropped, Redis prefix `account_runtime:loadtest:modular-20260706160929:*` deleted.
 
 Representative reports:
 

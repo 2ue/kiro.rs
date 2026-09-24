@@ -35,8 +35,8 @@ fake upstream 分别发送：无 `COMPLETED` 的正常 EOF、显式 completed、
   - `upstreamEventsBeforeFirstOutput`
   - parse/decode 错误计数等。
 - 首个下游事件前的流式换号重试已经有开关和边界：
-  - `kiroUpstreamStreamRetryEnabled`
-  - `kiroUpstreamStreamRetryMaxAttempts`
+  - `localUpstreamStreamRetryEnabled`
+  - `localUpstreamStreamRetryMaxAttempts`
   - idle/read/status 三类子开关。
 
 ## 2. 选定方案与本轮实施项
@@ -46,7 +46,7 @@ fake upstream 分别发送：无 `COMPLETED` 的正常 EOF、显式 completed、
 问题：
 
 - 真实 `/cc`/Claude Code CLI 验证显示，成功流经常是 `sawUpstreamCompleted=false`。
-- 如果 Kiro 当前协议本身经常不发送 `messageStatus=COMPLETED`，单靠该字段无法判定是否静默截断。
+- 如果 Account Runtime 当前协议本身经常不发送 `messageStatus=COMPLETED`，单靠该字段无法判定是否静默截断。
 
 实现：
 

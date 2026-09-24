@@ -87,7 +87,7 @@ Changes to PgSQL, Redis, runtime config, credentials, leases, queues, usage, or 
 
 ## Load, Chaos, And Resource Gates
 
-`src/bin/kiro_loadtest.rs` provides the fake-upstream/load driver. Existing guidance requires temporary ports and reports status, latency, resource, request, and error IDs. The modernization target expands this to:
+`src/bin/account_runtime_loadtest.rs` provides the fake-upstream/load driver. Existing guidance requires temporary ports and reports status, latency, resource, request, and error IDs. The modernization target expands this to:
 
 - concurrency and sudden bursts;
 - slow first byte at 30/60 seconds and active streams longer than 180 seconds;

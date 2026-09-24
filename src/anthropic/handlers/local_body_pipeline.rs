@@ -82,6 +82,7 @@ pub(super) fn prepare_with_plan(
 
     let mut local_upstream_request = LocalUpstreamRequest {
         conversation_state: conversion_result.conversation_state,
+        #[cfg(test)]
         profile_arn: None,
         additional_model_request_fields: conversion_result.additional_model_request_fields,
         tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),

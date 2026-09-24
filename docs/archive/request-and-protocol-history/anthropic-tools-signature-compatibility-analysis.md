@@ -5,7 +5,7 @@
 
 ## 1. 背景
 
-当前服务是一个 Anthropic/Claude Code 兼容入口，实际请求会被转换后发送到 Kiro 上游。用户侧希望解决黑盒检测或真实使用中暴露出的以下问题：
+当前服务是一个 Anthropic/Claude Code 兼容入口，实际请求会被转换后发送到 Account Runtime 上游。用户侧希望解决黑盒检测或真实使用中暴露出的以下问题：
 
 - 工具调用使用时不稳定，可能出现 `400 Improperly formed request`、工具不触发、工具结果不匹配、工具参数异常等问题。
 - 模型签名验证只达到“部分合格”，尤其是 thinking signature、redacted thinking、工具调用多轮之后的签名 round-trip 容易不符合官方表现。
@@ -49,19 +49,19 @@ user request
 - `src/anthropic/converter.rs`
   - 支持解析 Anthropic 风格 `tool_choice` 字符串和对象：`auto`、`any`、`none`、`{"type":"tool","name":"..."}`。
   - `tool_choice: none` 会在当前请求中省略 tools，降低本轮误触发工具的概率。
-  - `tool_choice: {"type":"tool","name":"x"}` 会把当前请求 tools 过滤到指定工具；匹配同时考虑原始工具名和 Kiro sanitized 后的工具名。
+  - `tool_choice: {"type":"tool","name":"x"}` 会把当前请求 tools 过滤到指定工具；匹配同时考虑原始工具名和 Account Runtime sanitized 后的工具名。
   - 如果强制指定的工具不存在，不做本地拒绝，而是保留全部工具并记录 warning，优先保证真实使用不中断。
-  - 非 strict 兼容模式会插入很小的 Kiro-facing steering 前缀，用于表达 `any`、`tool`、`none` 的意图。
+  - 非 strict 兼容模式会插入很小的 Account Runtime-facing steering 前缀，用于表达 `any`、`tool`、`none` 的意图。
   - `anthropic-strict` 模式只过滤工具，不注入 steering prompt，避免影响官方形态检测。
 - `src/anthropic/payload_guard.rs`
   - 增加 `PayloadByteBreakdown`，记录总字节、历史字节、当前消息字节、当前 tools/tool_results/images 字节、最大工具定义字节、历史 tool_use/tool_result 数量等。
-  - payload guard 仍会裁剪旧历史并修复工具配对，但如果裁剪后仍超出 `payloadGuardMaxBytes`，不再用本地 `Oversized` 拒绝请求，而是标记 `still_oversized=true` 后继续发送给 Kiro，让 Kiro 返回真实上游错误。
+  - payload guard 仍会裁剪旧历史并修复工具配对，但如果裁剪后仍超出 `payloadGuardMaxBytes`，不再用本地 `Oversized` 拒绝请求，而是标记 `still_oversized=true` 后继续发送给 Account Runtime，让 Account Runtime 返回真实上游错误。
   - `payloadGuardMaxBytes = 0` 仍表示关闭 size limit，只保留配对修复等非 size 相关处理。
 - `src/anthropic/handlers.rs`
   - `/v1/messages` 和 `/cc/v1/messages` 都会记录 payload breakdown。
   - 当 payload guard 修改了请求、payload 接近上限或仍超限时，会输出更详细日志，便于定位到底是历史、tools、tool_result、图片/PDF 文档还是当前消息导致过大。
 
-本次明确没有实现“当前 user message、tool_result、PDF、图片过大时直接本地拒绝”。这些场景应交给 Kiro 上游返回错误，代理层只做历史裁剪、配对修复和可观测性增强。
+本次明确没有实现“当前 user message、tool_result、PDF、图片过大时直接本地拒绝”。这些场景应交给 Account Runtime 上游返回错误，代理层只做历史裁剪、配对修复和可观测性增强。
 
 ## 3. 关键边界
 
@@ -82,7 +82,7 @@ Anthropic extended thinking 的 `signature` 是不透明签名字段，用于证
 - 自己生成 `signature`。
 - 修改 `signature`、`redacted_thinking.data` 或 signed thinking block 的顺序。
 
-如果 Kiro 上游没有返回真实 signature，那么本服务最多只能做到“不破坏已有签名”和“官方形态兼容”，不能凭空达到官方加密签名验证。
+如果 Account Runtime 上游没有返回真实 signature，那么本服务最多只能做到“不破坏已有签名”和“官方形态兼容”，不能凭空达到官方加密签名验证。
 
 官方参考：
 
@@ -90,13 +90,13 @@ Anthropic extended thinking 的 `signature` 是不透明签名字段，用于证
 
 ### 3.2 “真实使用不报错”和“官方协议严格保真”存在冲突
 
-当前服务为了让 Kiro 上游更容易接受请求，会做一些兼容修复：
+当前服务为了让 Account Runtime 上游更容易接受请求，会做一些兼容修复：
 
 - 修复或删除孤立的 `tool_use`。
 - 修复或删除孤立的 `tool_result`。
 - 把 orphan tool result 转成普通文本。
 - 给历史中出现但当前 tools 缺失的工具创建 placeholder。
-- 删除 Kiro 上游不接受的 JSON Schema 字段，例如 `additionalProperties`。
+- 删除 Account Runtime 上游不接受的 JSON Schema 字段，例如 `additionalProperties`。
 - 注入 Write/Edit 分块策略或工具描述后缀，降低工具调用过大导致失败的概率。
 
 这些行为对生产可用性有帮助，但对官方检测不利，因为它们会改变 Anthropic transcript 的真实形态。
@@ -105,7 +105,7 @@ Anthropic extended thinking 的 `signature` 是不透明签名字段，用于证
 
 ```text
 AnthropicTranscript：面对下游客户端/检测网站，保存官方原始语义和签名信息。
-KiroRequest：面对 Kiro 上游，可以做必要兼容转换和修复。
+Account RuntimeRequest：面对 Account Runtime 上游，可以做必要兼容转换和修复。
 ```
 
 只有这样才能同时追求：
@@ -134,7 +134,7 @@ pub struct MessagesRequest {
 }
 ```
 
-历史问题是：`tool_choice` 只是被反序列化，没有在 `convert_request_with_model_id()` 中真正转成 Kiro 行为。这会导致以下官方语义失效：
+历史问题是：`tool_choice` 只是被反序列化，没有在 `convert_request_with_model_id()` 中真正转成 Account Runtime 行为。这会导致以下官方语义失效：
 
 ```json
 {"type": "auto"}
@@ -152,8 +152,8 @@ pub struct MessagesRequest {
 
 仍需注意：
 
-- Kiro 上游如果没有原生 `tool_choice`，`any` 和强制工具只能通过工具列表过滤和 prompt steering 近似表达，不能保证与 Anthropic 官方 constrained behavior 完全等价。
-- 如果历史消息里出现过某个工具，但当前请求没有携带该工具定义，兼容模式仍可能为历史 tool_use 创建 placeholder，避免 Kiro 因历史不完整报错。
+- Account Runtime 上游如果没有原生 `tool_choice`，`any` 和强制工具只能通过工具列表过滤和 prompt steering 近似表达，不能保证与 Anthropic 官方 constrained behavior 完全等价。
+- 如果历史消息里出现过某个工具，但当前请求没有携带该工具定义，兼容模式仍可能为历史 tool_use 创建 placeholder，避免 Account Runtime 因历史不完整报错。
 - structured output 若依赖官方严格工具调用和 strict schema，还需要后续 schema 双轨与结构化输出阶段继续补齐。
 
 ### 4.2 Tool 类型缺少部分官方字段
@@ -177,7 +177,7 @@ pub struct Tool {
 - 未知官方扩展字段会被 serde 忽略。
 - strict tools、structured output 检测所需字段可能在进入转换层前就丢失。
 
-### 4.3 JSON Schema 被 Kiro 兼容化，可能破坏官方 strict schema
+### 4.3 JSON Schema 被 Account Runtime 兼容化，可能破坏官方 strict schema
 
 `src/anthropic/converter.rs` 中的 `normalize_json_schema()` 会递归删除 `additionalProperties` 并清理 `required`：
 
@@ -191,19 +191,19 @@ fn normalize_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>,
 目的：
 
 - 修复 MCP 工具定义中常见的异常 schema。
-- 避免 Kiro 上游返回 `400 Improperly formed request`。
+- 避免 Account Runtime 上游返回 `400 Improperly formed request`。
 
 副作用：
 
 - 官方 strict schema 通常依赖 `additionalProperties: false`。
-- 如果只保留一份被 Kiro 改写后的 schema，官方 structured output/tool strict 检测会失败。
+- 如果只保留一份被 Account Runtime 改写后的 schema，官方 structured output/tool strict 检测会失败。
 
 结论：
 
 ```text
 schema 需要双轨：
 1. original_input_schema：官方语义、校验、检测使用。
-2. kiro_input_schema：发送 Kiro 上游使用，可做兼容清理。
+2. account-runtime_input_schema：发送 Account Runtime 上游使用，可做兼容清理。
 ```
 
 ### 4.4 tool_result 内容处理过窄
@@ -297,7 +297,7 @@ payload guard 阶段还会再次修复：
 - 修复当前消息中的 orphan tool_result。
 - 移除没有结果的 tool_use。
 
-这些修复减少上游 Kiro 400，但会改变 transcript。签名过检时，如果上一轮 assistant 的 signed thinking + tool_use 被修复或重排，后续检测就可能失败。
+这些修复减少上游 Account Runtime 400，但会改变 transcript。签名过检时，如果上一轮 assistant 的 signed thinking + tool_use 被修复或重排，后续检测就可能失败。
 
 ### 4.7 assistant 历史中的 thinking signature 当前会丢失
 
@@ -310,8 +310,8 @@ payload guard 阶段还会再次修复：
 并且代码中已有日志说明：
 
 ```text
-当前 Kiro history 模型不支持 Anthropic thinking signature；仅透传 thinking 文本
-当前 Kiro history 模型不支持 redacted_thinking；已跳过该历史块
+当前 Account Runtime history 模型不支持 Anthropic thinking signature；仅透传 thinking 文本
+当前 Account Runtime history 模型不支持 redacted_thinking；已跳过该历史块
 ```
 
 问题：
@@ -373,7 +373,7 @@ payload guard 阶段还会再次修复：
 第一阶段目标：
 
 ```text
-真实工具调用多轮对话稳定，不再频繁触发 Kiro 400 或客户端执行错误工具参数。
+真实工具调用多轮对话稳定，不再频繁触发 Account Runtime 400 或客户端执行错误工具参数。
 ```
 
 这阶段暂不追求全部官方检测过关，但要为后续签名保真打基础。
@@ -413,38 +413,38 @@ pub extra: serde_json::Map<String, serde_json::Value>,
 
 ### 6.2 实现 tool_choice 转换策略
 
-Kiro 上游如果没有原生 `tool_choice`，可以先做兼容策略：
+Account Runtime 上游如果没有原生 `tool_choice`，可以先做兼容策略：
 
 | tool_choice | 兼容策略 |
 |---|---|
 | `auto` | 正常传 tools |
-| `none` | 不向 Kiro 传 tools，避免模型调用工具 |
-| `any` | 传 tools，并在 Kiro-facing prompt 中提示必须调用至少一个工具 |
+| `none` | 不向 Account Runtime 传 tools，避免模型调用工具 |
+| `any` | 传 tools，并在 Account Runtime-facing prompt 中提示必须调用至少一个工具 |
 | `tool{name}` | 只传目标工具，并提示必须调用该工具 |
 
 注意：
 
 - 这不是 100% 官方 constrained behavior。
 - 但可以先解决“工具使用不报错”和“检测期望工具调用但没有调用”的问题。
-- 后续如果 Kiro 上游支持原生 tool_choice，应优先走原生能力。
+- 后续如果 Account Runtime 上游支持原生 tool_choice，应优先走原生能力。
 
 ### 6.3 schema 双轨
 
-当前只生成 Kiro 兼容 schema，会破坏官方 strict schema。因此需要拆为：
+当前只生成 Account Runtime 兼容 schema，会破坏官方 strict schema。因此需要拆为：
 
 ```rust
 struct ToolSchemaPair {
     original: serde_json::Value,
-    kiro: serde_json::Value,
+    account-runtime: serde_json::Value,
 }
 ```
 
 使用原则：
 
 - `original`：用于官方响应、strict 校验、结构化输出检测。
-- `kiro`：用于上游请求，允许删除 Kiro 不支持字段。
+- `account-runtime`：用于上游请求，允许删除 Account Runtime 不支持字段。
 
-这样既能减少 Kiro 400，又不会让检测认为官方 schema 被代理改坏。
+这样既能减少 Account Runtime 400，又不会让检测认为官方 schema 被代理改坏。
 
 ### 6.4 增强 tool_result 内容处理
 
@@ -458,18 +458,18 @@ struct ToolSchemaPair {
 
 转换策略：
 
-| 输入内容 | Kiro 转换建议 |
+| 输入内容 | Account Runtime 转换建议 |
 |---|---|
 | string | 原样作为文本 |
 | text block | 拼接文本 |
-| image block | 转 Kiro image，如果 Kiro tool_result 不支持 image，则加入当前消息 images 或文本说明 |
+| image block | 转 Account Runtime image，如果 Account Runtime tool_result 不支持 image，则加入当前消息 images 或文本说明 |
 | document block | 走 document/PDF 转换逻辑 |
 | JSON object | 保留 JSON 字符串，避免丢字段 |
 | 不支持内容 | 不静默丢弃，返回明确降级说明或 400 |
 
 ### 6.5 工具配对状态机前置校验
 
-发送 Kiro 之前，应构建工具配对状态机，明确判断：
+发送 Account Runtime 之前，应构建工具配对状态机，明确判断：
 
 - 当前 user 的 `tool_result` 是否对应最近未完成的 assistant `tool_use`。
 - 是否存在重复 `tool_result`。
@@ -481,7 +481,7 @@ struct ToolSchemaPair {
 兼容模式策略：
 
 - 能修复就修复。
-- 不能修复则返回清晰本地 400，避免把问题交给 Kiro 返回模糊 `Improperly formed request`。
+- 不能修复则返回清晰本地 400，避免把问题交给 Account Runtime 返回模糊 `Improperly formed request`。
 
 官方模式策略：
 
@@ -539,7 +539,7 @@ message_stop
 
 ### 6.8 工具名映射要保持可追踪
 
-当前 Kiro 上游对工具名有限制，因此代码会 sanitize/shorten tool name，并在响应里 reverse mapping。
+当前 Account Runtime 上游对工具名有限制，因此代码会 sanitize/shorten tool name，并在响应里 reverse mapping。
 
 这条思路是对的，但需要确保：
 
@@ -581,7 +581,7 @@ message_stop
 ]
 ```
 
-KiroRequest 层可以继续把部分内容转换成 Kiro history，但 AnthropicTranscript 层不能丢 signature。
+Account RuntimeRequest 层可以继续把部分内容转换成 Account Runtime history，但 AnthropicTranscript 层不能丢 signature。
 
 ### 7.2 redacted_thinking 原样保留
 
@@ -634,16 +634,16 @@ content_block_stop
 
 目标：
 
-- 真实 Claude Code/Kiro 使用优先。
+- 真实 Claude Code/Account Runtime 使用优先。
 - 尽量修复请求，减少上游 400。
-- 可注入 Kiro 需要的提示/策略。
+- 可注入 Account Runtime 需要的提示/策略。
 
 允许：
 
 - 修复 orphan tool_result。
 - 移除 orphan tool_use。
 - placeholder tool。
-- schema Kiro 兼容化。
+- schema Account Runtime 兼容化。
 - payload guard 修复。
 - XML thinking 兼容提取。
 
@@ -667,7 +667,7 @@ content_block_stop
 
 允许：
 
-- 在 KiroRequest 层做必要上游兼容转换，但不能改变下游官方 transcript。
+- 在 Account RuntimeRequest 层做必要上游兼容转换，但不能改变下游官方 transcript。
 
 ## 9. 实施顺序
 
@@ -690,7 +690,7 @@ content_block_stop
 - 多工具调用不报错。
 - 工具结果下一轮可继续对话。
 - 非流式和流式输出都能让客户端正确执行工具。
-- Kiro 400 明显减少。
+- Account Runtime 400 明显减少。
 - 出错时是本地清晰错误，不是上游模糊错误。
 
 ### 阶段 B：签名保真
@@ -776,9 +776,9 @@ content_block_stop
 
 ## 11. 风险
 
-### 11.1 Kiro 上游能力限制
+### 11.1 Account Runtime 上游能力限制
 
-如果 Kiro 上游没有官方 constrained decoding、原生 tool_choice、原生 signed thinking history 支持，代理层不能保证与 Anthropic 官方完全等价。
+如果 Account Runtime 上游没有官方 constrained decoding、原生 tool_choice、原生 signed thinking history 支持，代理层不能保证与 Anthropic 官方完全等价。
 
 可实现的是：
 
@@ -804,7 +804,7 @@ content_block_stop
 
 ### 11.3 payload guard 可能影响工具和签名
 
-payload guard 会裁剪历史并修复工具配对。它有助于减少超大请求导致的 Kiro 400，但可能影响签名 round-trip。
+payload guard 会裁剪历史并修复工具配对。它有助于减少超大请求导致的 Account Runtime 400，但可能影响签名 round-trip。
 
 建议：
 
@@ -819,8 +819,8 @@ payload guard 会裁剪历史并修复工具配对。它有助于减少超大请
 原因：
 
 1. 工具调用是签名 round-trip 的前置路径。
-2. `tool_choice` 基础兼容已实现，但受 Kiro 上游原生能力限制，仍不能保证与 Anthropic 官方 constrained behavior 完全等价。
-3. 当前 schema 只有 Kiro 兼容形态，无法支持官方 strict schema。
+2. `tool_choice` 基础兼容已实现，但受 Account Runtime 上游原生能力限制，仍不能保证与 Anthropic 官方 constrained behavior 完全等价。
+3. 当前 schema 只有 Account Runtime 兼容形态，无法支持官方 strict schema。
 4. 当前 tool_result 内容处理过窄，会导致真实工具结果丢失。
 5. 当前非流式 JSON parse fail 返回 `{}`，可能导致错误工具执行。
 
@@ -864,18 +864,18 @@ payload guard 会裁剪历史并修复工具配对。它有助于减少超大请
 - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test --locked --no-default-features` 通过，结果为 `394 passed`。
 - `cargo build --locked --no-default-features` 通过。
 - 本地服务使用新二进制重启，监听端口保持 `127.0.0.1:9022`。
-- `GET /healthz` 返回 `{"service":"kiro-rs","status":"ok"}`。
+- `GET /healthz` 返回 `{"service":"account-runtime","status":"ok"}`。
 - `GET /cc/v1/models` 使用本地配置 API key 请求成功，返回模型列表。
-- `ccman cc` 已切换到 `local-kiro-rs-9022`，URL 为 `http://127.0.0.1:9022/cc`。
+- `ccman cc` 已切换到 `local-account-runtime-9022`，URL 为 `http://127.0.0.1:9022/cc`。
 - Claude Code CLI 非交互请求已经命中本地 `/cc/v1/messages`，日志显示：
-  - 模型 `claude-sonnet-4-6` 映射为 Kiro 上游 `claude-sonnet-4.6`。
+  - 模型 `claude-sonnet-4-6` 映射为 Account Runtime 上游 `claude-sonnet-4.6`。
   - Claude Code 默认工具定义进入转换链路。
   - 工具名称映射完成，超长工具名被缩短并保留 reverse mapping。
 
-当前未能完成真实上游生成验收，原因不是本地转换报错，而是 Kiro 上游对当前全部 5 个凭据返回 `429 Too Many Requests`，提示 suspicious activity temporary limits。服务最终返回：
+当前未能完成真实上游生成验收，原因不是本地转换报错，而是 Account Runtime 上游对当前全部 5 个凭据返回 `429 Too Many Requests`，提示 suspicious activity temporary limits。服务最终返回：
 
 ```text
 API Error: Request rejected (429) · Upstream temporarily rate limited.
 ```
 
-这说明本地服务、`ccman` 切换、Claude Code CLI 到 `/cc` 路由、模型映射和工具转换链路已经打通；剩余生成验收需要等 Kiro 凭据冷却结束或换一组可用凭据后再跑。
+这说明本地服务、`ccman` 切换、Claude Code CLI 到 `/cc` 路由、模型映射和工具转换链路已经打通；剩余生成验收需要等 Account Runtime 凭据冷却结束或换一组可用凭据后再跑。

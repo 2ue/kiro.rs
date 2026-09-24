@@ -12,8 +12,8 @@ Product contract: soft cleanup removes matching detail and subtracts its summary
 
 ## Isolated infrastructure
 
-- PostgreSQL container: `kiro-rs-validation-pg-20260716`, bound only to `127.0.0.1:47432`.
-- Redis container: `kiro-rs-validation-redis-20260716`, bound only to `127.0.0.1:47379`.
+- PostgreSQL container: `account-runtime-validation-pg-20260716`, bound only to `127.0.0.1:47432`.
+- Redis container: `account-runtime-validation-redis-20260716`, bound only to `127.0.0.1:47379`.
 - Existing `127.0.0.1:9022` and existing Redis/PostgreSQL listeners were not used.
 - Credentials were local disposable fixture values and are not production secrets.
 
@@ -34,7 +34,7 @@ The failed run is not counted as pass evidence.
 Command shape, executed three separate times after the fix:
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/kiro_rs_validation' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/account_runtime_validation' \
   cargo test postgres_usage_cleanup -- --nocapture --test-threads=1
 ```
 
@@ -47,7 +47,7 @@ Covered behavior: one active job; claim and unexpired lease exclusion; persisten
 Command shape, executed three separate times:
 
 ```bash
-KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:47379' \
+ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:47379' \
   cargo test redis_pattern_delete_is_bounded_and_cancellable -- --nocapture --test-threads=1
 ```
 
@@ -60,8 +60,8 @@ The cancellation branch proved that the snapshot index is removed immediately wh
 The following command was executed once at an earlier consistency stage; it is preserved as discovery evidence and superseded by the later 36-test three-outer-run result. Tests containing “for three rounds” perform three internal rounds:
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/kiro_rs_validation' \
-KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:47379' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/account_runtime_validation' \
+ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:47379' \
 CC=/usr/bin/cc \
 CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
 cargo test cleanup -- --nocapture --test-threads=1
@@ -91,7 +91,7 @@ Static gates after these patches passed: `cargo check`, `cargo check --tests`, `
 The cleanup filter is not a full PostgreSQL regression gate. Running the pre-existing round-trip case explicitly against the same isolated database failed:
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/kiro_rs_validation' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/account_runtime_validation' \
 cargo test postgres_persists_runtime_config_credentials_stats_usage_and_pricing \
   -- --nocapture --test-threads=1
 ```
@@ -128,7 +128,7 @@ The current source now:
 Focused command shape, executed three separate outer times against `127.0.0.1:47432`:
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/kiro_rs_validation' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/account_runtime_validation' \
   cargo +1.92.0 test postgres_usage_concurrent_writers_keep_rollup_lock_order_stable \
   -- --nocapture --test-threads=1
 ```
@@ -153,8 +153,8 @@ The aggregate shell wall time was 77.3 seconds and included compilation/build-di
 After the focused contract rerun, the complete cleanup filter was executed three separate outer times against the isolated PostgreSQL and Redis services:
 
 ```bash
-KIRO_RS_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/kiro_rs_validation' \
-KIRO_RS_TEST_REDIS_URL='redis://127.0.0.1:47379' \
+ACCOUNT_RUNTIME_TEST_POSTGRES_URL='postgres://<isolated>@127.0.0.1:47432/account_runtime_validation' \
+ACCOUNT_RUNTIME_TEST_REDIS_URL='redis://127.0.0.1:47379' \
 cargo test cleanup -- --nocapture --test-threads=1
 ```
 

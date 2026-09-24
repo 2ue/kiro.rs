@@ -17,8 +17,8 @@
 这个问题不能只看一个指纹。因为同一组字段在本仓库里至少经过四层：
 
 1. Anthropic/raw 入口解析。
-2. Anthropic `MessagesRequest` → Kiro-native 请求构造。
-3. Kiro-native JSON 序列化前的兼容归一化。
+2. Anthropic `MessagesRequest` → Account Runtime-native 请求构造。
+3. Account Runtime-native JSON 序列化前的兼容归一化。
 4. CLI / IDE 入口对 `additionalModelRequestFields` 的二次变换。
 
 ## 当前已确认的行为
@@ -28,15 +28,15 @@
 - `src/anthropic/converter.rs`
 - `src/anthropic/request_facts.rs`
 - `src/anthropic/payload_guard.rs`
-- `src/kiro/model/requests/kiro.rs`
-- `src/kiro/endpoint/cli.rs`
-- `src/kiro/endpoint/ide.rs`
+- `src/local_upstream_impl/model/requests/account-runtime`
+- `src/local_upstream_impl/endpoint/cli.rs`
+- `src/local_upstream_impl/endpoint/ide.rs`
 
 当前代码已经做到以下几点：
 
 - 显式 `output_config.effort=max` 没有被压成 `high`。
 - `thinking.type=adaptive` 的 native wire 仍会保留。
-- `thinking.type=disabled` 且存在显式 `output_config.effort` 时，Kiro-native 序列化会去掉不兼容的 sibling `thinking`，只保留 `output_config`。
+- `thinking.type=disabled` 且存在显式 `output_config.effort` 时，Account Runtime-native 序列化会去掉不兼容的 sibling `thinking`，只保留 `output_config`。
 - `thinking.type=disabled` 且没有显式 effort 时，不会偷偷生成 native reasoning fields。
 - CLI 与 IDE 的 JSON 变换都走同一个兼容归一化函数，不是两套互相漂移的规则。
 
@@ -45,8 +45,8 @@
 我做了两层验证：
 
 1. Rust 单测矩阵：
-   - `cargo test --bin kiro-rs output_config -- --nocapture`
-   - `cargo test --bin kiro-rs thinking -- --nocapture`
+   - `cargo test --bin account-runtime output_config -- --nocapture`
+   - `cargo test --bin account-runtime thinking -- --nocapture`
 
    这两组都通过，覆盖了：
 
@@ -97,8 +97,8 @@
 如果你要重现当前协议链路，建议按下面顺序：
 
 1. 先跑 Rust 协议单测：
-   - `cargo test --bin kiro-rs output_config -- --nocapture`
-   - `cargo test --bin kiro-rs thinking -- --nocapture`
+   - `cargo test --bin account-runtime output_config -- --nocapture`
+   - `cargo test --bin account-runtime thinking -- --nocapture`
 
 2. 再跑真实 CLI capture：
    - `node feature/tests/thinking-effort-claude-cli-capture.mjs`

@@ -4,7 +4,7 @@ Role: Implementation-driving architecture plan
 
 Status: Planning; not yet implemented
 
-Authority: Defines the final target for removing Kiro concepts from the current Rust runtime
+Authority: Defines the final target for removing Account Runtime concepts from the current Rust runtime
 
 As of: 2026-08-13
 
@@ -12,9 +12,9 @@ Related: [Plan root](../README.md), [roadmap](../roadmap.md), [module map](../..
 
 ## Core Objective
 
-Refactor the current Rust service into a Kiro-independent account scheduling and usage shaping runtime.
+Refactor the current Rust service into a Account Runtime-independent account scheduling and usage shaping runtime.
 
-The target is not a Kiro gateway, not a Kiro provider extraction, and not a Kiro-compatible abstraction. Kiro is absent from the target product vocabulary and runtime dependency graph. Existing Kiro-named code is only a source of generic implementation ideas where it contains reusable scheduling, lease, usage, stream, body, model, proxy, or observability behavior.
+The target is not a Account Runtime gateway, not a Account Runtime provider extraction, and not a Account Runtime-compatible abstraction. Account Runtime is absent from the target product vocabulary and runtime dependency graph. Existing Account Runtime-named code is only a source of generic implementation ideas where it contains reusable scheduling, lease, usage, stream, body, model, proxy, or observability behavior.
 
 ## Target Runtime Flow
 
@@ -51,20 +51,20 @@ Use these terms in target code and UI:
 
 Do not introduce or retain these as runtime/product terms:
 
-- `Kiro`
-- `kiro`
-- `KiroCredentials`
-- `KiroProvider`
-- `KiroEndpoint`
+- `Account Runtime`
+- `account-runtime`
+- `Account RuntimeCredentials`
+- `Account RuntimeProvider`
+- `Account RuntimeEndpoint`
 - `local_pool`
 - `external_pool`
 - `profile_arn`
-- `kiro_api_key`
+- `account-runtime_api_key`
 - `machine_id`
 - `codewhisperer`
 - `IdC`
 - `external_idp`
-- `KiroRsTool`
+- `Account RuntimeRsTool`
 
 Historical docs, archived evidence, and migration notes may mention old terms, but runtime source, Admin source, config fields, API DTOs, database schema, Redis keys, and tests for the target should not depend on them.
 
@@ -84,18 +84,18 @@ Preserve and rename these behaviors where current code already implements useful
 - Raw usage preservation, effective usage calculation, reported usage projection, prompt-cache simulation, pricing, rollups and dashboard queries.
 - Request API keys, Admin operations, audit, health and diagnostics that remain meaningful for upstream accounts.
 
-## Remove Kiro-Specific Behavior
+## Remove Account Runtime-Specific Behavior
 
 Remove these target behaviors rather than moving them behind a new abstraction:
 
-- Kiro OAuth, Social, IdC, external IdP, AWS SSO or Kiro API-key credential import and refresh.
-- Kiro credential files, `KIRO_API_KEY`, Kiro credential backup/import/export and Kiro account testing.
-- Kiro IDE/CLI endpoints, endpoint registry, request envelopes, profile ARN discovery and profile ARN/body injection.
-- Kiro EventStream parser, CRC/framing, Kiro event DTOs and direct Kiro-event-to-Anthropic stream handling.
-- Kiro model seed, model capability sync from Kiro, quota sync, usage limits, subscription titles and Opus eligibility derived from Kiro subscription.
-- Kiro cachePoint insertion and `kiro_cache_point_*` configuration.
-- Local Kiro pool, external fallback, local rescue and local pool circuit terminology.
-- Kiro metering usage fields as Kiro-named statistics.
+- Account Runtime OAuth, Social, IdC, external IdP, AWS SSO or Account Runtime API-key credential import and refresh.
+- Account Runtime credential files, `ACCOUNT_RUNTIME_API_KEY`, Account Runtime credential backup/import/export and Account Runtime account testing.
+- Account Runtime IDE/CLI endpoints, endpoint registry, request envelopes, profile ARN discovery and profile ARN/body injection.
+- Account Runtime EventStream parser, CRC/framing, Account Runtime event DTOs and direct Account Runtime-event-to-Anthropic stream handling.
+- Account Runtime model seed, model capability sync from Account Runtime, quota sync, usage limits, subscription titles and Opus eligibility derived from Account Runtime subscription.
+- Account Runtime cachePoint insertion and `account-runtime_cache_point_*` configuration.
+- Local Account Runtime pool, external fallback, local rescue and local pool circuit terminology.
+- Account Runtime metering usage fields as Account Runtime-named statistics.
 
 ## Target Module Shape
 
@@ -142,7 +142,7 @@ src/
 Dependency rules:
 
 - Protocol adapters cannot import account implementation details or storage adapters.
-- Account runtime cannot import Anthropic HTTP DTOs or legacy Kiro types.
+- Account runtime cannot import Anthropic HTTP DTOs or legacy Account Runtime types.
 - Upstream account execution cannot hide business attempts that may consume capacity or bill usage.
 - Usage persistence stores raw attempt facts separately from client-reported request usage.
 - Storage code may persist typed account/runtime facts but should not define product semantics.
@@ -171,7 +171,7 @@ There should be no local/external/fallback split. Routing selects ordered accoun
 
 ## Body And Protocol Boundary
 
-Body processing must be upstream-account oriented, not Kiro oriented.
+Body processing must be upstream-account oriented, not Account Runtime oriented.
 
 Keep:
 
@@ -183,11 +183,11 @@ Keep:
 
 Remove:
 
-- Anthropic-to-Kiro request conversion;
-- Kiro cachePoint conversion;
-- Kiro endpoint/profile/body injection;
-- code paths named `local_body_pipeline` if `local` means Kiro pool;
-- stream code that imports Kiro event DTOs.
+- Anthropic-to-Account Runtime request conversion;
+- Account Runtime cachePoint conversion;
+- Account Runtime endpoint/profile/body injection;
+- code paths named `local_body_pipeline` if `local` means Account Runtime pool;
+- stream code that imports Account Runtime event DTOs.
 
 Introduce canonical events before protocol encoding:
 
@@ -214,10 +214,10 @@ upstream raw usage
 
 Rename or replace old fields:
 
-- `KiroCredentialAttempt` -> `AccountAttemptTrace`
+- `Account RuntimeCredentialAttempt` -> `AccountAttemptTrace`
 - `ExternalPoolAttempt` -> `AccountAttemptTrace` or `UpstreamAttemptTrace`
 - `external_pool_billing` -> `upstream_account_billing` or generic usage projection details
-- `kiro_metering_usage` -> `upstream_metering_units` or provider-neutral raw usage/cost facts
+- `account-runtime_metering_usage` -> `upstream_metering_units` or provider-neutral raw usage/cost facts
 - `UsageRouteKind::LocalCredential` / `ExternalPool` -> account/route attempt terms
 
 Do not coerce missing or unknown upstream usage to zero when an attempt may have executed. Client-reported usage should project only the delivered attempt, while operational usage preserves every potentially executed attempt.
@@ -232,13 +232,13 @@ Rename and reshape Admin around accounts:
 - external attempts -> account attempts
 - external billing -> upstream account usage/projection
 
-Delete Kiro-specific UI/API:
+Delete Account Runtime-specific UI/API:
 
-- Kiro credentials page and import/export formats;
-- Kiro model sync;
-- Kiro quota/subscription views;
-- Kiro endpoint/profile/auth forms;
-- Kiro cachePoint settings.
+- Account Runtime credentials page and import/export formats;
+- Account Runtime model sync;
+- Account Runtime quota/subscription views;
+- Account Runtime endpoint/profile/auth forms;
+- Account Runtime cachePoint settings.
 
 Runtime settings should expose account scheduler, body policies, route policies, usage projection, protocol profiles, and observability settings.
 
@@ -249,25 +249,25 @@ The target should be implemented directly on a new branch from updated `master`.
 1. Commit and merge the current feature branch into `master`, then create `feature/account-runtime-upstream-accounts`.
 2. Add target-neutral account/runtime/canonical usage types.
 3. Convert external pool configuration and UI terminology toward account terminology.
-4. Extract scheduler primitives from Kiro credential dependencies into account runtime modules.
+4. Extract scheduler primitives from Account Runtime credential dependencies into account runtime modules.
 5. Replace local/external/fallback route terminology with account route planning and attempt terminology.
-6. Introduce canonical upstream response/events and remove direct Kiro event imports from protocol encoders.
-7. Convert body pipelines to upstream-account body preparation and remove Kiro envelope/cachePoint handling.
+6. Introduce canonical upstream response/events and remove direct Account Runtime event imports from protocol encoders.
+7. Convert body pipelines to upstream-account body preparation and remove Account Runtime envelope/cachePoint handling.
 8. Convert usage records, rollups and Admin DTOs to account/upstream terminology.
-9. Delete Kiro authentication, endpoint, provider, parser, model, credential and Admin paths once no runtime code imports them.
+9. Delete Account Runtime authentication, endpoint, provider, parser, model, credential and Admin paths once no runtime code imports them.
 10. Run source-level scans, unit/integration tests, frontend builds and targeted protocol/usage checks.
 
 ## Acceptance Checks
 
 The implementation is not complete until all of these are true:
 
-- Runtime source and UI source have no Kiro business dependency.
-- `src/kiro` is removed or contains no compiled runtime module.
-- No target config, DTO, DB table, Redis key, Admin page or test uses `kiro`, `local_pool` or `external_pool` terminology except migration/archive text.
+- Runtime source and UI source have no Account Runtime business dependency.
+- `src/account-runtime` is removed or contains no compiled runtime module.
+- No target config, DTO, DB table, Redis key, Admin page or test uses `account-runtime`, `local_pool` or `external_pool` terminology except migration/archive text.
 - Accounts are the only upstream scheduling unit.
 - Account scheduling supports priority, model support, RPM, weighted concurrency, proxy, health, cooldown, sticky, queueing and bounded release behavior.
-- Body handling supports compatible raw/normalized upstream account requests without Kiro envelope logic.
+- Body handling supports compatible raw/normalized upstream account requests without Account Runtime envelope logic.
 - Protocol handling emits correct stream/non-stream Anthropic/Claude-compatible responses from canonical upstream events.
-- Usage preserves raw/effective/reported layers and records account attempts without Kiro-named metering fields.
-- Admin can configure accounts, routes, scheduler settings, body policies and usage projection without Kiro settings.
+- Usage preserves raw/effective/reported layers and records account attempts without Account Runtime-named metering fields.
+- Admin can configure accounts, routes, scheduler settings, body policies and usage projection without Account Runtime settings.
 - Regression checks include source scans for removed terms and tests covering account acquire/release, retry/failover, usage projection, stream final usage and UI account configuration.

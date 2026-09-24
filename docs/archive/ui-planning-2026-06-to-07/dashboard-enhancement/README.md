@@ -4,7 +4,7 @@
 >
 > Original path: `ui/docs/dashboard-enhancement/README.md`. Current disposition and authority: [operator UI planning archive](../README.md).
 
-> 目标:基于 Kiro 控制台**现有后端能力**，增强 `ui/` 的 dashboard 与运维分析页，让运维"一眼看清健康、快速下钻排查、清晰复盘成本"。
+> 目标:基于 Account Runtime 控制台**现有后端能力**，增强 `ui/` 的 dashboard 与运维分析页，让运维"一眼看清健康、快速下钻排查、清晰复盘成本"。
 >
 > **本方案力求自包含**：即使不读源码、不看对话记录，也能据此准确理解每个模块的数据来源、实现边界与实施顺序，不产生误解。
 

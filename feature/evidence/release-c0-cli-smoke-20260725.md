@@ -17,17 +17,17 @@ Scope:
 Frozen candidate copied out of scoped Cargo target before cleanup:
 
 ```text
-candidate_root=/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T//kiro-release-candidate.JjCroS
-kiro-rs sha256=1290930ed48ee6e20d6ed0ea01095aa08d190164c5252921b7fa1688ca5e569e
-kiro_loadtest sha256=4f529fd5484b8f5552c0abb2a47bb5c9197b526c825a43c6d7cc44cd37a7ffd2
+candidate_root=/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T//account-runtime-release-candidate.JjCroS
+account-runtime sha256=1290930ed48ee6e20d6ed0ea01095aa08d190164c5252921b7fa1688ca5e569e
+account_runtime_loadtest sha256=4f529fd5484b8f5552c0abb2a47bb5c9197b526c825a43c6d7cc44cd37a7ffd2
 ```
 
-The frozen binary was started on the existing local validation port `127.0.0.1:9022` after confirming the prior listener was this project’s temporary `kiro-rs -c config.json --credentials credentials.json` process.
+The frozen binary was started on the existing local validation port `127.0.0.1:9022` after confirming the prior listener was this project’s temporary `account-runtime -c config.json --credentials credentials.json` process.
 
 ```text
 listener=127.0.0.1:9022
 pid=23501
-healthz={"service":"kiro-rs","status":"ok"}
+healthz={"service":"account-runtime","status":"ok"}
 validation_root=tmp/validation/claude-cli-current-20260725-050400
 ```
 
@@ -44,13 +44,13 @@ The scoped batch ran:
 - `cargo fmt --all -- --check`
 - `cargo test --locked --all-targets`
 - `cargo build --release --bins`
-- copied `kiro-rs` and `kiro_loadtest` to `candidate_root`
+- copied `account-runtime` and `account_runtime_loadtest` to `candidate_root`
 
 Result:
 
 ```text
 main tests: 1781 passed / 0 failed / 6 ignored
-kiro_loadtest tests: 31 passed / 0 failed
+account_runtime_loadtest tests: 31 passed / 0 failed
 release build: passed
 scoped target cleanup: removed=true / reservation_released=true
 ```
@@ -134,8 +134,8 @@ CLI version:
 Command class:
 
 ```text
-HOME=/tmp/kiro-claude-home-9022-current
-CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-9022-current
+HOME=/tmp/account-runtime-claude-home-9022-current
+CLAUDE_CONFIG_DIR=/tmp/account-runtime-claude-config-9022-current
 ANTHROPIC_BASE_URL=http://127.0.0.1:9022/cc
 ANTHROPIC_API_KEY=<redacted>
 claude --bare --print --verbose \
@@ -179,8 +179,8 @@ The only stderr note was Claude Code workspace trust warning for local settings;
 Command class:
 
 ```text
-HOME=/tmp/kiro-claude-home-9022-tool
-CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-9022-tool
+HOME=/tmp/account-runtime-claude-home-9022-tool
+CLAUDE_CONFIG_DIR=/tmp/account-runtime-claude-config-9022-tool
 ANTHROPIC_BASE_URL=http://127.0.0.1:9022/cc
 ANTHROPIC_API_KEY=<redacted>
 claude --bare --print --verbose \
@@ -275,7 +275,7 @@ Usage:
 }
 ```
 
-This live smoke proves the current proxy accepts `thinking.type=adaptive` together with `output_config.effort=max` and does not downgrade it into a local validation error. Exact upstream Kiro wire preservation is covered by the Rust C0 tests and historical thinking wire evidence; this smoke does not include a packet capture of the upstream request body.
+This live smoke proves the current proxy accepts `thinking.type=adaptive` together with `output_config.effort=max` and does not downgrade it into a local validation error. Exact upstream Account Runtime wire preservation is covered by the Rust C0 tests and historical thinking wire evidence; this smoke does not include a packet capture of the upstream request body.
 
 ## Limitations
 

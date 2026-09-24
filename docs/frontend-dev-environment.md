@@ -36,9 +36,9 @@ cargo run -- -c config.json --credentials credentials.json
 如果你想直接跑 release 二进制但仍走 Vite，可显式指定：
 
 ```bash
-KIRO_NEW_UI_MODE=redirect \
-KIRO_NEW_UI_DEV_SERVER=http://127.0.0.1:9023/ui \
-  ./target/release/kiro-rs -c config.json --credentials credentials.json
+ACCOUNT_RUNTIME_UI_MODE=redirect \
+ACCOUNT_RUNTIME_UI_DEV_SERVER=http://127.0.0.1:9023/ui \
+  ./target/release/<frozen-release-binary> -c config.json --credentials credentials.json
 ```
 
 最后启动需要看的前端。通常只需要新版 UI：

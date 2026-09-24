@@ -16,11 +16,11 @@ current source of truth.
 - Git HEAD during validation: `57d8c1ed1cff3fcd0f49935f1415294c9f0f13f9`
 - Working tree: dirty by design; validation covers the pre-release candidate diff.
 - Frozen product binary:
-  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-cli-candidate.rUvj61/kiro-rs`
+  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-cli-candidate.rUvj61/account-runtime`
 - Frozen product SHA-256:
   `40ec70c7036826807f3d59701fe02de8eada7c8d88f265ad4a68fde55ff3c9d3`
 - Frozen loadtest binary:
-  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/kiro-cli-candidate.rUvj61/kiro_loadtest`
+  `/private/var/folders/9p/fpr69g_x7pz9_g386g1kfpnc0000gn/T/account-runtime-cli-candidate.rUvj61/account_runtime_loadtest`
 - Frozen loadtest SHA-256:
   `a9b03d0dbe3f4456939641b434fcc3781ea6f6909a31dff393100d2bcbcc81c8`
 - Rust toolchain used for release/static gates: `1.92.0`
@@ -47,7 +47,7 @@ The current candidate includes these product fixes and hardening changes:
   state to avoid stale summary reuse after queued writes finish.
 - Dashboard query endpoints are split/gated so slow usage aggregation is non-core work.
 - Thinking/output_config mapping preserves explicit effort values, including `max`, and sends
-  Kiro-compatible `thinking.type=adaptive` with `output_config`.
+  Account Runtime-compatible `thinking.type=adaptive` with `output_config`.
 - Tool-history sanitizer keeps tool_use/tool_result structure without leaking Claude-internal
   transcript markers such as `Tool results provided`, `<function_results>`, or hashed tool names.
 - Test runner compatibility was updated for Claude Code CLI `2.1.220`, whose reachability probe is
@@ -85,8 +85,8 @@ test result: ok. 248 passed; 0 failed
 Result: pass.
 
 ```text
-kiro-rs main tests: 1816 passed; 0 failed; 6 ignored
-kiro_loadtest tests: 31 passed; 0 failed
+account-runtime main tests: 1816 passed; 0 failed; 6 ignored
+account_runtime_loadtest tests: 31 passed; 0 failed
 validation-build-cleanup removed=true reservation_released=true
 ```
 
@@ -215,7 +215,7 @@ Interpretation:
 
 ## 5. Real Claude Code CLI fake-upstream gates
 
-These gates use the real installed `claude` binary and a fake local Kiro upstream. They do not
+These gates use the real installed `claude` binary and a fake local Account Runtime upstream. They do not
 consume real accounts. They prove Claude Code CLI protocol compatibility, tool history round-trip,
 long session behavior, thinking/output_config wire behavior, and leakage protection for the frozen
 candidate.
@@ -267,7 +267,7 @@ important result is that these did not leak into the Claude CLI user-visible tra
 
 ### 5.3 Thinking/output_config wire
 
-Initial thinking-wire run with `KIRO_CLAUDE_BINARY=$(command -v claude)` failed before protocol
+Initial thinking-wire run with `ACCOUNT_RUNTIME_CLAUDE_BINARY=$(command -v claude)` failed before protocol
 validation because the runner canonicalized the Volta symlink to `volta-shim`. Executing the shim
 directly loses the `claude` argv0 identity.
 
@@ -275,13 +275,13 @@ Fix applied to validation harness:
 
 - use the real Claude package entrypoint:
   `/Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`;
-- set `KIRO_EXPECTED_CLAUDE_VERSION=2.1.220`;
+- set `ACCOUNT_RUNTIME_EXPECTED_CLAUDE_VERSION=2.1.220`;
 - classify Claude CLI `2.1.220` probe `HEAD /cc/api/hello` as the expected `cc_head_probe`.
 
 Contract test after harness update:
 
 ```text
-node --test feature/tests/thinking-effort-kiro-wire-contract.test.mjs
+node --test feature/tests/thinking-effort-account-runtime-wire-contract.test.mjs
 3/3 tests passed
 ```
 
@@ -312,7 +312,7 @@ Observed wire contract:
 ## 6. Load/chaos gates
 
 All load/chaos tests used isolated local PgSQL/Redis containers and fake upstreams. No production
-traffic was generated. Temporary `kiro_load_chaos_*` databases were created before each run and
+traffic was generated. Temporary `account-runtime_load_chaos_*` databases were created before each run and
 dropped after validation. Redis prefixes were cleaned by the runner.
 
 Validation dependency ports:
@@ -433,10 +433,10 @@ usable; it does not replace the separate dashboard product redesign described in
 
 Deleted only the temporary validation databases created in this run:
 
-- `kiro_load_chaos_l3_170406_84952_a/b/c`
-- `kiro_load_chaos_l4_170536_95280_a/b/c/d/e/f`
-- `kiro_load_chaos_l5_170727_8938_a`
-- `kiro_load_chaos_l5r2_170947_33708_a`
+- `account-runtime_load_chaos_l3_170406_84952_a/b/c`
+- `account-runtime_load_chaos_l4_170536_95280_a/b/c/d/e/f`
+- `account-runtime_load_chaos_l5_170727_8938_a`
+- `account-runtime_load_chaos_l5r2_170947_33708_a`
 
 Redis prefixes were cleaned by the load/chaos runner:
 

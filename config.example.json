@@ -1,17 +1,17 @@
 {
   "postgres": {
-    "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
+    "url": "postgres://account_runtime:account_runtime_dev_password@127.0.0.1:25432/account_runtime"
   },
   "redis": {
     "url": "redis://127.0.0.1:26379/0"
   },
   "observabilityRedis": {
     "url": null,
-    "keyPrefix": "kiro_rs:observability"
+    "keyPrefix": "account_runtime:observability"
   },
   "host": "127.0.0.1",
   "port": 8990,
-  "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "apiKey": "sk-account-runtime-qazWSXedcRFV123456",
   "apiKeys": [],
   "adminApiKey": "sk-admin-your-secret-key",
   "requestAdmission": {
@@ -20,7 +20,7 @@
     "maxQueuedRequests": 64,
     "queueTimeoutMs": 1000
   },
-  "kiroUpstreamResponseTimeoutSecs": 180,
+  "localUpstreamResponseTimeoutSecs": 180,
   "credentialRetryMaxAttempts": 0,
   "inferenceUpstreamMaxAttempts": 4,
   "auxiliaryUpstreamMaxAttempts": 2,
@@ -84,5 +84,5 @@
     "currentImagesMaxBytes": 180000,
     "oversizedImageHandling": "drop-with-placeholder"
   },
-  "kiroAgentModeStrategy": "vibe"
+  "localUpstreamAgentModeStrategy": "vibe"
 }

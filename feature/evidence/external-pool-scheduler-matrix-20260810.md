@@ -5,7 +5,7 @@
 This was service-level validation with frozen binaries and loopback mock upstreams. It was not a unit-test-only oracle.
 
 - Result: `pass`
-- Frozen binary: `/tmp/kiro-current-bin.k9z1NT/kiro-rs`
+- Frozen binary: `/tmp/account-runtime-current-bin.k9z1NT/account-runtime`
 - Frozen binary SHA256: `e58e116fc940593f42f81bb4cc07695bd08c39a89eaf2fee18090819d36f4e16`
 - Build artifact gate: `pass`
 - Temp e0102/external_matrix PostgreSQL databases after cleanup: `0`

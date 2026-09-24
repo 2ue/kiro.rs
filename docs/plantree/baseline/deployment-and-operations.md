@@ -9,7 +9,7 @@ Related: [System context](system-context.md), [Storage and state](storage-and-st
 
 ## Supported Operational Context
 
-`kiro-rs` is operated within one owner-controlled trust domain. A deployment may contain one process or multiple replicas, but every replica serves the same operator, request-key set, credential pool, and durable databases. Replication is for availability/capacity; it does not create users or tenants.
+`account-runtime` is operated within one owner-controlled trust domain. A deployment may contain one process or multiple replicas, but every replica serves the same operator, request-key set, credential pool, and durable databases. Replication is for availability/capacity; it does not create users or tenants.
 
 The runtime currently requires:
 
@@ -17,7 +17,7 @@ The runtime currently requires:
 - reachable PgSQL for durable state;
 - reachable Redis for coordination and runtime-event health;
 - a writable location when tool-format diagnostics or file logs are enabled;
-- network access to configured Kiro, external-pool, remote-content, and optional tokenizer endpoints.
+- network access to configured Account Runtime, external-pool, remote-content, and optional tokenizer endpoints.
 
 PgSQL and Redis are mandatory startup dependencies. There is no supported database-free or Redis-free serving mode in the current executable.
 
@@ -31,7 +31,7 @@ PgSQL and Redis are mandatory startup dependencies. There is no supported databa
 4. import runtime configuration and credentials into PgSQL only when the corresponding durable state is absent;
 5. load authoritative runtime configuration, credentials, credential runtime state, proxy resources, external pools, model capabilities, pricing, and supporting state from PgSQL;
 6. construct the request API key store and fail startup when no valid request API key is configured;
-7. build the usage recorder, prompt/cache state, model and pricing catalogs, `MultiTokenManager`, Kiro provider, external-pool manager, and request application state;
+7. build the usage recorder, prompt/cache state, model and pricing catalogs, `MultiTokenManager`, Account Runtime provider, external-pool manager, and request application state;
 8. start the statistics/runtime-mutation worker, Redis runtime-event listener, catalog synchronization tasks, usage writers, and shared storage workers;
 9. optionally assemble and mount the Admin API and two embedded Admin user interfaces according to configuration;
 10. mount authenticated route families plus `/healthz` and `/readyz`, bind the listener, and begin serving.
@@ -53,7 +53,7 @@ Operational consequence: editing `config.json` or `credentials.json` on disk aft
 | Runtime configuration | PgSQL runtime-config document/version | Redis runtime-change event | Request/config snapshots and clones |
 | Request API keys | PgSQL-backed runtime config | Runtime-config event | `RequestApiKeyStore` used by auth middleware |
 | Admin key | PgSQL-backed runtime config | Incomplete cross-replica refresh | `AdminState` on each process |
-| Kiro credentials and durable runtime facts | PgSQL credential/runtime tables | Redis refresh locks, cooldown, RPM, leases, queues, sticky bindings | Credential entries and pending mutation state |
+| Account Runtime credentials and durable runtime facts | PgSQL credential/runtime tables | Redis refresh locks, cooldown, RPM, leases, queues, sticky bindings | Credential entries and pending mutation state |
 | Proxy resources | PgSQL | Selected runtime events/coordination | Manager snapshots |
 | External-pool definitions | PgSQL | Redis leases, queues, cooldown/availability coordination | Pool manager caches |
 | Usage records and durable rollups | PgSQL | Redis realtime/derived views and dedup markers | Recent usage deque and writer queues |
@@ -100,7 +100,7 @@ Current incomplete convergence behavior is material:
 
 These are replica availability/consistency concerns, not tenant-data concerns. No tenant partitioning exists or is required by the current product.
 
-Evidence: `src/main.rs:813-968`, `src/common/auth.rs:63-89`, `src/admin/handlers.rs:1059-1089`, `src/kiro/token_manager/manager.rs:1245-1296`, `src/admin/service.rs:3708-3816`.
+Evidence: `src/main.rs:813-968`, `src/common/auth.rs:63-89`, `src/admin/handlers.rs:1059-1089`, `src/local_upstream_impl/token_manager/manager.rs:1245-1296`, `src/admin/service.rs:3708-3816`.
 
 ## Health And Readiness
 
@@ -139,7 +139,7 @@ Evidence: `src/main.rs:813-898`, `docker-compose.deploy.yml:1-22`, `docker-compo
 
 An item being queued does not always mean it has become durable. Each queue's accepted, finished, failed, timed-out, rejected, and abandoned semantics must be inspected separately.
 
-Evidence: `src/main.rs:260-485,530-645`, `src/anthropic/usage.rs:1398-1483`, `src/kiro/token_manager/storage_task.rs`, `src/admin/service.rs:1419-1438,3708-3816`.
+Evidence: `src/main.rs:260-485,530-645`, `src/anthropic/usage.rs:1398-1483`, `src/local_upstream_impl/token_manager/storage_task.rs`, `src/admin/service.rs:1419-1438,3708-3816`.
 
 ## Graceful Shutdown
 
@@ -219,7 +219,7 @@ Evidence: `.github/workflows/docker-build.yaml:103-109`, `docs/plantree/plans/ru
 | Redis unavailable during startup | Retry within startup bound, then fail startup |
 | PgSQL/Redis unavailable after startup | `/readyz` fails; request/background paths follow their local timeout/fallback behavior |
 | Redis runtime subscription lost | Listener health becomes unready and reconnects; periodic reload is part of the listener loop |
-| Kiro/external upstream slow | Request can remain leased until header/idle/request timeout semantics resolve it |
+| Account Runtime/external upstream slow | Request can remain leased until header/idle/request timeout semantics resolve it |
 | Replica restart | Durable PgSQL state reloads; process-local Files/cache/recent/job state is lost |
 | Usage/storage queue pressure | Bounded queues apply wait, reject, or synchronous fallback depending on path |
 | Shutdown deadline exhausted | Remaining work is logged/abandoned; only selected residue currently changes exit status |

@@ -478,15 +478,15 @@ pub const MAX_MISSING_MAX_TOKENS_VALUE: i32 = 200_000;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingMaxTokensPolicy {
-    Reject,
     #[default]
+    Reject,
     DefaultValue,
 }
 
 /// 入口 Messages 请求缺少顶层 max_tokens 时的兼容策略。
 ///
-/// Anthropic Messages 请求使用 max_tokens 表示本次输出上限。默认补一个较小正数，
-/// 只为兼容缺字段客户端；不使用 0，也不补过大的值，避免改变成本和输出语义。
+/// Anthropic Messages 请求使用 max_tokens 表示本次输出上限。默认拒绝缺字段请求，
+/// 需要兼容旧客户端时可显式改成默认值补齐。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MissingMaxTokensConfig {
@@ -500,7 +500,7 @@ pub struct MissingMaxTokensConfig {
 impl Default for MissingMaxTokensConfig {
     fn default() -> Self {
         Self {
-            policy: MissingMaxTokensPolicy::DefaultValue,
+            policy: MissingMaxTokensPolicy::Reject,
             default_value: default_missing_max_tokens_value(),
         }
     }
@@ -2055,7 +2055,7 @@ pub struct CacheRoutePolicyPatch {
     pub cache_point: Option<CachePointPolicyPatch>,
     #[serde(default)]
     pub bounds: Option<CacheBoundsPolicyPatch>,
-    #[serde(default, rename = "claudeCodeTool", alias = "kiroRsTool")]
+    #[serde(default, rename = "claudeCodeTool")]
     pub claude_code_tool: Option<ClaudeCodeToolCachePolicyPatch>,
 }
 
@@ -2190,7 +2190,7 @@ pub enum PromptCacheStrategyType {
     NoCache,
     #[default]
     CurrentHighCache,
-    #[serde(rename = "claude_code_tool", alias = "kiro_rs_tool")]
+    #[serde(rename = "claude_code_tool")]
     ClaudeCodeTool,
 }
 
@@ -2201,7 +2201,7 @@ pub struct CachePolicyConfig {
     pub default: CacheRoutePolicyPatch,
     #[serde(default)]
     pub current_high_cache: CacheRoutePolicyPatch,
-    #[serde(default, rename = "claudeCodeTool", alias = "kiroRsTool")]
+    #[serde(default, rename = "claudeCodeTool")]
     pub claude_code_tool: CacheRoutePolicyPatch,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
@@ -3399,10 +3399,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
-    #[serde(
-        default = "default_local_upstream_client_version",
-        alias = "kiroVersion"
-    )]
+    #[serde(default = "default_local_upstream_client_version")]
     pub local_upstream_client_version: String,
 
     #[serde(default)]
@@ -3533,20 +3530,14 @@ pub struct Config {
     /// 只限制请求发出到拿到响应头的阶段；响应头之后的流式 body 读取仍由
     /// Anthropic SSE 层的上游 idle timeout 控制，避免长输出被整段请求超时误杀。
     /// `0` 表示关闭该额外保护，仅使用底层 HTTP client 的全局超时。
-    #[serde(
-        default = "default_local_upstream_response_timeout_secs",
-        alias = "kiroUpstreamResponseTimeoutSecs"
-    )]
+    #[serde(default = "default_local_upstream_response_timeout_secs")]
     pub local_upstream_response_timeout_secs: u64,
 
     /// 本地上游流式响应正文的静默超时秒数。
     ///
     /// 响应头回来后，如果 eventstream 在该时间内没有任何新 chunk，就按上游
     /// stream idle 处理并释放并发占用。`0` 表示使用默认值，避免错误关闭保护。
-    #[serde(
-        default = "default_local_upstream_stream_idle_timeout_secs",
-        alias = "kiroUpstreamStreamIdleTimeoutSecs"
-    )]
+    #[serde(default = "default_local_upstream_stream_idle_timeout_secs")]
     pub local_upstream_stream_idle_timeout_secs: u64,
 
     /// 是否允许流式响应在尚未向下游发送任何 SSE 字节前，对上游流读取/空闲/错误事件进行重试。
@@ -3554,19 +3545,13 @@ pub struct Config {
     /// 该开关只覆盖“下游尚未提交”的安全窗口。只要已经发送过 message_start、ping、
     /// text/thinking/tool_use 或 error 等任意 SSE 字节，就不会自动换号重试，避免重复工具调用
     /// 或事件乱序。
-    #[serde(
-        default = "default_local_upstream_stream_retry_enabled",
-        alias = "kiroUpstreamStreamRetryEnabled"
-    )]
+    #[serde(default = "default_local_upstream_stream_retry_enabled")]
     pub local_upstream_stream_retry_enabled: bool,
 
     /// 单个流式请求在“未向下游提交”窗口内最多尝试多少次上游流。
     ///
     /// 包含首次调用；默认 2 表示最多补一次重试。0/1 都等价于不额外重试。
-    #[serde(
-        default = "default_local_upstream_stream_retry_max_attempts",
-        alias = "kiroUpstreamStreamRetryMaxAttempts"
-    )]
+    #[serde(default = "default_local_upstream_stream_retry_max_attempts")]
     pub local_upstream_stream_retry_max_attempts: u32,
 
     /// 单个下游 Messages 请求允许发出的推理上游 HTTP 请求硬上限。
@@ -3600,28 +3585,22 @@ pub struct Config {
     pub token_refresh_burst: u32,
 
     /// 上游 eventstream idle timeout 发生在下游提交前时是否允许重试。
-    #[serde(
-        default = "default_true",
-        alias = "kiroUpstreamStreamRetryOnIdleTimeout"
-    )]
+    #[serde(default = "default_true")]
     pub local_upstream_stream_retry_on_idle_timeout: bool,
 
     /// 上游 body read error 发生在下游提交前时是否允许重试。
-    #[serde(default = "default_true", alias = "kiroUpstreamStreamRetryOnReadError")]
+    #[serde(default = "default_true")]
     pub local_upstream_stream_retry_on_read_error: bool,
 
     /// 上游 2xx JSON 错误体、流内 error/invalidState 等状态错误发生在下游提交前时是否允许重试。
-    #[serde(
-        default = "default_true",
-        alias = "kiroUpstreamStreamRetryOnStatusError"
-    )]
+    #[serde(default = "default_true")]
     pub local_upstream_stream_retry_on_status_error: bool,
 
     /// 本地上游基础 URL 覆盖。
     ///
     /// 默认 `None` 时使用当前本地上游实现的官方地址。仅用于本地压测、
     /// staging 或显式内网代理验证；生产不配置时不会改变官方调用协议。
-    #[serde(default, alias = "kiroUpstreamBaseUrl")]
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_upstream_base_url: Option<String>,
 
@@ -3747,24 +3726,15 @@ pub struct Config {
     /// 是否把 Anthropic tool cache_control 转成本地上游 cachePoint。
     ///
     /// 默认关闭；开启后仅对实际发送给本地上游的工具定义插入 cachePoint。
-    #[serde(
-        default = "default_local_upstream_cache_point_enabled",
-        alias = "kiroCachePointEnabled"
-    )]
+    #[serde(default = "default_local_upstream_cache_point_enabled")]
     pub local_upstream_cache_point_enabled: bool,
 
     /// cachePoint 第一阶段只根据工具上的 cache_control 插入，不自动改写系统消息或历史消息。
-    #[serde(
-        default = "default_local_upstream_cache_point_tools_only",
-        alias = "kiroCachePointToolsOnly"
-    )]
+    #[serde(default = "default_local_upstream_cache_point_tools_only")]
     pub local_upstream_cache_point_tools_only: bool,
 
     /// 是否把 cachePoint 插入计划写入 payload diagnostics，便于定位上游 body invalid。
-    #[serde(
-        default = "default_local_upstream_cache_point_record_plan",
-        alias = "kiroCachePointRecordPlan"
-    )]
+    #[serde(default = "default_local_upstream_cache_point_record_plan")]
     pub local_upstream_cache_point_record_plan: bool,
 
     /// 负载均衡模式（"priority" 或 "balanced"）
@@ -3824,10 +3794,7 @@ pub struct Config {
     pub compat_profile: CompatProfile,
 
     /// 本地上游 agent-mode header 策略（默认 vibe，保持现有成功链路）。
-    #[serde(
-        default = "default_local_upstream_agent_mode_strategy",
-        alias = "kiroAgentModeStrategy"
-    )]
+    #[serde(default = "default_local_upstream_agent_mode_strategy")]
     pub local_upstream_agent_mode_strategy: LocalUpstreamAgentModeStrategy,
 
     /// 请求模型解析策略（默认 compatible）。
@@ -4469,7 +4436,7 @@ fn default_high_cache_threshold() -> i32 {
 }
 
 fn default_endpoint() -> String {
-    crate::local_upstream::endpoint::LOCAL_UPSTREAM_IDE_ENDPOINT_NAME.to_string()
+    "ide".to_string()
 }
 
 fn default_expose_proxy_warnings() -> bool {
@@ -5675,7 +5642,7 @@ mod tests {
             r#"{
                 "apiKey": "sk-test",
                 "compatProfile": "anthropic-strict",
-                "kiroAgentModeStrategy": "auto"
+                "localUpstreamAgentModeStrategy": "auto"
             }"#,
         )
         .unwrap();
@@ -6235,7 +6202,7 @@ mod tests {
     }
 
     #[test]
-    fn local_upstream_runtime_fields_emit_new_names_and_accept_legacy_aliases() {
+    fn local_upstream_runtime_fields_emit_current_names() {
         let mut config = Config::default();
         config.local_upstream_response_timeout_secs = 31;
         config.local_upstream_stream_idle_timeout_secs = 32;
@@ -6268,55 +6235,43 @@ mod tests {
         assert_eq!(serialized["localUpstreamCachePointRecordPlan"], false);
         assert_eq!(serialized["localUpstreamAgentModeStrategy"], "auto");
         assert_eq!(serialized["localUpstreamClientVersion"], "1.2.3");
-        assert!(serialized.get("kiroUpstreamResponseTimeoutSecs").is_none());
-        assert!(
-            serialized
-                .get("kiroUpstreamStreamIdleTimeoutSecs")
-                .is_none()
-        );
-        assert!(serialized.get("kiroUpstreamBaseUrl").is_none());
-        assert!(serialized.get("kiroCachePointEnabled").is_none());
-        assert!(serialized.get("kiroCachePointToolsOnly").is_none());
-        assert!(serialized.get("kiroCachePointRecordPlan").is_none());
-        assert!(serialized.get("kiroAgentModeStrategy").is_none());
-        assert!(serialized.get("kiroVersion").is_none());
 
-        let legacy: Config = serde_json::from_value(serde_json::json!({
-            "kiroUpstreamResponseTimeoutSecs": 41,
-            "kiroUpstreamStreamIdleTimeoutSecs": 42,
-            "kiroUpstreamStreamRetryEnabled": false,
-            "kiroUpstreamStreamRetryMaxAttempts": 4,
-            "kiroUpstreamStreamRetryOnIdleTimeout": false,
-            "kiroUpstreamStreamRetryOnReadError": false,
-            "kiroUpstreamStreamRetryOnStatusError": false,
-            "kiroUpstreamBaseUrl": "http://127.0.0.1:39091/mock",
-            "kiroCachePointEnabled": true,
-            "kiroCachePointToolsOnly": false,
-            "kiroCachePointRecordPlan": false,
-            "kiroAgentModeStrategy": "spec",
-            "kiroVersion": "4.5.6"
+        let parsed: Config = serde_json::from_value(serde_json::json!({
+            "localUpstreamResponseTimeoutSecs": 41,
+            "localUpstreamStreamIdleTimeoutSecs": 42,
+            "localUpstreamStreamRetryEnabled": false,
+            "localUpstreamStreamRetryMaxAttempts": 4,
+            "localUpstreamStreamRetryOnIdleTimeout": false,
+            "localUpstreamStreamRetryOnReadError": false,
+            "localUpstreamStreamRetryOnStatusError": false,
+            "localUpstreamBaseUrl": "http://127.0.0.1:39091/mock",
+            "localUpstreamCachePointEnabled": true,
+            "localUpstreamCachePointToolsOnly": false,
+            "localUpstreamCachePointRecordPlan": false,
+            "localUpstreamAgentModeStrategy": "spec",
+            "localUpstreamClientVersion": "4.5.6"
         }))
         .unwrap();
 
-        assert_eq!(legacy.local_upstream_response_timeout_secs, 41);
-        assert_eq!(legacy.local_upstream_stream_idle_timeout_secs, 42);
-        assert!(!legacy.local_upstream_stream_retry_enabled);
-        assert_eq!(legacy.local_upstream_stream_retry_max_attempts, 4);
-        assert!(!legacy.local_upstream_stream_retry_on_idle_timeout);
-        assert!(!legacy.local_upstream_stream_retry_on_read_error);
-        assert!(!legacy.local_upstream_stream_retry_on_status_error);
+        assert_eq!(parsed.local_upstream_response_timeout_secs, 41);
+        assert_eq!(parsed.local_upstream_stream_idle_timeout_secs, 42);
+        assert!(!parsed.local_upstream_stream_retry_enabled);
+        assert_eq!(parsed.local_upstream_stream_retry_max_attempts, 4);
+        assert!(!parsed.local_upstream_stream_retry_on_idle_timeout);
+        assert!(!parsed.local_upstream_stream_retry_on_read_error);
+        assert!(!parsed.local_upstream_stream_retry_on_status_error);
         assert_eq!(
-            legacy.local_upstream_base_url.as_deref(),
+            parsed.local_upstream_base_url.as_deref(),
             Some("http://127.0.0.1:39091/mock")
         );
-        assert!(legacy.local_upstream_cache_point_enabled);
-        assert!(!legacy.local_upstream_cache_point_tools_only);
-        assert!(!legacy.local_upstream_cache_point_record_plan);
+        assert!(parsed.local_upstream_cache_point_enabled);
+        assert!(!parsed.local_upstream_cache_point_tools_only);
+        assert!(!parsed.local_upstream_cache_point_record_plan);
         assert_eq!(
-            legacy.local_upstream_agent_mode_strategy,
+            parsed.local_upstream_agent_mode_strategy,
             LocalUpstreamAgentModeStrategy::Spec
         );
-        assert_eq!(legacy.local_upstream_client_version, "4.5.6");
+        assert_eq!(parsed.local_upstream_client_version, "4.5.6");
     }
 
     #[test]
@@ -6347,10 +6302,10 @@ mod tests {
                 "apiKey": "sk-test",
                 "selectionFailureSampleLimit": 12,
                 "selectionFailureRecordEnabled": false,
-                "kiroUpstreamStreamIdleTimeoutSecs": 45,
-                "kiroCachePointEnabled": true,
-                "kiroCachePointToolsOnly": false,
-                "kiroCachePointRecordPlan": false,
+                "localUpstreamStreamIdleTimeoutSecs": 45,
+                "localUpstreamCachePointEnabled": true,
+                "localUpstreamCachePointToolsOnly": false,
+                "localUpstreamCachePointRecordPlan": false,
                 "promptCacheMaxEntriesPerAccount": 50,
                 "promptCacheMaxEntriesGlobal": 500,
                 "promptCacheEntryTtlSecs": 600,
@@ -7032,11 +6987,11 @@ mod tests {
     fn claude_code_tool_cache_policy_deserializes_template_and_path_patch() {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "cachePolicy": {
-                "kiroRsTool": {
+                "claudeCodeTool": {
                     "reportedUsage": {
                         "skipNonStreamUsageProjection": true
                     },
-                    "kiroRsTool": {
+                    "claudeCodeTool": {
                         "coverageRatio": 0.75,
                         "maxCoverageTokens": 12000,
                         "incrementalCreateEnabled": true,
@@ -7048,9 +7003,9 @@ mod tests {
                     }
                 },
                 "pathOverrides": {
-                    "/dfcache/kiro-param": {
-                        "cacheType": "kiro_rs_tool",
-                        "kiroRsTool": {
+                    "/dfcache/claude-code-param": {
+                        "cacheType": "claude_code_tool",
+                        "claudeCodeTool": {
                             "coverageRatio": 0.5,
                             "maxNewCreationTokensPerRequest": 1000,
                             "reportedInputMinTokens": 128
@@ -7078,8 +7033,11 @@ mod tests {
             PromptCacheStrategyType::CurrentHighCache
         );
 
-        let resolved = config.cache_policy_for_path("/dfcache/kiro-param/v1/messages");
-        assert_eq!(resolved.namespace.as_deref(), Some("/dfcache/kiro-param"));
+        let resolved = config.cache_policy_for_path("/dfcache/claude-code-param/v1/messages");
+        assert_eq!(
+            resolved.namespace.as_deref(),
+            Some("/dfcache/claude-code-param")
+        );
         assert_eq!(
             resolved.policy.cache_type,
             PromptCacheStrategyType::ClaudeCodeTool
@@ -7139,7 +7097,6 @@ mod tests {
         .expect("serialize cache route policy patch");
         assert_eq!(serialized_patch["cacheType"], "claude_code_tool");
         assert!(serialized_patch.get("claudeCodeTool").is_some());
-        assert!(serialized_patch.get("kiroRsTool").is_none());
     }
 
     #[test]
@@ -7148,8 +7105,8 @@ mod tests {
             "cachePolicy": {
                 "pathOverrides": {
                     "/dfcache/bad": {
-                        "cacheType": "kiro_rs_tool",
-                        "kiroRsTool": {
+                        "cacheType": "claude_code_tool",
+                        "claudeCodeTool": {
                             "coverageRatio": 1.5
                         }
                     }
@@ -7168,8 +7125,8 @@ mod tests {
             "cachePolicy": {
                 "pathOverrides": {
                     "/dfcache/bad-range": {
-                        "cacheType": "kiro_rs_tool",
-                        "kiroRsTool": {
+                        "cacheType": "claude_code_tool",
+                        "claudeCodeTool": {
                             "reportedInputMinTokens": 4096,
                             "reportedInputMaxTokens": 32
                         }

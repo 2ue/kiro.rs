@@ -42,8 +42,8 @@ See [Correctness, security, and resource bounds](correctness-security-and-resour
 | `SEC-001` | P1 | Remote source DNS validation is not bound to the actual connection, leaving a rebinding window |
 | `RES-001` | P1 | Remote multimodal processing lacks per-request aggregate and global budgets |
 | `RES-002` | P1 | Files live bytes/count are bounded, but delete leaves FIFO tombstones and permits unbounded metadata growth |
-| `RES-003` | P1 | Kiro and external non-stream/error response bodies can be collected without a byte ceiling |
-| `RES-004` | P1/P2 conditional | Kiro HTTP clients are cached forever by proxy configuration and retain obsolete pools and proxy secrets |
+| `RES-003` | P1 | Account Runtime and external non-stream/error response bodies can be collected without a byte ceiling |
+| `RES-004` | P1/P2 conditional | Account Runtime HTTP clients are cached forever by proxy configuration and retain obsolete pools and proxy secrets |
 | `RES-005` | P1/P2 | Supported defaults leave process-wide local/external admission and wait queues unlimited |
 | `HA-001` | P1 in the supported multi-replica production profile | Admin key and selected catalogs do not fully converge across replicas |
 | `HA-002` | P1 in the supported multi-replica production profile | Process-local Files objects can be missing when upload and use reach different replicas |
@@ -71,7 +71,7 @@ See [Architecture, performance, and state](architecture-performance-and-state.md
 | `PERF-005` | P2 | Large request JSON, cache blocks, and diagnostics are repeatedly cloned/canonicalized/serialized |
 | `PERF-006` | P1/P2 | Usage batching still performs substantial per-record and per-rollup I/O |
 | `PERF-007` | P1/P2 conditional | PDF and configured remote tokenization can block or serialize request work |
-| `PERF-008` | P2 conditional | Kiro upstream requests explicitly send `Connection: close`; benefit/risk requires real A/B |
+| `PERF-008` | P2 conditional | Account Runtime upstream requests explicitly send `Connection: close`; benefit/risk requires real A/B |
 | `PERF-009` | P1/P2 conditional | Lease-acquire Lua scripts can scan and remove every stale member in one Redis invocation |
 
 ### Operations, Testing, Frontend, And Supply Chain

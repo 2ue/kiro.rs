@@ -12,13 +12,13 @@ Last updated: 2026-07-31 Asia/Shanghai
 
 This note supersedes any external-pool-based conclusions for the current debugging pass.
 
-The user explicitly requested validation through local Kiro accounts only. The local service under test was:
+The user explicitly requested validation through local Account Runtime accounts only. The local service under test was:
 
-- Service: `kiro-rs` on `127.0.0.1:9022`, listener PID `59668`.
+- Service: `account-runtime` on `127.0.0.1:9022`, listener PID `59668`.
 - Claude Code CLI: `2.1.220 (Claude Code)`.
-- `ccman cc current`: `local-kiro-rs-9022-current`, URL `http://127.0.0.1:9022/cc`.
-- Runtime external pools: disabled for this pass. Backup before the local-only runtime change: `/tmp/kiro-runtime-before-local-only-9022.json`.
-- Active non-deleted local credentials: id `7` and id `8`, both `social`, `KIRO FREE`, not disabled.
+- `ccman cc current`: `local-account-runtime-9022-current`, URL `http://127.0.0.1:9022/cc`.
+- Runtime external pools: disabled for this pass. Backup before the local-only runtime change: `/tmp/account-runtime-runtime-before-local-only-9022.json`.
+- Active non-deleted local credentials: id `7` and id `8`, both `social`, `ACCOUNT_RUNTIME FREE`, not disabled.
 - Credential smoke test endpoint confirmed both id `7` and id `8` can call `claude-sonnet-4.5` and return `local-ok`.
 
 Do not use older external fallback / external pool records as evidence for the three issues below.
@@ -201,7 +201,7 @@ Result:
 - handler WebSearch routing matrix: pass; pure native hits MCP, same-name custom tool still hits normal upstream, mixed native hits MCP and returns `web_search_tool_result`.
 - literal `<search_web>` protocol recovery: pass for stream and non-stream, including negative controls for unknown tool/code-fence/plain-text positions.
 - `cargo check --all-targets --locked`: pass.
-- Full candidate build evidence: scoped `cargo fmt --check && cargo test && cargo build --release` passed with main tests `1831 passed / 0 failed / 6 ignored`, `kiro_loadtest` `31 passed / 0 failed`; candidate SHA-256 `46ce4540fc23f121c4cc5f349e4da722db3da04f790fb3ff438b54e6a7129711`.
+- Full candidate build evidence: scoped `cargo fmt --check && cargo test && cargo build --release` passed with main tests `1831 passed / 0 failed / 6 ignored`, `account_runtime_loadtest` `31 passed / 0 failed`; candidate SHA-256 `46ce4540fc23f121c4cc5f349e4da722db3da04f790fb3ff438b54e6a7129711`.
 
 ### Likely causes
 
@@ -263,11 +263,11 @@ Real Claude Code CLI `Read` tool with image also works:
 
 ### Risky behavior observed
 
-Tool names are normalized/mapped for Kiro, not passed through literally.
+Tool names are normalized/mapped for Account Runtime, not passed through literally.
 
 Relevant source:
 
-- `src/anthropic/converter/tools.rs:95` sanitizes tool names into Kiro-safe camelCase names.
+- `src/anthropic/converter/tools.rs:95` sanitizes tool names into Account Runtime-safe camelCase names.
 - `src/anthropic/converter/tools.rs:130` deterministically maps a name when sanitized name differs or exceeds `TOOL_NAME_MAX_LEN`.
 - `src/anthropic/converter/tools.rs:173` records the reverse map.
 
@@ -301,20 +301,20 @@ Observed historical logs:
 - Live direct local-account matrix on the current candidate passed:
   - `Bash` returns downstream `tool_use name="Bash"`;
   - `weather-lookup` returns downstream `tool_use name="weather-lookup"`;
-  - `bad name` returns downstream `tool_use name="bad name"` after Kiro-safe mapping;
+  - `bad name` returns downstream `tool_use name="bad name"` after Account Runtime-safe mapping;
   - overlong `mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63` returns the original long name downstream;
-  - `schema_probe` with invalid keys returns downstream input keys `bad key` and `nested/key`, not the generated Kiro-safe hash keys;
+  - `schema_probe` with invalid keys returns downstream input keys `bad key` and `nested/key`, not the generated Account Runtime-safe hash keys;
   - ambiguous normalized `tool_choice name="fooBar"` for `foo-bar` + `foo_bar` returns local HTTP `400 invalid_request_error`;
   - raw-vs-mapped collision returns local HTTP `400 invalid_request_error`.
 - A real bug was reproduced in Claude CLI and direct protocol:
   - When the final user turn contained only a paired `tool_result` and no text, the converter set current content to `"."`.
-  - The structured `tool_results` were present, but Kiro often ignored them and answered generic readiness text.
+  - The structured `tool_results` were present, but Account Runtime often ignored them and answered generic readiness text.
   - CLI repro before the fix: `Bash` produced `tool_result="cli-bash-ok"`, but the final model text was generic Chinese readiness text.
   - Direct repro before the fix: paired current `tool_result` only returned generic readiness text and header `tool-result-content-placeholder=1`; adding any short text after the tool_result made the model consume the result.
 - Fix:
   - `src/anthropic/converter.rs` keeps the truly empty user placeholder as `"."`.
-  - Tool-result-only turns now use `Tool result received.` as the non-empty Kiro current-message marker.
-  - This avoids an internal `user Continue` transcript while giving Kiro enough semantic boundary to consume `context.toolResults`.
+  - Tool-result-only turns now use `Tool result received.` as the non-empty Account Runtime current-message marker.
+  - This avoids an internal `user Continue` transcript while giving Account Runtime enough semantic boundary to consume `context.toolResults`.
 - Post-fix evidence on the restarted local candidate SHA-256 `6aa907e78f26ce9eda8d36ea30fb104e73981abc05caeeb1f95d7715c2927cff`:
   - direct paired current `tool_result` only with `Bash` returned `direct-fixed-ok`;
   - real Claude CLI `Bash` returned `toolUses=[Bash]`, `toolResults=["cli-fixed-ok"]`, final text `cli-fixed-ok`;
@@ -322,7 +322,7 @@ Observed historical logs:
 
 The simple tool cases passed because response tool names were mapped back to Claude Code names. But the mapping layer can still explain "tools parsing is wrong" in more complex cases:
 
-- Multiple original names can normalize to the same Kiro-safe name and be rejected as ambiguous.
+- Multiple original names can normalize to the same Account Runtime-safe name and be rejected as ambiguous.
 - Historical assistant tool_use names and current tool definitions must share the same reverse map. Missing or stale mapping can break tool_use/tool_result pairing.
 - Tool-choice by name can become ambiguous after normalization.
 - Older logs made mapping look like an overlong-name-only path, hiding the fact that normal built-in names are also being rewritten. The 2026-07-31 observability fix separates total mapped, sanitized, and overlong counts.
@@ -357,7 +357,7 @@ Declared `image/jpeg` with PNG bytes was corrected and succeeded:
 
 Claude Code CLI `Read` image also worked:
 
-- file `/tmp/kiro-cli-red.png`
+- file `/tmp/account-runtime-cli-red.png`
 - CLI final text `Red`
 - second request log showed:
   - `current_tool_count=1`
@@ -419,7 +419,7 @@ Most likely root causes:
 3. Tool compatibility depends on converter repair:
    - simple direct and CLI Bash/Read tools work;
    - names are rewritten even for normal built-in names, then reversed;
-   - tool-result-only current turns previously used an inert `"."` placeholder and could make Kiro ignore otherwise valid tool results; this is fixed with `Tool result received.`;
+   - tool-result-only current turns previously used an inert `"."` placeholder and could make Account Runtime ignore otherwise valid tool results; this is fixed with `Tool result received.`;
    - ambiguous normalization, stale history mapping, schema-key normalization, or prefill/tool pairing repair can still break complex tool sessions.
    - mapping observability now reports sanitized-vs-overlong counts, so normal built-in name rewrites are visible.
 4. Image instability is likely payload/source dependent:
@@ -432,13 +432,13 @@ Most likely root causes:
 The current evidence points to multiple compatibility gaps rather than a single unavailable-account root cause:
 
 - WebSearch root cause: server-side native WebSearch was previously implemented as an exact single-tool branch for `web_search_20250305`. Before the focused fix, mixed native WebSearch requests bypassed that branch and became ordinary `tool_use web_search`; one earlier Claude CLI run also emitted pseudo XML rather than a formal tool call. Current behavior accepts `web_search_YYYYMMDD`, executes mixed native requests server-side, recovers complete pseudo XML in the parser, and has a latest real CLI pass for `WebSearch`.
-- Tools root cause: current simple tool paths work, but Kiro-safe tool-name and schema-key mapping is part of the compatibility layer. The concrete 2026-07-31 bug was not name reverse mapping; it was current tool-result-only turns using `"."` as the Kiro content placeholder, which made real CLI follow-up answers ignore valid tool_result content. Ambiguous normalization, stale reverse maps, tool_choice filtering, or long-history pairing can still break complex sessions.
+- Tools root cause: current simple tool paths work, but Account Runtime-safe tool-name and schema-key mapping is part of the compatibility layer. The concrete 2026-07-31 bug was not name reverse mapping; it was current tool-result-only turns using `"."` as the Account Runtime content placeholder, which made real CLI follow-up answers ignore valid tool_result content. Ambiguous normalization, stale reverse maps, tool_choice filtering, or long-history pairing can still break complex sessions.
 - Image root cause: valid inline and CLI Read image paths work. Intermittent failures are likely source/materialization/limit dependent rather than a blanket local-account or model failure.
 - Model root cause: local accounts only prove `claude-sonnet-4.5`; aliases or echoed requested model names can obscure the actual upstream model used for the request.
 
 ## Reproduction / 复现
 
-Use the local-only setup recorded in the Scope section: `127.0.0.1:9022`, `ccman` current profile `local-kiro-rs-9022-current`, external pools disabled, and credential `7` / `8`.
+Use the local-only setup recorded in the Scope section: `127.0.0.1:9022`, `ccman` current profile `local-account-runtime-9022-current`, external pools disabled, and credential `7` / `8`.
 
 Minimal repro classes:
 
@@ -447,7 +447,7 @@ Minimal repro classes:
 - CLI WebSearch: `claude --print --model claude-sonnet-4.5 --tools=WebSearch --allowedTools=WebSearch ...` should produce `tool_use name="WebSearch"`, one `tool_result`, and final search-derived text.
 - Pseudo XML fallback: if upstream text contains complete `<search_web><query>...</query></search_web>` at a protocol-visible position while a known WebSearch tool is declared, the stream parser should recover it into an executable tool_use; unit tests cover this path.
 - Tool controls: direct forced `echo_value`, CLI `Bash`, and CLI `Read` image are working controls.
-- Tool-result-only follow-up: a user turn containing only a paired `tool_result` should use the `Tool result received.` Kiro content marker and answer from the tool output, not generic readiness text.
+- Tool-result-only follow-up: a user turn containing only a paired `tool_result` should use the `Tool result received.` Account Runtime content marker and answer from the tool output, not generic readiness text.
 - Image controls: valid base64 PNG succeeds; invalid/fake image bytes return local 400.
 
 ## Suggested next tests/fixes
@@ -487,7 +487,7 @@ Focused implementation recorded on 2026-07-31:
 - Mixed native WebSearch now executes server-side before normal tool conversion. This prevents returning an ordinary `tool_use name="web_search"` that no client-side executor handles.
 - Claude Code-style `<search_web><query>...</query></search_web>` pseudo XML can be upgraded to an executable WebSearch tool_use when a known WebSearch tool is declared.
 - Tool-name mapping observability now reports normalized/mapped names accurately, with separate total/sanitized/overlong counters.
-- Tool-result-only current turns now use `Tool result received.` instead of `"."`, so valid CLI/direct tool results are consumed by Kiro on the follow-up turn.
+- Tool-result-only current turns now use `Tool result received.` instead of `"."`, so valid CLI/direct tool results are consumed by Account Runtime on the follow-up turn.
 
 Still open:
 

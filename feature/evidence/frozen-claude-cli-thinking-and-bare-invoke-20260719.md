@@ -6,19 +6,19 @@ Status: `r8 fake-upstream frozen runtime pass / real upstream and long-session s
 
 ## Scope
 
-This evidence covers two real Claude Code CLI gates against a repository-external frozen `kiro-rs` binary:
+This evidence covers two real Claude Code CLI gates against a repository-external frozen `account-runtime` binary:
 
 1. `bare-invoke-claude-cli.mjs`: literal protocol text must not become executable Claude Code tools, while real structured `toolUseEvent` still round-trips.
-2. `thinking-effort-kiro-wire.mjs`: Claude CLI/IDE ingress `thinking.type=adaptive` and `output_config.effort` must reach the Kiro wire according to the advertised upstream schema, without `max -> high` clamping and without invented unsupported fields.
+2. `thinking-effort-account-runtime-wire.mjs`: Claude CLI/IDE ingress `thinking.type=adaptive` and `output_config.effort` must reach the Account Runtime wire according to the advertised upstream schema, without `max -> high` clamping and without invented unsupported fields.
 
-It does not close real Kiro upstream, native thinking delta/usage, long interactive sessions, MCP/search/image combinations, L1-L5 load, two-instance scheduler chaos, UI browser gates, upgrade smoke, or final release inventory.
+It does not close real Account Runtime upstream, native thinking delta/usage, long interactive sessions, MCP/search/image combinations, L1-L5 load, two-instance scheduler chaos, UI browser gates, upgrade smoke, or final release inventory.
 
 ## Frozen binaries
 
 The first frozen C0 candidate existed at:
 
 ```text
-/tmp/kiro-frozen-20260719/kiro-rs
+/tmp/account-runtime-frozen-20260719/account-runtime
 sha256=70c9741b897ea9fe0343d4a279f6555e35f0bc23bccac58cec493a74bad76a80
 ```
 
@@ -27,7 +27,7 @@ It reproduced a real Claude CLI compatibility failure described below.
 After the fix, a new repository-external runtime candidate was built with Rust 1.92.0:
 
 ```text
-/tmp/kiro-frozen-20260719-r2/kiro-rs
+/tmp/account-runtime-frozen-20260719-r2/account-runtime
 sha256=e16df13a0ded4d53ac255f26ddc24056c4d385dde418a63944a2e00d122c642a
 ```
 
@@ -35,9 +35,9 @@ Build command:
 
 ```bash
 env RUSTUP_TOOLCHAIN=1.92.0 \
-  KIRO_FROZEN_BINARY=/tmp/kiro-frozen-20260719-r2/kiro-rs \
+  ACCOUNT_RUNTIME_FROZEN_BINARY=/tmp/account-runtime-frozen-20260719-r2/account-runtime \
   feature/tests/run-cargo-scoped.sh frozen-runtime-20260719-r2 -- \
-  bash -lc 'cargo build --release --bin kiro-rs && install -m 755 "$CARGO_TARGET_DIR/release/kiro-rs" "$KIRO_FROZEN_BINARY"'
+  bash -lc 'cargo build --release --bin account-runtime && install -m 755 "$CARGO_TARGET_DIR/release/account-runtime" "$ACCOUNT_RUNTIME_FROZEN_BINARY"'
 ```
 
 Cleanup evidence:
@@ -49,7 +49,7 @@ validation-build-cleanup scope=frozen-runtime-20260719-r2 size_kib=787044 availa
 The later r8 scheduler/runtime frozen candidate used for the current rerun is:
 
 ```text
-/tmp/kiro-frozen-20260719-r8/kiro-rs
+/tmp/account-runtime-frozen-20260719-r8/account-runtime
 sha256=131696bd81e1cdaeceaac6a45f9c76bf698eb559785b379a82fd77e2f742e631
 ```
 
@@ -62,7 +62,7 @@ Environment facts:
 - Claude Code CLI: `2.1.197`
 - Runner: `feature/tests/bare-invoke-claude-cli.mjs`
 - Model requested by runner: `sonnet`
-- Fake Kiro `ListAvailableModels`: advertised only `claude-sonnet-4` with no `additionalModelRequestFieldsSchema`
+- Fake Account Runtime `ListAvailableModels`: advertised only `claude-sonnet-4` with no `additionalModelRequestFieldsSchema`
 - Protected port handling: runner rejects `9022` by numeric value; one manual read-only `lsof` probe made during this session is excluded from evidence and not repeated
 
 Observed CLI JSONL failure:
@@ -74,9 +74,9 @@ API Error: 400 model claude-sonnet-4 does not advertise a native reasoning effor
 Root cause:
 
 - Claude Code CLI 2.1.197 sends `thinking.type=adaptive` and a default `output_config.effort=high` even for ordinary `--model sonnet` requests.
-- The runtime model catalog can legitimately resolve `sonnet` to an older advertised model such as `claude-sonnet-4` when that is the only model returned by Kiro model discovery.
-- The converter treated explicit `output_config.effort` as requiring a verified native Kiro reasoning schema and returned 400 before the existing compatibility prompt fallback could preserve the effort.
-- This made ordinary Claude CLI traffic fail whenever the active Kiro catalog did not advertise native reasoning fields for the selected model.
+- The runtime model catalog can legitimately resolve `sonnet` to an older advertised model such as `claude-sonnet-4` when that is the only model returned by Account Runtime model discovery.
+- The converter treated explicit `output_config.effort` as requiring a verified native Account Runtime reasoning schema and returned 400 before the existing compatibility prompt fallback could preserve the effort.
+- This made ordinary Claude CLI traffic fail whenever the active Account Runtime catalog did not advertise native reasoning fields for the selected model.
 
 This red result is materially different from the original `max -> high` suspicion: it was not a clamp; it was an early hard failure caused by coupling CLI default adaptive effort to native schema availability.
 
@@ -133,18 +133,18 @@ validation-build-cleanup scope=reasoning-fallback-20260719 size_kib=1123124 avai
 Runner command shape:
 
 ```bash
-KIRO_RS_BINARY=/tmp/kiro-frozen-20260719-r2/kiro-rs \
-KIRO_VALIDATION_ARTIFACT_DIR=/private/tmp/kiro-validation-artifacts-bare_<run> \
-KIRO_BARE_INVOKE_POSTGRES_URL=<caller-created-empty-db> \
-KIRO_BARE_INVOKE_REDIS_URL=redis://127.0.0.1:50892 \
-KIRO_CLAUDE_BINARY=/Users/yuanfeijie/.volta/bin/claude \
+ACCOUNT_RUNTIME_BINARY=/tmp/account-runtime-frozen-20260719-r2/account-runtime \
+ACCOUNT_RUNTIME_VALIDATION_ARTIFACT_DIR=/private/tmp/account-runtime-validation-artifacts-bare_<run> \
+ACCOUNT_RUNTIME_BARE_INVOKE_POSTGRES_URL=<caller-created-empty-db> \
+ACCOUNT_RUNTIME_BARE_INVOKE_REDIS_URL=redis://127.0.0.1:50892 \
+ACCOUNT_RUNTIME_CLAUDE_BINARY=/Users/yuanfeijie/.volta/bin/claude \
 node feature/tests/bare-invoke-claude-cli.mjs
 ```
 
 Current project isolated PostgreSQL/Redis were reused:
 
-- PostgreSQL: current-project container `kiro-final-20260718-pg`, loopback `127.0.0.1:50891`
-- Redis: current-project container `kiro-final-20260718-redis`, loopback `127.0.0.1:50892`
+- PostgreSQL: current-project container `account-runtime-final-20260718-pg`, loopback `127.0.0.1:50891`
+- Redis: current-project container `account-runtime-final-20260718-redis`, loopback `127.0.0.1:50892`
 - One caller-owned empty database was created and dropped with `DROP DATABASE ... WITH (FORCE)`.
 - Raw artifact directory was removed after hashing the report.
 
@@ -184,7 +184,7 @@ Result summary:
 
 ### r8 rerun
 
-The same gate was rerun against r8 with a caller-owned PostgreSQL database and isolated Redis prefix. The first attempt failed before Kiro startup because `claude` was not resolvable by `spawnSync` in this shell environment; it is excluded as environment setup evidence. The valid rerun used the canonical Claude package executable.
+The same gate was rerun against r8 with a caller-owned PostgreSQL database and isolated Redis prefix. The first attempt failed before Account Runtime startup because `claude` was not resolvable by `spawnSync` in this shell environment; it is excluded as environment setup evidence. The valid rerun used the canonical Claude package executable.
 
 Result summary:
 
@@ -231,7 +231,7 @@ The runner needs a canonical `psql` executable. The host PATH has no native `psq
 Important CLI path note:
 
 - `/Users/yuanfeijie/.volta/bin/claude` is a Volta shim symlink.
-- `thinking-effort-kiro-wire.mjs` canonicalizes executable paths before running them.
+- `thinking-effort-account-runtime-wire.mjs` canonicalizes executable paths before running them.
 - Passing the shim made the runner execute the real shim path as `volta-shim`, which failed.
 - The successful run therefore used the canonical package executable:
 
@@ -285,7 +285,7 @@ Result summary:
 
 ### r8 rerun
 
-The same 60-case Kiro wire gate was rerun against r8. Because the host still has no native `psql`, the harness used a temporary canonical wrapper under `/tmp` to invoke psql inside the current-project PostgreSQL container. The wrapper, two caller-owned databases and artifact root were deleted after summary extraction. The successful Claude executable path was the canonical package binary:
+The same 60-case Account Runtime wire gate was rerun against r8. Because the host still has no native `psql`, the harness used a temporary canonical wrapper under `/tmp` to invoke psql inside the current-project PostgreSQL container. The wrapper, two caller-owned databases and artifact root were deleted after summary extraction. The successful Claude executable path was the canonical package binary:
 
 ```text
 /Users/yuanfeijie/.volta/tools/image/packages/@anthropic-ai/claude-code/bin/claude
@@ -313,15 +313,15 @@ Result summary:
 }
 ```
 
-This rerun preserves the same protocol conclusion on r8: `max` is not clamped to `high`, and the proxy does not invent an upstream `thinking` field when the Kiro discovery schema only advertises `output_config.effort`.
+This rerun preserves the same protocol conclusion on r8: `max` is not clamped to `high`, and the proxy does not invent an upstream `thinking` field when the Account Runtime discovery schema only advertises `output_config.effort`.
 
 Interpretation:
 
-- The frozen runtime preserved the requested effort values through the final fake Kiro wire.
+- The frozen runtime preserved the requested effort values through the final fake Account Runtime wire.
 - `max` was not clamped to `high`.
 - The runner observed the advertised model-discovery schema on both CLI and IDE endpoints.
 - Unknown requests and invalid wire JSON were zero.
-- This is fake-upstream wire compatibility evidence. It does not prove real Kiro upstream currently accepts every value in production.
+- This is fake-upstream wire compatibility evidence. It does not prove real Account Runtime upstream currently accepts every value in production.
 
 ## Runner signal validation
 
@@ -337,7 +337,7 @@ Result:
 2026-07-19 current rerun after cleanup hardening:
 node --test feature/tests/bare-invoke-claude-cli-signal.test.mjs \
   feature/tests/thinking-effort-claude-cli-capture-signal.test.mjs \
-  feature/tests/thinking-effort-kiro-wire-signal.test.mjs \
+  feature/tests/thinking-effort-account-runtime-wire-signal.test.mjs \
   ...
 
 Full Node runner/path/signal/load-target contract: 85/85 pass
@@ -345,7 +345,7 @@ Full Node runner/path/signal/load-target contract: 85/85 pass
 
 Two test-runner abnormal-path reds were found and fixed before the 85/85 rerun:
 
-- `thinking-effort-kiro-wire.mjs` command-timeout cleanup initially waited the normal 1s TERM period after a child had already exceeded its command deadline. Under load the natural cleanup fixture crossed its strict 2.5s test bound once. Timed-out commands now use a shorter TERM grace before KILL; the focused signal suite then passed 42/42 and the full Node suite passed 85/85.
+- `thinking-effort-account-runtime-wire.mjs` command-timeout cleanup initially waited the normal 1s TERM period after a child had already exceeded its command deadline. Under load the natural cleanup fixture crossed its strict 2.5s test bound once. Timed-out commands now use a shorter TERM grace before KILL; the focused signal suite then passed 42/42 and the full Node suite passed 85/85.
 - `thinking-effort-claude-cli-capture.mjs` could abort SIGINT cleanup if a transient `ps` inspection failed while draining the owned Claude process group. The cleanup now treats process-group inspection failure as retryable during shutdown and still sends bounded TERM/KILL. The capture signal gate passed 9/9, and the full Node suite passed 85/85.
 
 ```text
@@ -359,24 +359,24 @@ duration_ms=340.9715
 Removed during this run:
 
 - failed bare-invoke artifact roots:
-  - `/private/tmp/kiro-validation-artifacts-bare_20260719095518_71330`
-  - `/private/tmp/kiro-validation-artifacts-bare_20260719095658_90075`
-  - `/private/tmp/kiro-validation-artifacts-bare_20260719095836_23854`
-- historical validation databases matching `kiro_thinking_wire_twire%_{cli,ide}`
+  - `/private/tmp/account-runtime-validation-artifacts-bare_20260719095518_71330`
+  - `/private/tmp/account-runtime-validation-artifacts-bare_20260719095658_90075`
+  - `/private/tmp/account-runtime-validation-artifacts-bare_20260719095836_23854`
+- historical validation databases matching `account-runtime_thinking_wire_twire%_{cli,ide}`
 - successful run artifact roots and temporary psql wrapper
 
-Post-run DB checks found no `kiro_bare_%` or `kiro_thinking_wire_twire%` database.
+Post-run DB checks found no `account-runtime_bare_%` or `account-runtime_thinking_wire_twire%` database.
 
 Post-run build inventory:
 
 ```text
 build-artifact-inventory version=2 mode=read-only targets=1 reservations=0 target_processes=1 blockers=2
 target classification=unmanaged-repo-cargo-target size_kib=725912
-target-process pid=84264 classification=kiro-runtime
+target-process pid=84264 classification=account-runtime-runtime
 release-gate result=fail
 ```
 
-This blocker is the user's existing `9022` service running from `./target/release/kiro-rs`. It is not a leftover from the scoped validation builds. Under the safety contract, it was not stopped or deleted. Final release inventory cannot pass until that service is stopped or moved to a repository-external binary by an explicitly authorized step.
+This blocker is the user's existing `9022` service running from `./target/release/account-runtime`. It is not a leftover from the scoped validation builds. Under the safety contract, it was not stopped or deleted. Final release inventory cannot pass until that service is stopped or moved to a repository-external binary by an explicitly authorized step.
 
 ## Remaining release blockers
 

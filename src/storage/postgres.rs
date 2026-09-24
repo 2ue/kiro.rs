@@ -147,7 +147,7 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_records",
-        column_name: "kiro_metering_usage",
+        column_name: "upstream_metering_units",
     },
     RequiredPostgresColumn {
         table_name: "usage_records",
@@ -167,7 +167,7 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
-        column_name: "total_kiro_metering_usage",
+        column_name: "total_upstream_metering_units",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
@@ -223,7 +223,7 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
-        column_name: "total_kiro_metering_usage",
+        column_name: "total_upstream_metering_units",
     },
     RequiredPostgresColumn {
         table_name: "usage_rollup_time_buckets",
@@ -283,7 +283,7 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     },
     RequiredPostgresColumn {
         table_name: "usage_credential_cost_summary",
-        column_name: "kiro_metering_usage",
+        column_name: "upstream_metering_units",
     },
     RequiredPostgresColumn {
         table_name: "usage_credential_cost_summary",
@@ -729,7 +729,7 @@ impl PostgresStore {
             .url
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("必须配置 postgres.url"))?;
-        let schema = format!("kiro_rs_test_{}", uuid::Uuid::new_v4().simple());
+        let schema = format!("account_runtime_test_{}", uuid::Uuid::new_v4().simple());
         let bootstrap_pool = PgPoolOptions::new().max_connections(1).connect(url).await?;
         sqlx::query(&format!(r#"CREATE SCHEMA "{}""#, schema))
             .execute(&bootstrap_pool)
@@ -893,7 +893,7 @@ impl PostgresStore {
             "startup migration is disabled"
         };
         anyhow::bail!(
-            "PostgreSQL schema is not compatible with this kiro.rs binary; missing required tables/columns: {}. {}. Set KIRO_RS_POSTGRES_MIGRATE_ON_START=true or postgres.migrateOnStart=true, restart once to migrate the database, and do not run the service with an old or partial schema.",
+            "PostgreSQL schema is not compatible with this account runtime binary; missing required tables/columns: {}. {}. Set ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=true or postgres.migrateOnStart=true, restart once to migrate the database, and do not run the service with an old or partial schema.",
             missing.join(", "),
             migration_state
         );
@@ -2545,17 +2545,117 @@ impl PostgresStore {
         {
             anyhow::bail!("刷新后的 refreshToken 不能为空");
         }
-        if patch.access_token.is_none()
-            && patch.refresh_token.is_none()
-            && patch.profile_arn.is_none()
-            && patch.expires_at.is_none()
-            && patch.scopes.is_none()
+        let has_refresh_fields = patch.access_token.is_some()
+            || patch.refresh_token.is_some()
+            || patch.expires_at.is_some()
+            || patch.scopes.is_some();
+        #[cfg(test)]
         {
+            let mut has_refresh_fields = has_refresh_fields;
+            has_refresh_fields |= patch.profile_arn.is_some();
+            if !has_refresh_fields {
+                anyhow::bail!("凭据 refresh 字段更新不能为空");
+            }
+        }
+        #[cfg(not(test))]
+        if !has_refresh_fields {
             anyhow::bail!("凭据 refresh 字段更新不能为空");
         }
 
         let new_refresh_token_hash = patch.refresh_token.as_deref().map(sha256_hex);
         let mut tx = self.pool.begin().await?;
+        #[cfg(not(test))]
+        let applied = sqlx::query(
+            r#"
+            UPDATE credentials
+            SET refresh_token_hash = CASE
+                    WHEN $11::text IS NULL THEN credentials.refresh_token_hash
+                    ELSE $12::text
+                END,
+                data = credentials.data
+                    || CASE WHEN $10::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('accessToken', $10::text)
+                    END
+                    || CASE WHEN $11::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('refreshToken', $11::text)
+                    END
+                    || CASE WHEN $13::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('expiresAt', $13::text)
+                    END
+                    || CASE WHEN $14::text IS NULL
+                        THEN '{}'::jsonb
+                        ELSE jsonb_build_object('scopes', $14::text)
+                    END,
+                updated_at = now(),
+                revision = credentials.revision + 1
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND refresh_token_hash = $2
+              AND (
+                  COALESCE(data->>'accessToken', data->>'access_token')
+                  IS NOT DISTINCT FROM $9::text
+              )
+              AND (
+                  CASE regexp_replace(
+                      lower(COALESCE(data->>'authMethod', data->>'auth_method')),
+                      '[^a-z0-9]',
+                      '',
+                      'g'
+                  )
+                      WHEN 'builderid' THEN 'idc'
+                      WHEN 'iam' THEN 'idc'
+                      WHEN 'idc' THEN 'idc'
+                      WHEN 'apikey' THEN 'api_key'
+                      WHEN 'externalidp' THEN 'external_idp'
+                      WHEN 'enterprise' THEN 'external_idp'
+                      WHEN 'iamsso' THEN 'external_idp'
+                      WHEN 'internal' THEN 'external_idp'
+                      WHEN 'social' THEN 'social'
+                      ELSE COALESCE(data->>'authMethod', data->>'auth_method')
+                  END
+                  IS NOT DISTINCT FROM $3::text
+              )
+              AND (data->>'provider' IS NOT DISTINCT FROM $4::text)
+              AND (
+                  COALESCE(data->>'clientId', data->>'client_id')
+                  IS NOT DISTINCT FROM $5::text
+              )
+              AND (
+                  COALESCE(data->>'clientSecret', data->>'client_secret')
+                  IS NOT DISTINCT FROM $6::text
+              )
+              AND (
+                  COALESCE(data->>'tokenEndpoint', data->>'token_endpoint')
+                  IS NOT DISTINCT FROM $7::text
+              )
+              AND (
+                  COALESCE(data->>'scopes', data->>'scope')
+                  IS NOT DISTINCT FROM $8::text
+              )
+            RETURNING id, priority, disabled, data, created_at, updated_at, revision
+            "#,
+        )
+        .bind(credential_id as i64)
+        .bind(&expected.refresh_token_hash)
+        .bind(&expected.auth_method)
+        .bind(&expected.provider)
+        .bind(&expected.client_id)
+        .bind(&expected.client_secret)
+        .bind(&expected.token_endpoint)
+        .bind(&expected.scopes)
+        .bind(&expected.access_token)
+        .bind(&patch.access_token)
+        .bind(&patch.refresh_token)
+        .bind(&new_refresh_token_hash)
+        .bind(&patch.expires_at)
+        .bind(&patch.scopes)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(duplicate_credential_message)?;
+        #[cfg(test)]
         let applied = sqlx::query(
             r#"
             UPDATE credentials
@@ -2607,7 +2707,6 @@ impl PostgresStore {
                       WHEN 'externalidp' THEN 'external_idp'
                       WHEN 'enterprise' THEN 'external_idp'
                       WHEN 'iamsso' THEN 'external_idp'
-                      WHEN 'awsidc' THEN 'external_idp'
                       WHEN 'internal' THEN 'external_idp'
                       WHEN 'social' THEN 'social'
                       ELSE COALESCE(data->>'authMethod', data->>'auth_method')
@@ -4986,7 +5085,7 @@ async fn repair_active_credential_hashes_in_tx(
           AND (
               (
                   api_key_hash IS NULL
-                  AND COALESCE(data->>'apiKey', data->>'kiroApiKey', data->>'kiro_api_key', data->>'api_key') IS NOT NULL
+                  AND COALESCE(data->>'apiKey', data->>'api_key') IS NOT NULL
               )
               OR (
                   refresh_token_hash IS NULL
@@ -5103,6 +5202,7 @@ pub struct CredentialStatsDeltaRow {
 pub struct CredentialRefreshFieldsPatch {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
+    #[cfg(test)]
     pub profile_arn: Option<String>,
     pub expires_at: Option<String>,
     pub scopes: Option<String>,
@@ -6089,8 +6189,8 @@ impl PostgresUsageStore {
                     THEN t.total_original_cost_usd
                     ELSE COALESCE(t.total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
-                COALESCE(t.total_kiro_metering_usage, 0)::double precision
-                    AS total_kiro_metering_usage,
+                COALESCE(t.total_upstream_metering_units, 0)::double precision
+                    AS total_upstream_metering_units,
                 COALESCE(t.priced_requests, 0)::bigint AS priced_requests,
                 COALESCE(t.unpriced_requests, 0)::bigint AS unpriced_requests,
                 COALESCE(t.local_prompt_cache_requests, 0)::bigint AS local_prompt_cache_requests,
@@ -6142,7 +6242,7 @@ impl PostgresUsageStore {
                      t.total_input_tokens, t.total_output_tokens,
                      t.total_cache_read_input_tokens, t.total_cache_creation_input_tokens,
                      t.total_estimated_cost_usd, t.total_original_cost_usd,
-                     t.total_kiro_metering_usage, t.priced_requests, t.unpriced_requests,
+                     t.total_upstream_metering_units, t.priced_requests, t.unpriced_requests,
                      t.local_prompt_cache_requests, t.local_prompt_cache_input_tokens,
                      t.local_prompt_cache_read_input_tokens,
                      t.local_prompt_cache_creation_input_tokens,
@@ -6161,7 +6261,7 @@ impl PostgresUsageStore {
         .await?;
         let account_billing = account_billing_summary_from_row(&row)?;
 
-        let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
+        let total_metering_units: f64 = row.try_get("total_upstream_metering_units")?;
         Ok(UsageSummary {
             total_requests: row_i64_to_usize(&row, "total_requests")?,
             success_requests: row_i64_to_usize(&row, "success_requests")?,
@@ -6174,7 +6274,6 @@ impl PostgresUsageStore {
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
             total_upstream_metering_units: total_metering_units,
-            total_kiro_metering_usage: total_metering_units,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             local_prompt_cache_requests: row_i64_to_usize(&row, "local_prompt_cache_requests")?,
@@ -6507,8 +6606,8 @@ impl PostgresUsageStore {
                         ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(s.total_kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage,
+                COALESCE(SUM(s.total_upstream_metering_units), 0)::double precision
+                    AS total_upstream_metering_units,
                 COALESCE(SUM(s.priced_requests), 0)::bigint AS priced_requests,
                 COALESCE(SUM(s.unpriced_requests), 0)::bigint AS unpriced_requests,
                 CASE
@@ -6650,7 +6749,7 @@ impl PostgresUsageStore {
                 r.total_cache_creation_input_tokens,
                 r.total_estimated_cost_usd,
                 r.total_original_cost_usd,
-                r.total_kiro_metering_usage,
+                r.total_upstream_metering_units,
                 r.priced_requests,
                 r.unpriced_requests,
                 r.average_duration_ms,
@@ -6876,8 +6975,8 @@ impl PostgresUsageStore {
                         ELSE COALESCE(s.total_estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(s.total_kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage
+                COALESCE(SUM(s.total_upstream_metering_units), 0)::double precision
+                    AS total_upstream_metering_units
             FROM window_bounds w
             LEFT JOIN dashboard_global_segments s ON s.window_key = w.key
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
@@ -7009,8 +7108,8 @@ impl PostgresUsageStore {
                     THEN total_original_cost_usd
                     ELSE COALESCE(total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
-                COALESCE(total_kiro_metering_usage, 0)::double precision
-                    AS total_kiro_metering_usage
+                COALESCE(total_upstream_metering_units, 0)::double precision
+                    AS total_upstream_metering_units
             FROM usage_rollup_totals
             WHERE dimension = "#,
         );
@@ -7061,8 +7160,8 @@ impl PostgresUsageStore {
                     THEN b.total_original_cost_usd
                     ELSE COALESCE(b.total_estimated_cost_usd, 0)
                 END::double precision AS total_original_cost_usd,
-                COALESCE(b.total_kiro_metering_usage, 0)::double precision
-                    AS total_kiro_metering_usage
+                COALESCE(b.total_upstream_metering_units, 0)::double precision
+                    AS total_upstream_metering_units
             FROM window_bounds w
             JOIN usage_rollup_time_buckets b
               ON b.dimension = "#,
@@ -7100,8 +7199,8 @@ impl PostgresUsageStore {
                         ELSE COALESCE(r.estimated_cost_usd, 0)
                     END
                 ), 0)::double precision AS total_original_cost_usd,
-                COALESCE(SUM(r.kiro_metering_usage), 0)::double precision
-                    AS total_kiro_metering_usage
+                COALESCE(SUM(r.upstream_metering_units), 0)::double precision
+                    AS total_upstream_metering_units
             FROM window_boundary_records r
             "#,
         );
@@ -7128,8 +7227,8 @@ impl PostgresUsageStore {
                 SUM(total_cache_creation_input_tokens)::bigint AS total_cache_creation_input_tokens,
                 SUM(total_estimated_cost_usd)::double precision AS total_estimated_cost_usd,
                 SUM(total_original_cost_usd)::double precision AS total_original_cost_usd,
-                SUM(total_kiro_metering_usage)::double precision
-                    AS total_kiro_metering_usage
+                SUM(total_upstream_metering_units)::double precision
+                    AS total_upstream_metering_units
             FROM top_metric_segments
             GROUP BY item_key
             )
@@ -7145,7 +7244,7 @@ impl PostgresUsageStore {
                 total_cache_creation_input_tokens,
                 total_estimated_cost_usd,
                 total_original_cost_usd,
-                total_kiro_metering_usage
+                total_upstream_metering_units
             FROM top_metric_totals
             WHERE requests > 0
             ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC, key
@@ -7175,7 +7274,7 @@ impl PostgresUsageStore {
                     THEN original_cost_usd
                     ELSE COALESCE(estimated_cost_usd, 0)
                 END::double precision AS original_cost_usd,
-                kiro_metering_usage,
+                upstream_metering_units,
                 priced_requests,
                 unpriced_requests
             FROM usage_credential_cost_summary
@@ -7188,14 +7287,13 @@ impl PostgresUsageStore {
         let mut summaries = HashMap::with_capacity(rows.len());
         for row in rows {
             let credential_id: i64 = row.try_get("credential_id")?;
-            let metering_units: f64 = row.try_get("kiro_metering_usage")?;
+            let metering_units: f64 = row.try_get("upstream_metering_units")?;
             summaries.insert(
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
                     original_cost_usd: row.try_get("original_cost_usd")?,
                     upstream_metering_units: metering_units,
-                    kiro_metering_usage: metering_units,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
                 },
@@ -7222,7 +7320,7 @@ impl PostgresUsageStore {
                     THEN original_cost_usd
                     ELSE COALESCE(estimated_cost_usd, 0)
                 END::double precision AS original_cost_usd,
-                kiro_metering_usage,
+                upstream_metering_units,
                 priced_requests,
                 unpriced_requests
             FROM usage_credential_cost_summary
@@ -7236,14 +7334,13 @@ impl PostgresUsageStore {
         let mut summaries = HashMap::with_capacity(rows.len());
         for row in rows {
             let credential_id: i64 = row.try_get("credential_id")?;
-            let metering_units: f64 = row.try_get("kiro_metering_usage")?;
+            let metering_units: f64 = row.try_get("upstream_metering_units")?;
             summaries.insert(
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
                     original_cost_usd: row.try_get("original_cost_usd")?,
                     upstream_metering_units: metering_units,
-                    kiro_metering_usage: metering_units,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
                 },
@@ -8158,7 +8255,7 @@ async fn upsert_usage_record_in_tx(
             credential_label, status, usage_source, total_input_tokens, compat_input_tokens,
             billable_input_tokens, output_tokens, cache_read_input_tokens,
             cache_creation_input_tokens, cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens, estimated_cost_usd, original_cost_usd, kiro_metering_usage,
+            cache_creation_1h_input_tokens, estimated_cost_usd, original_cost_usd, upstream_metering_units,
             pricing_available, pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
             error_type, error_message, error_detail, data
         )
@@ -8194,7 +8291,7 @@ async fn upsert_usage_record_in_tx(
             cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
             estimated_cost_usd = EXCLUDED.estimated_cost_usd,
             original_cost_usd = EXCLUDED.original_cost_usd,
-            kiro_metering_usage = EXCLUDED.kiro_metering_usage,
+            upstream_metering_units = EXCLUDED.upstream_metering_units,
             pricing_available = EXCLUDED.pricing_available,
             pricing_model = EXCLUDED.pricing_model,
             duration_ms = EXCLUDED.duration_ms,
@@ -8458,7 +8555,7 @@ struct UsageRollupMetrics {
     local_prompt_cache_creation_input_tokens: i64,
     total_estimated_cost_usd: f64,
     total_original_cost_usd: f64,
-    total_kiro_metering_usage: f64,
+    total_upstream_metering_units: f64,
     external_pool_requests: i64,
     external_pool_priced_requests: i64,
     external_pool_unpriced_requests: i64,
@@ -8522,7 +8619,7 @@ impl UsageRollupMetrics {
             },
             total_estimated_cost_usd: record.estimated_cost_usd * sign as f64,
             total_original_cost_usd: record.original_cost_usd * sign as f64,
-            total_kiro_metering_usage: record.upstream_metering_units() * sign as f64,
+            total_upstream_metering_units: record.upstream_metering_units() * sign as f64,
             external_pool_requests: signed_bool(external_pool, sign),
             external_pool_priced_requests: signed_bool(external_priced, sign),
             external_pool_unpriced_requests: signed_bool(external_pool && !external_priced, sign),
@@ -8585,7 +8682,7 @@ impl UsageRollupMetrics {
             other.local_prompt_cache_creation_input_tokens;
         self.total_estimated_cost_usd += other.total_estimated_cost_usd;
         self.total_original_cost_usd += other.total_original_cost_usd;
-        self.total_kiro_metering_usage += other.total_kiro_metering_usage;
+        self.total_upstream_metering_units += other.total_upstream_metering_units;
         self.external_pool_requests += other.external_pool_requests;
         self.external_pool_priced_requests += other.external_pool_priced_requests;
         self.external_pool_unpriced_requests += other.external_pool_unpriced_requests;
@@ -8631,7 +8728,7 @@ struct CredentialUsageSummaryDelta {
     requests: i64,
     estimated_cost_usd: f64,
     original_cost_usd: f64,
-    kiro_metering_usage: f64,
+    upstream_metering_units: f64,
     priced_requests: i64,
     unpriced_requests: i64,
 }
@@ -8683,7 +8780,7 @@ impl UsageRollupBatchDelta {
             summary.requests += direction;
             summary.estimated_cost_usd += record.estimated_cost_usd * direction as f64;
             summary.original_cost_usd += record.original_cost_usd * direction as f64;
-            summary.kiro_metering_usage += record.upstream_metering_units() * direction as f64;
+            summary.upstream_metering_units += record.upstream_metering_units() * direction as f64;
             summary.priced_requests += signed_bool(record.pricing_available, direction);
             summary.unpriced_requests += signed_bool(!record.pricing_available, direction);
         }
@@ -8918,7 +9015,7 @@ async fn upsert_usage_rollup_total(
             total_cache_read_input_tokens, total_cache_creation_input_tokens,
             local_prompt_cache_input_tokens, local_prompt_cache_read_input_tokens,
             local_prompt_cache_creation_input_tokens, total_estimated_cost_usd,
-            total_original_cost_usd, total_kiro_metering_usage,
+            total_original_cost_usd, total_upstream_metering_units,
             external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
             external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
             external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -8957,7 +9054,7 @@ async fn upsert_usage_rollup_total(
             local_prompt_cache_creation_input_tokens = usage_rollup_totals.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_totals.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_totals.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
-            total_kiro_metering_usage = usage_rollup_totals.total_kiro_metering_usage + EXCLUDED.total_kiro_metering_usage,
+            total_upstream_metering_units = usage_rollup_totals.total_upstream_metering_units + EXCLUDED.total_upstream_metering_units,
             external_pool_requests = usage_rollup_totals.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_totals.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_totals.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -9003,7 +9100,7 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
-    .bind(metrics.total_kiro_metering_usage)
+    .bind(metrics.total_upstream_metering_units)
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -9040,7 +9137,7 @@ async fn upsert_usage_rollup_time_bucket(
             total_output_tokens, total_cache_read_input_tokens,
             total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
             local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-            total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+            total_estimated_cost_usd, total_original_cost_usd, total_upstream_metering_units,
             external_pool_requests, external_pool_priced_requests,
             external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
             external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
@@ -9080,7 +9177,7 @@ async fn upsert_usage_rollup_time_bucket(
             local_prompt_cache_creation_input_tokens = usage_rollup_time_buckets.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
             total_estimated_cost_usd = usage_rollup_time_buckets.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
             total_original_cost_usd = usage_rollup_time_buckets.total_original_cost_usd + EXCLUDED.total_original_cost_usd,
-            total_kiro_metering_usage = usage_rollup_time_buckets.total_kiro_metering_usage + EXCLUDED.total_kiro_metering_usage,
+            total_upstream_metering_units = usage_rollup_time_buckets.total_upstream_metering_units + EXCLUDED.total_upstream_metering_units,
             external_pool_requests = usage_rollup_time_buckets.external_pool_requests + EXCLUDED.external_pool_requests,
             external_pool_priced_requests = usage_rollup_time_buckets.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
             external_pool_unpriced_requests = usage_rollup_time_buckets.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
@@ -9127,7 +9224,7 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.local_prompt_cache_creation_input_tokens)
     .bind(metrics.total_estimated_cost_usd)
     .bind(metrics.total_original_cost_usd)
-    .bind(metrics.total_kiro_metering_usage)
+    .bind(metrics.total_upstream_metering_units)
     .bind(metrics.external_pool_requests)
     .bind(metrics.external_pool_priced_requests)
     .bind(metrics.external_pool_unpriced_requests)
@@ -9367,7 +9464,7 @@ async fn upsert_credential_usage_summary_delta(
     sqlx::query(
         r#"
         INSERT INTO usage_credential_cost_summary (
-            credential_id, requests, estimated_cost_usd, original_cost_usd, kiro_metering_usage,
+            credential_id, requests, estimated_cost_usd, original_cost_usd, upstream_metering_units,
             priced_requests, unpriced_requests, updated_at
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
@@ -9375,7 +9472,7 @@ async fn upsert_credential_usage_summary_delta(
         SET requests = usage_credential_cost_summary.requests + EXCLUDED.requests,
             estimated_cost_usd = usage_credential_cost_summary.estimated_cost_usd + EXCLUDED.estimated_cost_usd,
             original_cost_usd = usage_credential_cost_summary.original_cost_usd + EXCLUDED.original_cost_usd,
-            kiro_metering_usage = usage_credential_cost_summary.kiro_metering_usage + EXCLUDED.kiro_metering_usage,
+            upstream_metering_units = usage_credential_cost_summary.upstream_metering_units + EXCLUDED.upstream_metering_units,
             priced_requests = usage_credential_cost_summary.priced_requests + EXCLUDED.priced_requests,
             unpriced_requests = usage_credential_cost_summary.unpriced_requests + EXCLUDED.unpriced_requests,
             updated_at = now()
@@ -9385,7 +9482,7 @@ async fn upsert_credential_usage_summary_delta(
     .bind(delta.requests)
     .bind(delta.estimated_cost_usd)
     .bind(delta.original_cost_usd)
-    .bind(delta.kiro_metering_usage)
+    .bind(delta.upstream_metering_units)
     .bind(delta.priced_requests)
     .bind(delta.unpriced_requests)
     .execute(&mut **tx)
@@ -9570,7 +9667,7 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "data->>'routeSubtype'",
             "data->>'modelResolutionSource'",
             "estimated_cost_usd::text",
-            "kiro_metering_usage::text",
+            "upstream_metering_units::text",
         ];
         for (index, field) in fields.iter().enumerate() {
             if index > 0 {
@@ -9744,7 +9841,7 @@ fn push_dashboard_windows_cte(
             records.cache_creation_input_tokens,
             records.estimated_cost_usd,
             records.original_cost_usd,
-            records.kiro_metering_usage,
+            records.upstream_metering_units,
             records.pricing_available,
             records.simulated,
             records.sticky_bound,
@@ -9855,7 +9952,7 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
             buckets.total_cache_creation_input_tokens,
             buckets.total_estimated_cost_usd,
             buckets.total_original_cost_usd,
-            buckets.total_kiro_metering_usage,
+            buckets.total_upstream_metering_units,
             buckets.priced_requests,
             buckets.unpriced_requests,
             buckets.sticky_bound_requests,
@@ -9899,8 +9996,8 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
             COALESCE(SUM(records.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
             COALESCE(SUM(records.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
             COALESCE(SUM(records.original_cost_usd), 0)::double precision AS total_original_cost_usd,
-            COALESCE(SUM(records.kiro_metering_usage), 0)::double precision
-                AS total_kiro_metering_usage,
+            COALESCE(SUM(records.upstream_metering_units), 0)::double precision
+                AS total_upstream_metering_units,
             COUNT(*) FILTER (WHERE records.pricing_available)::bigint AS priced_requests,
             COUNT(*) FILTER (WHERE NOT records.pricing_available)::bigint AS unpriced_requests,
             COUNT(*) FILTER (WHERE records.sticky_bound)::bigint AS sticky_bound_requests,
@@ -9965,8 +10062,8 @@ fn push_dashboard_global_segments_cte(builder: &mut QueryBuilder<'_, Postgres>) 
                 AS total_estimated_cost_usd,
             SUM(segment_rows.total_original_cost_usd)::double precision
                 AS total_original_cost_usd,
-            SUM(segment_rows.total_kiro_metering_usage)::double precision
-                AS total_kiro_metering_usage,
+            SUM(segment_rows.total_upstream_metering_units)::double precision
+                AS total_upstream_metering_units,
             SUM(segment_rows.priced_requests)::bigint AS priced_requests,
             SUM(segment_rows.unpriced_requests)::bigint AS unpriced_requests,
             SUM(segment_rows.sticky_bound_requests)::bigint AS sticky_bound_requests,
@@ -10148,7 +10245,7 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
     let total_input_tokens: i64 = row.try_get("total_input_tokens")?;
     let total_cache_read_input_tokens: i64 = row.try_get("total_cache_read_input_tokens")?;
     let p95_duration_ms: i64 = row.try_get("p95_duration_ms")?;
-    let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
+    let total_metering_units: f64 = row.try_get("total_upstream_metering_units")?;
     let account_billing = account_billing_summary_from_row(&row)?;
 
     Ok(UsageDashboardWindow {
@@ -10173,7 +10270,6 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
             total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
             total_original_cost_usd: row.try_get("total_original_cost_usd")?,
             total_upstream_metering_units: total_metering_units,
-            total_kiro_metering_usage: total_metering_units,
             priced_requests: row_i64_to_usize(&row, "priced_requests")?,
             unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
             average_duration_ms: row.try_get("average_duration_ms")?,
@@ -10198,7 +10294,7 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
     let total_metering_units = if point.total_upstream_metering_units != 0.0 {
         point.total_upstream_metering_units
     } else {
-        point.total_kiro_metering_usage
+        point.total_upstream_metering_units
     };
     UsageDashboardWindow {
         key: point.key,
@@ -10222,7 +10318,6 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
             total_estimated_cost_usd: point.total_estimated_cost_usd,
             total_original_cost_usd: point.total_original_cost_usd,
             total_upstream_metering_units: total_metering_units,
-            total_kiro_metering_usage: total_metering_units,
             priced_requests: 0,
             unpriced_requests: 0,
             average_duration_ms: 0.0,
@@ -10244,7 +10339,7 @@ fn usage_dashboard_window_from_series_point(point: UsageSeriesPoint) -> UsageDas
 fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
     let from: DateTime<Utc> = row.try_get("from_at")?;
     let to: DateTime<Utc> = row.try_get("to_at")?;
-    let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
+    let total_metering_units: f64 = row.try_get("total_upstream_metering_units")?;
     Ok(UsageSeriesPoint {
         key: row.try_get("key")?,
         label: row.try_get("label")?,
@@ -10259,7 +10354,6 @@ fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
         total_upstream_metering_units: total_metering_units,
-        total_kiro_metering_usage: total_metering_units,
     })
 }
 
@@ -10276,7 +10370,7 @@ fn usage_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageAggregate> {
 }
 
 fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate> {
-    let total_metering_units: f64 = row.try_get("total_kiro_metering_usage")?;
+    let total_metering_units: f64 = row.try_get("total_upstream_metering_units")?;
     Ok(UsageTopAggregate {
         key: row.try_get("key")?,
         label: row.try_get("label")?,
@@ -10290,7 +10384,6 @@ fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate>
         total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
         total_original_cost_usd: row.try_get("total_original_cost_usd")?,
         total_upstream_metering_units: total_metering_units,
-        total_kiro_metering_usage: total_metering_units,
     })
 }
 
@@ -10494,13 +10587,13 @@ fn external_pool_from_row_with_policy(
         row.try_get("request_body_mode")?
     } else {
         row.try_get("request_body_mode")
-            .unwrap_or_else(|_| "normalized".to_string())
+            .unwrap_or_else(|_| "raw_passthrough".to_string())
     };
     let raw_model_mode: String = if strict_dispatch {
         row.try_get("raw_model_mode")?
     } else {
         row.try_get("raw_model_mode")
-            .unwrap_or_else(|_| "none".to_string())
+            .unwrap_or_else(|_| "rewrite_top_level".to_string())
     };
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
     let pre_output_stream_retry_mode: String = if strict_dispatch {
@@ -11160,8 +11253,8 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through',
     stream_response_mode TEXT,
     skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false,
-    request_body_mode TEXT NOT NULL DEFAULT 'normalized',
-    raw_model_mode TEXT NOT NULL DEFAULT 'none',
+    request_body_mode TEXT NOT NULL DEFAULT 'raw_passthrough',
+    raw_model_mode TEXT NOT NULL DEFAULT 'rewrite_top_level',
     auto_disable_policy TEXT NOT NULL DEFAULT 'inherit',
     pre_output_stream_retry_mode TEXT NOT NULL DEFAULT 'inherit',
     auto_disabled BOOLEAN NOT NULL DEFAULT false,
@@ -11208,10 +11301,10 @@ ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS request_body_mode TEXT NOT NULL DEFAULT 'normalized';
+    ADD COLUMN IF NOT EXISTS request_body_mode TEXT NOT NULL DEFAULT 'raw_passthrough';
 
 ALTER TABLE external_upstream_pools
-    ADD COLUMN IF NOT EXISTS raw_model_mode TEXT NOT NULL DEFAULT 'none';
+    ADD COLUMN IF NOT EXISTS raw_model_mode TEXT NOT NULL DEFAULT 'rewrite_top_level';
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS auto_disable_policy TEXT NOT NULL DEFAULT 'inherit';
@@ -11392,7 +11485,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     cache_creation_1h_input_tokens INTEGER NOT NULL,
     estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     pricing_available BOOLEAN NOT NULL DEFAULT false,
     pricing_model TEXT,
     duration_ms BIGINT NOT NULL DEFAULT 0,
@@ -11427,7 +11520,7 @@ ALTER TABLE usage_records
     ADD COLUMN IF NOT EXISTS cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS pricing_available BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS pricing_model TEXT,
     ADD COLUMN IF NOT EXISTS duration_ms BIGINT NOT NULL DEFAULT 0,
@@ -11519,7 +11612,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -11562,7 +11655,7 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -11606,7 +11699,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -11649,7 +11742,7 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS total_kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
@@ -11693,7 +11786,7 @@ CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
     requests BIGINT NOT NULL DEFAULT 0,
     estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     priced_requests BIGINT NOT NULL DEFAULT 0,
     unpriced_requests BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -11703,7 +11796,7 @@ ALTER TABLE usage_credential_cost_summary
     ADD COLUMN IF NOT EXISTS requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS original_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS upstream_metering_units DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS priced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS unpriced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
@@ -11953,7 +12046,7 @@ SELECT
     COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
     COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
     COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
-    COALESCE(SUM(total_kiro_metering_usage), 0)::double precision AS total_kiro_metering_usage,
+    COALESCE(SUM(total_upstream_metering_units), 0)::double precision AS total_upstream_metering_units,
     COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
     COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
     COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
@@ -11983,7 +12076,7 @@ INSERT INTO usage_rollup_time_buckets (
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    total_estimated_cost_usd, total_original_cost_usd, total_upstream_metering_units,
     external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -12000,7 +12093,7 @@ SELECT
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
-    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    total_estimated_cost_usd, total_original_cost_usd, total_upstream_metering_units,
     external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
     external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
     external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
@@ -12079,7 +12172,7 @@ mod tests {
             ("usage_records", "rollup_active"),
             ("usage_cleanup_jobs", "batch_size"),
             ("usage_records", "original_cost_usd"),
-            ("usage_records", "kiro_metering_usage"),
+            ("usage_records", "upstream_metering_units"),
             ("model_capabilities_sync_status", "reasoning_fields"),
             ("credentials", "revision"),
             ("credential_runtime_state", "generation"),
@@ -12160,7 +12253,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("external_upstream_pools.revision"));
-        assert!(error.contains("KIRO_RS_POSTGRES_MIGRATE_ON_START=true"));
+        assert!(error.contains("ACCOUNT_RUNTIME_POSTGRES_MIGRATE_ON_START=true"));
         assert!(error.contains("startup migration is disabled"));
 
         store.drop_test_schema().await.unwrap();
@@ -12376,7 +12469,6 @@ mod tests {
             estimated_cost_usd: 0.001,
             original_cost_usd: 0.001,
             upstream_metering_units: 0.0,
-            kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 30,
@@ -12440,14 +12532,13 @@ mod tests {
             total_estimated_cost_usd: 1.25,
             total_original_cost_usd: 2.5,
             total_upstream_metering_units: 3.75,
-            total_kiro_metering_usage: 3.75,
         });
 
         assert_eq!(window.key, "today");
         assert_eq!(window.summary.total_requests, 100);
         assert_eq!(window.summary.success_requests, 97);
         assert_eq!(window.summary.error_requests, 3);
-        assert_eq!(window.summary.total_kiro_metering_usage, 3.75);
+        assert_eq!(window.summary.total_upstream_metering_units, 3.75);
         assert!((window.summary.error_rate - 0.03).abs() < f64::EPSILON);
         assert_eq!(window.summary.total_input_tokens, 12_345);
         assert_eq!(window.summary.billable_input_tokens, 2_345);
@@ -14554,12 +14645,12 @@ mod tests {
 
         let mut at_from = external_usage_record("dashboard-at-from", 0.010, 0.006, 0.008);
         at_from.created_at = (base + chrono::Duration::minutes(15)).to_rfc3339();
-        at_from.kiro_metering_usage = 1.0;
+        at_from.upstream_metering_units = 1.0;
 
         let mut first_boundary = usage_record("dashboard-first-boundary", 2_000);
         first_boundary.created_at = (base + chrono::Duration::minutes(30)).to_rfc3339();
         first_boundary.duration_ms = 30;
-        first_boundary.kiro_metering_usage = 2.0;
+        first_boundary.upstream_metering_units = 2.0;
 
         let mut before_full_hour = usage_record("dashboard-before-full-hour", 0);
         before_full_hour.created_at =
@@ -14567,18 +14658,18 @@ mod tests {
         before_full_hour.status = UsageRecordStatus::Error;
         before_full_hour.usage_source = UsageSource::RequestEstimate;
         before_full_hour.duration_ms = 40;
-        before_full_hour.kiro_metering_usage = 3.0;
+        before_full_hour.upstream_metering_units = 3.0;
 
         let mut full_hour_start = usage_record("dashboard-full-hour-start", 2_000);
         full_hour_start.created_at = (base + chrono::Duration::hours(1)).to_rfc3339();
         full_hour_start.duration_ms = 50;
-        full_hour_start.kiro_metering_usage = 4.0;
+        full_hour_start.upstream_metering_units = 4.0;
 
         let mut full_hour_external =
             external_usage_record("dashboard-full-hour-external", 0.010, 0.006, 0.008);
         full_hour_external.created_at =
             (base + chrono::Duration::hours(1) + chrono::Duration::minutes(30)).to_rfc3339();
-        full_hour_external.kiro_metering_usage = 5.0;
+        full_hour_external.upstream_metering_units = 5.0;
 
         let mut tail_legacy = usage_record("dashboard-tail-legacy", 2_000);
         tail_legacy.created_at =
@@ -14588,7 +14679,7 @@ mod tests {
         tail_legacy.estimated_cost_usd = 0.123;
         tail_legacy.original_cost_usd = 0.0;
         tail_legacy.duration_ms = 60;
-        tail_legacy.kiro_metering_usage = 6.0;
+        tail_legacy.upstream_metering_units = 6.0;
 
         let mut at_to = external_usage_record("dashboard-at-to", 1.0, 0.5, 0.75);
         at_to.created_at =
@@ -14649,12 +14740,12 @@ mod tests {
             (by_key["cross-hour"].summary.total_original_cost_usd - 0.146).abs() < 1e-12,
             "the boundary detail segment must preserve the legacy hourly original-cost fallback"
         );
-        assert!((by_key["cross-hour"].summary.total_kiro_metering_usage - 21.0).abs() < 1e-12);
+        assert!((by_key["cross-hour"].summary.total_upstream_metering_units - 21.0).abs() < 1e-12);
         assert_eq!(by_key["exact-hour"].summary.total_requests, 2);
         assert_eq!(by_key["exact-hour"].summary.high_cache_requests, 2);
-        assert!((by_key["exact-hour"].summary.total_kiro_metering_usage - 9.0).abs() < 1e-12);
+        assert!((by_key["exact-hour"].summary.total_upstream_metering_units - 9.0).abs() < 1e-12);
         assert_eq!(by_key["half-hour"].summary.total_requests, 3);
-        assert!((by_key["half-hour"].summary.total_kiro_metering_usage - 9.0).abs() < 1e-12);
+        assert!((by_key["half-hour"].summary.total_upstream_metering_units - 9.0).abs() < 1e-12);
 
         let series = usage_store.dashboard_series(&specs).await.unwrap();
         let series_by_key = series
@@ -14663,7 +14754,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(series_by_key["same-hour"].requests, 2);
         assert_eq!(series_by_key["cross-hour"].requests, 6);
-        assert!((series_by_key["cross-hour"].total_kiro_metering_usage - 21.0).abs() < 1e-12);
+        assert!((series_by_key["cross-hour"].total_upstream_metering_units - 21.0).abs() < 1e-12);
         assert_eq!(series_by_key["exact-hour"].requests, 2);
         assert_eq!(series_by_key["half-hour"].requests, 3);
 
@@ -14673,7 +14764,7 @@ mod tests {
             .unwrap();
         assert_eq!(top_credentials[0].key, "7");
         assert!(
-            (top_credentials[0].total_kiro_metering_usage - 15.0).abs() < 1e-12,
+            (top_credentials[0].total_upstream_metering_units - 15.0).abs() < 1e-12,
             "windowed credential top must preserve Upstream metering from rollup and boundary rows"
         );
 
@@ -15139,7 +15230,6 @@ mod tests {
             estimated_cost_usd: uplifted_cost_usd,
             original_cost_usd: raw_cost_usd,
             upstream_metering_units: 0.0,
-            kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 50,
@@ -15457,7 +15547,7 @@ mod tests {
 
         let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
         let mut usage_1 = usage_record("usage-1", 10);
-        usage_1.kiro_metering_usage = 0.125;
+        usage_1.upstream_metering_units = 0.125;
         usage_store.record(usage_1).await.unwrap();
         let mut usage_2 = usage_record("usage-2", 20);
         usage_2.status = UsageRecordStatus::Error;
@@ -15465,7 +15555,7 @@ mod tests {
         usage_2.conversation_id = Some("session-b".to_string());
         usage_2.request_api_key_id = Some("request-key-b".to_string());
         usage_2.estimated_cost_usd = 0.0;
-        usage_2.kiro_metering_usage = 0.375;
+        usage_2.upstream_metering_units = 0.375;
         usage_2.pricing_available = false;
         usage_2.pricing_model = None;
         usage_2.error_message = Some("upstream quota exceeded".to_string());
@@ -15555,7 +15645,7 @@ mod tests {
         assert_eq!(cost_summary.priced_requests, 1);
         assert_eq!(cost_summary.unpriced_requests, 1);
         assert!((cost_summary.estimated_cost_usd - 0.001).abs() < f64::EPSILON);
-        assert!((cost_summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
+        assert!((cost_summary.upstream_metering_units - 0.5).abs() < f64::EPSILON);
 
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         let cleanup_cutoff = Utc::now();

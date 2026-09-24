@@ -18,11 +18,11 @@ The target is binding through decisions 001 and 003-014. Current behavior remain
 
 ## Product Boundary
 
-`kiro-rs` is an Anthropic-compatible gateway operated in one trust domain by one operator. It accepts Anthropic and Claude Code traffic, routes it to a local Kiro credential pool or optional external Anthropic-compatible pools, translates protocols where required, preserves streaming semantics, projects cache usage, records usage and cost evidence, and exposes an Admin control plane.
+`account-runtime` is an Anthropic-compatible gateway operated in one trust domain by one operator. It accepts Anthropic and Claude Code traffic, routes it to a local Account Runtime credential pool or optional external Anthropic-compatible pools, translates protocols where required, preserves streaming semantics, projects cache usage, records usage and cost evidence, and exposes an Admin control plane.
 
-Multiple request API keys are authentication and rotation credentials. Multiple Kiro credentials are upstream capacity. Multiple external pools are alternative upstream capacity. Multiple replicas are one deployment. None of these represent users or tenants. The target architecture therefore MUST NOT introduce tenant repositories, tenant-scoped authorization, tenant billing, tenant quotas, tenant file ownership, or tenant-based routing.
+Multiple request API keys are authentication and rotation credentials. Multiple Account Runtime credentials are upstream capacity. Multiple external pools are alternative upstream capacity. Multiple replicas are one deployment. None of these represent users or tenants. The target architecture therefore MUST NOT introduce tenant repositories, tenant-scoped authorization, tenant billing, tenant quotas, tenant file ownership, or tenant-based routing.
 
-The single trust domain does not remove external boundaries. Clients, Kiro, external pools, remote media hosts, PgSQL, Redis, proxies, the filesystem, and diagnostic outputs remain independent protocol, security, capacity, and failure boundaries.
+The single trust domain does not remove external boundaries. Clients, Account Runtime, external pools, remote media hosts, PgSQL, Redis, proxies, the filesystem, and diagnostic outputs remain independent protocol, security, capacity, and failure boundaries.
 
 ## Required Business Capabilities
 
@@ -31,7 +31,7 @@ The target must preserve these capabilities while implementation is migrated:
 - Anthropic Messages, Models, token counting, and Files compatibility.
 - `/v1`, `/cc/v1`, `/ha/v1`, `/na/v1`, and declared `/dfcache/{route}/v1` profiles.
 - Claude Code stream ordering, thinking, tools, tool pairing, final usage, and normalized errors.
-- Local Kiro model resolution, request conversion, payload repair, cache-point behavior, token refresh, and retry behavior.
+- Local Account Runtime model resolution, request conversion, payload repair, cache-point behavior, token refresh, and retry behavior.
 - Multiple local credentials with priority, balancing, supported-model eligibility, sticky routing, warmup, RPM, concurrency, cooldown, queueing, and bounded attempts.
 - External direct and fallback routing, raw and normalized request modes, model mapping, `preservePath`, independent concurrency, failover, and optional usage projection.
 - Actual upstream usage, downstream reported usage, accounting/cost usage, cache evidence, latency, and attempt-chain observability.
@@ -71,8 +71,8 @@ The target must preserve these capabilities while implementation is migrated:
 flowchart LR
     Client[Claude Code and Anthropic API clients]
     Operator[Single operator and Admin UI]
-    Gateway[kiro-rs modular monolith]
-    Kiro[Kiro upstream APIs]
+    Gateway[account-runtime modular monolith]
+    Account Runtime[Account Runtime upstream APIs]
     External[External Anthropic-compatible pools]
     Remote[Remote media and configured tokenizer]
     PG[(PostgreSQL durable authority)]
@@ -83,7 +83,7 @@ flowchart LR
     Client -->|Messages, Models, Files, token count| Gateway
     Operator --> AdminUI
     AdminUI -->|Admin commands and queries| Gateway
-    Gateway -->|Converted local attempts| Kiro
+    Gateway -->|Converted local attempts| Account Runtime
     Gateway -->|Raw or normalized attempts| External
     Gateway -->|Budgeted fetch or token count| Remote
     Gateway -->|CAS, rows, events, queries| PG
@@ -148,7 +148,7 @@ src/
 │   ├── kernel/                   # MOD-KERNEL; no business policy or state
 │   ├── protocol/
 │   │   ├── anthropic/            # MOD-PROTO-ANTHROPIC
-│   │   ├── kiro/                 # MOD-PROTO-KIRO
+│   │   ├── account-runtime/                 # MOD-PROTO-ACCOUNT_RUNTIME
 │   │   ├── external_anthropic/   # MOD-PROTO-EXTERNAL
 │   │   └── sse/                  # MOD-PROTO-SSE
 │   └── observability/            # MOD-OBSERVABILITY
@@ -171,7 +171,7 @@ src/
 │   ├── messages/
 │   ├── request_artifacts/
 │   ├── payload/
-│   ├── kiro_upstream/
+│   ├── account-runtime_upstream/
 │   ├── external_upstream/
 │   ├── attempt_policy/
 │   ├── response/
@@ -209,12 +209,12 @@ There is no broad target `application`, `ports`, `adapters`, `workers`, or `admi
 | Resource governor | the single weighted process ledger, admission/reservation/upgrade/release state, listener/stream/body/control-plane reserves and low-memory fail-closed validation | business eligibility, scheduler fairness, media semantics or direct ownership of another module's queue |
 | Public transport | listener/header/body/keepalive/H2 limits, authentication, pre-body resource admission, endpoint profile and wire decoding/encoding | target selection, SQL, Redis, retry classification or unbounded complete-body allocation |
 | Admin transport | Admin authentication, pre-body resource admission, request validation and command/query DTOs | direct mutation of manager internals or storage rows, generic transactions or unbounded complete-body allocation |
-| Protocol | Anthropic, Kiro, external, and SSE wire formats/state machines | persistence, scheduling, route policy |
+| Protocol | Anthropic, Account Runtime, external, and SSE wire formats/state machines | persistence, scheduling, route policy |
 | Domain module | one capability's application orchestration, invariants, public contracts, owned ports and state authority | unrelated use cases, another module's private state, or a global service context |
 | Module adapters | the owner's PgSQL, Redis, upstream HTTP, DNS, proxy, or filesystem implementation | product policy hidden inside I/O helpers or another owner's persistence |
 | Module workers | bounded owner-specific batching, replay, cleanup, refresh, invalidation, and drain | detached tasks, unbounded queues, or business branching for unrelated modules |
 | Model catalog | public Models semantics, aliases, capabilities, pricing, validated refresh and immutable catalog publication | a second mutable model map in routing, Admin, usage, or transport |
-| Proxy resources | durable reusable-proxy catalog, secret lifecycle, validation/test, credential binding resolution and immutable publication | scheduler queue/lease policy, Kiro attempt retry policy, or generic HTTP-client ownership |
+| Proxy resources | durable reusable-proxy catalog, secret lifecycle, validation/test, credential binding resolution and immutable publication | scheduler queue/lease policy, Account Runtime attempt retry policy, or generic HTTP-client ownership |
 | Shared kernel | IDs, versions, time/deadline, cancellation and bounded error primitives | repositories, services, route/scheduler/usage policy, provider DTOs, or mutable state |
 | Observability | metrics, trace fields, safe diagnostic events | raw secret or request-body retention by default |
 
@@ -226,7 +226,7 @@ Under the accepted terminal contract, stable child IDs identify only lease compl
 
 Raw external passthrough remains a distinct capability. It may probe or rewrite the top-level model only when configured, but it does not implicitly parse or normalize the request. Usage projection remains independent from body mode.
 
-The local Kiro path and external normalized path may share canonical Anthropic parsing and request facts, but they own separate outbound-body pipelines. No unselected pipeline may perform remote fetch, PDF extraction, token counting, schema normalization, payload shaping, or serialization.
+The local Account Runtime path and external normalized path may share canonical Anthropic parsing and request facts, but they own separate outbound-body pipelines. No unselected pipeline may perform remote fetch, PDF extraction, token counting, schema normalization, payload shaping, or serialization.
 
 ## Control Plane Shape
 

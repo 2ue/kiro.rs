@@ -14,7 +14,7 @@ Owner intent:
 
 本分析不是为了修一个单点 fallback 条件，而是为了回答以下架构问题：
 
-1. 当前 kiro.rs 的“调度”到底由哪些组件共同决定，而不是只看外部池或本地凭证单点。
+1. 当前 account-runtime 的“调度”到底由哪些组件共同决定，而不是只看外部池或本地凭证单点。
 2. 本地凭证、外部池、request admission、Redis 分布式调度、sticky session、MCP/WebSearch、retry、fallback、rescue、usage/stat/dashboard 写入之间是否存在隐式耦合。
 3. 当前几种模式为什么用户体感“不起作用”或“不符合预期”：是配置命名问题、作用范围问题、实现错误，还是缺少统一调度模型。
 4. 外部池开启后为什么可能影响本地凭证，即使外部池理论上只是备用池。
@@ -50,7 +50,7 @@ Owner intent:
 
 ## 3. 当前初步判断
 
-当前源码显示，kiro.rs 的调度不是一个单一调度器，而是多套局部机制叠加：
+当前源码显示，account-runtime 的调度不是一个单一调度器，而是多套局部机制叠加：
 
 ```text
 HTTP request
@@ -92,7 +92,7 @@ HTTP request
 
 ## 4. 分析方法
 
-### 4.1 当前 kiro.rs 源码梳理
+### 4.1 当前 account-runtime 源码梳理
 
 按以下顺序只读梳理：
 
@@ -125,21 +125,21 @@ HTTP request
 
 ## 5. 重点参考位置
 
-### 5.1 kiro.rs 当前调度相关位置
+### 5.1 account-runtime 当前调度相关位置
 
 - Request admission 配置：`src/model/config.rs:3003`
 - Request admission middleware：`src/anthropic/request_admission.rs:1049`
 - `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/dfcache/*/v1/messages` admission 挂载：`src/anthropic/router.rs`
-- 本地 `AcquireMode`：`src/kiro/token_manager/types.rs:122`
-- 本地 route state：`src/kiro/token_manager/route_state.rs:5`
-- 本地账号 dispatchable 过滤：`src/kiro/token_manager/capacity.rs:29`
-- 本地 RPM selection window：`src/kiro/token_manager/rpm.rs`
-- 本地 health/weighted/balanced 策略：`src/kiro/token_manager/strategy.rs`
-- 本地候选选择：`src/kiro/token_manager/manager.rs:5089`
-- 本地 acquire 主循环：`src/kiro/token_manager/manager.rs:5612`
-- Redis scheduler affinity/hot/snapshot block/await 桥：`src/kiro/token_manager/manager.rs:3410`、`src/kiro/token_manager/manager.rs:3455`、`src/kiro/token_manager/manager.rs:3551`
-- Redis scheduler state sync：`src/kiro/token_manager/manager.rs:9332`
-- PgSQL credential runtime mutation：`src/kiro/token_manager/manager.rs:2010`、`src/kiro/token_manager/manager.rs:8946`
+- 本地 `AcquireMode`：`src/local_upstream_impl/token_manager/types.rs:122`
+- 本地 route state：`src/local_upstream_impl/token_manager/route_state.rs:5`
+- 本地账号 dispatchable 过滤：`src/local_upstream_impl/token_manager/capacity.rs:29`
+- 本地 RPM selection window：`src/local_upstream_impl/token_manager/rpm.rs`
+- 本地 health/weighted/balanced 策略：`src/local_upstream_impl/token_manager/strategy.rs`
+- 本地候选选择：`src/local_upstream_impl/token_manager/manager.rs:5089`
+- 本地 acquire 主循环：`src/local_upstream_impl/token_manager/manager.rs:5612`
+- Redis scheduler affinity/hot/snapshot block/await 桥：`src/local_upstream_impl/token_manager/manager.rs:3410`、`src/local_upstream_impl/token_manager/manager.rs:3455`、`src/local_upstream_impl/token_manager/manager.rs:3551`
+- Redis scheduler state sync：`src/local_upstream_impl/token_manager/manager.rs:9332`
+- PgSQL credential runtime mutation：`src/local_upstream_impl/token_manager/manager.rs:2010`、`src/local_upstream_impl/token_manager/manager.rs:8946`
 - 外部池配置：`src/model/config.rs:2677`
 - 外部池 direct policy：`src/external_pool.rs:3124`
 - 外部池 immediate availability：`src/external_pool.rs:4210`
@@ -228,7 +228,7 @@ HTTP request
 3. fallback/rescue 状态机矩阵：列出 local/external/direct/rescue 的所有允许和禁止转换。
 4. 容量账本分析：downstream RPM、local selection RPM、local upstream send、external send、MCP auxiliary send、usage RPM 的口径拆分。
 5. 故障域分析：Redis/PgSQL/usage/dashboard/external snapshot 对主业务调度的影响边界。
-6. 与 `new-api`、`sub2api`、`CLIProxyAPI` 的对照表：可借鉴点、不可照抄点、适配 kiro.rs 的原因。
+6. 与 `new-api`、`sub2api`、`CLIProxyAPI` 的对照表：可借鉴点、不可照抄点、适配 account-runtime 的原因。
 7. 新调度方案草案：RoutePlanner、RoutePlan、CapacityLedger、PoolScheduler trait、RouteExecutor finite-state-machine。
 8. 测试矩阵草案：不用生产流量即可验证各配置组合是否不会回环、不会多层排队、不会内部 RPM 无界放大。
 
@@ -264,7 +264,7 @@ RequestAdmission
 本节记录的是当前工作树源码已经核对到的真实行为，不是目标行为。源码证据集中在：
 
 - 入口与准入：`src/anthropic/handlers/request_entry.rs`、`src/anthropic/request_admission.rs`。
-- 本地凭证：`src/kiro/token_manager/manager.rs`、`route_state.rs`、`capacity.rs`、`strategy.rs`。
+- 本地凭证：`src/local_upstream_impl/token_manager/manager.rs`、`route_state.rs`、`capacity.rs`、`strategy.rs`。
 - 外部池：`src/external_pool.rs`、`src/external_pool/retry_pipeline.rs`。
 - 失败映射与 fallback：`src/anthropic/handlers.rs`、`src/anthropic/inference_attempt_budget.rs`。
 - 配置合同：`src/model/config.rs`。
@@ -377,7 +377,7 @@ Raw 外部路径的正文仍由选中的外部池在发送阶段处理。`请求
 5. 选中后先占用本地并发租约，再尝试 Token refresh；Token refresh 需要独立的“辅助上游最大尝试次数”和辅助并发上限。
 6. 选中账号在槽位竞争中失败时，当前请求会把账号放入 `local_excluded_ids` 并换号；普通容量等待则进入本地调度等待队列。
 7. 上游 refresh/协调失败不一定修改账号健康：共享失败波、Redis/PgSQL 协调失败、未提交的辅助失败只在当前请求临时排除，避免把基础设施抖动放大成账号禁用。
-8. 已发送的本地推理请求失败后，上层依据 `KiroCallFailureKind`、错误文本、已尝试账号和配置决定是否进入外部 fallback；本地 provider 自身在“推理尝试预算”内也可能先换号。
+8. 已发送的本地推理请求失败后，上层依据 `Account RuntimeCallFailureKind`、错误文本、已尝试账号和配置决定是否进入外部 fallback；本地 provider 自身在“推理尝试预算”内也可能先换号。
 
 本地账号的失败处理并不是“一次请求只打一个账号”，但它也不是无限换号：本请求有总“推理上游最大尝试次数”，本地 acquire 还有按账号数与失败阈值计算的上限，外层流式首输出前重试还有单独安全窗口。
 
@@ -714,10 +714,10 @@ External -> Local -> External 无限回环
 
 不能直接照抄：
 
-1. `sub2api` 的账号/平台模型与 kiro.rs 的本地 Kiro 凭证、外部 Anthropic 池不是同一资源域。
-2. kiro.rs 必须保留“直连外部不回本地”和“本地优先才允许 rescue”的业务边界。
-3. Kiro Token refresh、WebSearch/MCP 辅助请求、缓存/usage 整形和模型 alias 解析需要独立预算和协议处理。
-4. `sub2api` 的优先级/权重不能替代 kiro.rs 的外部池冷却、Redis 租约和模型级冷却。
+1. `sub2api` 的账号/平台模型与 account-runtime 的本地 Account Runtime 凭证、外部 Anthropic 池不是同一资源域。
+2. account-runtime 必须保留“直连外部不回本地”和“本地优先才允许 rescue”的业务边界。
+3. Account Runtime Token refresh、WebSearch/MCP 辅助请求、缓存/usage 整形和模型 alias 解析需要独立预算和协议处理。
+4. `sub2api` 的优先级/权重不能替代 account-runtime 的外部池冷却、Redis 租约和模型级冷却。
 
 ## 13. 当前缺陷与目标的差距
 

@@ -24,7 +24,7 @@ This baseline records project-wide facts that plans can reference without duplic
 
 1. [Runtime flows](runtime-flows.md): request, routing, upstream, usage, Admin, startup, reload, and shutdown paths.
 2. [Storage and state](storage-and-state.md): PgSQL, Redis, process memory, filesystem state, consistency, and lifecycle boundaries.
-3. [Protocol and API contracts](protocol-and-api-contracts.md): Anthropic, Claude Code, Kiro, external-pool, Admin, health, and compatibility contracts.
+3. [Protocol and API contracts](protocol-and-api-contracts.md): Anthropic, Claude Code, Account Runtime, external-pool, Admin, health, and compatibility contracts.
 4. [Resource and concurrency model](resource-and-concurrency-model.md): queues, leases, request/body budgets, background work, memory, file descriptors, and backpressure.
 
 ### Deployment And Assurance
@@ -35,8 +35,8 @@ This baseline records project-wide facts that plans can reference without duplic
 
 ## Current System Summary
 
-- `kiro-rs` is a self-hosted, single-operator Anthropic/Claude Code compatibility gateway; it has no multi-user or multi-tenant product boundary.
-- Requests can use operator-owned Kiro credentials or configured external compatible pools with raw or normalized body behavior.
+- `account-runtime` is a self-hosted, single-operator Anthropic/Claude Code compatibility gateway; it has no multi-user or multi-tenant product boundary.
+- Requests can use operator-owned Account Runtime credentials or configured external compatible pools with raw or normalized body behavior.
 - PgSQL is the durable authority for configuration and operational records; Redis coordinates cross-process transient state and derived realtime views.
 - Multiple replicas are an availability and capacity concern inside the same operator trust domain, not a tenant boundary.
 - `/v1/messages`, `/na/v1/messages`, `/ha/v1/messages`, `/dfcache/*/v1/messages`, and `/cc/v1/messages` share an entry path but apply distinct route, cache, usage, and compatibility policies.

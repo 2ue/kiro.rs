@@ -42,7 +42,7 @@ pub fn print_hex(data: &[u8]) {
     std::io::stdout().flush().ok();
 }
 
-/// 调试 CRC 计算 - 分析 AWS Event Stream 帧的 CRC
+/// 调试 CRC 计算 - 分析流式帧的 CRC
 pub fn debug_crc(data: &[u8]) {
     if data.len() < 12 {
         println!("[CRC 调试] 数据不足 12 字节");

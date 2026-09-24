@@ -13,13 +13,13 @@ import { resolveRuntimeValidationPaths } from './runtime-validation-paths.mjs'
 
 const ROOT = path.resolve(import.meta.dirname, '../..')
 const { binary: BINARY, artifactRoot: ARTIFACT_ROOT } = resolveRuntimeValidationPaths(ROOT)
-const ROUNDS = Number.parseInt(process.env.KIRO_E05_ROUNDS || '3', 10)
-const REQUESTS_PER_ROUND = Number.parseInt(process.env.KIRO_E05_REQUESTS || '5', 10)
-const SCHEDULER_FAULT_KIND = process.env.KIRO_E04_REDIS_FAULT || 'latency'
-const SCHEDULER_LATENCY_MS = Number.parseInt(process.env.KIRO_E04_REDIS_LATENCY_MS || '500', 10)
-const SCHEDULER_FALLBACK_ENABLED = process.env.KIRO_E04_FALLBACK_ENABLED !== 'false'
+const ROUNDS = Number.parseInt(process.env.ACCOUNT_RUNTIME_E05_ROUNDS || '3', 10)
+const REQUESTS_PER_ROUND = Number.parseInt(process.env.ACCOUNT_RUNTIME_E05_REQUESTS || '5', 10)
+const SCHEDULER_FAULT_KIND = process.env.ACCOUNT_RUNTIME_E04_REDIS_FAULT || 'latency'
+const SCHEDULER_LATENCY_MS = Number.parseInt(process.env.ACCOUNT_RUNTIME_E04_REDIS_LATENCY_MS || '500', 10)
+const SCHEDULER_FALLBACK_ENABLED = process.env.ACCOUNT_RUNTIME_E04_FALLBACK_ENABLED !== 'false'
 const SCHEDULER_RECOVERY_REQUESTS = Number.parseInt(
-  process.env.KIRO_E04_RECOVERY_REQUESTS || '5',
+  process.env.ACCOUNT_RUNTIME_E04_RECOVERY_REQUESTS || '5',
   10,
 )
 // Capacity/queue coordination intentionally has a wider budget than sticky
@@ -28,10 +28,10 @@ const SCHEDULER_RECOVERY_REQUESTS = Number.parseInt(
 const SCHEDULER_HOT_PATH_TIMEOUT_MS = 250
 const REQUEST_KEY = 'sk-request-e05-isolated-validation'
 const ADMIN_KEY = 'sk-admin-e05-isolated-validation'
-const POSTGRES_URL_TEMPLATE = requiredEnvironment('KIRO_E05_POSTGRES_URL_TEMPLATE')
-const REDIS_URL = requiredEnvironment('KIRO_E05_REDIS_URL')
-const REDIS_PREFIX = requiredEnvironment('KIRO_E05_REDIS_PREFIX')
-const VALIDATE_ONLY = process.env.KIRO_E05_VALIDATE_ONLY === '1'
+const POSTGRES_URL_TEMPLATE = requiredEnvironment('ACCOUNT_RUNTIME_E05_POSTGRES_URL_TEMPLATE')
+const REDIS_URL = requiredEnvironment('ACCOUNT_RUNTIME_E05_REDIS_URL')
+const REDIS_PREFIX = requiredEnvironment('ACCOUNT_RUNTIME_E05_REDIS_PREFIX')
+const VALIDATE_ONLY = process.env.ACCOUNT_RUNTIME_E05_VALIDATE_ONLY === '1'
 const RUN_ID = `e05-${new Date().toISOString().replace(/[-:.TZ]/g, '')}-${process.pid}-${crypto.randomBytes(3).toString('hex')}`
 const TEMP_ROOT = path.join(ARTIFACT_ROOT, 'runtime', 'e05', RUN_ID)
 const REPORT_ROOT = path.join(ARTIFACT_ROOT, 'reports', 'e05')
@@ -48,11 +48,11 @@ const ALL_MODES = [
   'external_error_no_loop',
   'local_ready_transient',
 ]
-const MODES = process.env.KIRO_E05_MODES
-  ? process.env.KIRO_E05_MODES.split(',').map((mode) => mode.trim()).filter(Boolean)
+const MODES = process.env.ACCOUNT_RUNTIME_E05_MODES
+  ? process.env.ACCOUNT_RUNTIME_E05_MODES.split(',').map((mode) => mode.trim()).filter(Boolean)
   : ALL_MODES
 const REQUIRED_DATABASE_COUNT = MODES.length * ROUNDS
-const POSTGRES_DATABASES = String(process.env.KIRO_E05_POSTGRES_DATABASES || '')
+const POSTGRES_DATABASES = String(process.env.ACCOUNT_RUNTIME_E05_POSTGRES_DATABASES || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean)
@@ -60,27 +60,27 @@ const ACTIVE_CHILDREN = new Set()
 let redisTarget = null
 
 if (!Number.isInteger(ROUNDS) || ROUNDS < 3 || ROUNDS > 10) {
-  throw new Error('KIRO_E05_ROUNDS must be an integer between 3 and 10')
+  throw new Error('ACCOUNT_RUNTIME_E05_ROUNDS must be an integer between 3 and 10')
 }
 if (!Number.isInteger(REQUESTS_PER_ROUND) || REQUESTS_PER_ROUND < 5 || REQUESTS_PER_ROUND > 10) {
-  throw new Error('KIRO_E05_REQUESTS must be an integer between 5 and 10')
+  throw new Error('ACCOUNT_RUNTIME_E05_REQUESTS must be an integer between 5 and 10')
 }
 if (MODES.length === 0 || MODES.some((mode) => !ALL_MODES.includes(mode))) {
-  throw new Error(`KIRO_E05_MODES must contain only: ${ALL_MODES.join(',')}`)
+  throw new Error(`ACCOUNT_RUNTIME_E05_MODES must contain only: ${ALL_MODES.join(',')}`)
 }
 if (MODES.includes('scheduler_redis_chaos')) {
   if (!['latency', 'disconnect'].includes(SCHEDULER_FAULT_KIND)) {
-    throw new Error('KIRO_E04_REDIS_FAULT must be latency or disconnect')
+    throw new Error('ACCOUNT_RUNTIME_E04_REDIS_FAULT must be latency or disconnect')
   }
   if (!Number.isInteger(SCHEDULER_LATENCY_MS)
     || SCHEDULER_LATENCY_MS < 0
     || SCHEDULER_LATENCY_MS > 2_000) {
-    throw new Error('KIRO_E04_REDIS_LATENCY_MS must be an integer between 0 and 2000')
+    throw new Error('ACCOUNT_RUNTIME_E04_REDIS_LATENCY_MS must be an integer between 0 and 2000')
   }
   if (!Number.isInteger(SCHEDULER_RECOVERY_REQUESTS)
     || SCHEDULER_RECOVERY_REQUESTS < 5
     || SCHEDULER_RECOVERY_REQUESTS > 20) {
-    throw new Error('KIRO_E04_RECOVERY_REQUESTS must be an integer between 5 and 20')
+    throw new Error('ACCOUNT_RUNTIME_E04_RECOVERY_REQUESTS must be an integer between 5 and 20')
   }
 }
 
@@ -93,46 +93,46 @@ function requiredEnvironment(name) {
 function validateInputs() {
   const placeholderCount = (POSTGRES_URL_TEMPLATE.match(/\{database\}/g) || []).length
   if (placeholderCount !== 1) {
-    throw new Error('KIRO_E05_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
+    throw new Error('ACCOUNT_RUNTIME_E05_POSTGRES_URL_TEMPLATE must contain exactly one literal {database} placeholder')
   }
-  const postgresSampleDatabase = POSTGRES_DATABASES[0] || 'kiro_e05_contract_sample'
+  const postgresSampleDatabase = POSTGRES_DATABASES[0] || 'account_runtime_e05_contract_sample'
   const postgres = new URL(POSTGRES_URL_TEMPLATE.replace('{database}', postgresSampleDatabase))
   if (!['postgres:', 'postgresql:'].includes(postgres.protocol)) {
-    throw new Error('KIRO_E05_POSTGRES_URL_TEMPLATE must use PostgreSQL')
+    throw new Error('ACCOUNT_RUNTIME_E05_POSTGRES_URL_TEMPLATE must use PostgreSQL')
   }
   if (!['127.0.0.1', 'localhost', '::1'].includes(postgres.hostname)) {
-    throw new Error('KIRO_E05_POSTGRES_URL_TEMPLATE must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_E05_POSTGRES_URL_TEMPLATE must target loopback')
   }
   if (Number(postgres.port || 5432) === 9022) throw new Error('port 9022 is protected')
   if (POSTGRES_DATABASES.length !== REQUIRED_DATABASE_COUNT) {
-    throw new Error(`KIRO_E05_POSTGRES_DATABASES must contain exactly ${REQUIRED_DATABASE_COUNT} pre-created database names`)
+    throw new Error(`ACCOUNT_RUNTIME_E05_POSTGRES_DATABASES must contain exactly ${REQUIRED_DATABASE_COUNT} pre-created database names`)
   }
   for (const database of POSTGRES_DATABASES) {
-    if (!/^kiro_e05_[a-z0-9_]{3,80}$/.test(database)) {
-      throw new Error('KIRO_E05_POSTGRES_DATABASES must contain caller-owned kiro_e05_* names')
+    if (!/^account_runtime_e05_[a-z0-9_]{3,80}$/.test(database)) {
+      throw new Error('ACCOUNT_RUNTIME_E05_POSTGRES_DATABASES must contain caller-owned account_runtime_e05_* names')
     }
   }
 
   const redis = new URL(REDIS_URL)
-  if (redis.protocol !== 'redis:') throw new Error('KIRO_E05_REDIS_URL must use redis://')
-  if (redis.username || redis.password) throw new Error('KIRO_E05_REDIS_URL must not contain Redis auth material')
+  if (redis.protocol !== 'redis:') throw new Error('ACCOUNT_RUNTIME_E05_REDIS_URL must use redis://')
+  if (redis.username || redis.password) throw new Error('ACCOUNT_RUNTIME_E05_REDIS_URL must not contain Redis auth material')
   if (!['127.0.0.1', 'localhost', '::1'].includes(redis.hostname)) {
-    throw new Error('KIRO_E05_REDIS_URL must target loopback')
+    throw new Error('ACCOUNT_RUNTIME_E05_REDIS_URL must target loopback')
   }
-  if (redis.search || redis.hash) throw new Error('KIRO_E05_REDIS_URL must not contain query or fragment data')
+  if (redis.search || redis.hash) throw new Error('ACCOUNT_RUNTIME_E05_REDIS_URL must not contain query or fragment data')
   const redisPort = Number(redis.port || 6379)
   if (redisPort === 9022) throw new Error('port 9022 is protected')
   const dbText = redis.pathname.replace(/^\//, '')
-  if (!/^\d+$/.test(dbText)) throw new Error('KIRO_E05_REDIS_URL must name a Redis database')
+  if (!/^\d+$/.test(dbText)) throw new Error('ACCOUNT_RUNTIME_E05_REDIS_URL must name a Redis database')
   const redisDatabase = Number(dbText)
   if (!Number.isSafeInteger(redisDatabase) || redisDatabase < 1 || redisDatabase > 15) {
-    throw new Error('KIRO_E05_REDIS_URL must use an isolated nonzero database in 1..15')
+    throw new Error('ACCOUNT_RUNTIME_E05_REDIS_URL must use an isolated nonzero database in 1..15')
   }
-  if (REDIS_PREFIX.includes('kiro_rs:local')) {
-    throw new Error('KIRO_E05_REDIS_PREFIX must be a caller-owned temporary prefix')
+  if (REDIS_PREFIX.includes('account_runtime:local')) {
+    throw new Error('ACCOUNT_RUNTIME_E05_REDIS_PREFIX must be a caller-owned temporary prefix')
   }
   if (!/^[a-z0-9][a-z0-9:._-]{7,95}$/.test(REDIS_PREFIX)) {
-    throw new Error('KIRO_E05_REDIS_PREFIX has an invalid format')
+    throw new Error('ACCOUNT_RUNTIME_E05_REDIS_PREFIX has an invalid format')
   }
   redisTarget = { redis, redisPort, redisDatabase }
   return {
@@ -256,7 +256,7 @@ function eventFrame(eventType, payload) {
   return frame
 }
 
-function writeKiroSuccess(response, text) {
+function writeAccountRuntimeSuccess(response, text) {
   const body = Buffer.concat([
     eventFrame('assistantResponseEvent', {
       content: text,
@@ -308,7 +308,7 @@ function createFakeUpstreams() {
   const local = http.createServer(async (request, response) => {
     await consumeRequest(request)
     const url = new URL(request.url || '/', 'http://127.0.0.1')
-    const target = String(request.headers['x-amz-target'] || '')
+    const target = String(request.headers['x-account-runtime-target'] || '')
     const kind = target.endsWith('.ListAvailableModels')
       || url.pathname.toLowerCase().endsWith('/listavailablemodels')
       ? 'auxiliary'
@@ -324,7 +324,7 @@ function createFakeUpstreams() {
       state.localInferenceHits += 1
       state.caseLocalInferenceHits += 1
       if (state.caseId?.startsWith('scheduler_redis_chaos-')) {
-        writeKiroSuccess(response, `local-ok ${state.caseId}`)
+        writeAccountRuntimeSuccess(response, `local-ok ${state.caseId}`)
         return
       }
       if (state.caseId?.startsWith('local_capacity_full-') && state.caseLocalInferenceHits === 1) {
@@ -455,7 +455,7 @@ async function waitForHealth(baseUrl, processHandle, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (processHandle.exitCode !== null) {
-      throw new Error(`kiro-rs exited before health check: ${processHandle.exitCode}`)
+      throw new Error(`account-runtime service exited before health check: ${processHandle.exitCode}`)
     }
     try {
       const response = await fetch(`${baseUrl}/healthz`)
@@ -489,7 +489,7 @@ function diagnosticLogLines(logPath) {
       'routing request directly to external pool',
       'fresh local state permits external fallback',
       'external fallback suppressed',
-      'Kiro API 凭据调用链路',
+      'account runtime API 凭据调用链路',
     ].some((marker) => line.includes(marker)))
   return selected.slice(-80)
 }
@@ -579,12 +579,12 @@ async function stopChild(handle, label) {
 }
 
 async function stopService(handle) {
-  await stopChild(handle, 'kiro-rs service')
+  await stopChild(handle, 'account-runtime service')
 }
 
 function startService(configPath, credentialsPath, logPath) {
   const log = fs.openSync(logPath, 'a')
-  const handle = startChild(BINARY, ['--config', configPath, '--credentials', credentialsPath], {
+  const handle = startChild(BINARY, ['--config', configPath], {
     env: { RUST_LOG: 'info', LOCAL_UPSTREAM_API_KEY: '' },
     stdio: ['ignore', log, log],
   })
@@ -781,8 +781,8 @@ async function runCase({
     apiKey: REQUEST_KEY,
     adminApiKey: ADMIN_KEY,
     defaultEndpoint: 'ide',
-    kiroUpstreamBaseUrl: `http://127.0.0.1:${localPort}/kiro`,
-    kiroUpstreamResponseTimeoutSecs: 5,
+    upstreamBaseUrl: `http://127.0.0.1:${localPort}/account-runtime`,
+    upstreamResponseTimeoutSecs: 5,
     credentialRetryMaxAttempts: 6,
     inferenceUpstreamMaxAttempts: 4,
     credentialPromptLogicRetryEnabled: false,
@@ -1323,7 +1323,7 @@ async function main() {
     assert.equal(
       binarySha256AtEnd,
       binarySha256AtStart,
-      'kiro-rs binary changed while E05 was running; discard the mixed-candidate result',
+      'account-runtime binary changed while E05 was running; discard the mixed-candidate result',
     )
     const report = {
       schemaVersion: 1,

@@ -27,8 +27,8 @@ Technical authority area: application architecture
 
 ### Evidence
 
-- `MultiTokenManager` has 28 fields covering configuration, credential entries, refresh, PgSQL, Redis, proxies, statistics, runtime mutations, sticky sessions, queues, leases, and notifications: `src/kiro/token_manager/manager.rs:368`.
-- `entries: Mutex<Vec<CredentialEntry>>` is acquired throughout the 8,178-line manager implementation; acquisition orchestration begins around `src/kiro/token_manager/manager.rs:3124` and spans selection, Redis, queueing, refresh, and persistence.
+- `MultiTokenManager` has 28 fields covering configuration, credential entries, refresh, PgSQL, Redis, proxies, statistics, runtime mutations, sticky sessions, queues, leases, and notifications: `src/local_upstream_impl/token_manager/manager.rs:368`.
+- `entries: Mutex<Vec<CredentialEntry>>` is acquired throughout the 8,178-line manager implementation; acquisition orchestration begins around `src/local_upstream_impl/token_manager/manager.rs:3124` and spans selection, Redis, queueing, refresh, and persistence.
 - `handlers.rs` is approximately 7,025 lines and coordinates parse, policy, route, local/external attempts, response translation, cache, usage, errors, and diagnostics.
 - `AdminService` is approximately 6,602 lines and exposes credentials, proxies, pools, configuration, usage, catalogs, security, audit, and cleanup operations.
 - `PostgresStore` and `RedisStore` each expose dozens of domain-specific methods across unrelated state classes.
@@ -97,10 +97,10 @@ Technical authority area: credential runtime state, Redis lease completion
 
 ### Evidence
 
-- Credential success persistence enters `persist_success_state`: `src/kiro/token_manager/manager.rs:5425`.
+- Credential success persistence enters `persist_success_state`: `src/local_upstream_impl/token_manager/manager.rs:5425`.
 - The PgSQL mutation starts a transaction and performs generation/revision/deduplication operations: `src/storage/postgres.rs:2317` onward.
-- `InFlightLeaseGuard::release` releases local state and then calls `block_on_storage` for Redis release/wakeup: `src/kiro/token_manager/concurrency.rs:231-268`.
-- The Redis critical operation timeout is two seconds: `src/kiro/token_manager/concurrency.rs:23`.
+- `InFlightLeaseGuard::release` releases local state and then calls `block_on_storage` for Redis release/wakeup: `src/local_upstream_impl/token_manager/concurrency.rs:231-268`.
+- The Redis critical operation timeout is two seconds: `src/local_upstream_impl/token_manager/concurrency.rs:23`.
 
 ### Impact Hypothesis
 
@@ -125,7 +125,7 @@ Technical authority area: scheduler coordination, external availability
 
 ### Evidence
 
-- Sticky acquisition and binding paths can read binding state more than once during a successful request: `src/kiro/token_manager/manager.rs:2870-2915`, `3163`, `3562`, and `6275`.
+- Sticky acquisition and binding paths can read binding state more than once during a successful request: `src/local_upstream_impl/token_manager/manager.rs:2870-2915`, `3163`, `3562`, and `6275`.
 - External raw direct and preflight checks can each query availability before a local request is parsed: `src/anthropic/handlers/request_entry.rs:37` onward.
 - External pool availability can load pool definitions and then query capacity/cooldown per pool: `src/external_pool.rs:2116-2160`.
 
@@ -149,8 +149,8 @@ Technical authority area: scheduler state and candidate indexing
 ### Evidence
 
 - Mutable credentials are stored as `Mutex<Vec<CredentialEntry>>` in `MultiTokenManager`.
-- Candidate selection scans and allocates candidate collections: `src/kiro/token_manager/manager.rs:2760`.
-- Acquire and lease paths perform additional cleanup/scans around `src/kiro/token_manager/manager.rs:3124-3603` and `2172`.
+- Candidate selection scans and allocates candidate collections: `src/local_upstream_impl/token_manager/manager.rs:2760`.
+- Acquire and lease paths perform additional cleanup/scans around `src/local_upstream_impl/token_manager/manager.rs:3124-3603` and `2172`.
 
 For N credentials and repeated attempts, cost is at least multiple O(N) passes plus shared-lock contention. This can be acceptable for small N and still become a bottleneck at 100-1,000 synthetic credentials.
 
@@ -177,7 +177,7 @@ Technical authority area: configuration publication and request context
 - Top-level `Config` begins at `src/model/config.rs:2500` and has about 101 fields.
 - `AppState` begins at `src/anthropic/middleware.rs:38` and expands many of the same policies/services.
 - `RequestRuntimeConfig` begins at `src/anthropic/handlers.rs:607` and copies another large subset.
-- `runtime_config()` clones complete config state: `src/kiro/token_manager/manager.rs:1091`.
+- `runtime_config()` clones complete config state: `src/local_upstream_impl/token_manager/manager.rs:1091`.
 - Request entry and main handling each materialize overlapping runtime state at `src/anthropic/handlers/request_entry.rs:12` and `src/anthropic/handlers.rs:4305`.
 
 ### Required Target
@@ -195,7 +195,7 @@ Technical authority area: payload artifacts, prompt cache, diagnostics, endpoint
 
 ### Evidence
 
-- Provider/endpoint/compression code parses or serializes request JSON in multiple stages: `src/kiro/provider.rs:3685`, `src/kiro/endpoint/ide.rs:166`, `src/kiro/endpoint/cli.rs:206`, `src/http_client.rs:36`.
+- Provider/endpoint/compression code parses or serializes request JSON in multiple stages: `src/local_upstream_impl/provider.rs:3685`, `src/local_upstream_impl/endpoint/ide.rs:166`, `src/local_upstream_impl/endpoint/cli.rs:206`, `src/http_client.rs:36`.
 - Prompt-cache flatten/profile/append paths clone values and canonicalize blocks more than once: `src/anthropic/prompt_cache.rs:283`, `717`, `1034`, `1302`.
 - External payload-guard retry clones payload and route state: `src/external_pool/retry_pipeline.rs:20`.
 
@@ -263,22 +263,22 @@ Technical authority area: content conversion and token counting
 
 Concurrent PDF/tokenizer tests measure Tokio heartbeat lag, queue wait, RSS, cancellation, and unrelated request p99. Work cannot exceed configured global permits.
 
-## `PERF-008`: Kiro Requests Disable Connection Reuse
+## `PERF-008`: Account Runtime Requests Disable Connection Reuse
 
 Severity: P2 conditional
-Technical authority area: Kiro HTTP transport
+Technical authority area: Account Runtime HTTP transport
 
 ### Evidence
 
-Kiro upstream requests explicitly set `Connection: close`: `src/kiro/provider.rs:2749`. Provider clients are otherwise cached by proxy configuration: `src/kiro/provider.rs:76-89`, `947`.
+Account Runtime upstream requests explicitly set `Connection: close`: `src/local_upstream_impl/provider.rs:2749`. Provider clients are otherwise cached by proxy configuration: `src/local_upstream_impl/provider.rs:76-89`, `947`.
 
 ### Risk
 
-HTTP/1.1 TCP/TLS connections may be recreated per request, increasing latency and socket churn. The header may also exist for upstream compatibility; removing it without real Kiro validation is unsafe.
+HTTP/1.1 TCP/TLS connections may be recreated per request, increasing latency and socket churn. The header may also exist for upstream compatibility; removing it without real Account Runtime validation is unsafe.
 
 ### Required Target And Acceptance
 
-Preserve explicit `Connection: close` conservatively in the isolated target construction until a bounded low-volume `G-KIRO` comparison establishes the final target transport profile. The comparison records success/protocol behavior, new TCP/TLS connections, handshake time, TTFB, FD recovery, and proxy/TLS-backend combinations. The accepted result freezes one profile before the complete candidate is released; it never duplicates production traffic or creates per-module activation or independently selectable behavior.
+Preserve explicit `Connection: close` conservatively in the isolated target construction until a bounded low-volume `G-ACCOUNT_RUNTIME` comparison establishes the final target transport profile. The comparison records success/protocol behavior, new TCP/TLS connections, handshake time, TTFB, FD recovery, and proxy/TLS-backend combinations. The accepted result freezes one profile before the complete candidate is released; it never duplicates production traffic or creates per-module activation or independently selectable behavior.
 
 ## `PERF-009`: Lease-Acquire Lua Performs Unbounded Stale Cleanup
 

@@ -68,7 +68,7 @@
 - 是否保留 `model_unavailable` 的模型级短冷却默认值 10 秒。
 - 是否需要给外部池配置一个“模型不支持时直接本地失败，不进入队列等待”的更强策略。
 
-## 1. P003：本地 Kiro upstream idle timeout / stream error
+## 1. P003：本地 Account Runtime upstream idle timeout / stream error
 
 本轮状态（2026-07-14）：已实现并完成静态/定向验证，待发布后继续观察生产复发率。
 
@@ -86,19 +86,19 @@
 
 ### 已实现方案
 
-新增本地 Kiro stream retry 策略，默认保守启用，且安全边界固定为“首个下游 SSE 字节提交前”：
+新增本地 Account Runtime stream retry 策略，默认保守启用，且安全边界固定为“首个下游 SSE 字节提交前”：
 
-- `kiroUpstreamStreamRetryEnabled`：是否启用首输出前流式换号重试，默认 `true`。
-- `kiroUpstreamStreamRetryMaxAttempts`：最大尝试次数，默认 `2`，包含第一次调用。
-- `kiroUpstreamStreamRetryOnIdleTimeout`：首输出前 idle timeout 是否重试，默认 `true`。
-- `kiroUpstreamStreamRetryOnReadError`：首输出前 stream read error 是否重试，默认 `true`。
-- `kiroUpstreamStreamRetryOnStatusError`：首输出前 2xx JSON 错误体 / 上游 status error 是否重试，默认 `true`。
+- `localUpstreamStreamRetryEnabled`：是否启用首输出前流式换号重试，默认 `true`。
+- `localUpstreamStreamRetryMaxAttempts`：最大尝试次数，默认 `2`，包含第一次调用。
+- `localUpstreamStreamRetryOnIdleTimeout`：首输出前 idle timeout 是否重试，默认 `true`。
+- `localUpstreamStreamRetryOnReadError`：首输出前 stream read error 是否重试，默认 `true`。
+- `localUpstreamStreamRetryOnStatusError`：首输出前 2xx JSON 错误体 / 上游 status error 是否重试，默认 `true`。
 
 实现约束：
 
 - 重试开启时，`message_start` 等初始 SSE 事件会延迟到首个真实下游事件或最终错误事件一起发送；这样在首输出前发生 idle/read/status 失败时，可以安全换号。
 - 一旦已经向客户端发送任何 SSE 字节，包括 ping / noop keepalive，就不再自动换号重试，避免重复 `message_start`、重复 `tool_use`、乱序事件和 usage 拼接。
-- 失败尝试会通过 `KiroStreamCompletion::report_upstream_stream_failure` 释放并发槽并进入短暂 stream 冷却；最终 usage record 记录 `streamRetryAttempts` / `streamRetryReasons`。
+- 失败尝试会通过 `Account RuntimeStreamCompletion::report_upstream_stream_failure` 释放并发槽并进入短暂 stream 冷却；最终 usage record 记录 `streamRetryAttempts` / `streamRetryReasons`。
 - 两套 UI 都已补充开关和原因展示字段；usage 详情会显示首输出前重试次数和原因。
 
 ### 需要补充的证据
@@ -158,7 +158,7 @@
 
 - 空图片是否来自当前消息、历史消息、tool result、文件转换，还是中间转换器生成了空 `data`。
 - `Improperly formed request` 是缺字段、字段类型不对、content block 顺序错误，还是工具调用 / 工具结果配对问题。
-- Bedrock image processing error 是否只来自外部池 / Bedrock 兼容层，还是本地 Kiro upstream 也会返回。
+- Bedrock image processing error 是否只来自外部池 / Bedrock 兼容层，还是本地 Account Runtime upstream 也会返回。
 - tool-format 诊断是否已经覆盖所有失败样本；如果没有，需要补充最小化请求结构摘要，而不是记录完整敏感 body。
 
 ### 已实现 / 保留方案
@@ -233,7 +233,7 @@
 ### 需要防止的回归
 
 - 修 usage 问题时不能导致所有 usage case 口径错乱。
-- external pool `current_path_policy`、本地 Kiro upstream、`/v1`、`/cc`、`/ha`、`/na` 都要分别覆盖。
+- external pool `current_path_policy`、本地 Account Runtime upstream、`/v1`、`/cc`、`/ha`、`/na` 都要分别覆盖。
 - stream 和 non-stream 都要覆盖 final usage。
 - 成功、错误、fallback、重试都不能重复计费或漏记录。
 
@@ -381,7 +381,7 @@ schema key / tool name 映射不是当前长上下文内存压力的主要来源
 
 ### 建议策略
 
-Kiro 官方上游：
+Account Runtime 官方上游：
 
 - 可透出结构化 JSON 中安全的 `message` / `reason` / `code`。
 - 需要先过敏感词和长度过滤。
@@ -405,7 +405,7 @@ Kiro 官方上游：
 
 ### 需要补充的证据
 
-- upstream error origin：official kiro / external pool / local scheduler / local validation。
+- upstream error origin：official account-runtime / external pool / local scheduler / local validation。
 - raw error type。
 - public error type。
 - public message source。
@@ -464,7 +464,7 @@ Kiro 官方上游：
 - 两套 UI 都要嵌入。
 - 位置应在 usage / reported usage 的 output_tokens 改写区域。
 - 不使用“输出后处理”作为用户可见标题。
-- 本地缓存和 `kiro-rs-tool` 缓存配置不要两列布局，避免之前反复提到的页面问题继续出现。
+- 本地缓存和 `account-runtime-tool` 缓存配置不要两列布局，避免之前反复提到的页面问题继续出现。
 
 ### 验收口径
 
@@ -480,7 +480,7 @@ Kiro 官方上游：
 等待裁定的建议顺序：
 
 1. **P005 usage projection**
-   先确保 `/cc`、`/ha`、外部池、本地 Kiro 的 usage 口径稳定，否则后续错误、重试和长上下文验证都会被错误 usage 干扰。
+   先确保 `/cc`、`/ha`、外部池、本地 Account Runtime 的 usage 口径稳定，否则后续错误、重试和长上下文验证都会被错误 usage 干扰。
 
 2. **P004 request body invalid / image / tool-format**
    这是明确的输入兼容与本地校验问题，能减少上游 400，且容易做真实调用验证。
@@ -532,7 +532,7 @@ Kiro 官方上游：
 - request body invalid：空 base64 图片、空 data URL 图片、tool_result 内空图片均本地返回明确 400；合法图片、合法工具、schema key、tool name 回归通过。
 - usage：`reported_usage`、`usage_projection`、`external_pool_max_input_preflight`、prompt too long public error 回归通过；`/cc`、`/ha` 无 cache-read 证据时差额计入 cache writer，不伪造 cache read。
 - schema/tool 映射：只对非法 key/name 做 request-local 映射；合法 key 不映射；stream/non-stream 响应能还原原始 key/name；并发会话不需要 Redis，也避免 TTL/跨实例串数据风险。
-- 错误提示：Kiro 官方上游结构化安全错误可透出；外部池、本地调度、账号、队列类错误继续返回脱敏 public message + error id。
+- 错误提示：Account Runtime 官方上游结构化安全错误可透出；外部池、本地调度、账号、队列类错误继续返回脱敏 public message + error id。
 - output tokens：输出字段四种策略先执行；之后在“输出字段改写（output_tokens）”区域的最终 guard 中按阈值放大并用 `max - jitter` 限制上限；该值返回给下游并写入 usage record。
 
 ### 真实本地服务验证
@@ -550,4 +550,4 @@ Kiro 官方上游：
 ### 尚未过度承诺的部分
 
 - P003 首输出前 retry 已实现安全边界和正常流回归，但没有在共享 PgSQL 运行配置上做破坏性故障注入；如果发布后仍复发，再用隔离 DB / fake upstream 补首输出前 idle/read/status 失败注入证据。
-- P008 本轮只保留分析要求，不提交 `.codex/skills/kiro-prod-evidence-audit/` 相关文件。
+- P008 本轮只保留分析要求，不提交 `.codex/skills/account-runtime-prod-evidence-audit/` 相关文件。

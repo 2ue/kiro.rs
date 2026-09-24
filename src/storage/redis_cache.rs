@@ -1726,8 +1726,7 @@ impl RedisStore {
                 total_output_tokens: usage_i64(&totals, "total_output_tokens"),
                 total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
                 total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
-                total_upstream_metering_units: usage_f64(&totals, "total_kiro_metering_usage"),
-                total_kiro_metering_usage: usage_f64(&totals, "total_kiro_metering_usage"),
+                total_upstream_metering_units: usage_f64(&totals, "total_upstream_metering_units"),
             });
         }
         points
@@ -1822,6 +1821,10 @@ impl RedisStore {
         self.key("events:external_pool_data_changed")
     }
 
+    pub fn account_runtime_data_changed_channel(&self) -> String {
+        self.external_pool_data_changed_channel()
+    }
+
     pub async fn subscribe_runtime_events(&self) -> anyhow::Result<PubSub> {
         let mut pubsub = self.client.get_async_pubsub().await?;
         pubsub
@@ -1830,7 +1833,7 @@ impl RedisStore {
         pubsub.subscribe(self.credentials_changed_channel()).await?;
         pubsub.subscribe(self.dispatch_wakeup_channel()).await?;
         pubsub
-            .subscribe(self.external_pool_data_changed_channel())
+            .subscribe(self.account_runtime_data_changed_channel())
             .await?;
         Ok(pubsub)
     }
@@ -1871,6 +1874,25 @@ impl RedisStore {
             .await
     }
 
+    pub async fn publish_account_runtime_data_changed(
+        &self,
+        reason: &str,
+        account_id: Option<u64>,
+    ) -> anyhow::Result<u64> {
+        self.publish_account_runtime_data_changed_with_origin(reason, account_id, None)
+            .await
+    }
+
+    pub async fn publish_account_runtime_data_changed_with_origin(
+        &self,
+        reason: &str,
+        account_id: Option<u64>,
+        origin: Option<&str>,
+    ) -> anyhow::Result<u64> {
+        self.publish_external_pool_data_changed_with_origin(reason, account_id, origin)
+            .await
+    }
+
     pub async fn publish_external_pool_data_changed_with_origin(
         &self,
         reason: &str,
@@ -1893,7 +1915,7 @@ impl RedisStore {
             .arg(SCRIPT)
             .arg(2)
             .arg(self.key(EXTERNAL_POOL_DATA_GENERATION_KEY))
-            .arg(self.external_pool_data_changed_channel())
+            .arg(self.account_runtime_data_changed_channel())
             .arg(reason)
             .arg(pool_id.map(|id| id.to_string()).unwrap_or_default())
             .arg(origin.unwrap_or_default())
@@ -2242,7 +2264,7 @@ impl RedisStore {
             .arg(record.original_cost_usd)
             .cmd("HINCRBYFLOAT")
             .arg(&totals_key)
-            .arg("total_kiro_metering_usage")
+            .arg("total_upstream_metering_units")
             .arg(record.upstream_metering_units())
             .cmd("HINCRBY")
             .arg(&totals_key)
@@ -2736,8 +2758,7 @@ impl RedisStore {
             ),
             total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
             total_original_cost_usd: usage_f64(&totals, "total_original_cost_usd"),
-            total_upstream_metering_units: usage_f64(&totals, "total_kiro_metering_usage"),
-            total_kiro_metering_usage: usage_f64(&totals, "total_kiro_metering_usage"),
+            total_upstream_metering_units: usage_f64(&totals, "total_upstream_metering_units"),
             priced_requests: usage_usize(&totals, "priced_requests"),
             unpriced_requests: usage_usize(&totals, "unpriced_requests"),
             local_prompt_cache_requests: usage_usize(&totals, "local_prompt_cache_requests"),
@@ -3230,8 +3251,7 @@ impl RedisStore {
                 ),
                 total_estimated_cost_usd: usage_f64(&metrics, "total_estimated_cost_usd"),
                 total_original_cost_usd: usage_f64(&metrics, "total_original_cost_usd"),
-                total_upstream_metering_units: usage_f64(&metrics, "total_kiro_metering_usage"),
-                total_kiro_metering_usage: usage_f64(&metrics, "total_kiro_metering_usage"),
+                total_upstream_metering_units: usage_f64(&metrics, "total_upstream_metering_units"),
             });
         }
         items.sort_by_key(|item| {
@@ -6263,7 +6283,7 @@ fn append_usage_dashboard_bucket_aggregate(
         .arg(record.original_cost_usd)
         .cmd("HINCRBYFLOAT")
         .arg(key)
-        .arg("total_kiro_metering_usage")
+        .arg("total_upstream_metering_units")
         .arg(record.upstream_metering_units())
         .cmd("HINCRBY")
         .arg(key)
@@ -6449,7 +6469,7 @@ fn append_usage_dashboard_top_aggregate(
         .arg(record.original_cost_usd)
         .cmd("HINCRBYFLOAT")
         .arg(&metrics_key)
-        .arg("total_kiro_metering_usage")
+        .arg("total_upstream_metering_units")
         .arg(record.upstream_metering_units());
     if let Some(label) = label.filter(|label| !label.trim().is_empty()) {
         pipe.cmd("HSET").arg(&metrics_key).arg("label").arg(label);
@@ -6557,8 +6577,7 @@ fn dashboard_summary_from_values(
         cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
         total_estimated_cost_usd: usage_f64(values, "total_estimated_cost_usd"),
         total_original_cost_usd: usage_f64(values, "total_original_cost_usd"),
-        total_upstream_metering_units: usage_f64(values, "total_kiro_metering_usage"),
-        total_kiro_metering_usage: usage_f64(values, "total_kiro_metering_usage"),
+        total_upstream_metering_units: usage_f64(values, "total_upstream_metering_units"),
         priced_requests: usage_usize(values, "priced_requests"),
         unpriced_requests: usage_usize(values, "unpriced_requests"),
         average_duration_ms,
@@ -6660,7 +6679,9 @@ fn push_dashboard_bucket_suffix(
 }
 
 fn usage_hash_field_is_float(key: &str) -> bool {
-    key.ends_with("_usd") || key == "kiro_metering_usage" || key == "total_kiro_metering_usage"
+    key.ends_with("_usd")
+        || key == "upstream_metering_units"
+        || key == "total_upstream_metering_units"
 }
 
 fn usage_ratio(part: usize, total: usize) -> f64 {
@@ -7417,7 +7438,6 @@ mod tests {
             estimated_cost_usd,
             original_cost_usd: estimated_cost_usd,
             upstream_metering_units: 0.0,
-            kiro_metering_usage: 0.0,
             pricing_available: status == UsageRecordStatus::Success,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms,
@@ -8149,7 +8169,7 @@ mod tests {
             0.10,
             20,
         );
-        success.kiro_metering_usage = 1.25;
+        success.upstream_metering_units = 1.25;
         let mut external = usage_record(
             "redis-usage-external",
             UsageRecordStatus::Success,
@@ -8158,7 +8178,7 @@ mod tests {
             0.42,
             30,
         );
-        external.kiro_metering_usage = 2.50;
+        external.upstream_metering_units = 2.50;
         external.route_kind = Some(UsageRouteKind::Account);
         external.route_subtype = Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts);
         external.credential_id = None;
@@ -8200,7 +8220,7 @@ mod tests {
             0.20,
             50,
         );
-        error.kiro_metering_usage = 3.75;
+        error.upstream_metering_units = 3.75;
         error.request_api_key_id = Some("request-key-error".to_string());
 
         store.record_usage_summary(&success).await.unwrap();
@@ -8214,7 +8234,7 @@ mod tests {
         assert_eq!(summary.error_requests, 1);
         assert_eq!(summary.high_cache_requests, 1);
         assert_eq!(summary.total_input_tokens, 300);
-        assert_f64_close(summary.total_kiro_metering_usage, 7.50);
+        assert_f64_close(summary.total_upstream_metering_units, 7.50);
         assert_eq!(summary.realtime.requests, 3);
         assert_eq!(summary.realtime.success_requests, 2);
         assert_eq!(summary.realtime.error_requests, 1);
@@ -8254,7 +8274,7 @@ mod tests {
         assert_eq!(last24h.summary.success_requests, 2);
         assert_eq!(last24h.summary.error_requests, 1);
         assert_eq!(last24h.summary.high_cache_requests, 1);
-        assert_f64_close(last24h.summary.total_kiro_metering_usage, 7.50);
+        assert_f64_close(last24h.summary.total_upstream_metering_units, 7.50);
         assert_eq!(last24h.summary.p95_duration_ms, 50);
         assert_eq!(last24h.summary.external_pool_billing.requests, 1);
         assert_f64_close(last24h.summary.external_pool_billing.raw_cost_usd, 0.10);
@@ -8280,7 +8300,7 @@ mod tests {
                 .any(|item| item.key == "local_prompt_cache")
         );
         assert_eq!(dashboard.top.models[0].requests, 3);
-        assert_f64_close(dashboard.top.models[0].total_kiro_metering_usage, 7.50);
+        assert_f64_close(dashboard.top.models[0].total_upstream_metering_units, 7.50);
         assert_eq!(dashboard.top.errors[0].key, "rate_limit");
         assert!(
             dashboard
@@ -8288,7 +8308,7 @@ mod tests {
                 .hourly_24h
                 .iter()
                 .any(|point| point.requests == 3
-                    && (point.total_kiro_metering_usage - 7.50).abs() < 1e-12)
+                    && (point.total_upstream_metering_units - 7.50).abs() < 1e-12)
         );
 
         let records = store

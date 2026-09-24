@@ -33,7 +33,7 @@ passed
 
 ## 证据限制
 
-`KIRO_RS_TEST_POSTGRES_URL` 和 `KIRO_RS_TEST_REDIS_URL` 未设置，所以 `external_pool_` 组内需要真实隔离 PgSQL/Redis 的用例在测试体内明确跳过。66/66 证明编译、纯函数和无外部依赖路径通过，不能代替以下未完成验收：
+`ACCOUNT_RUNTIME_TEST_POSTGRES_URL` 和 `ACCOUNT_RUNTIME_TEST_REDIS_URL` 未设置，所以 `external_pool_` 组内需要真实隔离 PgSQL/Redis 的用例在测试体内明确跳过。66/66 证明编译、纯函数和无外部依赖路径通过，不能代替以下未完成验收：
 
 - 50/74/75/90/150/500 ms Redis 延迟注入，各 3 轮；
 - connection reset、Redis restart、Lua commit-unknown；

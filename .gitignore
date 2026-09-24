@@ -13,9 +13,9 @@
 /admin-ui-daisy/.vite/
 /admin-ui-daisy/tsconfig.tsbuildinfo
 /credentials.*
-/kiro_balance_cache.json
-/kiro_stats.json
-/kiro_usage_records.jsonl
+/account-runtime_balance_cache.json
+/account-runtime_stats.json
+/account-runtime_usage_records.jsonl
 /.local-run/
 /backups/
 /logs/

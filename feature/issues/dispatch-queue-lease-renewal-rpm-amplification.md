@@ -8,7 +8,7 @@ Severity: P1 performance and availability amplifier; P0 when it contributes to s
 
 ## 现象与影响
 
-系统可能同时出现“下游 RPM 不高、Kiro inference RPM 也不高，但进程/Redis 内部操作很高”。在本地凭据容量满后，每个等待请求都会持有一个 Redis queue lease。旧实现即使初始 lease TTL 已经覆盖整个有限等待期，仍按每个 waiter 最长 20 秒续租一次；waiter 越多，越会在 Redis 已拥塞时继续制造 scheduler capacity 写操作。
+系统可能同时出现“下游 RPM 不高、Account Runtime inference RPM 也不高，但进程/Redis 内部操作很高”。在本地凭据容量满后，每个等待请求都会持有一个 Redis queue lease。旧实现即使初始 lease TTL 已经覆盖整个有限等待期，仍按每个 waiter 最长 20 秒续租一次；waiter 越多，越会在 Redis 已拥塞时继续制造 scheduler capacity 写操作。
 
 默认参数下，本地最大等待 120 秒、初始 TTL 180 秒。500 个持续 waiter 的 renewal 量约为 25 ops/s，即 1250-1500 ops/min。external 默认等待 30 秒、TTL 60 秒，也会为每个持续 waiter 在第 20 秒额外写一次。该操作不应被误计为用户请求或模型调用，但会增加 Redis 单线程尾延迟，间接提高 75 ms scheduler hot-path timeout、breaker open、local fallback/429 和慢首字概率。
 
@@ -82,7 +82,7 @@ waiter 以 1 秒最大等待 admission 后，将 runtime config 上调到 5 秒�
 
 ```text
 storage::redis_cache::tests::redis_scheduler_cooldown_and_rate_limit_round_trip = 1 passed
-kiro::token_manager::manager::tests::redis_backed_rpm_reservation_blocks_third_cross_instance_selection = 1 passed
+account-runtime::token_manager::manager::tests::redis_backed_rpm_reservation_blocks_third_cross_instance_selection = 1 passed
 cargo fmt --check = pass
 cargo check --all-targets = pass
 E03 true two-process runtime outerRounds=3 = pass

@@ -64,7 +64,7 @@ These IDs provide stable traceability names. Gate contracts are Accepted; every 
 | `G-EVID` | [Durable evidence](../topics/delivery/verification-rollout-and-rollback.md#g-evid-durable-evidence-manifest) and [empty registry](../history/evidence-index.md) | Accepted / Not Run |
 | `G-OPS` | [Startup, shutdown, readiness, recovery and deployment](../topics/delivery/verification-rollout-and-rollback.md#g-ops-startup-shutdown-readiness-recovery-and-deployment-gate) | Accepted / Not Run |
 | `G-DIAG` | [Diagnostics, logging and artifacts](../topics/delivery/verification-rollout-and-rollback.md#g-diag-diagnostics-sensitive-logging-and-artifact-gate) | Accepted / Not Run |
-| `G-KIRO` | [Low-volume real Kiro](../topics/delivery/verification-rollout-and-rollback.md#g-kiro-low-volume-real-kiro-gate) | Accepted / Not Run |
+| `G-ACCOUNT_RUNTIME` | [Low-volume real Account Runtime](../topics/delivery/verification-rollout-and-rollback.md#g-account-runtime-low-volume-real-account-runtime-gate) | Accepted / Not Run |
 | `G-SUP` | [Supply chain and release](../topics/delivery/verification-rollout-and-rollback.md#g-sup-supply-chain-and-release-gate) | Accepted / Not Run |
 
 ## Traceability Matrix
@@ -77,12 +77,12 @@ These IDs provide stable traceability names. Gate contracts are Accepted; every 
 | `COR-004` | `FUN-003`, `FUN-006` | `MOD-MESSAGES`, `MOD-EXTERNAL-POOLS`, `MOD-EXTERNAL-UPSTREAM` | R4.4/R5 -> R8 | D007/D010 Accepted | `G-P`, `G-UI`, `G-EVID` | `O / NS / E-` |
 | `COR-005` | `FUN-020`, `INV-001` | `MOD-RUNTIME-CONFIG`, `MOD-MESSAGES` | R1 -> R6 | D007 Accepted | `G-C`, `G-A`, `G-EVID` | `O / NS / E-` |
 | `COR-006` | `FUN-004`, `FUN-005`, `FUN-045` | `MOD-PROTO-ANTHROPIC`, `MOD-TRANSPORT-PUBLIC`, `MOD-PAYLOAD`, `MOD-CONTRACT-HARNESS` | R0.6/R1.5 -> R5.0.external/R6.3/R7.1 | D012 Accepted | `G-A`, `G-P`, `G-CLI`, `G-EVID` | `O / NS / E-` |
-| `COR-007` | `FUN-046`, `INV-012`, `QA-COMP-001`, `QA-COMP-003` | `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-KIRO`, `MOD-PROTO-EXTERNAL`, `MOD-PROTO-SSE`, `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD`, `MOD-RESPONSE` | R5.0.kiro/R5.0.external -> R6.2/R6.3/R7.0/R7.1 | D012 Accepted | `G-A`, `G-P`, `G-CLI`, `G-EVID` | `O / NS / E-` |
+| `COR-007` | `FUN-046`, `INV-012`, `QA-COMP-001`, `QA-COMP-003` | `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-ACCOUNT_RUNTIME`, `MOD-PROTO-EXTERNAL`, `MOD-PROTO-SSE`, `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD`, `MOD-RESPONSE` | R5.0.account-runtime/R5.0.external -> R6.2/R6.3/R7.0/R7.1 | D012 Accepted | `G-A`, `G-P`, `G-CLI`, `G-EVID` | `O / NS / E-` |
 | `SEC-001` | `FUN-041`, `QA-SEC-002`, `QA-SEC-004` | `MOD-MEDIA` | R0.2 -> R6.5 | D001/D010 Accepted | `G-A`, `G-P`, `G-EVID` | `O / NS / E-` |
 | `RES-001` | `FUN-042`, `FUN-047`, `QA-RES-001`, `QA-RES-002`, `QA-PERF-004` | `MOD-KERNEL`, `MOD-RESOURCE-GOVERNOR`, `MOD-TRANSPORT-PUBLIC`, `MOD-TRANSPORT-ADMIN`, `MOD-MEDIA`, `MOD-TOKEN-COUNT` | R0.2/R1.3/R1.9 -> R6.5/R6.6.count-tokens/R8.5 | D010/D011 Accepted (`Q-004`) | `G-A`, `G-P`, `G-PERF`, `G-EVID` | `O / NS / E-` |
 | `RES-002` | `FUN-040`, `QA-RES-001` | `MOD-FILES` | R0.3 -> R6.4/R9 | D001/D010 Accepted (`Q-003`, `Q-004`) | `G-A`, `G-OPS`, `G-EVID` | `O / NS / E-` |
-| `RES-003` | `FUN-018`, `QA-RES-001`, `QA-RES-002`, `QA-PERF-004` | `MOD-RESOURCE-GOVERNOR`, `MOD-KIRO-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM` | R0.7/R0.8/R1.9 -> R5.1/R5.2 | D010/D011 Accepted (`Q-004`) | `G-P`, `G-A`, `G-PERF`, `G-EVID` | `O / NS / E-` |
-| `RES-004` | `QA-RES-001`, `QA-RES-004`, `QA-SEC-003` | `MOD-KIRO-UPSTREAM` | R0.7 -> R5.1 | D010 Accepted (`Q-004`) | `G-KIRO`, `G-PERF`, `G-EVID` | `O / NS / E-` |
+| `RES-003` | `FUN-018`, `QA-RES-001`, `QA-RES-002`, `QA-PERF-004` | `MOD-RESOURCE-GOVERNOR`, `MOD-ACCOUNT_RUNTIME-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM` | R0.7/R0.8/R1.9 -> R5.1/R5.2 | D010/D011 Accepted (`Q-004`) | `G-P`, `G-A`, `G-PERF`, `G-EVID` | `O / NS / E-` |
+| `RES-004` | `QA-RES-001`, `QA-RES-004`, `QA-SEC-003` | `MOD-ACCOUNT_RUNTIME-UPSTREAM` | R0.7 -> R5.1 | D010 Accepted (`Q-004`) | `G-ACCOUNT_RUNTIME`, `G-PERF`, `G-EVID` | `O / NS / E-` |
 | `RES-005` | `FUN-017`, `FUN-047`, `QA-RES-001`, `QA-RES-005`, `QA-PERF-004` | `MOD-RESOURCE-GOVERNOR`, `MOD-SCHEDULER-LOCAL`, `MOD-SCHEDULER-EXTERNAL` | R0.9/R0.10/R1.9 -> R4.2/R4.5 | D005/D010/D011 Accepted (`Q-004`, `Q-005`, `Q-009`) | `G-SCH`, `G-PERF`, `G-OPS`, `G-EVID` | `O / NS / E-` |
 | `HA-001` | `FUN-022`, `FUN-023` | `MOD-RUNTIME-CONFIG`, `MOD-AUTH`, `MOD-MODEL-CATALOG`, `MOD-READINESS` | R2 -> R8/R9 | D001/D010 Accepted (`Q-001`, `Q-011`) | `G-C`, `G-UI`, `G-OPS`, `G-EVID` | `O / NS / E-` |
 | `HA-002` | `FUN-040`, `QA-COMP-001` | `MOD-FILES`, `MOD-READINESS` | R6 -> R9 | D001/D010 Accepted (`Q-001`, `Q-003`) | `G-A`, `G-CLI`, `G-OPS`, `G-EVID` | `O / NS / E-` |
@@ -103,7 +103,7 @@ These IDs provide stable traceability names. Gate contracts are Accepted; every 
 | `PERF-005` | `FUN-032`, `INV-009`, `QA-PERF-002`, `QA-PERF-006` | `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD` | R3/R6 | D007/D010 Accepted (`Q-005`) | `G-U`, `G-A`, `G-PERF`, `G-EVID` | `O / NS / E-` |
 | `PERF-006` | `FUN-035`, `FUN-036`, `INV-007`, `QA-PERF-003`, `QA-PERF-005` | `MOD-USAGE` | R2 -> R3 | D004/D010 Accepted (`Q-002`, `Q-005`) | `G-U`, `G-PERF`, `G-EVID` | `O / NS / E-` |
 | `PERF-007` | `FUN-042`, `QA-RES-001`, `QA-RES-002`, `QA-PERF-004` | `MOD-MEDIA`, `MOD-TOKEN-COUNT` | R1 -> R6 | D010 Accepted (`Q-004`, `Q-005`) | `G-A`, `G-PERF`, `G-EVID` | `O / NS / E-` |
-| `PERF-008` | `FUN-015`, `QA-PERF-003`, `QA-PERF-005` | `MOD-KIRO-UPSTREAM` | R5 | D003/D010 Accepted (`Q-008`) | `G-KIRO`, `G-PERF`, `G-EVID` | `O / NS / E-` |
+| `PERF-008` | `FUN-015`, `QA-PERF-003`, `QA-PERF-005` | `MOD-ACCOUNT_RUNTIME-UPSTREAM` | R5 | D003/D010 Accepted (`Q-008`) | `G-ACCOUNT_RUNTIME`, `G-PERF`, `G-EVID` | `O / NS / E-` |
 | `PERF-009` | `FUN-019`, `QA-PERF-003`, `QA-PERF-010`, `QA-RES-001` | `MOD-SCHEDULER-LOCAL`, `MOD-SCHEDULER-EXTERNAL` | R0.9/R0.10 -> R4.2/R4.5 | D005/D010 Accepted (`Q-005`, `Q-009`) | `G-SCH`, `G-PERF`, `G-OPS`, `G-EVID` | `O / NS / E-` |
 | `OPS-001` | `QA-OPS-001`, `QA-OBS-003` | `MOD-READINESS`, `MOD-TRANSPORT-HEALTH` | R9.1.readiness/R9.1.health | D006/D010/D014 Accepted (`Q-001`, `Q-010`) | `G-OPS`, `G-EVID` | `O / NS / E-` |
 | `OPS-002` | `FUN-016`, `INV-002`, `INV-011`, `QA-REL-002` | `MOD-SUPERVISOR`, `MOD-TERMINAL-JOURNAL` | R2/R7 -> R9 | D004/D006/D010 Accepted (`Q-002`, `Q-010`) | `G-U`, `G-OPS`, `G-EVID` | `O / NS / E-` |
@@ -126,7 +126,7 @@ These accepted clauses are product/system obligations rather than evidence of an
 | Requirement | Target technical authority | Dependency work | Accepted decision / required gates | Evidence / state |
 | --- | --- | --- | --- | --- |
 | `FUN-001` | `MOD-PROTO-ANTHROPIC`, `MOD-TRANSPORT-PUBLIC`, `MOD-MESSAGES`, `MOD-RESPONSE` | R1.5 -> R6.7/R7.1/R7.4 | D007/D009; `G-P`, `G-CLI`, `G-EVID` | `NS / E-` |
-| `FUN-002` | `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-KIRO`, `MOD-PROTO-SSE`, `MOD-MESSAGES`, `MOD-FILES`, `MOD-RESPONSE` | R1.5/R5 -> R6/R7/R9.3.real-client | D009/D012; `G-P`, `G-CLI`, `G-KIRO`, `G-EVID` | `NS / E-` |
+| `FUN-002` | `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-ACCOUNT_RUNTIME`, `MOD-PROTO-SSE`, `MOD-MESSAGES`, `MOD-FILES`, `MOD-RESPONSE` | R1.5/R5 -> R6/R7/R9.3.real-client | D009/D012; `G-P`, `G-CLI`, `G-ACCOUNT_RUNTIME`, `G-EVID` | `NS / E-` |
 | `FUN-013` | `MOD-SCHEDULER-LOCAL`, `MOD-SCHEDULER-EXTERNAL`, `MOD-READINESS`, `MOD-RECOVERY` | R4.2/R4.5 -> R9.1/R9.2 | D005/D010/D014; `G-SCH`, `G-OPS`, `G-PERF`, `G-EVID` | `NS / E-` |
 | `FUN-033` | `MOD-USAGE`, `MOD-PROMPT-CACHE` | R3.1/R3.4 | D004/D010; `G-U`, `G-EVID` | `NS / E-` |
 | `FUN-034` | `MOD-USAGE`, `MOD-RESPONSE`, `MOD-TERMINAL-LIFECYCLE` | R3.1 -> R7.1/R7.3 | D004; `G-U`, `G-P`, `G-EVID` | `NS / E-` |
@@ -144,9 +144,9 @@ This cross-check is independent from finding ownership: supporting modules need 
 
 | Coverage surface | Canonical target modules |
 | --- | --- |
-| Foundation, protocol, transport and telemetry | `MOD-KERNEL`, `MOD-RESOURCE-GOVERNOR`, `MOD-SECRET-ENVELOPE`, `MOD-OBSERVABILITY`, `MOD-DIAGNOSTICS`, `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-KIRO`, `MOD-PROTO-EXTERNAL`, `MOD-PROTO-SSE`, `MOD-TRANSPORT-PUBLIC`, `MOD-TRANSPORT-ADMIN`, `MOD-TRANSPORT-HEALTH` |
+| Foundation, protocol, transport and telemetry | `MOD-KERNEL`, `MOD-RESOURCE-GOVERNOR`, `MOD-SECRET-ENVELOPE`, `MOD-OBSERVABILITY`, `MOD-DIAGNOSTICS`, `MOD-PROTO-ANTHROPIC`, `MOD-PROTO-ACCOUNT_RUNTIME`, `MOD-PROTO-EXTERNAL`, `MOD-PROTO-SSE`, `MOD-TRANSPORT-PUBLIC`, `MOD-TRANSPORT-ADMIN`, `MOD-TRANSPORT-HEALTH` |
 | Durable/control authorities | `MOD-RUNTIME-CONFIG`, `MOD-AUTH`, `MOD-MODEL-CATALOG`, `MOD-CREDENTIALS`, `MOD-PROXY-RESOURCES`, `MOD-EXTERNAL-POOLS`, `MOD-TERMINAL-JOURNAL`, `MOD-USAGE`, `MOD-PROMPT-CACHE`, `MOD-FILES`, `MOD-AUDIT`, `MOD-MAINTENANCE-JOBS`, `MOD-MIGRATIONS` |
-| Request/data plane | `MOD-SCHEDULER-LOCAL`, `MOD-SCHEDULER-EXTERNAL`, `MOD-MESSAGES`, `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD`, `MOD-KIRO-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM`, `MOD-ATTEMPT-POLICY`, `MOD-RESPONSE`, `MOD-TERMINAL-LIFECYCLE`, `MOD-MEDIA`, `MOD-TOKEN-COUNT` |
+| Request/data plane | `MOD-SCHEDULER-LOCAL`, `MOD-SCHEDULER-EXTERNAL`, `MOD-MESSAGES`, `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD`, `MOD-ACCOUNT_RUNTIME-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM`, `MOD-ATTEMPT-POLICY`, `MOD-RESPONSE`, `MOD-TERMINAL-LIFECYCLE`, `MOD-MEDIA`, `MOD-TOKEN-COUNT` |
 | Lifecycle and recovery | `MOD-BOOTSTRAP`, `MOD-SUPERVISOR`, `MOD-READINESS`, `MOD-RECOVERY` |
 | Maintained frontends | `MOD-FRONTEND-CONTRACT`, `MOD-ADMIN-UI`, `MOD-OPERATOR-UI` |
 | Validation and release | `MOD-ARCH-FITNESS`, `MOD-CONTRACT-HARNESS`, `MOD-LOAD-CHAOS-HARNESS`, `MOD-REAL-CLIENT-HARNESS`, `MOD-BROWSER-HARNESS`, `MOD-RELEASE-HARNESS` |

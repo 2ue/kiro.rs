@@ -16,7 +16,7 @@ Related: [Decision 009](../../decisions/009-single-program-modular-build-and-fin
 
 Rewrite the complete first-party Rust core, both maintained Admin frontends, schema/state lifecycle, validation tooling and release tooling into one domain-oriented modular monolith with 50 explicit technical authority modules.
 
-The result must preserve characterized Anthropic, Claude Code, Kiro, external-pool, Files, Models, count-token and Admin behavior except for explicit accepted safety corrections. It must eliminate broad mutable state, God Objects, hidden I/O, unbounded work, duplicate policy, request-lifecycle ambiguity, startup mutation drift, handwritten frontend contract drift, unreliable evidence and obsolete legacy code.
+The result must preserve characterized Anthropic, Claude Code, Account Runtime, external-pool, Files, Models, count-token and Admin behavior except for explicit accepted safety corrections. It must eliminate broad mutable state, God Objects, hidden I/O, unbounded work, duplicate policy, request-lifecycle ambiguity, startup mutation drift, handwritten frontend contract drift, unreliable evidence and obsolete legacy code.
 
 Success is the complete final system, not smaller files, moved functions, a partial module set, one benchmark, or a planning-document count.
 
@@ -80,15 +80,15 @@ If a newly discovered fact contradicts an accepted contract, record a candidate 
 
 ## Isolated Target Candidate
 
-The candidate uses dedicated PgSQL, Redis, Files/diagnostic roots, ports, browser state, CLI HOME, artifacts and process limits. External network is deny-by-default. Deterministic fake Kiro, external-pool, media, DNS/redirect and fault endpoints drive normal tests.
+The candidate uses dedicated PgSQL, Redis, Files/diagnostic roots, ports, browser state, CLI HOME, artifacts and process limits. External network is deny-by-default. Deterministic fake Account Runtime, external-pool, media, DNS/redirect and fault endpoints drive normal tests.
 
 Legacy and target comparisons use two independent state clones from one sanitized baseline and execute sequentially. Pure decisions may consume the same immutable fact bundle. No comparison sends the same logical upstream request, acquires the same lease, mutates the same File/Admin/resource or writes the same durable state twice.
 
-Real Kiro and Claude Code validation is bounded, explicit and independent. It proves protocol/client behavior, not deterministic model output or general capacity.
+Real Account Runtime and Claude Code validation is bounded, explicit and independent. It proves protocol/client behavior, not deterministic model output or general capacity.
 
 ## Dependency Group R0: Constraints, Fixtures, Final Harnesses
 
-Implement the final architecture, contract and load/chaos harnesses once. Create reusable diagnostics, media, Files, Kiro response/client, external egress/response and local/external scheduler fixture corpora.
+Implement the final architecture, contract and load/chaos harnesses once. Create reusable diagnostics, media, Files, Account Runtime response/client, external egress/response and local/external scheduler fixture corpora.
 
 R0 does not patch the legacy production path and does not create temporary containment wrappers. Later module work consumes these final fixtures and accepted decision-010/011 limits. R0 must implement correct target PID identity, exact result accounting, typed invalid/missing metrics, per-operation timing, warmup/measurement/cooldown, watchdog, artifact-budget and cleanup semantics in the final load harness. No modernization harness implementation or passing evidence currently exists; R1/R9 add the accepted evaluator, manifests, orchestration and evidence to that one implementation.
 
@@ -147,19 +147,19 @@ Pure selection is separate from Redis/PgSQL/refresh/HTTP. FIFO applies within pr
 
 One complete scheduler path is integrated into the target candidate. Offline pure parity performs no lease or refresh. There is no dual production scheduler namespace or cohort.
 
-## Dependency Group R5: Kiro/External Upstreams And Attempt Policy
+## Dependency Group R5: Account Runtime/External Upstreams And Attempt Policy
 
-Implement `MOD-PROTO-KIRO`, `MOD-PROTO-EXTERNAL`, `MOD-KIRO-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM` and `MOD-ATTEMPT-POLICY`.
+Implement `MOD-PROTO-ACCOUNT_RUNTIME`, `MOD-PROTO-EXTERNAL`, `MOD-ACCOUNT_RUNTIME-UPSTREAM`, `MOD-EXTERNAL-UPSTREAM` and `MOD-ATTEMPT-POLICY`.
 
-Each adapter owns one complete real attempt and returns bounded transport facts. Kiro owns endpoint/TLS/proxy/auth/client-cache/response lifecycle; external owns safe destination/DNS/redirect/path/header/credential/response behavior. Success/error/stream bytes are enforced incrementally; error retention is bounded; cache labels contain no secrets.
+Each adapter owns one complete real attempt and returns bounded transport facts. Account Runtime owns endpoint/TLS/proxy/auth/client-cache/response lifecycle; external owns safe destination/DNS/redirect/path/header/credential/response behavior. Success/error/stream bytes are enforced incrementally; error retention is bounded; cache labels contain no secrets.
 
-Retry policy receives explicit request-delivery, upstream execution possibility, response and downstream commitment facts. Unknown delivery is not replay-safe. No HTTP status or library error alone authorizes duplicate execution. Tests use deterministic fakes; real Kiro operations are separate bounded requests.
+Retry policy receives explicit request-delivery, upstream execution possibility, response and downstream commitment facts. Unknown delivery is not replay-safe. No HTTP status or library error alone authorizes duplicate execution. Tests use deterministic fakes; real Account Runtime operations are separate bounded requests.
 
 ## Dependency Group R6: Request Planning, Payload, Files, Media, Endpoints
 
 Implement `MOD-MESSAGES` planning/orchestration, `MOD-REQUEST-ARTIFACTS`, `MOD-PAYLOAD`, `MOD-FILES`, `MOD-MEDIA`, `MOD-TOKEN-COUNT`, Models use case and thin non-Messages public routes.
 
-Route/target intent is selected before expensive work. Request facts are lazy, revisioned and bounded; each payload revision is parsed/count/serialized only as required. External raw executes zero forbidden heavy stages. Local Kiro and external normalized behavior retain established body-capability contracts.
+Route/target intent is selected before expensive work. Request facts are lazy, revisioned and bounded; each payload revision is parsed/count/serialized only as required. External raw executes zero forbidden heavy stages. Local Account Runtime and external normalized behavior retain established body-capability contracts.
 
 Files is shared and replica-safe. Remote media validates and binds every connection/redirect to the accepted egress policy before bytes are consumed. PDF/tokenizer/blocking work uses owned executors/permits with cancellation and resource recovery.
 
@@ -208,7 +208,7 @@ Readiness reflects dependencies, migration, auth epoch, queues, writer backlogs,
 
 `MOD-RELEASE-HARNESS` produces the signed release-generation manifest with the expected replica membership, backend/frontend/image digests, configuration/schema/auth/catalog versions and evidence identities. `MOD-READINESS` keeps public traffic closed until every expected member satisfies that generation, including after Redis loss or member replacement. The release artifact also fixes the single production migration window and the per-authority previous-release rollback compatibility matrix required by decision 014.
 
-Run real Claude Code 3x20-turn sessions, bounded independent real Kiro checks, both-app browser coverage, Docker/image consumer checks, SBOM/signature/provenance and clean artifact/secret scans.
+Run real Claude Code 3x20-turn sessions, bounded independent real Account Runtime checks, both-app browser coverage, Docker/image consumer checks, SBOM/signature/provenance and clean artifact/secret scans.
 
 ## Dependency Group R10: Complete Candidate And Final Activation
 

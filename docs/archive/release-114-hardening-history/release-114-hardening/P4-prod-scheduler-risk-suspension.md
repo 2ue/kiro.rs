@@ -8,8 +8,8 @@
 
 生产证据来源：
 
-- `152.53.243.159`：部署 `kiro-rs-2ue-59137`，版本 `0.0.113`，revision `36b65ce509809120ba53bb46c6b536e3658a6129`。
-- `152.53.194.142`：部署 `kiro-rs`，版本 `0.0.113`，revision `36b65ce509809120ba53bb46c6b536e3658a6129`。
+- `152.53.243.159`：部署 `account-runtime-2ue-59137`，版本 `0.0.113`，revision `36b65ce509809120ba53bb46c6b536e3658a6129`。
+- `152.53.194.142`：部署 `account-runtime`，版本 `0.0.113`，revision `36b65ce509809120ba53bb46c6b536e3658a6129`。
 
 本地 raw 证据目录：
 
@@ -29,7 +29,7 @@ raw 证据可能包含生产标识，不要打包或外发。
 
 这次不是单一原因。
 
-直接后果是：Kiro/AWS 上游对本地账号返回了 `403 TEMPORARILY_SUSPENDED`，系统按 `upstream_risk_controlled` 自动把凭据持久禁用。
+直接后果是：Account Runtime/AWS 上游对本地账号返回了 `403 TEMPORARILY_SUSPENDED`，系统按 `upstream_risk_controlled` 自动把凭据持久禁用。
 
 但导致事故放大的系统侧问题包括：
 
@@ -50,14 +50,14 @@ UTC 时间：
   - `routeKind=local_credential`
   - `routeSubtype=local_error_no_fallback`
   - 错误：`本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs=2）`
-  - 样本没有 `credentialAttempts`，说明失败在本地调度阶段，没有打到 Kiro 上游。
+  - 样本没有 `credentialAttempts`，说明失败在本地调度阶段，没有打到 Account Runtime 上游。
 - `07:57-08:23`：反复出现 Redis scheduler degraded/backoff，快速失败导致分钟 RPM 放大。
 - `08:24`：估算 completed-record in-flight 达到 106，其中 85 个为超过 60 秒的长请求。
 - `08:31:40-08:31:57`：仍有本地账号成功 200。
 - `08:31:56-08:31:59`：30 个凭据被 `system-scheduler` 自动禁用：
   - `trigger=upstream_risk_controlled`
   - `reason=TemporarilySuspended`
-  - 上游摘要为 Kiro/AWS `403 Forbidden` + `TEMPORARILY_SUSPENDED`
+  - 上游摘要为 Account Runtime/AWS `403 Forbidden` + `TEMPORARILY_SUSPENDED`
   - `availableCredentials` 从 29 递减到 0。
 
 关键分钟聚合：
@@ -169,7 +169,7 @@ Asia/Shanghai 时间：
 
 1. Redis scheduler latency 注入 + usage/dashboard 写入压力，验证主链路不被 observability 拖垮。
 2. scheduler degraded fallback 测试，验证不会出现 `local_error_no_fallback` 风暴。
-3. mock Kiro upstream 对多个凭据返回 `TEMPORARILY_SUSPENDED`，验证 risk circuit 打开后不继续烧剩余账号。
+3. mock Account Runtime upstream 对多个凭据返回 `TEMPORARILY_SUSPENDED`，验证 risk circuit 打开后不继续烧剩余账号。
 4. 批量导入/批量调并发后 ramp-up 测试，验证不会立即满速打新账号。
 5. request API key admission 测试，验证单 key 重试不会拖垮全局。
 6. 前端 dashboard 在大 usage 表下的响应时间测试。

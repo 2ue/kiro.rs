@@ -23,14 +23,14 @@ The later `v0.0.102` release action is a separate event and does not change the 
 This is current dirty-tree evidence for the v0.0.109 remediation branch, not evidence for
 the historical 2026-07-12 release artifact below.
 
-- Frozen `kiro-rs` SHA-256:
+- Frozen `account-runtime` SHA-256:
   `925525419cd48b460217df2568891a40287da0c44d2bf921a38b103c047775ee`.
-- Frozen `kiro_loadtest` SHA-256:
+- Frozen `account_runtime_loadtest` SHA-256:
   `90babda7388aa93854cbbdb81c132cc436c07f46b0ea22973531b0a7ffb3aff1`.
 - Scoped batch `final-c0-release-20260723-r4` passed:
   - `cargo +1.92.0 fmt --all -- --check`;
   - `cargo +1.92.0 test --all-targets` with main `1750 passed / 0 failed / 6 ignored`
-    and `kiro_loadtest 31/31`;
+    and `account_runtime_loadtest 31/31`;
   - `cargo +1.92.0 build --release --bins`.
 - Scoped cleanup reported
   `size_kib=2516216 available_kib=86414424 removed=true reservation_released=true`.
@@ -88,8 +88,8 @@ as pass. Existing `127.0.0.1:9022` production/development service was not modifi
 
 ## Static, Storage, And Frontend Gates
 
-- Default-feature suite: `1079/1079` main-program tests and `19/19` `kiro_loadtest` tests passed.
-- No-default-feature suite: `1079/1079` main-program tests and `19/19` `kiro_loadtest` tests passed.
+- Default-feature suite: `1079/1079` main-program tests and `19/19` `account_runtime_loadtest` tests passed.
+- No-default-feature suite: `1079/1079` main-program tests and `19/19` `account_runtime_loadtest` tests passed.
 - Focused real-Redis results: local queue `6/6`, external queue `4/4`, and external cancellation/coordinator `2/2` passed.
 - Clippy reported `685` warnings against the checked-in allowance of `711`; no new lint bucket remained.
 - `cargo +1.92.0 fmt --all -- --check` and `git diff --check` passed.
@@ -98,8 +98,8 @@ as pass. Existing `127.0.0.1:9022` production/development service was not modifi
 ## Release Artifact
 
 - An isolated Rust `1.92.0` default-feature release build passed with `LTO=false` and `codegen-units=16`.
-- `kiro-rs` SHA-256: `ff7b379d980e6a00239d1848c482ed2707aa55df7fc0904470756225ce917c5b`.
-- `kiro_loadtest` SHA-256: `eaf85d3d4a41c293685e69973878fd3a0f5f324ce6faa50726e2f8d4596c8871`.
+- `account-runtime` SHA-256: `ff7b379d980e6a00239d1848c482ed2707aa55df7fc0904470756225ce917c5b`.
+- `account_runtime_loadtest` SHA-256: `eaf85d3d4a41c293685e69973878fd3a0f5f324ce6faa50726e2f8d4596c8871`.
 - The isolated release target directory was deleted after validation; the hashes are also recorded in the runtime report's `binary-sha256.txt`.
 - Because the source commit/version was not captured in this index, these hashes prove the historical isolated build only. They are not `v0.0.102` release-binary hashes.
 
@@ -127,7 +127,7 @@ the historical 2026-07-12 release artifact above.
 - `rpm-reservation-focused-20260721-r4` passed the Redis storage reservation round-trip and
   two-manager shared-RPM manager test, with scoped target cleanup.
 - `rpm-reservation-check-all-20260721-r4` passed `cargo check --all-targets`, with scoped target cleanup.
-- Frozen candidate `/tmp/kiro-e03-candidate.T2iG7N/kiro-rs` had SHA-256
+- Frozen candidate `/tmp/account-runtime-e03-candidate.T2iG7N/account-runtime` had SHA-256
   `98e0f79328b49925dc940faaa3b1e8b0c8ae8ef7b9975725eb219635c8957ee7`.
 - Real E03 runtime `runId=e03-20260721013242272-88844-36667d` passed `outerRounds=3`.
   Each round had `rpm.firstStatuses=[200,200]`, `rpm.postRestartStatuses=[429,429]`,
@@ -176,7 +176,7 @@ the historical 2026-07-12 release artifact above.
   contract passed as part of `run-redis-fault-domain-product-validation.contract.test.mjs`
   (`37 pass / 9 skip / 0 fail`),
   the scheduler/fault-domain combined contract passed `53 pass / 21 skip / 0 fail`, and
-  scoped `cargo +1.92.0 check --bin kiro-rs` passed with cleanup
+  scoped `cargo +1.92.0 check --bin account-runtime` passed with cleanup
   `size_kib=446876 removed=true reservation_released=true`.
 - Durable issue/evidence detail lives in
   [feature/evidence/scheduler-redis-chaos-nondocker-20260720.md](../../../../../feature/evidence/scheduler-redis-chaos-nondocker-20260720.md),
@@ -221,7 +221,7 @@ the historical 2026-07-12 release artifact above.
   PostgreSQL/Redis, no longer runs Redis `FLUSHDB`, and no longer creates PostgreSQL
   databases.
 - The runner now requires a frozen external binary, an external artifact root, a loopback
-  PostgreSQL URL template, `modes × rounds` caller-owned `kiro_e0102_*` databases, a loopback
+  PostgreSQL URL template, `modes × rounds` caller-owned `account-runtime_e0102_*` databases, a loopback
   Redis DB1..15 URL, and a caller-owned Redis prefix.
 - Each dynamic case uses its own Redis `keyPrefix` and cleans only that owned prefix.
 - `node --test feature/tests/scheduler-fairness-sticky-race.contract.test.mjs` passed `7/7`.
@@ -242,7 +242,7 @@ the historical 2026-07-12 release artifact above.
 - `feature/tests/strict-local-first-routing.mjs` now uses caller-owned PostgreSQL/Redis
   inputs instead of the old Docker/Toxiproxy-managed runtime.
 - The runner requires a frozen external binary, external artifact root, `modes × rounds`
-  pre-created `kiro_e05_*` databases, a loopback Redis DB1..15 URL, and a caller-owned
+  pre-created `account-runtime_e05_*` databases, a loopback Redis DB1..15 URL, and a caller-owned
   Redis prefix.
 - It does not start Docker, create databases, `FLUSHDB` Redis, call Cargo, or probe
   protected `9022`; Redis fault injection uses `feature/tests/redis-chaos-proxy.mjs`.
@@ -270,12 +270,12 @@ the historical 2026-07-12 release artifact above.
 - `feature/tests/aws-api-key-region-lifecycle.mjs` now requires caller-owned runtime
   inputs instead of starting Docker-managed PostgreSQL/Redis.
 - The runner requires a frozen external binary, external artifact root, loopback
-  PostgreSQL URL whose database matches `kiro_f06_*`, loopback Redis DB1..15, and a
+  PostgreSQL URL whose database matches `account-runtime_f06_*`, loopback Redis DB1..15, and a
   caller-owned Redis prefix.
 - It does not start Docker, create PostgreSQL databases, `FLUSHDB`/`FLUSHALL` Redis,
   call Cargo, probe protected `9022`, or inherit the caller's full `process.env` into
   service children.
-- Redis cleanup is prefix-scoped to `${KIRO_F06_REDIS_PREFIX}:*`; PostgreSQL access is
+- Redis cleanup is prefix-scoped to `${ACCOUNT_RUNTIME_F06_REDIS_PREFIX}:*`; PostgreSQL access is
   limited to caller-owned database reads/checks through local `psql`.
 - `node --check feature/tests/aws-api-key-region-lifecycle.mjs` passed.
 - `node --test feature/tests/aws-api-key-region-lifecycle.contract.test.mjs` passed
@@ -300,13 +300,13 @@ the historical 2026-07-12 release artifact above.
   Toxiproxy.
 - The runner requires a frozen external binary, external artifact root, loopback
   PostgreSQL URL template with exactly one `{database}` placeholder, `rounds` pre-created
-  databases matching `kiro_request_admission_*`, loopback Redis DB1..15, and a
+  databases matching `account-runtime_request_admission_*`, loopback Redis DB1..15, and a
   caller-owned Redis prefix.
 - It does not start Docker, create PostgreSQL databases, `FLUSHDB`/`FLUSHALL` Redis, call
   Cargo, use `host.docker.internal`, probe protected `9022`, or inherit the caller's full
   `process.env` into service children.
 - Each round uses a round-specific Redis `keyPrefix`; cleanup only deletes
-  `${KIRO_REQUEST_ADMISSION_REDIS_PREFIX}:*`.
+  `${ACCOUNT_RUNTIME_REQUEST_ADMISSION_REDIS_PREFIX}:*`.
 - `node --check feature/tests/request-api-key-admission-multi-instance.mjs` passed.
 - `node --test feature/tests/request-api-key-admission-multi-instance.contract.test.mjs`
   passed `5/5`.
@@ -327,9 +327,9 @@ the historical 2026-07-12 release artifact above.
 
 - `feature/tests/frozen-load-chaos-runner.mjs` now requires caller-owned PostgreSQL/Redis
   inputs instead of using Docker-managed PostgreSQL/Redis.
-- The runner requires `KIRO_RS_BINARY`, `KIRO_LOADTEST_BINARY`, an external artifact root,
+- The runner requires `ACCOUNT_RUNTIME_BINARY`, `ACCOUNT_RUNTIME_LOADTEST_BINARY`, an external artifact root,
   a loopback PostgreSQL URL template with exactly one `{database}` placeholder, tier-sized
-  pre-created databases matching `kiro_load_chaos_*`, loopback Redis DB1..15, and a
+  pre-created databases matching `account-runtime_load_chaos_*`, loopback Redis DB1..15, and a
   caller-owned Redis prefix.
 - L3 requires three caller-owned databases, L4 requires six, and L5 requires one.
 - It does not start Docker, create/drop PostgreSQL databases, `FLUSHDB`/`FLUSHALL` Redis,
@@ -381,13 +381,13 @@ gate pass.
   effort capture, external takeover, E03 two-process scheduler, E01/E02 scheduler fairness
   and business/observability Redis fault-domain runners.
 - `node --test feature/tests/runtime-validation-paths.test.mjs` passed `11/11`, including
-  checks that `DATABASE_URL`, `REDIS_URL`, Anthropic/OpenAI keys, `KIRO_API_KEY`,
-  `KIRO_RS_TEST_REDIS_URL` and arbitrary unpassed `KIRO_*` state are not inherited by child
+  checks that `DATABASE_URL`, `REDIS_URL`, Anthropic/OpenAI keys, `ACCOUNT_RUNTIME_API_KEY`,
+  `ACCOUNT_RUNTIME_TEST_REDIS_URL` and arbitrary unpassed `ACCOUNT_RUNTIME_*` state are not inherited by child
   processes.
 - `node --check` passed for the updated helper and runner files.
 - Source scanning showed remaining `...process.env` matches only in `.test.mjs` fixture
   launchers, not in non-test validation runners.
-- No Docker, Cargo or `kiro-rs` service was started for this evidence.
+- No Docker, Cargo or `account-runtime` service was started for this evidence.
 - Durable evidence detail lives in
   [feature/evidence/runner-child-environment-isolation-20260721.md](../../../../../feature/evidence/runner-child-environment-isolation-20260721.md).
 
@@ -401,7 +401,7 @@ not evidence for the historical 2026-07-12 release artifact above.
 
 - Added `feature/tests/protocol-contamination-source-contract.test.mjs`.
 - The contract is pure Node source inspection: it does not start Docker, does not run Cargo,
-  and does not start a `kiro.rs` service.
+  and does not start a `account-runtime` service.
 - Standalone run passed `10 tests / 10 pass / 0 fail`.
 - Combined run with the business/observability Redis fault-domain contract passed
   `56 tests / 47 pass / 9 explicit live-signal skips / 0 fail`; the skips are inherited
@@ -415,14 +415,14 @@ not evidence for the historical 2026-07-12 release artifact above.
 - Durable evidence detail lives in
   [feature/evidence/protocol-contamination-source-contract-20260721.md](../../../../../feature/evidence/protocol-contamination-source-contract-20260721.md).
 
-This closes only the source-regression sub-gate. Real native Kiro upstream, active/passive
+This closes only the source-regression sub-gate. Real native Account Runtime upstream, active/passive
 thinking long sessions, MCP/search/image/agent, fault recovery, UI, upgrade and final release
 gates remain open.
 
 ## 2026-07-21 Protocol Marker Inventory Source Contract Evidence
 
 This is current dirty-tree source-contract evidence only. It does not start Docker, does not run
-Cargo, does not start kiro.rs and does not invoke Claude Code CLI.
+Cargo, does not start account-runtime and does not invoke Claude Code CLI.
 
 - `node --test feature/tests/protocol-marker-inventory-source-contract.test.mjs` passed
   `4/4`.
@@ -443,7 +443,7 @@ fault/load, UI, upgrade and final release gates remain open.
 ## 2026-07-21 Lightweight Contract Regression Evidence
 
 This is current dirty-tree evidence for low-artifact validation after the E05 runner
-rewrite. It does not start Docker, does not run Cargo and does not start kiro.rs.
+rewrite. It does not start Docker, does not run Cargo and does not start account-runtime.
 
 - Feature docs check first passed 47/47 issue documents and 102 relative links; after the
   runner child-environment evidence was added, the docs check reran as 47/47 and 104 links.
@@ -472,7 +472,7 @@ rewrite. It does not start Docker, does not run Cargo and does not start kiro.rs
   timed out and remained a manual-only hint; no Docker cleanup was performed.
 - After protocol documentation updates, feature docs passed again with 47/47 issue documents
   and 106 links, and `git diff --check` passed. A subsequent inventory first failed on a
-  root `target/` around 710 MiB with PID 84264 referencing `target/release/kiro-rs` and its
+  root `target/` around 710 MiB with PID 84264 referencing `target/release/account-runtime` and its
   local verification log; only unreferenced debug/flycheck/.rustc_info artifacts were removed,
   the service process was not stopped, and inventory then passed with
   `targets=0 reservations=0 target_processes=0 blockers=0` and `target=0B`.
@@ -509,8 +509,8 @@ the protected `9022` service.
   cluster failure replay exact test; scoped target `1713280 KiB` was removed and reservation
   released.
 - Default cluster matrix then passed with
-  `KIRO_TOKEN_REFRESH_CLUSTER_OUTER_ROUNDS=3`, isolated Redis DB `2` and PostgreSQL database
-  `kiro_rs`: 7 exact tests × 3 outer rounds × 5 internal rounds = 105 internal scenario
+  `ACCOUNT_RUNTIME_TOKEN_REFRESH_CLUSTER_OUTER_ROUNDS=3`, isolated Redis DB `2` and PostgreSQL database
+  `account_runtime`: 7 exact tests × 3 outer rounds × 5 internal rounds = 105 internal scenario
   rounds. Cleanup reported `childGroupsStopped=true`, `redisDatabaseEmpty=true`,
   `residualKeyCount=0`, `tempRemoved=true`; scoped target `1715296 KiB` was removed and
   reservation released.
@@ -531,7 +531,7 @@ real upstream/native CLI, UI/browser, upgrade or final release gates.
 
 - The final runtime evidence set contains 143 files (`2668 KiB`). Structured JSON/JSONL and high-signal text scans found no sensitive key assignments, Bearer credentials, embedded-authentication URLs, private keys, JWTs, or common API-key shapes.
 - Plain `token` mentions in `proxy.log` were non-secret runtime vocabulary without assigned credential values; the 26 logged URLs were local validation endpoints without credentials or sensitive query parameters.
-- Post-runtime checks found no listeners on validation ports `19280/19281`, no validation databases, no `kiro_rs:validate:*` or `kiro_rs:test:*` Redis keys, and no `/private/tmp/kiro-runtime-*` residue.
+- Post-runtime checks found no listeners on validation ports `19280/19281`, no validation databases, no `account_runtime:validate:*` or `account_runtime:test:*` Redis keys, and no `/private/tmp/account-runtime-runtime-*` residue.
 - The protected services on ports `9022` and `19422` retained their original PIDs throughout validation.
 - Generated frontend bundles/build metadata, shared `target/debug`, isolated static/release targets, and known validation temporary files were removed after use.
 - `target/worktrees` was preserved because it contains registered Git worktrees rather than disposable test output.

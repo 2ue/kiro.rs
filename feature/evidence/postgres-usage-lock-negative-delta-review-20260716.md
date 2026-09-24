@@ -284,7 +284,7 @@ Expected: exactly `(winner.hour, winner.duration_ms, 1)`. The global total and g
 
 ```sql
 SELECT credential_id, requests, estimated_cost_usd, original_cost_usd,
-       kiro_metering_usage, priced_requests, unpriced_requests
+       account-runtime_metering_usage, priced_requests, unpriced_requests
 FROM usage_credential_cost_summary
 ORDER BY credential_id;
 ```

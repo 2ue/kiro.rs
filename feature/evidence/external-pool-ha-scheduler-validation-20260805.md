@@ -37,13 +37,13 @@ Redis 跨实例失效事件。当前进程也订阅同一频道，但事件没�
 
 所有运行均使用：
 
-- 冻结二进制：`/tmp/kiro-release-candidate.7kctZt/kiro-rs`
+- 冻结二进制：`/tmp/account-runtime-release-candidate.7kctZt/account-runtime`
 - SHA-256：`9356d0d2f6d683f83626cf09e3d0f7daee7a07cfd4376afc50a71d061d400f66`
-- 隔离 PostgreSQL：`kiro-rs-postgres-local:25432`，每轮独立数据库
-- 隔离 Redis：`kiro-rs-redis-local:26379`，每轮独立 DB/Key 前缀
+- 隔离 PostgreSQL：`account-runtime-postgres-local:25432`，每轮独立数据库
+- 隔离 Redis：`account-runtime-redis-local:26379`，每轮独立 DB/Key 前缀
 - 三个 loopback fake Anthropic 上游：`yuenan` 优先级 1、`kkkkyue` 优先级 10、
   `jinnyapi` 优先级 20
-- 本地 Kiro fake 上游仅用于验证外部直连不得回本地
+- 本地 Account Runtime fake 上游仅用于验证外部直连不得回本地
 
 ### 修复前证据
 
@@ -111,7 +111,7 @@ ESTABLISHED TCP：45 -> 52 -> 44
   `external_pool_data_generation_invalidates_peer_without_clearing_on_policy_only_change`：`1/1`
 - 全量 Rust：
   `1896 passed / 0 failed / 6 ignored`
-- `kiro_loadtest`：
+- `account_runtime_loadtest`：
   `31 passed / 0 failed`
 - `cargo fmt --all -- --check`：通过
 - `git diff --check`：通过

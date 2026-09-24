@@ -84,8 +84,8 @@ function formatPercent(value: number | undefined | null): string {
   return `${((value as number) * 100).toFixed(1)}%`
 }
 
-function totalUpstreamMetering(value: { totalUpstreamMeteringUnits?: number; totalKiroMeteringUsage?: number }): number {
-  return value.totalUpstreamMeteringUnits ?? value.totalKiroMeteringUsage ?? 0
+function totalUpstreamMetering(value: { totalUpstreamMeteringUnits?: number }): number {
+  return value.totalUpstreamMeteringUnits ?? 0
 }
 
 function formatDate(value?: string): string {
