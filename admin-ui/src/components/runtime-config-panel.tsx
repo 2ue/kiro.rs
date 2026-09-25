@@ -1,9 +1,17 @@
 import { useEffect, useState } from 'react'
-import { Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Router, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
+import { Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Router, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import {
@@ -905,87 +913,116 @@ const DEFAULT_REQUEST_ADMISSION: RequestAdmissionConfig = {
   queueTimeoutMs: 1000,
 }
 
-function RequestApiKeyPolicyEditor({
+function RequestApiKeyDialog({
+  open,
   item,
+  initialApiKey,
   defaultAdmission,
-  disabled,
+  saving,
+  onOpenChange,
   onSave,
 }: {
-  item: RequestApiKeyItem
+  open: boolean
+  item?: RequestApiKeyItem
+  initialApiKey?: string
   defaultAdmission: RequestAdmissionConfig
-  disabled: boolean
+  saving: boolean
+  onOpenChange: (open: boolean) => void
   onSave: (policy: {
+    apiKey: string
     name: string
     enabled: boolean
     requestAdmission: RequestAdmissionConfig
   }) => void
 }) {
-  const admission = item.requestAdmission ?? defaultAdmission
-  const [name, setName] = useState(item.name)
-  const [enabled, setEnabled] = useState(item.enabled)
+  const isEdit = Boolean(item)
+  const admission = item?.requestAdmission ?? defaultAdmission
+  const [apiKey, setApiKey] = useState(initialApiKey ?? item?.apiKey ?? '')
+  const [name, setName] = useState(item?.name ?? '新请求 Key')
+  const [enabled, setEnabled] = useState(item?.enabled ?? true)
   const [rpm, setRpm] = useState(admission.rpm)
   const [concurrent, setConcurrent] = useState(admission.maxConcurrentRequests)
   const [queued, setQueued] = useState(admission.maxQueuedRequests)
   const [timeout, setTimeout] = useState(admission.queueTimeoutMs)
-  const numeric = (value: string, max: number) =>
-    Math.min(max, Math.max(0, Number.parseInt(value, 10) || 0))
 
   useEffect(() => {
-    setName(item.name)
-    setEnabled(item.enabled)
+    setApiKey(initialApiKey ?? item?.apiKey ?? '')
+    setName(item?.name ?? '新请求 Key')
+    setEnabled(item?.enabled ?? true)
     setRpm(admission.rpm)
     setConcurrent(admission.maxConcurrentRequests)
     setQueued(admission.maxQueuedRequests)
     setTimeout(admission.queueTimeoutMs)
-  }, [item.id, item.name, item.enabled, admission.rpm, admission.maxConcurrentRequests, admission.maxQueuedRequests, admission.queueTimeoutMs])
+  }, [open, initialApiKey, item?.id, item?.apiKey, item?.name, item?.enabled, admission.rpm, admission.maxConcurrentRequests, admission.maxQueuedRequests, admission.queueTimeoutMs])
+
+  const numeric = (value: string, max: number) =>
+    Math.min(max, Math.max(0, Number.parseInt(value, 10) || 0))
 
   return (
-    <div className="mt-4 border-t pt-4">
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-        <label className="space-y-1 text-xs text-muted-foreground">
-          <span>名称</span>
-          <Input value={name} maxLength={80} disabled={disabled} onChange={(event) => setName(event.target.value)} />
-        </label>
-        <div className="flex items-end justify-between gap-3 pb-1">
-          <span className="text-sm">启用此 Key</span>
-          <Switch checked={enabled} disabled={disabled} onCheckedChange={setEnabled} />
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{isEdit ? '编辑请求 Key' : '新增请求 Key'}</DialogTitle>
+          <DialogDescription>每个请求 Key 可单独设置名称、启用状态、RPM、并发和队列限制。</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="space-y-1 text-xs text-muted-foreground sm:col-span-2">
+            <span>请求 Key</span>
+            <div className="flex gap-2">
+              <Input value={apiKey} disabled={saving} className="font-mono text-xs" onChange={(event) => setApiKey(event.target.value)} />
+              <Button type="button" variant="outline" disabled={saving} onClick={() => fillWithGeneratedRequestKey(setApiKey)}>
+                <Wand2 className="h-4 w-4" />随机生成
+              </Button>
+            </div>
+          </label>
+          <label className="space-y-1 text-xs text-muted-foreground">
+            <span>名称</span>
+            <Input value={name} maxLength={80} disabled={saving} onChange={(event) => setName(event.target.value)} />
+          </label>
+          <div className="flex items-end justify-between gap-3 pb-1">
+            <span className="text-sm">启用此 Key</span>
+            <Switch checked={enabled} disabled={saving} onCheckedChange={setEnabled} />
+          </div>
+          <label className="space-y-1 text-xs text-muted-foreground">
+            <span>每分钟请求数，0 为不限</span>
+            <Input type="number" min={0} max={1_000_000} value={rpm} disabled={saving} onChange={(event) => setRpm(numeric(event.target.value, 1_000_000))} />
+          </label>
+          <label className="space-y-1 text-xs text-muted-foreground">
+            <span>同时请求数，0 为不限</span>
+            <Input type="number" min={0} max={10_000} value={concurrent} disabled={saving} onChange={(event) => setConcurrent(numeric(event.target.value, 10_000))} />
+          </label>
+          <label className="space-y-1 text-xs text-muted-foreground">
+            <span>最多排队数</span>
+            <Input type="number" min={0} max={100_000} value={queued} disabled={saving} onChange={(event) => setQueued(numeric(event.target.value, 100_000))} />
+          </label>
+          <label className="space-y-1 text-xs text-muted-foreground">
+            <span>最长等待毫秒</span>
+            <Input type="number" min={0} max={300_000} value={timeout} disabled={saving} onChange={(event) => setTimeout(numeric(event.target.value, 300_000))} />
+          </label>
         </div>
-        <label className="space-y-1 text-xs text-muted-foreground">
-          <span>每分钟请求数，0 为不限</span>
-          <Input type="number" min={0} max={1_000_000} value={rpm} disabled={disabled} onChange={(event) => setRpm(numeric(event.target.value, 1_000_000))} />
-        </label>
-        <label className="space-y-1 text-xs text-muted-foreground">
-          <span>同时请求数，0 为不限</span>
-          <Input type="number" min={0} max={10_000} value={concurrent} disabled={disabled} onChange={(event) => setConcurrent(numeric(event.target.value, 10_000))} />
-        </label>
-        <label className="space-y-1 text-xs text-muted-foreground">
-          <span>最多排队数</span>
-          <Input type="number" min={0} max={100_000} value={queued} disabled={disabled} onChange={(event) => setQueued(numeric(event.target.value, 100_000))} />
-        </label>
-        <label className="space-y-1 text-xs text-muted-foreground">
-          <span>最长等待毫秒</span>
-          <Input type="number" min={0} max={300_000} value={timeout} disabled={disabled} onChange={(event) => setTimeout(numeric(event.target.value, 300_000))} />
-        </label>
-      </div>
-      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-        <p className="text-xs leading-5 text-muted-foreground">
-          此上限按实例、按 Key 生效；排队请求不会自动切换到外部池。
-        </p>
-        <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={() => onSave({
-          name: name.trim(),
-          enabled,
-          requestAdmission: {
-            rpm,
-            maxConcurrentRequests: concurrent,
-            maxQueuedRequests: queued,
-            queueTimeoutMs: timeout,
-          },
-        })}>
-          <Save className="h-4 w-4" />
-          保存 Key 设置
-        </Button>
-      </div>
-    </div>
+        <p className="text-xs leading-5 text-muted-foreground">此上限按实例、按 Key 生效；排队请求不会自动切换到外部池。</p>
+        <DialogFooter>
+          <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>取消</Button>
+          <Button
+            type="button"
+            disabled={saving || apiKey.trim().length < 8}
+            onClick={() => onSave({
+              apiKey: apiKey.trim(),
+              name: name.trim(),
+              enabled,
+              requestAdmission: {
+                rpm,
+                maxConcurrentRequests: concurrent,
+                maxQueuedRequests: queued,
+                queueTimeoutMs: timeout,
+              },
+            })}
+          >
+            {saving ? '保存中...' : '保存'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -996,10 +1033,10 @@ function AccessKeysPanel() {
   const [showAdminKey, setShowAdminKey] = useState(false)
   const [creating, setCreating] = useState(false)
   const [processingKeyId, setProcessingKeyId] = useState<string | null>(null)
-  const [manualRequestApiKey, setManualRequestApiKey] = useState('')
   const [visibleRequestKeyIds, setVisibleRequestKeyIds] = useState<Set<string>>(new Set())
-  const [editingRequestKeyId, setEditingRequestKeyId] = useState<string | null>(null)
-  const [requestKeyDraft, setRequestKeyDraft] = useState('')
+  const [keyDialogOpen, setKeyDialogOpen] = useState(false)
+  const [keyDialogItem, setKeyDialogItem] = useState<RequestApiKeyItem | undefined>()
+  const [keyDialogInitialApiKey, setKeyDialogInitialApiKey] = useState('')
   const [nextAdminApiKey, setNextAdminApiKey] = useState('')
 
   const loadKeys = async () => {
@@ -1035,8 +1072,6 @@ function AccessKeysPanel() {
 
   const setKeysAndResetDrafts = (response: AccessKeysResponse) => {
     setKeys(response)
-    setEditingRequestKeyId(null)
-    setRequestKeyDraft('')
     setVisibleRequestKeyIds((prev) => {
       const valid = new Set(accessKeyItems(response).map((item) => item.id))
       return new Set(Array.from(prev).filter((id) => valid.has(id)))
@@ -1068,88 +1103,43 @@ function AccessKeysPanel() {
     }
   }
 
-  const generateRequestKey = async () => {
+  const openCreateKeyDialog = () => {
+    setKeyDialogItem(undefined)
+    setKeyDialogInitialApiKey(generateLocalRequestApiKey())
+    setKeyDialogOpen(true)
+  }
+
+  const openEditKeyDialog = (item: RequestApiKeyItem) => {
+    setKeyDialogItem(item)
+    setKeyDialogInitialApiKey(item.apiKey)
+    setKeyDialogOpen(true)
+  }
+
+  const saveKeyDialog = async (policy: {
+    apiKey: string
+    name: string
+    enabled: boolean
+    requestAdmission: RequestAdmissionConfig
+  }) => {
     setCreating(true)
     try {
-      const before = new Set(requestKeys.map((item) => item.id))
-      const response = await createRequestApiKey({})
+      const response = keyDialogItem
+        ? await updateRequestApiKey(keyDialogItem.id, policy)
+        : await createRequestApiKey(policy)
       setKeysAndResetDrafts(response)
-      const created = accessKeyItems(response).find((item) => !before.has(item.id))
-      if (created) {
-        setVisibleRequestKeyIds((prev) => new Set(prev).add(created.id))
-        await copy('新请求 Key', created.apiKey)
+      setKeyDialogOpen(false)
+      if (!keyDialogItem) {
+        const created = accessKeyItems(response).find((item) => item.apiKey === policy.apiKey)
+        if (created) {
+          setVisibleRequestKeyIds((prev) => new Set(prev).add(created.id))
+          await copy('新请求 Key', created.apiKey)
+        }
       }
-      toast.success('请求 Key 已生成并立即生效')
+      toast.success(keyDialogItem ? '请求 Key 已保存并立即生效' : '请求 Key 已新增并立即生效')
     } catch (error) {
-      toast.error(`生成请求 Key 失败: ${extractErrorMessage(error)}`)
+      toast.error(`${keyDialogItem ? '保存' : '新增'}请求 Key 失败: ${extractErrorMessage(error)}`)
     } finally {
       setCreating(false)
-    }
-  }
-
-  const addManualRequestKey = async () => {
-    const apiKey = manualRequestApiKey.trim()
-    if (!apiKey) return toast.error('请输入要新增的请求 Key')
-    if (apiKey.length < 8) return toast.error('请求 Key 至少需要 8 个字符')
-    setCreating(true)
-    try {
-      const response = await createRequestApiKey({ apiKey })
-      setKeysAndResetDrafts(response)
-      setManualRequestApiKey('')
-      toast.success('请求 Key 已新增并立即生效')
-    } catch (error) {
-      toast.error(`新增请求 Key 失败: ${extractErrorMessage(error)}`)
-    } finally {
-      setCreating(false)
-    }
-  }
-
-  const startEditRequestKey = (item: RequestApiKeyItem) => {
-    setEditingRequestKeyId(item.id)
-    setRequestKeyDraft(item.apiKey)
-  }
-
-  const cancelEditRequestKey = () => {
-    setEditingRequestKeyId(null)
-    setRequestKeyDraft('')
-  }
-
-  const saveEditedRequestKey = async (item: RequestApiKeyItem) => {
-    const apiKey = requestKeyDraft.trim()
-    if (!apiKey) return toast.error('请输入新的请求 Key')
-    if (apiKey.length < 8) return toast.error('请求 Key 至少需要 8 个字符')
-    if (apiKey === item.apiKey) {
-      cancelEditRequestKey()
-      return
-    }
-    setProcessingKeyId(item.id)
-    try {
-      const response = await updateRequestApiKey(item.id, { apiKey })
-      setKeysAndResetDrafts(response)
-      toast.success('请求 Key 已保存，旧 Key 立即失效')
-    } catch (error) {
-      toast.error(`保存请求 Key 失败: ${extractErrorMessage(error)}`)
-    } finally {
-      setProcessingKeyId(null)
-    }
-  }
-
-  const saveRequestKeyPolicy = async (
-    item: RequestApiKeyItem,
-    policy: {
-      name: string
-      enabled: boolean
-      requestAdmission: RequestAdmissionConfig
-    },
-  ) => {
-    setProcessingKeyId(item.id)
-    try {
-      setKeysAndResetDrafts(await updateRequestApiKey(item.id, policy))
-      toast.success('此 Key 的独立并发与 RPM 设置已生效')
-    } catch (error) {
-      toast.error(`保存 Key 设置失败: ${extractErrorMessage(error)}`)
-    } finally {
-      setProcessingKeyId(null)
     }
   }
 
@@ -1199,31 +1189,19 @@ function AccessKeysPanel() {
               用于调用 /v1/messages、/cc/v1/messages 等模型接口，可复制到 x-api-key 或 Authorization: Bearer。新增、编辑、删除后立即生效。
             </div>
           </div>
-          <Button type="button" className="shrink-0" disabled={loading || creating} onClick={generateRequestKey}>
-            {creating ? <span className="mr-2 inline-block h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" /> : <Wand2 className="h-4 w-4" />}
-            随机生成并新增
-          </Button>
-        </div>
-
-        <div className="mb-4 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_auto]">
-          <Input
-            className="w-full min-w-0 font-mono text-xs"
-            value={manualRequestApiKey}
-            placeholder="手动输入要新增的请求 Key"
-            disabled={loading || creating}
-            onChange={(event) => setManualRequestApiKey(event.target.value)}
-          />
-          <Button type="button" variant="outline" className="shrink-0" disabled={loading || creating} onClick={() => fillWithGeneratedRequestKey(setManualRequestApiKey)}>
-            <Wand2 className="h-4 w-4" />
-            随机生成
-          </Button>
-          <Button type="button" className="shrink-0" disabled={loading || creating || !manualRequestApiKey.trim()} onClick={addManualRequestKey}>
+          <Button type="button" className="shrink-0" disabled={loading || creating} onClick={openCreateKeyDialog}>
             <Plus className="h-4 w-4" />
             新增 Key
           </Button>
         </div>
 
-        <div className="space-y-3">
+        <div className="overflow-hidden rounded-md border">
+          <div className="hidden grid-cols-[minmax(0,1.35fr)_minmax(0,1.4fr)_minmax(0,1fr)_auto] gap-3 bg-muted/40 px-4 py-2 text-[11px] font-medium text-muted-foreground md:grid">
+            <span>名称 / 状态</span>
+            <span>请求 Key</span>
+            <span>准入策略</span>
+            <span className="text-right">操作</span>
+          </div>
           {loading && <div className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">加载中...</div>}
           {!loading && requestKeys.length === 0 && (
             <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">未配置请求 Key，请先生成或手动新增一个。</div>
@@ -1231,81 +1209,70 @@ function AccessKeysPanel() {
           {!loading && requestKeys.map((item) => {
             const visible = visibleRequestKeyIds.has(item.id)
             const busy = processingKeyId === item.id
-            const editing = editingRequestKeyId === item.id
+            const admission = item.requestAdmission ?? keys?.defaultRequestAdmission ?? DEFAULT_REQUEST_ADMISSION
             return (
-              <div key={item.id} className="rounded-md border bg-muted/20 p-4">
-                <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                  <div className="flex min-w-0 flex-wrap items-center gap-2">
-                    <span className="text-sm font-semibold">请求 Key</span>
-                    <span className="text-sm text-muted-foreground">{item.name}</span>
-                    {!item.enabled && (
-                      <span className="rounded-md border border-destructive/20 bg-destructive/10 px-2 py-0.5 text-[11px] font-medium text-destructive">
-                        已停用
-                      </span>
-                    )}
-                    {item.primary && (
-                      <span className="rounded-md border border-primary/20 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">主 Key</span>
-                    )}
-                    <span className="font-mono text-[11px] text-muted-foreground">{item.id.slice(0, 12)}</span>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button type="button" variant="outline" size="sm" disabled={busy || editing} onClick={() => toggleRequestKeyVisible(item.id)}>
-                      {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                      {visible ? '隐藏' : '显示'}
-                    </Button>
-                    <Button type="button" variant="outline" size="sm" disabled={busy || editing} onClick={() => copy('请求 Key', item.apiKey)}>
-                      <Copy className="h-4 w-4" />
-                      复制
-                    </Button>
-                    {!editing && (
-                      <Button type="button" variant="outline" size="sm" disabled={busy || Boolean(editingRequestKeyId)} onClick={() => startEditRequestKey(item)}>
-                        <Edit3 className="h-4 w-4" />
-                        编辑
-                      </Button>
-                    )}
-                    <Button type="button" variant="destructive" size="sm" disabled={busy || editing || requestKeys.length <= 1} onClick={() => removeRequestKey(item)}>
-                      <Trash2 className="h-4 w-4" />
-                      删除
-                    </Button>
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <Input
-                    readOnly={!editing}
-                    aria-label="请求调用 Key"
-                    className="w-full min-w-0 font-mono text-xs"
-                    value={editing ? requestKeyDraft : visible ? item.apiKey : item.maskedApiKey}
-                    disabled={busy}
-                    onChange={(event) => setRequestKeyDraft(event.target.value)}
-                  />
-                  {editing && (
-                    <div className="flex flex-wrap justify-end gap-2">
-                      <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => fillWithGeneratedRequestKey(setRequestKeyDraft)}>
-                        <Wand2 className="h-4 w-4" />
-                        随机生成
-                      </Button>
-                      <Button type="button" size="sm" disabled={busy || !requestKeyDraft.trim()} onClick={() => saveEditedRequestKey(item)}>
-                        {busy ? <span className="mr-2 inline-block h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" /> : <Save className="h-4 w-4" />}
-                        保存
-                      </Button>
-                      <Button type="button" variant="outline" size="sm" disabled={busy} onClick={cancelEditRequestKey}>
-                        <X className="h-4 w-4" />
-                        取消
-                      </Button>
+              <div key={item.id} className="border-t px-4 py-3 first:border-t-0">
+                <div className="grid gap-3 md:grid-cols-[minmax(0,1.35fr)_minmax(0,1.4fr)_minmax(0,1fr)_auto] md:items-center">
+                  <div className="min-w-0">
+                    <div className="flex min-w-0 flex-wrap items-center gap-2">
+                      <span className="truncate text-sm font-semibold">{item.name}</span>
+                      {!item.enabled && (
+                        <span className="rounded-md border border-destructive/20 bg-destructive/10 px-2 py-0.5 text-[11px] font-medium text-destructive">
+                          已停用
+                        </span>
+                      )}
+                      {item.primary && (
+                        <span className="rounded-md border border-primary/20 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">主 Key</span>
+                      )}
                     </div>
-                  )}
+                    <div className="mt-1 font-mono text-[11px] text-muted-foreground">ID {item.id.slice(0, 12)}</div>
+                  </div>
+                  <Input
+                    readOnly
+                    aria-label={`${item.name} 请求调用 Key`}
+                    className="w-full min-w-0 font-mono text-xs"
+                    value={visible ? item.apiKey : item.maskedApiKey}
+                    disabled={busy}
+                  />
+                  <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span className="rounded border bg-muted/50 px-2 py-1">RPM {admission.rpm || '不限'}</span>
+                    <span className="rounded border bg-muted/50 px-2 py-1">并发 {admission.maxConcurrentRequests || '不限'}</span>
+                    <span className="rounded border bg-muted/50 px-2 py-1">队列 {admission.maxQueuedRequests || 0}</span>
+                  </div>
+                  <div className="flex flex-wrap justify-start gap-1.5 md:justify-end">
+                    <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => toggleRequestKeyVisible(item.id)} title={visible ? '隐藏 Key' : '显示 Key'}>
+                      {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                      <span className="hidden lg:inline">{visible ? '隐藏' : '显示'}</span>
+                    </Button>
+                    <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => copy('请求 Key', item.apiKey)}>
+                      <Copy className="h-4 w-4" />
+                      <span className="hidden lg:inline">复制</span>
+                    </Button>
+                    <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => openEditKeyDialog(item)}>
+                      <Edit3 className="h-4 w-4" />
+                      <span className="hidden lg:inline">编辑</span>
+                    </Button>
+                    <Button type="button" variant="destructive" size="sm" disabled={busy || requestKeys.length <= 1} onClick={() => removeRequestKey(item)}>
+                      <Trash2 className="h-4 w-4" />
+                      <span className="hidden lg:inline">删除</span>
+                    </Button>
+                  </div>
                 </div>
-                <RequestApiKeyPolicyEditor
-                  item={item}
-                  defaultAdmission={keys?.defaultRequestAdmission ?? DEFAULT_REQUEST_ADMISSION}
-                  disabled={busy || editing}
-                  onSave={(policy) => saveRequestKeyPolicy(item, policy)}
-                />
               </div>
             )
           })}
         </div>
       </div>
+
+      <RequestApiKeyDialog
+        open={keyDialogOpen}
+        item={keyDialogItem}
+        initialApiKey={keyDialogInitialApiKey}
+        defaultAdmission={keys?.defaultRequestAdmission ?? DEFAULT_REQUEST_ADMISSION}
+        saving={creating}
+        onOpenChange={setKeyDialogOpen}
+        onSave={saveKeyDialog}
+      />
 
       <div className="rounded-md border bg-background p-4 md:col-span-2">
         <div className="mb-4">
