@@ -313,6 +313,123 @@ mixed-lane
 
 多个 Key 会复制每 Key 入口并发额度。若当前值为 32，10 个 Key 理论上可能把入口侧放大到约 320 个并发，而本地账号和外部池底层容量并不会同步放大。
 
+## 补充：单个账号设置为 5 并发，是否会超过 5
+
+### 正常情况下的结论
+
+如果“5 并发”指的是该凭据的 `max_concurrent_requests=5`，并且：
+
+- 所有请求都由同一个服务实例调度，或多实例共享同一个健康 Redis；
+- 没有启用会改变容量口径的特殊权重配置；
+- 没有人工清理仍在运行的 lease；
+- 没有发生 lease 过期回收误判；
+
+那么调度器不会故意让该账号同时持有超过 5 个**容量单位**。
+
+第 6 个请求的正常动作是：
+
+```text
+换其它可调度账号
+或进入本地 dispatch queue
+或按 local/external fallback 策略转外部
+或在等待队列/等待时间耗尽后失败
+```
+
+它不会因为 API Key 不同，就给同一个账号再增加一份“5 并发”。
+
+单账号限制和全局本地限制同时生效：
+
+```text
+单账号有效上限 = 凭据自身 max_concurrent_requests
+               或全局 credential_max_concurrent_requests
+
+整个本地池还受 dispatch_global_max_concurrent_requests 限制
+```
+
+实现上，账号 lease 建立时同时检查账号容量和本地全局容量；账号自身容量判断是 `entry.in_flight_requests + request_weight <= max`。见 `src/kiro/token_manager/capacity.rs:118-150`、`src/kiro/token_manager/manager.rs:4081-4115`。
+
+### 多 API Key 不会把同一个账号的上限复制
+
+下面这个理解是错误的：
+
+```text
+key-a -> 账号 A 5 并发
+key-b -> 账号 A 再 5 并发
+```
+
+正确行为是：
+
+```text
+key-a + key-b + 其它 Key
+    -> 竞争同一个账号 A 的同一组 in-flight leases
+    -> 总容量仍按账号 A 的有效上限判断
+```
+
+因此，在单实例或健康 Redis 协调下，5 是账号级上限，不是每 Key 上限。
+
+### 多实例但没有 Redis：可能出现聚合超 5
+
+如果部署了多个服务实例，但没有使用 Redis 做跨实例账号调度协调：
+
+```text
+实例 1：账号 A 最多 5
+实例 2：账号 A 最多 5
+```
+
+每个实例只知道自己的本地 lease，聚合到上游时可能出现约 10 个实际并发。此时“5”只是**每实例上限**，不是集群上限。
+
+如果启用 Redis，调度器会在确认本地 provisional slot 后调用 Redis 的 `acquire_dispatch_lease`，由 Redis 协调同一凭据的跨实例 lease；Redis 正常时，目标是维持账号级集群上限。见 `src/kiro/token_manager/manager.rs:4433-4462`、`:4488-4549`。
+
+Redis 调度不可用时，代码不会把本地 provisional slot 当成永久成功的跨实例 lease；通常会等待、失败或触发已配置的外部 fallback。因此 Redis 故障更可能造成不必要等待或容量不足，而不是安全地放大账号并发。
+
+### “5 并发”可能不是 5 个请求
+
+默认 `weighted_capacity.enabled=false` 时：
+
+```text
+1 请求 = 1 容量单位
+5 容量单位 ≈ 5 个同时执行请求
+```
+
+如果显式启用 weighted capacity，则一个大请求可能占用多个容量单位，因此：
+
+```text
+账号上限 = 5 容量单位
+实际请求数可能少于 5
+```
+
+权重模式不会让调度器合法地超过 5 个容量单位，但会让“请求数”和“容量数”不再相等。
+
+### 仍可能造成实际观测超过 5 的异常边界
+
+以下情况需要单独排查，不能把它们误认为正常调度策略：
+
+1. **多实例未接入 Redis**：每个实例都各自允许 5。
+2. **人工清理 in-flight leases**：如果 Admin 清理时请求仍在上游执行，旧请求可能仍占用真实上游并发，但调度器已经释放名额。
+3. **lease 超时回收**：默认 `credential_in_flight_lease_max_secs=900`。如果请求长时间没有任何可观测活动，lease 可能被当成 stale 清理；原请求若实际仍未结束，短窗口内可能出现真实并发高于调度快照。
+4. **Redis 数据被外部删除或协调存储发生异常**：需要结合 Redis lease、服务日志和上游时间线判断，不能只看 Admin 快照。
+5. **把入口 RequestAdmission active 数当成账号并发**：入口 active 只表示 API Key 持有 response body，不代表请求已经拿到某个账号 lease。
+
+### 如何验证“账号 A 是否真的超过 5”
+
+不能只看 API Key 并发或请求总数，至少要同时采集：
+
+```text
+credential_id = A
+in_flight_leases 数量与 weight_units 总和
+Redis 中 credential A 的 dispatch lease
+服务实例 ID
+upstream send / headers / terminal 时间线
+```
+
+验收条件应写成：
+
+```text
+单实例无 Redis：A 的本地有效容量 <= 5
+多实例有健康 Redis：A 的集群 lease 容量 <= 5
+weighted capacity 开启：A 的 weight_units 总和 <= 5
+```
+
 ## 场景五：共享 API Key 造成的隐形耦合示例
 
 假设：
