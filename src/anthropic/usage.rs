@@ -231,6 +231,10 @@ pub struct UsageLatencyTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_header_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_dispatch_elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_header_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_upstream_chunk_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_output_delta_ms: Option<u64>,
@@ -337,6 +341,8 @@ impl UsageLatencyTrace {
             && self.capacity_weight_units.is_none()
             && self.estimated_input_tokens.is_none()
             && self.upstream_header_ms.is_none()
+            && self.credential_dispatch_elapsed_ms.is_none()
+            && self.upstream_header_wait_ms.is_none()
             && self.first_upstream_chunk_ms.is_none()
             && self.first_output_delta_ms.is_none()
             && self.first_thinking_delta_ms.is_none()
@@ -3906,6 +3912,22 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::sync::{Notify, Semaphore};
+
+    #[test]
+    fn latency_trace_serializes_new_backlog_fields_in_camel_case_and_omits_absent_values() {
+        let trace = UsageLatencyTrace {
+            credential_dispatch_elapsed_ms: Some(40),
+            upstream_header_wait_ms: Some(16),
+            ..UsageLatencyTrace::default()
+        };
+        let value = serde_json::to_value(&trace).expect("latency trace JSON");
+        assert_eq!(value["credentialDispatchElapsedMs"], 40);
+        assert_eq!(value["upstreamHeaderWaitMs"], 16);
+        assert!(value.get("upstreamHeaderMs").is_none());
+
+        let empty = serde_json::to_value(UsageLatencyTrace::default()).expect("empty trace JSON");
+        assert_eq!(empty, serde_json::json!({}));
+    }
 
     fn record_with_time(
         id: &str,

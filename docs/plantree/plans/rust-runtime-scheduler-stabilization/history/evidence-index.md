@@ -1,11 +1,12 @@
 # Evidence Index
 
-Last reviewed: 2026-09-18 Asia/Shanghai
+Last reviewed: 2026-09-25 Asia/Shanghai
 
 ## Current evidence
 
 | Date | Evidence | Scope | Notes |
 | --- | --- | --- | --- |
+| 2026-09-25 | `service-audit-backlog-remediation-20260924.md` | Service audit items 1-6/8, Admin key propagation/authentication, async Redis dispatch-queue lease, latency attribution, low-capacity backlog behavior | Main Rust `2170/0/6 ignored`; `kiro_loadtest 31/31`; default/no-default; release; Clippy `764 <= 849`; fmt/diff/inventory pass; frozen L3 `9/9`; fresh-database HTTP backlog runs `run8/run9/run10` each pass with 47 long-stream chunks, queued normal-request recovery, cancellation without upstream hit, and Redis cleanup to zero. Production attribution remains pending redacted config/timeline evidence |
 | 2026-07-28 | `external_pool_cached_immediate_availability` | External pool cached/no-wait hot path | Real local PgSQL/Redis, 2 passed |
 | 2026-07-28 | `external_pool_immediate_availability_requires_current_capacity_and_recovers` | Authoritative external capacity behavior | Real local PgSQL/Redis, 1 passed |
 | 2026-07-28 | `external_fallback` | Handler fallback classifier/gates | 9 passed |

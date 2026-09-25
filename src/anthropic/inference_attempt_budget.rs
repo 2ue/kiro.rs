@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -189,6 +189,8 @@ pub(crate) struct InferenceAttemptBudget {
     auxiliary: Arc<AuxiliaryAttemptBudget>,
     started_at: Instant,
     dispatch_deadline: OnceLock<Instant>,
+    credential_dispatch_elapsed_ms: AtomicU64,
+    upstream_header_wait_ms: AtomicU64,
 }
 
 const DOWNSTREAM_COMMITTED_BIT: u32 = 1 << 31;
@@ -217,7 +219,25 @@ impl InferenceAttemptBudget {
             auxiliary: Arc::new(AuxiliaryAttemptBudget::new(auxiliary_max_attempts)),
             started_at: Instant::now(),
             dispatch_deadline: OnceLock::new(),
+            credential_dispatch_elapsed_ms: AtomicU64::new(0),
+            upstream_header_wait_ms: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn record_credential_dispatch_elapsed(&self, elapsed: Duration) {
+        saturating_add_ms(&self.credential_dispatch_elapsed_ms, elapsed);
+    }
+
+    pub(crate) fn record_upstream_header_wait(&self, elapsed: Duration) {
+        saturating_add_ms(&self.upstream_header_wait_ms, elapsed);
+    }
+
+    pub(crate) fn credential_dispatch_elapsed_ms(&self) -> Option<u64> {
+        nonzero_ms(&self.credential_dispatch_elapsed_ms)
+    }
+
+    pub(crate) fn upstream_header_wait_ms(&self) -> Option<u64> {
+        nonzero_ms(&self.upstream_header_wait_ms)
     }
 
     pub(crate) fn max_attempts(&self) -> u32 {
@@ -346,6 +366,18 @@ impl InferenceAttemptBudget {
             downstream_committed: state & DOWNSTREAM_COMMITTED_BIT != 0,
         }
     }
+}
+
+fn saturating_add_ms(target: &AtomicU64, elapsed: Duration) {
+    let millis = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    let _ = target.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(millis))
+    });
+}
+
+fn nonzero_ms(target: &AtomicU64) -> Option<u64> {
+    let value = target.load(Ordering::Acquire);
+    (value > 0).then_some(value)
 }
 
 #[cfg(test)]
@@ -761,5 +793,25 @@ mod tests {
             assert_eq!(error.consumed, 1);
             assert_eq!(budget.snapshot().profile_discovery_attempts, 0);
         }
+    }
+
+    #[test]
+    fn latency_attribution_accumulates_dispatch_and_header_wait_without_touching_attempt_budget() {
+        let budget = InferenceAttemptBudget::new(4);
+        budget.record_credential_dispatch_elapsed(Duration::from_millis(17));
+        budget.record_credential_dispatch_elapsed(Duration::from_millis(23));
+        budget.record_upstream_header_wait(Duration::from_millis(5));
+        budget.record_upstream_header_wait(Duration::from_millis(11));
+
+        assert_eq!(budget.credential_dispatch_elapsed_ms(), Some(40));
+        assert_eq!(budget.upstream_header_wait_ms(), Some(16));
+        assert_eq!(budget.snapshot().consumed, 0);
+    }
+
+    #[test]
+    fn latency_attribution_omits_zero_values_for_legacy_records() {
+        let budget = InferenceAttemptBudget::new(4);
+        assert_eq!(budget.credential_dispatch_elapsed_ms(), None);
+        assert_eq!(budget.upstream_header_wait_ms(), None);
     }
 }

@@ -2968,6 +2968,14 @@ impl RequestUsageContext {
 
     fn latency_trace(&self) -> Option<UsageLatencyTrace> {
         let upstream_header_ms = load_latency_ms(&self.latency.upstream_header_latency_ms);
+        let credential_dispatch_elapsed_ms = self
+            .latency
+            .inference_attempt_budget
+            .credential_dispatch_elapsed_ms();
+        let upstream_header_wait_ms = self
+            .latency
+            .inference_attempt_budget
+            .upstream_header_wait_ms();
         let first_upstream_chunk_ms =
             load_latency_ms(&self.latency.first_upstream_chunk_latency_ms);
         let first_output_delta_ms = self.first_token_latency_ms();
@@ -3014,6 +3022,8 @@ impl RequestUsageContext {
             estimated_input_tokens: (capacity_weight_units > 1).then_some(self.input_tokens),
             payload_guard_ms: self.latency.payload_guard_ms,
             upstream_header_ms,
+            credential_dispatch_elapsed_ms,
+            upstream_header_wait_ms,
             first_upstream_chunk_ms,
             first_output_delta_ms,
             first_thinking_delta_ms,

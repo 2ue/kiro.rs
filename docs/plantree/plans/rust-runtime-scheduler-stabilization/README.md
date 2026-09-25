@@ -6,7 +6,7 @@ Status: `In Progress`
 
 Current phase: `external-pool quality-aware scheduling focused-validated / Claude Code-Kiro interop P0 focused + isolated-real normal/alias validated / scheduler architecture and signature blockers open`
 
-Last reviewed: 2026-09-17 Asia/Shanghai
+Last reviewed: 2026-09-25 Asia/Shanghai
 
 Authority:
 
@@ -31,6 +31,7 @@ Authority:
    - [质量感知调度测试矩阵](topics/quality-aware-scheduling-test-matrix.md)
    - [Thinking signature 协议安全](topics/thinking-signature-protocol-safety.md)
    - [sub2api-kiro 协议互转优化执行计划](topics/sub2api-kiro-protocol-interop-optimization.md)
+   - [服务问题审计与并发积压因果](topics/service-audit-and-backlog-causality.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Decisions:
    - [Decision 001：本地账号与外部池统一调度目标契约](decisions/001-local-external-scheduler-target-contract.md)

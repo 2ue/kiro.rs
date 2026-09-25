@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-09-18 Asia/Shanghai
+Last reviewed: 2026-09-25 Asia/Shanghai
 
 ## Done
 
@@ -69,8 +69,25 @@ Last reviewed: 2026-09-18 Asia/Shanghai
   - [Sustained scheduling validation](topics/sustained-scheduling-validation.md) defines
     isolated L0-L5 testing, fake upstream behavior, multi-instance races, soak metrics and
     no-go conditions.
+- Service audit and backlog remediation (2026-09-25): audit items 1-6 and 8 were assessed
+  with item 7 explicitly excluded. The confirmed hot-path Redis queue lease bridge now awaits
+  asynchronously; Admin key propagation is shared across runtime-config reload paths; Admin
+  authentication is fail-closed for empty keys; and optional credential-dispatch/upstream-header
+  timing fields were added without changing request limits. Full default/no-default Rust,
+  release, Clippy, format, diff and artifact gates passed. Frozen L3 passed `9/9`; three
+  fresh-database low-capacity HTTP runs proved that valid long streams are not cut off,
+  queued normal requests complete after natural release, and cancellation does not leak an
+  upstream request. Production root-cause attribution remains pending redacted config and
+  request-timeline evidence. See [evidence](../../../../feature/evidence/service-audit-backlog-remediation-20260924.md).
 
 ## In Progress
+
+- Service audit and long-request backlog remediation is implementation-complete locally;
+  production attribution remains an evidence-only follow-up:
+  - obtain redacted dispatch wait/queue/account/lease configuration;
+  - obtain receive -> credential-selected -> upstream-send -> headers -> first-chunk ->
+    terminal/cancel timestamps;
+  - do not change timeout/capacity policy until those facts are available.
 
 - Document disposition cleanup:
   - current valid issues migrated into this plan;
@@ -149,10 +166,12 @@ Last reviewed: 2026-09-18 Asia/Shanghai
 
 ## Next
 
-1. Perform read-only `v0.0.134` production observation and update the issue/evidence
+1. Collect the production-only redacted configuration and request timeline needed to
+   attribute the concurrency backlog; no production load or policy change.
+2. Perform read-only `v0.0.134` production observation and update the issue/evidence
    indexes without changing usage semantics.
-2. Close the Claude Code/Kiro interop follow-ups above before widening fallback behavior.
-3. Continue the independent documentation archive and scheduler observability follow-ups.
+3. Close the Claude Code/Kiro interop follow-ups above before widening fallback behavior.
+4. Continue the independent documentation archive and scheduler observability follow-ups.
 
 ## Deferred
 

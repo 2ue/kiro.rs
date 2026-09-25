@@ -1266,6 +1266,8 @@ impl ExternalLatencyTraceState {
             estimated_input_tokens: None,
             payload_guard_ms: None,
             upstream_header_ms: load_nonzero(&self.upstream_header_ms),
+            credential_dispatch_elapsed_ms: None,
+            upstream_header_wait_ms: None,
             first_upstream_chunk_ms: load_nonzero(&self.first_upstream_chunk_ms),
             first_output_delta_ms,
             first_thinking_delta_ms: None,
@@ -7013,33 +7015,39 @@ impl ExternalPoolManager {
                 rejection,
             ));
         }
+        let upstream_header_started_at = Instant::now();
         let response = tokio::select! {
-            response = request.send() => response.map_err(|err| {
-                tracing::warn!(
-                    request_id = %route.request_id,
-                    error_id = %route.error_id,
-                    pool_id = pool.id,
-                    error_class = %sanitized_external_network_error("request send failed", &err),
-                    "external pool request send failed"
+            response = request.send() => {
+                route.inference_attempt_budget.record_upstream_header_wait(
+                    upstream_header_started_at.elapsed(),
                 );
-                ExternalForwardError::new(
-                    ExternalPoolError {
-                        status: None,
-                        message: sanitized_external_network_error("request send failed", &err),
-                        retryable: true,
-                        auto_disable_reason: None,
-                        cooldown: Some((
-                            Duration::from_secs(
-                                config.external_pool_network_error_cooldown_secs.max(1),
-                            ),
-                            "network_error".to_string(),
-                        )),
-                        protocol_error: None,
-                        raw_upstream_error: None,
-                    },
-                    outbound_model.clone(),
-                )
-            })?,
+                response.map_err(|err| {
+                    tracing::warn!(
+                        request_id = %route.request_id,
+                        error_id = %route.error_id,
+                        pool_id = pool.id,
+                        error_class = %sanitized_external_network_error("request send failed", &err),
+                        "external pool request send failed"
+                    );
+                    ExternalForwardError::new(
+                        ExternalPoolError {
+                            status: None,
+                            message: sanitized_external_network_error("request send failed", &err),
+                            retryable: true,
+                            auto_disable_reason: None,
+                            cooldown: Some((
+                                Duration::from_secs(
+                                    config.external_pool_network_error_cooldown_secs.max(1),
+                                ),
+                                "network_error".to_string(),
+                            )),
+                            protocol_error: None,
+                            raw_upstream_error: None,
+                        },
+                        outbound_model.clone(),
+                    )
+                })?
+            },
             _ = lease.wait_until_lost() => {
                 return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
             }
@@ -9791,6 +9799,11 @@ fn external_usage_latency_trace(route: &ExternalRouteRequest) -> UsageLatencyTra
     let mut latency_trace = route.latency_trace.snapshot().unwrap_or_default();
     latency_trace.inference_attempts = Some(route.inference_attempt_budget.snapshot());
     latency_trace.auxiliary_attempts = Some(route.inference_attempt_budget.auxiliary_snapshot());
+    latency_trace.credential_dispatch_elapsed_ms = route
+        .inference_attempt_budget
+        .credential_dispatch_elapsed_ms();
+    latency_trace.upstream_header_wait_ms =
+        route.inference_attempt_budget.upstream_header_wait_ms();
     latency_trace
 }
 

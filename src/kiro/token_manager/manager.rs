@@ -4925,7 +4925,7 @@ impl MultiTokenManager {
         }
     }
 
-    fn try_enter_dispatch_queue(
+    async fn try_enter_dispatch_queue(
         &self,
         max_wait: Option<StdDuration>,
     ) -> anyhow::Result<Option<DispatchQueueGuard>> {
@@ -4957,19 +4957,22 @@ impl MultiTokenManager {
                 lease_policy.ttl_secs,
                 lease_policy.renewal_required,
             );
-            match self.block_on_scheduler_redis_hot_outcome(
-                "占用 Redis 调度排队名额",
-                || guard.arm_redis_commit_unknown(),
-                async move {
-                    redis
-                        .try_enter_dispatch_queue(
-                            &acquire_lease_id,
-                            max_queued,
-                            lease_policy.ttl_secs,
-                        )
-                        .await
-                },
-            ) {
+            match self
+                .await_scheduler_redis_hot_outcome(
+                    "占用 Redis 调度排队名额",
+                    || guard.arm_redis_commit_unknown(),
+                    async move {
+                        redis
+                            .try_enter_dispatch_queue(
+                                &acquire_lease_id,
+                                max_queued,
+                                lease_policy.ttl_secs,
+                            )
+                            .await
+                    },
+                )
+                .await
+            {
                 SchedulerRedisHotOutcome::Completed(true) => {
                     guard.confirm_redis_acquired();
                     return Ok(Some(guard));
@@ -6202,7 +6205,7 @@ impl MultiTokenManager {
                         }
                     }
                     if queue_guard.is_none() {
-                        queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait)?;
+                        queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                         if queue_guard.is_none() {
                             anyhow::bail!(
                                 "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -6426,7 +6429,7 @@ impl MultiTokenManager {
                     continue;
                 }
                 if queue_guard.is_none() {
-                    queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait)?;
+                    queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                     if queue_guard.is_none() {
                         anyhow::bail!(
                             "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
@@ -6589,7 +6592,8 @@ impl MultiTokenManager {
                                 );
                             }
                             if queue_guard.is_none() {
-                                queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait)?;
+                                queue_guard =
+                                    self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                                 if queue_guard.is_none() {
                                     anyhow::bail!(
                                         "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",

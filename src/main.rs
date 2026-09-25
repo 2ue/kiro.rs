@@ -533,11 +533,14 @@ async fn main() {
         postgres_store.clone(),
         redis_store.clone(),
     ));
+    let admin_api_key_store =
+        admin::AdminApiKeyStore::new(config.admin_api_key.clone().unwrap_or_default());
     let runtime_event_health = Arc::new(RuntimeEventHealth::default());
     let runtime_event_listener = spawn_redis_runtime_event_listener(
         redis_store.clone(),
         token_manager.clone(),
         external_pool_manager.clone(),
+        admin_api_key_store.clone(),
         request_api_key_store.clone(),
         request_admission.clone(),
         runtime_event_health.clone(),
@@ -660,7 +663,8 @@ async fn main() {
                 request_admission: request_admission.clone(),
                 external_pool_manager: external_pool_manager.clone(),
             });
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let admin_state =
+                admin::AdminState::with_key_store(admin_api_key_store.clone(), admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建管理后台 UI 路由
@@ -1275,10 +1279,18 @@ async fn new_ui_index_redirect() -> Redirect {
     Redirect::permanent("/ui")
 }
 
+fn refresh_admin_api_key_from_runtime_config(
+    config: &Config,
+    admin_api_key_store: &admin::AdminApiKeyStore,
+) {
+    admin_api_key_store.replace(config.admin_api_key.clone().unwrap_or_default());
+}
+
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
     external_pool_manager: Arc<ExternalPoolManager>,
+    admin_api_key_store: admin::AdminApiKeyStore,
     request_api_key_store: Arc<RequestApiKeyStore>,
     request_admission: Arc<anthropic::request_admission::RequestAdmissionController>,
     health: Arc<RuntimeEventHealth>,
@@ -1325,6 +1337,10 @@ fn spawn_redis_runtime_event_listener(
                                     }
                                     request_api_key_store.replace_keys(config.request_api_keys());
                                     request_admission.update_config(config.request_admission);
+                                    refresh_admin_api_key_from_runtime_config(
+                                        &config,
+                                        &admin_api_key_store,
+                                    );
                                     tracing::info!(payload, "已根据 Redis 通知热加载运行配置");
                                 }
                                 Ok(false) => tracing::debug!(payload, "收到运行配置通知，但未执行热加载"),
@@ -1361,6 +1377,10 @@ fn spawn_redis_runtime_event_listener(
                                 }
                                 request_api_key_store.replace_keys(config.request_api_keys());
                                 request_admission.update_config(config.request_admission);
+                                refresh_admin_api_key_from_runtime_config(
+                                    &config,
+                                    &admin_api_key_store,
+                                );
                             }
                             Ok(false) => {}
                             Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),

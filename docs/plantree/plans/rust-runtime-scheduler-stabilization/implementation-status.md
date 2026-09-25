@@ -1,6 +1,14 @@
 # Implementation Status
 
-Last reviewed: 2026-09-18 Asia/Shanghai
+Last reviewed: 2026-09-25 Asia/Shanghai
+
+Current active work: [Service audit and backlog causality](topics/service-audit-and-backlog-causality.md).
+
+- Plan phase: service-audit/backlog implementation complete; local validation complete;
+  production attribution evidence pending.
+- Hard constraints: preserve current request/queue/stream/RPM limits; no production load; do not mutate the user-provided untracked analysis/refactor documents or `.kilo` state.
+- Next: collect only the missing redacted production configuration and request timeline;
+  do not change policy based on local fake-upstream evidence alone.
 
 Current phase:
 

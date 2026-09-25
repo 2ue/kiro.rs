@@ -10225,7 +10225,8 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let mut ctx = match self
+            let acquire_started_at = Instant::now();
+            let acquire_result = self
                 .token_manager
                 .acquire_context_for_session_with_mode_and_auxiliary_budget(
                     None,
@@ -10235,8 +10236,10 @@ impl KiroProvider {
                     1,
                     Some(auxiliary_attempt_budget.clone()),
                 )
-                .await
-            {
+                .await;
+            inference_attempt_budget
+                .record_credential_dispatch_elapsed(acquire_started_at.elapsed());
+            let mut ctx = match acquire_result {
                 Ok(c) => c,
                 Err(e) => {
                     if last_error.is_none() {
@@ -10393,12 +10396,15 @@ impl KiroProvider {
             }
             attribution_sink.begin_send(attempt, ctx.id, &credential_label);
 
-            let response = match send_with_response_header_timeout(
+            let upstream_header_started_at = Instant::now();
+            let response_result = send_with_response_header_timeout(
                 request,
                 config.kiro_upstream_response_timeout_secs,
             )
-            .await
-            {
+            .await;
+            inference_attempt_budget
+                .record_upstream_header_wait(upstream_header_started_at.elapsed());
+            let response = match response_result {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -11249,7 +11255,8 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self
+            let acquire_started_at = Instant::now();
+            let acquire_result = self
                 .token_manager
                 .acquire_context_for_session_with_mode_and_auxiliary_budget(
                     model.as_deref(),
@@ -11259,8 +11266,11 @@ impl KiroProvider {
                     capacity_weight_units,
                     Some(auxiliary_attempt_budget.clone()),
                 )
-                .await
-            {
+                .await;
+            if let Some(budget) = inference_attempt_budget {
+                budget.record_credential_dispatch_elapsed(acquire_started_at.elapsed());
+            }
+            let mut ctx = match acquire_result {
                 Ok(c) => c,
                 Err(e) => {
                     let call_failure_kind = Self::auxiliary_call_failure_kind(&e);
@@ -11442,12 +11452,16 @@ impl KiroProvider {
                 }
             }
 
-            let response = match send_with_response_header_timeout(
+            let upstream_header_started_at = Instant::now();
+            let response_result = send_with_response_header_timeout(
                 request,
                 config.kiro_upstream_response_timeout_secs,
             )
-            .await
-            {
+            .await;
+            if let Some(budget) = inference_attempt_budget {
+                budget.record_upstream_header_wait(upstream_header_started_at.elapsed());
+            }
+            let response = match response_result {
                 Ok(resp) => resp,
                 Err(e) => {
                     let failure_kind = Self::send_failure_kind(&e);
@@ -12244,12 +12258,16 @@ impl KiroProvider {
                     .header("content-type", endpoint.content_type())
                     .header("Connection", "close");
                 let retry_request = endpoint.decorate_api(retry_base, &retry_rctx);
-                let retry_response = match send_with_response_header_timeout(
+                let upstream_header_started_at = Instant::now();
+                let retry_response_result = send_with_response_header_timeout(
                     retry_request,
                     config.kiro_upstream_response_timeout_secs,
                 )
-                .await
-                {
+                .await;
+                if let Some(budget) = inference_attempt_budget {
+                    budget.record_upstream_header_wait(upstream_header_started_at.elapsed());
+                }
+                let retry_response = match retry_response_result {
                     Ok(response) => response,
                     Err(error) => {
                         let failure_kind = Self::send_failure_kind(&error);
