@@ -94,6 +94,9 @@ Last reviewed: 2026-09-25 Asia/Shanghai
   - first historical archive batch for old slow-first-token/stream-fluidity analysis.
 - External pool strategy productization:
   - local capacity queue-first vs external takeover policy;
+  - source-verified route concurrency scenarios now distinguish per-API-Key
+    admission coupling from independent local/external capacity domains; see
+    [route concurrency scenarios](topics/local-external-route-concurrency-scenarios-20260925.md);
   - keep local rescue capacity-aware and prevent direct/external-only requests from returning
   to local credentials;
   - candidate rejection observability and clearer model-stage display;

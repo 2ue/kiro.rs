@@ -20,6 +20,7 @@ Authority:
 2. [Implementation status](implementation-status.md)
 3. Topics:
    - [外部池与本地凭证调度](topics/external-pool-local-first-scheduler.md)
+   - [本地账号与外部池路由并发场景](topics/local-external-route-concurrency-scenarios-20260925.md)
    - [整体调度架构优化](topics/route-planner-capacity-ledger.md)
    - [统一调度目标契约、状态机与验证方案](topics/scheduler-target-state-machine-and-test-contract.md)
    - [当前目标符合度矩阵](topics/scheduler-target-compliance-matrix.md)
