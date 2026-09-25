@@ -399,6 +399,11 @@ async fn main() {
     let request_admission = Arc::new(
         anthropic::request_admission::RequestAdmissionController::new(config.request_admission),
     );
+    apply_request_api_key_runtime(&config, &request_api_key_store, &request_admission);
+    if request_api_key_store.len() == 0 {
+        tracing::error!("运行配置中没有启用的客户端请求 API Key");
+        std::process::exit(1);
+    }
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -1286,6 +1291,30 @@ fn refresh_admin_api_key_from_runtime_config(
     admin_api_key_store.replace(config.admin_api_key.clone().unwrap_or_default());
 }
 
+fn apply_request_api_key_runtime(
+    config: &Config,
+    request_api_key_store: &RequestApiKeyStore,
+    request_admission: &anthropic::request_admission::RequestAdmissionController,
+) {
+    let policies = config.request_api_key_policies();
+    let disabled = policies
+        .iter()
+        .filter(|policy| !policy.enabled)
+        .map(|policy| policy.api_key.as_str())
+        .collect::<Vec<_>>();
+    request_api_key_store.replace_keys_with_disabled(config.request_api_keys(), disabled);
+
+    let overrides = policies
+        .iter()
+        .filter_map(|policy| {
+            let admission = policy.request_admission?;
+            let identity = request_api_key_store.authenticate(&policy.api_key)?;
+            Some((identity, admission))
+        })
+        .collect::<Vec<_>>();
+    request_admission.update_policies(config.request_admission, overrides);
+}
+
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
@@ -1335,8 +1364,11 @@ fn spawn_redis_runtime_event_listener(
                                         external_pool_manager
                                             .invalidate_external_pool_policy_state();
                                     }
-                                    request_api_key_store.replace_keys(config.request_api_keys());
-                                    request_admission.update_config(config.request_admission);
+                                    apply_request_api_key_runtime(
+                                        &config,
+                                        &request_api_key_store,
+                                        &request_admission,
+                                    );
                                     refresh_admin_api_key_from_runtime_config(
                                         &config,
                                         &admin_api_key_store,
@@ -1375,8 +1407,11 @@ fn spawn_redis_runtime_event_listener(
                                     external_pool_manager
                                         .invalidate_external_pool_policy_state();
                                 }
-                                request_api_key_store.replace_keys(config.request_api_keys());
-                                request_admission.update_config(config.request_admission);
+                                apply_request_api_key_runtime(
+                                    &config,
+                                    &request_api_key_store,
+                                    &request_admission,
+                                );
                                 refresh_admin_api_key_from_runtime_config(
                                     &config,
                                     &admin_api_key_store,

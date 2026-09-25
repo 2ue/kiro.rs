@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::config::{ExternalPoolsConfig, RequestAdmissionConfig};
+use crate::model::config::{ExternalPoolsConfig, RequestAdmissionConfig, RequestApiKeyPolicy};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1080,7 +1080,7 @@ fn remove_request_api_key_by_id_removes_requested_key() {
 
 #[test]
 fn admin_request_key_id_matches_runtime_authenticated_identity() {
-    let items = request_api_key_items(&[" sk-one ".to_string()]);
+    let items = request_api_key_items(&[" sk-one ".to_string()], &[]);
     let store = RequestApiKeyStore::new(["sk-one"]);
     let runtime_id = store.authenticate("sk-one").unwrap().stable_id();
 
@@ -1091,6 +1091,74 @@ fn admin_request_key_id_matches_runtime_authenticated_identity() {
         items[0].id,
         crate::common::auth::request_api_key_id("sk-one")
     );
+}
+
+#[test]
+fn access_key_response_keeps_legacy_primary_field_and_lists_managed_policies() {
+    let keys = vec![
+        "sk-legacy-primary".to_string(),
+        "sk-managed-client".to_string(),
+    ];
+    let policies = vec![RequestApiKeyPolicy {
+        api_key: "sk-managed-client".to_string(),
+        name: "client-a".to_string(),
+        enabled: true,
+        request_admission: Some(RequestAdmissionConfig {
+            max_concurrent_requests: 5,
+            ..RequestAdmissionConfig::default()
+        }),
+    }];
+    let response = access_keys_response(
+        &keys,
+        &policies,
+        RequestAdmissionConfig::default(),
+        "sk-admin",
+    );
+
+    assert_eq!(response.request_api_key, "sk-legacy-primary");
+    assert_eq!(response.request_api_keys.len(), 2);
+    assert!(response.request_api_keys[0].primary);
+    assert_eq!(response.request_api_keys[0].api_key, "sk-legacy-primary");
+    assert!(!response.request_api_keys[1].primary);
+    assert_eq!(response.request_api_keys[1].name, "client-a");
+    assert_eq!(
+        response.request_api_keys[1]
+            .request_admission
+            .unwrap()
+            .max_concurrent_requests,
+        5
+    );
+
+    let wire = serde_json::to_value(response).expect("access-key response json");
+    assert_eq!(wire["requestApiKey"], "sk-legacy-primary");
+    assert_eq!(wire["requestApiKeys"][1]["apiKey"], "sk-managed-client");
+}
+
+#[test]
+fn request_key_policy_validation_preserves_legacy_keys_and_fails_closed() {
+    let keys = vec!["sk-legacy".to_string(), "sk-managed".to_string()];
+    assert!(validate_request_api_key_policies(&keys, &[]).is_ok());
+
+    let policy = RequestApiKeyPolicy {
+        api_key: "sk-managed".to_string(),
+        name: "client-a".to_string(),
+        enabled: true,
+        request_admission: Some(RequestAdmissionConfig {
+            max_concurrent_requests: 5,
+            ..RequestAdmissionConfig::default()
+        }),
+    };
+    assert!(validate_request_api_key_policies(&keys, std::slice::from_ref(&policy)).is_ok());
+
+    let mut unknown = policy.clone();
+    unknown.api_key = "sk-not-configured".to_string();
+    assert!(validate_request_api_key_policies(&keys, &[unknown]).is_err());
+
+    let mut disabled = policy.clone();
+    disabled.enabled = false;
+    assert!(validate_request_api_key_policies(&["sk-managed".to_string()], &[disabled]).is_err());
+
+    assert!(validate_request_api_key_policies(&keys, &[policy.clone(), policy]).is_err());
 }
 
 #[test]

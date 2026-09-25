@@ -111,8 +111,23 @@ impl RequestApiKeyStore {
         }
     }
 
+    #[cfg(test)]
     pub fn replace_keys(&self, keys: impl IntoIterator<Item = impl AsRef<str>>) {
         *self.hashes.write() = api_key_hashes(keys);
+    }
+
+    /// Replace the authentication set while keeping disabled managed keys in
+    /// configuration but out of the hot-path lookup set.
+    pub fn replace_keys_with_disabled(
+        &self,
+        keys: impl IntoIterator<Item = impl AsRef<str>>,
+        disabled_keys: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        let mut hashes = api_key_hashes(keys);
+        for disabled in api_key_hashes(disabled_keys) {
+            hashes.remove(&disabled);
+        }
+        *self.hashes.write() = hashes;
     }
 
     #[cfg(test)]
@@ -156,6 +171,17 @@ mod tests {
         assert!(!store.contains("sk-old"));
         assert!(store.contains("sk-new"));
         assert!(store.contains("sk-extra"));
+    }
+
+    #[test]
+    fn disabled_managed_key_is_removed_without_affecting_other_legacy_keys() {
+        let store = RequestApiKeyStore::new(["sk-primary", "sk-extra", "sk-managed"]);
+
+        store.replace_keys_with_disabled(["sk-primary", "sk-extra", "sk-managed"], ["sk-managed"]);
+
+        assert!(store.contains("sk-primary"));
+        assert!(store.contains("sk-extra"));
+        assert!(!store.contains("sk-managed"));
     }
 
     #[test]

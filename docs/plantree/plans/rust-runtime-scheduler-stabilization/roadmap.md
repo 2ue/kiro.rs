@@ -4,6 +4,17 @@ Last reviewed: 2026-09-25 Asia/Shanghai
 
 ## Done
 
+- Per-request API Key admission management: managed Key list and per-Key RPM,
+  concurrency, queue size and timeout now use digest-keyed independent admission
+  state. Legacy `apiKey`/`apiKeys` and `requestApiKey` primary response remain
+  compatible; runtime policy publication is atomic, queued waiters are woken on
+  updates, and stale file config cannot resurrect a removed managed Key. Default
+  and no-default Rust suites, targeted two-key/queue/instance-scope tests, both
+  UI builds, Clippy baseline, release build and inventory passed. Per-key
+  admission is per process; local/external dispatch capacity remains shared.
+  See [implementation plan](topics/per-key-request-admission-management.md)
+  and [verification evidence](../../../../feature/evidence/per-key-request-admission-management-20260925.md).
+
 - External pool local-route hot path moved to cached/no-wait gates.
 - Raw preflight route gate moved to cached/no-wait.
 - Raw direct external no longer filters candidates by “请求正文模式”; it still performs a

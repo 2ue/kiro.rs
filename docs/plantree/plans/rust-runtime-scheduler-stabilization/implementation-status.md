@@ -2,7 +2,23 @@
 
 Last reviewed: 2026-09-25 Asia/Shanghai
 
-Current active work: [Service audit and backlog causality](topics/service-audit-and-backlog-causality.md).
+Current active work: [Per-key request admission management](topics/per-key-request-admission-management.md).
+
+- Plan phase: per-key request admission implementation and local verification complete; release publication is the next action.
+- Compatibility invariant: existing `apiKey`/`apiKeys` remain accepted; an unmanaged key
+  continues to inherit global `requestAdmission`.
+- Current scope: independent per-key HTTP admission settings and key-list UI; local and
+  external scheduler capacity remains shared and is not claimed as isolated here.
+- Done this phase: compatibility merge, Admin API/key list, per-key RPM/concurrency/queue,
+  atomic live policy snapshots, two-key HTTP mock pressure tests, two-instance scope test,
+  and both UI surfaces.
+- Last verified: default Rust `2179 passed / 6 ignored` plus loadtest `31/31`; no-default
+  full suite passed; Clippy `764 <= 849`; all-target check and release build passed;
+  both frontend builds, fake-upstream smoke `12/12`, and artifact inventory passed.
+- Next: finish the requested release workflow; preserve the documented per-instance
+  limit and shared local/external scheduler boundary.
+
+Related active follow-up: [Service audit and backlog causality](topics/service-audit-and-backlog-causality.md).
 
 - Plan phase: service-audit/backlog implementation complete; local validation complete;
   production attribution evidence pending.

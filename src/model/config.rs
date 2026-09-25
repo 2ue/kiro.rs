@@ -3339,6 +3339,39 @@ const MAX_REQUEST_API_KEY_CONCURRENT_REQUESTS: u32 = 10_000;
 const MAX_REQUEST_API_KEY_QUEUED_REQUESTS: u32 = 100_000;
 const MAX_REQUEST_API_KEY_QUEUE_TIMEOUT_MS: u64 = 300_000;
 
+/// Optional per-client admission override for a managed request API Key.
+///
+/// The secret is intentionally kept in the same runtime configuration surface
+/// as the legacy `apiKey`/`apiKeys` fields. Existing deployments therefore do
+/// not need a migration step: a policy is only applied when its key is present
+/// in this list, while all legacy keys continue to use `requestAdmission`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestApiKeyPolicy {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub request_admission: Option<RequestAdmissionConfig>,
+}
+
+impl RequestApiKeyPolicy {
+    pub fn normalized(mut self) -> Option<Self> {
+        self.api_key = self.api_key.trim().to_string();
+        if self.api_key.is_empty() {
+            return None;
+        }
+        self.name = self.name.trim().chars().take(80).collect();
+        self.request_admission = self
+            .request_admission
+            .map(RequestAdmissionConfig::normalized);
+        Some(self)
+    }
+}
+
 fn default_request_api_key_rpm() -> u32 {
     300
 }
@@ -3576,6 +3609,12 @@ pub struct Config {
     /// Queue 只修饰并发等待，无独立 enabled 语义，并在无效组合中规范化为 0/0。
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub request_admission: RequestAdmissionConfig,
+
+    /// Managed request API Keys. This is additive to the legacy `apiKey` and
+    /// `apiKeys` fields; legacy keys remain valid and inherit the global
+    /// `requestAdmission` policy unless an override is explicitly present.
+    #[serde(default)]
+    pub request_api_key_policies: Vec<RequestApiKeyPolicy>,
 
     /// 单凭据目标请求速率（RPM）。
     ///
@@ -5055,6 +5094,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             request_admission: RequestAdmissionConfig::default(),
+            request_api_key_policies: Vec::new(),
             credential_rpm: default_credential_rpm(),
             credential_max_concurrent_requests: default_credential_max_concurrent_requests(),
             credential_info_refresh_concurrency: default_credential_info_refresh_concurrency(),
@@ -5232,12 +5272,41 @@ impl Config {
     /// 历史配置只包含 `apiKey`；新配置可以额外包含 `apiKeys`。这里统一去空、trim、去重，
     /// 并保留原始顺序，保证旧主 key 仍排在第一位。
     pub fn request_api_keys(&self) -> Vec<String> {
-        normalize_request_api_keys(
+        let mut keys = normalize_request_api_keys(
             self.api_key
                 .iter()
                 .chain(self.api_keys.iter())
                 .map(String::as_str),
-        )
+        );
+        for policy in &self.request_api_key_policies {
+            keys.extend(normalize_request_api_keys([policy.api_key.as_str()]));
+        }
+        normalize_request_api_keys(keys)
+    }
+
+    /// Returns normalized managed policies with duplicate secrets collapsed.
+    ///
+    /// The first entry wins so an operator cannot accidentally change a
+    /// client's limits by adding a duplicate later in the file.
+    pub fn request_api_key_policies(&self) -> Vec<RequestApiKeyPolicy> {
+        let mut seen = BTreeSet::new();
+        self.request_api_key_policies
+            .iter()
+            .filter_map(|policy| policy.clone().normalized())
+            .filter(|policy| seen.insert(policy.api_key.clone()))
+            .collect()
+    }
+
+    pub fn set_request_api_key_policies(
+        &mut self,
+        policies: impl IntoIterator<Item = RequestApiKeyPolicy>,
+    ) {
+        let mut seen = BTreeSet::new();
+        self.request_api_key_policies = policies
+            .into_iter()
+            .filter_map(RequestApiKeyPolicy::normalized)
+            .filter(|policy| seen.insert(policy.api_key.clone()))
+            .collect();
     }
 
     /// Validate that observability Redis cannot share the scheduler Redis fault domain.
@@ -5283,12 +5352,20 @@ impl Config {
     /// 如果数据库 runtime config 缺少客户端调用 Key，则从文件配置补齐一次。
     pub fn fill_missing_access_keys_from(&mut self, file_config: &Config) -> bool {
         let mut changed = false;
-        if self.request_api_keys().is_empty() {
+        let missing_request_keys = self.request_api_keys().is_empty();
+        if missing_request_keys {
             let file_keys = file_config.request_api_keys();
             if !file_keys.is_empty() {
                 self.set_request_api_keys(file_keys);
                 changed = true;
             }
+        }
+        if missing_request_keys
+            && self.request_api_key_policies.is_empty()
+            && !file_config.request_api_key_policies.is_empty()
+        {
+            self.set_request_api_key_policies(file_config.request_api_key_policies.clone());
+            changed = true;
         }
         if self
             .admin_api_key
@@ -5955,6 +6032,62 @@ mod tests {
     }
 
     #[test]
+    fn managed_request_key_policies_are_additive_and_keep_legacy_keys() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-legacy-primary",
+                "apiKeys": ["sk-legacy-extra"],
+                "requestAdmission": {
+                    "rpm": 300,
+                    "maxConcurrentRequests": 32,
+                    "maxQueuedRequests": 64,
+                    "queueTimeoutMs": 1000
+                },
+                "requestApiKeyPolicies": [{
+                    "apiKey": "sk-managed",
+                    "name": "client-a",
+                    "enabled": true,
+                    "requestAdmission": {
+                        "rpm": 120,
+                        "maxConcurrentRequests": 5,
+                        "maxQueuedRequests": 7,
+                        "queueTimeoutMs": 2500
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.request_api_keys(),
+            vec![
+                "sk-legacy-primary".to_string(),
+                "sk-legacy-extra".to_string(),
+                "sk-managed".to_string(),
+            ]
+        );
+        assert_eq!(config.request_admission, RequestAdmissionConfig::default());
+        assert_eq!(config.request_api_key_policies().len(), 1);
+        assert_eq!(
+            config.request_api_key_policies()[0].request_admission,
+            Some(RequestAdmissionConfig {
+                rpm: 120,
+                max_concurrent_requests: 5,
+                max_queued_requests: 7,
+                queue_timeout_ms: 2_500,
+            })
+        );
+
+        let round_trip: Config =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(round_trip.request_api_keys(), config.request_api_keys());
+        assert_eq!(
+            round_trip.request_api_key_policies(),
+            config.request_api_key_policies()
+        );
+    }
+
+    #[test]
     fn request_admission_has_conservative_defaults_and_explicit_zero_disables() {
         let fresh = Config::default();
         assert_eq!(fresh.request_admission, RequestAdmissionConfig::default());
@@ -6132,6 +6265,15 @@ mod tests {
         let mut database = Config::default();
         let mut file = Config::default();
         file.set_request_api_keys(["sk-file", "sk-extra"]);
+        file.set_request_api_key_policies([RequestApiKeyPolicy {
+            api_key: "sk-extra".to_string(),
+            name: "file-managed".to_string(),
+            enabled: true,
+            request_admission: Some(RequestAdmissionConfig {
+                max_concurrent_requests: 4,
+                ..RequestAdmissionConfig::default()
+            }),
+        }]);
         file.admin_api_key = Some("sk-admin-file".to_string());
 
         assert!(database.fill_missing_access_keys_from(&file));
@@ -6139,7 +6281,33 @@ mod tests {
             database.request_api_keys(),
             vec!["sk-file".to_string(), "sk-extra".to_string()]
         );
+        assert_eq!(
+            database.request_api_key_policies(),
+            file.request_api_key_policies()
+        );
         assert_eq!(database.admin_api_key.as_deref(), Some("sk-admin-file"));
+    }
+
+    #[test]
+    fn fill_missing_access_keys_does_not_resurrect_removed_managed_key_from_file() {
+        let mut database = Config::default();
+        database.set_request_api_keys(["sk-legacy"]);
+        let mut file = Config::default();
+        file.set_request_api_keys(["sk-legacy", "sk-removed"]);
+        file.set_request_api_key_policies([RequestApiKeyPolicy {
+            api_key: "sk-removed".to_string(),
+            name: "stale-file-entry".to_string(),
+            enabled: true,
+            request_admission: Some(RequestAdmissionConfig::default()),
+        }]);
+
+        assert!(!database.fill_missing_access_keys_from(&file));
+        assert_eq!(
+            database.request_api_keys(),
+            vec!["sk-legacy".to_string()],
+            "database key removal must not be undone by stale file policies"
+        );
+        assert!(database.request_api_key_policies().is_empty());
     }
 
     #[test]

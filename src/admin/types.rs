@@ -1577,6 +1577,7 @@ pub struct AccessKeysResponse {
     pub masked_request_api_key: String,
     /// 下游客户端调用 API Key 列表。`requestApiKey` 为兼容旧前端保留，等于这里的第一项。
     pub request_api_keys: Vec<RequestApiKeyItem>,
+    pub default_request_admission: RequestAdmissionConfig,
     /// 管理后台登录和 /api/admin 认证使用的 Key。
     pub admin_api_key: String,
     pub masked_admin_api_key: String,
@@ -1589,6 +1590,10 @@ pub struct RequestApiKeyItem {
     pub api_key: String,
     pub masked_api_key: String,
     pub primary: bool,
+    pub name: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_admission: Option<RequestAdmissionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1596,6 +1601,12 @@ pub struct RequestApiKeyItem {
 pub struct CreateRequestApiKeyRequest {
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub request_admission: Option<RequestAdmissionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1603,6 +1614,12 @@ pub struct CreateRequestApiKeyRequest {
 pub struct UpdateRequestApiKeyRequest {
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub request_admission: Option<RequestAdmissionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

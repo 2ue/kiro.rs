@@ -37,6 +37,7 @@ import type {
   ReportedUsageFieldPolicy,
   ReportedUsagePathPolicy,
   RequestApiKeyItem,
+  RequestAdmissionConfig,
   RuntimeConfig,
 } from '@/types/api'
 
@@ -858,7 +859,13 @@ function ImpactGroupHeader({
 
 function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[] {
   if (!response) return []
-  if (response.requestApiKeys?.length) return response.requestApiKeys
+  if (response.requestApiKeys?.length) {
+    return response.requestApiKeys.map((item, index) => ({
+      ...item,
+      name: item.name ?? `请求 Key ${index + 1}`,
+      enabled: item.enabled ?? true,
+    }))
+  }
   if (!response.requestApiKey) return []
   return [
     {
@@ -866,6 +873,8 @@ function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[
       apiKey: response.requestApiKey,
       maskedApiKey: response.maskedRequestApiKey,
       primary: true,
+      name: '兼容旧主 Key',
+      enabled: true,
     },
   ]
 }
@@ -875,15 +884,109 @@ const REQUEST_API_KEY_PREFIX = 'sk-kiro-rs-'
 function generateLocalRequestApiKey(): string {
   const bytes = new Uint8Array(32)
   const cryptoApi = globalThis.crypto
-  if (cryptoApi?.getRandomValues) {
-    cryptoApi.getRandomValues(bytes)
-  } else {
-    for (let index = 0; index < bytes.length; index += 1) {
-      bytes[index] = Math.floor(Math.random() * 256)
-    }
-  }
+  if (!cryptoApi?.getRandomValues) throw new Error('当前环境不支持安全随机数生成')
+  cryptoApi.getRandomValues(bytes)
   const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
   return `${REQUEST_API_KEY_PREFIX}${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`
+}
+
+function fillWithGeneratedRequestKey(setValue: (value: string) => void) {
+  try {
+    setValue(generateLocalRequestApiKey())
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法安全生成请求 Key')
+  }
+}
+
+const DEFAULT_REQUEST_ADMISSION: RequestAdmissionConfig = {
+  rpm: 300,
+  maxConcurrentRequests: 32,
+  maxQueuedRequests: 64,
+  queueTimeoutMs: 1000,
+}
+
+function RequestApiKeyPolicyEditor({
+  item,
+  defaultAdmission,
+  disabled,
+  onSave,
+}: {
+  item: RequestApiKeyItem
+  defaultAdmission: RequestAdmissionConfig
+  disabled: boolean
+  onSave: (policy: {
+    name: string
+    enabled: boolean
+    requestAdmission: RequestAdmissionConfig
+  }) => void
+}) {
+  const admission = item.requestAdmission ?? defaultAdmission
+  const [name, setName] = useState(item.name)
+  const [enabled, setEnabled] = useState(item.enabled)
+  const [rpm, setRpm] = useState(admission.rpm)
+  const [concurrent, setConcurrent] = useState(admission.maxConcurrentRequests)
+  const [queued, setQueued] = useState(admission.maxQueuedRequests)
+  const [timeout, setTimeout] = useState(admission.queueTimeoutMs)
+  const numeric = (value: string, max: number) =>
+    Math.min(max, Math.max(0, Number.parseInt(value, 10) || 0))
+
+  useEffect(() => {
+    setName(item.name)
+    setEnabled(item.enabled)
+    setRpm(admission.rpm)
+    setConcurrent(admission.maxConcurrentRequests)
+    setQueued(admission.maxQueuedRequests)
+    setTimeout(admission.queueTimeoutMs)
+  }, [item.id, item.name, item.enabled, admission.rpm, admission.maxConcurrentRequests, admission.maxQueuedRequests, admission.queueTimeoutMs])
+
+  return (
+    <div className="mt-4 border-t pt-4">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        <label className="space-y-1 text-xs text-muted-foreground">
+          <span>名称</span>
+          <Input value={name} maxLength={80} disabled={disabled} onChange={(event) => setName(event.target.value)} />
+        </label>
+        <div className="flex items-end justify-between gap-3 pb-1">
+          <span className="text-sm">启用此 Key</span>
+          <Switch checked={enabled} disabled={disabled} onCheckedChange={setEnabled} />
+        </div>
+        <label className="space-y-1 text-xs text-muted-foreground">
+          <span>每分钟请求数，0 为不限</span>
+          <Input type="number" min={0} max={1_000_000} value={rpm} disabled={disabled} onChange={(event) => setRpm(numeric(event.target.value, 1_000_000))} />
+        </label>
+        <label className="space-y-1 text-xs text-muted-foreground">
+          <span>同时请求数，0 为不限</span>
+          <Input type="number" min={0} max={10_000} value={concurrent} disabled={disabled} onChange={(event) => setConcurrent(numeric(event.target.value, 10_000))} />
+        </label>
+        <label className="space-y-1 text-xs text-muted-foreground">
+          <span>最多排队数</span>
+          <Input type="number" min={0} max={100_000} value={queued} disabled={disabled} onChange={(event) => setQueued(numeric(event.target.value, 100_000))} />
+        </label>
+        <label className="space-y-1 text-xs text-muted-foreground">
+          <span>最长等待毫秒</span>
+          <Input type="number" min={0} max={300_000} value={timeout} disabled={disabled} onChange={(event) => setTimeout(numeric(event.target.value, 300_000))} />
+        </label>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs leading-5 text-muted-foreground">
+          此上限按实例、按 Key 生效；排队请求不会自动切换到外部池。
+        </p>
+        <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={() => onSave({
+          name: name.trim(),
+          enabled,
+          requestAdmission: {
+            rpm,
+            maxConcurrentRequests: concurrent,
+            maxQueuedRequests: queued,
+            queueTimeoutMs: timeout,
+          },
+        })}>
+          <Save className="h-4 w-4" />
+          保存 Key 设置
+        </Button>
+      </div>
+    </div>
+  )
 }
 
 function AccessKeysPanel() {
@@ -1031,6 +1134,25 @@ function AccessKeysPanel() {
     }
   }
 
+  const saveRequestKeyPolicy = async (
+    item: RequestApiKeyItem,
+    policy: {
+      name: string
+      enabled: boolean
+      requestAdmission: RequestAdmissionConfig
+    },
+  ) => {
+    setProcessingKeyId(item.id)
+    try {
+      setKeysAndResetDrafts(await updateRequestApiKey(item.id, policy))
+      toast.success('此 Key 的独立并发与 RPM 设置已生效')
+    } catch (error) {
+      toast.error(`保存 Key 设置失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setProcessingKeyId(null)
+    }
+  }
+
   const removeRequestKey = async (item: RequestApiKeyItem) => {
     if (requestKeys.length <= 1) return toast.error('至少需要保留一个请求 Key')
     if (!window.confirm(`确认删除 ${item.maskedApiKey}？删除后使用该 Key 的客户端会立即 401。`)) return
@@ -1070,7 +1192,7 @@ function AccessKeysPanel() {
                 apiKey / apiKeys
               </span>
               <span className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
-                {requestKeys.length} 个可用
+                {requestKeys.filter((item) => item.enabled).length} 个可用
               </span>
             </div>
             <div className="mt-1 text-xs leading-5 text-muted-foreground">
@@ -1091,7 +1213,7 @@ function AccessKeysPanel() {
             disabled={loading || creating}
             onChange={(event) => setManualRequestApiKey(event.target.value)}
           />
-          <Button type="button" variant="outline" className="shrink-0" disabled={loading || creating} onClick={() => setManualRequestApiKey(generateLocalRequestApiKey())}>
+          <Button type="button" variant="outline" className="shrink-0" disabled={loading || creating} onClick={() => fillWithGeneratedRequestKey(setManualRequestApiKey)}>
             <Wand2 className="h-4 w-4" />
             随机生成
           </Button>
@@ -1115,6 +1237,12 @@ function AccessKeysPanel() {
                 <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <span className="text-sm font-semibold">请求 Key</span>
+                    <span className="text-sm text-muted-foreground">{item.name}</span>
+                    {!item.enabled && (
+                      <span className="rounded-md border border-destructive/20 bg-destructive/10 px-2 py-0.5 text-[11px] font-medium text-destructive">
+                        已停用
+                      </span>
+                    )}
                     {item.primary && (
                       <span className="rounded-md border border-primary/20 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary">主 Key</span>
                     )}
@@ -1152,7 +1280,7 @@ function AccessKeysPanel() {
                   />
                   {editing && (
                     <div className="flex flex-wrap justify-end gap-2">
-                      <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => setRequestKeyDraft(generateLocalRequestApiKey())}>
+                      <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => fillWithGeneratedRequestKey(setRequestKeyDraft)}>
                         <Wand2 className="h-4 w-4" />
                         随机生成
                       </Button>
@@ -1167,6 +1295,12 @@ function AccessKeysPanel() {
                     </div>
                   )}
                 </div>
+                <RequestApiKeyPolicyEditor
+                  item={item}
+                  defaultAdmission={keys?.defaultRequestAdmission ?? DEFAULT_REQUEST_ADMISSION}
+                  disabled={busy || editing}
+                  onSave={(policy) => saveRequestKeyPolicy(item, policy)}
+                />
               </div>
             )
           })}

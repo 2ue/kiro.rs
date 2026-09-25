@@ -88,7 +88,8 @@ use crate::kiro::token_manager::{
 use crate::model::config::{
     Config, ExternalPoolsConfig, MAX_LOCAL_BERSERK_ROUND_DELAY_MS, MAX_LOCAL_BERSERK_ROUNDS,
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
-    MIN_TOKEN_REFRESH_MAX_RPM, normalize_defined_cache_routes,
+    MIN_TOKEN_REFRESH_MAX_RPM, RequestAdmissionConfig, RequestApiKeyPolicy,
+    normalize_defined_cache_routes,
 };
 use crate::model::model_support::normalize_supported_models;
 use crate::storage::postgres::{
@@ -550,24 +551,46 @@ fn credential_secret_hash(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
-fn request_api_key_items(keys: &[String]) -> Vec<RequestApiKeyItem> {
+fn request_api_key_items(
+    keys: &[String],
+    policies: &[RequestApiKeyPolicy],
+) -> Vec<RequestApiKeyItem> {
+    let policy_by_key = policies
+        .iter()
+        .map(|policy| (policy.api_key.as_str(), policy))
+        .collect::<HashMap<_, _>>();
     keys.iter()
         .enumerate()
-        .map(|(index, key)| RequestApiKeyItem {
-            id: crate::common::auth::request_api_key_id(key),
-            api_key: key.clone(),
-            masked_api_key: mask_secret(key),
-            primary: index == 0,
+        .map(|(index, key)| {
+            let policy = policy_by_key.get(key.as_str()).copied();
+            RequestApiKeyItem {
+                id: crate::common::auth::request_api_key_id(key),
+                api_key: key.clone(),
+                masked_api_key: mask_secret(key),
+                primary: index == 0,
+                name: policy
+                    .map(|policy| policy.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("请求 Key {}", index + 1)),
+                enabled: policy.map(|policy| policy.enabled).unwrap_or(true),
+                request_admission: policy.and_then(|policy| policy.request_admission),
+            }
         })
         .collect()
 }
 
-fn access_keys_response(request_api_keys: &[String], admin_api_key: &str) -> AccessKeysResponse {
+fn access_keys_response(
+    request_api_keys: &[String],
+    policies: &[RequestApiKeyPolicy],
+    default_request_admission: RequestAdmissionConfig,
+    admin_api_key: &str,
+) -> AccessKeysResponse {
     let primary = request_api_keys.first().cloned().unwrap_or_default();
     AccessKeysResponse {
         request_api_key: primary.clone(),
         masked_request_api_key: mask_secret(&primary),
-        request_api_keys: request_api_key_items(request_api_keys),
+        request_api_keys: request_api_key_items(request_api_keys, policies),
+        default_request_admission,
         admin_api_key: admin_api_key.to_string(),
         masked_admin_api_key: mask_secret(admin_api_key),
     }
@@ -905,8 +928,11 @@ impl AdminService {
     }
 
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
+        let config = self.token_manager.runtime_config();
         access_keys_response(
-            &self.token_manager.runtime_config().request_api_keys(),
+            &config.request_api_keys(),
+            &config.request_api_key_policies(),
+            config.request_admission.normalized(),
             admin_api_key,
         )
     }
@@ -914,6 +940,7 @@ impl AdminService {
     fn persist_request_api_keys(
         &self,
         keys: Vec<String>,
+        policies: Vec<RequestApiKeyPolicy>,
         action: &'static str,
         detail: serde_json::Value,
     ) -> Result<(), AdminServiceError> {
@@ -922,13 +949,17 @@ impl AdminService {
                 "至少需要保留一个调用 API Key".to_string(),
             ));
         }
+        validate_request_api_key_policies(&keys, &policies)
+            .map_err(AdminServiceError::InvalidCredential)?;
 
         self.token_manager
             .update_runtime_config(|config| {
                 config.set_request_api_keys(keys.clone());
+                config.set_request_api_key_policies(policies.clone());
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        self.request_api_key_store.replace_keys(keys);
+        let config = self.token_manager.runtime_config();
+        self.refresh_request_api_key_runtime(&config);
         self.audit(
             action,
             "security_keys",
@@ -938,6 +969,27 @@ impl AdminService {
             detail,
         );
         Ok(())
+    }
+
+    fn refresh_request_api_key_runtime(&self, config: &Config) {
+        let policies = config.request_api_key_policies();
+        let disabled = policies
+            .iter()
+            .filter(|policy| !policy.enabled)
+            .map(|policy| policy.api_key.as_str())
+            .collect::<Vec<_>>();
+        self.request_api_key_store
+            .replace_keys_with_disabled(config.request_api_keys(), disabled);
+        let overrides = policies
+            .iter()
+            .filter_map(|policy| {
+                let admission = policy.request_admission?;
+                let identity = self.request_api_key_store.authenticate(&policy.api_key)?;
+                Some((identity, admission))
+            })
+            .collect::<Vec<_>>();
+        self.request_admission
+            .update_policies(config.request_admission, overrides);
     }
 
     pub fn create_request_api_key(
@@ -958,15 +1010,30 @@ impl AdminService {
             ));
         }
 
-        let mut keys = self.token_manager.runtime_config().request_api_keys();
+        let current_config = self.token_manager.runtime_config();
+        let mut keys = current_config.request_api_keys();
+        let mut policies = current_config.request_api_key_policies();
         if keys.iter().any(|key| key == &next_key) {
             return Err(AdminServiceError::Conflict(
                 "调用 API Key 已存在".to_string(),
             ));
         }
+        let admission = req
+            .request_admission
+            .unwrap_or(current_config.request_admission);
+        admission
+            .validate()
+            .map_err(AdminServiceError::InvalidCredential)?;
         keys.push(next_key.clone());
+        policies.push(RequestApiKeyPolicy {
+            api_key: next_key.clone(),
+            name: req.name.unwrap_or_default(),
+            enabled: req.enabled.unwrap_or(true),
+            request_admission: Some(admission),
+        });
         self.persist_request_api_keys(
             keys,
+            policies,
             "create_request_api_key",
             json!({
                 "keyId": stable_request_api_key_id(&next_key),
@@ -982,28 +1049,34 @@ impl AdminService {
         req: UpdateRequestApiKeyRequest,
         admin_api_key: &str,
     ) -> Result<AccessKeysResponse, AdminServiceError> {
-        let next_key = req
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| {
-                AdminServiceError::InvalidCredential("调用 API Key 不能为空".to_string())
-            })?
-            .to_string();
-        if next_key.len() < 8 {
-            return Err(AdminServiceError::InvalidCredential(
-                "调用 API Key 至少需要 8 个字符".to_string(),
-            ));
-        }
-
-        let mut keys = self.token_manager.runtime_config().request_api_keys();
+        let current_config = self.token_manager.runtime_config();
+        let mut keys = current_config.request_api_keys();
+        let mut policies = current_config.request_api_key_policies();
         let index = keys
             .iter()
             .position(|key| stable_request_api_key_id(key) == key_id)
             .ok_or_else(|| {
                 AdminServiceError::InvalidCredential("调用 API Key 不存在".to_string())
             })?;
+        let next_key = match req.api_key.as_deref() {
+            Some(key) if key.trim().is_empty() => {
+                return Err(AdminServiceError::InvalidCredential(
+                    "调用 API Key 不能为空".to_string(),
+                ));
+            }
+            Some(key) => key.trim().to_string(),
+            None => keys[index].clone(),
+        };
+        if next_key.len() < 8 {
+            return Err(AdminServiceError::InvalidCredential(
+                "调用 API Key 至少需要 8 个字符".to_string(),
+            ));
+        }
+        if let Some(admission) = req.request_admission {
+            admission
+                .validate()
+                .map_err(AdminServiceError::InvalidCredential)?;
+        }
         if keys
             .iter()
             .enumerate()
@@ -1013,9 +1086,33 @@ impl AdminService {
                 "调用 API Key 已存在".to_string(),
             ));
         }
+        let previous_key = keys[index].clone();
         keys[index] = next_key.clone();
+        if let Some(policy) = policies
+            .iter_mut()
+            .find(|policy| policy.api_key == previous_key)
+        {
+            policy.api_key = next_key.clone();
+            if let Some(name) = req.name.as_ref() {
+                policy.name = name.clone();
+            }
+            if let Some(enabled) = req.enabled {
+                policy.enabled = enabled;
+            }
+            if let Some(admission) = req.request_admission {
+                policy.request_admission = Some(admission);
+            }
+        } else if req.name.is_some() || req.enabled.is_some() || req.request_admission.is_some() {
+            policies.push(RequestApiKeyPolicy {
+                api_key: next_key.clone(),
+                name: req.name.unwrap_or_default(),
+                enabled: req.enabled.unwrap_or(true),
+                request_admission: req.request_admission,
+            });
+        }
         self.persist_request_api_keys(
             keys,
+            policies,
             "update_request_api_key",
             json!({
                 "keyId": key_id,
@@ -1031,9 +1128,17 @@ impl AdminService {
         key_id: &str,
         admin_api_key: &str,
     ) -> Result<AccessKeysResponse, AdminServiceError> {
-        let mut keys = self.token_manager.runtime_config().request_api_keys();
+        let current_config = self.token_manager.runtime_config();
+        let mut keys = current_config.request_api_keys();
+        let mut policies = current_config.request_api_key_policies();
         remove_request_api_key_by_id(&mut keys, key_id)?;
-        self.persist_request_api_keys(keys, "delete_request_api_key", json!({ "keyId": key_id }))?;
+        policies.retain(|policy| stable_request_api_key_id(&policy.api_key) != key_id);
+        self.persist_request_api_keys(
+            keys,
+            policies,
+            "delete_request_api_key",
+            json!({ "keyId": key_id }),
+        )?;
         Ok(self.get_access_keys(admin_api_key))
     }
 
@@ -5816,6 +5921,8 @@ impl AdminService {
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         self.request_admission.update_config(request_admission);
+        let updated_config = self.token_manager.runtime_config();
+        self.refresh_request_api_key_runtime(&updated_config);
         self.audit(
             "update_runtime_config",
             "runtime_config",
@@ -6553,6 +6660,41 @@ fn normalize_admin_request_admission(
         .validate()
         .map_err(AdminServiceError::InvalidCredential)?;
     Ok(config.normalized())
+}
+
+fn validate_request_api_key_policies(
+    keys: &[String],
+    policies: &[RequestApiKeyPolicy],
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    if policies.len() > 10_000 {
+        return Err("requestApiKeyPolicies 不能超过 10000 个".to_string());
+    }
+    for policy in policies {
+        let key = policy.api_key.trim();
+        if key.len() < 8 {
+            return Err("managed request API Key 至少需要 8 个字符".to_string());
+        }
+        if !seen.insert(key.to_string()) {
+            return Err("requestApiKeyPolicies 不能包含重复 Key".to_string());
+        }
+        if let Some(admission) = policy.request_admission {
+            admission.validate()?;
+        }
+        if !keys.iter().any(|configured| configured == key) {
+            return Err("managed request API Key 必须同时存在于 apiKey/apiKeys 列表".to_string());
+        }
+    }
+    if !keys.iter().any(|key| {
+        policies
+            .iter()
+            .find(|policy| policy.api_key.trim() == key)
+            .map(|policy| policy.enabled)
+            .unwrap_or(true)
+    }) {
+        return Err("至少需要保留一个启用的请求 API Key".to_string());
+    }
+    Ok(())
 }
 
 fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {

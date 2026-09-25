@@ -21,6 +21,7 @@ Authority:
 3. Topics:
    - [外部池与本地凭证调度](topics/external-pool-local-first-scheduler.md)
    - [本地账号与外部池路由并发场景](topics/local-external-route-concurrency-scenarios-20260925.md)
+   - [按请求 API Key 独立并发管理](topics/per-key-request-admission-management.md)
    - [整体调度架构优化](topics/route-planner-capacity-ledger.md)
    - [统一调度目标契约、状态机与验证方案](topics/scheduler-target-state-machine-and-test-contract.md)
    - [当前目标符合度矩阵](topics/scheduler-target-compliance-matrix.md)
@@ -65,6 +66,7 @@ Out of scope:
 | Problem | Status | Owning topic |
 | --- | --- | --- |
 | 外部池开启影响本地凭证热路径 | Hot-path fixed; strategy/chaos follow-up open | [External pool local-first scheduler](topics/external-pool-local-first-scheduler.md) |
+| 请求 API Key 只有独立状态、没有独立配置；需保留旧 Key 兼容 | Implemented and locally verified; release publication pending | [Per-key request admission management](topics/per-key-request-admission-management.md) |
 | 外部池流式首语义输出前 error/空回不会换池 | Focused implementation, normal routing/output rerun, frozen Claude CLI and L3-L5 load/chaos gates passed; production rollout observation pending | [External pool stream pre-output retry](topics/external-pool-stream-pre-output-retry-20260806.md), [Stream terminal errors and precommit retry](../../../../feature/issues/stream-terminal-errors-and-precommit-retry.md) |
 | 调度模式分散、无法统一解释 route/fallback/rescue | Open design | [Route planner and capacity ledger](topics/route-planner-capacity-ledger.md) |
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |

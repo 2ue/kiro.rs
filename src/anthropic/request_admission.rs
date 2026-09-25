@@ -266,7 +266,7 @@ impl RejectionLogTokenBucket {
 
 /// Admission controller shared by all `/messages` route variants.
 pub struct RequestAdmissionController {
-    config: RwLock<RequestAdmissionConfig>,
+    policies: RwLock<RequestAdmissionPolicySnapshot>,
     shards: Box<[Mutex<HashMap<[u8; 32], Arc<KeyState>>>]>,
     tracked_keys: AtomicUsize,
     operations: AtomicUsize,
@@ -282,6 +282,11 @@ pub struct RequestAdmissionController {
     rejection_log_detailed_emitted: AtomicU64,
     rejection_log_summaries_emitted: AtomicU64,
     rejection_log_budget_lock_acquisitions: AtomicU64,
+}
+
+struct RequestAdmissionPolicySnapshot {
+    default: RequestAdmissionConfig,
+    per_key: HashMap<[u8; 32], RequestAdmissionConfig>,
 }
 
 #[derive(Clone)]
@@ -453,7 +458,10 @@ impl RequestAdmissionController {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
-            config: RwLock::new(config.normalized()),
+            policies: RwLock::new(RequestAdmissionPolicySnapshot {
+                default: config.normalized(),
+                per_key: HashMap::new(),
+            }),
             shards,
             tracked_keys: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -476,7 +484,44 @@ impl RequestAdmissionController {
     }
 
     pub(crate) fn update_config(&self, config: RequestAdmissionConfig) {
-        *self.config.write() = config.normalized();
+        self.policies.write().default = config.normalized();
+        self.notify_policy_waiters();
+    }
+
+    /// Atomically replace the default and per-key policies without disturbing
+    /// in-flight permits.
+    pub(crate) fn update_policies(
+        &self,
+        default: RequestAdmissionConfig,
+        overrides: impl IntoIterator<Item = (RequestApiKeyIdentity, RequestAdmissionConfig)>,
+    ) {
+        let per_key = overrides
+            .into_iter()
+            .map(|(identity, config)| (identity.digest(), config.normalized()))
+            .collect();
+        *self.policies.write() = RequestAdmissionPolicySnapshot {
+            default: default.normalized(),
+            per_key,
+        };
+        self.notify_policy_waiters();
+    }
+
+    /// Replace per-key overrides without disturbing in-flight permits.
+    /// Missing entries fall back to the current default policy.
+    #[cfg(test)]
+    pub(crate) fn update_policy_overrides(
+        &self,
+        overrides: impl IntoIterator<Item = (RequestApiKeyIdentity, RequestAdmissionConfig)>,
+    ) {
+        let per_key = overrides
+            .into_iter()
+            .map(|(identity, config)| (identity.digest(), config.normalized()))
+            .collect();
+        self.policies.write().per_key = per_key;
+        self.notify_policy_waiters();
+    }
+
+    fn notify_policy_waiters(&self) {
         for shard in self.shards.iter() {
             for state in shard.lock().values() {
                 state.notify.notify_waiters();
@@ -484,15 +529,20 @@ impl RequestAdmissionController {
         }
     }
 
-    pub(crate) fn config(&self) -> RequestAdmissionConfig {
-        *self.config.read()
+    fn policy_for(&self, identity: RequestApiKeyIdentity) -> RequestAdmissionConfig {
+        let policies = self.policies.read();
+        policies
+            .per_key
+            .get(&identity.digest())
+            .copied()
+            .unwrap_or(policies.default)
     }
 
     async fn acquire(
         &self,
         identity: RequestApiKeyIdentity,
     ) -> Result<RequestAdmissionPermit, AdmissionRejection> {
-        let initial_config = self.config();
+        let initial_config = self.policy_for(identity);
         if !initial_config.enabled() {
             return Ok(RequestAdmissionPermit::disabled());
         }
@@ -506,7 +556,7 @@ impl RequestAdmissionController {
         }
 
         let counted_concurrency = if initial_config.max_concurrent_requests > 0 {
-            self.acquire_concurrency(state.clone(), initial_config)
+            self.acquire_concurrency(identity, state.clone(), initial_config)
                 .await?
         } else {
             false
@@ -618,7 +668,7 @@ impl RequestAdmissionController {
         key_state: Option<Arc<KeyState>>,
         retry_after: Duration,
     ) -> bool {
-        if !self.config().enabled() {
+        if !self.policy_for(identity).enabled() {
             return false;
         }
         let state = match key_state {
@@ -775,6 +825,7 @@ impl RequestAdmissionController {
 
     async fn acquire_concurrency(
         &self,
+        identity: RequestApiKeyIdentity,
         state: Arc<KeyState>,
         initial_config: RequestAdmissionConfig,
     ) -> Result<bool, AdmissionRejection> {
@@ -789,7 +840,7 @@ impl RequestAdmissionController {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let current_config = self.config();
+            let current_config = self.policy_for(identity);
             if current_config.max_concurrent_requests == 0 {
                 let mut gate = state.gate.lock();
                 registration.complete_locked(&mut gate);
@@ -1736,6 +1787,213 @@ mod tests {
             assert_eq!(gate_snapshot(&controller, quiet), idle_gate_snapshot());
             assert_eq!(controller.tracked_key_count(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn per_key_overrides_isolate_http_concurrency_and_queue_pressure() {
+        let controller = test_controller(RequestAdmissionConfig::disabled());
+        let key_a = identity("managed-key-a");
+        let key_b = identity("managed-key-b");
+        controller.update_policy_overrides([
+            (key_a, config(0, 1, 1, 1_000)),
+            (key_b, config(0, 2, 0, 0)),
+        ]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = middleware_router(controller.clone(), hits.clone(), BodyMode::Pending);
+
+        let key_a_holder = app
+            .clone()
+            .oneshot(request("/messages", key_a))
+            .await
+            .unwrap();
+        assert_eq!(key_a_holder.status(), StatusCode::OK);
+
+        let key_a_waiter = tokio::spawn({
+            let app = app.clone();
+            async move { app.oneshot(request("/messages", key_a)).await.unwrap() }
+        });
+        wait_for_queue_count(&controller, key_a, 1).await;
+
+        let key_a_queue_full = app
+            .clone()
+            .oneshot(request("/messages", key_a))
+            .await
+            .unwrap();
+        assert_eq!(key_a_queue_full.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let key_b_first = app
+            .clone()
+            .oneshot(request("/messages", key_b))
+            .await
+            .unwrap();
+        let key_b_second = app
+            .clone()
+            .oneshot(request("/messages", key_b))
+            .await
+            .unwrap();
+        assert_eq!(key_b_first.status(), StatusCode::OK);
+        assert_eq!(key_b_second.status(), StatusCode::OK);
+        assert_eq!(gate_snapshot(&controller, key_a).active, 1);
+        assert_eq!(gate_snapshot(&controller, key_a).queued, 1);
+        assert_eq!(gate_snapshot(&controller, key_b).active, 2);
+
+        let key_b_over_limit = app
+            .clone()
+            .oneshot(request("/messages", key_b))
+            .await
+            .unwrap();
+        assert_eq!(key_b_over_limit.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        drop(key_a_holder);
+        let key_a_recovered = tokio::time::timeout(Duration::from_secs(1), key_a_waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key_a_recovered.status(), StatusCode::OK);
+        assert_eq!(gate_snapshot(&controller, key_a).active, 1);
+        assert_eq!(gate_snapshot(&controller, key_a).queued, 0);
+
+        drop(key_a_recovered);
+        drop(key_b_first);
+        drop(key_b_second);
+        assert_eq!(gate_snapshot(&controller, key_a), idle_gate_snapshot());
+        assert_eq!(gate_snapshot(&controller, key_b), idle_gate_snapshot());
+    }
+
+    #[tokio::test]
+    async fn per_key_rpm_overrides_and_live_limit_updates_are_independent() {
+        let controller = test_controller(RequestAdmissionConfig::disabled());
+        let key_a = identity("rpm-key-a");
+        let key_b = identity("rpm-key-b");
+        controller
+            .update_policy_overrides([(key_a, config(2, 2, 0, 0)), (key_b, config(300, 2, 0, 0))]);
+
+        let first_a = controller.acquire(key_a).await.unwrap();
+        let second_a = controller.acquire(key_a).await.unwrap();
+        assert_eq!(
+            controller.acquire(key_a).await.unwrap_err().kind,
+            AdmissionRejectionKind::Rpm
+        );
+        let first_b = controller.acquire(key_b).await.unwrap();
+        let second_b = controller.acquire(key_b).await.unwrap();
+        drop(first_b);
+        drop(second_b);
+        let third_b = controller.acquire(key_b).await.unwrap();
+        drop(third_b);
+
+        controller
+            .update_policy_overrides([(key_a, config(0, 1, 0, 0)), (key_b, config(300, 2, 0, 0))]);
+        assert_eq!(
+            controller.acquire(key_a).await.unwrap_err().kind,
+            AdmissionRejectionKind::ConcurrencyFull
+        );
+        assert_eq!(gate_snapshot(&controller, key_a).active, 2);
+
+        drop(first_a);
+        assert_eq!(
+            controller.acquire(key_a).await.unwrap_err().kind,
+            AdmissionRejectionKind::ConcurrencyFull,
+            "lowering the cap must not revoke or overbook the still-active permit"
+        );
+        drop(second_a);
+        let recovered_a = controller.acquire(key_a).await.unwrap();
+
+        drop(recovered_a);
+    }
+
+    #[tokio::test]
+    async fn per_key_limit_of_five_never_admits_a_sixth_active_request() {
+        let controller = test_controller(RequestAdmissionConfig::disabled());
+        let key = identity("five-concurrent-key");
+        controller.update_policy_overrides([(key, config(0, 5, 0, 0))]);
+
+        let mut permits = Vec::new();
+        for _ in 0..5 {
+            permits.push(controller.acquire(key).await.unwrap());
+        }
+        assert_eq!(gate_snapshot(&controller, key).active, 5);
+
+        assert_eq!(
+            controller.acquire(key).await.unwrap_err().kind,
+            AdmissionRejectionKind::ConcurrencyFull
+        );
+        assert_eq!(gate_snapshot(&controller, key).active, 5);
+
+        drop(permits.pop());
+        permits.push(controller.acquire(key).await.unwrap());
+        assert_eq!(gate_snapshot(&controller, key).active, 5);
+
+        drop(permits);
+        assert_eq!(gate_snapshot(&controller, key), idle_gate_snapshot());
+    }
+
+    #[tokio::test]
+    async fn per_key_concurrency_limit_is_instance_local() {
+        let key = identity("multi-instance-key");
+        let policy = config(0, 5, 0, 0);
+        let first_instance = test_controller(RequestAdmissionConfig::disabled());
+        let second_instance = test_controller(RequestAdmissionConfig::disabled());
+        first_instance.update_policy_overrides([(key, policy)]);
+        second_instance.update_policy_overrides([(key, policy)]);
+
+        let mut first_permits = Vec::new();
+        let mut second_permits = Vec::new();
+        for _ in 0..5 {
+            first_permits.push(first_instance.acquire(key).await.unwrap());
+            second_permits.push(second_instance.acquire(key).await.unwrap());
+        }
+
+        assert_eq!(gate_snapshot(&first_instance, key).active, 5);
+        assert_eq!(gate_snapshot(&second_instance, key).active, 5);
+        assert_eq!(
+            gate_snapshot(&first_instance, key).active
+                + gate_snapshot(&second_instance, key).active,
+            10,
+            "independent instances do not share a distributed per-key counter"
+        );
+        assert_eq!(
+            first_instance.acquire(key).await.unwrap_err().kind,
+            AdmissionRejectionKind::ConcurrencyFull
+        );
+        assert_eq!(
+            second_instance.acquire(key).await.unwrap_err().kind,
+            AdmissionRejectionKind::ConcurrencyFull
+        );
+
+        drop(first_permits);
+        drop(second_permits);
+    }
+
+    #[test]
+    fn replacing_default_and_per_key_policies_publishes_one_complete_snapshot() {
+        let controller = test_controller(config(10, 1, 0, 0));
+        let key_a = identity("snapshot-key-a");
+        let key_b = identity("snapshot-key-b");
+        controller.update_policies(
+            config(20, 3, 0, 0),
+            [(key_a, config(30, 2, 0, 0)), (key_b, config(40, 4, 0, 0))],
+        );
+
+        let policies = controller.policies.read();
+        assert_eq!(policies.default, config(20, 3, 0, 0));
+        assert_eq!(
+            policies.per_key.get(&key_a.digest()),
+            Some(&config(30, 2, 0, 0))
+        );
+        assert_eq!(
+            policies.per_key.get(&key_b.digest()),
+            Some(&config(40, 4, 0, 0))
+        );
+        drop(policies);
+
+        assert_eq!(controller.policy_for(key_a), config(30, 2, 0, 0));
+        assert_eq!(controller.policy_for(key_b), config(40, 4, 0, 0));
+        assert_eq!(
+            controller.policy_for(identity("legacy-key")),
+            config(20, 3, 0, 0)
+        );
     }
 
     #[tokio::test]

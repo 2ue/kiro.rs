@@ -1878,6 +1878,7 @@ export interface AccessKeysResponse {
   requestApiKey: string
   maskedRequestApiKey: string
   requestApiKeys: RequestApiKeyItem[]
+  defaultRequestAdmission: RequestAdmissionConfig
   adminApiKey: string
   maskedAdminApiKey: string
 }
@@ -1887,14 +1888,23 @@ export interface RequestApiKeyItem {
   apiKey: string
   maskedApiKey: string
   primary: boolean
+  name: string
+  enabled: boolean
+  requestAdmission?: RequestAdmissionConfig
 }
 
 export interface CreateRequestApiKeyRequest {
   apiKey?: string
+  name?: string
+  enabled?: boolean
+  requestAdmission?: RequestAdmissionConfig
 }
 
 export interface UpdateRequestApiKeyRequest {
   apiKey?: string
+  name?: string
+  enabled?: boolean
+  requestAdmission?: RequestAdmissionConfig
 }
 
 export interface UpdateAdminApiKeyRequest {
