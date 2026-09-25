@@ -166,7 +166,154 @@ external_pool_capacity_mode = fail_fast
 
 所有允许进入同一外部池管理器的路由共享外部池容量和外部队列。一个 external-only 路由的外部积压会影响其它 external-eligible 路由，但不影响纯本地请求的本地槽位。
 
-## 场景四：共享 API Key 造成的隐形耦合示例
+## 场景四：多 API Key 能否实现路由并发隔离
+
+### 当前已经支持的部分
+
+当前 `RequestAdmissionController` 按“实例 + 请求 API Key”保存并发、排队和 RPM 状态。不同 API Key 不共享这一层的 `active`、`queued` 和 RPM bucket，因此：
+
+- `key-local-a` 的入口排队不会直接占用 `key-external-a` 的入口并发；
+- external-only 请求使用独立 Key 后，可以绕过 local-only 请求造成的同 Key Layer A 阻塞；
+- 不同 Key 的入口队列长度、入口超时和入口拒绝计数互相独立。
+
+### 当前没有支持的部分
+
+多 Key **不会**自动创建下面这些独立资源：
+
+1. **本地账号调度池不会按 Key 拆分。**
+   - 所有允许本地调度的路由最终使用同一个 `KiroProvider` / 本地凭证管理器。
+   - 本地账号的全局并发、单账号槽位、dispatch queue 和 Redis 调度协调状态仍然是共享的。
+   - 因此，`key-local-a` 的本地排队仍可能占用本地全局 dispatch queue，影响 `key-local-b` 的本地请求。
+
+2. **外部池管理器不会按 Key 拆分。**
+   - 所有 external-eligible 路由进入同一外部池管理器和外部容量协调域。
+   - `key-external-a` 的外部积压仍可能占用外部全局容量或外部等待队列，影响 `key-external-b`。
+   - 外部池的 route rules 只负责候选是否允许该 endpoint，不等于为每个 endpoint 创建独立容量池。
+
+3. **不同 Key 目前不能配置不同的入口上限。**
+   - `RequestAdmissionConfig` 是一份运行时配置，`maxConcurrentRequests`、`maxQueuedRequests`、`queueTimeoutMs` 和 `rpm` 对所有 Key 使用同一组数值。
+   - 状态按 Key 分开，但策略参数不是按 Key 分开。
+   - 使用 10 个 Key 会把这层“每 Key 上限”复制 10 份；如果没有额外总量限制，入口总并发可能约放大到 10 倍。
+
+### 对“10 个路由”的直接判断
+
+假设：
+
+```text
+路由 R1、R2：只允许本地账号
+路由 R3、R4、R5：只允许外部池
+路由 R6-R10：允许本地和外部
+```
+
+| 做法 | 能否隔离入口准入 | 能否隔离本地/外部调度容量 | 是否足以保证队列互不影响 |
+|---|---:|---:|---:|
+| 10 个路由共用 1 个 API Key | 否 | 否 | 不足 |
+| 本地路由和外部路由各用 1 个 API Key | 是，按两类隔离 | 否，底层调度器仍共享 | 只能部分满足 |
+| 每个路由 1 个 API Key | 是，按路由隔离入口 | 否，底层调度器仍共享 | 只能部分满足 |
+| API Key + 独立本地/外部调度 lane | 是 | 是 | 可以满足设计目标 |
+| API Key + 完全独立凭据池/外部池实例 | 是 | 是，隔离最强 | 可以满足，但资源碎片和运维成本最高 |
+
+因此，**多 Key 不是完整方案，只是第一层保护**。
+
+## 针对你的 10 个路由，推荐的实际方案
+
+### 方案 A：立即可用的低风险配置方案
+
+在不修改运行时代码的前提下，建议至少按流量职责拆成 3 个 API Key：
+
+```text
+key-local-only     -> R1、R2
+key-external-only  -> R3、R4、R5
+key-mixed          -> R6-R10
+```
+
+这样可以保证：
+
+- local-only 长请求不会直接吃光 external-only 的入口准入；
+- external-only 的入口排队不会直接挡住 mixed 路由；
+- 三类流量在 Layer A 有独立排队计数。
+
+但必须明确：
+
+- R1/R2 仍共享本地账号调度容量；
+- R3/R4/R5 仍共享外部池容量和外部队列；
+- R6-R10 仍会和 R1/R2 竞争本地容量，也会和 R3-R5 竞争外部容量；
+- 这只能减少入口级互相阻塞，不能保证底层账号调度完全不受影响。
+
+如果 R1 和 R2 也必须完全互不影响，则应使用两个不同 Key；不过这会进一步复制入口并发上限，必须同步设置总量保护。
+
+### 方案 B：满足“排队不影响正常账号调度”的正式改造
+
+建议增加显式的 `schedulerDomain` / `routeConcurrencyProfile`，按路由组建立调度 lane，而不是把 API Key 当成调度池：
+
+```text
+local-only-lane
+  routes: R1、R2
+  local: enabled
+  external: disabled
+  local max inflight / max queued: 独立配置
+
+external-only-lane
+  routes: R3、R4、R5
+  local: disabled
+  external: enabled
+  external max inflight / max queued: 独立配置
+
+mixed-lane
+  routes: R6-R10
+  local: preferred
+  external: fallback
+  local/external budgets: 独立配置
+```
+
+实现上需要同时具备两层：
+
+1. **入口 lane**
+   - 每个 lane 有独立的 `active`、`queued`、`queue_timeout`；
+   - 仍保留每 API Key 总上限，防止单个 Key 无限放大总并发；
+   - lane 入口队列不能直接占用其它 lane 的 reserved 名额。
+
+2. **调度容量 ledger**
+   - 本地账号池增加按 lane 的并发预算或保留配额；
+   - 外部池增加按 lane 的并发预算或保留配额；
+   - 一个 lane 的排队不能消耗另一个 lane 的保留容量；
+   - 空闲 lane 的容量可以按明确规则借给其它 lane，但借用不能抢占已经运行的正常请求。
+
+只有做到第二层，才可以真正保证：
+
+> R1/R2 本地-only 排队时，不会把 R6-R10 的正常本地账号调度全部拖住；R3-R5 外部-only 排队时，也不会把 mixed 路由的外部 fallback 全部拖住。
+
+### 方案 C：最强隔离
+
+为不同路由组配置完全独立的本地凭据集合、外部池集合和调度器实例。
+
+优点是边界最清楚，缺点是：
+
+- 账号和外部池不能共享空闲容量；
+- 容量碎片化；
+- 配置、监控、故障切换和发布复杂度明显增加。
+
+除非 R1/R2、R3/R5 是强租户或强 SLA 隔离场景，否则不建议一开始就采用方案 C。
+
+## 需要避免的误区
+
+### 误区 1：每个路由配一个 Key，就等于每个路由有独立账号并发
+
+不等于。它只隔离了 RequestAdmission；本地账号 manager 和外部 pool manager 仍是共享对象。
+
+### 误区 2：把 `local_pool_route_rules` 当成本地账号池分组
+
+不等于。它只决定某个 endpoint 是否允许进入本地池，不会自动给该 endpoint 分配独立账号集合或独立并发预算。
+
+### 误区 3：把 external pool 的 `route_rules` 当成外部队列隔离
+
+不等于。它主要影响候选资格；如果多个路由仍命中同一外部池管理器和容量协调域，容量竞争仍然存在。
+
+### 误区 4：用多个 Key 解决总容量问题，却不设置总量保护
+
+多个 Key 会复制每 Key 入口并发额度。若当前值为 32，10 个 Key 理论上可能把入口侧放大到约 320 个并发，而本地账号和外部池底层容量并不会同步放大。
+
+## 场景五：共享 API Key 造成的隐形耦合示例
 
 假设：
 
@@ -188,7 +335,7 @@ external-only 短请求 = 1 个
 
 如果把 external-only 流量换成另一个 API Key，则不会经过同一个 Layer A gate，通常可以直接进入外部池；此时仍需考虑外部池自己的容量和队列。
 
-## 场景五：不能误用的结论
+## 场景六：不能误用的结论
 
 ### 错误结论 1：本地排队一定会拖住外部
 
