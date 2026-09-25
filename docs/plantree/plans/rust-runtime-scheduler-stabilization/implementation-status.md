@@ -16,7 +16,15 @@ Current active work: [Per-key request admission management](topics/per-key-reque
   full suite passed; Clippy `764 <= 849`; all-target check and release build passed;
   both frontend builds, fake-upstream smoke `12/12`, and artifact inventory passed.
   Exact `0.0.172` release binaries were rebuilt; `kiro-rs --version` reported
-  `0.0.172`, and the post-build artifact inventory passed.
+  `0.0.172`, and the post-build artifact inventory passed. A follow-up local mock
+  rerun passed admission `27/27`, authentication `4/4`, Admin/key compatibility
+  filters, and the runner safety contract `5/5`; no account-backed instance was hit.
+- The final rerun's artifact inventory passed with
+  `targets=0 reservations=0 target_processes=0 blockers=0`. Changed-document
+  links and diff hygiene passed. The repository-wide feature-doc checker remains
+  blocked by 20 findings in unchanged historical issue reports; the Docker
+  workflow state remains pending because the unauthenticated status query returned
+  HTTP 403.
 - Next: confirm Docker workflow #228 and the published multi-architecture manifest,
   then close release evidence; preserve the documented per-instance limit and
   shared local/external scheduler boundary.

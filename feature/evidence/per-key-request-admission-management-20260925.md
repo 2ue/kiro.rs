@@ -79,6 +79,43 @@ The final release binaries were rebuilt from the version-bumped source using
 `kiro-rs 0.0.172`. The test-only additions are `#[cfg(test)]` and do not alter
 the production source behavior.
 
+## Additional Local Mock Retest
+
+After the request for local mock coverage, the focused key-admission tests were
+rerun on 2026-09-25 using the scoped Cargo runner. These tests did not connect to
+`127.0.0.1:19023`, use real account credentials, or contact an upstream.
+
+- `cargo test --locked anthropic::request_admission::tests -- --test-threads=1`:
+  `27 passed / 0 failed`. The tests exercise the actual Axum admission middleware
+  through an in-process `Router::oneshot` HTTP mock, with synthetic request-key
+  identities and a counted mock handler.
+- The mock matrix covers cross-key isolation while one key is saturated, 429
+  envelope/headers and zero rejected-handler hits, five-round FIFO/cancel/timeout
+  and recovery, live policy changes, per-instance limits, and permit release at
+  response-body EOF, body error, and client drop.
+- `common::auth::tests`: `4 passed / 0 failed`; the Admin legacy response field
+  test: `1 passed / 0 failed`; the `request_api_key` filter: `8 passed / 0 failed`;
+  stale-file policy non-resurrection: `1 passed / 0 failed`. These focused filters
+  overlap and must not be added together as a unique-test count.
+- `node --test feature/tests/request-api-key-admission-multi-instance.contract.test.mjs`:
+  `5 passed / 0 failed`. This validates runner input guards only; it is not a
+  runtime multi-instance or database load result.
+- The latest local rerun completed in 2m 09s with all 27 admission tests passing.
+  The scoped runner removed its owned target and released its reservation.
+- Final post-test artifact inventory:
+  `targets=0 reservations=0 target_processes=0 blockers=0`; process inspection
+  completed and the release gate passed.
+- `git diff --check` and relative Markdown link checks for the three changed
+  evidence/status documents passed. The repository-wide
+  `node feature/tests/check-feature-docs.mjs` check still reports 20 unrelated
+  findings under unchanged `feature/issues/` documents (missing archived
+  `tmp/prod-evidence` links and issue-contract fields); none are in the changed
+  documents.
+
+`Router::oneshot` verifies routing and middleware behavior without opening a TCP
+listener. It does not claim real socket-level disconnect behavior, real upstream
+behavior, cross-instance shared counters, or local/external scheduler isolation.
+
 ## Runtime Safety
 
 No request was sent to the configured `127.0.0.1:19023` service because it was
@@ -110,7 +147,10 @@ Release model: `rust-crate`; version authority: root `Cargo.toml` package.
   (run `36110326384`) was still `In progress` at the time of this record. The
   new GHCR tag `ghcr.io/2ue/kiro-rs:0.0.172` returned `manifest unknown`, so
   container publication is not claimed as complete yet. Production deployment
-  is also unverified.
+  is also unverified. The closeout recheck could not refresh the run state:
+  `gh` is not installed and the unauthenticated Actions API returned HTTP 403.
+  Keep the workflow and image publication status pending until an authenticated
+  status check confirms completion.
 
 Remote refs observed:
 
