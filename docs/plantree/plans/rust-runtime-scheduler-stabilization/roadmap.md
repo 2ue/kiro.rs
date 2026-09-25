@@ -12,6 +12,8 @@ Last reviewed: 2026-09-25 Asia/Shanghai
   and no-default Rust suites, targeted two-key/queue/instance-scope tests, both
   UI builds, Clippy baseline, release build and inventory passed. Per-key
   admission is per process; local/external dispatch capacity remains shared.
+  Work commit `f12dc91` and release bump `9021f7c` are on `main`, with annotated
+  tag `v0.0.172` pushed; Docker image workflow #228 is still pending completion.
   See [implementation plan](topics/per-key-request-admission-management.md)
   and [verification evidence](../../../../feature/evidence/per-key-request-admission-management-20260925.md).
 

@@ -2,7 +2,7 @@
 
 Date: 2026-09-25
 
-Status: Local implementation and verification passed; release publication pending.
+Status: Local implementation and verification passed; `v0.0.172` source/tag pushed; Docker image publication workflow pending.
 
 Related plan: [Per-key request admission management](../../docs/plantree/plans/rust-runtime-scheduler-stabilization/topics/per-key-request-admission-management.md)
 
@@ -70,12 +70,14 @@ default suite passed.
 Frozen binary hashes:
 
 ```text
-kiro-rs       ce2fddb09ede2215d2aa9c13334bb908a73880affbea15407e3bb9b1ff5f690c
-kiro_loadtest 89a0a94057d23ede60e1253c05e553dc3b1d1a72ad6966b972e29d5632b77511
+kiro-rs       dbf9a2295dd07d723cb8ffffd1d1a0bf2fd249d960fcd85498804727918ec792
+kiro_loadtest 0f08e458f75ec91b48d064c102b400b3e3b7c415cc5a305367041dcb50d4c7cf
 ```
 
-The final focused test added after the frozen release build is `#[cfg(test)]`
-only; production source and release-binary behavior did not change afterward.
+The final release binaries were rebuilt from the version-bumped source using
+`cargo build --release --locked --bins`; the service binary reported
+`kiro-rs 0.0.172`. The test-only additions are `#[cfg(test)]` and do not alter
+the production source behavior.
 
 ## Runtime Safety
 
@@ -87,5 +89,33 @@ production endpoint was used.
 
 ## Release
 
-Publication is pending. The release version and tag will be recorded after the
-remote branch/tag state is fetched and the safe push sequence completes.
+Release model: `rust-crate`; version authority: root `Cargo.toml` package.
+
+- Remote stable tag used as the base: `v0.0.171`. The `0.0.171` GHCR manifest
+  was present with `amd64` and `arm64`; Docker Hub could not be checked from this
+  environment because registry authentication was unavailable.
+- Work commit: `f12dc919ea737c5a922dd741267cde5f64b02dc4`
+  (`feat: add independent request API key admission`).
+- Release bump commit: `9021f7c8ce6c68da1ca62dfe395978b65fa14767`
+  (`chore(release): 0.0.172`).
+- New package version and tag: `0.0.172` / `v0.0.172`.
+- Annotated tag object: `e9fb0d00b5650e4447dbbc85c739413ae9815938`.
+- Peeled tag commit: `9021f7c8ce6c68da1ca62dfe395978b65fa14767`.
+- Branch push and tag push both succeeded. A subsequent remote query confirmed
+  `origin/main` and the peeled tag both point to the release bump commit.
+- Local release binary build passed, and the service binary reports
+  `kiro-rs 0.0.172`; post-build inventory reported
+  `targets=0 reservations=0 target_processes=0 blockers=0`.
+- GitHub Actions `Publish Docker Images #228`
+  (run `36110326384`) was still `In progress` at the time of this record. The
+  new GHCR tag `ghcr.io/2ue/kiro-rs:0.0.172` returned `manifest unknown`, so
+  container publication is not claimed as complete yet. Production deployment
+  is also unverified.
+
+Remote refs observed:
+
+```text
+9021f7c8ce6c68da1ca62dfe395978b65fa14767 refs/heads/main
+e9fb0d00b5650e4447dbbc85c739413ae9815938 refs/tags/v0.0.172
+9021f7c8ce6c68da1ca62dfe395978b65fa14767 refs/tags/v0.0.172^{}
+```

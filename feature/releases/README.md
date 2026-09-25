@@ -2,7 +2,7 @@
 
 Role: 保存最终发布门禁、版本决策、提交、tag、推送、回滚点和发布后观察结果
 
-Status: `v0.0.131` 已发布；post-release observation remains open
+Status: `v0.0.172` source/tag pushed; Docker image workflow in progress; deployment observation remains open
 
 在所有适用门禁通过前，本目录不会记录“可发布”。发布时必须先同步远端分支与 tag，使用项目版本权威计算新版本，工作修复提交与版本提交分开，先推分支再推 tag，不修改依赖要求版本，不 force push。
 
@@ -75,3 +75,34 @@ git ls-remote origin 'refs/tags/v0.0.131^{}'
 本次发布修复了首次 `30757990049` 因 `src/model/config.rs` Clippy
 bucket 回归导致的失败。生产服务未被本地操作；部署是否已拉取新镜像仍需
 按现网发布流程单独观察。
+
+## 2026-09-25 v0.0.172
+
+本次使用 `rust-crate` release model。根 `Cargo.toml [package].version`
+是版本权威。fetch 后远端最新稳定 tag 为 `v0.0.171`，根 crate 版本也是
+`0.0.171`；检查 GHCR 确认 `0.0.171` 的 amd64/arm64 manifest 已存在，因此
+下一版为 `0.0.172`。当前环境未能认证 Docker Hub，故不记录其 registry 状态。
+
+- 功能提交：`f12dc919ea737c5a922dd741267cde5f64b02dc4`
+  (`feat: add independent request API key admission`)。
+- 版本提交：`9021f7c8ce6c68da1ca62dfe395978b65fa14767`
+  (`chore(release): 0.0.172`)；只更新根 Cargo 包版本及 Cargo.lock 中当前
+  `kiro-rs` 项版本，没有修改依赖要求版本。
+- 最终 release build：`cargo build --release --locked --bins` 通过；冻结二进制
+  `kiro-rs --version` 输出 `kiro-rs 0.0.172`。
+- `kiro-rs` SHA-256：
+  `dbf9a2295dd07d723cb8ffffd1d1a0bf2fd249d960fcd85498804727918ec792`。
+- `kiro_loadtest` SHA-256：
+  `0f08e458f75ec91b48d064c102b400b3e3b7c415cc5a305367041dcb50d4c7cf`。
+- Annotated tag `v0.0.172` object:
+  `e9fb0d00b5650e4447dbbc85c739413ae9815938`; peeled release commit:
+  `9021f7c8ce6c68da1ca62dfe395978b65fa14767`。
+- 先推 `main`、再推 tag 均成功；远端 `main` 和 tag peel 均核实为
+  `9021f7c8ce6c68da1ca62dfe395978b65fa14767`。
+- GitHub Actions [Publish Docker Images #228](https://github.com/2ue/kiro.rs/actions/runs/36110326384)
+  在本记录生成时仍为 `In progress`。GHCR 上 `0.0.172` manifest 尚不可见，
+  因此 Docker 镜像完整发布仍待流水线确认；生产部署未验证。
+- 构建 inventory：`targets=0 reservations=0 target_processes=0 blockers=0`。
+
+该功能仅提供每进程、每 API Key 的 HTTP 入口 RPM/并发/排队隔离；本地账号与
+外部池调度容量仍共享，不把本次版本表述为路由池或跨实例并发隔离。

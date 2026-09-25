@@ -66,7 +66,7 @@ Out of scope:
 | Problem | Status | Owning topic |
 | --- | --- | --- |
 | 外部池开启影响本地凭证热路径 | Hot-path fixed; strategy/chaos follow-up open | [External pool local-first scheduler](topics/external-pool-local-first-scheduler.md) |
-| 请求 API Key 只有独立状态、没有独立配置；需保留旧 Key 兼容 | Implemented and locally verified; release publication pending | [Per-key request admission management](topics/per-key-request-admission-management.md) |
+| 请求 API Key 只有独立状态、没有独立配置；需保留旧 Key 兼容 | Implemented and locally verified; `v0.0.172` tag pushed; Docker publish workflow in progress | [Per-key request admission management](topics/per-key-request-admission-management.md) |
 | 外部池流式首语义输出前 error/空回不会换池 | Focused implementation, normal routing/output rerun, frozen Claude CLI and L3-L5 load/chaos gates passed; production rollout observation pending | [External pool stream pre-output retry](topics/external-pool-stream-pre-output-retry-20260806.md), [Stream terminal errors and precommit retry](../../../../feature/issues/stream-terminal-errors-and-precommit-retry.md) |
 | 调度模式分散、无法统一解释 route/fallback/rescue | Open design | [Route planner and capacity ledger](topics/route-planner-capacity-ledger.md) |
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |

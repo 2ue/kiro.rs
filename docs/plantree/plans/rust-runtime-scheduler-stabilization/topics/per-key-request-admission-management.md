@@ -1,6 +1,6 @@
 # Per-Key Request Admission Management
 
-- Status: implementation and local verification complete; release publication pending
+- Status: implementation and local verification complete; `v0.0.172` tag pushed; Docker image workflow pending
 - Owner: Rust Runtime Scheduler Stabilization
 - Last reviewed: 2026-09-25 Asia/Shanghai
 - Related: [Local/external route concurrency scenarios](local-external-route-concurrency-scenarios-20260925.md), [Route planner and capacity ledger](route-planner-capacity-ledger.md)
