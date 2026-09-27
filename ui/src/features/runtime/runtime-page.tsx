@@ -346,6 +346,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
     payloadShaping: normalizePayloadShaping(draft.payloadShaping),
     payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
+    payloadGuardKiroMaxWeight: toWhole(draft.payloadGuardKiroMaxWeight),
     payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
     promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
     promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -1420,6 +1421,7 @@ export function RuntimePage() {
                   </div>
                   <TwoCol>
                     <NumField label="请求大小阈值" desc="超过此大小才触发处理（如 1048576 = 1 MB）；0 表示不按大小处理" value={draft.payloadGuardMaxBytes} min={0} suffix="字节" onChange={set('payloadGuardMaxBytes')} />
+                    <NumField label="Kiro 加权阈值" desc="Kiro 本地账号按字符集加权计算：ASCII=1，非 ASCII=8；默认 1300000" value={draft.payloadGuardKiroMaxWeight} min={1} suffix="weight" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardKiroMaxWeight')} />
                     <NumField label="安全余量" desc="处理目标比阈值小出的缓冲（如 65536 = 64 KB），避免裁剪后仍超限" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="字节" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardSafetyMarginBytes')} />
                   </TwoCol>
                 </div>

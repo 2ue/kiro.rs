@@ -11103,6 +11103,7 @@ fn external_payload_guard_retry_route_trims_and_disables_second_retry() {
         route.payload_guard_retry_config = Some(PayloadGuardConfig {
             enabled: true,
             max_bytes: 8_000,
+            max_kiro_weight: 8_000,
             trim_history: true,
             shaping: crate::model::config::PayloadShapingConfig::default(),
         });
@@ -11252,6 +11253,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         payload_guard_initial_config: PayloadGuardConfig {
             enabled: true,
             max_bytes: 0,
+            max_kiro_weight: 0,
             trim_history: false,
             shaping: crate::model::config::PayloadShapingConfig::default(),
         },
@@ -12520,6 +12522,7 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         payload_guard_initial_config: PayloadGuardConfig {
             enabled: true,
             max_bytes: 0,
+            max_kiro_weight: 0,
             trim_history: false,
             shaping: crate::model::config::PayloadShapingConfig::default(),
         },
@@ -13702,6 +13705,7 @@ fn external_pool_raw_body_mode_does_not_apply_payload_guard() {
     route.payload_guard_initial_config = PayloadGuardConfig {
         enabled: true,
         max_bytes: 32,
+        max_kiro_weight: 32,
         trim_history: true,
         shaping: crate::model::config::PayloadShapingConfig::default(),
     };
@@ -13740,6 +13744,7 @@ fn external_pool_normalized_body_mode_applies_payload_guard() {
     route.payload_guard_initial_config = PayloadGuardConfig {
         enabled: true,
         max_bytes: 2_000,
+        max_kiro_weight: 2_000,
         trim_history: true,
         shaping: crate::model::config::PayloadShapingConfig::default(),
     };

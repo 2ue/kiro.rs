@@ -168,6 +168,7 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
   "adminApiKey": "sk-admin-change-me",
   "payloadGuardEnabled": true,
   "payloadGuardMaxBytes": 460800,
+  "payloadGuardKiroMaxWeight": 1300000,
   "payloadGuardTrimHistory": true,
   "payloadShaping": {
     "enabled": true,
@@ -324,9 +325,10 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
-| `payloadGuardEnabled` | `true` | 是否在发送 Kiro 上游前按最终 JSON 字节数检查请求体。 |
-| `payloadGuardMaxBytes` | `460800` | 本地 payload 经验预算，不是模型上下文上限；`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复。 |
-| `payloadGuardTrimHistory` | `true` | 请求体超出本地预算时是否裁剪最旧历史；关闭后仍超预算会标记后透传给 Kiro。 |
+| `payloadGuardEnabled` | `true` | 是否在发送上游前启用 payload 协议修复和体积守卫。 |
+| `payloadGuardMaxBytes` | `460800` | 兼容的本地 byte soft target 和按大小处理总开关；`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复。Kiro local path 的真实体积判断使用下面的 weighted 字段。 |
+| `payloadGuardKiroMaxWeight` | `1300000` | Kiro local path 的字符集加权目标：ASCII 字符计 `1`，非 ASCII 字符计 `8`。该值来自上游黑盒实测，仍应按当前 endpoint/model/account 做低风险 fixture 验证。 |
+| `payloadGuardTrimHistory` | `true` | Kiro weighted 或其它兼容 payload 预算超出时是否裁剪最旧历史；关闭后仍超预算会标记后透传给上游。 |
 | `payloadShaping.enabled` | `true` | 超出本地预算时先执行历史内容和 tools 低风险整形。 |
 | `payloadShaping.truncateHistoricalToolResults` | `true` | 对普通历史 `tool_result` 做头尾保留截断；默认上限 `8000` 字符。 |
 | `payloadShaping.discardHistoricalThinking` | `true` | 移除旧 assistant 历史中的 `<thinking>` 块。 |

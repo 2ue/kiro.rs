@@ -1995,6 +1995,7 @@ export interface RuntimeConfig {
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number
+  payloadGuardKiroMaxWeight: number
   payloadGuardSafetyMarginBytes: number
   payloadGuardTrimHistory: boolean
   payloadGuardExternalEnabled: boolean

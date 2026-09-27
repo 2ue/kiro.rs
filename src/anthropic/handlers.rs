@@ -841,6 +841,7 @@ struct RequestRuntimeConfig {
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
     payload_guard_max_bytes: usize,
+    payload_guard_kiro_max_weight: usize,
     payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
     payload_guard_external_enabled: bool,
@@ -887,6 +888,7 @@ impl RequestRuntimeConfig {
             payload_guard_enabled: state.payload_guard_enabled,
             payload_guard_mode: state.payload_guard_mode,
             payload_guard_max_bytes: state.payload_guard_max_bytes,
+            payload_guard_kiro_max_weight: state.payload_guard_kiro_max_weight,
             payload_guard_safety_margin_bytes: state.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: state.payload_guard_trim_history,
             payload_guard_external_enabled: state.payload_guard_external_enabled,
@@ -953,6 +955,7 @@ impl RequestRuntimeConfig {
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes,
+            payload_guard_kiro_max_weight: config.payload_guard_kiro_max_weight,
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_guard_external_enabled: config.payload_guard_external_enabled,
@@ -1000,8 +1003,17 @@ impl RequestRuntimeConfig {
         PayloadGuardConfig {
             enabled: self.payload_guard_enabled,
             max_bytes: self.effective_payload_guard_max_bytes(),
+            max_kiro_weight: self.effective_payload_guard_kiro_max_weight(),
             trim_history: self.payload_guard_trim_history,
             shaping: self.payload_shaping,
+        }
+    }
+
+    fn effective_payload_guard_kiro_max_weight(&self) -> usize {
+        if self.payload_guard_max_bytes == 0 {
+            0
+        } else {
+            self.payload_guard_kiro_max_weight
         }
     }
 
@@ -1011,6 +1023,7 @@ impl RequestRuntimeConfig {
             PayloadGuardMode::OnTooLong => PayloadGuardConfig {
                 enabled: self.payload_guard_enabled,
                 max_bytes: 0,
+                max_kiro_weight: 0,
                 trim_history: false,
                 shaping: self.payload_shaping,
             },
@@ -4167,6 +4180,27 @@ impl CredentialUsageContext {
         );
     }
 
+    fn record_websearch_tool_error_success(
+        &self,
+        usage: super::cache::CacheUsage,
+        error_code: &'static str,
+        internal_reason: &'static str,
+    ) {
+        self.record(
+            UsageRecordStatus::Success,
+            usage,
+            UsageSource::RequestEstimate,
+            Some(usage),
+            Some("websearch_tool_error".to_string()),
+            Some(internal_reason.to_string()),
+            Some(format!(
+                "websearch_tool_error:{error_code}:{internal_reason}"
+            )),
+            None,
+            None,
+        );
+    }
+
     fn record_client_dropped(&self) {
         self.record_failure(
             UsageRecordStatus::ClientDropped,
@@ -4459,6 +4493,22 @@ fn websearch_error_metadata(
     .ok()
 }
 
+fn websearch_tool_error_metadata(
+    attribution: &McpCallAttribution,
+    internal_reason: &'static str,
+    error_code: &'static str,
+) -> Option<serde_json::Value> {
+    let base = serde_json::to_value(json!({
+        "websearchToolError": {
+            "errorCode": error_code,
+            "internalReason": internal_reason,
+            "mcpAttempts": attribution.attempts.len(),
+        }
+    }))
+    .ok();
+    merge_error_metadata_values(base, websearch_error_metadata(attribution, internal_reason))
+}
+
 fn should_persist_payload_diagnostics(
     status: UsageRecordStatus,
     report: Option<&PayloadGuardReport>,
@@ -4559,6 +4609,7 @@ fn wrap_websearch_stream_usage_record(
     response: Response,
     usage_context: CredentialUsageContext,
     usage: super::cache::CacheUsage,
+    tool_error: Option<(&'static str, &'static str)>,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let data_stream = body.into_data_stream();
@@ -4613,12 +4664,20 @@ fn wrap_websearch_stream_usage_record(
                             .context()
                             .request
                             .mark_stream_terminal(StreamTerminalReason::Completed);
-                        guard.context().record_success_reported_with_metering(
-                            usage,
-                            UsageSource::RequestEstimate,
-                            Some(usage),
-                            None,
-                        );
+                        if let Some((error_code, internal_reason)) = tool_error {
+                            guard.context().record_websearch_tool_error_success(
+                                usage,
+                                error_code,
+                                internal_reason,
+                            );
+                        } else {
+                            guard.context().record_success_reported_with_metering(
+                                usage,
+                                UsageSource::RequestEstimate,
+                                Some(usage),
+                                None,
+                            );
+                        }
                         guard.complete();
                     }
                     None
@@ -5705,6 +5764,10 @@ fn log_payload_guard_report(
             original_bytes = report.original_bytes,
             final_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
+            limit_basis = report.limit_basis,
+            original_weight = report.original_weight,
+            final_weight = report.final_weight,
+            max_weight = report.max_weight,
             original_history_entries = report.original_history_entries,
             final_history_entries = report.final_history_entries,
             trimmed_history_entries = report.trimmed_history_entries,
@@ -5749,6 +5812,9 @@ fn log_payload_guard_report(
             conversation_id,
             payload_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
+            limit_basis = report.limit_basis,
+            payload_weight = report.final_weight,
+            max_weight = report.max_weight,
             history_entries = report.final_history_entries,
             "Kiro payload guard observed large request"
         );
@@ -5759,6 +5825,8 @@ fn should_log_payload_byte_breakdown(report: &PayloadGuardReport) -> bool {
     report.was_modified()
         || report.still_oversized
         || (report.max_bytes > 0 && report.final_bytes > report.max_bytes.saturating_mul(70) / 100)
+        || (report.max_weight > 0
+            && report.final_weight > report.max_weight.saturating_mul(70) / 100)
 }
 
 fn log_payload_byte_breakdown(
@@ -5777,6 +5845,9 @@ fn log_payload_byte_breakdown(
             conversation_id,
             total_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
+            limit_basis = report.limit_basis,
+            total_weight = report.final_weight,
+            max_weight = report.max_weight,
             still_oversized = report.still_oversized,
             "Kiro payload byte breakdown skipped for small unmodified request"
         );
@@ -5790,6 +5861,9 @@ fn log_payload_byte_breakdown(
         conversation_id,
         total_bytes = breakdown.total_bytes,
         max_bytes = report.max_bytes,
+        limit_basis = report.limit_basis,
+        total_weight = report.final_weight,
+        max_weight = report.max_weight,
         history_bytes = breakdown.history_bytes,
         current_message_bytes = breakdown.current_message_bytes,
         current_content_bytes = breakdown.current_content_bytes,
@@ -6325,15 +6399,15 @@ async fn post_messages_inner(
         let attribution_sink = Arc::new(McpCallAttributionSink::default());
         let mut usage_guard =
             WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
-        let outcome = websearch::handle_websearch_request(
+        let outcome = websearch::handle_websearch_request(websearch::WebSearchRequestContext {
             provider,
-            &payload,
+            payload: &payload,
             input_tokens,
             inference_attempt_budget,
             attribution_sink,
-            &request_id,
-            &error_id,
-        )
+            request_id: &request_id,
+            error_id: &error_id,
+        })
         .await;
         let usage_context = usage_guard.take();
         return match outcome {
@@ -6359,7 +6433,7 @@ async fn post_messages_inner(
                     cache_creation_1h_input_tokens: 0,
                 };
                 if payload.stream {
-                    wrap_websearch_stream_usage_record(response, usage_context, usage)
+                    wrap_websearch_stream_usage_record(response, usage_context, usage, None)
                 } else {
                     usage_context.request.set_downstream_stop_reason("end_turn");
                     usage_context
@@ -6381,6 +6455,7 @@ async fn post_messages_inner(
                 error_type,
                 internal_reason,
                 attribution,
+                tool_error,
             } => {
                 if let Some(external_response) =
                     maybe_external_fallback_after_websearch_mcp_failure(
@@ -6392,6 +6467,53 @@ async fn post_messages_inner(
                     .await
                 {
                     return external_response;
+                }
+                if let Some(tool_error) = tool_error {
+                    let tool_error_code = tool_error.error_code;
+                    let tool_error_internal_reason = tool_error.internal_reason;
+                    let error_metadata = websearch_tool_error_metadata(
+                        &attribution,
+                        tool_error_internal_reason,
+                        tool_error_code,
+                    );
+                    let usage_context = usage_context.attach_credential(
+                        attribution.credential_id,
+                        attribution.credential_label,
+                        false,
+                        false,
+                        attribution.attempts,
+                    );
+                    let usage = super::cache::CacheUsage {
+                        total_input_tokens: input_tokens.max(0),
+                        input_tokens: input_tokens.max(0),
+                        output_tokens: tool_error.output_tokens.max(0),
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                        cache_creation_5m_input_tokens: 0,
+                        cache_creation_1h_input_tokens: 0,
+                    };
+                    if payload.stream {
+                        return wrap_websearch_stream_usage_record(
+                            tool_error.response,
+                            usage_context.with_error_metadata(error_metadata),
+                            usage,
+                            Some((tool_error_code, tool_error_internal_reason)),
+                        );
+                    }
+                    usage_context.request.set_downstream_stop_reason("end_turn");
+                    usage_context
+                        .request
+                        .latency
+                        .inference_attempt_budget
+                        .mark_downstream_committed();
+                    usage_context
+                        .with_error_metadata(error_metadata)
+                        .record_websearch_tool_error_success(
+                            usage,
+                            tool_error_code,
+                            tool_error_internal_reason,
+                        );
+                    return tool_error.response;
                 }
                 let error_metadata = websearch_error_metadata(&attribution, internal_reason);
                 let usage_context = usage_context.attach_credential(

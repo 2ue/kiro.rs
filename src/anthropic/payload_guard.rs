@@ -30,6 +30,8 @@ const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
 const CURRENT_FIT_OVERHEAD_BYTES: usize = 512;
 const PAYLOAD_GUARD_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 const UPSTREAM_IMAGE_SOURCE_MAX_BYTES: usize = 5 * 1024 * 1024;
+pub const KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT: usize = 1_300_000;
+pub const KIRO_NON_ASCII_PAYLOAD_WEIGHT: usize = 8;
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 const EMPTY_USER_CONTENT_PLACEHOLDER: &str = ".";
 const TOOL_FORMAT_DIAGNOSTIC_MAX_HISTORY_ENTRIES: usize = 512;
@@ -102,6 +104,7 @@ impl ToolUseFormatDiagnostics {
 pub struct PayloadGuardConfig {
     pub enabled: bool,
     pub max_bytes: usize,
+    pub max_kiro_weight: usize,
     pub trim_history: bool,
     pub shaping: PayloadShapingConfig,
 }
@@ -110,9 +113,17 @@ pub struct PayloadGuardConfig {
 #[serde(rename_all = "camelCase")]
 pub struct PayloadGuardReport {
     pub enabled: bool,
+    #[serde(default)]
+    pub limit_basis: String,
     pub max_bytes: usize,
+    #[serde(default)]
+    pub max_weight: usize,
     pub original_bytes: usize,
     pub final_bytes: usize,
+    #[serde(default)]
+    pub original_weight: usize,
+    #[serde(default)]
+    pub final_weight: usize,
     pub original_history_entries: usize,
     pub final_history_entries: usize,
     pub trimmed_history_entries: usize,
@@ -180,9 +191,13 @@ impl PayloadGuardReport {
     fn disabled(size: usize, history_entries: usize) -> Self {
         Self {
             enabled: false,
+            limit_basis: String::new(),
             max_bytes: 0,
+            max_weight: 0,
             original_bytes: size,
             final_bytes: size,
+            original_weight: 0,
+            final_weight: 0,
             original_history_entries: history_entries,
             final_history_entries: history_entries,
             trimmed_history_entries: 0,
@@ -445,22 +460,35 @@ pub fn guard_kiro_request(
     guard_serializations += 1;
     serialize_elapsed += serialize_started_at.elapsed();
     let original_bytes = original_body.len();
+    let original_weight = kiro_payload_weight(&original_body);
     let original_history_entries = request.conversation_state.history.len();
 
     if !config.enabled {
         let mut report = PayloadGuardReport::disabled(original_bytes, original_history_entries);
+        report.limit_basis = "kiroWeighted".to_string();
+        report.original_weight = original_weight;
+        report.final_weight = original_weight;
         report.guard_serializations = guard_serializations;
         set_cache_point_report_fields(&mut report, request);
         report.body_sha256 = Some(sha256_hex(&original_body));
         return Ok((original_body, report));
     }
-    let size_limit_enabled = config.max_bytes > 0;
+    let max_weight = if config.max_bytes > 0 {
+        config.max_kiro_weight
+    } else {
+        0
+    };
+    let size_limit_enabled = max_weight > 0;
 
     let mut report = PayloadGuardReport {
         enabled: true,
+        limit_basis: "kiroWeighted".to_string(),
         max_bytes: config.max_bytes,
+        max_weight,
         original_bytes,
         final_bytes: original_bytes,
+        original_weight,
+        final_weight: original_weight,
         original_history_entries,
         final_history_entries: original_history_entries,
         trimmed_history_entries: 0,
@@ -525,6 +553,7 @@ pub fn guard_kiro_request(
         original_body
     };
     report.final_bytes = body.len();
+    report.final_weight = kiro_payload_weight(&body);
 
     if config.shaping.enabled {
         let shaping_started_at = Instant::now();
@@ -545,11 +574,12 @@ pub fn guard_kiro_request(
             guard_serializations += 1;
             serialize_elapsed += serialize_started_at.elapsed();
             report.final_bytes = body.len();
+            report.final_weight = kiro_payload_weight(&body);
         }
         shaping_elapsed += shaping_started_at.elapsed();
     }
 
-    if size_limit_enabled && report.final_bytes > config.max_bytes && config.shaping.enabled {
+    if size_limit_enabled && report.final_weight > max_weight && config.shaping.enabled {
         let shaping_started_at = Instant::now();
         let shaping = apply_payload_shaping(request, config.shaping);
         let should_reserialize = shaping.was_modified();
@@ -561,15 +591,14 @@ pub fn guard_kiro_request(
             guard_serializations += 1;
             serialize_elapsed += serialize_started_at.elapsed();
             report.final_bytes = body.len();
+            report.final_weight = kiro_payload_weight(&body);
         }
         shaping_elapsed += shaping_started_at.elapsed();
     }
 
     if size_limit_enabled && config.trim_history {
         let trim_started_at = Instant::now();
-        while report.final_bytes > config.max_bytes
-            && !request.conversation_state.history.is_empty()
-        {
+        while report.final_weight > max_weight && !request.conversation_state.history.is_empty() {
             history_trim_iterations += 1;
             let removed = {
                 let state = &mut request.conversation_state;
@@ -580,8 +609,9 @@ pub fn guard_kiro_request(
                         .user_input_message
                         .user_input_message_context
                         .tool_results,
-                    report.final_bytes,
-                    config.max_bytes,
+                    report.final_weight,
+                    max_weight,
+                    true,
                 )
             };
             if removed == 0 {
@@ -601,12 +631,13 @@ pub fn guard_kiro_request(
             serialize_elapsed += serialize_started_at.elapsed();
             let new_size = body.len();
             report.final_bytes = new_size;
+            report.final_weight = kiro_payload_weight(&body);
         }
         trim_elapsed += trim_started_at.elapsed();
     }
 
     if size_limit_enabled
-        && report.final_bytes > config.max_bytes
+        && report.final_weight > max_weight
         && config.shaping.enabled
         && current_payload_shaping_enabled(config.shaping)
     {
@@ -614,14 +645,16 @@ pub fn guard_kiro_request(
         let (new_body, current_stats) = apply_current_payload_shaping_until_fit(
             request,
             config.shaping,
-            config.max_bytes,
+            max_weight,
             body,
+            kiro_payload_weight,
             &mut serialize_elapsed,
             &mut guard_serializations,
         )?;
         add_current_shaping_stats_to_report(&mut report, &current_stats);
         body = new_body;
         report.final_bytes = body.len();
+        report.final_weight = kiro_payload_weight(&body);
         current_shaping_elapsed += current_started_at.elapsed();
 
         if current_stats.was_modified() {
@@ -637,6 +670,7 @@ pub fn guard_kiro_request(
                 guard_serializations += 1;
                 serialize_elapsed += serialize_started_at.elapsed();
                 report.final_bytes = body.len();
+                report.final_weight = kiro_payload_weight(&body);
             }
         }
     }
@@ -652,15 +686,17 @@ pub fn guard_kiro_request(
         body = serialize_request(request)?;
         guard_serializations += 1;
         serialize_elapsed += serialize_started_at.elapsed();
+        report.final_weight = kiro_payload_weight(&body);
     }
 
     validate_kiro_tool_pairing_invariant(request)?;
 
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
+    report.final_weight = kiro_payload_weight(&body);
     report.guard_serializations = guard_serializations;
     report.history_trim_passes = history_trim_iterations;
-    report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
+    report.still_oversized = size_limit_enabled && report.final_weight > max_weight;
     set_cache_point_report_fields(&mut report, request);
     report.body_sha256 = Some(sha256_hex(&body));
 
@@ -1348,9 +1384,13 @@ fn new_payload_guard_report(
 ) -> PayloadGuardReport {
     PayloadGuardReport {
         enabled: true,
+        limit_basis: "bytes".to_string(),
         max_bytes,
+        max_weight: 0,
         original_bytes,
         final_bytes: original_bytes,
+        original_weight: 0,
+        final_weight: 0,
         original_history_entries,
         final_history_entries: original_history_entries,
         trimmed_history_entries: 0,
@@ -1535,6 +1575,25 @@ fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
         .unwrap_or(0)
 }
 
+pub fn kiro_payload_weight(payload: &str) -> usize {
+    payload
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() {
+                1
+            } else {
+                KIRO_NON_ASCII_PAYLOAD_WEIGHT
+            }
+        })
+        .sum()
+}
+
+fn json_weight<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_string(value)
+        .map(|value| kiro_payload_weight(&value))
+        .unwrap_or(0)
+}
+
 fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -1572,6 +1631,10 @@ fn log_payload_guard_timing(
             original_bytes = report.original_bytes,
             final_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
+            limit_basis = report.limit_basis,
+            original_weight = report.original_weight,
+            final_weight = report.final_weight,
+            max_weight = report.max_weight,
             modified = report.was_modified(),
             flattened_history_tool_uses = report.flattened_history_tool_uses,
             textified_history_tool_results = report.textified_history_tool_results,
@@ -3445,15 +3508,16 @@ fn current_payload_shaping_enabled(config: PayloadShapingConfig) -> bool {
 fn apply_current_payload_shaping_until_fit(
     request: &mut KiroRequest,
     config: PayloadShapingConfig,
-    max_bytes: usize,
+    max_size: usize,
     body: String,
+    measure_body: fn(&str) -> usize,
     serialize_elapsed: &mut Duration,
     guard_serializations: &mut usize,
 ) -> Result<(String, CurrentShapingStats), PayloadGuardError> {
     let mut body = body;
     let mut stats = CurrentShapingStats::default();
 
-    if body.len() <= max_bytes {
+    if measure_body(&body) <= max_size {
         return Ok((body, stats));
     }
 
@@ -3517,15 +3581,15 @@ fn apply_current_payload_shaping_until_fit(
     *serialize_elapsed += serialize_started_at.elapsed();
 
     let mut iterations = 0usize;
-    while body.len() > max_bytes && iterations < CURRENT_FIT_MAX_ITERATIONS {
+    while measure_body(&body) > max_size && iterations < CURRENT_FIT_MAX_ITERATIONS {
         iterations += 1;
-        let before_len = body.len();
+        let before_size = measure_body(&body);
         let mut changed = false;
 
         if truncate_tool_results
             && tool_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
         {
-            tool_budget = next_fit_budget(tool_budget, body.len(), max_bytes);
+            tool_budget = next_fit_budget(tool_budget, before_size, max_size);
             let result = truncate_current_tool_results(request, tool_budget);
             if result.0 > 0 {
                 stats.truncated_current_tool_results += result.0;
@@ -3538,7 +3602,7 @@ fn apply_current_payload_shaping_until_fit(
             && truncate_documents
             && document_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
         {
-            document_budget = next_fit_budget(document_budget, body.len(), max_bytes);
+            document_budget = next_fit_budget(document_budget, before_size, max_size);
             let result = truncate_current_documents(
                 &mut request
                     .conversation_state
@@ -3558,7 +3622,7 @@ fn apply_current_payload_shaping_until_fit(
             && truncate_user_content
             && user_content_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
         {
-            user_content_budget = next_fit_budget(user_content_budget, body.len(), max_bytes);
+            user_content_budget = next_fit_budget(user_content_budget, before_size, max_size);
             let result = truncate_current_user_content(
                 &mut request
                     .conversation_state
@@ -3575,9 +3639,8 @@ fn apply_current_payload_shaping_until_fit(
         }
 
         if !changed && truncate_images {
-            let required_reduction = body
-                .len()
-                .saturating_sub(max_bytes)
+            let required_reduction = before_size
+                .saturating_sub(max_size)
                 .saturating_add(CURRENT_FIT_OVERHEAD_BYTES);
             let result = drop_current_images_for_body_reduction(
                 &mut request
@@ -3601,7 +3664,7 @@ fn apply_current_payload_shaping_until_fit(
         body = serialize_request(request)?;
         *guard_serializations = (*guard_serializations).saturating_add(1);
         *serialize_elapsed += serialize_started_at.elapsed();
-        if body.len() >= before_len {
+        if measure_body(&body) >= before_size {
             break;
         }
     }
@@ -4348,17 +4411,18 @@ fn drop_current_images_for_body_reduction(
 fn trim_history_to_estimated_budget(
     history: &mut Vec<Message>,
     current_results: &[ToolResult],
-    current_bytes: usize,
-    target_bytes: usize,
+    current_size: usize,
+    target_size: usize,
+    weighted: bool,
 ) -> usize {
-    if history.is_empty() || current_bytes <= target_bytes {
+    if history.is_empty() || current_size <= target_size {
         return 0;
     }
 
     let mut prefix_len = 0usize;
-    let mut removed_item_bytes = 0usize;
-    let mut estimated_bytes = current_bytes;
-    while estimated_bytes > target_bytes && prefix_len < history.len() {
+    let mut removed_item_size = 0usize;
+    let mut estimated_size = current_size;
+    while estimated_size > target_size && prefix_len < history.len() {
         let remaining = &history[prefix_len..];
         let next_turn = remaining
             .iter()
@@ -4384,18 +4448,23 @@ fn trim_history_to_estimated_budget(
         }
         let previous_prefix_len = prefix_len;
         prefix_len += relative_end;
-        removed_item_bytes = removed_item_bytes.saturating_add(
+        removed_item_size = removed_item_size.saturating_add(
             history[previous_prefix_len..prefix_len]
                 .iter()
-                .map(json_len)
+                .map(|message| {
+                    if weighted {
+                        json_weight(message)
+                    } else {
+                        json_len(message)
+                    }
+                })
                 .sum::<usize>(),
         );
-        estimated_bytes =
-            current_bytes.saturating_sub(json_array_prefix_reduction_from_item_bytes(
-                history.len(),
-                prefix_len,
-                removed_item_bytes,
-            ));
+        estimated_size = current_size.saturating_sub(json_array_prefix_reduction_from_item_bytes(
+            history.len(),
+            prefix_len,
+            removed_item_size,
+        ));
     }
 
     if prefix_len > 0 {
@@ -5005,6 +5074,7 @@ mod tests {
         PayloadGuardConfig {
             enabled: true,
             max_bytes,
+            max_kiro_weight: max_bytes,
             trim_history: true,
             shaping: PayloadShapingConfig::default(),
         }
@@ -5014,6 +5084,7 @@ mod tests {
         PayloadGuardConfig {
             enabled: true,
             max_bytes: 1,
+            max_kiro_weight: 1,
             trim_history: false,
             shaping,
         }
@@ -5092,6 +5163,7 @@ mod tests {
         PayloadGuardConfig {
             enabled: true,
             max_bytes,
+            max_kiro_weight: max_bytes,
             trim_history,
             shaping,
         }
@@ -5228,6 +5300,136 @@ mod tests {
         assert!(serialized.contains("bodySha256"));
         assert!(!serialized.contains("current user content"));
         assert!(!serialized.contains(&body));
+    }
+
+    #[test]
+    fn kiro_payload_weight_charges_non_ascii_by_character() {
+        assert_eq!(kiro_payload_weight("hello"), 5);
+        assert_eq!("中文".len(), 6);
+        assert_eq!(
+            kiro_payload_weight("中文"),
+            2 * KIRO_NON_ASCII_PAYLOAD_WEIGHT
+        );
+        assert_eq!("é".len(), 2);
+        assert_eq!(kiro_payload_weight("é"), KIRO_NON_ASCII_PAYLOAD_WEIGHT);
+        assert_eq!("🙂".len(), 4);
+        assert_eq!(kiro_payload_weight("🙂"), KIRO_NON_ASCII_PAYLOAD_WEIGHT);
+
+        let ascii = "a".repeat(300);
+        let chinese = "填".repeat(100);
+        assert_eq!(ascii.len(), chinese.len());
+        assert_eq!(kiro_payload_weight(&ascii), 300);
+        assert_eq!(kiro_payload_weight(&chinese), 800);
+    }
+
+    #[test]
+    fn kiro_guard_uses_weight_not_bytes_for_limit_decision() {
+        let current = "é".repeat(600);
+        assert_eq!(current.len(), 1_200);
+        assert_eq!(kiro_payload_weight(&current), 4_800);
+
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = current;
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: body_size_target_for_weight_test(),
+                max_kiro_weight: 2_000,
+                trim_history: true,
+                shaping: PayloadShapingConfig::default(),
+            },
+        )
+        .expect("guard");
+
+        assert!(
+            body.len() < report.max_bytes,
+            "bytes are below the old local threshold"
+        );
+        assert_eq!(report.limit_basis, "kiroWeighted");
+        assert!(report.final_weight > report.max_weight);
+        assert!(report.still_oversized);
+    }
+
+    #[test]
+    fn kiro_guard_does_not_trim_when_bytes_exceed_but_weight_is_under_limit() {
+        let current = "a".repeat(600);
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = current;
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: 100,
+                max_kiro_weight: 2_000,
+                trim_history: true,
+                shaping: PayloadShapingConfig::default(),
+            },
+        )
+        .expect("guard");
+
+        assert!(body.len() > report.max_bytes);
+        assert!(report.final_weight <= report.max_weight);
+        assert!(!report.still_oversized);
+        assert_eq!(report.trimmed_history_entries, 0);
+        assert_eq!(body, serde_json::to_string(&request).expect("serialize"));
+    }
+
+    #[test]
+    fn kiro_guard_trims_history_until_weight_is_under_limit() {
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("é".repeat(250), TEST_MODEL)),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("ok"),
+            }),
+            Message::User(HistoryUserMessage::new("keep this turn", TEST_MODEL)),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("ok"),
+            }),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = "final".to_string();
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: body_size_target_for_weight_test(),
+                max_kiro_weight: 1_500,
+                trim_history: true,
+                shaping: PayloadShapingConfig::default(),
+            },
+        )
+        .expect("guard");
+
+        assert!(
+            body.len() < report.max_bytes,
+            "this regression is about weighted size"
+        );
+        assert_eq!(report.limit_basis, "kiroWeighted");
+        assert!(report.original_weight > report.max_weight);
+        assert!(report.final_weight <= report.max_weight);
+        assert!(!report.still_oversized);
+        assert!(report.trimmed_history_entries > 0);
+        assert!(!body.contains(&"é".repeat(250)));
+        assert!(body.contains("keep this turn"));
+    }
+
+    fn body_size_target_for_weight_test() -> usize {
+        100_000
     }
 
     #[test]
@@ -5567,7 +5769,7 @@ mod tests {
         let current_bytes = json_len(&history);
         let target_bytes = current_bytes.saturating_sub(json_array_prefix_reduction(&history, 4));
         let removed =
-            trim_history_to_estimated_budget(&mut history, &[], current_bytes, target_bytes);
+            trim_history_to_estimated_budget(&mut history, &[], current_bytes, target_bytes, false);
 
         assert_eq!(removed, 4);
         assert_eq!(history.len(), 2);
@@ -5595,7 +5797,13 @@ mod tests {
 
         let current_bytes = json_len(&history);
         assert_eq!(
-            trim_history_to_estimated_budget(&mut history, &current_results, current_bytes, 0),
+            trim_history_to_estimated_budget(
+                &mut history,
+                &current_results,
+                current_bytes,
+                0,
+                false,
+            ),
             0
         );
         assert_eq!(history.len(), 2);
@@ -5666,6 +5874,7 @@ mod tests {
             PayloadGuardConfig {
                 enabled: true,
                 max_bytes: target_bytes,
+                max_kiro_weight: target_bytes,
                 trim_history: true,
                 shaping: PayloadShapingConfig::default(),
             },
@@ -5970,7 +6179,7 @@ mod tests {
         let expected_prefix = 300usize;
         let expected_reduction = json_array_prefix_reduction(&history, expected_prefix);
         let target = before.saturating_sub(expected_reduction);
-        let removed = trim_history_to_estimated_budget(&mut history, &[], before, target);
+        let removed = trim_history_to_estimated_budget(&mut history, &[], before, target, false);
         let after = serde_json::to_vec(&history).unwrap().len();
 
         assert_eq!(removed, expected_prefix);
@@ -6610,6 +6819,7 @@ mod tests {
             PayloadGuardConfig {
                 enabled: true,
                 max_bytes: 0,
+                max_kiro_weight: 0,
                 trim_history: true,
                 shaping: PayloadShapingConfig::default(),
             },
@@ -6663,6 +6873,7 @@ mod tests {
             PayloadGuardConfig {
                 enabled: true,
                 max_bytes: 0,
+                max_kiro_weight: 0,
                 trim_history: true,
                 shaping: PayloadShapingConfig::default(),
             },
@@ -6789,6 +7000,7 @@ mod tests {
             PayloadGuardConfig {
                 enabled: true,
                 max_bytes: 0,
+                max_kiro_weight: 0,
                 trim_history: true,
                 shaping: PayloadShapingConfig::default(),
             },
@@ -6945,6 +7157,7 @@ mod tests {
                     PayloadGuardConfig {
                         enabled: true,
                         max_bytes: 0,
+                        max_kiro_weight: 0,
                         trim_history: true,
                         shaping: PayloadShapingConfig::default(),
                     },
@@ -6958,6 +7171,7 @@ mod tests {
                     PayloadGuardConfig {
                         enabled: true,
                         max_bytes,
+                        max_kiro_weight: max_bytes,
                         trim_history: true,
                         shaping: PayloadShapingConfig::default(),
                     },
@@ -7257,9 +7471,13 @@ mod tests {
     fn warning_header_fragment_reports_changes() {
         let report = PayloadGuardReport {
             enabled: true,
+            limit_basis: "kiroWeighted".to_string(),
             max_bytes: 1000,
+            max_weight: 1300,
             original_bytes: 2000,
             final_bytes: 900,
+            original_weight: 1600,
+            final_weight: 900,
             original_history_entries: 4,
             final_history_entries: 2,
             trimmed_history_entries: 2,

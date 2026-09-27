@@ -129,6 +129,16 @@ export interface CredentialRuntimeResponse {
   fresh: boolean
 }
 
+export interface CredentialDiagnosticsResponse {
+  credentialId: number
+  runtime?: CredentialRuntimeItem
+  page: number
+  limit: number
+  hasNext: boolean
+  records: UsageRecord[]
+  generatedAt: string
+}
+
 export interface CredentialAccountInfoListResponse {
   items: CredentialAccountInfoItem[]
   updatedAt: string
@@ -1840,6 +1850,7 @@ export interface RuntimeConfig {
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number
+  payloadGuardKiroMaxWeight: number
   payloadGuardSafetyMarginBytes: number
   payloadGuardTrimHistory: boolean
   payloadGuardExternalEnabled: boolean

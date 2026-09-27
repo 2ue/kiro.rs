@@ -88,6 +88,7 @@ mod tests {
         PayloadGuardConfig {
             enabled,
             max_bytes,
+            max_kiro_weight: max_bytes,
             trim_history: true,
             shaping: PayloadShapingConfig::default(),
         }

@@ -115,7 +115,33 @@ pub enum WebSearchOutcome {
         error_type: &'static str,
         internal_reason: &'static str,
         attribution: McpCallAttribution,
+        tool_error: Option<WebSearchToolErrorOutcome>,
     },
+}
+
+pub struct WebSearchToolErrorOutcome {
+    pub response: Response,
+    pub output_tokens: i32,
+    pub error_code: &'static str,
+    pub internal_reason: &'static str,
+}
+
+pub struct WebSearchRequestContext<'a> {
+    pub provider: Arc<crate::kiro::provider::KiroProvider>,
+    pub payload: &'a MessagesRequest,
+    pub input_tokens: i32,
+    pub inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    pub attribution_sink: Arc<McpCallAttributionSink>,
+    pub request_id: &'a str,
+    pub error_id: &'a str,
+}
+
+struct WebSearchResponseContext<'a> {
+    model: &'a str,
+    query: &'a str,
+    tool_use_id: &'a str,
+    summary: &'a str,
+    input_tokens: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +227,15 @@ impl WebSearchFailure {
     }
 
     fn into_outcome(self, request_id: &str, error_id: &str) -> WebSearchOutcome {
+        self.into_outcome_with_tool_error(request_id, error_id, None)
+    }
+
+    fn into_outcome_with_tool_error(
+        self,
+        request_id: &str,
+        error_id: &str,
+        tool_error: Option<WebSearchToolErrorOutcome>,
+    ) -> WebSearchOutcome {
         let (status, error_type, message, retry_after) = match self.kind {
             WebSearchFailureKind::Scheduler => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -255,8 +290,58 @@ impl WebSearchFailure {
             error_type,
             internal_reason: self.internal_reason,
             attribution: *self.attribution,
+            tool_error,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum WebSearchToolErrorCode {
+    TooManyRequests,
+    InvalidToolInput,
+    MaxUsesExceeded,
+    QueryTooLong,
+    RequestTooLarge,
+    Unavailable,
+}
+
+impl WebSearchToolErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TooManyRequests => "too_many_requests",
+            Self::InvalidToolInput => "invalid_tool_input",
+            Self::MaxUsesExceeded => "max_uses_exceeded",
+            Self::QueryTooLong => "query_too_long",
+            Self::RequestTooLarge => "request_too_large",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+fn websearch_tool_error_code_for_failure(failure: &WebSearchFailure) -> WebSearchToolErrorCode {
+    match failure.kind {
+        WebSearchFailureKind::InvalidRequest => WebSearchToolErrorCode::InvalidToolInput,
+        WebSearchFailureKind::RateLimit => WebSearchToolErrorCode::TooManyRequests,
+        WebSearchFailureKind::Scheduler
+        | WebSearchFailureKind::Timeout
+        | WebSearchFailureKind::AttemptLimit
+        | WebSearchFailureKind::Upstream
+        | WebSearchFailureKind::Protocol => WebSearchToolErrorCode::Unavailable,
+    }
+}
+
+fn should_continue_after_websearch_failure(failure: &WebSearchFailure) -> bool {
+    !matches!(
+        failure.internal_reason,
+        "websearch_mcp_malformed_json"
+            | "websearch_mcp_invalid_envelope"
+            | "websearch_mcp_missing_result"
+            | "websearch_mcp_non_utf8_response"
+            | "websearch_mcp_response_too_large"
+            | "websearch_mcp_invalid_search_result"
+            | "websearch_mcp_protocol_error"
+    )
 }
 
 fn is_known_native_web_search_tool_type(tool_type: &str) -> bool {
@@ -454,6 +539,18 @@ fn parse_mcp_search_response(
         ));
     }
     if response.error.is_some() {
+        if response
+            .error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64)
+            == Some(-32602)
+        {
+            return Err(WebSearchFailure::new(
+                WebSearchFailureKind::InvalidRequest,
+                "websearch_mcp_invalid_tool_input",
+            ));
+        }
         return Err(WebSearchFailure::new(
             WebSearchFailureKind::Upstream,
             "websearch_mcp_rpc_error",
@@ -504,33 +601,104 @@ pub fn create_websearch_sse_stream(
     )
 }
 
-fn websearch_result_content(search_results: &Option<WebSearchResults>) -> Vec<Value> {
-    search_results
-        .as_ref()
-        .map(|results| {
-            results
-                .results
-                .iter()
-                .map(|result| {
-                    let page_age = result.published_date.and_then(|milliseconds| {
-                        chrono::DateTime::from_timestamp_millis(milliseconds)
-                            .map(|date| date.format("%B %-d, %Y").to_string())
-                    });
-                    json!({
-                        "type": "web_search_result",
-                        "title": result.title,
-                        "url": result.url,
-                        "encrypted_content": result.snippet.clone().unwrap_or_default(),
-                        "page_age": page_age
+fn websearch_result_content(search_results: &Option<WebSearchResults>) -> Value {
+    Value::Array(
+        search_results
+            .as_ref()
+            .map(|results| {
+                results
+                    .results
+                    .iter()
+                    .map(|result| {
+                        let page_age = result.published_date.and_then(|milliseconds| {
+                            chrono::DateTime::from_timestamp_millis(milliseconds)
+                                .map(|date| date.format("%B %-d, %Y").to_string())
+                        });
+                        json!({
+                            "type": "web_search_result",
+                            "title": result.title,
+                            "url": result.url,
+                            "encrypted_content": result.snippet.clone().unwrap_or_default(),
+                            "page_age": page_age
+                        })
                     })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+fn websearch_error_content(error_code: WebSearchToolErrorCode) -> Value {
+    json!({
+        "type": "web_search_tool_result_error",
+        "error_code": error_code.as_str()
+    })
 }
 
 fn estimated_output_tokens(summary: &str) -> i32 {
     ((summary.chars().count() as i32).saturating_add(3) / 4).max(1)
+}
+
+fn generate_websearch_tool_error_summary(
+    query: &str,
+    error_code: WebSearchToolErrorCode,
+) -> String {
+    let reason = match error_code {
+        WebSearchToolErrorCode::TooManyRequests => "the search service is currently rate limited",
+        WebSearchToolErrorCode::InvalidToolInput => {
+            "the search request was rejected as invalid tool input"
+        }
+        WebSearchToolErrorCode::MaxUsesExceeded => "the search use limit was reached",
+        WebSearchToolErrorCode::QueryTooLong => "the search query is too long",
+        WebSearchToolErrorCode::RequestTooLarge => "the search request is too large",
+        WebSearchToolErrorCode::Unavailable => "the search service is temporarily unavailable",
+    };
+    format!(
+        "I couldn't complete the web search for \"{}\" because {}. I can continue without live search results, but the answer may not include current web evidence.",
+        query, reason
+    )
+}
+
+fn generate_websearch_message_with_content(
+    context: &WebSearchResponseContext<'_>,
+    search_content: Value,
+) -> Value {
+    let output_tokens = estimated_output_tokens(context.summary);
+    json!({
+        "id": envelope::message_id(),
+        "type": "message",
+        "role": "assistant",
+        "model": context.model,
+        "content": [
+            {
+                "type": "text",
+                "text": format!("I'll search for \"{}\".", context.query)
+            },
+            {
+                "id": context.tool_use_id,
+                "type": "server_tool_use",
+                "name": "web_search",
+                "input": {"query": context.query}
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": context.tool_use_id,
+                "content": search_content
+            },
+            {
+                "type": "text",
+                "text": context.summary
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": context.input_tokens.max(0),
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        }
+    })
 }
 
 fn generate_websearch_message(
@@ -541,52 +709,20 @@ fn generate_websearch_message(
     summary: &str,
     input_tokens: i32,
 ) -> Value {
-    let search_content = websearch_result_content(&search_results);
-    let output_tokens = estimated_output_tokens(summary);
-    json!({
-        "id": envelope::message_id(),
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": [
-            {
-                "type": "text",
-                "text": format!("I'll search for \"{}\".", query)
-            },
-            {
-                "id": tool_use_id,
-                "type": "server_tool_use",
-                "name": "web_search",
-                "input": {"query": query}
-            },
-            {
-                "type": "web_search_tool_result",
-                "content": search_content
-            },
-            {
-                "type": "text",
-                "text": summary
-            }
-        ],
-        "stop_reason": "end_turn",
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens.max(0),
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
-        }
-    })
+    let context = WebSearchResponseContext {
+        model,
+        query,
+        tool_use_id,
+        summary,
+        input_tokens,
+    };
+    generate_websearch_message_with_content(&context, websearch_result_content(&search_results))
 }
 
 /// 生成 WebSearch SSE 事件序列
-fn generate_websearch_events(
-    model: &str,
-    query: &str,
-    tool_use_id: &str,
-    search_results: Option<WebSearchResults>,
-    summary: &str,
-    input_tokens: i32,
+fn generate_websearch_events_with_content(
+    context: &WebSearchResponseContext<'_>,
+    search_content: Value,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = envelope::message_id();
@@ -600,11 +736,11 @@ fn generate_websearch_events(
                 "id": message_id,
                 "type": "message",
                 "role": "assistant",
-                "model": model,
+                "model": context.model,
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": context.input_tokens,
                     "output_tokens": 0,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0
@@ -614,7 +750,7 @@ fn generate_websearch_events(
     ));
 
     // 2. content_block_start (text - 搜索决策说明, index 0)
-    let decision_text = format!("I'll search for \"{}\".", query);
+    let decision_text = format!("I'll search for \"{}\".", context.query);
     events.push(SseEvent::new(
         "content_block_start",
         json!({
@@ -656,10 +792,10 @@ fn generate_websearch_events(
             "type": "content_block_start",
             "index": 1,
             "content_block": {
-                "id": tool_use_id,
+                "id": context.tool_use_id,
                 "type": "server_tool_use",
                 "name": "web_search",
-                "input": {"query": query}
+                "input": {"query": context.query}
             }
         }),
     ));
@@ -674,9 +810,6 @@ fn generate_websearch_events(
     ));
 
     // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
-    let search_content = websearch_result_content(&search_results);
-
     events.push(SseEvent::new(
         "content_block_start",
         json!({
@@ -684,6 +817,7 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": context.tool_use_id,
                 "content": search_content
             }
         }),
@@ -712,7 +846,7 @@ fn generate_websearch_events(
     ));
 
     // 分块发送文本
-    let mut chars = summary.chars();
+    let mut chars = context.summary.chars();
     loop {
         let text = chars.by_ref().take(100).collect::<String>();
         if text.is_empty() {
@@ -742,7 +876,7 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = estimated_output_tokens(summary);
+    let output_tokens = estimated_output_tokens(context.summary);
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -751,7 +885,7 @@ fn generate_websearch_events(
                 "stop_reason": "end_turn"
             },
             "usage": {
-                "input_tokens": input_tokens,
+                "input_tokens": context.input_tokens,
                 "output_tokens": output_tokens,
                 "cache_creation_input_tokens": 0,
                 "cache_read_input_tokens": 0
@@ -768,6 +902,57 @@ fn generate_websearch_events(
     ));
 
     events
+}
+
+/// 生成 WebSearch SSE 事件序列
+fn generate_websearch_events(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: Option<WebSearchResults>,
+    summary: &str,
+    input_tokens: i32,
+) -> Vec<SseEvent> {
+    let context = WebSearchResponseContext {
+        model,
+        query,
+        tool_use_id,
+        summary,
+        input_tokens,
+    };
+    generate_websearch_events_with_content(&context, websearch_result_content(&search_results))
+}
+
+fn create_websearch_tool_error_outcome(
+    context: &WebSearchResponseContext<'_>,
+    error_code: WebSearchToolErrorCode,
+    internal_reason: &'static str,
+    stream_response: bool,
+    request_id: &str,
+) -> WebSearchToolErrorOutcome {
+    let output_tokens = estimated_output_tokens(context.summary);
+    let search_content = websearch_error_content(error_code);
+    let response = if stream_response {
+        let events = generate_websearch_events_with_content(context, search_content);
+        envelope::sse_builder_with_id(request_id)
+            .body(Body::from_stream(stream::iter(events.into_iter().map(
+                |event| Ok::<_, Infallible>(Bytes::from(event.to_sse_string())),
+            ))))
+            .unwrap()
+    } else {
+        envelope::json_response_with_id(
+            StatusCode::OK,
+            generate_websearch_message_with_content(context, search_content),
+            request_id,
+            None,
+        )
+    };
+    WebSearchToolErrorOutcome {
+        response,
+        output_tokens,
+        error_code: error_code.as_str(),
+        internal_reason,
+    }
 }
 
 /// 生成搜索结果摘要
@@ -800,15 +985,12 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
 }
 
 /// 处理 WebSearch 请求
-pub async fn handle_websearch_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    payload: &MessagesRequest,
-    input_tokens: i32,
-    inference_attempt_budget: Arc<InferenceAttemptBudget>,
-    attribution_sink: Arc<McpCallAttributionSink>,
-    request_id: &str,
-    error_id: &str,
-) -> WebSearchOutcome {
+pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> WebSearchOutcome {
+    let payload = context.payload;
+    let request_id = context.request_id;
+    let error_id = context.error_id;
+    let input_tokens = context.input_tokens;
+
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
         Some(q) => q,
@@ -832,10 +1014,10 @@ pub async fn handle_websearch_request(
 
     // 3. 调用 Kiro MCP API
     let (search_results, attribution) = match call_mcp_api(
-        &provider,
+        &context.provider,
         &mcp_request,
-        inference_attempt_budget,
-        attribution_sink,
+        context.inference_attempt_budget,
+        context.attribution_sink,
         request_id,
     )
     .await
@@ -847,7 +1029,25 @@ pub async fn handle_websearch_request(
                 failure = failure.internal_reason,
                 "native WebSearch MCP request failed"
             );
-            return failure.into_outcome(request_id, error_id);
+            let tool_error = should_continue_after_websearch_failure(&failure).then(|| {
+                let error_code = websearch_tool_error_code_for_failure(&failure);
+                let summary = generate_websearch_tool_error_summary(&query, error_code);
+                let response_context = WebSearchResponseContext {
+                    model: &payload.model,
+                    query: &query,
+                    tool_use_id: &tool_use_id,
+                    summary: &summary,
+                    input_tokens,
+                };
+                create_websearch_tool_error_outcome(
+                    &response_context,
+                    error_code,
+                    failure.internal_reason,
+                    payload.stream,
+                    request_id,
+                )
+            });
+            return failure.into_outcome_with_tool_error(request_id, error_id, tool_error);
         }
     };
 
@@ -1407,6 +1607,71 @@ mod tests {
     }
 
     #[test]
+    fn mcp_invalid_params_maps_to_invalid_tool_input_for_five_rounds() {
+        for _ in 0..5 {
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "id": "expected",
+                "error": {
+                    "code": -32602,
+                    "message": "private upstream invalid params detail"
+                }
+            })
+            .to_string();
+            let failure = parse_mcp_search_response(&payload, "expected")
+                .expect_err("MCP invalid params must not parse as success");
+            assert_eq!(failure.kind, WebSearchFailureKind::InvalidRequest);
+            assert_eq!(failure.internal_reason, "websearch_mcp_invalid_tool_input");
+            assert_eq!(
+                websearch_tool_error_code_for_failure(&failure),
+                WebSearchToolErrorCode::InvalidToolInput
+            );
+        }
+    }
+
+    #[test]
+    fn only_recoverable_websearch_failures_emit_tool_errors_for_five_rounds() {
+        let recoverable = [
+            "websearch_mcp_invalid_request",
+            "websearch_mcp_invalid_tool_input",
+            "websearch_mcp_rate_limit",
+            "websearch_mcp_timeout",
+            "websearch_mcp_body_timeout",
+            "websearch_mcp_body_read",
+            "websearch_mcp_upstream_error",
+            "websearch_mcp_rpc_error",
+            "websearch_mcp_tool_error",
+            "websearch_mcp_scheduler_unavailable",
+            "websearch_mcp_attempt_limit",
+        ];
+        let hard_failures = [
+            "websearch_mcp_malformed_json",
+            "websearch_mcp_invalid_envelope",
+            "websearch_mcp_missing_result",
+            "websearch_mcp_non_utf8_response",
+            "websearch_mcp_response_too_large",
+            "websearch_mcp_invalid_search_result",
+            "websearch_mcp_protocol_error",
+        ];
+        for _ in 0..5 {
+            for reason in recoverable {
+                let failure = WebSearchFailure::new(WebSearchFailureKind::Upstream, reason);
+                assert!(
+                    should_continue_after_websearch_failure(&failure),
+                    "{reason}"
+                );
+            }
+            for reason in hard_failures {
+                let failure = WebSearchFailure::new(WebSearchFailureKind::Protocol, reason);
+                assert!(
+                    !should_continue_after_websearch_failure(&failure),
+                    "{reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn auxiliary_focus_provider_typed_failures_ignore_misleading_error_text_for_five_rounds() {
         let cases = [
             (
@@ -1604,6 +1869,65 @@ mod tests {
                 .map(|event| &event.data["usage"])
                 .expect("stream final usage");
             assert_eq!(&non_stream["usage"], final_usage);
+        }
+    }
+
+    #[test]
+    fn stream_and_non_stream_tool_error_shapes_match_anthropic_protocol_for_five_rounds() {
+        for _ in 0..5 {
+            let search_content = websearch_error_content(WebSearchToolErrorCode::InvalidToolInput);
+            let summary = generate_websearch_tool_error_summary(
+                "query",
+                WebSearchToolErrorCode::InvalidToolInput,
+            );
+            let context = WebSearchResponseContext {
+                model: "test-model",
+                query: "query",
+                tool_use_id: "tool-1",
+                summary: &summary,
+                input_tokens: 123,
+            };
+            let non_stream =
+                generate_websearch_message_with_content(&context, search_content.clone());
+            let blocks = non_stream["content"]
+                .as_array()
+                .expect("tool-error content blocks");
+            let server_tool = blocks
+                .iter()
+                .find(|block| block["type"] == "server_tool_use")
+                .expect("server tool block");
+            let result = blocks
+                .iter()
+                .find(|block| block["type"] == "web_search_tool_result")
+                .expect("tool result block");
+            assert_eq!(server_tool["id"], "tool-1");
+            assert_eq!(result["tool_use_id"], "tool-1");
+            assert_eq!(
+                result["content"],
+                json!({
+                    "type": "web_search_tool_result_error",
+                    "error_code": "invalid_tool_input"
+                })
+            );
+            assert_eq!(non_stream["stop_reason"], "end_turn");
+            assert!(
+                non_stream["usage"]["output_tokens"]
+                    .as_i64()
+                    .unwrap_or_default()
+                    > 0
+            );
+
+            let events = generate_websearch_events_with_content(&context, search_content);
+            let streamed_result = events
+                .iter()
+                .find(|event| event.event == "content_block_start" && event.data["index"] == 2)
+                .map(|event| &event.data["content_block"])
+                .expect("streamed tool result block");
+            assert_eq!(streamed_result, result);
+            assert_eq!(
+                events.last().map(|event| event.event.as_str()),
+                Some("message_stop")
+            );
         }
     }
 

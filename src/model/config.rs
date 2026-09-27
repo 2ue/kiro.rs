@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::anthropic::inference_attempt_budget::DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS;
+use crate::anthropic::{
+    inference_attempt_budget::DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
+    payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
+};
 
 pub(crate) const DEFAULT_TOKEN_REFRESH_MAX_RPM: u32 = 60;
 pub(crate) const MIN_TOKEN_REFRESH_MAX_RPM: u32 = 1;
@@ -2666,9 +2669,10 @@ impl ModelMappingConfig {
 
 /// Kiro payload guard 的大小裁剪触发模式。
 ///
-/// `preemptive` 保持原有行为：发送上游前只要超过 `payloadGuardMaxBytes`
-/// 就执行配置的内容整形和裁剪。`on_too_long` 首次请求只做协议修复；
-/// 只有上游返回输入过长类错误后，才按 `payloadGuardMaxBytes` 裁剪并重试一次。
+/// `preemptive` 在 Kiro local path 按 `payloadGuardKiroMaxWeight`、
+/// 在外部/Anthropic byte path 按 `payloadGuardMaxBytes`，发送上游前执行配置的
+/// 内容整形和裁剪。`on_too_long` 首次请求只做协议修复；只有上游返回输入过长类
+/// 错误后，才按对应口径裁剪并重试一次。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadGuardMode {
@@ -3888,7 +3892,7 @@ pub struct Config {
 
     /// 发送 Kiro 上游前启用最终 payload 防护。
     ///
-    /// 防护在 Anthropic -> Kiro 转换之后运行，按真实 JSON 字节数裁剪旧历史，
+    /// 防护在 Anthropic -> Kiro 转换之后运行，按 Kiro weighted 口径裁剪旧历史，
     /// 并修复 Kiro 容易返回 `400 Improperly formed request` 的工具配对边界。
     #[serde(default = "default_payload_guard_enabled")]
     pub payload_guard_enabled: bool,
@@ -3897,17 +3901,26 @@ pub struct Config {
     #[serde(default = "default_payload_guard_mode")]
     pub payload_guard_mode: PayloadGuardMode,
 
-    /// Kiro 上游请求 JSON body 的本地裁剪目标。默认使用保守阈值 450 KiB；
-    /// `0` 表示不按大小整形或裁剪，但仍执行协议修复。该字段不是入站
-    /// hard limit；无法安全裁剪时会记录 `still_oversized` 并由上游裁决。
+    /// 通用 payload 的本地 byte soft target 和按大小处理总开关。Kiro local path
+    /// 的真实体积判断由 `payload_guard_kiro_max_weight` 提供；`0` 表示不按大小
+    /// 整形或裁剪，但仍执行协议修复。该字段不是入站 hard limit；无法安全裁剪时
+    /// 会记录 `still_oversized` 并由上游裁决。
     #[serde(default = "default_payload_guard_max_bytes")]
     pub payload_guard_max_bytes: usize,
 
-    /// payload guard 的安全余量字节数。
+    /// Kiro 上游真实 payload 体积的字符集加权裁剪目标。
     ///
-    /// 当 `payloadGuardMaxBytes > 0` 时，实际裁剪目标为
-    /// `payloadGuardMaxBytes - payloadGuardSafetyMarginBytes`，避免 provider
-    /// 层追加 endpoint/profile 等字段后贴近 Kiro 的真实请求体上限。
+    /// 与 `payloadGuardMaxBytes` 不同，本字段只用于 Kiro local path：
+    /// ASCII 字符计 1，非 ASCII 字符计 8。`payloadGuardMaxBytes=0`
+    /// 仍表示关闭所有按大小触发的整形/裁剪。
+    #[serde(default = "default_payload_guard_kiro_max_weight")]
+    pub payload_guard_kiro_max_weight: usize,
+
+    /// 外部/Anthropic byte guard 的安全余量字节数。
+    ///
+    /// 当 `payloadGuardMaxBytes > 0` 时，外部/Anthropic byte path 的实际裁剪目标为
+    /// `payloadGuardMaxBytes - payloadGuardSafetyMarginBytes`。Kiro local path 使用
+    /// `payloadGuardKiroMaxWeight`，不把这个 byte margin 当成 weighted 阈值。
     #[serde(default = "default_payload_guard_safety_margin_bytes")]
     pub payload_guard_safety_margin_bytes: usize,
 
@@ -4449,6 +4462,10 @@ fn default_payload_guard_mode() -> PayloadGuardMode {
 
 fn default_payload_guard_max_bytes() -> usize {
     450 * 1024
+}
+
+fn default_payload_guard_kiro_max_weight() -> usize {
+    KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT
 }
 
 fn default_payload_guard_safety_margin_bytes() -> usize {
@@ -5154,6 +5171,7 @@ impl Default for Config {
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),
             payload_guard_max_bytes: default_payload_guard_max_bytes(),
+            payload_guard_kiro_max_weight: default_payload_guard_kiro_max_weight(),
             payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
             payload_guard_external_enabled: default_payload_guard_external_enabled(),
@@ -5799,6 +5817,10 @@ mod tests {
         assert!(config.payload_guard_enabled);
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
         assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
+        assert_eq!(
+            config.payload_guard_kiro_max_weight,
+            KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT
+        );
         assert_eq!(config.payload_guard_safety_margin_bytes, 32 * 1024);
         assert!(config.payload_guard_trim_history);
         assert!(config.payload_guard_external_enabled);

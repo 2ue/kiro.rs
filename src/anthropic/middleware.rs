@@ -26,6 +26,7 @@ use super::{
     envelope,
     files::AnthropicFileStore,
     model_capabilities::ModelCapabilitiesCatalog,
+    payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
@@ -95,8 +96,10 @@ pub struct AppState {
     pub payload_guard_enabled: bool,
     /// payload guard 大小裁剪触发模式
     pub payload_guard_mode: PayloadGuardMode,
-    /// Kiro 上游请求 JSON body 最大字节数
+    /// 通用 payload 的本地 byte soft target 和按大小处理总开关
     pub payload_guard_max_bytes: usize,
+    /// Kiro 上游请求体字符集加权体积目标
+    pub payload_guard_kiro_max_weight: usize,
     /// payload guard 安全余量字节数
     pub payload_guard_safety_margin_bytes: usize,
     /// payload 超限时是否裁剪旧历史
@@ -171,6 +174,7 @@ impl AppState {
             payload_guard_enabled: true,
             payload_guard_mode: PayloadGuardMode::OnTooLong,
             payload_guard_max_bytes: 450 * 1024,
+            payload_guard_kiro_max_weight: KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
             payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,
             payload_guard_external_enabled: true,
@@ -273,6 +277,7 @@ impl AppState {
         enabled: bool,
         mode: PayloadGuardMode,
         max_bytes: usize,
+        max_kiro_weight: usize,
         safety_margin_bytes: usize,
         trim_history: bool,
         external_enabled: bool,
@@ -288,6 +293,7 @@ impl AppState {
         self.payload_guard_enabled = enabled;
         self.payload_guard_mode = mode;
         self.payload_guard_max_bytes = max_bytes;
+        self.payload_guard_kiro_max_weight = max_kiro_weight;
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
         self.payload_guard_trim_history = trim_history;
         self.payload_guard_external_enabled = external_enabled;

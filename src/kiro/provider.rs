@@ -25,6 +25,7 @@ use crate::anthropic::inference_attempt_budget::{
 use crate::anthropic::model_capabilities::{
     KiroReasoningCapabilityState, intersect_authoritative_reasoning_schemas,
 };
+use crate::anthropic::payload_guard::kiro_payload_weight;
 use crate::http_client::{
     HttpSendError, ProxyConfig, build_client, execute_with_response_header_timeout,
     response_bytes_with_limit_and_body_timeout, response_text_with_limit_and_body_timeout,
@@ -341,25 +342,15 @@ impl std::fmt::Display for McpCallError {
 
 impl std::error::Error for McpCallError {}
 
-fn effective_payload_guard_limit_for_logging(config: &Config) -> usize {
-    const MIN_EFFECTIVE_LIMIT_BYTES: usize = 64 * 1024;
-    let max_bytes = config.payload_guard_max_bytes;
-    if max_bytes == 0 || config.payload_guard_safety_margin_bytes == 0 {
-        return max_bytes;
-    }
-    if max_bytes <= MIN_EFFECTIVE_LIMIT_BYTES {
-        return max_bytes;
-    }
-    let margin = config
-        .payload_guard_safety_margin_bytes
-        .min(max_bytes.saturating_sub(MIN_EFFECTIVE_LIMIT_BYTES));
-    max_bytes.saturating_sub(margin)
-}
-
-fn should_log_upstream_body_size_at_info(body_bytes: usize, config: &Config) -> bool {
-    let payload_guard_limit = effective_payload_guard_limit_for_logging(config);
+fn should_log_upstream_body_size_at_info(body: &str, config: &Config) -> bool {
+    let payload_guard_limit = if config.payload_guard_max_bytes > 0 {
+        config.payload_guard_kiro_max_weight
+    } else {
+        0
+    };
+    let body_weight = kiro_payload_weight(body);
     let near_payload_guard_limit =
-        payload_guard_limit > 0 && body_bytes > payload_guard_limit.saturating_mul(70) / 100;
+        payload_guard_limit > 0 && body_weight > payload_guard_limit.saturating_mul(70) / 100;
     let compression_enabled =
         config.compression.enabled && config.compression.whitespace_compression;
 
@@ -9463,12 +9454,14 @@ impl KiroProvider {
             endpoint.transform_api_body(request_body, &rctx),
             config.compression.enabled && config.compression.whitespace_compression,
         );
-        if should_log_upstream_body_size_at_info(body.len(), &config) {
+        if should_log_upstream_body_size_at_info(&body, &config) {
             tracing::info!(
                 endpoint = endpoint.name(),
                 credential_id = ctx.id,
                 credential_label = %credential_label,
                 upstream_body_bytes = body.len(),
+                upstream_body_weight = kiro_payload_weight(&body),
+                upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                 pre_endpoint_body_bytes = request_body.len(),
                 compression_enabled = config.compression.enabled
                     && config.compression.whitespace_compression,
@@ -9480,6 +9473,8 @@ impl KiroProvider {
                 credential_id = ctx.id,
                 credential_label = %credential_label,
                 upstream_body_bytes = body.len(),
+                upstream_body_weight = kiro_payload_weight(&body),
+                upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                 pre_endpoint_body_bytes = request_body.len(),
                 compression_enabled = config.compression.enabled
                     && config.compression.whitespace_compression,
@@ -11368,7 +11363,7 @@ impl KiroProvider {
                 endpoint.transform_api_body(request_body, &rctx),
                 config.compression.enabled && config.compression.whitespace_compression,
             );
-            if should_log_upstream_body_size_at_info(body.len(), &config) {
+            if should_log_upstream_body_size_at_info(&body, &config) {
                 tracing::info!(
                     request_id,
                     api_type,
@@ -11377,9 +11372,11 @@ impl KiroProvider {
                     credential_label = %credential_label,
                     attempt = attempt + 1,
                     max_retries,
+                    upstream_body_bytes = body.len(),
+                    upstream_body_weight = kiro_payload_weight(&body),
+                    upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                     model = model.as_deref(),
                     conversation_id = conversation_id.as_deref(),
-                    upstream_body_bytes = body.len(),
                     pre_endpoint_body_bytes = request_body.len(),
                     compression_enabled = config.compression.enabled
                         && config.compression.whitespace_compression,
@@ -11394,9 +11391,11 @@ impl KiroProvider {
                     credential_label = %credential_label,
                     attempt = attempt + 1,
                     max_retries,
+                    upstream_body_bytes = body.len(),
+                    upstream_body_weight = kiro_payload_weight(&body),
+                    upstream_body_weight_limit = config.payload_guard_kiro_max_weight,
                     model = model.as_deref(),
                     conversation_id = conversation_id.as_deref(),
-                    upstream_body_bytes = body.len(),
                     pre_endpoint_body_bytes = request_body.len(),
                     compression_enabled = config.compression.enabled
                         && config.compression.whitespace_compression,

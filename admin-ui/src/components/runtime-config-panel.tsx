@@ -624,6 +624,7 @@ const emptyConfig: RuntimeConfig = {
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
+  payloadGuardKiroMaxWeight: 1300000,
   payloadGuardSafetyMarginBytes: 32768,
   payloadGuardTrimHistory: true,
   payloadGuardExternalEnabled: true,
@@ -3094,6 +3095,7 @@ export function RuntimeConfigPanel() {
       definedCacheRoutes,
       modelMapping: normalizeModelMapping(draft.modelMapping),
       payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
+      payloadGuardKiroMaxWeight: toWhole(draft.payloadGuardKiroMaxWeight),
       payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
       externalPools: {
         ...defaultExternalPoolsConfig(),
@@ -4125,12 +4127,23 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="Kiro Payload 裁剪目标阈值"
-              description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。"
+              description="本地按大小触发的兼容阈值和总开关。填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发；Kiro 本地账号的真实体积判断使用下面的加权阈值。"
               value={draft.payloadGuardMaxBytes}
               min={0}
               suffix="bytes"
               onChange={(payloadGuardMaxBytes) =>
                 setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))
+              }
+            />
+            <NumberField
+              title="Kiro 加权体积阈值"
+              description="Kiro 本地账号按字符集加权计算 payload：ASCII=1，非 ASCII=8。默认 1300000。"
+              value={draft.payloadGuardKiroMaxWeight}
+              min={1}
+              suffix="weight"
+              disabled={!payloadSizeLimitEnabled}
+              onChange={(payloadGuardKiroMaxWeight) =>
+                setDraft((prev) => ({ ...prev, payloadGuardKiroMaxWeight }))
               }
             />
             <NumberField

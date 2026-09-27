@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-09-25 Asia/Shanghai
+Last reviewed: 2026-09-27 Asia/Shanghai
 
 ## Done
 
@@ -129,6 +129,31 @@ Last reviewed: 2026-09-25 Asia/Shanghai
     schema profile、thinking 多块、WebSearch index 和错误分类消费仍不得在真实证据前扩大默认行为；
   - 实现、进度、测试结果和复现记录见 [sub2api-kiro 协议互转优化执行计划](topics/sub2api-kiro-protocol-interop-optimization.md)，
     本批次证据见 [P0 evidence](../../../../feature/evidence/sub2api-kiro-protocol-interop-p0-20260916.md)。
+- WebSearch tool-error stability:
+  - 当前工作树已把 recoverable MCP/WebSearch execution failures 转换为 Anthropic
+    `web_search_tool_result_error`，并保持 `HTTP 200` + `message_stop/end_turn` 的完整
+    assistant message 形状；malformed JSON、invalid envelope、missing result、non-UTF8、
+    response-too-large、invalid search result 和通用 protocol corruption 仍硬失败。
+  - 空 query / 当前 user query 缺失仍在 MCP 前 `400`，因为 C003 真实反事实证明绕过
+    本地校验后真实 MCP 会返回 JSON-RPC `-32602` 且没有可用 WebSearch 内容；本项不
+    扩大为 query 语义预检，也不新增 MCP 试探请求。
+  - Focused unit/handler matrices、full scoped C0、真实 direct native WebSearch、真实
+    Claude CLI normal path、fake CLI tool-error/502 对照均已记录。真实 Claude CLI
+    `2.1.280` 尚未触发 native WebSearch，因此完整 native CLI C2/C3 仍是后续验证项。
+    Summary:
+    [WebSearch tool-error stability fix](../../../analysis/websearch-tool-error-stability-fix-20260927.md).
+- P001 Kiro weighted payload guard:
+  - `sub2api-kiro` 的 Kiro weighted 规则已迁入当前 Rust local Kiro guard：
+    ASCII=1、非 ASCII=8，默认 `payloadGuardKiroMaxWeight=1,300,000`；
+  - Kiro history trim、current-fit、`stillOversized` 和 payload diagnostics 已切到
+    weighted basis；外部 Anthropic/Raw paths 保留 byte basis；
+  - Admin API、两套 UI、配置默认值和 report/log 字段已同步；Rust focused `92/0/1`
+    和 handler/config/external `16/0/1` 通过，完整 Rust `2187/0/6`、release build、
+    fmt/diff、两套 UI build 和 artifact inventory 也通过；
+  - 真实 endpoint/model/account fixture、阈值漂移验证和生产 rollout 仍未完成，不能
+    把默认 1.3M 视为已被当前生产上游重新确认；
+  - 详情见 [P001 weighted 分析](../../../analysis/p001-kiro-payload-guard-weighted-analysis-20260927.md)
+    和 [验证计划](../../../analysis/p001-payload-guard-weighted-validation-20260927.md)。
 - Scheduler target decision and implementation readiness:
   - core target semantics are accepted in [Decision 001](decisions/001-local-external-scheduler-target-contract.md):
     all upstream errors default to temporary turbulence, priority cannot block healthy-pool

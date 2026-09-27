@@ -520,6 +520,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
+  payloadGuardKiroMaxWeight: 1300000,
   payloadGuardSafetyMarginBytes: 32768,
   payloadGuardTrimHistory: true,
   payloadGuardExternalEnabled: true,

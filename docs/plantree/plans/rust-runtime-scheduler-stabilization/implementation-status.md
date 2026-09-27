@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last reviewed: 2026-09-25 Asia/Shanghai
+Last reviewed: 2026-09-27 Asia/Shanghai
 
 Current active work: [Per-key request admission management](topics/per-key-request-admission-management.md).
 
@@ -36,6 +36,42 @@ Related active follow-up: [Service audit and backlog causality](topics/service-a
 - Hard constraints: preserve current request/queue/stream/RPM limits; no production load; do not mutate the user-provided untracked analysis/refactor documents or `.kilo` state.
 - Next: collect only the missing redacted production configuration and request timeline;
   do not change policy based on local fake-upstream evidence alone.
+
+Related active follow-up: WebSearch tool-error stability.
+
+- Plan phase: local implementation and validation complete; production rollout not started.
+- User-facing design: keep light current-user-query validation for deterministic empty-query
+  failures, but return recoverable MCP/WebSearch execution failures as Anthropic
+  `web_search_tool_result_error` inside `HTTP 200` assistant messages so Claude Code CLI does
+  not treat them as API-layer failures.
+- Boundary: malformed/unsafe MCP protocol responses, oversized/non-UTF8 bodies, missing result
+  and invalid search-result payloads still fail hard; the patch does not implement a second
+  model inference loop or change external-pool retry/deadline policy.
+- Last verified: focused WebSearch unit and handler matrices passed; full scoped C0 passed
+  `2183/0/6 ignored` plus `kiro_loadtest 31/31`, release build, fmt and diff. Frozen binary
+  SHA-256 `84f1acae7ffc8c6f9d630ff2d681d443d160857c96a097df3e05348b7e673bb7` is running on
+  the designated `127.0.0.1:19023` instance for local validation. Real direct native
+  WebSearch succeeded for stream/non-stream and rejected empty/stale-query cases before MCP;
+  real Claude Code CLI `2.1.280` did not emit native WebSearch, while a protocol-shape fake
+  server proved `HTTP 200 + tool_result_error` completes and `HTTP 502` enters repeated CLI
+  retry/error behavior. Summary:
+  [WebSearch tool-error stability fix](../../../analysis/websearch-tool-error-stability-fix-20260927.md).
+
+Related active follow-up: P001 Kiro weighted payload guard.
+
+- Plan phase: Kiro-specific weighted guard migration is implemented and locally focused-validated;
+  production rollout and current endpoint/model/account threshold confirmation remain open.
+- User-facing design: local Kiro payload size uses serialized-payload weighted units
+  (`ASCII=1`, non-ASCII `=8`) with default `payloadGuardKiroMaxWeight=1,300,000`;
+  external Anthropic/Raw paths retain byte-based guard semantics.
+- Last verified: Rust payload guard `92 passed / 0 failed / 1 ignored`; handler/config/external
+  payload subset `16 passed / 0 failed / 1 ignored`; complete scoped Rust suite
+  `2187 passed / 0 failed / 6 ignored`; Rust release build, `cargo fmt --check`,
+  `git diff --check`, UI typecheck/build, Admin UI build, and artifact inventory all passed.
+  Report/log fields now include `limitBasis`, `originalWeight`, `finalWeight`, and `maxWeight`.
+- Remaining evidence: low-risk real upstream fixtures for the current endpoint/model/account;
+  no production load or remote mutation was performed. Summary:
+  [P001 Kiro weighted payload guard analysis](../../../analysis/p001-kiro-payload-guard-weighted-analysis-20260927.md).
 
 Current phase:
 

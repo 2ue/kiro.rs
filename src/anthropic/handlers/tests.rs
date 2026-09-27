@@ -441,6 +441,12 @@ async fn websearch_handler_mcp_upstream(
             "error": {"code": -32000, "message": "private-jsonrpc-marker"}
         }))
         .into_response(),
+        value if value.starts_with("jsonrpc-invalid-params") => Json(json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32602, "message": "private-invalid-params-marker"}
+        }))
+        .into_response(),
         value if value.starts_with("is-error") => Json(json!({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -2359,7 +2365,8 @@ fn websearch_debug_logs_and_usage_never_capture_raw_query_or_result_markers_for_
     });
 }
 
-async fn run_websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for_five_rounds() {
+async fn run_websearch_mcp_error_resource_and_recovery_matrix_returns_tool_errors_for_five_rounds()
+{
     let captured = CapturedTestLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -2371,107 +2378,155 @@ async fn run_websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for
     let upstream = WebSearchHandlerUpstream::start().await;
     let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
     let cases = [
-        ("http-400", StatusCode::BAD_REQUEST, "invalid_request_error"),
+        ("http-400", StatusCode::OK, Some("invalid_tool_input")),
+        ("http-429", StatusCode::OK, Some("too_many_requests")),
+        ("http-500", StatusCode::OK, Some("unavailable")),
+        ("header-timeout", StatusCode::OK, Some("unavailable")),
+        ("body-timeout", StatusCode::OK, Some("unavailable")),
+        ("disconnect", StatusCode::OK, Some("unavailable")),
+        ("malformed", StatusCode::BAD_GATEWAY, None),
         (
-            "http-429",
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
+            "jsonrpc-invalid-params",
+            StatusCode::OK,
+            Some("invalid_tool_input"),
         ),
-        ("http-500", StatusCode::BAD_GATEWAY, "api_error"),
-        ("header-timeout", StatusCode::GATEWAY_TIMEOUT, "api_error"),
-        ("body-timeout", StatusCode::GATEWAY_TIMEOUT, "api_error"),
-        ("disconnect", StatusCode::BAD_GATEWAY, "api_error"),
-        ("malformed", StatusCode::BAD_GATEWAY, "api_error"),
-        ("jsonrpc-error", StatusCode::BAD_GATEWAY, "api_error"),
-        ("is-error", StatusCode::BAD_GATEWAY, "api_error"),
-        ("non-text-content", StatusCode::BAD_GATEWAY, "api_error"),
-        ("mismatched-id", StatusCode::BAD_GATEWAY, "api_error"),
-        (
-            "content-length-over-limit",
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-        ),
-        ("chunked-over-limit", StatusCode::BAD_GATEWAY, "api_error"),
+        ("jsonrpc-error", StatusCode::OK, Some("unavailable")),
+        ("is-error", StatusCode::OK, Some("unavailable")),
+        ("non-text-content", StatusCode::BAD_GATEWAY, None),
+        ("mismatched-id", StatusCode::BAD_GATEWAY, None),
+        ("content-length-over-limit", StatusCode::BAD_GATEWAY, None),
+        ("chunked-over-limit", StatusCode::BAD_GATEWAY, None),
     ];
     let private_markers = [
         "private-400-marker",
         "private-429-marker",
         "private-500-marker",
+        "private-invalid-params-marker",
         "private-jsonrpc-marker",
         "private-is-error-marker",
         "private-non-text-marker",
     ];
 
-    for (scenario, expected_status, expected_error_type) in cases {
+    for (scenario, expected_status, expected_error_code) in cases {
         for round in 1..=5 {
             let query = format!("{scenario}-{round}");
+            let stream = round % 2 == 0;
             let response = router
                 .clone()
                 .oneshot(multimodal_handler_request(
                     "/cc/v1/messages",
-                    single_query_websearch_body(&query, round % 2 == 0),
+                    single_query_websearch_body(&query, stream),
                 ))
                 .await
-                .expect("WebSearch error response");
+                .expect("WebSearch response");
             assert_eq!(
                 response.status(),
                 expected_status,
                 "{scenario} round {round}"
             );
-            let request_id = response_request_id(&response);
-            let error_id = response
+            let content_type = response
                 .headers()
-                .get("x-error-id")
+                .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
-                .expect("normalized WebSearch error-id")
-                .to_string();
-            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+                .map(str::to_string)
+                .expect("WebSearch content type");
+            let request_id = response_request_id(&response);
+            let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
                 .await
-                .expect("normalized WebSearch error body");
-            let body = String::from_utf8(body.to_vec()).expect("error body UTF-8");
-            let value: Value = serde_json::from_str(&body).expect("error response JSON");
-            assert_eq!(value["type"], "error");
-            assert_eq!(value["error"]["type"], expected_error_type);
-            assert!(
-                value["error"]["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains(&error_id)),
-                "{scenario} round {round}"
-            );
-            assert_eq!(value["request_id"], request_id);
-            assert!(!body.contains(&query));
+                .expect("WebSearch body");
+            let body = String::from_utf8(body.to_vec()).expect("WebSearch body UTF-8");
             for marker in private_markers {
                 assert!(!body.contains(marker), "{scenario} round {round}: {marker}");
             }
-
             let record = usage_record_for_request(&usage_recorder, &request_id);
-            assert_eq!(record.status, UsageRecordStatus::Error);
-            assert_websearch_usage_attribution(
-                &record,
-                &format!("{scenario} round {round}"),
-                &[query.as_str(), "private-", "WEBSEARCH_RAW_RESULT_MARKER"],
-            );
-            assert_eq!(record.error_id.as_deref(), Some(error_id.as_str()));
-            assert_eq!(
-                record.public_error_status_code,
-                Some(expected_status.as_u16())
-            );
-            assert_eq!(
-                record.public_error_type.as_deref(),
-                Some(expected_error_type)
-            );
-            assert_eq!(record.output_tokens, 0);
-            let serialized = serde_json::to_string(&record).expect("serialize error usage");
-            assert!(!serialized.contains(&query));
-            for marker in private_markers {
-                assert!(!serialized.contains(marker));
+            if let Some(expected_error_code) = expected_error_code {
+                if stream {
+                    assert_eq!(content_type, "text/event-stream", "{scenario}");
+                } else {
+                    assert!(content_type.starts_with("application/json"), "{scenario}");
+                }
+                assert!(body.contains(r#""type":"web_search_tool_result_error""#));
+                assert!(
+                    body.contains(&format!(r#""error_code":"{expected_error_code}""#)),
+                    "{scenario} round {round}: {body}"
+                );
+                assert!(body.contains(r#""type":"server_tool_use""#));
+                assert!(body.contains(r#""type":"web_search_tool_result""#));
+                assert!(
+                    body.contains("message_stop") || body.contains(r#""stop_reason":"end_turn""#)
+                );
+                if !stream {
+                    let value: Value =
+                        serde_json::from_str(&body).expect("tool-error message JSON");
+                    assert_eq!(value["type"], "message", "{scenario}");
+                    assert_eq!(value["stop_reason"], "end_turn", "{scenario}");
+                    let blocks = value["content"]
+                        .as_array()
+                        .expect("tool-error content array");
+                    let server_tool = blocks
+                        .iter()
+                        .find(|block| block["type"] == "server_tool_use")
+                        .expect("server_tool_use block");
+                    let tool_use_id = server_tool["id"].as_str().expect("server tool id");
+                    assert_eq!(server_tool["input"]["query"], query);
+                    let result = blocks
+                        .iter()
+                        .find(|block| block["type"] == "web_search_tool_result")
+                        .expect("web search result block");
+                    assert_eq!(result["tool_use_id"].as_str(), Some(tool_use_id));
+                    assert_eq!(
+                        result["content"]["type"].as_str(),
+                        Some("web_search_tool_result_error")
+                    );
+                    assert_eq!(
+                        result["content"]["error_code"].as_str(),
+                        Some(expected_error_code)
+                    );
+                }
+                assert_eq!(record.status, UsageRecordStatus::Success);
+                assert_websearch_usage_attribution(
+                    &record,
+                    &format!("{scenario} round {round}"),
+                    &[query.as_str(), "private-", "WEBSEARCH_RAW_RESULT_MARKER"],
+                );
+                assert_eq!(record.error_type.as_deref(), Some("websearch_tool_error"));
+                assert_eq!(record.public_error_status_code, None);
+                assert_eq!(record.public_error_type, None);
+                assert!(record.output_tokens > 0);
+                let serialized =
+                    serde_json::to_string(&record).expect("serialize tool-error usage");
+                assert!(serialized.contains("websearchToolError"));
+                assert!(serialized.contains(expected_error_code));
+                assert!(!serialized.contains(&query));
+                let attempts = record
+                    .latency_trace
+                    .and_then(|trace| trace.inference_attempts)
+                    .expect("error attempt snapshot");
+                assert_eq!(attempts.consumed, 1, "{scenario} round {round}");
+                assert!(attempts.downstream_committed);
+            } else {
+                assert!(content_type.starts_with("application/json"), "{scenario}");
+                let value: Value =
+                    serde_json::from_str(&body).expect("normalized protocol error JSON");
+                assert_eq!(value["type"], "error", "{scenario}");
+                assert_eq!(value["error"]["type"], "api_error", "{scenario}");
+                assert_eq!(value["request_id"], request_id, "{scenario}");
+                assert!(!body.contains(&query));
+                assert_eq!(record.status, UsageRecordStatus::Error, "{scenario}");
+                assert_eq!(
+                    record.public_error_status_code,
+                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    "{scenario}"
+                );
+                assert_eq!(record.public_error_type.as_deref(), Some("api_error"));
+                assert_eq!(record.output_tokens, 0);
+                let attempts = record
+                    .latency_trace
+                    .and_then(|trace| trace.inference_attempts)
+                    .expect("hard-failure attempt snapshot");
+                assert_eq!(attempts.consumed, 1, "{scenario}");
+                assert!(!attempts.downstream_committed, "{scenario}");
             }
-            let attempts = record
-                .latency_trace
-                .and_then(|trace| trace.inference_attempts)
-                .expect("error attempt snapshot");
-            assert_eq!(attempts.consumed, 1, "{scenario} round {round}");
-            assert!(!attempts.downstream_committed);
         }
     }
 
@@ -2518,9 +2573,10 @@ async fn run_websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for
 }
 
 #[test]
-fn websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for_five_rounds() {
+fn websearch_mcp_error_resource_and_recovery_matrix_returns_tool_errors_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread("websearch-error-matrix", || async {
-        run_websearch_mcp_error_resource_and_recovery_matrix_is_fail_closed_for_five_rounds().await;
+        run_websearch_mcp_error_resource_and_recovery_matrix_returns_tool_errors_for_five_rounds()
+            .await;
     });
 }
 
@@ -5695,6 +5751,8 @@ fn runtime_config_for_payload_guard(
         payload_guard_enabled: enabled,
         payload_guard_mode: mode,
         payload_guard_max_bytes: max_bytes,
+        payload_guard_kiro_max_weight:
+            crate::anthropic::payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
         payload_guard_safety_margin_bytes: 0,
         payload_guard_trim_history: true,
         payload_guard_external_enabled: true,
@@ -6084,6 +6142,7 @@ fn payload_guard_then_signature_retry_preserves_actual_trimmed_history_five_roun
             PayloadGuardConfig {
                 enabled: true,
                 max_bytes: expected_trimmed_len,
+                max_kiro_weight: expected_trimmed_len,
                 trim_history: true,
                 shaping,
             },
@@ -6377,6 +6436,10 @@ fn on_too_long_initial_guard_repairs_without_size_trimming() {
     assert!(!initial.trim_history);
     assert!(runtime_config.too_long_retry_enabled());
     assert_eq!(runtime_config.payload_guard_config().max_bytes, 460_800);
+    assert_eq!(
+        runtime_config.payload_guard_config().max_kiro_weight,
+        crate::anthropic::payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT
+    );
     assert!(runtime_config.payload_guard_config().trim_history);
 }
 
@@ -6390,6 +6453,7 @@ fn payload_guard_safety_margin_reduces_effective_size_target() {
 
     runtime_config.payload_guard_max_bytes = 0;
     assert_eq!(runtime_config.payload_guard_config().max_bytes, 0);
+    assert_eq!(runtime_config.payload_guard_config().max_kiro_weight, 0);
 }
 
 #[test]

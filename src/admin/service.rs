@@ -5221,6 +5221,7 @@ impl AdminService {
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
+            payload_guard_kiro_max_weight: config.payload_guard_kiro_max_weight as u64,
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes as u64,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_guard_external_enabled: config.payload_guard_external_enabled,
@@ -5442,6 +5443,10 @@ impl AdminService {
             .payload_guard_max_bytes
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(current_config.payload_guard_max_bytes);
+        let payload_guard_kiro_max_weight = req
+            .payload_guard_kiro_max_weight
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(current_config.payload_guard_kiro_max_weight);
         let payload_guard_safety_margin_bytes = req
             .payload_guard_safety_margin_bytes
             .and_then(|value| usize::try_from(value).ok())
@@ -5887,6 +5892,7 @@ impl AdminService {
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;
+                config.payload_guard_kiro_max_weight = payload_guard_kiro_max_weight;
                 config.payload_guard_safety_margin_bytes = payload_guard_safety_margin_bytes;
                 config.payload_guard_trim_history = payload_guard_trim_history;
                 config.payload_guard_external_enabled = payload_guard_external_enabled;
