@@ -53,7 +53,19 @@
 
 ## 待发布结果
 
-- 工作提交：待创建。
-- 版本提交：待创建。
-- 发布 tag：待创建。
-- 推送结果：待执行。
+- 工作提交：`cb5c309f`（`fix: stabilize websearch errors and kiro payload guard`）。
+- 版本提交：`1194c403`（`chore(release): 0.0.174`）。
+- 发布 tag：`v0.0.174`，指向 `1194c4035aed007e92e9ce2449dc47e71f5dd7ab`。
+- 推送结果：`main` 与 `v0.0.174` 均已推送到 `origin`。
+- 发布后文档提交：待创建；用于记录本段最终推送状态，不移动 `v0.0.174` tag。
+
+## 最终发布结果
+
+- 最新远端基线 tag：`v0.0.173`。
+- 新版本：`0.0.174`。
+- 新 tag：`v0.0.174`。
+- 发布模型：Rust crate 版本提交 + `v*` tag 触发 Docker workflow。
+- 远端回读：`origin/main` 已到 `1194c4035aed007e92e9ce2449dc47e71f5dd7ab`；远端 tag `v0.0.174` 已存在。
+- GitHub Actions 监控：本机未安装 `gh`；未认证 GitHub API 返回 `HTTP 403` 且 rate limit remaining 为 `0`，因此本地无法继续监控 tag workflow 结果。
+- 已知 registry 检查限制：`docker manifest inspect ghcr.io/2ue/kiro-rs:v0.0.173` 返回 `manifest unknown`，可能是镜像未公开、仓库/owner 不同或上一版发布产物不可匿名访问；本轮未能用本机匿名 registry 查询确认已发布镜像。
+- 生产边界：未触碰远端生产机器、生产数据库、生产 Redis 或生产配置。
