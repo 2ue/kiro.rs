@@ -36,8 +36,9 @@ use crate::kiro::model::available_models::{
 use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{
-    Config, MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
-    MIN_TOKEN_REFRESH_MAX_RPM,
+    Config, MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS, MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS,
+    MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS,
+    MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS, MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM,
 };
 use crate::storage::postgres::{
     CredentialAccountInfoRow, CredentialRefreshExpectedContext, CredentialRefreshFieldsCasOutcome,
@@ -96,8 +97,8 @@ use super::redis_runtime::{
 };
 use super::refresh::{
     RefreshFailure, RefreshFailureKind, RefreshFailureStage, RefreshSendAdmission,
-    get_usage_limits, is_token_expired, refresh_token_with_client, set_overage_status,
-    validate_refresh_token,
+    get_usage_limits, is_token_expired, is_token_expiring_within_secs, refresh_token_with_client,
+    set_overage_status, validate_refresh_token,
 };
 use super::route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 use super::rpm::{
@@ -160,7 +161,32 @@ fn validate_token_refresh_admission_config(config: &Config) -> anyhow::Result<()
             MAX_TOKEN_REFRESH_BURST
         );
     }
+    if !(MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS..=MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS)
+        .contains(&config.token_refresh_background_interval_secs)
+    {
+        anyhow::bail!(
+            "tokenRefreshBackgroundIntervalSecs must be between {} and {}",
+            MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS,
+            MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
+        );
+    }
+    if !(MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS..=MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS)
+        .contains(&config.token_refresh_background_lead_secs)
+    {
+        anyhow::bail!(
+            "tokenRefreshBackgroundLeadSecs must be between {} and {}",
+            MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS,
+            MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
+        );
+    }
     Ok(())
+}
+
+fn token_needs_refresh(credentials: &KiroCredentials, refresh_lead: Option<StdDuration>) -> bool {
+    match refresh_lead {
+        Some(lead) => is_token_expiring_within_secs(credentials, lead.as_secs()).unwrap_or(true),
+        None => is_token_expired(credentials),
+    }
 }
 
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
@@ -345,6 +371,66 @@ pub struct StatsFlushWorkerHandle {
     shutdown: Option<oneshot::Sender<Instant>>,
     task: JoinHandle<bool>,
     manager: Arc<MultiTokenManager>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackgroundTokenRefreshPassReport {
+    pub scanned: usize,
+    pub attempted: usize,
+    pub refreshed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackgroundTokenRefreshShutdownReport {
+    pub signal_sent: bool,
+    pub completed: bool,
+    pub timed_out: bool,
+    pub task_failed: bool,
+    pub last_pass: BackgroundTokenRefreshPassReport,
+}
+
+pub struct BackgroundTokenRefreshWorkerHandle {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<BackgroundTokenRefreshPassReport>,
+}
+
+impl BackgroundTokenRefreshWorkerHandle {
+    pub async fn shutdown(mut self, timeout: StdDuration) -> BackgroundTokenRefreshShutdownReport {
+        const ABORT_JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+        let signal_sent = self
+            .shutdown
+            .take()
+            .is_some_and(|shutdown| shutdown.send(()).is_ok());
+        let mut task = self.task;
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(Ok(last_pass)) => BackgroundTokenRefreshShutdownReport {
+                signal_sent,
+                completed: true,
+                last_pass,
+                ..Default::default()
+            },
+            Ok(Err(err)) => {
+                tracing::warn!("后台 Token 主动刷新任务异常退出: {}", err);
+                BackgroundTokenRefreshShutdownReport {
+                    signal_sent,
+                    task_failed: true,
+                    ..Default::default()
+                }
+            }
+            Err(_) => {
+                task.abort();
+                let _ = tokio::time::timeout(ABORT_JOIN_TIMEOUT, &mut task).await;
+                tracing::warn!("等待后台 Token 主动刷新任务退出超时，已停止后台任务");
+                BackgroundTokenRefreshShutdownReport {
+                    signal_sent,
+                    timed_out: true,
+                    ..Default::default()
+                }
+            }
+        }
+    }
 }
 
 impl StatsFlushWorkerHandle {
@@ -6923,6 +7009,26 @@ impl MultiTokenManager {
         budgets: TokenRefreshBudgets,
         auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     ) -> anyhow::Result<CallContext> {
+        self.try_ensure_token_with_budgets_and_auxiliary_budget_and_lead(
+            id,
+            credentials,
+            update_refresh_health,
+            budgets,
+            auxiliary_attempt_budget,
+            None,
+        )
+        .await
+    }
+
+    async fn try_ensure_token_with_budgets_and_auxiliary_budget_and_lead(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        update_refresh_health: bool,
+        budgets: TokenRefreshBudgets,
+        auxiliary_attempt_budget: Option<Arc<AuxiliaryAttemptBudget>>,
+        refresh_lead: Option<StdDuration>,
+    ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
             let credentials = self.resolve_proxy_for_credential(credentials.clone())?;
@@ -6944,7 +7050,7 @@ impl MultiTokenManager {
         // "expiring soon" window here makes a freshly issued short-lived token immediately
         // refreshable again, so lock waiters serialize duplicate refresh sends instead of
         // coalescing behind the first successful refresh.
-        let needs_refresh = is_token_expired(credentials);
+        let needs_refresh = token_needs_refresh(credentials, refresh_lead);
         let deadlines = budgets.deadlines()?;
 
         let creds = if needs_refresh {
@@ -6964,7 +7070,7 @@ impl MultiTokenManager {
                     .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
             };
 
-            if is_token_expired(&current_creds) {
+            if token_needs_refresh(&current_creds, refresh_lead) {
                 let current_creds_for_proxy = self
                     .resolve_proxy_for_credential(current_creds.clone())
                     .map_err(|_| {
@@ -9182,6 +9288,132 @@ impl MultiTokenManager {
                 tracing::warn!("清理 PgSQL 凭据运行态 mutation 幂等记录失败: {}", err);
             }
         }
+    }
+
+    pub fn spawn_background_token_refresh_worker(
+        self: &Arc<Self>,
+    ) -> BackgroundTokenRefreshWorkerHandle {
+        let first_tick = tokio::time::Instant::now()
+            + StdDuration::from_secs(self.runtime_config().token_refresh_background_interval_secs);
+        self.spawn_background_token_refresh_worker_inner(first_tick)
+    }
+
+    #[cfg(test)]
+    fn spawn_background_token_refresh_worker_inner_for_test(
+        self: &Arc<Self>,
+        first_tick: tokio::time::Instant,
+    ) -> BackgroundTokenRefreshWorkerHandle {
+        self.spawn_background_token_refresh_worker_inner(first_tick)
+    }
+
+    fn spawn_background_token_refresh_worker_inner(
+        self: &Arc<Self>,
+        first_tick: tokio::time::Instant,
+    ) -> BackgroundTokenRefreshWorkerHandle {
+        let (shutdown, mut shutdown_requested) = oneshot::channel();
+        let manager = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut next_tick = Box::pin(tokio::time::sleep_until(first_tick));
+            let mut last_pass = BackgroundTokenRefreshPassReport::default();
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_requested => break,
+                    _ = &mut next_tick => {
+                        let result = AssertUnwindSafe(manager.run_background_token_refresh_pass())
+                            .catch_unwind()
+                            .await;
+                        match result {
+                            Ok(report) => {
+                                last_pass = report;
+                                if report.attempted > 0 || report.failed > 0 {
+                                    tracing::info!(
+                                        scanned = report.scanned,
+                                        attempted = report.attempted,
+                                        refreshed = report.refreshed,
+                                        skipped = report.skipped,
+                                        failed = report.failed,
+                                        "后台 Token 主动刷新扫描完成"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                tracing::error!("后台 Token 主动刷新扫描发生 panic，worker 将继续运行");
+                            }
+                        }
+                        let interval_secs = manager
+                            .runtime_config()
+                            .token_refresh_background_interval_secs;
+                        next_tick = Box::pin(tokio::time::sleep(
+                            StdDuration::from_secs(interval_secs),
+                        ));
+                    }
+                }
+            }
+            last_pass
+        });
+        BackgroundTokenRefreshWorkerHandle {
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+
+    async fn run_background_token_refresh_pass(&self) -> BackgroundTokenRefreshPassReport {
+        let config = self.runtime_config();
+        if !config.token_refresh_background_enabled {
+            return BackgroundTokenRefreshPassReport::default();
+        }
+        let lead = StdDuration::from_secs(config.token_refresh_background_lead_secs);
+        let candidates = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|entry| {
+                    !entry.disabled
+                        && !entry.credentials.disabled
+                        && !entry.credentials.is_api_key_credential()
+                        && entry
+                            .credentials
+                            .refresh_token
+                            .as_deref()
+                            .is_some_and(|token| !token.trim().is_empty())
+                })
+                .map(|entry| (entry.id, entry.credentials.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut report = BackgroundTokenRefreshPassReport {
+            scanned: candidates.len(),
+            ..Default::default()
+        };
+        for (id, credentials) in candidates {
+            if !token_needs_refresh(&credentials, Some(lead)) {
+                report.skipped += 1;
+                continue;
+            }
+            report.attempted += 1;
+            match self
+                .try_ensure_token_with_budgets_and_auxiliary_budget_and_lead(
+                    id,
+                    &credentials,
+                    true,
+                    TokenRefreshBudgets::default(),
+                    None,
+                    Some(lead),
+                )
+                .await
+            {
+                Ok(_) => report.refreshed += 1,
+                Err(err) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        credential_id = id,
+                        error = %err,
+                        "后台 Token 主动刷新失败，将在下一轮按既有退避/协调状态重试"
+                    );
+                }
+            }
+        }
+        report
     }
 
     pub fn spawn_stats_flush_worker(self: &Arc<Self>) -> StatsFlushWorkerHandle {

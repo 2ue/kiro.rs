@@ -65,6 +65,27 @@ fn token_refresh_admission_config_is_fail_fast_at_startup_and_runtime_update() {
             "round {round}: runtime config must reject an out-of-range burst"
         );
         assert_eq!(manager.runtime_config().token_refresh_burst, original);
+
+        let mut invalid_interval = Config::default();
+        invalid_interval.token_refresh_background_interval_secs = 9;
+        assert!(
+            MultiTokenManager::new(invalid_interval, Vec::new(), None, None, false).is_err(),
+            "round {round}: background refresh interval must fail closed"
+        );
+        let mut invalid_lead = Config::default();
+        invalid_lead.token_refresh_background_lead_secs = 59;
+        assert!(
+            MultiTokenManager::new(invalid_lead, Vec::new(), None, None, false).is_err(),
+            "round {round}: background refresh lead must fail closed"
+        );
+        assert!(
+            manager
+                .update_runtime_config(|config| {
+                    config.token_refresh_background_interval_secs = 9;
+                })
+                .is_err(),
+            "round {round}: runtime background refresh interval must fail closed"
+        );
     }
 }
 
@@ -574,6 +595,162 @@ async fn stats_flush_worker_shutdown_flushes_and_releases_manager() {
     assert!(!report.task_failed);
     assert_eq!(report.pending_runtime_mutations, 0);
     assert_eq!(report.overflow_runtime_mutations, 0);
+    assert_eq!(Arc::strong_count(&manager), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_token_refresh_pass_refreshes_idle_oauth_and_persists_rotation() {
+    let (token_endpoint, request_received, server) = spawn_force_refresh_token_endpoint().await;
+    let mut credential = force_refresh_test_credential(token_endpoint);
+    credential.expires_at = Some((Utc::now() + Duration::minutes(6)).to_rfc3339());
+    let mut config = Config::default();
+    config.token_refresh_background_enabled = true;
+    config.token_refresh_background_lead_secs = 10 * 60;
+    let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+    let report = manager.run_background_token_refresh_pass().await;
+
+    assert_eq!(
+        report,
+        BackgroundTokenRefreshPassReport {
+            scanned: 1,
+            attempted: 1,
+            refreshed: 1,
+            skipped: 0,
+            failed: 0,
+        }
+    );
+    tokio::time::timeout(StdDuration::from_secs(1), request_received.notified())
+        .await
+        .expect("background refresh must send an OAuth request");
+    let refreshed = manager
+        .entries
+        .lock()
+        .iter()
+        .find(|entry| entry.id == 1)
+        .unwrap()
+        .credentials
+        .clone();
+    assert_eq!(
+        refreshed.access_token.as_deref(),
+        Some("force-refreshed-access-token")
+    );
+    assert_eq!(refreshed.refresh_token.as_ref().map(String::len), Some(150));
+    assert!(
+        refreshed
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| token.chars().all(|character| character == 'n'))
+    );
+    assert!(
+        refreshed
+            .expires_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|expires| expires > chrono::Utc::now())
+    );
+    assert_eq!(
+        manager.run_background_token_refresh_pass().await.attempted,
+        0,
+        "a successful rotation outside the proactive window must not be sent again"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_token_refresh_pass_skips_api_key_disabled_and_missing_refresh_token() {
+    let mut api_key = api_key_credential("background-skip-api-key");
+    api_key.id = Some(1);
+    let mut disabled = force_refresh_test_credential("http://127.0.0.1:1/token".to_string());
+    disabled.id = Some(2);
+    disabled.disabled = true;
+    disabled.refresh_token = Some(format!("disabled-refresh-{}", "d".repeat(150)));
+    let mut missing_refresh = force_refresh_test_credential("http://127.0.0.1:1/token".to_string());
+    missing_refresh.id = Some(3);
+    missing_refresh.refresh_token = None;
+    let mut outside_window = force_refresh_test_credential("http://127.0.0.1:1/token".to_string());
+    outside_window.id = Some(4);
+    outside_window.refresh_token = Some(format!("outside-refresh-{}", "o".repeat(150)));
+    outside_window.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+    let mut config = Config::default();
+    config.token_refresh_background_enabled = true;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![api_key, disabled, missing_refresh, outside_window],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    let report = manager.run_background_token_refresh_pass().await;
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.skipped, 1);
+    assert_eq!(report.refreshed, 0);
+    assert_eq!(report.failed, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_token_refresh_failure_isolated_and_next_account_still_refreshes() {
+    let (token_endpoint, request_received, server) = spawn_force_refresh_token_endpoint().await;
+    let mut failed = force_refresh_test_credential("http://127.0.0.1:1/token".to_string());
+    failed.id = Some(1);
+    failed.refresh_token = Some(format!("failed-refresh-{}", "f".repeat(150)));
+    failed.expires_at = Some((Utc::now() + Duration::minutes(6)).to_rfc3339());
+    let mut succeeds = force_refresh_test_credential(token_endpoint);
+    succeeds.id = Some(2);
+    succeeds.refresh_token = Some(format!("succeeds-refresh-{}", "s".repeat(150)));
+    succeeds.expires_at = Some((Utc::now() + Duration::minutes(6)).to_rfc3339());
+    let mut config = Config::default();
+    config.token_refresh_background_enabled = true;
+    let manager =
+        MultiTokenManager::new(config, vec![failed, succeeds], None, None, false).unwrap();
+
+    let report = manager.run_background_token_refresh_pass().await;
+
+    assert_eq!(report.scanned, 2);
+    assert_eq!(report.attempted, 2);
+    assert_eq!(report.refreshed, 1);
+    assert_eq!(report.failed, 1);
+    tokio::time::timeout(StdDuration::from_secs(1), request_received.notified())
+        .await
+        .expect("a later account must still be refreshed after an earlier failure");
+    assert_eq!(
+        manager
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == 2)
+            .and_then(|entry| entry.credentials.access_token.as_deref()),
+        Some("force-refreshed-access-token")
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_token_refresh_worker_shutdown_is_bounded() {
+    let manager = Arc::new(
+        MultiTokenManager::new(
+            Config::default(),
+            vec![api_key_credential("background-worker-shutdown")],
+            None,
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let worker = manager.spawn_background_token_refresh_worker_inner_for_test(
+        tokio::time::Instant::now() + StdDuration::from_secs(60),
+    );
+
+    let report = worker.shutdown(StdDuration::from_secs(1)).await;
+
+    assert!(report.signal_sent);
+    assert!(report.completed);
+    assert!(!report.timed_out);
+    assert!(!report.task_failed);
     assert_eq!(Arc::strong_count(&manager), 1);
 }
 

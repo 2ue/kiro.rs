@@ -533,6 +533,7 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
     let external_pool_manager = Arc::new(ExternalPoolManager::new(
         postgres_store.clone(),
@@ -752,6 +753,24 @@ async fn main() {
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
         abort_task_with_timeout("model capability recovery", model_capability_recovery_task),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
+    );
+
+    let background_token_refresh_report = background_token_refresh_worker
+        .shutdown(remaining_shutdown_budget(
+            shutdown_deadline,
+            BACKGROUND_SHUTDOWN_TIMEOUT,
+        ))
+        .await;
+    tracing::info!(
+        signal_sent = background_token_refresh_report.signal_sent,
+        completed = background_token_refresh_report.completed,
+        timed_out = background_token_refresh_report.timed_out,
+        task_failed = background_token_refresh_report.task_failed,
+        last_scanned = background_token_refresh_report.last_pass.scanned,
+        last_attempted = background_token_refresh_report.last_pass.attempted,
+        last_refreshed = background_token_refresh_report.last_pass.refreshed,
+        last_failed = background_token_refresh_report.last_pass.failed,
+        "后台 Token 主动刷新任务已停止"
     );
 
     let stats_report = stats_flush_worker

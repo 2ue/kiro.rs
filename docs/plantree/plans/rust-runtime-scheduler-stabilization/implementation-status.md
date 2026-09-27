@@ -2,7 +2,15 @@
 
 Last reviewed: 2026-09-27 Asia/Shanghai
 
-Current active work: [Per-key request admission management](topics/per-key-request-admission-management.md).
+Current active work: [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md).
+
+- Plan phase: implementation and local release verification complete; release tag and
+  remote workflow status remain to be recorded after the release push.
+- Last verified fact: the designated local instance ran the new candidate and emitted
+  `scanned=3 attempted=3 refreshed=3 skipped=0 failed=0`; dynamic Admin disable/restore
+  and C1/C2 protocol checks also passed.
+- Remaining TODO: publish the next patch tag, verify the tag workflow quality/image/
+  manifest jobs, and keep production observation separate from local verification.
 
 - Plan phase: implementation and local verification complete; `v0.0.172` source/tag are pushed, and Docker image workflow #228 is pending completion.
 - Compatibility invariant: existing `apiKey`/`apiKeys` remain accepted; an unmanaged key

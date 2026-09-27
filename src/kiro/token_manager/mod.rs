@@ -28,7 +28,11 @@ pub(crate) use auxiliary::{
 pub use concurrency::InFlightLeaseGuard;
 pub(crate) use manager::AutomaticTokenRecoveryOutcome;
 #[allow(unused_imports)]
-pub use manager::{MultiTokenManager, StatsFlushShutdownReport, StatsFlushWorkerHandle};
+pub use manager::{
+    BackgroundTokenRefreshPassReport, BackgroundTokenRefreshShutdownReport,
+    BackgroundTokenRefreshWorkerHandle, MultiTokenManager, StatsFlushShutdownReport,
+    StatsFlushWorkerHandle,
+};
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 #[allow(unused_imports)]
 pub use storage_task::{

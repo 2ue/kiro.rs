@@ -27,6 +27,9 @@
   "auxiliaryUpstreamMaxConcurrentRequests": 16,
   "tokenRefreshMaxRpm": 60,
   "tokenRefreshBurst": 8,
+  "tokenRefreshBackgroundEnabled": true,
+  "tokenRefreshBackgroundIntervalSecs": 60,
+  "tokenRefreshBackgroundLeadSecs": 600,
   "weightedCapacity": {
     "enabled": false,
     "maxUnitsPerRequest": 8,

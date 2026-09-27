@@ -87,9 +87,10 @@ use crate::kiro::token_manager::{
 };
 use crate::model::config::{
     Config, ExternalPoolsConfig, MAX_LOCAL_BERSERK_ROUND_DELAY_MS, MAX_LOCAL_BERSERK_ROUNDS,
-    MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BURST,
-    MIN_TOKEN_REFRESH_MAX_RPM, RequestAdmissionConfig, RequestApiKeyPolicy,
-    normalize_defined_cache_routes,
+    MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS, MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS,
+    MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS,
+    MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS, MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM,
+    RequestAdmissionConfig, RequestApiKeyPolicy, normalize_defined_cache_routes,
 };
 use crate::model::model_support::normalize_supported_models;
 use crate::storage::postgres::{
@@ -5167,6 +5168,9 @@ impl AdminService {
             },
             token_refresh_max_rpm: config.token_refresh_max_rpm,
             token_refresh_burst: config.token_refresh_burst,
+            token_refresh_background_enabled: config.token_refresh_background_enabled,
+            token_refresh_background_interval_secs: config.token_refresh_background_interval_secs,
+            token_refresh_background_lead_secs: config.token_refresh_background_lead_secs,
             token_refresh_admission_runtime: TokenRefreshAdmissionRuntimeResponse {
                 authority: token_refresh_admission.authority.as_str().to_string(),
                 breaker_state: token_refresh_admission.breaker_state.to_string(),
@@ -5303,6 +5307,15 @@ impl AdminService {
         let token_refresh_burst = req
             .token_refresh_burst
             .unwrap_or(current_config.token_refresh_burst);
+        let token_refresh_background_enabled = req
+            .token_refresh_background_enabled
+            .unwrap_or(current_config.token_refresh_background_enabled);
+        let token_refresh_background_interval_secs = req
+            .token_refresh_background_interval_secs
+            .unwrap_or(current_config.token_refresh_background_interval_secs);
+        let token_refresh_background_lead_secs = req
+            .token_refresh_background_lead_secs
+            .unwrap_or(current_config.token_refresh_background_lead_secs);
         let kiro_upstream_stream_retry_on_idle_timeout = req
             .kiro_upstream_stream_retry_on_idle_timeout
             .unwrap_or(current_config.kiro_upstream_stream_retry_on_idle_timeout);
@@ -5632,6 +5645,24 @@ impl AdminService {
                 MIN_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_BURST
             )));
         }
+        if !(MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
+            ..=MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS)
+            .contains(&token_refresh_background_interval_secs)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "tokenRefreshBackgroundIntervalSecs 必须在 {} 到 {} 之间",
+                MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS,
+                MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
+            )));
+        }
+        if !(MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS..=MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS)
+            .contains(&token_refresh_background_lead_secs)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "tokenRefreshBackgroundLeadSecs 必须在 {} 到 {} 之间",
+                MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS, MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
+            )));
+        }
         if credential_prompt_logic_retry_max_attempts > 10_000 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialPromptLogicRetryMaxAttempts 不能大于 10000".to_string(),
@@ -5849,6 +5880,10 @@ impl AdminService {
                     auxiliary_upstream_max_concurrent_requests;
                 config.token_refresh_max_rpm = token_refresh_max_rpm;
                 config.token_refresh_burst = token_refresh_burst;
+                config.token_refresh_background_enabled = token_refresh_background_enabled;
+                config.token_refresh_background_interval_secs =
+                    token_refresh_background_interval_secs;
+                config.token_refresh_background_lead_secs = token_refresh_background_lead_secs;
                 config.kiro_upstream_stream_retry_on_idle_timeout =
                     kiro_upstream_stream_retry_on_idle_timeout;
                 config.kiro_upstream_stream_retry_on_read_error =

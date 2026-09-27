@@ -14,6 +14,13 @@ pub(crate) const MAX_TOKEN_REFRESH_MAX_RPM: u32 = 6_000;
 pub(crate) const DEFAULT_TOKEN_REFRESH_BURST: u32 = 8;
 pub(crate) const MIN_TOKEN_REFRESH_BURST: u32 = 1;
 pub(crate) const MAX_TOKEN_REFRESH_BURST: u32 = 256;
+pub(crate) const DEFAULT_TOKEN_REFRESH_BACKGROUND_ENABLED: bool = true;
+pub(crate) const DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS: u64 = 60;
+pub(crate) const MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS: u64 = 10;
+pub(crate) const MAX_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS: u64 = 3_600;
+pub(crate) const DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 600;
+pub(crate) const MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 60;
+pub(crate) const MAX_TOKEN_REFRESH_BACKGROUND_LEAD_SECS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
@@ -3751,6 +3758,18 @@ pub struct Config {
     #[serde(default = "default_token_refresh_burst")]
     pub token_refresh_burst: u32,
 
+    /// 是否启用闲置账号的后台 Token 主动刷新。
+    #[serde(default = "default_token_refresh_background_enabled")]
+    pub token_refresh_background_enabled: bool,
+
+    /// 后台 Token 扫描间隔（秒）。
+    #[serde(default = "default_token_refresh_background_interval_secs")]
+    pub token_refresh_background_interval_secs: u64,
+
+    /// 后台 Token 主动刷新提前量（秒）。
+    #[serde(default = "default_token_refresh_background_lead_secs")]
+    pub token_refresh_background_lead_secs: u64,
+
     /// 上游 eventstream idle timeout 发生在下游提交前时是否允许重试。
     #[serde(default = "default_true")]
     pub kiro_upstream_stream_retry_on_idle_timeout: bool,
@@ -4301,6 +4320,18 @@ pub(crate) fn default_token_refresh_max_rpm() -> u32 {
 
 pub(crate) fn default_token_refresh_burst() -> u32 {
     DEFAULT_TOKEN_REFRESH_BURST
+}
+
+pub(crate) fn default_token_refresh_background_enabled() -> bool {
+    DEFAULT_TOKEN_REFRESH_BACKGROUND_ENABLED
+}
+
+pub(crate) fn default_token_refresh_background_interval_secs() -> u64 {
+    DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
+}
+
+pub(crate) fn default_token_refresh_background_lead_secs() -> u64 {
+    DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
 }
 
 fn default_credential_in_flight_lease_max_secs() -> u64 {
@@ -5142,6 +5173,10 @@ impl Default for Config {
                 default_auxiliary_upstream_max_concurrent_requests(),
             token_refresh_max_rpm: default_token_refresh_max_rpm(),
             token_refresh_burst: default_token_refresh_burst(),
+            token_refresh_background_enabled: default_token_refresh_background_enabled(),
+            token_refresh_background_interval_secs: default_token_refresh_background_interval_secs(
+            ),
+            token_refresh_background_lead_secs: default_token_refresh_background_lead_secs(),
             kiro_upstream_stream_retry_on_idle_timeout: true,
             kiro_upstream_stream_retry_on_read_error: true,
             kiro_upstream_stream_retry_on_status_error: true,
@@ -8341,6 +8376,18 @@ mod tests {
         );
         assert_eq!(config.token_refresh_max_rpm, DEFAULT_TOKEN_REFRESH_MAX_RPM);
         assert_eq!(config.token_refresh_burst, DEFAULT_TOKEN_REFRESH_BURST);
+        assert_eq!(
+            config.token_refresh_background_enabled,
+            DEFAULT_TOKEN_REFRESH_BACKGROUND_ENABLED
+        );
+        assert_eq!(
+            config.token_refresh_background_interval_secs,
+            DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
+        );
+        assert_eq!(
+            config.token_refresh_background_lead_secs,
+            DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
+        );
         assert!(!config.weighted_capacity.enabled);
         assert_eq!(config.weighted_capacity.max_units_per_request, 8);
         assert_eq!(config.weighted_capacity.units_for_tokens(1_000_000), 1);
@@ -8442,6 +8489,15 @@ mod tests {
                 DEFAULT_TOKEN_REFRESH_MAX_RPM
             );
             assert_eq!(historical.token_refresh_burst, DEFAULT_TOKEN_REFRESH_BURST);
+            assert!(historical.token_refresh_background_enabled);
+            assert_eq!(
+                historical.token_refresh_background_interval_secs,
+                DEFAULT_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS
+            );
+            assert_eq!(
+                historical.token_refresh_background_lead_secs,
+                DEFAULT_TOKEN_REFRESH_BACKGROUND_LEAD_SECS
+            );
 
             let explicit: Config = serde_json::from_str(
                 r#"{
@@ -8449,6 +8505,9 @@ mod tests {
                     "auxiliaryUpstreamMaxConcurrentRequests": 31,
                     "tokenRefreshMaxRpm": 120,
                     "tokenRefreshBurst": 16,
+                    "tokenRefreshBackgroundEnabled": false,
+                    "tokenRefreshBackgroundIntervalSecs": 120,
+                    "tokenRefreshBackgroundLeadSecs": 900,
                     "promptSteering": {"enabled": false}
                 }"#,
             )
@@ -8457,6 +8516,9 @@ mod tests {
             assert_eq!(explicit.auxiliary_upstream_max_concurrent_requests, 31);
             assert_eq!(explicit.token_refresh_max_rpm, 120);
             assert_eq!(explicit.token_refresh_burst, 16);
+            assert!(!explicit.token_refresh_background_enabled);
+            assert_eq!(explicit.token_refresh_background_interval_secs, 120);
+            assert_eq!(explicit.token_refresh_background_lead_secs, 900);
             assert!(!explicit.prompt_steering.enabled);
 
             let round_trip: Config =
@@ -8465,6 +8527,9 @@ mod tests {
             assert_eq!(round_trip.auxiliary_upstream_max_concurrent_requests, 31);
             assert_eq!(round_trip.token_refresh_max_rpm, 120);
             assert_eq!(round_trip.token_refresh_burst, 16);
+            assert!(!round_trip.token_refresh_background_enabled);
+            assert_eq!(round_trip.token_refresh_background_interval_secs, 120);
+            assert_eq!(round_trip.token_refresh_background_lead_secs, 900);
             assert!(!round_trip.prompt_steering.enabled);
         }
     }

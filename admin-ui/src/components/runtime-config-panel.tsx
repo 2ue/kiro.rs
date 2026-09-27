@@ -564,6 +564,9 @@ const emptyConfig: RuntimeConfig = {
   auxiliaryUpstreamMaxConcurrentRequests: 16,
   tokenRefreshMaxRpm: 60,
   tokenRefreshBurst: 8,
+  tokenRefreshBackgroundEnabled: true,
+  tokenRefreshBackgroundIntervalSecs: 60,
+  tokenRefreshBackgroundLeadSecs: 600,
   tokenRefreshAdmissionRuntime: {
     authority: 'process_local',
     configuredRpm: 60,
@@ -3049,6 +3052,9 @@ export function RuntimeConfigPanel() {
       auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
       tokenRefreshMaxRpm: toWhole(draft.tokenRefreshMaxRpm, 1, 6000),
       tokenRefreshBurst: toWhole(draft.tokenRefreshBurst, 1, 256),
+      tokenRefreshBackgroundEnabled: Boolean(draft.tokenRefreshBackgroundEnabled),
+      tokenRefreshBackgroundIntervalSecs: toWhole(draft.tokenRefreshBackgroundIntervalSecs, 10, 3600),
+      tokenRefreshBackgroundLeadSecs: toWhole(draft.tokenRefreshBackgroundLeadSecs, 60, 3600),
       kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
       kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
       kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
@@ -3469,6 +3475,38 @@ export function RuntimeConfigPanel() {
               suffix="次"
               onChange={(tokenRefreshBurst) =>
                 setDraft((prev) => ({ ...prev, tokenRefreshBurst }))
+              }
+            />
+            <ToggleField
+              title="闲置账号后台刷新"
+              description="服务端定期扫描长期未调用的 OAuth/外部 IdP 账号，在过期前主动轮换 Token；关闭后仅保留请求触发刷新。"
+              checked={draft.tokenRefreshBackgroundEnabled}
+              onCheckedChange={(tokenRefreshBackgroundEnabled) =>
+                setDraft((prev) => ({ ...prev, tokenRefreshBackgroundEnabled }))
+              }
+            />
+            <NumberField
+              title="后台刷新扫描间隔"
+              description="后台扫描账号的间隔，范围 10 到 3600 秒。"
+              value={draft.tokenRefreshBackgroundIntervalSecs}
+              min={10}
+              max={3600}
+              suffix="秒"
+              disabled={!draft.tokenRefreshBackgroundEnabled}
+              onChange={(tokenRefreshBackgroundIntervalSecs) =>
+                setDraft((prev) => ({ ...prev, tokenRefreshBackgroundIntervalSecs }))
+              }
+            />
+            <NumberField
+              title="后台刷新提前量"
+              description="Token 剩余多少秒时进入主动刷新窗口，范围 60 到 3600 秒。"
+              value={draft.tokenRefreshBackgroundLeadSecs}
+              min={60}
+              max={3600}
+              suffix="秒"
+              disabled={!draft.tokenRefreshBackgroundEnabled}
+              onChange={(tokenRefreshBackgroundLeadSecs) =>
+                setDraft((prev) => ({ ...prev, tokenRefreshBackgroundLeadSecs }))
               }
             />
             <div className="rounded-md border bg-background p-4 text-xs leading-5 text-muted-foreground md:col-span-2">

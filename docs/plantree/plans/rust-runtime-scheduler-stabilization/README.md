@@ -34,6 +34,7 @@ Authority:
    - [Thinking signature 协议安全](topics/thinking-signature-protocol-safety.md)
    - [sub2api-kiro 协议互转优化执行计划](topics/sub2api-kiro-protocol-interop-optimization.md)
    - [服务问题审计与并发积压因果](topics/service-audit-and-backlog-causality.md)
+   - [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Decisions:
    - [Decision 001：本地账号与外部池统一调度目标契约](decisions/001-local-external-scheduler-target-contract.md)

@@ -317,6 +317,9 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     auxiliaryUpstreamMaxConcurrentRequests: toWhole(draft.auxiliaryUpstreamMaxConcurrentRequests, 1, 256),
     tokenRefreshMaxRpm: toWhole(draft.tokenRefreshMaxRpm, 1, 6000),
     tokenRefreshBurst: toWhole(draft.tokenRefreshBurst, 1, 256),
+    tokenRefreshBackgroundEnabled: Boolean(draft.tokenRefreshBackgroundEnabled),
+    tokenRefreshBackgroundIntervalSecs: toWhole(draft.tokenRefreshBackgroundIntervalSecs, 10, 3600),
+    tokenRefreshBackgroundLeadSecs: toWhole(draft.tokenRefreshBackgroundLeadSecs, 60, 3600),
     kiroUpstreamStreamRetryOnIdleTimeout: Boolean(draft.kiroUpstreamStreamRetryOnIdleTimeout),
     kiroUpstreamStreamRetryOnReadError: Boolean(draft.kiroUpstreamStreamRetryOnReadError),
     kiroUpstreamStreamRetryOnStatusError: Boolean(draft.kiroUpstreamStreamRetryOnStatusError),
@@ -846,6 +849,9 @@ export function RuntimePage() {
                 <NumField label="单实例辅助并发上限" desc="限制同时进行的 Token 刷新、Profile 探测和模型目录请求；饱和时立即拒绝，不进入无界等待队列。" value={draft.auxiliaryUpstreamMaxConcurrentRequests} min={1} max={256} suffix="路" onChange={set('auxiliaryUpstreamMaxConcurrentRequests')} />
                 <NumField label="Token 刷新 RPM 上限" desc="Redis 可用时为跨实例共享上限；未配置 Redis 时为单进程上限。" value={draft.tokenRefreshMaxRpm} min={1} max={6000} suffix="RPM" onChange={set('tokenRefreshMaxRpm')} />
                 <NumField label="Token 刷新突发容量" desc="允许立即发送的刷新数量；之后按 RPM 速率补充。" value={draft.tokenRefreshBurst} min={1} max={256} suffix="次" onChange={set('tokenRefreshBurst')} />
+                <TogField label="闲置账号后台刷新" desc="服务端定期扫描长期未调用的 OAuth/外部 IdP 账号，在过期前主动轮换 Token；关闭后仅保留请求触发刷新。" checked={draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundEnabled')} />
+                <NumField label="后台刷新扫描间隔" desc="后台扫描账号的间隔；范围 10 到 3600 秒。" value={draft.tokenRefreshBackgroundIntervalSecs} min={10} max={3600} suffix="秒" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundIntervalSecs')} />
+                <NumField label="后台刷新提前量" desc="Token 剩余多少秒时进入主动刷新窗口；范围 60 到 3600 秒。" value={draft.tokenRefreshBackgroundLeadSecs} min={60} max={3600} suffix="秒" disabled={!draft.tokenRefreshBackgroundEnabled} onChange={set('tokenRefreshBackgroundLeadSecs')} />
                 <div className="rounded-lg border bg-muted/20 p-4 text-xs leading-5 text-muted-foreground md:col-span-2">
                   当前辅助通道：进行中 {draft.auxiliaryUpstreamRuntime.inFlight}，历史峰值 {draft.auxiliaryUpstreamRuntime.peakInFlight}，饱和拒绝 {draft.auxiliaryUpstreamRuntime.rejected}。Refresh client 缓存 {draft.auxiliaryUpstreamRuntime.refreshClientCacheEntries}/{draft.auxiliaryUpstreamRuntime.refreshClientCacheMaxEntries}，构建 {draft.auxiliaryUpstreamRuntime.refreshClientBuilds}，命中 {draft.auxiliaryUpstreamRuntime.refreshClientHits}，未命中 {draft.auxiliaryUpstreamRuntime.refreshClientMisses}，容量拒绝 {draft.auxiliaryUpstreamRuntime.refreshClientCacheSaturated}。
                   <br />Token refresh authority {draft.tokenRefreshAdmissionRuntime.authority}，准入 {draft.tokenRefreshAdmissionRuntime.admitted}，RPM 拒绝 {draft.tokenRefreshAdmissionRuntime.rateLimited}，协调拒绝 {draft.tokenRefreshAdmissionRuntime.coordinationRejected}，Redis 错误 {draft.tokenRefreshAdmissionRuntime.redisErrors}，剩余 {draft.tokenRefreshAdmissionRuntime.remainingMilliTokens / 1000} tokens。

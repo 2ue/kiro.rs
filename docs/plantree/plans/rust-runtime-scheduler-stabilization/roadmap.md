@@ -95,6 +95,15 @@ Last reviewed: 2026-09-27 Asia/Shanghai
 
 ## In Progress
 
+- 闲置账号后台 Token 主动刷新：
+  - 当前请求热路径、Admin 强刷和鉴权失败恢复都不能覆盖长期未调用账号；
+  - 已完成 `kiro-account-manager` 对照、可动态配置的服务端 worker、rotation/
+    真实 `expires_in` 持久化、失败隔离和有界 shutdown；
+  - focused/default/no-default Rust、两套 UI、指定 `19023` 实例闲置账号扫描、
+    动态开关、C1 `/cc/v1` 和真实 Claude Code CLI 均已验证；候选 SHA 与限制记录在
+    [后台 Token 主动刷新](topics/background-token-refresh.md)；
+  - 详情见 [后台 Token 主动刷新](topics/background-token-refresh.md)。
+
 - Service audit and long-request backlog remediation is implementation-complete locally;
   production attribution remains an evidence-only follow-up:
   - obtain redacted dispatch wait/queue/account/lease configuration;

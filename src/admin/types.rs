@@ -1697,6 +1697,9 @@ pub struct RuntimeConfigResponse {
     pub auxiliary_upstream_runtime: AuxiliaryUpstreamRuntimeResponse,
     pub token_refresh_max_rpm: u32,
     pub token_refresh_burst: u32,
+    pub token_refresh_background_enabled: bool,
+    pub token_refresh_background_interval_secs: u64,
+    pub token_refresh_background_lead_secs: u64,
     pub token_refresh_admission_runtime: TokenRefreshAdmissionRuntimeResponse,
     pub kiro_upstream_stream_retry_on_idle_timeout: bool,
     pub kiro_upstream_stream_retry_on_read_error: bool,
@@ -1818,6 +1821,12 @@ pub struct UpdateRuntimeConfigRequest {
     pub token_refresh_max_rpm: Option<u32>,
     #[serde(default)]
     pub token_refresh_burst: Option<u32>,
+    #[serde(default)]
+    pub token_refresh_background_enabled: Option<bool>,
+    #[serde(default)]
+    pub token_refresh_background_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub token_refresh_background_lead_secs: Option<u64>,
     #[serde(default)]
     pub kiro_upstream_stream_retry_on_idle_timeout: Option<bool>,
     #[serde(default)]

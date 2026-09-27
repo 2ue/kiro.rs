@@ -278,6 +278,18 @@ pub(crate) fn is_token_expiring_within(
         .map(|expires| expires <= Utc::now() + Duration::minutes(minutes))
 }
 
+pub(crate) fn is_token_expiring_within_secs(
+    credentials: &KiroCredentials,
+    seconds: u64,
+) -> Option<bool> {
+    let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+    credentials
+        .expires_at
+        .as_ref()
+        .and_then(|expires_at| DateTime::parse_from_rfc3339(expires_at).ok())
+        .map(|expires| expires <= Utc::now() + Duration::seconds(seconds))
+}
+
 /// 请求热路径的 Token 刷新边界（真实到期前保留 5 分钟安全余量）。
 ///
 /// 刷新 singleflight、跨实例 peer 接受和刷新 CAS 都必须使用这个边界。上游可能合法

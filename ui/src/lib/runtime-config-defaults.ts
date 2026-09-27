@@ -460,6 +460,9 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   auxiliaryUpstreamMaxConcurrentRequests: 16,
   tokenRefreshMaxRpm: 60,
   tokenRefreshBurst: 8,
+  tokenRefreshBackgroundEnabled: true,
+  tokenRefreshBackgroundIntervalSecs: 60,
+  tokenRefreshBackgroundLeadSecs: 600,
   tokenRefreshAdmissionRuntime: {
     authority: 'process_local',
     configuredRpm: 60,

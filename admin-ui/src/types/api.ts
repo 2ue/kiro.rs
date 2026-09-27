@@ -1812,6 +1812,9 @@ export interface RuntimeConfig {
   auxiliaryUpstreamRuntime: AuxiliaryUpstreamRuntime
   tokenRefreshMaxRpm: number
   tokenRefreshBurst: number
+  tokenRefreshBackgroundEnabled: boolean
+  tokenRefreshBackgroundIntervalSecs: number
+  tokenRefreshBackgroundLeadSecs: number
   tokenRefreshAdmissionRuntime: TokenRefreshAdmissionRuntime
   kiroUpstreamStreamRetryOnIdleTimeout: boolean
   kiroUpstreamStreamRetryOnReadError: boolean
