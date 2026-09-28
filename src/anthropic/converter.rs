@@ -117,6 +117,11 @@ pub struct ConverterOptions {
     pub kiro_cache_point_tools_only: bool,
     pub kiro_cache_point_record_plan: bool,
     pub force_visible_thinking: bool,
+    /// Explicit client reasoning is a protocol capability request, not an operator prompt
+    /// addition. It is populated from the request before history conversion so a disabled
+    /// operator prompt master cannot turn a valid Claude Code reasoning request into a local 400
+    /// when the configured compatibility thinking transport is available.
+    pub(crate) explicit_reasoning_request: bool,
     pub(crate) native_reasoning_capability: KiroReasoningCapabilityState,
     pub prompt_steering: PromptSteeringConfig,
 }
@@ -131,6 +136,7 @@ impl Default for ConverterOptions {
             kiro_cache_point_tools_only: true,
             kiro_cache_point_record_plan: true,
             force_visible_thinking: false,
+            explicit_reasoning_request: false,
             native_reasoning_capability: KiroReasoningCapabilityState::LegacyFallback,
             prompt_steering: PromptSteeringConfig::default(),
         }
@@ -162,7 +168,7 @@ impl ConverterOptions {
 
     fn inject_thinking_prefix(&self) -> bool {
         let prompt_steering = self.prompt_steering.clone().normalized();
-        prompt_steering.enabled
+        (prompt_steering.enabled || self.explicit_reasoning_request)
             && self.conversion.thinking_prompt_controls.is_enabled()
             && prompt_steering.thinking.enabled
             && (self.force_visible_thinking || !self.is_strict())
@@ -410,9 +416,13 @@ pub fn convert_request_with_resolved_model(
 
 fn convert_request_with_model_id(
     req: &MessagesRequest,
-    options: ConverterOptions,
+    mut options: ConverterOptions,
     model_id: String,
 ) -> Result<ConversionResult, ConversionError> {
+    // An explicit Anthropic reasoning request must not be blocked by the operator prompt master.
+    // The flag only re-enables the dedicated thinking compatibility control; all other prompt
+    // additions continue to use promptSteering.enabled.
+    options.explicit_reasoning_request = requested_native_reasoning(req);
     let mut warnings = ProxyWarnings::default();
 
     // 2. 检查消息列表
@@ -1515,6 +1525,74 @@ mod tests {
             options.tool_choice_steering_enabled(),
             "prompt-only toggles must not disable structured tool filtering"
         );
+    }
+
+    #[test]
+    fn explicit_reasoning_keeps_compatibility_transport_when_operator_prompt_master_is_off() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let cases = [
+            (
+                Some(Thinking {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: 512,
+                }),
+                None,
+                "<thinking_mode>enabled</thinking_mode>",
+                "<max_thinking_length>512</max_thinking_length>",
+            ),
+            (
+                None,
+                Some(OutputConfig {
+                    effort: Some("low".to_string()),
+                }),
+                "<thinking_mode>adaptive</thinking_mode>",
+                "<thinking_effort>low</thinking_effort>",
+            ),
+        ];
+
+        for (thinking, output_config, mode_tag, control_tag) in cases {
+            let req = MessagesRequest {
+                model: "claude-haiku-4.5".to_string(),
+                max_tokens: 1024,
+                messages: vec![AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Hello"),
+                }],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking,
+                output_config,
+                metadata: None,
+            };
+            let mut options = ConverterOptions {
+                native_reasoning_capability: KiroReasoningCapabilityState::Unknown,
+                ..ConverterOptions::default()
+            };
+            options.prompt_steering.enabled = false;
+
+            let result = convert_request_with_options(&req, options)
+                .expect("explicit reasoning should use the compatibility transport");
+
+            assert!(
+                result.additional_model_request_fields.is_none(),
+                "unknown upstream capability must not invent native reasoning fields"
+            );
+            let injected = result
+                .conversation_state
+                .history
+                .iter()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(&user.user_input_message.content),
+                    _ => None,
+                })
+                .expect("compat thinking controls should be injected");
+            assert!(injected.contains(mode_tag), "{injected}");
+            assert!(injected.contains(control_tag), "{injected}");
+            assert!(!injected.contains(SYSTEM_CHUNKED_POLICY));
+        }
     }
 
     #[test]

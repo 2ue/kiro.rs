@@ -37,6 +37,7 @@ Authority:
    - [服务问题审计与并发积压因果](topics/service-audit-and-backlog-causality.md)
    - [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md)
    - [导入账号标签属性](topics/credential-import-tags.md)
+   - [官方 Claude Code / Anthropic 与 Kiro 协议互操作审计](topics/official-claude-code-kiro-protocol-audit-20260928.md)
    - [验证与发版门禁](topics/validation-and-release-gates.md)
 4. Decisions:
    - [Decision 001：本地账号与外部池统一调度目标契约](decisions/001-local-external-scheduler-target-contract.md)
@@ -76,6 +77,7 @@ Out of scope:
 | 调度模式分散、无法统一解释 route/fallback/rescue | Open design | [Route planner and capacity ledger](topics/route-planner-capacity-ledger.md) |
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |
 | 生产 `THINKING_SIGNATURE_INVALID`、stream read error、retry 后 too-long 归因 | Completed read-only audits; retry-state-machine, observability and protocol follow-ups open | [Production Thinking Signature audit](topics/production-thinking-signature-error-20260928.md) |
+| Claude Code / Kiro reasoning 400 与入口拒绝记录 `model=unknown`、内容/诊断缺失 | Audit complete; explicit reasoning fallback fixed locally and verified with real Claude Code CLI; release/deploy validation pending | [Official Claude Code / Anthropic 与 Kiro protocol audit](topics/official-claude-code-kiro-protocol-audit-20260928.md) |
 | 真实 CLI / load chaos / release gates 未全量闭环 | Open validation | [Validation and release gates](topics/validation-and-release-gates.md) |
 | 项目文档状态漂移、旧分析未归档 | In progress | [Document disposition](indexes/document-disposition.md) |
 | 本地账号 WebSearch/tools/image Wave 1 | WebSearch and tool parsing focused verified; image/model/multi-tool-history follow-up open | [Current issue status index](../../../../feature/issues/current-issue-status-index-20260731.md), [analysis priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) |

@@ -409,6 +409,8 @@ impl Default for ChunkedWritePromptSteeringConfig {
 pub struct PromptSteeringConfig {
     /// 总提示词引导开关。关闭后不注入 language/task/custom、tool_choice、thinking 或
     /// Write/Edit 分块兼容提示；客户端已经提供的结构化字段仍按原始请求语义保留。
+    /// 当上游缺少原生 reasoning schema 时，显式客户端 reasoning 请求仍可使用专用
+    /// thinking 兼容传输，避免把协议能力请求误判为运营方主动提示词注入。
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
