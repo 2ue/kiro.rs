@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Eye, EyeOff } from 'lucide-react'
 import {
@@ -11,10 +11,11 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
-import { useAddCredential, useProxyResources } from '@/hooks/use-credentials'
+import { useAddCredential, useCredentials, useProxyResources } from '@/hooks/use-credentials'
 import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { parseCredentialImportFiles } from '@/lib/credential-import'
+import { CredentialTagsField } from '@/components/credential-tags-field'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -99,10 +100,16 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [endpoint, setEndpoint] = useState('')
   const [enableOverageAfterImport, setEnableOverageAfterImport] = useState(false)
+  const [tags, setTags] = useState<string[]>([])
 
   const { mutate, isPending } = useAddCredential()
+  const { data: existingCredentials } = useCredentials({ enabled: open })
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
+  const tagOptions = useMemo(
+    () => Array.from(new Set(existingCredentials?.credentials.flatMap((credential) => credential.tags ?? []) || [])).sort((a, b) => a.localeCompare(b)),
+    [existingCredentials?.credentials],
+  )
 
   const resetForm = () => {
     setRefreshToken('')
@@ -131,6 +138,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setShowProxyPassword(false)
     setEndpoint('')
     setEnableOverageAfterImport(false)
+    setTags([])
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -160,6 +168,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     proxyResourceId?: number | null
     endpoint?: string
     enableOverageAfterImport?: boolean | null
+    tags?: string[]
   }) => {
     setAuthMethod(credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
     setRefreshToken(credential.refreshToken || '')
@@ -194,6 +203,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setShowProxyPassword(false)
     setEndpoint(credential.endpoint || '')
     setEnableOverageAfterImport(credential.enableOverageAfterImport === true)
+    setTags(credential.tags || [])
   }
 
   const handleAuthMethodChange = (nextAuthMethod: AuthMethod) => {
@@ -361,6 +371,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyPassword: proxyResourceId ? undefined : directProxyPassword || undefined,
         endpoint: endpoint.trim() || undefined,
         enableOverageAfterImport,
+        tags,
       },
       {
         onSuccess: async (data) => {
@@ -479,6 +490,19 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 placeholder="可选，用于管理页识别账号"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
+                disabled={isPending}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="text-sm font-medium">账号标签</div>
+              <div className="text-xs leading-5 text-muted-foreground">
+                可点击已有标签，也可以输入新标签后按 Enter。
+              </div>
+              <CredentialTagsField
+                value={tags}
+                options={tagOptions}
+                onChange={setTags}
                 disabled={isPending}
               />
             </div>

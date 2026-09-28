@@ -95,6 +95,17 @@ Last reviewed: 2026-09-27 Asia/Shanghai
 
 ## In Progress
 
+## Done (2026-09-28)
+
+- Credential import tags completed: account-owned `tags: Vec<String>` now flows through
+  JSON/PgSQL persistence, Admin and main UI import/export/list contracts, single/batch/KAM
+  import dialogs, and existing-tag candidate selection. Backend normalization is the final
+  boundary; tags do not affect identity, authentication, refresh, dispatch, or upstream
+  requests. Rust full regression, focused tag/API tests, both frontend builds, formatting
+  and diff checks passed. The work is ready for the user-requested replacement
+  `v0.0.174` release; release evidence will be appended after the tag and workflow checks.
+  See [credential import tags](topics/credential-import-tags.md).
+
 - 闲置账号后台 Token 主动刷新：
   - 当前请求热路径、Admin 强刷和鉴权失败恢复都不能覆盖长期未调用账号；
   - 已完成 `kiro-account-manager` 对照、可动态配置的服务端 worker、rotation/

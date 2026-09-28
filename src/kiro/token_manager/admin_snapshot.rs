@@ -95,6 +95,9 @@ pub struct CredentialEntrySnapshot {
     /// 凭据支持的模型列表。空列表表示不限制模型调度。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    /// 账号标签。标签属于账号属性，不参与调度。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 调度器实际选中该凭据的总次数。
@@ -226,6 +229,8 @@ pub struct CredentialBaseSnapshot {
     pub subscription_title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub has_proxy: bool,
     pub proxy_url: Option<String>,
     pub proxy_username: Option<String>,
@@ -413,6 +418,7 @@ pub(super) fn base_snapshot_from_entry(
         email: entry.credentials.email.clone(),
         subscription_title: entry.credentials.subscription_title.clone(),
         supported_models: entry.credentials.supported_models.clone(),
+        tags: entry.credentials.tags.clone(),
         has_proxy: effective_proxy_url.is_some(),
         proxy_url: entry.credentials.proxy_url.clone(),
         proxy_username: entry.credentials.proxy_username.clone(),
@@ -509,6 +515,7 @@ pub(super) fn runtime_snapshot_from_entry(
         email: entry.credentials.email.clone(),
         subscription_title: entry.credentials.subscription_title.clone(),
         supported_models: entry.credentials.supported_models.clone(),
+        tags: entry.credentials.tags.clone(),
         success_count: entry.success_count,
         total_selection_count: entry.total_selection_count,
         last_used_at: entry.last_used_at.clone(),

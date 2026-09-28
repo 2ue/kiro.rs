@@ -42,7 +42,7 @@ import {
   testModelLabel,
 } from '@/lib/test-models'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
-import { useAddCredential, useBatchUpdateCredentials, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
+import { useAddCredential, useBatchUpdateCredentials, useCredentials, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
   AddCredentialRequest,
@@ -53,6 +53,7 @@ import type {
   TestCredentialResponse,
 } from '@/types/api'
 import { SecretInput } from './credential-inputs'
+import { CredentialTagsField } from '@/components/credential-tags-field'
 
 // ============================================================================
 // ImportProgressList — 共用进度列表（BatchImportModal + KamImportModal 共用）
@@ -172,6 +173,7 @@ interface CredentialParameterDefaults {
   proxyUsername: string
   proxyPassword: string
   enableOverageAfterImport: boolean
+  tags: string[]
 }
 
 function initialParameterDefaults(): CredentialParameterDefaults {
@@ -192,11 +194,12 @@ function initialParameterDefaults(): CredentialParameterDefaults {
     proxyUsername: '',
     proxyPassword: '',
     enableOverageAfterImport: false,
+    tags: [],
   }
 }
 
 function initialCredentialForm() {
-  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false }
+  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '', enableOverageAfterImport: false, tags: [] as string[] }
 }
 
 function formFromCredential(c: AddCredentialRequest) {
@@ -214,6 +217,7 @@ function formFromCredential(c: AddCredentialRequest) {
     proxyPassword: c.proxyPassword || '', proxyResourceId: c.proxyResourceId ? String(c.proxyResourceId) : '',
     endpoint: c.endpoint || '',
     enableOverageAfterImport: c.enableOverageAfterImport === true,
+    tags: c.tags || [],
   }
 }
 
@@ -293,6 +297,7 @@ function mergeCredentialDefaults(
     proxyUrl: optionalTrimmed(cred.proxyUrl) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUrl)),
     proxyUsername: optionalTrimmed(cred.proxyUsername) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUsername)),
     proxyPassword: optionalTrimmed(cred.proxyPassword) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyPassword)),
+    tags: cred.tags?.length ? cred.tags : defaults.tags,
   }
 }
 
@@ -342,13 +347,13 @@ function downloadBlob(blob: Blob, filename: string) {
 // CredentialParameterDefaultsPanel
 // ============================================================================
 
-function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, disabled }: {
+function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, tagOptions = [], disabled }: {
   defaults: CredentialParameterDefaults; onChange: (d: CredentialParameterDefaults) => void
-  proxyResources: ProxyResource[]; disabled?: boolean
+  proxyResources: ProxyResource[]; tagOptions?: string[]; disabled?: boolean
 }) {
   const [showPu, setShowPu] = useState(false)
   const [showPp, setShowPp] = useState(false)
-  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds'>
+  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds' | 'tags'>
   const update = (key: StringDefaultKey, value: string) => {
     const text = value
     if (key === 'proxyResourceId' && value && value !== '__none__') {
@@ -434,6 +439,18 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
             导入后尝试开启超额
           </label>
         </div>
+        <div className="sm:col-span-2 space-y-1.5">
+          <div className="text-sm font-medium">账号标签</div>
+          <div className="text-xs leading-5 text-muted-foreground">
+            文件中已有标签优先；没有标签的账号使用这里的默认标签。
+          </div>
+          <CredentialTagsField
+            value={defaults.tags}
+            options={tagOptions}
+            onChange={(tags) => onChange({ ...defaults, tags })}
+            disabled={disabled}
+          />
+        </div>
         <Field label="默认优先级"><Input type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(e) => update('priority', e.target.value)} /></Field>
         <Field label="默认账号并发" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
         <Field label="默认账号 RPM" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(e) => update('rpm', e.target.value)} /></Field>
@@ -507,8 +524,13 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
   const [showPu, setShowPu] = useState(false)
   const [showPp, setShowPp] = useState(false)
   const add = useAddCredential()
+  const { data: existingCredentials } = useCredentials({ enabled: open })
   const proxyResources = useProxyResources()
   const proxyOptions = (proxyResources.data?.resources || []).filter((r) => r.enabled)
+  const tagOptions = useMemo(
+    () => Array.from(new Set(existingCredentials?.credentials.flatMap((credential) => credential.tags ?? []) || [])).sort((a, b) => a.localeCompare(b)),
+    [existingCredentials?.credentials],
+  )
   const isApiKey = form.authMethod === 'api_key'
 
   useEffect(() => { if (!open) { setForm(initialCredentialForm()); setShowPu(false); setShowPp(false) } }, [open])
@@ -593,6 +615,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       proxyPassword: form.proxyPassword.trim() || undefined,
       endpoint: form.endpoint.trim() || undefined,
       enableOverageAfterImport: form.enableOverageAfterImport,
+      tags: form.tags,
     }, {
       onSuccess: async (data) => {
         if (data.warning) toast.warning(data.warning)
@@ -662,6 +685,16 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
             <Field label="Scopes（可选）"><Input className="font-mono" value={form.scopes} disabled={add.isPending} onChange={(e) => update('scopes', e.target.value)} placeholder="offline_access ..." /></Field>
           </>}
           <Field label="邮箱（可选）"><Input value={form.email} disabled={add.isPending} onChange={(e) => update('email', e.target.value)} placeholder="user@example.com" /></Field>
+          <div className="sm:col-span-2 space-y-1.5">
+            <div className="text-sm font-medium">账号标签</div>
+            <div className="text-xs leading-5 text-muted-foreground">可点击已有标签，也可以输入新标签后按 Enter。</div>
+            <CredentialTagsField
+              value={form.tags}
+              options={tagOptions}
+              onChange={(tags) => setForm((prev) => ({ ...prev, tags }))}
+              disabled={add.isPending}
+            />
+          </div>
           <Field label="Profile ARN（可选）"><Input value={form.profileArn} disabled={add.isPending} onChange={(e) => update('profileArn', e.target.value)} /></Field>
           <Field label="优先级"><Input type="number" min={0} value={form.priority} disabled={add.isPending} onChange={(e) => update('priority', e.target.value)} /></Field>
           <Field label="初始状态" description="新增后默认查询订阅，不测试模型">
@@ -714,7 +747,7 @@ interface ImportResult {
 
 export function BatchImportModal({ open, onClose, existingCredentials, onDone }: {
   open: boolean; onClose: () => void
-  existingCredentials: Array<{ id: number; refreshTokenHash?: string; apiKeyHash?: string }>
+  existingCredentials: Array<{ id: number; refreshTokenHash?: string; apiKeyHash?: string; tags?: string[] }>
   onDone: () => void
 }) {
   const [text, setText] = useState('')
@@ -729,6 +762,10 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const [parseError, setParseError] = useState('')
   const proxyResources = useProxyResources()
   const proxyOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
+  const tagOptions = useMemo(
+    () => Array.from(new Set(existingCredentials.flatMap((credential) => credential.tags ?? []))).sort((a, b) => a.localeCompare(b)),
+    [existingCredentials],
+  )
   const modelCapabilities = useModelCapabilities()
   const testModelOptions = useMemo(
     () => buildTestModelOptions(modelCapabilities.data?.models),
@@ -869,7 +906,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
               onChange={(e) => setText(e.target.value)}
             />
             {parseError && <div className="text-xs text-destructive">{parseError}</div>}
-            <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} />
+            <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} tagOptions={tagOptions} />
             <div className="flex items-center gap-3 rounded-lg bg-muted/30 p-3">
               <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="batch-auto-discover-models" />
               <label htmlFor="batch-auto-discover-models" className="text-sm cursor-pointer">自动发现模型限制</label>
@@ -940,9 +977,9 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
 // KamImportModal
 // ============================================================================
 
-export function KamImportModal({ open, onClose, onDone }: {
+export function KamImportModal({ open, onClose, existingCredentials, onDone }: {
   open: boolean; onClose: () => void
-  existingCredentials?: Array<{ id: number; refreshTokenHash?: string; apiKeyHash?: string }>
+  existingCredentials?: Array<{ id: number; refreshTokenHash?: string; apiKeyHash?: string; tags?: string[] }>
   onDone: () => void
 }) {
   const [text, setText] = useState('')
@@ -957,6 +994,10 @@ export function KamImportModal({ open, onClose, onDone }: {
   const [results, setResults] = useState<ImportResult[]>([])
   const proxyResources = useProxyResources()
   const proxyOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
+  const tagOptions = useMemo(
+    () => Array.from(new Set((existingCredentials || []).flatMap((credential) => credential.tags ?? []))).sort((a, b) => a.localeCompare(b)),
+    [existingCredentials],
+  )
   const modelCapabilities = useModelCapabilities()
   const testModelOptions = useMemo(
     () => buildTestModelOptions(modelCapabilities.data?.models),
@@ -1038,6 +1079,7 @@ export function KamImportModal({ open, onClose, onDone }: {
           apiRegion: optionalTrimmed(acc.credentials.apiRegion),
           email: optionalTrimmed(acc.email),
           machineId: optionalTrimmed(acc.machineId),
+          tags: acc.tags,
         }, defaults, originalIndex)
         const res = await addCredential({ ...cred, autoDiscoverSupportedModels })
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, warning: res.warning }
@@ -1105,7 +1147,7 @@ export function KamImportModal({ open, onClose, onDone }: {
               </label>
             </div>
             <Textarea className="min-h-[120px] font-mono text-xs" placeholder='粘贴 KAM JSON...' value={text} onChange={(e) => setText(e.target.value)} />
-            <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} />
+            <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} tagOptions={tagOptions} />
             <div className="flex items-center gap-3 rounded-lg bg-muted/30 p-3">
               <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="kam-auto-discover-models" />
               <label htmlFor="kam-auto-discover-models" className="text-sm cursor-pointer">自动发现模型限制</label>

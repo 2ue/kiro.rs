@@ -16,6 +16,18 @@ function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
+function tagsField(value: unknown): string[] {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,\n]/)
+      : []
+  return values
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
 function splitKiroApiKeyValue(value: string): { key: string; region?: string } {
   const [rawKey, rawRegion] = value.trim().split('|', 2)
   return { key: rawKey?.trim() || '', region: rawRegion?.trim() || undefined }
@@ -226,6 +238,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     proxyPassword: stringField(normalized.proxyPassword) ?? stringField(nested?.proxyPassword),
     proxyResourceId: numberField(normalized.proxyResourceId) ?? numberField(nested?.proxyResourceId),
     endpoint: stringField(normalized.endpoint) ?? stringField(nested?.endpoint) ?? (authMethod === 'api_key' ? 'cli' : undefined),
+    tags: tagsField(normalized.tags ?? normalized.labels ?? nested?.tags ?? nested?.labels),
     enableOverageAfterImport:
       booleanField(normalized.enableOverageAfterImport) ??
       booleanField(nested?.enableOverageAfterImport),

@@ -580,6 +580,9 @@ fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
     credential.normalize_supported_models();
     credential.normalize_api_key_defaults();
     credential.normalize_external_idp_defaults();
+    credential
+        .normalize_tags()
+        .map_err(|reason| anyhow::anyhow!("账号标签无效: {reason}"))?;
     Ok(credential)
 }
 
@@ -2287,6 +2290,9 @@ impl PostgresStore {
         canonical.normalize_supported_models();
         canonical.normalize_api_key_defaults();
         canonical.normalize_external_idp_defaults();
+        canonical
+            .normalize_tags()
+            .map_err(|reason| anyhow::anyhow!("账号标签无效: {reason}"))?;
         let priority = i32::try_from(canonical.priority)
             .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
@@ -2418,6 +2424,9 @@ impl PostgresStore {
         canonical.normalize_supported_models();
         canonical.normalize_api_key_defaults();
         canonical.normalize_external_idp_defaults();
+        canonical
+            .normalize_tags()
+            .map_err(|reason| anyhow::anyhow!("账号标签无效: {reason}"))?;
         let priority = i32::try_from(canonical.priority)
             .map_err(|_| anyhow::anyhow!("凭据 priority 超出 PgSQL INTEGER 范围"))?;
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);

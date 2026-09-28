@@ -3,6 +3,7 @@ import { Eye, EyeOff } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
+import { CredentialTagsField } from '@/components/credential-tags-field'
 import type { AddCredentialRequest, ProxyResource } from '@/types/api'
 
 export type ProxyAssignmentMode = 'single' | 'round_robin' | 'none'
@@ -24,6 +25,7 @@ export interface CredentialParameterDefaults {
   proxyUsername: string
   proxyPassword: string
   enableOverageAfterImport: boolean
+  tags: string[]
 }
 
 export function initialParameterDefaults(): CredentialParameterDefaults {
@@ -44,6 +46,7 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
     proxyUsername: '',
     proxyPassword: '',
     enableOverageAfterImport: false,
+    tags: [],
   }
 }
 
@@ -116,6 +119,7 @@ export function mergeCredentialDefaults(
     proxyUrl: optionalTrimmed(credential.proxyUrl) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUrl)),
     proxyUsername: optionalTrimmed(credential.proxyUsername) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUsername)),
     proxyPassword: optionalTrimmed(credential.proxyPassword) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyPassword)),
+    tags: credential.tags?.length ? credential.tags : defaults.tags,
   }
 }
 
@@ -188,19 +192,21 @@ export function CredentialParameterDefaultsPanel({
   defaults,
   onChange,
   proxyResources,
+  tagOptions = [],
   disabled,
   title = '默认参数',
 }: {
   defaults: CredentialParameterDefaults
   onChange: (defaults: CredentialParameterDefaults) => void
   proxyResources: ProxyResource[]
+  tagOptions?: string[]
   disabled?: boolean
   title?: string
 }) {
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
 
-  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds'>
+  type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds' | 'tags'>
 
   const update = (key: StringDefaultKey, value: string) => {
     if (key === 'proxyResourceId' && value) {
@@ -310,6 +316,18 @@ export function CredentialParameterDefaultsPanel({
           <label htmlFor="default-enable-overage" className="cursor-pointer text-sm">
             导入后尝试开启超额
           </label>
+        </div>
+        <div className="md:col-span-2 space-y-1.5">
+          <div className="text-sm font-medium">账号标签</div>
+          <div className="text-xs leading-5 text-muted-foreground">
+            文件中已有标签优先；没有标签的账号使用这里的默认标签。
+          </div>
+          <CredentialTagsField
+            value={defaults.tags}
+            options={tagOptions}
+            onChange={(tags) => onChange({ ...defaults, tags })}
+            disabled={disabled}
+          />
         </div>
         <FieldLabel title="默认优先级" description="留空时使用凭据自身值或 0">
           <Input type="number" min="0" value={defaults.priority} disabled={disabled} onChange={(event) => update('priority', event.target.value)} />

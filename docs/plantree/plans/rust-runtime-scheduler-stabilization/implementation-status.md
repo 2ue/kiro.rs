@@ -1,8 +1,19 @@
 # Implementation Status
 
-Last reviewed: 2026-09-27 Asia/Shanghai
+Last reviewed: 2026-09-28 Asia/Shanghai
 
 Current active work: [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md).
+
+Completed follow-up: [导入账号标签属性](topics/credential-import-tags.md).
+
+- Plan phase: implementation and local regression complete; the remaining operation is the
+  user-authorized replacement `v0.0.174` release.
+- Last verified: Rust full regression `2196 passed / 0 failed / 6 ignored` plus
+  `kiro_loadtest 31/31`; main UI typecheck/build, Admin UI build, formatting and diff
+  checks passed. The tag topic records the focused model/API/import tests.
+- Remaining TODO: commit the feature, remove local/remote `v0.0.174` and `v0.0.175`,
+  restore the crate version to `0.0.174`, recreate the annotated `v0.0.174` tag, push
+  `main` before the tag, and record the remote quality/image/manifest evidence.
 
 - Plan phase: implementation and local release verification complete; release tag and
   remote workflow status remain to be recorded after the release push.

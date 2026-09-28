@@ -166,6 +166,31 @@ fn missing_auth_method_with_kiro_api_key_is_inferred_as_api_key() {
 }
 
 #[test]
+fn batch_import_tags_apply_only_when_credential_has_no_tags() {
+    let defaults = BatchCredentialImportDefaults {
+        tags: vec!["默认".to_string(), "team-a".to_string()],
+        ..Default::default()
+    };
+
+    let without_tags: AddCredentialRequest =
+        serde_json::from_value(serde_json::json!({ "kiroApiKey": "ksk_without_tags" })).unwrap();
+    assert_eq!(
+        apply_batch_import_defaults(without_tags, &defaults, None).tags,
+        vec!["默认", "team-a"]
+    );
+
+    let with_tags: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+        "kiroApiKey": "ksk_with_tags",
+        "tags": ["账号自身"]
+    }))
+    .unwrap();
+    assert_eq!(
+        apply_batch_import_defaults(with_tags, &defaults, None).tags,
+        vec!["账号自身"]
+    );
+}
+
+#[test]
 fn batch_import_proxy_ids_are_deduplicated_preserving_order() {
     assert_eq!(
         normalized_batch_proxy_resource_ids(&[3, 1, 3, 2, 1]),
@@ -708,6 +733,7 @@ fn credential_item(
         success_count,
         last_used_at: None,
         supported_models: Vec::new(),
+        tags: Vec::new(),
         has_proxy: false,
         proxy_url: None,
         proxy_username: None,

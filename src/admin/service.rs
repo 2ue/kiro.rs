@@ -1724,6 +1724,7 @@ impl AdminService {
             disabled,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            tags: req.tags,
         };
         credentials
             .validate_api_key_import_fields()
@@ -1736,6 +1737,9 @@ impl AdminService {
         credentials.normalize_supported_models();
         credentials.normalize_api_key_defaults();
         credentials.normalize_external_idp_defaults();
+        credentials.normalize_tags().map_err(|reason| {
+            AdminServiceError::InvalidCredential(format!("账号标签无效: {reason}"))
+        })?;
         if credentials.api_region.as_deref().is_none_or(str::is_empty) {
             if let Some(region) = credentials
                 .profile_arn
@@ -7055,6 +7059,9 @@ fn apply_batch_import_defaults(
             credential.supported_models = supported_models.clone();
         }
     }
+    if credential.tags.is_empty() {
+        credential.tags = defaults.tags.clone();
+    }
     credential
 }
 
@@ -7216,6 +7223,7 @@ fn credential_status_item_from_snapshot(
         masked_api_key: entry.masked_api_key,
         email: entry.email,
         subscription_title: entry.subscription_title,
+        tags: entry.tags,
         account_info: None,
         success_count: entry.success_count,
         last_used_at: entry.last_used_at,
@@ -7294,6 +7302,7 @@ fn credential_list_item_from_base(
         masked_api_key: credential.masked_api_key,
         email: credential.email,
         subscription_title: credential.subscription_title,
+        tags: credential.tags,
         supported_models: credential.supported_models,
         has_proxy: credential.has_proxy,
         proxy_url: credential.proxy_url,

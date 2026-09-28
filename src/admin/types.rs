@@ -394,6 +394,8 @@ pub struct CredentialListItem {
     pub warmup_remaining: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// 凭据数量与全局调度容量概览。
@@ -546,6 +548,9 @@ pub struct CredentialStatusItem {
     /// 凭据支持的模型列表。空列表表示不限制模型调度。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
+    /// 账号标签。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// 连续瞬态失败次数。
     pub transient_failure_streak: u32,
     /// 近期错误率 EWMA，范围 0..=1。
@@ -987,6 +992,10 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号标签；标签属于账号属性，不建立独立标签表。
+    #[serde(default, alias = "labels")]
+    pub tags: Vec<String>,
 }
 
 fn default_auth_method() -> String {
@@ -1048,6 +1057,9 @@ pub struct BatchCredentialImportDefaults {
     pub enable_overage_after_import: Option<bool>,
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
+    /// 批量导入时为未显式设置标签的账号补充的账号属性标签。
+    #[serde(default, alias = "labels")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2222,6 +2234,36 @@ mod tests {
         assert_eq!(req.machine_id.as_deref(), Some("fake-machine-id"));
         assert_eq!(req.max_concurrent_requests, Some(3));
         assert_eq!(req.auto_discover_supported_models, None);
+    }
+
+    #[test]
+    fn add_and_batch_import_requests_accept_tags_and_labels() {
+        let camel: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "kiroApiKey": "ksk_fake",
+            "tags": ["team-a", "生产"]
+        }))
+        .unwrap();
+        assert_eq!(camel.tags, vec!["team-a", "生产"]);
+
+        let snake: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "kiro_api_key": "ksk_fake",
+            "labels": ["legacy"]
+        }))
+        .unwrap();
+        assert_eq!(snake.tags, vec!["legacy"]);
+
+        let batch: BatchCredentialImportRequest = serde_json::from_value(serde_json::json!({
+            "defaults": {
+                "labels": ["team-a"]
+            },
+            "credentials": [{
+                "kiroApiKey": "ksk_fake",
+                "tags": ["team-b"]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(batch.defaults.tags, vec!["team-a"]);
+        assert_eq!(batch.credentials[0].tags, vec!["team-b"]);
     }
 
     #[test]

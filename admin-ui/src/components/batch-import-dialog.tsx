@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp, RotateCw } from 'lucide-react'
 import {
@@ -91,6 +91,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const { mutateAsync: deleteCredential } = useDeleteCredential()
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
+  const tagOptions = useMemo(
+    () => Array.from(new Set(existingCredentials?.credentials.flatMap((credential) => credential.tags ?? []) || [])).sort((a, b) => a.localeCompare(b)),
+    [existingCredentials?.credentials],
+  )
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -643,6 +647,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             defaults={defaults}
             onChange={setDefaults}
             proxyResources={proxyResourceOptions}
+            tagOptions={tagOptions}
             disabled={importing}
             title="导入默认参数"
           />

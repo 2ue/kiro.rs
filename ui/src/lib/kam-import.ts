@@ -5,6 +5,7 @@ export interface KamAccount {
   email?: string
   userId?: string | null
   nickname?: string
+  tags?: string[]
   credentials: {
     accessToken?: string
     expiresAt?: string
@@ -32,6 +33,19 @@ function isObject(value: unknown): value is JsonObject {
 
 function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function tagsField(value: unknown): string[] | undefined {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,\n]/)
+      : []
+  const tags = values
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean)
+  return tags.length ? tags : undefined
 }
 
 function profileArnRegion(profileArn: string | undefined): string | undefined {
@@ -72,6 +86,7 @@ function normalizeKamAccount(item: unknown): unknown {
     email: stringField(obj.email),
     userId: typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined,
     nickname: stringField(obj.nickname) ?? stringField(obj.label),
+    tags: tagsField(obj.tags ?? obj.labels),
     status: stringField(obj.status),
     machineId: stringField(obj.machineId) ?? stringField(source.machineId),
     credentials: {

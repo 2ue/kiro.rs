@@ -33,6 +33,7 @@ interface KamAccount {
   email?: string
   userId?: string | null
   nickname?: string
+  tags?: string[]
   credentials: {
     accessToken?: string
     expiresAt?: string
@@ -75,6 +76,19 @@ function isObject(value: unknown): value is JsonObject {
 
 function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function tagsField(value: unknown): string[] | undefined {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,\n]/)
+      : []
+  const tags = values
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim())
+    .filter(Boolean)
+  return tags.length ? tags : undefined
 }
 
 function profileArnRegion(profileArn: string | undefined): string | undefined {
@@ -150,6 +164,7 @@ function normalizeKamAccount(item: unknown): unknown {
     email: stringField(obj.email),
     userId: typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined,
     nickname: stringField(obj.nickname) ?? stringField(obj.label),
+    tags: tagsField(obj.tags ?? obj.labels),
     status: stringField(obj.status),
     machineId: stringField(obj.machineId) ?? stringField(source.machineId),
     credentials: {
@@ -268,6 +283,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const { mutateAsync: deleteCredential } = useDeleteCredential()
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
+  const tagOptions = useMemo(
+    () => Array.from(new Set(existingCredentials?.credentials.flatMap((credential) => credential.tags ?? []) || [])).sort((a, b) => a.localeCompare(b)),
+    [existingCredentials?.credentials],
+  )
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -462,6 +481,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             issuerUrl: authMethod === 'external_idp' ? stringField(cred.issuerUrl) : undefined,
             scopes: authMethod === 'external_idp' ? stringField(cred.scopes) : undefined,
             machineId: stringField(account.machineId),
+            tags: account.tags,
           }
           const addedCred = await addCredential(
             mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }, originalIndex),
@@ -675,6 +695,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             defaults={defaults}
             onChange={setDefaults}
             proxyResources={proxyResourceOptions}
+            tagOptions={tagOptions}
             disabled={importing}
             title="KAM 导入默认参数"
           />

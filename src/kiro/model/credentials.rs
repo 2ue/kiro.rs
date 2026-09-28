@@ -4,6 +4,7 @@
 //! 支持单凭据和多凭据配置格式
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use std::{fmt, fs};
 
@@ -22,6 +23,9 @@ use crate::model::model_support::{model_is_supported_by_list, normalize_supporte
 /// 但 `ksk_...` API Key 是 Kiro CLI/headless 认证形态，默认走 `cli` 可以避免
 /// 误带 IDE/profile 语义。
 pub const KIRO_API_KEY_DEFAULT_ENDPOINT: &str = "cli";
+pub const MAX_CREDENTIAL_TAGS: usize = 32;
+pub const MAX_CREDENTIAL_TAG_LENGTH: usize = 64;
+pub const MAX_CREDENTIAL_TAGS_TOTAL_CHARS: usize = 1024;
 
 /// Kiro OAuth 凭证
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -195,6 +199,10 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号标签。标签是账号属性，不建立独立标签实体或表。
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "labels")]
+    pub tags: Vec<String>,
 }
 
 impl fmt::Debug for KiroCredentials {
@@ -242,6 +250,7 @@ impl fmt::Debug for KiroCredentials {
             .field("disabled", &self.disabled)
             .field("kiro_api_key_present", &self.kiro_api_key.is_some())
             .field("endpoint_present", &self.endpoint.is_some())
+            .field("tag_count", &self.tags.len())
             .finish()
     }
 }
@@ -587,6 +596,13 @@ impl KiroCredentials {
             && self.endpoint == other.endpoint
     }
 
+    /// 规范化账号标签并校验持久化边界。
+    ///
+    /// 标签不是独立实体：保留首次出现顺序、按精确字符串去重，空白标签丢弃。
+    pub fn normalize_tags(&mut self) -> Result<(), String> {
+        normalize_credential_tags(&mut self.tags)
+    }
+
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
@@ -849,6 +865,41 @@ impl KiroCredentials {
     }
 }
 
+/// 规范化账号标签并校验持久化边界。
+pub fn normalize_credential_tags(tags: &mut Vec<String>) -> Result<(), String> {
+    let mut normalized = Vec::with_capacity(tags.len().min(MAX_CREDENTIAL_TAGS));
+    let mut seen = HashSet::new();
+    let mut total_chars = 0usize;
+
+    for raw in tags.drain(..) {
+        let tag = raw.trim();
+        if tag.is_empty() || !seen.insert(tag.to_string()) {
+            continue;
+        }
+        let length = tag.chars().count();
+        if length > MAX_CREDENTIAL_TAG_LENGTH {
+            return Err(format!(
+                "单个标签不能超过 {} 个字符",
+                MAX_CREDENTIAL_TAG_LENGTH
+            ));
+        }
+        if normalized.len() >= MAX_CREDENTIAL_TAGS {
+            return Err(format!("单个账号最多保存 {} 个标签", MAX_CREDENTIAL_TAGS));
+        }
+        total_chars = total_chars.saturating_add(length);
+        if total_chars > MAX_CREDENTIAL_TAGS_TOTAL_CHARS {
+            return Err(format!(
+                "账号标签总字符数不能超过 {}",
+                MAX_CREDENTIAL_TAGS_TOTAL_CHARS
+            ));
+        }
+        normalized.push(tag.to_string());
+    }
+
+    *tags = normalized;
+    Ok(())
+}
+
 #[cfg(test)]
 impl KiroCredentials {
     fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
@@ -864,6 +915,53 @@ impl KiroCredentials {
 mod tests {
     use super::*;
     use crate::model::config::Config;
+
+    #[test]
+    fn credential_tags_round_trip_and_normalize() {
+        let mut credentials = KiroCredentials {
+            tags: vec![
+                "  team-a ".to_string(),
+                "team-a".to_string(),
+                "".to_string(),
+                " 中文 ".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        credentials.normalize_tags().unwrap();
+        assert_eq!(credentials.tags, vec!["team-a", "中文"]);
+
+        let json = serde_json::to_value(&credentials).unwrap();
+        assert_eq!(json["tags"], serde_json::json!(["team-a", "中文"]));
+        let decoded: KiroCredentials = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.tags, credentials.tags);
+
+        let legacy: KiroCredentials = serde_json::from_value(serde_json::json!({
+            "refreshToken": "legacy"
+        }))
+        .unwrap();
+        assert!(legacy.tags.is_empty());
+    }
+
+    #[test]
+    fn credential_tags_reject_length_and_count_limits() {
+        let mut too_long = vec!["x".repeat(MAX_CREDENTIAL_TAG_LENGTH + 1)];
+        assert!(normalize_credential_tags(&mut too_long).is_err());
+
+        let mut too_many = (0..=MAX_CREDENTIAL_TAGS)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        assert!(normalize_credential_tags(&mut too_many).is_err());
+    }
+
+    #[test]
+    fn credential_tags_do_not_change_dispatch_config() {
+        let tagged = KiroCredentials {
+            tags: vec!["team-a".to_string()],
+            ..Default::default()
+        };
+        assert!(KiroCredentials::default().same_dispatch_config(&tagged));
+    }
 
     #[test]
     fn debug_output_redacts_all_credential_strings() {
@@ -903,6 +1001,7 @@ mod tests {
             disabled: true,
             kiro_api_key: Some("kiro-api-key-sensitive-value".to_string()),
             endpoint: Some("endpoint-sensitive-value".to_string()),
+            tags: Vec::new(),
         };
 
         let debug_output = format!("{credentials:?}");

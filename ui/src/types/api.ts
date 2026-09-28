@@ -139,6 +139,7 @@ export interface CredentialStatusItem {
   lastErrorReason?: string
   lastErrorAtMs?: number | null
   supportedModels?: string[]
+  tags?: string[]
   inProbation?: boolean
   probationRemainingSecs?: number
   schedulerSelectionCount?: number
@@ -194,6 +195,7 @@ export type CredentialListItem = Pick<
   | 'rateLimitAutoDisableEnabled'
   | 'warmupRemaining'
   | 'supportedModels'
+  | 'tags'
 >
 
 export type CredentialRuntimeItem = Pick<
@@ -628,6 +630,7 @@ export interface AddCredentialRequest {
   kiroApiKey?: string
   endpoint?: string
   supportedModels?: string[]
+  tags?: string[]
   autoDiscoverSupportedModels?: boolean | null
 }
 
