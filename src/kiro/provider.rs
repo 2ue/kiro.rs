@@ -1949,6 +1949,17 @@ mod tests {
                     .body(axum::body::Body::from_stream(chunks))
                     .expect("json-labeled signature retry eventstream response");
             }
+            "thinking_signature_malformed_success" if !has_history_reasoning_content => {
+                return (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/vnd.amazon.eventstream",
+                    )],
+                    Vec::<u8>::new(),
+                )
+                    .into_response();
+            }
             "thinking_signature_unexpected_second" if !has_history_reasoning_content => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2043,6 +2054,10 @@ mod tests {
             "invalid_tool_prompt_retry_disabled" => serde_json::json!({
                 "message": "Invalid tool use format.",
                 "reason": "REQUEST_BODY_INVALID"
+            }),
+            "thinking_signature_malformed_success" => serde_json::json!({
+                "message": "Improperly formed request.",
+                "reason": null
             }),
             "thinking_signature_root_success"
             | "thinking_signature_json_header_stream_success"
@@ -4838,6 +4853,93 @@ mod tests {
                         &format!("{scenario} stream={is_stream} round {round}"),
                     );
                 }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reasoning_malformed_retry_strips_reasoning_same_credential_for_five_rounds() {
+        let server = FakeBadRequestServer::start().await;
+        let scenario = "thinking_signature_malformed_success";
+        for is_stream in [false, true] {
+            let (provider, manager) = fake_thinking_signature_provider(&server.base_url, 3);
+            for round in 1..=5 {
+                let request_body = thinking_signature_request_body(scenario, round);
+                let retry_body = strip_reasoning_content_for_provider_test(&request_body);
+                let builder_calls = Arc::new(AtomicUsize::new(0));
+                let builder_counter = builder_calls.clone();
+                let budget = Arc::new(InferenceAttemptBudget::new(4));
+                let captures_before = server.state.signature_requests(scenario).len();
+                let hits_before = server.state.scenario_hits(scenario);
+
+                let (credential_id, attempts) = call_thinking_signature_retry(
+                    &provider,
+                    &request_body,
+                    is_stream,
+                    budget.clone(),
+                    false,
+                    Some(2),
+                    move || {
+                        builder_counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(retry_body)
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{scenario} stream={is_stream} round {round}: {error}")
+                });
+
+                assert_eq!(
+                    server.state.scenario_hits(scenario) - hits_before,
+                    2,
+                    "{scenario} stream={is_stream} round {round}: exactly two sends"
+                );
+                assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(attempts.len(), 2);
+                assert_eq!(attempts[0].credential_id, credential_id);
+                assert_eq!(attempts[1].credential_id, credential_id);
+                assert_eq!(
+                    attempts[0].action,
+                    "reasoning_malformed_retry_same_credential"
+                );
+                assert_eq!(
+                    attempts[0].error_type.as_deref(),
+                    Some("reasoning_malformed_request")
+                );
+                assert_eq!(
+                    attempts[1].action,
+                    "response_headers_received_after_reasoning_malformed_retry"
+                );
+                let snapshot = budget.snapshot();
+                assert_eq!(snapshot.consumed, 2);
+                assert_eq!(snapshot.local_attempts, 2);
+                assert_eq!(snapshot.external_attempts, 0);
+                assert_eq!(snapshot.mcp_attempts, 0);
+
+                let captures = server.state.signature_requests(scenario);
+                let pair = &captures[captures_before..];
+                assert_eq!(pair.len(), 2);
+                assert!(
+                    pair[0]
+                        .body
+                        .pointer(
+                            "/conversationState/history/0/assistantResponseMessage/reasoningContent"
+                        )
+                        .is_some()
+                );
+                assert!(
+                    pair[1]
+                        .body
+                        .pointer(
+                            "/conversationState/history/0/assistantResponseMessage/reasoningContent"
+                        )
+                        .is_none()
+                );
+                assert_eq!(pair[0].body["keepMarker"], pair[1].body["keepMarker"]);
+                assert_signature_retry_did_not_cool_down(
+                    &manager,
+                    &format!("{scenario} stream={is_stream} round {round}"),
+                );
             }
         }
     }
@@ -12101,16 +12203,34 @@ impl KiroProvider {
                 continue;
             }
 
-            if Self::is_thinking_signature_invalid_response(status, &body)
-                && thinking_signature_retry_body_builder.is_some()
+            if let Some(reasoning_compatibility_reason) =
+                Self::reasoning_compatibility_retry_reason(status, &body)
+                    .filter(|_| thinking_signature_retry_body_builder.is_some())
             {
+                let is_signature_retry =
+                    reasoning_compatibility_reason == "THINKING_SIGNATURE_INVALID";
+                let first_retry_action = if is_signature_retry {
+                    "thinking_signature_retry_same_credential"
+                } else {
+                    "reasoning_malformed_retry_same_credential"
+                };
+                let first_retry_error_type = if is_signature_retry {
+                    "thinking_signature_invalid"
+                } else {
+                    "reasoning_malformed_request"
+                };
+                let retry_success_action = if is_signature_retry {
+                    "response_headers_received_after_thinking_signature_retry"
+                } else {
+                    "response_headers_received_after_reasoning_malformed_retry"
+                };
                 let first_message = Self::api_failure_diagnostic(
                     ApiUpstreamFailureKind::InvalidRequest,
                     status,
                     Some(body_bytes),
                     retry_after,
                     Some(content_kind),
-                    Some("THINKING_SIGNATURE_INVALID"),
+                    Some(reasoning_compatibility_reason),
                 );
                 Self::push_attempt(
                     &mut attempts,
@@ -12118,8 +12238,8 @@ impl KiroProvider {
                     ctx.id,
                     &credential_label,
                     Some(status),
-                    "thinking_signature_retry_same_credential",
-                    Some("thinking_signature_invalid"),
+                    first_retry_action,
+                    Some(first_retry_error_type),
                     Some(first_message),
                     attempt_started_at,
                     model.as_deref(),
@@ -12345,7 +12465,7 @@ impl KiroProvider {
                         ctx.id,
                         &credential_label,
                         Some(retry_status),
-                        "response_headers_received_after_thinking_signature_retry",
+                        retry_success_action,
                         None::<&str>,
                         None::<String>,
                         retry_started_at,
@@ -13539,6 +13659,21 @@ impl KiroProvider {
             value.pointer(pointer).and_then(serde_json::Value::as_str)
                 == Some("THINKING_SIGNATURE_INVALID")
         })
+    }
+
+    fn reasoning_compatibility_retry_reason(
+        status: reqwest::StatusCode,
+        body: &str,
+    ) -> Option<&'static str> {
+        if Self::is_thinking_signature_invalid_response(status, body) {
+            return Some("THINKING_SIGNATURE_INVALID");
+        }
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && Self::classify_bad_request_reason(body) == "malformed_request"
+        {
+            return Some("malformed_request");
+        }
+        None
     }
 
     fn thinking_signature_retry_failure_diagnostic(

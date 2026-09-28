@@ -47,7 +47,13 @@ pub(super) async fn handle_messages_endpoint(
         &mut defaulted_max_tokens,
     ) {
         let request_id = envelope::request_id();
-        record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+        record_entry_request_error(
+            attribution.as_ref(),
+            &endpoint,
+            &request_id,
+            &error,
+            Some(&raw_probe),
+        );
         return error.to_response(&request_id);
     }
     if defaulted_max_tokens.is_some() {
@@ -56,7 +62,13 @@ pub(super) async fn handle_messages_endpoint(
     if let Some(probe_error) = raw_probe.scan_error() {
         let request_id = envelope::request_id();
         let error = entry_error_from_raw_probe(probe_error);
-        record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+        record_entry_request_error(
+            attribution.as_ref(),
+            &endpoint,
+            &request_id,
+            &error,
+            Some(&raw_probe),
+        );
         return error.to_response(&request_id);
     }
     let mut requires_normalized_body = false;
@@ -98,7 +110,13 @@ pub(super) async fn handle_messages_endpoint(
         Err(message) => {
             let request_id = envelope::request_id();
             let error = EntryRequestError::invalid(message, "reasoning_normalization_failed");
-            record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+            record_entry_request_error(
+                attribution.as_ref(),
+                &endpoint,
+                &request_id,
+                &error,
+                Some(&raw_probe),
+            );
             return error.to_response(&request_id);
         }
     }
@@ -113,7 +131,13 @@ pub(super) async fn handle_messages_endpoint(
     {
         let request_id = envelope::request_id();
         let error = EntryRequestError::invalid(message, "invalid_reasoning_protocol");
-        record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+        record_entry_request_error(
+            attribution.as_ref(),
+            &endpoint,
+            &request_id,
+            &error,
+            Some(&raw_probe),
+        );
         return error.to_response(&request_id);
     }
 
@@ -129,7 +153,13 @@ pub(super) async fn handle_messages_endpoint(
                 format!("Invalid JSON body: {error}"),
                 "request_history_inspection_failed",
             );
-            record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+            record_entry_request_error(
+                attribution.as_ref(),
+                &endpoint,
+                &request_id,
+                &error,
+                Some(&raw_probe),
+            );
             return error.to_response(&request_id);
         }
     };
@@ -145,7 +175,13 @@ pub(super) async fn handle_messages_endpoint(
                 envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
                 "strict_request_protocol_contamination",
             );
-            record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+            record_entry_request_error(
+                attribution.as_ref(),
+                &endpoint,
+                &request_id,
+                &error,
+                Some(&effective_raw_probe),
+            );
             return envelope::error_response_with_id_and_headers(
                 error.status,
                 error.error_type,
@@ -259,7 +295,13 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     {
         Ok(payload) => payload,
         Err(error) => {
-            record_entry_request_error(attribution.as_ref(), &endpoint, &request_id, &error);
+            record_entry_request_error(
+                attribution.as_ref(),
+                &endpoint,
+                &request_id,
+                &error,
+                Some(&parsed_raw_probe),
+            );
             return error.to_response(&request_id);
         }
     };
@@ -336,7 +378,14 @@ fn maybe_local_pool_unavailable_fast_fail_response(
         ),
         None => envelope::error_response_with_id(status, error_type, message, &request_id),
     };
-    record_pre_usage_rejection(attribution, reason, endpoint, &response);
+    record_pre_usage_rejection_with_metadata_and_context(
+        attribution,
+        reason,
+        endpoint,
+        &response,
+        None,
+        request_rejection_usage_context_from_probe(raw_probe),
+    );
     Some(response)
 }
 
@@ -580,9 +629,10 @@ fn record_entry_request_error(
     endpoint: &str,
     request_id: &str,
     error: &EntryRequestError,
+    raw_probe: Option<&RawMessagesBodyProbe>,
 ) {
     if let Some(attribution) = attribution {
-        attribution.record_with_metadata(
+        attribution.record_with_metadata_and_context(
             error.rejection_reason(),
             "request_entry",
             error.status,
@@ -592,8 +642,31 @@ fn record_entry_request_error(
                 "entryReason": error.reason,
                 "entryMessage": bounded_entry_error_message(&error.message),
             })),
+            raw_probe.and_then(request_rejection_usage_context_from_probe),
         );
     }
+}
+
+fn request_rejection_usage_context_from_probe(
+    probe: &RawMessagesBodyProbe,
+) -> Option<super::super::usage::RequestRejectionUsageContext> {
+    let context = super::super::usage::RequestRejectionUsageContext {
+        model: probe
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+        stream: probe.stream,
+        requested_max_tokens: probe
+            .max_tokens
+            .and_then(|tokens| i32::try_from(tokens).ok())
+            .filter(|tokens| *tokens > 0),
+        upstream_model: None,
+        model_resolution_source: None,
+        model_resolution_note: None,
+    };
+    (!context.is_empty()).then_some(context)
 }
 
 fn bounded_entry_error_message(message: &str) -> String {
@@ -791,6 +864,10 @@ mod tests {
         let attribution = test_attribution(recorder.clone());
         let error =
             EntryRequestError::invalid("max_tokens: field is required", "missing_max_tokens");
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5","stream":true,"messages":[{"role":"user","content":"secret-body"}]}"#,
+        );
+        let raw_probe = probe_raw_messages_body(&raw);
 
         for count in 1..=5 {
             record_entry_request_error(
@@ -798,6 +875,7 @@ mod tests {
                 "/cc/v1/messages",
                 &format!("req_entry_missing_max_tokens_{count}"),
                 &error,
+                Some(&raw_probe),
             );
         }
 
@@ -808,6 +886,9 @@ mod tests {
             .map(|record| {
                 assert_eq!(record.status, UsageRecordStatus::Error);
                 assert_eq!(record.usage_source, UsageSource::None);
+                assert_eq!(record.model, "claude-sonnet-4-5");
+                assert!(record.stream);
+                assert_eq!(record.requested_max_tokens, None);
                 assert_eq!(record.error_source.as_deref(), Some("request_rejection"));
                 assert_eq!(record.error_status_code, Some(400));
                 let metadata = record.error_metadata.as_ref().expect("metadata");
@@ -838,6 +919,7 @@ mod tests {
                 "/v1/messages",
                 &format!("req_entry_bad_json_{count}"),
                 &error,
+                None,
             );
         }
 

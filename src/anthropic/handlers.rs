@@ -89,9 +89,9 @@ use super::types::{
     CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, Thinking,
 };
 use super::usage::{
-    ExternalPoolAttempt, ExternalPoolUsageSnapshot, StreamTerminalReason, UsageLatencyTrace,
-    UsagePublicError, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
-    UsageSource,
+    ExternalPoolAttempt, ExternalPoolUsageSnapshot, RequestRejectionUsageContext,
+    StreamTerminalReason, UsageLatencyTrace, UsagePublicError, UsageRecord, UsageRecordStatus,
+    UsageRouteKind, UsageRouteSubtype, UsageSource,
 };
 use super::websearch;
 use crate::external_pool::{
@@ -6038,15 +6038,66 @@ fn record_pre_usage_rejection(
     endpoint: &str,
     response: &Response,
 ) {
-    record_pre_usage_rejection_with_metadata(attribution, reason, endpoint, response, None);
+    record_pre_usage_rejection_with_metadata_and_context(
+        attribution,
+        reason,
+        endpoint,
+        response,
+        None,
+        None,
+    );
 }
 
-fn record_pre_usage_rejection_with_metadata(
+fn record_pre_usage_rejection_for_request(
+    attribution: Option<&RequestRejectionAttribution>,
+    reason: RequestRejectionReason,
+    endpoint: &str,
+    response: &Response,
+    payload: &MessagesRequest,
+    model_resolution: Option<&ModelResolution>,
+) {
+    record_pre_usage_rejection_with_metadata_and_context(
+        attribution,
+        reason,
+        endpoint,
+        response,
+        None,
+        Some(RequestRejectionUsageContext::from_request(
+            payload,
+            model_resolution,
+        )),
+    );
+}
+
+fn record_pre_usage_rejection_with_metadata_for_request(
     attribution: Option<&RequestRejectionAttribution>,
     reason: RequestRejectionReason,
     endpoint: &str,
     response: &Response,
     extra_metadata: Option<Value>,
+    payload: &MessagesRequest,
+    model_resolution: Option<&ModelResolution>,
+) {
+    record_pre_usage_rejection_with_metadata_and_context(
+        attribution,
+        reason,
+        endpoint,
+        response,
+        extra_metadata,
+        Some(RequestRejectionUsageContext::from_request(
+            payload,
+            model_resolution,
+        )),
+    );
+}
+
+fn record_pre_usage_rejection_with_metadata_and_context(
+    attribution: Option<&RequestRejectionAttribution>,
+    reason: RequestRejectionReason,
+    endpoint: &str,
+    response: &Response,
+    extra_metadata: Option<Value>,
+    request_context: Option<RequestRejectionUsageContext>,
 ) {
     let Some(attribution) = attribution else {
         return;
@@ -6058,13 +6109,14 @@ fn record_pre_usage_rejection_with_metadata(
     else {
         return;
     };
-    attribution.record_with_metadata(
+    attribution.record_with_metadata_and_context(
         reason,
         "handler_preflight",
         response.status(),
         request_id,
         endpoint,
         extra_metadata,
+        request_context,
     );
 }
 
@@ -6231,11 +6283,13 @@ async fn post_messages_inner(
                 "api_error",
                 envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
             );
-            record_pre_usage_rejection(
+            record_pre_usage_rejection_for_request(
                 attribution.as_ref(),
                 RequestRejectionReason::ProviderNotReady,
                 &endpoint,
                 &response,
+                &payload,
+                None,
             );
             return response;
         }
@@ -6305,11 +6359,13 @@ async fn post_messages_inner(
             "api_error",
             "request route is blocked by local pool route policy",
         );
-        record_pre_usage_rejection(
+        record_pre_usage_rejection_for_request(
             attribution.as_ref(),
             RequestRejectionReason::LocalRouteBlocked,
             &endpoint,
             &response,
+            &payload,
+            None,
         );
         return response;
     }
@@ -6328,11 +6384,13 @@ async fn post_messages_inner(
     {
         Ok(report) => report,
         Err(response) => {
-            record_pre_usage_rejection(
+            record_pre_usage_rejection_for_request(
                 attribution.as_ref(),
                 RequestRejectionReason::MultimodalInvalid,
                 &endpoint,
                 &response,
+                &payload,
+                None,
             );
             return response;
         }
@@ -6389,11 +6447,13 @@ async fn post_messages_inner(
             {
                 return external_response;
             }
-            record_pre_usage_rejection(
+            record_pre_usage_rejection_for_request(
                 attribution.as_ref(),
                 RequestRejectionReason::ModelUnsupported,
                 &endpoint,
                 &response,
+                &payload,
+                None,
             );
             return response;
         }
@@ -6408,11 +6468,13 @@ async fn post_messages_inner(
             "invalid_request_error",
             "The native web_search tool must be named web_search.",
         );
-        record_pre_usage_rejection(
+        record_pre_usage_rejection_for_request(
             attribution.as_ref(),
             RequestRejectionReason::WebSearchUnsupported,
             &endpoint,
             &response,
+            &payload,
+            Some(&model_resolution),
         );
         return response;
     }
@@ -6424,11 +6486,13 @@ async fn post_messages_inner(
                 "invalid_request_error",
                 "The web_search tool is not supported for this request.",
             );
-            record_pre_usage_rejection(
+            record_pre_usage_rejection_for_request(
                 attribution.as_ref(),
                 RequestRejectionReason::WebSearchUnsupported,
                 &endpoint,
                 &response,
+                &payload,
+                Some(&model_resolution),
             );
             return response;
         }
@@ -6648,12 +6712,14 @@ async fn post_messages_inner(
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
-            record_pre_usage_rejection_with_metadata(
+            record_pre_usage_rejection_with_metadata_for_request(
                 attribution.as_ref(),
                 RequestRejectionReason::LocalBodyPrepare,
                 &endpoint,
                 &error.response,
                 Some(error.error_metadata.clone()),
+                &payload,
+                Some(&model_resolution),
             );
             return error.response;
         }

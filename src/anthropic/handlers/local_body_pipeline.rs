@@ -1,6 +1,8 @@
 use super::*;
 use crate::anthropic::body_capabilities::{BodyStageState, LocalKiroBodyPlan};
+use crate::anthropic::payload_guard::sanitize_anthropic_messages_for_external_forwarding;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
+use crate::model::config::PayloadShapingConfig;
 
 pub(super) struct PreparedLocalKiroBody {
     pub(super) request_body: String,
@@ -68,6 +70,25 @@ fn conversion_error_category(error: &ConversionError) -> &'static str {
             }
         }
     }
+}
+
+fn should_retry_local_conversion_after_reasoning_shaping(error: &ConversionError) -> bool {
+    let ConversionError::UnsupportedContent(message) = error else {
+        return false;
+    };
+    matches!(
+        message.as_str(),
+        "consecutive assistant messages contain multiple native reasoning blocks and cannot be merged losslessly"
+            | "assistant history contains multiple or mixed native reasoning blocks; Kiro accepts one reasoningContent union value per assistant message"
+    )
+}
+
+fn local_reasoning_fallback_shaping_config(
+    mut shaping: PayloadShapingConfig,
+) -> PayloadShapingConfig {
+    shaping.enabled = true;
+    shaping.discard_historical_thinking = true;
+    shaping
 }
 
 fn conversion_error_public_message(error: &ConversionError) -> String {
@@ -144,25 +165,52 @@ pub(super) fn prepare_with_plan(
         &native_reasoning_capability,
         KiroReasoningCapabilityState::Supported(_)
     );
+    let converter_options = ConverterOptions {
+        compat_profile: runtime_config.compat_profile,
+        conversion: plan.converter,
+        prompt_cache_simulation_mode: converter_prompt_cache_mode,
+        kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
+        kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
+        kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
+        force_visible_thinking: should_force_visible_thinking(payload, runtime_config),
+        explicit_reasoning_request: false,
+        native_reasoning_capability,
+        prompt_steering: runtime_config.prompt_steering.clone().normalized(),
+    };
     let conversion_result = match convert_request_with_resolved_model(
         payload,
-        ConverterOptions {
-            compat_profile: runtime_config.compat_profile,
-            conversion: plan.converter,
-            prompt_cache_simulation_mode: converter_prompt_cache_mode,
-            kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
-            kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
-            kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
-            force_visible_thinking: should_force_visible_thinking(payload, runtime_config),
-            explicit_reasoning_request: false,
-            native_reasoning_capability,
-            prompt_steering: runtime_config.prompt_steering.clone().normalized(),
-        },
+        converter_options.clone(),
         model_resolution,
     ) {
         Ok(result) => result,
-        Err(e) => {
-            return Err(LocalBodyPrepareError::conversion(&e));
+        Err(first_error) if should_retry_local_conversion_after_reasoning_shaping(&first_error) => {
+            let mut shaped_payload = payload.clone();
+            let fallback_shaping =
+                local_reasoning_fallback_shaping_config(plan.payload_guard.config.shaping);
+            if sanitize_anthropic_messages_for_external_forwarding(
+                &mut shaped_payload,
+                fallback_shaping,
+            ) {
+                tracing::info!(
+                    endpoint,
+                    model = %payload.model,
+                    upstream_model = ?model_resolution.upstream_model,
+                    "applied local conversion fallback Anthropic payload shaping"
+                );
+                match convert_request_with_resolved_model(
+                    &shaped_payload,
+                    converter_options,
+                    model_resolution,
+                ) {
+                    Ok(result) => result,
+                    Err(_) => return Err(LocalBodyPrepareError::conversion(&first_error)),
+                }
+            } else {
+                return Err(LocalBodyPrepareError::conversion(&first_error));
+            }
+        }
+        Err(error) => {
+            return Err(LocalBodyPrepareError::conversion(&error));
         }
     };
 

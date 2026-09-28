@@ -516,6 +516,53 @@ pub struct UsageRecord {
     pub payload_guard_report: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RequestRejectionUsageContext {
+    pub model: Option<String>,
+    pub stream: Option<bool>,
+    pub requested_max_tokens: Option<i32>,
+    pub upstream_model: Option<String>,
+    pub model_resolution_source: Option<String>,
+    pub model_resolution_note: Option<String>,
+}
+
+impl RequestRejectionUsageContext {
+    pub(crate) fn from_request(
+        payload: &crate::anthropic::types::MessagesRequest,
+        resolution: Option<&crate::anthropic::model_capabilities::ModelResolution>,
+    ) -> Self {
+        Self {
+            model: non_empty_string(&payload.model),
+            stream: Some(payload.stream),
+            requested_max_tokens: (payload.max_tokens > 0).then_some(payload.max_tokens),
+            upstream_model: resolution.and_then(|resolution| {
+                resolution
+                    .upstream_model
+                    .as_deref()
+                    .and_then(non_empty_string)
+            }),
+            model_resolution_source: resolution
+                .map(|resolution| resolution.source.as_str().to_string()),
+            model_resolution_note: resolution
+                .and_then(|resolution| resolution.note.as_deref().and_then(non_empty_string)),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.stream.is_none()
+            && self.requested_max_tokens.is_none()
+            && self.upstream_model.is_none()
+            && self.model_resolution_source.is_none()
+            && self.model_resolution_note.is_none()
+    }
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Builds a bounded diagnostic record for a sampled gateway rejection.
 ///
 /// `observed_count` is the monotonic count observed when the sample was selected. It is not the
@@ -530,7 +577,7 @@ pub(crate) fn sampled_request_rejection_usage_record(
     status: http::StatusCode,
     observed_count: u64,
 ) -> UsageRecord {
-    sampled_request_rejection_usage_record_with_metadata(
+    sampled_request_rejection_usage_record_with_metadata_and_context(
         request_id,
         endpoint,
         request_api_key_id,
@@ -539,11 +586,12 @@ pub(crate) fn sampled_request_rejection_usage_record(
         status,
         observed_count,
         None,
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
+pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
     request_id: &str,
     endpoint: &str,
     request_api_key_id: Option<String>,
@@ -552,6 +600,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
     status: http::StatusCode,
     observed_count: u64,
     extra_metadata: Option<serde_json::Value>,
+    request_context: Option<RequestRejectionUsageContext>,
 ) -> UsageRecord {
     let mut error_metadata = serde_json::json!({
         "sampled": true,
@@ -563,19 +612,22 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata(
     if let Some(extra_metadata) = extra_metadata {
         merge_usage_error_metadata(&mut error_metadata, extra_metadata);
     }
+    let request_context = request_context.unwrap_or_default();
 
     UsageRecord {
         id: request_id.to_string(),
         created_at: Utc::now().to_rfc3339(),
         endpoint: endpoint.to_string(),
-        stream: false,
-        model: "unknown".to_string(),
-        requested_max_tokens: None,
+        stream: request_context.stream.unwrap_or(false),
+        model: request_context
+            .model
+            .unwrap_or_else(|| "unknown".to_string()),
+        requested_max_tokens: request_context.requested_max_tokens,
         downstream_stop_reason: None,
-        upstream_model: None,
+        upstream_model: request_context.upstream_model,
         external_outbound_model: None,
-        model_resolution_source: None,
-        model_resolution_note: None,
+        model_resolution_source: request_context.model_resolution_source,
+        model_resolution_note: request_context.model_resolution_note,
         conversation_id: None,
         request_api_key_id,
         credential_id: None,

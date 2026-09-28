@@ -927,6 +927,20 @@ async fn run_local_body_prepare_unsupported_image_media_type_records_diagnostic_
 
         let record = usage_record_for_request(&usage_recorder, &request_id);
         assert_eq!(record.status, UsageRecordStatus::Error);
+        assert_eq!(record.model, "claude-sonnet-4-20250514");
+        assert_eq!(record.requested_max_tokens, Some(32));
+        assert!(!record.stream);
+        assert!(
+            record
+                .upstream_model
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty()),
+            "local body prepare rejection should retain resolved upstream model"
+        );
+        assert!(
+            record.model_resolution_source.is_some(),
+            "local body prepare rejection should retain model resolution source"
+        );
         assert_eq!(record.error_source.as_deref(), Some("request_rejection"));
         assert_eq!(record.error_status_code, Some(400));
         let metadata = record.error_metadata.as_ref().expect("error metadata");
@@ -960,6 +974,147 @@ fn local_body_prepare_unsupported_image_media_type_records_diagnostic_for_five_r
     run_handler_fixture_on_four_mib_thread("local-body-prepare-image-diagnostic", || async {
         run_local_body_prepare_unsupported_image_media_type_records_diagnostic_for_five_rounds()
             .await;
+    });
+}
+
+async fn assert_consecutive_assistant_reasoning_request_succeeds(
+    app: Router,
+    usage_recorder: &Arc<UsageRecorder>,
+    upstream: &MultimodalHandlerUpstream,
+    round: usize,
+) {
+    let first_thought = format!("first-private-thought-{round}");
+    let second_thought = format!("second-private-thought-{round}");
+    let first_signature = format!("first-private-signature-{round}");
+    let second_signature = format!("second-private-signature-{round}");
+
+    let response = app
+        .oneshot(multimodal_handler_request(
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [
+                    {"role": "user", "content": "initial question"},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": first_thought, "signature": first_signature},
+                        {"type": "text", "text": format!("first visible answer {round}")}
+                    ]},
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": second_thought, "signature": second_signature},
+                        {"type": "text", "text": format!("second visible answer {round}")}
+                    ]},
+                    {"role": "user", "content": "continue"}
+                ]
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("consecutive assistant reasoning response");
+
+    assert_eq!(response.status(), StatusCode::OK, "round {round}");
+    let request_id = response_request_id(&response);
+    axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read success body");
+
+    let bodies = upstream.bodies_snapshot();
+    assert_eq!(bodies.len(), round, "round {round}");
+    let upstream_body = bodies.last().expect("captured upstream body");
+    assert!(
+        !upstream_body.contains("reasoningContent"),
+        "round {round}: local pre-conversion shaping must remove unmergeable native reasoning"
+    );
+    assert!(!upstream_body.contains("private-thought"), "round {round}");
+    assert!(
+        !upstream_body.contains("private-signature"),
+        "round {round}"
+    );
+    assert!(
+        upstream_body.contains(&format!("first visible answer {round}")),
+        "round {round}: visible first answer must survive"
+    );
+    assert!(
+        upstream_body.contains(&format!("second visible answer {round}")),
+        "round {round}: visible second answer must survive"
+    );
+
+    let sent: Value = serde_json::from_str(upstream_body).expect("upstream body JSON");
+    let assistant_history = sent["conversationState"]["history"]
+        .as_array()
+        .expect("history array")
+        .iter()
+        .filter_map(|message| message.get("assistantResponseMessage"))
+        .collect::<Vec<_>>();
+    assert!(
+        assistant_history
+            .iter()
+            .any(|assistant| assistant["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("first visible answer")
+                    && content.contains("second visible answer"))),
+        "round {round}: consecutive assistant visible content should be merged"
+    );
+
+    let record = usage_record_for_request(usage_recorder, &request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success, "round {round}");
+    assert_eq!(record.error_source, None, "round {round}");
+}
+
+async fn run_local_preconversion_shaping_handles_consecutive_assistant_reasoning_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let (app, usage_recorder) = multimodal_handler_test_router_with_usage(&upstream.base_url);
+
+    for round in 1..=5 {
+        assert_consecutive_assistant_reasoning_request_succeeds(
+            app.clone(),
+            &usage_recorder,
+            &upstream,
+            round,
+        )
+        .await;
+    }
+
+    assert_eq!(upstream.hits(), 5);
+}
+
+#[test]
+fn local_preconversion_shaping_handles_consecutive_assistant_reasoning_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("local-preconversion-reasoning-shaping", || async {
+        run_local_preconversion_shaping_handles_consecutive_assistant_reasoning_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(upstream.base_url.clone());
+    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+    config.kiro_upstream_response_timeout_secs = 2;
+    config.credential_retry_max_attempts = 1;
+    config.payload_shaping.enabled = false;
+    config.payload_shaping.discard_historical_thinking = false;
+    let (app, usage_recorder) = multimodal_handler_test_router_from_config(config);
+
+    for round in 1..=5 {
+        assert_consecutive_assistant_reasoning_request_succeeds(
+            app.clone(),
+            &usage_recorder,
+            &upstream,
+            round,
+        )
+        .await;
+    }
+
+    assert_eq!(upstream.hits(), 5);
+}
+
+#[test]
+fn local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("local-reasoning-fallback-shaping-disabled", || async {
+        run_local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds().await;
     });
 }
 

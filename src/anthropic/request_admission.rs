@@ -30,7 +30,10 @@ use crate::{common::auth::RequestApiKeyIdentity, model::config::RequestAdmission
 
 use super::{
     envelope,
-    usage::{UsageRecorder, sampled_request_rejection_usage_record_with_metadata},
+    usage::{
+        RequestRejectionUsageContext, UsageRecorder,
+        sampled_request_rejection_usage_record_with_metadata_and_context,
+    },
 };
 
 const STATE_SHARDS: usize = 16;
@@ -371,6 +374,28 @@ impl RequestRejectionAttribution {
         endpoint: &str,
         extra_metadata: Option<serde_json::Value>,
     ) -> bool {
+        self.record_with_metadata_and_context(
+            reason,
+            stage,
+            status,
+            request_id,
+            endpoint,
+            extra_metadata,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_with_metadata_and_context(
+        &self,
+        reason: RequestRejectionReason,
+        stage: &'static str,
+        status: StatusCode,
+        request_id: &str,
+        endpoint: &str,
+        extra_metadata: Option<serde_json::Value>,
+        request_context: Option<RequestRejectionUsageContext>,
+    ) -> bool {
         let key_state = if reason == RequestRejectionReason::AdmissionStateCapacity {
             None
         } else {
@@ -389,8 +414,8 @@ impl RequestRejectionAttribution {
         ) else {
             return false;
         };
-        self.recorder
-            .record(sampled_request_rejection_usage_record_with_metadata(
+        self.recorder.record(
+            sampled_request_rejection_usage_record_with_metadata_and_context(
                 request_id,
                 endpoint,
                 Some(sample.request_api_key_id),
@@ -399,7 +424,9 @@ impl RequestRejectionAttribution {
                 status,
                 sample.observed_count,
                 extra_metadata,
-            ));
+                request_context,
+            ),
+        );
         true
     }
 }

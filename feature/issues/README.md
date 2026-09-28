@@ -35,6 +35,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 
 ## 当前权威专题
 
+- [Claude Code 协议与 Kiro 协议互转审计（2026-09-28）](protocol-conversion-audit-20260928/README.md)：共 25 个单问题文档，覆盖请求、响应、流式和辅助接口的互转偏差，包括 usage 页面样本 `consecutive assistant messages contain multiple native reasoning blocks` 的本地前置 400（P22），以及 P22 之外的 reasoning 多 block 缺口（P23）。
 - [外部池质量感知调度零派发活锁](external-pool-quality-scheduling-zero-dispatch-20260918.md) - 2026-09-18；P0；`v0.0.162`/`v0.0.163`（二者代码一致）外部池零派发、usage 无记录、切回 `v0.0.161` 立即恢复。已确认升级兼容缺陷：质量调度默认值曾为开启，普通瞬态失败可升级池级 hard cooldown；已确认并修复质量采样与正式 Redis 调度链路的资源隔离、相对 cohort probation、selector 空转兜底和无样本 legacy 回退。现网 coordinator/Redis 争用是否为零 upstream 派发的最终根因仍未闭环，状态见专项文档。
 - [当前问题状态索引与文档维护规则](current-issue-status-index-20260731.md) - 2026-07-31 当前 open/fix-pending/NO-GO/验证缺口汇总；代码或状态改动必须同步更新 owning issue、该索引和必要的 plan-tree 状态。
 - [当前问题逐项分析优先级队列](issue-analysis-priority-queue-20260731.md) - 2026-07-31 按紧急度和难度排序的问题分析执行顺序；先处理本地账号 Claude Code/WebSearch/tools/image，再推进协议、调度、存储和 UI/release gates。
