@@ -3145,6 +3145,7 @@ enum HandlerEventStreamFault {
     JsonBodyWithEventStreamContentType,
     SignatureInvalidThenJsonLabeledEventStreamSuccess,
     SignatureInvalidThenJsonErrorEnvelope,
+    SignatureInvalidThenTooLong,
     ReadErrorBeforeOutput,
     IdleBeforeOutput,
     BadCrcBeforeOutput,
@@ -3171,6 +3172,7 @@ enum HandlerEventStreamFault {
 struct HandlerEventStreamFaultState {
     fault: HandlerEventStreamFault,
     hits: Arc<AtomicUsize>,
+    bodies: Arc<StdMutex<Vec<serde_json::Value>>>,
     json_secret_marker: String,
 }
 
@@ -3192,6 +3194,7 @@ impl HandlerEventStreamFaultUpstream {
         let state = HandlerEventStreamFaultState {
             fault,
             hits: Arc::new(AtomicUsize::new(0)),
+            bodies: Arc::new(StdMutex::new(Vec::new())),
             json_secret_marker,
         };
         let app = Router::new()
@@ -3220,6 +3223,14 @@ impl HandlerEventStreamFaultUpstream {
 
     fn hits(&self) -> usize {
         self.state.hits.load(Ordering::Acquire)
+    }
+
+    fn bodies_snapshot(&self) -> Vec<serde_json::Value> {
+        self.state
+            .bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -3304,12 +3315,32 @@ fn handler_eventstream_chunked_response(
 
 async fn handler_eventstream_fault_upstream(
     State(state): State<HandlerEventStreamFaultState>,
+    body: Bytes,
 ) -> Response {
     let hit = state.hits.fetch_add(1, Ordering::AcqRel) + 1;
+    let request =
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null);
+    state
+        .bodies
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(request);
     if hit > 1 {
         return match state.fault {
             HandlerEventStreamFault::SignatureInvalidThenJsonLabeledEventStreamSuccess => {
                 handler_eventstream_json_labeled_bytes_response(handler_eventstream_normal_body())
+            }
+            HandlerEventStreamFault::SignatureInvalidThenTooLong if hit == 2 => (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(json!({
+                    "message": "Input is too long.",
+                    "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                })),
+            )
+                .into_response(),
+            HandlerEventStreamFault::SignatureInvalidThenTooLong => {
+                handler_eventstream_bytes_response(handler_eventstream_normal_body())
             }
             HandlerEventStreamFault::SignatureInvalidThenJsonErrorEnvelope => (
                 StatusCode::OK,
@@ -3326,7 +3357,8 @@ async fn handler_eventstream_fault_upstream(
 
     match state.fault {
         HandlerEventStreamFault::SignatureInvalidThenJsonLabeledEventStreamSuccess
-        | HandlerEventStreamFault::SignatureInvalidThenJsonErrorEnvelope => (
+        | HandlerEventStreamFault::SignatureInvalidThenJsonErrorEnvelope
+        | HandlerEventStreamFault::SignatureInvalidThenTooLong => (
             StatusCode::BAD_REQUEST,
             [(header::CONTENT_TYPE, "application/json")],
             Json(json!({
@@ -3907,6 +3939,64 @@ async fn run_handler_thinking_signature_retry_rejects_json_error_envelope_for_fi
     }
 }
 
+fn handler_body_has_history_reasoning_content(value: &serde_json::Value) -> bool {
+    value
+        .pointer("/conversationState/history")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|history| {
+            history.iter().any(|message| {
+                message
+                    .pointer("/assistantResponseMessage/reasoningContent")
+                    .is_some()
+            })
+        })
+}
+
+async fn run_handler_thinking_signature_retry_too_long_enters_payload_guard_for_five_rounds() {
+    for stream in [false, true] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::SignatureInvalidThenTooLong,
+            )
+            .await;
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
+            let (status, request_id, body) =
+                call_handler_thinking_signature_retry(app, stream).await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "stream={stream} round={round} body={body}"
+            );
+            assert!(
+                body.contains("recovered-ok"),
+                "stream={stream} round={round} body={body}"
+            );
+            assert_eq!(
+                upstream.hits(),
+                3,
+                "stream={stream} round={round}: signature retry too-long should enter common payload guard retry"
+            );
+            let bodies = upstream.bodies_snapshot();
+            assert_eq!(bodies.len(), 3, "stream={stream} round={round}");
+            assert!(
+                handler_body_has_history_reasoning_content(&bodies[0]),
+                "stream={stream} round={round}: first request should reproduce invalid signed thinking"
+            );
+            assert!(
+                !handler_body_has_history_reasoning_content(&bodies[1]),
+                "stream={stream} round={round}: provider signature retry should strip historical reasoning"
+            );
+            assert!(
+                !handler_body_has_history_reasoning_content(&bodies[2]),
+                "stream={stream} round={round}: payload guard retry must use the provider-derived body, not the original signed-thinking body"
+            );
+            assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 3);
+        }
+    }
+}
+
 #[test]
 fn handler_thinking_signature_retry_accepts_json_labeled_eventstream_success_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread(
@@ -3920,6 +4010,14 @@ fn handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds(
     run_handler_fixture_on_four_mib_thread(
         "signature-retry-json-error-envelope",
         run_handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds,
+    );
+}
+
+#[test]
+fn handler_thinking_signature_retry_too_long_enters_payload_guard_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "signature-retry-too-long-payload-guard",
+        run_handler_thinking_signature_retry_too_long_enters_payload_guard_for_five_rounds,
     );
 }
 

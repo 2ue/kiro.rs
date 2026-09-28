@@ -1,6 +1,6 @@
 # Roadmap
 
-Last reviewed: 2026-09-27 Asia/Shanghai
+Last reviewed: 2026-09-28 Asia/Shanghai
 
 ## Done
 
@@ -95,7 +95,39 @@ Last reviewed: 2026-09-27 Asia/Shanghai
 
 ## In Progress
 
+- Thinking Signature 后 Too-Long 修复：已完成 provider terminal reason 保留、handler
+  公共 too-long 分类和派生 body guard 基线修复；fake upstream 11 项 focused test
+  通过。真实上游低并发复现、修复后二进制验证和发布门禁待完成。详见
+  [修复计划](topics/thinking-signature-too-long-remediation-20260928.md)。
+
 ## Done (2026-09-28)
+
+- Production Thinking Signature root-cause follow-up for
+  `req_01hJ2YhjMEyjrrVEQFTZpqri`: read-only production evidence showed attempt 1
+  returned Kiro 400 `THINKING_SIGNATURE_INVALID`; same-credential retry stripped
+  historical reasoning, so attempt 2 no longer hit signature validation and instead
+  returned Kiro 400 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`. The direct root cause is that
+  outbound Kiro body admission and upstream too-long classification are not centralized:
+  the derived retry body was still too large, but production `v0.0.173` handled the
+  second error inside the provider branch instead of the common classifier/guard path. Runtime
+  config confirmed `payloadGuardMode=on_too_long`, `payloadGuardMaxBytes=460800`;
+  the target retry body was about 5.76 MB with 1996 history entries, and 28 same-shape
+  rows were exported from the recent 5000 usage window. No production/code mutation
+  was performed. See
+  [follow-up root-cause report](../../../analysis/production-thinking-signature-followup-root-cause-20260928.md).
+
+- Production Thinking Signature error audit for request
+  `req_01tA8uNUqeCYgg94MNMbNaX6`: read-only production evidence showed this ID is
+  `data.errorId` on canonical usage row `req_01cs7AQe21bKgNrxrgrygdTN`. Attempt 1
+  hit a real Kiro 400 `THINKING_SIGNATURE_INVALID`; the system retried once on the
+  same credential with historical reasoning stripped; attempt 2 returned HTTP 200
+  headers, produced reasoning output and then failed post-commit with
+  `upstream stream read error: error decoding response body`. The audit recommends
+  separating prior-attempt failures from final stream failures, adding transport-layer
+  stream-read observability and not post-commit replaying or disabling the account
+  based on this record. No production or code mutation was performed. See
+  [analysis](../../../analysis/production-thinking-signature-error-20260928.md) and
+  [topic](topics/production-thinking-signature-error-20260928.md).
 
 - Credential import tags completed: account-owned `tags: Vec<String>` now flows through
   JSON/PgSQL persistence, Admin and main UI import/export/list contracts, single/batch/KAM

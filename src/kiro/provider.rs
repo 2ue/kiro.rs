@@ -1963,6 +1963,29 @@ mod tests {
                 )
                     .into_response();
             }
+            "thinking_signature_too_long_second"
+                if !has_history_reasoning_content && state.scenario_hits(&scenario) == 2 =>
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "message": "Input is too long.",
+                        "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+                    })),
+                )
+                    .into_response();
+            }
+            "thinking_signature_too_long_second" if !has_history_reasoning_content => {
+                return (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/vnd.amazon.eventstream",
+                    )],
+                    Vec::<u8>::new(),
+                )
+                    .into_response();
+            }
             "thinking_signature_read_failure" if !has_history_reasoning_content => {
                 let first = Bytes::from_static(b"{\"message\":\"");
                 let chunks = futures::stream::once(async move { Ok::<_, std::io::Error>(first) })
@@ -2026,6 +2049,7 @@ mod tests {
             | "thinking_signature_repeat"
             | "thinking_signature_unexpected_second"
             | "thinking_signature_rate_limited_second"
+            | "thinking_signature_too_long_second"
             | "thinking_signature_read_failure"
             | "thinking_signature_root_without_builder" => serde_json::json!({
                 "message": "Historical reasoning signature is no longer valid.",
@@ -12503,13 +12527,15 @@ impl KiroProvider {
                 }
 
                 if retry_status.is_client_error() {
+                    let bad_request_reason =
+                        Self::classify_bad_request_reason(&retry_upstream_body.text);
                     let message = Self::api_failure_diagnostic(
                         ApiUpstreamFailureKind::InvalidRequest,
                         retry_status,
                         Some(retry_upstream_body.bytes),
                         retry_after,
                         Some(retry_content_kind),
-                        Some("thinking_signature_retry"),
+                        Some(Self::bad_request_diagnostic_reason(bad_request_reason)),
                     );
                     Self::push_attempt(
                         &mut attempts,

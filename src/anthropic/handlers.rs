@@ -1152,6 +1152,12 @@ struct PayloadTooLongRetryRequest {
     conversion_warnings: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadTooLongRetryBase {
+    Original,
+    ThinkingSignatureRetryWithoutHistoryReasoning,
+}
+
 impl PayloadTooLongRetryRequest {
     fn new(
         request: &KiroRequest,
@@ -1173,11 +1179,35 @@ impl PayloadTooLongRetryRequest {
         })
     }
 
-    fn build_retry_body(
+    fn build_retry_body_after_provider_error(
         self,
         usage_context: &mut RequestUsageContext,
+        attempts: &[KiroCredentialAttempt],
+    ) -> Result<(String, Option<String>, KiroRequest), PayloadGuardError> {
+        let base = payload_too_long_retry_base_for_provider_attempts(attempts);
+        self.build_retry_body_with_base(usage_context, base)
+    }
+
+    fn build_retry_body_with_base(
+        self,
+        usage_context: &mut RequestUsageContext,
+        base: PayloadTooLongRetryBase,
     ) -> Result<(String, Option<String>, KiroRequest), PayloadGuardError> {
         let mut request = self.request;
+        if base == PayloadTooLongRetryBase::ThinkingSignatureRetryWithoutHistoryReasoning {
+            let removed = request
+                .conversation_state
+                .clear_history_reasoning_content_for_compatibility_retry();
+            tracing::warn!(
+                request_id = %usage_context.request_id,
+                endpoint = %self.endpoint,
+                requested_model = %self.requested_model,
+                upstream_model = ?self.upstream_model,
+                conversation_id = %self.conversation_id,
+                removed_history_reasoning_blocks = removed,
+                "Kiro too-long retry is rebuilding the provider's thinking-signature retry body before applying payload guard"
+            );
+        }
         let (request_body, report) = guard_kiro_request(&mut request, self.config)?;
         log_payload_guard_report(
             &report,
@@ -5494,6 +5524,69 @@ fn should_retry_payload_guard_after_error(
             && is_upstream_improperly_formed_error(value))
 }
 
+fn should_retry_payload_guard_after_provider_error(
+    value: &str,
+    attempts: &[KiroCredentialAttempt],
+    attempted_body_bytes: usize,
+    retry_max_bytes: usize,
+) -> bool {
+    should_retry_payload_guard_after_error(value, attempted_body_bytes, retry_max_bytes)
+        || attempts.last().is_some_and(|attempt| {
+            should_retry_payload_guard_after_attempt(attempt, attempted_body_bytes, retry_max_bytes)
+        })
+}
+
+fn should_retry_payload_guard_after_attempt(
+    attempt: &KiroCredentialAttempt,
+    attempted_body_bytes: usize,
+    retry_max_bytes: usize,
+) -> bool {
+    attempt
+        .error_message
+        .as_deref()
+        .is_some_and(is_upstream_too_long_error)
+        || attempt
+            .raw_upstream_error
+            .as_ref()
+            .is_some_and(|raw| is_upstream_too_long_error(&raw.body))
+        || (retry_max_bytes > 0
+            && attempted_body_bytes > retry_max_bytes
+            && (attempt
+                .error_message
+                .as_deref()
+                .is_some_and(is_upstream_improperly_formed_error)
+                || attempt
+                    .raw_upstream_error
+                    .as_ref()
+                    .is_some_and(|raw| is_upstream_improperly_formed_error(&raw.body))))
+}
+
+fn payload_too_long_retry_base_for_provider_attempts(
+    attempts: &[KiroCredentialAttempt],
+) -> PayloadTooLongRetryBase {
+    let Some(terminal) = attempts.last() else {
+        return PayloadTooLongRetryBase::Original;
+    };
+    let signature_retry_started = attempts.iter().any(|attempt| {
+        attempt.action == "thinking_signature_retry_same_credential"
+            || attempt.error_type.as_deref() == Some("thinking_signature_invalid")
+    });
+    let terminal_is_too_long = terminal
+        .error_message
+        .as_deref()
+        .is_some_and(is_upstream_too_long_error)
+        || terminal
+            .raw_upstream_error
+            .as_ref()
+            .is_some_and(|raw| is_upstream_too_long_error(&raw.body));
+
+    if signature_retry_started && terminal_is_too_long {
+        PayloadTooLongRetryBase::ThinkingSignatureRetryWithoutHistoryReasoning
+    } else {
+        PayloadTooLongRetryBase::Original
+    }
+}
+
 fn should_retry_without_cache_point_after_error(value: &str) -> bool {
     if value.contains("reason=THINKING_SIGNATURE_INVALID") {
         return false;
@@ -7499,8 +7592,9 @@ async fn handle_stream_request(
                     preflight_model,
                 );
                 let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
-                    should_retry_payload_guard_after_error(
+                    should_retry_payload_guard_after_provider_error(
                         &message,
+                        &attempts,
                         request_body.len(),
                         retry.config.max_bytes,
                     )
@@ -7610,8 +7704,9 @@ async fn handle_stream_request(
                         }
                     }
                 } else if let Some(retry) = too_long_retry.filter(|retry| {
-                    should_retry_payload_guard_after_error(
+                    should_retry_payload_guard_after_provider_error(
                         &message,
+                        &attempts,
                         request_body.len(),
                         retry.config.max_bytes,
                     )
@@ -7621,11 +7716,12 @@ async fn handle_stream_request(
                         "Kiro stream request rejected as too long; applying configured payload guard and retrying once"
                     );
                     retry_attempt_prefix = attempts.clone();
-                    let (retry_body, retry_warnings_header, retry_kiro_request) =
-                        match retry.build_retry_body(&mut usage_context) {
-                            Ok(result) => result,
-                            Err(err) => {
-                                usage_context
+                    let (retry_body, retry_warnings_header, retry_kiro_request) = match retry
+                        .build_retry_body_after_provider_error(&mut usage_context, &attempts)
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            usage_context
                                 .attach_provider_error_credential(&provider, &message, attempts)
                                 .with_error_metadata(provider_error_metadata(&e))
                                 .record_failure(
@@ -7636,9 +7732,9 @@ async fn handle_stream_request(
                                     err
                                 ),
                                 );
-                                return payload_guard_error_response(err);
-                            }
-                        };
+                            return payload_guard_error_response(err);
+                        }
+                    };
                     warnings_header = retry_warnings_header;
                     match call_api_stream_maybe_fail_fast(
                         &provider,
@@ -9805,8 +9901,9 @@ async fn handle_non_stream_request(
                     preflight_model,
                 );
                 let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
-                    should_retry_payload_guard_after_error(
+                    should_retry_payload_guard_after_provider_error(
                         &message,
+                        &attempts,
                         request_body.len(),
                         retry.config.max_bytes,
                     )
@@ -9913,8 +10010,9 @@ async fn handle_non_stream_request(
                         }
                     }
                 } else if let Some(retry) = too_long_retry.filter(|retry| {
-                    should_retry_payload_guard_after_error(
+                    should_retry_payload_guard_after_provider_error(
                         &message,
+                        &attempts,
                         request_body.len(),
                         retry.config.max_bytes,
                     )
@@ -9924,11 +10022,12 @@ async fn handle_non_stream_request(
                         "Kiro non-stream request rejected as too long; applying configured payload guard and retrying once"
                     );
                     retry_attempt_prefix = attempts.clone();
-                    let (retry_body, retry_warnings_header, retry_kiro_request) =
-                        match retry.build_retry_body(&mut usage_context) {
-                            Ok(result) => result,
-                            Err(err) => {
-                                usage_context
+                    let (retry_body, retry_warnings_header, retry_kiro_request) = match retry
+                        .build_retry_body_after_provider_error(&mut usage_context, &attempts)
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            usage_context
                                 .attach_provider_error_credential(&provider, &message, attempts)
                                 .with_error_metadata(provider_error_metadata(&e))
                                 .record_failure(
@@ -9939,9 +10038,9 @@ async fn handle_non_stream_request(
                                     err
                                 ),
                                 );
-                                return payload_guard_error_response(err);
-                            }
-                        };
+                            return payload_guard_error_response(err);
+                        }
+                    };
                     warnings_header = retry_warnings_header;
                     match call_api_maybe_fail_fast(
                         &provider,

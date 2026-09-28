@@ -4,7 +4,59 @@ Last reviewed: 2026-09-28 Asia/Shanghai
 
 Current active work: [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md).
 
+Implementation follow-up:
+[Thinking Signature 后 Too-Long 修复](topics/thinking-signature-too-long-remediation-20260928.md).
+
+- Scope: fix the confirmed `THINKING_SIGNATURE_INVALID -> CONTENT_LENGTH_EXCEEDS_THRESHOLD`
+  gap without making signature retry own payload trimming.
+- Landed locally: provider preserves terminal 4xx reason; handler classifies nested too-long
+  from attempts/raw fragments; payload guard retry rebuilds from the stripped-reasoning derived
+  body. Fake upstream stream/non-stream matrix passed 11 focused tests.
+- Next: validate the frozen candidate against the designated `127.0.0.1:19023` instance and
+  a low-volume real Kiro upstream request; keep production `152.53.243.159:59137` read-only.
+
 Completed follow-up: [导入账号标签属性](topics/credential-import-tags.md).
+
+Completed read-only follow-up:
+[生产 `req_01hJ2YhjMEyjrrVEQFTZpqri` Thinking Signature 根因跟进](topics/production-thinking-signature-error-20260928.md).
+
+- Result: target request is a production `v0.0.173` `/ha/v1/messages` error where
+  attempt 1 returned Kiro HTTP 400 `THINKING_SIGNATURE_INVALID`, then the same-credential
+  signature retry stripped historical reasoning and attempt 2 returned Kiro HTTP 400
+  `CONTENT_LENGTH_EXCEEDS_THRESHOLD`. The second attempt does not repeat signature because
+  the retry body no longer contains the historical signed thinking; it exposes the next
+  validation failure.
+- Key classification: the direct root cause is that outbound Kiro body admission and
+  upstream too-long classification are not centralized. The derived retry body still
+  exceeded Kiro limits, but its `CONTENT_LENGTH_EXCEEDS_THRESHOLD` was wrapped inside
+  the provider branch instead of going through the common classifier/guard path.
+- Current-window cohort: 28 matching rows in the recent 5000 usage records share
+  `/ha/v1/messages`, `claude-opus-4-8`, credential `#1428`, about `5.76 MB`,
+  `1996` history entries and the same `THINKING_SIGNATURE_INVALID ->
+  CONTENT_LENGTH_EXCEEDS_THRESHOLD` chain.
+- Safety boundary honored: no production mutation, restart, migration, Redis write,
+  credential change, code edit, release, or production load test was performed.
+- Output:
+  [follow-up root-cause report](../../../analysis/production-thinking-signature-followup-root-cause-20260928.md)
+  and local evidence under
+  `tmp/prod-evidence/20260928-162208-152.53.243.159-signature-followup/`.
+
+[生产 Thinking Signature 错误审计 2026-09-28](topics/production-thinking-signature-error-20260928.md).
+
+- Result: user-visible error ID `req_01tA8uNUqeCYgg94MNMbNaX6` maps to
+  `usage_records.data.errorId` on canonical usage row `req_01cs7AQe21bKgNrxrgrygdTN`.
+  Attempt 1 was a real Kiro HTTP 400 `THINKING_SIGNATURE_INVALID`; the service then retried
+  once on the same credential with historical reasoning stripped. Attempt 2 received HTTP 200
+  headers, emitted 167 reasoning frames before first output, committed downstream, and then
+  failed while reading the stream body with `error decoding response body`.
+- Key classification: `THINKING_SIGNATURE_INVALID` is a prior-attempt failure, while the final
+  request failure is the second attempt's post-commit stream read error. The evidence does not
+  prove that all stream read errors are caused by signature invalidation.
+- Safety boundary honored: no production mutation, restart, migration, Redis write, credential
+  change, code edit, release, or production load test was performed.
+- Output: [production Thinking Signature analysis](../../../analysis/production-thinking-signature-error-20260928.md)
+  and local evidence under
+  `tmp/prod-evidence/20260928-145914-152.53.243.159-thinking-signature/`.
 
 - Plan phase: implementation, local regression and the user-authorized replacement
   `v0.0.174` release complete.

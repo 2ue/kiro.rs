@@ -6,7 +6,7 @@ Status: `In Progress`
 
 Current phase: `external-pool quality-aware scheduling focused-validated / Claude Code-Kiro interop P0 focused + isolated-real normal/alias validated / scheduler architecture and signature blockers open`
 
-Last reviewed: 2026-09-25 Asia/Shanghai
+Last reviewed: 2026-09-28 Asia/Shanghai
 
 Authority:
 
@@ -32,6 +32,7 @@ Authority:
    - [质量感知调度总览](topics/quality-aware-scheduling-summary.md)
    - [质量感知调度测试矩阵](topics/quality-aware-scheduling-test-matrix.md)
    - [Thinking signature 协议安全](topics/thinking-signature-protocol-safety.md)
+   - [生产 Thinking Signature 错误审计 2026-09-28](topics/production-thinking-signature-error-20260928.md)
    - [sub2api-kiro 协议互转优化执行计划](topics/sub2api-kiro-protocol-interop-optimization.md)
    - [服务问题审计与并发积压因果](topics/service-audit-and-backlog-causality.md)
    - [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md)
@@ -53,6 +54,8 @@ In scope:
 - 外部池 direct、local-first fallback、capacity wait、cooldown、internal failover、local rescue。
 - RoutePlanner / RoutePlan / CapacityLedger / RouteExecutor 状态机设计。
 - Thinking/reasoning signature、redacted thinking、payload guard、sanitizer、retry。
+- 当前实现中的 Thinking Signature 后 Too-Long 修复，见
+  [专项计划](topics/thinking-signature-too-long-remediation-20260928.md)。
 - 真实 Claude Code CLI、load/chaos、PgSQL/Redis 故障域、usage/dashboard 非阻塞验证。
 - 项目文档按当前事实重新分类、迁移和归档。
 
@@ -72,6 +75,7 @@ Out of scope:
 | 外部池流式首语义输出前 error/空回不会换池 | Focused implementation, normal routing/output rerun, frozen Claude CLI and L3-L5 load/chaos gates passed; production rollout observation pending | [External pool stream pre-output retry](topics/external-pool-stream-pre-output-retry-20260806.md), [Stream terminal errors and precommit retry](../../../../feature/issues/stream-terminal-errors-and-precommit-retry.md) |
 | 调度模式分散、无法统一解释 route/fallback/rescue | Open design | [Route planner and capacity ledger](topics/route-planner-capacity-ledger.md) |
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |
+| 生产 `THINKING_SIGNATURE_INVALID`、stream read error、retry 后 too-long 归因 | Completed read-only audits; retry-state-machine, observability and protocol follow-ups open | [Production Thinking Signature audit](topics/production-thinking-signature-error-20260928.md) |
 | 真实 CLI / load chaos / release gates 未全量闭环 | Open validation | [Validation and release gates](topics/validation-and-release-gates.md) |
 | 项目文档状态漂移、旧分析未归档 | In progress | [Document disposition](indexes/document-disposition.md) |
 | 本地账号 WebSearch/tools/image Wave 1 | WebSearch and tool parsing focused verified; image/model/multi-tool-history follow-up open | [Current issue status index](../../../../feature/issues/current-issue-status-index-20260731.md), [analysis priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) |
