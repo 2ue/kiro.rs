@@ -6,14 +6,15 @@ Current active work: [闲置账号后台 Token 主动刷新](topics/background-t
 
 Completed follow-up: [导入账号标签属性](topics/credential-import-tags.md).
 
-- Plan phase: implementation and local regression complete; the remaining operation is the
-  user-authorized replacement `v0.0.174` release.
+- Plan phase: implementation, local regression and the user-authorized replacement
+  `v0.0.174` release complete.
 - Last verified: Rust full regression `2196 passed / 0 failed / 6 ignored` plus
   `kiro_loadtest 31/31`; main UI typecheck/build, Admin UI build, formatting and diff
   checks passed. The tag topic records the focused model/API/import tests.
-- Remaining TODO: commit the feature, remove local/remote `v0.0.174` and `v0.0.175`,
-  restore the crate version to `0.0.174`, recreate the annotated `v0.0.174` tag, push
-  `main` before the tag, and record the remote quality/image/manifest evidence.
+- Release evidence: feature commit `05bbbf3`, release commit `83fd06b`, old `v0.0.174`
+  removed and recreated, `v0.0.175` already absent, and remote `main`/`v0.0.174` now
+  point to `83fd06b`. GitHub Actions `Publish Docker Images #231` (`36378663559`)
+  passed quality, amd64, arm64 and manifest jobs.
 
 - Plan phase: implementation and local release verification complete; release tag and
   remote workflow status remain to be recorded after the release push.

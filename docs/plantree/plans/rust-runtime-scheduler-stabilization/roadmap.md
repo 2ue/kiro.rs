@@ -102,8 +102,9 @@ Last reviewed: 2026-09-27 Asia/Shanghai
   import dialogs, and existing-tag candidate selection. Backend normalization is the final
   boundary; tags do not affect identity, authentication, refresh, dispatch, or upstream
   requests. Rust full regression, focused tag/API tests, both frontend builds, formatting
-  and diff checks passed. The work is ready for the user-requested replacement
-  `v0.0.174` release; release evidence will be appended after the tag and workflow checks.
+  and diff checks passed. The old `v0.0.174` was removed and replaced by an annotated
+  `v0.0.174` pointing to `83fd06b`; `v0.0.175` was already absent. GitHub Actions
+  `Publish Docker Images #231` passed quality, amd64, arm64 and manifest jobs.
   See [credential import tags](topics/credential-import-tags.md).
 
 - 闲置账号后台 Token 主动刷新：

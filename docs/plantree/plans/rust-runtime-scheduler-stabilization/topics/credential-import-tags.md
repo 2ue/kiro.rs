@@ -73,7 +73,7 @@ Out of scope:
 - [x] Rust 模型、Admin API、导入/导出链路
 - [x] 主 UI 与 Admin UI 标签选择器
 - [x] Rust/前端/真实本地实例回归
-- [x] 合并到工作提交并准备重新发布 `v0.0.174`
+- [x] 合并到功能提交并重新发布 `v0.0.174`
 
 ## 已验证证据
 
@@ -82,5 +82,15 @@ Out of scope:
 - 标签模型、历史兼容、边界规范化、调度配置不变性及 Admin 默认标签定向测试通过。
 - 主 UI `pnpm check`、主 UI `pnpm build`、Admin UI `pnpm build` 通过；
   `cargo fmt --check` 与 `git diff --check` 通过。
-- 当前工作树尚未提交；下一步是提交功能、删除旧的
-  `v0.0.174`/`v0.0.175` 标签并以新的 release commit 重新创建 `v0.0.174`。
+## 发布证据
+
+- 功能提交：`05bbbf3`（`feat: add credential import tags`）。
+- 发版提交：`83fd06b`（`chore(release): 0.0.174`）。
+- 已删除旧远端/本地 `v0.0.174`；`v0.0.175` 在本地和远端均已不存在，因此没有执行
+  对不存在标签的删除操作。
+- 新 annotated `v0.0.174` 已推送，剥离后指向 `83fd06b`；远端 `main` 同样指向
+  `83fd06b`，本地工作树与远端一致。
+- GitHub Actions `Publish Docker Images #231`（run
+  `36378663559`，2026-09-28）成功完成：`quality / Frontend and Rust quality gate`、
+  `build (linux/amd64)`、`build (linux/arm64)` 和 `manifest` 全部通过。
+- 本次发布未修改生产机器、生产数据库或生产配置。
