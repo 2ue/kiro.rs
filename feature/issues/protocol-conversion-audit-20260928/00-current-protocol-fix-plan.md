@@ -1,6 +1,6 @@
 # 当前协议问题修复计划与进度
 
-Status: release-pending
+Status: complete
 Owner: Codex
 Updated: 2026-09-29
 
@@ -64,8 +64,14 @@ Updated: 2026-09-29
   - normal Sonnet；
   - Haiku alias、完整 Sonnet model id；
   - 被动 `ultrathink`、wrapper prompt、`sonnet-thinking`；
-  - Bash、WebSearch、MCP、Read、Edit；
-  - 两轮 resume 会话，第二轮保留 cache read usage；
+  - Bash、MCP、Read、Edit；
+  - 两轮持久化 resume 会话，第二轮保留 cache read usage；
   - 所有通过 case 均返回预期文本、退出码 0，并在 usage 记录为真实 local account / `local_success`。
+- 2026-09-29：对 WebSearch 做了额外的协议级复核，修正“CLI 有 `server_tool_use` 标记就等于执行 native WebSearch”的误判：
+  - 直接构造官方 `web_search_20250305` native tool 的 non-stream/stream 请求，均真实返回 `server_tool_use` + 配对的 `web_search_tool_result`，服务端 usage 有真实 MCP 调用；
+  - `claude --tools WebSearch` 在本轮隔离 CLI 中没有形成 native tool_use，服务端 `mcpAttempts=0`、`sawUpstreamToolUse=false`，模型输出的是 XML/function-call 文本或已合成文本；这不能算 CLI native WebSearch 通过，已单独记为 CLI 能力协商限制；
+  - native 空 query 真实返回 400 `invalid_request_error`，且不发 MCP；这是已验证的真实无效输入，不删除轻量 query 预检。
+- 2026-09-29：tag 后多轮 resume 补测初次因测试命令带 `--no-session-persistence` 而无法恢复，已在隔离 config 去掉该开关重新验证，两轮均成功，第二轮 `cache_read_input_tokens=8802`。
 - 2026-09-29：agent 能力未宣称通过。CLI `--print` 的若干尝试中，一次是模型文本模拟 `<function_calls>`，另两次仅调用 Bash；`subagent_stats.spawned=0`。`--bg` 需要 CLI 自身的权限免责声明和交互式会话初始化，本轮隔离探测已清理 idle 后台进程，未形成服务端错误。
 - 2026-09-29：直接协议和 CLI 证据已归档到 `tmp/thinking-budget-local/cli-protocol-evidence-20260929/summary.md`；进入 release gate，之后按用户要求打 tag 并推送，再由子 agent 监控发布。
+- 2026-09-29：`v0.0.177` 已推送并完成发布监控；GitHub Actions run `36460755631` 的 quality/amd64/arm64/manifest 全部成功，GHCR `0.0.177` 与 `latest` 已更新到相同双架构 manifest。Docker Hub 匿名接口仍返回 404，未将其误判为失败。
