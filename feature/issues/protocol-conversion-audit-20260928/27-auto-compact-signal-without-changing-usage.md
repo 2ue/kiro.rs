@@ -1,6 +1,6 @@
 # P27 Claude Code 不触发自动压缩（usage 按路由整形后客户端看不到真实上下文）
 
-Status: fixed-in-working-tree (context compaction signal; not released)
+Status: fixed-in-833315c (context compaction signal) + 439e5ce (reactive message); not released
 Severity: High
 Area: response + scheduling
 Discovered: 2026-09-29
