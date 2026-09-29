@@ -2828,6 +2828,94 @@ mod tests {
     }
 
     #[test]
+    fn thinking_suffixed_models_split_into_base_model_and_thinking_mode() {
+        // A discovered catalog without `-thinking` variants: every `-thinking` request must
+        // resolve to the matching base model while the requested name keeps the thinking flag.
+        let models = [
+            "claude-haiku-4.5",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4",
+            "claude-sonnet-4.5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-opus-4.5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4.6",
+            "claude-opus-4-6",
+            "claude-opus-4.7",
+            "claude-opus-4-7",
+            "claude-opus-4.8",
+            "claude-opus-5",
+            "claude-opus-5.5",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        for (requested, expected_upstream) in [
+            ("sonnet-thinking", "claude-sonnet-5"),
+            ("opus-thinking", "claude-opus-5.5"),
+            ("haiku-thinking", "claude-haiku-4-5-20251001"),
+            ("claude-sonnet-4-5-thinking", "claude-sonnet-4.5"),
+            ("claude-opus-4-5-thinking", "claude-opus-4.5"),
+            ("claude-haiku-4-5-thinking", "claude-haiku-4.5"),
+            ("claude-sonnet-4-6-thinking", "claude-sonnet-4-6"),
+            ("claude-opus-4-6-thinking", "claude-opus-4-6"),
+            ("claude-opus-4-7-thinking", "claude-opus-4-7"),
+            ("claude-opus-4-8-thinking", "claude-opus-4.8"),
+            ("claude-sonnet-5-thinking", "claude-sonnet-5"),
+            ("claude-opus-5-thinking", "claude-opus-5"),
+            ("claude-opus-5-5-thinking", "claude-opus-5.5"),
+            ("claude-opus-5.5-thinking", "claude-opus-5.5"),
+            (
+                "claude-sonnet-4-5-20250929-thinking",
+                "claude-sonnet-4-5-20250929",
+            ),
+            (
+                "claude-opus-4-5-20251101-thinking",
+                "claude-opus-4-5-20251101",
+            ),
+            (
+                "claude-haiku-4-5-20251001-thinking",
+                "claude-haiku-4-5-20251001",
+            ),
+            ("claude-sonnet-4-20250514-thinking", "claude-sonnet-4"),
+            ("sonnet[1m]-thinking", "claude-sonnet-5"),
+            ("opus-thinking[1m]", "claude-opus-5.5"),
+            ("claude-sonnet-4-6-thinking[1m]", "claude-sonnet-4-6"),
+            ("claude-sonnet-4-6[1m]-thinking", "claude-sonnet-4-6"),
+            ("claude-opus-4-8-thinking[1m]", "claude-opus-4.8"),
+            ("claude-opus-4-8[1m]-thinking", "claude-opus-4.8"),
+            (
+                "claude-sonnet-4-5-20250929[1m]-thinking",
+                "claude-sonnet-4-5-20250929",
+            ),
+        ] {
+            let result = resolve_model_with_catalog(requested, &models);
+            assert_eq!(
+                result.upstream_model.as_deref(),
+                Some(expected_upstream),
+                "{requested}"
+            );
+            assert!(
+                strip_model_compat_suffixes(requested).1,
+                "{requested} must keep the thinking mode"
+            );
+            // Scheduling sees explicit ids verbatim (aliases are resolved first), so an explicit
+            // `-thinking`/`[1m]` id must match credentials that list only the base model.
+            if requested.starts_with("claude-") {
+                assert!(
+                    crate::model::model_support::model_is_supported_by_list(
+                        &[expected_upstream.to_string()],
+                        &[Some(requested)],
+                    ),
+                    "{requested} must schedule on credentials listing {expected_upstream}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn known_anthropic_model_distinguishes_known_from_invented_ids() {
         for known in [
             "sonnet",

@@ -204,7 +204,23 @@ fn known_anthropic_dated_model(model: &str) -> Option<&'static str> {
     }
 }
 
+/// `[1m]` selects the 1M context window of the same model, so it never changes which
+/// credentials can serve it. Handles both `x[1m]` and `x[1m]-thinking`.
+fn strip_context_window_suffix(model: String) -> String {
+    if let Some(base) = model.strip_suffix("[1m]") {
+        return base.to_string();
+    }
+    if let Some(base) = model
+        .strip_suffix("-thinking")
+        .and_then(|base| base.strip_suffix("[1m]"))
+    {
+        return format!("{base}-thinking");
+    }
+    model
+}
+
 fn support_match_variants(model: String) -> Vec<String> {
+    let model = strip_context_window_suffix(model);
     let mut variants = expand_claude_supported_model_variants([model.clone()]);
     if let Some(base) = model.strip_suffix("-thinking") {
         variants.extend(expand_claude_supported_model_variants([base.to_string()]));
@@ -253,6 +269,41 @@ pub fn model_is_supported_by_list(models: &[String], candidates: &[Option<&str>]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_and_1m_suffixes_schedule_on_the_base_model_catalog() {
+        let catalog = vec![
+            "claude-sonnet-4.6".to_string(),
+            "claude-sonnet-5".to_string(),
+            "claude-opus-4.8".to_string(),
+            "claude-opus-5.5".to_string(),
+            "claude-haiku-4-5-20251001".to_string(),
+        ];
+        for candidate in [
+            "claude-sonnet-4-6-thinking",
+            "claude-sonnet-4.6-thinking",
+            "claude-sonnet-4-6[1m]",
+            "claude-sonnet-4-6-thinking[1m]",
+            "claude-sonnet-4-6[1m]-thinking",
+            "claude-sonnet-5-thinking",
+            "claude-sonnet-5[1m]",
+            "claude-opus-4-8-thinking",
+            "claude-opus-4.8[1m]",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5-thinking[1m]",
+            "claude-haiku-4-5-thinking",
+            "claude-haiku-4-5-20251001-thinking",
+            "claude-haiku-4.5[1m]",
+        ] {
+            assert!(
+                model_is_supported_by_list(&catalog, &[Some(candidate)]),
+                "{candidate} should match the base model catalog"
+            );
+        }
+        for candidate in ["claude-opus-4-7-thinking", "claude-sonnet-4-5[1m]"] {
+            assert!(!model_is_supported_by_list(&catalog, &[Some(candidate)]));
+        }
+    }
 
     #[test]
     fn normalizes_supported_models() {
