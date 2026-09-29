@@ -1,6 +1,6 @@
 # P02 XML thinking 结束标签只接受 `</thinking>\n\n`，正文被吞进 thinking 并误报 max_tokens
 
-Status: open / documented / not-fixed
+Status: fixed-in-619ac56 (not released)
 Severity: High
 Area: stream
 Discovered: 2026-09-28 协议互转审计
@@ -266,3 +266,10 @@ fn find_real_thinking_end_tag_for(buffer: &str, tag: ThinkingXmlTag) -> EndTagMa
 - 性能：只多几次字符比较，可忽略。
 - 回滚：规则集中在 `find_real_thinking_end_tag_for`，可回退为只接受 `\n\n`。
 - 未验证项：线上 `</thinking>` 后缀形态的分布没有统计，B3 的标点集合需要用真实样本校准。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`619ac56`）：`find_real_thinking_end_tag_for` 改为分级规则，以下形态都识别为结束标签：`</thinking>` 后跟 `\n\n`、`\n`、`\r\n`；标签位于行首或 thinking 开头；标签紧贴句末标点。行内提及（如 `关于 </thinking> 标签`）和被引号包裹的情况仍然跳过。流式场景通过 `last_xml_thinking_char` 判断缓冲区开头的标签所处位置；非流式 `extract_thinking_from_complete_text`、tool_use 边界和结束 flush 使用同一套规则。
+- 单测：`xml_thinking_close_tag_accepts_real_world_separators_for_five_rounds`（覆盖 8 种形态，含 `<think>`）、`xml_thinking_close_tag_split_at_every_byte_keeps_answer_visible`（在每个 UTF-8 边界切成两个 chunk）、`xml_thinking_glued_close_tag_before_tool_use_closes_thinking`、`non_stream_thinking_extraction_uses_stream_close_tag_rules`。
+- 真实上游：thinking 矩阵共 18 类场景、23 个请求，加上 CLI ultrathink、`MAX_THINKING_TOKENS`、thinking + 工具的 3 轮 resume。正文里没有出现 thinking 标签泄漏，结果与修复前基线一致。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

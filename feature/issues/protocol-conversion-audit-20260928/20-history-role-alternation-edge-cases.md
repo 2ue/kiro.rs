@@ -1,6 +1,6 @@
 # P20 历史角色交替的边界情况：首条 assistant、合成 system 对后连续 assistant、伪造 "OK"、prefill 静默截断、多 text 块无分隔
 
-Status: open / documented / not-fixed
+Status: partially-fixed-in-be5ee15 (leading assistant kept; synthetic OK still open)
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -200,3 +200,10 @@ B（在源头处理，信息不丢），辅以对 prefill 的显式策略：
 - 首条 assistant 合并进合成 assistant 后，如果首条 assistant 带 tool_use，其 tool_result 在下一条 user，配对关系保持；
   需要测试确认 `validate_tool_pairing` 仍通过。
 - `prefillHandling=reject` 若误设为默认，会影响少数依赖 prefill 的 SDK 用户，因此默认保持 `drop`。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`be5ee15`）：对话以 assistant 开头时，在它前面插入占位 user `.`，保留 assistant 的内容，并保证 history 以 user 开头、交替排列（有无 system 两种情况都覆盖）。伪造的 `"OK"`、prefill 截断、多个 text 块直接拼接，这几项仍未处理。
+- 单测：`leading_assistant_turn_is_kept_behind_placeholder_user_for_five_rounds`。
+- 真实上游：以 assistant 开头的对话，在有 system 和无 system 两种情况下都返回 200，模型能复述其中的口令 `OSPREY`。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

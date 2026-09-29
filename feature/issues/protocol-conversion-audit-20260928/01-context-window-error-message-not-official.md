@@ -1,6 +1,6 @@
 # P01 上下文超限 / 输入超阈值错误文案不符合官方格式，Claude Code 无法触发自动压缩
 
-Status: open / documented / not-fixed
+Status: fixed-in-439e5ce (not released)
 Severity: High
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -274,3 +274,10 @@ if is_upstream_payload_too_long_error(&err_str) || is_upstream_context_window_fu
 - 回滚：新文案集中在一个函数，回滚为旧常量即可；调用点新增参数可保留。
 - 性能：无额外计算，token 估算已在请求开始时完成。
 - 未验证项：Claude Code 的识别规则和 token 差额解析规则来自经验观察，未对其发布包源码逐行核对；需要用当前 Claude Code 版本做一次真实验收。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`439e5ce`）：上游 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 或 context window full 时，返回 400 `invalid_request_error`，文案改为 Claude Code 协议格式。本地估算的 token 超过模型窗口时，返回 `prompt is too long: N tokens > M maximum`；没超过时（Kiro 按内容阈值拒绝）不编造数字，返回以 `prompt is too long:` 开头的说明。error id 只放在 `x-error-id` 响应头里，message 保持纯净格式；另外新增 `x-kiro-too-long-kind` 响应头。外部池的两条文案也加上了 `prompt is too long:` 前缀。相邻问题一并修复：请求体超过 50 MiB 时，`error.type` 改为 `request_too_large`。
+- 单测：`prompt_too_long_messages_use_claude_code_protocol_prefix`、`upstream_too_long_errors_map_to_prompt_is_too_long_for_five_rounds`，并更新了已有的 too-long 和 413 用例；全量 `cargo test --bin kiro-rs` 通过。
+- 真实上游：900 KB 和 1.1 MB 的请求被 Kiro 拒绝后，返回 `prompt is too long: 225933 tokens > 200000 maximum`，message 后面不再附加 error-id 后缀。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

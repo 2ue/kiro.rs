@@ -1,6 +1,6 @@
 # P08 流式 ContentLengthExceededException 被转成 SSE error，非流式却返回正常 max_tokens
 
-Status: open / documented / not-fixed
+Status: fixed-in-619ac56 + 5358be6 (not released)
 Severity: Medium
 Area: stream
 Discovered: 2026-09-28 协议互转审计
@@ -278,3 +278,11 @@ handler 级（`src/anthropic/handlers/tests.rs`）：
 - 子问题修改会改变 `stop_reason_source` 统计中 `local_context_window_exceeded` 的数量。
 - 回滚：两处改动都局部，可单独回退。
 - 未验证项：Kiro `ContentLengthExceededException` 的官方语义；Claude Code 对 `model_context_window_exceeded` + tool_use 组合的处理方式。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`619ac56`）：流式收到 `ContentLengthExceededException` 时，如果之前已有输出，以 `stop_reason=max_tokens` 正常结束，发出 message_delta 和 message_stop，行为与非流式一致；如果之前没有任何输出，仍然按错误处理。
+- 子问题修复（`5358be6`）：contextUsage 达到 100% 时，如果本轮已经输出了 tool_use，stop_reason 保持 `tool_use`（流式和非流式都是），避免 Claude Code 不执行已返回的工具调用。
+- 单测：`content_length_exceeded_after_output_ends_with_max_tokens_for_five_rounds`、`content_length_exceeded_without_output_is_still_an_error`、`context_window_full_does_not_hide_emitted_tool_use`。
+- 真实上游：没有找到能稳定触发该异常的输入，这一项只由单测覆盖。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

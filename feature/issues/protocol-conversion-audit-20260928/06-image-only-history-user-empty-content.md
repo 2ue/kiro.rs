@@ -1,6 +1,6 @@
 # P06 历史中只含图片（或只含被忽略块）的 user 消息被转成空 content
 
-Status: open / documented / not-fixed
+Status: fixed-in-a6abce7 (not released)
 Severity: Medium
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -201,3 +201,10 @@ pub(super) fn non_empty_user_content(text: String, has_tool_results: bool, has_i
 - 仅影响“原本为空”的 content，非空消息 byte-identical，prompt cache 前缀不受影响（空消息原本就可能导致失败）。
 - 占位文本进入模型上下文，理论上有轻微语义噪音；`.` 已在 current 路径长期使用，风险可控。
 - 若事后证明 Kiro 实际接受空 content，本改动仍无害。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`a6abce7`）：历史中的 user 合并后如果内容为空，一律补上与当前消息相同的占位：没有 tool_result 时补 `.`，有 tool_result 时补 `Tool result received.`。
+- 单测：`image_only_history_user_turn_gets_non_empty_content_for_five_rounds`。
+- 真实上游：只含图片的历史 user 轮次返回 200，结果为 `image-history-ok`。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

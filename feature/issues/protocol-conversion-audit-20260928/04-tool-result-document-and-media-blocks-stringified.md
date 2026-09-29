@@ -1,6 +1,6 @@
 # P04 tool_result 内的 document / search_result 等块被整体 JSON 字符串化，嵌套 url/file 图片未物化导致 400
 
-Status: open / documented / not-fixed
+Status: fixed-in-a6abce7 (not released)
 Severity: High
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -272,3 +272,10 @@ fn extract_tool_result_content(content: &Option<Value>) -> Result<String, Conver
   需要关注锁竞争，必要时把抽取移到 blocking 线程池。
 - 嵌套远程物化会增加一次网络下载，受现有预算和 SSRF 防护约束；light 模式会开始拒绝嵌套远程源（行为收紧）。
 - 外部池 Anthropic 透传路径不受影响（改动只在 Kiro converter 与本地物化）。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`a6abce7`）：`tool_result.content` 中的内容按类型处理：document（base64、text、url 以及 `source.type=content`）按顶层规则转换为文本，并带上 title 和 context；search_result 渲染为带来源的文本；未知块只保留 `[<type> block omitted]` 占位，不再输出 JSON 或 base64。顶层的 search_result 与 `source.type=content` 的 document 也不再丢弃或返回 400。嵌套在 tool_result 里的图片和文档，如果来源是 url 或 file，现在会先物化，走与顶层相同的 SSRF 防护和预算限制。
+- 单测：`tool_result_document_and_search_result_are_rendered_as_text`、`top_level_search_result_and_content_document_are_not_dropped`、`tool_result_nested_media_sources_are_counted_and_checked`、`materializes_file_source_nested_in_tool_result`。
+- 真实上游：tool_result 中的文本 document 和 search_result 返回 200，模型准确复述了 `AURORA-17` 和 `Zephyr Launch Notes`；`source.type=content` 的 document 返回 200，内容为 `PELICAN`；tool_result 中通过 Files API `file_id` 引用的图片返回 200，修复前会返回 400。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

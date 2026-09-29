@@ -1,6 +1,6 @@
 # P11 `/v1/models` 返回 OpenAI 风格混合结构，缺少官方分页字段、`created_at` 与单模型查询端点
 
-Status: open / documented / not-fixed
+Status: fixed-in-439e5ce (not released)
 Severity: Medium
 Area: aux
 Discovered: 2026-09-28 协议互转审计
@@ -240,3 +240,10 @@ C. 按入口区分形态：`/cc` 和 strict profile 输出官方形态，其余�
 - 默认 `limit=20` 可能让只读第一页的 OpenAI 风格客户端看不到全部模型。目前静态表加上游同步模型可能超过 20 个，建议先上线"未传 `limit` 返回全量"的兼容默认，观察一段时间后再切换。
 - 持久化首次同步时间需要改动能力目录的存储结构；如果只做进程内缓存，重启后时间戳仍会变化，需要在验收里写明这一边界。
 - 本改动不影响推理链路，回滚只需恢复 handler 和类型。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`439e5ce`）：`/v1/models` 在保留 `object`、`created`、`owned_by` 的同时，新增或修正了官方字段：`type: "model"`、RFC3339 格式的 `created_at`、顶层 `has_more`/`first_id`/`last_id`。未知模型的 `created` 改为固定值，每次调用返回的结果保持一致。
+- 单测：`models_response_is_a_superset_of_the_claude_code_models_shape`。
+- 真实上游：`GET /cc/v1/models` 返回 17 个模型，全部满足新的字段要求。`GET /v1/models/{id}` 和分页参数仍未实现。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

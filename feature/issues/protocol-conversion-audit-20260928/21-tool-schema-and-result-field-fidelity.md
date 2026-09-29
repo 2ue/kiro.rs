@@ -1,6 +1,6 @@
 # P21 工具定义与工具结果字段保真度：isError、描述截断、schema 清洗、非 object input、document content 源
 
-Status: open / documented / not-fixed
+Status: partially-fixed-in-a6abce7 (description truncation order; others open)
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -236,3 +236,8 @@ if !suffix.is_empty() { description.push('\n'); description.push_str(suffix); }
 - schema 描述提示增加少量 token；只在命中字典类型参数时出现。
 - document `content` 源从 400 变为可用，属于能力扩展；`title/context` 进入 prompt 会改变包含 document 的请求文本。
 - strict profile 下非 object input 改为拒绝，可能影响依赖宽容行为的非官方客户端，因此只在 strict 生效。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`a6abce7`）：先把客户端的工具描述截断到 10000 字符，再追加代理自己的 Write/Edit 策略后缀，这样截断不会再把策略后缀截掉。其余几项（`isError`、`additionalProperties`、非对象 input）维持原结论。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

@@ -1,6 +1,6 @@
 # P07 非流式响应按 "工具名 + 规范化 input" 去重结构化 tool_use，误删合法的重复调用；流式不去重，两条路径行为不一致
 
-Status: open / documented / not-fixed
+Status: fixed-in-439e5ce (not released)
 Severity: Medium
 Area: response
 Discovered: 2026-09-28 协议互转审计
@@ -155,3 +155,10 @@ fn audit_p07_distinct_tool_use_ids_with_same_input_are_all_kept_for_five_rounds(
 - 如果上游确实会用**不同** `toolUseId` 重复发送同一个调用（本仓库没有样本），修复后非流式会多出一个 tool_use，和流式现状一致。先在 debug 日志里统计 "重复 toolUseId" 和 "同签名不同 ID" 两类计数跑一周，再决定是否需要额外防护。
 - 客户端会真实执行两次相同的命令。这本来就是模型的意图，也是官方 API 的行为。
 - 回滚：恢复签名判断即可，没有状态迁移。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`439e5ce`）：非流式的结构化 tool_use（包括 EOF flush 路径）改为按 `toolUseId` 去重，相同 name 和 input 的并行调用会全部返回。签名去重仍然保留，用来抑制与结构化调用重复的泄漏文本 invoke。
+- 单测：新增 fake upstream 场景 `TwoIdenticalToolsWithoutStatus`，用例 `identical_parallel_tool_uses_are_both_returned_for_five_rounds` 覆盖流式和非流式，各跑 5 轮。
+- 真实上游：无法让模型稳定产生完全相同的并行调用，这一项只由 fake upstream 覆盖。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

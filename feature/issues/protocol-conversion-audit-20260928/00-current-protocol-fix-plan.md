@@ -1,6 +1,6 @@
 # 当前协议问题修复计划与进度
 
-Status: revised / v0.0.177 fallback released; all-request pre-conversion shaping in working tree (2026-09-29, not committed)
+Status: revised / 第 3 版已提交 38129e0，并继续完成本轮修复批次（见文末）
 Owner: Codex (v0.0.177), Claude Code session (2026-09-29 revision)
 Updated: 2026-09-29
 

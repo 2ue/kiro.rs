@@ -1,6 +1,6 @@
 # P22 连续 assistant 各带原生 reasoning 时本地转换前置拒绝（400）
 
-Status: fallback-fixed-in-3a1306d (v0.0.177) / all-request pre-conversion shaping in working tree (2026-09-29, not committed)
+Status: fixed-in-38129e0 (all-request pre-conversion shaping; v0.0.177 fallback kept for shaping-disabled configs; not released)
 Severity: High
 Area: request
 Discovered: 2026-09-28 usage 页面错误样本

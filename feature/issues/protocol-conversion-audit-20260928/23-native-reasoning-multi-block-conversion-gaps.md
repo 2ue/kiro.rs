@@ -1,6 +1,6 @@
 # P23 原生 reasoning 多 block 互转的剩余缺口（P22 最小修复之外）
 
-Status: partially-mitigated (old-history cases by pre-conversion shaping, working tree) / protected-turn + stream signature gaps open
+Status: partially-fixed (#2 in 1450bb0, #3 in 619ac56, #4 by P22; #1 protected-turn open)
 Severity: Medium
 Area: request + stream
 Discovered: 2026-09-28，P22 分析过程中确认；为保持 P22 最小范围，从 P22 拆出
@@ -224,3 +224,10 @@ curl -sS http://127.0.0.1:19023/cc/v1/messages \
   - Kiro 真实流量中单次响应的 reasoning 段数。
   - Claude Code CLI 回放时是否把同一响应的多个 block 放在同一条 assistant 消息中。
   - 取舍规则能否通过 Kiro 的校验。
+
+## 修复结果与验证（2026-09-29）
+
+- 第 2 点（`1450bb0`）：`cannot be represented losslessly` 已加入 P22 fallback 的触发列表。
+- 第 3 点（`619ac56`）：新的原生 reasoning 段开始时，会重置签名状态，每个 thinking block 都会发出自己的 `signature_delta`。单测为 `each_native_reasoning_segment_emits_its_own_signature_for_five_rounds`。
+- 第 1 点：受保护的工具续写 assistant 内部有多个原生 reasoning 的情况仍未处理。测试实例的 native reasoning 能力当前为 Unknown，opus 账号返回 503，无法用真实原生签名验证取舍规则，所以暂不修改。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

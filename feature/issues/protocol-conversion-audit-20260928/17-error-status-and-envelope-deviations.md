@@ -1,6 +1,6 @@
 # P17 错误状态码与信封偏离官方：未知模型 400、无可用账号 503、未匹配路由空 body 404、count_tokens 纯文本 400/415/422、`"429"` 子串误判限流
 
-Status: open / documented / not-fixed
+Status: partially-fixed-in-439e5ce (413 request_too_large; other items open)
 Severity: Low
 Area: aux
 Discovered: 2026-09-28 协议互转审计
@@ -231,3 +231,8 @@ C. 按路由区分：`anthropic-strict` 按官方映射，`claude-code` 保持�
 - 529 可能让 Claude Code 在 Opus 上触发 fallback model（推断），导致用户在不知情的情况下换了模型。如果不希望这样，可以只对非 Opus 模型或非 `/cc` 路由返回 529，或者保留 503；这需要运营方决定。
 - 400 改为 404：依赖"400 即不可重试"的客户端不受影响（404 同样不会重试）。依赖 message 文本匹配的脚本需要注意 message 的变化。
 - 加路由 fallback 后，原来返回空 404 的路径改为返回 JSON。前端的静态资源路径（`/admin`、`/ui`）要确认不会被 API fallback 截走。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`439e5ce`）：请求体超过 50 MiB 时，返回的 `error.type` 改为 `request_too_large`。其余几项（未知模型 404、503/529、未知路由的 JSON 404、`"429"` 子串判断）仍未处理。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

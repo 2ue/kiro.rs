@@ -1,6 +1,6 @@
 # P03 payload guard 超限时静默裁剪上下文（含 system prompt），仍返回 200
 
-Status: open / documented / not-fixed
+Status: partially-fixed-in-ce2fad6 (system pair protected; silent trim disclosure/reject mode still open)
 Severity: High
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -297,3 +297,11 @@ PayloadGuardError::PromptTooLong { weight, max_weight } => envelope::error_respo
 - `reject` 模式对非 Claude Code 客户端（无自动 compact）体验更差，所以不设为默认，由运营方按路由/客户端选择。
 - 头部语义调整可能影响依赖现有 `x-kiro-rs-warnings` 的排障脚本，需要在发布说明里写明。
 - 阈值本身仍是黑盒模型，本方案不改变 1.3M 默认值，也不改变 `on_too_long` 默认。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`ce2fad6`）：history 裁剪先删除 system prompt 合成对之后的会话轮次，只有其余可删的轮次都删完仍然超限时，才删除 system 对。
+- 单测：`history_trim_keeps_system_prompt_pair_for_five_rounds`、`history_trim_drops_system_pair_only_as_last_resort`。
+- 真实上游新发现（2026-09-29，sonnet-4.5 测试账号）：Kiro 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 实际表现更接近按 token 计的上下文上限（约 200k token）。纯 ASCII 的 900 KB 请求就会被拒绝；1.85 MB 的请求经 on_too_long 重试裁剪到 weighted 1,237,949（低于 1.3M 安全阈值）后，仍然被拒绝。因此，对 ASCII 为主的大请求，现有 weighted 1.3M 阈值基本无法让重试成功。本次没有修改阈值，因为改默认值会影响所有调度。结合 P01 的修复，这类请求现在会收到 `prompt is too long: N tokens > M maximum`，Claude Code 可以据此自动 compact。按模型窗口 token 设置重试目标，需要单独立项评估。
+- 仍然开放的部分：静默裁剪的披露方式，以及可配置的 reject 模式。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

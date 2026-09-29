@@ -1,6 +1,6 @@
 # P18 流式事件顺序细节：多个块同时打开、`content_block_stop` 顺序不确定、纯工具调用多出空 text 块、reasoning 非增量、帧 prelude CRC 校验滞后
 
-Status: open / documented / not-fixed
+Status: partially-fixed-in-619ac56 (close order deterministic; others open)
 Severity: Low
 Area: stream
 Discovered: 2026-09-28 协议互转审计
@@ -222,3 +222,8 @@ C. 在输出层重排：先缓存整条流，最后按 index 排序输出。这�
 - 去掉预开的 text 块后，首个 SSE 块事件会推迟到模型的首个输出。`message_start` 仍然立即发送，客户端的"已连接"判断不受影响；如果有中转依赖"message_start 之后立刻出现 content_block_start"，需要回归验证。
 - `BTreeMap` 比 `HashMap` 多一点开销，但活跃块数量很少，可以忽略。
 - 帧解析改动只影响异常路径，风险很低。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`619ac56`）：`close_open_blocks` 改为按 index 顺序关闭。多个 tool_use 块同时打开、纯工具响应前的空 text 块、原生 reasoning 缓冲，这几项仍未处理。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

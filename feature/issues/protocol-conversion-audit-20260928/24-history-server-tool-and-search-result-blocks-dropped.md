@@ -1,6 +1,6 @@
 # P24 历史中的 server_tool_use / web_search_tool_result 等服务端工具块被静默丢弃
 
-Status: open / documented / not-fixed
+Status: fixed-in-a6abce7 (not released)
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -276,3 +276,10 @@ pub(super) fn render_server_tool_block(item: &serde_json::Value) -> Option<Strin
 - 渲染格式可能被模型在可见输出中模仿。采用与现有摘要相近的纯文本行格式，不引入新的伪 XML 标签（`search_result` 沿用 P04 的包装）。
 - 本文不涉及 WebSearch 模拟本身的偏差（query 来源、citations、`encrypted_content` 放明文），这些属于审计索引中的 P13。
 - 回滚：去掉 `render_server_tool_block` 的调用即可恢复为丢弃。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`a6abce7`）：历史中 assistant 和 user 里的 `server_tool_use`、`web_search_tool_result`、`web_fetch_tool_result`、`search_result`，改为渲染成有长度上限的文本：单个块最多 8000 字符，最多 20 条结果，每个字段最多 512 字符，永远不输出 `encrypted_content`。
+- 单测：`history_server_tool_blocks_are_replayed_as_bounded_text`。
+- 真实上游：回放包含 web_search 结果的历史后，模型能准确回答第一条结果的标题 `Tokio Quasar Runtime`。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

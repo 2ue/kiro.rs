@@ -1,6 +1,6 @@
 # P09 XML thinking 探测丢失正文空白，且正文中的裸 `<thinking>` 会被误判为思考开始
 
-Status: open / documented / not-fixed
+Status: fixed-in-619ac56 (not released)
 Severity: Medium
 Area: stream
 Discovered: 2026-09-28 协议互转审计
@@ -219,3 +219,10 @@ while let Some((idx, ch)) = self.thinking_buffer[..retain_start].char_indices().
 - 与 P02 同改 `process_content_with_thinking`，建议合并到一个 PR。
 - 回滚：`xml_thinking_probe_closed` 可通过常量开关短路为旧行为。
 - 未验证项：Kiro 上游是否会在开头输出非空白前导字符（如 BOM 或零宽字符）再接 `<thinking>`；如果有，需要把这类字符纳入"前导空白"。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`619ac56`）：探测 `<thinking>` 时，纯空白前缀会和部分标签一起保留在缓冲区，不再丢弃；一旦输出了非空白正文，XML thinking 只在响应开头识别，后面出现的 `<thinking>` 按正文处理。非流式同样规则。
+- 单测：`xml_thinking_mode_keeps_whitespace_before_markup_for_five_rounds`、`xml_thinking_tag_after_visible_text_is_not_reasoning_for_five_rounds`，并更新了 `test_partial_thinking_tag_prefix_is_still_buffered` 的期望值。
+- 真实上游：thinking 矩阵和 CLI 用例与修复前基线一致，没有回归。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

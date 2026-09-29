@@ -1,6 +1,6 @@
 # P05 合法的 PascalCase / MCP 工具名也被改写成 `xxxHash<8hex>`，模型侧看到的工具名与 system prompt 不一致
 
-Status: open / documented / not-fixed
+Status: fixed-in-76d0ade (not released)
 Severity: Medium
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -206,3 +206,11 @@ fn audit_p05_kiro_safe_names_are_sent_verbatim() {
 - **Prompt cache 一次性失效。** 工具名进入 tools 数组的字节，上线后所有进行中会话的前缀缓存会 miss 一轮。
 - **历史里的旧名。** 客户端历史里的 tool_use 用的是原名，每次请求都会重新映射，所以请求内部是一致的。旧映射名只可能出现在历史的文本泄漏里，由第 5 步的 legacy 识别兜底。
 - **回滚：** 撤掉直通判断就能完全恢复旧行为，没有持久化状态。
+
+## 修复结果与验证（2026-09-29）
+
+- 修复（`76d0ade`）：符合 Kiro 工具名规则（ASCII 字母开头，只含字母、数字、`_`、`-`，不超过 63 字符）的名称原样透传；非法或超长的名称仍然走 camelCase + Hash 映射。大小写冲突（如 `Read` 与 `read`）时，后出现的名称回退到 hash 映射，不再返回本地 400。新增配置 `bodyConversion.toolNameVerbatimWhenValid`，默认 `true`，设为 `false` 即恢复旧行为。transcript sanitizer 仍然识别旧的映射名。
+- 上游兜底：真实验证表明 Kiro 接受原样透传的名称，所以本次没有实现"上游拒绝工具名后回退重试"。如果以后出现工具名专属的 `TOOL_SCHEMA_INVALID`，可以先把配置切回 `false`，再补做兜底。
+- 单测：`kiro_safe_tool_names_are_sent_verbatim_for_five_rounds`、`case_insensitive_verbatim_collision_falls_back_to_hash_mapping`，并按新语义更新了 13 个已有用例；全量测试通过。
+- 真实上游：`Read`、`Bash`、`WebFetch`、`Task`、`mcp__srv__do_thing`、`foo-bar`、`TodoWrite` 在流式和非流式下都返回 200，响应中的 `tool_use.name` 与原名一致（`read_file` 因模型自身选择没有调用工具，与工具名无关）；非法名 `my.tool`、`$WEB_SEARCH_X` 仍然正确映射并还原；历史中带原样名称的续写返回 200。真实 CLI 中的 Read、Bash、Write、Edit 多轮调用全部通过。
+- 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。
