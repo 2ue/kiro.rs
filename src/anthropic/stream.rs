@@ -1069,11 +1069,13 @@ pub(crate) fn extract_invoke_content_blocks(
                     }
                     push_text(&mut blocks, &mut pending_text);
                     for call in calls.expect("known calls exist") {
-                        let upstream_name = call.name;
-                        let name = tool_name_map
-                            .get(&upstream_name)
-                            .cloned()
-                            .unwrap_or_else(|| upstream_name.clone());
+                        let resolved = super::tool_name_restore::resolve_response_tool_name(
+                            tool_name_map,
+                            known_tool_names,
+                            &call.name,
+                        );
+                        let upstream_name = resolved.upstream;
+                        let name = resolved.original;
                         let input: serde_json::Value =
                             serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
                         let input = tool_schema_key_map.reverse_tool_input(&upstream_name, input);
@@ -1712,6 +1714,8 @@ pub struct StreamContext {
     stop_sequence_filter: Option<super::stop_sequence::StopSequenceFilter>,
     /// 请求 `thinking.display` 为 `omitted` 时不下发 thinking 文本。
     omit_thinking_display: bool,
+    /// 把正文中复述的 Hash 映射工具名还原为原名。
+    tool_name_text_restorer: Option<super::tool_name_restore::ToolNameTextRestorer>,
 }
 
 impl StreamContext {
@@ -1810,6 +1814,8 @@ impl StreamContext {
         simulated_usage: Option<super::cache::CacheSimulation>,
         simulation_mode: PromptCacheSimulationMode,
     ) -> Self {
+        let tool_name_text_restorer =
+            super::tool_name_restore::ToolNameTextRestorer::new(&tool_name_map);
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
@@ -1891,6 +1897,7 @@ impl StreamContext {
             response_tool_gate: ResponseToolGate::default(),
             stop_sequence_filter: None,
             omit_thinking_display: false,
+            tool_name_text_restorer,
         }
     }
 
@@ -1919,6 +1926,10 @@ impl StreamContext {
     }
 
     fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        let events = match self.tool_name_text_restorer.as_mut() {
+            Some(restorer) => restorer.apply(events),
+            None => events,
+        };
         let events = if self.omit_thinking_display {
             super::thinking_display::omit_thinking_text_in_events(events)
         } else {
@@ -3141,14 +3152,15 @@ impl StreamContext {
     }
 
     fn queue_leaked_tool_use(&mut self, parsed_name: String, input_json: String) -> Vec<SseEvent> {
-        let output_name = self
-            .tool_name_map
-            .get(&parsed_name)
-            .cloned()
-            .unwrap_or_else(|| parsed_name.clone());
+        let resolved = super::tool_name_restore::resolve_response_tool_name(
+            &self.tool_name_map,
+            &self.known_tool_names,
+            &parsed_name,
+        );
+        let output_name = resolved.original;
         let input_json = self
             .tool_schema_key_map
-            .reverse_tool_input_json(&parsed_name, &input_json);
+            .reverse_tool_input_json(&resolved.upstream, &input_json);
         let input_json = repair_tool_use_input_json_for_cli(&output_name, &input_json);
         let sig = tool_use_signature_from_json_str(&output_name, &input_json);
         if self.seen_tool_sigs.contains(&sig) {
@@ -3695,12 +3707,14 @@ impl StreamContext {
             idx
         };
 
-        // 还原工具名称（如果有映射）
-        let original_name = self
-            .tool_name_map
-            .get(&tool_use.name)
-            .cloned()
-            .unwrap_or_else(|| tool_use.name.clone());
+        // 还原工具名称（如果有映射）；模型用了去 Hash 后缀等变体时宽容匹配到已定义工具。
+        let resolved = super::tool_name_restore::resolve_response_tool_name(
+            &self.tool_name_map,
+            &self.known_tool_names,
+            &tool_use.name,
+        );
+        let upstream_name = resolved.upstream;
+        let original_name = resolved.original;
 
         if !tool_use.input.is_empty() {
             self.tool_input_buffers
@@ -3709,7 +3723,7 @@ impl StreamContext {
                 .push_str(&tool_use.input);
         }
         self.tool_input_names
-            .insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
+            .insert(tool_use.tool_use_id.clone(), upstream_name.clone());
 
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
@@ -3728,7 +3742,7 @@ impl StreamContext {
         );
         events.extend(start_events);
 
-        let has_schema_key_map = self.tool_schema_key_map.has_tool(&tool_use.name);
+        let has_schema_key_map = self.tool_schema_key_map.has_tool(&upstream_name);
         let defer_input_until_stop = original_name == "AskUserQuestion" || has_schema_key_map;
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)。AskUserQuestion 需要先
@@ -3762,7 +3776,7 @@ impl StreamContext {
             self.tool_input_names.remove(&tool_use.tool_use_id);
             let output_input = if has_schema_key_map {
                 self.tool_schema_key_map
-                    .reverse_tool_input_json(&tool_use.name, &full_input)
+                    .reverse_tool_input_json(&upstream_name, &full_input)
             } else {
                 full_input
             };
@@ -3816,11 +3830,13 @@ impl StreamContext {
                 .tool_input_names
                 .remove(&tool_use_id)
                 .unwrap_or_default();
-            let original_name = self
-                .tool_name_map
-                .get(&upstream_name)
-                .cloned()
-                .unwrap_or_else(|| upstream_name.clone());
+            let resolved = super::tool_name_restore::resolve_response_tool_name(
+                &self.tool_name_map,
+                &self.known_tool_names,
+                &upstream_name,
+            );
+            let upstream_name = resolved.upstream;
+            let original_name = resolved.original;
             let has_schema_key_map = self.tool_schema_key_map.has_tool(&upstream_name);
             let defer_input_until_stop = original_name == "AskUserQuestion" || has_schema_key_map;
             let output_input = if has_schema_key_map {
@@ -4229,6 +4245,49 @@ mod tests {
             .collect::<String>();
         assert!(!serialized.contains("private plan"));
         assert!(serialized.contains("visible answer"));
+    }
+
+    #[test]
+    fn hash_less_tool_name_and_text_hash_names_are_restored() {
+        let mapped = "mcpFsListDirectoryHash1a2b3c4d";
+        let original = "mcp__fs__list_directory";
+        let tool_name_map = HashMap::from([(mapped.to_string(), original.to_string())]);
+        let known = HashSet::from([mapped.to_string(), original.to_string()]);
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            tool_name_map,
+            known,
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                &format!("Calling {mapped} now. "),
+                None,
+            ))),
+        );
+        events.extend(ctx.process_kiro_event(&Event::ToolUse(
+            crate::kiro::model::events::ToolUseEvent {
+                name: "mcpFsListDirectory".to_string(),
+                tool_use_id: "toolu_dir".to_string(),
+                input: r#"{"path":"."}"#.to_string(),
+                stop: true,
+            },
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let tool_start = events
+            .iter()
+            .find(|event| event.data["content_block"]["type"] == "tool_use")
+            .expect("tool_use start");
+        assert_eq!(tool_start.data["content_block"]["name"], original);
+        let serialized = events
+            .iter()
+            .map(SseEvent::to_sse_string)
+            .collect::<String>();
+        assert!(!serialized.contains("Hash1a2b3c4d"));
+        assert!(serialized.contains(&format!("Calling {original} now.")));
     }
 
     #[test]

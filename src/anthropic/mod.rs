@@ -57,6 +57,7 @@ mod stop_sequence;
 mod stream;
 mod thinking_display;
 pub(crate) mod tool_format_debug;
+mod tool_name_restore;
 pub(crate) mod tool_schema_keys;
 pub(crate) mod tool_use_policy;
 pub(crate) mod transcript_sanitizer;

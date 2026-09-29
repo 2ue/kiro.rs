@@ -11046,11 +11046,13 @@ async fn handle_non_stream_request(
                         }
                     };
 
-                    let original_name = tool_name_map
-                        .get(&tool_use.name)
-                        .cloned()
-                        .unwrap_or_else(|| tool_use.name.clone());
-                    let input = tool_schema_key_map.reverse_tool_input(&tool_use.name, input);
+                    let resolved = super::tool_name_restore::resolve_response_tool_name(
+                        &tool_name_map,
+                        &known_tool_names,
+                        &tool_use.name,
+                    );
+                    let original_name = resolved.original;
+                    let input = tool_schema_key_map.reverse_tool_input(&resolved.upstream, input);
                     let input = crate::anthropic::stream::repair_tool_use_input_for_cli(
                         &original_name,
                         input,
@@ -11246,10 +11248,13 @@ async fn handle_non_stream_request(
     if !tool_json_buffers.is_empty() {
         for (tool_use_id, buffer) in std::mem::take(&mut tool_json_buffers) {
             let upstream_name = tool_json_names.remove(&tool_use_id).unwrap_or_default();
-            let original_name = tool_name_map
-                .get(&upstream_name)
-                .cloned()
-                .unwrap_or_else(|| upstream_name.clone());
+            let resolved = super::tool_name_restore::resolve_response_tool_name(
+                &tool_name_map,
+                &known_tool_names,
+                &upstream_name,
+            );
+            let upstream_name = resolved.upstream;
+            let original_name = resolved.original;
             let input: serde_json::Value = if buffer.is_empty() {
                 serde_json::json!({})
             } else {
@@ -11428,6 +11433,9 @@ async fn handle_non_stream_request(
     credential_usage
         .request
         .mark_response_tool_gate(&response_tool_gate);
+
+    // 正文里复述的 Hash 映射工具名还原为原名，下游不应看到代理内部名称。
+    super::tool_name_restore::restore_tool_names_in_content(&tool_name_map, &mut content);
 
     if credential_usage.request.omit_thinking_display {
         super::thinking_display::omit_thinking_text_in_content(&mut content);
