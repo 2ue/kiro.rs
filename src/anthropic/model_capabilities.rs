@@ -551,6 +551,42 @@ impl ModelCapabilitiesCatalog {
         models
     }
 
+    /// Claude Code protocol `/v1/models` listing: Claude models only under their Anthropic
+    /// hyphenated ids (never Kiro's dotted ids), without aliases or `-thinking` / `[1m]`
+    /// variants. Those names stay valid as request models; they are just not listed.
+    pub fn standard_anthropic_models(&self) -> Vec<Model> {
+        standardize_model_listing(self.anthropic_models())
+    }
+
+    /// Looks up one listed model. Accepts the listed id as well as request-side spellings
+    /// (dotted Kiro ids, aliases, `-thinking` / `[1m]` variants) and returns the listed entry
+    /// they resolve to; unknown models return `None`.
+    pub fn standard_anthropic_model(&self, requested_model: &str) -> Option<Model> {
+        let models = self.standard_anthropic_models();
+        let requested = normalize_model_id(requested_model);
+        let (base, _) = strip_model_compat_suffixes(&requested);
+        let direct = [requested.clone(), base.clone(), claude_listing_id(&base)];
+        if let Some(model) = direct
+            .iter()
+            .find_map(|id| models.iter().find(|model| &model.id == id))
+        {
+            return Some(model.clone());
+        }
+        let upstream_ids = self
+            .status()
+            .models
+            .into_iter()
+            .map(|item| item.model)
+            .collect::<Vec<_>>();
+        let resolution = resolve_model_with_catalog(&base, &upstream_ids);
+        if resolution.source == ModelResolutionSource::Unsupported {
+            return None;
+        }
+        // A pass-through of an unknown name resolves to itself, which is not listed.
+        let listing_id = standard_listing_id(resolution.upstream_model.as_deref()?)?;
+        models.into_iter().find(|model| model.id == listing_id)
+    }
+
     pub fn max_input_tokens_for(&self, model: &str) -> Option<i32> {
         let model = normalize_model_id(model);
         self.inner
@@ -1802,6 +1838,56 @@ fn static_model_capabilities() -> Vec<ModelCapabilityItem> {
             source: Some(SEED_SOURCE.to_string()),
         })
         .collect()
+}
+
+/// Request-side aliases that are never listed by `/v1/models`.
+const MODEL_LISTING_ALIASES: &[&str] = &[
+    "auto", "best", "default", "haiku", "opus", "opusplan", "sonnet",
+];
+
+/// Kiro spells Claude versions with dots (`claude-opus-4.6`); the Claude Code protocol
+/// uses hyphens (`claude-opus-4-6`).
+fn claude_listing_id(model: &str) -> String {
+    if model.starts_with("claude-") {
+        model.replace('.', "-")
+    } else {
+        model.to_string()
+    }
+}
+
+/// Listing id for a catalog entry, or `None` for aliases and compatibility variants.
+fn standard_listing_id(model: &str) -> Option<String> {
+    let model = normalize_model_id(model);
+    if MODEL_LISTING_ALIASES.contains(&model.as_str()) {
+        return None;
+    }
+    let (base, thinking) = strip_model_compat_suffixes(&model);
+    if thinking || base != model {
+        return None;
+    }
+    Some(claude_listing_id(&model))
+}
+
+fn standardize_model_listing(models: Vec<Model>) -> Vec<Model> {
+    let mut listed: std::collections::BTreeMap<String, Model> = std::collections::BTreeMap::new();
+    for mut model in models {
+        let Some(id) = standard_listing_id(&model.id) else {
+            continue;
+        };
+        match listed.get_mut(&id) {
+            Some(existing) => {
+                if existing.max_input_tokens.is_none() {
+                    existing.max_input_tokens = model.max_input_tokens;
+                    existing.context_window = model.context_window;
+                }
+            }
+            None => {
+                model.id = id.clone();
+                listed.insert(id, model);
+            }
+        }
+    }
+    listed.into_values().collect()
 }
 
 pub fn static_anthropic_models() -> Vec<Model> {
@@ -3213,6 +3299,80 @@ mod tests {
             alias_only.upstream_model.as_deref(),
             Some("claude-sonnet-5-20270101")
         );
+    }
+
+    fn standard_listing_catalog() -> ModelCapabilitiesCatalog {
+        let catalog = ModelCapabilitiesCatalog::new();
+        let model = |id: &str, name: &str| KiroAvailableModel {
+            model_id: id.to_string(),
+            model_name: Some(name.to_string()),
+            token_limits: Some(KiroModelTokenLimits {
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }),
+            ..Default::default()
+        };
+        catalog.sync_from_kiro_models(vec![
+            model("auto", "Auto"),
+            model("claude-opus-4.6", "Claude Opus 4.6"),
+            model("claude-sonnet-4.5", "Claude Sonnet 4.5"),
+            model("claude-haiku-4.5", "Claude Haiku 4.5"),
+            model("deepseek-3.2", "DeepSeek 3.2"),
+        ]);
+        catalog
+    }
+
+    #[test]
+    fn standard_models_list_only_hyphenated_claude_ids() {
+        let ids: Vec<String> = standard_listing_catalog()
+            .standard_anthropic_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+
+        assert!(ids.iter().any(|id| id == "claude-opus-4-6"));
+        assert!(ids.iter().any(|id| id == "claude-sonnet-4-5"));
+        assert!(ids.iter().any(|id| id == "deepseek-3.2"));
+        for id in &ids {
+            assert!(
+                !(id.starts_with("claude-") && id.contains('.')),
+                "Kiro dotted id listed: {id}"
+            );
+            assert!(!id.ends_with("-thinking"), "thinking variant listed: {id}");
+            assert!(!id.contains("[1m]"), "1m variant listed: {id}");
+            assert!(
+                !MODEL_LISTING_ALIASES.contains(&id.as_str()),
+                "alias listed: {id}"
+            );
+        }
+        let mut deduped = ids.clone();
+        deduped.dedup();
+        assert_eq!(ids, deduped);
+    }
+
+    #[test]
+    fn standard_model_lookup_accepts_request_spellings() {
+        let catalog = standard_listing_catalog();
+        let lookup = |id: &str| catalog.standard_anthropic_model(id).map(|model| model.id);
+
+        assert_eq!(
+            lookup("claude-opus-4-6").as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(
+            lookup("claude-opus-4.6").as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(
+            lookup("claude-opus-4-6-thinking").as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(
+            lookup("claude-opus-4-6[1m]").as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert!(lookup("sonnet").is_some_and(|id| id.starts_with("claude-sonnet-")));
+        assert_eq!(lookup("claude-nonexistent-9-9"), None);
     }
 
     #[test]

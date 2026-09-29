@@ -27,7 +27,7 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -87,8 +87,8 @@ use super::transcript_sanitizer::RESPONSE_PROTOCOL_CONTAMINATION_DETAIL;
 #[cfg(test)]
 use super::types::OutputConfig;
 use super::types::{
-    CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, Thinking,
-    ThinkingDisplay,
+    CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsQuery, ModelsResponse,
+    Thinking, ThinkingDisplay,
 };
 use super::usage::{
     ExternalPoolAttempt, ExternalPoolUsageSnapshot, RequestRejectionUsageContext,
@@ -6261,12 +6261,34 @@ fn websearch_supported_for_profile(profile: CompatProfile) -> bool {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = state.model_capabilities.anthropic_models();
+    models_list_response(&state, &query)
+}
 
-    Json(ModelsResponse::from_models(models))
+/// GET /v1/models/{model_id}
+pub async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) -> Response {
+    model_retrieve_response(&state, &model_id)
+}
+
+fn models_list_response(state: &AppState, query: &ModelsQuery) -> Response {
+    let models = state.model_capabilities.standard_anthropic_models();
+    Json(ModelsResponse::paginate(models, query)).into_response()
+}
+
+fn model_retrieve_response(state: &AppState, model_id: &str) -> Response {
+    match state.model_capabilities.standard_anthropic_model(model_id) {
+        Some(model) => Json(model).into_response(),
+        None => envelope::error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("model: {model_id}"),
+        ),
+    }
 }
 
 fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, Response> {
@@ -6387,13 +6409,25 @@ fn record_pre_usage_rejection_with_metadata_and_context(
 pub async fn get_models_dfcache(
     State(state): State<AppState>,
     Path(route): Path<String>,
+    Query(query): Query<ModelsQuery>,
 ) -> Response {
     if let Err(response) = resolve_defined_cache_route(&state, &route) {
         return response;
     }
 
-    let models = state.model_capabilities.anthropic_models();
-    Json(ModelsResponse::from_models(models)).into_response()
+    models_list_response(&state, &query)
+}
+
+/// GET /dfcache/:route/v1/models/{model_id}
+pub async fn get_model_dfcache(
+    State(state): State<AppState>,
+    Path((route, model_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = resolve_defined_cache_route(&state, &route) {
+        return response;
+    }
+
+    model_retrieve_response(&state, &model_id)
 }
 
 /// POST /v1/messages

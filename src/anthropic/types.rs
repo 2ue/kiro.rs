@@ -81,6 +81,16 @@ pub struct ModelsResponse {
     pub last_id: Option<String>,
 }
 
+/// `/v1/models` 分页参数（Claude Code 协议：`limit`、`after_id`、`before_id`）
+#[derive(Debug, Default, Deserialize)]
+pub struct ModelsQuery {
+    pub limit: Option<usize>,
+    pub after_id: Option<String>,
+    pub before_id: Option<String>,
+}
+
+const MODELS_PAGE_MAX_LIMIT: usize = 1000;
+
 impl ModelsResponse {
     pub fn from_models(data: Vec<Model>) -> Self {
         Self {
@@ -89,6 +99,44 @@ impl ModelsResponse {
             last_id: data.last().map(|model| model.id.clone()),
             has_more: false,
             data,
+        }
+    }
+
+    /// Pages `data` by cursor. Without `limit` the whole list is returned, so clients that
+    /// never paginate still see every model.
+    pub fn paginate(data: Vec<Model>, query: &ModelsQuery) -> Self {
+        let mut start = 0;
+        let mut end = data.len();
+        if let Some(after_id) = query.after_id.as_deref() {
+            start = data
+                .iter()
+                .position(|model| model.id == after_id)
+                .map_or(data.len(), |index| index + 1);
+        }
+        if let Some(before_id) = query.before_id.as_deref() {
+            end = data
+                .iter()
+                .position(|model| model.id == before_id)
+                .unwrap_or(0);
+        }
+        let window: Vec<Model> = data.into_iter().take(end).skip(start.min(end)).collect();
+        let Some(limit) = query
+            .limit
+            .map(|limit| limit.clamp(1, MODELS_PAGE_MAX_LIMIT))
+        else {
+            return Self::from_models(window);
+        };
+        let has_more = window.len() > limit;
+        let page = if query.before_id.is_some() && query.after_id.is_none() {
+            // Backward paging keeps the items closest to the cursor.
+            let skip = window.len().saturating_sub(limit);
+            window.into_iter().skip(skip).collect()
+        } else {
+            window.into_iter().take(limit).collect()
+        };
+        Self {
+            has_more,
+            ..Self::from_models(page)
         }
     }
 }
@@ -273,6 +321,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listed(ids: &[&str]) -> Vec<Model> {
+        ids.iter()
+            .map(|id| Model {
+                id: id.to_string(),
+                object: "model".to_string(),
+                created: 0,
+                created_at: model_created_at_rfc3339(0),
+                owned_by: "anthropic".to_string(),
+                display_name: id.to_string(),
+                model_type: "model".to_string(),
+                max_tokens: 1,
+                max_input_tokens: None,
+                context_window: None,
+            })
+            .collect()
+    }
+
+    fn page_ids(response: &ModelsResponse) -> Vec<&str> {
+        response
+            .data
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn models_pagination_follows_cursors() {
+        let all = || listed(&["a", "b", "c", "d"]);
+        let query = |limit, after: Option<&str>, before: Option<&str>| ModelsQuery {
+            limit,
+            after_id: after.map(str::to_string),
+            before_id: before.map(str::to_string),
+        };
+
+        let full = ModelsResponse::paginate(all(), &ModelsQuery::default());
+        assert_eq!(page_ids(&full), ["a", "b", "c", "d"]);
+        assert!(!full.has_more);
+
+        let first = ModelsResponse::paginate(all(), &query(Some(2), None, None));
+        assert_eq!(page_ids(&first), ["a", "b"]);
+        assert!(first.has_more);
+        assert_eq!(first.last_id.as_deref(), Some("b"));
+
+        let next = ModelsResponse::paginate(all(), &query(Some(2), Some("b"), None));
+        assert_eq!(page_ids(&next), ["c", "d"]);
+        assert!(!next.has_more);
+
+        let back = ModelsResponse::paginate(all(), &query(Some(1), None, Some("c")));
+        assert_eq!(page_ids(&back), ["b"]);
+        assert!(back.has_more);
+
+        let unknown = ModelsResponse::paginate(all(), &query(Some(2), Some("zzz"), None));
+        assert!(unknown.data.is_empty());
+        assert!(!unknown.has_more);
+    }
 
     #[test]
     fn stop_sequences_are_parsed_leniently() {

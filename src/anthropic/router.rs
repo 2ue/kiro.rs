@@ -30,8 +30,8 @@ use super::{
     },
     handlers::{
         count_tokens, count_tokens_cc, count_tokens_dfcache, count_tokens_ha, count_tokens_na,
-        get_models, get_models_dfcache, post_messages, post_messages_cc, post_messages_dfcache,
-        post_messages_ha, post_messages_na,
+        get_model, get_model_dfcache, get_models, get_models_dfcache, post_messages,
+        post_messages_cc, post_messages_dfcache, post_messages_ha, post_messages_na,
     },
     middleware::{AppState, auth_middleware, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
@@ -278,6 +278,7 @@ pub fn create_router_with_provider(
     // 需要认证的内置 /v1 路由。运行策略由运行配置按入口路径解析。
     let v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/models/{model_id}", get(get_model))
         .route(
             "/files",
             get(list_files)
@@ -305,6 +306,7 @@ pub fn create_router_with_provider(
     // 需要认证的内置 /na/v1 路由。运行策略由运行配置按入口路径解析。
     let na_v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/models/{model_id}", get(get_model))
         .route(
             "/files",
             get(list_files)
@@ -332,6 +334,7 @@ pub fn create_router_with_provider(
     // 需要认证的内置 /cc/v1 路由。运行策略由运行配置按入口路径解析。
     let cc_v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/models/{model_id}", get(get_model))
         .route(
             "/files",
             get(list_files)
@@ -359,6 +362,7 @@ pub fn create_router_with_provider(
     // 需要认证的内置 /ha/v1 路由。运行策略由运行配置按入口路径解析。
     let ha_v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/models/{model_id}", get(get_model))
         .route(
             "/files",
             get(list_files)
@@ -387,6 +391,7 @@ pub fn create_router_with_provider(
     // route 必须在 definedCacheRoutes 中显式定义，避免未知路径被默认放行。
     let dfcache_routes = Router::new()
         .route("/{route}/v1/models", get(get_models_dfcache))
+        .route("/{route}/v1/models/{model_id}", get(get_model_dfcache))
         .route(
             "/{route}/v1/files",
             get(list_files)
