@@ -5986,30 +5986,37 @@ mod tests {
     fn unsigned_thinking_keeps_compat_xml_without_native_reasoning_for_five_rounds() {
         for round in 0..5 {
             let thinking = format!("unsigned thought {round}");
-            let message = super::super::types::Message {
-                role: "assistant".to_string(),
-                content: serde_json::json!([
-                    {"type": "thinking", "thinking": thinking},
-                    {"type": "text", "text": format!("answer {round}")}
-                ]),
-            };
+            // 文本提取的 thinking 块以空字符串 signature 下发；Claude Code 原样回传时
+            // 必须与缺省 signature 一样按无签名 thinking 处理，不能被误判为签名。
+            for thinking_block in [
+                serde_json::json!({"type": "thinking", "thinking": thinking}),
+                serde_json::json!({"type": "thinking", "thinking": thinking, "signature": ""}),
+            ] {
+                let message = super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        thinking_block,
+                        {"type": "text", "text": format!("answer {round}")}
+                    ]),
+                };
 
-            let converted = convert_assistant_message(
-                &message,
-                &mut HashMap::new(),
-                ConverterOptions::default(),
-            )
-            .expect("unsigned thinking should convert");
-            assert_eq!(
-                converted.assistant_response_message.content,
-                format!("<thinking>{thinking}</thinking>\n\nanswer {round}")
-            );
-            assert!(
-                converted
-                    .assistant_response_message
-                    .reasoning_content
-                    .is_none()
-            );
+                let converted = convert_assistant_message(
+                    &message,
+                    &mut HashMap::new(),
+                    ConverterOptions::default(),
+                )
+                .expect("unsigned thinking should convert");
+                assert_eq!(
+                    converted.assistant_response_message.content,
+                    format!("<thinking>{thinking}</thinking>\n\nanswer {round}")
+                );
+                assert!(
+                    converted
+                        .assistant_response_message
+                        .reasoning_content
+                        .is_none()
+                );
+            }
         }
     }
 

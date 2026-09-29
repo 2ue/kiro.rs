@@ -2832,7 +2832,9 @@ impl StreamContext {
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + tag.open.len()..].to_string();
 
-                    // 创建 thinking 块的 content_block_start 事件
+                    // 创建 thinking 块的 content_block_start 事件。
+                    // 与 Anthropic 协议一致总带 signature 字段；文本提取的 thinking 没有上游签名，
+                    // 用空字符串表示，回传时 converter 按无签名 thinking 处理。
                     let thinking_index = self.state_manager.next_block_index();
                     self.thinking_block_index = Some(thinking_index);
                     let start_events = self.state_manager.handle_content_block_start(
@@ -2843,7 +2845,8 @@ impl StreamContext {
                             "index": thinking_index,
                             "content_block": {
                                 "type": "thinking",
-                                "thinking": ""
+                                "thinking": "",
+                                "signature": ""
                             }
                         }),
                     );
@@ -3348,7 +3351,8 @@ impl StreamContext {
                     "index": thinking_index,
                     "content_block": {
                         "type": "thinking",
-                        "thinking": ""
+                        "thinking": "",
+                        "signature": ""
                     }
                 }),
             ));
@@ -3527,7 +3531,7 @@ impl StreamContext {
             json!({
                 "type": "content_block_start",
                 "index": thinking_index,
-                "content_block": {"type": "thinking", "thinking": ""}
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
             }),
         ));
         events.push(self.create_sanitized_thinking_delta_event(thinking_index, &output));
@@ -4862,7 +4866,8 @@ mod tests {
                 e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
             })
             .expect("native thinking block should start");
-        assert!(thinking_start.data["content_block"]["signature"].is_null());
+        // 真实签名只通过 signature_delta 下发；start 里只有协议要求的空占位。
+        assert_eq!(thinking_start.data["content_block"]["signature"], "");
 
         let signature_delta_pos = all_events
             .iter()
@@ -6635,6 +6640,41 @@ mod tests {
             .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == delta_type)
             .filter_map(|e| e.data["delta"][field].as_str())
             .collect()
+    }
+
+    #[test]
+    fn thinking_block_starts_always_carry_signature_field() {
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+            let mut all_events = ctx.generate_initial_events();
+            all_events.extend(ctx.process_assistant_response("<thinking>\nfirst plan"));
+            all_events.extend(
+                ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                    name: "Read".to_string(),
+                    tool_use_id: format!("toolu_signature_{round}"),
+                    input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+                    stop: true,
+                }),
+            );
+            all_events.extend(ctx.process_assistant_response(" resumed</thinking>\n\nok"));
+            all_events.extend(ctx.generate_final_events());
+
+            let thinking_starts = all_events
+                .iter()
+                .filter(|e| {
+                    e.event == "content_block_start"
+                        && e.data["content_block"]["type"] == "thinking"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(thinking_starts.len(), 2, "round {round}");
+            for start in thinking_starts {
+                assert_eq!(
+                    start.data["content_block"]["signature"], "",
+                    "round {round}: {:?}",
+                    start.data
+                );
+            }
+        }
     }
 
     #[test]

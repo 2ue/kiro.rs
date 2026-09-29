@@ -9883,14 +9883,13 @@ fn append_non_stream_reasoning_and_text(
                     safe_thinking.as_str()
                 };
                 if !output.is_empty() {
-                    let mut thinking_block = json!({
+                    // thinking 块总带 signature 字段；无上游签名时为空字符串，
+                    // 回传时 converter 按无签名 thinking 处理。
+                    content.push(json!({
                         "type": "thinking",
-                        "thinking": output
-                    });
-                    if let Some(signature) = signature {
-                        thinking_block["signature"] = json!(signature);
-                    }
-                    content.push(thinking_block);
+                        "thinking": output,
+                        "signature": signature.unwrap_or_default()
+                    }));
                 }
             }
             append_recovered_non_stream_blocks(
@@ -9917,7 +9916,8 @@ fn append_non_stream_reasoning_and_text(
             if !safe_thinking.is_empty() {
                 content.push(json!({
                     "type": "thinking",
-                    "thinking": safe_thinking
+                    "thinking": safe_thinking,
+                    "signature": ""
                 }));
             }
         }

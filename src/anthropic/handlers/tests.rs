@@ -5826,6 +5826,62 @@ fn non_stream_native_reasoning_is_independent_from_xml_extraction_for_five_round
 }
 
 #[test]
+fn non_stream_unsigned_thinking_blocks_carry_empty_signature_for_five_rounds() {
+    for round in 0..5 {
+        // 文本提取的 XML thinking。
+        let mut extracted = Vec::new();
+        let mut extracted_sanitizer =
+            super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(std::iter::empty::<
+                String,
+            >());
+        append_non_stream_reasoning_and_text(
+            &mut extracted,
+            false,
+            true,
+            None,
+            "",
+            None,
+            &format!("<thinking>plan {round}</thinking>\n\nanswer {round}"),
+            &HashSet::new(),
+            &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
+            &mut HashSet::new(),
+            &mut extracted_sanitizer,
+        )
+        .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert_eq!(
+            extracted[0],
+            json!({"type": "thinking", "thinking": format!("plan {round}"), "signature": ""}),
+            "round {round}"
+        );
+
+        // 无签名的原生 reasoning。
+        let mut native = Vec::new();
+        let mut native_sanitizer =
+            super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(std::iter::empty::<
+                String,
+            >());
+        append_non_stream_reasoning_and_text(
+            &mut native,
+            true,
+            false,
+            None,
+            "native reasoning",
+            None,
+            "visible",
+            &HashSet::new(),
+            &HashMap::new(),
+            &ToolSchemaKeyMap::default(),
+            &mut HashSet::new(),
+            &mut native_sanitizer,
+        )
+        .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert_eq!(native[0]["type"], "thinking");
+        assert_eq!(native[0]["signature"], "", "round {round}");
+    }
+}
+
+#[test]
 fn non_stream_thinking_policy_sanitizes_unsigned_and_drops_atomic_blocks() {
     let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
     for _round in 0..5 {
