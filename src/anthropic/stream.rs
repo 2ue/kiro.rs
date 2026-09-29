@@ -1394,6 +1394,11 @@ impl SseStateManager {
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
+            // A completed turn that already emitted tool calls must stay `tool_use`, otherwise the
+            // client never executes them. contextUsage reaching 100% only reports window usage.
+            if reason == "model_context_window_exceeded" && self.has_tool_use {
+                return "tool_use".to_string();
+            }
             reason.clone()
         } else if self.has_tool_use {
             "tool_use".to_string()
@@ -5792,6 +5797,27 @@ mod tests {
             message_delta.data["delta"]["stop_reason"],
             "model_context_window_exceeded"
         );
+    }
+
+    #[test]
+    fn context_window_full_does_not_hide_emitted_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "toolu_ctx".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
+        events.extend(ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 100.0,
+            },
+        )));
+        events.extend(ctx.generate_final_events());
+        assert_eq!(final_stop_reason(&events).as_deref(), Some("tool_use"));
     }
 
     #[test]

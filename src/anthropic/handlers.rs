@@ -11073,7 +11073,8 @@ async fn handle_non_stream_request(
     text_content.push_str(&transcript_sanitizer.finish());
 
     // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
+    if has_tool_use && (stop_reason == "end_turn" || stop_reason == "model_context_window_exceeded")
+    {
         stop_reason = "tool_use".to_string();
     }
 
