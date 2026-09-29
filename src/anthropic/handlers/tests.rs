@@ -1174,17 +1174,19 @@ fn models_response_is_a_superset_of_the_claude_code_models_shape() {
 
 #[test]
 fn prompt_too_long_messages_use_claude_code_protocol_prefix() {
-    let over = PromptTooLongContext {
+    let over = ProviderErrorContext {
         estimated_input_tokens: 210_000,
         context_window_tokens: 200_000,
+        requested_model: None,
     };
     assert_eq!(
         official_prompt_too_long_message(Some(over), false),
         "prompt is too long: 210000 tokens > 200000 maximum"
     );
-    let under = PromptTooLongContext {
+    let under = ProviderErrorContext {
         estimated_input_tokens: 150_000,
         context_window_tokens: 200_000,
+        requested_model: None,
     };
     for (context, window_full) in [
         (Some(under), false),
@@ -1219,9 +1221,10 @@ async fn upstream_too_long_errors_map_to_prompt_is_too_long_for_five_rounds() {
                 Some("req_prompt_too_long"),
                 Some("err_prompt_too_long"),
                 None,
-                Some(PromptTooLongContext {
+                Some(ProviderErrorContext {
                     estimated_input_tokens: 250_000,
                     context_window_tokens: 200_000,
+                    requested_model: None,
                 }),
             );
             assert_eq!(
@@ -4884,6 +4887,7 @@ async fn run_provider_json_exception_retry_and_single_credential_failure_are_pri
             .error_id
             .as_deref()
             .expect("single JSON stream error-id");
+        assert_eq!(error_id, request_id, "error ID must match the request id");
         assert!(body.contains(error_id), "round={round} body={body}");
         let serialized =
             serde_json::to_string(&record).expect("serialize provider JSON failure usage");
@@ -9850,24 +9854,72 @@ async fn model_unavailable_400_maps_to_public_model_unavailable_message() {
         None,
     );
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-error-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_01public_model_unavailable")
+    );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(
         value.pointer("/error/type").and_then(|v| v.as_str()),
-        Some("invalid_request_error")
+        Some("not_found_error")
     );
     let message = value
         .pointer("/error/message")
         .and_then(|v| v.as_str())
         .expect("error message");
 
-    assert!(message.contains(envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE));
-    assert!(message.contains("error ID: req_01public_model_unavailable"));
+    // Without a known requested model the generic model-unavailable wording is used.
+    assert_eq!(message, envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE);
     assert!(!message.contains("req_01raw"));
     assert_public_error_message_is_normalized(message);
+}
+
+#[tokio::test]
+async fn classified_invalid_model_diagnostic_maps_to_official_not_found_for_five_rounds() {
+    for round in 0..5 {
+        for reason in ["model_invalid_bad_request", "model_unavailable_bad_request"] {
+            let diagnostic = format!(
+                "upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=101 retry_after_secs=unknown content_type=json reason={reason}"
+            );
+            let response = map_provider_error(
+                anyhow::anyhow!(diagnostic.clone()),
+                Some("req_invalid_model"),
+                Some("req_invalid_model"),
+                None,
+                Some(ProviderErrorContext {
+                    requested_model: Some("claude-fable-5-1"),
+                    ..Default::default()
+                }),
+            );
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "round {round}");
+            assert_eq!(response.headers()["x-should-retry"], "false");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            assert_eq!(value["type"], "error");
+            assert_eq!(value["error"]["type"], "not_found_error", "round {round}");
+            assert_eq!(value["error"]["message"], "model: claude-fable-5-1");
+            assert_eq!(value["request_id"], "req_invalid_model");
+
+            let public_error = provider_public_error_for_message(
+                &diagnostic,
+                Some("req_invalid_model"),
+                None,
+                Some("claude-fable-5-1"),
+            );
+            assert_eq!(public_error.status_code, 404);
+            assert_eq!(public_error.error_type, "not_found_error");
+            assert_eq!(public_error.message, "model: claude-fable-5-1");
+        }
+    }
 }
 
 #[tokio::test]

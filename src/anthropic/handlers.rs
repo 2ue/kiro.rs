@@ -780,7 +780,6 @@ struct ExternalFallbackContext {
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
-    error_id: String,
     payload_guard_external_enabled: bool,
     payload_guard_initial_config: PayloadGuardConfig,
     payload_guard_retry_config: Option<PayloadGuardConfig>,
@@ -1686,7 +1685,8 @@ fn raw_external_route_request_with_hints(
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         request_id: request_id.clone(),
-        error_id: envelope::request_id(),
+        // The public error ID is the request id so clients and logs share one identifier.
+        error_id: request_id.clone(),
         recorder: state.usage_recorder.clone(),
         started_at: inference_attempt_budget.started_at().into(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -1755,7 +1755,6 @@ fn build_external_fallback_context(
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         recorder: state.usage_recorder.clone(),
-        error_id: envelope::request_id(),
         payload_guard_external_enabled: runtime_config.payload_guard_external_enabled,
         payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
         payload_guard_retry_config: (runtime_config.payload_guard_external_enabled
@@ -2256,8 +2255,8 @@ impl ExternalFallbackContext {
             kiro_rs_tool_cache_policy: self.kiro_rs_tool_cache_policy,
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
+            error_id: request_id.clone(),
             request_id,
-            error_id: self.error_id.clone(),
             recorder: self.recorder.clone(),
             started_at: self.inference_attempt_budget.started_at().into(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -4199,6 +4198,7 @@ impl CredentialUsageContext {
                 &error_message,
                 Some(&self.request.error_id),
                 None,
+                Some(&self.request.model),
             ))
         };
         self.record_failure_with_public_error(status, error_type, error_message, public_error);
@@ -4900,7 +4900,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         }
     };
     let request_id = envelope::request_id();
-    let error_id = envelope::request_id();
+    let error_id = request_id.clone();
     let reported_cache_creation_seed = prompt_cache_profile
         .as_ref()
         .map(|profile| profile.cache_jitter_seed())
@@ -5110,6 +5110,7 @@ fn provider_public_error_for_message(
     err_str: &str,
     error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
+    requested_model: Option<&str>,
 ) -> UsagePublicError {
     if err_str.contains("reason=THINKING_SIGNATURE_INVALID") {
         return usage_public_error(
@@ -5139,10 +5140,10 @@ fn provider_public_error_for_message(
 
     if is_upstream_invalid_model_error(err_str) {
         return usage_public_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE,
-            error_id,
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            model_not_found_message(requested_model),
+            None,
         );
     }
 
@@ -5301,14 +5302,17 @@ fn apply_local_temporary_admission_backoff(
     attribution.apply_local_temporary_backoff(retry_after_secs);
 }
 
-/// Token figures used to phrase an upstream too-long rejection in the Claude Code protocol
-/// format (`prompt is too long: N tokens > M maximum`), which Claude Code uses to compact.
+/// Request facts used to phrase upstream rejections in the Claude Code protocol format:
+/// token figures for `prompt is too long: N tokens > M maximum` (which Claude Code uses to
+/// compact) and the requested model for `model: <id>` not-found errors.
 #[derive(Debug, Clone, Copy, Default)]
-struct PromptTooLongContext {
+struct ProviderErrorContext<'a> {
     /// Local input-token estimate for the request; 0 when not counted.
     estimated_input_tokens: i32,
     /// Model context window in tokens; 0 when unknown.
     context_window_tokens: i32,
+    /// Model id exactly as the client requested it.
+    requested_model: Option<&'a str>,
 }
 
 const PROMPT_TOO_LONG_THRESHOLD_MESSAGE: &str = "prompt is too long: the request input exceeds the upstream content length limit, which is separate from the model context window. Reduce conversation history, tools, documents, images, or tool results.";
@@ -5319,7 +5323,7 @@ const PROMPT_TOO_LONG_CONTEXT_WINDOW_MESSAGE: &str =
 /// are only reported when the local estimate really exceeds the window; Kiro also rejects on a
 /// content-length threshold below the window, where inventing `N > M` numbers would be wrong.
 fn official_prompt_too_long_message(
-    context: Option<PromptTooLongContext>,
+    context: Option<ProviderErrorContext<'_>>,
     context_window_full: bool,
 ) -> String {
     match context {
@@ -5354,7 +5358,7 @@ fn map_provider_error_with_admission_feedback(
     error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
     attribution: Option<&RequestRejectionAttribution>,
-    prompt_context: Option<PromptTooLongContext>,
+    prompt_context: Option<ProviderErrorContext<'_>>,
 ) -> Response {
     apply_local_temporary_admission_backoff(attribution, &err, provider);
     map_provider_error(err, request_id, error_id, provider, prompt_context)
@@ -5365,7 +5369,7 @@ fn map_provider_error(
     request_id: Option<&str>,
     error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
-    prompt_context: Option<PromptTooLongContext>,
+    prompt_context: Option<ProviderErrorContext<'_>>,
 ) -> Response {
     if let Some(failure_kind) = KiroProvider::call_failure_kind_from_error(&err) {
         let status = match failure_kind {
@@ -5441,14 +5445,16 @@ fn map_provider_error(
             "请求被拒绝：上游模型不可用（本地 provider 已在可重试场景尝试换号）",
             error_id,
         );
-        let message = envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE;
         return public_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            message,
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            model_not_found_message(prompt_context.and_then(|context| context.requested_model)),
             request_id,
-            error_id,
-            std::iter::empty::<(&'static str, String)>(),
+            // Keep the Claude Code protocol message verbatim; the error id travels in a header.
+            None,
+            error_id
+                .map(|error_id| vec![("x-error-id", error_id.to_string())])
+                .unwrap_or_default(),
         );
     }
 
@@ -5615,9 +5621,32 @@ fn is_upstream_bad_request_error(value: &str) -> bool {
         || lower.contains("请求参数错误")
 }
 
+/// Anthropic `not_found_error` wording for a model the deployment cannot serve. Claude Code
+/// keys its "run /model to pick a different model" hint off the 404 status.
+fn model_not_found_message(requested_model: Option<&str>) -> String {
+    const MAX_MODEL_CHARS: usize = 256;
+    match requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        Some(model) => {
+            let model = model
+                .chars()
+                .take(MAX_MODEL_CHARS)
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect::<String>();
+            format!("model: {model}")
+        }
+        None => envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE.to_string(),
+    }
+}
+
 fn is_upstream_invalid_model_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    lower.contains("invalid model")
+    // Provider diagnostics carry the classified 400 reason instead of the raw upstream body.
+    lower.contains("reason=model_invalid_bad_request")
+        || lower.contains("reason=model_unavailable_bad_request")
+        || lower.contains("invalid model")
         || lower.contains("invalid_model_id")
         || lower.contains("invalid_model")
         || lower.contains("model not found")
@@ -7655,9 +7684,11 @@ async fn handle_stream_request(
     capacity_weight_units: u32,
     claude_code_noop_delta_keepalive: bool,
 ) -> Response {
-    let prompt_too_long_context = PromptTooLongContext {
+    let requested_model = usage_context.model.clone();
+    let prompt_too_long_context = ProviderErrorContext {
         estimated_input_tokens: input_tokens,
         context_window_tokens,
+        requested_model: Some(requested_model.as_str()),
     };
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
@@ -10030,9 +10061,11 @@ async fn handle_non_stream_request(
     stream_retry_config: LocalStreamRetryConfig,
     capacity_weight_units: u32,
 ) -> Response {
-    let prompt_too_long_context = PromptTooLongContext {
+    let requested_model = usage_context.model.clone();
+    let prompt_too_long_context = ProviderErrorContext {
         estimated_input_tokens: input_tokens,
         context_window_tokens: usage_context.context_window_tokens,
+        requested_model: Some(requested_model.as_str()),
     };
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
