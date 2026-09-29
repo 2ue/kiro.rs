@@ -8886,7 +8886,6 @@ fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
         None,
         PromptCacheSimulationMode::Disabled,
     );
-    stream_context.set_requested_max_tokens(payload.max_tokens);
     let _initial_events = stream_context.generate_initial_events();
     let mut events = Vec::new();
     let assistant_response = crate::kiro::model::events::AssistantResponseEvent {
@@ -8908,8 +8907,9 @@ fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
         },
     )));
     events.extend(stream_context.generate_final_events());
+    // 上游 output_tokens 接近 max_tokens 但内容完整：不再推断 max_tokens（think-09 / conv-16）。
     assert!(events.iter().any(|event| {
-        event.event == "message_delta" && event.data["delta"]["stop_reason"] == "max_tokens"
+        event.event == "message_delta" && event.data["delta"]["stop_reason"] == "end_turn"
     }));
 
     credential_usage.record_success_from_stream(&stream_context);
@@ -8918,7 +8918,7 @@ fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
     assert_eq!(records.total, 1);
     let record = records.records.first().expect("usage record should exist");
     assert_eq!(record.requested_max_tokens, Some(100));
-    assert_eq!(record.downstream_stop_reason.as_deref(), Some("max_tokens"));
+    assert_eq!(record.downstream_stop_reason.as_deref(), Some("end_turn"));
 }
 
 #[test]

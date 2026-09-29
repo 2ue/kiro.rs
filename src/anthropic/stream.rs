@@ -1246,22 +1246,6 @@ impl BlockState {
     }
 }
 
-pub(crate) fn output_tokens_reached_requested_max_tokens(
-    requested_max_tokens: i32,
-    output_tokens: i32,
-) -> bool {
-    if requested_max_tokens <= 0 || output_tokens <= 0 {
-        return false;
-    }
-
-    let tolerance = requested_max_tokens
-        .saturating_div(20)
-        .clamp(1, 256)
-        .min(requested_max_tokens.saturating_sub(1).max(0));
-    let threshold = requested_max_tokens.saturating_sub(tolerance);
-    output_tokens >= threshold
-}
-
 /// SSE 状态管理器
 ///
 /// 确保 SSE 事件序列符合 Claude API 规范：
@@ -1345,19 +1329,6 @@ impl SseStateManager {
 
     fn explicit_stop_reason(&self) -> Option<&str> {
         self.stop_reason.as_deref()
-    }
-
-    fn has_explicit_stop_reason(&self) -> bool {
-        self.stop_reason.is_some()
-    }
-
-    fn maybe_set_max_tokens_stop_reason(&mut self, requested_max_tokens: i32, output_tokens: i32) {
-        if self.has_explicit_stop_reason() || self.has_tool_use {
-            return;
-        }
-        if output_tokens_reached_requested_max_tokens(requested_max_tokens, output_tokens) {
-            self.set_stop_reason("max_tokens");
-        }
     }
 
     /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
@@ -1578,8 +1549,6 @@ pub struct StreamContext {
     pub metadata_usage: Option<MetadataTokenUsage>,
     /// Metadata-provided output tokens when available.
     pub output_tokens: i32,
-    /// 下游请求声明的 max_tokens。Kiro 上游没有等价字段时，用于最终 stop_reason 推断。
-    requested_max_tokens: i32,
     /// Chunk-invariant estimates count only content actually emitted downstream.
     output_token_estimate: StreamTokenEstimate,
     thinking_token_estimate: StreamTokenEstimate,
@@ -1819,7 +1788,6 @@ impl StreamContext {
             context_input_tokens: None,
             metadata_usage: None,
             output_tokens: 0,
-            requested_max_tokens: 0,
             output_token_estimate: StreamTokenEstimate::default(),
             thinking_token_estimate: StreamTokenEstimate::default(),
             tool_block_indices: HashMap::new(),
@@ -1898,10 +1866,6 @@ impl StreamContext {
 
     pub fn response_tool_gate(&self) -> &ResponseToolGate {
         &self.response_tool_gate
-    }
-
-    pub fn set_requested_max_tokens(&mut self, max_tokens: i32) {
-        self.requested_max_tokens = max_tokens.max(0);
     }
 
     pub fn downstream_stop_reason(&self) -> String {
@@ -3940,8 +3904,9 @@ impl StreamContext {
             .map(|usage| usage.output_tokens)
             .filter(|tokens| *tokens > 0)
             .unwrap_or(estimated_output_tokens);
-        self.state_manager
-            .maybe_set_max_tokens_stop_reason(self.requested_max_tokens, final_output_tokens);
+        // Kiro 上游没有 max_tokens 字段，输出不会按客户端 max_tokens 截断。内容完整时不再
+        // 按 token 数推断 max_tokens：否则 Claude Code 会误判输出被截断并自动续写。
+        // 只有上游明确的截断信号（如 ContentLengthExceededException）才报 max_tokens。
         let final_usage = super::cache::build_usage_with_simulation_policy(
             self.metadata_usage.as_ref(),
             usage_input_tokens,
@@ -5848,21 +5813,12 @@ mod tests {
     }
 
     #[test]
-    fn test_requested_max_tokens_threshold_is_not_overbroad_for_small_budgets() {
-        assert!(!output_tokens_reached_requested_max_tokens(0, 100));
-        assert!(!output_tokens_reached_requested_max_tokens(16, 1));
-        assert!(!output_tokens_reached_requested_max_tokens(16, 14));
-        assert!(output_tokens_reached_requested_max_tokens(16, 15));
-        assert!(!output_tokens_reached_requested_max_tokens(100, 94));
-        assert!(output_tokens_reached_requested_max_tokens(100, 95));
-    }
-
-    #[test]
-    fn test_requested_max_tokens_infers_max_tokens_stop_reason() {
+    fn complete_output_over_client_max_tokens_reports_end_turn() {
         use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
 
+        // think-09 / conv-16：Kiro 上游不按客户端 max_tokens 截断。上游 output_tokens 达到甚至
+        // 超过 max_tokens，但内容完整结束时，必须报 end_turn，不能推断 max_tokens。
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
-        ctx.set_requested_max_tokens(100);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -5873,8 +5829,8 @@ mod tests {
                 utterance_id: Some("utt-max".to_string()),
                 token_usage: Some(MetadataTokenUsage {
                     uncached_input_tokens: 21,
-                    output_tokens: 95,
-                    total_tokens: 116,
+                    output_tokens: 2532,
+                    total_tokens: 2553,
                     cache_read_input_tokens: 0,
                     cache_write_input_tokens: 0,
                 }),
@@ -5886,7 +5842,8 @@ mod tests {
             .iter()
             .find(|event| event.event == "message_delta")
             .expect("message_delta should exist");
-        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 2532);
     }
 
     #[test]
@@ -5894,7 +5851,6 @@ mod tests {
         use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
-        ctx.set_requested_max_tokens(100);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -5944,7 +5900,6 @@ mod tests {
             None,
             PromptCacheSimulationMode::Disabled,
         );
-        ctx.set_requested_max_tokens(100);
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();

@@ -6892,7 +6892,6 @@ async fn post_messages_inner(
                 .upstream_model
                 .as_deref()
                 .unwrap_or(&payload.model),
-            payload.max_tokens,
             input_tokens,
             usage_context.context_window_tokens,
             thinking_enabled,
@@ -7473,7 +7472,6 @@ async fn call_non_stream_local_rescue_after_external_error(
 #[derive(Clone)]
 struct StreamContextTemplate {
     model: String,
-    requested_max_tokens: i32,
     input_tokens: i32,
     context_window_tokens: i32,
     thinking_enabled: bool,
@@ -7498,7 +7496,6 @@ impl StreamContextTemplate {
             credential_usage.request.simulated_usage,
             credential_usage.request.simulation_mode,
         );
-        ctx.set_requested_max_tokens(self.requested_max_tokens);
         ctx.set_response_tool_policy(&self.response_tool_policy);
         ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
         ctx.set_local_prompt_cache_projection_enabled(
@@ -7639,7 +7636,6 @@ async fn handle_stream_request(
     kiro_request: KiroRequest,
     model: &str,
     preflight_model: &str,
-    requested_max_tokens: i32,
     input_tokens: i32,
     context_window_tokens: i32,
     thinking_enabled: bool,
@@ -8254,7 +8250,6 @@ async fn handle_stream_request(
 
     let context_template = StreamContextTemplate {
         model: model.to_string(),
-        requested_max_tokens,
         input_tokens,
         context_window_tokens,
         thinking_enabled,
@@ -11318,15 +11313,8 @@ async fn handle_non_stream_request(
         .map(|usage| usage.output_tokens)
         .filter(|tokens| *tokens > 0)
         .unwrap_or(estimated_content_output_tokens);
-    if stop_reason == "end_turn"
-        && !has_tool_use
-        && super::stream::output_tokens_reached_requested_max_tokens(
-            credential_usage.request.requested_max_tokens,
-            output_tokens,
-        )
-    {
-        stop_reason = "max_tokens".to_string();
-    }
+    // 与流式一致：内容完整时不按 token 数推断 max_tokens（Kiro 上游不按 max_tokens 截断），
+    // 避免 Claude Code 误判截断后自动续写。
     credential_usage
         .request
         .set_downstream_stop_reason(stop_reason.clone());
