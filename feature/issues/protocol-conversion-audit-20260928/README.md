@@ -92,6 +92,7 @@ usage 与缓存模拟（token 放大、cache 命中统计）属于产品策略�
 | [P23](23-native-reasoning-multi-block-conversion-gaps.md) | P22 之外的原生 reasoning 多 block 互转缺口 | Medium | request + stream |
 | [P24](24-history-server-tool-and-search-result-blocks-dropped.md) | 历史中的 server_tool_use、web_search_tool_result、search_result 被丢弃 | Low | request |
 | [P25](25-thinking-parameter-validation-gaps.md) | thinking 参数校验缺口 | Low | request |
+| [P27](27-auto-compact-signal-without-changing-usage.md) | usage 整形后 Claude Code 不自动压缩：保留 usage 字段，改用协议 `prompt is too long` 信号 | High | response |
 | [P26](26-merged-catalog-alias-routes-to-accounts-without-model.md) | 合并目录后，别名解析到只有部分账号支持的模型，请求被派到不支持的账号 | Medium | request + scheduling |
 
 ## 维护规则
