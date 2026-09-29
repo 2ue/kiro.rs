@@ -11126,12 +11126,14 @@ async fn handle_non_stream_request(
     if missing_explicit_status {
         let has_trusted_upstream_completion_signal =
             saw_upstream_metadata || saw_upstream_context_usage || saw_upstream_metering;
-        let terminal_failure = if !saw_meaningful_upstream_response
-            && !has_trusted_upstream_completion_signal
-        {
-            Some(
-                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
-            )
+        // 与流式一致：仅有 usage/metadata 侧信道事件而无任何输出时视为上游失败，
+        // 不返回 200 空内容。
+        let terminal_failure = if !saw_meaningful_upstream_response {
+            Some(if has_trusted_upstream_completion_signal {
+                super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
+            } else {
+                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event"
+            })
         } else if !saw_completed_tool_use && !has_trusted_upstream_completion_signal {
             Some("upstream eventstream ended without a trusted completion signal")
         } else {

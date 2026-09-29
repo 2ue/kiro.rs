@@ -84,6 +84,8 @@ fn is_trivial_tool_preamble_text(content: &str) -> bool {
 const ASSISTANT_TEXT_TAIL_LIMIT_CHARS: usize = 4096;
 const TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS: usize = 128;
 const MAX_BUFFERED_ATOMIC_THINKING_BYTES: usize = 1024 * 1024;
+/// 上游只返回 usage/metadata 侧信道事件就 EOF，没有任何 assistant/reasoning/tool 输出。
+pub(crate) const UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL: &str = "upstream eventstream ended with only usage/metadata events and no assistant, reasoning, or tool output";
 
 const TOOL_CONTEXT_LEAK_MARKERS: &[(&str, &str)] = &[
     ("tool_results_provided", "Tool results provided"),
@@ -1927,12 +1929,16 @@ impl StreamContext {
         if self.has_stream_error() || self.saw_upstream_completed {
             return None;
         }
-        if !self.has_meaningful_upstream_response()
-            && !self.has_trusted_upstream_completion_signal()
-        {
-            return Some(
-                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
-            );
+        if !self.has_meaningful_upstream_response() {
+            // usage/metadata side-channel events only prove the upstream turn was
+            // metered, not that it produced output. Surfacing that as a 200 empty
+            // end_turn leaves Claude Code with an empty result, so treat it as an
+            // upstream failure (pre-output retry first, then a stream error).
+            return Some(if self.has_trusted_upstream_completion_signal() {
+                UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
+            } else {
+                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event"
+            });
         }
         if !self.tool_input_buffers.is_empty() {
             if self.has_flushable_incomplete_tool_input_buffers() {
@@ -4168,7 +4174,7 @@ mod tests {
             }));
             assert_eq!(
                 context_usage_only.upstream_terminal_failure_detail(),
-                None,
+                Some(UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL),
                 "context usage only round {round}"
             );
 
@@ -4197,8 +4203,23 @@ mod tests {
             }));
             assert_eq!(
                 metering_only.upstream_terminal_failure_detail(),
-                None,
+                Some(UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL),
                 "metering only round {round}"
+            );
+
+            // think-02: thinking 模式下上游只回 contextUsageEvent 即 EOF，不能推断为空 end_turn。
+            let mut thinking_context_usage_only =
+                StreamContext::new_with_thinking("test-model", 8, true, HashMap::new());
+            thinking_context_usage_only.generate_initial_events();
+            thinking_context_usage_only.process_kiro_event(&Event::ContextUsage(
+                ContextUsageEvent {
+                    context_usage_percentage: 3.9,
+                },
+            ));
+            assert_eq!(
+                thinking_context_usage_only.upstream_terminal_failure_detail(),
+                Some(UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL),
+                "thinking context usage only round {round}"
             );
 
             let mut partial_tool =

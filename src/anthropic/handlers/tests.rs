@@ -5417,6 +5417,46 @@ fn handler_unknown_event_only_retries_before_empty_success_for_five_rounds() {
     );
 }
 
+/// think-02：上游只回 usage/metadata 侧信道事件即 EOF 时，首输出前换号重试，
+/// 而不是向 Claude Code 返回 200 空 end_turn。
+async fn run_handler_usage_only_eof_matrix() {
+    for round in 1..=5 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
+        )
+        .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "usage-only round={round}");
+        assert!(
+            body.contains("recovered-ok"),
+            "usage-only round={round} body={body}"
+        );
+        assert_eq!(body.matches("event: message_start").count(), 1);
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert_eq!(upstream.hits(), 2, "usage-only round={round}");
+        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("usage-only retry latency trace");
+        assert_eq!(trace.stream_retry_attempts, Some(1));
+        assert_eq!(
+            trace.stream_retry_reasons.as_deref(),
+            Some(&["protocol_error:sends=1".to_string()][..])
+        );
+    }
+}
+
+#[test]
+fn handler_usage_only_eof_retries_before_empty_success_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "usage-only-eof-terminal-fixture",
+        run_handler_usage_only_eof_matrix,
+    );
+}
+
 async fn run_handler_missing_completion_after_text_matrix() {
     for round in 1..=5 {
         let upstream = HandlerEventStreamFaultUpstream::start(
@@ -5474,6 +5514,10 @@ async fn run_handler_non_stream_untrusted_eof_matrix() {
             HandlerEventStreamFault::MissingCompletionAfterText,
             "unterminated-visible",
         ),
+        (
+            HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
+            "USAGE_ONLY_NON_STREAM_PRIVATE_MARKER",
+        ),
     ] {
         for round in 1..=5 {
             let marker = format!("{forbidden}_{round}");
@@ -5529,12 +5573,6 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
             0.42,
         ),
         (
-            HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
-            None,
-            "end_turn",
-            0.24,
-        ),
-        (
             HandlerEventStreamFault::CompleteToolWithoutStatus,
             Some(r#""name":"Bash""#),
             "tool_use",
@@ -5584,13 +5622,6 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
                     "fault={fault:?} stream={stream} round={round} kiro_metering_usage={}",
                     record.kiro_metering_usage
                 );
-                if matches!(fault, HandlerEventStreamFault::UsageOnlyMeteringNoStatus) {
-                    assert_eq!(record.output_tokens, 0);
-                    assert!(
-                        record.total_input_tokens > 0 || record.compat_input_tokens > 0,
-                        "usage-only metering should preserve an input-token signal: {record:?}"
-                    );
-                }
             }
         }
     }
