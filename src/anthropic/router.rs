@@ -667,7 +667,7 @@ mod tests {
                 let value: serde_json::Value = serde_json::from_slice(&body)
                     .expect("oversized response must use the Anthropic JSON envelope");
                 assert_eq!(value["type"], "error");
-                assert_eq!(value["error"]["type"], "invalid_request_error");
+                assert_eq!(value["error"]["type"], "request_too_large");
                 assert_eq!(value["request_id"], request_id);
             }
         }

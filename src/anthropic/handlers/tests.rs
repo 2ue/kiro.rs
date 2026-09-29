@@ -1087,6 +1087,39 @@ fn local_preconversion_shaping_handles_consecutive_assistant_reasoning_for_five_
     });
 }
 
+async fn run_identical_parallel_tool_uses_are_both_returned_for_five_rounds() {
+    for stream in [false, true] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::TwoIdenticalToolsWithoutStatus,
+            )
+            .await;
+            let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "stream={stream} round={round} body={body}"
+            );
+            assert!(
+                body.contains("toolu_same_a") && body.contains("toolu_same_b"),
+                "stream={stream} round={round}: identical calls with distinct ids must both survive: {body}"
+            );
+            assert!(
+                body.contains(r#""stop_reason":"tool_use""#),
+                "stream={stream} body={body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn identical_parallel_tool_uses_are_both_returned_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("identical-parallel-tool-uses", || async {
+        run_identical_parallel_tool_uses_are_both_returned_for_five_rounds().await;
+    });
+}
+
 async fn run_local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds() {
     let upstream = MultimodalHandlerUpstream::start().await;
     let mut config = Config::default();
@@ -1109,6 +1142,114 @@ async fn run_local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_
     }
 
     assert_eq!(upstream.hits(), 5);
+}
+
+#[test]
+fn models_response_is_a_superset_of_the_claude_code_models_shape() {
+    let models = crate::anthropic::model_capabilities::ModelCapabilitiesCatalog::default()
+        .anthropic_models();
+    let value = serde_json::to_value(ModelsResponse::from_models(models)).unwrap();
+    assert_eq!(value["object"], "list");
+    assert_eq!(value["has_more"], false);
+    let data = value["data"].as_array().expect("data");
+    assert!(!data.is_empty());
+    assert_eq!(value["first_id"], data[0]["id"]);
+    assert_eq!(value["last_id"], data[data.len() - 1]["id"]);
+    for model in data {
+        assert_eq!(model["type"], "model", "{model}");
+        assert!(model["display_name"].is_string(), "{model}");
+        let created_at = model["created_at"].as_str().expect("created_at");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(created_at).is_ok(),
+            "{model}"
+        );
+    }
+    let again = serde_json::to_value(ModelsResponse::from_models(
+        crate::anthropic::model_capabilities::ModelCapabilitiesCatalog::default()
+            .anthropic_models(),
+    ))
+    .unwrap();
+    assert_eq!(value, again, "model metadata must be stable across calls");
+}
+
+#[test]
+fn prompt_too_long_messages_use_claude_code_protocol_prefix() {
+    let over = PromptTooLongContext {
+        estimated_input_tokens: 210_000,
+        context_window_tokens: 200_000,
+    };
+    assert_eq!(
+        official_prompt_too_long_message(Some(over), false),
+        "prompt is too long: 210000 tokens > 200000 maximum"
+    );
+    let under = PromptTooLongContext {
+        estimated_input_tokens: 150_000,
+        context_window_tokens: 200_000,
+    };
+    for (context, window_full) in [
+        (Some(under), false),
+        (None, false),
+        (Some(under), true),
+        (None, true),
+    ] {
+        let message = official_prompt_too_long_message(context, window_full);
+        assert!(message.starts_with("prompt is too long"), "{message}");
+        assert!(
+            !message.contains(" tokens > "),
+            "no invented figures: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn upstream_too_long_errors_map_to_prompt_is_too_long_for_five_rounds() {
+    for round in 0..5 {
+        for (raw, kind) in [
+            (
+                "upstream_failure class=invalid_request reason=CONTENT_LENGTH_EXCEEDS_THRESHOLD Input is too long.",
+                "content_length_threshold",
+            ),
+            (
+                "upstream_failure class=invalid_request Context window is full. Reduce conversation history.",
+                "context_window_full",
+            ),
+        ] {
+            let response = map_provider_error(
+                anyhow::anyhow!(raw.to_string()),
+                Some("req_prompt_too_long"),
+                Some("err_prompt_too_long"),
+                None,
+                Some(PromptTooLongContext {
+                    estimated_input_tokens: 250_000,
+                    context_window_tokens: 200_000,
+                }),
+            );
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "round {round}: {raw}"
+            );
+            assert_eq!(
+                response.headers()["x-kiro-too-long-kind"],
+                kind,
+                "round {round}"
+            );
+            assert_eq!(
+                response.headers()["x-error-id"],
+                "err_prompt_too_long",
+                "round {round}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert_eq!(
+                value["error"]["message"], "prompt is too long: 250000 tokens > 200000 maximum",
+                "round {round}: message must stay in the exact protocol format"
+            );
+        }
+    }
 }
 
 fn historical_and_protected_reasoning_request(round: usize) -> Request<Body> {
@@ -3437,6 +3578,7 @@ enum HandlerEventStreamFault {
     TextWithMeteringNoStatus,
     UsageOnlyMeteringNoStatus,
     CompleteToolWithoutStatus,
+    TwoIdenticalToolsWithoutStatus,
     IncompleteToolWithoutStatus,
     TextThenReadError,
     ThinkingThenReadError,
@@ -3793,6 +3935,21 @@ async fn handler_eventstream_fault_upstream(
                     "stop":true
                 }),
             ))
+        }
+        HandlerEventStreamFault::TwoIdenticalToolsWithoutStatus => {
+            let mut body = Vec::new();
+            for id in ["toolu_same_a", "toolu_same_b"] {
+                body.extend(eventstream_test_frame(
+                    "toolUseEvent",
+                    json!({
+                        "name":"Bash",
+                        "toolUseId":id,
+                        "input":"{\"command\":\"printf same\"}",
+                        "stop":true
+                    }),
+                ));
+            }
+            handler_eventstream_bytes_response(body)
         }
         HandlerEventStreamFault::IncompleteToolWithoutStatus => {
             handler_eventstream_bytes_response(eventstream_test_frame(
@@ -6625,6 +6782,7 @@ async fn thinking_signature_typed_failures_map_to_stable_public_errors_five_roun
                 Some("req_signature_handler"),
                 Some("err_signature_handler"),
                 None,
+                None,
             );
             assert_eq!(response.status(), expected_status);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -6682,6 +6840,7 @@ async fn auxiliary_focus_attempt_limits_map_to_public_temporary_failure_without_
                 err,
                 Some("req_attempt_limit_test"),
                 Some("req_attempt_limit_error"),
+                None,
                 None,
             );
             let expected_status = if failure_kind == KiroCallFailureKind::DownstreamCommitted {
@@ -9060,6 +9219,7 @@ async fn content_length_threshold_error_is_not_reported_as_context_window_full()
         Some("req_test_content_length"),
         None,
         None,
+        None,
     );
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -9072,7 +9232,8 @@ async fn content_length_threshold_error_is_not_reported_as_context_window_full()
         .and_then(|v| v.as_str())
         .expect("error message");
 
-    assert!(message.contains("input content length exceeded"));
+    assert!(message.starts_with("prompt is too long"), "{message}");
+    assert!(message.contains("content length limit"), "{message}");
     assert!(message.contains("separate from the model context window"));
     assert!(!message.contains("Context window is full"));
 }
@@ -9087,6 +9248,7 @@ async fn prompt_too_long_error_maps_to_input_length_message() {
         Some("req_test_prompt_too_long"),
         None,
         None,
+        None,
     );
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -9099,7 +9261,7 @@ async fn prompt_too_long_error_maps_to_input_length_message() {
         .and_then(|v| v.as_str())
         .expect("error message");
 
-    assert!(message.contains("input content length exceeded"));
+    assert!(message.starts_with("prompt is too long"), "{message}");
     assert!(!message.contains("hidden"));
     assert!(!message.contains("1000000"));
 }
@@ -9113,6 +9275,7 @@ async fn official_kiro_upstream_400_message_is_exposed_without_internal_prefix()
         ),
         Some("req_test_official_upstream"),
         Some("req_01official"),
+        None,
         None,
     );
 
@@ -9154,6 +9317,7 @@ async fn malformed_upstream_error_exposes_safe_official_message() {
         Some("req_test_malformed"),
         None,
         None,
+        None,
     );
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -9182,6 +9346,7 @@ async fn official_kiro_bad_request_message_is_exposed_when_safe() {
         ),
         Some("req_test_official_bad_request"),
         Some("req_01official_bad_request"),
+        None,
         None,
     );
 
@@ -9216,6 +9381,7 @@ async fn official_kiro_high_load_message_is_exposed_when_safe() {
         Some("req_test_official_high_load"),
         Some("req_01official_high_load"),
         None,
+        None,
     );
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -9249,6 +9415,7 @@ async fn official_kiro_upstream_message_with_kiro_term_is_masked() {
         Some("req_test_official_kiro_term"),
         Some("req_01official_term"),
         None,
+        None,
     );
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -9280,6 +9447,7 @@ async fn opaque_400_bad_request_maps_to_invalid_request_not_gateway() {
         Some("req_test_opaque_bad_request"),
         None,
         None,
+        None,
     );
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -9306,6 +9474,7 @@ async fn model_unavailable_400_maps_to_public_model_unavailable_message() {
         ),
         Some("req_test_model_unavailable"),
         Some("req_01public_model_unavailable"),
+        None,
         None,
     );
 
@@ -9334,6 +9503,7 @@ async fn no_available_credentials_error_uses_public_account_message() {
     let response = map_provider_error(
         anyhow::anyhow!("所有凭据均已禁用（0/26）"),
         Some("req_no_account"),
+        None,
         None,
         None,
     );
@@ -9367,6 +9537,7 @@ async fn generic_provider_error_masks_raw_internal_details() {
         Some("req_generic_provider"),
         None,
         None,
+        None,
     );
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -9396,6 +9567,7 @@ async fn provider_error_response_exposes_matching_public_error_id() {
         ),
         Some("req_public_error_id"),
         Some("req_01public_error_id"),
+        None,
         None,
     );
 

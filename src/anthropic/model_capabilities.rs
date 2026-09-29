@@ -516,9 +516,10 @@ impl ModelCapabilitiesCatalog {
                     id: item.model,
                     object: "model".to_string(),
                     created,
+                    created_at: crate::anthropic::types::model_created_at_rfc3339(created),
                     owned_by: "anthropic".to_string(),
                     display_name: item.display_name,
-                    model_type: "chat".to_string(),
+                    model_type: "model".to_string(),
                     max_tokens,
                     max_input_tokens,
                     context_window: max_input_tokens,
@@ -1819,9 +1820,10 @@ pub fn static_anthropic_models() -> Vec<Model> {
             id: id.to_string(),
             object: "model".to_string(),
             created,
+            created_at: crate::anthropic::types::model_created_at_rfc3339(created),
             owned_by: "anthropic".to_string(),
             display_name: display_name.to_string(),
-            model_type: "chat".to_string(),
+            model_type: "model".to_string(),
             max_tokens,
             max_input_tokens: None,
             context_window: None,
@@ -1834,8 +1836,12 @@ fn model_created_at(model: &str) -> i64 {
         .into_iter()
         .find(|item| item.id == model)
         .map(|item| item.created)
-        .unwrap_or_else(|| Utc::now().timestamp())
+        // Stable fallback so repeated /v1/models calls return identical metadata.
+        .unwrap_or(UNKNOWN_MODEL_CREATED_AT)
 }
+
+/// 2025-01-01T00:00:00Z，用于上游目录中没有发布时间的模型。
+const UNKNOWN_MODEL_CREATED_AT: i64 = 1_735_689_600;
 
 #[cfg(test)]
 mod tests {

@@ -1670,9 +1670,9 @@ impl ExternalPoolFinalError {
         let message = if self.is_rate_limit() {
             envelope::PUBLIC_RATE_LIMIT_MESSAGE
         } else if self.is_external_payload_too_large() {
-            "Request input content length exceeded the external upstream threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history and retry."
+            "prompt is too long: Request input content length exceeded the external upstream threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history and retry."
         } else if self.is_external_context_window_full() {
-            "Context window is full for the external model. Reduce conversation history, system prompt, tools, documents, images, or tool results and retry."
+            "prompt is too long: Context window is full for the external model. Reduce conversation history, system prompt, tools, documents, images, or tool results and retry."
         } else if self.is_public_invalid_request() {
             envelope::PUBLIC_INVALID_REQUEST_MESSAGE
         } else {

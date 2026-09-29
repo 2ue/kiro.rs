@@ -5052,7 +5052,7 @@ fn provider_public_error_for_message(
         return usage_public_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "Request input content length exceeded the request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.",
+            PROMPT_TOO_LONG_THRESHOLD_MESSAGE,
             error_id,
         );
     }
@@ -5061,7 +5061,7 @@ fn provider_public_error_for_message(
         return usage_public_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "Context window is full. Reduce conversation history, system prompt, tools, documents, images, or tool results.",
+            PROMPT_TOO_LONG_CONTEXT_WINDOW_MESSAGE,
             error_id,
         );
     }
@@ -5230,15 +5230,63 @@ fn apply_local_temporary_admission_backoff(
     attribution.apply_local_temporary_backoff(retry_after_secs);
 }
 
+/// Token figures used to phrase an upstream too-long rejection in the Claude Code protocol
+/// format (`prompt is too long: N tokens > M maximum`), which Claude Code uses to compact.
+#[derive(Debug, Clone, Copy, Default)]
+struct PromptTooLongContext {
+    /// Local input-token estimate for the request; 0 when not counted.
+    estimated_input_tokens: i32,
+    /// Model context window in tokens; 0 when unknown.
+    context_window_tokens: i32,
+}
+
+const PROMPT_TOO_LONG_THRESHOLD_MESSAGE: &str = "prompt is too long: the request input exceeds the upstream content length limit, which is separate from the model context window. Reduce conversation history, tools, documents, images, or tool results.";
+const PROMPT_TOO_LONG_CONTEXT_WINDOW_MESSAGE: &str =
+    "prompt is too long: the conversation exceeds the model context window.";
+
+/// Claude Code protocol wording for an upstream input-too-long rejection. Exact token figures
+/// are only reported when the local estimate really exceeds the window; Kiro also rejects on a
+/// content-length threshold below the window, where inventing `N > M` numbers would be wrong.
+fn official_prompt_too_long_message(
+    context: Option<PromptTooLongContext>,
+    context_window_full: bool,
+) -> String {
+    match context {
+        Some(context)
+            if context.context_window_tokens > 0
+                && context.estimated_input_tokens > context.context_window_tokens =>
+        {
+            format!(
+                "prompt is too long: {} tokens > {} maximum",
+                context.estimated_input_tokens, context.context_window_tokens
+            )
+        }
+        _ if context_window_full => PROMPT_TOO_LONG_CONTEXT_WINDOW_MESSAGE.to_string(),
+        _ => PROMPT_TOO_LONG_THRESHOLD_MESSAGE.to_string(),
+    }
+}
+
+fn prompt_too_long_headers(
+    kind: &'static str,
+    error_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut headers = vec![("x-kiro-too-long-kind", kind.to_string())];
+    if let Some(error_id) = error_id {
+        headers.push(("x-error-id", error_id.to_string()));
+    }
+    headers
+}
+
 fn map_provider_error_with_admission_feedback(
     err: Error,
     request_id: Option<&str>,
     error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
     attribution: Option<&RequestRejectionAttribution>,
+    prompt_context: Option<PromptTooLongContext>,
 ) -> Response {
     apply_local_temporary_admission_backoff(attribution, &err, provider);
-    map_provider_error(err, request_id, error_id, provider)
+    map_provider_error(err, request_id, error_id, provider, prompt_context)
 }
 
 fn map_provider_error(
@@ -5246,6 +5294,7 @@ fn map_provider_error(
     request_id: Option<&str>,
     error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
+    prompt_context: Option<PromptTooLongContext>,
 ) -> Response {
     if let Some(failure_kind) = KiroProvider::call_failure_kind_from_error(&err) {
         let status = match failure_kind {
@@ -5290,28 +5339,28 @@ fn map_provider_error(
 
     // Provider content length thresholds and model context windows are different limits.
     if is_upstream_payload_too_long_error(&err_str) {
-        let message = "Request input content length exceeded the request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.";
         log_provider_warning_with_hint(&err_str, "请求被拒绝：输入内容长度超过接口阈值", error_id);
         return public_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            message,
+            official_prompt_too_long_message(prompt_context, false),
             request_id,
-            error_id,
-            std::iter::empty::<(&'static str, String)>(),
+            // Keep the Claude Code protocol message verbatim; the error id travels in a header.
+            None,
+            prompt_too_long_headers("content_length_threshold", error_id),
         );
     }
 
     if is_upstream_context_window_full_error(&err_str) {
-        let message = "Context window is full. Reduce conversation history, system prompt, tools, documents, images, or tool results.";
         log_provider_warning_with_hint(&err_str, "请求被拒绝：上下文窗口已满", error_id);
         return public_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            message,
+            official_prompt_too_long_message(prompt_context, true),
             request_id,
-            error_id,
-            std::iter::empty::<(&'static str, String)>(),
+            // Keep the Claude Code protocol message verbatim; the error id travels in a header.
+            None,
+            prompt_too_long_headers("context_window_full", error_id),
         );
     }
 
@@ -6000,10 +6049,7 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 
     let models = state.model_capabilities.anthropic_models();
 
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    Json(ModelsResponse::from_models(models))
 }
 
 fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, Response> {
@@ -6130,11 +6176,7 @@ pub async fn get_models_dfcache(
     }
 
     let models = state.model_capabilities.anthropic_models();
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
-    .into_response()
+    Json(ModelsResponse::from_models(models)).into_response()
 }
 
 /// POST /v1/messages
@@ -7540,6 +7582,10 @@ async fn handle_stream_request(
     capacity_weight_units: u32,
     claude_code_noop_delta_keepalive: bool,
 ) -> Response {
+    let prompt_too_long_context = PromptTooLongContext {
+        estimated_input_tokens: input_tokens,
+        context_window_tokens,
+    };
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
@@ -7618,6 +7664,7 @@ async fn handle_stream_request(
                                     Some(&error_id),
                                     Some(provider.as_ref()),
                                     admission_attribution.as_ref(),
+                                    Some(prompt_too_long_context),
                                 );
                             }
                         }
@@ -7766,6 +7813,7 @@ async fn handle_stream_request(
                                 Some(&error_id),
                                 Some(provider.as_ref()),
                                 admission_attribution.as_ref(),
+                                Some(prompt_too_long_context),
                             );
                         }
                     }
@@ -7950,6 +7998,7 @@ async fn handle_stream_request(
                                                         Some(&error_id),
                                                         Some(provider.as_ref()),
                                                         admission_attribution.as_ref(),
+                                                        Some(prompt_too_long_context),
                                                     );
                                                     }
                                                 }
@@ -7981,6 +8030,7 @@ async fn handle_stream_request(
                                     Some(&error_id),
                                     Some(provider.as_ref()),
                                     admission_attribution.as_ref(),
+                                    Some(prompt_too_long_context),
                                 );
                             }
                         }
@@ -8077,6 +8127,7 @@ async fn handle_stream_request(
                                                     Some(&error_id),
                                                     Some(provider.as_ref()),
                                                     admission_attribution.as_ref(),
+                                                    Some(prompt_too_long_context),
                                                 );
                                             }
                                         }
@@ -8100,6 +8151,7 @@ async fn handle_stream_request(
                             Some(&error_id),
                             Some(provider.as_ref()),
                             admission_attribution.as_ref(),
+                            Some(prompt_too_long_context),
                         );
                     }
                 }
@@ -9850,6 +9902,10 @@ async fn handle_non_stream_request(
     stream_retry_config: LocalStreamRetryConfig,
     capacity_weight_units: u32,
 ) -> Response {
+    let prompt_too_long_context = PromptTooLongContext {
+        estimated_input_tokens: input_tokens,
+        context_window_tokens: usage_context.context_window_tokens,
+    };
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
@@ -9927,6 +9983,7 @@ async fn handle_non_stream_request(
                                     Some(&error_id),
                                     Some(provider.as_ref()),
                                     admission_attribution.as_ref(),
+                                    Some(prompt_too_long_context),
                                 );
                             }
                         }
@@ -10072,6 +10129,7 @@ async fn handle_non_stream_request(
                                 Some(&error_id),
                                 Some(provider.as_ref()),
                                 admission_attribution.as_ref(),
+                                Some(prompt_too_long_context),
                             );
                         }
                     }
@@ -10244,6 +10302,7 @@ async fn handle_non_stream_request(
                                                         Some(&error_id),
                                                         Some(provider.as_ref()),
                                                         admission_attribution.as_ref(),
+                                                        Some(prompt_too_long_context),
                                                     );
                                                 }
                                             }
@@ -10275,6 +10334,7 @@ async fn handle_non_stream_request(
                                     Some(&error_id),
                                     Some(provider.as_ref()),
                                     admission_attribution.as_ref(),
+                                    Some(prompt_too_long_context),
                                 );
                             }
                         }
@@ -10371,6 +10431,7 @@ async fn handle_non_stream_request(
                                                     Some(&error_id),
                                                     Some(provider.as_ref()),
                                                     admission_attribution.as_ref(),
+                                                    Some(prompt_too_long_context),
                                                 );
                                             }
                                         }
@@ -10394,6 +10455,7 @@ async fn handle_non_stream_request(
                             Some(&error_id),
                             Some(provider.as_ref()),
                             admission_attribution.as_ref(),
+                            Some(prompt_too_long_context),
                         );
                     }
                 }
@@ -10594,6 +10656,7 @@ async fn handle_non_stream_request(
                             Some(&error_id),
                             Some(provider.as_ref()),
                             admission_attribution.as_ref(),
+                            Some(prompt_too_long_context),
                         );
                     }
                 }
@@ -10615,6 +10678,11 @@ async fn handle_non_stream_request(
     let mut native_thinking_signature: Option<String> = None;
     let mut redacted_thinking: Option<String> = None;
     let mut seen_tool_sigs: HashSet<String> = HashSet::new();
+    // Structured tool_use blocks are deduplicated by id only: two identical calls (for example
+    // two parallel reads of the same file) are both legitimate and each gets its own tool_result.
+    // Signatures still suppress a leaked textual invoke that duplicates a structured call.
+    let mut structured_tool_sigs: HashSet<String> = HashSet::new();
+    let mut seen_tool_ids: HashSet<String> = HashSet::new();
     let mut transcript_sanitizer =
         super::transcript_sanitizer::ToolTranscriptSanitizer::new(known_tool_names.iter().cloned());
     let mut thinking_transcript_sanitizer =
@@ -10733,7 +10801,13 @@ async fn handle_non_stream_request(
                         input,
                     );
                     let sig = crate::anthropic::stream::tool_use_signature(&original_name, &input);
-                    if seen_tool_sigs.insert(sig) {
+                    let duplicates_leaked_invoke =
+                        seen_tool_sigs.contains(&sig) && !structured_tool_sigs.contains(&sig);
+                    seen_tool_sigs.insert(sig.clone());
+                    structured_tool_sigs.insert(sig);
+                    if !duplicates_leaked_invoke
+                        && seen_tool_ids.insert(tool_use.tool_use_id.clone())
+                    {
                         tool_uses.push(json!({
                             "type": "tool_use",
                             "id": tool_use.tool_use_id,
@@ -10954,7 +11028,11 @@ async fn handle_non_stream_request(
             let input =
                 crate::anthropic::stream::repair_tool_use_input_for_cli(&original_name, input);
             let sig = crate::anthropic::stream::tool_use_signature(&original_name, &input);
-            if seen_tool_sigs.insert(sig) {
+            let duplicates_leaked_invoke =
+                seen_tool_sigs.contains(&sig) && !structured_tool_sigs.contains(&sig);
+            seen_tool_sigs.insert(sig.clone());
+            structured_tool_sigs.insert(sig);
+            if !duplicates_leaked_invoke && seen_tool_ids.insert(tool_use_id.clone()) {
                 tool_uses.push(json!({
                     "type": "tool_use",
                     "id": tool_use_id,

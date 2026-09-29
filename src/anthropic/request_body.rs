@@ -58,7 +58,7 @@ where
                 }
                 Err(envelope::error_response_with_id(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "invalid_request_error",
+                    "request_too_large",
                     BODY_LIMIT_MESSAGE,
                     &request_id,
                 ))
@@ -233,7 +233,7 @@ mod tests {
                 .await
                 .unwrap();
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert_eq!(value["error"]["type"], "request_too_large");
         }
     }
 

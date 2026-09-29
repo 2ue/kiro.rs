@@ -51,11 +51,15 @@ impl ErrorResponse {
 // === Models 端点类型 ===
 
 /// 模型信息
+///
+/// 序列化结果是 Claude Code 协议 `/v1/models` 形态（`type: "model"`、`display_name`、
+/// RFC3339 `created_at`）的超集，保留旧的 `object`/`created`/`owned_by` 字段兼容已有客户端。
 #[derive(Debug, Serialize, Clone)]
 pub struct Model {
     pub id: String,
     pub object: String,
     pub created: i64,
+    pub created_at: String,
     pub owned_by: String,
     pub display_name: String,
     #[serde(rename = "type")]
@@ -67,11 +71,33 @@ pub struct Model {
     pub context_window: Option<i32>,
 }
 
-/// 模型列表响应
+/// 模型列表响应（Claude Code 协议分页字段 + 旧 `object` 字段）
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
     pub object: String,
     pub data: Vec<Model>,
+    pub has_more: bool,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+}
+
+impl ModelsResponse {
+    pub fn from_models(data: Vec<Model>) -> Self {
+        Self {
+            object: "list".to_string(),
+            first_id: data.first().map(|model| model.id.clone()),
+            last_id: data.last().map(|model| model.id.clone()),
+            has_more: false,
+            data,
+        }
+    }
+}
+
+/// RFC3339 form of a Unix timestamp for the `created_at` model field.
+pub fn model_created_at_rfc3339(created: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(created, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 // === Messages 端点类型 ===
