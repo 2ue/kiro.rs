@@ -1623,6 +1623,8 @@ mod tests {
             input_schema: HashMap::new(),
             max_uses: None,
             cache_control: Some(json!({"type": "ephemeral"})),
+            allowed_domains: None,
+            blocked_domains: None,
         }]);
         let profile = tracker
             .build_profile(&req, 4096)

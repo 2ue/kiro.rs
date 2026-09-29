@@ -445,6 +445,141 @@ fn non_empty_trimmed(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// 加入 query 的 `site:` 提示最多覆盖的 allowed 域名数，避免 query 过长。
+const MAX_SITE_HINT_DOMAINS: usize = 3;
+
+/// 原生 WebSearch 工具上的 `allowed_domains` / `blocked_domains`。
+///
+/// Kiro MCP web_search 只接受 query，因此代理在结果侧按域名（含子域名）过滤，
+/// 并把 allowed 域名以 `site:` 形式辅助加入 query，提高命中率。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebSearchDomainFilter {
+    allowed: Vec<String>,
+    blocked: Vec<String>,
+}
+
+impl WebSearchDomainFilter {
+    pub fn from_request(req: &MessagesRequest) -> Self {
+        let Some(tool) = req
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.iter().find(|tool| is_native_web_search_tool(tool)))
+        else {
+            return Self::default();
+        };
+        Self {
+            allowed: normalize_domains(tool.allowed_domains.as_deref()),
+            blocked: normalize_domains(tool.blocked_domains.as_deref()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allowed.is_empty() && self.blocked.is_empty()
+    }
+
+    /// 结果 URL（或 MCP 返回的 domain 字段）是否满足过滤条件。
+    fn permits(&self, result: &WebSearchResult) -> bool {
+        let Some(host) = result_host(result) else {
+            // 无法判定域名时：有 allowed 限制则排除，否则保留。
+            return self.allowed.is_empty();
+        };
+        if self
+            .blocked
+            .iter()
+            .any(|domain| host_matches_domain(&host, domain))
+        {
+            return false;
+        }
+        self.allowed.is_empty()
+            || self
+                .allowed
+                .iter()
+                .any(|domain| host_matches_domain(&host, domain))
+    }
+
+    /// 过滤搜索结果，返回被移除的条数。
+    fn apply(&self, results: &mut WebSearchResults) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+        let before = results.results.len();
+        results.results.retain(|result| self.permits(result));
+        before - results.results.len()
+    }
+
+    /// 发给 MCP 的 query：allowed 域名较少时附加 `site:` 提示。
+    fn mcp_query(&self, query: &str) -> String {
+        if self.allowed.is_empty() || self.allowed.len() > MAX_SITE_HINT_DOMAINS {
+            return query.to_string();
+        }
+        let sites = self
+            .allowed
+            .iter()
+            .map(|domain| format!("site:{domain}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("{query} {sites}")
+    }
+}
+
+/// 官方语义：allowed_domains 与 blocked_domains 不能同时使用。
+pub fn has_conflicting_web_search_domain_filters(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .filter(|tool| is_native_web_search_tool(tool))
+            .any(|tool| {
+                tool.allowed_domains.as_ref().is_some_and(|d| !d.is_empty())
+                    && tool.blocked_domains.as_ref().is_some_and(|d| !d.is_empty())
+            })
+    })
+}
+
+fn normalize_domains(domains: Option<&[String]>) -> Vec<String> {
+    let mut normalized: Vec<String> = domains
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|domain| normalize_domain(domain))
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+/// 把 `https://Sub.Example.com/path`、`*.example.com` 等写法统一为 `sub.example.com`。
+fn normalize_domain(value: &str) -> Option<String> {
+    let lower = value.trim().to_ascii_lowercase();
+    let without_scheme = lower
+        .split_once("://")
+        .map_or(lower.as_str(), |(_, rest)| rest);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.split(':').next().unwrap_or_default();
+    let host = host.trim_start_matches("*.").trim_matches('.');
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+fn result_host(result: &WebSearchResult) -> Option<String> {
+    url::Url::parse(&result.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .or_else(|| result.domain.as_deref().and_then(normalize_domain))
+        .map(|host| host.trim_matches('.').to_string())
+        .filter(|host| !host.is_empty())
+}
+
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
 /// 生成22位大小写字母和数字的随机字符串
 fn generate_random_id_22() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -1009,11 +1144,12 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
         "handling native WebSearch request"
     );
 
-    // 2. 创建 MCP 请求
-    let (tool_use_id, mcp_request) = create_mcp_request(&query);
+    // 2. 创建 MCP 请求（allowed_domains 以 site: 提示辅助加入 query）
+    let domain_filter = WebSearchDomainFilter::from_request(payload);
+    let (tool_use_id, mcp_request) = create_mcp_request(&domain_filter.mcp_query(&query));
 
     // 3. 调用 Kiro MCP API
-    let (search_results, attribution) = match call_mcp_api(
+    let (mut search_results, attribution) = match call_mcp_api(
         &context.provider,
         &mcp_request,
         context.inference_attempt_budget,
@@ -1051,7 +1187,20 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
         }
     };
 
-    // 4. 按 Anthropic `stream` 语义生成响应。
+    // 4. 按 allowed_domains / blocked_domains 过滤结果（含子域名）。
+    let filtered_out = domain_filter.apply(&mut search_results);
+    if !domain_filter.is_empty() {
+        tracing::info!(
+            request_id,
+            allowed_domains = domain_filter.allowed.len(),
+            blocked_domains = domain_filter.blocked.len(),
+            filtered_out,
+            remaining = search_results.results.len(),
+            "applied native WebSearch domain filters to MCP results"
+        );
+    }
+
+    // 5. 按 Anthropic `stream` 语义生成响应。
     let model = payload.model.clone();
     let search_results = Some(search_results);
     let summary = generate_search_summary(&query, &search_results);
@@ -1210,6 +1359,8 @@ mod tests {
                 input_schema: Default::default(),
                 max_uses: Some(8),
                 cache_control: None,
+                allowed_domains: None,
+                blocked_domains: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -1237,6 +1388,8 @@ mod tests {
                 input_schema: Default::default(),
                 max_uses: Some(8),
                 cache_control: None,
+                allowed_domains: None,
+                blocked_domains: None,
             }]),
             tool_choice: None,
             thinking: None,
@@ -1247,6 +1400,122 @@ mod tests {
 
         assert!(has_web_search_tool(&req));
         assert!(has_native_web_search_tool(&req));
+    }
+
+    fn domain_request(allowed: Option<&[&str]>, blocked: Option<&[&str]>) -> MessagesRequest {
+        let mut req = request_with(
+            vec![Message {
+                role: "user".to_string(),
+                content: json!("query"),
+            }],
+            Some("web_search_20250305"),
+            false,
+        );
+        let tool = &mut req.tools.as_mut().expect("tools")[0];
+        let to_vec = |domains: &[&str]| domains.iter().map(|d| d.to_string()).collect();
+        tool.allowed_domains = allowed.map(to_vec);
+        tool.blocked_domains = blocked.map(to_vec);
+        req
+    }
+
+    fn search_result(url: &str, domain: Option<&str>) -> WebSearchResult {
+        WebSearchResult {
+            title: url.to_string(),
+            url: url.to_string(),
+            snippet: None,
+            published_date: None,
+            id: None,
+            domain: domain.map(str::to_string),
+            max_verbatim_word_limit: None,
+            public_domain: None,
+        }
+    }
+
+    fn results_of(urls: &[&str]) -> WebSearchResults {
+        WebSearchResults {
+            results: urls.iter().map(|url| search_result(url, None)).collect(),
+            total_results: None,
+            query: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn allowed_domains_keep_matching_hosts_and_subdomains_only() {
+        let req = domain_request(Some(&["https://Example.com/docs", "*.rust-lang.org"]), None);
+        let filter = WebSearchDomainFilter::from_request(&req);
+        let mut results = results_of(&[
+            "https://example.com/a",
+            "https://docs.example.com/b",
+            "https://notexample.com/c",
+            "https://doc.rust-lang.org/std",
+            "https://evil.com/?q=example.com",
+            "not a url",
+        ]);
+
+        assert_eq!(filter.apply(&mut results), 3);
+        let urls: Vec<&str> = results.results.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/a",
+                "https://docs.example.com/b",
+                "https://doc.rust-lang.org/std"
+            ]
+        );
+        assert_eq!(
+            filter.mcp_query("rust news"),
+            "rust news site:example.com OR site:rust-lang.org"
+        );
+    }
+
+    #[test]
+    fn blocked_domains_remove_matching_hosts_and_subdomains() {
+        let req = domain_request(None, Some(&["reddit.com"]));
+        let filter = WebSearchDomainFilter::from_request(&req);
+        let mut results = results_of(&[
+            "https://www.reddit.com/r/rust",
+            "https://reddit.com/",
+            "https://notreddit.com/",
+        ]);
+        results
+            .results
+            .push(search_result("", Some("old.reddit.com")));
+
+        assert_eq!(filter.apply(&mut results), 3);
+        assert_eq!(results.results.len(), 1);
+        assert_eq!(results.results[0].url, "https://notreddit.com/");
+        // blocked 不改写 query。
+        assert_eq!(filter.mcp_query("rust"), "rust");
+    }
+
+    #[test]
+    fn domain_filters_conflict_only_when_both_are_non_empty() {
+        assert!(has_conflicting_web_search_domain_filters(&domain_request(
+            Some(&["a.com"]),
+            Some(&["b.com"])
+        )));
+        assert!(!has_conflicting_web_search_domain_filters(&domain_request(
+            Some(&["a.com"]),
+            Some(&[])
+        )));
+        assert!(!has_conflicting_web_search_domain_filters(&domain_request(
+            None, None
+        )));
+        let filter = WebSearchDomainFilter::from_request(&domain_request(None, None));
+        assert!(filter.is_empty());
+        let mut results = results_of(&["https://x.com"]);
+        assert_eq!(filter.apply(&mut results), 0);
+        assert_eq!(filter.mcp_query("q"), "q");
+    }
+
+    #[test]
+    fn many_allowed_domains_skip_site_hint_but_still_filter() {
+        let req = domain_request(Some(&["a.com", "b.com", "c.com", "d.com"]), None);
+        let filter = WebSearchDomainFilter::from_request(&req);
+        assert_eq!(filter.mcp_query("q"), "q");
+        let mut results = results_of(&["https://d.com/x", "https://e.com/y"]);
+        assert_eq!(filter.apply(&mut results), 1);
     }
 
     #[test]
@@ -1333,6 +1602,8 @@ mod tests {
                     input_schema: Default::default(),
                     max_uses: Some(8),
                     cache_control: None,
+                    allowed_domains: None,
+                    blocked_domains: None,
                 },
                 Tool {
                     tool_type: None,
@@ -1341,6 +1612,8 @@ mod tests {
                     input_schema: Default::default(),
                     max_uses: None,
                     cache_control: None,
+                    allowed_domains: None,
+                    blocked_domains: None,
                 },
             ]),
             tool_choice: None,
@@ -1375,6 +1648,8 @@ mod tests {
                     input_schema: Default::default(),
                     max_uses: None,
                     cache_control: None,
+                    allowed_domains: None,
+                    blocked_domains: None,
                 },
                 Tool {
                     tool_type: None,
@@ -1383,6 +1658,8 @@ mod tests {
                     input_schema: Default::default(),
                     max_uses: None,
                     cache_control: None,
+                    allowed_domains: None,
+                    blocked_domains: None,
                 },
             ]),
             tool_choice: None,

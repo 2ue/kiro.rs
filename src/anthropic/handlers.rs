@@ -6692,6 +6692,26 @@ async fn post_messages_inner(
         );
         return response;
     }
+    if websearch::has_conflicting_web_search_domain_filters(&payload) {
+        let mut response = envelope::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "web_search tool: allowed_domains and blocked_domains cannot be used together.",
+        );
+        response.headers_mut().insert(
+            "x-should-retry",
+            axum::http::HeaderValue::from_static("false"),
+        );
+        record_pre_usage_rejection_for_request(
+            attribution.as_ref(),
+            RequestRejectionReason::WebSearchUnsupported,
+            &endpoint,
+            &response,
+            &payload,
+            Some(&model_resolution),
+        );
+        return response;
+    }
     // 检查是否声明了 Anthropic 原生 WebSearch 工具。
     if websearch::has_native_web_search_tool(&payload) {
         if !websearch_supported_for_profile(runtime_config.compat_profile) {

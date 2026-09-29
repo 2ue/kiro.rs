@@ -515,6 +515,12 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// 仅返回这些域名（含子域名）的结果（仅 WebSearch 工具）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    /// 排除这些域名（含子域名）的结果（仅 WebSearch 工具）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_domains: Option<Vec<String>>,
     /// Prompt cache control for cacheable tool definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<serde_json::Value>,
