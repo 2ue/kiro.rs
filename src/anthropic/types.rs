@@ -204,6 +204,60 @@ where
     i32::deserialize(deserializer)
 }
 
+/// 宽容解析 stop_sequences：单个字符串视为一项，数组中只取非空字符串，
+/// 其余形态忽略并记日志，不因格式问题拒绝整个请求。
+fn deserialize_stop_sequences<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(normalize_stop_sequences(value))
+}
+
+fn normalize_stop_sequences(value: Option<serde_json::Value>) -> Option<Vec<String>> {
+    let sequences = match value? {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(sequence) => vec![sequence],
+        serde_json::Value::Array(items) => {
+            let total = items.len();
+            let sequences: Vec<String> = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(sequence) => Some(sequence),
+                    _ => None,
+                })
+                .collect();
+            if sequences.len() != total {
+                tracing::warn!(
+                    ignored = total - sequences.len(),
+                    "ignoring non-string stop_sequences entries"
+                );
+            }
+            sequences
+        }
+        other => {
+            tracing::warn!(
+                kind = json_value_kind(&other),
+                "ignoring stop_sequences that is neither a string nor an array"
+            );
+            return None;
+        }
+    };
+    let sequences: Vec<String> = sequences.into_iter().filter(|s| !s.is_empty()).collect();
+    (!sequences.is_empty()).then_some(sequences)
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn deserialize_nullable_map<'de, D>(
     deserializer: D,
 ) -> Result<HashMap<String, serde_json::Value>, D::Error>
@@ -219,6 +273,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_sequences_are_parsed_leniently() {
+        let parse = |stop_sequences: serde_json::Value| -> Option<Vec<String>> {
+            serde_json::from_value::<MessagesRequest>(serde_json::json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop_sequences": stop_sequences,
+            }))
+            .expect("request with any stop_sequences shape still parses")
+            .stop_sequences
+        };
+
+        assert_eq!(
+            parse(serde_json::json!(["END", "STOP"])),
+            Some(vec!["END".to_string(), "STOP".to_string()])
+        );
+        assert_eq!(
+            parse(serde_json::json!("END")),
+            Some(vec!["END".to_string()])
+        );
+        assert_eq!(
+            parse(serde_json::json!(["END", 3, null, "", {"a": 1}])),
+            Some(vec!["END".to_string()])
+        );
+        assert_eq!(parse(serde_json::json!([1, 2])), None);
+        assert_eq!(parse(serde_json::json!(42)), None);
+        assert_eq!(parse(serde_json::json!({"a": "END"})), None);
+        assert_eq!(parse(serde_json::Value::Null), None);
+    }
 
     #[test]
     fn thinking_display_is_parsed_leniently() {
@@ -415,7 +500,11 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
     /// 自定义停止序列。Kiro 无对应参数，由代理在输出侧检测并截断。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stop_sequences"
+    )]
     pub stop_sequences: Option<Vec<String>>,
 }
 
