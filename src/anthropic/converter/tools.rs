@@ -518,7 +518,7 @@ pub(super) fn convert_tools(
 
     for (idx, mapped_name) in allocated_tools {
         let t = &tools[idx];
-        let mut description = normalize_tool_description(&t.name, &t.description);
+        let description = normalize_tool_description(&t.name, &t.description);
 
         // 对 Write/Edit 工具追加自定义描述后缀
         let suffix = if options.inject_chunked_tool_descriptions() {
@@ -530,16 +530,16 @@ pub(super) fn convert_tools(
         } else {
             ""
         };
+        // 限制客户端描述长度为 10000 字符（安全截断 UTF-8，单次遍历）。先截断客户端描述再追加
+        // 代理自己的策略后缀，避免长描述把后缀截掉。
+        let mut description = match description.char_indices().nth(10000) {
+            Some((idx, _)) => description[..idx].to_string(),
+            None => description,
+        };
         if !suffix.is_empty() {
             description.push('\n');
             description.push_str(suffix);
         }
-
-        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-        let description = match description.char_indices().nth(10000) {
-            Some((idx, _)) => description[..idx].to_string(),
-            None => description,
-        };
 
         let converted_idx = converted.len();
         let has_cache_control = t.cache_control.is_some();

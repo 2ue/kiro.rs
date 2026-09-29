@@ -6004,4 +6004,162 @@ mod tests {
             Some("[image attached]")
         );
     }
+
+    fn audit_request(messages: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": messages
+        }))
+        .expect("audit request")
+    }
+
+    fn history_user_contents(result: &ConversionResult) -> Vec<String> {
+        result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                crate::kiro::model::requests::conversation::Message::User(user) => {
+                    Some(user.user_input_message.content.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn history_assistant_contents(result: &ConversionResult) -> Vec<String> {
+        result
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                crate::kiro::model::requests::conversation::Message::Assistant(assistant) => {
+                    Some(assistant.assistant_response_message.content.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn image_only_history_user_turn_gets_non_empty_content_for_five_rounds() {
+        for round in 0..5 {
+            let req = audit_request(serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_BASE64}}
+                ]},
+                {"role": "assistant", "content": format!("I see an image {round}")},
+                {"role": "user", "content": "what color is it?"}
+            ]));
+            let result = convert_request(&req).expect("image-only history converts");
+            let contents = history_user_contents(&result);
+            assert!(
+                contents.iter().all(|content| !content.trim().is_empty()),
+                "round {round}: {contents:?}"
+            );
+            assert!(
+                contents
+                    .iter()
+                    .any(|content| content == EMPTY_USER_CONTENT_PLACEHOLDER)
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_document_and_search_result_are_rendered_as_text() {
+        let pdf_like_text = BASE64_STANDARD.encode("quarterly revenue grew");
+        let req = audit_request(serde_json::json!([
+            {"role": "user", "content": "read the report"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_doc", "name": "Read", "input": {"file_path": "/r.txt"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_doc", "content": [
+                    {"type": "text", "text": "header"},
+                    {"type": "document", "title": "Report", "source": {"type": "base64", "media_type": "text/plain", "data": pdf_like_text}},
+                    {"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": "inline doc body"}]}},
+                    {"type": "search_result", "source": "https://example.com/a", "title": "A", "content": [{"type": "text", "text": "snippet a"}]},
+                    {"type": "tool_reference", "tool_name": "Grep"}
+                ]}
+            ]}
+        ]));
+        let result = convert_request(&req).expect("tool_result with document converts");
+        let tool_results = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        let text = serde_json::to_string(&tool_results[0]).expect("serialize tool result");
+        assert!(text.contains("quarterly revenue grew"), "{text}");
+        assert!(text.contains("Document title: Report"), "{text}");
+        assert!(text.contains("inline doc body"), "{text}");
+        assert!(
+            text.contains("snippet a") && text.contains("https://example.com/a"),
+            "{text}"
+        );
+        assert!(text.contains("[tool_reference block omitted]"), "{text}");
+        assert!(
+            !text.contains(&pdf_like_text),
+            "base64 payload must not leak: {text}"
+        );
+    }
+
+    #[test]
+    fn top_level_search_result_and_content_document_are_not_dropped() {
+        let req = audit_request(serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "search_result", "source": "https://example.com/b", "title": "B", "content": [{"type": "text", "text": "snippet b"}]},
+                {"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": "custom content doc"}]}},
+                {"type": "text", "text": "summarize"}
+            ]}
+        ]));
+        let result = convert_request(&req).expect("search_result converts");
+        let content = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(
+            content.contains("snippet b") && content.contains("custom content doc"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn history_server_tool_blocks_are_replayed_as_bounded_text() {
+        let results = (0..25)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "web_search_result",
+                    "url": format!("https://example.com/{index}"),
+                    "title": format!("Result {index}"),
+                    "encrypted_content": "SECRET-ENCRYPTED",
+                    "page_age": "2026-09-01"
+                })
+            })
+            .collect::<Vec<_>>();
+        let req = audit_request(serde_json::json!([
+            {"role": "user", "content": "search rust"},
+            {"role": "assistant", "content": [
+                {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "rust async"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": results},
+                {"type": "text", "text": "Here is what I found."}
+            ]},
+            {"role": "user", "content": "which result was first?"}
+        ]));
+        let result = convert_request(&req).expect("server tool history converts");
+        let assistant = history_assistant_contents(&result).join("\n");
+        assert!(assistant.contains("query: rust async"), "{assistant}");
+        assert!(
+            assistant.contains("Result 0 - https://example.com/0"),
+            "{assistant}"
+        );
+        assert!(assistant.contains("5 more results omitted"), "{assistant}");
+        assert!(assistant.contains("Here is what I found."), "{assistant}");
+        assert!(!assistant.contains("SECRET-ENCRYPTED"), "{assistant}");
+    }
 }

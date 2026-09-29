@@ -10,10 +10,16 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::ToolUseEntry;
 use crate::model::config::CompatProfile;
 
-use super::content::{normalize_tool_use_input, process_message_content, sanitize_tool_use_id};
+use super::content::{
+    normalize_tool_use_input, process_message_content, render_server_tool_block,
+    sanitize_tool_use_id,
+};
 use super::thinking::{generate_thinking_prefix_for_model, has_thinking_tags};
 use super::tools::{SYSTEM_CHUNKED_POLICY, generate_tool_choice_prefix, map_tool_name};
-use super::{ConversionError, ConverterOptions, ProxyWarnings, TOOL_RESULTS_PROVIDED_PLACEHOLDER};
+use super::{
+    ConversionError, ConverterOptions, EMPTY_USER_CONTENT_PLACEHOLDER, ProxyWarnings,
+    TOOL_RESULTS_PROVIDED_PLACEHOLDER,
+};
 use crate::anthropic::transcript_sanitizer::ToolTranscriptSanitizer;
 
 /// 构建历史消息
@@ -202,8 +208,14 @@ pub(super) fn merge_user_messages(
     }
 
     let mut content = content_parts.join("\n");
-    if content.trim().is_empty() && !all_tool_results.is_empty() {
-        content = TOOL_RESULTS_PROVIDED_PLACEHOLDER.to_string();
+    if content.trim().is_empty() {
+        // Kiro rejects empty user content. History turns get the same placeholders as the
+        // current message, including image-only turns such as a pasted screenshot.
+        content = if all_tool_results.is_empty() {
+            EMPTY_USER_CONTENT_PLACEHOLDER.to_string()
+        } else {
+            TOOL_RESULTS_PROVIDED_PLACEHOLDER.to_string()
+        };
     }
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
@@ -280,6 +292,15 @@ fn convert_assistant_message_with_known_tools(
                         &mut native_reasoning_content,
                         ReasoningContent::redacted_content(data),
                     )?;
+                    continue;
+                }
+                if let Some(rendered) = render_server_tool_block(item) {
+                    // Kiro has no server-tool block; keep the replayed search context as text.
+                    if !text_content.is_empty() && !text_content.ends_with('\n') {
+                        text_content.push_str("\n\n");
+                    }
+                    text_content.push_str(&rendered);
+                    text_content.push_str("\n\n");
                     continue;
                 }
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {

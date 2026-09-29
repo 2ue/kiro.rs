@@ -304,12 +304,32 @@ fn reject_non_inline_sources(messages: &[Message]) -> Result<(), String> {
     Ok(())
 }
 
+/// Image/document blocks nested in `tool_result.content` follow the same source rules as
+/// top-level blocks, so every media pass also visits them.
+fn nested_tool_result_content(item: &Value) -> Option<&Value> {
+    (item.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .then(|| item.get("content"))
+        .flatten()
+        .filter(|content| content.is_array())
+}
+
+fn nested_tool_result_content_mut(item: &mut Value) -> Option<&mut Value> {
+    if item.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return None;
+    }
+    item.get_mut("content").filter(|content| content.is_array())
+}
+
 fn reject_non_inline_sources_in_content(content: &Value) -> Result<(), String> {
     let Value::Array(items) = content else {
         return Ok(());
     };
 
     for item in items {
+        if let Some(nested) = nested_tool_result_content(item) {
+            reject_non_inline_sources_in_content(nested)?;
+            continue;
+        }
         let Some(obj) = item.as_object() else {
             continue;
         };
@@ -437,9 +457,15 @@ fn count_remote_content_sources(content: &Value) -> usize {
     };
     items
         .iter()
-        .filter_map(remote_source_info)
-        .filter(|(_, url, _)| !url.starts_with("data:"))
-        .count()
+        .map(|item| {
+            if let Some(nested) = nested_tool_result_content(item) {
+                return count_remote_content_sources(nested);
+            }
+            remote_source_info(item)
+                .filter(|(_, url, _)| !url.starts_with("data:"))
+                .map_or(0, |_| 1)
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -484,6 +510,10 @@ fn normalize_content_base64_image_media_types(content: &mut Value) -> usize {
 
     let mut fixed = 0usize;
     for item in items {
+        if let Some(nested) = nested_tool_result_content_mut(item) {
+            fixed += normalize_content_base64_image_media_types(nested);
+            continue;
+        }
         let Some(obj) = item.as_object_mut() else {
             continue;
         };
@@ -561,26 +591,35 @@ async fn materialize_content_sources(
 
     let mut materialized = 0usize;
     for item in items {
-        let Some((block_type, url, provided_media_type)) = remote_source_info(item) else {
-            continue;
-        };
-        if url.starts_with("data:") {
+        if let Some(Value::Array(nested_items)) = nested_tool_result_content_mut(item) {
+            for nested_item in nested_items {
+                materialized += materialize_remote_source_item(client, nested_item, budget).await?;
+            }
             continue;
         }
-
-        let (media_type, data) = download_remote_multimodal_source(
-            client,
-            &block_type,
-            &url,
-            provided_media_type,
-            budget,
-        )
-        .await?;
-        replace_source_with_base64(item, media_type, data);
-        materialized += 1;
+        materialized += materialize_remote_source_item(client, item, budget).await?;
     }
 
     Ok(materialized)
+}
+
+async fn materialize_remote_source_item(
+    client: &reqwest::Client,
+    item: &mut Value,
+    budget: &mut RemoteMaterializationBudget,
+) -> Result<usize, String> {
+    let Some((block_type, url, provided_media_type)) = remote_source_info(item) else {
+        return Ok(0);
+    };
+    if url.starts_with("data:") {
+        return Ok(0);
+    }
+
+    let (media_type, data) =
+        download_remote_multimodal_source(client, &block_type, &url, provided_media_type, budget)
+            .await?;
+    replace_source_with_base64(item, media_type, data);
+    Ok(1)
 }
 
 fn remote_source_info(item: &Value) -> Option<(String, String, Option<String>)> {
@@ -1197,6 +1236,37 @@ mod tests {
         }));
 
         reject_non_inline_sources(&payload.messages).expect("data URL is inline");
+    }
+
+    #[test]
+    fn tool_result_nested_media_sources_are_counted_and_checked() {
+        let content = json!([
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a.png"}},
+                {"type": "document", "source": {"type": "url", "url": "https://example.invalid/b.pdf"}},
+                {"type": "image", "source": {"type": "url", "url": "data:image/png;base64,iVBORw0KGgo="}}
+            ]},
+            {"type": "image", "source": {"type": "url", "url": "https://example.invalid/c.png"}}
+        ]);
+        assert_eq!(count_remote_content_sources(&content), 3);
+        let error = reject_non_inline_sources_in_content(&content)
+            .expect_err("nested remote sources must be subject to light-mode rules");
+        assert!(error.contains("image source type 'url'"), "{error}");
+
+        let mut nested_png = json!([
+            {"type": "tool_result", "tool_use_id": "toolu_2", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}}
+            ]}
+        ]);
+        assert_eq!(
+            normalize_content_base64_image_media_types(&mut nested_png),
+            1
+        );
+        assert_eq!(
+            nested_png[0]["content"][0]["source"]["media_type"],
+            "image/png"
+        );
     }
 
     #[tokio::test]

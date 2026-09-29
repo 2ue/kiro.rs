@@ -27,6 +27,23 @@ pub(super) fn process_message_content(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                match item.get("type").and_then(|value| value.as_str()) {
+                    Some("document") => {
+                        let document_text = document_block_to_text(item)?;
+                        if !document_text.is_empty() {
+                            text_parts.push(document_text);
+                        }
+                        continue;
+                    }
+                    // Server-tool and `search_result` blocks are rendered from raw JSON: for
+                    // example `search_result.source` is a string, which ContentBlock rejects.
+                    _ => {
+                        if let Some(text) = render_server_tool_block(item) {
+                            text_parts.push(text);
+                            continue;
+                        }
+                    }
+                }
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "text" => {
@@ -41,17 +58,6 @@ pub(super) fn process_message_content(
                                 )
                             })?;
                             images.push(convert_image_source(source)?);
-                        }
-                        "document" => {
-                            let source = block.source.ok_or_else(|| {
-                                ConversionError::UnsupportedContent(
-                                    "document block missing source".to_string(),
-                                )
-                            })?;
-                            let document_text = convert_document_source_to_text(source)?;
-                            if !document_text.is_empty() {
-                                text_parts.push(document_text);
-                            }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) =
@@ -603,18 +609,38 @@ pub(crate) fn infer_document_media_type_from_url(url: &str) -> String {
 }
 
 /// 提取工具结果内容
+///
+/// Claude Code 协议允许 `tool_result.content` 包含 text、image、document、search_result。
+/// Kiro 的 toolResult 只承载文本，所以 document 与顶层一样转换为文本，search_result
+/// 渲染为带来源的文本；其他未知块只保留简短占位，避免把整块 JSON/base64 塞给模型。
 fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             for item in arr {
-                if item.get("type").and_then(|value| value.as_str()) == Some("image") {
-                    parts.push(TOOL_RESULT_IMAGE_PLACEHOLDER.to_string());
-                } else if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
-                } else if !item.is_null() {
-                    parts.push(item.to_string());
+                match item.get("type").and_then(|value| value.as_str()) {
+                    Some("image") => parts.push(TOOL_RESULT_IMAGE_PLACEHOLDER.to_string()),
+                    Some("document") => match document_block_to_text(item) {
+                        Ok(text) if !text.is_empty() => parts.push(text),
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "tool_result document could not be converted");
+                            parts.push(format!("[document omitted: {error}]"));
+                        }
+                    },
+                    Some("search_result") => parts.push(render_search_result_block(item)),
+                    _ => {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            parts.push(text.to_string());
+                        } else if let Some(block_type) =
+                            item.get("type").and_then(|value| value.as_str())
+                        {
+                            parts.push(format!("[{block_type} block omitted]"));
+                        } else if !item.is_null() {
+                            parts.push(item.to_string());
+                        }
+                    }
                 }
             }
             parts.join("\n")
@@ -622,6 +648,166 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
+}
+
+/// Converts a Claude Code `document` block (top-level or nested in a tool_result) to text,
+/// including the `content` source form whose payload is an array of text blocks.
+fn document_block_to_text(item: &serde_json::Value) -> Result<String, ConversionError> {
+    let source = item.get("source").ok_or_else(|| {
+        ConversionError::UnsupportedContent("document block missing source".to_string())
+    })?;
+    let text = if source.get("type").and_then(|value| value.as_str()) == Some("content") {
+        let text = match source.get("content") {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(serde_json::Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if text.is_empty() {
+            return Ok(String::new());
+        }
+        format_document_text("text/plain", text)
+    } else {
+        let block = serde_json::from_value::<ContentBlock>(item.clone()).map_err(|error| {
+            ConversionError::UnsupportedContent(format!("invalid document block: {error}"))
+        })?;
+        let source = block.source.ok_or_else(|| {
+            ConversionError::UnsupportedContent("document block missing source".to_string())
+        })?;
+        convert_document_source_to_text(source)?
+    };
+    let title = item
+        .get("title")
+        .and_then(|value| value.as_str())
+        .filter(|title| !title.trim().is_empty());
+    let context = item
+        .get("context")
+        .and_then(|value| value.as_str())
+        .filter(|context| !context.trim().is_empty());
+    let mut header = String::new();
+    if let Some(title) = title {
+        header.push_str(&format!("Document title: {title}\n"));
+    }
+    if let Some(context) = context {
+        header.push_str(&format!("Document context: {context}\n"));
+    }
+    Ok(format!("{header}{text}"))
+}
+
+const SERVER_TOOL_TEXT_MAX_CHARS: usize = 8_000;
+const SERVER_TOOL_MAX_RESULTS: usize = 20;
+const SERVER_TOOL_FIELD_MAX_CHARS: usize = 512;
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((index, _)) => format!("{}...", &text[..index]),
+        None => text.to_string(),
+    }
+}
+
+/// Renders Claude Code server-tool blocks (web search/fetch) as bounded plain text so replayed
+/// history keeps their context after conversion to Kiro, which has no server-tool block type.
+/// Returns `None` for other block types. `encrypted_content` is never rendered.
+pub(super) fn render_server_tool_block(item: &serde_json::Value) -> Option<String> {
+    let field = |value: &serde_json::Value, key: &str| {
+        truncate_chars(
+            value.get(key).and_then(|v| v.as_str()).unwrap_or_default(),
+            SERVER_TOOL_FIELD_MAX_CHARS,
+        )
+    };
+    let rendered = match item.get("type")?.as_str()? {
+        "server_tool_use" => {
+            let name = field(item, "name");
+            let input = item.get("input").cloned().unwrap_or_default();
+            match input.get("query").and_then(|v| v.as_str()) {
+                Some(query) => format!(
+                    "[{name}] query: {}",
+                    truncate_chars(query, SERVER_TOOL_FIELD_MAX_CHARS)
+                ),
+                None => format!(
+                    "[{name}] input: {}",
+                    truncate_chars(&input.to_string(), SERVER_TOOL_FIELD_MAX_CHARS)
+                ),
+            }
+        }
+        "web_search_tool_result" => match item.get("content") {
+            Some(serde_json::Value::Array(results)) => {
+                let mut lines = vec!["[web_search results]".to_string()];
+                for (index, result) in results.iter().take(SERVER_TOOL_MAX_RESULTS).enumerate() {
+                    let page_age = field(result, "page_age");
+                    lines.push(format!(
+                        "{}. {} - {}{}",
+                        index + 1,
+                        field(result, "title"),
+                        field(result, "url"),
+                        if page_age.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({page_age})")
+                        }
+                    ));
+                }
+                if results.len() > SERVER_TOOL_MAX_RESULTS {
+                    lines.push(format!(
+                        "... {} more results omitted",
+                        results.len() - SERVER_TOOL_MAX_RESULTS
+                    ));
+                }
+                lines.join("\n")
+            }
+            Some(error) => format!("[web_search error: {}]", field(error, "error_code")),
+            None => "[web_search results]".to_string(),
+        },
+        "web_fetch_tool_result" => {
+            let content = item.get("content").cloned().unwrap_or_default();
+            let url = field(&content, "url");
+            let document = content
+                .get("content")
+                .filter(|document| {
+                    document.get("type").and_then(|v| v.as_str()) == Some("document")
+                })
+                .and_then(|document| document_block_to_text(document).ok())
+                .unwrap_or_default();
+            if let Some(code) = content.get("error_code").and_then(|v| v.as_str()) {
+                format!("[web_fetch error: {code}]")
+            } else {
+                format!("[web_fetch {url}]\n{document}")
+            }
+        }
+        "search_result" => render_search_result_block(item),
+        _ => return None,
+    };
+    Some(truncate_chars(&rendered, SERVER_TOOL_TEXT_MAX_CHARS))
+}
+
+/// Renders a Claude Code `search_result` block as plain text with its source and title.
+fn render_search_result_block(item: &serde_json::Value) -> String {
+    let source = item
+        .get("source")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let title = item
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let body = match item.get("content") {
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        _ => String::new(),
+    };
+    format!(
+        "<search_result source=\"{}\" title=\"{}\">\n{}\n</search_result>",
+        source.replace('"', "&quot;"),
+        title.replace('"', "&quot;"),
+        body
+    )
 }
 
 fn extract_tool_result_images(

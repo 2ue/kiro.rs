@@ -430,6 +430,13 @@ fn materialize_file_sources_in_content(
 
     let mut materialized = 0usize;
     for item in items {
+        // Media blocks nested in `tool_result.content` use the same file materialization.
+        if item.get("type").and_then(Value::as_str) == Some("tool_result") {
+            if let Some(nested) = item.get_mut("content").filter(|content| content.is_array()) {
+                materialized += materialize_file_sources_in_content(store, nested, budget)?;
+            }
+            continue;
+        }
         let Some(obj) = item.as_object_mut() else {
             continue;
         };
@@ -587,6 +594,35 @@ mod tests {
         assert_eq!(messages[0].content[0]["source"]["type"], "base64");
         assert_eq!(messages[0].content[0]["source"]["media_type"], "image/png");
         assert!(messages[0].content[0]["source"]["data"].as_str().is_some());
+    }
+
+    #[test]
+    fn materializes_file_source_nested_in_tool_result() {
+        let store = AnthropicFileStore::default();
+        let file = store
+            .insert(
+                "shot.png",
+                "image/png",
+                vec![
+                    0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 0,
+                ],
+            )
+            .unwrap();
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{"type": "image", "source": {"type": "file", "file_id": file.id}}]
+            }]),
+        }];
+
+        let count = materialize_file_sources(&store, &mut messages).unwrap();
+
+        assert_eq!(count, 1);
+        let source = &messages[0].content[0]["content"][0]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["media_type"], "image/png");
     }
 
     #[test]
