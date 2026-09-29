@@ -5184,6 +5184,31 @@ impl MultiTokenManager {
         self.has_alternate_usable_credential_from_current_state(model, excluded_ids, current_id)
     }
 
+    /// 汇总当前可用凭据（未禁用、未被额度快照拦截）明确列出的模型目录。
+    ///
+    /// 只要有一个可用凭据目录为空（未发现或发现失败），就无法断言"所有可用账号都不支持"，
+    /// 返回 `None`；没有可用凭据时同样返回 `None`。
+    pub fn usable_explicit_model_catalog(&self) -> Option<Vec<String>> {
+        let entries = self.entries.lock();
+        let mut catalog = Vec::new();
+        let mut any_usable = false;
+        for entry in entries
+            .iter()
+            .filter(|entry| !entry.disabled && !entry.account_quota_blocked)
+        {
+            if entry.credentials.supported_models.is_empty() {
+                return None;
+            }
+            any_usable = true;
+            for model in &entry.credentials.supported_models {
+                if !catalog.contains(model) {
+                    catalog.push(model.clone());
+                }
+            }
+        }
+        any_usable.then_some(catalog)
+    }
+
     /// 判断当前本机内存态中是否还有其他"模型目录明确列出该模型"的可调度凭据。
     ///
     /// 目录为空的凭据不算：它们只是"未知是否支持"，不能作为 invalid-model 换号的依据。

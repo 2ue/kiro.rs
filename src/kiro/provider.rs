@@ -7924,6 +7924,11 @@ impl KiroProvider {
         self.token_manager.local_pool_route_state_fresh(model)
     }
 
+    /// See [`MultiTokenManager::usable_explicit_model_catalog`].
+    pub fn usable_explicit_model_catalog(&self) -> Option<Vec<String>> {
+        self.token_manager.usable_explicit_model_catalog()
+    }
+
     pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
         self.token_manager.local_pool_route_state_cached(model)
     }

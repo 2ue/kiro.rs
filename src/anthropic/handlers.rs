@@ -54,8 +54,8 @@ use super::inference_attempt_budget::{
 };
 use super::middleware::AppState;
 use super::model_capabilities::{
-    KiroReasoningCapabilityState, ModelResolution, ModelResolutionSource,
-    strip_model_compat_suffixes,
+    KiroReasoningCapabilityState, ModelResolution, ModelResolutionSource, is_known_anthropic_model,
+    resolve_model_with_catalog_mapping_and_mode, strip_model_compat_suffixes,
 };
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
@@ -5870,6 +5870,16 @@ fn resolve_request_model(
             envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE,
         ));
     }
+    let usable_catalog = state
+        .kiro_provider
+        .as_ref()
+        .and_then(|provider| provider.usable_explicit_model_catalog());
+    let resolution = remap_known_model_for_usable_catalog(
+        resolution,
+        usable_catalog.as_deref(),
+        runtime_config,
+        endpoint,
+    );
 
     if let Some(upstream_model) = resolution.upstream_model.as_deref() {
         let (_, requested_thinking) = strip_model_compat_suffixes(&resolution.requested_model);
@@ -5906,6 +5916,56 @@ fn resolve_request_model(
     }
 
     Ok(resolution)
+}
+
+/// The merged catalog can list a model that only unusable credentials (disabled, quota
+/// blocked) serve. When every usable credential has an explicit catalog and none lists the
+/// resolved model, a known Anthropic model or Claude Code alias is re-resolved against the
+/// usable catalogs so it lands on the closest same-family model instead of failing. Unknown
+/// models, and pools with any unknown-catalog credential, keep the original resolution.
+fn remap_known_model_for_usable_catalog(
+    resolution: ModelResolution,
+    usable_catalog: Option<&[String]>,
+    runtime_config: &RequestRuntimeConfig,
+    endpoint: &str,
+) -> ModelResolution {
+    let (Some(catalog), Some(upstream_model)) =
+        (usable_catalog, resolution.upstream_model.as_deref())
+    else {
+        return resolution;
+    };
+    if !is_known_anthropic_model(&resolution.requested_model)
+        || crate::model::model_support::model_is_supported_by_list(catalog, &[Some(upstream_model)])
+    {
+        return resolution;
+    }
+    let remapped = resolve_model_with_catalog_mapping_and_mode(
+        &resolution.requested_model,
+        catalog,
+        runtime_config.model_resolution_mode,
+        &runtime_config.model_mapping,
+    );
+    let Some(remapped_model) = remapped.upstream_model.clone().filter(|model| {
+        crate::model::model_support::model_is_supported_by_list(catalog, &[Some(model.as_str())])
+    }) else {
+        return resolution;
+    };
+    tracing::warn!(
+        endpoint,
+        requested_model = %resolution.requested_model,
+        original_upstream_model = %upstream_model,
+        upstream_model = %remapped_model,
+        "可用账号均不支持解析出的模型，改用可用账号目录中最接近的同族模型"
+    );
+    ModelResolution {
+        note: Some(format!(
+            "{} -> {} (no usable account serves {}; closest same-family model)",
+            resolution.requested_model, remapped_model, upstream_model
+        )),
+        requested_model: resolution.requested_model,
+        upstream_model: Some(remapped_model),
+        source: ModelResolutionSource::FamilyNormalized,
+    }
 }
 
 fn external_route_model_resolution(mut resolution: ModelResolution) -> ModelResolution {

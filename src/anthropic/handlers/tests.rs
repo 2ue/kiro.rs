@@ -12239,3 +12239,91 @@ fn remote_url_safety_rejects_local_and_private_targets() {
         );
     }
 }
+
+#[test]
+fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_five_rounds() {
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(10)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.98,
+        CompatProfile::ClaudeCode,
+        false,
+    );
+    let runtime_config = RequestRuntimeConfig::from_app_state(&state);
+    let usable = vec![
+        "claude-sonnet-4.6".to_string(),
+        "claude-opus-4.6".to_string(),
+        "claude-haiku-4.5".to_string(),
+    ];
+    let resolved = |requested: &str, upstream: &str| {
+        ModelResolution::resolved(
+            requested.to_string(),
+            upstream.to_string(),
+            ModelResolutionSource::Alias,
+        )
+    };
+    for round in 0..5 {
+        // Known alias / explicit known versions that only an unusable credential serves.
+        for (requested, upstream, expected) in [
+            ("sonnet", "claude-sonnet-5", "claude-sonnet-4.6"),
+            ("sonnet-thinking", "claude-sonnet-5", "claude-sonnet-4.6"),
+            ("claude-opus-4-8", "claude-opus-4.8", "claude-opus-4.6"),
+            (
+                "claude-opus-4-8-thinking",
+                "claude-opus-4.8",
+                "claude-opus-4.6",
+            ),
+        ] {
+            let result = remap_known_model_for_usable_catalog(
+                resolved(requested, upstream),
+                Some(&usable),
+                &runtime_config,
+                "/cc/v1/messages",
+            );
+            assert_eq!(
+                result.upstream_model.as_deref(),
+                Some(expected),
+                "round {round}: {requested}"
+            );
+            assert_eq!(result.source, ModelResolutionSource::FamilyNormalized);
+            assert_eq!(result.requested_model, requested);
+            assert!(result.note.unwrap().contains(upstream));
+        }
+
+        // Completely unknown models are left for the upstream (and the 404 mapping).
+        let unknown = remap_known_model_for_usable_catalog(
+            ModelResolution::pass_through("claude-foo-9-9".to_string()),
+            Some(&usable),
+            &runtime_config,
+            "/cc/v1/messages",
+        );
+        assert_eq!(unknown.source, ModelResolutionSource::PassThrough);
+        assert_eq!(unknown.upstream_model.as_deref(), Some("claude-foo-9-9"));
+
+        // A usable credential already lists the model: nothing changes.
+        let served = remap_known_model_for_usable_catalog(
+            resolved("sonnet", "claude-sonnet-4.6"),
+            Some(&usable),
+            &runtime_config,
+            "/cc/v1/messages",
+        );
+        assert_eq!(served.upstream_model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(served.source, ModelResolutionSource::Alias);
+
+        // Unknown-catalog credentials might serve it, so the resolution is kept.
+        let unknown_catalog = remap_known_model_for_usable_catalog(
+            resolved("sonnet", "claude-sonnet-5"),
+            None,
+            &runtime_config,
+            "/cc/v1/messages",
+        );
+        assert_eq!(
+            unknown_catalog.upstream_model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+}

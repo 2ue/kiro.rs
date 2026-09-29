@@ -1244,17 +1244,33 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
         );
     }
 
-    if is_explicit_claude_minor_version(&base) {
-        // An explicit Claude minor version is a contract selection, not a
-        // family alias. If the exact version (or its dash/dot spelling) is
-        // unavailable, pass it through so the upstream can report the real
-        // capability error. Silent fallback to another minor version changes
-        // limits, reasoning support, and request semantics.
+    if !model_mapping.auto_generate_rules {
         return ModelResolution::pass_through(requested);
     }
 
-    if !model_mapping.auto_generate_rules {
-        return ModelResolution::pass_through(requested);
+    if let Some(requested_version) = parse_claude_minor_version(&base) {
+        // An explicit Claude minor version is a contract selection, not a family alias, so
+        // an unrecognized version (typo, invented id) passes through and the upstream reports
+        // the real error. A version this project knows as a real Anthropic model that no
+        // catalog account serves is mapped to the closest same-family model instead, keeping
+        // the Claude Code session alive; the note records the substitution.
+        if !is_known_anthropic_model(&base) {
+            return ModelResolution::pass_through(requested);
+        }
+        return match pick_closest_family_version(&available, requested_version) {
+            Some(candidate) => {
+                let mut resolution = ModelResolution::resolved(
+                    requested,
+                    candidate,
+                    ModelResolutionSource::FamilyNormalized,
+                );
+                resolution.note = resolution.note.map(|note| {
+                    format!("{note} (known model unavailable; closest same-family model)")
+                });
+                resolution
+            }
+            None => ModelResolution::pass_through(requested),
+        };
     }
 
     if let Some(candidate) = family_model_candidates(&base)
@@ -1387,10 +1403,6 @@ struct ClaudeMinorVersion {
     has_date_suffix: bool,
 }
 
-fn is_explicit_claude_minor_version(model: &str) -> bool {
-    parse_claude_minor_version(model).is_some()
-}
-
 fn pick_configured_mapping_rule(
     model_mapping: &ModelMappingConfig,
     requested: &str,
@@ -1510,6 +1522,78 @@ fn has_date_suffix(rest: &str) -> bool {
     };
     let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
     digits >= 6
+}
+
+/// Claude family/major/minor versions of real Anthropic models this project ships knowledge
+/// of (the static model list and the built-in Kiro seed catalog).
+fn known_anthropic_versions() -> &'static HashSet<(&'static str, u32, u32)> {
+    static KNOWN: std::sync::OnceLock<HashSet<(&'static str, u32, u32)>> =
+        std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        static_anthropic_models()
+            .into_iter()
+            .map(|model| model.id)
+            .chain(seed_model_capabilities().into_iter().map(|item| item.model))
+            .chain(
+                LEGACY_ALIAS_TABLE_MODELS
+                    .iter()
+                    .map(|model| model.to_string()),
+            )
+            .filter_map(|model| parse_claude_minor_version(&model))
+            .map(|version| (version.family, version.major, version.minor))
+            .collect()
+    })
+}
+
+/// Dated Anthropic ids that only appear as keys of the explicit alias table.
+const LEGACY_ALIAS_TABLE_MODELS: [&str; 1] = ["claude-opus-4-1-20250805"];
+
+/// "Known but unavailable" versus "completely unknown": a model is known when it is a Claude
+/// Code alias (`sonnet`, `opus`, `default`, ...), a legacy id from the explicit alias table,
+/// or its explicit Claude version matches a model in the static list, seed catalog or alias
+/// table in any spelling (`claude-opus-4-8`, `claude-opus-4.8`, dated, `-thinking`, `[1m]`).
+/// Anything else, including invented versions of a real family such as `claude-sonnet-4-7`,
+/// is unknown and keeps passing through so the upstream reports it.
+pub(crate) fn is_known_anthropic_model(model: &str) -> bool {
+    let (base, _) = strip_model_compat_suffixes(model);
+    explicit_model_alias_families(&base).is_some()
+        || explicit_model_alias_candidates(&base).is_some()
+        || parse_claude_minor_version(&base).is_some_and(|version| {
+            known_anthropic_versions().contains(&(version.family, version.major, version.minor))
+        })
+}
+
+/// Closest same-family model in `available` by version distance; ties prefer the newer
+/// version. Base models win over `-thinking` variants because thinking controls travel
+/// separately.
+fn pick_closest_family_version(
+    available: &HashSet<String>,
+    requested: ClaudeMinorVersion,
+) -> Option<String> {
+    let requested_rank = i64::from(requested.major) * 1_000 + i64::from(requested.minor);
+    available
+        .iter()
+        .filter_map(|candidate| {
+            let version = parse_claude_minor_version(candidate)?;
+            (version.family == requested.family).then_some((candidate, version))
+        })
+        .max_by(|(a, a_version), (b, b_version)| {
+            let rank = |version: &ClaudeMinorVersion| {
+                i64::from(version.major) * 1_000 + i64::from(version.minor)
+            };
+            let key = |model: &str, version: &ClaudeMinorVersion| {
+                (
+                    !model.ends_with("-thinking"),
+                    -(rank(version) - requested_rank).abs(),
+                    rank(version),
+                    version_equivalent_score(model, *version, false),
+                )
+            };
+            key(a, a_version)
+                .cmp(&key(b, b_version))
+                .then_with(|| b.cmp(a))
+        })
+        .map(|(candidate, _)| candidate.clone())
 }
 
 fn explicit_model_alias_families(model: &str) -> Option<Vec<&'static str>> {
@@ -2462,18 +2546,20 @@ mod tests {
             }),
             ..Default::default()
         }]);
+        // Known Sonnet 4.6 is absent from the free catalog: it maps to the closest same-family
+        // model, and the context window follows that real upstream model.
         let normalized = free_catalog.resolve_model("claude-sonnet-4-6");
-        assert_eq!(normalized.source, ModelResolutionSource::PassThrough);
+        assert_eq!(normalized.source, ModelResolutionSource::FamilyNormalized);
         assert_eq!(
             normalized.upstream_model.as_deref(),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-4.5")
         );
         assert_eq!(
             normalized
                 .upstream_model
                 .as_deref()
                 .and_then(|model| free_catalog.max_input_tokens_for(model)),
-            None
+            Some(200_000)
         );
     }
 
@@ -2699,17 +2785,85 @@ mod tests {
     }
 
     #[test]
-    fn resolver_does_not_downgrade_explicit_minor_versions_to_older_family_models() {
+    fn resolver_maps_known_unavailable_minor_versions_to_closest_family_model() {
         let models = vec!["claude-opus-4.5".to_string(), "claude-opus-4.6".to_string()];
 
+        // claude-opus-4.8 is a known model (static list / seed) that this catalog lacks.
         let result = resolve_model_with_catalog("claude-opus-4-8", &models);
 
-        assert_eq!(result.source, ModelResolutionSource::PassThrough);
-        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(result.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4.6"));
+        assert!(result.note.unwrap().contains("closest same-family"));
     }
 
     #[test]
-    fn resolver_does_not_silently_downgrade_explicit_sonnet_46_for_free_pool() {
+    fn resolver_keeps_unknown_minor_versions_for_upstream_rejection() {
+        let models = vec![
+            "claude-opus-4.5".to_string(),
+            "claude-sonnet-4.6".to_string(),
+        ];
+
+        for requested in [
+            "claude-sonnet-4-7",
+            "claude-sonnet-4-7-thinking",
+            "claude-opus-4-9",
+            "claude-haiku-4-6",
+        ] {
+            let result = resolve_model_with_catalog(requested, &models);
+            assert_eq!(
+                result.source,
+                ModelResolutionSource::PassThrough,
+                "{requested}"
+            );
+            assert_eq!(result.upstream_model.as_deref(), Some(requested));
+        }
+        for requested in ["claude-foo-9-9", "claude-fable-5-1", "gpt-4o"] {
+            let result = resolve_model_with_catalog(requested, &models);
+            assert_eq!(
+                result.source,
+                ModelResolutionSource::PassThrough,
+                "{requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_anthropic_model_distinguishes_known_from_invented_ids() {
+        for known in [
+            "sonnet",
+            "opus-thinking",
+            "haiku[1m]",
+            "default",
+            "claude-opus-4-8",
+            "claude-opus-4.8-thinking",
+            "claude-sonnet-4-6[1m]",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5-thinking",
+            "claude-opus-4-1",
+            "claude-opus-4-1-20250805",
+            "claude-sonnet-4-20250514",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert!(is_known_anthropic_model(known), "{known} should be known");
+        }
+        for unknown in [
+            "claude-foo-9-9",
+            "claude-fable-5-1",
+            "claude-sonnet-4-7",
+            "claude-opus-9-9",
+            "gpt-4o",
+            "",
+        ] {
+            assert!(
+                !is_known_anthropic_model(unknown),
+                "{unknown} should be unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_maps_known_sonnet_46_to_closest_free_pool_model() {
         let models = vec![
             "auto".to_string(),
             "claude-haiku-4.5".to_string(),
@@ -2719,21 +2873,20 @@ mod tests {
             "glm-5".to_string(),
         ];
 
-        let dashed = resolve_model_with_catalog("claude-sonnet-4-6", &models);
-        assert_eq!(dashed.source, ModelResolutionSource::PassThrough);
-        assert_eq!(dashed.upstream_model.as_deref(), Some("claude-sonnet-4-6"));
-
-        let dotted = resolve_model_with_catalog("claude-sonnet-4.6", &models);
-        assert_eq!(dotted.source, ModelResolutionSource::PassThrough);
-        assert_eq!(dotted.upstream_model.as_deref(), Some("claude-sonnet-4.6"));
-
-        let thinking = resolve_model_with_catalog("claude-sonnet-4-6-thinking", &models);
-        assert_eq!(thinking.source, ModelResolutionSource::PassThrough);
-        assert_eq!(thinking.requested_model, "claude-sonnet-4-6-thinking");
-        assert_eq!(
-            thinking.upstream_model.as_deref(),
-            Some("claude-sonnet-4-6-thinking")
-        );
+        for requested in [
+            "claude-sonnet-4-6",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4-6-thinking",
+        ] {
+            let result = resolve_model_with_catalog(requested, &models);
+            assert_eq!(
+                result.source,
+                ModelResolutionSource::FamilyNormalized,
+                "{requested}"
+            );
+            assert_eq!(result.requested_model, requested);
+            assert_eq!(result.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
+        }
     }
 
     #[test]
