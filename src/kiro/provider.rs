@@ -5404,7 +5404,11 @@ mod tests {
                 "model_unavailable_bad_request",
                 Some("model_unavailable_retry_next"),
             ),
-            ("invalid_model", "model_invalid_bad_request", None),
+            (
+                "invalid_model",
+                "model_invalid_bad_request",
+                Some("model_unavailable_retry_next"),
+            ),
             (
                 "invalid_model_404",
                 "model_invalid_bad_request",
@@ -5446,7 +5450,12 @@ mod tests {
                         prompt_logic_retry_enabled,
                     )
                     .await;
-                    let expected_hits = if retry_action.is_some() && pool_size > 1 {
+                    let expected_hits = if pool_size == 1 {
+                        1
+                    } else if scenario == "invalid_model" {
+                        // One alternate credential for a 400 invalid model.
+                        2
+                    } else if retry_action.is_some() {
                         4
                     } else {
                         1
@@ -12786,9 +12795,10 @@ impl KiroProvider {
                     self.finish_attempt(&mut ctx);
                     return Err(Self::traced_error(message, &attempts));
                 }
-                if Self::should_retry_model_unavailable_bad_request(
+                if Self::should_retry_model_400_bad_request(
                     bad_request_reason,
                     model.as_deref(),
+                    attempt,
                 ) && attempt + 1 < max_retries
                     && self.token_manager.has_alternate_usable_credential_cached(
                         model.as_deref(),
@@ -13769,6 +13779,22 @@ impl KiroProvider {
     fn should_retry_model_unavailable_bad_request(reason: &str, model: Option<&str>) -> bool {
         reason == "model_unavailable_bad_request"
             && model.map(str::trim).is_some_and(|value| !value.is_empty())
+    }
+
+    /// 400 retry policy for model rejections. "Model unavailable" is account/region specific and
+    /// may move to every alternate credential. "Invalid model" is usually deterministic, but a
+    /// newer model can exist only on some accounts (for example a model that appears in the
+    /// catalog after a new account is imported), so it gets exactly one alternate credential.
+    /// The transient model failure recorded for the rejecting credential steers later requests.
+    fn should_retry_model_400_bad_request(
+        reason: &str,
+        model: Option<&str>,
+        attempt: usize,
+    ) -> bool {
+        Self::should_retry_model_unavailable_bad_request(reason, model)
+            || (reason == "model_invalid_bad_request"
+                && attempt == 0
+                && model.map(str::trim).is_some_and(|value| !value.is_empty()))
     }
 
     fn should_retry_model_404_bad_request(reason: &str, model: Option<&str>) -> bool {
