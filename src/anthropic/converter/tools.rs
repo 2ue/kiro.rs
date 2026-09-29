@@ -25,6 +25,8 @@ const PLACEHOLDER_TOOL_DESCRIPTION: &str = "Tool used in conversation history";
 const UNAVAILABLE_PLACEHOLDER_TOOL_DESCRIPTION: &str =
     "Tool used earlier in this conversation. It is NOT available in this turn: do not call it.";
 
+const TOOL_CHOICE_PARALLEL_DISABLED_PREFIX: &str = "<tool_choice_parallel>disabled</tool_choice_parallel><tool_choice_policy>Call at most one tool in this turn. Do not issue several tool calls in the same response.</tool_choice_policy>";
+
 const TOOL_CHOICE_NONE_PREFIX: &str = "<tool_choice>none</tool_choice><tool_choice_policy>Do not call any tool in this turn, including tools used earlier in this conversation. Respond with text only.</tool_choice_policy>";
 
 /// 追加到系统提示词的分块写入策略
@@ -517,7 +519,26 @@ pub(super) fn generate_tool_choice_prefix(
         return None;
     }
 
-    match parse_tool_choice(&req.tool_choice) {
+    let directive = parse_tool_choice(&req.tool_choice);
+    let parallel_disabled = directive != ToolChoiceDirective::None
+        && request_declares_tools(req)
+        && parallel_tool_use_disabled(&req.tool_choice);
+    let prefix = tool_choice_directive_prefix(req, directive, tool_name_map);
+    if !parallel_disabled {
+        return prefix;
+    }
+    Some(match prefix {
+        Some(prefix) => format!("{prefix}{TOOL_CHOICE_PARALLEL_DISABLED_PREFIX}"),
+        None => TOOL_CHOICE_PARALLEL_DISABLED_PREFIX.to_string(),
+    })
+}
+
+fn tool_choice_directive_prefix(
+    req: &MessagesRequest,
+    directive: ToolChoiceDirective,
+    tool_name_map: &HashMap<String, String>,
+) -> Option<String> {
+    match directive {
         ToolChoiceDirective::Any => Some(
             "<tool_choice>any</tool_choice><tool_choice_policy>Use at least one available tool in this turn when a tool can satisfy the request.</tool_choice_policy>"
                 .to_string(),
@@ -540,6 +561,26 @@ pub(super) fn generate_tool_choice_prefix(
         }
         _ => None,
     }
+}
+
+/// Anthropic `tool_choice.disable_parallel_tool_use`（auto/any/tool 均可携带）。
+fn parallel_tool_use_disabled(tool_choice: &Option<serde_json::Value>) -> bool {
+    tool_choice
+        .as_ref()
+        .and_then(|value| value.get("disable_parallel_tool_use"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Kiro 没有并行工具调用开关：请求要求禁用并行时，响应侧最多保留一个 tool_use。
+pub(super) fn max_response_tool_uses(
+    req: &MessagesRequest,
+    options: &ConverterOptions,
+) -> Option<usize> {
+    (options.tool_choice_steering_enabled()
+        && parse_tool_choice(&req.tool_choice) != ToolChoiceDirective::None
+        && parallel_tool_use_disabled(&req.tool_choice))
+    .then_some(1)
 }
 
 fn request_declares_tools(req: &MessagesRequest) -> bool {

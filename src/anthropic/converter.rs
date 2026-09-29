@@ -66,7 +66,8 @@ use tools::{
 };
 use tools::{
     collect_history_tool_names, convert_tools, create_placeholder_tool,
-    create_unavailable_placeholder_tool, summarize_tool_name_mapping, tools_unavailable_this_turn,
+    create_unavailable_placeholder_tool, max_response_tool_uses, summarize_tool_name_mapping,
+    tools_unavailable_this_turn,
 };
 
 pub(crate) fn deterministic_mapped_tool_name(name: &str) -> String {
@@ -532,6 +533,9 @@ fn convert_request_with_model_id(
         .collect();
     let tools_unavailable = tools_unavailable_this_turn(req, &options);
     let mut response_tool_policy = ResponseToolPolicy::default();
+    if let Some(max) = max_response_tool_uses(req, &options) {
+        response_tool_policy.limit_tool_uses(max);
+    }
 
     if options.conversion.history_placeholder_tools.is_enabled() || options.is_strict() {
         for tool_name in history_tool_names {
@@ -4230,6 +4234,53 @@ mod tests {
         );
         assert!(!result.response_tool_policy.is_unavailable("Bash"));
         assert!(!history_has_tool_choice_none_prompt(&result));
+    }
+
+    #[test]
+    fn disable_parallel_tool_use_injects_prompt_and_limits_response_tool_uses() {
+        for tool_choice in [
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": true}),
+            serde_json::json!({"type": "any", "disable_parallel_tool_use": true}),
+            serde_json::json!({"type": "tool", "name": "read_file", "disable_parallel_tool_use": true}),
+        ] {
+            let req = base_tool_choice_request(tool_choice.clone());
+            let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+
+            assert_eq!(
+                result.response_tool_policy.max_tool_uses(),
+                Some(1),
+                "{tool_choice}"
+            );
+            assert!(
+                result
+                    .conversation_state
+                    .history
+                    .iter()
+                    .any(|message| matches!(
+                        message,
+                        Message::User(user)
+                            if user
+                                .user_input_message
+                                .content
+                                .contains("<tool_choice_parallel>disabled</tool_choice_parallel>")
+                    )),
+                "{tool_choice}"
+            );
+        }
+
+        for tool_choice in [
+            serde_json::json!({"type": "auto"}),
+            serde_json::json!({"type": "auto", "disable_parallel_tool_use": false}),
+            serde_json::json!({"type": "none", "disable_parallel_tool_use": true}),
+        ] {
+            let req = base_tool_choice_request(tool_choice.clone());
+            let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+            assert_eq!(
+                result.response_tool_policy.max_tool_uses(),
+                None,
+                "{tool_choice}"
+            );
+        }
     }
 
     #[test]

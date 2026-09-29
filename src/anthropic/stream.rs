@@ -8175,4 +8175,59 @@ mod tests {
         assert!(tool_use_start_names(&events).is_empty());
         assert_ne!(final_stop_reason(&events).as_deref(), Some("tool_use"));
     }
+
+    #[test]
+    fn disabled_parallel_tool_use_streams_only_the_first_tool_call() {
+        let mut policy = ResponseToolPolicy::default();
+        policy.limit_tool_uses(1);
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "claude-sonnet-4.6",
+            100,
+            false,
+            HashMap::new(),
+            HashSet::from(["Read".to_string()]),
+        );
+        ctx.set_response_tool_policy(&policy);
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&tool_use_fragment(
+            "toolu_1",
+            "Read",
+            "{\"file_path\":\"a\"}",
+            false,
+        )));
+        // The second call starts while the first is still open, then both complete.
+        events.extend(ctx.process_kiro_event(&tool_use_fragment(
+            "toolu_2",
+            "Read",
+            "{\"file_path\":\"b\"}",
+            true,
+        )));
+        events.extend(ctx.process_kiro_event(&tool_use_fragment("toolu_1", "Read", "", true)));
+        events.extend(ctx.generate_final_events());
+
+        let starts = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].data["content_block"]["id"], "toolu_1");
+        let index = starts[0].data["index"].clone();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "content_block_stop" && event.data["index"] == index),
+            "the admitted tool block must be closed"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data["delta"]["partial_json"] == "{\"file_path\":\"b\"}"),
+            "dropped call input must not leak downstream"
+        );
+        assert_eq!(final_stop_reason(&events).as_deref(), Some("tool_use"));
+        assert_eq!(ctx.response_tool_gate().dropped_count(), 1);
+    }
 }

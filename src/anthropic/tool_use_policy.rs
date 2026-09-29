@@ -15,6 +15,8 @@ use serde_json::Value;
 pub(crate) struct ResponseToolPolicy {
     /// Lower-cased tool names (Kiro-side and client-side) that must not be called this turn.
     unavailable_tool_names: HashSet<String>,
+    /// Maximum number of tool calls forwarded downstream (`disable_parallel_tool_use` → 1).
+    max_tool_uses: Option<usize>,
 }
 
 impl ResponseToolPolicy {
@@ -24,6 +26,15 @@ impl ResponseToolPolicy {
             self.unavailable_tool_names
                 .insert(name.to_ascii_lowercase());
         }
+    }
+
+    pub(crate) fn limit_tool_uses(&mut self, max: usize) {
+        self.max_tool_uses = Some(max);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_tool_uses(&self) -> Option<usize> {
+        self.max_tool_uses
     }
 
     pub(crate) fn is_unavailable(&self, name: &str) -> bool {
@@ -43,12 +54,15 @@ impl ResponseToolPolicy {
 pub(crate) enum ToolUseDropReason {
     /// The tool only exists as a history placeholder; the client offered no such tool this turn.
     UnavailableTool,
+    /// The client set `disable_parallel_tool_use` and an earlier call was already forwarded.
+    ParallelDisabled,
 }
 
 impl ToolUseDropReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::UnavailableTool => "unavailable_tool",
+            Self::ParallelDisabled => "parallel_tool_use_disabled",
         }
     }
 }
@@ -69,10 +83,17 @@ impl ResponseToolGate {
         if let Some(&admitted) = self.decisions.get(tool_use_id) {
             return admitted;
         }
-        let reason = self
+        let reason = if self.policy.is_unavailable(name) {
+            Some(ToolUseDropReason::UnavailableTool)
+        } else if self
             .policy
-            .is_unavailable(name)
-            .then_some(ToolUseDropReason::UnavailableTool);
+            .max_tool_uses
+            .is_some_and(|max| self.admitted >= max)
+        {
+            Some(ToolUseDropReason::ParallelDisabled)
+        } else {
+            None
+        };
         let admitted = reason.is_none();
         if let Some(reason) = reason {
             tracing::warn!(
@@ -137,6 +158,30 @@ mod tests {
         assert!(!gate.admit("toolu_1", "bash"));
         assert!(gate.admit("toolu_2", "Read"));
         assert_eq!(gate.dropped_count(), 1);
+    }
+
+    #[test]
+    fn disabled_parallel_tool_use_keeps_only_the_first_call() {
+        let mut policy = ResponseToolPolicy::default();
+        policy.limit_tool_uses(1);
+        let mut gate = policy.gate();
+
+        assert!(gate.admit("toolu_1", "Read"));
+        // Continuation fragments of the admitted call stay admitted.
+        assert!(gate.admit("toolu_1", "Read"));
+        assert!(!gate.admit("toolu_2", "Read"));
+        assert!(!gate.admit("toolu_3", "Bash"));
+        assert_eq!(gate.dropped_count(), 2);
+
+        let mut content = vec![
+            json!({"type": "text", "text": "reading"}),
+            json!({"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "a"}}),
+            json!({"type": "tool_use", "id": "b", "name": "Read", "input": {"file_path": "b"}}),
+        ];
+        let mut gate = policy.gate();
+        assert_eq!(gate.retain_admitted_tool_use_blocks(&mut content), 1);
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["id"], "a");
     }
 
     #[test]
