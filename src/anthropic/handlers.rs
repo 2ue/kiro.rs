@@ -6033,6 +6033,46 @@ fn merge_warning_headers(
     (!warnings.is_empty()).then(|| warnings.join(","))
 }
 
+/// 当前轮图片超过上游大小限制时的官方风格 400 响应。
+fn current_image_too_large_response(
+    violation: &super::payload_guard::CurrentImageTooLarge,
+) -> Response {
+    let mut response = envelope::error_response(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        violation.message(),
+    );
+    response.headers_mut().insert(
+        "x-should-retry",
+        axum::http::HeaderValue::from_static("false"),
+    );
+    response
+}
+
+fn reject_oversized_current_image(
+    payload: &MessagesRequest,
+    attribution: Option<&RequestRejectionAttribution>,
+    endpoint: &str,
+) -> Option<Response> {
+    let violation = super::payload_guard::find_oversized_current_image(payload)?;
+    tracing::warn!(
+        path = %violation.path,
+        image_bytes = violation.bytes,
+        max_bytes = violation.max_bytes,
+        "rejecting request: current-turn image exceeds upstream size limit"
+    );
+    let response = current_image_too_large_response(&violation);
+    record_pre_usage_rejection_for_request(
+        attribution,
+        RequestRejectionReason::MultimodalInvalid,
+        endpoint,
+        &response,
+        payload,
+        None,
+    );
+    Some(response)
+}
+
 fn payload_guard_error_response(err: PayloadGuardError) -> Response {
     match err {
         PayloadGuardError::Serialize(_message) => envelope::error_response(
@@ -6543,6 +6583,12 @@ async fn post_messages_inner(
         runtime_config.compat_profile,
         &runtime_config.prompt_steering,
     );
+    // 当前轮超大图片对所有路由一致地返回 400（历史超大图片仍由 payload guard 占位处理）。
+    if let Some(response) =
+        reject_oversized_current_image(&payload, attribution.as_ref(), &endpoint)
+    {
+        return response;
+    }
     let local_route_allowed = runtime_config
         .external_pools
         .local_pool_route_allowed(&endpoint);
@@ -6614,6 +6660,12 @@ async fn post_messages_inner(
             return response;
         }
     };
+    // 远程 / file 图片源在上面物化为 base64 后再检查一次。
+    if let Some(response) =
+        reject_oversized_current_image(&payload, attribution.as_ref(), &endpoint)
+    {
+        return response;
+    }
 
     if prompt_steering_for_external {
         super::prompt_steering::apply_to_messages_request(

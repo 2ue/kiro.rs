@@ -12384,3 +12384,31 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
         );
     }
 }
+
+#[tokio::test]
+async fn oversized_current_image_response_is_official_400_without_retry() {
+    let violation = crate::anthropic::payload_guard::CurrentImageTooLarge {
+        path: "messages.0.content.1.image.source.base64".to_string(),
+        bytes: 5_763_023,
+        max_bytes: 5_242_880,
+    };
+    let response = current_image_too_large_response(&violation);
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-should-retry")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "messages.0.content.1.image.source.base64: image exceeds 5 MB maximum: 5763023 bytes > 5242880 bytes"
+    );
+}

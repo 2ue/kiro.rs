@@ -2448,6 +2448,65 @@ fn find_oversized_anthropic_images(
     violation
 }
 
+/// 当前轮图片超过上游大小限制：输入本身不可服务，按官方语义返回 400。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentImageTooLarge {
+    /// 官方风格的字段路径，如 `messages.0.content.1.image.source.base64`。
+    pub path: String,
+    pub bytes: usize,
+    pub max_bytes: usize,
+}
+
+impl CurrentImageTooLarge {
+    /// 与官方 API 一致的错误文案。
+    pub fn message(&self) -> String {
+        format!(
+            "{}: image exceeds 5 MB maximum: {} bytes > {} bytes",
+            self.path, self.bytes, self.max_bytes
+        )
+    }
+}
+
+/// 检查当前轮（最后一条消息）中的 base64 图片是否超过上游限制，包括 tool_result 内嵌图片。
+///
+/// 历史消息里的超大图片不在这里报错，仍由 payload guard 替换为占位文本，避免会话永久失败。
+/// 所有路由共用这一检查，保证本地与外部池行为一致。
+pub fn find_oversized_current_image(request: &MessagesRequest) -> Option<CurrentImageTooLarge> {
+    let message_index = request.messages.len().checked_sub(1)?;
+    let content = request.messages[message_index].content.as_array()?;
+    let prefix = format!("messages.{message_index}.content");
+    find_oversized_image_in_blocks(content, &prefix, UPSTREAM_IMAGE_SOURCE_MAX_BYTES)
+}
+
+fn find_oversized_image_in_blocks(
+    blocks: &[Value],
+    prefix: &str,
+    max_bytes: usize,
+) -> Option<CurrentImageTooLarge> {
+    blocks.iter().enumerate().find_map(|(index, block)| {
+        let path = format!("{prefix}.{index}");
+        match block.get("type").and_then(Value::as_str) {
+            Some("image") => {
+                let data = block
+                    .get("source")
+                    .and_then(|source| source.get("data"))
+                    .and_then(Value::as_str)?;
+                let bytes = decoded_base64_source_bytes(data).unwrap_or(data.len());
+                (bytes > max_bytes).then(|| CurrentImageTooLarge {
+                    path: format!("{path}.image.source.base64"),
+                    bytes,
+                    max_bytes,
+                })
+            }
+            Some("tool_result") => {
+                let nested = block.get("content").and_then(Value::as_array)?;
+                find_oversized_image_in_blocks(nested, &format!("{path}.content"), max_bytes)
+            }
+            _ => None,
+        }
+    })
+}
+
 fn oversized_historical_image_placeholder(dropped: usize) -> Value {
     let text = if dropped == 1 {
         "[Historical image was omitted because it exceeded the upstream 5 MB image size limit.]"
@@ -9261,6 +9320,87 @@ mod tests {
                 .contains("Current image was omitted because it exceeded the upstream 5 MB image size limit")
         );
         assert!(!body.contains(&"A".repeat(128)));
+    }
+
+    fn image_block(decoded_bytes: usize) -> Value {
+        serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": base64_zeros_for_decoded_bytes(decoded_bytes)
+            }
+        })
+    }
+
+    fn anthropic_request_with_messages(messages: Value) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "messages": messages
+        }))
+        .expect("messages request")
+    }
+
+    #[test]
+    fn oversized_current_image_is_reported_with_official_path_and_message() {
+        let bytes = UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 520_143;
+        let request = anthropic_request_with_messages(serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "look"}, image_block(bytes)]}
+        ]));
+
+        let violation = find_oversized_current_image(&request).expect("violation");
+
+        assert_eq!(violation.path, "messages.0.content.1.image.source.base64");
+        assert_eq!(violation.bytes, bytes);
+        assert_eq!(
+            violation.message(),
+            format!(
+                "messages.0.content.1.image.source.base64: image exceeds 5 MB maximum: {bytes} bytes > 5242880 bytes"
+            )
+        );
+    }
+
+    #[test]
+    fn oversized_current_tool_result_image_uses_nested_path() {
+        let request = anthropic_request_with_messages(serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [{"type": "text", "text": "img"}, image_block(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1)]
+            }]}
+        ]));
+
+        let violation = find_oversized_current_image(&request).expect("violation");
+        assert_eq!(
+            violation.path,
+            "messages.2.content.0.content.1.image.source.base64"
+        );
+    }
+
+    #[test]
+    fn oversized_historical_image_does_not_reject_current_turn() {
+        let request = anthropic_request_with_messages(serde_json::json!([
+            {"role": "user", "content": [image_block(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1)]},
+            {"role": "assistant", "content": "seen"},
+            {"role": "user", "content": [{"type": "text", "text": "next"}, image_block(1024)]}
+        ]));
+
+        assert!(find_oversized_current_image(&request).is_none());
+    }
+
+    #[test]
+    fn current_image_within_limit_is_accepted() {
+        let request = anthropic_request_with_messages(serde_json::json!([
+            {"role": "user", "content": [image_block(UPSTREAM_IMAGE_SOURCE_MAX_BYTES)]}
+        ]));
+        assert!(find_oversized_current_image(&request).is_none());
+        let url_image = anthropic_request_with_messages(serde_json::json!([
+            {"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}]}
+        ]));
+        assert!(find_oversized_current_image(&url_image).is_none());
     }
 
     #[test]
