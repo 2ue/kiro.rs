@@ -479,6 +479,7 @@ const MAX_SITE_HINT_DOMAINS: usize = 3;
 ///
 /// Kiro MCP web_search 只接受 query，因此代理在结果侧按域名（含子域名）过滤，
 /// 并把 allowed 域名以 `site:` 形式辅助加入 query，提高命中率。
+/// 两者同时出现时都生效：先按 allowed 保留，再排除 blocked。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WebSearchDomainFilter {
     allowed: Vec<String>,
@@ -494,10 +495,18 @@ impl WebSearchDomainFilter {
         else {
             return Self::default();
         };
-        Self {
+        let filter = Self {
             allowed: normalize_domains(tool.allowed_domains.as_deref()),
             blocked: normalize_domains(tool.blocked_domains.as_deref()),
+        };
+        if !filter.allowed.is_empty() && !filter.blocked.is_empty() {
+            tracing::info!(
+                allowed_domains = ?filter.allowed,
+                blocked_domains = ?filter.blocked,
+                "native WebSearch declares both allowed_domains and blocked_domains; applying allowed first, then excluding blocked"
+            );
         }
+        filter
     }
 
     pub fn is_empty(&self) -> bool {
@@ -510,16 +519,14 @@ impl WebSearchDomainFilter {
             // 无法判定域名时：有 allowed 限制则排除，否则保留。
             return self.allowed.is_empty();
         };
-        if self
-            .blocked
-            .iter()
-            .any(|domain| host_matches_domain(&host, domain))
-        {
-            return false;
-        }
-        self.allowed.is_empty()
+        let allowed = self.allowed.is_empty()
             || self
                 .allowed
+                .iter()
+                .any(|domain| host_matches_domain(&host, domain));
+        allowed
+            && !self
+                .blocked
                 .iter()
                 .any(|domain| host_matches_domain(&host, domain))
     }
@@ -554,17 +561,24 @@ impl WebSearchDomainFilter {
     }
 }
 
-/// 官方语义：allowed_domains 与 blocked_domains 不能同时使用。
-pub fn has_conflicting_web_search_domain_filters(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools
-            .iter()
-            .filter(|tool| is_native_web_search_tool(tool))
-            .any(|tool| {
-                tool.allowed_domains.as_ref().is_some_and(|d| !d.is_empty())
-                    && tool.blocked_domains.as_ref().is_some_and(|d| !d.is_empty())
-            })
-    })
+/// `max_uses` ≤ 0 不是可服务的限制值：按未设置处理（使用默认行为）并记日志，不报错。
+/// 在路由分流前对请求统一改写，本地与外部池看到的是同一份规范化请求。
+pub fn normalize_web_search_max_uses(req: &mut MessagesRequest) -> usize {
+    let mut normalized = 0;
+    for tool in req.tools.iter_mut().flatten() {
+        if !is_native_web_search_tool(tool) {
+            continue;
+        }
+        if let Some(max_uses) = tool.max_uses.filter(|max_uses| *max_uses <= 0) {
+            tracing::warn!(
+                max_uses,
+                "ignoring non-positive web_search max_uses; treating it as unset"
+            );
+            tool.max_uses = None;
+            normalized += 1;
+        }
+    }
+    normalized
 }
 
 fn normalize_domains(domains: Option<&[String]>) -> Vec<String> {
@@ -1535,18 +1549,45 @@ mod tests {
     }
 
     #[test]
-    fn domain_filters_conflict_only_when_both_are_non_empty() {
-        assert!(has_conflicting_web_search_domain_filters(&domain_request(
-            Some(&["a.com"]),
-            Some(&["b.com"])
-        )));
-        assert!(!has_conflicting_web_search_domain_filters(&domain_request(
-            Some(&["a.com"]),
-            Some(&[])
-        )));
-        assert!(!has_conflicting_web_search_domain_filters(&domain_request(
-            None, None
-        )));
+    fn allowed_and_blocked_domains_both_apply_when_declared_together() {
+        let req = domain_request(Some(&["example.com"]), Some(&["ads.example.com"]));
+        let filter = WebSearchDomainFilter::from_request(&req);
+        let mut results = results_of(&[
+            "https://example.com/a",
+            "https://docs.example.com/b",
+            "https://ads.example.com/c",
+            "https://x.ads.example.com/d",
+            "https://other.com/e",
+        ]);
+
+        assert_eq!(filter.apply(&mut results), 3);
+        let urls: Vec<&str> = results.results.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://example.com/a", "https://docs.example.com/b"]
+        );
+        assert_eq!(filter.mcp_query("q"), "q site:example.com");
+    }
+
+    #[test]
+    fn non_positive_max_uses_is_treated_as_unset() {
+        for max_uses in [0, -3] {
+            let mut req = domain_request(None, None);
+            req.tools.as_mut().expect("tools")[0].max_uses = Some(max_uses);
+
+            assert_eq!(normalize_web_search_max_uses(&mut req), 1);
+            assert_eq!(req.tools.as_ref().expect("tools")[0].max_uses, None);
+            assert!(has_web_search_tool(&req));
+        }
+
+        let mut req = domain_request(None, None);
+        req.tools.as_mut().expect("tools")[0].max_uses = Some(5);
+        assert_eq!(normalize_web_search_max_uses(&mut req), 0);
+        assert_eq!(req.tools.as_ref().expect("tools")[0].max_uses, Some(5));
+    }
+
+    #[test]
+    fn empty_domain_filters_are_a_no_op() {
         let filter = WebSearchDomainFilter::from_request(&domain_request(None, None));
         assert!(filter.is_empty());
         let mut results = results_of(&["https://x.com"]);
