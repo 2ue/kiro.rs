@@ -2408,10 +2408,9 @@ impl StreamContext {
         })
     }
 
-    /// 生成初始事件序列 (message_start + 文本块 start)
+    /// 生成初始事件序列（仅 message_start）
     ///
-    /// 当 thinking 启用时，不在初始化时创建文本块，而是等到实际收到内容时再创建。
-    /// 这样可以确保 thinking 块（索引 0）在文本块（索引 1）之前。
+    /// 内容块一律等到实际收到内容时再创建，不预开空文本块。
     #[cfg(test)]
     pub fn generate_initial_events(&mut self) -> Vec<SseEvent> {
         self.generate_initial_events_with_reported_usage_mapper(|reported_usage| reported_usage)
@@ -2432,29 +2431,10 @@ impl StreamContext {
             events.push(event);
         }
 
-        // 如果启用了 thinking，不在这里创建文本块
-        // thinking 块和文本块会在 process_content_with_thinking 中按正确顺序创建
-        if self.thinking_enabled {
-            return events;
-        }
-
-        // 创建初始文本块（仅在未启用 thinking 时）
-        let text_block_index = self.state_manager.next_block_index();
-        self.text_block_index = Some(text_block_index);
-        let text_block_events = self.state_manager.handle_content_block_start(
-            text_block_index,
-            "text",
-            json!({
-                "type": "content_block_start",
-                "index": text_block_index,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        );
-        events.extend(text_block_events);
-
+        // 不在这里预开文本块：文本块在 emit_text_delta_raw 收到首段真实文本时才创建。
+        // 预开的空 text 块在纯 tool_use 响应中会原样写进 Claude Code 会话历史；
+        // thinking 模式下也要保证 thinking 块（索引 0）位于文本块之前。
+        // message_start 之后、首个内容块之前的保活退化为 ping 事件。
         events
     }
 
@@ -6245,10 +6225,15 @@ mod tests {
     fn claude_code_noop_keepalive_matches_open_block_type() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
+        assert!(
+            ctx.claude_code_noop_delta_keepalive_event().is_none(),
+            "no content block is open before the first real content"
+        );
+        let _text_events = ctx.process_assistant_response("hello");
 
         let text_keepalive = ctx
             .claude_code_noop_delta_keepalive_event()
-            .expect("initial text block should have keepalive");
+            .expect("open text block should have keepalive");
         assert_eq!(text_keepalive.event, "content_block_delta");
         assert_eq!(text_keepalive.data["delta"]["type"], "text_delta");
         assert_eq!(text_keepalive.data["delta"]["text"], "");
@@ -6270,9 +6255,10 @@ mod tests {
     fn test_text_delta_after_tool_use_restarts_text_block() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
 
-        let initial_events = ctx.generate_initial_events();
+        let _initial_events = ctx.generate_initial_events();
+        let first_text_events = ctx.process_assistant_response("before tool");
         assert!(
-            initial_events
+            first_text_events
                 .iter()
                 .any(|e| e.event == "content_block_start"
                     && e.data["content_block"]["type"] == "text")
@@ -6280,7 +6266,7 @@ mod tests {
 
         let initial_text_index = ctx
             .text_block_index
-            .expect("initial text block index should exist");
+            .expect("first text block index should exist");
 
         // tool_use 开始会自动关闭现有 text block
         let tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
@@ -6649,6 +6635,73 @@ mod tests {
             .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == delta_type)
             .filter_map(|e| e.data["delta"][field].as_str())
             .collect()
+    }
+
+    #[test]
+    fn non_thinking_stream_does_not_preopen_empty_text_block() {
+        for round in 0..5 {
+            // 纯 tool_use 响应：不能出现 index 0 的空 text 块。
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let initial = ctx.generate_initial_events();
+            assert_eq!(
+                initial.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(),
+                vec!["message_start"],
+                "round {round}"
+            );
+            // 首个内容块之前没有可用于空 delta 保活的块，handler 退化为 ping。
+            assert!(ctx.claude_code_noop_delta_keepalive_event().is_none());
+            assert!(ctx.create_keepalive_text_block_event().is_none());
+
+            let mut all_events = initial;
+            all_events.extend(ctx.process_kiro_event(&Event::ToolUse(
+                crate::kiro::model::events::ToolUseEvent {
+                    name: "Read".to_string(),
+                    tool_use_id: format!("toolu_no_preopen_{round}"),
+                    input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+                    stop: true,
+                },
+            )));
+            all_events.extend(ctx.generate_final_events());
+            assert_content_blocks_are_serial(&all_events);
+            let starts = all_events
+                .iter()
+                .filter(|e| e.event == "content_block_start")
+                .map(|e| {
+                    (
+                        e.data["index"].as_i64(),
+                        e.data["content_block"]["type"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                starts,
+                vec![(Some(0), "tool_use".to_string())],
+                "round {round}"
+            );
+
+            // 有真实文本时才在 index 0 开 text 块。
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let mut all_events = ctx.generate_initial_events();
+            all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+                assistant_response_event("hello", None),
+            )));
+            all_events.extend(ctx.generate_final_events());
+            assert_content_blocks_are_serial(&all_events);
+            let text_start = all_events
+                .iter()
+                .position(|e| e.event == "content_block_start")
+                .expect("text block start");
+            assert_eq!(all_events[text_start].data["index"], 0);
+            assert_eq!(all_events[text_start].data["content_block"]["type"], "text");
+            assert_eq!(
+                all_events[text_start + 1].data["delta"]["text"],
+                "hello",
+                "round {round}"
+            );
+        }
     }
 
     #[test]
