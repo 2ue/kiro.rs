@@ -3583,6 +3583,7 @@ enum HandlerEventStreamFault {
     TextThenReadError,
     ThinkingThenReadError,
     ToolThenReadError,
+    EmptyToolThenReadError,
     NonStreamContentLengthOverLimit,
     NonStreamChunkedOverLimit,
     NonStreamExactLimit,
@@ -4024,6 +4025,29 @@ async fn handler_eventstream_fault_upstream(
                 )),
             ),
         ]),
+        HandlerEventStreamFault::EmptyToolThenReadError => {
+            handler_eventstream_chunked_response(vec![
+                (
+                    Duration::ZERO,
+                    Ok(Bytes::from(eventstream_test_frame(
+                        "toolUseEvent",
+                        json!({
+                            "name":"Bash",
+                            "toolUseId":"toolu_empty_fault",
+                            "input":"",
+                            "stop":false
+                        }),
+                    ))),
+                ),
+                (
+                    Duration::from_millis(20),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "fixture read reset before tool input",
+                    )),
+                ),
+            ])
+        }
         HandlerEventStreamFault::NonStreamContentLengthOverLimit => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
@@ -5531,6 +5555,47 @@ fn handler_non_stream_usage_only_eof_disables_client_retry_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread(
         "non-stream-usage-only-no-retry-fixture",
         run_handler_non_stream_usage_only_eof_should_not_retry_matrix,
+    );
+}
+
+/// errmm-12：上游在生成 tool_use input 之前失败时，空 input 的 tool_use 不下发，
+/// 首输出前换号重试，下游不会收到以 `{}` 完成的工具调用。
+async fn run_handler_empty_tool_then_read_error_matrix() {
+    for round in 1..=5 {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::EmptyToolThenReadError)
+                .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "empty tool round={round}");
+        assert!(
+            body.contains("recovered-ok"),
+            "empty tool round={round} body={body}"
+        );
+        assert!(
+            !body.contains("toolu_empty_fault"),
+            "empty tool round={round} body={body}"
+        );
+        assert!(!body.contains(r#""type":"error""#));
+        assert_eq!(upstream.hits(), 2, "empty tool round={round}");
+        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("empty tool retry latency trace");
+        assert_eq!(
+            trace.stream_retry_reasons.as_deref(),
+            Some(&["read_error:sends=1".to_string()][..])
+        );
+    }
+}
+
+#[test]
+fn handler_empty_tool_then_read_error_retries_before_output_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "empty-tool-read-error-fixture",
+        run_handler_empty_tool_then_read_error_matrix,
     );
 }
 

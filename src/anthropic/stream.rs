@@ -1338,6 +1338,29 @@ impl SseStateManager {
             .any(|b| b.block_type != "thinking")
     }
 
+    /// 关闭所有未关闭的非 tool_use 内容块（错误收尾时使用）。
+    fn close_open_non_tool_use_blocks(&mut self) -> Vec<SseEvent> {
+        let mut open_blocks = self
+            .active_blocks
+            .iter_mut()
+            .filter(|(_, block)| block.started && !block.stopped && block.block_type != "tool_use")
+            .collect::<Vec<_>>();
+        open_blocks.sort_by_key(|(index, _)| **index);
+        open_blocks
+            .into_iter()
+            .map(|(index, block)| {
+                block.stopped = true;
+                SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                )
+            })
+            .collect()
+    }
+
     /// 关闭所有未关闭的内容块。
     fn close_open_blocks(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -1558,6 +1581,10 @@ pub struct StreamContext {
     tool_input_buffers: HashMap<String, String>,
     /// 工具输入缓冲对应的上游工具名，用于 EOF 容错 flush。
     tool_input_names: HashMap<String, String>,
+    /// 已收到 toolUseEvent 但还没有任何 input 片段的工具调用（按到达顺序）。
+    /// 首个 input 片段或 stop 到达前不下发 content_block_start，这样上游在生成 input 前
+    /// 失败时仍可走首输出前重试，也不会把空 input 的 tool_use 当成完整调用交给下游。
+    pending_tool_starts: Vec<String>,
     /// 从文本泄漏中恢复出的工具调用，延迟到流末尾发出，以便和后续结构化 toolUseEvent 去重。
     pending_leaked_tools: Vec<(String, String, String)>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1793,6 +1820,7 @@ impl StreamContext {
             tool_block_indices: HashMap::new(),
             tool_input_buffers: HashMap::new(),
             tool_input_names: HashMap::new(),
+            pending_tool_starts: Vec::new(),
             pending_leaked_tools: Vec::new(),
             tool_name_map,
             tool_schema_key_map,
@@ -3595,6 +3623,22 @@ impl StreamContext {
         let safe_pending = self.tool_transcript_sanitizer.structured_tool_boundary();
         events.extend(self.create_sanitized_text_delta_events(&safe_pending));
 
+        // errmm-12：还没有任何 input 片段时先不下发 content_block_start，等首个 input 片段或
+        // stop 到达再开块；上游在此之前失败时，下游看不到这个工具调用。
+        if !self.tool_block_indices.contains_key(&tool_use.tool_use_id)
+            && tool_use.input.is_empty()
+            && !tool_use.stop
+        {
+            self.tool_input_names
+                .insert(tool_use.tool_use_id.clone(), tool_use.name.clone());
+            if !self.pending_tool_starts.contains(&tool_use.tool_use_id) {
+                self.pending_tool_starts.push(tool_use.tool_use_id.clone());
+            }
+            return events;
+        }
+        self.pending_tool_starts
+            .retain(|tool_use_id| tool_use_id != &tool_use.tool_use_id);
+
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&tool_use.tool_use_id) {
             idx
@@ -3774,6 +3818,28 @@ impl StreamContext {
         events
     }
 
+    /// 正常 EOF 时补发仍未开块的空 input 工具调用（沿用 EOF 容错：以 `{}` 完成）。
+    fn flush_pending_tool_starts(&mut self) -> Vec<SseEvent> {
+        let pending = std::mem::take(&mut self.pending_tool_starts);
+        let mut events = Vec::new();
+        for tool_use_id in pending {
+            let name = self
+                .tool_input_names
+                .get(&tool_use_id)
+                .cloned()
+                .unwrap_or_default();
+            events.extend(
+                self.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                    name,
+                    tool_use_id,
+                    input: String::new(),
+                    stop: true,
+                }),
+            );
+        }
+        events
+    }
+
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         self.generate_final_events_with_reported_usage_mapper(|_, reported_usage, _, _, _| {
@@ -3797,7 +3863,14 @@ impl StreamContext {
         let mut events = Vec::new();
 
         events.extend(self.flush_pending_trivial_text());
-        events.extend(self.flush_incomplete_tool_input_buffers());
+        if self.stream_error.is_none() {
+            events.extend(self.flush_incomplete_tool_input_buffers());
+            events.extend(self.flush_pending_tool_starts());
+        } else {
+            // errmm-12：流以错误结束时，input 不完整的工具调用不能被当成完整调用补全。
+            // 未开块的直接丢弃；已开块的在下面保持打开，下游只会看到 error 事件。
+            self.pending_tool_starts.clear();
+        }
 
         if self.native_reasoning_seen {
             events.extend(self.close_native_reasoning_block());
@@ -3860,7 +3933,10 @@ impl StreamContext {
         }
 
         if let Some((error_type, raw_message)) = self.stream_error.take() {
-            events.extend(self.state_manager.close_open_blocks());
+            // 不关闭仍打开的 tool_use 块：已完成的工具调用在 stop=true 时就已关闭，仍打开的
+            // 都是 input 不完整的调用。发送 content_block_stop 会让 Claude Code 以残缺/空 input
+            // 执行工具；保持打开时 CLI 丢弃该块并把本轮视为失败。
+            events.extend(self.state_manager.close_open_non_tool_use_blocks());
             let message = self.public_stream_error_message(&error_type, raw_message);
             events.push(Self::create_error_event(error_type, message));
             return events;
@@ -6595,6 +6671,127 @@ mod tests {
             .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == delta_type)
             .filter_map(|e| e.data["delta"][field].as_str())
             .collect()
+    }
+
+    fn tool_event(id: &str, input: &str, stop: bool) -> Event {
+        Event::ToolUse(crate::kiro::model::events::ToolUseEvent {
+            name: "Bash".to_string(),
+            tool_use_id: id.to_string(),
+            input: input.to_string(),
+            stop,
+        })
+    }
+
+    #[test]
+    fn tool_use_start_is_deferred_until_first_input_fragment() {
+        for round in 0..5 {
+            let id = format!("toolu_defer_{round}");
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let mut all_events = ctx.generate_initial_events();
+            let empty_events = ctx.process_kiro_event(&tool_event(&id, "", false));
+            assert!(
+                empty_events.is_empty(),
+                "round {round}: no downstream output before the first input fragment"
+            );
+            all_events.extend(empty_events);
+            all_events.extend(ctx.process_kiro_event(&tool_event(&id, r#"{"command":"#, false)));
+            all_events.extend(ctx.process_kiro_event(&tool_event(&id, r#""pwd"}"#, true)));
+            all_events.extend(ctx.generate_final_events());
+
+            assert_content_blocks_are_serial(&all_events);
+            assert_eq!(
+                collect_delta_text(&all_events, "input_json_delta", "partial_json"),
+                r#"{"command":"pwd"}"#,
+                "round {round}"
+            );
+            let message_delta = all_events
+                .iter()
+                .find(|e| e.event == "message_delta")
+                .expect("message_delta");
+            assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
+        }
+    }
+
+    #[test]
+    fn stream_error_never_completes_tool_use_with_missing_or_partial_input() {
+        for round in 0..5 {
+            // 1) 上游在任何 input 之前失败：下游完全看不到这个 tool_use。
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let mut all_events = ctx.generate_initial_events();
+            all_events.extend(ctx.process_kiro_event(&tool_event("toolu_empty", "", false)));
+            ctx.record_stream_error("api_error", "upstream stream idle timeout");
+            all_events.extend(ctx.generate_final_events());
+            assert!(
+                !all_events
+                    .iter()
+                    .any(|e| e.event.starts_with("content_block")),
+                "round {round}: {:?}",
+                all_events
+                    .iter()
+                    .map(|e| e.event.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert!(all_events.iter().any(|e| e.event == "error"));
+
+            // 2) 上游在大 input 生成中途失败：tool_use 块保持打开（不发 stop），随后是 error。
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let mut all_events = ctx.generate_initial_events();
+            all_events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+                assistant_response_event("Writing the file now.", None),
+            )));
+            all_events.extend(ctx.process_kiro_event(&tool_event(
+                "toolu_partial",
+                r#"{"command":"cat > /tmp/x <<'EOF'\nline"#,
+                false,
+            )));
+            ctx.record_stream_error("api_error", "upstream stream idle timeout");
+            all_events.extend(ctx.generate_final_events());
+
+            let tool_index = all_events
+                .iter()
+                .find(|e| {
+                    e.event == "content_block_start"
+                        && e.data["content_block"]["type"] == "tool_use"
+                })
+                .and_then(|e| e.data["index"].as_i64())
+                .expect("partial tool_use block started");
+            assert!(
+                !all_events.iter().any(|e| {
+                    e.event == "content_block_stop" && e.data["index"].as_i64() == Some(tool_index)
+                }),
+                "round {round}: incomplete tool_use must not be stopped"
+            );
+            let text_index = all_events
+                .iter()
+                .find(|e| {
+                    e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+                })
+                .and_then(|e| e.data["index"].as_i64())
+                .expect("text block");
+            assert!(all_events.iter().any(|e| {
+                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(text_index)
+            }));
+            assert_eq!(all_events.last().map(|e| e.event.as_str()), Some("error"));
+            assert!(!all_events.iter().any(|e| e.event == "message_stop"));
+        }
+    }
+
+    #[test]
+    fn clean_eof_still_completes_pending_empty_tool_use() {
+        // c073a4f 的 EOF 容错保持不变：正常结束（有可信终止信号）时，空 input 工具以 `{}` 完成。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_kiro_event(&tool_event("toolu_eof", "", false)));
+        all_events.extend(ctx.generate_final_events());
+        assert_content_blocks_are_serial(&all_events);
+        assert!(all_events.iter().any(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["id"] == "toolu_eof"
+        }));
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]
