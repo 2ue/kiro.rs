@@ -344,7 +344,18 @@ fn convert_assistant_message_with_known_tools(
                                 .push((ReasoningContent::redacted_content(data), tool_uses.len()));
                         }
                         "text" => {
-                            if let Some(text) = block.text {
+                            if let Some(text) = block.text.filter(|text| !text.is_empty()) {
+                                // Kiro 每条 assistant 历史只有一个 content 字符串；相邻 text 块之间
+                                // 补一个换行，避免 "First." + "Second." 被拼成 "First.Second."。
+                                // sanitizer 仍暂存疑似 transcript 片段时不插入分隔符，保证跨块拆开的
+                                // 内部 transcript 依旧能被识别（此时 text_content 也还不完整）。
+                                let separator = !text.starts_with('\n')
+                                    && !text_content.is_empty()
+                                    && !text_content.ends_with('\n')
+                                    && sanitizer
+                                        .as_ref()
+                                        .is_none_or(|sanitizer| !sanitizer.has_pending_text());
+                                let text = if separator { format!("\n{text}") } else { text };
                                 if let Some(sanitizer) = sanitizer.as_mut() {
                                     text_content.push_str(&sanitizer.push(&text));
                                 } else {

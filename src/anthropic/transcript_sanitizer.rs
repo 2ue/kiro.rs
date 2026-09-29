@@ -735,6 +735,13 @@ impl ToolTranscriptSanitizer {
         self.finish_segment()
     }
 
+    /// Whether text is still held back (a line-start probe, an unconfirmed candidate, or a
+    /// confirmed transcript being dropped). Callers must not splice separators in that state,
+    /// because a scaffold split across chunks has to stay contiguous to be recognized.
+    pub(crate) fn has_pending_text(&self) -> bool {
+        !matches!(self.state, State::Scan) || !self.line_probe.is_empty()
+    }
+
     pub(crate) fn suppressed_blocks(&self) -> u32 {
         self.suppressed_blocks
     }

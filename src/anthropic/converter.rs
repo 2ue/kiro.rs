@@ -5598,6 +5598,62 @@ mod tests {
     }
 
     #[test]
+    fn assistant_text_blocks_are_separated_by_newline() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let cases = [
+            (
+                serde_json::json!([
+                    {"type": "text", "text": "First."},
+                    {"type": "text", "text": "Second."}
+                ]),
+                "First.\nSecond.",
+            ),
+            (
+                serde_json::json!([
+                    {"type": "text", "text": "Before."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}},
+                    {"type": "text", "text": "After."}
+                ]),
+                "Before.\nAfter.",
+            ),
+            // Existing line breaks are kept as-is instead of being doubled.
+            (
+                serde_json::json!([
+                    {"type": "text", "text": "Line one\n"},
+                    {"type": "text", "text": "Line two"}
+                ]),
+                "Line one\nLine two",
+            ),
+            (
+                serde_json::json!([
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "Only."}
+                ]),
+                "Only.",
+            ),
+        ];
+        for profile in [CompatProfile::ClaudeCode, CompatProfile::AnthropicStrict] {
+            for (content, expected) in &cases {
+                let msg = AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: content.clone(),
+                };
+                let options = ConverterOptions {
+                    compat_profile: profile,
+                    ..ConverterOptions::default()
+                };
+                let result = convert_assistant_message(&msg, &mut HashMap::new(), options)
+                    .expect("assistant message converts");
+                assert_eq!(
+                    result.assistant_response_message.content, *expected,
+                    "{profile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_remove_orphaned_tool_uses() {
         use crate::kiro::model::requests::tool::ToolUseEntry;
 
