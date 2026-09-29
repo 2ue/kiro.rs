@@ -5578,6 +5578,86 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sticky_session_leaves_unknown_catalog_credential_after_model_rejection_for_five_rounds()
+     {
+        let server = FakeBadRequestServer::start().await;
+        for round in 0..5 {
+            let session = format!("sticky-invalid-model-{round}");
+            let mut config = Config::default();
+            config.kiro_upstream_base_url = Some(server.base_url.clone());
+            config.kiro_upstream_response_timeout_secs = 2;
+            config.credential_retry_max_attempts = 100;
+            let mut credentials = fake_bad_request_credentials(2);
+            credentials[1].supported_models = vec!["claude-sonnet-4".to_string()];
+            let manager = Arc::new(
+                MultiTokenManager::new(config, credentials, None, None, false)
+                    .expect("fake provider token manager"),
+            );
+            // Bind the session to the unknown-catalog credential while the listed one is busy.
+            let mut bound = manager
+                .acquire_context_for_session(
+                    Some("claude-sonnet-4"),
+                    Some(&session),
+                    &HashSet::from([2]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(bound.id, 1);
+            manager.report_success_for_session(bound.id, Some(&session));
+            bound.release_in_flight();
+
+            let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+            endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+            let provider =
+                KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+            let request_body = serde_json::json!({
+                "testScenario": "invalid_model",
+                "conversationState": {
+                    "conversationId": session,
+                    "currentMessage": {
+                        "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                    }
+                }
+            })
+            .to_string();
+            // A one-attempt budget forces the final-failure path (no in-request retry).
+            let error = provider
+                .call_api_with_context_with_request_id_and_attempt_budget(
+                    &request_body,
+                    Some("req-sticky-invalid-model"),
+                    AcquireMode::WaitForCapacity,
+                    1,
+                    Some("claude-sonnet-4"),
+                    Arc::new(InferenceAttemptBudget::new(1)),
+                    false,
+                )
+                .await
+                .err()
+                .expect("fake upstream rejects the model");
+            let attempts = KiroProvider::attempts_from_error(&error);
+            assert_eq!(attempts.len(), 1, "round {round}");
+            assert_eq!(
+                attempts[0].credential_id, 1,
+                "round {round}: sticky was used"
+            );
+
+            let mut next = manager
+                .acquire_context_for_session(
+                    Some("claude-sonnet-4"),
+                    Some(&session),
+                    &HashSet::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                next.id, 2,
+                "round {round}: the session must move to the catalog-listed credential"
+            );
+            next.release_in_flight();
+        }
+    }
+
     #[test]
     fn invalid_model_retry_is_unbounded_only_with_a_catalog_listed_alternate() {
         let model = Some("claude-sonnet-5");
@@ -13022,6 +13102,12 @@ impl KiroProvider {
                     self.finish_attempt(&mut ctx);
                     continue;
                 }
+                self.release_sticky_after_model_rejection(
+                    conversation_id.as_deref(),
+                    &ctx,
+                    model.as_deref(),
+                    bad_request_reason,
+                );
                 Self::push_attempt(
                     &mut attempts,
                     attempt,
@@ -13119,6 +13205,12 @@ impl KiroProvider {
                     self.finish_attempt(&mut ctx);
                     continue;
                 }
+                self.release_sticky_after_model_rejection(
+                    conversation_id.as_deref(),
+                    &ctx,
+                    model.as_deref(),
+                    bad_request_reason,
+                );
                 Self::push_attempt(
                     &mut attempts,
                     attempt,
@@ -13912,6 +14004,33 @@ impl KiroProvider {
             || (reason == "model_invalid_bad_request"
                 && (attempt == 0 || alternate_catalog_listed)
                 && model.map(str::trim).is_some_and(|value| !value.is_empty()))
+    }
+
+    /// A session stuck to an unknown-catalog credential that just rejected the model would keep
+    /// hitting it on every turn. When a credential whose catalog lists the model is available,
+    /// drop the binding so the next turn selects (and binds) that credential instead. Sticky
+    /// bindings that work, or that point at a catalog-listed credential, stay untouched.
+    fn release_sticky_after_model_rejection(
+        &self,
+        session_id: Option<&str>,
+        ctx: &CallContext,
+        model: Option<&str>,
+        reason: &str,
+    ) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        if matches!(
+            reason,
+            "model_unavailable_bad_request" | "model_invalid_bad_request"
+        ) && ctx.credentials.supported_models.is_empty()
+            && self
+                .token_manager
+                .has_alternate_catalog_listed_credential_cached(model, &HashSet::new(), ctx.id)
+        {
+            self.token_manager
+                .unbind_session_if_bound_to_deferred(session_id, ctx.id);
+        }
     }
 
     fn should_retry_model_404_bad_request(reason: &str, model: Option<&str>) -> bool {
