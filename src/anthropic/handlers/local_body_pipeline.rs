@@ -260,7 +260,6 @@ pub(super) fn prepare_with_plan(
             &kiro_request,
             runtime_config,
             endpoint,
-            &payload.model,
             model_resolution.upstream_model.as_deref(),
             &conversation_id,
             should_expose_proxy_warnings(runtime_config)

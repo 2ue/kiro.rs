@@ -1193,11 +1193,11 @@ impl PayloadTooLongRetryRequest {
         request: &KiroRequest,
         runtime_config: &RequestRuntimeConfig,
         endpoint: &str,
-        requested_model: &str,
         upstream_model: Option<&str>,
         conversation_id: &str,
         conversion_warnings: Option<String>,
     ) -> Option<Self> {
+        let requested_model = payload.model.as_str();
         let mut config = runtime_config.payload_guard_config();
         if is_claude_code_compaction_request(payload) {
             // Claude Code's compaction request can carry the oversized tool results of the turn
