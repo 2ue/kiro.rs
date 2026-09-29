@@ -445,6 +445,33 @@ fn non_empty_trimmed(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// 发给 Kiro MCP web_search 的 query 最大字符数。
+///
+/// 上游未公开限制：实测约 560 字符的 query 返回 `invalid_tool_input`。这里取保守值 200，
+/// 常规搜索词远小于此长度，超长 query 截断后仍保留主要关键词。
+const MAX_WEB_SEARCH_QUERY_CHARS: usize = 200;
+
+/// 把 query 截断到 `max_chars` 个字符以内，优先在词边界截断。
+///
+/// 截断点落在单词中间时回退到前一个空白；若回退会丢掉一半以上内容
+/// （如无空格的中文长句），则直接按字符截断。
+fn truncate_search_query(query: &str, max_chars: usize) -> String {
+    let Some((cut, next)) = query.char_indices().nth(max_chars) else {
+        return query.to_string();
+    };
+    let head = &query[..cut];
+    let mid_word = !next.is_whitespace() && !head.ends_with(char::is_whitespace);
+    let head = if mid_word {
+        match head.rfind(char::is_whitespace) {
+            Some(space) if head[..space].chars().count() >= max_chars / 2 => &head[..space],
+            _ => head,
+        }
+    } else {
+        head
+    };
+    head.trim_end().to_string()
+}
+
 /// 加入 query 的 `site:` 提示最多覆盖的 allowed 域名数，避免 query 过长。
 const MAX_SITE_HINT_DOMAINS: usize = 3;
 
@@ -507,7 +534,8 @@ impl WebSearchDomainFilter {
         before - results.results.len()
     }
 
-    /// 发给 MCP 的 query：allowed 域名较少时附加 `site:` 提示。
+    /// 发给 MCP 的 query：allowed 域名较少、且附加后不超过 query 长度上限时，
+    /// 附加 `site:` 提示；否则只依赖结果侧过滤。
     fn mcp_query(&self, query: &str) -> String {
         if self.allowed.is_empty() || self.allowed.len() > MAX_SITE_HINT_DOMAINS {
             return query.to_string();
@@ -518,7 +546,11 @@ impl WebSearchDomainFilter {
             .map(|domain| format!("site:{domain}"))
             .collect::<Vec<_>>()
             .join(" OR ");
-        format!("{query} {sites}")
+        let combined = format!("{query} {sites}");
+        if combined.chars().count() > MAX_WEB_SEARCH_QUERY_CHARS {
+            return query.to_string();
+        }
+        combined
     }
 }
 
@@ -1138,6 +1170,19 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
         }
     };
 
+    // Kiro MCP 对过长 query 返回 invalid_tool_input，先截断到安全长度。
+    let original_query_chars = query.chars().count();
+    let query = truncate_search_query(&query, MAX_WEB_SEARCH_QUERY_CHARS);
+    if query.chars().count() < original_query_chars {
+        tracing::warn!(
+            request_id,
+            original_query_chars,
+            truncated_query_chars = query.chars().count(),
+            max_query_chars = MAX_WEB_SEARCH_QUERY_CHARS,
+            "native WebSearch query truncated to upstream-safe length"
+        );
+    }
+
     tracing::info!(
         request_id,
         query_bytes = query.len(),
@@ -1507,6 +1552,43 @@ mod tests {
         let mut results = results_of(&["https://x.com"]);
         assert_eq!(filter.apply(&mut results), 0);
         assert_eq!(filter.mcp_query("q"), "q");
+    }
+
+    #[test]
+    fn long_search_query_is_truncated_on_word_boundary() {
+        let short = "tokio spawn_blocking";
+        assert_eq!(
+            truncate_search_query(short, MAX_WEB_SEARCH_QUERY_CHARS),
+            short
+        );
+
+        let long = format!(
+            "tokio spawn_blocking thread pool{}",
+            " with detailed explanation of blocking tasks".repeat(12)
+        );
+        assert!(long.chars().count() > 500);
+        let truncated = truncate_search_query(&long, MAX_WEB_SEARCH_QUERY_CHARS);
+        assert!(truncated.chars().count() <= MAX_WEB_SEARCH_QUERY_CHARS);
+        assert!(long.starts_with(&truncated));
+        // 截断点之后紧跟空白，说明没有切断单词。
+        assert!(long[truncated.len()..].starts_with(' '));
+        assert!(!truncated.ends_with(' '));
+    }
+
+    #[test]
+    fn long_query_without_spaces_is_truncated_by_chars() {
+        let long = "中文长查询".repeat(60);
+        let truncated = truncate_search_query(&long, MAX_WEB_SEARCH_QUERY_CHARS);
+        assert_eq!(truncated.chars().count(), MAX_WEB_SEARCH_QUERY_CHARS);
+        assert!(long.starts_with(&truncated));
+    }
+
+    #[test]
+    fn site_hint_is_skipped_when_it_would_exceed_query_limit() {
+        let req = domain_request(Some(&["example.com"]), None);
+        let filter = WebSearchDomainFilter::from_request(&req);
+        let query = "q".repeat(MAX_WEB_SEARCH_QUERY_CHARS - 5);
+        assert_eq!(filter.mcp_query(&query), query);
     }
 
     #[test]
