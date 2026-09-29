@@ -620,6 +620,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
     if let Some(extra_metadata) = extra_metadata {
         merge_usage_error_metadata(&mut error_metadata, extra_metadata);
     }
+    let error_detail = request_rejection_error_detail(&error_metadata);
     let request_context = request_context.unwrap_or_default();
 
     UsageRecord {
@@ -677,7 +678,7 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
         external_pool_billing: None,
         error_type: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
         error_message: Some(REQUEST_REJECTION_ERROR_MESSAGE.to_string()),
-        error_detail: None,
+        error_detail: Some(error_detail),
         error_status_code: Some(status.as_u16()),
         error_source: Some(REQUEST_REJECTION_ERROR_TYPE.to_string()),
         error_id: Some(request_id.to_string()),
@@ -689,6 +690,43 @@ pub(crate) fn sampled_request_rejection_usage_record_with_metadata_and_context(
         payload_breakdown: None,
         payload_guard_report: None,
     }
+}
+
+/// Metadata keys whose values are closed diagnostic categories set by kiro-rs itself. Free
+/// text fields (entry messages, conversion diagnostics) are left to `errorMetadata` so the
+/// detail line never carries request content.
+const REQUEST_REJECTION_DETAIL_KEYS: [(&str, &str); 6] = [
+    ("stage", "stage"),
+    ("reason", "reason"),
+    ("entryReason", "entry_reason"),
+    ("localBodyPrepareKind", "kind"),
+    ("localBodyPrepareCategory", "category"),
+    ("preflightStage", "preflight_stage"),
+];
+
+fn request_rejection_error_detail(metadata: &serde_json::Value) -> String {
+    let mut detail = REQUEST_REJECTION_ERROR_TYPE.to_string();
+    for (key, label) in REQUEST_REJECTION_DETAIL_KEYS {
+        let Some(value) = metadata.get(key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if is_diagnostic_category(value) {
+            detail.push(' ');
+            detail.push_str(label);
+            detail.push('=');
+            detail.push_str(value);
+        }
+    }
+    detail
+}
+
+/// Accepts only short identifier-like values so a mislabelled free-text field is dropped.
+fn is_diagnostic_category(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn merge_usage_error_metadata(target: &mut serde_json::Value, extra: serde_json::Value) {
@@ -4156,7 +4194,13 @@ mod tests {
                 Some(REQUEST_REJECTION_ERROR_MESSAGE),
                 "round {round}"
             );
-            assert!(usage.error_detail.is_none(), "round {round}");
+            assert_eq!(
+                usage.error_detail,
+                Some(format!(
+                    "{REQUEST_REJECTION_ERROR_TYPE} stage={stage} reason={reason}"
+                )),
+                "round {round}"
+            );
             assert_eq!(
                 usage.error_status_code,
                 Some(status.as_u16()),
@@ -4177,6 +4221,36 @@ mod tests {
             assert!(usage.public_error_message.is_none(), "round {round}");
             assert!(usage.payload_breakdown.is_none(), "round {round}");
             assert!(usage.payload_guard_report.is_none(), "round {round}");
+        }
+    }
+
+    #[test]
+    fn rejection_error_detail_names_diagnostic_categories_without_free_text_for_five_rounds() {
+        for round in 0..5 {
+            let usage = sampled_request_rejection_usage_record_with_metadata_and_context(
+                &format!("req_local_body_prepare_{round}"),
+                "/cc/v1/messages",
+                None,
+                "local_body_prepare",
+                "local_body_prepare",
+                http::StatusCode::BAD_REQUEST,
+                1,
+                Some(json!({
+                    "localBodyPrepareKind": "conversion_error",
+                    "localBodyPrepareCategory": "invalid_image_data",
+                    "localBodyPrepareDiagnostic": "invalid image data for media_type: secret-user-text",
+                    "entryReason": "has spaces and user text",
+                })),
+                None,
+            );
+            let detail = usage.error_detail.expect("rejection detail");
+            assert_eq!(
+                detail,
+                "request_rejection stage=local_body_prepare reason=local_body_prepare kind=conversion_error category=invalid_image_data",
+                "round {round}"
+            );
+            assert!(!detail.contains("secret-user-text"));
+            assert!(!detail.contains("user text"));
         }
     }
 
