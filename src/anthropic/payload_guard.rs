@@ -4408,6 +4408,24 @@ fn drop_current_images_for_body_reduction(
     (dropped, dropped_bytes)
 }
 
+/// Assistant acknowledgement the converter emits after the synthetic system user turn.
+const SYNTHETIC_SYSTEM_ACK: &str = "I will follow these instructions.";
+
+/// Length of the converter-generated system prompt pair at the head of the history, if any.
+fn synthetic_system_prefix_len(history: &[Message]) -> usize {
+    match history {
+        [Message::User(_), Message::Assistant(assistant), ..]
+            if assistant.assistant_response_message.content == SYNTHETIC_SYSTEM_ACK =>
+        {
+            2
+        }
+        _ => 0,
+    }
+}
+
+/// Drops whole leading conversation turns until the estimated size fits. The converter's
+/// system prompt pair is kept and only removed as a last resort, once every other removable
+/// turn is gone, so trimming never silently discards the client's system prompt first.
 fn trim_history_to_estimated_budget(
     history: &mut Vec<Message>,
     current_results: &[ToolResult],
@@ -4415,15 +4433,46 @@ fn trim_history_to_estimated_budget(
     target_size: usize,
     weighted: bool,
 ) -> usize {
-    if history.is_empty() || current_size <= target_size {
-        return 0;
+    let protected = synthetic_system_prefix_len(history);
+    let (removed, estimated_size) = trim_history_turns_from(
+        history,
+        protected,
+        current_results,
+        current_size,
+        target_size,
+        weighted,
+    );
+    if protected == 0 || estimated_size <= target_size || history.len() > protected {
+        return removed;
+    }
+    let (removed_system, _) = trim_history_turns_from(
+        history,
+        0,
+        current_results,
+        estimated_size,
+        target_size,
+        weighted,
+    );
+    removed + removed_system
+}
+
+fn trim_history_turns_from(
+    history: &mut Vec<Message>,
+    start: usize,
+    current_results: &[ToolResult],
+    current_size: usize,
+    target_size: usize,
+    weighted: bool,
+) -> (usize, usize) {
+    if history.len() <= start || current_size <= target_size {
+        return (0, current_size);
     }
 
-    let mut prefix_len = 0usize;
+    let mut end = start;
     let mut removed_item_size = 0usize;
     let mut estimated_size = current_size;
-    while estimated_size > target_size && prefix_len < history.len() {
-        let remaining = &history[prefix_len..];
+    while estimated_size > target_size && end < history.len() {
+        let remaining = &history[end..];
         let next_turn = remaining
             .iter()
             .enumerate()
@@ -4446,10 +4495,10 @@ fn trim_history_to_estimated_budget(
         if relative_end == 0 {
             break;
         }
-        let previous_prefix_len = prefix_len;
-        prefix_len += relative_end;
+        let previous_end = end;
+        end += relative_end;
         removed_item_size = removed_item_size.saturating_add(
-            history[previous_prefix_len..prefix_len]
+            history[previous_end..end]
                 .iter()
                 .map(|message| {
                     if weighted {
@@ -4462,15 +4511,15 @@ fn trim_history_to_estimated_budget(
         );
         estimated_size = current_size.saturating_sub(json_array_prefix_reduction_from_item_bytes(
             history.len(),
-            prefix_len,
+            end - start,
             removed_item_size,
         ));
     }
 
-    if prefix_len > 0 {
-        history.drain(0..prefix_len);
+    if end > start {
+        history.drain(start..end);
     }
-    prefix_len
+    (end - start, estimated_size)
 }
 
 #[cfg(test)]
@@ -6186,6 +6235,61 @@ mod tests {
         assert_eq!(before.saturating_sub(after), expected_reduction);
         assert_eq!(after, target);
         assert!(matches!(history.first(), Some(Message::User(_))));
+    }
+
+    fn history_with_system_pair(turns: usize) -> Vec<Message> {
+        let mut history = vec![
+            Message::User(HistoryUserMessage::new(
+                format!("SYSTEM PROMPT {}", "s".repeat(64)),
+                TEST_MODEL,
+            )),
+            Message::Assistant(HistoryAssistantMessage::new(SYNTHETIC_SYSTEM_ACK)),
+        ];
+        for idx in 0..turns {
+            history.push(Message::User(HistoryUserMessage::new(
+                format!("history-{idx}-{}", "x".repeat(128)),
+                TEST_MODEL,
+            )));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "answer-{idx}-{}",
+                "y".repeat(128)
+            ))));
+        }
+        history
+    }
+
+    #[test]
+    fn history_trim_keeps_system_prompt_pair_for_five_rounds() {
+        for round in 0..5 {
+            let mut history = history_with_system_pair(20 + round);
+            let before = serde_json::to_vec(&history).unwrap().len();
+            let target = before / 2;
+            let removed =
+                trim_history_to_estimated_budget(&mut history, &[], before, target, false);
+            assert!(removed > 0, "round {round}");
+            assert_eq!(synthetic_system_prefix_len(&history), 2, "round {round}");
+            assert!(
+                matches!(&history[0], Message::User(user) if user.user_input_message.content.starts_with("SYSTEM PROMPT")),
+                "round {round}: system prompt pair must survive trimming"
+            );
+            assert!(
+                matches!(history.get(2), Some(Message::User(_))),
+                "round {round}"
+            );
+            assert!(
+                serde_json::to_vec(&history).unwrap().len() <= target,
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_trim_drops_system_pair_only_as_last_resort() {
+        let mut history = history_with_system_pair(3);
+        let before = serde_json::to_vec(&history).unwrap().len();
+        let removed = trim_history_to_estimated_budget(&mut history, &[], before, 10, false);
+        assert_eq!(removed, 8);
+        assert!(history.is_empty());
     }
 
     #[test]
