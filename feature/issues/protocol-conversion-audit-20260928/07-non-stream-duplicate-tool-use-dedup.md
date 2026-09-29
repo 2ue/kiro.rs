@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: response
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动非流式 tool_use 收集与 `stream.rs`，问题仍存在。`handlers.rs`、`stream.rs` 行号与 HEAD 一致。`src/anthropic/handlers/tests.rs` 在 3a1306d 中新增了约 155 行测试，夹具整体下移 45 行，已按 HEAD 更新（`HandlerEventStreamFault` `:3295`、router `:3848`、调用函数 `:3900`、`CompleteToolWithoutStatus` `:3662-3672`、EOF 矩阵 `:5035-5145`）。
 
 ## 问题与影响
 
@@ -39,7 +42,7 @@ Discovered: 2026-09-28 协议互转审计
 
 1. 事件循环里先处理所有结构化 tool_use，把签名写入 `seen_tool_sigs`（`src/anthropic/handlers.rs:10677-10751`）。
 2. EOF flush 未完成的 tool buffer（`src/anthropic/handlers.rs:10917-10968`）。
-3. 最后在 `append_non_stream_reasoning_and_text` → `append_recovered_non_stream_blocks` 里从正文恢复字面 invoke，用同一个集合跳过重复（`src/anthropic/handlers.rs:9670-9704`、`src/anthropic/handlers.rs:9706-9814`）。
+3. 最后在 `append_non_stream_reasoning_and_text` → `append_recovered_non_stream_blocks` 里从正文恢复字面 invoke，用同一个集合跳过重复（`src/anthropic/handlers.rs:9670-9704`、`src/anthropic/handlers.rs:9707-9814`）。
 
 根因：去重键选错了。结构化事件本身有唯一 ID，应该按 ID 去重；按内容签名去重只适用于 "没有可信 ID 的泄漏恢复块"。
 
@@ -49,7 +52,7 @@ Discovered: 2026-09-28 协议互转审计
 
 ### 最小复现（单测）
 
-放进 `src/anthropic/handlers/tests.rs`，复用已有的 fake upstream 夹具：`HandlerEventStreamFault`（`src/anthropic/handlers/tests.rs:3250`）、`eventstream_test_frame`（`src/anthropic/handlers/tests.rs:49`）、`handler_eventstream_fault_router`（`src/anthropic/handlers/tests.rs:3803`）、`call_handler_eventstream_fault`（`src/anthropic/handlers/tests.rs:3855`），写法参照 `CompleteToolWithoutStatus`（`src/anthropic/handlers/tests.rs:3617-3627`）。
+放进 `src/anthropic/handlers/tests.rs`，复用已有的 fake upstream 夹具：`HandlerEventStreamFault`（`src/anthropic/handlers/tests.rs:3295`）、`eventstream_test_frame`（`src/anthropic/handlers/tests.rs:49`）、`handler_eventstream_fault_router`（`src/anthropic/handlers/tests.rs:3848`）、`call_handler_eventstream_fault`（`src/anthropic/handlers/tests.rs:3900`），写法参照 `CompleteToolWithoutStatus`（`src/anthropic/handlers/tests.rs:3662-3672`）。
 
 先在 enum 里加一个 `DuplicateStructuredToolUses` 变体，响应分支如下：
 
@@ -140,10 +143,12 @@ fn audit_p07_distinct_tool_use_ids_with_same_input_are_all_kept_for_five_rounds(
 
 ## 测试与验收
 
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
+
 - 新增 `audit_p07_distinct_tool_use_ids_with_same_input_are_all_kept_for_five_rounds`（stream 和非流式都跑，每种 5 轮）。
 - 保留并重跑 `literal_tool_protocol_dedupes_later_structured_tool_use_for_five_rounds`（`src/anthropic/stream.rs:7213`）。补一个非流式的对等用例：结构化 `Bash{"command":"ls"}` 加上正文里的字面 `<invoke name="Bash">` 泄漏，结果必须只有 1 个 tool_use。
 - 同 `toolUseId` 重发：非流式和流式都只输出 1 个块。
-- 回归 `run_handler_non_stream_untrusted_eof_matrix` 和 `CompleteToolWithoutStatus` / `IncompleteToolWithoutStatus` 相关矩阵（`src/anthropic/handlers/tests.rs:4990-5100`）。
+- 回归 `run_handler_non_stream_untrusted_eof_matrix` 和 `CompleteToolWithoutStatus` / `IncompleteToolWithoutStatus` 相关矩阵（`src/anthropic/handlers/tests.rs:5035-5145`）。
 
 ## 兼容性与风险
 

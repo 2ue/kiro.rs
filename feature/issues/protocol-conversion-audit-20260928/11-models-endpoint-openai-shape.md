@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: aux
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -222,6 +223,8 @@ C. 按入口区分形态：`/cc` 和 strict profile 输出官方形态，其余�
 5. camelCase 的 `maxInputTokens` / `contextWindow` 保留（避免破坏现有读取方），同时新增 snake_case 的 `max_input_tokens`，文档中注明 camelCase 已弃用。`-thinking` 和别名条目可以加一个扩展标记（例如 `"alias_of"`），不删除条目，删除与否由 P19 统一决定。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 单测：`created` / `created_at` 连续两次调用结果相等；`type == "model"`；`created_at` 能按 RFC 3339 解析；静态模型的 `created_at` 与静态表一致。
 - Handler：`/v1/models` 顶层有 `has_more`、`first_id`、`last_id`；`limit=2` 返回 2 条且 `has_more=true`；用 `after_id=<last_id>` 翻页后无重复、无遗漏，覆盖全量；`before_id` 反向翻页。

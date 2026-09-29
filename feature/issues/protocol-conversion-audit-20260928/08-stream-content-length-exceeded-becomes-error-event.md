@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: stream
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动 `stream.rs` 的 `Event::Exception` / `ContextUsage` 分支和非流式事件循环，主问题与子问题均仍存在。所引 `stream.rs`、`handlers.rs`、`tool_use.rs` 行号与 HEAD 一致（仅把既有测试起始行从 `:5684` 更正为函数所在的 `:5685`）。3a1306d 在 `usage.rs` 的改动只影响请求拒绝（pre-usage rejection）记录，不影响流错误的用量记录。
 
 ## 问题与影响
 
@@ -120,7 +123,7 @@ if percentage.is_finite() && percentage >= 100.0 {
 如果以 stop_reason 为准，工具不会被执行，会话停住；即使以块为准，`model_context_window_exceeded` 也会让客户端提示上下文满，与"工具调用成功发出"矛盾。
 另外 `>= 100.0` 是浮点边界，上游若把 99.995 四舍五入为 100 上报，也会触发。
 
-现有测试 `test_context_usage_100_percent_reports_context_window_exceeded`（`src/anthropic/stream.rs:5684` 起）只覆盖纯文本场景。
+现有测试 `test_context_usage_100_percent_reports_context_window_exceeded`（`src/anthropic/stream.rs:5685` 起）只覆盖纯文本场景。
 
 ## 复现
 
@@ -248,6 +251,8 @@ if self.context_usage_reached_full
 4. 不改非流式 ContentLengthExceeded 行为（已符合预期）。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 单测：
 

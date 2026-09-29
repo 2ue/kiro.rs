@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 工作树更新（尚未提交，见 [00 修复计划：2026-09-29 方案复核](00-current-protocol-fix-plan.md)）：本地路径已改为所有请求在转换前执行历史 thinking 丢弃。条件是 `payloadGuardEnabled`、`payloadShaping.enabled` 和 `discardHistoricalThinking` 同时为真，这也是默认配置。受保护的当前工具续写 assistant 保留 Kiro 原生签名。所以，本文中"本地首发保留全部历史签名 thinking"这一前提，在默认配置下不再成立，只有关闭上述任一配置时才成立。
 
 ## 问题与影响
 
@@ -36,6 +39,8 @@ Kiro `history` 期望 user/assistant 严格交替、以 user 开头（本项目 
   converter.rs 的 prefill 预处理（`src/anthropic/converter.rs:433-446`）只处理末尾，不涉及开头。全仓没有合并“合成 assistant +
   真实 assistant”的逻辑。
 - 情况 3/4/5：没有修补，按设计如此。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：本文引用的 `history.rs`、`content.rs`、`converter.rs`、`payload_guard.rs` 行号在 HEAD 上全部核对一致，5 种边界情况均仍存在。3a1306d 没有改动 converter 的角色交替逻辑，只在本地路径新增了一次转换重试：当转换报 "consecutive assistant messages contain multiple native reasoning blocks..." 或 "assistant history contains multiple or mixed native reasoning blocks..." 时，先用 `sanitize_anthropic_messages_for_external_forwarding`（`src/anthropic/payload_guard.rs:2143-2148`）按 `enabled=true, discardHistoricalThinking=true` 整形 Anthropic 消息，再转换一次（`src/anthropic/handlers/local_body_pipeline.rs:75-92`、`:186-214`）。这一重试不处理首条 assistant、伪造 "OK"、prefill 截断或多 text 块拼接。另外需要注意 payload 整形的实际口径：本地 Kiro 路径上，`discardHistoricalThinking` 只在 `guard_kiro_request` 的超限分支里生效（`src/anthropic/payload_guard.rs:582-584`，`size_limit_enabled && report.final_weight > max_weight && config.shaping.enabled`），常驻的 `apply_payload_safety_shaping`（`:2063-2078`）只丢超大历史图片。所以默认 `on_too_long` 模式下首次发送会保留历史中的 Kiro 原生签名 thinking；`align_history_to_user`（`:537-539`）删除前导 assistant 时，其 reasoning 也随之丢失。外部池路径则在 `shaping.enabled` 下通过 `apply_anthropic_payload_safety_shaping`（`:2080-2106`）直接丢弃历史 thinking（`discardHistoricalThinking` 默认 true）。
 
 影响评估（为什么是 Low）：Claude Code 正常会话总是 user 开头、严格交替、无 prefill；上述情况主要出现在 SDK/第三方客户端、
 手工构造请求、或客户端 compact 后首条变成 assistant 摘要的场景（经验推断，未抓包）。Kiro 对连续 assistant 是否 400 没有本地证据。
@@ -176,11 +181,15 @@ B（在源头处理，信息不丢），辅以对 prefill 的显式策略：
 
 ## 测试与验收
 
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
+
 - 上面 3 条单测转绿；`guard_aligns_leading_assistant_and_repairs_result` 保持（guard 兜底行为不变），新增 converter 级测试证明
   guard 不再需要删除。
 - 回归：正常交替会话、Claude Code 真实会话的 history 序列化结果 byte-identical（新增逻辑只在边界触发）。
 - 连续 assistant 合并与 native reasoning 的交互需与 [P22](22-consecutive-assistant-native-reasoning-merge-rejected.md) 一致：
   合成 assistant 不带 reasoning，合并真实 assistant 的 reasoning 不应触发“多个 reasoning”错误。
+  HEAD 上即使触发了该错误，本地路径也会走 3a1306d 的丢弃历史 thinking 重试；验收时应断言首次转换就成功、没有走这次重试，
+  否则等于静默丢掉了首条 assistant 的 Kiro 原生签名 thinking。
 - prefill `reject` 模式返回 400，`drop` 模式行为与现状一致。
 - 补证：一次“连续 assistant”真实上游请求的返回码写入本文。
 

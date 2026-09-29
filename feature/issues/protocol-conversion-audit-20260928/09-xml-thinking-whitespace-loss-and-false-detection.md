@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: stream
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动 `src/anthropic/stream.rs` 与 `converter/thinking.rs`，两个缺陷均仍存在。所引行号与 HEAD 一致，只给"边界 flush 另有两处"补了具体行号。
 
 ## 问题与影响
 
@@ -13,7 +16,7 @@ XML thinking 提取模式下，在尚未完成一次 thinking 提取之前（`!i
 1. 空白丢失：当 buffer 尾部可能是开始标签前缀（如 `<`、`<th`）时，前面的内容只有"不是纯空白"才会发出。
    chunk 为 `\n\n<`、`\n<`、`  <` 这类形态时，空白被直接丢弃。
    例：模型输出 `代码如下：` 与 `\n\n<div>…` 分两个 chunk 到达，下游看到的是 `代码如下：<div>…`，Markdown 段落/代码块结构被破坏。
-2. 误判 thinking：`thinking_extracted` 只在**找到结束标签**时置为真（`src/anthropic/stream.rs:2838`，边界 flush 另有两处）。
+2. 误判 thinking：`thinking_extracted` 只在**找到结束标签**时置为真（`src/anthropic/stream.rs:2838`，边界 flush 另有两处：tool_use 边界 `:3470`、最终 flush `:3758`；`:3720` 是原生 reasoning 收尾，与 XML 探测无关）。
    模型这一轮没有思考（adaptive 模式常见）时，整条回答都处于"可能开始 thinking"状态；
    正文后面任何一个前后不是 `` ` " ' \ `` 的 `<thinking>` 都会开启一个 thinking 块，之后的正文全部进入 thinking。
    典型触发：模型在围栏代码块里写 XML/提示词样例（```` ```xml\n<thinking>\n... ````），或者讨论本项目这类代理代码。
@@ -189,6 +192,8 @@ while let Some((idx, ch)) = self.thinking_buffer[..retain_start].char_indices().
 6. tool_use 边界 flush（`src/anthropic/stream.rs:3497-3506`）逻辑不变，只额外设置 `xml_thinking_probe_closed = true`。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 新增单测：上面三个草稿，另加：
 

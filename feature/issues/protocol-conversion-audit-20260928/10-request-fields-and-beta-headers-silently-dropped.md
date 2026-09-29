@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -43,7 +44,9 @@ Discovered: 2026-09-28 协议互转审计
 ## 源码链与根因
 
 1. HTTP body → `MessagesRequest` 反序列化（`src/anthropic/types.rs:282-308`），未建模的字段在这一步就没了。
-2. 本地 Kiro 转换入口 `convert_request_with_resolved_model`（`src/anthropic/converter.rs:405-415`，调用点在 `src/anthropic/handlers/local_body_pipeline.rs:166`）只读取已建模的字段。
+2. 本地 Kiro 转换入口 `convert_request_with_resolved_model`（`src/anthropic/converter.rs:405-415`，调用点在 `src/anthropic/handlers/local_body_pipeline.rs:180`）只读取已建模的字段。
+
+   > 2026-09-29 代码核对（HEAD a4227c1）：调用点行号由 `:166` 更正为 `:180`。3a1306d 在 `local_body_pipeline.rs:200` 新增了一次 reasoning 回退重转（对 `payload.clone()` 做历史 thinking 裁剪后再次调用 `convert_request_with_resolved_model`），输入仍是已反序列化的 `MessagesRequest`，未建模字段早已丢失，本问题结论不变。
 3. `build_additional_model_request_fields` 只根据 thinking / output_config 生成 native reasoning 字段（`src/anthropic/converter.rs:601-607`）。
 4. 响应构造时 `stop_sequence` 固定写 `null`（`src/anthropic/handlers.rs:11155-11164`、`src/anthropic/stream.rs:1490-1502`）。
 
@@ -115,6 +118,8 @@ fn audit_p10_unmodeled_protocol_fields_are_silently_dropped() {
 `temperature` 等透传放到实测之后再做，本期不做。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 单测：`audit_p10_unmodeled_protocol_fields_are_silently_dropped` 改写为 "字段被建模 + 出现在 warnings" 的断言。
 - `stop_sequences`：

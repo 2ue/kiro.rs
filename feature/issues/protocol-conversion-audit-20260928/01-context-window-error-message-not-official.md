@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: High
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动 `map_provider_error`、`provider_public_error_for_message` 与 too-long 分类函数，问题仍存在。修正了移位的行号：`src/kiro/provider.rs` 的 Kiro 分类字面量移到 `:13590-13606`（`classify_bad_request_reason`），`local_body_pipeline.rs` 的 token 计数移到 `:312-320`，`provider_public_error_for_message` 的两个 too-long 分支在 `:5051-5067`。另外 3a1306d 让 `classify_bad_request_reason == "malformed_request"` 的 400 也能触发同凭据剥离 reasoning 重试（`reasoning_compatibility_retry_reason`），但 too-long 类仍归到 `content_length_exceeds_threshold`，不受影响。
 
 ## 问题与影响
 
@@ -40,7 +43,7 @@ Discovered: 2026-09-28 协议互转审计
 - 输入 token 超过模型上下文窗口：HTTP 400，`error.type = "invalid_request_error"`，
   `error.message` 形如 `prompt is too long: 208310 tokens > 200000 maximum`。
 - 请求体字节数超过网关限制：HTTP 413，`error.type = "request_too_large"`。
-- 本仓库 50 MiB 请求体限制已返回 413（`src/anthropic/request_body.rs:16`、`:58-64`），
+- 本仓库 50 MiB 请求体限制已返回 413（`src/anthropic/request_body.rs:15`、`:58-64`），
   但 `error.type` 用的是 `invalid_request_error` 而非官方的 `request_too_large`，是一个相邻的小偏差，本 issue 一并记录，不在推荐方案主线。
 
 经验推断（未对 Claude Code 源码逐行验证，来自线上行为观察和社区逆向资料）：
@@ -51,7 +54,7 @@ Discovered: 2026-09-28 协议互转审计
   解析失败时仍按"超限"处理，只是无法精确计算要裁掉多少。
 - 413 `request_too_large` 在 Claude Code 中会提示请求过大（多与图片/文件相关），不触发 compact。
 
-Kiro 侧（已验证于代码中的分类字面量，`src/kiro/provider.rs:13471-13486`）：
+Kiro 侧（已验证于代码中的分类字面量，`src/kiro/provider.rs:13590-13606`，`classify_bad_request_reason`）：
 
 - `CONTENT_LENGTH_EXCEEDS_THRESHOLD` / `Input is too long.`：Kiro 的输入长度阈值，按内容长度而非 token 计算，与模型上下文窗口不是同一个限制；
 - `context window is full ... reduce conversation history`：Kiro 的上下文窗口满。
@@ -157,7 +160,7 @@ print(json.dumps({
   "messages": [{"role": "user", "content": big}]
 }))
 EOF
-curl -sS http://127.0.0.1:8990/v1/messages \
+curl -sS http://127.0.0.1:19023/v1/messages \
   -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
   -H "x-api-key: $KEY" --data-binary @/tmp/p01.json -D - | head -40
 ```
@@ -231,10 +234,12 @@ if is_upstream_payload_too_long_error(&err_str) || is_upstream_context_window_fu
    `:8074`、`:8097`、`:9924`、`:10069`、`:10241`、`:10272`、`:10368`、`:10391`、`:10591`）传入
    `Some(PromptTooLongContext { estimated_input_tokens: usage_context.request.input_tokens, context_window_tokens: usage_context.request.context_window_tokens })`。
    若 payload guard 重试后失败，N 应取裁剪后 body 的估算值（重试分支已重新计数时使用新值；未重新计数时退回方案 A）。
-5. `provider_public_error_for_message`（`:5054-5070`）同步改为同一文案（无 token 上下文时用方案 A），保证用量记录与实际响应一致。
+5. `provider_public_error_for_message`（`:5051-5067`）同步改为同一文案（无 token 上下文时用方案 A），保证用量记录与实际响应一致。
 6. 相邻偏差（可选，同一提交或单独提交）：`src/anthropic/request_body.rs:61` 的 413 `error.type` 改为 `request_too_large`。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 单测（`src/anthropic/handlers/tests.rs`）：
 
@@ -243,7 +248,7 @@ if is_upstream_payload_too_long_error(&err_str) || is_upstream_context_window_fu
 - `prompt_too_long_message_includes_token_numbers_when_estimate_exceeds_window`：`estimated=1_200_000, window=1_000_000` →
   message 等于 `prompt is too long: 1200000 tokens > 1000000 maximum`。
 - `prompt_too_long_message_omits_numbers_when_estimate_not_above_window`：`estimated=300_000, window=1_000_000` → message 等于 `prompt is too long`。
-- `estimated_input_tokens=0`（token counting 关闭，`src/anthropic/handlers/local_body_pipeline.rs:283-292`）→ 无数字。
+- `estimated_input_tokens=0`（token counting 关闭，`src/anthropic/handlers/local_body_pipeline.rs:312-320`）→ 无数字。
 - 响应头包含 `x-error-id` 与 `x-kiro-too-long-kind`。
 
 需要更新的已有测试：

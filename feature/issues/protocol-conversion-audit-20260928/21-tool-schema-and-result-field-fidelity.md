@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -32,6 +33,7 @@ Discovered: 2026-09-28 协议互转审计
      如果上游按字节计，会超限。上游真实上限和单位未验证。
    - 另有 payload guard 的工具定义压缩（`tool_description_max_chars`，`src/anthropic/payload_guard.rs:2190-2216`），只在体积超限时触发，
      与这里的无条件截断是两层机制。
+     （压缩调用在 `apply_payload_shaping` 内，即 `guard_kiro_request` 的超限分支 `src/anthropic/payload_guard.rs:582-584`。）
 3. schema 清洗：
    - `normalize_schema_object` 在每一层删除 `additionalProperties`、`additionalItems`、`unevaluated*` 等（`src/anthropic/converter/schema.rs:147-157`）。
      `sub2api-kiro` 注释说明 Kiro Smithy 校验遇到 `additionalProperties` 会拒绝整个请求（社区一致经验，本仓库无抓包），
@@ -52,6 +54,8 @@ Discovered: 2026-09-28 协议互转审计
    对 `content` 源落到 `other =>` 分支，返回 `unsupported document source type: content`（`src/anthropic/converter/content.rs:223-226`），HTTP 400。
    `ContentBlock` 没有 `title`、`context`、`citations` 字段（`src/anthropic/types.rs:413-438`），顶层 document 的标题和上下文说明被丢弃，
    `<document media_type="...">` 包装里只有 media_type（`src/anthropic/converter/content.rs:264-269`）。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：本文引用的 `tool.rs`、`tools.rs`、`schema.rs`、`content.rs`、`history.rs`、`types.rs`、`converter.rs`、`payload_guard.rs` 行号在 HEAD 上全部核对一致，5 项均仍存在。3a1306d 没有改动这些文件；它只让本地 body 准备阶段的转换拒绝（例如 `unsupported document source type: content`，公开文案即 `ConversionError::UnsupportedContent` 原文，见 `src/anthropic/handlers/local_body_pipeline.rs:94-102`）在 usage 记录里额外带上 model、stream、max_tokens 和模型解析上下文，对外响应不变。
 
 ## 官方协议对照
 
@@ -213,6 +217,8 @@ if !suffix.is_empty() { description.push('\n'); description.push_str(suffix); }
   的嵌套 document 渲染共用同一函数。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 上述单测转绿；`test_tool_result_serialize`、`test_normalize_json_schema_flattens_root_*`、现有 additionalProperties 删除测试保持通过
   （3A 只新增 description，不恢复 additionalProperties）。

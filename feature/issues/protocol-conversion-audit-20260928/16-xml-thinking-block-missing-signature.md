@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Low
 Area: response
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 工作树更新（尚未提交，见 [00 修复计划：2026-09-29 方案复核](00-current-protocol-fix-plan.md)）：本地路径已改为所有请求在转换前执行历史 thinking 丢弃。条件是 `payloadGuardEnabled`、`payloadShaping.enabled` 和 `discardHistoricalThinking` 同时为真，这也是默认配置。受保护的当前工具续写 assistant 保留 Kiro 原生签名。所以，本文中"本地首发保留全部历史签名 thinking"这一前提，在默认配置下不再成立，只有关闭上述任一配置时才成立。
 
 ## 问题与影响
 
@@ -63,6 +66,8 @@ XML 提取出来的 thinking 块（流式和非流式）既没有 `signature` �
 - `src/anthropic/converter/history.rs:371-376`：同一条 assistant 消息里既有签名/redacted reasoning 又有无签名 thinking 时，返回
   `ConversionError::UnsupportedContent("assistant history mixes native signed/redacted reasoning with unsigned thinking ...")`，
   handler 映射为 400 `invalid_request_error`（`src/anthropic/handlers.rs:5701`）。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 在本地转换失败时新增了一次"丢弃历史 thinking 后重转"的回退（`src/anthropic/handlers/local_body_pipeline.rs:75-84`、`186-211`），但只匹配两条错误文案："consecutive assistant messages contain multiple native reasoning blocks ..." 和 "assistant history contains multiple or mixed native reasoning blocks ..."。本节的 "mixes native signed/redacted reasoning with unsigned thinking" 不在匹配列表里，所以签名块和无签名 thinking 混在同一条消息时仍然直接返回 400。候选方案 E 仍未实现。
 
 混合的理论来源（未在线上确认）：一次流式响应先按 XML 打开了 thinking 块，之后上游又发 `reasoningContentEvent`。
 `emit_assistant_response_content`（`src/anthropic/stream.rs:2639-2658`）在 `native_reasoning_seen` 后停止 XML 解析，
@@ -146,11 +151,13 @@ B，并以配置开关保护；E 另开 issue 跟踪。
    现有断言 `src/anthropic/stream.rs:4762` 需同步调整。
 2. 非流式：`src/anthropic/handlers.rs:9788-9791` 的块增加 `"signature": ""`；原生无签名分支（`:9753-9763`）同样补空字符串。
 3. 不发送空 `signature_delta`（`take_native_signature_delta_event` 的非空判断保持不变）。
-4. 配置：`compat_profile` 已控制 XML 提取（`src/anthropic/handlers/local_body_pipeline.rs:302`）。建议加一个布尔项
+4. 配置：`compat_profile` 已控制 XML 提取（`src/anthropic/handlers/local_body_pipeline.rs:331`，2026-09-29 核对时由 `:302` 更正）。建议加一个布尔项
    `emit_empty_thinking_signature`（默认 true），出现客户端兼容问题时可关闭，恢复旧形状。
 5. 文档：在用户文档中说明"经代理产生的 thinking 在官方 API 上不可回放；需要跨上游切换的用户使用 strict profile 或在切换前 `/clear`"。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 单测：
 

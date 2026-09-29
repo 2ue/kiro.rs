@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: response
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -176,6 +177,8 @@ C. 实现完整的 server tool loop：模型选 query，然后多次搜索，把
 6. **模型摘要（P3，可选）**：作为按路由启用的 opt-in。MCP 成功后，把结果作为 context 发起一次受预算和 deadline 约束的 Kiro 推理，用它替换模板摘要；推理失败时回退到模板。必须复用 shared attempt ledger 和 usage 记录。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 请求解析：`allowed_domains`、`blocked_domains`、`user_location` 反序列化后能原样保留；二者同时出现时返回 400，且 0 次 MCP 调用。
 - 过滤：fake MCP 返回 `a.com`、`sub.a.com`、`b.com` 三条结果。`allowed=[a.com]` 剩 2 条；`blocked=[a.com]` 剩 1 条；全部过滤后得到合法零结果，stream 和 non-stream 各 5 轮。

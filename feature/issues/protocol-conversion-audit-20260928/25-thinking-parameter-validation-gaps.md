@@ -4,6 +4,9 @@ Status: documented / 入口校验与规范化已实现 / residual-gaps-open
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 工作树更新（尚未提交，见 [00 修复计划：2026-09-29 方案复核](00-current-protocol-fix-plan.md)）：本地路径已改为所有请求在转换前执行历史 thinking 丢弃。条件是 `payloadGuardEnabled`、`payloadShaping.enabled` 和 `discardHistoricalThinking` 同时为真，这也是默认配置。受保护的当前工具续写 assistant 保留 Kiro 原生签名。所以，本文中"本地首发保留全部历史签名 thinking"这一前提，在默认配置下不再成立，只有关闭上述任一配置时才成立。
 
 ## 问题与影响
 
@@ -26,6 +29,8 @@ Discovered: 2026-09-28 协议互转审计
 | user 消息里的 `redacted_thinking` / `thinking` | 静默丢弃（前者有 debug 日志） | 缺口 G3（只需观测） |
 
 剩余缺口都是低影响：不会导致请求失败，只是客户端表达的意图没有被执行，而且没有任何可见信号。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：`request_entry.rs`、`request_facts.rs`、`types.rs`、`envelope.rs`、`converter/model.rs`、`kiro.rs`、`thinking.rs`、`content.rs`、`handlers.rs:11377-11399`、`converter.rs:3640` 的引用行号在 HEAD 上全部核对一致（`request_entry.rs` 的行号写作时已包含 3a1306d 的改动），G1/G2/G3 均仍存在。3a1306d 对 `request_entry.rs` 的改动只是让入口拒绝的 usage 记录额外带上 model、stream、max_tokens（`record_entry_request_error` 新增 `raw_probe` 参数），不改变校验与规范化逻辑，也不改变对外错误响应。已更正端到端复现里的笔误：budget 512 规范化后是 1024（`MIN_ENABLED_THINKING_BUDGET_TOKENS`，`request_facts.rs:428-436`），不是 200。
 
 ## 官方协议对照
 
@@ -192,7 +197,7 @@ fn clipped_budget_lowers_native_effort_bucket() {
 ### 端到端复现
 
 ```bash
-BASE=http://127.0.0.1:8990/cc/v1/messages
+BASE=http://127.0.0.1:19023/cc/v1/messages
 H=(-H 'content-type: application/json' -H 'x-api-key: <key>' -H 'anthropic-version: 2023-06-01')
 
 # 已校验：null budget -> 400 thinking.budget_tokens must be an integer
@@ -203,7 +208,7 @@ curl -sS "$BASE" "${H[@]}" -d '{"model":"claude-sonnet-4-5","max_tokens":2048,
 curl -sS "$BASE" "${H[@]}" -d '{"model":"claude-sonnet-4-5","max_tokens":2048,
   "thinking":{"type":"mystery"},"messages":[{"role":"user","content":"hi"}]}'
 
-# 有意规范化：budget 512 -> 200；日志 normalization_reason=raise_budget_to_minimum
+# 有意规范化：budget 512 -> 1024；日志 normalization_reason=raise_budget_to_minimum
 curl -sS "$BASE" "${H[@]}" -d '{"model":"claude-sonnet-4-5","max_tokens":4096,
   "thinking":{"type":"enabled","budget_tokens":512},"messages":[{"role":"user","content":"hi"}]}'
 
@@ -236,6 +241,8 @@ C. 把客户端 `display` 原样转发给 Kiro。Kiro 是否接受 `omitted` 没
 | 未知/缺失 `type`、非整数或越界 budget、非对象 thinking | 保持本地 400（已实现） | 意图无法确定；发给上游只会得到不可诊断的 400，而且确定性错误不应进入选路和重试 |
 | `display` 非 `summarized`/`omitted`、非字符串 | 新增本地 400：`thinking.display must be one of: summarized, omitted` | 同上；放在 `validate_raw_reasoning_protocol_with_probe` 的 thinking 分支，raw 和本地路由同时生效 |
 | `display:"omitted"` | 接受，暂不执行；计入告警 | 省略 thinking 文本需要在响应侧清空文本、保留 Kiro 签名，而空文本配原签名回放时 Kiro 能否校验通过没有证据；在拿到证据前保守返回完整文本，并在 `x-kiro-rs-warnings` 中写 `thinking-display-ignored=1` |
+
+> 2026-09-29 代码核对（HEAD a4227c1）：上面“空文本配原签名回放”的风险在本地 Kiro 路径上是真实会发生的，不能假设历史 thinking 会先被整形掉。本地路径的 `discardHistoricalThinking` 只在 `guard_kiro_request` 的超限分支里生效（`src/anthropic/payload_guard.rs:582-584`，`size_limit_enabled && report.final_weight > max_weight && config.shaping.enabled` 时才调用 `apply_payload_shaping`）；常驻的 `apply_payload_safety_shaping`（`:2063-2078`）只丢超大历史图片。所以默认 `on_too_long` 模式下首次发送会保留历史中的 Kiro 原生签名 thinking，作为 `reasoningContent` 原样透传给 Kiro。外部池路径则不同：`apply_anthropic_payload_safety_shaping`（`:2080-2106`）在 `shaping.enabled` 下直接丢弃历史 thinking（`discardHistoricalThinking` 默认 true），这条路径上的回放不会被验证到。补证时必须走本地路径。另外 3a1306d 增加了两层兜底，会掩盖回放失败：本地转换遇到多个或混合的 native reasoning 块时，会丢弃历史 thinking 后重试（`src/anthropic/handlers/local_body_pipeline.rs:186-214`）；provider 遇到 `THINKING_SIGNATURE_INVALID`，或者 `Improperly formed request` 这类 400 malformed_request 时，只要存在 `thinking_signature_retry_body_builder`，就会去掉 reasoning 后用同一凭据重试（`src/kiro/provider.rs:12207`、`:13664-13677`）。补证时需要检查 attempts 里有没有 `thinking_signature_retry_same_credential` / `reasoning_malformed_retry_same_credential`，不能只看最终是否 200。
 | budget < 1024、== max、缺省、adaptive/disabled 带 budget | 保持静默规范化（有意设计） | 已有真实账号证据；Kiro 不接收 budget/max_tokens，规范化不改变上游语义。建议把 `normalization_reason` 同时写入 `x-kiro-rs-warnings`（目前只有 info 日志，`request_entry.rs:93-104`） |
 | budget > max 且带 `interleaved-thinking-*` beta | 不截断 budget，也不扩大 max；raw 校验在此条件下跳过 `budget < max_tokens` | 官方语义下合法；Kiro 不接收 max_tokens，截断只会让 effort 档位无故下降 |
 | user 消息中的 `thinking`/`redacted_thinking` | 保持丢弃；新增 `user_thinking_blocks_dropped` 告警计数 | Kiro user 消息无 reasoning 字段；本地 400 会让偶发异常历史整段不可用，收益低于成本 |
@@ -252,6 +259,8 @@ C. 把客户端 `display` 原样转发给 Kiro。Kiro 是否接受 `omitted` 没
 
 ## 测试与验收
 
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
+
 - 新增 `raw_reasoning_protocol_validates_thinking_display_for_five_rounds`：修复前失败、修复后通过。
 - 新增 `raw_reasoning_protocol_null_budget_is_a_public_integer_error`、`clipped_budget_lowers_native_effort_bucket`：修复前后都通过，作为护栏。
 - 新增入口测试：带 `anthropic-beta: interleaved-thinking-2025-05-14`，`max_tokens=32000`、`budget_tokens=100000`，
@@ -261,7 +270,7 @@ C. 把客户端 `display` 原样转发给 Kiro。Kiro 是否接受 `omitted` 没
   `explicit_max_output_config_effort_survives_authoritative_wire_conversion_five_rounds` 全部通过。
 - 端到端：上面 5 条 curl 的结果符合“推荐方案”表格；`display:"omitted"` 响应头含 `thinking-display-ignored`。
 - 真实 Claude Code CLI（带 interleaved beta，`--effort max`）：thinking 正常输出，wire effort 不低于修复前。
-- 补证：抓一次 Kiro 对 `thinking.display:"omitted"` 的真实返回，决定是否把 G1 升级为“转发给 Kiro”。
+- 补证：抓一次 Kiro 对 `thinking.display:"omitted"` 的真实返回，决定是否把 G1 升级为“转发给 Kiro”。空文本加原签名的回放补证只在本地路径上有意义，并且要确认没有触发 3a1306d 的去 reasoning 重试（见“推荐方案”表后的核对说明）。
 
 ## 兼容性与风险
 

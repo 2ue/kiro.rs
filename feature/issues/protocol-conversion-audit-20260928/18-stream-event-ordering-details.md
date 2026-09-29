@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Low
 Area: stream
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -65,7 +66,7 @@ AWS EventStream 编码（公开规范）：prelude = `total_length(4) + headers_
 
 原生 reasoning：
 
-- `src/anthropic/stream.rs:2661-2737` `process_reasoning_content`：第 2735-2736 行 `native_reasoning_content.clear(); push_str(text)`，每个事件用最新的累计快照覆盖，不下发任何事件。
+- `src/anthropic/stream.rs:2661-2737` `process_reasoning_content`：第 2737-2738 行（2026-09-29 核对时由 2735-2736 更正）`native_reasoning_content.clear(); push_str(text)`，每个事件用最新的累计快照覆盖，不下发任何事件。
 - `src/anthropic/stream.rs:3373-3433` `close_native_reasoning_block`：拿到完整内容后，先整体经过 sanitizer，签名块如果被污染就整体丢弃；然后一次性发出 start、单个 `thinking_delta`、`signature_delta`、stop。
 - 缓冲上限：`src/anthropic/stream.rs:85` `MAX_BUFFERED_ATOMIC_THINKING_BYTES = 1 MiB`。
 - **这是有意的设计**：[Thinking 与签名内容安全](../thinking-and-signed-content-safety.md) 规定"signed/redacted：完整原子缓冲后才决定是否下发；绝不局部改写或把净化后的正文与原 signature 重新组合"，并把"首 thinking 延迟"列为必要成本。本文不推翻这个决策。
@@ -205,6 +206,8 @@ C. 在输出层重排：先缓存整条流，最后按 index 排序输出。这�
 4. **帧解析**：`parse_frame` 读完 12 字节 prelude 后立刻校验 prelude CRC，再判断长度和等待完整帧。message CRC 的校验时机保持不变。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 串行性：上面的 `assert_blocks_are_sequential` 作为通用断言，加到 stream 测试矩阵中所有涉及多块的用例（text→tool、tool→tool、tool→text、thinking→text→tool、stop 缺失、EOF flush），每个用例 20 轮，全部通过。
 - 确定性：同一组上游事件在 20 个新建的 `StreamContext` 上回放，SSE 事件序列逐字节相同。

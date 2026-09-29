@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -21,7 +22,9 @@ Kiro 的请求模型里没有 `toolChoice` 字段（`src/kiro/model/requests/kir
 | `{type:"tool",name}` | 必须调用这个工具 | 只发这一个工具，加上历史占位工具，再加提示 | 模型可以不调用而直接回文本，也可以调用占位工具。名字不存在时会退化成发送全部工具，只打一条 warn（`src/anthropic/converter/tools.rs:280-287`） |
 | 任意 + `disable_parallel_tool_use: true` | `auto` 时最多 1 个，`any`/`tool` 时恰好 1 个 | 字段被完全忽略（在 `src/` 下 grep 不到 `disable_parallel_tool_use`） | 可能一次返回多个 tool_use |
 
-提示词引导的默认生效范围：converter 用的是全局 `prompt_steering.enabled`（`src/anthropic/handlers.rs:908`、`src/anthropic/handlers/local_body_pipeline.rs:166-181`），**不受** request-level `scope/routeRules` 的影响。`routeRules` 默认 `["/cc"]`，只对 `prompt_steering.rs` 注入 language/task/custom system prompt 生效（`src/anthropic/prompt_steering.rs:67-107`）。所以在默认配置下，所有非 strict 路由都会注入 tool_choice 前缀。运营方关闭总开关，或者使用 strict / anthropic-strict profile 时，`any`/`tool` 就**只剩结构化过滤，没有任何引导**。
+提示词引导的默认生效范围：converter 用的是全局 `prompt_steering.enabled`（`src/anthropic/handlers.rs:908`、`src/anthropic/handlers/local_body_pipeline.rs:168-184`），**不受** request-level `scope/routeRules` 的影响。`routeRules` 默认 `["/cc"]`，只对 `prompt_steering.rs` 注入 language/task/custom system prompt 生效（`src/anthropic/prompt_steering.rs:67-107`）。所以在默认配置下，所有非 strict 路由都会注入 tool_choice 前缀。运营方关闭总开关，或者使用 strict / anthropic-strict profile 时，`any`/`tool` 就**只剩结构化过滤，没有任何引导**。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 把 `ConverterOptions` 提成局部变量（`local_body_pipeline.rs:168-179`），首次转换在 `:180-184`，行号由 `166-181` 更正为 `168-184`。新增的 reasoning 回退重转（`:200`）复用同一份 `converter_options`，tool_choice 过滤与提示词注入行为不变。
 
 影响：
 
@@ -149,6 +152,8 @@ A 为主，同时做 B 里低成本的部分：
 4. 可观测性：usage 记录增加 `tool_choice_mode` 和 `tool_choice_violation`，先上线观测，量化违规率之后再决定是否开启重试。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 单测：上面两个 `audit_p15_*` 测试改成修复后的期望：`none` 时占位工具被标记为不可调用；`disable_parallel` 进入 contract。
 - 流式单测（`src/anthropic/stream.rs` 的 `mod tests`，参照 `stream_suppresses_continue_transcript_and_keeps_structured_tool_boundary`，`src/anthropic/stream.rs:4221`）：

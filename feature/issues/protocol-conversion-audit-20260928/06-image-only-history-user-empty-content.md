@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动 `converter/history.rs`、`converter.rs`、`payload_guard.rs`，问题仍存在，引用行号与 HEAD 一致（两处 payload_guard 范围微调）。相关副作用：3a1306d 让 Kiro 400 `malformed_request`（含 `Improperly formed request`）在 history 带 `reasoningContent` 时触发一次同凭据剥离 reasoning 重试（`src/kiro/provider.rs:13664-13677`，`src/anthropic/handlers.rs:6850`、`:6897`）。如果 Kiro 对空 content 返回的正是这类 400，这次重试修不好空 content，只会多一次上游调用后再失败；Kiro 对空 content 的具体错误仍未取证。
 
 ## 问题与影响
 
@@ -38,9 +41,9 @@ if content.trim().is_empty() && !all_tool_results.is_empty() {
 - payload guard 的 `repair_request`（`src/anthropic/payload_guard.rs:4528-4555`）只规范化空 tool_result 内容，
   不处理空 user content。
 - guard 唯一写 `.` 占位的地方是 `repair_tool_results`：仅当“移除孤儿 tool_result 后结果为空且 content 为空”时才写
-  （`src/anthropic/payload_guard.rs:4812-4826`）。纯图片消息没有 tool_results，不命中。
+  （`src/anthropic/payload_guard.rs:4810-4826`）。纯图片消息没有 tool_results，不命中。
 - `drop_oversized_history_images` 只在丢弃超过 5 MB 的图片时通过 `append_text` 追加说明文本
-  （`src/anthropic/payload_guard.rs:1969-2010`、`src/anthropic/payload_guard.rs:5031-5041`）；普通尺寸图片不命中。
+  （`src/anthropic/payload_guard.rs:1970-2010`、`src/anthropic/payload_guard.rs:5031-5041`）；普通尺寸图片不命中。
 - `UserMessage` 序列化没有跳过空 content（`src/kiro/model/requests/conversation.rs:281-307`）。
 
 结论：审计所述成立，当前没有任何后续环节为纯图片历史 user 填充 content。
@@ -184,6 +187,8 @@ pub(super) fn non_empty_user_content(text: String, has_tool_results: bool, has_i
    但纯图片场景没有 tool_result，风险不同；若担心模型忽略图片，可改用 `[image]`，需要真实 CLI 验证后定。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 两条新单测转绿；已有 `current_empty_user_message_gets_inert_placeholder`、tool_result 占位测试保持通过。
 - 纯图片历史 user：`images` 保留，content 为占位；`warnings.empty_content_placeholders` 计数 +1。

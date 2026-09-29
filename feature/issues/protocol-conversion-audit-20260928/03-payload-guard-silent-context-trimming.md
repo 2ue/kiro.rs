@@ -4,6 +4,11 @@ Status: open / documented / not-fixed
 Severity: High
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 工作树更新（尚未提交，见 [00 修复计划：2026-09-29 方案复核](00-current-protocol-fix-plan.md)）：本地路径已改为所有请求在转换前执行历史 thinking 丢弃。条件是 `payloadGuardEnabled`、`payloadShaping.enabled` 和 `discardHistoricalThinking` 同时为真，这也是默认配置。受保护的当前工具续写 assistant 保留 Kiro 原生签名。所以，本文中"本地首发保留全部历史签名 thinking"这一前提，在默认配置下不再成立，只有关闭上述任一配置时才成立。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：问题仍存在，3a1306d 未改动 `payload_guard.rs`，也没有加入 system 保护、in-band 披露或 reject 模式。修正：`apply_payload_shaping` 实际范围 `:2150-2226`，`trim_history_to_estimated_budget` 到 `:4474`，`local_body_pipeline.rs` 的引用按 HEAD 重排（prepare `:129-150`、重试请求构造 `:226-239`、首发 warnings `:323-330`）。补充了 LOCAL 与外部池在历史 thinking 丢弃上的差异，以及 3a1306d 新增的两条与体积无关、同样静默的历史 thinking 删减路径（本地转换回退、上游 `malformed_request` 剥离 reasoning 重试）。核对时工作区另有未提交的 `local_body_pipeline.rs` 改动（转换前按配置丢历史 thinking），不属于 HEAD，本文未计入。
 
 ## 问题与影响
 
@@ -12,8 +17,8 @@ Kiro local path 的 payload guard（`guard_kiro_request`，`src/anthropic/payloa
 `src/anthropic/payload_guard.rs:1578-1589`）时，会按顺序：
 
 1. 截断历史 tool_result（默认每条 8,000 字符 head/tail）、裁剪历史 web_fetch、丢弃历史 thinking、压缩工具定义
-   （`apply_payload_shaping`，`src/anthropic/payload_guard.rs:2150-2219`）；
-2. 从最旧一轮开始整轮删除 history（`trim_history_to_estimated_budget`，`src/anthropic/payload_guard.rs:4411-4472`），
+   （`apply_payload_shaping`，`src/anthropic/payload_guard.rs:2150-2226`，仅在 `:582` 的超限分支 `size_limit_enabled && report.final_weight > max_weight && config.shaping.enabled` 内执行）；
+2. 从最旧一轮开始整轮删除 history（`trim_history_to_estimated_budget`，`src/anthropic/payload_guard.rs:4411-4474`），
    删除后不插入任何“此前内容已省略”标记；
 3. 若显式开启了 current shaping，再截断当前 tool_result / 当前 document / 当前用户文本 / 当前图片
    （`apply_current_payload_shaping_until_fit`，`src/anthropic/payload_guard.rs:3508` 起）。
@@ -37,7 +42,7 @@ Claude Code 不会触发 compact。
 - 新发现（比审计更严重）：Kiro history 的第 0、1 项是 system prompt 转成的 `user(system) + assistant("I will follow these instructions.")`
   合成对（`src/anthropic/converter/history.rs:97-102`、`src/anthropic/converter/history.rs:113-119`）。
   `trim_history_to_estimated_budget` 从下标 0 开始按“到下一个不带 tool_results 的 user 为止”删整轮，没有任何 system 保护
-  （`src/anthropic/payload_guard.rs:4425-4468`；`payload_guard.rs` 内无任何 system 相关保护逻辑）。
+  （`src/anthropic/payload_guard.rs:4425-4471`；`payload_guard.rs` 内无任何 system 相关保护逻辑）。
   所以第一批被删的恰好就是 system prompt（包括注入的 thinking 前缀、tool_choice 前缀、分块写入策略）。
   P001 生产样本 `trimmedHistoryEntries=2`（见 `docs/analysis/p001-kiro-payload-guard-weighted-analysis-20260927.md`）
   与“正好删掉 system 对”一致，但该样本没有保留 body，这一对应关系属于推断。
@@ -45,6 +50,25 @@ Claude Code 不会触发 compact。
   超过 5 MB 的历史/当前图片会被丢弃并留占位文本（`src/anthropic/payload_guard.rs:558-580`、
   `src/anthropic/payload_guard.rs:2063-2078`、`src/anthropic/payload_guard.rs:2109-2126`）。这里有 in-band 占位，
   模型知道图片被省略，本文不把它列为主问题。
+- 澄清（2026-09-29 核对）：LOCAL Kiro 路径上，`discardHistoricalThinking` 只在 `guard_kiro_request` 的超限分支
+  （`src/anthropic/payload_guard.rs:582`，`apply_payload_shaping`）里生效；始终执行的 `apply_payload_safety_shaping`
+  （`src/anthropic/payload_guard.rs:2063-2078`）只丢超大历史图片。所以默认 `on_too_long` 模式下，首发请求（`max_bytes=0`
+  → `size_limit_enabled=false`）保留历史中的 Kiro 原生签名 thinking，只有 too-long 重试或 `preemptive` 超限时才丢。
+  外部池路径不同：`apply_anthropic_payload_safety_shaping`（`src/anthropic/payload_guard.rs:2080-2107`）在
+  `discard_historical_thinking=true`（默认）时无条件丢历史 thinking（保护当前 tool 续轮的 assistant）。
+- 新增（3a1306d 引入的两条静默删减路径，与体积无关）：
+  - 本地转换回退：converter 以 "multiple native reasoning blocks" 两类 `UnsupportedContent` 拒绝时
+    （`should_retry_local_conversion_after_reasoning_shaping`，`src/anthropic/handlers/local_body_pipeline.rs:75-84`），
+    代理强制 `shaping.enabled=true`、`discard_historical_thinking=true`（`local_reasoning_fallback_shaping_config`，`:86-92`，
+    **无视运营方关闭 shaping 的配置**），对 Claude Code 协议 payload 调 `sanitize_anthropic_messages_for_external_forwarding`
+    丢掉历史 thinking 与超大历史图片后重新转换（`:186-215`）。成功则 200，只有一条 `tracing::info!`，无响应头、无 in-band 标记。
+  - 上游重试：Kiro 返回 400 且 `classify_bad_request_reason == "malformed_request"`（如 `Improperly formed request.`）时，
+    `reasoning_compatibility_retry_reason`（`src/kiro/provider.rs:13664-13677`，调用点 `:12206-12208`）现在也会用
+    `build_thinking_signature_retry_body`（`src/anthropic/handlers.rs:6926`）剥离 history 的 `reasoningContent` 后同凭据重发一次
+    （attempt action `reasoning_malformed_retry_same_credential`）。以前只有 `THINKING_SIGNATURE_INVALID` 触发。
+    仅当 Kiro 请求 history 含 `reasoningContent` 时才挂这个 builder（`src/anthropic/handlers.rs:6850`、`:6897`）。
+  两条路径删的都是历史 thinking（签名原样透传或整块删除，不会改写/伪造签名），语义影响小于删整轮 history，
+  但同样是客户端不可见的上下文删减，纳入本 issue 的"披露"范围。
 
 影响：
 
@@ -80,9 +104,11 @@ Claude Code 不会触发 compact。
 请求链：
 
 ```text
-local_body_pipeline::prepare (src/anthropic/handlers/local_body_pipeline.rs:197-218)
-  -> PayloadTooLongRetryRequest::new (handlers.rs:1161-1180)  // 保存完整配置，仅 on_too_long 且 maxBytes>0 时启用
-  -> prepare_kiro_request_body(initial_payload_guard_config)  // on_too_long: 不按体积裁剪
+local_body_pipeline::prepare (src/anthropic/handlers/local_body_pipeline.rs:129-150, initial_payload_guard_config @ :138)
+  -> prepare_with_plan (:152)
+     (3a1306d) 转换失败且为多 native reasoning 块 -> 强制丢历史 thinking 后重转 (:186-215)
+  -> PayloadTooLongRetryRequest::new (local_body_pipeline.rs:226-239 -> handlers.rs:1162-1180)  // 保存完整配置，仅 on_too_long 且 maxBytes>0 时启用
+  -> prepare_kiro_request_body(initial_payload_guard_config)  // local_body_pipeline.rs:242；on_too_long: 不按体积裁剪，也不丢历史 thinking
   -> call_api_stream_maybe_fail_fast
      Err(too-long) -> should_retry_payload_guard_after_provider_error (handlers.rs:7660-7666)
        -> build_retry_body_after_provider_error -> guard_kiro_request(完整配置) (handlers.rs:1211)
@@ -112,9 +138,9 @@ report.still_oversized = size_limit_enabled && report.final_weight > max_weight;
 - 响应头 `x-kiro-rs-warnings`：`warning_header_fragment`（`src/anthropic/payload_guard.rs:272-395`）会输出
   `payload-trimmed-history=N`、`payload-history-tool-results-truncated=N` 等。
   - 首发路径受 `exposeProxyWarnings`（默认 `false`，`src/model/config.rs:4720-4722`）且非 strict profile 控制
-    （`src/anthropic/handlers.rs:5789-5791`、`src/anthropic/handlers/local_body_pipeline.rs:294-301`）。
+    （`src/anthropic/handlers.rs:5789-5791`、`src/anthropic/handlers/local_body_pipeline.rs:323-330`）。
   - too-long 重试路径不一致：`merge_warning_headers(self.conversion_warnings, Some(&report))`
-    （`src/anthropic/handlers.rs:1229`）只对 conversion warnings 做了开关判断（构造时 `local_body_pipeline.rs:205-207`），
+    （`src/anthropic/handlers.rs:1229`）只对 conversion warnings 做了开关判断（构造时 `local_body_pipeline.rs:234-236`），
     payload 片段无条件输出，并在 `handlers.rs:7804` 覆盖原头。即重试路径在 `exposeProxyWarnings=false`、甚至 strict
     profile 下也会带头。这本身不是坏事，但开关语义被绕过。
   - `payload-oversized=` 片段写的是 `final_bytes`（`src/anthropic/payload_guard.rs:391-392`），而 Kiro 判据是 weight，数值口径不一致。
@@ -252,6 +278,8 @@ PayloadGuardError::PromptTooLong { weight, max_weight } => envelope::error_respo
 5. 配置：`PayloadGuardConfig` 增加 `overflow_action`；`src/model/config.rs` 增字段、默认 `trim_and_disclose`；Admin API / 两套 UI 同步。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 单测：上面两条红测转绿；`reject_prompt_too_long` 下超限返回 `PromptTooLong` 且 `request` 未被修改；
   未超限时两种模式 body 与现状 byte-identical（沿用现有 clean body identity 测试）。

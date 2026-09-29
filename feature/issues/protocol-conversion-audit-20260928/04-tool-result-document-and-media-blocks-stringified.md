@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: High
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动 converter、`body_processing.rs`、`files.rs`，问题仍存在。所引 `content.rs`、`body_processing.rs`、`files.rs`、`handlers.rs:5691-5704` 行号与 HEAD 一致，仅微调 `types.rs` 与 `config.rs` 两处范围。3a1306d 新增的本地转换回退（`local_body_pipeline.rs:186-215`）只对"多 native reasoning 块"两类 `UnsupportedContent` 生效，嵌套 url/file 图片的 `not materialized before conversion` 错误仍直接 400。
 
 ## 问题与影响
 
@@ -23,7 +26,7 @@ Discovered: 2026-09-28 协议互转审计
 - 体积：base64 全是 ASCII，weighted = 字节数。一个约 1 MB 的 PDF 编码后约 1.33M 字符，单个 tool_result 就超过 Kiro 默认
   weighted 阈值 `1,300,000`（`src/anthropic/payload_guard.rs:33`）。当前 tool_result 截断默认关闭（`src/model/config.rs:686`），
   `on_too_long` 重试只能删历史，删不动当前 tool_result，最终 400。进入历史后又被 8,000 字符 head/tail 截断
-  （`src/model/config.rs:652`、`src/model/config.rs:4440-4442`），留下的是 base64 头尾，毫无信息量。
+  （`src/model/config.rs:652-653`、`src/model/config.rs:4441-4443`），留下的是 base64 头尾，毫无信息量。
 - 语义：模型可能尝试“解码 base64”或回答“文件内容无法读取”，工具循环质量显著下降。
 
 第二个子问题：tool_result 内的 `image` 若 `source.type` 为 `url`（非 data URL）或 `file`/`file_id`，请求直接 400。
@@ -46,7 +49,7 @@ Discovered: 2026-09-28 协议互转审计
 - 审计写“顶层 document 在 content.rs ~45-55 处理”：成立（`src/anthropic/converter/content.rs:45-55` →
   `convert_document_source_to_text` `src/anthropic/converter/content.rs:180-228`，PDF 走 `extract_text_from_pdf_bytes`）。
 - 补充：顶层 `search_result` 块被整块静默丢弃。`ContentBlock.source` 类型是 `Option<ImageSource>`（结构体，
-  `src/anthropic/types.rs:437`、`src/anthropic/types.rs:442-453`），`search_result.source` 是字符串，
+  `src/anthropic/types.rs:437`、`src/anthropic/types.rs:441-453`），`search_result.source` 是字符串，
   `serde_json::from_value::<ContentBlock>` 失败，`process_message_content` 的 `if let Ok(block)`（`src/anthropic/converter/content.rs:30`）
   直接跳过；即使解析成功也会落到 `_ => {}`（`src/anthropic/converter/content.rs:85`）。
 
@@ -249,6 +252,8 @@ fn extract_tool_result_content(content: &Option<Value>) -> Result<String, Conver
 4. payload guard 口径：展开后的 PDF 文本属于“当前 tool_result”，沿用现有 current/historical tool_result 截断规则，无需新规则。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 上述 4 条 converter 单测、1 条 body_processing 单测转绿。
 - 回归：现有 `empty_tool_result_image_is_rejected_with_clear_error`、tool_result 图片提升到 `images` 的测试保持通过；

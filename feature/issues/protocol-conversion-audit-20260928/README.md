@@ -14,6 +14,27 @@ kiro.rs 以 Kiro 为后端，对外提供 Anthropic 协议（Claude Code 协议�
 
 usage 与缓存模拟（token 放大、cache 命中统计）属于产品策略，按要求不纳入本目录。
 
+## 测试隔离要求（所有文档的测试步骤都适用）
+
+测试不能影响本机正在运行的 Claude Code CLI 会话，也不能影响正在使用的 kiro.rs 服务。以 `docs/testing/project-test-instance.md` 和 `.codex/skills/kiro-claude-cli-validation/SKILL.md` 为准，下面是摘要：
+
+1. **只使用项目指定的测试实例** `127.0.0.1:19023`，配置文件为 `tmp/thinking-budget-local/config.json`。文档里的 curl 和 CLI 示例都指向这个端口。不要把请求发到日常使用的代理端口，也不要改动日常使用的服务配置。
+2. **替换或重启测试实例之前**，先用 `lsof -nP -iTCP:19023 -sTCP:LISTEN` 找到监听进程的 PID，再用 `ps -p <pid> -o command=` 确认它是本仓库的 `kiro-rs`，然后只停这一个进程。测试前后都要检查一遍端口状态。
+3. **真实 Claude Code CLI 测试必须隔离配置**，每条命令都带上：
+
+   ```bash
+   HOME=/tmp/kiro-claude-home-19023 \
+   CLAUDE_CONFIG_DIR=/tmp/kiro-claude-config-19023 \
+   ANTHROPIC_BASE_URL=http://127.0.0.1:19023/cc \
+   ANTHROPIC_API_KEY=<测试 key> \
+   claude -p '...' --output-format stream-json --verbose
+   ```
+
+   不得读取或修改本机真实的 `~/.claude`、`~/.claude.json` 和项目 `.claude/` 配置，也不得复用正在运行的 CLI 会话。
+4. **Cargo 命令一律通过 `feature/tests/run-cargo-scoped.sh <scope> -- <command...>` 执行**，使用独立的 target 目录，结束后自动清理。这样不会和正在运行的服务或其他会话争用 `target/`。
+5. **临时服务**：只有当指定实例无法安全执行破坏性用例时，才另起临时服务。需要记录启动原因、端口和生命周期，测试结束后必须停掉。
+6. **真实上游调用保持适量**。不要打印 API key、refresh token 或完整的凭据 JSON。
+
 ## 文档结构
 
 每份问题文档包含：问题与影响、官方协议对照、源码链与根因、复现（单测与端到端）、修复方案（候选与推荐）、测试与验收、兼容性与风险。
@@ -47,7 +68,7 @@ usage 与缓存模拟（token 放大、cache 命中统计）属于产品策略�
 | [P19](19-model-id-silent-upgrade-mapping.md) | 模型 ID 被静默升级，显式 4.1 被映射成 4.5 | Low | request |
 | [P20](20-history-role-alternation-edge-cases.md) | history 角色交替的边界（前导 assistant、伪造的 "OK"） | Low | request |
 | [P21](21-tool-schema-and-result-field-fidelity.md) | 工具 schema 与 tool_result 字段保真度 | Low | request |
-| [P22](22-consecutive-assistant-native-reasoning-merge-rejected.md) | 连续 assistant 各带原生 reasoning 时本地前置 400（usage 页面样本） | High | request |
+| [P22](22-consecutive-assistant-native-reasoning-merge-rejected.md) | 连续 assistant 各带原生 reasoning 时本地前置 400（usage 页面样本）；v0.0.177 用 fallback 修复，工作树已改为所有请求在转换前处理 | High | request |
 | [P23](23-native-reasoning-multi-block-conversion-gaps.md) | P22 之外的原生 reasoning 多 block 互转缺口 | Medium | request + stream |
 | [P24](24-history-server-tool-and-search-result-blocks-dropped.md) | 历史中的 server_tool_use、web_search_tool_result、search_result 被丢弃 | Low | request |
 | [P25](25-thinking-parameter-validation-gaps.md) | thinking 参数校验缺口 | Low | request |

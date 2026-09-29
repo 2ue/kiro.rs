@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: High
 Area: stream
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动 `src/anthropic/stream.rs` 与 converter，问题仍存在。`src/anthropic/stream.rs`、`converter/thinking.rs`、`converter/history.rs`、`handlers.rs:9778-9801` 的引用均与 HEAD 一致；仅 `extract_xml_thinking` 赋值行因 3a1306d 在 `local_body_pipeline.rs` 前部新增重试逻辑，从 `:302` 移到 `:331`。
 
 ## 问题与影响
 
@@ -25,7 +28,7 @@ Claude Code 上的表现：
 thinking 块未被正确关闭，正文仍在 thinking 里；stop_reason 为 tool_use（因为有 tool_use 块），不会误报 max_tokens。
 
 影响面：非 strict compat profile（`extract_xml_thinking = allows_unsigned_thinking()`，
-`src/anthropic/handlers/local_body_pipeline.rs:302`，`src/model/config.rs:2520-2522`）且上游未返回原生
+`src/anthropic/handlers/local_body_pipeline.rs:331`，`src/model/config.rs:2520-2522`）且上游未返回原生
 `reasoningContentEvent` 的所有 thinking 请求。
 
 ## 官方协议对照
@@ -154,7 +157,7 @@ assistantResponseEvent {"content":"。</thinking>\n下面是实现：\n```rust\n
 下游请求：
 
 ```bash
-curl -N http://127.0.0.1:8990/v1/messages -H 'content-type: application/json' \
+curl -N http://127.0.0.1:19023/v1/messages -H 'content-type: application/json' \
   -H 'anthropic-version: 2023-06-01' -H "x-api-key: $KEY" -d '{
   "model":"claude-sonnet-4-5","max_tokens":4096,"stream":true,
   "thinking":{"type":"enabled","budget_tokens":2048},
@@ -225,6 +228,8 @@ fn find_real_thinking_end_tag_for(buffer: &str, tag: ThinkingXmlTag) -> EndTagMa
 6. thinking-only 兜底本身（`:3813-3823`）不在本 issue 修改；规则放宽后它只在"模型真的只输出了 thinking"时触发。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 新增单测：
 

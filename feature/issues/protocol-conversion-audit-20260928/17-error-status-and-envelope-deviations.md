@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Low
 Area: aux
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -59,7 +60,7 @@ Discovered: 2026-09-28 协议互转审计
 
 #1 未知模型：
 
-- `src/anthropic/handlers.rs:5707-5723` `resolve_request_model`：`ModelResolutionSource::Unsupported` 时返回 `400 invalid_request_error`。需要纠正审计的一处表述：默认的 `Compatible` 模式下，这个分支**很少被触发**。`src/anthropic/model_capabilities.rs:1140-1170` 只有在 model 为空，或者是 `ExactOnly` 模式时才返回 `unsupported`；其余未知模型会走 `pass_through` 发给上游。所以真实环境中更常见的路径是：上游返回 invalid model 错误，然后被 `src/anthropic/handlers.rs:5318-5331`（`map_provider_error`）以及 usage 映射 `src/anthropic/handlers.rs:5069-5076` 转成 `400 invalid_request_error`。
+- `src/anthropic/handlers.rs:5706-5723` `resolve_request_model`：`ModelResolutionSource::Unsupported` 时返回 `400 invalid_request_error`。需要纠正审计的一处表述：默认的 `Compatible` 模式下，这个分支**很少被触发**。`src/anthropic/model_capabilities.rs:1140-1170` 只有在 model 为空，或者是 `ExactOnly` 模式时才返回 `unsupported`；其余未知模型会走 `pass_through` 发给上游。所以真实环境中更常见的路径是：上游返回 invalid model 错误，然后被 `src/anthropic/handlers.rs:5318-5331`（`map_provider_error`）以及 usage 映射 `src/anthropic/handlers.rs:5069-5076` 转成 `400 invalid_request_error`。
 - `src/anthropic/handlers.rs:5691-5704` `conversion_error_response`：`ConversionError::UnsupportedModel` 同样返回 400。
 - 公共文案：`src/anthropic/envelope.rs:22-23` `PUBLIC_MODEL_UNAVAILABLE_MESSAGE`。
 
@@ -76,7 +77,7 @@ Discovered: 2026-09-28 协议互转审计
 
 #4 count_tokens：
 
-- `src/anthropic/handlers.rs:28`（`Json as JsonExtractor`），`src/anthropic/handlers.rs:11404-11434`、`11505-11516`。详见 [P12](12-count-tokens-estimate-inconsistent.md)。对照 messages：`src/anthropic/handlers/request_entry.rs:153`、`516` 用 `EntryRequestError::invalid` 生成规范的 `invalid_request_error`。
+- `src/anthropic/handlers.rs:28`（`Json as JsonExtractor`），`src/anthropic/handlers.rs:11404-11434`、`11505-11516`。详见 [P12](12-count-tokens-estimate-inconsistent.md)。对照 messages：`src/anthropic/handlers/request_entry.rs:152`、`515`（2026-09-29 核对时由 `153`、`516` 更正）用 `EntryRequestError::invalid` 生成规范的 `invalid_request_error`。
 
 #5 413：`src/anthropic/request_body.rs:59-64` 返回 `413` 加 `"invalid_request_error"`。
 
@@ -87,9 +88,14 @@ Discovered: 2026-09-28 协议互转审计
 - `src/anthropic/handlers.rs:5392-5418`（`map_provider_error`）：`err_str.contains("429")`（第 5403 行）与"临时冷却 / 本地限流 / retry-after"等条件写在同一个 `||` 链里。
 - `src/anthropic/handlers.rs:5100-5126`（usage 映射，第 5111 行）：同样的子串判断。
 - `src/anthropic/handlers.rs:2526-2541`（外部池 fallback 原因，第 2528 行 `lower.contains("429")`；同一组里还有 `"502"`、`"503"`、`"504"` 子串）。
-- 错误字符串的格式里带有凭据标签（`src/kiro/provider.rs:7823-7835` 的 `format_credential_log_label` 生成 `#<id> <label>`），以及上游原始 body 片段，所以数字子串随处可见。
+- 错误字符串的格式里带有凭据标签（`src/kiro/provider.rs:7823-7841`：`credential_log_label` 调用 `format_credential_log_label`，生成 `#<id> <label>`；2026-09-29 核对时由 `7823-7835` 更正），以及上游原始 body 片段，所以数字子串随处可见。
 
 根因：错误映射是从"内部错误字符串"匹配关键词得到的，不是由结构化的错误类型（`KiroCallFailureKind` 或 HTTP status 字段）决定。状态码选择也沿用了通用网关的习惯（400 / 503 / 502），没有按官方错误表逐项对齐。路由层也没有统一的 fallback。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 没有修复 #1 到 #7 中的任何一项，上文所列的状态码和 `error.type` 映射都没变。它影响本文的地方有两处：
+>
+> 1. **新增 reasoning malformed 重试（错误分类）**：Kiro 首次返回 `400`，且 `classify_bad_request_reason(body) == "malformed_request"`（例如 `Improperly formed request.`），同时请求带有 retry body builder（历史里有 `reasoningContent`）时，`src/kiro/provider.rs:12206-12209` 通过 `reasoning_compatibility_retry_reason`（`src/kiro/provider.rs:13664-13677`）走和 `THINKING_SIGNATURE_INVALID` 相同的路径：同一凭据、剥掉历史 `reasoningContent` 后重试一次，attempt action 记为 `reasoning_malformed_retry_same_credential`。在此之前，这类请求走普通的 400 分支。现在对外的结果分四种：重试成功返回 200；重试返回 4xx 时按字符串规则映射（和以前一样）；重试返回 408/429/5xx 时也按字符串规则映射，仍然受 #7 子串误判影响；本地侧失败（发送上限、attempt 预算、builder 不可用或构建失败、传输错误、读 body 失败、意外响应）则带 `KiroCallFailureKind::ThinkingSignatureRetryFailed`，由 `src/anthropic/handlers.rs:5250-5287` 按结构化类型映射成 `502 api_error`，并且不进入外部池 fallback（`src/anthropic/handlers.rs:2464-2468`）。推荐映射表需要为这一类补一行。结构化分支先于 `contains("429")`（第 5403 行）执行，所以这条路径不受 #7 影响。usage 侧对这一类的映射没有逐条核对。
+> 2. **拒绝记录的模型归因（观测）**：`ProviderNotReady`、`LocalRouteBlocked`、`MultimodalInvalid`、`ModelUnsupported`、`WebSearchUnsupported`、`LocalBodyPrepare`（`src/anthropic/handlers.rs:6286-6293` 等调用点），以及 request_entry 的各类拒绝（`src/anthropic/handlers/request_entry.rs:627-670`），现在都通过 `RequestRejectionUsageContext`（`src/anthropic/usage.rs:519-564`）把请求的 `model`、`stream`、`requested_max_tokens`（以及已解析时的 `upstream_model` / `model_resolution_*`）写进 usage 拒绝记录，不再固定为 `model="unknown"`、`stream=false`。只影响 usage 记录，HTTP 状态码、`error.type` 和响应信封都没变，#1（`ModelUnsupported` 仍是 400）、#2（`ProviderNotReady` / `LocalRouteBlocked` 仍是 503）的结论不变。
 
 ## 复现
 
@@ -211,10 +217,12 @@ C. 按路由区分：`anthropic-strict` 按官方映射，`claude-code` 保持�
 
 ## 测试与验收
 
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
+
 - 表驱动测试：上表每一行构造一个内部错误（包括结构化的 `KiroCallFailureKind`），断言状态码、`error.type`、是否带 `retry-after`，以及 usage 记录中的 `status_code` / `error_type` 与响应一致。每行 5 轮。
 - 子串负例：`#1429`、`14290ms`、`4290 bytes`、`req-…429…` 等 10 种以上含 429 的非限流错误都不能被判为 429；真实的 `429 Too Many Requests` 仍然判为 429。外部池 fallback 原因的判定同样覆盖。
 - 路由：未匹配的 GET / POST / DELETE、`/v1/models/{id}`（如果 [P11](11-models-endpoint-openai-shape.md) 已实现，则改为命中）、`/dfcache/unknown/v1/messages` 都返回 JSON 信封加 `request-id`。
-- 回归：现有的 `map_provider_error` 测试组（`src/anthropic/handlers/tests.rs:8877` 起）中，状态码的变化都要逐条确认并有意识地更新，不能批量替换。
+- 回归：现有的 `map_provider_error` 测试组（`src/anthropic/handlers/tests.rs:8921` 起，即 `content_length_threshold_error_is_not_reported_as_context_window_full`，另有 `6490`、`6548` 两处循环用例；2026-09-29 核对时由 `8877` 更正）中，状态码的变化都要逐条确认并有意识地更新，不能批量替换。
 - 真实 Claude Code：未知模型时显示模型相关的提示；无可用账号时显示 overloaded 类提示并重试；两种情况下 CLI 都不崩溃。
 
 ## 兼容性与风险

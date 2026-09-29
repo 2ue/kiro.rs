@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -147,6 +148,8 @@ C. 只增加披露，不改默认值。成本最低，但 `/v1`、`/na`、`/ha` 
 语言和任务质量块：保持 `/cc` 默认开启（已有决策），只补披露。任务质量块是否精简由运营决定，不在本 issue 范围内。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 路由矩阵：`/v1`、`/na/v1`、`/ha/v1`、`/cc/v1`、`/dfcache/{route}/v1` × {messages, count_tokens} × 总开关 ON/OFF，每格 5 轮。检查捕获的 Kiro body 中三类注入内容只在配置命中的路由出现。
 - 回归：[已有专题](../prompt-policy-tool-choice-and-count-tokens.md) 的四个聚焦测试和 128 组合 × 5 轮配置 round-trip 都要保持通过；总开关 OFF 时，结构化 `tool_choice` 过滤不受影响。

@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: aux
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 工作树更新（尚未提交，见 [00 修复计划：2026-09-29 方案复核](00-current-protocol-fix-plan.md)）：本地路径已改为所有请求在转换前执行历史 thinking 丢弃。条件是 `payloadGuardEnabled`、`payloadShaping.enabled` 和 `discardHistoricalThinking` 同时为真，这也是默认配置。受保护的当前工具续写 assistant 保留 Kiro 原生签名。所以，本文中"本地首发保留全部历史签名 thinking"这一前提，在默认配置下不再成立，只有关闭上述任一配置时才成立。对本文的影响：本地 `input_tokens` 估算仍然基于客户端的原始 payload。usage 的重新计算和整形逻辑属于核心逻辑，这次按要求没有改动。因此只要请求带有历史 thinking，本地估算就会比实际发给 Kiro 的内容略高，这和 count_tokens 的口径一致。
 
 ## 问题与影响
 
@@ -57,7 +60,9 @@ Discovered: 2026-09-28 协议互转审计
 
 messages 路径同样调用 `count_all_tokens`（远程外发和阻塞在这里同样生效）：
 
-- `src/anthropic/handlers/local_body_pipeline.rs:283-291`：本地请求的 input 估算。
+- `src/anthropic/handlers/local_body_pipeline.rs:312-321`：本地请求的 input 估算（受 `plan.token_counting` 控制）。
+
+  > 2026-09-29 代码核对（HEAD a4227c1）：行号由 `283-291` 更正为 `312-321`（原行号处是 tracing 日志）。3a1306d 新增的 reasoning 回退重转（`local_body_pipeline.rs:186-211`）会把裁剪掉历史 thinking 的 `shaped_payload` 发给 Kiro，但这里的估算仍基于未裁剪的原始 `payload`。它和 count_tokens 口径一致（两者都用原始 payload），但在触发回退时会高于实际发给 Kiro 的内容。本问题结论不变。
 - `src/anthropic/handlers.rs:1726-1754` `ExternalFallbackContext::refresh_payload`：一次调用里执行两次 `count_all_tokens`（原始 payload 和 sanitize 后的 payload），调用点在 `src/anthropic/handlers.rs:6340` 和 `6408`。
 - `src/anthropic/handlers.rs:6532-6537`：WebSearch 路径。
 - `src/external_pool.rs:15831-15838`、`src/external_pool/usage_projection.rs:193-201`：外部池 usage 投影。
@@ -182,6 +187,8 @@ C. 实现真实 tokenizer：Claude 的 tokenizer 没有公开，没法做到精�
 5. **字段**：`CountTokensRequest` 增加 `thinking` / `tool_choice`（可选），估算时把它们带来的系统开销计入；未知模型按 [P17](17-error-status-and-envelope-deviations.md) 的映射返回 404。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 单调性：长度 1..10k 的 ASCII 文本和 CJK 文本，估算值都不下降。
 - 片段无关性：同一文本切成 1、10、100 段，估算差值不超过 10%。

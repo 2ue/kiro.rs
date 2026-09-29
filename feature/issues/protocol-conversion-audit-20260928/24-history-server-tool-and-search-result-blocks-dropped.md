@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -79,10 +80,12 @@ convert_request_with_model_id
              match block_type: thinking | redacted_thinking | text | tool_use | _ => {} (286-346)
      user 消息 -> merge_user_messages (history.rs:187) -> process_message_content (content.rs:17)
         match block_type: text | image | document | tool_result | tool_use | redacted_thinking | _ => {} (31-86)
-  -> guard_kiro_request -> apply_payload_shaping (payload_guard.rs:2150)
+  -> guard_kiro_request -> apply_payload_shaping (payload_guard.rs:2150，仅在超限分支 payload_guard.rs:582-584 调用)
 ```
 
 根因：converter 按“已知块白名单”转换，白名单之外一律静默丢弃，没有“无法结构化表示的块降级为文本”这一层，也没有告警计数。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：本文引用的 `history.rs`、`content.rs`、`types.rs`、`websearch.rs`、`handlers.rs`（`:6482`、`:6559`）、`payload_guard.rs`、`config.rs`、`converter.rs` 行号在 HEAD 上全部核对一致，问题仍存在。3a1306d 在本地路径新增的 reasoning 整形重试（`src/anthropic/handlers/local_body_pipeline.rs:186-214`）只丢弃历史 thinking 和超大历史图片，不处理服务端工具块，对本文结论没有影响。
 
 payload guard 的后续环节不会补回这些内容，也不会限制渲染后的大小：
 
@@ -182,7 +185,7 @@ fn proxy_generated_websearch_summary_text_survives_history_replay() {
 后续请求不声明原生 web_search 工具，历史里带一条官方形状的搜索结果（结果只存在于 `web_search_tool_result` 中）：
 
 ```bash
-curl -sS http://127.0.0.1:8990/cc/v1/messages \
+curl -sS http://127.0.0.1:19023/cc/v1/messages \
   -H 'content-type: application/json' -H 'x-api-key: <key>' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"claude-sonnet-4-5","max_tokens":256,
@@ -253,6 +256,8 @@ pub(super) fn render_server_tool_block(item: &serde_json::Value) -> Option<Strin
 6. 不改变 WebSearch 路由决策（声明原生 web_search 就走 MCP），不改变本项目 WebSearch 回复的块形状。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 上面 3 条单测：前 2 条修复前失败、修复后通过；第 3 条修复前后都通过（本项目自产形状不回退）。
 - 补充：`web_fetch_tool_result`、`web_search_tool_result_error`、只含服务端块的 assistant（content 不再是 `" "`，而是渲染文本）。

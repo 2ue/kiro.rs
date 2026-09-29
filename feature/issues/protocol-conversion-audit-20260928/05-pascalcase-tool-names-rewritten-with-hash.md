@@ -4,6 +4,9 @@ Status: open / documented / not-fixed
 Severity: Medium
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 未改动工具名映射，问题仍存在。`converter/tools.rs`、`converter.rs`、`transcript_sanitizer.rs`、`stream.rs`、`handlers.rs`、`config.rs` 的引用均与 HEAD 一致。更正一处：原文把 `src/kiro/provider.rs:2052` 称为 Kiro 侧分类，实际它是测试夹具，真正的分类在 `:13747-13757`。
 
 ## 问题与影响
 
@@ -47,7 +50,7 @@ bad_request: {"error":{"type":"<nil>","message":"上游 API 400: {\"message\":\"
 
 这份报文说明了三点：
 
-1. **报错对象是 property key，不是工具名。** 路径 `***.***.custom.input_schema.properties` 就是现有专题里的 `tools.N.custom.input_schema.properties`。这类问题已经由可逆的 schema key 映射处理了，见 [tool-property-key 专题](../tool-property-key-invalid-400-tool-schema-invalid.md)。实现位于 `src/anthropic/tool_schema_keys.rs`，默认正则由 `src/model/config.rs:131` 的 `default_tool_schema_key_validation_regex` 提供，Kiro 侧的分类在 `src/kiro/provider.rs:2052` 的 `TOOL_SCHEMA_INVALID`。它不属于本文的问题。
+1. **报错对象是 property key，不是工具名。** 路径 `***.***.custom.input_schema.properties` 就是现有专题里的 `tools.N.custom.input_schema.properties`。这类问题已经由可逆的 schema key 映射处理了，见 [tool-property-key 专题](../tool-property-key-invalid-400-tool-schema-invalid.md)。实现位于 `src/anthropic/tool_schema_keys.rs`，默认正则由 `src/model/config.rs:131` 的 `default_tool_schema_key_validation_regex` 提供，Kiro 侧的分类在 `src/kiro/provider.rs:13747-13757` 的 `bad_request_body_indicates_tool_protocol_error`（匹配 `tool_schema_invalid`）；`src/kiro/provider.rs:2052` 只是测试 fake upstream 的 `TOOL_SCHEMA_INVALID` 夹具。它不属于本文的问题。
 2. **Kiro 上游在内部做了 Anthropic 风格的请求校验。** 错误由 Kiro 后端的 "Mantle" 服务返回，内层格式是 Anthropic 错误信封：`{"type":"error","request_id":"req_...","error":{"type":"invalid_request_error",...}}`，字段路径也是 Anthropic 的 `tools.N.custom...` 形式。因此有理由推断，Kiro 对工具**名**也执行了 Anthropic 的工具名约束，即 `^[a-zA-Z0-9_-]{1,64}$`。这一点是推断：目前还没有专门针对工具名的上游报文。
 3. **property key 正则允许 `.`，工具名正则大概率不允许。** 两者不能共用一个正则。本文的工具名规则必须单独定义为 `[a-zA-Z0-9_-]`，并且不包含 `.`。
 
@@ -172,7 +175,7 @@ fn audit_p05_kiro_safe_names_are_sent_verbatim() {
    - 在 `src/kiro/provider.rs` 的 400 分类里，新增一个工具名校验失败的识别项。匹配条件：`reason=TOOL_SCHEMA_INVALID`，且错误路径以 `tools.N.custom.name` 结尾或包含 `name: ... should match pattern`。
    - 命中后，本请求用同一账号重试一次：以 `legacy_camel_hash` 模式重新生成请求体，也就是当前行为，这条路径已被生产验证可用。重试只执行一次，不换号，不进入 external fallback。
    - 记录 metric `tool_name_verbatim_rejected`，并用 warn 日志输出被拒绝的工具名（脱敏后），用于反向确认上游的真实工具名规则。
-   - 这与仓库现有的"确定性 400 仅做一次定向修复重试"模式一致，见 `raw-max-tokens`、`reasoning malformed stripped retry` 等先例。
+   - 这与仓库现有的"确定性 400 仅做一次定向修复重试"模式一致，见 `raw-max-tokens`、`reasoning malformed stripped retry` 等先例（后者在 3a1306d 落地：`reasoning_compatibility_retry_reason`，`src/kiro/provider.rs:13664-13677`，attempt action `reasoning_malformed_retry_same_credential`）。
 
 **其余步骤：**
 
@@ -182,6 +185,8 @@ fn audit_p05_kiro_safe_names_are_sent_verbatim() {
 7. 如果响应里出现旧映射名（上游从历史里复述），反向映射表查不到。可以在请求侧给 reverse map 补上 legacy camel-hash 条目，指向原名，成本很低。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 更新依赖旧行为的单测：
   - `test_tool_name_mapping_summary_distinguishes_sanitized_and_overlong_names`：`Bash`、`echo_value` 不再计入 sanitized（`src/anthropic/converter.rs:1400-1414`）。

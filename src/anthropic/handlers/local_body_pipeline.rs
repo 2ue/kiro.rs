@@ -177,13 +177,43 @@ pub(super) fn prepare_with_plan(
         native_reasoning_capability,
         prompt_steering: runtime_config.prompt_steering.clone().normalized(),
     };
+    // Historical thinking is discarded before conversion for every request when the configured
+    // shaping allows it, matching the external-pool path. The protected tool-continuation
+    // assistant keeps its Kiro-native signed reasoning. Without this, the Kiro-layer discard only
+    // runs inside the oversize branch, so first sends replay every historical signature and hit
+    // avoidable THINKING_SIGNATURE_INVALID retries or single-union merge failures.
+    let pre_conversion_shaping = plan.payload_guard.config.shaping;
+    let mut pre_shaped_payload = None;
+    if plan.payload_guard.config.enabled
+        && pre_conversion_shaping.enabled
+        && pre_conversion_shaping.discard_historical_thinking
+    {
+        let mut shaped_payload = payload.clone();
+        if sanitize_anthropic_messages_for_external_forwarding(
+            &mut shaped_payload,
+            pre_conversion_shaping,
+        ) {
+            tracing::debug!(
+                endpoint,
+                model = %payload.model,
+                upstream_model = ?model_resolution.upstream_model,
+                "applied local pre-conversion historical thinking shaping"
+            );
+            pre_shaped_payload = Some(shaped_payload);
+        }
+    }
+    let conversion_payload = pre_shaped_payload.as_ref().unwrap_or(payload);
+
     let conversion_result = match convert_request_with_resolved_model(
-        payload,
+        conversion_payload,
         converter_options.clone(),
         model_resolution,
     ) {
         Ok(result) => result,
-        Err(first_error) if should_retry_local_conversion_after_reasoning_shaping(&first_error) => {
+        Err(first_error)
+            if pre_shaped_payload.is_none()
+                && should_retry_local_conversion_after_reasoning_shaping(&first_error) =>
+        {
             let mut shaped_payload = payload.clone();
             let fallback_shaping =
                 local_reasoning_fallback_shaping_config(plan.payload_guard.config.shaping);

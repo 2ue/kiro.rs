@@ -1,6 +1,6 @@
 # P22 连续 assistant 各带原生 reasoning 时本地转换前置拒绝（400）
 
-Status: open / root-cause-confirmed-in-source / fallback-fix-in-working-tree (parallel session, uncommitted)
+Status: fallback-fixed-in-3a1306d (v0.0.177) / all-request pre-conversion shaping in working tree (2026-09-29, not committed)
 Severity: High
 Area: request
 Discovered: 2026-09-28 usage 页面错误样本
@@ -70,7 +70,9 @@ thinking 与签名是这套双向转换的一部分：
 
 - `payloadShaping.discardHistoricalThinking` 默认为 `true`（`src/model/config.rs:2470`）。它的作用本来就是在发送前去掉旧 assistant 的 thinking，只保留当前工具续写那一条 assistant。受保护的 assistant 由 `payload_guard.rs:1709` 的 `active_anthropic_tool_turn_assistant_index` 确定。
 - 外部池路径在转换前（Claude Code 协议请求层）先执行这一步（`payload_guard.rs:2080` 的 `apply_anthropic_payload_safety_shaping`，调用方为 `payload_guard_runtime.rs:66` 和 `external_pool/body_pipeline.rs:605`），所以不会出现这个问题。
-- 本地路径只在 Kiro 层执行这一步（`payload_guard.rs:2173`，位于 `guard_kiro_request` 内），而它在转换之后才运行（`local_body_pipeline.rs:193` 之后）。转换器先对"之后本来就会被丢弃的旧 reasoning"做了无损合并校验，直接失败，丢弃逻辑根本没有机会执行。
+- 本地路径只在 Kiro 层执行这一步（`payload_guard.rs:2173` 的 `apply_payload_shaping`），而且**只在请求超限的分支里执行**（`payload_guard.rs:581`：`size_limit_enabled && final_weight > max_weight`）。每次都会执行的 `apply_payload_safety_shaping`（`payload_guard.rs:2063`）只负责丢弃超限的历史图片。所以默认 `on_too_long` 首发时，本地路径根本不会丢弃历史 thinking，所有历史签名 reasoning 都会进入转换器。转换器在对这些 reasoning 做无损合并校验时直接失败。
+
+> 2026-09-29 更正：初版文档写的是"丢弃发生在转换之后"，这个说法不准确。实际情况是本地首发完全不丢弃，和外部池路径的无条件丢弃不一致，`discardHistoricalThinking=true` 在本地首发时并没有生效。
 
 触发条件：最后一条 user 之前存在两条或更多相邻的 assistant 消息（中间没有 user），且其中至少两条各带一个签名 thinking 或 redacted_thinking。相邻 assistant 在 Claude Code 中是如何产生的（例如流中断后重试），目前没有抓包确认。这不影响修复，因为修复针对的是转换顺序。
 
@@ -84,7 +86,7 @@ thinking 与签名是这套双向转换的一部分：
 ### 端到端复现
 
 ```bash
-curl -sS http://127.0.0.1:8990/cc/v1/messages \
+curl -sS http://127.0.0.1:19023/cc/v1/messages \
   -H 'content-type: application/json' -H 'x-api-key: <key>' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"claude-sonnet-4-5","max_tokens":512,
@@ -113,6 +115,8 @@ curl -sS http://127.0.0.1:8990/cc/v1/messages \
 
 ### 推荐方案
 
+> 2026-09-29 方案升级：v0.0.177 已发布下面的 A2 fallback 方案。复核后，改为**所有请求在转换前处理历史 thinking**（第 3 版），并保留 A2 作为配置关闭时的兜底。详细分析、取舍和验收见 [00 修复计划：2026-09-29 方案复核](00-current-protocol-fix-plan.md)。下面的 A2 描述保留，作为 v0.0.177 的记录。
+
 采用 A2，只改 `src/anthropic/handlers/local_body_pipeline.rs` 的 `prepare_with_plan`。以下内容按工作树当前 diff 核对，由并行会话实现，尚未提交：
 
 1. `should_retry_local_conversion_after_reasoning_shaping(error)` 只匹配两条 `UnsupportedContent` 文案：
@@ -131,6 +135,8 @@ curl -sS http://127.0.0.1:8990/cc/v1/messages \
 不在本问题范围内：受保护的工具续写 assistant 内部仍有多个 reasoning 的情况、签名与无签名混用、流式多段 reasoning 的签名输出，这些都记录在 [P23](23-native-reasoning-multi-block-conversion-gaps.md)。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 1. 单测（工作树已有，根据并行会话进度记录已通过，本会话未独立复跑）：
    - `local_preconversion_shaping_handles_consecutive_assistant_reasoning_for_five_rounds`：本错误形状返回 200，上游 body 不含旧的私有 thinking 和签名，两段可见回答都保留。

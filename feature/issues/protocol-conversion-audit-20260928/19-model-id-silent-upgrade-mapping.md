@@ -4,6 +4,7 @@ Status: open / documented / not-fixed
 Severity: Low
 Area: request
 Discovered: 2026-09-28 协议互转审计
+Verified-against: a4227c1 (2026-09-29)
 
 ## 问题与影响
 
@@ -21,7 +22,7 @@ Discovered: 2026-09-28 协议互转审计
 
 - 非流式：`handle_non_stream_request` 收到的 `model` 参数是 `&payload.model`（`src/anthropic/handlers.rs:6804-6812`），写入 `"model": model`（`src/anthropic/handlers.rs:11160`）。
 - 流式：`handle_stream_request` 同样拿到 `&payload.model`（`src/anthropic/handlers.rs:6772-6780`），`StreamContextTemplate.model = model.to_string()`（`src/anthropic/handlers.rs:8127`），`message_start.message.model` 使用的就是它（`src/anthropic/stream.rs:2336`）。
-- `x-kiro-rs-warnings` 不包含模型重映射信息（`src/anthropic/converter.rs:215-275`），而且默认关闭。重映射只出现在 info 日志 "Kiro upstream model mapping applied to request payload"（`src/anthropic/handlers/local_body_pipeline.rs:256-265`）和 usage 记录的 `upstream_model` / `model_resolution_*` 字段里（`src/anthropic/handlers.rs:4856-4865`）。
+- `x-kiro-rs-warnings` 不包含模型重映射信息（`src/anthropic/converter.rs:215-275`），而且默认关闭。重映射只出现在 info 日志 "Kiro upstream model mapping applied to request payload"（`src/anthropic/handlers/local_body_pipeline.rs:285-295`）和 usage 记录的 `upstream_model` / `model_resolution_*` 字段里（`src/anthropic/handlers.rs:4856-4865`）。
 
 影响：
 
@@ -40,9 +41,9 @@ Discovered: 2026-09-28 协议互转审计
 
 模型解析有两套实现，它们的优先级需要先理清：
 
-1. **本地 Kiro 主路径**：`resolve_request_model` → `ModelCapabilities::resolve_model_with_mapping`（`src/anthropic/handlers.rs:5706-5760`）→ `resolve_model_with_catalog_mapping_and_mode`（`src/anthropic/model_capabilities.rs:1139-1280`）。结果 `ModelResolution` 传给 `local_body_pipeline::prepare`，再调用 `convert_request_with_resolved_model`（`src/anthropic/handlers/local_body_pipeline.rs:166`、`src/anthropic/converter.rs:405-415`），**直接使用 `resolution.upstream_model`，不会调用 `map_model`**。
+1. **本地 Kiro 主路径**：`resolve_request_model` → `ModelCapabilities::resolve_model_with_mapping`（`src/anthropic/handlers.rs:5706-5760`）→ `resolve_model_with_catalog_mapping_and_mode`（`src/anthropic/model_capabilities.rs:1139-1280`）。结果 `ModelResolution` 传给 `local_body_pipeline::prepare`（`src/anthropic/handlers/local_body_pipeline.rs:129`）→ `prepare_with_plan`（`:152`），再调用 `convert_request_with_resolved_model`（`src/anthropic/handlers/local_body_pipeline.rs:180`；3a1306d 新增的 reasoning 整形重试在 `:200` 用同一个 `model_resolution` 再转换一次；`src/anthropic/converter.rs:405-415`），**直接使用 `resolution.upstream_model`，不会调用 `map_model`**。
 2. **`map_model`**（`src/anthropic/converter/model.rs:14-79`）只在下面几处被调用：
-   - `convert_request_with_options`（`src/anthropic/converter.rs:395-402`）：生产代码里只有 `src/kiro/provider.rs:2860` 的测试夹具和 converter 自己的单测在用，**不在请求主路径上**；
+   - `convert_request_with_options`（`src/anthropic/converter.rs:395-402`）：生产代码里没有调用方，只有 `src/kiro/provider.rs:2875` 的测试夹具和 converter 自己的单测在用，**不在请求主路径上**；
    - `external_route_model_resolution`（`src/anthropic/handlers.rs:5762-5790`）：外部池路由在解析结果是 `ExactUpstream`/`PassThrough` 时，会用 `map_model` 再改写一次（调用点 `src/anthropic/handlers.rs:6349`、`src/anthropic/handlers.rs:6427`、`src/anthropic/handlers.rs:6462`）；
    - 外部池模型变体展开（`src/external_pool.rs:11456`、`src/external_pool.rs:11486`）。
 
@@ -67,6 +68,8 @@ Discovered: 2026-09-28 协议互转审计
 - **`map_model` 的子串匹配很宽**：只要名字包含 `sonnet` 且包含字符 `4`（包括日期里的 4），就会返回 `claude-sonnet-4.5`（`src/anthropic/converter/model.rs:33-45`，`contains("4")` 在 `:38`）。所以 `claude-3-sonnet-20240229` 会被映射成 4.5，而 `claude-3-7-sonnet-20250219` 反而返回 `None`（名字里既没有 `4` 也没有 `3-5`）。审计原述 "opus 没有 minor → opus-4.7" 成立（`src/anthropic/converter/model.rs:56-67` 里 `contains("4")` 的分支，在 `:63`；只针对非原生格式，原生 `claude-opus-4-...` 会先走 `:46-55`），"未知版本透传" 对 `claude-<family>-<n>...` 这种原生格式成立（`src/anthropic/converter/model.rs:25-32`、`:46-55`、`:68-73`）。
 
 审计原述中 `converter/model.rs:25-73` 的行号大致准确，函数完整范围是 `src/anthropic/converter/model.rs:14-79`。
+
+> 2026-09-29 代码核对（HEAD a4227c1）：3a1306d 没有改动模型解析（`model_capabilities.rs`、`converter/model.rs`、`external_route_model_resolution` 均未变），本问题仍存在。`handlers.rs` 与 `model_capabilities.rs` 的引用行号在 HEAD 上均核对一致；已更新 `local_body_pipeline.rs`（转换调用 `:180`、映射日志 `:285-295`）和 `provider.rs`（测试夹具 `:2875`）的行号。补充：第 4 步在 `explicit_model_alias_candidates`（`:1222-1227`）之前还有 `explicit_model_alias_families`（`:1215-1220`）。
 
 ## 复现
 
@@ -134,6 +137,8 @@ A + B 组合：
 5. 响应 `model` 字段暂时保持回显请求值（官方对别名的行为没有验证，不贸然改动）。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - `audit_p19_explicit_minor_is_upgraded_by_alias_table_even_in_alias_only_mode` 改为修复后的期望：`claude-opus-4-1-20250805` → pass-through；配置了用户 Alias 规则时 → 规则目标。
 - 更新 `resolver_maps_legacy_dated_models_to_seeded_kiro_models`（`src/anthropic/model_capabilities.rs:2565-2584`）里 opus-4-1 的断言；`claude-sonnet-4-20250514` → `claude-sonnet-4` 保持不变。

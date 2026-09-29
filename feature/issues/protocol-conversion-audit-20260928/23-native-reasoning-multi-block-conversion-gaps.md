@@ -1,11 +1,13 @@
 # P23 原生 reasoning 多 block 互转的剩余缺口（P22 最小修复之外）
 
-Status: open / confirmed-in-source / not-fixed（第 4 点已由 P22 fallback 关闭）
+Status: partially-mitigated (old-history cases by pre-conversion shaping, working tree) / protected-turn + stream signature gaps open
 Severity: Medium
 Area: request + stream
 Discovered: 2026-09-28，P22 分析过程中确认；为保持 P22 最小范围，从 P22 拆出
 
 ## 问题与影响
+
+> 2026-09-29 更新（第 3 版，工作树内，见 [00 修复计划](00-current-protocol-fix-plan.md)）：本地路径在默认配置下，所有请求都会在转换前丢弃非受保护的历史 thinking。因此第 1 点和第 2 点里凡是发生在**旧 assistant** 上的情况，都已在转换前被消除，真实上游 T12、T13 均返回 200。仍然存在的只剩下面三处：一是冲突发生在**受保护的当前工具续写 assistant** 内部；二是配置关闭时，第 2 点的混用文案不会触发 fallback；三是第 3 点的流式签名问题。
 
 项目定位：kiro.rs 基于 Kiro 对外提供 Anthropic 协议（Claude Code 协议）接口。客户端（如 Claude Code CLI）发来 Claude Code 协议请求，代理把它转换成 Kiro 协议，调度给最终上游 Kiro。Kiro 的响应再转换回 Claude Code 协议，返回给客户端。thinking 和签名是这套双向转换的一部分：签名始终是 Kiro 原生签名，代理负责原样转换和透传，保证 Claude Code CLI 回放历史时 Kiro 能校验通过。
 
@@ -152,7 +154,7 @@ fn second_native_reasoning_segment_emits_its_own_signature() {
 1. 单条 assistant 多 block。下面的请求中，最后一条 user 是 tool_result，所以该 assistant 是受保护的工具续写，P22 的 shaping 不会丢弃它的 thinking：
 
 ```bash
-curl -sS http://127.0.0.1:8990/cc/v1/messages \
+curl -sS http://127.0.0.1:19023/cc/v1/messages \
   -H 'content-type: application/json' -H 'x-api-key: <key>' -H 'anthropic-version: 2023-06-01' \
   -d '{"model":"claude-sonnet-4-5","max_tokens":512,"thinking":{"type":"enabled","budget_tokens":1024},
        "tools":[{"name":"Read","description":"read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}],
@@ -199,6 +201,8 @@ curl -sS http://127.0.0.1:8990/cc/v1/messages \
 4. 第 2 点的最小改动选项：把 `cannot be represented losslessly` 这条文案加入 P22 的 fallback 触发列表（`should_retry_local_conversion_after_reasoning_shaping`）。这样旧 assistant 上的混用会被 shaping 去掉，与 P22 同等处理；受保护 assistant 上的混用仍然走方案 A。
 
 ## 测试与验收
+
+> 测试隔离：所有端到端与真实 CLI 步骤必须遵守 [测试隔离要求](README.md#测试隔离要求所有文档的测试步骤都适用)，只使用 `127.0.0.1:19023` 指定测试实例和隔离的 `HOME`/`CLAUDE_CONFIG_DIR`，Cargo 通过 `feature/tests/run-cargo-scoped.sh` 运行，不得影响本机正在运行的 Claude Code CLI 与服务。
 
 - 单测：
   - 上面三个草稿，修复后按注释翻转断言。

@@ -1111,6 +1111,130 @@ async fn run_local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_
     assert_eq!(upstream.hits(), 5);
 }
 
+fn historical_and_protected_reasoning_request(round: usize) -> Request<Body> {
+    multimodal_handler_request(
+        "/v1/messages",
+        json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 32,
+            "stream": false,
+            "tools": [{
+                "name": "Read",
+                "description": "Read a file",
+                "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}
+            }],
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": format!("old-private-thought-{round}"), "signature": format!("old-private-signature-{round}")},
+                    {"type": "text", "text": format!("old visible answer {round}")}
+                ]},
+                {"role": "user", "content": "read the file"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": format!("live-thought-{round}"), "signature": format!("live-signature-{round}")},
+                    {"type": "tool_use", "id": format!("toolu_live_{round}"), "name": "Read", "input": {"file_path": "/tmp/a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": format!("toolu_live_{round}"), "content": "file body"}
+                ]}
+            ]
+        })
+        .to_string(),
+    )
+}
+
+async fn send_historical_and_protected_reasoning(
+    app: Router,
+    upstream: &MultimodalHandlerUpstream,
+    round: usize,
+) -> String {
+    let response = app
+        .oneshot(historical_and_protected_reasoning_request(round))
+        .await
+        .expect("historical reasoning response");
+    assert_eq!(response.status(), StatusCode::OK, "round {round}");
+    axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read success body");
+    upstream
+        .bodies_snapshot()
+        .last()
+        .cloned()
+        .expect("captured upstream body")
+}
+
+async fn run_local_first_send_discards_historical_reasoning_but_keeps_tool_turn_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let (app, _usage_recorder) = multimodal_handler_test_router_with_usage(&upstream.base_url);
+
+    for round in 1..=5 {
+        let upstream_body =
+            send_historical_and_protected_reasoning(app.clone(), &upstream, round).await;
+        assert!(
+            !upstream_body.contains(&format!("old-private-thought-{round}"))
+                && !upstream_body.contains(&format!("old-private-signature-{round}")),
+            "round {round}: historical reasoning must be discarded before the first send"
+        );
+        assert!(
+            upstream_body.contains(&format!("old visible answer {round}")),
+            "round {round}: historical visible text must survive"
+        );
+        let sent: Value = serde_json::from_str(&upstream_body).expect("upstream body JSON");
+        let history = sent["conversationState"]["history"]
+            .as_array()
+            .expect("history array");
+        let protected = history
+            .iter()
+            .rev()
+            .find_map(|message| message.get("assistantResponseMessage"))
+            .expect("protected tool-turn assistant");
+        assert_eq!(
+            protected["reasoningContent"]["reasoningText"]["signature"],
+            format!("live-signature-{round}"),
+            "round {round}: active tool continuation must keep its Kiro-native signature"
+        );
+    }
+}
+
+#[test]
+fn local_first_send_discards_historical_reasoning_but_keeps_tool_turn_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("local-first-send-historical-reasoning", || async {
+        run_local_first_send_discards_historical_reasoning_but_keeps_tool_turn_for_five_rounds()
+            .await;
+    });
+}
+
+async fn run_local_historical_reasoning_is_kept_when_discard_disabled_for_five_rounds() {
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(upstream.base_url.clone());
+    config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+    config.kiro_upstream_response_timeout_secs = 2;
+    config.credential_retry_max_attempts = 1;
+    config.payload_shaping.discard_historical_thinking = false;
+    let (app, _usage_recorder) = multimodal_handler_test_router_from_config(config);
+
+    for round in 1..=5 {
+        let upstream_body =
+            send_historical_and_protected_reasoning(app.clone(), &upstream, round).await;
+        assert!(
+            upstream_body.contains(&format!("old-private-signature-{round}")),
+            "round {round}: discardHistoricalThinking=false must keep historical reasoning"
+        );
+        assert!(
+            upstream_body.contains(&format!("live-signature-{round}")),
+            "round {round}: tool-turn reasoning must be kept"
+        );
+    }
+}
+
+#[test]
+fn local_historical_reasoning_is_kept_when_discard_disabled_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread("local-historical-reasoning-kept", || async {
+        run_local_historical_reasoning_is_kept_when_discard_disabled_for_five_rounds().await;
+    });
+}
+
 #[test]
 fn local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread("local-reasoning-fallback-shaping-disabled", || async {
@@ -3880,17 +4004,26 @@ fn handler_thinking_signature_retry_request(stream: bool) -> Request<Body> {
             "max_tokens":128,
             "stream":stream,
             "thinking":{"type":"adaptive"},
+            "tools":[{
+                "name":"Read",
+                "description":"Read a file",
+                "input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}
+            }],
+            // The signed thinking belongs to the active tool continuation, so pre-conversion
+            // historical thinking shaping keeps it and Kiro still validates the signature.
             "messages":[
-                {"role":"user","content":"Say hello."},
+                {"role":"user","content":"Read /tmp/a then reply exactly: recovered-ok"},
                 {"role":"assistant","content":[
                     {
                         "type":"thinking",
                         "thinking":"prior private reasoning",
                         "signature":"invalid-signature-fixture"
                     },
-                    {"type":"text","text":"Hello."}
+                    {"type":"tool_use","id":"toolu_signature_retry","name":"Read","input":{"file_path":"/tmp/a"}}
                 ]},
-                {"role":"user","content":"Reply exactly: recovered-ok"}
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"toolu_signature_retry","content":"file body"}
+                ]}
             ]
         })
         .to_string(),
