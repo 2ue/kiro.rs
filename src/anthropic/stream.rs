@@ -1894,7 +1894,6 @@ impl StreamContext {
         self.response_tool_gate = policy.gate();
     }
 
-    #[cfg(test)]
     pub fn response_tool_gate(&self) -> &ResponseToolGate {
         &self.response_tool_gate
     }

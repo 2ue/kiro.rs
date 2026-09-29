@@ -318,6 +318,12 @@ pub struct UsageLatencyTrace {
     pub filtered_trivial_text_blocks: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filtered_trivial_text_chars: Option<u32>,
+    /// 响应未满足 tool_choice any/tool（Kiro 无法强制工具调用），例如 `any_without_tool_use`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice_violation: Option<String>,
+    /// 因违反本轮工具约束被丢弃的 tool_use，格式 `reason:tool`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_tool_uses: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -391,6 +397,8 @@ impl UsageLatencyTrace {
             && self.last_assistant_content_chars.is_none()
             && self.filtered_trivial_text_blocks.is_none()
             && self.filtered_trivial_text_chars.is_none()
+            && self.tool_choice_violation.is_none()
+            && self.dropped_tool_uses.is_none()
     }
 }
 

@@ -10,6 +10,15 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+/// Tool call the request's `tool_choice` requires in this turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequiredToolUse {
+    /// `tool_choice: {"type": "any"}`
+    Any,
+    /// `tool_choice: {"type": "tool", "name": ...}` (client-side name)
+    Named(String),
+}
+
 /// Per-request policy derived from the Anthropic request during conversion.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ResponseToolPolicy {
@@ -17,6 +26,8 @@ pub(crate) struct ResponseToolPolicy {
     unavailable_tool_names: HashSet<String>,
     /// Maximum number of tool calls forwarded downstream (`disable_parallel_tool_use` → 1).
     max_tool_uses: Option<usize>,
+    /// Kiro cannot force a tool call; this is only diagnosed after the response completes.
+    required: Option<RequiredToolUse>,
 }
 
 impl ResponseToolPolicy {
@@ -26,6 +37,15 @@ impl ResponseToolPolicy {
             self.unavailable_tool_names
                 .insert(name.to_ascii_lowercase());
         }
+    }
+
+    pub(crate) fn require_tool_use(&mut self, required: RequiredToolUse) {
+        self.required = Some(required);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn required(&self) -> Option<&RequiredToolUse> {
+        self.required.as_ref()
     }
 
     pub(crate) fn limit_tool_uses(&mut self, max: usize) {
@@ -74,6 +94,7 @@ pub(crate) struct ResponseToolGate {
     policy: ResponseToolPolicy,
     decisions: HashMap<String, bool>,
     admitted: usize,
+    admitted_names: Vec<String>,
     dropped: Vec<(String, ToolUseDropReason)>,
 }
 
@@ -105,6 +126,7 @@ impl ResponseToolGate {
             self.dropped.push((name.to_string(), reason));
         } else {
             self.admitted += 1;
+            self.admitted_names.push(name.to_string());
         }
         if !tool_use_id.is_empty() {
             self.decisions.insert(tool_use_id.to_string(), admitted);
@@ -130,11 +152,61 @@ impl ResponseToolGate {
         before - content.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn dropped_count(&self) -> usize {
         self.dropped.len()
     }
+
+    /// `reason:tool` summaries of dropped calls for usage diagnostics (bounded).
+    pub(crate) fn dropped_summaries(&self) -> Vec<String> {
+        self.dropped
+            .iter()
+            .take(MAX_DIAGNOSTIC_ENTRIES)
+            .map(|(name, reason)| format!("{}:{}", reason.as_str(), name))
+            .collect()
+    }
+
+    /// Whether the completed response violated a required `tool_choice`, and how.
+    pub(crate) fn tool_choice_violation(&self) -> Option<&'static str> {
+        match self.policy.required.as_ref()? {
+            RequiredToolUse::Any => (self.admitted == 0).then_some("any_without_tool_use"),
+            RequiredToolUse::Named(required) => {
+                if self
+                    .admitted_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(required))
+                {
+                    None
+                } else if self.admitted == 0 {
+                    Some("named_tool_without_tool_use")
+                } else {
+                    Some("named_tool_mismatch")
+                }
+            }
+        }
+    }
+
+    /// Logs dropped calls and `tool_choice` violations once per completed response.
+    pub(crate) fn log_completion(&self, request_id: &str) {
+        if let Some(violation) = self.tool_choice_violation() {
+            tracing::warn!(
+                request_id = %request_id,
+                violation,
+                required = ?self.policy.required,
+                called_tools = ?self.admitted_names,
+                "上游响应违反 tool_choice 约束（Kiro 无法强制工具调用）"
+            );
+        }
+        if !self.dropped.is_empty() {
+            tracing::warn!(
+                request_id = %request_id,
+                dropped_tool_uses = ?self.dropped_summaries(),
+                "响应中违反工具约束的 tool_use 已丢弃"
+            );
+        }
+    }
 }
+
+const MAX_DIAGNOSTIC_ENTRIES: usize = 8;
 
 #[cfg(test)]
 mod tests {
@@ -182,6 +254,51 @@ mod tests {
         assert_eq!(gate.retain_admitted_tool_use_blocks(&mut content), 1);
         assert_eq!(content.len(), 2);
         assert_eq!(content[1]["id"], "a");
+    }
+
+    #[test]
+    fn required_tool_choice_violations_are_classified() {
+        let mut any = ResponseToolPolicy::default();
+        any.require_tool_use(RequiredToolUse::Any);
+        assert_eq!(
+            any.gate().tool_choice_violation(),
+            Some("any_without_tool_use")
+        );
+        let mut gate = any.gate();
+        gate.admit("toolu_1", "Read");
+        assert_eq!(gate.tool_choice_violation(), None);
+
+        let mut named = ResponseToolPolicy::default();
+        named.require_tool_use(RequiredToolUse::Named("Read".to_string()));
+        assert_eq!(
+            named.gate().tool_choice_violation(),
+            Some("named_tool_without_tool_use")
+        );
+        let mut gate = named.gate();
+        gate.admit("toolu_1", "Bash");
+        assert_eq!(gate.tool_choice_violation(), Some("named_tool_mismatch"));
+        gate.admit("toolu_2", "Read");
+        assert_eq!(gate.tool_choice_violation(), None);
+
+        assert_eq!(
+            ResponseToolPolicy::default().gate().tool_choice_violation(),
+            None
+        );
+    }
+
+    #[test]
+    fn dropped_calls_are_summarized_for_diagnostics() {
+        let mut policy = blocking(&["Bash"]);
+        policy.limit_tool_uses(1);
+        let mut gate = policy.gate();
+        gate.admit("a", "Bash");
+        gate.admit("b", "Read");
+        gate.admit("c", "Read");
+
+        assert_eq!(
+            gate.dropped_summaries(),
+            ["unavailable_tool:Bash", "parallel_tool_use_disabled:Read"]
+        );
     }
 
     #[test]

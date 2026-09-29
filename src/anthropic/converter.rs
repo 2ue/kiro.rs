@@ -66,7 +66,8 @@ use tools::{
 };
 use tools::{
     collect_history_tool_names, convert_tools, create_placeholder_tool,
-    create_unavailable_placeholder_tool, max_response_tool_uses, summarize_tool_name_mapping,
+    create_unavailable_placeholder_tool, generate_tool_choice_turn_reminder,
+    max_response_tool_uses, required_response_tool_use, summarize_tool_name_mapping,
     tools_unavailable_this_turn,
 };
 
@@ -536,6 +537,9 @@ fn convert_request_with_model_id(
     if let Some(max) = max_response_tool_uses(req, &options) {
         response_tool_policy.limit_tool_uses(max);
     }
+    if let Some(required) = required_response_tool_use(req, &options) {
+        response_tool_policy.require_tool_use(required);
+    }
 
     if options.conversion.history_placeholder_tools.is_enabled() || options.is_strict() {
         for tool_name in history_tool_names {
@@ -585,6 +589,11 @@ fn convert_request_with_model_id(
             content = EMPTY_USER_CONTENT_PLACEHOLDER.to_string();
             warnings.empty_content_placeholders += 1;
         }
+    }
+    if let Some(reminder) = generate_tool_choice_turn_reminder(req, &tool_name_map, options.clone())
+    {
+        content.push_str("\n\n");
+        content.push_str(&reminder);
     }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
@@ -4281,6 +4290,89 @@ mod tests {
                 "{tool_choice}"
             );
         }
+    }
+
+    #[test]
+    fn required_tool_choice_adds_turn_reminder_and_violation_diagnostics() {
+        use crate::anthropic::tool_use_policy::RequiredToolUse;
+
+        let cases = [
+            (
+                serde_json::json!({"type": "any"}),
+                "one of the available tools",
+                Some(RequiredToolUse::Any),
+            ),
+            (
+                serde_json::json!({"type": "tool", "name": "read_file"}),
+                "the tool `read_file`",
+                Some(RequiredToolUse::Named("read_file".to_string())),
+            ),
+        ];
+        for (tool_choice, reminder, required) in cases {
+            let req = base_tool_choice_request(tool_choice.clone());
+            let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+            let current = &result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content;
+
+            assert!(current.starts_with("use the appropriate tool"), "{current}");
+            assert!(
+                current.ends_with(&format!(
+                    "<tool_choice_reminder>Respond by calling {reminder}.</tool_choice_reminder>"
+                )),
+                "{tool_choice}: {current}"
+            );
+            assert_eq!(
+                result.response_tool_policy.required(),
+                required.as_ref(),
+                "{tool_choice}"
+            );
+            assert!(
+                result.conversation_state.history.iter().any(|message| matches!(
+                    message,
+                    Message::User(user) if user.user_input_message.content.contains("You MUST call")
+                )),
+                "{tool_choice}"
+            );
+        }
+
+        for tool_choice in [
+            serde_json::json!({"type": "auto"}),
+            serde_json::json!({"type": "none"}),
+        ] {
+            let req = base_tool_choice_request(tool_choice.clone());
+            let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+            assert!(
+                !result
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .content
+                    .contains("<tool_choice_reminder>"),
+                "{tool_choice}"
+            );
+            assert_eq!(
+                result.response_tool_policy.required(),
+                None,
+                "{tool_choice}"
+            );
+        }
+
+        // Prompt steering disabled keeps the current user text untouched.
+        let req = base_tool_choice_request(serde_json::json!({"type": "any"}));
+        let mut options = ConverterOptions::default();
+        options.prompt_steering.tool_choice.enabled = false;
+        let result = convert_request_with_options(&req, options).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "use the appropriate tool"
+        );
     }
 
     #[test]

@@ -82,7 +82,7 @@ use super::request_facts::{
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
 use super::tool_schema_keys::ToolSchemaKeyMap;
-use super::tool_use_policy::ResponseToolPolicy;
+use super::tool_use_policy::{ResponseToolGate, ResponseToolPolicy};
 use super::transcript_sanitizer::RESPONSE_PROTOCOL_CONTAMINATION_DETAIL;
 #[cfg(test)]
 use super::types::OutputConfig;
@@ -341,6 +341,8 @@ struct RequestLatencyTraceState {
     last_assistant_content_chars: Arc<Mutex<Option<u32>>>,
     filtered_trivial_text_blocks: Arc<Mutex<Option<u32>>>,
     filtered_trivial_text_chars: Arc<Mutex<Option<u32>>>,
+    tool_choice_violation: Arc<Mutex<Option<String>>>,
+    dropped_tool_uses: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl RequestLatencyTraceState {
@@ -402,6 +404,8 @@ impl RequestLatencyTraceState {
             last_assistant_content_chars: Arc::new(Mutex::new(None)),
             filtered_trivial_text_blocks: Arc::new(Mutex::new(None)),
             filtered_trivial_text_chars: Arc::new(Mutex::new(None)),
+            tool_choice_violation: Arc::new(Mutex::new(None)),
+            dropped_tool_uses: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2993,6 +2997,17 @@ impl RequestUsageContext {
         }
     }
 
+    /// 记录响应侧工具约束结果：tool_choice 违规与被丢弃的 tool_use（同时写日志）。
+    fn mark_response_tool_gate(&self, gate: &ResponseToolGate) {
+        gate.log_completion(&self.request_id);
+        if let Some(violation) = gate.tool_choice_violation() {
+            *self.latency.tool_choice_violation.lock() = Some(violation.to_string());
+        }
+        if gate.dropped_count() > 0 {
+            *self.latency.dropped_tool_uses.lock() = Some(gate.dropped_summaries());
+        }
+    }
+
     fn mark_suppressed_tool_context_leak(&self, blocks: u32, chars: usize, kinds: Vec<String>) {
         if blocks == 0 {
             return;
@@ -3212,6 +3227,8 @@ impl RequestUsageContext {
             last_assistant_content_chars: *self.latency.last_assistant_content_chars.lock(),
             filtered_trivial_text_blocks: *self.latency.filtered_trivial_text_blocks.lock(),
             filtered_trivial_text_chars: *self.latency.filtered_trivial_text_chars.lock(),
+            tool_choice_violation: self.latency.tool_choice_violation.lock().clone(),
+            dropped_tool_uses: self.latency.dropped_tool_uses.lock().clone(),
         };
         (!trace.is_empty()).then_some(trace)
     }
@@ -3993,6 +4010,8 @@ impl CredentialUsageContext {
                 filtered_trivial_text_blocks: ctx.filtered_trivial_text_blocks(),
                 filtered_trivial_text_chars: ctx.filtered_trivial_text_chars(),
             });
+        self.request
+            .mark_response_tool_gate(ctx.response_tool_gate());
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage
             .is_none_or(|usage| !super::cache::metadata_usage_has_signal(usage))
@@ -11222,6 +11241,9 @@ async fn handle_non_stream_request(
             stop_reason = "end_turn".to_string();
         }
     }
+    credential_usage
+        .request
+        .mark_response_tool_gate(&response_tool_gate);
 
     // 估算输出 tokens
     let estimated_content_output_tokens = if content.is_empty() {

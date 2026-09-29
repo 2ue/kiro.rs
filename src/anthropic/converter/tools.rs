@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 use crate::anthropic::tool_schema_keys::{SchemaKeyMapper, ToolSchemaKeyMap};
+use crate::anthropic::tool_use_policy::RequiredToolUse;
 use crate::anthropic::types::{MessagesRequest, Tool as AnthropicTool};
 use crate::kiro::model::requests::conversation::Message;
 use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolSpecification};
@@ -533,6 +534,44 @@ pub(super) fn generate_tool_choice_prefix(
     })
 }
 
+/// any/tool 的当前轮提醒，追加在当前 user 消息末尾。系统级前缀离生成位置太远，
+/// 实测 any/tool 仍几乎总是只回文本；把约束放在最近的位置能提高遵从率，但仍不是硬保证。
+pub(super) fn generate_tool_choice_turn_reminder(
+    req: &MessagesRequest,
+    tool_name_map: &HashMap<String, String>,
+    options: ConverterOptions,
+) -> Option<String> {
+    if !options.inject_tool_choice_prefix() || !request_declares_tools(req) {
+        return None;
+    }
+    match parse_tool_choice(&req.tool_choice) {
+        ToolChoiceDirective::Any => Some(
+            "<tool_choice_reminder>Respond by calling one of the available tools.</tool_choice_reminder>"
+                .to_string(),
+        ),
+        ToolChoiceDirective::Tool(name) => Some(format!(
+            "<tool_choice_reminder>Respond by calling the tool `{}`.</tool_choice_reminder>",
+            kiro_facing_tool_choice_name(req, &name, tool_name_map)
+        )),
+        _ => None,
+    }
+}
+
+/// 请求要求本轮必须产生的工具调用（用于响应侧违规诊断）。
+pub(super) fn required_response_tool_use(
+    req: &MessagesRequest,
+    options: &ConverterOptions,
+) -> Option<RequiredToolUse> {
+    if !options.tool_choice_steering_enabled() || !request_declares_tools(req) {
+        return None;
+    }
+    match parse_tool_choice(&req.tool_choice) {
+        ToolChoiceDirective::Any => Some(RequiredToolUse::Any),
+        ToolChoiceDirective::Tool(name) => Some(RequiredToolUse::Named(name)),
+        _ => None,
+    }
+}
+
 fn tool_choice_directive_prefix(
     req: &MessagesRequest,
     directive: ToolChoiceDirective,
@@ -540,14 +579,14 @@ fn tool_choice_directive_prefix(
 ) -> Option<String> {
     match directive {
         ToolChoiceDirective::Any => Some(
-            "<tool_choice>any</tool_choice><tool_choice_policy>Use at least one available tool in this turn when a tool can satisfy the request.</tool_choice_policy>"
+            "<tool_choice>any</tool_choice><tool_choice_policy>You MUST call at least one of the available tools in this turn. A response without a tool call is invalid.</tool_choice_policy>"
                 .to_string(),
         ),
         ToolChoiceDirective::Tool(name) => {
             let kiro_name = kiro_facing_tool_choice_name(req, &name, tool_name_map);
             Some(format!(
-                "<tool_choice>tool</tool_choice><tool_choice_name>{}</tool_choice_name><tool_choice_policy>Use the named tool in this turn when responding.</tool_choice_policy>",
-                kiro_name
+                "<tool_choice>tool</tool_choice><tool_choice_name>{}</tool_choice_name><tool_choice_policy>You MUST call the tool `{}` in this turn. A response without that tool call is invalid.</tool_choice_policy>",
+                kiro_name, kiro_name
             ))
         }
         ToolChoiceDirective::None if request_declares_tools(req) || request_history_has_tool_use(req) => {
