@@ -12,6 +12,7 @@ use crate::model::config::{PromptCacheSimulationMode, ReportedUsagePathPolicy};
 
 use super::envelope;
 use super::tool_schema_keys::ToolSchemaKeyMap;
+use super::tool_use_policy::{ResponseToolGate, ResponseToolPolicy};
 use super::transcript_sanitizer::{
     RESPONSE_PROTOCOL_CONTAMINATION_DETAIL, ToolTranscriptSanitizer,
 };
@@ -1707,6 +1708,8 @@ pub struct StreamContext {
     repeat_guard_run: u32,
     /// stray token 复读熔断：触发后本轮剩余文本丢弃。
     repeat_guard_tripped: bool,
+    /// 响应侧工具调用约束（tool_choice=none 等 Kiro 无法表达的语义）。
+    response_tool_gate: ResponseToolGate,
 }
 
 impl StreamContext {
@@ -1883,7 +1886,17 @@ impl StreamContext {
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
+            response_tool_gate: ResponseToolGate::default(),
         }
+    }
+
+    pub fn set_response_tool_policy(&mut self, policy: &ResponseToolPolicy) {
+        self.response_tool_gate = policy.gate();
+    }
+
+    #[cfg(test)]
+    pub fn response_tool_gate(&self) -> &ResponseToolGate {
+        &self.response_tool_gate
     }
 
     pub fn set_requested_max_tokens(&mut self, max_tokens: i32) {
@@ -3175,10 +3188,13 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         self.seen_tool_sigs.insert(sig);
 
+        let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+        if !self.response_tool_gate.admit(&tool_use_id, &output_name) {
+            return Vec::new();
+        }
         let mut events = Vec::new();
         self.state_manager.set_has_tool_use(true);
         let block_index = self.state_manager.next_block_index();
-        let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
         self.tool_block_indices
             .insert(tool_use_id.clone(), block_index);
         events.extend(self.state_manager.handle_content_block_start(
@@ -3514,6 +3530,20 @@ impl StreamContext {
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
+        // 不允许的调用（例如 tool_choice=none 时对历史占位工具的调用）整段丢弃：
+        // 不开块、不计入 has_tool_use，下游不会收到需要回 tool_result 的 tool_use。
+        let gate_name = self
+            .tool_name_map
+            .get(&tool_use.name)
+            .map(String::as_str)
+            .unwrap_or(tool_use.name.as_str());
+        if !self
+            .response_tool_gate
+            .admit(&tool_use.tool_use_id, gate_name)
+        {
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
         self.drop_pending_trivial_text_before_tool_use();
@@ -8048,5 +8078,101 @@ mod tests {
                 "round {round}"
             );
         }
+    }
+
+    fn tool_use_fragment(id: &str, name: &str, input: &str, stop: bool) -> Event {
+        Event::ToolUse(crate::kiro::model::events::ToolUseEvent {
+            name: name.to_string(),
+            tool_use_id: id.to_string(),
+            input: input.to_string(),
+            stop,
+        })
+    }
+
+    fn tool_use_start_names(events: &[SseEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .map(|event| {
+                event.data["content_block"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unavailable_placeholder_tool_use_is_dropped_and_turn_ends_normally() {
+        let mut policy = ResponseToolPolicy::default();
+        policy.block_tool("Bash");
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "claude-sonnet-4.6",
+            100,
+            false,
+            HashMap::new(),
+            HashSet::from(["Bash".to_string()]),
+        );
+        ctx.set_response_tool_policy(&policy);
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_assistant_response("Here is the answer."));
+        events.extend(ctx.process_kiro_event(&tool_use_fragment(
+            "toolu_1",
+            "Bash",
+            "{\"command\":",
+            false,
+        )));
+        events.extend(ctx.process_kiro_event(&tool_use_fragment(
+            "toolu_1",
+            "Bash",
+            "\"echo hi\"}",
+            true,
+        )));
+        events.extend(ctx.generate_final_events());
+
+        assert!(tool_use_start_names(&events).is_empty());
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data["delta"]["type"] == "input_json_delta"),
+            "dropped tool input must not leak downstream"
+        );
+        assert_eq!(final_stop_reason(&events).as_deref(), Some("end_turn"));
+        assert_eq!(ctx.response_tool_gate().dropped_count(), 1);
+    }
+
+    #[test]
+    fn leaked_invoke_for_unavailable_tool_is_not_recovered_as_tool_use() {
+        let run = |policy: &ResponseToolPolicy| {
+            let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+                "claude-sonnet-4.6",
+                100,
+                false,
+                HashMap::new(),
+                HashSet::from(["Bash".to_string()]),
+            );
+            ctx.set_response_tool_policy(policy);
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_assistant_response(
+                "<function_calls><invoke name=\"Bash\"><parameter name=\"command\">ls</parameter></invoke></function_calls>",
+            ));
+            events.extend(ctx.generate_final_events());
+            events
+        };
+
+        // Control: without the policy the leaked invoke is recovered as a tool call.
+        assert_eq!(
+            tool_use_start_names(&run(&ResponseToolPolicy::default())),
+            ["Bash"]
+        );
+
+        let mut policy = ResponseToolPolicy::default();
+        policy.block_tool("Bash");
+        let events = run(&policy);
+        assert!(tool_use_start_names(&events).is_empty());
+        assert_ne!(final_stop_reason(&events).as_deref(), Some("tool_use"));
     }
 }

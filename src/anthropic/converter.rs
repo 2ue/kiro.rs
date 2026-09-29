@@ -13,6 +13,7 @@ use crate::anthropic::body_capabilities::KiroConverterPlan;
 use crate::anthropic::model_capabilities::{KiroReasoningCapabilityState, ModelResolution};
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
+use crate::anthropic::tool_use_policy::ResponseToolPolicy;
 #[cfg(test)]
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, ReasoningContent,
@@ -64,7 +65,8 @@ use tools::{
     SYSTEM_CHUNKED_POLICY, TOOL_HASH_MARKER, TOOL_NAME_MAX_LEN, map_tool_name, shorten_tool_name,
 };
 use tools::{
-    collect_history_tool_names, convert_tools, create_placeholder_tool, summarize_tool_name_mapping,
+    collect_history_tool_names, convert_tools, create_placeholder_tool,
+    create_unavailable_placeholder_tool, summarize_tool_name_mapping, tools_unavailable_this_turn,
 };
 
 pub(crate) fn deterministic_mapped_tool_name(name: &str) -> String {
@@ -104,6 +106,8 @@ pub struct ConversionResult {
     pub known_tool_names: std::collections::HashSet<String>,
     /// 代理对入参的隐式改写汇总（兜底动作的统计），用于可选的 `x-kiro-rs-warnings` 响应头。
     pub warnings: ProxyWarnings,
+    /// 响应侧工具调用约束（例如 tool_choice=none 时丢弃对历史占位工具的调用）。
+    pub response_tool_policy: ResponseToolPolicy,
     /// Kiro 原生模型扩展字段，例如 reasoning effort。
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
@@ -519,11 +523,15 @@ fn convert_request_with_model_id(
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
+    // 本轮不允许调用工具时（tool_choice=none 或未声明 tools），占位定义只用于满足上述校验：
+    // 描述明确标注不可调用，并在响应侧丢弃对这些工具的调用，避免客户端真的执行。
     let history_tool_names = collect_history_tool_names(&history);
     let mut existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
+    let tools_unavailable = tools_unavailable_this_turn(req, &options);
+    let mut response_tool_policy = ResponseToolPolicy::default();
 
     if options.conversion.history_placeholder_tools.is_enabled() || options.is_strict() {
         for tool_name in history_tool_names {
@@ -536,7 +544,18 @@ fn convert_request_with_model_id(
                     )));
                 }
                 known_tool_names.insert(tool_name.clone());
-                tools.push(create_placeholder_tool(&tool_name, options.clone()));
+                if tools_unavailable {
+                    response_tool_policy.block_tool(&tool_name);
+                    if let Some(original_name) = tool_name_map.get(&tool_name) {
+                        response_tool_policy.block_tool(original_name);
+                    }
+                    tools.push(create_unavailable_placeholder_tool(
+                        &tool_name,
+                        options.clone(),
+                    ));
+                } else {
+                    tools.push(create_placeholder_tool(&tool_name, options.clone()));
+                }
                 existing_tool_names.insert(tool_name_lower);
             }
         }
@@ -633,6 +652,7 @@ fn convert_request_with_model_id(
         tool_schema_key_map: converted_tools.tool_schema_key_map,
         known_tool_names,
         warnings,
+        response_tool_policy,
         additional_model_request_fields,
     })
 }
@@ -4092,6 +4112,124 @@ mod tests {
                 )),
             "compat mode should steer Kiro away from tool calls when tool_choice is none"
         );
+    }
+
+    fn history_bash_request(
+        tools: Option<Vec<super::super::types::Tool>>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("run echo"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{
+                        "type": "tool_use",
+                        "id": "toolu_hist_1",
+                        "name": "Bash",
+                        "input": {"command": "echo hi"}
+                    }]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_hist_1", "content": "hi"},
+                        {"type": "text", "text": "now just summarize"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools,
+            tool_choice,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    fn history_has_tool_choice_none_prompt(result: &ConversionResult) -> bool {
+        result.conversation_state.history.iter().any(|message| {
+            matches!(
+                message,
+                Message::User(user)
+                    if user.user_input_message.content.contains("<tool_choice>none</tool_choice>")
+            )
+        })
+    }
+
+    #[test]
+    fn tool_choice_none_marks_history_placeholders_unavailable_and_blocks_them() {
+        for (label, req) in [
+            (
+                "tool_choice none",
+                history_bash_request(
+                    Some(vec![test_tool("Bash")]),
+                    Some(serde_json::json!({"type": "none"})),
+                ),
+            ),
+            ("no tools field", history_bash_request(None, None)),
+            (
+                "no tools field with none",
+                history_bash_request(None, Some(serde_json::json!({"type": "none"}))),
+            ),
+        ] {
+            let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+            let tools = &result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools;
+
+            // Kiro still needs a definition for the history toolUse.
+            assert_eq!(tools.len(), 1, "{label}");
+            assert_eq!(tools[0].tool_specification.name, "Bash", "{label}");
+            assert!(
+                tools[0]
+                    .tool_specification
+                    .description
+                    .contains("NOT available in this turn"),
+                "{label}: {}",
+                tools[0].tool_specification.description
+            );
+            assert!(
+                result.response_tool_policy.is_unavailable("Bash"),
+                "{label}"
+            );
+            assert!(history_has_tool_choice_none_prompt(&result), "{label}");
+        }
+    }
+
+    #[test]
+    fn auto_tool_choice_keeps_regular_history_placeholder_without_blocking() {
+        let req = history_bash_request(Some(vec![test_tool("Read")]), None);
+
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        let placeholder = tools
+            .iter()
+            .find(|tool| tool.tool_specification.name == "Bash")
+            .expect("history placeholder");
+        assert_eq!(
+            placeholder.tool_specification.description,
+            "Tool used in conversation history"
+        );
+        assert!(!result.response_tool_policy.is_unavailable("Bash"));
+        assert!(!history_has_tool_choice_none_prompt(&result));
     }
 
     #[test]

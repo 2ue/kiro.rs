@@ -2,6 +2,7 @@ use super::*;
 use crate::anthropic::body_capabilities::{BodyStageState, LocalKiroBodyPlan};
 use crate::anthropic::payload_guard::sanitize_anthropic_messages_for_external_forwarding;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
+use crate::anthropic::tool_use_policy::ResponseToolPolicy;
 use crate::model::config::PayloadShapingConfig;
 
 pub(super) struct PreparedLocalKiroBody {
@@ -16,6 +17,7 @@ pub(super) struct PreparedLocalKiroBody {
     pub(super) tool_name_map: HashMap<String, String>,
     pub(super) tool_schema_key_map: ToolSchemaKeyMap,
     pub(super) known_tool_names: HashSet<String>,
+    pub(super) response_tool_policy: ResponseToolPolicy,
     pub(super) warnings_header: Option<String>,
     pub(super) extract_xml_thinking: bool,
     pub(super) too_long_retry: Option<PayloadTooLongRetryRequest>,
@@ -384,6 +386,7 @@ pub(super) fn prepare_with_plan(
         tool_name_map: conversion_result.tool_name_map,
         tool_schema_key_map: conversion_result.tool_schema_key_map,
         known_tool_names: conversion_result.known_tool_names,
+        response_tool_policy: conversion_result.response_tool_policy,
         warnings_header,
         extract_xml_thinking,
         too_long_retry,

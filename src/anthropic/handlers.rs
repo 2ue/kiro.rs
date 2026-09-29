@@ -82,6 +82,7 @@ use super::request_facts::{
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
 use super::tool_schema_keys::ToolSchemaKeyMap;
+use super::tool_use_policy::ResponseToolPolicy;
 use super::transcript_sanitizer::RESPONSE_PROTOCOL_CONTAMINATION_DETAIL;
 #[cfg(test)]
 use super::types::OutputConfig;
@@ -6829,6 +6830,7 @@ async fn post_messages_inner(
         tool_name_map,
         tool_schema_key_map,
         known_tool_names,
+        response_tool_policy,
         warnings_header,
         extract_xml_thinking,
         too_long_retry,
@@ -6879,6 +6881,7 @@ async fn post_messages_inner(
             tool_name_map,
             tool_schema_key_map,
             known_tool_names,
+            response_tool_policy,
             usage_context,
             attribution,
             warnings_header,
@@ -6909,6 +6912,7 @@ async fn post_messages_inner(
             tool_name_map,
             tool_schema_key_map,
             known_tool_names,
+            response_tool_policy,
             usage_context,
             attribution,
             warnings_header,
@@ -7458,6 +7462,7 @@ struct StreamContextTemplate {
     tool_name_map: HashMap<String, String>,
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
+    response_tool_policy: ResponseToolPolicy,
 }
 
 impl StreamContextTemplate {
@@ -7475,6 +7480,7 @@ impl StreamContextTemplate {
             credential_usage.request.simulation_mode,
         );
         ctx.set_requested_max_tokens(self.requested_max_tokens);
+        ctx.set_response_tool_policy(&self.response_tool_policy);
         ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
         ctx.set_local_prompt_cache_projection_enabled(
             credential_usage.request.uses_local_prompt_cache_strategy(),
@@ -7622,6 +7628,7 @@ async fn handle_stream_request(
     tool_name_map: HashMap<String, String>,
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
+    response_tool_policy: ResponseToolPolicy,
     usage_context: RequestUsageContext,
     admission_attribution: Option<RequestRejectionAttribution>,
     warnings_header: Option<String>,
@@ -8236,6 +8243,7 @@ async fn handle_stream_request(
         tool_name_map,
         tool_schema_key_map,
         known_tool_names,
+        response_tool_policy,
     };
     let (ctx, initial_events) = context_template.build(&credential_usage);
     let retry_plan = if stream_retry_config.active() {
@@ -9944,6 +9952,7 @@ async fn handle_non_stream_request(
     tool_name_map: HashMap<String, String>,
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
+    response_tool_policy: ResponseToolPolicy,
     usage_context: RequestUsageContext,
     admission_attribution: Option<RequestRejectionAttribution>,
     warnings_header: Option<String>,
@@ -11202,6 +11211,17 @@ async fn handle_non_stream_request(
     }
 
     content.extend(tool_uses);
+    // Kiro 无法表达 tool_choice=none 等约束，这里丢弃不允许的调用；被丢弃的调用不会下发，
+    // 因而也不会产生需要配对的 tool_result。
+    let mut response_tool_gate = response_tool_policy.gate();
+    if response_tool_gate.retain_admitted_tool_use_blocks(&mut content) > 0 {
+        has_tool_use = content
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+        if !has_tool_use && stop_reason == "tool_use" {
+            stop_reason = "end_turn".to_string();
+        }
+    }
 
     // 估算输出 tokens
     let estimated_content_output_tokens = if content.is_empty() {

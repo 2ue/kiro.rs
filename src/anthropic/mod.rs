@@ -56,6 +56,7 @@ mod router;
 mod stream;
 pub(crate) mod tool_format_debug;
 pub(crate) mod tool_schema_keys;
+pub(crate) mod tool_use_policy;
 pub(crate) mod transcript_sanitizer;
 pub mod types;
 pub(crate) mod usage;

@@ -20,6 +20,13 @@ const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` con
 
 const EMPTY_TOOL_DESCRIPTION_PLACEHOLDER: &str = "Tool available to the assistant.";
 
+const PLACEHOLDER_TOOL_DESCRIPTION: &str = "Tool used in conversation history";
+
+const UNAVAILABLE_PLACEHOLDER_TOOL_DESCRIPTION: &str =
+    "Tool used earlier in this conversation. It is NOT available in this turn: do not call it.";
+
+const TOOL_CHOICE_NONE_PREFIX: &str = "<tool_choice>none</tool_choice><tool_choice_policy>Do not call any tool in this turn, including tools used earlier in this conversation. Respond with text only.</tool_choice_policy>";
+
 /// 追加到系统提示词的分块写入策略
 pub(super) const SYSTEM_CHUNKED_POLICY: &str = "\
 When the Write or Edit tool has content size limits, always comply silently. \
@@ -59,6 +66,20 @@ pub(super) fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 pub(super) fn create_placeholder_tool(name: &str, options: ConverterOptions) -> Tool {
+    placeholder_tool_with_description(name, PLACEHOLDER_TOOL_DESCRIPTION, options)
+}
+
+/// 本轮客户端不允许调用任何工具（tool_choice=none 或未声明 tools）时的历史工具占位定义。
+/// 定义本身只用于满足 Kiro 的历史校验；描述明确告知不可调用，响应侧还会丢弃对它的调用。
+pub(super) fn create_unavailable_placeholder_tool(name: &str, options: ConverterOptions) -> Tool {
+    placeholder_tool_with_description(name, UNAVAILABLE_PLACEHOLDER_TOOL_DESCRIPTION, options)
+}
+
+fn placeholder_tool_with_description(
+    name: &str,
+    description: &str,
+    options: ConverterOptions,
+) -> Tool {
     let schema = serde_json::json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -72,7 +93,7 @@ pub(super) fn create_placeholder_tool(name: &str, options: ConverterOptions) -> 
     Tool {
         tool_specification: ToolSpecification {
             name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
+            description: description.to_string(),
             input_schema: InputSchema::from_json(schema),
         },
     }
@@ -508,14 +529,41 @@ pub(super) fn generate_tool_choice_prefix(
                 kiro_name
             ))
         }
-        ToolChoiceDirective::None if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) => {
-            Some(
-                "<tool_choice>none</tool_choice><tool_choice_policy>Do not call tools in this turn.</tool_choice_policy>"
-                    .to_string(),
-            )
+        ToolChoiceDirective::None if request_declares_tools(req) || request_history_has_tool_use(req) => {
+            Some(TOOL_CHOICE_NONE_PREFIX.to_string())
+        }
+        // 未声明 tools 时客户端同样不允许调用工具；只有历史里出现过工具调用（会生成占位定义）时才需要提示。
+        ToolChoiceDirective::Auto | ToolChoiceDirective::Unknown
+            if !request_declares_tools(req) && request_history_has_tool_use(req) =>
+        {
+            Some(TOOL_CHOICE_NONE_PREFIX.to_string())
         }
         _ => None,
     }
+}
+
+fn request_declares_tools(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+}
+
+fn request_history_has_tool_use(req: &MessagesRequest) -> bool {
+    req.messages.iter().any(|message| {
+        message.content.as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(|value| value.as_str()) == Some("tool_use"))
+        })
+    })
+}
+
+/// 本轮客户端是否不允许调用任何工具：未声明 tools，或 tool_choice=none（结构化 tool_choice 处理开启时）。
+pub(super) fn tools_unavailable_this_turn(
+    req: &MessagesRequest,
+    options: &ConverterOptions,
+) -> bool {
+    !request_declares_tools(req)
+        || (options.tool_choice_steering_enabled()
+            && parse_tool_choice(&req.tool_choice) == ToolChoiceDirective::None)
 }
 
 /// 转换工具定义
