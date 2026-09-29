@@ -6239,4 +6239,41 @@ mod tests {
         assert!(assistant.contains("Here is what I found."), "{assistant}");
         assert!(!assistant.contains("SECRET-ENCRYPTED"), "{assistant}");
     }
+
+    #[test]
+    fn leading_assistant_turn_is_kept_behind_placeholder_user_for_five_rounds() {
+        for round in 0..5 {
+            for system in [None, Some("be brief")] {
+                let mut req = audit_request(serde_json::json!([
+                    {"role": "assistant", "content": format!("Hello! I am ready {round}.")},
+                    {"role": "user", "content": "hi"}
+                ]));
+                if let Some(system) = system {
+                    req.system = Some(vec![crate::anthropic::types::SystemMessage {
+                        text: system.to_string(),
+                        cache_control: None,
+                    }]);
+                }
+                let result = convert_request(&req).expect("leading assistant converts");
+                let history = &result.conversation_state.history;
+                for (index, message) in history.iter().enumerate() {
+                    let expected_user = index % 2 == 0;
+                    assert_eq!(
+                        matches!(
+                            message,
+                            crate::kiro::model::requests::conversation::Message::User(_)
+                        ),
+                        expected_user,
+                        "round {round} system={system:?}: history must alternate starting with user"
+                    );
+                }
+                assert!(
+                    history_assistant_contents(&result)
+                        .iter()
+                        .any(|content| content.contains(&format!("Hello! I am ready {round}."))),
+                    "round {round}: leading assistant content must survive"
+                );
+            }
+        }
+    }
 }

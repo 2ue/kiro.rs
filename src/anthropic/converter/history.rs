@@ -158,6 +158,16 @@ pub(super) fn build_history(
                 let merged_user = merge_user_messages(&user_buffer, model_id)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
+            } else if assistant_buffer.is_empty()
+                && !matches!(history.last(), Some(Message::User(_)))
+            {
+                // The conversation starts with an assistant turn (for example a client-side
+                // greeting). Kiro history must alternate starting with a user turn, so keep the
+                // assistant content behind a placeholder user turn instead of dropping it.
+                history.push(Message::User(HistoryUserMessage::new(
+                    EMPTY_USER_CONTENT_PLACEHOLDER,
+                    model_id,
+                )));
             }
             // 累积 assistant 消息（支持连续多条）
             assistant_buffer.push(msg);
