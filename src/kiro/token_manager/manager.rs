@@ -68,7 +68,7 @@ use super::auxiliary::{
     TokenRefreshAdmissionSnapshot,
 };
 use super::capacity::{
-    credential_is_dispatch_candidate, credential_is_dispatchable,
+    credential_catalog_lists_model, credential_is_dispatch_candidate, credential_is_dispatchable,
     credential_is_temporarily_available, credential_is_usable_for_model,
     credential_proxy_availability, credential_proxy_is_dispatchable,
     effective_max_concurrent_requests, effective_weight_for_limit, entry_has_concurrency_capacity,
@@ -5184,6 +5184,40 @@ impl MultiTokenManager {
         self.has_alternate_usable_credential_from_current_state(model, excluded_ids, current_id)
     }
 
+    /// 判断当前本机内存态中是否还有其他"模型目录明确列出该模型"的可调度凭据。
+    ///
+    /// 目录为空的凭据不算：它们只是"未知是否支持"，不能作为 invalid-model 换号的依据。
+    pub fn has_alternate_catalog_listed_credential_cached(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let now = Instant::now();
+        let config = self.config.lock().clone();
+        let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
+        if self.redis_store.is_none() {
+            refresh_local_selection_windows_locked(&mut entries, now);
+        }
+        let proxy_resources = self.proxy_resources.lock();
+        entries.iter().any(|entry| {
+            entry.id != current_id
+                && !excluded_ids.contains(&entry.id)
+                && credential_catalog_lists_model(entry, model)
+                && credential_is_dispatchable(
+                    &proxy_resources,
+                    entry,
+                    model,
+                    now,
+                    max_concurrent_requests,
+                    global_rpm,
+                    1,
+                )
+        })
+    }
+
     /// Returns whether the selected credential is currently blocked by a fresh account-balance
     /// snapshot. This is intentionally separate from `disabled`: the derived guard must not
     /// overwrite an Admin/runtime disable or its persisted generation.
@@ -5316,18 +5350,29 @@ impl MultiTokenManager {
         let mut warming_recent = 0u64;
 
         if global_has_capacity {
-            for entry in entries.iter() {
-                if excluded_ids.contains(&entry.id)
-                    || !credential_is_dispatchable(
-                        &proxy_resources,
-                        entry,
-                        model,
-                        now,
-                        max_concurrent_requests,
-                        global_rpm,
-                        request_weight_units,
-                    )
-                {
+            let dispatchable = entries
+                .iter()
+                .filter(|entry| {
+                    !excluded_ids.contains(&entry.id)
+                        && credential_is_dispatchable(
+                            &proxy_resources,
+                            entry,
+                            model,
+                            now,
+                            max_concurrent_requests,
+                            global_rpm,
+                            request_weight_units,
+                        )
+                })
+                .collect::<Vec<_>>();
+            // Credentials with an empty model catalog are only a fallback: when any dispatchable
+            // credential's catalog lists the model, unknown-catalog credentials (failed discovery,
+            // invalid keys) must not win the selection and burn an attempt.
+            let prefer_catalog_listed = dispatchable
+                .iter()
+                .any(|entry| credential_catalog_lists_model(entry, model));
+            for entry in dispatchable {
+                if prefer_catalog_listed && !credential_catalog_lists_model(entry, model) {
                     continue;
                 }
 

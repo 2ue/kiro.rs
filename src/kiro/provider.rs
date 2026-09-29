@@ -4053,6 +4053,24 @@ mod tests {
         round: usize,
         prompt_logic_retry_enabled: bool,
     ) -> (usize, Vec<crate::kiro::call_trace::KiroCredentialAttempt>) {
+        call_fake_bad_request_provider_with_credentials(
+            server,
+            scenario,
+            fake_bad_request_credentials(pool_size),
+            round,
+            prompt_logic_retry_enabled,
+        )
+        .await
+    }
+
+    async fn call_fake_bad_request_provider_with_credentials(
+        server: &FakeBadRequestServer,
+        scenario: &str,
+        credentials: Vec<KiroCredentials>,
+        round: usize,
+        prompt_logic_retry_enabled: bool,
+    ) -> (usize, Vec<crate::kiro::call_trace::KiroCredentialAttempt>) {
+        let pool_size = credentials.len();
         let hits_before = server.state.scenario_hits(scenario);
         let total_hits_before = server.state.total_hits.load(Ordering::Relaxed);
         let mut config = Config::default();
@@ -4062,14 +4080,8 @@ mod tests {
         config.credential_prompt_logic_retry_enabled = prompt_logic_retry_enabled;
         config.credential_prompt_logic_retry_max_attempts = 100;
         let manager = Arc::new(
-            MultiTokenManager::new(
-                config,
-                fake_bad_request_credentials(pool_size),
-                None,
-                None,
-                false,
-            )
-            .expect("fake provider token manager"),
+            MultiTokenManager::new(config, credentials, None, None, false)
+                .expect("fake provider token manager"),
         );
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
@@ -5514,6 +5526,93 @@ mod tests {
             expected_total_hits,
             "the full retry matrix should issue exactly the sum of each case's expected inference requests"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_model_400_moves_across_catalog_listed_credentials_within_budget_for_five_rounds()
+     {
+        let server = FakeBadRequestServer::start().await;
+        for round in 0..5 {
+            // Credentials 1-2 have an empty catalog (failed discovery, e.g. invalid keys);
+            // 3-8 explicitly list the model. The unknown-catalog credentials must neither be
+            // picked first nor serve as invalid-model alternates while listed ones remain.
+            let credentials = fake_bad_request_credentials(8)
+                .into_iter()
+                .map(|mut credential| {
+                    if credential.id.unwrap_or_default() > 2 {
+                        credential.supported_models = vec!["claude-sonnet-4".to_string()];
+                    }
+                    credential
+                })
+                .collect::<Vec<_>>();
+            let (hits, attempts) = call_fake_bad_request_provider_with_credentials(
+                &server,
+                "invalid_model",
+                credentials,
+                round,
+                true,
+            )
+            .await;
+            // The request moves on until the 4-attempt budget is spent.
+            assert_eq!(hits, 4, "round {round}");
+            let ids = attempts
+                .iter()
+                .map(|attempt| attempt.credential_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids.iter().collect::<HashSet<_>>().len(),
+                4,
+                "round {round}: {ids:?}"
+            );
+            assert!(
+                ids.iter().all(|id| *id > 2),
+                "round {round}: unknown-catalog credential used while listed ones remained: {ids:?}"
+            );
+            for attempt in attempts.iter().take(3) {
+                assert_eq!(attempt.action, "model_unavailable_retry_next");
+            }
+            assert_eq!(
+                attempts.last().map(|attempt| attempt.action.as_str()),
+                Some("fail")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_model_retry_is_unbounded_only_with_a_catalog_listed_alternate() {
+        let model = Some("claude-sonnet-5");
+        assert!(KiroProvider::should_retry_model_400_bad_request(
+            "model_invalid_bad_request",
+            model,
+            0,
+            false
+        ));
+        assert!(!KiroProvider::should_retry_model_400_bad_request(
+            "model_invalid_bad_request",
+            model,
+            1,
+            false
+        ));
+        for attempt in 1..4 {
+            assert!(KiroProvider::should_retry_model_400_bad_request(
+                "model_invalid_bad_request",
+                model,
+                attempt,
+                true
+            ));
+        }
+        assert!(!KiroProvider::should_retry_model_400_bad_request(
+            "model_invalid_bad_request",
+            None,
+            0,
+            true
+        ));
+        assert!(!KiroProvider::should_retry_model_400_bad_request(
+            "malformed_request",
+            model,
+            0,
+            true
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -12795,10 +12894,19 @@ impl KiroProvider {
                     self.finish_attempt(&mut ctx);
                     return Err(Self::traced_error(message, &attempts));
                 }
+                let alternate_catalog_listed = bad_request_reason == "model_invalid_bad_request"
+                    && self
+                        .token_manager
+                        .has_alternate_catalog_listed_credential_cached(
+                            model.as_deref(),
+                            &excluded_ids,
+                            ctx.id,
+                        );
                 if Self::should_retry_model_400_bad_request(
                     bad_request_reason,
                     model.as_deref(),
                     attempt,
+                    alternate_catalog_listed,
                 ) && attempt + 1 < max_retries
                     && self.token_manager.has_alternate_usable_credential_cached(
                         model.as_deref(),
@@ -13784,16 +13892,20 @@ impl KiroProvider {
     /// 400 retry policy for model rejections. "Model unavailable" is account/region specific and
     /// may move to every alternate credential. "Invalid model" is usually deterministic, but a
     /// newer model can exist only on some accounts (for example a model that appears in the
-    /// catalog after a new account is imported), so it gets exactly one alternate credential.
+    /// catalog after a new account is imported). While another dispatchable credential's catalog
+    /// explicitly lists the model, the rejecting credential is excluded and the request moves on
+    /// within the attempt budget. Without such a known supporter only one blind alternate is
+    /// tried, so a truly unknown model id costs at most two upstream calls.
     /// The transient model failure recorded for the rejecting credential steers later requests.
     fn should_retry_model_400_bad_request(
         reason: &str,
         model: Option<&str>,
         attempt: usize,
+        alternate_catalog_listed: bool,
     ) -> bool {
         Self::should_retry_model_unavailable_bad_request(reason, model)
             || (reason == "model_invalid_bad_request"
-                && attempt == 0
+                && (attempt == 0 || alternate_catalog_listed)
                 && model.map(str::trim).is_some_and(|value| !value.is_empty()))
     }
 

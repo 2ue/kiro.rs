@@ -6264,6 +6264,61 @@ async fn test_empty_supported_models_allows_future_model_when_restricted_credent
 }
 
 #[tokio::test]
+async fn test_catalog_listed_credentials_win_over_unknown_catalog_for_five_rounds() {
+    for mode in [
+        "priority",
+        "balanced",
+        "health_balanced",
+        "weighted_least_inflight",
+    ] {
+        for round in 0..5 {
+            let mut config = Config::default();
+            config.load_balancing_mode = mode.to_string();
+
+            // An unknown catalog (discovery failed) with the best priority must not win while a
+            // credential whose catalog lists the model is dispatchable.
+            let mut unknown = test_access_token_credential("unknown-catalog", "Pro");
+            unknown.priority = 0;
+            unknown.supported_models = Vec::new();
+            let mut listed = test_access_token_credential("listed", "Pro");
+            listed.priority = 1;
+            listed.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
+
+            let manager =
+                MultiTokenManager::new(config, vec![unknown, listed], None, None, false).unwrap();
+            let mut ctx = manager
+                .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
+                .await
+                .unwrap();
+            assert_eq!(ctx.id, 2, "mode {mode} round {round}");
+            assert!(
+                !manager.has_alternate_catalog_listed_credential_cached(
+                    Some("claude-sonnet-4"),
+                    &HashSet::new(),
+                    2
+                ),
+                "an empty catalog is not a known supporter"
+            );
+            ctx.release_in_flight();
+
+            // Once the listed credential is excluded, the unknown-catalog one is the fallback.
+            let excluded = HashSet::from([2]);
+            let mut ctx = manager
+                .acquire_context_for_session(Some("claude-sonnet-4"), None, &excluded)
+                .await
+                .unwrap();
+            assert_eq!(ctx.id, 1, "mode {mode} round {round}");
+            assert!(manager.has_alternate_catalog_listed_credential_cached(
+                Some("claude-sonnet-4"),
+                &HashSet::new(),
+                1
+            ));
+            ctx.release_in_flight();
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_supported_model_alias_does_not_cross_family_in_local_scheduler() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();

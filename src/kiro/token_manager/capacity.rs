@@ -26,6 +26,15 @@ pub(super) fn credential_is_usable_for_model(entry: &CredentialEntry, model: Opt
     true
 }
 
+/// Whether the credential's discovered model catalog explicitly lists `model`. An empty
+/// catalog (discovery never ran or failed) only passes `supports_model` as "unknown", so it
+/// is not a known supporter.
+pub(super) fn credential_catalog_lists_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
+    model.is_some_and(|model| !model.trim().is_empty())
+        && !entry.credentials.supported_models.is_empty()
+        && entry.credentials.supports_model(&[model])
+}
+
 pub(super) fn credential_is_dispatchable(
     proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
     entry: &CredentialEntry,
