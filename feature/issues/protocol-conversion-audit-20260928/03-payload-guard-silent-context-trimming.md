@@ -311,3 +311,5 @@ PayloadGuardError::PromptTooLong { weight, max_weight } => envelope::error_respo
 - 使用 `claude-opus-4-8`（1M 上下文）发送约 4.5 MB 的 45 轮历史，并在 system 中写入口令。第一次请求被 Kiro 以 too-long 拒绝；on_too_long 重试删除了 66 条历史，weighted 1,246,437 时返回 200，模型准确说出了 system 中的口令 `ZEBRAFINCH`。这说明裁剪之后 system prompt 仍然保留着。修复前，system 所在的 history[0..2] 会最先被删掉。
 - 对照：同一个口令问题在不裁剪的情况下也能答对，说明判断依据是有效的。
 - 1M 上下文：约 1.15 MB 的内容（约 30 万 token）发给 `claude-opus-4-8` 后直接返回 200，没有触发裁剪。
+
+> 2026-09-29 行为变更：默认 `payloadTooLongHandling=client_compaction`。Kiro 判定过长时，服务端不再静默裁剪，而是返回协议格式的 `prompt is too long`，由客户端压缩。只有 Claude Code 的压缩请求仍按窗口上限裁剪重试。本文描述的"静默裁剪"只在设置为 `trim_retry` 或 `payloadGuardMode=preemptive` 时才会出现。详见 [P27](27-auto-compact-signal-without-changing-usage.md)。
