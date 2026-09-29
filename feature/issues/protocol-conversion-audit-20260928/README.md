@@ -58,8 +58,10 @@ usage 与缓存模拟（token 放大、cache 命中统计）属于产品策略�
 | `76d0ade` | P05（合法工具名原样透传） |
 | `5358be6` | P08 子问题（contextUsage 100% 时保留 tool_use） |
 | `be5ee15` | P20（以 assistant 开头的对话） |
+| `6877e7a` | P23 #1（每条 assistant 保留一个 Kiro 原生 reasoning） |
+| `f965f1d` | P26 缓解（400 invalid model 换一个账号重试一次） |
 
-各文档的 `Status:` 与"修复结果与验证（2026-09-29）"一节记录具体改动、单测和真实上游结果。仍然开放：P10、P12、P13、P14、P15、P16、P19、P25 的缺口；P03、P17、P18、P20、P21 的剩余子项；P23 #1。
+各文档的 `Status:` 与"修复结果与验证（2026-09-29）"一节记录具体改动、单测和真实上游结果。仍然开放：P10、P12、P13、P14、P15、P16、P19、P25 的缺口；P03、P17、P18、P20、P21 的剩余子项；P26 的根治方案（按账号目录派发）。
 
 ## 问题列表
 
@@ -90,6 +92,7 @@ usage 与缓存模拟（token 放大、cache 命中统计）属于产品策略�
 | [P23](23-native-reasoning-multi-block-conversion-gaps.md) | P22 之外的原生 reasoning 多 block 互转缺口 | Medium | request + stream |
 | [P24](24-history-server-tool-and-search-result-blocks-dropped.md) | 历史中的 server_tool_use、web_search_tool_result、search_result 被丢弃 | Low | request |
 | [P25](25-thinking-parameter-validation-gaps.md) | thinking 参数校验缺口 | Low | request |
+| [P26](26-merged-catalog-alias-routes-to-accounts-without-model.md) | 合并目录后，别名解析到只有部分账号支持的模型，请求被派到不支持的账号 | Medium | request + scheduling |
 
 ## 维护规则
 

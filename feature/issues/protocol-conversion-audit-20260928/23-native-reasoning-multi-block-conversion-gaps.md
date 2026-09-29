@@ -1,6 +1,6 @@
 # P23 原生 reasoning 多 block 互转的剩余缺口（P22 最小修复之外）
 
-Status: partially-fixed (#2 in 1450bb0, #3 in 619ac56, #4 by P22; #1 protected-turn open)
+Status: fixed (#1 in 6877e7a, #2 in 1450bb0, #3 in 619ac56, #4 by P22; not released)
 Severity: Medium
 Area: request + stream
 Discovered: 2026-09-28，P22 分析过程中确认；为保持 P22 最小范围，从 P22 拆出
@@ -231,3 +231,13 @@ curl -sS http://127.0.0.1:19023/cc/v1/messages \
 - 第 3 点（`619ac56`）：新的原生 reasoning 段开始时，会重置签名状态，每个 thinking block 都会发出自己的 `signature_delta`。单测为 `each_native_reasoning_segment_emits_its_own_signature_for_five_rounds`。
 - 第 1 点：受保护的工具续写 assistant 内部有多个原生 reasoning 的情况仍未处理。测试实例的 native reasoning 能力当前为 Unknown，opus 账号返回 503，无法用真实原生签名验证取舍规则，所以暂不修改。
 - 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。
+
+## 修复结果与验证（2026-09-29，Opus 原生签名）
+
+- 第 1 点（`6877e7a`）：一条 assistant 中出现多个 Kiro 原生 reasoning 时，改为只保留一个：优先保留最后一个 tool_use 之前最近的原生块；如果没有这样的块，则保留最后一个原生块。同一条 assistant 中的无签名 thinking 会被丢弃，不再在本地返回 400。签名原样透传，不做合并或改写。单测：`multiple_or_mixed_native_reasoning_blocks_keep_one_kiro_native_value_for_five_rounds`，覆盖多块签名、redacted、签名与无签名混用、与工具调用交错这几种情况。
+- 真实上游：导入了支持 Opus 的账号 `#313`，使用 `claude-opus-4-8`，并拿到了真实的原生签名。
+  - 修复前：受保护工具轮次中出现交错的两个签名块时，本地返回 400，报错为 `assistant history contains multiple or mixed native reasoning blocks`。
+  - 修复后：同样的请求在流式和非流式下都返回 200，并且没有触发重试；签名与无签名混用的请求也返回 200。
+  - 另外验证了：把一个响应中的真实签名放到另一个响应的上下文里，Kiro 同样接受。也就是说，"选哪个块"不会导致上游签名校验失败。
+- 真实 Kiro 在一次响应中只输出一段 reasoning（`thinking → text → tool_use×2`），所以第 3 点中的多段场景主要出现在客户端组合出来的历史里。
+- 验证环境：`127.0.0.1:19023` 指定测试实例，使用隔离的 CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。

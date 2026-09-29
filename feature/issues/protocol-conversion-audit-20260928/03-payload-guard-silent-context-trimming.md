@@ -1,6 +1,6 @@
 # P03 payload guard 超限时静默裁剪上下文（含 system prompt），仍返回 200
 
-Status: partially-fixed-in-ce2fad6 (system pair protected; silent trim disclosure/reject mode still open)
+Status: partially-fixed-in-ce2fad6 (system pair protected, real-upstream verified; disclosure/reject mode open)
 Severity: High
 Area: request
 Discovered: 2026-09-28 协议互转审计
@@ -305,3 +305,9 @@ PayloadGuardError::PromptTooLong { weight, max_weight } => envelope::error_respo
 - 真实上游新发现（2026-09-29，sonnet-4.5 测试账号）：Kiro 的 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 实际表现更接近按 token 计的上下文上限（约 200k token）。纯 ASCII 的 900 KB 请求就会被拒绝；1.85 MB 的请求经 on_too_long 重试裁剪到 weighted 1,237,949（低于 1.3M 安全阈值）后，仍然被拒绝。因此，对 ASCII 为主的大请求，现有 weighted 1.3M 阈值基本无法让重试成功。本次没有修改阈值，因为改默认值会影响所有调度。结合 P01 的修复，这类请求现在会收到 `prompt is too long: N tokens > M maximum`，Claude Code 可以据此自动 compact。按模型窗口 token 设置重试目标，需要单独立项评估。
 - 仍然开放的部分：静默裁剪的披露方式，以及可配置的 reject 模式。
 - 验证环境：真实上游验证使用 `127.0.0.1:19023` 指定测试实例和隔离的 CLI `HOME`/`CLAUDE_CONFIG_DIR`，未改动本机正在运行的 Claude Code CLI 环境。证据见 `tmp/thinking-budget-local/fix-evidence-20260929/`。
+
+## 修复结果与验证补充（2026-09-29，Opus 1M）
+
+- 使用 `claude-opus-4-8`（1M 上下文）发送约 4.5 MB 的 45 轮历史，并在 system 中写入口令。第一次请求被 Kiro 以 too-long 拒绝；on_too_long 重试删除了 66 条历史，weighted 1,246,437 时返回 200，模型准确说出了 system 中的口令 `ZEBRAFINCH`。这说明裁剪之后 system prompt 仍然保留着。修复前，system 所在的 history[0..2] 会最先被删掉。
+- 对照：同一个口令问题在不裁剪的情况下也能答对，说明判断依据是有效的。
+- 1M 上下文：约 1.15 MB 的内容（约 30 万 token）发给 `claude-opus-4-8` 后直接返回 200，没有触发裁剪。
