@@ -264,6 +264,8 @@ struct RequestUsageContext {
     stop_sequences: Vec<String>,
     /// `thinking.display` 为 `omitted`：thinking 块只下发空文本与 signature。
     omit_thinking_display: bool,
+    /// 是否清洗正文中复述的代理注入控制块；客户端自身使用同名标签时关闭。
+    strip_injected_control_blocks: bool,
     downstream_stop_reason: Arc<Mutex<Option<String>>>,
     conversation_id: Option<String>,
     request_api_key_id: Option<String>,
@@ -4947,6 +4949,9 @@ fn prepare_usage_context_with_inference_attempt_budget(
             .thinking
             .as_ref()
             .is_some_and(|thinking| thinking.display_mode() == ThinkingDisplay::Omitted),
+        strip_injected_control_blocks: !super::control_block_cleaner::request_mentions_control_tags(
+            payload,
+        ),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id,
         request_api_key_id,
@@ -7620,6 +7625,9 @@ impl StreamContextTemplate {
         ctx.set_response_tool_policy(&self.response_tool_policy);
         ctx.set_stop_sequences(credential_usage.request.stop_sequences.clone());
         ctx.set_omit_thinking_display(credential_usage.request.omit_thinking_display);
+        ctx.set_strip_injected_control_blocks(
+            credential_usage.request.strip_injected_control_blocks,
+        );
         ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
         ctx.set_local_prompt_cache_projection_enabled(
             credential_usage.request.uses_local_prompt_cache_strategy(),
@@ -11434,6 +11442,9 @@ async fn handle_non_stream_request(
         .request
         .mark_response_tool_gate(&response_tool_gate);
 
+    if credential_usage.request.strip_injected_control_blocks {
+        super::control_block_cleaner::strip_control_blocks_in_content(&mut content);
+    }
     // 正文里复述的 Hash 映射工具名还原为原名，下游不应看到代理内部名称。
     super::tool_name_restore::restore_tool_names_in_content(&tool_name_map, &mut content);
 

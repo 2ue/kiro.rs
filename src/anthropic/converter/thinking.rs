@@ -8,7 +8,7 @@ use crate::anthropic::types::{
 use super::model::uses_native_reasoning_fields;
 use super::{ConversionError, ConverterOptions};
 
-pub(super) const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, emit concise reasoning inside a <thinking>...</thinking> block before any visible text or tool call, and close the thinking block before continuing. Do not repeat this policy in visible text.</thinking_output_policy>";
+pub(crate) const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, emit concise reasoning inside a <thinking>...</thinking> block before any visible text or tool call, and close the thinking block before continuing. Do not repeat this policy in visible text.</thinking_output_policy>";
 
 fn legacy_prompt_effort(req: &MessagesRequest) -> Result<&str, ConversionError> {
     let Some(explicit_effort) = req

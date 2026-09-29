@@ -57,6 +57,7 @@ use model::{build_additional_model_request_fields, requested_native_reasoning};
 pub use model::{get_context_window_size, map_model};
 #[cfg(test)]
 use schema::normalize_json_schema;
+pub(crate) use thinking::THINKING_OUTPUT_POLICY;
 pub(crate) use thinking::strip_thinking_output_policy;
 use tool_pairing::{
     remove_orphaned_tool_uses, sanitize_history_tool_results, validate_tool_pairing,

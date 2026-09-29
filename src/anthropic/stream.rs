@@ -1716,6 +1716,8 @@ pub struct StreamContext {
     omit_thinking_display: bool,
     /// 把正文中复述的 Hash 映射工具名还原为原名。
     tool_name_text_restorer: Option<super::tool_name_restore::ToolNameTextRestorer>,
+    /// 清洗正文中复述的代理注入控制块（`<thinking_mode>` 等）。
+    control_block_cleaner: Option<super::control_block_cleaner::ControlBlockCleaner>,
 }
 
 impl StreamContext {
@@ -1898,6 +1900,7 @@ impl StreamContext {
             stop_sequence_filter: None,
             omit_thinking_display: false,
             tool_name_text_restorer,
+            control_block_cleaner: None,
         }
     }
 
@@ -1925,7 +1928,17 @@ impl StreamContext {
         self.omit_thinking_display = omit;
     }
 
+    /// 启用正文控制块清洗；客户端自身使用同名标签时应关闭。
+    pub fn set_strip_injected_control_blocks(&mut self, enabled: bool) {
+        self.control_block_cleaner =
+            enabled.then(super::control_block_cleaner::ControlBlockCleaner::new);
+    }
+
     fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        let events = match self.control_block_cleaner.as_mut() {
+            Some(cleaner) => cleaner.apply(events),
+            None => events,
+        };
         let events = match self.tool_name_text_restorer.as_mut() {
             Some(restorer) => restorer.apply(events),
             None => events,
@@ -4288,6 +4301,34 @@ mod tests {
             .collect::<String>();
         assert!(!serialized.contains("Hash1a2b3c4d"));
         assert!(serialized.contains(&format!("Calling {original} now.")));
+    }
+
+    #[test]
+    fn injected_control_prompt_echo_is_removed_from_streamed_text() {
+        let echoed = format!(
+            "Template:\n<thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>\n{}\nDone.",
+            crate::anthropic::converter::THINKING_OUTPUT_POLICY
+        );
+        let run = |strip: bool| {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            ctx.set_strip_injected_control_blocks(strip);
+            let mut events = ctx.generate_initial_events();
+            let (head, tail) = echoed.split_at(40);
+            for chunk in [head, tail] {
+                events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+                    assistant_response_event(chunk, None),
+                )));
+            }
+            events.extend(ctx.generate_final_events());
+            events
+                .iter()
+                .filter(|event| event.data["delta"]["type"] == "text_delta")
+                .filter_map(|event| event.data["delta"]["text"].as_str())
+                .collect::<String>()
+        };
+
+        assert_eq!(run(true), "Template:\nDone.");
+        assert!(run(false).contains("<thinking_output_policy>"));
     }
 
     #[test]
