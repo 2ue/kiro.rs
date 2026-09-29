@@ -2465,32 +2465,6 @@ impl Default for CompressionConfig {
     }
 }
 
-/// Claude Code 自动压缩信号配置。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ContextCompactSignalConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// 上一轮真实上下文占模型窗口的比例达到该值时发出压缩信号，取值 (0, 1)。
-    #[serde(default = "default_context_compact_signal_trigger_ratio")]
-    pub trigger_ratio: f64,
-}
-
-fn default_context_compact_signal_trigger_ratio() -> f64 {
-    // Kiro rejects below the nominal window (sonnet-4.5 on a 200k window: 169k accepted,
-    // 191k rejected on 2026-09-29), so signal with margin instead of at the window edge.
-    0.8
-}
-
-impl Default for ContextCompactSignalConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            trigger_ratio: default_context_compact_signal_trigger_ratio(),
-        }
-    }
-}
-
 impl Default for PayloadShapingConfig {
     fn default() -> Self {
         Self {
@@ -3943,12 +3917,6 @@ pub struct Config {
     #[serde(default)]
     pub payload_shaping: PayloadShapingConfig,
 
-    /// Claude Code 自动压缩信号。按路由整形后的 usage 字段保持不变；当会话上一轮真实上下文
-    /// 已达到模型窗口的 `triggerRatio` 时，下一次请求返回协议格式的 `prompt is too long`，
-    /// 让客户端触发压缩并重试。
-    #[serde(default)]
-    pub context_compact_signal: ContextCompactSignalConfig,
-
     /// 发送 Kiro 上游前启用最终 payload 防护。
     ///
     /// 防护在 Anthropic -> Kiro 转换之后运行，按 Kiro weighted 口径裁剪旧历史，
@@ -5243,7 +5211,6 @@ impl Default for Config {
             prompt_steering: PromptSteeringConfig::default(),
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
-            context_compact_signal: ContextCompactSignalConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),
             payload_guard_max_bytes: default_payload_guard_max_bytes(),

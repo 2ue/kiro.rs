@@ -6315,7 +6315,6 @@ fn runtime_config_for_payload_guard(
         prompt_steering: PromptSteeringConfig::default(),
         missing_max_tokens: MissingMaxTokensConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
-        context_compact_signal: crate::model::config::ContextCompactSignalConfig::default(),
         external_pools: ExternalPoolsConfig::default(),
     }
 }
