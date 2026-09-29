@@ -55,6 +55,7 @@ pub(crate) mod request_facts;
 mod router;
 mod stop_sequence;
 mod stream;
+mod thinking_display;
 pub(crate) mod tool_format_debug;
 pub(crate) mod tool_schema_keys;
 pub(crate) mod tool_use_policy;

@@ -12731,6 +12731,7 @@ fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
         budget_tokens: 20000,
+        display: None,
     });
     payload_mut(&mut route).output_config = Some(OutputConfig {
         effort: Some("xhigh".to_string()),
@@ -12754,6 +12755,7 @@ fn external_pool_normalized_wire_preserves_omitted_output_effort_for_five_rounds
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
         budget_tokens: 0,
+        display: None,
     });
     payload_mut(&mut route).output_config = Some(OutputConfig::default());
     route.raw_body = Bytes::from_static(
@@ -12847,6 +12849,7 @@ fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization(
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
         budget_tokens: 20000,
+        display: None,
     });
     payload_mut(&mut route).output_config = Some(OutputConfig {
         effort: Some("xhigh".to_string()),
@@ -14124,6 +14127,7 @@ fn external_pool_outbound_body_strips_budget_tokens_for_disabled_thinking() {
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "disabled".to_string(),
         budget_tokens: 20000,
+        display: None,
     });
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-7","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"disabled","budget_tokens":20000}}"#,
@@ -14143,6 +14147,7 @@ fn external_pool_outbound_body_preserves_enabled_budget_tokens() {
     payload_mut(&mut route).thinking = Some(Thinking {
         thinking_type: "enabled".to_string(),
         budget_tokens: 12345,
+        display: None,
     });
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-6-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"enabled","budget_tokens":12345}}"#,

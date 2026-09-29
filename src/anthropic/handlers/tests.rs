@@ -7517,6 +7517,7 @@ fn thinking_suffix_preserves_explicit_enabled_without_effort() {
     payload.thinking = Some(Thinking {
         thinking_type: "enabled".to_string(),
         budget_tokens: 4096,
+        display: None,
     });
 
     override_thinking_from_model_name(&mut payload).expect("thinking model override");
@@ -7533,6 +7534,7 @@ fn thinking_suffix_preserves_omitted_effort_for_explicit_adaptive() {
     payload.thinking = Some(Thinking {
         thinking_type: "adaptive".to_string(),
         budget_tokens: 4096,
+        display: None,
     });
 
     override_thinking_from_model_name(&mut payload).expect("thinking model override");
@@ -7640,6 +7642,7 @@ fn thinking_trigger_real_request_respects_explicit_disabled_over_cli_signal() {
     payload.thinking = Some(Thinking {
         thinking_type: "disabled".to_string(),
         budget_tokens: 4096,
+        display: None,
     });
     let runtime_config =
         runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
@@ -7805,6 +7808,7 @@ fn thinking_trigger_always_preserves_disabled() {
     payload.thinking = Some(Thinking {
         thinking_type: "disabled".to_string(),
         budget_tokens: 4096,
+        display: None,
     });
     let mut runtime_config =
         runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
@@ -7828,6 +7832,7 @@ fn thinking_trigger_always_preserves_enabled_and_output_config() {
     payload.thinking = Some(Thinking {
         thinking_type: "enabled".to_string(),
         budget_tokens: 4096,
+        display: None,
     });
     payload.output_config = Some(OutputConfig {
         effort: Some("low".to_string()),
@@ -7862,6 +7867,7 @@ fn thinking_trigger_always_preserves_unknown_type_without_implicit_activation() 
     payload.thinking = Some(Thinking {
         thinking_type: "mystery".to_string(),
         budget_tokens: 4096,
+        display: None,
     });
     let mut runtime_config =
         runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
@@ -8155,6 +8161,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-limit".to_string()),
         request_api_key_id: None,
@@ -8264,6 +8271,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-dfcache-tool".to_string()),
         request_api_key_id: None,
@@ -8351,6 +8359,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-upstream-raw-limit".to_string()),
         request_api_key_id: None,
@@ -8443,6 +8452,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-prod-like".to_string()),
         request_api_key_id: None,
@@ -8570,6 +8580,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("context-estimate-session".to_string()),
         request_api_key_id: None,
@@ -8647,6 +8658,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-kiro-strategy".to_string()),
         request_api_key_id: None,
@@ -8788,6 +8800,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-latency".to_string()),
         request_api_key_id: None,
@@ -9121,6 +9134,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-policy".to_string()),
         request_api_key_id: None,
@@ -9289,6 +9303,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-creation-policy".to_string()),
         request_api_key_id: None,
@@ -9392,6 +9407,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-error".to_string()),
         request_api_key_id: None,
@@ -9475,6 +9491,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-large-failure".to_string()),
         request_api_key_id: None,
@@ -10097,6 +10114,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-a".to_string()),
         request_api_key_id: None,
@@ -10192,6 +10210,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         model_resolution_note: None,
         requested_max_tokens: 0,
         stop_sequences: Vec::new(),
+        omit_thinking_display: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-high-cache".to_string()),
         request_api_key_id: None,

@@ -1655,6 +1655,7 @@ mod tests {
                 Some(Thinking {
                     thinking_type: "enabled".to_string(),
                     budget_tokens: 512,
+                    display: None,
                 }),
                 None,
                 "<thinking_mode>enabled</thinking_mode>",
@@ -2777,6 +2778,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: 20000,
+                display: None,
             }),
             output_config: None,
             metadata: None,
@@ -2856,6 +2858,7 @@ mod tests {
                     thinking: Some(Thinking {
                         thinking_type: "enabled".to_string(),
                         budget_tokens: 1024,
+                        display: None,
                     }),
                     output_config: None,
                     metadata: None,
@@ -2927,6 +2930,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: 20000,
+                display: None,
             }),
             output_config: None,
             metadata: None,
@@ -2997,6 +3001,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
@@ -3054,6 +3059,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("xhigh".to_string()),
@@ -3105,6 +3111,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("xhigh".to_string()),
@@ -3138,6 +3145,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
@@ -3231,6 +3239,7 @@ mod tests {
                     thinking: Some(Thinking {
                         thinking_type: "adaptive".to_string(),
                         budget_tokens: 0,
+                        display: None,
                     }),
                     output_config: None,
                     metadata: None,
@@ -3261,6 +3270,7 @@ mod tests {
                 thinking: Some(Thinking {
                     thinking_type: "adaptive".to_string(),
                     budget_tokens: 0,
+                    display: None,
                 }),
                 output_config: None,
                 metadata: None,
@@ -3311,6 +3321,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
@@ -3364,6 +3375,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
@@ -3419,6 +3431,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
@@ -3474,6 +3487,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
@@ -3530,6 +3544,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
@@ -3622,6 +3637,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "disabled".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
@@ -3681,6 +3697,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "disabled".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
@@ -3735,6 +3752,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: 32_000,
+                display: None,
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
@@ -3788,6 +3806,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: 32_000,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
@@ -3843,6 +3862,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
@@ -3889,6 +3909,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: 100_000,
+                display: None,
             }),
             output_config: None,
             metadata: None,
@@ -3927,6 +3948,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("xhigh".to_string()),
@@ -4017,6 +4039,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
@@ -4058,6 +4081,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
@@ -4113,6 +4137,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),

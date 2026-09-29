@@ -1710,6 +1710,8 @@ pub struct StreamContext {
     response_tool_gate: ResponseToolGate,
     /// 请求声明了 stop_sequences 时的输出侧截断过滤器。
     stop_sequence_filter: Option<super::stop_sequence::StopSequenceFilter>,
+    /// 请求 `thinking.display` 为 `omitted` 时不下发 thinking 文本。
+    omit_thinking_display: bool,
 }
 
 impl StreamContext {
@@ -1888,6 +1890,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             response_tool_gate: ResponseToolGate::default(),
             stop_sequence_filter: None,
+            omit_thinking_display: false,
         }
     }
 
@@ -1910,7 +1913,17 @@ impl StreamContext {
             .is_some_and(|filter| filter.matched().is_some())
     }
 
+    /// `thinking.display: "omitted"` 时只下发空 thinking 与 signature。
+    pub fn set_omit_thinking_display(&mut self, omit: bool) {
+        self.omit_thinking_display = omit;
+    }
+
     fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        let events = if self.omit_thinking_display {
+            super::thinking_display::omit_thinking_text_in_events(events)
+        } else {
+            events
+        };
         match self.stop_sequence_filter.as_mut() {
             Some(filter) => filter.apply(events),
             None => events,
@@ -4185,6 +4198,37 @@ mod tests {
                 .filter(|event| event.event == "content_block_stop")
                 .count()
         );
+    }
+
+    #[test]
+    fn omitted_thinking_display_hides_xml_thinking_text() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 8, true, HashMap::new());
+        ctx.set_omit_thinking_display(true);
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
+                "<thinking>private plan</thinking>\n\nvisible answer",
+                None,
+            ))),
+        );
+        events.extend(ctx.generate_final_events());
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["content_block"]["type"] == "thinking")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data["delta"]["type"] == "thinking_delta")
+        );
+        let serialized = events
+            .iter()
+            .map(SseEvent::to_sse_string)
+            .collect::<String>();
+        assert!(!serialized.contains("private plan"));
+        assert!(serialized.contains("visible answer"));
     }
 
     #[test]

@@ -114,12 +114,59 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
+    /// `thinking.display`（`summarized` / `omitted`）。保留原始 JSON 值，
+    /// 非法值不报错，按默认处理（见 [`Thinking::display_mode`]）。
+    #[serde(default)]
+    pub display: Option<serde_json::Value>,
+}
+
+/// `thinking.display` 的解析结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingDisplay {
+    /// 默认：正常下发 thinking 文本。
+    #[default]
+    Summarized,
+    /// thinking 块只下发空文本和 signature。
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+        }
+    }
 }
 
 impl Thinking {
     /// 是否启用了 thinking（enabled 或 adaptive）
     pub fn is_enabled(&self) -> bool {
         self.thinking_type == "enabled" || self.thinking_type == "adaptive"
+    }
+
+    /// 解析 `thinking.display`；缺省、`null` 与非法值都返回 `None`。
+    pub fn parsed_display(&self) -> Option<ThinkingDisplay> {
+        match self.display.as_ref()?.as_str()? {
+            "summarized" => Some(ThinkingDisplay::Summarized),
+            "omitted" => Some(ThinkingDisplay::Omitted),
+            _ => None,
+        }
+    }
+
+    /// 宽容解析 `thinking.display`：非法值记录日志并按默认（summarized）处理。
+    pub fn display_mode(&self) -> ThinkingDisplay {
+        match (self.display.as_ref(), self.parsed_display()) {
+            (_, Some(display)) => display,
+            (None | Some(serde_json::Value::Null), None) => ThinkingDisplay::default(),
+            (Some(value), None) => {
+                tracing::warn!(
+                    thinking_display = %value,
+                    "ignoring unsupported thinking.display value; using default display"
+                );
+                ThinkingDisplay::default()
+            }
+        }
     }
 }
 
@@ -128,15 +175,20 @@ impl Serialize for Thinking {
     where
         S: serde::Serializer,
     {
+        // 只转发合法的 display 值，非法值已按默认处理。
+        let display = self.parsed_display().filter(|_| self.is_enabled());
         let field_count = if self.thinking_type == "enabled" {
             2
         } else {
             1
-        };
+        } + usize::from(display.is_some());
         let mut state = serializer.serialize_struct("Thinking", field_count)?;
         state.serialize_field("type", &self.thinking_type)?;
         if self.thinking_type == "enabled" {
             state.serialize_field("budget_tokens", &self.budget_tokens)?;
+        }
+        if let Some(display) = display {
+            state.serialize_field("display", display.as_str())?;
         }
         state.end()
     }
@@ -169,10 +221,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thinking_display_is_parsed_leniently() {
+        let parse = |value: serde_json::Value| -> Thinking {
+            serde_json::from_value(value).expect("thinking")
+        };
+
+        let omitted = parse(serde_json::json!({"type": "adaptive", "display": "omitted"}));
+        assert_eq!(omitted.display_mode(), ThinkingDisplay::Omitted);
+        let summarized = parse(serde_json::json!({"type": "adaptive", "display": "summarized"}));
+        assert_eq!(summarized.display_mode(), ThinkingDisplay::Summarized);
+        let missing = parse(serde_json::json!({"type": "adaptive"}));
+        assert_eq!(missing.display_mode(), ThinkingDisplay::Summarized);
+        // 非法字符串与非法类型都不报错，按默认处理。
+        let bogus = parse(serde_json::json!({"type": "adaptive", "display": "bogus"}));
+        assert_eq!(bogus.display_mode(), ThinkingDisplay::Summarized);
+        let wrong_type = parse(serde_json::json!({"type": "adaptive", "display": 3}));
+        assert_eq!(wrong_type.display_mode(), ThinkingDisplay::Summarized);
+
+        assert_eq!(
+            serde_json::to_value(&omitted).unwrap(),
+            serde_json::json!({"type": "adaptive", "display": "omitted"})
+        );
+        assert_eq!(
+            serde_json::to_value(&bogus).unwrap(),
+            serde_json::json!({"type": "adaptive"})
+        );
+    }
+
+    #[test]
     fn thinking_enabled_serializes_budget_tokens() {
         let thinking = Thinking {
             thinking_type: "enabled".to_string(),
             budget_tokens: 1234,
+            display: None,
         };
 
         let json = serde_json::to_string(&thinking).expect("serialize thinking");
@@ -186,6 +267,7 @@ mod tests {
         let thinking = Thinking {
             thinking_type: "adaptive".to_string(),
             budget_tokens: 1234,
+            display: None,
         };
 
         let json = serde_json::to_string(&thinking).expect("serialize thinking");
@@ -199,6 +281,7 @@ mod tests {
         let thinking = Thinking {
             thinking_type: "disabled".to_string(),
             budget_tokens: 1234,
+            display: None,
         };
 
         let json = serde_json::to_string(&thinking).expect("serialize thinking");

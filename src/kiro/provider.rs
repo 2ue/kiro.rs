@@ -2842,6 +2842,7 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),

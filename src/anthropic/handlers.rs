@@ -88,6 +88,7 @@ use super::transcript_sanitizer::RESPONSE_PROTOCOL_CONTAMINATION_DETAIL;
 use super::types::OutputConfig;
 use super::types::{
     CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, Thinking,
+    ThinkingDisplay,
 };
 use super::usage::{
     ExternalPoolAttempt, ExternalPoolUsageSnapshot, RequestRejectionUsageContext,
@@ -261,6 +262,8 @@ struct RequestUsageContext {
     requested_max_tokens: i32,
     /// 规范化后的 stop_sequences，由代理在输出侧实现。
     stop_sequences: Vec<String>,
+    /// `thinking.display` 为 `omitted`：thinking 块只下发空文本与 signature。
+    omit_thinking_display: bool,
     downstream_stop_reason: Arc<Mutex<Option<String>>>,
     conversation_id: Option<String>,
     request_api_key_id: Option<String>,
@@ -4940,6 +4943,10 @@ fn prepare_usage_context_with_inference_attempt_budget(
         stop_sequences: super::stop_sequence::normalize_stop_sequences(
             payload.stop_sequences.as_deref(),
         ),
+        omit_thinking_display: payload
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.display_mode() == ThinkingDisplay::Omitted),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id,
         request_api_key_id,
@@ -7592,6 +7599,7 @@ impl StreamContextTemplate {
         );
         ctx.set_response_tool_policy(&self.response_tool_policy);
         ctx.set_stop_sequences(credential_usage.request.stop_sequences.clone());
+        ctx.set_omit_thinking_display(credential_usage.request.omit_thinking_display);
         ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
         ctx.set_local_prompt_cache_projection_enabled(
             credential_usage.request.uses_local_prompt_cache_strategy(),
@@ -11401,6 +11409,10 @@ async fn handle_non_stream_request(
         .request
         .mark_response_tool_gate(&response_tool_gate);
 
+    if credential_usage.request.omit_thinking_display {
+        super::thinking_display::omit_thinking_text_in_content(&mut content);
+    }
+
     let matched_stop_sequence = super::stop_sequence::truncate_content_at_stop_sequence(
         &mut content,
         &credential_usage.request.stop_sequences,
@@ -11580,6 +11592,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) -> Result<()
         payload.thinking = Some(Thinking {
             thinking_type: defaults.thinking_type.to_string(),
             budget_tokens,
+            display: None,
         });
     } else {
         tracing::debug!(
@@ -11632,6 +11645,7 @@ fn apply_thinking_trigger_mode(
             payload.thinking = Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             });
         }
     }

@@ -448,6 +448,7 @@ mod tests {
             thinking: thinking_type.map(|thinking_type| Thinking {
                 thinking_type: thinking_type.to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: output_effort.map(|effort| OutputConfig {
                 effort: Some(effort.to_string()),
