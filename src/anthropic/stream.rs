@@ -260,51 +260,94 @@ fn valid_unquoted_tag(buffer: &str, absolute_pos: usize, tag: &str) -> bool {
     !has_quote_before && !has_quote_after
 }
 
-/// 查找真正的 thinking 结束标签（不被引用字符包裹，且后面有双换行符）
+/// Characters that end a sentence or clause; a close tag glued to one of them is treated as
+/// the real end of thinking rather than an inline mention such as "关于 </thinking> 标签".
+fn is_thinking_close_clause_end(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | '。'
+            | '．'
+            | '!'
+            | '！'
+            | '?'
+            | '？'
+            | ':'
+            | '：'
+            | ';'
+            | '；'
+            | ')'
+            | '）'
+            | ']'
+            | '】'
+    )
+}
+
+/// Returns how many bytes after an unquoted close tag belong to the tag separator, or `None`
+/// when the tag looks like an inline mention inside the thinking text.
+///
+/// Accepted forms (the model output carries no protocol guarantee of `\n\n`):
+/// - `</thinking>\n\n` and `</thinking>\n` (with optional `\r`);
+/// - a tag at the start of a line or of the thinking block, followed by anything;
+/// - a tag glued to a clause end such as `abc。</thinking>正文`.
+fn accepted_thinking_close_separator(prev: Option<char>, after: &str) -> Option<usize> {
+    for separator in ["\r\n\r\n", "\n\n", "\r\n", "\n"] {
+        if after.starts_with(separator) {
+            return Some(separator.len());
+        }
+    }
+    let inline_whitespace = after.len() - after.trim_start_matches([' ', '\t']).len();
+    match prev {
+        None | Some('\n') => Some(inline_whitespace),
+        Some(ch) if is_thinking_close_clause_end(ch) => Some(inline_whitespace),
+        _ => None,
+    }
+}
+
+/// 查找真正的 thinking 结束标签（不被引用字符包裹，且不是正文中的行内提及）
 ///
 /// 当模型在思考过程中提到 `</thinking>` 时，通常会用反引号、引号等包裹，
-/// 或者在同一行有其他内容（如"关于 </thinking> 标签"）。
-/// 这个函数会跳过这些情况，只返回真正的结束标签位置。
+/// 或者在同一行有其他内容（如"关于 </thinking> 标签"）。这些情况会被跳过。
 ///
-/// 跳过的情况：
-/// - 被引用字符包裹（反引号、引号等）
-/// - 后面没有双换行符（真正的结束标签后面会有 `\n\n`）
-/// - 标签在缓冲区末尾（流式处理时需要等待更多内容）
-///
-/// # 参数
-/// - `buffer`: 要搜索的字符串
+/// - `prev_char`: 缓冲区之前最后一个已输出的 thinking 字符；`None` 表示 thinking 块开头。
+/// - `complete`: 文本已完整（非流式、tool_use 边界或流结束），标签后不足 2 字节时不再等待。
 ///
 /// # 返回值
-/// - `Some(pos)`: 真正的结束标签的起始位置
-/// - `None`: 没有找到真正的结束标签
-fn find_real_thinking_end_tag_for(buffer: &str, tag: ThinkingXmlTag) -> Option<usize> {
+/// - `Some((pos, separator_len))`: 结束标签起始位置，以及标签后需要一并消费的分隔符长度
+/// - `None`: 没有找到，或者流式场景下需要等待更多内容
+fn find_real_thinking_end_tag_for(
+    buffer: &str,
+    tag: ThinkingXmlTag,
+    prev_char: Option<char>,
+    complete: bool,
+) -> Option<(usize, usize)> {
     let mut search_start = 0;
 
     while let Some(pos) = buffer[search_start..].find(tag.close) {
         let absolute_pos = search_start + pos;
+        search_start = absolute_pos + 1;
 
         // 如果被引用字符包裹，跳过
         if !valid_unquoted_tag(buffer, absolute_pos, tag.close) {
-            search_start = absolute_pos + 1;
             continue;
         }
 
-        // 检查后面的内容
-        let after_pos = absolute_pos + tag.close.len();
-        let after_content = &buffer[after_pos..];
-
-        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
-        if after_content.len() < 2 {
+        let after_content = &buffer[absolute_pos + tag.close.len()..];
+        if complete && after_content.trim().is_empty() {
+            return Some((absolute_pos, after_content.len()));
+        }
+        // 流式场景下标签后的内容不足以判断分隔符，等待更多内容
+        if !complete && after_content.len() < 2 {
             return None;
         }
 
-        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
-        if after_content.starts_with("\n\n") {
-            return Some(absolute_pos);
+        let prev = if absolute_pos == 0 {
+            prev_char
+        } else {
+            buffer[..absolute_pos].chars().next_back()
+        };
+        if let Some(separator_len) = accepted_thinking_close_separator(prev, after_content) {
+            return Some((absolute_pos, separator_len));
         }
-
-        // 不是双换行符，跳过继续搜索
-        search_start = absolute_pos + 1;
     }
 
     None
@@ -319,41 +362,23 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
 fn find_real_thinking_end_tag_with_variant(buffer: &str) -> Option<(usize, ThinkingXmlTag)> {
     THINKING_XML_TAGS
         .iter()
-        .filter_map(|tag| find_real_thinking_end_tag_for(buffer, *tag).map(|pos| (pos, *tag)))
+        .filter_map(|tag| {
+            find_real_thinking_end_tag_for(buffer, *tag, None, false).map(|(pos, _)| (pos, *tag))
+        })
         .min_by_key(|(pos, _)| *pos)
 }
 
-/// 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
+/// 查找缓冲区中的 thinking 结束标签（文本已完整的“边界事件”场景）
 ///
-/// 用于“边界事件”场景：例如 thinking 结束后立刻进入 tool_use，或流结束，
-/// 此时 `</thinking>` 后面可能没有 `\n\n`，但结束标签依然应被识别并过滤。
-///
-/// 约束：只有当 `</thinking>` 之后全部都是空白字符时才认为是结束标签，
-/// 以避免在 thinking 内容中提到 `</thinking>`（非结束标签）时误判。
+/// 用于 thinking 结束后立刻进入 tool_use，或流结束：此时 `</thinking>` 后面可能没有
+/// 分隔符，但结束标签依然应被识别并过滤。标签后全是空白时一定命中；否则沿用
+/// `find_real_thinking_end_tag_for` 的行首/句末规则，避免把行内提及误判为结束标签。
 fn find_real_thinking_end_tag_at_buffer_end_for(
     buffer: &str,
     tag: ThinkingXmlTag,
+    prev_char: Option<char>,
 ) -> Option<usize> {
-    let mut search_start = 0;
-
-    while let Some(pos) = buffer[search_start..].find(tag.close) {
-        let absolute_pos = search_start + pos;
-
-        if !valid_unquoted_tag(buffer, absolute_pos, tag.close) {
-            search_start = absolute_pos + 1;
-            continue;
-        }
-
-        // 只有当标签后面全部是空白字符时才认定为结束标签
-        let after_pos = absolute_pos + tag.close.len();
-        if buffer[after_pos..].trim().is_empty() {
-            return Some(absolute_pos);
-        }
-
-        search_start = absolute_pos + 1;
-    }
-
-    None
+    find_real_thinking_end_tag_for(buffer, tag, prev_char, true).map(|(pos, _)| pos)
 }
 
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
@@ -1138,19 +1163,21 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     };
 
     let before = &text[..start_pos];
+    // XML-compat thinking only opens a response. A `<thinking>` after visible text is an
+    // inline mention (for example an XML explanation), not a reasoning block.
+    if !before.trim().is_empty() {
+        return (None, text.to_string());
+    }
     let after_open = &text[start_pos + tag.open.len()..];
 
-    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) =
-        find_real_thinking_end_tag_for(after_open, tag)
+    // 文本已完整：与流式使用同一套结束标签规则
+    let (thinking_raw, text_after) = if let Some((end_pos, separator_len)) =
+        find_real_thinking_end_tag_for(after_open, tag, None, true)
     {
         (
             &after_open[..end_pos],
-            &after_open[end_pos + tag.close.len() + "\n\n".len()..],
+            &after_open[end_pos + tag.close.len() + separator_len..],
         )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end_for(after_open, tag) {
-        let after_tag = end_pos + tag.close.len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
     } else {
         // 找不到有效的结束标签，不做提取
         return (None, text.to_string());
@@ -1341,8 +1368,15 @@ impl SseStateManager {
     fn close_open_blocks(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        for (index, block) in self.active_blocks.iter_mut() {
-            if block.started && !block.stopped {
+        // Close in index order so content_block_stop events are deterministic.
+        let mut open_blocks = self
+            .active_blocks
+            .iter_mut()
+            .filter(|(_, block)| block.started && !block.stopped)
+            .collect::<Vec<_>>();
+        open_blocks.sort_by_key(|(index, _)| **index);
+        for (index, block) in open_blocks {
+            {
                 events.push(SseEvent::new(
                     "content_block_stop",
                     json!({
@@ -1584,6 +1618,9 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 最后一个已作为 thinking_delta 发出的 XML thinking 字符；`None` 表示 thinking 块开头。
+    /// 结束标签位于缓冲区开头时，用它判断标签是否处在行首或句末。
+    last_xml_thinking_char: Option<char>,
     /// 当前 XML thinking 标签形态，兼容 `<thinking>` 与 `<think>`
     current_thinking_tag: Option<ThinkingXmlTag>,
     /// 是否已收到原生 reasoningContentEvent
@@ -1641,6 +1678,8 @@ pub struct StreamContext {
     saw_upstream_context_usage: bool,
     /// 是否见过上游 meteringEvent。
     saw_upstream_metering: bool,
+    /// 上游在已有输出后发出 `ContentLengthExceededException`（输出达到上限），这是可信的结束信号。
+    saw_upstream_output_limit: bool,
     /// 最近一次 assistant/code 内容片段的字符数。
     last_assistant_content_chars: u32,
     /// 最近 assistant/code 可见文本尾部窗口，仅用于低成本异常特征检测，不落库。
@@ -1798,6 +1837,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            last_xml_thinking_char: None,
             current_thinking_tag: None,
             native_reasoning_seen: false,
             native_reasoning_content: String::new(),
@@ -1826,6 +1866,7 @@ impl StreamContext {
             saw_upstream_metadata: false,
             saw_upstream_context_usage: false,
             saw_upstream_metering: false,
+            saw_upstream_output_limit: false,
             last_assistant_content_chars: 0,
             assistant_text_tail: String::new(),
             tool_context_leak_markers: Vec::new(),
@@ -1892,7 +1933,10 @@ impl StreamContext {
     }
 
     fn has_trusted_upstream_completion_signal(&self) -> bool {
-        self.saw_upstream_metadata || self.saw_upstream_context_usage || self.saw_upstream_metering
+        self.saw_upstream_metadata
+            || self.saw_upstream_context_usage
+            || self.saw_upstream_metering
+            || self.saw_upstream_output_limit
     }
 
     fn has_meaningful_upstream_response(&self) -> bool {
@@ -2530,9 +2574,16 @@ impl StreamContext {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
-                if exception_type == "ContentLengthExceededException" {
+                // ContentLengthExceededException 表示输出达到上限。已有输出时，按 Claude Code 协议
+                // 以 `stop_reason=max_tokens` 正常结束（与非流式一致），客户端可以继续续写；
+                // 没有任何输出时仍按上游错误处理。
+                if exception_type == "ContentLengthExceededException"
+                    && self.has_meaningful_upstream_response()
+                {
+                    tracing::warn!("收到输出长度上限异常，按 max_tokens 结束: {}", message);
                     self.state_manager.set_stop_reason("max_tokens");
+                    self.saw_upstream_output_limit = true;
+                    return Vec::new();
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 self.record_stream_error("api_error", message.clone());
@@ -2667,6 +2718,14 @@ impl StreamContext {
         }
 
         self.native_reasoning_seen = true;
+        if self.native_reasoning_finalized {
+            // A previous reasoning segment was already closed, so this event starts a new block.
+            // Each Claude Code thinking block must carry its own Kiro-native signature_delta.
+            self.native_reasoning_content.clear();
+            self.native_reasoning_signature = None;
+            self.native_reasoning_signature_sent = false;
+            self.native_reasoning_buffer_overflow = false;
+        }
         self.native_reasoning_finalized = false;
         let mut events = Vec::new();
 
@@ -2766,6 +2825,7 @@ impl StreamContext {
                     self.in_thinking_block = true;
                     self.strip_thinking_leading_newline = true;
                     self.current_thinking_tag = Some(tag);
+                    self.last_xml_thinking_char = None;
                     self.thinking_buffer =
                         self.thinking_buffer[start_pos + tag.open.len()..].to_string();
 
@@ -2789,21 +2849,27 @@ impl StreamContext {
                     // 没有找到完整 thinking 开始标签时，只保留可能组成 `<thinking>` / `<think>`
                     // 的尾部。旧逻辑按最长标签长度保守缓冲，会把很短的正常正文首包压住，
                     // 导致 Claude Code 在工具调用后长时间没有可见 text_delta。
+                    //
+                    // 纯空白前缀继续留在缓冲区，而不是丢弃：它要么是 `<thinking>` 之前的
+                    // adaptive 空白（开标签到达后丢弃），要么属于后续正文（例如 `\n\n<div>`）。
+                    // 一旦输出了非空白正文，XML thinking 只能出现在响应开头，后续的
+                    // `<thinking>` 视为正文里的提及，不再探测。
                     if let Some(retain_start) =
                         thinking_open_tag_partial_start(&self.thinking_buffer)
                     {
-                        if retain_start > 0 {
+                        if retain_start > 0
+                            && !self.thinking_buffer[..retain_start].trim().is_empty()
+                        {
                             let safe_content = self.thinking_buffer[..retain_start].to_string();
-                            if !safe_content.trim().is_empty() {
-                                events.extend(self.create_text_delta_events(&safe_content));
-                            }
-                            self.thinking_buffer = self.thinking_buffer[retain_start..].to_string();
-                        }
-                    } else {
-                        let safe_content = std::mem::take(&mut self.thinking_buffer);
-                        if !safe_content.trim().is_empty() {
                             events.extend(self.create_text_delta_events(&safe_content));
+                            self.thinking_buffer = self.thinking_buffer[retain_start..].to_string();
+                            self.thinking_extracted = true;
+                            continue;
                         }
+                    } else if !self.thinking_buffer.trim().is_empty() {
+                        let safe_content = std::mem::take(&mut self.thinking_buffer);
+                        events.extend(self.create_text_delta_events(&safe_content));
+                        self.thinking_extracted = true;
                     }
                     break;
                 }
@@ -2822,7 +2888,12 @@ impl StreamContext {
 
                 // 在 thinking 块内，查找匹配的结束标签（跳过被反引号包裹的）
                 let tag = self.current_thinking_tag.unwrap_or(THINKING_XML_TAG);
-                if let Some(end_pos) = find_real_thinking_end_tag_for(&self.thinking_buffer, tag) {
+                if let Some((end_pos, separator_len)) = find_real_thinking_end_tag_for(
+                    &self.thinking_buffer,
+                    tag,
+                    self.last_xml_thinking_char,
+                    false,
+                ) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
@@ -2852,9 +2923,9 @@ impl StreamContext {
                         }
                     }
 
-                    // 剥离 thinking 结束标签及其 `\n\n` 后缀
+                    // 剥离 thinking 结束标签及其分隔符
                     self.thinking_buffer = self.thinking_buffer
-                        [end_pos + tag.close.len() + "\n\n".len()..]
+                        [end_pos + tag.close.len() + separator_len..]
                         .to_string();
                 } else {
                     // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
@@ -2871,6 +2942,7 @@ impl StreamContext {
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty() {
+                            self.last_xml_thinking_char = safe_content.chars().next_back();
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
                                     self.create_thinking_delta_event(thinking_index, &safe_content),
@@ -3453,9 +3525,11 @@ impl StreamContext {
         // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
         if self.thinking_enabled && self.extract_xml_thinking && self.in_thinking_block {
             let tag = self.current_thinking_tag.unwrap_or(THINKING_XML_TAG);
-            if let Some(end_pos) =
-                find_real_thinking_end_tag_at_buffer_end_for(&self.thinking_buffer, tag)
-            {
+            if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end_for(
+                &self.thinking_buffer,
+                tag,
+                self.last_xml_thinking_char,
+            ) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -3725,9 +3799,11 @@ impl StreamContext {
             if self.in_thinking_block {
                 // 末尾可能残留 `</thinking>`（例如紧跟 tool_use 或流结束），需要在 flush 时过滤掉结束标签。
                 let tag = self.current_thinking_tag.unwrap_or(THINKING_XML_TAG);
-                if let Some(end_pos) =
-                    find_real_thinking_end_tag_at_buffer_end_for(&self.thinking_buffer, tag)
-                {
+                if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end_for(
+                    &self.thinking_buffer,
+                    tag,
+                    self.last_xml_thinking_char,
+                ) {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
@@ -6216,7 +6292,9 @@ mod tests {
             }),
             "partial thinking tag prefix should not be emitted as visible text"
         );
-        assert_eq!(ctx.thinking_buffer, "<th");
+        // Leading whitespace stays buffered with the partial tag so it is not lost when the
+        // tag turns out to be ordinary markup (for example `\n\n<html>`).
+        assert_eq!(ctx.thinking_buffer, "\n\n<th");
     }
 
     #[test]
@@ -6340,7 +6418,9 @@ mod tests {
         // 没有双换行符的情况
         assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
         assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
+        // 位于 thinking 开头/行首的结束标签即使后面紧跟正文也会被接受
+        assert_eq!(find_real_thinking_end_tag("</thinking> more"), Some(0));
+        assert_eq!(find_real_thinking_end_tag("x</thinking> more"), None);
         assert_eq!(find_real_thinking_end_tag("</think>"), None);
     }
 
@@ -7661,5 +7741,286 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    fn run_xml_thinking_chunks(chunks: &[&str]) -> (Vec<SseEvent>, StreamContext) {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        for chunk in chunks {
+            events.extend(ctx.process_assistant_response(chunk));
+        }
+        events.extend(ctx.generate_final_events());
+        (events, ctx)
+    }
+
+    fn final_stop_reason(events: &[SseEvent]) -> Option<String> {
+        events
+            .iter()
+            .rev()
+            .find(|event| event.event == "message_delta")
+            .and_then(|event| event.data["delta"]["stop_reason"].as_str())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn xml_thinking_close_tag_accepts_real_world_separators_for_five_rounds() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "<thinking>\n用户想要一个函数。\n</thinking>\n下面是实现：代码",
+                "用户想要一个函数。",
+                "下面是实现：代码",
+            ),
+            ("<thinking>\nabc。</thinking>正文", "abc。", "正文"),
+            ("<thinking>\nabc\n</thinking>正文", "abc", "正文"),
+            ("<thinking>\nabc.</thinking> answer", "abc.", "answer"),
+            ("<thinking>\nabc</thinking>\r\nanswer", "abc", "answer"),
+            ("<thinking>\nabc</thinking>\n\nanswer", "abc", "answer"),
+            ("<think>\nabc</think>\nanswer", "abc", "answer"),
+            (
+                "<thinking>\n关于 </thinking> 标签的解释\n</thinking>\n\n正文",
+                "关于 </thinking> 标签的解释",
+                "正文",
+            ),
+        ];
+        for round in 0..5 {
+            for (input, thinking, text) in cases {
+                let (events, _) = run_xml_thinking_chunks(&[input]);
+                assert_eq!(
+                    collect_thinking_content(&events).trim(),
+                    *thinking,
+                    "round {round}: {input:?}"
+                );
+                assert_eq!(
+                    collect_text_content(&events).trim(),
+                    *text,
+                    "round {round}: {input:?}"
+                );
+                assert_eq!(
+                    final_stop_reason(&events).as_deref(),
+                    Some("end_turn"),
+                    "round {round}: {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn xml_thinking_close_tag_split_at_every_byte_keeps_answer_visible() {
+        let input = "<thinking>\n先分析需求。\n</thinking>\n答案是 42";
+        for split in (0..=input.len()).filter(|index| input.is_char_boundary(*index)) {
+            let (first, second) = input.split_at(split);
+            let (events, _) = run_xml_thinking_chunks(&[first, second]);
+            assert_eq!(
+                collect_thinking_content(&events).trim(),
+                "先分析需求。",
+                "split {split}"
+            );
+            assert_eq!(
+                collect_text_content(&events).trim(),
+                "答案是 42",
+                "split {split}"
+            );
+            assert_eq!(
+                final_stop_reason(&events).as_deref(),
+                Some("end_turn"),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_thinking_glued_close_tag_before_tool_use_closes_thinking() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_assistant_response("<thinking>\n需要读取文件。</thinking>我来读取"),
+        );
+        events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
+        events.extend(ctx.generate_final_events());
+        assert_eq!(collect_thinking_content(&events).trim(), "需要读取文件。");
+        assert_eq!(collect_text_content(&events).trim(), "我来读取");
+        assert_eq!(final_stop_reason(&events).as_deref(), Some("tool_use"));
+    }
+
+    #[test]
+    fn xml_thinking_mode_keeps_whitespace_before_markup_for_five_rounds() {
+        for round in 0..5 {
+            let (events, _) = run_xml_thinking_chunks(&["\n\n<", "div>hi</div>"]);
+            assert_eq!(
+                collect_text_content(&events),
+                "\n\n<div>hi</div>",
+                "round {round}"
+            );
+            assert!(
+                collect_thinking_content(&events).is_empty(),
+                "round {round}"
+            );
+
+            // Adaptive leading whitespace before a real thinking block is still dropped.
+            let (events, _) =
+                run_xml_thinking_chunks(&["\n\n<th", "inking>\nplan\n</thinking>\n\nok"]);
+            assert_eq!(
+                collect_thinking_content(&events).trim(),
+                "plan",
+                "round {round}"
+            );
+            assert_eq!(collect_text_content(&events), "ok", "round {round}");
+        }
+    }
+
+    #[test]
+    fn xml_thinking_tag_after_visible_text_is_not_reasoning_for_five_rounds() {
+        for round in 0..5 {
+            let (events, ctx) = run_xml_thinking_chunks(&[
+                "Use this XML: ",
+                "<thinking>draft</thinking>\n\nthen continue.",
+            ]);
+            assert!(
+                collect_thinking_content(&events).is_empty(),
+                "round {round}"
+            );
+            assert_eq!(
+                collect_text_content(&events),
+                "Use this XML: <thinking>draft</thinking>\n\nthen continue.",
+                "round {round}"
+            );
+            assert!(ctx.thinking_block_index.is_none(), "round {round}");
+            assert_eq!(
+                final_stop_reason(&events).as_deref(),
+                Some("end_turn"),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_stream_thinking_extraction_uses_stream_close_tag_rules() {
+        assert_eq!(
+            extract_thinking_from_complete_text("<thinking>\nabc\n</thinking>\n答案"),
+            (Some("abc\n".to_string()), "答案".to_string())
+        );
+        assert_eq!(
+            extract_thinking_from_complete_text("<thinking>\nabc。</thinking>答案"),
+            (Some("abc。".to_string()), "答案".to_string())
+        );
+        assert_eq!(
+            extract_thinking_from_complete_text("<thinking>\nabc</thinking>"),
+            (Some("abc".to_string()), String::new())
+        );
+        assert_eq!(
+            extract_thinking_from_complete_text("前言<thinking>x</thinking>\n\n正文"),
+            (None, "前言<thinking>x</thinking>\n\n正文".to_string())
+        );
+        assert_eq!(
+            extract_thinking_from_complete_text(
+                "<thinking>\n关于 </thinking> 标签\n</thinking>\n\n正文"
+            ),
+            (
+                Some("关于 </thinking> 标签\n".to_string()),
+                "正文".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn content_length_exceeded_after_output_ends_with_max_tokens_for_five_rounds() {
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+                assistant_response_event("partial answer", None),
+            )));
+            events.extend(ctx.process_kiro_event(&Event::Exception {
+                exception_type: "ContentLengthExceededException".to_string(),
+                message: "output too long".to_string(),
+            }));
+            events.extend(ctx.generate_final_events());
+            assert!(!ctx.has_stream_error(), "round {round}");
+            assert!(
+                ctx.upstream_terminal_failure_detail().is_none(),
+                "round {round}"
+            );
+            assert!(
+                events.iter().all(|event| event.event != "error"),
+                "round {round}"
+            );
+            assert_eq!(
+                final_stop_reason(&events).as_deref(),
+                Some("max_tokens"),
+                "round {round}"
+            );
+            assert!(
+                events.iter().any(|event| event.event == "message_stop"),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_length_exceeded_without_output_is_still_an_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+        assert!(ctx.has_stream_error());
+    }
+
+    #[test]
+    fn each_native_reasoning_segment_emits_its_own_signature_for_five_rounds() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                ReasoningContentEvent {
+                    text: format!("first {round}"),
+                    signature: Some(format!("sig-1-{round}")),
+                    redacted_content: None,
+                },
+            )));
+            events.extend(ctx.process_assistant_response("visible one "));
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                ReasoningContentEvent {
+                    text: format!("second {round}"),
+                    signature: Some(format!("sig-2-{round}")),
+                    redacted_content: None,
+                },
+            )));
+            events.extend(ctx.process_assistant_response("visible two"));
+            events.extend(ctx.generate_final_events());
+
+            let signatures = events
+                .iter()
+                .filter(|event| {
+                    event.event == "content_block_delta"
+                        && event.data["delta"]["type"] == "signature_delta"
+                })
+                .map(|event| {
+                    event.data["delta"]["signature"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                signatures,
+                vec![format!("sig-1-{round}"), format!("sig-2-{round}")],
+                "round {round}"
+            );
+            assert_eq!(
+                collect_thinking_content(&events),
+                format!("first {round}second {round}"),
+                "round {round}"
+            );
+        }
     }
 }
