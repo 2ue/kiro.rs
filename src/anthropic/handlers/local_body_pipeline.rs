@@ -256,6 +256,7 @@ pub(super) fn prepare_with_plan(
 
     let too_long_retry = if plan.retry_payloads.is_enabled() {
         PayloadTooLongRetryRequest::new(
+            payload,
             &kiro_request,
             runtime_config,
             endpoint,

@@ -4063,6 +4063,20 @@ fn handler_eventstream_fault_router_with_limits(
     credential_count: u64,
     credential_retry_max_attempts: u32,
 ) -> (Router, Arc<UsageRecorder>) {
+    handler_eventstream_fault_router_with_config(
+        base_url,
+        credential_count,
+        credential_retry_max_attempts,
+        |_| {},
+    )
+}
+
+fn handler_eventstream_fault_router_with_config(
+    base_url: &str,
+    credential_count: u64,
+    credential_retry_max_attempts: u32,
+    configure: impl FnOnce(&mut Config),
+) -> (Router, Arc<UsageRecorder>) {
     assert!(credential_count > 0);
     let mut config = Config::default();
     config.kiro_upstream_base_url = Some(base_url.to_string());
@@ -4081,6 +4095,7 @@ fn handler_eventstream_fault_router_with_limits(
     config.credential_retry_max_attempts = credential_retry_max_attempts;
     config.inference_upstream_max_attempts = 4;
     config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+    configure(&mut config);
     let credentials = (1..=credential_count)
         .map(|id| KiroCredentials {
             id: Some(id),
@@ -4404,8 +4419,12 @@ async fn run_handler_thinking_signature_retry_too_long_enters_payload_guard_for_
                 HandlerEventStreamFault::SignatureInvalidThenTooLong,
             )
             .await;
+            // Legacy server-side trimming mode.
             let (app, usage_recorder) =
-                handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+                    config.payload_too_long_handling =
+                        crate::model::config::PayloadTooLongHandling::TrimRetry;
+                });
             let (status, request_id, body) =
                 call_handler_thinking_signature_retry(app, stream).await;
 
@@ -4440,6 +4459,131 @@ async fn run_handler_thinking_signature_retry_too_long_enters_payload_guard_for_
             assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 3);
         }
     }
+}
+
+async fn run_upstream_too_long_returns_prompt_is_too_long_for_client_compaction_for_five_rounds() {
+    for stream in [false, true] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::SignatureInvalidThenTooLong,
+            )
+            .await;
+            // Default handling: no server-side trimming, the client compacts.
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_limits(&upstream.base_url, 1, 1);
+            let (status, request_id, body) =
+                call_handler_thinking_signature_retry(app, stream).await;
+
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "stream={stream} round={round} body={body}"
+            );
+            let value: Value = serde_json::from_str(&body).expect("error envelope JSON");
+            assert_eq!(value["type"], "error", "stream={stream} round={round}");
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("prompt is too long"),
+                "stream={stream} round={round}: Claude Code compacts only on this message: {body}"
+            );
+            assert_eq!(
+                upstream.hits(),
+                2,
+                "stream={stream} round={round}: signature retry, then no trimming retry"
+            );
+            let records = usage_recorder.query(UsageRecordQuery {
+                request_id: Some(request_id.clone()),
+                ..UsageRecordQuery::default()
+            });
+            assert_eq!(records.records.len(), 1, "stream={stream} round={round}");
+        }
+    }
+}
+
+#[test]
+fn upstream_too_long_returns_prompt_is_too_long_for_client_compaction_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "too-long-client-compaction",
+        run_upstream_too_long_returns_prompt_is_too_long_for_client_compaction_for_five_rounds,
+    );
+}
+
+#[test]
+fn claude_code_compaction_request_is_detected() {
+    let compaction: MessagesRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": [{"type": "text", "text": "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}]}
+        ]
+    }))
+    .unwrap();
+    assert!(is_claude_code_compaction_request(&compaction));
+    let normal: MessagesRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "summarize this file"}]
+    }))
+    .unwrap();
+    assert!(!is_claude_code_compaction_request(&normal));
+
+    let mut config = Config::default();
+    config.payload_guard_max_bytes = 460_800;
+    let runtime = RequestRuntimeConfig::from_config_with_fallback(
+        &config,
+        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800),
+    );
+    assert!(runtime.too_long_retry_enabled_for(&compaction));
+    assert!(!runtime.too_long_retry_enabled_for(&normal));
+    config.payload_too_long_handling = crate::model::config::PayloadTooLongHandling::TrimRetry;
+    let runtime = RequestRuntimeConfig::from_config_with_fallback(
+        &config,
+        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800),
+    );
+    assert!(runtime.too_long_retry_enabled_for(&normal));
+
+    // Compaction retries also fit the current tool results; normal trim retries do not.
+    let kiro_request = thinking_signature_retry_kiro_fixture();
+    let compaction_retry = PayloadTooLongRetryRequest::new(
+        &compaction,
+        &kiro_request,
+        &runtime,
+        "/v1/messages",
+        "claude-sonnet-4-5",
+        None,
+        "conv",
+        None,
+    )
+    .expect("compaction request gets a trim retry");
+    assert!(
+        compaction_retry
+            .config
+            .shaping
+            .truncate_current_tool_results
+    );
+    let normal_retry = PayloadTooLongRetryRequest::new(
+        &normal,
+        &kiro_request,
+        &runtime,
+        "/v1/messages",
+        "claude-sonnet-4-5",
+        None,
+        "conv",
+        None,
+    )
+    .expect("trim_retry mode retries normal requests");
+    assert_eq!(
+        normal_retry.config.shaping.truncate_current_tool_results,
+        runtime
+            .payload_guard_config()
+            .shaping
+            .truncate_current_tool_results
+    );
 }
 
 #[test]
@@ -6293,6 +6437,7 @@ fn runtime_config_for_payload_guard(
         expose_proxy_warnings: false,
         payload_guard_enabled: enabled,
         payload_guard_mode: mode,
+        payload_too_long_handling: crate::model::config::PayloadTooLongHandling::TrimRetry,
         payload_guard_max_bytes: max_bytes,
         payload_guard_kiro_max_weight:
             crate::anthropic::payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,

@@ -840,6 +840,7 @@ struct RequestRuntimeConfig {
     expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
+    payload_too_long_handling: crate::model::config::PayloadTooLongHandling,
     payload_guard_max_bytes: usize,
     payload_guard_kiro_max_weight: usize,
     payload_guard_safety_margin_bytes: usize,
@@ -887,6 +888,7 @@ impl RequestRuntimeConfig {
             expose_proxy_warnings: state.expose_proxy_warnings,
             payload_guard_enabled: state.payload_guard_enabled,
             payload_guard_mode: state.payload_guard_mode,
+            payload_too_long_handling: crate::model::config::PayloadTooLongHandling::default(),
             payload_guard_max_bytes: state.payload_guard_max_bytes,
             payload_guard_kiro_max_weight: state.payload_guard_kiro_max_weight,
             payload_guard_safety_margin_bytes: state.payload_guard_safety_margin_bytes,
@@ -954,6 +956,7 @@ impl RequestRuntimeConfig {
             expose_proxy_warnings: config.expose_proxy_warnings || config.compat_profile.is_debug(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
+            payload_too_long_handling: config.payload_too_long_handling,
             payload_guard_max_bytes: config.payload_guard_max_bytes,
             payload_guard_kiro_max_weight: config.payload_guard_kiro_max_weight,
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
@@ -1034,6 +1037,17 @@ impl RequestRuntimeConfig {
         self.payload_guard_mode == PayloadGuardMode::OnTooLong
             && self.payload_guard_enabled
             && self.payload_guard_max_bytes > 0
+    }
+
+    /// Whether an upstream input-too-long rejection of this request is trimmed and retried by the
+    /// server. With `client_compaction` (default, every route) only Claude Code's own compaction
+    /// request is retried, so compaction itself can finish; every other request gets the
+    /// protocol `prompt is too long` error and the client compacts, the same as the official API.
+    fn too_long_retry_enabled_for(&self, payload: &MessagesRequest) -> bool {
+        self.too_long_retry_enabled()
+            && (self.payload_too_long_handling
+                == crate::model::config::PayloadTooLongHandling::TrimRetry
+                || is_claude_code_compaction_request(payload))
     }
 
     fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
@@ -1158,8 +1172,24 @@ enum PayloadTooLongRetryBase {
     ThinkingSignatureRetryWithoutHistoryReasoning,
 }
 
+/// Opening sentence of Claude Code's compaction prompt (`/compact` and auto-compaction).
+const CLAUDE_CODE_COMPACTION_MARKER: &str = "create a detailed summary of the conversation";
+
+/// Whether the request is Claude Code's own conversation-compaction request.
+fn is_claude_code_compaction_request(payload: &MessagesRequest) -> bool {
+    payload.messages.last().is_some_and(|message| {
+        message.role == "user"
+            && message
+                .content
+                .to_string()
+                .to_ascii_lowercase()
+                .contains(CLAUDE_CODE_COMPACTION_MARKER)
+    })
+}
+
 impl PayloadTooLongRetryRequest {
     fn new(
+        payload: &MessagesRequest,
         request: &KiroRequest,
         runtime_config: &RequestRuntimeConfig,
         endpoint: &str,
@@ -1168,15 +1198,36 @@ impl PayloadTooLongRetryRequest {
         conversation_id: &str,
         conversion_warnings: Option<String>,
     ) -> Option<Self> {
-        runtime_config.too_long_retry_enabled().then(|| Self {
-            request: request.clone(),
-            config: runtime_config.payload_guard_config(),
-            endpoint: endpoint.to_string(),
-            requested_model: requested_model.to_string(),
-            upstream_model: upstream_model.map(str::to_string),
-            conversation_id: conversation_id.to_string(),
-            conversion_warnings,
-        })
+        let mut config = runtime_config.payload_guard_config();
+        if is_claude_code_compaction_request(payload) {
+            // Claude Code's compaction request can carry the oversized tool results of the turn
+            // being compacted in its current message, where history trimming cannot help. Fit
+            // those tool results into the budget so compaction itself finishes; the summary
+            // instruction in the user text is left untouched.
+            config.shaping.truncate_current_tool_results = true;
+            // The generic weighted limit can still be above the model window (Kiro counts
+            // tokens, and ASCII text can need fewer than two bytes per token). Weight is at least
+            // one unit per token, so capping it at 90% of the window keeps the retried
+            // compaction request inside the window.
+            let window_tokens = super::converter::get_context_window_size(
+                upstream_model.unwrap_or(requested_model),
+            )
+            .max(1) as usize;
+            let window_budget = window_tokens.saturating_mul(9) / 10;
+            config.max_kiro_weight = config.max_kiro_weight.min(window_budget).max(1);
+            config.max_bytes = config.max_bytes.min(window_budget).max(1);
+        }
+        runtime_config
+            .too_long_retry_enabled_for(payload)
+            .then(|| Self {
+                request: request.clone(),
+                config,
+                endpoint: endpoint.to_string(),
+                requested_model: requested_model.to_string(),
+                upstream_model: upstream_model.map(str::to_string),
+                conversation_id: conversation_id.to_string(),
+                conversion_warnings,
+            })
     }
 
     fn build_retry_body_after_provider_error(
@@ -1703,7 +1754,7 @@ fn build_external_fallback_context(
         payload_guard_external_enabled: runtime_config.payload_guard_external_enabled,
         payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
         payload_guard_retry_config: (runtime_config.payload_guard_external_enabled
-            && runtime_config.too_long_retry_enabled())
+            && runtime_config.too_long_retry_enabled_for(payload))
         .then(|| runtime_config.payload_guard_config()),
         inference_attempt_budget,
         request_api_key_id,

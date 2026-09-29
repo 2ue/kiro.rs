@@ -2701,6 +2701,19 @@ impl Default for PayloadGuardMode {
     }
 }
 
+/// 上游判定输入过长后的处理方式（对所有路由生效，与路由挂载的 usage 策略无关）。
+///
+/// - `client_compaction`（默认）：按 Claude Code 协议返回 `prompt is too long`，由客户端自动压缩后
+///   重试；只有 Claude Code 自己的压缩请求仍按 payload guard 裁剪重试，保证压缩本身能完成。
+/// - `trim_retry`：旧行为，所有请求都由服务端裁剪历史后重试。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadTooLongHandling {
+    #[default]
+    ClientCompaction,
+    TrimRetry,
+}
+
 /// 外部备用号池并发满时的处理模式。
 ///
 /// `fail_fast` 保持历史行为：当前没有外部池并发槽时立即返回调度不可用。
@@ -3927,6 +3940,10 @@ pub struct Config {
     /// payload guard 大小裁剪触发模式。
     #[serde(default = "default_payload_guard_mode")]
     pub payload_guard_mode: PayloadGuardMode,
+
+    /// 上游输入过长后的处理方式，见 [`PayloadTooLongHandling`]。
+    #[serde(default)]
+    pub payload_too_long_handling: PayloadTooLongHandling,
 
     /// 通用 payload 的本地 byte soft target 和按大小处理总开关。Kiro local path
     /// 的真实体积判断由 `payload_guard_kiro_max_weight` 提供；`0` 表示不按大小
@@ -5213,6 +5230,7 @@ impl Default for Config {
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),
+            payload_too_long_handling: PayloadTooLongHandling::default(),
             payload_guard_max_bytes: default_payload_guard_max_bytes(),
             payload_guard_kiro_max_weight: default_payload_guard_kiro_max_weight(),
             payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
