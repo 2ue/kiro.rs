@@ -568,7 +568,7 @@ fn parse_messages_payload_with_probe(
     if let Some(error) = probe.scan_error() {
         return Err(entry_error_from_raw_probe(error));
     }
-    let payload = deserialize_messages_request_with_probe(raw_body, probe)
+    let mut payload = deserialize_messages_request_with_probe(raw_body, probe)
         .map_err(|message| EntryRequestError::invalid(message, "invalid_json_body"))?;
     if payload.model.trim().is_empty() {
         return Err(EntryRequestError::invalid(
@@ -576,8 +576,87 @@ fn parse_messages_payload_with_probe(
             "empty_model",
         ));
     }
+    normalize_message_roles_and_content(&mut payload)?;
     validate_typed_reasoning_protocol(&payload)?;
     Ok(payload)
+}
+
+/// Rejects roles the Anthropic API rejects, and normalizes content shapes Claude Code
+/// clients may send but Kiro cannot take directly: scalar content becomes text, scalar list
+/// items become text blocks, and nulls are dropped. Normalizing here keeps every later stage
+/// (conversion, history, token counting) on the same string-or-block-list shape.
+fn normalize_message_roles_and_content(
+    payload: &mut MessagesRequest,
+) -> Result<(), EntryRequestError> {
+    for (index, message) in payload.messages.iter_mut().enumerate() {
+        if !matches!(message.role.as_str(), "user" | "assistant") {
+            return Err(EntryRequestError::invalid(
+                format!("messages.{index}.role: Input should be 'user' or 'assistant'"),
+                "invalid_message_role",
+            ));
+        }
+        let replacement = match &mut message.content {
+            Value::String(_) => None,
+            Value::Array(blocks) => {
+                if blocks.iter().all(Value::is_object) {
+                    continue;
+                }
+                let original_len = blocks.len();
+                let normalized = std::mem::take(blocks)
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        Value::Object(_) => Some(block),
+                        Value::Null => None,
+                        other => Some(json!({"type": "text", "text": scalar_content_text(&other)})),
+                    })
+                    .collect::<Vec<_>>();
+                tracing::info!(
+                    message_index = index,
+                    original_blocks = original_len,
+                    kept_blocks = normalized.len(),
+                    "消息 content 数组含非对象元素，已转为 text 块（null 已丢弃）"
+                );
+                *blocks = normalized;
+                None
+            }
+            Value::Null => {
+                tracing::info!(message_index = index, "消息 content 为 null，按空内容处理");
+                Some(Value::Array(Vec::new()))
+            }
+            Value::Object(_) => {
+                tracing::info!(
+                    message_index = index,
+                    "消息 content 为单个对象，按单元素 content 块列表处理"
+                );
+                Some(Value::Array(vec![message.content.take()]))
+            }
+            other => {
+                let kind = if other.is_number() {
+                    "number"
+                } else {
+                    "boolean"
+                };
+                tracing::info!(
+                    message_index = index,
+                    content_kind = kind,
+                    "消息 content 为标量，已转为文本内容"
+                );
+                Some(Value::String(scalar_content_text(other)))
+            }
+        };
+        if let Some(replacement) = replacement {
+            message.content = replacement;
+        }
+    }
+    Ok(())
+}
+
+/// Text form of a non-object content value: strings verbatim, other values as compact JSON.
+fn scalar_content_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
 }
 
 fn validate_typed_reasoning_protocol(payload: &MessagesRequest) -> Result<(), EntryRequestError> {
@@ -809,6 +888,79 @@ mod tests {
             assert!(!should_try_raw_external_routes(
                 inspection.requires_normalized_body
             ));
+        }
+    }
+
+    #[test]
+    fn invalid_message_roles_are_rejected_at_entry_for_five_rounds() {
+        let cases: [(&[u8], &str); 2] = [
+            (
+                br#"{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"robot","content":"hi"}]}"#,
+                "messages.0.role: Input should be 'user' or 'assistant'",
+            ),
+            (
+                br#"{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"x"}]}"#,
+                "messages.1.role: Input should be 'user' or 'assistant'",
+            ),
+        ];
+        for round in 0..5 {
+            for (raw, expected_message) in cases {
+                let raw = Bytes::copy_from_slice(raw);
+                let error = parse_messages_payload(&raw, "req_invalid_message_role")
+                    .expect_err("invalid role must be rejected");
+                assert_eq!(error.status, StatusCode::BAD_REQUEST, "round {round}");
+                assert_eq!(error.error_type, "invalid_request_error");
+                assert_eq!(error.message, expected_message, "round {round}");
+                assert_eq!(error.reason, "invalid_message_role", "round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_block_message_content_is_normalized_instead_of_rejected_for_five_rounds() {
+        let cases: [(&[u8], Value); 6] = [
+            (
+                br#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":42}]}"#,
+                json!("42"),
+            ),
+            (
+                br#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":true}]}"#,
+                json!("true"),
+            ),
+            (
+                br#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":null}]}"#,
+                json!([]),
+            ),
+            (
+                br#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":{"type":"text","text":"one"}}]}"#,
+                json!([{"type": "text", "text": "one"}]),
+            ),
+            (
+                br#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":["plain",{"type":"text","text":"ok"},7,false,null,[1]]}]}"#,
+                json!([
+                    {"type": "text", "text": "plain"},
+                    {"type": "text", "text": "ok"},
+                    {"type": "text", "text": "7"},
+                    {"type": "text", "text": "false"},
+                    {"type": "text", "text": "[1]"}
+                ]),
+            ),
+            (
+                br#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"text","text":"ok"}]},{"role":"user","content":[]}]}"#,
+                json!([]),
+            ),
+        ];
+        for round in 0..5 {
+            for (raw, expected_last_content) in &cases {
+                let raw = Bytes::copy_from_slice(raw);
+                let payload = parse_messages_payload(&raw, "req_normalized_content")
+                    .unwrap_or_else(|error| panic!("round {round}: {}", error.message));
+                assert_eq!(
+                    &payload.messages.last().unwrap().content,
+                    expected_last_content,
+                    "round {round}"
+                );
+            }
         }
     }
 
