@@ -57,6 +57,7 @@ use model::{build_additional_model_request_fields, requested_native_reasoning};
 pub use model::{get_context_window_size, map_model};
 #[cfg(test)]
 use schema::normalize_json_schema;
+pub(crate) use thinking::strip_thinking_output_policy;
 use tool_pairing::{
     remove_orphaned_tool_uses, sanitize_history_tool_results, validate_tool_pairing,
 };
@@ -2805,6 +2806,86 @@ mod tests {
                 .effort,
             "high"
         );
+    }
+
+    #[test]
+    fn opus_5_thinking_prefix_omits_visible_thinking_policy_for_five_rounds() {
+        use crate::anthropic::model_capabilities::ModelResolutionSource;
+
+        use super::super::types::{Message as AnthropicMessage, Thinking};
+
+        // think-02：claude-opus-5.5 遇到可见 thinking 输出策略时只回 usage 事件即 EOF。
+        // 保留 <thinking_mode> 控制标签，但不注入策略；其他模型维持原行为。
+        for round in 0..5 {
+            for (requested, upstream, expect_policy) in [
+                ("claude-opus-5-5", "claude-opus-5.5", false),
+                ("opus-thinking", "claude-opus-5.5", false),
+                ("claude-opus-5-5[1m]", "claude-opus-5.5[1m]", false),
+                ("claude-sonnet-4-6", "claude-sonnet-4.6", true),
+                ("claude-opus-4-6", "claude-opus-4.6", true),
+            ] {
+                let req = MessagesRequest {
+                    model: requested.to_string(),
+                    max_tokens: 2000,
+                    messages: vec![AnthropicMessage {
+                        role: "user".to_string(),
+                        content: serde_json::json!(format!("17*23=? round {round}")),
+                    }],
+                    stream: true,
+                    system: None,
+                    tools: None,
+                    tool_choice: None,
+                    thinking: Some(Thinking {
+                        thinking_type: "enabled".to_string(),
+                        budget_tokens: 1024,
+                    }),
+                    output_config: None,
+                    metadata: None,
+                };
+                let resolution = ModelResolution::resolved(
+                    requested.to_string(),
+                    upstream.to_string(),
+                    ModelResolutionSource::FamilyNormalized,
+                );
+                let mut options = ConverterOptions::default();
+                options.conversion.native_reasoning_fields =
+                    crate::anthropic::body_capabilities::BodyStageState::Disabled;
+                let result = convert_request_with_resolved_model(&req, options, &resolution)
+                    .expect("thinking request should convert");
+                let controls = result
+                    .conversation_state
+                    .history
+                    .iter()
+                    .find_map(|message| match message {
+                        Message::User(user) => Some(user.user_input_message.content.clone()),
+                        _ => None,
+                    })
+                    .expect("thinking controls should be injected");
+                assert!(
+                    controls.contains("<thinking_mode>enabled</thinking_mode>"),
+                    "{requested} round {round}"
+                );
+                assert_eq!(
+                    controls.contains("<thinking_output_policy>"),
+                    expect_policy,
+                    "{requested} round {round}: {controls}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_thinking_output_policy_removes_only_the_policy() {
+        let mut content = format!(
+            "<thinking_mode>enabled</thinking_mode><max_thinking_length>1024</max_thinking_length>\n{}\nsystem prompt",
+            super::thinking::THINKING_OUTPUT_POLICY
+        );
+        assert!(strip_thinking_output_policy(&mut content));
+        assert_eq!(
+            content,
+            "<thinking_mode>enabled</thinking_mode><max_thinking_length>1024</max_thinking_length>\nsystem prompt"
+        );
+        assert!(!strip_thinking_output_policy(&mut content));
     }
 
     #[test]

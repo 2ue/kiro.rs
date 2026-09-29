@@ -8991,6 +8991,46 @@ enum StreamRetryOutcome {
     NotRetried(SseStreamState),
 }
 
+/// 上游只回 usage/metadata 就 EOF（空响应）时，把首输出前重试降级为不带 reasoning/thinking
+/// 整形的请求：去掉原生 reasoning 字段、历史 reasoning 和可见 thinking 输出策略。
+/// 同样的整形大概率再次得到空响应，降级后至少保证本轮有可见回答。返回是否有改动。
+fn degrade_stream_retry_plan_without_reasoning_shaping(plan: &mut StreamRetryPlan) -> bool {
+    let mut request = match plan.kiro_request.as_deref() {
+        Some(request) => request.clone(),
+        None => match serde_json::from_str::<KiroRequest>(&plan.request_body) {
+            Ok(request) => request,
+            Err(_) => return false,
+        },
+    };
+    let mut changed = request.additional_model_request_fields.take().is_some();
+    changed |= request.conversation_state.clear_history_reasoning_content() > 0;
+    for message in &mut request.conversation_state.history {
+        if let crate::kiro::model::requests::conversation::Message::User(user) = message {
+            changed |= super::converter::strip_thinking_output_policy(
+                &mut user.user_input_message.content,
+            );
+        }
+    }
+    changed |= super::converter::strip_thinking_output_policy(
+        &mut request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content,
+    );
+    if !changed {
+        return false;
+    }
+    match serialize_kiro_request(&request) {
+        Ok(body) => {
+            plan.request_body = Arc::<str>::from(body);
+            plan.kiro_request = Some(Arc::new(request));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 async fn retry_stream_before_downstream_commit(
     mut state: SseStreamState,
     reason: StreamRetryReason,
@@ -9548,6 +9588,20 @@ fn create_sse_stream(
                                     error = %detail,
                                     "EventStream 在协议完成前结束"
                                 );
+                                if !state.downstream_committed
+                                    && detail
+                                        == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
+                                {
+                                    if let Some(plan) = state.retry_plan.as_mut() {
+                                        if degrade_stream_retry_plan_without_reasoning_shaping(plan)
+                                        {
+                                            tracing::warn!(
+                                                request_id = %plan.request_id,
+                                                "上游空响应，首输出前重试降级为不带 reasoning/thinking 整形的请求"
+                                            );
+                                        }
+                                    }
+                                }
                                 if !state.downstream_committed {
                                     match retry_stream_before_downstream_commit(
                                         state,
@@ -11143,11 +11197,17 @@ async fn handle_non_stream_request(
             tracing::warn!(error = detail, "非流式响应缺少可信完成信号");
             credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
             completion.release();
-            return envelope::error_response_with_id(
+            // 空响应对同一请求通常可复现：Claude Code 在流式 SSE error 后会发一次非流式
+            // 兜底请求，这里的 502 不带 `x-should-retry: false` 会被 CLI 连续重试 10 次
+            // （约 3 分钟）。明确告知不要重试，让本轮直接失败。
+            let extra_headers = (detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL)
+                .then(|| ("x-should-retry", "false".to_string()));
+            return envelope::error_response_with_id_and_headers(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
                 &credential_usage.request.request_id,
+                extra_headers,
             );
         }
     }

@@ -5435,6 +5435,32 @@ async fn run_handler_usage_only_eof_matrix() {
         assert_eq!(body.matches("event: message_start").count(), 1);
         assert_eq!(body.matches("event: message_stop").count(), 1);
         assert_eq!(upstream.hits(), 2, "usage-only round={round}");
+        // 首发带 thinking 兼容整形；空响应后的重试降级为不带可见 thinking 输出策略的请求。
+        let bodies = upstream
+            .bodies_snapshot()
+            .into_iter()
+            .map(|body| body.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            bodies[0].contains("<thinking_output_policy>"),
+            "usage-only round={round} first body should carry the thinking policy"
+        );
+        assert!(
+            bodies[0].contains("<thinking_mode>enabled</thinking_mode>"),
+            "usage-only round={round}"
+        );
+        assert!(
+            !bodies[1].contains("<thinking_output_policy>"),
+            "usage-only round={round} degraded retry must drop the thinking policy"
+        );
+        assert!(
+            bodies[1].contains("<thinking_mode>enabled</thinking_mode>"),
+            "usage-only round={round} degraded retry keeps the thinking mode control"
+        );
+        assert!(
+            !bodies[1].contains("additionalModelRequestFields"),
+            "usage-only round={round}"
+        );
         assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
         let record = usage_record_for_request(&usage_recorder, &request_id);
         let trace = record
@@ -5454,6 +5480,57 @@ fn handler_usage_only_eof_retries_before_empty_success_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread(
         "usage-only-eof-terminal-fixture",
         run_handler_usage_only_eof_matrix,
+    );
+}
+
+/// think-02：非流式空响应（Claude Code 在流式 SSE error 后的兜底请求）返回 502 时带
+/// `x-should-retry: false`，避免 CLI 连续重试 10 次；其他未完成 EOF 维持原有可重试语义。
+async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
+    for (fault, expect_no_retry) in [
+        (HandlerEventStreamFault::UsageOnlyMeteringNoStatus, true),
+        (HandlerEventStreamFault::UnknownEventOnly, false),
+    ] {
+        for round in 1..=5 {
+            let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+            let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                app.oneshot(handler_eventstream_fault_request_for_path(
+                    "/cc/v1/messages",
+                    false,
+                )),
+            )
+            .await
+            .expect("usage-only non-stream response timed out")
+            .expect("usage-only non-stream response");
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "fault={fault:?} round={round}"
+            );
+            let should_retry = response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            if expect_no_retry {
+                assert_eq!(
+                    should_retry.as_deref(),
+                    Some("false"),
+                    "fault={fault:?} round={round}"
+                );
+            } else {
+                assert_eq!(should_retry, None, "fault={fault:?} round={round}");
+            }
+        }
+    }
+}
+
+#[test]
+fn handler_non_stream_usage_only_eof_disables_client_retry_for_five_rounds() {
+    run_handler_fixture_on_four_mib_thread(
+        "non-stream-usage-only-no-retry-fixture",
+        run_handler_non_stream_usage_only_eof_should_not_retry_matrix,
     );
 }
 
