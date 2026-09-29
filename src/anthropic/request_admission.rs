@@ -1146,10 +1146,17 @@ pub(crate) async fn request_admission_middleware(
     next: Next,
 ) -> Response {
     let Some(identity) = request.extensions().get::<RequestApiKeyIdentity>().copied() else {
-        return envelope::error_response(
+        let request_id = envelope::request_id();
+        tracing::warn!(
+            request_id = %request_id,
+            path = %request.uri().path(),
+            "准入中间件未拿到认证身份，按认证失败拒绝"
+        );
+        return envelope::error_response_with_id(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "Invalid API key",
+            &request_id,
         );
     };
 

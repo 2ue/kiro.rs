@@ -186,6 +186,34 @@ pub(crate) fn insert_request_id_headers(headers: &mut HeaderMap, request_id: &st
     }
 }
 
+/// Header the Anthropic API and its SDKs use to override the status-based retry decision.
+pub(crate) const SHOULD_RETRY_HEADER: &str = "x-should-retry";
+
+/// Client errors that repeat identically on retry. The Anthropic API marks these with
+/// `x-should-retry: false`; without it Claude Code keeps retrying (for example a 401 for
+/// about ten attempts). 408, 409, 429 and 5xx stay retryable and are left untouched.
+pub(crate) fn status_is_non_retryable_client_error(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::PAYMENT_REQUIRED
+            | StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::PAYLOAD_TOO_LARGE
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            | StatusCode::UNPROCESSABLE_ENTITY
+    )
+}
+
+/// Adds `x-should-retry: false` to non-retryable client errors unless a handler already set it.
+pub(crate) fn insert_should_retry_header(headers: &mut HeaderMap, status: StatusCode) {
+    if status_is_non_retryable_client_error(status) && !headers.contains_key(SHOULD_RETRY_HEADER) {
+        headers.insert(SHOULD_RETRY_HEADER, HeaderValue::from_static("false"));
+    }
+}
+
 pub(crate) fn insert_optional_warnings_header(headers: &mut HeaderMap, warnings: Option<String>) {
     let Some(warnings) = warnings else {
         return;
@@ -207,6 +235,7 @@ pub(crate) fn error_response_with_id(
     )
         .into_response();
     insert_request_id_headers(response.headers_mut(), request_id);
+    insert_should_retry_header(response.headers_mut(), status);
     response
 }
 
@@ -284,6 +313,48 @@ mod tests {
 
         assert_eq!(headers["request-id"], "req_existing");
         assert_eq!(headers["anthropic-request-id"], "req_01abc");
+    }
+
+    #[test]
+    fn error_responses_mark_only_non_retryable_client_errors() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ] {
+            let response = error_response(status, "invalid_request_error", "nope");
+            assert_eq!(
+                response.headers()[SHOULD_RETRY_HEADER],
+                "false",
+                "{status} must not be retried"
+            );
+        }
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::CONFLICT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::from_u16(529).unwrap(),
+        ] {
+            let response = error_response(status, "api_error", "later");
+            assert!(
+                !response.headers().contains_key(SHOULD_RETRY_HEADER),
+                "{status} must stay retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn should_retry_header_keeps_explicit_handler_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(SHOULD_RETRY_HEADER, HeaderValue::from_static("true"));
+        insert_should_retry_header(&mut headers, StatusCode::BAD_REQUEST);
+        assert_eq!(headers[SHOULD_RETRY_HEADER], "true");
     }
 
     #[test]

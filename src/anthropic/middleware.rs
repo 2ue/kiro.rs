@@ -339,8 +339,9 @@ pub async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let identity =
-        auth::extract_api_key(&request).and_then(|key| state.request_api_keys.authenticate(&key));
+    let presented_key = auth::extract_api_key(&request);
+    let key_present = presented_key.is_some();
+    let identity = presented_key.and_then(|key| state.request_api_keys.authenticate(&key));
     match identity {
         Some(identity) => {
             request.extensions_mut().insert(identity);
@@ -351,11 +352,23 @@ pub async fn auth_middleware(
             }
             response
         }
-        _ => envelope::error_response(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            "Invalid API key",
-        ),
+        _ => {
+            let request_id = envelope::request_id();
+            // Only record whether a key was presented; the key itself never reaches the log.
+            tracing::warn!(
+                request_id = %request_id,
+                method = %request.method(),
+                path = %request.uri().path(),
+                key_present,
+                "请求 API Key 认证失败"
+            );
+            envelope::error_response_with_id(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Invalid API key",
+                &request_id,
+            )
+        }
     }
 }
 

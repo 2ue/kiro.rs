@@ -6,6 +6,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     middleware,
+    response::Response,
     routing::{get, post},
 };
 
@@ -21,6 +22,7 @@ use crate::model::config::{
 };
 
 use super::{
+    envelope,
     files::{
         MAX_FILE_UPLOAD_BODY_SIZE, delete_file, delete_file_dfcache, get_file, get_file_content,
         get_file_content_dfcache, get_file_dfcache, list_files, upload_file,
@@ -413,8 +415,17 @@ pub fn create_router_with_provider(
         .nest("/cc/v1", cc_v1_routes)
         .nest("/ha/v1", ha_v1_routes)
         .nest("/dfcache", dfcache_routes)
+        .layer(middleware::map_response(mark_non_retryable_client_errors))
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_MESSAGES_BODY_SIZE))
+}
+
+/// Covers client errors built outside the envelope helpers (framework rejections, handler
+/// shortcuts) so every non-retryable 4xx tells Claude Code not to retry.
+async fn mark_non_retryable_client_errors(mut response: Response) -> Response {
+    let status = response.status();
+    envelope::insert_should_retry_header(response.headers_mut(), status);
+    response
 }
 
 fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppState, AppState) {
@@ -599,6 +610,10 @@ mod tests {
 
                 let rejected = app.clone().oneshot(make_request()).await.unwrap();
                 assert_eq!(rejected.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+                assert!(
+                    !rejected.headers().contains_key("x-should-retry"),
+                    "rate limits must stay retryable"
+                );
             }
         }
     }
@@ -648,6 +663,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(response.headers()["x-should-retry"], "false");
                 let request_id = response
                     .headers()
                     .get("request-id")
@@ -669,6 +685,69 @@ mod tests {
                 assert_eq!(value["type"], "error");
                 assert_eq!(value["error"]["type"], "request_too_large");
                 assert_eq!(value["request_id"], request_id);
+            }
+        }
+    }
+
+    fn test_router(keys: &[&str]) -> Router {
+        let mut config = Config::default();
+        config.defined_cache_routes = vec!["/dfcache/demo".to_string()];
+        create_router_with_provider(
+            AnthropicRouterDependencies {
+                request_api_keys: Arc::new(RequestApiKeyStore::new(keys)),
+                request_admission: Arc::new(RequestAdmissionController::new(
+                    RequestAdmissionConfig::disabled(),
+                )),
+                kiro_provider: None,
+                usage_recorder: Arc::new(UsageRecorder::new(10)),
+                prompt_cache: Arc::new(PromptCacheTracker::default()),
+                prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+                pricing_catalog: Arc::new(PricingCatalog::new()),
+                model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+                external_pool_manager: None,
+            },
+            AnthropicRouterConfig::from_runtime_config(&config),
+        )
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_tell_clients_not_to_retry_for_five_rounds() {
+        const PATHS: [&str; 5] = [
+            "/v1/messages",
+            "/na/v1/messages",
+            "/cc/v1/messages",
+            "/ha/v1/messages",
+            "/dfcache/demo/v1/messages",
+        ];
+        let app = test_router(&["should-retry-key"]);
+        for _round in 0..5 {
+            for path in PATHS {
+                for key in [Some("wrong-key"), None] {
+                    let mut request = Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json");
+                    if let Some(key) = key {
+                        request = request.header("x-api-key", key);
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(request.body(Body::from("{}")).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+                    assert_eq!(response.headers()["x-should-retry"], "false", "{path}");
+                    let request_id = response.headers()["request-id"]
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(value["error"]["type"], "authentication_error");
+                    assert_eq!(value["request_id"], request_id);
+                }
             }
         }
     }
