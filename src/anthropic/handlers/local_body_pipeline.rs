@@ -80,6 +80,7 @@ fn should_retry_local_conversion_after_reasoning_shaping(error: &ConversionError
         message.as_str(),
         "consecutive assistant messages contain multiple native reasoning blocks and cannot be merged losslessly"
             | "assistant history contains multiple or mixed native reasoning blocks; Kiro accepts one reasoningContent union value per assistant message"
+            | "assistant history mixes native signed/redacted reasoning with unsigned thinking and cannot be represented losslessly"
     )
 }
 
