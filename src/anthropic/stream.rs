@@ -2919,32 +2919,14 @@ impl StreamContext {
                 ) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
+                    self.push_xml_thinking_delta(&mut events, &thinking_content);
 
                     // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        if let Some(pending) = self.flush_thinking_transcript(thinking_index) {
-                            events.push(pending);
-                        }
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
-                    }
+                    self.close_xml_thinking_block(&mut events);
 
                     // 剥离 thinking 结束标签及其分隔符
                     self.thinking_buffer = self.thinking_buffer
@@ -2966,11 +2948,7 @@ impl StreamContext {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty() {
                             self.last_xml_thinking_char = safe_content.chars().next_back();
-                            if let Some(thinking_index) = self.thinking_block_index {
-                                events.push(
-                                    self.create_thinking_delta_event(thinking_index, &safe_content),
-                                );
-                            }
+                            self.push_xml_thinking_delta(&mut events, &safe_content);
                         }
                         self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
@@ -3368,6 +3346,59 @@ impl StreamContext {
         (!pending.is_empty()).then(|| self.create_sanitized_thinking_delta_event(index, &pending))
     }
 
+    /// 在 XML thinking 块内追加内容。
+    ///
+    /// 如果当前 thinking 块已在 tool_use 边界被提前关闭（thinking 尚未收到结束标签），
+    /// 则在追加前另开一个新的 thinking 块，保证内容块严格串行，不会与 tool_use 交错。
+    fn push_xml_thinking_delta(&mut self, events: &mut Vec<SseEvent>, thinking: &str) {
+        if thinking.is_empty() {
+            return;
+        }
+        let block_open = self
+            .thinking_block_index
+            .is_some_and(|index| self.state_manager.is_block_open_of_type(index, "thinking"));
+        if !block_open {
+            let thinking_index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(thinking_index);
+            events.extend(self.state_manager.handle_content_block_start(
+                thinking_index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": ""
+                    }
+                }),
+            ));
+        }
+        if let Some(thinking_index) = self.thinking_block_index {
+            events.push(self.create_thinking_delta_event(thinking_index, thinking));
+        }
+    }
+
+    /// 关闭当前打开的 XML thinking 块：flush 脱敏缓冲，先发送空的 thinking_delta，
+    /// 再发送 content_block_stop。块已关闭时不发送任何事件。
+    fn close_xml_thinking_block(&mut self, events: &mut Vec<SseEvent>) {
+        let Some(thinking_index) = self.thinking_block_index else {
+            return;
+        };
+        if !self
+            .state_manager
+            .is_block_open_of_type(thinking_index, "thinking")
+        {
+            return;
+        }
+        if let Some(pending) = self.flush_thinking_transcript(thinking_index) {
+            events.push(pending);
+        }
+        events.push(self.create_thinking_delta_event(thinking_index, ""));
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+    }
+
     pub fn claude_code_noop_delta_keepalive_event(&self) -> Option<SseEvent> {
         let (index, block_type) = self.state_manager.active_open_block_for_keepalive()?;
         let delta = match block_type.as_str() {
@@ -3571,31 +3602,13 @@ impl StreamContext {
                 self.last_xml_thinking_char,
             ) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                if !thinking_content.is_empty() {
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_content),
-                        );
-                    }
-                }
+                self.push_xml_thinking_delta(&mut events, &thinking_content);
 
                 // 结束 thinking 块
                 self.in_thinking_block = false;
                 self.thinking_extracted = true;
 
-                if let Some(thinking_index) = self.thinking_block_index {
-                    if let Some(pending) = self.flush_thinking_transcript(thinking_index) {
-                        events.push(pending);
-                    }
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
-                }
+                self.close_xml_thinking_block(&mut events);
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
                 let after_pos = end_pos + tag.close.len();
@@ -3604,6 +3617,17 @@ impl StreamContext {
                 if !remaining.is_empty() {
                     events.extend(self.create_text_delta_events(&remaining));
                 }
+            } else {
+                // thinking 尚未收到结束标签就开始 tool_use：内容块必须串行，
+                // 先 flush 已缓冲的 thinking 并关闭当前 thinking 块，再开 tool_use。
+                // 仍保持 in_thinking_block，tool_use 之后的 thinking 内容另开新块，
+                // 直到收到结束标签。
+                let pending = std::mem::take(&mut self.thinking_buffer);
+                if !pending.is_empty() {
+                    self.last_xml_thinking_char = pending.chars().next_back();
+                }
+                self.push_xml_thinking_delta(&mut events, &pending);
+                self.close_xml_thinking_block(&mut events);
             }
         }
 
@@ -3845,26 +3869,10 @@ impl StreamContext {
                     self.last_xml_thinking_char,
                 ) {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
-                    if !thinking_content.is_empty() {
-                        if let Some(thinking_index) = self.thinking_block_index {
-                            events.push(
-                                self.create_thinking_delta_event(thinking_index, &thinking_content),
-                            );
-                        }
-                    }
+                    self.push_xml_thinking_delta(&mut events, &thinking_content);
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        if let Some(pending) = self.flush_thinking_transcript(thinking_index) {
-                            events.push(pending);
-                        }
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
-                    }
+                    self.close_xml_thinking_block(&mut events);
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
                     let after_pos = end_pos + tag.close.len();
@@ -3877,26 +3885,10 @@ impl StreamContext {
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        let thinking_buffer = self.thinking_buffer.clone();
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &thinking_buffer),
-                        );
-                    }
+                    let thinking_buffer = self.thinking_buffer.clone();
+                    self.push_xml_thinking_delta(&mut events, &thinking_buffer);
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
-                    if let Some(thinking_index) = self.thinking_block_index {
-                        if let Some(pending) = self.flush_thinking_transcript(thinking_index) {
-                            events.push(pending);
-                        }
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
-                    }
+                    self.close_xml_thinking_block(&mut events);
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta
@@ -6618,6 +6610,117 @@ mod tests {
             pos_thinking_stop.unwrap() < pos_tool_start.unwrap(),
             "thinking block should stop before tool_use block starts"
         );
+    }
+
+    /// 断言内容块严格串行：新块开始时不存在未关闭的块，delta 只写入当前打开的块。
+    fn assert_content_blocks_are_serial(events: &[SseEvent]) {
+        let mut open: Option<i64> = None;
+        let sequence = events
+            .iter()
+            .filter(|e| e.event.starts_with("content_block"))
+            .map(|e| format!("{}:{}", e.event, e.data["index"]))
+            .collect::<Vec<_>>();
+        for event in events {
+            let index = event.data["index"].as_i64();
+            match event.event.as_str() {
+                "content_block_start" => {
+                    assert!(
+                        open.is_none(),
+                        "block {index:?} started while {open:?} still open: {sequence:?}"
+                    );
+                    open = index;
+                }
+                "content_block_delta" => {
+                    assert_eq!(open, index, "delta outside open block: {sequence:?}");
+                }
+                "content_block_stop" => {
+                    assert_eq!(open, index, "stop of non-open block: {sequence:?}");
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_none(), "block left open: {sequence:?}");
+    }
+
+    fn collect_delta_text(events: &[SseEvent], delta_type: &str, field: &str) -> String {
+        events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == delta_type)
+            .filter_map(|e| e.data["delta"][field].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn unclosed_xml_thinking_is_closed_before_tool_use_and_resumes_in_new_block() {
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+            let mut all_events = ctx.generate_initial_events();
+            all_events.extend(
+                ctx.process_assistant_response("<thinking>\nplanning the Read call for round"),
+            );
+            all_events.extend(
+                ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                    name: "Read".to_string(),
+                    tool_use_id: format!("tool_unclosed_{round}"),
+                    input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+                    stop: true,
+                }),
+            );
+            all_events
+                .extend(ctx.process_assistant_response(" still thinking</thinking>\n\nDone."));
+            all_events.extend(ctx.generate_final_events());
+
+            assert_content_blocks_are_serial(&all_events);
+            let block_types = all_events
+                .iter()
+                .filter(|e| e.event == "content_block_start")
+                .map(|e| e.data["content_block"]["type"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                block_types,
+                vec!["thinking", "tool_use", "thinking", "text"],
+                "round {round}"
+            );
+            let thinking = collect_delta_text(&all_events, "thinking_delta", "thinking");
+            assert_eq!(
+                thinking, "planning the Read call for round still thinking",
+                "round {round}"
+            );
+            assert_eq!(
+                collect_delta_text(&all_events, "text_delta", "text"),
+                "Done.",
+                "round {round}"
+            );
+            assert!(!thinking.contains("</thinking>"), "round {round}");
+        }
+    }
+
+    #[test]
+    fn unclosed_xml_thinking_before_tool_use_at_stream_end_stays_serial() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut all_events = ctx.generate_initial_events();
+        all_events.extend(ctx.process_assistant_response("<thinking>\nabout to call Read"));
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "Read".to_string(),
+                tool_use_id: "tool_unclosed_eof".to_string(),
+                input: r#"{"file_path":"Cargo.toml"}"#.to_string(),
+                stop: true,
+            }),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        assert_content_blocks_are_serial(&all_events);
+        assert_eq!(
+            collect_delta_text(&all_events, "thinking_delta", "thinking"),
+            "about to call Read"
+        );
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]
