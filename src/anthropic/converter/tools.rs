@@ -143,6 +143,32 @@ pub(super) fn deterministic_mapped_tool_name(name: &str) -> String {
     }
 }
 
+/// Whether a Claude Code tool name already satisfies the Kiro tool-name constraint
+/// (ASCII letter first, then letters, digits, `_` or `-`, at most 63 characters), so it can be
+/// sent verbatim. Kiro's validation mirrors the Claude Code protocol rule
+/// `^[a-zA-Z0-9_-]{1,64}$`; the length and leading-letter limits are kept one step stricter.
+pub(super) fn is_kiro_safe_tool_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= TOOL_NAME_MAX_LEN
+        && chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// Kiro-side name for a request tool: valid names pass through unchanged when the conversion
+/// plan allows it, everything else uses the deterministic camelCase + Hash mapping.
+fn kiro_request_tool_name(name: &str, options: &ConverterOptions) -> String {
+    if options
+        .conversion
+        .tool_name_verbatim_when_valid
+        .is_enabled()
+        && is_kiro_safe_tool_name(name)
+    {
+        name.to_string()
+    } else {
+        deterministic_mapped_tool_name(name)
+    }
+}
+
 /// Exact name emitted by the pre-2026-05-29 mapper for an overlong tool.
 /// This is response/history compatibility only; new requests always use the
 /// current Kiro-safe mapper above.
@@ -186,7 +212,15 @@ pub(super) fn map_tool_name(
     if !options.conversion.tool_name_mapping.is_enabled() {
         return name.to_string();
     }
-    let mapped = deterministic_mapped_tool_name(name);
+    // Reuse the allocation made for the current tool list (for example a hash fallback after a
+    // case-insensitive collision) so history and definitions always agree.
+    if let Some(mapped) = tool_name_map
+        .iter()
+        .find_map(|(mapped, original)| (original == name).then(|| mapped.clone()))
+    {
+        return mapped;
+    }
+    let mapped = kiro_request_tool_name(name, &options);
     if mapped != name {
         // `convert_tools` rejects ambiguous allocations before committing this
         // reverse map. Keep this helper non-overwriting as a final invariant for
@@ -318,11 +352,22 @@ fn allocate_selected_tool_names(
     let mut pending_reverse_map = HashMap::new();
     for &idx in selected_indices {
         let tool = &tools[idx];
-        let mapped = if options.conversion.tool_name_mapping.is_enabled() {
-            deterministic_mapped_tool_name(&tool.name)
+        let mut mapped = if options.conversion.tool_name_mapping.is_enabled() {
+            kiro_request_tool_name(&tool.name, options)
         } else {
             tool.name.clone()
         };
+        // Kiro matches tool names case-insensitively. When a verbatim name would collide with a
+        // different tool (for example `Read` and `read`), fall back to the hash mapping instead
+        // of rejecting the request.
+        if mapped == tool.name
+            && options.conversion.tool_name_mapping.is_enabled()
+            && reserved
+                .get(&mapped.to_ascii_lowercase())
+                .is_some_and(|previous_original| previous_original != &tool.name)
+        {
+            mapped = shorten_tool_name(&sanitize_tool_name(&tool.name), &tool.name);
+        }
         let collision_key = mapped.to_ascii_lowercase();
         if let Some(previous_original) = reserved.get(&collision_key) {
             if previous_original == &tool.name {

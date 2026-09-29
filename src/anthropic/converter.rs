@@ -1359,13 +1359,75 @@ mod tests {
         assert!(map.is_empty(), "Kiro-safe 短名称不应产生映射");
     }
 
+    /// Options with the pre-verbatim behavior: every tool name goes through camelCase + Hash.
+    fn legacy_tool_name_options() -> ConverterOptions {
+        let mut options = ConverterOptions::default();
+        options.conversion.tool_name_verbatim_when_valid =
+            crate::anthropic::body_capabilities::BodyStageState::Disabled;
+        options
+    }
+
+    /// Client-side name for a Kiro tool name: verbatim names have no reverse-map entry.
+    fn original_tool_name<'a>(map: &'a HashMap<String, String>, upstream: &'a str) -> &'a str {
+        map.get(upstream).map(String::as_str).unwrap_or(upstream)
+    }
+
+    #[test]
+    fn kiro_safe_tool_names_are_sent_verbatim_for_five_rounds() {
+        for round in 0..5 {
+            let mut map = HashMap::new();
+            for name in [
+                "Read",
+                "Bash",
+                "WebFetch",
+                "mcp__a__b",
+                "read_file",
+                "foo-bar",
+                "Task",
+            ] {
+                assert_eq!(
+                    map_tool_name(name, &mut map, ConverterOptions::default()),
+                    name,
+                    "round {round}"
+                );
+            }
+            assert!(
+                map.is_empty(),
+                "round {round}: verbatim names need no reverse map"
+            );
+            for name in ["$WEB_SEARCH", "a.b", "工具", "1tool", &"x".repeat(64)] {
+                let mapped = map_tool_name(name, &mut map, ConverterOptions::default());
+                assert_ne!(mapped, name, "round {round}");
+                assert!(mapped.len() <= TOOL_NAME_MAX_LEN);
+                assert!(mapped.chars().all(|ch| ch.is_ascii_alphanumeric()));
+                assert_eq!(map.get(&mapped).map(String::as_str), Some(name));
+            }
+        }
+    }
+
+    #[test]
+    fn case_insensitive_verbatim_collision_falls_back_to_hash_mapping() {
+        let tools = Some(vec![test_tool("Read"), test_tool("read")]);
+        let mut reverse_map = HashMap::new();
+        let converted = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
+            .expect("case-only collisions must not be rejected");
+        let names = converted
+            .tools
+            .iter()
+            .map(|tool| tool.tool_specification.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names[0], "Read");
+        assert_ne!(names[1], "read");
+        assert_eq!(reverse_map.get(&names[1]).map(String::as_str), Some("read"));
+    }
+
     #[test]
     fn test_map_tool_name_sanitizes_separators_and_records_mapping() {
         let mut map = HashMap::new();
         let result = map_tool_name(
             "mcp__server-name__read_file",
             &mut map,
-            ConverterOptions::default(),
+            legacy_tool_name_options(),
         );
         assert!(result.len() <= TOOL_NAME_MAX_LEN);
         assert!(result.chars().all(|ch| ch.is_ascii_alphanumeric()));
@@ -1379,8 +1441,8 @@ mod tests {
     #[test]
     fn test_map_tool_name_avoids_collisions_after_sanitizing() {
         let mut map = HashMap::new();
-        let dash = map_tool_name("foo-bar", &mut map, ConverterOptions::default());
-        let underscore = map_tool_name("foo_bar", &mut map, ConverterOptions::default());
+        let dash = map_tool_name("foo-bar", &mut map, legacy_tool_name_options());
+        let underscore = map_tool_name("foo_bar", &mut map, legacy_tool_name_options());
         assert_ne!(dash, underscore);
         assert_eq!(map.get(&dash), Some(&"foo-bar".to_string()));
         assert_eq!(map.get(&underscore), Some(&"foo_bar".to_string()));
@@ -1404,36 +1466,58 @@ mod tests {
             "echo_value",
             "veryLongToolNameThatKeepsGrowingBeyondTheKiroSixtyThreeCharacterLimit",
         ] {
-            map_tool_name(name, &mut map, ConverterOptions::default());
+            map_tool_name(name, &mut map, legacy_tool_name_options());
         }
 
         let summary = summarize_tool_name_mapping(&map);
         assert_eq!(summary.total, 3);
         assert_eq!(summary.sanitized, 2);
         assert_eq!(summary.overlong, 1);
+
+        // Default behavior: only the overlong name needs a mapping.
+        let mut map = HashMap::new();
+        for name in [
+            "Bash",
+            "echo_value",
+            "veryLongToolNameThatKeepsGrowingBeyondTheKiroSixtyThreeCharacterLimit",
+        ] {
+            map_tool_name(name, &mut map, ConverterOptions::default());
+        }
+        let summary = summarize_tool_name_mapping(&map);
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.overlong, 1);
     }
 
     #[test]
     fn convert_tools_rejects_raw_name_that_collides_with_another_mapped_name_atomically() {
-        let invalid_name = "foo-bar";
+        let invalid_name = "foo.bar";
         let mapped_name = deterministic_mapped_tool_name(invalid_name);
 
-        for names in [
-            [invalid_name.to_string(), mapped_name.clone()],
-            [mapped_name.clone(), invalid_name.to_string()],
-        ] {
-            let tools = Some(names.into_iter().map(|name| test_tool(&name)).collect());
-            let mut reverse_map = HashMap::from([(
-                "existingMapped".to_string(),
-                "existing-original".to_string(),
-            )]);
-            let before = reverse_map.clone();
-            let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
-                .expect_err("raw-vs-mapped collision must be rejected");
+        // A verbatim raw name that collides with an earlier mapped name is itself re-mapped.
+        let tools = Some(vec![test_tool(invalid_name), test_tool(&mapped_name)]);
+        let mut reverse_map = HashMap::new();
+        let converted = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
+            .expect("later verbatim name falls back to a distinct hash name");
+        let names = converted
+            .tools
+            .iter()
+            .map(|tool| tool.tool_specification.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names[0], mapped_name);
+        assert_ne!(names[1], mapped_name);
+        assert_eq!(reverse_map.get(&names[1]), Some(&mapped_name));
 
-            assert!(error.to_string().contains("same Kiro tool name"));
-            assert_eq!(reverse_map, before, "reverse map commit must be atomic");
-        }
+        // A mapped name that collides with an earlier raw name has no safe alternative.
+        let tools = Some(vec![test_tool(&mapped_name), test_tool(invalid_name)]);
+        let mut reverse_map = HashMap::from([(
+            "existingMapped".to_string(),
+            "existing-original".to_string(),
+        )]);
+        let before = reverse_map.clone();
+        let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
+            .expect_err("raw-vs-mapped collision must be rejected");
+        assert!(error.to_string().contains("same Kiro tool name"));
+        assert_eq!(reverse_map, before, "reverse map commit must be atomic");
     }
 
     #[test]
@@ -1684,7 +1768,7 @@ mod tests {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
         use crate::kiro::model::requests::kiro::KiroRequest;
 
-        let original_name = "mcp__server-name__read_file";
+        let original_name = "mcp__server.name__read_file";
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert(
@@ -4027,8 +4111,8 @@ mod tests {
         assert_eq!(context.tools.len(), 1);
         let kiro_tool_name = &context.tools[0].tool_specification.name;
         assert_eq!(
-            result.tool_name_map.get(kiro_tool_name),
-            Some(&"read_file".to_string())
+            original_tool_name(&result.tool_name_map, kiro_tool_name),
+            "read_file"
         );
         assert!(
             result
@@ -4074,8 +4158,8 @@ mod tests {
                     assert_eq!(tools.len(), 1);
                     let upstream_name = &tools[0].tool_specification.name;
                     assert_eq!(
-                        result.tool_name_map.get(upstream_name).map(String::as_str),
-                        Some(requested)
+                        original_tool_name(&result.tool_name_map, upstream_name),
+                        requested
                     );
                 }
             }
@@ -4123,8 +4207,8 @@ mod tests {
         assert_eq!(tools.len(), 1);
         let upstream_name = &tools[0].tool_specification.name;
         assert_eq!(
-            result.tool_name_map.get(upstream_name).map(String::as_str),
-            Some("foo-bar")
+            original_tool_name(&result.tool_name_map, upstream_name),
+            "foo-bar"
         );
     }
 
@@ -4285,10 +4369,11 @@ mod tests {
             .user_input_message_context;
         assert_eq!(context.tools.len(), 1);
         assert_eq!(
-            result
-                .tool_name_map
-                .get(&context.tools[0].tool_specification.name),
-            Some(&"write_file".to_string())
+            original_tool_name(
+                &result.tool_name_map,
+                &context.tools[0].tool_specification.name
+            ),
+            "write_file"
         );
     }
 
@@ -4764,17 +4849,9 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
-        assert_ne!(tool_uses[0].name, "read_file");
-        assert!(
-            tool_uses[0]
-                .name
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric())
-        );
-        assert_eq!(
-            tool_name_map.get(&tool_uses[0].name),
-            Some(&"read_file".to_string())
-        );
+        // `read_file` already satisfies the Kiro tool-name rule, so it is sent verbatim.
+        assert_eq!(tool_uses[0].name, "read_file");
+        assert!(tool_name_map.is_empty());
     }
 
     #[test]
@@ -5234,8 +5311,8 @@ mod tests {
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
         assert_eq!(
-            tool_name_map.get(&tool_uses[0].name),
-            Some(&"read_file".to_string())
+            original_tool_name(&tool_name_map, &tool_uses[0].name),
+            "read_file"
         );
     }
 

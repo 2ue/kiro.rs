@@ -7090,7 +7090,7 @@ mod tests {
             .tool_name_map
             .iter()
             .find_map(|(mapped, original)| (original == "Bash").then(|| mapped.clone()))
-            .expect("mapped Bash name");
+            .unwrap_or_else(|| "Bash".to_string());
         let mut request = KiroRequest {
             conversation_state: converted.conversation_state,
             profile_arn: None,
@@ -7211,7 +7211,7 @@ mod tests {
                 .tool_name_map
                 .iter()
                 .find_map(|(mapped, original)| (original == "Bash").then(|| mapped.clone()))
-                .expect("mapped Bash name");
+                .unwrap_or_else(|| "Bash".to_string());
             (
                 KiroRequest {
                     conversation_state: converted.conversation_state,

@@ -117,6 +117,7 @@ impl PayloadGuardStagePlan {
 pub(crate) struct KiroConverterPlan {
     pub(crate) tool_schema_normalization: BodyStageState,
     pub(crate) tool_name_mapping: BodyStageState,
+    pub(crate) tool_name_verbatim_when_valid: BodyStageState,
     pub(crate) tool_schema_key_mapping: ToolSchemaKeyMappingMode,
     pub(crate) tool_schema_key_validation_regex: String,
     pub(crate) tool_choice_steering: BodyStageState,
@@ -132,6 +133,9 @@ impl KiroConverterPlan {
         Self {
             tool_schema_normalization: BodyStageState::from(config.tool_schema_normalization),
             tool_name_mapping: BodyStageState::from(config.tool_name_mapping),
+            tool_name_verbatim_when_valid: BodyStageState::from(
+                config.tool_name_verbatim_when_valid,
+            ),
             tool_schema_key_mapping: config.tool_schema_key_mapping,
             tool_schema_key_validation_regex: config.tool_schema_key_validation_regex,
             tool_choice_steering: BodyStageState::from(config.tool_choice_steering),

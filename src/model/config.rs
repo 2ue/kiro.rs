@@ -160,6 +160,11 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub tool_name_mapping: bool,
 
+    /// 工具名已满足 Kiro 约束（ASCII 字母开头，只含字母、数字、`_`、`-`，不超过 63 字符）时原样透传，
+    /// 只对非法或超长名称做映射。关闭时回到旧的 camelCase + Hash 全量改写。
+    #[serde(default = "default_true")]
+    pub tool_name_verbatim_when_valid: bool,
+
     /// 工具 input_schema property key 映射策略。
     ///
     /// `sanitize` 仅清洗不匹配 `tool_schema_key_validation_regex` 的 key，合法 key 原样保留且不建映射；
@@ -203,6 +208,7 @@ impl Default for BodyConversionConfig {
         Self {
             tool_schema_normalization: true,
             tool_name_mapping: true,
+            tool_name_verbatim_when_valid: true,
             tool_schema_key_mapping: ToolSchemaKeyMappingMode::Sanitize,
             tool_schema_key_validation_regex: default_tool_schema_key_validation_regex(),
             tool_choice_steering: true,
