@@ -861,6 +861,7 @@ struct RequestRuntimeConfig {
     prompt_steering: PromptSteeringConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
+    context_compact_signal: crate::model::config::ContextCompactSignalConfig,
     external_pools: ExternalPoolsConfig,
 }
 
@@ -908,6 +909,7 @@ impl RequestRuntimeConfig {
             prompt_steering: state.prompt_steering.clone().normalized(),
             missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
+            context_compact_signal: crate::model::config::ContextCompactSignalConfig::default(),
             external_pools: state.external_pools.clone(),
         }
     }
@@ -980,6 +982,7 @@ impl RequestRuntimeConfig {
             prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
+            context_compact_signal: config.context_compact_signal,
             external_pools: config.external_pools.clone(),
         }
     }
@@ -4071,6 +4074,17 @@ impl CredentialUsageContext {
         raw_usage: Option<super::cache::CacheUsage>,
         kiro_metering_usage: Option<f64>,
     ) {
+        if let (Some(conversation_id), Some(raw)) =
+            (self.request.conversation_id.as_deref(), raw_usage.as_ref())
+        {
+            // Real context size of this turn (raw upstream figures, not the reported usage).
+            super::context_compact_signal::observe(
+                conversation_id,
+                &self.request.request_id,
+                raw.total_input_tokens.saturating_add(raw.output_tokens),
+                self.request.context_window_tokens,
+            );
+        }
         self.record(
             UsageRecordStatus::Success,
             usage,
@@ -5275,6 +5289,24 @@ fn prompt_too_long_headers(
         headers.push(("x-error-id", error_id.to_string()));
     }
     headers
+}
+
+/// Claude Code protocol error that makes the client compact the conversation. Reported usage
+/// fields are not involved; the figures come from the real context Kiro reported last turn.
+fn context_compact_signal_response(
+    signal: super::context_compact_signal::CompactSignal,
+    request_id: &str,
+) -> Response {
+    envelope::error_response_with_id_and_headers(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        format!(
+            "prompt is too long: {} tokens > {} maximum",
+            signal.observed_context_tokens, signal.signal_threshold_tokens
+        ),
+        request_id,
+        vec![("x-kiro-too-long-kind", "context_compact_signal".to_string())],
+    )
 }
 
 fn map_provider_error_with_admission_feedback(
@@ -6806,6 +6838,33 @@ async fn post_messages_inner(
     let capacity_weight_units =
         capacity_weight_units_for_local_request(provider.as_ref(), input_tokens);
     usage_context.set_capacity_weight_units(capacity_weight_units);
+
+    if runtime_config.context_compact_signal.enabled {
+        if super::context_compact_signal::is_compaction_request(&payload) {
+            super::context_compact_signal::mark_compaction_request(&usage_context.request_id);
+        } else if let Some(signal) = super::context_compact_signal::pending_signal(
+            &conversation_id,
+            &payload,
+            usage_context.context_window_tokens,
+            runtime_config.context_compact_signal.trigger_ratio,
+        ) {
+            let response = context_compact_signal_response(signal, &usage_context.request_id);
+            record_pre_usage_rejection_with_metadata_for_request(
+                attribution.as_ref(),
+                RequestRejectionReason::ContextCompactSignal,
+                &endpoint,
+                &response,
+                Some(serde_json::json!({
+                    "observedContextTokens": signal.observed_context_tokens,
+                    "signalThresholdTokens": signal.signal_threshold_tokens,
+                    "contextWindowTokens": usage_context.context_window_tokens,
+                })),
+                &payload,
+                Some(&model_resolution),
+            );
+            return response;
+        }
+    }
 
     if payload.stream {
         let claude_code_noop_delta_keepalive =

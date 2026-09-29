@@ -36,6 +36,7 @@
 pub(crate) mod body_capabilities;
 pub(crate) mod body_processing;
 pub(crate) mod cache;
+pub(crate) mod context_compact_signal;
 pub(crate) mod converter;
 pub(crate) mod envelope;
 pub(crate) mod files;

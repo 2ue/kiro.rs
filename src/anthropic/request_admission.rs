@@ -143,10 +143,12 @@ pub(crate) enum RequestRejectionReason {
     LocalPoolUnavailable,
     LocalPoolTemporaryUnavailable,
     AdmissionLocalTemporaryBackoff,
+    /// Protocol `prompt is too long` signal that asks Claude Code to compact the conversation.
+    ContextCompactSignal,
 }
 
 impl RequestRejectionReason {
-    const COUNT: usize = Self::AdmissionLocalTemporaryBackoff as usize + 1;
+    const COUNT: usize = Self::ContextCompactSignal as usize + 1;
 
     const fn index(self) -> usize {
         self as usize
@@ -173,6 +175,7 @@ impl RequestRejectionReason {
             Self::LocalPoolUnavailable => "local_pool_unavailable",
             Self::LocalPoolTemporaryUnavailable => "local_pool_temporary_unavailable",
             Self::AdmissionLocalTemporaryBackoff => "admission_local_temporary_backoff",
+            Self::ContextCompactSignal => "context_compact_signal",
         }
     }
 }
@@ -2234,6 +2237,7 @@ mod tests {
             RequestRejectionReason::LocalPoolUnavailable,
             RequestRejectionReason::LocalPoolTemporaryUnavailable,
             RequestRejectionReason::AdmissionLocalTemporaryBackoff,
+            RequestRejectionReason::ContextCompactSignal,
         ];
 
         for (expected_index, reason) in ALL_REASONS.iter().copied().enumerate() {
