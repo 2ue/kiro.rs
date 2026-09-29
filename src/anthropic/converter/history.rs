@@ -271,7 +271,11 @@ fn convert_assistant_message_with_known_tools(
     options: ConverterOptions,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
-    let mut native_reasoning_content = None;
+    // Kiro accepts one reasoningContent union value per assistant history item, while the
+    // Claude Code protocol allows several thinking/redacted_thinking blocks (for example
+    // interleaved thinking between tool calls). Collect every Kiro-native block with the number
+    // of tool_use blocks seen before it, then keep exactly one below.
+    let mut native_candidates: Vec<(ReasoningContent, usize)> = Vec::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
     let mut sanitizer = (options.compat_profile != CompatProfile::AnthropicStrict)
@@ -298,10 +302,8 @@ fn convert_assistant_message_with_known_tools(
                                     .to_string(),
                             )
                         })?;
-                    set_native_reasoning_content(
-                        &mut native_reasoning_content,
-                        ReasoningContent::redacted_content(data),
-                    )?;
+                    native_candidates
+                        .push((ReasoningContent::redacted_content(data), tool_uses.len()));
                     continue;
                 }
                 if let Some(rendered) = render_server_tool_block(item) {
@@ -324,10 +326,10 @@ fn convert_assistant_message_with_known_tools(
                             if let Some(signature) =
                                 block.signature.filter(|signature| !signature.is_empty())
                             {
-                                set_native_reasoning_content(
-                                    &mut native_reasoning_content,
+                                native_candidates.push((
                                     ReasoningContent::reasoning_text(thinking, signature),
-                                )?;
+                                    tool_uses.len(),
+                                ));
                             } else {
                                 thinking_content.push_str(&thinking);
                             }
@@ -338,10 +340,8 @@ fn convert_assistant_message_with_known_tools(
                                     "assistant redacted_thinking block is missing data".to_string(),
                                 )
                             })?;
-                            set_native_reasoning_content(
-                                &mut native_reasoning_content,
-                                ReasoningContent::redacted_content(data),
-                            )?;
+                            native_candidates
+                                .push((ReasoningContent::redacted_content(data), tool_uses.len()));
                         }
                         "text" => {
                             if let Some(text) = block.text {
@@ -399,11 +399,15 @@ fn convert_assistant_message_with_known_tools(
         }
     }
 
+    let native_reasoning_content = select_native_reasoning(native_candidates, tool_uses.len());
     if native_reasoning_content.is_some() && !thinking_content.is_empty() {
-        return Err(ConversionError::UnsupportedContent(
-            "assistant history mixes native signed/redacted reasoning with unsigned thinking and cannot be represented losslessly"
-                .to_string(),
-        ));
+        // Unsigned thinking cannot be replayed as Kiro-native reasoning next to a signed block,
+        // and prior-turn thinking may be omitted under the Claude Code protocol.
+        tracing::warn!(
+            dropped_unsigned_thinking_chars = thinking_content.chars().count(),
+            "dropped unsigned thinking next to Kiro-native reasoning in assistant history"
+        );
+        thinking_content.clear();
     }
 
     // 组合 unsigned thinking 和 text 内容
@@ -435,6 +439,32 @@ fn convert_assistant_message_with_known_tools(
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
+}
+
+/// Picks the single reasoning value Kiro can carry for one assistant history item: the last
+/// native block that precedes the final tool_use (the reasoning behind the tool calls being
+/// continued), or the last native block when none precedes a tool_use. Signatures are Kiro-native
+/// and passed through unchanged; the other blocks are omitted, never merged or rewritten.
+fn select_native_reasoning(
+    candidates: Vec<(ReasoningContent, usize)>,
+    total_tool_uses: usize,
+) -> Option<ReasoningContent> {
+    let candidate_count = candidates.len();
+    let selected_index = candidates
+        .iter()
+        .rposition(|(_, tools_before)| *tools_before < total_tool_uses)
+        .or_else(|| candidate_count.checked_sub(1))?;
+    if candidate_count > 1 {
+        tracing::warn!(
+            native_reasoning_blocks = candidate_count,
+            selected_index,
+            "assistant history carried several Kiro-native reasoning blocks; kept one"
+        );
+    }
+    candidates
+        .into_iter()
+        .nth(selected_index)
+        .map(|(reasoning, _)| reasoning)
 }
 
 fn set_native_reasoning_content(

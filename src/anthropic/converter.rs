@@ -5798,37 +5798,64 @@ mod tests {
     }
 
     #[test]
-    fn multiple_or_mixed_native_reasoning_blocks_are_rejected_for_five_rounds() {
+    fn multiple_or_mixed_native_reasoning_blocks_keep_one_kiro_native_value_for_five_rounds() {
+        use crate::kiro::model::requests::conversation::ReasoningContent;
         for round in 0..5 {
             let redacted = BASE64_STANDARD.encode(format!("opaque-{round}"));
-            for content in [
-                serde_json::json!([
-                    {"type": "thinking", "thinking": "first", "signature": "sig-1"},
-                    {"type": "thinking", "thinking": "second", "signature": "sig-2"}
-                ]),
-                serde_json::json!([
-                    {"type": "thinking", "thinking": "first", "signature": "sig-1"},
-                    {"type": "redacted_thinking", "data": redacted}
-                ]),
-                serde_json::json!([
-                    {"type": "thinking", "thinking": "signed", "signature": "sig-1"},
-                    {"type": "thinking", "thinking": "unsigned"}
-                ]),
-            ] {
+            let cases = [
+                // No tool_use: keep the last native block.
+                (
+                    serde_json::json!([
+                        {"type": "thinking", "thinking": "first", "signature": "sig-1"},
+                        {"type": "thinking", "thinking": "second", "signature": "sig-2"}
+                    ]),
+                    ReasoningContent::reasoning_text("second".to_string(), "sig-2".to_string()),
+                ),
+                (
+                    serde_json::json!([
+                        {"type": "thinking", "thinking": "first", "signature": "sig-1"},
+                        {"type": "redacted_thinking", "data": redacted}
+                    ]),
+                    ReasoningContent::redacted_content(redacted.clone()),
+                ),
+                // Mixed with unsigned thinking: the unsigned text is dropped.
+                (
+                    serde_json::json!([
+                        {"type": "thinking", "thinking": "signed", "signature": "sig-1"},
+                        {"type": "thinking", "thinking": "unsigned"}
+                    ]),
+                    ReasoningContent::reasoning_text("signed".to_string(), "sig-1".to_string()),
+                ),
+                // Interleaved with tool calls: keep the block before the final tool_use.
+                (
+                    serde_json::json!([
+                        {"type": "thinking", "thinking": "plan", "signature": "sig-a"},
+                        {"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {}},
+                        {"type": "thinking", "thinking": "second plan", "signature": "sig-b"},
+                        {"type": "tool_use", "id": "toolu_b", "name": "Bash", "input": {}},
+                        {"type": "thinking", "thinking": "trailing", "signature": "sig-c"}
+                    ]),
+                    ReasoningContent::reasoning_text(
+                        "second plan".to_string(),
+                        "sig-b".to_string(),
+                    ),
+                ),
+            ];
+            for (content, expected) in cases {
                 let message = super::super::types::Message {
                     role: "assistant".to_string(),
                     content,
                 };
-                let error = convert_assistant_message(
+                let converted = convert_assistant_message(
                     &message,
                     &mut HashMap::new(),
                     ConverterOptions::default(),
                 )
-                .expect_err("multiple native reasoning blocks must fail");
-                assert!(
-                    error.to_string().contains("native") && error.to_string().contains("reasoning"),
-                    "round {round}: {error}"
-                );
+                .expect("several native reasoning blocks must convert");
+                let assistant = converted.assistant_response_message;
+                assert_eq!(assistant.reasoning_content, Some(expected), "round {round}");
+                assert!(!assistant.content.contains("unsigned"), "round {round}");
+                assert!(!assistant.content.contains("<thinking>"), "round {round}");
             }
         }
     }
