@@ -331,6 +331,9 @@ pub struct MessagesRequest {
     /// Claude Code 请求中的 metadata，包含 session 信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
+    /// 自定义停止序列。Kiro 无对应参数，由代理在输出侧检测并截断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式

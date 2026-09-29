@@ -2847,6 +2847,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(

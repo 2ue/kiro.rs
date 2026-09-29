@@ -189,6 +189,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         }
     }
 

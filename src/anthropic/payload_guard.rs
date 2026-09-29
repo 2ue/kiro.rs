@@ -5189,6 +5189,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         }
     }
 
@@ -7084,6 +7085,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
         let converted = crate::anthropic::converter::convert_request(&anthropic).expect("convert");
         let mapped_bash = converted
@@ -7204,6 +7206,7 @@ mod tests {
                 tool_choice: None,
                 output_config: None,
                 metadata: None,
+                stop_sequences: None,
             };
             let converted =
                 crate::anthropic::converter::convert_request(&anthropic).expect("convert cycles");

@@ -53,6 +53,7 @@ pub(crate) mod request_admission;
 pub(crate) mod request_body;
 pub(crate) mod request_facts;
 mod router;
+mod stop_sequence;
 mod stream;
 pub(crate) mod tool_format_debug;
 pub(crate) mod tool_schema_keys;

@@ -1708,6 +1708,8 @@ pub struct StreamContext {
     repeat_guard_tripped: bool,
     /// 响应侧工具调用约束（tool_choice=none 等 Kiro 无法表达的语义）。
     response_tool_gate: ResponseToolGate,
+    /// 请求声明了 stop_sequences 时的输出侧截断过滤器。
+    stop_sequence_filter: Option<super::stop_sequence::StopSequenceFilter>,
 }
 
 impl StreamContext {
@@ -1885,6 +1887,7 @@ impl StreamContext {
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
             response_tool_gate: ResponseToolGate::default(),
+            stop_sequence_filter: None,
         }
     }
 
@@ -1896,7 +1899,28 @@ impl StreamContext {
         &self.response_tool_gate
     }
 
+    /// 设置请求的 stop_sequences；为空时不启用过滤。
+    pub fn set_stop_sequences(&mut self, sequences: Vec<String>) {
+        self.stop_sequence_filter = super::stop_sequence::StopSequenceFilter::new(sequences);
+    }
+
+    fn stop_sequence_matched(&self) -> bool {
+        self.stop_sequence_filter
+            .as_ref()
+            .is_some_and(|filter| filter.matched().is_some())
+    }
+
+    fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        match self.stop_sequence_filter.as_mut() {
+            Some(filter) => filter.apply(events),
+            None => events,
+        }
+    }
+
     pub fn downstream_stop_reason(&self) -> String {
+        if self.stop_sequence_matched() {
+            return super::stop_sequence::STOP_SEQUENCE_STOP_REASON.to_string();
+        }
         self.state_manager.get_stop_reason()
     }
 
@@ -2427,11 +2451,16 @@ impl StreamContext {
         // 预开的空 text 块在纯 tool_use 响应中会原样写进 Claude Code 会话历史；
         // thinking 模式下也要保证 thinking 块（索引 0）位于文本块之前。
         // message_start 之后、首个内容块之前的保活退化为 ping 事件。
-        events
+        self.apply_output_filters(events)
     }
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        let events = self.process_kiro_event_unfiltered(event);
+        self.apply_output_filters(events)
+    }
+
+    fn process_kiro_event_unfiltered(&mut self, event: &Event) -> Vec<SseEvent> {
         self.record_upstream_event(event);
         match event {
             Event::AssistantResponse(resp) => {
@@ -3376,6 +3405,10 @@ impl StreamContext {
     }
 
     pub fn claude_code_noop_delta_keepalive_event(&self) -> Option<SseEvent> {
+        // stop sequence 命中后，仍打开的块可能从未下发给客户端，改用 ping 保活。
+        if self.stop_sequence_matched() {
+            return None;
+        }
         let (index, block_type) = self.state_manager.active_open_block_for_keepalive()?;
         let delta = match block_type.as_str() {
             "text" => json!({
@@ -3411,7 +3444,7 @@ impl StreamContext {
     /// 创建一个保活用的文本块事件（仅在没有活跃块时使用）
     /// 发送一个空的 text delta 作为保活信号
     pub fn create_keepalive_text_block_event(&self) -> Option<SseEvent> {
-        if !self.state_manager.message_started {
+        if !self.state_manager.message_started || self.stop_sequence_matched() {
             return None;
         }
 
@@ -3860,6 +3893,20 @@ impl StreamContext {
             i32,
         ) -> super::cache::CacheUsage,
     {
+        let events = self.generate_final_events_unfiltered(usage_mapper);
+        self.apply_output_filters(events)
+    }
+
+    fn generate_final_events_unfiltered<F>(&mut self, usage_mapper: F) -> Vec<SseEvent>
+    where
+        F: FnOnce(
+            super::cache::CacheUsage,
+            super::cache::CacheUsage,
+            Option<&MetadataTokenUsage>,
+            bool,
+            i32,
+        ) -> super::cache::CacheUsage,
+    {
         let mut events = Vec::new();
 
         events.extend(self.flush_pending_trivial_text());
@@ -4099,6 +4146,45 @@ mod tests {
             .find(|event| event.event == "message_delta")
             .expect("message_delta");
         assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn stop_sequences_truncate_streamed_text_across_chunks() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+        ctx.set_stop_sequences(vec!["###".to_string()]);
+        let mut events = ctx.generate_initial_events();
+        for chunk in ["alpha #", "## beta", " gamma"] {
+            events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+                assistant_response_event(chunk, None),
+            )));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let text: String = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "text_delta")
+            .filter_map(|event| event.data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(text.trim_end(), "alpha");
+        assert!(!text.contains("beta"));
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "stop_sequence");
+        assert_eq!(message_delta.data["delta"]["stop_sequence"], "###");
+        assert_eq!(ctx.downstream_stop_reason(), "stop_sequence");
+        assert!(ctx.claude_code_noop_delta_keepalive_event().is_none());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == "content_block_start")
+                .count(),
+            events
+                .iter()
+                .filter(|event| event.event == "content_block_stop")
+                .count()
+        );
     }
 
     #[test]

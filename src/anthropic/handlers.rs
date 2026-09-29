@@ -259,6 +259,8 @@ struct RequestUsageContext {
     model_resolution_source: Option<String>,
     model_resolution_note: Option<String>,
     requested_max_tokens: i32,
+    /// 规范化后的 stop_sequences，由代理在输出侧实现。
+    stop_sequences: Vec<String>,
     downstream_stop_reason: Arc<Mutex<Option<String>>>,
     conversation_id: Option<String>,
     request_api_key_id: Option<String>,
@@ -4935,6 +4937,9 @@ fn prepare_usage_context_with_inference_attempt_budget(
             .as_ref()
             .and_then(|resolution| resolution.note.clone()),
         requested_max_tokens: payload.max_tokens.max(0),
+        stop_sequences: super::stop_sequence::normalize_stop_sequences(
+            payload.stop_sequences.as_deref(),
+        ),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id,
         request_api_key_id,
@@ -7586,6 +7591,7 @@ impl StreamContextTemplate {
             credential_usage.request.simulation_mode,
         );
         ctx.set_response_tool_policy(&self.response_tool_policy);
+        ctx.set_stop_sequences(credential_usage.request.stop_sequences.clone());
         ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
         ctx.set_local_prompt_cache_projection_enabled(
             credential_usage.request.uses_local_prompt_cache_strategy(),
@@ -11395,6 +11401,17 @@ async fn handle_non_stream_request(
         .request
         .mark_response_tool_gate(&response_tool_gate);
 
+    let matched_stop_sequence = super::stop_sequence::truncate_content_at_stop_sequence(
+        &mut content,
+        &credential_usage.request.stop_sequences,
+    );
+    if matched_stop_sequence.is_some() {
+        tracing::debug!(
+            stop_sequence = ?matched_stop_sequence,
+            "stop sequence matched in non-streaming response; truncating output"
+        );
+    }
+
     // 估算输出 tokens
     let estimated_content_output_tokens = if content.is_empty() {
         0
@@ -11408,6 +11425,9 @@ async fn handle_non_stream_request(
         .unwrap_or(estimated_content_output_tokens);
     // 与流式一致：内容完整时不按 token 数推断 max_tokens（Kiro 上游不按 max_tokens 截断），
     // 避免 Claude Code 误判截断后自动续写。
+    if matched_stop_sequence.is_some() {
+        stop_reason = super::stop_sequence::STOP_SEQUENCE_STOP_REASON.to_string();
+    }
     credential_usage
         .request
         .set_downstream_stop_reason(stop_reason.clone());
@@ -11474,7 +11494,7 @@ async fn handle_non_stream_request(
         "content": content,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": null,
+        "stop_sequence": matched_stop_sequence,
         "usage": usage_json
     });
 

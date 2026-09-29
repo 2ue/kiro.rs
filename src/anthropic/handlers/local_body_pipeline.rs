@@ -453,6 +453,7 @@ mod tests {
                 effort: Some(effort.to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         }
     }
 

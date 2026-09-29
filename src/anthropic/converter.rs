@@ -1012,6 +1012,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
     }
@@ -1684,6 +1685,7 @@ mod tests {
                 thinking,
                 output_config,
                 metadata: None,
+                stop_sequences: None,
             };
             let mut options = ConverterOptions {
                 native_reasoning_capability: KiroReasoningCapabilityState::Unknown,
@@ -1774,6 +1776,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -1850,6 +1853,7 @@ mod tests {
             tool_choice: Some(serde_json::json!({"type": "tool", "name": original_name})),
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).expect("convert request");
@@ -1921,6 +1925,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         }
     }
 
@@ -2106,6 +2111,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2153,6 +2159,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2213,6 +2220,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2270,6 +2278,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2328,6 +2337,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2435,6 +2445,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2467,6 +2478,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2518,6 +2530,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2618,6 +2631,7 @@ mod tests {
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
                 ),
             }),
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2648,6 +2662,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let second_req = MessagesRequest {
@@ -2677,6 +2692,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let first_result = convert_request(&first_req).unwrap();
@@ -2710,6 +2726,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let first_result = convert_request_with_options(
@@ -2763,6 +2780,7 @@ mod tests {
             }),
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request_with_options(
@@ -2841,6 +2859,7 @@ mod tests {
                     }),
                     output_config: None,
                     metadata: None,
+                    stop_sequences: None,
                 };
                 let resolution = ModelResolution::resolved(
                     requested.to_string(),
@@ -2911,6 +2930,7 @@ mod tests {
             }),
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
         let resolution = ModelResolution::resolved(
             "claude-sonnet-4-6-thinking".to_string(),
@@ -2982,6 +3002,7 @@ mod tests {
                 effort: Some("high".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let adaptive_resolution = ModelResolution::resolved(
             "claude-sonnet-4-6".to_string(),
@@ -3038,6 +3059,7 @@ mod tests {
                 effort: Some("xhigh".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request_with_options(&req, ConverterOptions::default())
@@ -3088,6 +3110,7 @@ mod tests {
                 effort: Some("xhigh".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
 
         let error = convert_request_with_options(&req, ConverterOptions::default())
@@ -3120,6 +3143,7 @@ mod tests {
                 effort: Some("high".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
 
         for round in 0..5 {
@@ -3210,6 +3234,7 @@ mod tests {
                     }),
                     output_config: None,
                     metadata: None,
+                    stop_sequences: None,
                 };
                 let fields = convert_request_with_options(&req, ConverterOptions::default())
                     .unwrap_or_else(|error| panic!("round {round}: {model}: {error}"))
@@ -3239,6 +3264,7 @@ mod tests {
                 }),
                 output_config: None,
                 metadata: None,
+                stop_sequences: None,
             };
             let fields = convert_request_with_options(
                 &req,
@@ -3288,6 +3314,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3342,6 +3369,7 @@ mod tests {
                 effort: Some("high".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3396,6 +3424,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3450,6 +3479,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             force_visible_thinking: true,
@@ -3503,6 +3533,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3545,6 +3576,7 @@ mod tests {
             thinking: None,
             output_config: Some(OutputConfig::default()),
             metadata: None,
+            stop_sequences: None,
         };
         let mut options = ConverterOptions::default();
         options.conversion.native_reasoning_fields = BodyStageState::Disabled;
@@ -3593,6 +3625,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3653,6 +3686,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3704,6 +3738,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig::default()),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3758,6 +3793,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3812,6 +3848,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let options = ConverterOptions {
             native_reasoning_capability: KiroReasoningCapabilityState::Supported(
@@ -3855,6 +3892,7 @@ mod tests {
             }),
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let fields = convert_request_with_options(&req, ConverterOptions::default())
@@ -3894,6 +3932,7 @@ mod tests {
                 effort: Some("xhigh".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let mut options = ConverterOptions::default();
         options.conversion.native_reasoning_fields = BodyStageState::Disabled;
@@ -3935,6 +3974,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let mut options = ConverterOptions::default();
         options.conversion.native_reasoning_fields = BodyStageState::Disabled;
@@ -3982,6 +4022,7 @@ mod tests {
                 effort: Some("max".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
         let mut options = ConverterOptions::default();
         options.conversion.native_reasoning_fields = BodyStageState::Disabled;
@@ -4022,6 +4063,7 @@ mod tests {
                 effort: Some("high".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
 
         let mut options = ConverterOptions {
@@ -4076,6 +4118,7 @@ mod tests {
                 effort: Some("high".to_string()),
             }),
             metadata: None,
+            stop_sequences: None,
         };
 
         let mut options = ConverterOptions {
@@ -4126,6 +4169,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request_with_options(
@@ -4179,6 +4223,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         }
     }
 
@@ -4246,6 +4291,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         }
     }
 
@@ -6446,6 +6492,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req);
@@ -6514,6 +6561,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let result = convert_request(&req).expect("tool-result image should convert");

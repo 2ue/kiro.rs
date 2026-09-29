@@ -1440,6 +1440,7 @@ mod tests {
                     "user_test_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string(),
                 ),
             }),
+            stop_sequences: None,
         }
     }
 
@@ -1923,6 +1924,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let first_req = make_req("time=1000");
@@ -1972,6 +1974,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let plan = tracker.compute_kiro_rs_tool_with_bounds(
@@ -2249,6 +2252,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            stop_sequences: None,
         };
 
         let default_plan = tracker.compute_kiro_rs_tool_with_bounds(

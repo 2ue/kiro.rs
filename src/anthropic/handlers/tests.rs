@@ -3530,6 +3530,7 @@ fn messages_request_for_model(model: &str) -> MessagesRequest {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     }
 }
 
@@ -8153,6 +8154,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-limit".to_string()),
         request_api_key_id: None,
@@ -8261,6 +8263,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-dfcache-tool".to_string()),
         request_api_key_id: None,
@@ -8347,6 +8350,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-upstream-raw-limit".to_string()),
         request_api_key_id: None,
@@ -8438,6 +8442,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-prod-like".to_string()),
         request_api_key_id: None,
@@ -8564,6 +8569,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("context-estimate-session".to_string()),
         request_api_key_id: None,
@@ -8640,6 +8646,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-kiro-strategy".to_string()),
         request_api_key_id: None,
@@ -8780,6 +8787,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-latency".to_string()),
         request_api_key_id: None,
@@ -9112,6 +9120,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-policy".to_string()),
         request_api_key_id: None,
@@ -9279,6 +9288,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-creation-policy".to_string()),
         request_api_key_id: None,
@@ -9381,6 +9391,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-error".to_string()),
         request_api_key_id: None,
@@ -9463,6 +9474,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-large-failure".to_string()),
         request_api_key_id: None,
@@ -10066,6 +10078,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
     let profile = prompt_cache.build_profile(&payload, 4096);
     let usage_context = RequestUsageContext {
@@ -10083,6 +10096,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-a".to_string()),
         request_api_key_id: None,
@@ -10159,6 +10173,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
     let profile = prompt_cache.build_high_cache_profile(&payload, 4096);
     let usage_context = RequestUsageContext {
@@ -10176,6 +10191,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         model_resolution_source: None,
         model_resolution_note: None,
         requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-high-cache".to_string()),
         request_api_key_id: None,
@@ -10290,6 +10306,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
     let first_conversation_id =
         extract_stable_conversation_id(&first_payload).expect("fallback id");
@@ -10352,6 +10369,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
     let second_conversation_id =
         extract_stable_conversation_id(&second_payload).expect("fallback id");
@@ -10428,6 +10446,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         metadata: Some(Metadata {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
+        stop_sequences: None,
     };
     let cache_route =
         RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
@@ -10567,6 +10586,7 @@ fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
         metadata: Some(Metadata {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
+        stop_sequences: None,
     };
 
     let first_context = prepare_usage_context(
@@ -10665,6 +10685,7 @@ fn disabled_prompt_cache_does_not_simulate_without_stable_conversation_id() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
     let (simulation, source) =
         build_simulated_usage(PromptCacheSimulationMode::Disabled, None, None);
@@ -10730,6 +10751,7 @@ fn builtin_na_path_does_not_build_local_profile_or_reporting_policy() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
 
     let context = prepare_usage_context(
@@ -10816,6 +10838,7 @@ fn no_cache_route_does_not_build_cache_profile_plan_or_shape_reporting() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
 
     let cache_route =
@@ -10929,6 +10952,7 @@ fn no_cache_disabled_reported_usage_preserves_upstream_metadata_usage() {
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
 
     let context = prepare_usage_context(
@@ -11016,6 +11040,7 @@ fn no_cache_canonical_record_keeps_upstream_raw_when_default_reporting_exists() 
         thinking: None,
         output_config: None,
         metadata: None,
+        stop_sequences: None,
     };
 
     let context = prepare_usage_context(
