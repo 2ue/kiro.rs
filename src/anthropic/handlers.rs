@@ -1201,18 +1201,24 @@ enum PayloadTooLongRetryBase {
     ThinkingSignatureRetryWithoutHistoryReasoning,
 }
 
-/// Opening sentence of Claude Code's compaction prompt (`/compact` and auto-compaction).
-const CLAUDE_CODE_COMPACTION_MARKER: &str = "create a detailed summary of the conversation";
+/// Opening sentences of Claude Code's compaction prompts: the full summary (`/compact` and
+/// auto-compaction) says "of the conversation", the partial summary that keeps the recent
+/// messages says "of this conversation" (Claude Code 2.1.283).
+const CLAUDE_CODE_COMPACTION_MARKERS: &[&str] = &[
+    "create a detailed summary of the conversation",
+    "create a detailed summary of this conversation",
+];
 
 /// Whether the request is Claude Code's own conversation-compaction request.
 fn is_claude_code_compaction_request(payload: &MessagesRequest) -> bool {
     payload.messages.last().is_some_and(|message| {
-        message.role == "user"
-            && message
-                .content
-                .to_string()
-                .to_ascii_lowercase()
-                .contains(CLAUDE_CODE_COMPACTION_MARKER)
+        if message.role != "user" {
+            return false;
+        }
+        let content = message.content.to_string().to_ascii_lowercase();
+        CLAUDE_CODE_COMPACTION_MARKERS
+            .iter()
+            .any(|marker| content.contains(marker))
     })
 }
 

@@ -4533,6 +4533,17 @@ fn claude_code_compaction_request_is_detected() {
     }))
     .unwrap();
     assert!(is_claude_code_compaction_request(&compaction));
+    let partial_compaction: MessagesRequest = serde_json::from_value(json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": [{"type": "text", "text": "Your task is to create a detailed summary of this conversation. This summary will be placed at the start of a continuing session."}]}
+        ]
+    }))
+    .unwrap();
+    assert!(is_claude_code_compaction_request(&partial_compaction));
     let normal: MessagesRequest = serde_json::from_value(json!({
         "model": "claude-sonnet-4-5",
         "max_tokens": 32,
