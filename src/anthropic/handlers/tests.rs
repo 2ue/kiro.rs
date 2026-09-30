@@ -5235,6 +5235,56 @@ fn hold_window_starts_keepalive_then_first_output_timeout_frees_upstream() {
     );
 }
 
+async fn run_non_stream_first_output_timeout_retries_then_fails_fast() {
+    for round in 1..=3 {
+        // Two credentials: the silent attempt is abandoned and retried transparently.
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NoContentHeartbeats)
+                .await;
+        let (app, usage_recorder) = first_output_router(&upstream.base_url, 2, 10, 1);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert!(body.contains("recovered-ok"), "round={round} body={body}");
+        assert_eq!(upstream.hits(), 2, "round={round}");
+        assert_eq!(
+            usage_record_for_request(&usage_recorder, &request_id).status,
+            UsageRecordStatus::Success
+        );
+
+        // One credential: the request ends at the limit with a retryable overloaded error.
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NoContentHeartbeats)
+                .await;
+        let (app, usage_recorder) = first_output_router(&upstream.base_url, 1, 10, 2);
+        let started = std::time::Instant::now();
+        let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+        assert_eq!(status.as_u16(), 529, "round={round} body={body}");
+        assert!(
+            body.contains("overloaded_error"),
+            "round={round} body={body}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "round={round}: took {:?}",
+            started.elapsed()
+        );
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::UpstreamTimeout);
+        assert_eq!(
+            record.latency_trace.and_then(|trace| trace.terminal_reason),
+            Some(StreamTerminalReason::FirstOutputTimeout)
+        );
+    }
+}
+
+#[test]
+fn non_stream_first_output_timeout_retries_then_fails_fast() {
+    run_handler_fixture_on_four_mib_thread(
+        "non-stream-first-output-fixture",
+        run_non_stream_first_output_timeout_retries_then_fails_fast,
+    );
+}
+
 #[test]
 fn handler_eventstream_postcommit_faults_never_retry_or_fake_success_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread(

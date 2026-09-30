@@ -101,7 +101,6 @@ use crate::external_pool::{
     ExternalPoolRequestBodyMode, ExternalRouteRequest, ExternalRouteRequestPreparationCache,
     record_external_pool_wire_debug_handler_ingress,
 };
-use crate::http_client::response_bytes_with_limit_and_body_timeout;
 use crate::kiro::call_trace::{
     AccountRejectReason, KiroCallFailureKind, KiroCredentialAttempt, McpCallAttributionSink,
     SelectionFailureStage,
@@ -165,7 +164,7 @@ impl LocalStreamRetryConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamRetryReason {
     IdleTimeout,
     FirstOutputTimeout,
@@ -8619,6 +8618,116 @@ fn normalize_stream_keepalive_interval_secs(secs: u64) -> u64 {
     )
 }
 
+enum NonStreamBodyError {
+    FirstOutputTimeout { timeout_secs: u64 },
+    Http(crate::http_client::HttpSendError),
+}
+
+impl std::fmt::Display for NonStreamBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FirstOutputTimeout { timeout_secs } => {
+                write!(
+                    f,
+                    "upstream produced no output within {timeout_secs} seconds"
+                )
+            }
+            Self::Http(error) => error.fmt(f),
+        }
+    }
+}
+
+/// EventStream event types that carry model output.
+const NON_STREAM_CONTENT_EVENT_MARKERS: [&[u8]; 3] = [
+    b"assistantResponseEvent",
+    b"toolUseEvent",
+    b"reasoningContentEvent",
+];
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Reads a non-streaming EventStream body like `response_bytes_with_limit_and_body_timeout`,
+/// and additionally gives up when no content event arrives within `first_output_timeout_secs`
+/// (`0` disables it), so a silent upstream does not hold the connection and credential slot
+/// for the whole body timeout.
+async fn read_non_stream_body_with_first_output_deadline(
+    response: reqwest::Response,
+    body_timeout_secs: u64,
+    max_bytes: usize,
+    first_output_timeout_secs: u64,
+) -> Result<Bytes, NonStreamBodyError> {
+    if first_output_timeout_secs == 0 {
+        return crate::http_client::response_bytes_with_limit_and_body_timeout(
+            response,
+            body_timeout_secs,
+            max_bytes,
+        )
+        .await
+        .map_err(NonStreamBodyError::Http);
+    }
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_bytes as u64)
+    {
+        return Err(NonStreamBodyError::Http(
+            crate::http_client::HttpSendError::ResponseBodyTooLarge { max_bytes },
+        ));
+    }
+    let started = Instant::now();
+    let body_deadline =
+        (body_timeout_secs > 0).then(|| started + Duration::from_secs(body_timeout_secs));
+    let first_output_deadline = started + Duration::from_secs(first_output_timeout_secs);
+    let mut stream = response.bytes_stream();
+    let mut body = bytes::BytesMut::with_capacity(max_bytes.min(16 * 1024));
+    let mut saw_content = false;
+    loop {
+        let deadline = match (saw_content, body_deadline) {
+            (false, Some(body)) => body.min(first_output_deadline),
+            (false, None) => first_output_deadline,
+            (true, Some(body)) => body,
+            (true, None) => started + Duration::from_secs(u32::MAX as u64),
+        };
+        let next = tokio::select! {
+            chunk = stream.next() => chunk,
+            _ = sleep_until(deadline) => {
+                return Err(if saw_content || body_deadline.is_some_and(|body| body <= first_output_deadline) {
+                    NonStreamBodyError::Http(crate::http_client::HttpSendError::ResponseBodyTimeout {
+                        timeout_secs: body_timeout_secs,
+                    })
+                } else {
+                    NonStreamBodyError::FirstOutputTimeout {
+                        timeout_secs: first_output_timeout_secs,
+                    }
+                });
+            }
+        };
+        let Some(chunk) = next else {
+            return Ok(body.freeze());
+        };
+        let chunk = chunk.map_err(|error| {
+            NonStreamBodyError::Http(crate::http_client::HttpSendError::Request(error))
+        })?;
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(NonStreamBodyError::Http(
+                crate::http_client::HttpSendError::ResponseBodyTooLarge { max_bytes },
+            ));
+        }
+        // Scan the new bytes plus a small overlap so a marker split across chunks is found.
+        let overlap = body.len().min(32);
+        body.extend_from_slice(&chunk);
+        if !saw_content {
+            let recent = &body[body.len() - chunk.len() - overlap..];
+            saw_content = NON_STREAM_CONTENT_EVENT_MARKERS
+                .iter()
+                .any(|marker| contains_subslice(recent, marker));
+        }
+    }
+}
+
 /// One keepalive tick. Claude Code clients that accept empty deltas get one on the open
 /// content block (it resets their idle timer and passes through buffering proxies);
 /// otherwise, and whenever no block is open, a standard `ping` is sent. No synthetic
@@ -10960,17 +11069,26 @@ async fn handle_non_stream_request(
             .map(str::to_string);
 
         // 读取响应体
-        let body_bytes = match response_bytes_with_limit_and_body_timeout(
+        let runtime = provider.runtime_config();
+        let body_read = read_non_stream_body_with_first_output_deadline(
             response,
-            provider
-                .runtime_config()
-                .kiro_upstream_response_timeout_secs,
+            runtime.kiro_upstream_response_timeout_secs,
             LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
+            runtime
+                .stream_first_output_timeout_secs
+                .min(crate::model::config::STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS),
         )
-        .await
-        {
+        .await;
+        let first_output_timeout = match &body_read {
+            Err(NonStreamBodyError::FirstOutputTimeout { timeout_secs }) => Some(format!(
+                "upstream produced no output within {timeout_secs} seconds"
+            )),
+            _ => None,
+        };
+        let body_bytes = match body_read {
             Ok(bytes) => bytes,
-            Err(e) => {
+            Err(NonStreamBodyError::FirstOutputTimeout { .. }) => Bytes::new(),
+            Err(NonStreamBodyError::Http(e)) => {
                 tracing::error!("读取响应体失败: {}", e);
                 credential_usage.record_failure(
                     UsageRecordStatus::Error,
@@ -10987,7 +11105,9 @@ async fn handle_non_stream_request(
             }
         };
 
-        let body_bytes =
+        let body_bytes = if first_output_timeout.is_some() {
+            body_bytes
+        } else {
             match inspect_complete_upstream_body(upstream_content_type.as_deref(), body_bytes) {
                 Ok(body) => body,
                 Err(error) => {
@@ -11036,25 +11156,35 @@ async fn handle_non_stream_request(
                         &credential_usage.request.request_id,
                     );
                 }
-            };
-        let upstream_events = match decode_complete_eventstream(&body_bytes) {
-            Ok(events) => events,
-            Err(detail) => {
-                tracing::warn!(error = %detail, "非流式 EventStream 响应不完整");
-                credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-                completion.release();
-                return envelope::error_response_with_id(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-                    &credential_usage.request.request_id,
-                );
+            }
+        };
+        let upstream_events = if first_output_timeout.is_some() {
+            Vec::new()
+        } else {
+            match decode_complete_eventstream(&body_bytes) {
+                Ok(events) => events,
+                Err(detail) => {
+                    tracing::warn!(error = %detail, "非流式 EventStream 响应不完整");
+                    credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
+                    completion.release();
+                    return envelope::error_response_with_id(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                        &credential_usage.request.request_id,
+                    );
+                }
             }
         };
 
-        if let Some(detail) = non_stream_status_error_before_first_output(&upstream_events) {
+        let pre_output_failure = match first_output_timeout {
+            Some(detail) => Some((StreamRetryReason::FirstOutputTimeout, detail)),
+            None => non_stream_status_error_before_first_output(&upstream_events)
+                .map(|detail| (StreamRetryReason::StatusError, detail)),
+        };
+        if let Some((retry_reason, detail)) = pre_output_failure {
             if stream_retry_config.active()
-                && stream_retry_config.allows(StreamRetryReason::StatusError)
+                && stream_retry_config.allows(retry_reason)
                 && non_stream_status_retry_attempt < stream_retry_config.max_attempts
             {
                 let next_attempt = non_stream_status_retry_attempt.saturating_add(1);
@@ -11087,17 +11217,24 @@ async fn handle_non_stream_request(
                     .consumed
                     .saturating_sub(consumed_before);
                 if retry_sends > 0 {
-                    usage_context
-                        .mark_stream_retry_sends(retry_sends, StreamRetryReason::StatusError);
+                    usage_context.mark_stream_retry_sends(retry_sends, retry_reason);
                 } else if retry_dispatch.is_err() {
-                    usage_context
-                        .mark_stream_retry_dispatch_failure(StreamRetryReason::StatusError);
+                    usage_context.mark_stream_retry_dispatch_failure(retry_reason);
                 }
                 match retry_dispatch {
                     Ok(response) => {
                         api_response = response;
                         non_stream_status_retry_attempt = next_attempt;
                         continue;
+                    }
+                    // The silent upstream is the actual failure; a retry that found no other
+                    // credential still ends with the retryable first-output timeout below.
+                    Err(retry_error) if retry_reason == StreamRetryReason::FirstOutputTimeout => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            error = %retry_error,
+                            "非流式首输出超时后的换号重试未能发出"
+                        );
                     }
                     Err(retry_error) => {
                         let retry_message = retry_error.to_string();
@@ -11135,6 +11272,29 @@ async fn handle_non_stream_request(
                         );
                     }
                 }
+            }
+            if retry_reason == StreamRetryReason::FirstOutputTimeout {
+                tracing::warn!(
+                    request_id = %request_id,
+                    detail = %detail,
+                    "非流式上游在首输出等待上限内没有产生任何内容，已断开上游"
+                );
+                credential_usage
+                    .request
+                    .mark_stream_terminal(StreamTerminalReason::FirstOutputTimeout);
+                credential_usage.record_failure(
+                    UsageRecordStatus::UpstreamTimeout,
+                    "overloaded_error",
+                    detail,
+                );
+                completion.release();
+                // 529 overloaded_error: Claude Code retries this on its own.
+                return envelope::error_response_with_id(
+                    StatusCode::from_u16(529).expect("529 is a valid status code"),
+                    "overloaded_error",
+                    envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+                    &credential_usage.request.request_id,
+                );
             }
         }
 
