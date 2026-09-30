@@ -3113,7 +3113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sonnet_4_6_explicit_unsupported_xhigh_is_rejected() {
+    fn test_sonnet_4_6_explicit_unsupported_xhigh_maps_to_nearest_supported_effort() {
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
         let req = MessagesRequest {
@@ -3139,9 +3139,15 @@ mod tests {
             stop_sequences: None,
         };
 
-        let error = convert_request_with_options(&req, ConverterOptions::default())
-            .expect_err("explicit unsupported effort must not be silently remapped");
-        assert!(error.to_string().contains("not supported"));
+        // Claude Code may send an effort the upstream model does not list; it is served at
+        // the nearest supported level instead of failing the request.
+        let result = convert_request_with_options(&req, ConverterOptions::default())
+            .expect("unsupported explicit effort maps to the nearest supported level");
+        let effort = result
+            .additional_model_request_fields
+            .and_then(|fields| fields.output_config)
+            .map(|config| config.effort);
+        assert_eq!(effort.as_deref(), Some("max"));
     }
 
     #[test]

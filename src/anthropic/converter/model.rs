@@ -4,7 +4,7 @@ use crate::anthropic::model_capabilities::strip_model_1m_suffix;
 use crate::anthropic::model_capabilities::{
     KiroReasoningCapabilityState, KiroReasoningFieldCapability, KiroReasoningFieldPath,
 };
-use crate::anthropic::types::{MessagesRequest, parse_thinking_effort};
+use crate::anthropic::types::{MessagesRequest, THINKING_EFFORT_VALUES, parse_thinking_effort};
 use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
 };
@@ -178,12 +178,11 @@ fn select_native_reasoning_effort(
                 "unsupported output_config.effort: {explicit_effort}"
             )));
         };
-        if !capability.efforts.iter().any(|effort| effort == requested) {
-            return Err(super::ConversionError::UnsupportedContent(format!(
+        return nearest_supported_effort(requested, &capability.efforts).ok_or_else(|| {
+            super::ConversionError::UnsupportedContent(format!(
                 "output_config.effort {requested} is not supported by the selected upstream model"
-            )));
-        }
-        return Ok(requested.to_string());
+            ))
+        });
     }
 
     let requested = match req.thinking.as_ref() {
@@ -203,15 +202,38 @@ fn select_native_reasoning_effort(
             });
         }
     };
-    if capability.efforts.iter().any(|effort| effort == requested) {
-        return Ok(requested.to_string());
+    nearest_supported_effort(requested, &capability.efforts).ok_or_else(|| {
+        super::ConversionError::UnsupportedContent(format!(
+            "thinking budget maps to effort {requested}, which is not supported by the selected upstream model"
+        ))
+    })
+}
+
+/// Picks the supported upstream effort closest to `requested`; on a tie the stronger level
+/// wins (so `xhigh` becomes `max` when only `high` and `max` exist). Claude Code sends
+/// efforts such as `xhigh` that some upstream models do not list; serving the nearest level
+/// keeps the request working. `None` only when the model lists no known effort.
+fn nearest_supported_effort(requested: &str, supported: &[String]) -> Option<String> {
+    if supported.iter().any(|effort| effort == requested) {
+        return Some(requested.to_string());
     }
-    if requested == "xhigh" && capability.efforts.iter().any(|effort| effort == "max") {
-        return Ok("max".to_string());
-    }
-    Err(super::ConversionError::UnsupportedContent(format!(
-        "thinking budget maps to effort {requested}, which is not supported by the selected upstream model"
-    )))
+    let rank = |effort: &str| {
+        THINKING_EFFORT_VALUES
+            .iter()
+            .position(|value| *value == effort)
+    };
+    let requested_rank = rank(requested)?;
+    let chosen = supported
+        .iter()
+        .filter_map(|effort| rank(effort).map(|position| (position, effort)))
+        .min_by_key(|(position, _)| (position.abs_diff(requested_rank), usize::MAX - position))
+        .map(|(_, effort)| effort.clone())?;
+    tracing::info!(
+        requested_effort = requested,
+        upstream_effort = %chosen,
+        "mapped reasoning effort to the nearest level the upstream model supports"
+    );
+    Some(chosen)
 }
 
 pub(super) fn build_additional_model_request_fields(
@@ -279,4 +301,43 @@ pub(super) fn uses_native_reasoning_fields(
                 capability_state,
                 KiroReasoningCapabilityState::LegacyFallback
             ) && legacy_native_reasoning_capability(model_id).is_some()))
+}
+
+#[cfg(test)]
+mod nearest_effort_tests {
+    use super::nearest_supported_effort;
+
+    fn levels(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn unsupported_efforts_map_to_the_nearest_supported_level() {
+        let four = levels(&["low", "medium", "high", "max"]);
+        assert_eq!(
+            nearest_supported_effort("high", &four).as_deref(),
+            Some("high")
+        );
+        // xhigh sits between high and max: the tie goes to the stronger level.
+        assert_eq!(
+            nearest_supported_effort("xhigh", &four).as_deref(),
+            Some("max")
+        );
+        let three = levels(&["low", "medium", "high"]);
+        assert_eq!(
+            nearest_supported_effort("xhigh", &three).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            nearest_supported_effort("max", &three).as_deref(),
+            Some("high")
+        );
+        let upper = levels(&["high", "max"]);
+        assert_eq!(
+            nearest_supported_effort("low", &upper).as_deref(),
+            Some("high")
+        );
+        assert_eq!(nearest_supported_effort("xhigh", &levels(&[])), None);
+        assert_eq!(nearest_supported_effort("bogus", &three), None);
+    }
 }
