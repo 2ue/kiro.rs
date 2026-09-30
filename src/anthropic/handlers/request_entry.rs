@@ -581,6 +581,63 @@ fn parse_messages_payload_with_probe(
     Ok(payload)
 }
 
+/// Some clients put `system`/`developer` turns inside `messages`. Their text is moved into the
+/// system prompt (in order), and messages with any other non-user/assistant role are dropped,
+/// matching how earlier releases served these requests instead of rejecting them.
+fn normalize_message_roles(payload: &mut MessagesRequest) {
+    if payload
+        .messages
+        .iter()
+        .all(|message| matches!(message.role.as_str(), "user" | "assistant"))
+    {
+        return;
+    }
+    let mut moved = 0usize;
+    let mut dropped = 0usize;
+    let mut kept = Vec::with_capacity(payload.messages.len());
+    for message in std::mem::take(&mut payload.messages) {
+        match message.role.to_ascii_lowercase().as_str() {
+            "user" | "assistant" => kept.push(message),
+            "system" | "developer" => {
+                let text = message_content_text(&message.content);
+                if !text.trim().is_empty() {
+                    payload.system.get_or_insert_with(Vec::new).push(
+                        crate::anthropic::types::SystemMessage {
+                            text,
+                            cache_control: None,
+                        },
+                    );
+                }
+                moved += 1;
+            }
+            _ => dropped += 1,
+        }
+    }
+    payload.messages = kept;
+    tracing::info!(
+        moved_to_system = moved,
+        dropped_unknown_roles = dropped,
+        "normalized non-standard message roles"
+    );
+}
+
+fn message_content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                Value::String(text) => Some(text.clone()),
+                Value::Object(map) => map.get("text").and_then(Value::as_str).map(str::to_string),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => scalar_content_text(other),
+    }
+}
+
 /// Rejects roles the Anthropic API rejects, and normalizes content shapes Claude Code
 /// clients may send but Kiro cannot take directly: scalar content becomes text, scalar list
 /// items become text blocks, and nulls are dropped. Normalizing here keeps every later stage
@@ -588,13 +645,8 @@ fn parse_messages_payload_with_probe(
 fn normalize_message_roles_and_content(
     payload: &mut MessagesRequest,
 ) -> Result<(), EntryRequestError> {
+    normalize_message_roles(payload);
     for (index, message) in payload.messages.iter_mut().enumerate() {
-        if !matches!(message.role.as_str(), "user" | "assistant") {
-            return Err(EntryRequestError::invalid(
-                format!("messages.{index}.role: Input should be 'user' or 'assistant'"),
-                "invalid_message_role",
-            ));
-        }
         let replacement = match &mut message.content {
             Value::String(_) => None,
             Value::Array(blocks) => {
@@ -892,27 +944,27 @@ mod tests {
     }
 
     #[test]
-    fn invalid_message_roles_are_rejected_at_entry_for_five_rounds() {
-        let cases: [(&[u8], &str); 2] = [
-            (
-                br#"{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"robot","content":"hi"}]}"#,
-                "messages.0.role: Input should be 'user' or 'assistant'",
-            ),
-            (
-                br#"{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"x"}]}"#,
-                "messages.1.role: Input should be 'user' or 'assistant'",
-            ),
-        ];
+    fn non_standard_message_roles_are_normalized_for_five_rounds() {
         for round in 0..5 {
-            for (raw, expected_message) in cases {
-                let raw = Bytes::copy_from_slice(raw);
-                let error = parse_messages_payload(&raw, "req_invalid_message_role")
-                    .expect_err("invalid role must be rejected");
-                assert_eq!(error.status, StatusCode::BAD_REQUEST, "round {round}");
-                assert_eq!(error.error_type, "invalid_request_error");
-                assert_eq!(error.message, expected_message, "round {round}");
-                assert_eq!(error.reason, "invalid_message_role", "round {round}");
-            }
+            let raw = Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-5","max_tokens":16,"system":"base","messages":[{"role":"user","content":"hi"},{"role":"system","content":"be brief"},{"role":"developer","content":[{"type":"text","text":"answer in English"}]},{"role":"robot","content":"ignored"},{"role":"assistant","content":"ok"},{"role":"user","content":"again"}]}"#,
+            );
+            let payload = parse_messages_payload(&raw, "req_roles")
+                .unwrap_or_else(|error| panic!("round {round}: {}", error.message));
+            let roles: Vec<&str> = payload.messages.iter().map(|m| m.role.as_str()).collect();
+            assert_eq!(roles, ["user", "assistant", "user"], "round {round}");
+            let system: Vec<&str> = payload
+                .system
+                .as_ref()
+                .expect("system")
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect();
+            assert_eq!(
+                system,
+                ["base", "be brief", "answer in English"],
+                "round {round}"
+            );
         }
     }
 
