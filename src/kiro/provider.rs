@@ -7181,8 +7181,8 @@ mod tests {
         }
     }
 
-    /// 上游已开始处理（5xx）后的重试必须换新的会话标识，否则 Kiro 对同一标识的重发一律返回
-    /// "Improperly formed request"；429 这类未进入处理的重试保留原标识。
+    /// 瞬态失败（5xx/408/429）后的重试必须换新的会话标识，否则 Kiro 对同一标识的重发一律返回
+    /// "Improperly formed request"。
     #[tokio::test]
     async fn retries_after_server_errors_use_fresh_conversation_identity() {
         let rule: RotationRule = Arc::new(|attempt: &RotationAttempt| {
@@ -7221,12 +7221,12 @@ mod tests {
         assert!(result.is_ok());
         let ids = server.state.conversation_identities();
         assert_eq!(ids.len(), 2);
-        assert!(
-            ids.iter()
-                .all(|(conversation, continuation)| conversation == "conv-429"
-                    && continuation.as_deref() == Some("conv-429-continuation")),
-            "429 retries keep the original identity: {ids:?}"
+        assert_eq!(ids[0].0, "conv-429");
+        assert_ne!(
+            ids[1].0, "conv-429",
+            "retry after 429 must use a new conversationId: {ids:?}"
         );
+        assert_ne!(ids[1].1.as_deref(), Some("conv-429-continuation"));
     }
 
     #[test]
@@ -13529,7 +13529,10 @@ impl KiroProvider {
                     "Kiro API returned a retryable upstream status"
                 );
                 let mut can_retry = attempt + 1 < max_retries;
-                if can_retry && (status.is_server_error() || status.as_u16() == 408) {
+                // 5xx/408: the upstream already started processing the turn. 429: production
+                // shows the same "Improperly formed request" on every resend with the same ids
+                // (169 of 169 in 24h), so every transient retry gets a fresh identity.
+                if can_retry {
                     Self::refresh_request_identity_for_retry(
                         &mut refreshed_request_body,
                         request_body,
