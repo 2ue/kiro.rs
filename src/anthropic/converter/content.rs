@@ -474,14 +474,16 @@ fn image_format_from_base64_or_media_type(media_type: &str, data: &str) -> Optio
         }
     };
     let detected = infer_image_format_from_bytes(&bytes)?;
+    // The trailer checks are advisory only: valid JPEGs often carry bytes after the EOI
+    // marker, and Kiro decides whether an image is usable (answering an official 400 for
+    // truly broken ones), so a local mismatch is logged instead of rejecting the request.
     if !image_bytes_are_structurally_valid(detected, &bytes) {
         tracing::warn!(
             declared_media_type = %media_type,
             detected_format = detected,
             image_bytes = bytes.len(),
-            "图片字节未通过轻量结构校验，已拒绝转发到上游"
+            "图片字节未通过轻量结构校验，仍按识别格式转发，由上游判断"
         );
-        return None;
     }
     if declared.as_deref().is_some_and(|value| value != detected) {
         tracing::warn!(

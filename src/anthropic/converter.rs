@@ -894,24 +894,27 @@ mod tests {
     }
 
     #[test]
-    fn test_process_message_content_rejects_truncated_png() {
+    fn test_process_message_content_forwards_images_that_fail_trailer_checks() {
+        // Kiro decides whether such bytes are usable; locally only the file header matters.
         let truncated_png = BASE64_STANDARD.encode([
             0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
             b'D', b'R',
         ]);
-        let content = serde_json::json!([
-            {
+        let jpeg_with_trailing_bytes =
+            BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9, 0x00, 0x00]);
+        for (media_type, data, format) in [
+            ("image/png", truncated_png, "png"),
+            ("image/jpeg", jpeg_with_trailing_bytes, "jpeg"),
+        ] {
+            let content = serde_json::json!([{
                 "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": truncated_png
-                }
-            }
-        ]);
-
-        let err = process_message_content(&content).expect_err("truncated png should be rejected");
-        assert!(err.to_string().contains("invalid image data"));
+                "source": {"type": "base64", "media_type": media_type, "data": data}
+            }]);
+            let (_, images, _) = process_message_content(&content)
+                .unwrap_or_else(|err| panic!("{media_type} should be forwarded: {err}"));
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].format, format);
+        }
     }
 
     #[test]
