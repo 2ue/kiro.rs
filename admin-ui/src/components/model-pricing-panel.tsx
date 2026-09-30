@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { RefreshCw, AlertTriangle, Plus, Edit3, Trash2, ListChecks } from 'lucide-react'
+import { RefreshCw, AlertTriangle, Plus, Edit3, Trash2, Search } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -321,6 +321,161 @@ function Field({ title, children }: { title: string; children: React.ReactNode }
   )
 }
 
+type SyncMode = 'auto' | 'manual'
+
+function SyncCapabilitiesDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const syncCapabilities = useSyncModelCapabilities()
+  const credentialList = useCredentialsList({ page: 1, limit: 500 })
+  const [mode, setMode] = useState<SyncMode>('auto')
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+
+  useEffect(() => {
+    if (!open) return
+    setMode('auto')
+    setQuery('')
+    setSelected(new Set())
+  }, [open])
+
+  const credentials = credentialList.data?.items ?? []
+  const filtered = useMemo(() => {
+    const keyword = query.trim().toLowerCase()
+    if (!keyword) return credentials
+    return credentials.filter((credential) =>
+      [String(credential.id), credential.email, credential.maskedApiKey, credential.subscriptionTitle, credential.authMethod]
+        .some((value) => value?.toLowerCase().includes(keyword)),
+    )
+  }, [credentials, query])
+  const selectable = filtered.filter((credential) => !credential.disabled)
+  const allFilteredSelected = selectable.length > 0 && selectable.every((credential) => selected.has(credential.id))
+
+  const toggle = (id: number, checked: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+  const toggleAllFiltered = (checked: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      selectable.forEach((credential) => (checked ? next.add(credential.id) : next.delete(credential.id)))
+      return next
+    })
+  }
+
+  const pending = syncCapabilities.isPending
+  const credentialIds = mode === 'manual' ? Array.from(selected) : []
+  const canSubmit = !pending && (mode === 'auto' || credentialIds.length > 0)
+  const submit = () => {
+    syncCapabilities.mutate({ credentialIds }, {
+      onSuccess: (status) => {
+        if (status.lastError) toast.warning(`模型能力同步失败，继续使用当前目录: ${status.lastError}`)
+        else toast.success(
+          `${credentialIds.length ? `已按 ${credentialIds.length} 个账号` : '已按自动策略'}同步模型能力：${status.modelCount} 个模型`,
+        )
+        onClose()
+      },
+      onError: (error) => toast.error(`同步失败: ${extractErrorMessage(error)}`),
+    })
+  }
+
+  const modeOption = (value: SyncMode, title: string, description: string) => (
+    <button
+      type="button"
+      onClick={() => setMode(value)}
+      disabled={pending}
+      aria-pressed={mode === value}
+      className={
+        'flex-1 rounded-lg border p-3 text-left transition-colors ' +
+        (mode === value ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted/40')
+      }
+    >
+      <div className="text-sm font-medium">{title}</div>
+      <div className="mt-1 text-xs text-muted-foreground">{description}</div>
+    </button>
+  )
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>同步模型能力</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">从 Kiro 上游拉取可用模型和能力参数。</p>
+          <div className="flex gap-3">
+            {modeOption('auto', '自动选择', '按账号能力分组各取样本账号，推荐。')}
+            {modeOption('manual', '指定账号', '只用选中的账号拉取模型目录。')}
+          </div>
+          {mode === 'manual' && (
+            <div className="space-y-2">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  className="h-9 pl-8 text-sm"
+                  placeholder="搜索账号 ID、邮箱、订阅类型"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <label className="flex items-center gap-2">
+                  <Checkbox
+                    checked={allFilteredSelected}
+                    disabled={selectable.length === 0 || pending}
+                    onCheckedChange={(checked) => toggleAllFiltered(checked === true)}
+                  />
+                  全选当前结果
+                </label>
+                <span>已选 {selected.size} 个</span>
+              </div>
+              <div className="max-h-72 divide-y overflow-y-auto rounded-lg border">
+                {credentialList.isLoading && (
+                  <div className="p-6 text-center text-sm text-muted-foreground">加载账号...</div>
+                )}
+                {!credentialList.isLoading && filtered.length === 0 && (
+                  <div className="p-6 text-center text-sm text-muted-foreground">没有匹配的账号</div>
+                )}
+                {filtered.map((credential) => {
+                  const account = credential.email || credential.maskedApiKey || `账号 #${credential.id}`
+                  return (
+                    <label
+                      key={credential.id}
+                      className={
+                        'flex items-center gap-3 px-3 py-2 text-sm ' +
+                        (credential.disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-muted/40')
+                      }
+                    >
+                      <Checkbox
+                        checked={selected.has(credential.id)}
+                        disabled={credential.disabled || pending}
+                        onCheckedChange={(checked) => toggle(credential.id, checked === true)}
+                      />
+                      <span className="w-12 shrink-0 font-mono text-xs text-muted-foreground">#{credential.id}</span>
+                      <span className="min-w-0 flex-1 truncate">{account}</span>
+                      <Badge variant="secondary">{credential.subscriptionTitle || '订阅未知'}</Badge>
+                      {credential.disabled && <Badge variant="destructive">已禁用</Badge>}
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" size="sm" onClick={onClose} disabled={pending}>取消</Button>
+          <Button size="sm" onClick={submit} disabled={!canSubmit}>
+            <RefreshCw className={`h-4 w-4 ${pending ? 'animate-spin' : ''}`} />
+            {mode === 'manual' ? `同步（${credentialIds.length} 个账号）` : '开始同步'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function ModelPricingPanel() {
   const [manualOpen, setManualOpen] = useState(false)
   const [editing, setEditing] = useState<ManualModelForm | null>(null)
@@ -328,12 +483,10 @@ export function ModelPricingPanel() {
   const syncPricing = useSyncModelPricing()
   const capabilities = useModelCapabilities()
   const syncCapabilities = useSyncModelCapabilities()
-  const credentialList = useCredentialsList({ page: 1, limit: 500 })
   const deleteManual = useDeleteManualModel()
   const data = pricing.data
   const capabilityData = capabilities.data
-  const [syncCredentialIds, setSyncCredentialIds] = useState<number[]>([])
-  const credentialOptions = credentialList.data?.items ?? []
+  const [syncOpen, setSyncOpen] = useState(false)
   const priceMap = useMemo(() => priceMapFrom(data), [data])
 
   const handleSync = () => {
@@ -341,16 +494,6 @@ export function ModelPricingPanel() {
       onSuccess: (status) => {
         if (status.lastError) toast.warning(`同步失败，继续使用当前价格目录: ${status.lastError}`)
         else toast.success(`模型价格已同步：${status.modelCount} 个模型`)
-      },
-      onError: (error) => toast.error(`同步失败: ${extractErrorMessage(error)}`),
-    })
-  }
-
-  const handleSyncCapabilities = () => {
-    syncCapabilities.mutate({ credentialIds: syncCredentialIds }, {
-      onSuccess: (status) => {
-        if (status.lastError) toast.warning(`模型能力同步失败，继续使用当前目录: ${status.lastError}`)
-        else toast.success(`模型能力已同步：${status.modelCount} 个模型`)
       },
       onError: (error) => toast.error(`同步失败: ${extractErrorMessage(error)}`),
     })
@@ -393,47 +536,18 @@ export function ModelPricingPanel() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-1.5">
-            <ListChecks className="h-4 w-4 text-muted-foreground" />
-            <select
-              multiple
-              size={Math.min(Math.max(credentialOptions.length, 3), 6)}
-              aria-label="选择用于同步模型能力的账号"
-              className="min-h-9 min-w-[240px] max-w-[340px] rounded-md border border-input bg-background px-2 py-1 text-xs"
-              value={syncCredentialIds.map(String)}
-              disabled={syncCapabilities.isPending || credentialList.isLoading}
-              onChange={(event) => {
-                setSyncCredentialIds(
-                  Array.from(event.target.selectedOptions)
-                    .map((option) => Number(option.value))
-                    .filter((id) => Number.isFinite(id)),
-                )
-              }}
-            >
-              <option value="" disabled>
-                {credentialList.isLoading ? '加载账号...' : '自动选择（按能力分组采样）'}
-              </option>
-              {credentialOptions.map((credential) => {
-                const account = credential.email || credential.maskedApiKey || `账号 #${credential.id}`
-                const subscription = credential.subscriptionTitle || '订阅未知'
-                return (
-                  <option key={credential.id} value={credential.id} disabled={credential.disabled}>
-                    #{credential.id} {account} · {subscription}{credential.disabled ? ' · 已禁用' : ''}
-                  </option>
-                )
-              })}
-            </select>
-          </div>
           <Button size="sm" onClick={openAdd}>
             <Plus className="h-4 w-4" />
             手动添加模型
           </Button>
-          <Button variant="outline" size="sm" onClick={handleSyncCapabilities} disabled={syncCapabilities.isPending}>
+          <Button variant="outline" size="sm" onClick={() => setSyncOpen(true)} disabled={syncCapabilities.isPending}>
             <RefreshCw className={`h-4 w-4 ${syncCapabilities.isPending ? 'animate-spin' : ''}`} />
-            同步模型能力{syncCredentialIds.length ? `（${syncCredentialIds.length}）` : ''}
+            同步模型能力
           </Button>
         </div>
       </div>
+
+      <SyncCapabilitiesDialog open={syncOpen} onClose={() => setSyncOpen(false)} />
 
       {capabilityData?.lastError && <WarningBox text={capabilityData.lastError} />}
 
