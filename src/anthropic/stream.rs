@@ -343,11 +343,23 @@ fn find_real_thinking_end_tag_for(
             return None;
         }
 
+        // An open tag earlier on the same line makes this an inline mention such as
+        // "inside a <thinking>...</thinking> block", not the end of the thinking block.
+        let line_start = buffer[..absolute_pos]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        if buffer[line_start..absolute_pos].contains(tag.open) {
+            continue;
+        }
+        let before = &buffer[..absolute_pos];
         let prev = if absolute_pos == 0 {
             prev_char
         } else {
-            buffer[..absolute_pos].chars().next_back()
+            before.chars().next_back()
         };
+        // An ellipsis ("...", "…") is not a clause end.
+        let ellipsis = before.ends_with("..") || before.ends_with('…');
+        let prev = if ellipsis { Some(' ') } else { prev };
         if let Some(separator_len) = accepted_thinking_close_separator(prev, after_content) {
             return Some((absolute_pos, separator_len));
         }
@@ -6680,6 +6692,27 @@ mod tests {
             find_real_thinking_start_tag("about \"<thinking>\" and '<thinking>' then<thinking>"),
             Some(40)
         );
+    }
+
+    #[test]
+    fn inline_thinking_tag_mentions_do_not_close_the_block() {
+        // Real transcript: the model quoted the steering policy inside its reasoning.
+        let buffer = "According to the policy: \"emit concise reasoning inside a <thinking>...</thinking> block before any visible text\".\n\nSo I output pong.\n</thinking>\n\npong";
+        let (pos, _) = find_real_thinking_end_tag_for(buffer, THINKING_XML_TAG, Some('x'), true)
+            .expect("real close tag found");
+        assert_eq!(&buffer[pos..], "</thinking>\n\npong");
+
+        // An ellipsis right before the tag is not a clause end either.
+        let buffer = "wait for it...</thinking> and continue\n</thinking>\n\nanswer";
+        let (pos, _) = find_real_thinking_end_tag_for(buffer, THINKING_XML_TAG, Some('x'), true)
+            .expect("real close tag found");
+        assert_eq!(&buffer[pos..], "</thinking>\n\nanswer");
+
+        // A genuine clause-end close is still accepted.
+        let buffer = "done.</thinking>answer";
+        let (pos, _) = find_real_thinking_end_tag_for(buffer, THINKING_XML_TAG, Some('x'), true)
+            .expect("clause-end close tag");
+        assert_eq!(pos, "done.".len());
     }
 
     #[test]
