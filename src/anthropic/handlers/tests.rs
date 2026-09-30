@@ -3546,6 +3546,7 @@ enum HandlerEventStreamFault {
     LegacyTextWithMetadataNoStatus,
     TextWithMeteringNoStatus,
     UsageOnlyMeteringNoStatus,
+    UsageOnlyEveryAttempt,
     CompleteToolWithoutStatus,
     TwoIdenticalToolsWithoutStatus,
     IncompleteToolWithoutStatus,
@@ -3705,6 +3706,16 @@ fn handler_eventstream_chunked_response(
         .expect("build EventStream chunked response")
 }
 
+fn handler_eventstream_usage_only_body() -> Vec<u8> {
+    let mut body =
+        eventstream_test_frame("contextUsageEvent", json!({"contextUsagePercentage":0.01}));
+    body.extend(eventstream_test_frame(
+        "meteringEvent",
+        json!({"usage":0.24,"inputTokens":123,"outputTokens":0}),
+    ));
+    body
+}
+
 async fn handler_eventstream_fault_upstream(
     State(state): State<HandlerEventStreamFaultState>,
     body: Bytes,
@@ -3743,6 +3754,9 @@ async fn handler_eventstream_fault_upstream(
                 })),
             )
                 .into_response(),
+            HandlerEventStreamFault::UsageOnlyEveryAttempt => {
+                handler_eventstream_bytes_response(handler_eventstream_usage_only_body())
+            }
             _ => handler_eventstream_bytes_response(handler_eventstream_normal_body()),
         };
     }
@@ -3887,14 +3901,9 @@ async fn handler_eventstream_fault_upstream(
             ));
             handler_eventstream_bytes_response(body)
         }
-        HandlerEventStreamFault::UsageOnlyMeteringNoStatus => {
-            let mut body =
-                eventstream_test_frame("contextUsageEvent", json!({"contextUsagePercentage":0.01}));
-            body.extend(eventstream_test_frame(
-                "meteringEvent",
-                json!({"usage":0.24,"inputTokens":123,"outputTokens":0}),
-            ));
-            handler_eventstream_bytes_response(body)
+        HandlerEventStreamFault::UsageOnlyMeteringNoStatus
+        | HandlerEventStreamFault::UsageOnlyEveryAttempt => {
+            handler_eventstream_bytes_response(handler_eventstream_usage_only_body())
         }
         HandlerEventStreamFault::CompleteToolWithoutStatus => {
             handler_eventstream_bytes_response(eventstream_test_frame(
@@ -5628,6 +5637,21 @@ async fn run_handler_usage_only_eof_matrix() {
             !bodies[1].contains("additionalModelRequestFields"),
             "usage-only round={round}"
         );
+        let nudge = serde_json::to_string(crate::anthropic::empty_turn_nudge::EMPTY_TURN_NUDGE)
+            .expect("nudge json");
+        let nudge = nudge.trim_matches('"');
+        assert!(
+            !bodies[0].contains(nudge),
+            "usage-only round={round} first body must not carry the continue nudge"
+        );
+        assert!(
+            bodies[1].contains(nudge),
+            "usage-only round={round} retry must carry the continue nudge"
+        );
+        assert!(
+            !body.contains("system-reminder"),
+            "usage-only round={round} the nudge must not reach the client: {body}"
+        );
         assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 2);
         let record = usage_record_for_request(&usage_recorder, &request_id);
         let trace = record
@@ -5637,8 +5661,25 @@ async fn run_handler_usage_only_eof_matrix() {
         assert_eq!(trace.stream_retry_attempts, Some(1));
         assert_eq!(
             trace.stream_retry_reasons.as_deref(),
-            Some(&["protocol_error:sends=1".to_string()][..])
+            Some(&["usage_only:sends=1".to_string()][..])
         );
+
+        // 重试仍为空：只重试一次，按空 end_turn 结束，不报错。
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
+                .await;
+        let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, _request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "usage-only twice round={round}");
+        assert!(
+            body.contains(r#""stop_reason":"end_turn""#),
+            "usage-only twice round={round} body={body}"
+        );
+        assert!(
+            !body.contains("event: error"),
+            "usage-only twice round={round}"
+        );
+        assert_eq!(upstream.hits(), 2, "usage-only twice round={round}");
     }
 }
 
@@ -5650,15 +5691,48 @@ fn handler_usage_only_eof_retries_before_empty_success_for_five_rounds() {
     );
 }
 
-/// A non-streaming turn that only reports usage/metadata is served as an empty end_turn
-/// (as before) instead of an error that interrupts the Claude Code task; an EOF without any
-/// trusted completion signal still fails with a retryable 502.
+/// A non-streaming turn that only reports usage/metadata is retried once with the continue
+/// nudge; if the retry is still empty it is served as an empty end_turn (as before) instead of
+/// an error that interrupts the Claude Code task. An EOF without any trusted completion signal
+/// still fails with a retryable 502.
 async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
+    let nudge = serde_json::to_string(crate::anthropic::empty_turn_nudge::EMPTY_TURN_NUDGE)
+        .expect("nudge json");
+    let nudge = nudge.trim_matches('"').to_string();
     for round in 1..=5 {
         let upstream = HandlerEventStreamFaultUpstream::start(
             HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
         )
         .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, false).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert!(body.contains("recovered-ok"), "round={round} body={body}");
+        assert!(
+            !body.contains("system-reminder"),
+            "round={round} body={body}"
+        );
+        assert_eq!(upstream.hits(), 2, "round={round}");
+        let bodies = upstream
+            .bodies_snapshot()
+            .into_iter()
+            .map(|body| body.to_string())
+            .collect::<Vec<_>>();
+        assert!(!bodies[0].contains(&nudge), "round={round}");
+        assert!(bodies[1].contains(&nudge), "round={round}");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(
+            record
+                .latency_trace
+                .as_ref()
+                .and_then(|trace| trace.stream_retry_reasons.as_deref()),
+            Some(&["usage_only:sends=1".to_string()][..]),
+            "round={round}"
+        );
+
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
+                .await;
         let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
         let (status, _request_id, body) = call_handler_eventstream_fault(app, false).await;
         assert_eq!(status, StatusCode::OK, "round={round} body={body}");
@@ -5666,6 +5740,7 @@ async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
             body.contains(r#""stop_reason":"end_turn""#),
             "round={round} body={body}"
         );
+        assert_eq!(upstream.hits(), 2, "round={round}");
 
         let upstream =
             HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UnknownEventOnly).await;

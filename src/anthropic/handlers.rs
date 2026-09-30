@@ -159,7 +159,8 @@ impl LocalStreamRetryConfig {
             StreamRetryReason::ReadError => self.on_read_error,
             StreamRetryReason::StatusError
             | StreamRetryReason::ProtocolError
-            | StreamRetryReason::ProtocolContamination => self.on_status_error,
+            | StreamRetryReason::ProtocolContamination
+            | StreamRetryReason::UsageOnly => self.on_status_error,
         }
     }
 }
@@ -172,6 +173,8 @@ enum StreamRetryReason {
     StatusError,
     ProtocolError,
     ProtocolContamination,
+    /// 上游只返回 usage/metadata、没有任何输出。
+    UsageOnly,
 }
 
 impl StreamRetryReason {
@@ -183,6 +186,7 @@ impl StreamRetryReason {
             StreamRetryReason::StatusError => "status_error",
             StreamRetryReason::ProtocolError => "protocol_error",
             StreamRetryReason::ProtocolContamination => "protocol_contamination",
+            StreamRetryReason::UsageOnly => "usage_only",
         }
     }
 }
@@ -9231,6 +9235,41 @@ fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<Event>, String> {
     Ok(events)
 }
 
+/// 非流式完整响应是否为空轮次：没有任何文本、reasoning 或工具输出，也没有错误类事件，
+/// 只有 usage/metadata/metering 侧信道事件。
+fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
+    let mut saw_side_channel = false;
+    for event in events {
+        match event {
+            Event::AssistantResponse(resp) if !resp.content.is_empty() => return false,
+            Event::Code(code) if !code.content.is_empty() => return false,
+            Event::ReasoningContent(reasoning)
+                if !reasoning.text.is_empty()
+                    || reasoning
+                        .signature
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    || reasoning
+                        .redacted_content
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty()) =>
+            {
+                return false;
+            }
+            Event::ToolUse(_)
+            | Event::InvalidState(_)
+            | Event::Error { .. }
+            | Event::Exception { .. } => return false,
+            Event::Metadata(_)
+            | Event::MessageMetadata(_)
+            | Event::Metering(_)
+            | Event::ContextUsage(_) => saw_side_channel = true,
+            _ => {}
+        }
+    }
+    saw_side_channel
+}
+
 fn non_stream_status_error_before_first_output(events: &[Event]) -> Option<String> {
     let mut saw_output = false;
     for event in events {
@@ -9371,44 +9410,46 @@ enum StreamRetryOutcome {
     NotRetried(SseStreamState),
 }
 
-/// 上游只回 usage/metadata 就 EOF（空响应）时，把首输出前重试降级为不带 reasoning/thinking
-/// 整形的请求：去掉原生 reasoning 字段、历史 reasoning 和可见 thinking 输出策略。
-/// 同样的整形大概率再次得到空响应，降级后至少保证本轮有可见回答。返回是否有改动。
-fn degrade_stream_retry_plan_without_reasoning_shaping(plan: &mut StreamRetryPlan) -> bool {
-    let mut request = match plan.kiro_request.as_deref() {
+/// 上游只回 usage/metadata 就 EOF（空轮次）时，首输出前那一次重试使用的请求：去掉原生
+/// reasoning 字段、历史 reasoning 和可见 thinking 输出策略，并在当前轮末尾追加续写提示。
+/// 现网同一请求原样重发（含换号）几乎总是再次为空，重试必须改变请求。无法解析时返回 None。
+fn usage_only_retry_request(
+    request_body: &str,
+    kiro_request: Option<&KiroRequest>,
+) -> Option<(String, KiroRequest)> {
+    let mut request = match kiro_request {
         Some(request) => request.clone(),
-        None => match serde_json::from_str::<KiroRequest>(&plan.request_body) {
-            Ok(request) => request,
-            Err(_) => return false,
-        },
+        None => serde_json::from_str::<KiroRequest>(request_body).ok()?,
     };
-    let mut changed = request.additional_model_request_fields.take().is_some();
-    changed |= request.conversation_state.clear_history_reasoning_content() > 0;
+    request.additional_model_request_fields = None;
+    request.conversation_state.clear_history_reasoning_content();
     for message in &mut request.conversation_state.history {
         if let crate::kiro::model::requests::conversation::Message::User(user) = message {
-            changed |= super::converter::strip_thinking_output_policy(
-                &mut user.user_input_message.content,
-            );
+            super::converter::strip_thinking_output_policy(&mut user.user_input_message.content);
         }
     }
-    changed |= super::converter::strip_thinking_output_policy(
+    super::converter::strip_thinking_output_policy(
         &mut request
             .conversation_state
             .current_message
             .user_input_message
             .content,
     );
-    if !changed {
+    super::empty_turn_nudge::append_empty_turn_nudge(&mut request);
+    let body = serialize_kiro_request(&request).ok()?;
+    Some((body, request))
+}
+
+/// 流式空轮次：把重试计划替换为 [`usage_only_retry_request`]。返回是否替换成功。
+fn prepare_usage_only_stream_retry_plan(plan: &mut StreamRetryPlan) -> bool {
+    let Some((body, request)) =
+        usage_only_retry_request(&plan.request_body, plan.kiro_request.as_deref())
+    else {
         return false;
-    }
-    match serialize_kiro_request(&request) {
-        Ok(body) => {
-            plan.request_body = Arc::<str>::from(body);
-            plan.kiro_request = Some(Arc::new(request));
-            true
-        }
-        Err(_) => false,
-    }
+    };
+    plan.request_body = Arc::<str>::from(body);
+    plan.kiro_request = Some(Arc::new(request));
+    true
 }
 
 async fn retry_stream_before_downstream_commit(
@@ -10005,9 +10046,9 @@ fn create_sse_stream(
                                 None
                             };
                             // An upstream turn that only reports usage/metadata is retried once
-                            // before output (without reasoning shaping); if it is still empty it is
-                            // served as a normal empty end_turn, as before, so a Claude Code task
-                            // is never interrupted by it.
+                            // before output with a continue nudge (and without reasoning shaping);
+                            // if it is still empty it is served as a normal empty end_turn, as
+                            // before, so a Claude Code task is never interrupted by an error.
                             let terminal_protocol_failure = match terminal_protocol_failure {
                                 Some(detail)
                                     if detail
@@ -10016,11 +10057,11 @@ fn create_sse_stream(
                                     if !state.downstream_committed && !state.usage_only_retried {
                                         state.usage_only_retried = true;
                                         if let Some(plan) = state.retry_plan.as_mut() {
-                                            degrade_stream_retry_plan_without_reasoning_shaping(plan);
+                                            prepare_usage_only_stream_retry_plan(plan);
                                         }
                                         match retry_stream_before_downstream_commit(
                                             state,
-                                            StreamRetryReason::ProtocolError,
+                                            StreamRetryReason::UsageOnly,
                                             detail.clone(),
                                         )
                                         .await
@@ -11081,6 +11122,7 @@ async fn handle_non_stream_request(
         }
     };
     let mut non_stream_status_retry_attempt = 1_u32;
+    let mut usage_only_retried = false;
     let (credential_usage, completion, upstream_events) = loop {
         usage_context.mark_upstream_header();
         let credential_attempts = merge_credential_attempts(
@@ -11329,6 +11371,70 @@ async fn handle_non_stream_request(
                     envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
                     &credential_usage.request.request_id,
                 );
+            }
+        }
+
+        // 与流式一致：上游只返回 usage/metadata 时，带续写提示重试一次；仍为空则按空 end_turn 返回。
+        if !usage_only_retried
+            && stream_retry_config.active()
+            && stream_retry_config.allows(StreamRetryReason::UsageOnly)
+            && non_stream_status_retry_attempt < stream_retry_config.max_attempts
+            && non_stream_events_are_usage_only(&upstream_events)
+        {
+            usage_only_retried = true;
+            if let Some((retry_body, retry_request)) =
+                usage_only_retry_request(request_body, Some(kiro_request))
+            {
+                let next_attempt = non_stream_status_retry_attempt.saturating_add(1);
+                tracing::warn!(
+                    request_id = %request_id,
+                    attempt = non_stream_status_retry_attempt,
+                    next_attempt,
+                    "本地 Kiro 非流式响应只返回 usage/metadata，带续写提示重试一次"
+                );
+                retry_attempt_prefix =
+                    merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
+                completion.report_upstream_body_status_failure(
+                    super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL,
+                );
+                let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
+                let consumed_before = attempt_budget.snapshot().consumed;
+                let retry_dispatch = call_api_maybe_fail_fast(
+                    &provider,
+                    &retry_body,
+                    Some(&retry_request),
+                    Some(&request_id),
+                    external_fallback.as_ref(),
+                    capacity_weight_units,
+                    Some(model),
+                    attempt_budget.clone(),
+                )
+                .await;
+                let retry_sends = attempt_budget
+                    .snapshot()
+                    .consumed
+                    .saturating_sub(consumed_before);
+                if retry_sends > 0 {
+                    usage_context
+                        .mark_stream_retry_sends(retry_sends, StreamRetryReason::UsageOnly);
+                } else if retry_dispatch.is_err() {
+                    usage_context.mark_stream_retry_dispatch_failure(StreamRetryReason::UsageOnly);
+                }
+                match retry_dispatch {
+                    Ok(response) => {
+                        api_response = response;
+                        non_stream_status_retry_attempt = next_attempt;
+                        continue;
+                    }
+                    // 重试没能发出时，这一轮本身已是可交付的空 end_turn，按原结果返回。
+                    Err(retry_error) => {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            error = %retry_error,
+                            "非流式空轮次的续写重试未能发出，按空 end_turn 返回"
+                        );
+                    }
+                }
             }
         }
 
