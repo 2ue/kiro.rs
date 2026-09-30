@@ -3735,6 +3735,13 @@ pub struct Config {
     #[serde(default = "default_kiro_upstream_stream_idle_timeout_secs")]
     pub kiro_upstream_stream_idle_timeout_secs: u64,
 
+    /// 下游流式响应的保活心跳间隔秒数（1–300）。
+    ///
+    /// 上游暂时没有新内容时，按该间隔向客户端发送保活事件，防止客户端或中间代理
+    /// 因空闲断开。
+    #[serde(default = "default_stream_keepalive_interval_secs")]
+    pub stream_keepalive_interval_secs: u64,
+
     /// 是否允许流式响应在尚未向下游发送任何 SSE 字节前，对上游流读取/空闲/错误事件进行重试。
     ///
     /// 该开关只覆盖“下游尚未提交”的安全窗口。只要已经发送过 message_start、ping、
@@ -4294,6 +4301,21 @@ fn default_kiro_upstream_response_timeout_secs() -> u64 {
 
 fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
     180
+}
+
+pub const STREAM_KEEPALIVE_INTERVAL_MIN_SECS: u64 = 1;
+pub const STREAM_KEEPALIVE_INTERVAL_MAX_SECS: u64 = 300;
+
+/// 默认 5 秒；`KIRO_STREAM_KEEPALIVE_INTERVAL_SECS` 仍可作为未配置时的默认值。
+fn default_stream_keepalive_interval_secs() -> u64 {
+    std::env::var("KIRO_STREAM_KEEPALIVE_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| {
+            (STREAM_KEEPALIVE_INTERVAL_MIN_SECS..=STREAM_KEEPALIVE_INTERVAL_MAX_SECS)
+                .contains(value)
+        })
+        .unwrap_or(5)
 }
 
 fn default_kiro_upstream_stream_retry_enabled() -> bool {
@@ -5189,6 +5211,7 @@ impl Default for Config {
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
             kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
             ),
+            stream_keepalive_interval_secs: default_stream_keepalive_interval_secs(),
             kiro_upstream_stream_retry_enabled: default_kiro_upstream_stream_retry_enabled(),
             kiro_upstream_stream_retry_max_attempts:
                 default_kiro_upstream_stream_retry_max_attempts(),
@@ -5850,6 +5873,7 @@ mod tests {
         assert_eq!(config.credential_dispatch_max_wait_secs, 5);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
+        assert_eq!(config.stream_keepalive_interval_secs, 5);
         assert!(config.kiro_upstream_stream_retry_enabled);
         assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 2);
         assert!(config.kiro_upstream_stream_retry_on_idle_timeout);
@@ -6843,6 +6867,7 @@ mod tests {
                 "selectionFailureSampleLimit": 12,
                 "selectionFailureRecordEnabled": false,
                 "kiroUpstreamStreamIdleTimeoutSecs": 45,
+                "streamKeepaliveIntervalSecs": 12,
                 "kiroCachePointEnabled": true,
                 "kiroCachePointToolsOnly": false,
                 "kiroCachePointRecordPlan": false,
@@ -6857,6 +6882,7 @@ mod tests {
         assert_eq!(config.selection_failure_sample_limit, 12);
         assert!(!config.selection_failure_record_enabled);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 45);
+        assert_eq!(config.stream_keepalive_interval_secs, 12);
         assert!(config.kiro_cache_point_enabled);
         assert!(!config.kiro_cache_point_tools_only);
         assert!(!config.kiro_cache_point_record_plan);

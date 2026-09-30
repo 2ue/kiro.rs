@@ -1807,6 +1807,7 @@ export interface RuntimeConfig {
   credentialDispatchMaxWaitSecs: number
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
+  streamKeepaliveIntervalSecs: number
   kiroUpstreamStreamRetryEnabled: boolean
   kiroUpstreamStreamRetryMaxAttempts: number
   inferenceUpstreamMaxAttempts: number

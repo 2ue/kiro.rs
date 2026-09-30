@@ -557,6 +557,7 @@ const emptyConfig: RuntimeConfig = {
   credentialDispatchMaxWaitSecs: 120,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
+  streamKeepaliveIntervalSecs: 5,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 2,
   inferenceUpstreamMaxAttempts: 4,
@@ -3045,6 +3046,7 @@ export function RuntimeConfigPanel() {
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
+      streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
       kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
       kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
       inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
@@ -3400,6 +3402,17 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(kiroUpstreamStreamIdleTimeoutSecs) =>
                 setDraft((prev) => ({ ...prev, kiroUpstreamStreamIdleTimeoutSecs }))
+              }
+            />
+            <NumberField
+              title="流式保活间隔"
+              description="上游暂时没有新内容时，每隔多久向客户端发一次保活心跳，防止客户端或中间代理因空闲断开；默认 5 秒。"
+              value={draft.streamKeepaliveIntervalSecs}
+              min={1}
+              max={300}
+              suffix="秒"
+              onChange={(streamKeepaliveIntervalSecs) =>
+                setDraft((prev) => ({ ...prev, streamKeepaliveIntervalSecs }))
               }
             />
             <ToggleField

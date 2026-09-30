@@ -453,6 +453,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   credentialDispatchMaxWaitSecs: 120,
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
+  streamKeepaliveIntervalSecs: 5,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 2,
   inferenceUpstreamMaxAttempts: 4,

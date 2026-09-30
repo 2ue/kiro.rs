@@ -6316,6 +6316,44 @@ fn claude_code_noop_delta_keepalive_is_version_gated() {
     assert!(!should_use_claude_code_noop_delta_keepalive(None));
 }
 
+#[test]
+fn keepalive_tick_sends_noop_delta_only_to_capable_clients_with_an_open_block() {
+    let mut open_block = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+    let _ = open_block.generate_initial_events();
+    let _ = open_block.process_kiro_event(&crate::kiro::model::events::Event::AssistantResponse(
+        serde_json::from_value(json!({"content": "partial answer"})).expect("assistant event"),
+    ));
+    let no_block = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+
+    let tick = |ctx: &StreamContext, noop: bool| {
+        String::from_utf8(keepalive_sse_bytes(ctx, noop).to_vec()).expect("keepalive UTF-8")
+    };
+
+    let capable = tick(&open_block, true);
+    assert!(
+        capable.starts_with("event: content_block_delta"),
+        "{capable}"
+    );
+    assert!(capable.contains(r#""text":"""#), "{capable}");
+
+    // Older clients and moments without an open block get a standard ping, never a
+    // synthetic content block.
+    for keepalive in [tick(&open_block, false), tick(&no_block, true)] {
+        assert!(keepalive.starts_with("event: ping"), "{keepalive}");
+        assert!(!keepalive.contains("content_block"), "{keepalive}");
+    }
+}
+
+#[test]
+fn keepalive_policy_clamps_configured_interval() {
+    assert_eq!(StreamKeepalivePolicy::new(0, true, 180).interval_secs, 1);
+    assert_eq!(StreamKeepalivePolicy::new(5, false, 180).interval_secs, 5);
+    assert_eq!(
+        StreamKeepalivePolicy::new(10_000, false, 180).interval_secs,
+        300
+    );
+}
+
 #[tokio::test]
 async fn parse_messages_payload_rejects_empty_model_before_routing() {
     for model in ["", "   "] {
@@ -6680,6 +6718,7 @@ fn runtime_config_for_payload_guard(
         kiro_cache_point_tools_only: true,
         kiro_cache_point_record_plan: true,
         kiro_upstream_stream_idle_timeout_secs: 180,
+        stream_keepalive_interval_secs: 5,
         kiro_upstream_stream_retry_enabled: true,
         kiro_upstream_stream_retry_max_attempts: 2,
         inference_upstream_max_attempts: 4,

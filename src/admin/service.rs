@@ -5152,6 +5152,7 @@ impl AdminService {
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            stream_keepalive_interval_secs: config.stream_keepalive_interval_secs,
             kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
             kiro_upstream_stream_retry_max_attempts: config.kiro_upstream_stream_retry_max_attempts,
             inference_upstream_max_attempts: config.inference_upstream_max_attempts,
@@ -5290,6 +5291,9 @@ impl AdminService {
         let kiro_upstream_stream_idle_timeout_secs = req
             .kiro_upstream_stream_idle_timeout_secs
             .unwrap_or(current_config.kiro_upstream_stream_idle_timeout_secs);
+        let stream_keepalive_interval_secs = req
+            .stream_keepalive_interval_secs
+            .unwrap_or(current_config.stream_keepalive_interval_secs);
         let kiro_upstream_stream_retry_enabled = req
             .kiro_upstream_stream_retry_enabled
             .unwrap_or(current_config.kiro_upstream_stream_retry_enabled);
@@ -5683,6 +5687,16 @@ impl AdminService {
                 "kiroUpstreamStreamIdleTimeoutSecs 不能大于 86400".to_string(),
             ));
         }
+        if !(crate::model::config::STREAM_KEEPALIVE_INTERVAL_MIN_SECS
+            ..=crate::model::config::STREAM_KEEPALIVE_INTERVAL_MAX_SECS)
+            .contains(&stream_keepalive_interval_secs)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "streamKeepaliveIntervalSecs 必须在 {}–{} 秒之间",
+                crate::model::config::STREAM_KEEPALIVE_INTERVAL_MIN_SECS,
+                crate::model::config::STREAM_KEEPALIVE_INTERVAL_MAX_SECS
+            )));
+        }
         if kiro_upstream_stream_retry_max_attempts > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamStreamRetryMaxAttempts 不能大于 100".to_string(),
@@ -5875,6 +5889,7 @@ impl AdminService {
                 config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
                 config.kiro_upstream_stream_idle_timeout_secs =
                     kiro_upstream_stream_idle_timeout_secs;
+                config.stream_keepalive_interval_secs = stream_keepalive_interval_secs;
                 config.kiro_upstream_stream_retry_enabled = kiro_upstream_stream_retry_enabled;
                 config.kiro_upstream_stream_retry_max_attempts =
                     kiro_upstream_stream_retry_max_attempts;

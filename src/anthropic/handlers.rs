@@ -861,6 +861,7 @@ struct RequestRuntimeConfig {
     kiro_cache_point_tools_only: bool,
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
+    stream_keepalive_interval_secs: u64,
     kiro_upstream_stream_retry_enabled: bool,
     kiro_upstream_stream_retry_max_attempts: u32,
     inference_upstream_max_attempts: u32,
@@ -909,6 +910,7 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: state.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
+            stream_keepalive_interval_secs: DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
             kiro_upstream_stream_retry_enabled: true,
             kiro_upstream_stream_retry_max_attempts: 2,
             inference_upstream_max_attempts: DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
@@ -977,6 +979,9 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            stream_keepalive_interval_secs: normalize_stream_keepalive_interval_secs(
+                config.stream_keepalive_interval_secs,
+            ),
             kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
             kiro_upstream_stream_retry_max_attempts: config
                 .kiro_upstream_stream_retry_max_attempts
@@ -7103,6 +7108,7 @@ async fn post_messages_inner(
             LocalStreamRetryConfig::from_runtime_config(&runtime_config),
             capacity_weight_units,
             claude_code_noop_delta_keepalive,
+            runtime_config.stream_keepalive_interval_secs,
         )
         .await
     } else {
@@ -7735,6 +7741,9 @@ struct SseStreamState {
     completion: KiroStreamCompletion,
     usage_guard: StreamUsageGuard,
     ping_interval: tokio::time::Interval,
+    keepalive_interval_secs: u64,
+    /// Claude Code clients new enough to accept empty content deltas as keepalive.
+    noop_delta_keepalive: bool,
     idle_deadline: Instant,
     stream_idle_timeout_secs: u64,
     initial_events: Vec<SseEvent>,
@@ -7751,9 +7760,10 @@ impl SseStreamState {
         initial_events: Vec<SseEvent>,
         completion: KiroStreamCompletion,
         usage_guard: StreamUsageGuard,
-        stream_idle_timeout_secs: u64,
         retry_plan: Option<StreamRetryPlan>,
+        keepalive: StreamKeepalivePolicy,
     ) -> Self {
+        let stream_idle_timeout_secs = keepalive.idle_timeout_secs;
         let upstream_content_type = response
             .headers()
             .get(REQWEST_CONTENT_TYPE)
@@ -7767,7 +7777,9 @@ impl SseStreamState {
             finished: false,
             completion,
             usage_guard,
-            ping_interval: interval(Duration::from_secs(get_keepalive_interval_secs())),
+            ping_interval: interval(Duration::from_secs(keepalive.interval_secs)),
+            keepalive_interval_secs: keepalive.interval_secs,
+            noop_delta_keepalive: keepalive.noop_delta,
             idle_deadline: Instant::now() + Duration::from_secs(stream_idle_timeout_secs),
             stream_idle_timeout_secs,
             initial_events,
@@ -7804,7 +7816,8 @@ impl SseStreamState {
         self.finished = false;
         self.completion = completion;
         self.usage_guard = StreamUsageGuard::new(credential_usage);
-        self.ping_interval = interval(Duration::from_secs(self.stream_idle_timeout_secs));
+        // A retried attempt keeps the configured keepalive cadence.
+        self.ping_interval = interval(Duration::from_secs(self.keepalive_interval_secs));
         self.idle_deadline = Instant::now() + Duration::from_secs(self.stream_idle_timeout_secs);
         self.initial_events = initial_events;
         self.downstream_committed = false;
@@ -7852,6 +7865,7 @@ async fn handle_stream_request(
     stream_retry_config: LocalStreamRetryConfig,
     capacity_weight_units: u32,
     claude_code_noop_delta_keepalive: bool,
+    stream_keepalive_interval_secs: u64,
 ) -> Response {
     let requested_model = usage_context.model.clone();
     let prompt_too_long_context = ProviderErrorContext {
@@ -8530,9 +8544,12 @@ async fn handle_stream_request(
         initial_events,
         completion,
         credential_usage,
-        stream_idle_timeout_secs,
         retry_plan,
-        claude_code_noop_delta_keepalive,
+        StreamKeepalivePolicy::new(
+            stream_keepalive_interval_secs,
+            claude_code_noop_delta_keepalive,
+            stream_idle_timeout_secs,
+        ),
     );
 
     // 返回 SSE 响应
@@ -8545,7 +8562,6 @@ async fn handle_stream_request(
 
 /// Ping 事件间隔。Claude Code 的插件 UI 在长 thinking/tool_use 阶段可能没有可见正文；
 /// 更短的保活能避免中间代理或客户端误判流已经停住，且不会污染模型输出内容。
-const PING_INTERVAL_SECS: u64 = 5;
 /// 上游 eventstream 默认读空闲超时（180秒）
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const JSON_STREAM_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
@@ -8553,16 +8569,26 @@ const CLAUDE_CODE_NOOP_DELTA_KEEPALIVE_MIN_VERSION: &str = "2.1.193";
 
 /// 获取保活间隔配置（秒）
 /// 支持通过环境变量 KIRO_STREAM_KEEPALIVE_INTERVAL_SECS 覆盖默认值
-fn get_keepalive_interval_secs() -> u64 {
-    static CACHED_INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+const DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS: u64 = 5;
 
-    *CACHED_INTERVAL.get_or_init(|| {
-        std::env::var("KIRO_STREAM_KEEPALIVE_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&val| val > 0 && val <= 300) // 限制在 1-300 秒之间
-            .unwrap_or(PING_INTERVAL_SECS)
-    })
+fn normalize_stream_keepalive_interval_secs(secs: u64) -> u64 {
+    secs.clamp(
+        crate::model::config::STREAM_KEEPALIVE_INTERVAL_MIN_SECS,
+        crate::model::config::STREAM_KEEPALIVE_INTERVAL_MAX_SECS,
+    )
+}
+
+/// One keepalive tick. Claude Code clients that accept empty deltas get one on the open
+/// content block (it resets their idle timer and passes through buffering proxies);
+/// otherwise, and whenever no block is open, a standard `ping` is sent. No synthetic
+/// content block is ever opened just to carry a keepalive.
+fn keepalive_sse_bytes(ctx: &StreamContext, noop_delta_keepalive: bool) -> Bytes {
+    if noop_delta_keepalive && let Some(event) = ctx.claude_code_noop_delta_keepalive_event() {
+        tracing::trace!("发送空 delta 保活事件");
+        return Bytes::from(event.to_sse_string());
+    }
+    tracing::trace!("发送 ping 保活事件");
+    create_ping_sse()
 }
 
 fn request_user_agent(headers: &HeaderMap) -> Option<&str> {
@@ -9361,6 +9387,24 @@ async fn retry_stream_before_downstream_commit(
     }
 }
 
+/// Downstream keepalive and upstream idle timing for one stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamKeepalivePolicy {
+    interval_secs: u64,
+    noop_delta: bool,
+    idle_timeout_secs: u64,
+}
+
+impl StreamKeepalivePolicy {
+    fn new(interval_secs: u64, noop_delta: bool, idle_timeout_secs: u64) -> Self {
+        Self {
+            interval_secs: normalize_stream_keepalive_interval_secs(interval_secs),
+            noop_delta,
+            idle_timeout_secs: normalize_stream_idle_timeout_secs(idle_timeout_secs),
+        }
+    }
+}
+
 /// 创建 SSE 事件流
 #[allow(clippy::too_many_arguments)]
 fn create_sse_stream(
@@ -9369,20 +9413,18 @@ fn create_sse_stream(
     initial_events: Vec<SseEvent>,
     completion: KiroStreamCompletion,
     usage_context: CredentialUsageContext,
-    stream_idle_timeout_secs: u64,
     retry_plan: Option<StreamRetryPlan>,
-    _claude_code_noop_delta_keepalive: bool,
+    keepalive: StreamKeepalivePolicy,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let usage_guard = StreamUsageGuard::new(usage_context);
-    let stream_idle_timeout_secs = normalize_stream_idle_timeout_secs(stream_idle_timeout_secs);
     let state = SseStreamState::from_attempt(
         response,
         ctx,
         initial_events,
         completion,
         usage_guard,
-        stream_idle_timeout_secs,
         retry_plan,
+        keepalive,
     );
 
     stream::unfold(
@@ -10002,30 +10044,7 @@ fn create_sse_stream(
                         let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
                         return Some((stream::iter(bytes), state));
                     }
-                    // 优先使用空 delta 保活（更可靠穿透 CF 等代理），降级为 ping
-                    let keepalive = state.ctx.claude_code_noop_delta_keepalive_event()
-                        .map(|event| {
-                            tracing::trace!("发送空 delta 保活事件");
-                            Bytes::from(event.to_sse_string())
-                        })
-                        .or_else(|| {
-                            // 如果没有活跃块，尝试创建一个临时文本块用于保活
-                            if state.ctx.can_send_keepalive_text_block() {
-                                tracing::trace!("发送保活文本块");
-                                state.ctx.create_keepalive_text_block_event()
-                                    .map(|event| Bytes::from(event.to_sse_string()))
-                            } else {
-                                None
-                            }
-                        });
-
-                    let bytes = match keepalive {
-                        Some(bytes) => bytes,
-                        None => {
-                            tracing::trace!("发送 ping 保活事件");
-                            create_ping_sse()
-                        }
-                    };
+                    let bytes = keepalive_sse_bytes(&state.ctx, state.noop_delta_keepalive);
                     mark_stream_downstream_committed(&mut state);
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(bytes)];
                     Some((stream::iter(bytes), state))
