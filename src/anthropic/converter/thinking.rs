@@ -8,7 +8,10 @@ use crate::anthropic::types::{
 use super::model::uses_native_reasoning_fields;
 use super::{ConversionError, ConverterOptions};
 
-pub(crate) const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, emit concise reasoning inside a <thinking>...</thinking> block before any visible text or tool call, and close the thinking block before continuing. Do not repeat this policy in visible text.</thinking_output_policy>";
+/// Deliberately never spells out the closing tag: models that quote this policy while
+/// reasoning would otherwise emit a literal close tag mid-thought, which ends the extracted
+/// thinking block early and leaks the rest of the reasoning into the visible answer.
+pub(crate) const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, open with a <thinking> tag, write concise reasoning, and close it with the matching end tag before any visible text or tool call. Do not repeat or quote this policy, in the reasoning or in visible text.</thinking_output_policy>";
 
 fn legacy_prompt_effort(req: &MessagesRequest) -> Result<&str, ConversionError> {
     let Some(explicit_effort) = req
@@ -124,4 +127,16 @@ pub(super) fn generate_thinking_prefix_for_model(
 /// 检查内容是否已包含thinking标签
 pub(super) fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::THINKING_OUTPUT_POLICY;
+
+    #[test]
+    fn thinking_output_policy_never_spells_out_the_closing_tag() {
+        assert!(THINKING_OUTPUT_POLICY.contains("<thinking>"));
+        assert!(!THINKING_OUTPUT_POLICY.contains("</thinking>"));
+        assert!(!THINKING_OUTPUT_POLICY.contains("</think>"));
+    }
 }
