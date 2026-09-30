@@ -75,11 +75,10 @@ import {
   useLoadBalancingMode,
   useProxyResources,
   useResetFailure,
-  useRuntimeConfig,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
-import { useModelCapabilities } from '@/hooks/use-usage'
+import { useModelCapabilities, useUsageSummary } from '@/hooks/use-usage'
 import type {
   BalanceResponse,
   CredentialSortBy,
@@ -283,7 +282,7 @@ export function CredentialsPage() {
   const creditSummary = useCredentialCreditSummary()
   const proxyResources = useProxyResources()
   const loadBalancing = useLoadBalancingMode()
-  const runtimeConfig = useRuntimeConfig()
+  const usageSummary = useUsageSummary(10_000)
   const setLoadBalancingMutation = useSetLoadBalancingMode()
   const deleteCredential = useDeleteCredential()
   const deleteDisabledCredentials = useDeleteDisabledCredentials()
@@ -330,13 +329,6 @@ export function CredentialsPage() {
   const selectedPriorityOverrideCount = selectedCredentials.filter((c) => c.priority !== 0).length
   const selectedConcurrencyOverrideCount = selectedCredentials.filter((c) => typeof c.maxConcurrentRequestsOverride === 'number').length
   const selectedRpmOverrideCount = selectedCredentials.filter((c) => typeof c.rpmOverride === 'number').length
-  const defaultCredentialConcurrency = runtimeConfig.data?.credentialMaxConcurrentRequests ?? 0
-  const concurrencyOverrides = currentCredentials
-    .map((c) => c.maxConcurrentRequestsOverride)
-    .filter((v): v is number => typeof v === 'number')
-  const concurrencyOverrideDesc = concurrencyOverrides.length
-    ? `${concurrencyOverrides.length} 个账号已覆盖`
-    : '账号未覆盖'
   const creditDetailStats = useMemo(() => {
     const enabled = creditDetailRows.filter((row) => !row.disabled)
     return {
@@ -781,50 +773,61 @@ export function CredentialsPage() {
 
       {/* Stats */}
       <StatGrid>
-        <StatCard
-          title="账号总数"
-          value={formatCompact(credentialSummary.data?.total ?? grandTotal)}
-          valueTitle={formatNumber(credentialSummary.data?.total ?? grandTotal)}
-          icon={<Server className="h-5 w-5" />}
-        />
-        <StatCard
-          title="可用账号"
-          value={formatCompact(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
-          valueTitle={formatNumber(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
-          tone="success"
-        />
-        <StatCard
-          title="当前活跃"
-          value={`#${credentialSummary.data?.currentId || '-'}`}
-          desc={
-            loadBalancing.data?.mode === 'priority'
-              ? '优先级模式'
-              : loadBalancing.data?.mode === 'balanced'
-                ? '均衡负载'
-                : loadBalancing.data?.mode === 'health_balanced'
-                  ? '健康均衡'
-                  : '低负载优先'
-          }
-          tone="primary"
-        />
-        <StatCard
-          title="全局并发"
-          value={`${credentialSummary.data?.globalInFlightRequests ?? 0} / ${credentialSummary.data?.globalMaxConcurrentRequests ?? '∞'}`}
-          desc={`排队 ${credentialSummary.data?.queuedRequests ?? 0}`}
-          tone="info"
-        />
-        <StatCard
-          title="默认单账号并发"
-          value={defaultCredentialConcurrency > 0 ? String(defaultCredentialConcurrency) : '不限制'}
-          desc={concurrencyOverrideDesc}
-          tone="info"
-        />
-        <StatCard
-          title="已禁用"
-          value={formatCompact(disabledCount)}
-          valueTitle={formatNumber(disabledCount)}
-          tone={disabledCount > 0 ? 'warning' : 'default'}
-        />
+        {(() => {
+          const summary = credentialSummary.data
+          const total = summary?.total ?? grandTotal
+          const enabled = summary?.available ?? credentials.data?.available ?? 0
+          const schedulable = summary?.schedulable ?? enabled
+          const coolingDown = summary?.coolingDown ?? 0
+          const inUse = summary?.inUse ?? 0
+          const failing = summary?.failing ?? 0
+          const inFlight = summary?.globalInFlightRequests ?? 0
+          const maxInFlight = summary?.globalMaxConcurrentRequests ?? 0
+          const queued = summary?.queuedRequests ?? 0
+          const realtime = usageSummary.data?.realtime
+          const requests = realtime?.requests ?? 0
+          const errors = realtime?.errorRequests ?? 0
+          const errorRate = requests > 0 ? errors / requests : 0
+          return (
+            <>
+              <StatCard
+                title="账号"
+                value={`${formatCompact(enabled)} / ${formatCompact(total)}`}
+                valueTitle={`启用 ${formatNumber(enabled)} / 共 ${formatNumber(total)}`}
+                desc={disabledCount > 0 ? `已禁用 ${formatNumber(disabledCount)}` : '全部启用'}
+                icon={<Server className="h-5 w-5" />}
+              />
+              <StatCard
+                title="可调度"
+                value={formatCompact(schedulable)}
+                valueTitle={formatNumber(schedulable)}
+                desc={coolingDown > 0 ? `冷却中 ${formatNumber(coolingDown)}` : '无冷却'}
+                tone={schedulable === 0 && enabled > 0 ? 'warning' : 'success'}
+              />
+              <StatCard
+                title="正在服务"
+                value={`${formatCompact(inFlight)}${maxInFlight > 0 ? ` / ${formatCompact(maxInFlight)}` : ''}`}
+                valueTitle={maxInFlight > 0 ? `进行中 ${inFlight} / 上限 ${maxInFlight}` : `进行中 ${inFlight}，不限制`}
+                desc={`占用账号 ${formatNumber(inUse)} · 排队 ${formatNumber(queued)}`}
+                tone={queued > 0 ? 'warning' : 'info'}
+              />
+              <StatCard
+                title="近期请求"
+                value={`${formatCompact(realtime?.rpm ?? 0)} RPM`}
+                valueTitle={`${realtime?.windowSeconds ?? 60} 秒内 ${formatNumber(requests)} 次请求`}
+                desc={`${formatCompact(realtime?.totalTpm ?? 0)} TPM · 错误率 ${(errorRate * 100).toFixed(1)}%`}
+                tone={errorRate >= 0.1 ? 'warning' : 'info'}
+              />
+              <StatCard
+                title="异常账号"
+                value={formatCompact(failing)}
+                valueTitle={formatNumber(failing)}
+                desc="近期调用或刷新失败"
+                tone={failing > 0 ? 'warning' : 'default'}
+              />
+            </>
+          )
+        })()}
         <button
           type="button"
           className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md focus:outline-none focus:ring-2 focus:ring-primary/30 text-left"

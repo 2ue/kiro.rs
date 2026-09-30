@@ -412,6 +412,14 @@ pub struct CredentialSummaryResponse {
     pub max_queued_requests: u32,
     pub updated_at: String,
     pub runtime_fresh: bool,
+    /// Enabled accounts not in an account-wide cooldown.
+    pub schedulable: usize,
+    /// Enabled accounts with any active cooldown.
+    pub cooling_down: usize,
+    /// Enabled accounts serving at least one request right now.
+    pub in_use: usize,
+    /// Enabled accounts with recent call or token-refresh failures.
+    pub failing: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

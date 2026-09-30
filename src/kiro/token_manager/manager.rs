@@ -59,8 +59,8 @@ use super::account_state::{
     InFlightLease, ProxyResourceAvailability, ProxyResourceRuntime, SessionBinding,
 };
 use super::admin_snapshot::{
-    ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
-    base_snapshot_from_entry, runtime_snapshot_from_entry,
+    ManagerAccountStateCounts, ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot,
+    ManagerSummarySnapshot, base_snapshot_from_entry, runtime_snapshot_from_entry,
 };
 use super::auxiliary::{
     AuxiliaryConcurrencyController, AuxiliaryConcurrencySaturated, AuxiliaryConcurrencySnapshot,
@@ -81,7 +81,10 @@ use super::concurrency::{
     DispatchQueueGuard, InFlightLeaseGuard, ReleasedInFlightLeaseTombstones,
     SchedulerRedisReleaseDispatcher, filter_released_in_flight_leases_from_scheduler_states,
 };
-use super::cooldown::{entry_any_cooldown_remaining, entry_cooldown_remaining, model_state_key};
+use super::cooldown::{
+    entry_any_cooldown_remaining, entry_cooldown_remaining, entry_global_cooldown_remaining,
+    model_state_key,
+};
 use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
     format_effective_concurrency_range, min_dispatch_wait, rate_limit_blocked_count,
@@ -11877,13 +11880,30 @@ impl MultiTokenManager {
     pub fn summary_snapshot(&self) -> ManagerSummarySnapshot {
         self.cleanup_expired_in_flight_leases_local_first();
         let config = self.config.lock().clone();
-        let (current_id, total, available, local_global_in_flight) = {
+        let now = Instant::now();
+        let (current_id, total, available, local_global_in_flight, account_states) = {
             let entries = self.entries.lock();
+            let enabled = || entries.iter().filter(|entry| !entry.disabled);
+            let account_states = ManagerAccountStateCounts {
+                schedulable: enabled()
+                    .filter(|entry| entry_global_cooldown_remaining(entry, now).is_none())
+                    .count(),
+                cooling_down: enabled()
+                    .filter(|entry| entry_any_cooldown_remaining(entry, now).is_some())
+                    .count(),
+                in_use: enabled()
+                    .filter(|entry| entry.in_flight_requests > 0)
+                    .count(),
+                failing: enabled()
+                    .filter(|entry| entry.failure_count > 0 || entry.refresh_failure_count > 0)
+                    .count(),
+            };
             (
                 *self.current_id.lock(),
                 entries.len(),
-                entries.iter().filter(|e| !e.disabled).count(),
+                enabled().count(),
                 entries.iter().map(|entry| entry.in_flight_requests).sum(),
+                account_states,
             )
         };
         let (global_capacity, runtime_fresh) = if self.redis_store.is_some() {
@@ -11907,6 +11927,7 @@ impl MultiTokenManager {
             global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
             max_queued_requests: config.dispatch_max_queued_requests,
             runtime_fresh,
+            account_states,
         }
     }
 

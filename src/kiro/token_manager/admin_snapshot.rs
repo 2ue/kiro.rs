@@ -273,6 +273,21 @@ pub struct ManagerSummarySnapshot {
     pub global_max_concurrent_requests: u32,
     pub max_queued_requests: u32,
     pub runtime_fresh: bool,
+    pub account_states: ManagerAccountStateCounts,
+}
+
+/// Counts over enabled accounts for the admin overview.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerAccountStateCounts {
+    /// Enabled and not in an account-wide cooldown right now.
+    pub schedulable: usize,
+    /// Enabled with any active cooldown (account-wide or for some model).
+    pub cooling_down: usize,
+    /// Enabled with at least one request in flight on this instance.
+    pub in_use: usize,
+    /// Enabled with recent call or token-refresh failures.
+    pub failing: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

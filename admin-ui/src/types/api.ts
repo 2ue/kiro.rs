@@ -40,6 +40,10 @@ export interface CredentialSummaryResponse {
   maxQueuedRequests: number
   updatedAt: string
   runtimeFresh: boolean
+  schedulable: number
+  coolingDown: number
+  inUse: number
+  failing: number
 }
 
 export interface SystemVersionResponse {

@@ -40,9 +40,9 @@ import {
   useLoadBalancingMode,
   useProxyResources,
   useResetFailure,
-  useRuntimeConfig,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
+import { useUsageSummary } from '@/hooks/use-usage'
 import {
   forceRefreshToken,
   getCredentialInfo,
@@ -289,7 +289,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { data: proxyResourcesData } = useProxyResources()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
-  const runtimeConfig = useRuntimeConfig()
+  const usageStatsQuery = useUsageSummary(10_000)
   const creditSummary = useCredentialCreditSummary()
   const refetch = () => {
     refetchList()
@@ -367,6 +367,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       queuedRequests: summaryData?.queuedRequests ?? 0,
       globalMaxConcurrentRequests: summaryData?.globalMaxConcurrentRequests ?? 0,
       maxQueuedRequests: summaryData?.maxQueuedRequests ?? 0,
+      schedulable: summaryData?.schedulable ?? summaryData?.available ?? listData?.available ?? 0,
+      coolingDown: summaryData?.coolingDown ?? 0,
+      inUse: summaryData?.inUse ?? 0,
+      failing: summaryData?.failing ?? 0,
       page: listData?.page ?? currentPage,
       limit: listData?.limit ?? itemsPerPage,
       totalPages: listData?.totalPages ?? 0,
@@ -1193,57 +1197,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-6 mb-6">
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
+              <CardTitle className="text-sm font-medium text-muted-foreground">账号</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
+              <div className="text-2xl font-bold">{data?.available ?? 0} / {data?.total ?? 0}</div>
+              <div className="text-xs text-muted-foreground">{(data?.total ?? 0) - (data?.available ?? 0) > 0 ? `已禁用 ${(data?.total ?? 0) - (data?.available ?? 0)}` : '全部启用'}</div>
             </CardContent>
           </Card>
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
+              <CardTitle className="text-sm font-medium text-muted-foreground">可调度</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
+              <div className="text-2xl font-bold text-green-600">{data?.schedulable ?? 0}</div>
+              <div className="text-xs text-muted-foreground">{data?.coolingDown ? `冷却中 ${data.coolingDown}` : '无冷却'}</div>
             </CardContent>
           </Card>
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
+              <CardTitle className="text-sm font-medium text-muted-foreground">正在服务</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
+              <div className="text-2xl font-bold">{data?.globalInFlightRequests ?? 0}{data?.globalMaxConcurrentRequests ? ` / ${data.globalMaxConcurrentRequests}` : ''}</div>
+              <div className="text-xs text-muted-foreground">占用账号 {data?.inUse ?? 0} · 排队 {data?.queuedRequests ?? 0}</div>
             </CardContent>
           </Card>
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">调度容量</CardTitle>
+              <CardTitle className="text-sm font-medium text-muted-foreground">近期请求</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">
-                {data?.globalInFlightRequests || 0}/{data?.globalMaxConcurrentRequests || '不限'}
-              </div>
-              <div className="text-xs text-muted-foreground">全局并发 · 排队 {data?.queuedRequests || 0}/{data?.maxQueuedRequests || '不限'}</div>
+              <div className="text-2xl font-bold">{Math.round(usageStatsQuery.data?.realtime?.rpm ?? 0)} RPM</div>
+              <div className="text-xs text-muted-foreground">{Math.round(usageStatsQuery.data?.realtime?.totalTpm ?? 0)} TPM · 错误率 {((usageStatsQuery.data?.realtime?.requests ?? 0) > 0 ? ((usageStatsQuery.data?.realtime?.errorRequests ?? 0) / (usageStatsQuery.data?.realtime?.requests ?? 1)) * 100 : 0).toFixed(1)}%</div>
             </CardContent>
           </Card>
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">单凭据并发</CardTitle>
+              <CardTitle className="text-sm font-medium text-muted-foreground">异常账号</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">
-                {runtimeConfig.data?.credentialMaxConcurrentRequests || '不限'}
-              </div>
-              <div className="text-xs text-muted-foreground">每个凭据同时处理请求上限</div>
+              <div className={`text-2xl font-bold ${data?.failing ? 'text-amber-600' : ''}`}>{data?.failing ?? 0}</div>
+              <div className="text-xs text-muted-foreground">近期调用或刷新失败</div>
             </CardContent>
           </Card>
           <Card

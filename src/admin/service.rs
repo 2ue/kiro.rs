@@ -1986,6 +1986,10 @@ impl AdminService {
             max_queued_requests: snapshot.max_queued_requests,
             updated_at: Utc::now().to_rfc3339(),
             runtime_fresh: snapshot.runtime_fresh,
+            schedulable: snapshot.account_states.schedulable,
+            cooling_down: snapshot.account_states.cooling_down,
+            in_use: snapshot.account_states.in_use,
+            failing: snapshot.account_states.failing,
         }
     }
 
