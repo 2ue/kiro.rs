@@ -559,7 +559,7 @@ const emptyConfig: RuntimeConfig = {
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   streamKeepaliveIntervalSecs: 5,
   streamPreOutputHoldSecs: 15,
-  streamFirstOutputTimeoutSecs: 90,
+  streamFirstOutputTimeoutSecs: 0,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 2,
   inferenceUpstreamMaxAttempts: 4,
@@ -3432,7 +3432,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="首输出等待上限"
-              description="上游返回响应头后最多等待多少秒出现首个内容；超时断开上游并释放账号，未写入时换号重试，已写入时返回过载错误让客户端重试。0 表示关闭；默认 90 秒。"
+              description="上游返回响应头后最多等待多少秒出现首个内容；超时断开上游并释放账号，未写入时换号重试，已写入时返回过载错误让客户端重试。0 表示关闭（默认）。开启时应大于慢模型的首输出耗时，建议不低于 300 秒。"
               value={draft.streamFirstOutputTimeoutSecs}
               min={0}
               max={3600}

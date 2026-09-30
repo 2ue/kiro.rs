@@ -7767,6 +7767,8 @@ struct SseStreamState {
     first_output_timeout_secs: u64,
     /// Deadline for this attempt's first content event; cleared once content starts.
     first_output_deadline: Option<Instant>,
+    /// A usage-only upstream turn gets one transparent retry per request.
+    usage_only_retried: bool,
     initial_events: Vec<SseEvent>,
     downstream_committed: bool,
     retry_plan: Option<StreamRetryPlan>,
@@ -7810,6 +7812,7 @@ impl SseStreamState {
             first_output_deadline: StreamKeepalivePolicy::deadline_after(
                 keepalive.first_output_timeout_secs,
             ),
+            usage_only_retried: false,
             initial_events,
             downstream_committed: false,
             retry_plan,
@@ -8609,7 +8612,7 @@ const CLAUDE_CODE_NOOP_DELTA_KEEPALIVE_MIN_VERSION: &str = "2.1.193";
 /// 支持通过环境变量 KIRO_STREAM_KEEPALIVE_INTERVAL_SECS 覆盖默认值
 const DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS: u64 = 5;
 const DEFAULT_STREAM_PRE_OUTPUT_HOLD_SECS: u64 = 15;
-const DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS: u64 = 0;
 
 fn normalize_stream_keepalive_interval_secs(secs: u64) -> u64 {
     secs.clamp(
@@ -9995,6 +9998,45 @@ fn create_sse_stream(
                             } else {
                                 None
                             };
+                            // An upstream turn that only reports usage/metadata is retried once
+                            // before output (without reasoning shaping); if it is still empty it is
+                            // served as a normal empty end_turn, as before, so a Claude Code task
+                            // is never interrupted by it.
+                            let terminal_protocol_failure = match terminal_protocol_failure {
+                                Some(detail)
+                                    if detail
+                                        == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL =>
+                                {
+                                    if !state.downstream_committed && !state.usage_only_retried {
+                                        state.usage_only_retried = true;
+                                        if let Some(plan) = state.retry_plan.as_mut() {
+                                            degrade_stream_retry_plan_without_reasoning_shaping(plan);
+                                        }
+                                        match retry_stream_before_downstream_commit(
+                                            state,
+                                            StreamRetryReason::ProtocolError,
+                                            detail.clone(),
+                                        )
+                                        .await
+                                        {
+                                            StreamRetryOutcome::Retried(state) => {
+                                                let bytes: Vec<Result<Bytes, Infallible>> =
+                                                    Vec::new();
+                                                return Some((stream::iter(bytes), state));
+                                            }
+                                            StreamRetryOutcome::NotRetried(next_state) => {
+                                                state = next_state;
+                                            }
+                                        }
+                                    }
+                                    tracing::warn!(
+                                        attempt = state.attempt_number,
+                                        "上游只返回 usage/metadata，按空 end_turn 结束本轮"
+                                    );
+                                    None
+                                }
+                                other => other,
+                            };
                             if let Some(detail) = terminal_protocol_failure {
                                 tracing::warn!(
                                     pending_bytes = state.decoder.pending_bytes(),
@@ -10003,20 +10045,6 @@ fn create_sse_stream(
                                     error = %detail,
                                     "EventStream 在协议完成前结束"
                                 );
-                                if !state.downstream_committed
-                                    && detail
-                                        == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
-                                {
-                                    if let Some(plan) = state.retry_plan.as_mut() {
-                                        if degrade_stream_retry_plan_without_reasoning_shaping(plan)
-                                        {
-                                            tracing::warn!(
-                                                request_id = %plan.request_id,
-                                                "上游空响应，首输出前重试降级为不带 reasoning/thinking 整形的请求"
-                                            );
-                                        }
-                                    }
-                                }
                                 if !state.downstream_committed {
                                     match retry_stream_before_downstream_commit(
                                         state,
@@ -11687,14 +11715,12 @@ async fn handle_non_stream_request(
     if missing_explicit_status {
         let has_trusted_upstream_completion_signal =
             saw_upstream_metadata || saw_upstream_context_usage || saw_upstream_metering;
-        // 与流式一致：仅有 usage/metadata 侧信道事件而无任何输出时视为上游失败，
-        // 不返回 200 空内容。
+        // 与流式一致：仅有 usage/metadata 侧信道事件而无任何输出时按空 end_turn 返回，
+        // 不报错中断 Claude Code 的任务。
         let terminal_failure = if !saw_meaningful_upstream_response {
-            Some(if has_trusted_upstream_completion_signal {
-                super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
-            } else {
-                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event"
-            })
+            (!has_trusted_upstream_completion_signal).then_some(
+                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
+            )
         } else if !saw_completed_tool_use && !has_trusted_upstream_completion_signal {
             Some("upstream eventstream ended without a trusted completion signal")
         } else {
@@ -11704,17 +11730,11 @@ async fn handle_non_stream_request(
             tracing::warn!(error = detail, "非流式响应缺少可信完成信号");
             credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
             completion.release();
-            // 空响应对同一请求通常可复现：Claude Code 在流式 SSE error 后会发一次非流式
-            // 兜底请求，这里的 502 不带 `x-should-retry: false` 会被 CLI 连续重试 10 次
-            // （约 3 分钟）。明确告知不要重试，让本轮直接失败。
-            let extra_headers = (detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL)
-                .then(|| ("x-should-retry", "false".to_string()));
-            return envelope::error_response_with_id_and_headers(
+            return envelope::error_response_with_id(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
                 envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
                 &credential_usage.request.request_id,
-                extra_headers,
             );
         }
     }

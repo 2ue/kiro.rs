@@ -3749,7 +3749,7 @@ pub struct Config {
     #[serde(default = "default_stream_pre_output_hold_secs")]
     pub stream_pre_output_hold_secs: u64,
 
-    /// 上游响应头之后等待首个内容事件的上限秒数（0 关闭，默认 90，最大 3600）。
+    /// 上游响应头之后等待首个内容事件的上限秒数（0 关闭，默认 0，最大 3600）。
     ///
     /// 超时后主动断开上游并释放账号并发：尚未向客户端写入时按首输出前重试换号，
     /// 已写入时以 overloaded_error 结束流。已有输出之后的静默仍由上游流静默超时控制。
@@ -4325,7 +4325,9 @@ fn default_stream_pre_output_hold_secs() -> u64 {
 }
 
 fn default_stream_first_output_timeout_secs() -> u64 {
-    90
+    // Off by default: slow first outputs (opus-5.5 p99 ~140s) are legitimate, and the hold
+    // window plus keepalive already keep the client connection alive.
+    0
 }
 
 pub const STREAM_KEEPALIVE_INTERVAL_MIN_SECS: u64 = 1;
@@ -5902,7 +5904,7 @@ mod tests {
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
         assert_eq!(config.stream_keepalive_interval_secs, 5);
         assert_eq!(config.stream_pre_output_hold_secs, 15);
-        assert_eq!(config.stream_first_output_timeout_secs, 90);
+        assert_eq!(config.stream_first_output_timeout_secs, 0);
         assert!(config.kiro_upstream_stream_retry_enabled);
         assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 2);
         assert!(config.kiro_upstream_stream_retry_on_idle_timeout);

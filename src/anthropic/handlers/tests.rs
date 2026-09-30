@@ -5639,46 +5639,41 @@ fn handler_usage_only_eof_retries_before_empty_success_for_five_rounds() {
     );
 }
 
-/// think-02：非流式空响应（Claude Code 在流式 SSE error 后的兜底请求）返回 502 时带
-/// `x-should-retry: false`，避免 CLI 连续重试 10 次；其他未完成 EOF 维持原有可重试语义。
+/// A non-streaming turn that only reports usage/metadata is served as an empty end_turn
+/// (as before) instead of an error that interrupts the Claude Code task; an EOF without any
+/// trusted completion signal still fails with a retryable 502.
 async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
-    for (fault, expect_no_retry) in [
-        (HandlerEventStreamFault::UsageOnlyMeteringNoStatus, true),
-        (HandlerEventStreamFault::UnknownEventOnly, false),
-    ] {
-        for round in 1..=5 {
-            let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
-            let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
-            let response = tokio::time::timeout(
-                Duration::from_secs(5),
-                app.oneshot(handler_eventstream_fault_request_for_path(
-                    "/cc/v1/messages",
-                    false,
-                )),
-            )
-            .await
-            .expect("usage-only non-stream response timed out")
-            .expect("usage-only non-stream response");
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_GATEWAY,
-                "fault={fault:?} round={round}"
-            );
-            let should_retry = response
-                .headers()
-                .get("x-should-retry")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            if expect_no_retry {
-                assert_eq!(
-                    should_retry.as_deref(),
-                    Some("false"),
-                    "fault={fault:?} round={round}"
-                );
-            } else {
-                assert_eq!(should_retry, None, "fault={fault:?} round={round}");
-            }
-        }
+    for round in 1..=5 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
+        )
+        .await;
+        let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, _request_id, body) = call_handler_eventstream_fault(app, false).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert!(
+            body.contains(r#""stop_reason":"end_turn""#),
+            "round={round} body={body}"
+        );
+
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UnknownEventOnly).await;
+        let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(handler_eventstream_fault_request_for_path(
+                "/cc/v1/messages",
+                false,
+            )),
+        )
+        .await
+        .expect("unknown-event non-stream response timed out")
+        .expect("unknown-event non-stream response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "round={round}");
+        assert!(
+            response.headers().get("x-should-retry").is_none(),
+            "round={round}"
+        );
     }
 }
 
@@ -5787,10 +5782,6 @@ async fn run_handler_non_stream_untrusted_eof_matrix() {
         (
             HandlerEventStreamFault::MissingCompletionAfterText,
             "unterminated-visible",
-        ),
-        (
-            HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
-            "USAGE_ONLY_NON_STREAM_PRIVATE_MARKER",
         ),
     ] {
         for round in 1..=5 {
@@ -6847,7 +6838,7 @@ fn runtime_config_for_payload_guard(
         kiro_upstream_stream_idle_timeout_secs: 180,
         stream_keepalive_interval_secs: 5,
         stream_pre_output_hold_secs: 15,
-        stream_first_output_timeout_secs: 90,
+        stream_first_output_timeout_secs: 0,
         kiro_upstream_stream_retry_enabled: true,
         kiro_upstream_stream_retry_max_attempts: 2,
         inference_upstream_max_attempts: 4,
