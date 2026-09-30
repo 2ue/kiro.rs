@@ -1957,12 +1957,26 @@ impl PendingCredentialRuntimeMutation {
         match self {
             Self::Disable { .. } => true,
             Self::Patch { patch, .. } => {
+                // A patch that only advances the generation (per-account concurrency or RPM
+                // edits) changes no dispatch-relevant state, so it must not pull the account
+                // out of scheduling while the replay queue drains. Quarantining it made an
+                // account look disabled for seconds after a concurrency edit whenever its
+                // recent results were still being persisted.
+                let generation_only = patch.failure_count.is_none()
+                    && patch.refresh_failure_count.is_none()
+                    && patch.warmup_remaining.is_none()
+                    && patch.last_used_at.is_none()
+                    && patch.credential_disabled.is_none()
+                    && matches!(
+                        patch.disabled_reason,
+                        CredentialRuntimeDisabledReasonPatch::Preserve
+                    );
                 patch.credential_disabled.is_some()
                     || !matches!(
                         patch.disabled_reason,
                         CredentialRuntimeDisabledReasonPatch::Preserve
                     )
-                    || patch.advance_generation
+                    || (patch.advance_generation && !generation_only)
             }
             Self::Success { .. } | Self::ApiFailure { .. } => false,
             #[cfg(test)]

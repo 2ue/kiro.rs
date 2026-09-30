@@ -5145,6 +5145,12 @@ fn runtime_patch_quarantine_is_field_semantic_for_five_rounds() {
                 expected_generation: Some(round),
                 ..Default::default()
             },
+            // Per-account concurrency/RPM edits only advance the generation.
+            CredentialRuntimeStatePatch {
+                expected_generation: Some(round),
+                advance_generation: true,
+                ..Default::default()
+            },
         ] {
             assert!(
                 !PendingCredentialRuntimeMutation::Patch {
@@ -5172,6 +5178,12 @@ fn runtime_patch_quarantine_is_field_semantic_for_five_rounds() {
                 ..Default::default()
             },
             CredentialRuntimeStatePatch {
+                failure_count: Some(0),
+                advance_generation: true,
+                ..Default::default()
+            },
+            CredentialRuntimeStatePatch {
+                warmup_remaining: Some(round as u32),
                 advance_generation: true,
                 ..Default::default()
             },
