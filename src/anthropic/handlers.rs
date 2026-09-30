@@ -154,7 +154,9 @@ impl LocalStreamRetryConfig {
 
     fn allows(self, reason: StreamRetryReason) -> bool {
         match reason {
-            StreamRetryReason::IdleTimeout => self.on_idle_timeout,
+            StreamRetryReason::IdleTimeout | StreamRetryReason::FirstOutputTimeout => {
+                self.on_idle_timeout
+            }
             StreamRetryReason::ReadError => self.on_read_error,
             StreamRetryReason::StatusError
             | StreamRetryReason::ProtocolError
@@ -166,6 +168,7 @@ impl LocalStreamRetryConfig {
 #[derive(Debug, Clone, Copy)]
 enum StreamRetryReason {
     IdleTimeout,
+    FirstOutputTimeout,
     ReadError,
     StatusError,
     ProtocolError,
@@ -176,6 +179,7 @@ impl StreamRetryReason {
     fn as_str(self) -> &'static str {
         match self {
             StreamRetryReason::IdleTimeout => "idle_timeout",
+            StreamRetryReason::FirstOutputTimeout => "first_output_timeout",
             StreamRetryReason::ReadError => "read_error",
             StreamRetryReason::StatusError => "status_error",
             StreamRetryReason::ProtocolError => "protocol_error",
@@ -862,6 +866,8 @@ struct RequestRuntimeConfig {
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
     stream_keepalive_interval_secs: u64,
+    stream_pre_output_hold_secs: u64,
+    stream_first_output_timeout_secs: u64,
     kiro_upstream_stream_retry_enabled: bool,
     kiro_upstream_stream_retry_max_attempts: u32,
     inference_upstream_max_attempts: u32,
@@ -911,6 +917,8 @@ impl RequestRuntimeConfig {
             kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
             stream_keepalive_interval_secs: DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS,
+            stream_pre_output_hold_secs: DEFAULT_STREAM_PRE_OUTPUT_HOLD_SECS,
+            stream_first_output_timeout_secs: DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS,
             kiro_upstream_stream_retry_enabled: true,
             kiro_upstream_stream_retry_max_attempts: 2,
             inference_upstream_max_attempts: DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
@@ -982,6 +990,12 @@ impl RequestRuntimeConfig {
             stream_keepalive_interval_secs: normalize_stream_keepalive_interval_secs(
                 config.stream_keepalive_interval_secs,
             ),
+            stream_pre_output_hold_secs: config
+                .stream_pre_output_hold_secs
+                .min(crate::model::config::STREAM_PRE_OUTPUT_HOLD_MAX_SECS),
+            stream_first_output_timeout_secs: config
+                .stream_first_output_timeout_secs
+                .min(crate::model::config::STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS),
             kiro_upstream_stream_retry_enabled: config.kiro_upstream_stream_retry_enabled,
             kiro_upstream_stream_retry_max_attempts: config
                 .kiro_upstream_stream_retry_max_attempts
@@ -7110,6 +7124,8 @@ async fn post_messages_inner(
             capacity_weight_units,
             claude_code_noop_delta_keepalive,
             runtime_config.stream_keepalive_interval_secs,
+            runtime_config.stream_pre_output_hold_secs,
+            runtime_config.stream_first_output_timeout_secs,
         )
         .await
     } else {
@@ -7747,6 +7763,11 @@ struct SseStreamState {
     noop_delta_keepalive: bool,
     idle_deadline: Instant,
     stream_idle_timeout_secs: u64,
+    /// When withheld downstream bytes are released (measured from the first attempt).
+    pre_output_hold_deadline: Option<Instant>,
+    first_output_timeout_secs: u64,
+    /// Deadline for this attempt's first content event; cleared once content starts.
+    first_output_deadline: Option<Instant>,
     initial_events: Vec<SseEvent>,
     downstream_committed: bool,
     retry_plan: Option<StreamRetryPlan>,
@@ -7783,6 +7804,13 @@ impl SseStreamState {
             noop_delta_keepalive: keepalive.noop_delta,
             idle_deadline: Instant::now() + Duration::from_secs(stream_idle_timeout_secs),
             stream_idle_timeout_secs,
+            pre_output_hold_deadline: StreamKeepalivePolicy::deadline_after(
+                keepalive.pre_output_hold_secs,
+            ),
+            first_output_timeout_secs: keepalive.first_output_timeout_secs,
+            first_output_deadline: StreamKeepalivePolicy::deadline_after(
+                keepalive.first_output_timeout_secs,
+            ),
             initial_events,
             downstream_committed: false,
             retry_plan,
@@ -7820,6 +7848,10 @@ impl SseStreamState {
         // A retried attempt keeps the configured keepalive cadence.
         self.ping_interval = interval(Duration::from_secs(self.keepalive_interval_secs));
         self.idle_deadline = Instant::now() + Duration::from_secs(self.stream_idle_timeout_secs);
+        // The hold window keeps counting from the first attempt; the first-output limit is
+        // per upstream attempt.
+        self.first_output_deadline =
+            StreamKeepalivePolicy::deadline_after(self.first_output_timeout_secs);
         self.initial_events = initial_events;
         self.downstream_committed = false;
         self.attempt_number = self.attempt_number.saturating_add(1);
@@ -7867,6 +7899,8 @@ async fn handle_stream_request(
     capacity_weight_units: u32,
     claude_code_noop_delta_keepalive: bool,
     stream_keepalive_interval_secs: u64,
+    stream_pre_output_hold_secs: u64,
+    stream_first_output_timeout_secs: u64,
 ) -> Response {
     let requested_model = usage_context.model.clone();
     let prompt_too_long_context = ProviderErrorContext {
@@ -8550,6 +8584,10 @@ async fn handle_stream_request(
             stream_keepalive_interval_secs,
             claude_code_noop_delta_keepalive,
             stream_idle_timeout_secs,
+        )
+        .with_first_output_limits(
+            stream_pre_output_hold_secs,
+            stream_first_output_timeout_secs,
         ),
     );
 
@@ -8571,6 +8609,8 @@ const CLAUDE_CODE_NOOP_DELTA_KEEPALIVE_MIN_VERSION: &str = "2.1.193";
 /// 获取保活间隔配置（秒）
 /// 支持通过环境变量 KIRO_STREAM_KEEPALIVE_INTERVAL_SECS 覆盖默认值
 const DEFAULT_STREAM_KEEPALIVE_INTERVAL_SECS: u64 = 5;
+const DEFAULT_STREAM_PRE_OUTPUT_HOLD_SECS: u64 = 15;
+const DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS: u64 = 90;
 
 fn normalize_stream_keepalive_interval_secs(secs: u64) -> u64 {
     secs.clamp(
@@ -9388,12 +9428,17 @@ async fn retry_stream_before_downstream_commit(
     }
 }
 
-/// Downstream keepalive and upstream idle timing for one stream.
+/// Downstream keepalive and upstream timing for one stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StreamKeepalivePolicy {
     interval_secs: u64,
     noop_delta: bool,
     idle_timeout_secs: u64,
+    /// How long downstream bytes are withheld before the first upstream output so a failed
+    /// attempt can still be retried transparently; `0` holds until the first output.
+    pre_output_hold_secs: u64,
+    /// Longest wait from upstream headers to the first content event; `0` disables it.
+    first_output_timeout_secs: u64,
 }
 
 impl StreamKeepalivePolicy {
@@ -9402,7 +9447,19 @@ impl StreamKeepalivePolicy {
             interval_secs: normalize_stream_keepalive_interval_secs(interval_secs),
             noop_delta,
             idle_timeout_secs: normalize_stream_idle_timeout_secs(idle_timeout_secs),
+            pre_output_hold_secs: DEFAULT_STREAM_PRE_OUTPUT_HOLD_SECS,
+            first_output_timeout_secs: DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS,
         }
+    }
+
+    fn with_first_output_limits(mut self, hold_secs: u64, first_output_timeout_secs: u64) -> Self {
+        self.pre_output_hold_secs = hold_secs;
+        self.first_output_timeout_secs = first_output_timeout_secs;
+        self
+    }
+
+    fn deadline_after(secs: u64) -> Option<Instant> {
+        (secs > 0).then(|| Instant::now() + Duration::from_secs(secs))
     }
 }
 
@@ -9441,8 +9498,19 @@ fn create_sse_stream(
                 return Some((stream::iter(bytes), state));
             }
 
+            if state.first_output_deadline.is_some() && state.ctx.has_emitted_content() {
+                state.first_output_deadline = None;
+            }
             let idle_sleep = sleep_until(state.idle_deadline);
             tokio::pin!(idle_sleep);
+            let first_output_deadline = state.first_output_deadline;
+            let first_output_sleep = async move {
+                match first_output_deadline {
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(first_output_sleep);
 
             // 使用 select! 同时等待数据、ping 定时器和上游空闲超时。
             // 如果开启了首输出前重试，在未向客户端发送任何 SSE 字节前不发送 ping，
@@ -10040,9 +10108,66 @@ fn create_sse_stream(
                     state.finished = true;
                     Some((stream::iter(bytes), state))
                 }
+                _ = &mut first_output_sleep => {
+                    let detail = format!(
+                        "upstream produced no output within {} seconds",
+                        state.first_output_timeout_secs
+                    );
+                    tracing::warn!(
+                        first_output_timeout_secs = state.first_output_timeout_secs,
+                        downstream_committed = state.downstream_committed,
+                        "上游在首输出等待上限内没有产生任何内容，断开上游并释放账号并发"
+                    );
+                    state.first_output_deadline = None;
+                    if !state.downstream_committed {
+                        match retry_stream_before_downstream_commit(
+                            state,
+                            StreamRetryReason::FirstOutputTimeout,
+                            detail.clone(),
+                        )
+                        .await
+                        {
+                            StreamRetryOutcome::Retried(state) => {
+                                let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                return Some((stream::iter(bytes), state));
+                            }
+                            StreamRetryOutcome::NotRetried(next_state) => {
+                                state = next_state;
+                            }
+                        }
+                    }
+                    state.completion.report_upstream_stream_failure(detail.clone());
+                    // overloaded_error lets Claude Code retry the turn on its own.
+                    state.ctx.record_stream_error("overloaded_error", detail);
+                    let bytes = finish_stream_with_recorded_error(
+                        &mut state.ctx,
+                        &state.usage_guard,
+                        UsageRecordStatus::UpstreamTimeout,
+                        StreamTerminalReason::FirstOutputTimeout,
+                    );
+                    let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
+                    state.finished = true;
+                    Some((stream::iter(bytes), state))
+                }
                 _ = state.ping_interval.tick() => {
                     if !state.downstream_committed && state.retry_plan.is_some() {
-                        let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                        let hold_expired = state
+                            .pre_output_hold_deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline);
+                        if !hold_expired {
+                            let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                            return Some((stream::iter(bytes), state));
+                        }
+                        // Holding bytes any longer would let clients and proxies time out on a
+                        // silent connection. Start the message and keep it alive instead; the
+                        // transparent pre-output retry is given up from here on.
+                        tracing::info!(
+                            attempt = state.attempt_number,
+                            "首输出前静默保留窗口已到，开始向客户端下发 message_start 与保活"
+                        );
+                        state.retry_plan = None;
+                        let keepalive = keepalive_sse_bytes(&state.ctx, state.noop_delta_keepalive);
+                        let bytes = prepend_initial_bytes_if_needed(&mut state, vec![Ok(keepalive)], true);
                         return Some((stream::iter(bytes), state));
                     }
                     let bytes = keepalive_sse_bytes(&state.ctx, state.noop_delta_keepalive);

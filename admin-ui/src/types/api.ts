@@ -768,7 +768,7 @@ export interface UsageLatencyTrace {
   streamRetryDispatchFailures?: number
   streamRetryReasons?: string[]
   clientDroppedMs?: number
-  terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
+  terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'first_output_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
   upstreamMessageStatus?: string
   sawUpstreamCompleted?: boolean
   stopReasonSource?: string
@@ -1808,6 +1808,8 @@ export interface RuntimeConfig {
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
   streamKeepaliveIntervalSecs: number
+  streamPreOutputHoldSecs: number
+  streamFirstOutputTimeoutSecs: number
   kiroUpstreamStreamRetryEnabled: boolean
   kiroUpstreamStreamRetryMaxAttempts: number
   inferenceUpstreamMaxAttempts: number

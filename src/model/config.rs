@@ -3742,6 +3742,20 @@ pub struct Config {
     #[serde(default = "default_stream_keepalive_interval_secs")]
     pub stream_keepalive_interval_secs: u64,
 
+    /// 首个上游内容到达前，最多静默保留多少秒（0–60，默认 15）。
+    ///
+    /// 窗口内不向客户端写任何字节，以便上游失败时无感换号重试；超过窗口仍无输出时，
+    /// 先发出 message_start 并开始保活，此后不再做首输出前换号。0 表示一直保留到首个输出。
+    #[serde(default = "default_stream_pre_output_hold_secs")]
+    pub stream_pre_output_hold_secs: u64,
+
+    /// 上游响应头之后等待首个内容事件的上限秒数（0 关闭，默认 90，最大 3600）。
+    ///
+    /// 超时后主动断开上游并释放账号并发：尚未向客户端写入时按首输出前重试换号，
+    /// 已写入时以 overloaded_error 结束流。已有输出之后的静默仍由上游流静默超时控制。
+    #[serde(default = "default_stream_first_output_timeout_secs")]
+    pub stream_first_output_timeout_secs: u64,
+
     /// 是否允许流式响应在尚未向下游发送任何 SSE 字节前，对上游流读取/空闲/错误事件进行重试。
     ///
     /// 该开关只覆盖“下游尚未提交”的安全窗口。只要已经发送过 message_start、ping、
@@ -4301,6 +4315,17 @@ fn default_kiro_upstream_response_timeout_secs() -> u64 {
 
 fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
     180
+}
+
+pub const STREAM_PRE_OUTPUT_HOLD_MAX_SECS: u64 = 60;
+pub const STREAM_FIRST_OUTPUT_TIMEOUT_MAX_SECS: u64 = 3600;
+
+fn default_stream_pre_output_hold_secs() -> u64 {
+    15
+}
+
+fn default_stream_first_output_timeout_secs() -> u64 {
+    90
 }
 
 pub const STREAM_KEEPALIVE_INTERVAL_MIN_SECS: u64 = 1;
@@ -5212,6 +5237,8 @@ impl Default for Config {
             kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
             ),
             stream_keepalive_interval_secs: default_stream_keepalive_interval_secs(),
+            stream_pre_output_hold_secs: default_stream_pre_output_hold_secs(),
+            stream_first_output_timeout_secs: default_stream_first_output_timeout_secs(),
             kiro_upstream_stream_retry_enabled: default_kiro_upstream_stream_retry_enabled(),
             kiro_upstream_stream_retry_max_attempts:
                 default_kiro_upstream_stream_retry_max_attempts(),
@@ -5874,6 +5901,8 @@ mod tests {
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
         assert_eq!(config.stream_keepalive_interval_secs, 5);
+        assert_eq!(config.stream_pre_output_hold_secs, 15);
+        assert_eq!(config.stream_first_output_timeout_secs, 90);
         assert!(config.kiro_upstream_stream_retry_enabled);
         assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 2);
         assert!(config.kiro_upstream_stream_retry_on_idle_timeout);
@@ -6868,6 +6897,8 @@ mod tests {
                 "selectionFailureRecordEnabled": false,
                 "kiroUpstreamStreamIdleTimeoutSecs": 45,
                 "streamKeepaliveIntervalSecs": 12,
+                "streamPreOutputHoldSecs": 20,
+                "streamFirstOutputTimeoutSecs": 0,
                 "kiroCachePointEnabled": true,
                 "kiroCachePointToolsOnly": false,
                 "kiroCachePointRecordPlan": false,
@@ -6883,6 +6914,8 @@ mod tests {
         assert!(!config.selection_failure_record_enabled);
         assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 45);
         assert_eq!(config.stream_keepalive_interval_secs, 12);
+        assert_eq!(config.stream_pre_output_hold_secs, 20);
+        assert_eq!(config.stream_first_output_timeout_secs, 0);
         assert!(config.kiro_cache_point_enabled);
         assert!(!config.kiro_cache_point_tools_only);
         assert!(!config.kiro_cache_point_record_plan);

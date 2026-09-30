@@ -3550,6 +3550,7 @@ enum HandlerEventStreamFault {
     TwoIdenticalToolsWithoutStatus,
     IncompleteToolWithoutStatus,
     TextThenReadError,
+    NoContentHeartbeats,
     ThinkingThenReadError,
     ToolThenReadError,
     EmptyToolThenReadError,
@@ -3932,6 +3933,21 @@ async fn handler_eventstream_fault_upstream(
                 }),
             ))
         }
+        // Headers and periodic contextUsage frames keep the connection busy, but no content
+        // event ever arrives (the production opus-5.5 silent-first-output shape).
+        HandlerEventStreamFault::NoContentHeartbeats => handler_eventstream_chunked_response(
+            (0..40)
+                .map(|_| {
+                    (
+                        Duration::from_millis(250),
+                        Ok(Bytes::from(eventstream_test_frame(
+                            "contextUsageEvent",
+                            json!({"contextUsagePercentage": 1.0}),
+                        ))),
+                    )
+                })
+                .collect(),
+        ),
         HandlerEventStreamFault::TextThenReadError => handler_eventstream_chunked_response(vec![
             (
                 Duration::ZERO,
@@ -5121,6 +5137,102 @@ async fn run_handler_eventstream_postcommit_faults_matrix() {
             );
         }
     }
+}
+
+fn first_output_router(
+    base_url: &str,
+    credential_count: u64,
+    hold_secs: u64,
+    first_output_timeout_secs: u64,
+) -> (Router, Arc<UsageRecorder>) {
+    handler_eventstream_fault_router_with_config(base_url, credential_count, 1, |config| {
+        config.kiro_upstream_stream_idle_timeout_secs = 30;
+        config.stream_keepalive_interval_secs = 1;
+        config.stream_pre_output_hold_secs = hold_secs;
+        config.stream_first_output_timeout_secs = first_output_timeout_secs;
+    })
+}
+
+async fn run_first_output_timeout_retries_transparently_inside_hold_window() {
+    for round in 1..=3 {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NoContentHeartbeats)
+                .await;
+        let (app, usage_recorder) = first_output_router(&upstream.base_url, 2, 10, 1);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+
+        assert_eq!(status, StatusCode::OK, "round={round}");
+        assert!(body.contains("recovered-ok"), "round={round} body={body}");
+        assert!(
+            !body.contains(r#""type":"error""#),
+            "round={round} body={body}"
+        );
+        assert_eq!(body.matches("event: message_start").count(), 1);
+        assert_eq!(
+            upstream.hits(),
+            2,
+            "round={round}: silent attempt was retried"
+        );
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success, "round={round}");
+    }
+}
+
+#[test]
+fn first_output_timeout_retries_transparently_inside_hold_window() {
+    run_handler_fixture_on_four_mib_thread(
+        "first-output-timeout-retry-fixture",
+        run_first_output_timeout_retries_transparently_inside_hold_window,
+    );
+}
+
+async fn run_hold_window_starts_keepalive_then_first_output_timeout_frees_upstream() {
+    for round in 1..=3 {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NoContentHeartbeats)
+                .await;
+        let (app, usage_recorder) = first_output_router(&upstream.base_url, 1, 1, 3);
+        let started = std::time::Instant::now();
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(status, StatusCode::OK, "round={round}");
+        // The hold window released message_start and keepalive before the timeout …
+        let message_start = body
+            .find("event: message_start")
+            .expect("message_start sent");
+        let ping = body
+            .find("event: ping")
+            .expect("keepalive sent after hold window");
+        let error = body
+            .find("overloaded_error")
+            .expect("first-output timeout error");
+        assert!(
+            message_start < ping && ping < error,
+            "round={round} body={body}"
+        );
+        // … and the silent upstream (10s of frames) was abandoned at the 3s limit.
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "round={round}: stream must end at the first-output limit, took {elapsed:?}"
+        );
+        assert_eq!(upstream.hits(), 1, "round={round}");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::UpstreamTimeout);
+        assert_eq!(
+            record.latency_trace.and_then(|trace| trace.terminal_reason),
+            Some(StreamTerminalReason::FirstOutputTimeout),
+            "round={round}"
+        );
+    }
+}
+
+#[test]
+fn hold_window_starts_keepalive_then_first_output_timeout_frees_upstream() {
+    run_handler_fixture_on_four_mib_thread(
+        "first-output-hold-fixture",
+        run_hold_window_starts_keepalive_then_first_output_timeout_frees_upstream,
+    );
 }
 
 #[test]
@@ -6684,6 +6796,8 @@ fn runtime_config_for_payload_guard(
         kiro_cache_point_record_plan: true,
         kiro_upstream_stream_idle_timeout_secs: 180,
         stream_keepalive_interval_secs: 5,
+        stream_pre_output_hold_secs: 15,
+        stream_first_output_timeout_secs: 90,
         kiro_upstream_stream_retry_enabled: true,
         kiro_upstream_stream_retry_max_attempts: 2,
         inference_upstream_max_attempts: 4,

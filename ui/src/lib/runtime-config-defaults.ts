@@ -454,6 +454,8 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   streamKeepaliveIntervalSecs: 5,
+  streamPreOutputHoldSecs: 15,
+  streamFirstOutputTimeoutSecs: 90,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 2,
   inferenceUpstreamMaxAttempts: 4,

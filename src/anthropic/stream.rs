@@ -1308,6 +1308,11 @@ impl SseStateManager {
     }
 
     /// 获取下一个块索引
+    /// Whether any content block (text, thinking or tool_use) has been started.
+    pub fn has_started_content_block(&self) -> bool {
+        self.next_block_index > 0
+    }
+
     pub fn next_block_index(&mut self) -> i32 {
         let index = self.next_block_index;
         self.next_block_index += 1;
@@ -2038,6 +2043,11 @@ impl StreamContext {
             .iter()
             .map(|event| (*event).to_string())
             .collect()
+    }
+
+    /// Whether this stream has produced any downstream content block yet.
+    pub fn has_emitted_content(&self) -> bool {
+        self.state_manager.has_started_content_block()
     }
 
     pub fn saw_upstream_assistant_response(&self) -> bool {

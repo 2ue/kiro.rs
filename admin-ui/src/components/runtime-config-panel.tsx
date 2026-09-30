@@ -558,6 +558,8 @@ const emptyConfig: RuntimeConfig = {
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   streamKeepaliveIntervalSecs: 5,
+  streamPreOutputHoldSecs: 15,
+  streamFirstOutputTimeoutSecs: 90,
   kiroUpstreamStreamRetryEnabled: true,
   kiroUpstreamStreamRetryMaxAttempts: 2,
   inferenceUpstreamMaxAttempts: 4,
@@ -3047,6 +3049,8 @@ export function RuntimeConfigPanel() {
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
       streamKeepaliveIntervalSecs: toWhole(draft.streamKeepaliveIntervalSecs, 1, 300),
+      streamPreOutputHoldSecs: toWhole(draft.streamPreOutputHoldSecs, 0, 60),
+      streamFirstOutputTimeoutSecs: toWhole(draft.streamFirstOutputTimeoutSecs, 0, 3600),
       kiroUpstreamStreamRetryEnabled: Boolean(draft.kiroUpstreamStreamRetryEnabled),
       kiroUpstreamStreamRetryMaxAttempts: toWhole(draft.kiroUpstreamStreamRetryMaxAttempts, 1, 100),
       inferenceUpstreamMaxAttempts: toWhole(draft.inferenceUpstreamMaxAttempts, 1, 10),
@@ -3413,6 +3417,28 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(streamKeepaliveIntervalSecs) =>
                 setDraft((prev) => ({ ...prev, streamKeepaliveIntervalSecs }))
+              }
+            />
+            <NumberField
+              title="首输出前静默保留"
+              description="上游还没有输出时，最多多少秒内不向客户端写入，以便失败时无感换号；超过后开始下发并保活，不再换号。0 表示一直保留到首个输出；默认 15 秒。"
+              value={draft.streamPreOutputHoldSecs}
+              min={0}
+              max={60}
+              suffix="秒"
+              onChange={(streamPreOutputHoldSecs) =>
+                setDraft((prev) => ({ ...prev, streamPreOutputHoldSecs }))
+              }
+            />
+            <NumberField
+              title="首输出等待上限"
+              description="上游返回响应头后最多等待多少秒出现首个内容；超时断开上游并释放账号，未写入时换号重试，已写入时返回过载错误让客户端重试。0 表示关闭；默认 90 秒。"
+              value={draft.streamFirstOutputTimeoutSecs}
+              min={0}
+              max={3600}
+              suffix="秒"
+              onChange={(streamFirstOutputTimeoutSecs) =>
+                setDraft((prev) => ({ ...prev, streamFirstOutputTimeoutSecs }))
               }
             />
             <ToggleField

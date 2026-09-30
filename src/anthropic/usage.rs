@@ -333,6 +333,8 @@ pub enum StreamTerminalReason {
     UpstreamStatusError,
     UpstreamJsonException,
     UpstreamIdleTimeout,
+    /// Upstream sent headers but no content event within the first-output limit.
+    FirstOutputTimeout,
     MalformedSse,
     ProtocolContamination,
     ClientDropped,
