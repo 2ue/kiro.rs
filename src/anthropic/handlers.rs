@@ -6790,6 +6790,7 @@ async fn post_messages_inner(
         return response;
     }
     // 检查是否声明了 Anthropic 原生 WebSearch 工具。
+    websearch::strip_native_web_search_tools_without_query(&mut payload);
     if websearch::has_native_web_search_tool(&payload) {
         if !websearch_supported_for_profile(runtime_config.compat_profile) {
             let response = envelope::error_response(

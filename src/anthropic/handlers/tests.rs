@@ -2271,10 +2271,11 @@ fn native_websearch_scheduler_failure_falls_back_to_external_after_mcp_path_for_
     });
 }
 
-async fn run_websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_for_five_rounds() {
+async fn run_websearch_latest_non_text_or_blank_user_turn_serves_without_web_search_for_five_rounds()
+ {
     let upstream = WebSearchHandlerUpstream::start().await;
-    let (router, usage_recorder) = websearch_handler_test_router(&upstream.base_url);
-    let expected_key_id = crate::common::auth::request_api_key_id("b07-handler-key");
+    let (router, _usage_recorder) = websearch_handler_test_router(&upstream.base_url);
+    let mut requests = 0;
 
     for round in 1..=5 {
         for current_content in [
@@ -2302,61 +2303,25 @@ async fn run_websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_fo
                     ),
                 ))
                 .await
-                .expect("invalid current-turn WebSearch response");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "round {round}");
-            let request_id = response_request_id(&response);
-            let error_id = response
-                .headers()
-                .get("x-error-id")
-                .and_then(|value| value.to_str().ok())
-                .expect("invalid current-turn error-id")
-                .to_string();
-            let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
-                .await
-                .expect("invalid current-turn body");
-            let body = String::from_utf8(body.to_vec()).expect("invalid body UTF-8");
-            assert!(body.contains(&error_id));
-            assert!(!body.contains(&stale_query));
-
-            let record = usage_record_for_request(&usage_recorder, &request_id);
-            assert_eq!(record.status, UsageRecordStatus::Error);
-            assert_eq!(record.public_error_status_code, Some(400));
-            assert_eq!(
-                record.public_error_type.as_deref(),
-                Some("invalid_request_error")
-            );
-            assert_eq!(record.error_id.as_deref(), Some(error_id.as_str()));
-            assert_eq!(
-                record.request_api_key_id.as_deref(),
-                Some(expected_key_id.as_str())
-            );
-            assert_eq!(record.credential_id, None);
-            assert!(record.credential_attempts.is_empty());
-            let attempts = record
-                .latency_trace
-                .as_ref()
-                .and_then(|trace| trace.inference_attempts)
-                .expect("invalid current-turn attempt snapshot");
-            assert_eq!(attempts.consumed, 0);
-            assert_eq!(attempts.local_attempts, 0);
-            assert_eq!(attempts.external_attempts, 0);
-            assert_eq!(attempts.mcp_attempts, 0);
-            assert!(!attempts.downstream_committed);
-            let serialized = serde_json::to_string(&record).expect("serialize invalid usage");
-            assert!(!serialized.contains(&stale_query));
+                .expect("current-turn-without-query response");
+            requests += 1;
+            // Without a query in the current turn the request is served as a normal
+            // conversation: no MCP search, and never a search for the stale history query.
+            assert_eq!(response.status(), StatusCode::OK, "round {round}");
         }
     }
 
     assert_eq!(upstream.state.mcp_hits(), 0);
-    assert_eq!(upstream.state.normal_hits(), 0);
+    assert_eq!(upstream.state.normal_hits(), requests);
     assert!(upstream.state.queries().is_empty());
 }
 
 #[test]
-fn websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_for_five_rounds() {
+fn websearch_latest_non_text_or_blank_user_turn_serves_without_web_search_for_five_rounds() {
     run_handler_fixture_on_four_mib_thread("websearch-empty-query-matrix", || async {
-        run_websearch_latest_non_text_or_blank_user_turn_rejects_without_mcp_for_five_rounds()
-            .await;
+        run_websearch_latest_non_text_or_blank_user_turn_serves_without_web_search_for_five_rounds(
+        )
+        .await;
     });
 }
 

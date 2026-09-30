@@ -395,6 +395,30 @@ pub fn has_native_web_search_tool(req: &MessagesRequest) -> bool {
         .is_some_and(|tools| tools.iter().any(is_native_web_search_tool))
 }
 
+/// 当前用户轮没有可用的搜索文本时（例如只有工具结果或图片），移除原生 WebSearch 工具，
+/// 让请求按普通对话处理，而不是直接报错或复用历史里的旧 query。返回移除的工具数。
+pub fn strip_native_web_search_tools_without_query(req: &mut MessagesRequest) -> usize {
+    if !has_native_web_search_tool(req) || extract_search_query(req).is_some() {
+        return 0;
+    }
+    let Some(tools) = req.tools.as_mut() else {
+        return 0;
+    };
+    let before = tools.len();
+    tools.retain(|tool| !is_native_web_search_tool(tool));
+    let removed = before - tools.len();
+    if tools.is_empty() {
+        req.tools = None;
+    }
+    if removed > 0 {
+        tracing::info!(
+            removed_web_search_tools = removed,
+            "current user turn has no search query; serving the request without native WebSearch"
+        );
+    }
+    removed
+}
+
 /// 检查请求是否为纯 WebSearch 请求
 ///
 /// 条件：tools 有且只有一个，且是 Anthropic 原生 WebSearch 类型。
@@ -1882,6 +1906,36 @@ mod tests {
 
             assert_eq!(extract_search_query(&req).as_deref(), Some("current query"));
         }
+    }
+
+    #[test]
+    fn requests_without_a_current_query_drop_native_web_search_tools() {
+        let tool_result_turn = || Message {
+            role: "user".to_string(),
+            content: json!([{
+                "type": "tool_result",
+                "tool_use_id": "tool-1",
+                "content": "no search text here"
+            }]),
+        };
+        let mut pure = request_with(vec![tool_result_turn()], Some("web_search_20250305"), false);
+        assert_eq!(strip_native_web_search_tools_without_query(&mut pure), 1);
+        assert!(pure.tools.is_none());
+        assert!(!has_native_web_search_tool(&pure));
+
+        let mut with_query = request_with(
+            vec![Message {
+                role: "user".to_string(),
+                content: json!("rust release notes"),
+            }],
+            Some("web_search_20250305"),
+            false,
+        );
+        assert_eq!(
+            strip_native_web_search_tools_without_query(&mut with_query),
+            0
+        );
+        assert!(has_native_web_search_tool(&with_query));
     }
 
     #[test]
