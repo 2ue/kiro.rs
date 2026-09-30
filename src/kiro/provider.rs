@@ -1013,6 +1013,29 @@ impl KiroStreamResponse {
     }
 }
 
+/// Swaps `conversationState.conversationId` and, when present, `agentContinuationId` for
+/// fresh UUIDs. The ids are replaced in place so the rest of the serialized body (field
+/// order, formatting) stays byte-identical. Returns `None` when the ids cannot be located.
+fn refresh_kiro_request_identity(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let state = value.get("conversationState")?;
+    let mut refreshed = body.to_string();
+    let mut replaced_conversation = false;
+    for key in ["conversationId", "agentContinuationId"] {
+        let Some(old) = state.get(key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let old_pair = format!("\"{key}\":{}", serde_json::to_string(old).ok()?);
+        if refreshed.matches(&old_pair).count() != 1 {
+            return None;
+        }
+        let new_pair = format!("\"{key}\":\"{}\"", uuid::Uuid::new_v4());
+        refreshed = refreshed.replacen(&old_pair, &new_pair, 1);
+        replaced_conversation |= key == "conversationId";
+    }
+    replaced_conversation.then_some(refreshed)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -1086,6 +1109,7 @@ mod tests {
     #[derive(Clone)]
     struct RotationState {
         attempts: Arc<StdMutex<Vec<RotationAttempt>>>,
+        bodies: Arc<StdMutex<Vec<String>>>,
         rule: RotationRule,
     }
 
@@ -1093,8 +1117,30 @@ mod tests {
         fn new(rule: RotationRule) -> Self {
             Self {
                 attempts: Arc::new(StdMutex::new(Vec::new())),
+                bodies: Arc::new(StdMutex::new(Vec::new())),
                 rule,
             }
+        }
+
+        /// `conversationState` 标识序列，按尝试顺序排列。
+        fn conversation_identities(&self) -> Vec<(String, Option<String>)> {
+            self.bodies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|body| {
+                    let value: serde_json::Value =
+                        serde_json::from_str(body).expect("upstream body is JSON");
+                    let state = &value["conversationState"];
+                    (
+                        state["conversationId"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        state["agentContinuationId"].as_str().map(str::to_string),
+                    )
+                })
+                .collect()
         }
 
         fn attempts(&self) -> Vec<RotationAttempt> {
@@ -1152,7 +1198,13 @@ mod tests {
     async fn rotation_response(
         State(state): State<RotationState>,
         headers: AxumHeaderMap,
+        body: Bytes,
     ) -> axum::response::Response {
+        state
+            .bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(String::from_utf8_lossy(&body).into_owned());
         let account = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -1287,6 +1339,7 @@ mod tests {
         let request_body = serde_json::json!({
             "conversationState": {
                 "conversationId": conversation,
+                "agentContinuationId": format!("{conversation}-continuation"),
                 "currentMessage": {
                     "userInputMessage": {
                         "content": "test",
@@ -7128,6 +7181,78 @@ mod tests {
         }
     }
 
+    /// 上游已开始处理（5xx）后的重试必须换新的会话标识，否则 Kiro 对同一标识的重发一律返回
+    /// "Improperly formed request"；429 这类未进入处理的重试保留原标识。
+    #[tokio::test]
+    async fn retries_after_server_errors_use_fresh_conversation_identity() {
+        let rule: RotationRule = Arc::new(|attempt: &RotationAttempt| {
+            if attempt.account == 1 {
+                RotationReply::ServerError
+            } else {
+                RotationReply::Success
+            }
+        });
+        let server = RotationServer::start(rule).await;
+        let result = call_rotation_provider(&server, RotationConfig::new(2), "conv-5xx").await;
+        assert!(result.is_ok(), "retry on the second account should succeed");
+        let ids = server.state.conversation_identities();
+        assert_eq!(ids.len(), 2, "one failed attempt and one retry: {ids:?}");
+        assert_eq!(ids[0].0, "conv-5xx");
+        assert_eq!(ids[0].1.as_deref(), Some("conv-5xx-continuation"));
+        assert_ne!(
+            ids[1].0, ids[0].0,
+            "retry after 5xx must use a new conversationId"
+        );
+        assert_ne!(
+            ids[1].1, ids[0].1,
+            "retry after 5xx must use a new agentContinuationId"
+        );
+        assert!(uuid::Uuid::parse_str(&ids[1].0).is_ok());
+
+        let rule: RotationRule = Arc::new(|attempt: &RotationAttempt| {
+            if attempt.account == 1 {
+                RotationReply::TooManyRequests
+            } else {
+                RotationReply::Success
+            }
+        });
+        let server = RotationServer::start(rule).await;
+        let result = call_rotation_provider(&server, RotationConfig::new(2), "conv-429").await;
+        assert!(result.is_ok());
+        let ids = server.state.conversation_identities();
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.iter()
+                .all(|(conversation, continuation)| conversation == "conv-429"
+                    && continuation.as_deref() == Some("conv-429-continuation")),
+            "429 retries keep the original identity: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_kiro_request_identity_only_swaps_the_ids() {
+        let body = r#"{"conversationState":{"agentContinuationId":"c-1","conversationId":"conv-1","currentMessage":{"userInputMessage":{"content":"conversationId conv-1"}}},"profileArn":"arn"}"#;
+        let refreshed = super::refresh_kiro_request_identity(body).expect("ids located");
+        let value: serde_json::Value = serde_json::from_str(&refreshed).expect("json");
+        let conversation = value["conversationState"]["conversationId"]
+            .as_str()
+            .unwrap();
+        let continuation = value["conversationState"]["agentContinuationId"]
+            .as_str()
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(conversation).is_ok());
+        assert!(uuid::Uuid::parse_str(continuation).is_ok());
+        assert_ne!(conversation, continuation);
+        // Everything else, including text that merely mentions the old id, is untouched.
+        let restored = refreshed
+            .replace(conversation, "conv-1")
+            .replace(continuation, "c-1");
+        assert_eq!(restored, body);
+
+        assert!(super::refresh_kiro_request_identity(r#"{"conversationState":{}}"#).is_none());
+        assert!(super::refresh_kiro_request_identity("not json").is_none());
+    }
+
     /// S7 补充：500 与 429 混合 —— 5xx 同属可重试类，也应参与轮换并被账号覆盖。
     #[tokio::test]
     async fn s7_server_errors_participate_in_rotation_alongside_rate_limits() {
@@ -11558,6 +11683,9 @@ impl KiroProvider {
             .or_else(|| Self::extract_model_from_request(request_body));
         let conversation_id = Self::extract_conversation_id_from_request(request_body);
         let mut excluded_ids: HashSet<u64> = HashSet::new();
+        // Replaced after an attempt the upstream had already started processing, so the retry
+        // carries a fresh request identity (see `refresh_kiro_request_identity`).
+        let mut refreshed_request_body: Option<String> = None;
         let auxiliary_attempt_budget = inference_attempt_budget
             .map(InferenceAttemptBudget::auxiliary_budget)
             .unwrap_or_else(|| {
@@ -11681,7 +11809,10 @@ impl KiroProvider {
 
             let url = endpoint.api_url(&rctx);
             let body = crate::http_client::maybe_compress_json_whitespace(
-                endpoint.transform_api_body(request_body, &rctx),
+                endpoint.transform_api_body(
+                    refreshed_request_body.as_deref().unwrap_or(request_body),
+                    &rctx,
+                ),
                 config.compression.enabled && config.compression.whitespace_compression,
             );
             if should_log_upstream_body_size_at_info(&body, &config) {
@@ -11846,6 +11977,11 @@ impl KiroProvider {
                     );
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries && retry_target_available {
+                        Self::refresh_request_identity_for_retry(
+                            &mut refreshed_request_body,
+                            request_body,
+                            request_id,
+                        );
                         sleep(Self::retry_delay(attempt)).await;
                         continue;
                     }
@@ -11992,6 +12128,11 @@ impl KiroProvider {
                     can_retry &= retry_target_available;
                     self.finish_attempt(&mut ctx);
                     if can_retry {
+                        Self::refresh_request_identity_for_retry(
+                            &mut refreshed_request_body,
+                            request_body,
+                            request_id,
+                        );
                         last_error = Some(anyhow::anyhow!(message));
                         sleep(Self::retry_delay(attempt)).await;
                         continue;
@@ -13388,6 +13529,13 @@ impl KiroProvider {
                     "Kiro API returned a retryable upstream status"
                 );
                 let mut can_retry = attempt + 1 < max_retries;
+                if can_retry && (status.is_server_error() || status.as_u16() == 408) {
+                    Self::refresh_request_identity_for_retry(
+                        &mut refreshed_request_body,
+                        request_body,
+                        request_id,
+                    );
+                }
                 Self::push_attempt(
                     &mut attempts,
                     attempt,
@@ -13625,6 +13773,31 @@ impl KiroProvider {
     }
 
     /// 从请求体中提取 Kiro conversationId，用于账号粘性调度。
+    /// Replaces the request identity before retrying an attempt the upstream had already
+    /// started processing (5xx, timeout, broken response body). Kiro answers every resend of
+    /// such a turn with "Improperly formed request" while the same ids are reused; retries
+    /// after plain 4xx rejections keep the original identity and succeed.
+    fn refresh_request_identity_for_retry(
+        refreshed: &mut Option<String>,
+        original: &str,
+        request_id: Option<&str>,
+    ) {
+        let current = refreshed.as_deref().unwrap_or(original);
+        match refresh_kiro_request_identity(current) {
+            Some(body) => {
+                tracing::info!(
+                    request_id,
+                    "Kiro retry after an upstream-side failure uses a fresh conversation identity"
+                );
+                *refreshed = Some(body);
+            }
+            None => tracing::warn!(
+                request_id,
+                "Kiro retry could not refresh the conversation identity; resending unchanged"
+            ),
+        }
+    }
+
     fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
         use serde_json::Value;
 
