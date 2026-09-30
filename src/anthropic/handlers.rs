@@ -11399,7 +11399,10 @@ async fn handle_non_stream_request(
                     redacted_thinking = Some(redacted);
                 }
                 if !reasoning.text.is_empty() {
-                    native_thinking_content = reasoning.text;
+                    super::stream::merge_native_reasoning_text(
+                        &mut native_thinking_content,
+                        &reasoning.text,
+                    );
                 }
                 if reasoning.signature.is_some() {
                     native_thinking_signature = reasoning.signature;

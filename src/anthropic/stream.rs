@@ -87,6 +87,16 @@ const MAX_BUFFERED_ATOMIC_THINKING_BYTES: usize = 1024 * 1024;
 /// 上游只返回 usage/metadata 侧信道事件就 EOF，没有任何 assistant/reasoning/tool 输出。
 pub(crate) const UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL: &str = "upstream eventstream ended with only usage/metadata events and no assistant, reasoning, or tool output";
 
+/// 合并一段 Kiro 原生 reasoning 文本。上游有两种形态：每个事件带截至目前的完整内容
+/// （新文本以已有内容开头），或只带新增片段。前者替换，后者追加；只按"替换"处理会让
+/// 增量形态只剩最后一个片段。
+pub(crate) fn merge_native_reasoning_text(accumulated: &mut String, text: &str) {
+    if text.starts_with(accumulated.as_str()) {
+        accumulated.clear();
+    }
+    accumulated.push_str(text);
+}
+
 const TOOL_CONTEXT_LEAK_MARKERS: &[(&str, &str)] = &[
     ("tool_results_provided", "Tool results provided"),
     ("tool_results_heading", "Tool results:"),
@@ -2862,7 +2872,14 @@ impl StreamContext {
             return events;
         }
 
-        if text.len().saturating_add(
+        let merged_len = if text.starts_with(self.native_reasoning_content.as_str()) {
+            text.len()
+        } else {
+            self.native_reasoning_content
+                .len()
+                .saturating_add(text.len())
+        };
+        if merged_len.saturating_add(
             self.native_reasoning_signature
                 .as_ref()
                 .map_or(0, String::len),
@@ -2876,8 +2893,7 @@ impl StreamContext {
             );
             return events;
         }
-        self.native_reasoning_content.clear();
-        self.native_reasoning_content.push_str(text);
+        merge_native_reasoning_text(&mut self.native_reasoning_content, text);
         events
     }
 
@@ -5066,6 +5082,52 @@ mod tests {
             5
         );
         assert_eq!(message_delta.data["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn test_native_reasoning_content_appends_incremental_deltas() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        for (text, signature) in [
+            ("Let me check", None),
+            (" the request", None),
+            (" 发压缩。\n\n", Some("sig")),
+        ] {
+            all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                ReasoningContentEvent {
+                    text: text.to_string(),
+                    signature: signature.map(str::to_string),
+                    redacted_content: None,
+                },
+            )));
+        }
+        all_events.extend(ctx.process_assistant_response("answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "Let me check the request 发压缩。\n\n"
+        );
+        assert_eq!(collect_text_content(&all_events), "answer");
+    }
+
+    #[test]
+    fn merge_native_reasoning_text_handles_cumulative_and_incremental() {
+        let mut cumulative = String::new();
+        for text in ["hello", "hello world"] {
+            merge_native_reasoning_text(&mut cumulative, text);
+        }
+        assert_eq!(cumulative, "hello world");
+
+        let mut incremental = String::new();
+        for text in ["hello", " world", "。"] {
+            merge_native_reasoning_text(&mut incremental, text);
+        }
+        assert_eq!(incremental, "hello world。");
     }
 
     #[test]
