@@ -5,9 +5,9 @@ import { testExternalPool } from '@/api/credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import {
-  buildClaudeCodeTestModelOptions,
-  defaultClaudeCodeTestModelForOptions,
-  DEFAULT_CLAUDE_CODE_TEST_MODEL,
+  buildExternalPoolTestModelOptions,
+  defaultExternalPoolTestModelForOptions,
+  DEFAULT_EXTERNAL_POOL_TEST_MODEL,
   DEFAULT_TEST_PROMPT,
 } from '@/lib/test-models'
 import type { ExternalPool, ExternalPoolTestResponse } from '@/types/api'
@@ -33,7 +33,7 @@ export function ExternalPoolTestModal({
   onDone: () => void
 }) {
   const modelCapabilities = useModelCapabilities()
-  const [model, setModel] = useState(DEFAULT_CLAUDE_CODE_TEST_MODEL)
+  const [model, setModel] = useState(DEFAULT_EXTERNAL_POOL_TEST_MODEL)
   const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
   const [result, setResult] = useState<ExternalPoolTestResponse | null>(null)
   const [error, setError] = useState('')
@@ -41,9 +41,9 @@ export function ExternalPoolTestModal({
   const userSelectedModelRef = useRef(false)
 
   const modelOptions = useMemo(() => {
-    return buildClaudeCodeTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels)
+    return buildExternalPoolTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels)
   }, [modelCapabilities.data?.models, pool?.supportedModels])
-  const defaultModel = defaultClaudeCodeTestModelForOptions(modelOptions)
+  const defaultModel = defaultExternalPoolTestModelForOptions(modelOptions)
 
   const selectedModelLabel = useMemo(
     () => modelOptions.find((o) => o.id === model)?.label || model,
