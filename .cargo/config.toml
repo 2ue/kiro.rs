@@ -6,3 +6,6 @@ linker = "/usr/bin/cc"
 
 [env]
 CC_aarch64_apple_darwin = "/usr/bin/cc"
+# Test threads in debug builds: unoptimized async handler futures need more than the 2 MiB
+# default. Release builds stay well within the 2 MiB tokio worker stack used in production.
+RUST_MIN_STACK = "8388608"

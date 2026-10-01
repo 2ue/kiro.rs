@@ -820,7 +820,7 @@ async fn run_strict_request_protocol_contamination_fails_closed_before_upstream_
 
 #[test]
 fn strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("strict-contamination-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("strict-contamination-matrix", || async {
         run_strict_request_protocol_contamination_fails_closed_before_upstream_for_five_rounds()
             .await;
     });
@@ -877,7 +877,7 @@ async fn run_local_non_stream_success_commits_shared_attempt_budget_before_usage
 
 #[test]
 fn local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("local-non-stream-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("local-non-stream-matrix", || async {
         run_local_non_stream_success_commits_shared_attempt_budget_before_usage_for_five_rounds()
             .await;
     });
@@ -971,7 +971,7 @@ async fn run_local_body_prepare_unsupported_image_media_type_records_diagnostic_
 
 #[test]
 fn local_body_prepare_unsupported_image_media_type_records_diagnostic_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("local-body-prepare-image-diagnostic", || async {
+    run_handler_fixture_on_large_stack_thread("local-body-prepare-image-diagnostic", || async {
         run_local_body_prepare_unsupported_image_media_type_records_diagnostic_for_five_rounds()
             .await;
     });
@@ -1081,7 +1081,7 @@ async fn run_local_preconversion_shaping_handles_consecutive_assistant_reasoning
 
 #[test]
 fn local_preconversion_shaping_handles_consecutive_assistant_reasoning_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("local-preconversion-reasoning-shaping", || async {
+    run_handler_fixture_on_large_stack_thread("local-preconversion-reasoning-shaping", || async {
         run_local_preconversion_shaping_handles_consecutive_assistant_reasoning_for_five_rounds()
             .await;
     });
@@ -1115,7 +1115,7 @@ async fn run_identical_parallel_tool_uses_are_both_returned_for_five_rounds() {
 
 #[test]
 fn identical_parallel_tool_uses_are_both_returned_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("identical-parallel-tool-uses", || async {
+    run_handler_fixture_on_large_stack_thread("identical-parallel-tool-uses", || async {
         run_identical_parallel_tool_uses_are_both_returned_for_five_rounds().await;
     });
 }
@@ -1342,7 +1342,7 @@ async fn run_local_first_send_discards_historical_reasoning_but_keeps_tool_turn_
 
 #[test]
 fn local_first_send_discards_historical_reasoning_but_keeps_tool_turn_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("local-first-send-historical-reasoning", || async {
+    run_handler_fixture_on_large_stack_thread("local-first-send-historical-reasoning", || async {
         run_local_first_send_discards_historical_reasoning_but_keeps_tool_turn_for_five_rounds()
             .await;
     });
@@ -1374,16 +1374,19 @@ async fn run_local_historical_reasoning_is_kept_when_discard_disabled_for_five_r
 
 #[test]
 fn local_historical_reasoning_is_kept_when_discard_disabled_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("local-historical-reasoning-kept", || async {
+    run_handler_fixture_on_large_stack_thread("local-historical-reasoning-kept", || async {
         run_local_historical_reasoning_is_kept_when_discard_disabled_for_five_rounds().await;
     });
 }
 
 #[test]
 fn local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("local-reasoning-fallback-shaping-disabled", || async {
-        run_local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds().await;
-    });
+    run_handler_fixture_on_large_stack_thread(
+        "local-reasoning-fallback-shaping-disabled",
+        || async {
+            run_local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds().await;
+        },
+    );
 }
 
 fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
@@ -1898,7 +1901,7 @@ async fn run_websearch_canonical_detection_and_current_long_history_query_are_ex
 
 #[test]
 fn websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-routing-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-routing-matrix", || async {
         run_websearch_canonical_detection_and_current_long_history_query_are_exact_for_five_rounds(
         )
         .await;
@@ -1954,7 +1957,7 @@ async fn run_native_websearch_current_official_and_future_version_formats_route_
 
 #[test]
 fn native_websearch_current_official_and_future_version_formats_route_to_mcp() {
-    run_handler_fixture_on_four_mib_thread("websearch-official-versions", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-official-versions", || async {
         run_native_websearch_current_official_and_future_version_formats_route_to_mcp().await;
     });
 }
@@ -2059,7 +2062,7 @@ async fn run_native_websearch_normalized_external_preflight_precedes_mcp_for_fiv
 
 #[test]
 fn native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-normalized-external", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-normalized-external", || async {
         run_native_websearch_normalized_external_preflight_precedes_mcp_for_five_rounds().await;
     });
 }
@@ -2165,7 +2168,7 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
 
 #[test]
 fn normalized_external_direct_policy_skips_raw_preparse_without_raw_pool() {
-    run_handler_fixture_on_four_mib_thread("normalized-external-direct-raw-guard", || async {
+    run_handler_fixture_on_large_stack_thread("normalized-external-direct-raw-guard", || async {
         run_normalized_external_direct_policy_skips_raw_preparse_without_raw_pool().await;
     });
 }
@@ -2264,7 +2267,7 @@ async fn run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp
 
 #[test]
 fn native_websearch_scheduler_failure_falls_back_to_external_after_mcp_path_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-after-mcp-external", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-after-mcp-external", || async {
         run_native_websearch_scheduler_failure_falls_back_to_external_after_mcp_path_for_five_rounds(
         )
         .await;
@@ -2318,7 +2321,7 @@ async fn run_websearch_latest_non_text_or_blank_user_turn_serves_without_web_sea
 
 #[test]
 fn websearch_latest_non_text_or_blank_user_turn_serves_without_web_search_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-empty-query-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-empty-query-matrix", || async {
         run_websearch_latest_non_text_or_blank_user_turn_serves_without_web_search_for_five_rounds(
         )
         .await;
@@ -2389,7 +2392,7 @@ async fn run_websearch_valid_zero_results_keep_stream_and_non_stream_success_for
 
 #[test]
 fn websearch_valid_zero_results_keep_stream_and_non_stream_success_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-zero-results-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-zero-results-matrix", || async {
         run_websearch_valid_zero_results_keep_stream_and_non_stream_success_for_five_rounds().await;
     });
 }
@@ -2513,7 +2516,7 @@ async fn run_websearch_stream_completion_and_client_drop_usage_ownership_hold_fo
 
 #[test]
 fn websearch_stream_completion_and_client_drop_usage_ownership_hold_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-stream-drop-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-stream-drop-matrix", || async {
         run_websearch_stream_completion_and_client_drop_usage_ownership_hold_for_five_rounds()
             .await;
     });
@@ -2618,7 +2621,7 @@ async fn run_websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_f
 
 #[test]
 fn websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-cancel-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-cancel-matrix", || async {
         run_websearch_client_cancel_during_mcp_body_keeps_usage_ownership_for_five_rounds().await;
     });
 }
@@ -2684,7 +2687,7 @@ async fn run_websearch_non_stream_success_has_json_shape_usage_and_stable_key_fo
 
 #[test]
 fn websearch_non_stream_success_has_json_shape_usage_and_stable_key_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-non-stream-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-non-stream-matrix", || async {
         run_websearch_non_stream_success_has_json_shape_usage_and_stable_key_for_five_rounds()
             .await;
     });
@@ -2747,7 +2750,7 @@ async fn run_websearch_debug_logs_and_usage_never_capture_raw_query_or_result_ma
 
 #[test]
 fn websearch_debug_logs_and_usage_never_capture_raw_query_or_result_markers_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-privacy-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-privacy-matrix", || async {
         run_websearch_debug_logs_and_usage_never_capture_raw_query_or_result_markers_for_five_rounds()
             .await;
     });
@@ -2962,7 +2965,7 @@ async fn run_websearch_mcp_error_resource_and_recovery_matrix_returns_tool_error
 
 #[test]
 fn websearch_mcp_error_resource_and_recovery_matrix_returns_tool_errors_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("websearch-error-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("websearch-error-matrix", || async {
         run_websearch_mcp_error_resource_and_recovery_matrix_returns_tool_errors_for_five_rounds()
             .await;
     });
@@ -3216,7 +3219,7 @@ async fn assert_remote_multimodal_limit_response(response: Response, path: &str,
 
 #[test]
 fn all_multimodal_handlers_reject_21_remote_sources_before_upstream_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("multimodal-handler-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("multimodal-handler-matrix", || async {
         const MESSAGE_PATHS: [&str; 5] = [
             "/v1/messages",
             "/cc/v1/messages",
@@ -3341,7 +3344,7 @@ fn all_multimodal_handlers_reject_21_remote_sources_before_upstream_for_five_rou
 
 #[test]
 fn builtin_routes_follow_runtime_cache_and_prompt_config_matrix() {
-    run_handler_fixture_on_four_mib_thread("route-policy-config-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("route-policy-config-matrix", || async {
         let upstream = MultimodalHandlerUpstream::start().await;
         let config = route_policy_matrix_config(&upstream.base_url);
         let (app, usage_recorder) = multimodal_handler_test_router_from_config(config.clone());
@@ -4523,7 +4526,7 @@ async fn run_upstream_too_long_returns_prompt_is_too_long_for_client_compaction_
 
 #[test]
 fn upstream_too_long_returns_prompt_is_too_long_for_client_compaction_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "too-long-client-compaction",
         run_upstream_too_long_returns_prompt_is_too_long_for_client_compaction_for_five_rounds,
     );
@@ -4615,7 +4618,7 @@ fn claude_code_compaction_request_is_detected() {
 
 #[test]
 fn handler_thinking_signature_retry_accepts_json_labeled_eventstream_success_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "signature-retry-json-eventstream",
         run_handler_thinking_signature_retry_accepts_json_labeled_eventstream_success_for_five_rounds,
     );
@@ -4623,7 +4626,7 @@ fn handler_thinking_signature_retry_accepts_json_labeled_eventstream_success_for
 
 #[test]
 fn handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "signature-retry-json-error-envelope",
         run_handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds,
     );
@@ -4631,7 +4634,7 @@ fn handler_thinking_signature_retry_rejects_json_error_envelope_for_five_rounds(
 
 #[test]
 fn handler_thinking_signature_retry_too_long_enters_payload_guard_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "signature-retry-too-long-payload-guard",
         run_handler_thinking_signature_retry_too_long_enters_payload_guard_for_five_rounds,
     );
@@ -4723,14 +4726,17 @@ fn boxed_precommit_retry_matrix() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     })
 }
 
-fn run_handler_fixture_on_four_mib_thread<F, Fut>(thread_name: &'static str, fixture: F)
+/// Debug builds keep large async handler futures on the stack (the route-policy matrix needs
+/// about 5 MiB unoptimized); release builds run the same fixture within 1 MiB, below the
+/// 2 MiB tokio worker stack used in production.
+fn run_handler_fixture_on_large_stack_thread<F, Fut>(thread_name: &'static str, fixture: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
     std::thread::Builder::new()
         .name(thread_name.to_string())
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4747,7 +4753,7 @@ where
 fn handler_eventstream_precommit_faults_retry_once_and_recover_for_five_rounds() {
     std::thread::Builder::new()
         .name("precommit-matrix-constructor".to_string())
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4762,7 +4768,7 @@ fn handler_eventstream_precommit_faults_retry_once_and_recover_for_five_rounds()
 
 #[test]
 fn handler_eventstream_status_retry_is_shared_by_dfcache_route_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("dfcache-precommit-eventstream-fixture", || async {
+    run_handler_fixture_on_large_stack_thread("dfcache-precommit-eventstream-fixture", || async {
         for round in 1..=5 {
             let upstream = HandlerEventStreamFaultUpstream::start(
                 HandlerEventStreamFault::ExceptionEventBeforeOutput,
@@ -4905,7 +4911,7 @@ async fn run_provider_json_exception_retry_and_single_credential_failure_are_pri
 
 #[test]
 fn provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("provider-json-fault-matrix", || async {
+    run_handler_fixture_on_large_stack_thread("provider-json-fault-matrix", || async {
         run_provider_json_exception_retry_and_single_credential_failure_are_private_for_five_rounds()
             .await;
     });
@@ -4915,7 +4921,7 @@ fn provider_json_exception_retry_and_single_credential_failure_are_private_for_f
 fn eventstream_content_type_with_json_bytes_uses_protocol_retry_for_five_rounds() {
     std::thread::Builder::new()
         .name("mislabeled-json-eventstream-fixture".to_string())
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -5089,7 +5095,7 @@ async fn run_single_credential_precommit_retry_matrix() {
 fn handler_single_credential_precommit_retry_is_bounded_and_fails_closed_for_five_rounds() {
     std::thread::Builder::new()
         .name("single-credential-precommit-fixture".to_string())
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -5200,7 +5206,7 @@ async fn run_first_output_timeout_retries_transparently_inside_hold_window() {
 
 #[test]
 fn first_output_timeout_retries_transparently_inside_hold_window() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "first-output-timeout-retry-fixture",
         run_first_output_timeout_retries_transparently_inside_hold_window,
     );
@@ -5249,7 +5255,7 @@ async fn run_hold_window_starts_keepalive_then_first_output_timeout_frees_upstre
 
 #[test]
 fn hold_window_starts_keepalive_then_first_output_timeout_frees_upstream() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "first-output-hold-fixture",
         run_hold_window_starts_keepalive_then_first_output_timeout_frees_upstream,
     );
@@ -5299,7 +5305,7 @@ async fn run_non_stream_first_output_timeout_retries_then_fails_fast() {
 
 #[test]
 fn non_stream_first_output_timeout_retries_then_fails_fast() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "non-stream-first-output-fixture",
         run_non_stream_first_output_timeout_retries_then_fails_fast,
     );
@@ -5307,7 +5313,7 @@ fn non_stream_first_output_timeout_retries_then_fails_fast() {
 
 #[test]
 fn handler_eventstream_postcommit_faults_never_retry_or_fake_success_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "postcommit-eventstream-fixture",
         run_handler_eventstream_postcommit_faults_matrix,
     );
@@ -5339,7 +5345,7 @@ async fn run_handler_non_stream_eventstream_faults_matrix() {
 
 #[test]
 fn handler_non_stream_eventstream_faults_fail_closed_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "non-stream-eventstream-fixture",
         run_handler_non_stream_eventstream_faults_matrix,
     );
@@ -5347,7 +5353,7 @@ fn handler_non_stream_eventstream_faults_fail_closed_for_five_rounds() {
 
 #[test]
 fn handler_non_stream_status_events_retry_once_and_recover_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("non-stream-status-retry-fixture", || async {
+    run_handler_fixture_on_large_stack_thread("non-stream-status-retry-fixture", || async {
         const PATHS: [&str; 5] = [
             "/v1/messages",
             "/na/v1/messages",
@@ -5407,42 +5413,48 @@ fn handler_non_stream_status_events_retry_once_and_recover_for_five_rounds() {
 
 #[test]
 fn handler_non_stream_status_retry_fails_closed_without_eligible_credential_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread("non-stream-status-retry-single-credential", || async {
-        for fault in [
-            HandlerEventStreamFault::ExceptionEventBeforeOutput,
-            HandlerEventStreamFault::ErrorEventBeforeOutput,
-        ] {
-            for round in 1..=5 {
-                let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
-                let (app, usage_recorder) =
-                    handler_eventstream_fault_router_with_credential_count(&upstream.base_url, 1);
-                let (status, request_id, body) =
-                    call_handler_eventstream_fault_on_path(app, "/v1/messages", false).await;
+    run_handler_fixture_on_large_stack_thread(
+        "non-stream-status-retry-single-credential",
+        || async {
+            for fault in [
+                HandlerEventStreamFault::ExceptionEventBeforeOutput,
+                HandlerEventStreamFault::ErrorEventBeforeOutput,
+            ] {
+                for round in 1..=5 {
+                    let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+                    let (app, usage_recorder) =
+                        handler_eventstream_fault_router_with_credential_count(
+                            &upstream.base_url,
+                            1,
+                        );
+                    let (status, request_id, body) =
+                        call_handler_eventstream_fault_on_path(app, "/v1/messages", false).await;
 
-                assert!(
-                    status.is_client_error() || status.is_server_error(),
-                    "fault={fault:?} round={round} status={status} body={body}"
-                );
-                assert!(body.contains(&request_id));
-                assert!(!body.contains("private fault fixture detail"));
-                assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
-                assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
-                let record = usage_record_for_request(&usage_recorder, &request_id);
-                let trace = record
-                    .latency_trace
-                    .as_ref()
-                    .expect("non-stream status retry failure trace");
-                assert_eq!(trace.stream_retry_attempts, None);
-                assert_eq!(trace.stream_retry_dispatch_failures, Some(1));
-                assert_eq!(
-                    trace.stream_retry_reasons.as_deref(),
-                    Some(&["status_error:dispatch_failed_without_send".to_string()][..]),
-                    "fault={fault:?} round={round}"
-                );
-                assert_eq!(record.credential_attempts.len(), 1);
+                    assert!(
+                        status.is_client_error() || status.is_server_error(),
+                        "fault={fault:?} round={round} status={status} body={body}"
+                    );
+                    assert!(body.contains(&request_id));
+                    assert!(!body.contains("private fault fixture detail"));
+                    assert_eq!(upstream.hits(), 1, "fault={fault:?} round={round}");
+                    assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Error, 1);
+                    let record = usage_record_for_request(&usage_recorder, &request_id);
+                    let trace = record
+                        .latency_trace
+                        .as_ref()
+                        .expect("non-stream status retry failure trace");
+                    assert_eq!(trace.stream_retry_attempts, None);
+                    assert_eq!(trace.stream_retry_dispatch_failures, Some(1));
+                    assert_eq!(
+                        trace.stream_retry_reasons.as_deref(),
+                        Some(&["status_error:dispatch_failed_without_send".to_string()][..]),
+                        "fault={fault:?} round={round}"
+                    );
+                    assert_eq!(record.credential_attempts.len(), 1);
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 async fn run_handler_binary_eventstream_with_json_content_type_matrix() {
@@ -5483,7 +5495,7 @@ async fn run_handler_binary_eventstream_with_json_content_type_matrix() {
 
 #[test]
 fn handler_binary_eventstream_with_json_content_type_is_body_sniffed_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "json-labeled-binary-eventstream-fixture",
         run_handler_binary_eventstream_with_json_content_type_matrix,
     );
@@ -5545,7 +5557,7 @@ async fn run_handler_json_stream_secret_markers_matrix() {
 
 #[test]
 fn handler_json_stream_secret_markers_never_reach_logs_or_usage_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "json-stream-privacy-fixture",
         run_handler_json_stream_secret_markers_matrix,
     );
@@ -5587,7 +5599,7 @@ async fn run_handler_unknown_event_only_matrix() {
 
 #[test]
 fn handler_unknown_event_only_retries_before_empty_success_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "unknown-event-terminal-fixture",
         run_handler_unknown_event_only_matrix,
     );
@@ -5685,7 +5697,7 @@ async fn run_handler_usage_only_eof_matrix() {
 
 #[test]
 fn handler_usage_only_eof_retries_before_empty_success_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "usage-only-eof-terminal-fixture",
         run_handler_usage_only_eof_matrix,
     );
@@ -5765,7 +5777,7 @@ async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
 
 #[test]
 fn handler_non_stream_usage_only_eof_disables_client_retry_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "non-stream-usage-only-no-retry-fixture",
         run_handler_non_stream_usage_only_eof_should_not_retry_matrix,
     );
@@ -5806,7 +5818,7 @@ async fn run_handler_empty_tool_then_read_error_matrix() {
 
 #[test]
 fn handler_empty_tool_then_read_error_retries_before_output_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "empty-tool-read-error-fixture",
         run_handler_empty_tool_then_read_error_matrix,
     );
@@ -5853,7 +5865,7 @@ async fn run_handler_missing_completion_after_text_matrix() {
 
 #[test]
 fn handler_missing_completion_after_text_fails_closed_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "missing-completion-terminal-fixture",
         run_handler_missing_completion_after_text_matrix,
     );
@@ -5903,7 +5915,7 @@ async fn run_handler_non_stream_untrusted_eof_matrix() {
 
 #[test]
 fn handler_non_stream_untrusted_eof_fails_closed_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "non-stream-untrusted-eof-fixture",
         run_handler_non_stream_untrusted_eof_matrix,
     );
@@ -5980,7 +5992,7 @@ async fn run_handler_legacy_metadata_and_complete_tool_matrix() {
 
 #[test]
 fn handler_legacy_metadata_metering_and_complete_tool_are_trusted_terminals_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "legacy-terminal-positive-fixture",
         run_handler_legacy_metadata_and_complete_tool_matrix,
     );
@@ -6051,7 +6063,7 @@ async fn run_handler_non_stream_response_body_limit_matrix() {
 
 #[test]
 fn handler_non_stream_response_body_limit_and_recovery_hold_for_five_rounds() {
-    run_handler_fixture_on_four_mib_thread(
+    run_handler_fixture_on_large_stack_thread(
         "non-stream-response-limit-fixture",
         run_handler_non_stream_response_body_limit_matrix,
     );
