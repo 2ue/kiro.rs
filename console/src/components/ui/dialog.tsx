@@ -65,6 +65,10 @@ function DialogContent({
           className
         )}
         {...props}
+        onInteractOutside={(e) => {
+          keepOpenForToast(e)
+          props.onInteractOutside?.(e)
+        }}
       >
         {children}
         {showCloseButton && (
@@ -165,4 +169,9 @@ export {
   DialogPortal,
   DialogTitle,
   DialogTrigger,
+}
+
+/** 点击 toast（如"撤销"）不应被视为点击弹层外部而关闭弹层 */
+function keepOpenForToast(e: { target: EventTarget | null; preventDefault: () => void }) {
+  if (e.target instanceof Element && e.target.closest("[data-sonner-toaster]")) e.preventDefault()
 }

@@ -34,6 +34,8 @@ const Toaster = ({ ...props }: ToasterProps) => {
           "--normal-text": "var(--popover-foreground)",
           "--normal-border": "var(--border)",
           "--border-radius": "var(--radius)",
+          // 模态 Sheet/Dialog 打开时 Radix 会禁用外部指针事件，toast 的"撤销"仍需可点
+          pointerEvents: "auto",
         } as React.CSSProperties
       }
       toastOptions={{

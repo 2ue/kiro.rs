@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { CircleAlert, Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
-import type { RuntimeConfig } from '@/api/types'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { FIELD_BY_PATH } from './registry'
@@ -23,7 +22,7 @@ export function DirtyBar({ cfg }: { cfg: ConfigDraft }) {
   if (!cfg.dirty) return null
 
   const trySave = () => {
-    const errors = validateConfig(cfg.draft as RuntimeConfig)
+    const errors = validateConfig(cfg.draft ?? {})
     if (errors.length) {
       toast.error('配置校验未通过', { description: errors.join('\n') })
       return
