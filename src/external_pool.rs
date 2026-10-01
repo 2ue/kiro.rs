@@ -7017,6 +7017,25 @@ impl ExternalPoolManager {
                 rejection,
             ));
         }
+        if crate::diagnostics::capture::is_active() {
+            if let Some(built) = request.try_clone().and_then(|builder| builder.build().ok()) {
+                crate::diagnostics::capture::record(
+                    "external_upstream_request",
+                    Some(&route.request_id),
+                    || {
+                        serde_json::json!({
+                            "poolId": pool.id,
+                            "endpoint": route.endpoint,
+                            "outboundModel": outbound_model,
+                            "method": built.method().as_str(),
+                            "url": built.url().as_str(),
+                            "headers": crate::diagnostics::capture::http_headers_json(built.headers()),
+                            "body": crate::diagnostics::capture::body_json(&outbound_body),
+                        })
+                    },
+                );
+            }
+        }
         let upstream_header_started_at = Instant::now();
         let response = tokio::select! {
             response = request.send() => {
@@ -7056,6 +7075,19 @@ impl ExternalPoolManager {
         };
 
         let status = response.status();
+        crate::diagnostics::capture::record(
+            "external_upstream_response",
+            Some(&route.request_id),
+            || {
+                serde_json::json!({
+                    "poolId": pool.id,
+                    "status": status.as_u16(),
+                    "httpVersion": format!("{:?}", response.version()),
+                    "headerWaitMs": upstream_header_started_at.elapsed().as_millis() as u64,
+                    "headers": crate::diagnostics::capture::http_headers_json(response.headers()),
+                })
+            },
+        );
         if !status.is_success() {
             let headers = response.headers().clone();
             let body = tokio::select! {
@@ -7073,6 +7105,18 @@ impl ExternalPoolManager {
                     return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
                 }
             };
+            crate::diagnostics::capture::record(
+                "upstream_error_body",
+                Some(&route.request_id),
+                || {
+                    serde_json::json!({
+                        "phase": "external",
+                        "poolId": pool.id,
+                        "status": status.as_u16(),
+                        "body": crate::diagnostics::capture::body_json(&body),
+                    })
+                },
+            );
             return Err(ExternalForwardError::new(
                 classify_external_error(status, body, headers, config),
                 outbound_model.clone(),
@@ -7545,6 +7589,15 @@ impl ExternalPoolManager {
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
             let upstream_declared_sse = response_headers_look_like_sse(&response_headers);
             let downstream_body = projected.body;
+            crate::diagnostics::capture::record("client_response", Some(&route.request_id), || {
+                serde_json::json!({
+                    "kind": "external",
+                    "poolId": pool.id,
+                    "status": status.as_u16(),
+                    "headers": crate::diagnostics::capture::http_headers_json(&response_headers),
+                    "body": crate::diagnostics::capture::body_json(&downstream_body),
+                })
+            });
             let mut response =
                 builder
                     .body(Body::from(downstream_body.clone()))
@@ -9521,6 +9574,7 @@ impl ExternalPoolManager {
             usage_capture,
             usage_projection,
         } = ctx;
+        let capture_request_id = route.request_id.clone();
         let (parts, body) = response.into_parts();
         let response_status = parts.status;
         let response_content_type = parts
@@ -9591,6 +9645,14 @@ impl ExternalPoolManager {
                 }
             },
         );
+        if crate::diagnostics::capture::is_active() {
+            let stream = crate::diagnostics::capture::tap_client_stream(
+                capture_request_id,
+                "external",
+                stream,
+            );
+            return Response::from_parts(parts, Body::from_stream(stream));
+        }
         Response::from_parts(parts, Body::from_stream(stream))
     }
 

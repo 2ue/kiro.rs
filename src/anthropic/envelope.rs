@@ -229,11 +229,15 @@ pub(crate) fn error_response_with_id(
     message: impl Into<String>,
     request_id: &str,
 ) -> Response {
-    let mut response = (
-        status,
-        Json(ErrorResponse::new(error_type, message).with_request_id(request_id)),
-    )
-        .into_response();
+    let body = ErrorResponse::new(error_type, message).with_request_id(request_id);
+    crate::diagnostics::capture::record("client_response", Some(request_id), || {
+        serde_json::json!({
+            "kind": "error",
+            "status": status.as_u16(),
+            "body": serde_json::to_value(&body).unwrap_or(Value::Null),
+        })
+    });
+    let mut response = (status, Json(body)).into_response();
     insert_request_id_headers(response.headers_mut(), request_id);
     insert_should_retry_header(response.headers_mut(), status);
     response
@@ -270,6 +274,14 @@ pub(crate) fn json_response_with_id(
     request_id: &str,
     warnings: Option<String>,
 ) -> Response {
+    crate::diagnostics::capture::record("client_response", Some(request_id), || {
+        serde_json::json!({
+            "kind": "json",
+            "status": status.as_u16(),
+            "warnings": warnings,
+            "body": body,
+        })
+    });
     let mut response = (status, Json(body)).into_response();
     insert_request_id_headers(response.headers_mut(), request_id);
     insert_optional_warnings_header(response.headers_mut(), warnings);

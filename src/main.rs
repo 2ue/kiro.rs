@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod diagnostics;
 mod external_pool;
 mod http_client;
 mod kiro;
@@ -624,6 +625,13 @@ async fn main() {
         proxy: proxy_config,
         tls_backend: config.tls_backend,
     });
+
+    // 初始化 LLM 明文采集（默认空闲，仅在 Admin API 显式启动后写盘）
+    let capture_dir = std::env::var("KIRO_CAPTURE_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| diagnostics::capture::DEFAULT_CAPTURE_DIR.to_string());
+    diagnostics::capture::init_global(capture_dir);
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(

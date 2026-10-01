@@ -12571,3 +12571,121 @@ async fn oversized_current_image_response_is_official_400_without_retry() {
         "messages.0.content.1.image.source.base64: image exceeds 5 MB maximum: 5763023 bytes > 5242880 bytes"
     );
 }
+
+async fn run_llm_capture_records_full_local_round_trip() {
+    use crate::diagnostics::capture;
+
+    let root = std::env::temp_dir().join(format!(
+        "kiro-llm-capture-e2e-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let manager = capture::init_global(&root);
+    let session = manager
+        .start(capture::CaptureLimits::default())
+        .expect("start capture");
+    let session_id = session.session_id.expect("session id");
+
+    let upstream = MultimodalHandlerUpstream::start().await;
+    let mut config = Config::default();
+    config.kiro_upstream_base_url = Some(upstream.base_url.clone());
+    config.kiro_upstream_response_timeout_secs = 2;
+    config.credential_retry_max_attempts = 1;
+    let (app, _usage_recorder) = multimodal_handler_test_router_from_config(config);
+
+    let mut request_ids = Vec::new();
+    for stream in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/v1/messages",
+                json!({
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 32,
+                    "stream": stream,
+                    "system": "CAPTURE_SYSTEM_PROMPT_MARKER",
+                    "tools": [{"name": "capture_tool_marker", "input_schema": {"type": "object"}}],
+                    "messages": [{"role": "user", "content": "CAPTURE_USER_MARKER"}]
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("capture round trip response");
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("request-id")
+            .to_string();
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("capture body");
+        request_ids.push((stream, request_id));
+    }
+
+    let manager_for_stop = manager.clone();
+    let stopped = tokio::task::spawn_blocking(move || manager_for_stop.stop("test"))
+        .await
+        .expect("join stop")
+        .expect("stop capture");
+    assert_eq!(stopped.state, "stopped");
+    assert!(manager.archive_path(&session_id).is_some());
+
+    let events: Vec<Value> = std::fs::read_to_string(root.join(&session_id).join("events.jsonl"))
+        .expect("events file")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event json"))
+        .collect();
+    for (stream, request_id) in request_ids {
+        let types: Vec<&str> = events
+            .iter()
+            .filter(|event| event["requestId"] == request_id.as_str())
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        for expected in [
+            "client_request",
+            "upstream_request",
+            "upstream_response",
+            "upstream_frame",
+        ] {
+            assert!(
+                types.contains(&expected),
+                "stream={stream} missing {expected}: {types:?}"
+            );
+        }
+        if stream {
+            assert!(types.contains(&"client_sse"), "{types:?}");
+            assert!(types.contains(&"client_stream_end"), "{types:?}");
+        } else {
+            assert!(types.contains(&"client_response"), "{types:?}");
+        }
+        let joined = events
+            .iter()
+            .filter(|event| event["requestId"] == request_id.as_str())
+            .map(Value::to_string)
+            .collect::<String>();
+        assert!(joined.contains("CAPTURE_SYSTEM_PROMPT_MARKER"));
+        assert!(joined.contains("CAPTURE_USER_MARKER"));
+        assert!(joined.contains("capture_tool_marker"));
+        assert!(joined.contains("inline-ok"));
+    }
+    let upstream_request = events
+        .iter()
+        .find(|event| event["type"] == "upstream_request")
+        .expect("upstream request event");
+    let authorization = upstream_request["data"]["headers"]["authorization"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        authorization.is_empty() || authorization.contains("[redacted]"),
+        "upstream authorization must be redacted: {authorization}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn llm_capture_records_full_local_round_trip() {
+    run_handler_fixture_on_four_mib_thread("llm-capture-round-trip", || async {
+        run_llm_capture_records_full_local_round_trip().await;
+    });
+}

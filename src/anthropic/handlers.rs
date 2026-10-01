@@ -1668,6 +1668,18 @@ fn raw_external_route_request_with_hints(
 ) -> ExternalRouteRequest {
     let model_hint = raw_probe.model.clone();
     let stream_hint = raw_probe.stream;
+    crate::diagnostics::capture::record("client_request", Some(&request_id), || {
+        serde_json::json!({
+            "route": "external_raw",
+            "endpoint": endpoint,
+            "requestedModel": model_hint,
+            "stream": stream_hint,
+            "routeSubtype": format!("{route_subtype:?}"),
+            "requestApiKeyId": request_api_key_id,
+            "headers": crate::diagnostics::capture::http_headers_json(&headers),
+            "rawBody": crate::diagnostics::capture::body_json(&raw_body),
+        })
+    });
     let effective_cache_route =
         cache_route_for_request_stream(cache_route.clone(), stream_hint.unwrap_or(false));
     let policy = &effective_cache_route.policy;
@@ -4739,6 +4751,7 @@ fn wrap_websearch_stream_usage_record(
 ) -> Response {
     let (parts, body) = response.into_parts();
     let data_stream = body.into_data_stream();
+    let capture_request_id = usage_context.request.request_id.clone();
     let guard = StreamUsageGuard::new(usage_context);
     let stream = stream::unfold(
         (data_stream, Some(guard)),
@@ -4811,6 +4824,11 @@ fn wrap_websearch_stream_usage_record(
             }
         },
     );
+    if crate::diagnostics::capture::is_active() {
+        let stream =
+            crate::diagnostics::capture::tap_client_stream(capture_request_id, "websearch", stream);
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
@@ -6615,6 +6633,9 @@ async fn post_messages_inner(
         request_api_key_id.as_deref(),
     );
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
+    // Bytes 克隆仅增加引用计数；只在采集开启时保留，避免延长请求体生命周期。
+    let capture_bodies = crate::diagnostics::capture::is_active()
+        .then(|| (raw_body.clone(), effective_raw_body.clone()));
     let mut external_fallback = build_external_fallback_context(
         &state,
         &runtime_config,
@@ -7090,6 +7111,25 @@ async fn post_messages_inner(
     let capacity_weight_units =
         capacity_weight_units_for_local_request(provider.as_ref(), input_tokens);
     usage_context.set_capacity_weight_units(capacity_weight_units);
+    crate::diagnostics::capture::record("client_request", Some(&usage_context.request_id), || {
+        serde_json::json!({
+            "route": "local",
+            "endpoint": endpoint,
+            "requestedModel": payload.model,
+            "upstreamModel": model_resolution.upstream_model,
+            "stream": payload.stream,
+            "conversationId": conversation_id,
+            "requestApiKeyId": usage_context.request_api_key_id,
+            "headers": crate::diagnostics::capture::http_headers_json(&headers),
+            "rawBody": capture_bodies
+                .as_ref()
+                .map(|(raw, _)| crate::diagnostics::capture::body_json(raw)),
+            "effectiveBody": capture_bodies
+                .as_ref()
+                .filter(|(raw, effective)| raw != effective)
+                .map(|(_, effective)| crate::diagnostics::capture::body_json(effective)),
+        })
+    });
 
     if payload.stream {
         let claude_code_noop_delta_keepalive =
@@ -8598,6 +8638,11 @@ async fn handle_stream_request(
     if let Some(warnings) = warnings_header {
         builder = builder.header("x-kiro-rs-warnings", warnings);
     }
+    if crate::diagnostics::capture::is_active() {
+        let stream =
+            crate::diagnostics::capture::tap_client_stream(response_request_id, "local", stream);
+        return builder.body(Body::from_stream(stream)).unwrap();
+    }
     builder.body(Body::from_stream(stream)).unwrap()
 }
 
@@ -9197,6 +9242,42 @@ fn inspect_complete_upstream_body(
     }
 }
 
+/// LLM 明文采集：非流式上游响应逐帧记录；无法按 EventStream 解码的部分整体记录。
+fn capture_complete_upstream_body(request_id: &str, credential_id: Option<u64>, body: &[u8]) {
+    let mut decoder = EventStreamDecoder::new();
+    let mut decoded_any = false;
+    let mut failure = decoder.feed(body).err().map(|error| error.to_string());
+    if failure.is_none() {
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(frame) => {
+                    decoded_any = true;
+                    crate::diagnostics::capture::record_upstream_frame(
+                        Some(request_id),
+                        credential_id,
+                        1,
+                        &frame,
+                    );
+                }
+                Err(error) => {
+                    failure = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if !decoded_any || failure.is_some() {
+        crate::diagnostics::capture::record("upstream_body", Some(request_id), || {
+            json!({
+                "credentialId": credential_id,
+                "decodedFrames": decoded_any,
+                "decodeError": failure,
+                "body": crate::diagnostics::capture::body_json(body),
+            })
+        });
+    }
+}
+
 fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<Event>, String> {
     let mut decoder = EventStreamDecoder::new();
     decoder
@@ -9653,6 +9734,19 @@ fn create_sse_stream(
                                         body_bytes = error.body_bytes,
                                         "流式 API 返回 2xx JSON 错误体"
                                     );
+                                    crate::diagnostics::capture::record(
+                                        "upstream_stream_json_error",
+                                        Some(&state.usage_guard.context().request.request_id),
+                                        || {
+                                            serde_json::json!({
+                                                "attempt": state.attempt_number,
+                                                "errorType": error.error_type,
+                                                "detail": error.internal_detail,
+                                                "bodyBytes": error.body_bytes,
+                                                "diagnostics": error.diagnostics,
+                                            })
+                                        },
+                                    );
                                     let retry_detail = error.internal_detail.clone();
                                     if !state.downstream_committed {
                                         match retry_stream_before_downstream_commit(
@@ -9743,6 +9837,15 @@ fn create_sse_stream(
                                     Ok(frame) => {
                                         decoded_frames_in_chunk =
                                             decoded_frames_in_chunk.saturating_add(1);
+                                        if crate::diagnostics::capture::is_active() {
+                                            let capture_ctx = state.usage_guard.context();
+                                            crate::diagnostics::capture::record_upstream_frame(
+                                                Some(&capture_ctx.request.request_id),
+                                                capture_ctx.credential_id,
+                                                state.attempt_number,
+                                                &frame,
+                                            );
+                                        }
                                         let before_first_output =
                                             !first_output_reached_in_chunk
                                                 && !state.usage_guard.context().request.has_first_output();
@@ -9813,6 +9916,17 @@ fn create_sse_stream(
                                     }
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
+                                        crate::diagnostics::capture::record(
+                                            "upstream_decode_error",
+                                            Some(&state.usage_guard.context().request.request_id),
+                                            || {
+                                                serde_json::json!({
+                                                    "attempt": state.attempt_number,
+                                                    "error": e.to_string(),
+                                                    "chunkBase64": crate::diagnostics::capture::base64_encode(&chunk),
+                                                })
+                                            },
+                                        );
                                         if !first_output_reached_in_chunk
                                             && !state.usage_guard.context().request.has_first_output()
                                         {
@@ -11133,6 +11247,13 @@ async fn handle_non_stream_request(
             }
         };
 
+        if crate::diagnostics::capture::is_active() {
+            capture_complete_upstream_body(
+                &credential_usage.request.request_id,
+                credential_usage.credential_id,
+                &body_bytes,
+            );
+        }
         let body_bytes = if first_output_timeout.is_some() {
             body_bytes
         } else {
