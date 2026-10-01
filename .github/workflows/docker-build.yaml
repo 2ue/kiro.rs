@@ -26,8 +26,11 @@ jobs:
       release_tag: ${{ github.ref_name }}
       profile: release
 
+  # Image builds run in parallel with the quality gate. They only push by digest (no tags);
+  # the manifest job below tags the release, and it waits for both quality and build, so a
+  # tag is never published unless the quality gate passed.
   build:
-    needs: quality
+    if: ${{ github.event.created == true && github.event.deleted == false && github.event.forced == false }}
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -137,7 +140,7 @@ jobs:
           retention-days: 1
 
   manifest:
-    needs: build
+    needs: [quality, build]
     runs-on: ubuntu-latest
 
     steps:
