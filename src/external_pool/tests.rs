@@ -6,6 +6,7 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{AcquireMode, MultiTokenManager};
 use crate::model::config::Config;
+use crate::model::config::StableSegmentCachePolicy;
 use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
 
 #[test]
@@ -11240,6 +11241,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
+        stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
         request_id: "req_external_capacity".to_string(),
@@ -12509,6 +12511,7 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
+        stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
         request_id: "req_external_billing".to_string(),

@@ -2010,10 +2010,10 @@ impl KiroRsToolCachePolicyPatch {
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {
-        if let Some(value) = self.coverage_ratio {
-            if !(0.0..=1.0).contains(&value) || !value.is_finite() {
-                return Err(format!("{label}.coverageRatio 必须在 0 到 1 之间"));
-            }
+        if let Some(value) = self.coverage_ratio
+            && (!(0.0..=1.0).contains(&value) || !value.is_finite())
+        {
+            return Err(format!("{label}.coverageRatio 必须在 0 到 1 之间"));
         }
         if self.max_coverage_tokens.is_some_and(|value| value < 0) {
             return Err(format!("{label}.maxCoverageTokens 不能小于 0"));
@@ -2031,6 +2031,345 @@ impl KiroRsToolCachePolicyPatch {
             return Err(format!(
                 "{label}.currentUserStablePrefixMaxTokens 不能小于 0"
             ));
+        }
+        if self
+            .reported_input_min_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.reportedInputMinTokens 不能小于 0"));
+        }
+        if self
+            .reported_input_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.reportedInputMaxTokens 不能小于 0"));
+        }
+        if matches!(
+            (self.reported_input_min_tokens, self.reported_input_max_tokens),
+            (Some(min), Some(max)) if max > 0 && min > max
+        ) {
+            return Err(format!(
+                "{label}.reportedInputMinTokens 不能大于 reportedInputMaxTokens"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StableSegmentCachePolicy {
+    #[serde(default = "default_stable_segment_coverage_ratio")]
+    pub coverage_ratio: f64,
+    #[serde(default = "default_stable_segment_max_coverage_tokens")]
+    pub max_coverage_tokens: i32,
+    #[serde(default = "default_stable_segment_min_total_input_tokens")]
+    pub min_total_input_tokens: i32,
+    #[serde(default = "default_stable_segment_min_segment_tokens")]
+    pub min_segment_tokens: i32,
+    #[serde(default = "default_true")]
+    pub incremental_create_enabled: bool,
+    #[serde(default = "default_stable_segment_max_new_creation_tokens_per_request")]
+    pub max_new_creation_tokens_per_request: i32,
+    #[serde(default = "default_true")]
+    pub include_tools: bool,
+    #[serde(default = "default_true")]
+    pub include_system: bool,
+    #[serde(default = "default_true")]
+    pub include_history: bool,
+    #[serde(default = "default_stable_segment_history_message_limit")]
+    pub history_message_limit: usize,
+    #[serde(default = "default_true")]
+    pub honor_explicit_cache_control: bool,
+    #[serde(default = "default_true")]
+    pub auto_cache_system: bool,
+    #[serde(default = "default_true")]
+    pub auto_cache_tools: bool,
+    #[serde(default = "default_true")]
+    pub auto_cache_history_message_ends: bool,
+    #[serde(default)]
+    pub cache_current_user_stable_prefix: bool,
+    #[serde(default)]
+    pub current_user_stable_prefix_max_tokens: i32,
+    #[serde(default = "default_stable_segment_default_ttl_secs")]
+    pub default_ttl_secs: u64,
+    #[serde(default = "default_stable_segment_extended_ttl_secs")]
+    pub extended_ttl_secs: u64,
+    #[serde(default = "default_stable_segment_reported_input_min_tokens")]
+    pub reported_input_min_tokens: i32,
+    #[serde(default = "default_stable_segment_reported_input_max_tokens")]
+    pub reported_input_max_tokens: i32,
+}
+
+impl Default for StableSegmentCachePolicy {
+    fn default() -> Self {
+        Self {
+            coverage_ratio: default_stable_segment_coverage_ratio(),
+            max_coverage_tokens: default_stable_segment_max_coverage_tokens(),
+            min_total_input_tokens: default_stable_segment_min_total_input_tokens(),
+            min_segment_tokens: default_stable_segment_min_segment_tokens(),
+            incremental_create_enabled: true,
+            max_new_creation_tokens_per_request:
+                default_stable_segment_max_new_creation_tokens_per_request(),
+            include_tools: true,
+            include_system: true,
+            include_history: true,
+            history_message_limit: default_stable_segment_history_message_limit(),
+            honor_explicit_cache_control: true,
+            auto_cache_system: true,
+            auto_cache_tools: true,
+            auto_cache_history_message_ends: true,
+            cache_current_user_stable_prefix: false,
+            current_user_stable_prefix_max_tokens: 0,
+            default_ttl_secs: default_stable_segment_default_ttl_secs(),
+            extended_ttl_secs: default_stable_segment_extended_ttl_secs(),
+            reported_input_min_tokens: default_stable_segment_reported_input_min_tokens(),
+            reported_input_max_tokens: default_stable_segment_reported_input_max_tokens(),
+        }
+    }
+}
+
+impl StableSegmentCachePolicy {
+    pub fn normalized(mut self) -> Self {
+        if !self.coverage_ratio.is_finite() {
+            self.coverage_ratio = default_stable_segment_coverage_ratio();
+        }
+        self.coverage_ratio = self.coverage_ratio.clamp(0.0, 1.0);
+        self.max_coverage_tokens = self.max_coverage_tokens.max(0);
+        self.min_total_input_tokens = self.min_total_input_tokens.max(0);
+        self.min_segment_tokens = self.min_segment_tokens.max(0);
+        self.max_new_creation_tokens_per_request = self.max_new_creation_tokens_per_request.max(0);
+        self.current_user_stable_prefix_max_tokens =
+            self.current_user_stable_prefix_max_tokens.max(0);
+        self.default_ttl_secs = self.default_ttl_secs.max(1);
+        self.extended_ttl_secs = self.extended_ttl_secs.max(self.default_ttl_secs);
+        self.reported_input_min_tokens = self.reported_input_min_tokens.max(0);
+        self.reported_input_max_tokens = self.reported_input_max_tokens.max(0);
+        if self.reported_input_max_tokens > 0
+            && self.reported_input_min_tokens > self.reported_input_max_tokens
+        {
+            self.reported_input_min_tokens = self.reported_input_max_tokens;
+        }
+        if !self.cache_current_user_stable_prefix {
+            self.current_user_stable_prefix_max_tokens = 0;
+        }
+        self
+    }
+
+    pub fn validate(self, label: &str) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.coverage_ratio) || !self.coverage_ratio.is_finite() {
+            return Err(format!("{label}.coverageRatio 必须在 0 到 1 之间"));
+        }
+        if self.max_coverage_tokens < 0 {
+            return Err(format!("{label}.maxCoverageTokens 不能小于 0"));
+        }
+        if self.min_total_input_tokens < 0 {
+            return Err(format!("{label}.minTotalInputTokens 不能小于 0"));
+        }
+        if self.min_segment_tokens < 0 {
+            return Err(format!("{label}.minSegmentTokens 不能小于 0"));
+        }
+        if self.max_new_creation_tokens_per_request < 0 {
+            return Err(format!("{label}.maxNewCreationTokensPerRequest 不能小于 0"));
+        }
+        if self.current_user_stable_prefix_max_tokens < 0 {
+            return Err(format!(
+                "{label}.currentUserStablePrefixMaxTokens 不能小于 0"
+            ));
+        }
+        if self.default_ttl_secs == 0 {
+            return Err(format!("{label}.defaultTtlSecs 必须大于 0"));
+        }
+        if self.extended_ttl_secs < self.default_ttl_secs {
+            return Err(format!("{label}.extendedTtlSecs 不能小于 defaultTtlSecs"));
+        }
+        if self.reported_input_min_tokens < 0 {
+            return Err(format!("{label}.reportedInputMinTokens 不能小于 0"));
+        }
+        if self.reported_input_max_tokens < 0 {
+            return Err(format!("{label}.reportedInputMaxTokens 不能小于 0"));
+        }
+        if self.reported_input_max_tokens > 0
+            && self.reported_input_min_tokens > self.reported_input_max_tokens
+        {
+            return Err(format!(
+                "{label}.reportedInputMinTokens 不能大于 reportedInputMaxTokens"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StableSegmentCachePolicyPatch {
+    #[serde(default)]
+    pub coverage_ratio: Option<f64>,
+    #[serde(default)]
+    pub max_coverage_tokens: Option<i32>,
+    #[serde(default)]
+    pub min_total_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub min_segment_tokens: Option<i32>,
+    #[serde(default)]
+    pub incremental_create_enabled: Option<bool>,
+    #[serde(default)]
+    pub max_new_creation_tokens_per_request: Option<i32>,
+    #[serde(default)]
+    pub include_tools: Option<bool>,
+    #[serde(default)]
+    pub include_system: Option<bool>,
+    #[serde(default)]
+    pub include_history: Option<bool>,
+    #[serde(default)]
+    pub history_message_limit: Option<usize>,
+    #[serde(default)]
+    pub honor_explicit_cache_control: Option<bool>,
+    #[serde(default)]
+    pub auto_cache_system: Option<bool>,
+    #[serde(default)]
+    pub auto_cache_tools: Option<bool>,
+    #[serde(default)]
+    pub auto_cache_history_message_ends: Option<bool>,
+    #[serde(default)]
+    pub cache_current_user_stable_prefix: Option<bool>,
+    #[serde(default)]
+    pub current_user_stable_prefix_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub default_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub extended_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub reported_input_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub reported_input_max_tokens: Option<i32>,
+}
+
+impl StableSegmentCachePolicyPatch {
+    fn apply_to(self, mut policy: StableSegmentCachePolicy) -> StableSegmentCachePolicy {
+        if let Some(value) = self.coverage_ratio {
+            policy.coverage_ratio = value;
+        }
+        if let Some(value) = self.max_coverage_tokens {
+            policy.max_coverage_tokens = value;
+        }
+        if let Some(value) = self.min_total_input_tokens {
+            policy.min_total_input_tokens = value;
+        }
+        if let Some(value) = self.min_segment_tokens {
+            policy.min_segment_tokens = value;
+        }
+        if let Some(value) = self.incremental_create_enabled {
+            policy.incremental_create_enabled = value;
+        }
+        if let Some(value) = self.max_new_creation_tokens_per_request {
+            policy.max_new_creation_tokens_per_request = value;
+        }
+        if let Some(value) = self.include_tools {
+            policy.include_tools = value;
+        }
+        if let Some(value) = self.include_system {
+            policy.include_system = value;
+        }
+        if let Some(value) = self.include_history {
+            policy.include_history = value;
+        }
+        if let Some(value) = self.history_message_limit {
+            policy.history_message_limit = value;
+        }
+        if let Some(value) = self.honor_explicit_cache_control {
+            policy.honor_explicit_cache_control = value;
+        }
+        if let Some(value) = self.auto_cache_system {
+            policy.auto_cache_system = value;
+        }
+        if let Some(value) = self.auto_cache_tools {
+            policy.auto_cache_tools = value;
+        }
+        if let Some(value) = self.auto_cache_history_message_ends {
+            policy.auto_cache_history_message_ends = value;
+        }
+        if let Some(value) = self.cache_current_user_stable_prefix {
+            policy.cache_current_user_stable_prefix = value;
+        }
+        if let Some(value) = self.current_user_stable_prefix_max_tokens {
+            policy.current_user_stable_prefix_max_tokens = value;
+        }
+        if let Some(value) = self.default_ttl_secs {
+            policy.default_ttl_secs = value;
+        }
+        if let Some(value) = self.extended_ttl_secs {
+            policy.extended_ttl_secs = value;
+        }
+        if let Some(value) = self.reported_input_min_tokens {
+            policy.reported_input_min_tokens = value;
+        }
+        if let Some(value) = self.reported_input_max_tokens {
+            policy.reported_input_max_tokens = value;
+        }
+        policy.normalized()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.coverage_ratio.is_none()
+            && self.max_coverage_tokens.is_none()
+            && self.min_total_input_tokens.is_none()
+            && self.min_segment_tokens.is_none()
+            && self.incremental_create_enabled.is_none()
+            && self.max_new_creation_tokens_per_request.is_none()
+            && self.include_tools.is_none()
+            && self.include_system.is_none()
+            && self.include_history.is_none()
+            && self.history_message_limit.is_none()
+            && self.honor_explicit_cache_control.is_none()
+            && self.auto_cache_system.is_none()
+            && self.auto_cache_tools.is_none()
+            && self.auto_cache_history_message_ends.is_none()
+            && self.cache_current_user_stable_prefix.is_none()
+            && self.current_user_stable_prefix_max_tokens.is_none()
+            && self.default_ttl_secs.is_none()
+            && self.extended_ttl_secs.is_none()
+            && self.reported_input_min_tokens.is_none()
+            && self.reported_input_max_tokens.is_none()
+    }
+
+    fn validate_raw(&self, label: &str) -> Result<(), String> {
+        if let Some(value) = self.coverage_ratio
+            && (!(0.0..=1.0).contains(&value) || !value.is_finite())
+        {
+            return Err(format!("{label}.coverageRatio 必须在 0 到 1 之间"));
+        }
+        if self.max_coverage_tokens.is_some_and(|value| value < 0) {
+            return Err(format!("{label}.maxCoverageTokens 不能小于 0"));
+        }
+        if self.min_total_input_tokens.is_some_and(|value| value < 0) {
+            return Err(format!("{label}.minTotalInputTokens 不能小于 0"));
+        }
+        if self.min_segment_tokens.is_some_and(|value| value < 0) {
+            return Err(format!("{label}.minSegmentTokens 不能小于 0"));
+        }
+        if self
+            .max_new_creation_tokens_per_request
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.maxNewCreationTokensPerRequest 不能小于 0"));
+        }
+        if self
+            .current_user_stable_prefix_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!(
+                "{label}.currentUserStablePrefixMaxTokens 不能小于 0"
+            ));
+        }
+        if self.default_ttl_secs == Some(0) {
+            return Err(format!("{label}.defaultTtlSecs 必须大于 0"));
+        }
+        if matches!(
+            (self.default_ttl_secs, self.extended_ttl_secs),
+            (Some(default_ttl), Some(extended_ttl)) if extended_ttl < default_ttl
+        ) {
+            return Err(format!("{label}.extendedTtlSecs 不能小于 defaultTtlSecs"));
         }
         if self
             .reported_input_min_tokens
@@ -2075,6 +2414,10 @@ pub struct CacheRoutePolicyPatch {
     pub bounds: Option<CacheBoundsPolicyPatch>,
     #[serde(default)]
     pub kiro_rs_tool: Option<KiroRsToolCachePolicyPatch>,
+    /// Boxed: the patch has ~25 optional fields and `CachePolicyConfig` embeds this struct
+    /// several times, which otherwise bloats every `Config` copy on debug-build stacks.
+    #[serde(default)]
+    pub stable_segment: Option<Box<StableSegmentCachePolicyPatch>>,
 }
 
 impl CacheRoutePolicyPatch {
@@ -2105,6 +2448,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.kiro_rs_tool {
             policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
         }
+        if let Some(patch) = self.stable_segment.as_deref() {
+            policy.stable_segment = patch.apply_to(policy.stable_segment);
+        }
         policy.normalized()
     }
 
@@ -2129,6 +2475,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = &self.kiro_rs_tool {
             patch.validate_raw(&format!("{label}.kiroRsTool"))?;
         }
+        if let Some(patch) = &self.stable_segment {
+            patch.validate_raw(&format!("{label}.stableSegment"))?;
+        }
         let policy = self.apply_route_to(base);
         policy.validate(label)
     }
@@ -2138,6 +2487,9 @@ impl CacheRoutePolicyPatch {
             PromptCacheStrategyType::NoCache => self.apply_no_cache_fields_to(policy),
             PromptCacheStrategyType::CurrentHighCache => self.apply_fields_to(policy),
             PromptCacheStrategyType::KiroRsTool => self.apply_kiro_rs_tool_fields_to(policy),
+            PromptCacheStrategyType::StableSegmentCache => {
+                self.apply_stable_segment_fields_to(policy)
+            }
         }
     }
 
@@ -2165,6 +2517,25 @@ impl CacheRoutePolicyPatch {
         policy.normalized()
     }
 
+    fn apply_stable_segment_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        if let Some(cache_type) = self.cache_type {
+            policy.cache_type = cache_type;
+        }
+        if let Some(reported_usage) = &self.reported_usage {
+            policy.reported_usage = reported_usage.normalized();
+        }
+        if let Some(patch) = self.cache_point {
+            policy.cache_point = patch.apply_to(policy.cache_point);
+        }
+        if let Some(patch) = self.bounds {
+            policy.bounds = patch.apply_to(policy.bounds);
+        }
+        if let Some(patch) = self.stable_segment.as_deref() {
+            policy.stable_segment = patch.apply_to(policy.stable_segment);
+        }
+        policy.normalized()
+    }
+
     fn affects_cache_state(&self) -> bool {
         self.cache_type
             .is_some_and(|cache_type| cache_type != PromptCacheStrategyType::NoCache)
@@ -2174,6 +2545,7 @@ impl CacheRoutePolicyPatch {
             || self.cache_point.is_some()
             || self.bounds.is_some()
             || self.kiro_rs_tool.is_some()
+            || self.stable_segment.is_some()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2197,6 +2569,10 @@ impl CacheRoutePolicyPatch {
                 .kiro_rs_tool
                 .as_ref()
                 .is_none_or(KiroRsToolCachePolicyPatch::is_empty)
+            && self
+                .stable_segment
+                .as_deref()
+                .is_none_or(StableSegmentCachePolicyPatch::is_empty)
     }
 }
 
@@ -2207,6 +2583,7 @@ pub enum PromptCacheStrategyType {
     #[default]
     CurrentHighCache,
     KiroRsTool,
+    StableSegmentCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -2218,6 +2595,8 @@ pub struct CachePolicyConfig {
     pub current_high_cache: CacheRoutePolicyPatch,
     #[serde(default)]
     pub kiro_rs_tool: CacheRoutePolicyPatch,
+    #[serde(default)]
+    pub stable_segment_cache: CacheRoutePolicyPatch,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
 }
@@ -2273,6 +2652,7 @@ impl CachePolicyConfig {
             default: self.default.clone(),
             current_high_cache: self.current_high_cache.clone(),
             kiro_rs_tool: self.kiro_rs_tool.clone(),
+            stable_segment_cache: self.stable_segment_cache.clone(),
             path_overrides,
         }
     }
@@ -2284,6 +2664,8 @@ impl CachePolicyConfig {
             .validate("当前本地模拟策略模板", base.clone())?;
         self.kiro_rs_tool
             .validate("Kiro-RS-Tool 缓存策略模板", base.clone())?;
+        self.stable_segment_cache
+            .validate("Stable Segment 缓存策略模板", base.clone())?;
         for (prefix, policy) in &self.path_overrides {
             let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
                 return Err("缓存策略路径前缀不能为空".to_string());
@@ -2320,8 +2702,37 @@ impl CachePolicyConfig {
             cache_point: CachePointPolicy::default(),
             bounds: base.bounds,
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            stable_segment: base.stable_segment,
         };
         self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
+    }
+
+    fn stable_segment_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+        let neutral = CacheRoutePolicy {
+            cache_type: PromptCacheStrategyType::StableSegmentCache,
+            simulation: CacheSimulationPolicy {
+                enabled: false,
+                target_read_ratio: default_prompt_cache_target_read_ratio(),
+                token_scale: 1.0,
+                max_simulated_input_tokens: 0,
+                cap_jitter_min_tokens: 0,
+                cap_jitter_max_tokens: 0,
+                scale_min_input_tokens: 0,
+            }
+            .normalized(),
+            creation_control: PromptCacheCreationControlConfig {
+                enabled: false,
+                ..base.creation_control
+            }
+            .normalized(),
+            reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
+            cache_point: CachePointPolicy::default(),
+            bounds: base.bounds,
+            kiro_rs_tool: base.kiro_rs_tool,
+            stable_segment: StableSegmentCachePolicy::default(),
+        };
+        self.stable_segment_cache
+            .apply_stable_segment_fields_to(neutral)
     }
 
     fn no_cache_policy(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
@@ -2344,6 +2755,7 @@ impl CachePolicyConfig {
             },
             bounds: base.bounds,
             kiro_rs_tool: base.kiro_rs_tool,
+            stable_segment: base.stable_segment,
         }
         .normalized()
     }
@@ -2365,6 +2777,11 @@ impl CachePolicyConfig {
                 policy.cache_type = PromptCacheStrategyType::KiroRsTool;
                 policy.normalized()
             }
+            PromptCacheStrategyType::StableSegmentCache => {
+                let mut policy = self.stable_segment_template(base);
+                policy.cache_type = PromptCacheStrategyType::StableSegmentCache;
+                policy.normalized()
+            }
         }
     }
 }
@@ -2378,6 +2795,7 @@ pub struct CacheRoutePolicy {
     pub cache_point: CachePointPolicy,
     pub bounds: CacheBoundsPolicy,
     pub kiro_rs_tool: KiroRsToolCachePolicy,
+    pub stable_segment: StableSegmentCachePolicy,
 }
 
 impl CacheRoutePolicy {
@@ -2386,6 +2804,7 @@ impl CacheRoutePolicy {
         self.creation_control = self.creation_control.normalized();
         self.reported_usage = self.reported_usage.normalized();
         self.kiro_rs_tool = self.kiro_rs_tool.normalized();
+        self.stable_segment = self.stable_segment.normalized();
         self
     }
 
@@ -2398,6 +2817,8 @@ impl CacheRoutePolicy {
             .validate(&format!("{label}.reportedUsage"))?;
         self.bounds.validate(&format!("{label}.bounds"))?;
         self.kiro_rs_tool.validate(&format!("{label}.kiroRsTool"))?;
+        self.stable_segment
+            .validate(&format!("{label}.stableSegment"))?;
         Ok(())
     }
 }
@@ -2444,6 +2865,10 @@ pub fn resolve_cache_policy_for_path(
     let namespace = match cache_type {
         PromptCacheStrategyType::NoCache => None,
         PromptCacheStrategyType::KiroRsTool => Some(prefix.clone()),
+        PromptCacheStrategyType::StableSegmentCache => override_policy
+            .route_namespace
+            .unwrap_or_else(|| override_policy.affects_cache_state())
+            .then(|| prefix.clone()),
         PromptCacheStrategyType::CurrentHighCache => override_policy
             .route_namespace
             .unwrap_or_else(|| override_policy.affects_cache_state())
@@ -4637,6 +5062,46 @@ fn default_kiro_rs_tool_reported_input_max_tokens() -> i32 {
     4_096
 }
 
+fn default_stable_segment_coverage_ratio() -> f64 {
+    0.90
+}
+
+fn default_stable_segment_max_coverage_tokens() -> i32 {
+    120_000
+}
+
+fn default_stable_segment_min_total_input_tokens() -> i32 {
+    4_096
+}
+
+fn default_stable_segment_min_segment_tokens() -> i32 {
+    1_024
+}
+
+fn default_stable_segment_max_new_creation_tokens_per_request() -> i32 {
+    30_000
+}
+
+fn default_stable_segment_history_message_limit() -> usize {
+    40
+}
+
+fn default_stable_segment_default_ttl_secs() -> u64 {
+    300
+}
+
+fn default_stable_segment_extended_ttl_secs() -> u64 {
+    3_600
+}
+
+fn default_stable_segment_reported_input_min_tokens() -> i32 {
+    32
+}
+
+fn default_stable_segment_reported_input_max_tokens() -> i32 {
+    256
+}
+
 fn default_prompt_cache_token_scale() -> f64 {
     1.6
 }
@@ -5380,6 +5845,7 @@ impl Config {
                 estimated_bytes_limit: self.prompt_cache_estimated_bytes_limit,
             },
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            stable_segment: StableSegmentCachePolicy::default(),
         }
         .normalized()
     }
@@ -7220,6 +7686,7 @@ mod tests {
                     current_user_stable_prefix_max_tokens: Some(700),
                     ..Default::default()
                 }),
+                ..CacheRoutePolicyPatch::default()
             },
         );
         config.cache_policy.path_overrides.insert(
@@ -7254,6 +7721,7 @@ mod tests {
                     coverage_ratio: Some(0.2),
                     ..KiroRsToolCachePolicyPatch::default()
                 }),
+                ..CacheRoutePolicyPatch::default()
             },
         );
         config.cache_policy.path_overrides.insert(
@@ -7291,6 +7759,7 @@ mod tests {
                     current_user_stable_prefix_max_tokens: Some(500),
                     ..Default::default()
                 }),
+                ..CacheRoutePolicyPatch::default()
             },
         );
 
@@ -7564,6 +8033,108 @@ mod tests {
         assert_eq!(policy.current_user_stable_prefix_max_tokens, 0);
         assert_eq!(policy.reported_input_min_tokens, 32);
         assert_eq!(policy.reported_input_max_tokens, 4_096);
+    }
+
+    #[test]
+    fn stable_segment_cache_policy_defaults_match_design() {
+        let policy = StableSegmentCachePolicy::default();
+
+        assert_eq!(policy.coverage_ratio, 0.9);
+        assert_eq!(policy.max_coverage_tokens, 120_000);
+        assert_eq!(policy.min_total_input_tokens, 4_096);
+        assert_eq!(policy.min_segment_tokens, 1_024);
+        assert!(policy.incremental_create_enabled);
+        assert_eq!(policy.max_new_creation_tokens_per_request, 30_000);
+        assert!(policy.include_tools);
+        assert!(policy.include_system);
+        assert!(policy.include_history);
+        assert_eq!(policy.history_message_limit, 40);
+        assert!(policy.honor_explicit_cache_control);
+        assert!(policy.auto_cache_system);
+        assert!(policy.auto_cache_tools);
+        assert!(policy.auto_cache_history_message_ends);
+        assert!(!policy.cache_current_user_stable_prefix);
+        assert_eq!(policy.current_user_stable_prefix_max_tokens, 0);
+        assert_eq!(policy.default_ttl_secs, 300);
+        assert_eq!(policy.extended_ttl_secs, 3_600);
+        assert_eq!(policy.reported_input_min_tokens, 32);
+        assert_eq!(policy.reported_input_max_tokens, 256);
+    }
+
+    #[test]
+    fn stable_segment_cache_policy_deserializes_template_and_path_patch() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "cachePolicy": {
+                "stableSegmentCache": {
+                    "reportedUsage": {
+                        "skipNonStreamUsageProjection": true
+                    },
+                    "stableSegment": {
+                        "coverageRatio": 0.8,
+                        "maxCoverageTokens": 90000,
+                        "minTotalInputTokens": 3000,
+                        "minSegmentTokens": 700,
+                        "historyMessageLimit": 20,
+                        "reportedInputMaxTokens": 192
+                    }
+                },
+                "pathOverrides": {
+                    "/dfcache/stable": {
+                        "cacheType": "stable_segment_cache",
+                        "routeNamespace": true,
+                        "stableSegment": {
+                            "coverageRatio": 0.6,
+                            "maxNewCreationTokensPerRequest": 12000,
+                            "reportedInputMinTokens": 48
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize config");
+        config.cache_policy = config
+            .cache_policy
+            .with_builtin_path_defaults()
+            .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
+            .normalized();
+
+        let builtin = config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(
+            builtin.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+
+        let resolved = config.cache_policy_for_path("/dfcache/stable/v1/messages");
+        assert_eq!(resolved.namespace.as_deref(), Some("/dfcache/stable"));
+        assert_eq!(
+            resolved.policy.cache_type,
+            PromptCacheStrategyType::StableSegmentCache
+        );
+        assert!(!resolved.policy.simulation.enabled);
+        assert!(!resolved.policy.creation_control.enabled);
+        assert!(
+            resolved
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
+        );
+        assert_eq!(resolved.policy.stable_segment.coverage_ratio, 0.6);
+        assert_eq!(resolved.policy.stable_segment.max_coverage_tokens, 90_000);
+        assert_eq!(resolved.policy.stable_segment.min_total_input_tokens, 3_000);
+        assert_eq!(resolved.policy.stable_segment.min_segment_tokens, 700);
+        assert_eq!(resolved.policy.stable_segment.history_message_limit, 20);
+        assert_eq!(
+            resolved
+                .policy
+                .stable_segment
+                .max_new_creation_tokens_per_request,
+            12_000
+        );
+        assert_eq!(resolved.policy.stable_segment.reported_input_min_tokens, 48);
+        assert_eq!(
+            resolved.policy.stable_segment.reported_input_max_tokens,
+            192
+        );
     }
 
     #[test]
@@ -8443,6 +9014,27 @@ mod tests {
             invalid_bounds
                 .cache_policy
                 .validate(invalid_bounds.legacy_cache_route_policy_default())
+                .is_err()
+        );
+
+        let mut invalid_stable_segment = Config::default();
+        invalid_stable_segment.cache_policy.path_overrides.insert(
+            "/bad-stable".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::StableSegmentCache),
+                stable_segment: Some(Box::new(StableSegmentCachePolicyPatch {
+                    coverage_ratio: Some(1.5),
+                    default_ttl_secs: Some(300),
+                    extended_ttl_secs: Some(60),
+                    ..StableSegmentCachePolicyPatch::default()
+                })),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        assert!(
+            invalid_stable_segment
+                .cache_policy
+                .validate(invalid_stable_segment.legacy_cache_route_policy_default())
                 .is_err()
         );
     }

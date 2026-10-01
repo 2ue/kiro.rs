@@ -19,6 +19,8 @@ pub(super) struct ExternalUsageProjectionContext {
     pub(super) prompt_cache: Arc<PromptCacheTracker>,
     pub(super) prompt_cache_profile: Option<PromptCacheProfile>,
     pub(super) kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
+    pub(super) stable_segment_prompt_cache_plan: Option<StableSegmentPromptCachePlan>,
+    pub(super) stable_segment_cache_policy: Option<StableSegmentCachePolicy>,
     pub(super) prompt_cache_target_read_ratio: f64,
     pub(super) prompt_cache_bounds: PromptCacheBounds,
     pub(super) prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -48,6 +50,8 @@ pub(super) struct ExternalUsageProjectionTemplate {
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
     kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
+    stable_segment_prompt_cache_plan: Option<StableSegmentPromptCachePlan>,
+    stable_segment_cache_policy: Option<StableSegmentCachePolicy>,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_bounds: PromptCacheBounds,
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -72,18 +76,48 @@ impl ExternalUsageProjectionTemplate {
     }
 
     fn context_for_pool(&self, pool: &ExternalPool) -> ExternalUsageProjectionContext {
+        let (scope, simulated_usage, stable_segment_prompt_cache_plan) =
+            if let Some(policy) = self.stable_segment_cache_policy {
+                let scope = self.scope.clone();
+                let plan = self
+                    .prompt_cache
+                    .compute_stable_segment_with_profile_bounds(
+                        scope.clone(),
+                        self.prompt_cache_profile.clone(),
+                        self.prompt_cache_bounds,
+                        policy,
+                    );
+                let policy = policy.normalized();
+                let simulated_usage =
+                    CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
+                        plan.usage(),
+                        policy.reported_input_min_tokens,
+                        policy.reported_input_max_tokens,
+                        plan.cache_jitter_seed(),
+                    );
+                (scope, simulated_usage, Some(plan))
+            } else {
+                (
+                    self.scope.clone(),
+                    self.simulated_usage,
+                    self.stable_segment_prompt_cache_plan.clone(),
+                )
+            };
+
         ExternalUsageProjectionContext {
             mode: pool.usage_projection_mode,
             raw_input_tokens: self.raw_input_tokens,
             cache_state_enabled: self.cache_state_enabled,
             credential_key: Some(format!("external_pool:{}", pool.id)),
             model: self.model.clone(),
-            simulated_usage: self.simulated_usage,
+            simulated_usage,
             reported_policy: self.reported_policy.clone(),
-            scope: self.scope.clone(),
+            scope,
             prompt_cache: self.prompt_cache.clone(),
             prompt_cache_profile: self.prompt_cache_profile.clone(),
             kiro_rs_tool_prompt_cache_plan: self.kiro_rs_tool_prompt_cache_plan.clone(),
+            stable_segment_prompt_cache_plan,
+            stable_segment_cache_policy: self.stable_segment_cache_policy,
             prompt_cache_target_read_ratio: self.prompt_cache_target_read_ratio,
             prompt_cache_bounds: self.prompt_cache_bounds,
             prompt_cache_creation_controller: self.prompt_cache_creation_controller.clone(),
@@ -213,54 +247,63 @@ fn build_template(
             )
         })
         .flatten();
-    let (profile, kiro_rs_tool_prompt_cache_plan, simulated_usage) = match route
-        .prompt_cache_strategy_type
-    {
-        PromptCacheStrategyType::CurrentHighCache
-            if prompt_cache_supported
-                && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
-        {
-            let profile = route.prompt_cache.build_high_cache_profile_for_model(
-                payload,
-                raw_input_tokens,
-                &model,
-            );
-            let prompt_usage = route.prompt_cache.compute_with_bounds(
-                scope.clone(),
-                profile.as_ref(),
-                route.prompt_cache_target_read_ratio,
-                route.prompt_cache_bounds,
-            );
-            let simulated_usage = profile.as_ref().and_then(|profile| {
-                CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
-                    prompt_usage,
-                    route.prompt_cache_target_read_ratio,
-                    cache_amplification(route, profile),
-                )
-            });
-            (profile, None, simulated_usage)
-        }
-        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
-            let plan = route.prompt_cache.compute_kiro_rs_tool_with_bounds(
-                scope.clone(),
-                payload,
-                raw_input_tokens,
-                &model,
-                route.prompt_cache_bounds,
-                route.kiro_rs_tool_cache_policy,
-            );
-            let policy = route.kiro_rs_tool_cache_policy.normalized();
-            let simulated_usage =
-                CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
-                    plan.usage(),
-                    policy.reported_input_min_tokens,
-                    policy.reported_input_max_tokens,
-                    plan.cache_jitter_seed(),
+    let (profile, kiro_rs_tool_prompt_cache_plan, stable_segment_cache_policy, simulated_usage) =
+        match route.prompt_cache_strategy_type {
+            PromptCacheStrategyType::CurrentHighCache
+                if prompt_cache_supported
+                    && route.prompt_cache_simulation_mode
+                        == PromptCacheSimulationMode::HighCache =>
+            {
+                let profile = route.prompt_cache.build_high_cache_profile_for_model(
+                    payload,
+                    raw_input_tokens,
+                    &model,
                 );
-            (None, Some(plan), simulated_usage)
-        }
-        _ => (None, None, None),
-    };
+                let prompt_usage = route.prompt_cache.compute_with_bounds(
+                    scope.clone(),
+                    profile.as_ref(),
+                    route.prompt_cache_target_read_ratio,
+                    route.prompt_cache_bounds,
+                );
+                let simulated_usage = profile.as_ref().and_then(|profile| {
+                    CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+                        prompt_usage,
+                        route.prompt_cache_target_read_ratio,
+                        cache_amplification(route, profile),
+                    )
+                });
+                (profile, None, None, simulated_usage)
+            }
+            PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
+                let plan = route.prompt_cache.compute_kiro_rs_tool_with_bounds(
+                    scope.clone(),
+                    payload,
+                    raw_input_tokens,
+                    &model,
+                    route.prompt_cache_bounds,
+                    route.kiro_rs_tool_cache_policy,
+                );
+                let policy = route.kiro_rs_tool_cache_policy.normalized();
+                let simulated_usage =
+                    CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
+                        plan.usage(),
+                        policy.reported_input_min_tokens,
+                        policy.reported_input_max_tokens,
+                        plan.cache_jitter_seed(),
+                    );
+                (None, Some(plan), None, simulated_usage)
+            }
+            PromptCacheStrategyType::StableSegmentCache if prompt_cache_supported => {
+                let profile = route.prompt_cache.build_stable_segment_profile_for_model(
+                    payload,
+                    raw_input_tokens,
+                    &model,
+                    route.stable_segment_cache_policy,
+                );
+                (profile, None, Some(route.stable_segment_cache_policy), None)
+            }
+            _ => (None, None, None, None),
+        };
     let reported_policy = match route.prompt_cache_strategy_type {
         PromptCacheStrategyType::NoCache => ReportedCacheUsagePolicy::from_path_policy(
             crate::model::config::ReportedUsagePathPolicy::disabled(),
@@ -283,7 +326,9 @@ fn build_template(
             .enabled
             .then(|| ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..)))
             .flatten(),
-        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool => None,
+        PromptCacheStrategyType::CurrentHighCache
+        | PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::StableSegmentCache => None,
     };
     Some(ExternalUsageProjectionTemplate {
         uplift_percent,
@@ -300,6 +345,8 @@ fn build_template(
         prompt_cache: route.prompt_cache.clone(),
         prompt_cache_profile: profile,
         kiro_rs_tool_prompt_cache_plan,
+        stable_segment_prompt_cache_plan: None,
+        stable_segment_cache_policy,
         prompt_cache_target_read_ratio: route.prompt_cache_target_read_ratio,
         prompt_cache_bounds: route.prompt_cache_bounds,
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
@@ -364,6 +411,13 @@ impl ExternalUsageProjectionContext {
                 self.scope.clone(),
                 plan,
                 self.prompt_cache_bounds,
+            );
+        } else if let Some(plan) = self.stable_segment_prompt_cache_plan.as_ref() {
+            self.prompt_cache.commit_stable_segment_success_with_bounds(
+                self.scope.clone(),
+                plan,
+                self.prompt_cache_bounds,
+                self.stable_segment_cache_policy.unwrap_or_default(),
             );
         } else {
             self.prompt_cache.update_with_bounds(

@@ -7,7 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Tool};
-use crate::model::config::KiroRsToolCachePolicy;
+use crate::model::config::{KiroRsToolCachePolicy, StableSegmentCachePolicy};
 use crate::token;
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -85,6 +85,26 @@ pub struct KiroRsToolPromptCachePlan {
 }
 
 impl KiroRsToolPromptCachePlan {
+    pub fn usage(&self) -> PromptCacheUsage {
+        self.usage
+    }
+
+    pub fn cache_jitter_seed(&self) -> u64 {
+        self.profile
+            .as_ref()
+            .map(PromptCacheProfile::cache_jitter_seed)
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StableSegmentPromptCachePlan {
+    profile: Option<PromptCacheProfile>,
+    usage: PromptCacheUsage,
+    committed_cache_tokens: i32,
+}
+
+impl StableSegmentPromptCachePlan {
     pub fn usage(&self) -> PromptCacheUsage {
         self.usage
     }
@@ -221,6 +241,83 @@ impl PromptCacheTracker {
             scope,
             plan.profile.as_ref(),
             bounds,
+            plan.committed_cache_tokens,
+        );
+    }
+
+    pub fn build_stable_segment_profile_for_model(
+        &self,
+        req: &MessagesRequest,
+        total_input_tokens: i32,
+        cache_model: &str,
+        policy: StableSegmentCachePolicy,
+    ) -> Option<PromptCacheProfile> {
+        let policy = policy.normalized();
+        self.build_profile_with_blocks(
+            stable_segment_cache_blocks(req, policy),
+            total_input_tokens,
+            cache_model,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn compute_stable_segment_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        req: &MessagesRequest,
+        total_input_tokens: i32,
+        cache_model: &str,
+        bounds: PromptCacheBounds,
+        policy: StableSegmentCachePolicy,
+    ) -> StableSegmentPromptCachePlan {
+        let profile = self.build_stable_segment_profile_for_model(
+            req,
+            total_input_tokens,
+            cache_model,
+            policy,
+        );
+        self.compute_stable_segment_with_profile_bounds(scope, profile, bounds, policy)
+    }
+
+    pub fn compute_stable_segment_with_profile_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<PromptCacheProfile>,
+        bounds: PromptCacheBounds,
+        policy: StableSegmentCachePolicy,
+    ) -> StableSegmentPromptCachePlan {
+        let policy = policy.normalized();
+        let usage = self.compute_stable_segment_profile_with_bounds(
+            scope,
+            profile.as_ref(),
+            bounds,
+            policy,
+        );
+        StableSegmentPromptCachePlan {
+            profile,
+            usage,
+            committed_cache_tokens: usage
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens)
+                .max(0),
+        }
+    }
+
+    pub fn commit_stable_segment_success_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        plan: &StableSegmentPromptCachePlan,
+        bounds: PromptCacheBounds,
+        policy: StableSegmentCachePolicy,
+    ) {
+        self.update_stable_segment_profile_with_bounds(
+            scope,
+            plan.profile.as_ref(),
+            bounds,
+            policy,
             plan.committed_cache_tokens,
         );
     }
@@ -566,6 +663,138 @@ impl PromptCacheTracker {
         }
     }
 
+    fn compute_stable_segment_profile_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        bounds: PromptCacheBounds,
+        policy: StableSegmentCachePolicy,
+    ) -> PromptCacheUsage {
+        let policy = policy.normalized();
+        let Some(scope) = scope else {
+            return PromptCacheUsage::default();
+        };
+        let Some(profile) = profile else {
+            return PromptCacheUsage::default();
+        };
+        if profile.total_input_tokens < policy.min_total_input_tokens {
+            return PromptCacheUsage::default();
+        }
+        let Some(covered_tokens) = profile
+            .lookup_points
+            .last()
+            .map(|point| point.cumulative_tokens.max(0))
+        else {
+            return PromptCacheUsage::default();
+        };
+        let covered_tokens = apply_stable_segment_coverage_policy(covered_tokens, policy);
+        if covered_tokens < policy.min_segment_tokens.max(1) {
+            return PromptCacheUsage::default();
+        }
+
+        let now = Utc::now();
+        let mut entries_by_scope = self.entries.lock();
+        prune_expired_locked(&mut entries_by_scope, now);
+
+        let mut read_tokens = 0;
+        if let Some(entries) = entries_by_scope.get_mut(&scope) {
+            for point in profile.lookup_points.iter().rev() {
+                if point.cumulative_tokens < policy.min_segment_tokens {
+                    continue;
+                }
+                let Some(entry) = entries.get_mut(&point.fingerprint) else {
+                    continue;
+                };
+                if entry.expires_at <= now {
+                    continue;
+                }
+                entry.last_used_at = now;
+                entry.expires_at = now
+                    + chrono::Duration::from_std(bounds.effective_ttl(entry.ttl))
+                        .unwrap_or_default();
+                read_tokens = point
+                    .cumulative_tokens
+                    .min(entry.cached_tokens)
+                    .min(covered_tokens)
+                    .max(0);
+                break;
+            }
+        }
+
+        let mut creation = covered_tokens.saturating_sub(read_tokens).max(0);
+        if !policy.incremental_create_enabled && read_tokens > 0 {
+            creation = 0;
+        }
+        if policy.max_new_creation_tokens_per_request > 0 {
+            creation = creation.min(policy.max_new_creation_tokens_per_request);
+        }
+        let (cache5m, cache1h) = target_ttl_breakdown(profile, creation);
+        PromptCacheUsage {
+            cache_creation_input_tokens: creation,
+            cache_read_input_tokens: read_tokens,
+            cache_creation_5m_input_tokens: cache5m,
+            cache_creation_1h_input_tokens: cache1h,
+            effective_cache_ratio: (profile.total_input_tokens > 0)
+                .then(|| covered_tokens as f64 / profile.total_input_tokens as f64),
+        }
+    }
+
+    fn update_stable_segment_profile_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        bounds: PromptCacheBounds,
+        policy: StableSegmentCachePolicy,
+        committed_cache_tokens: i32,
+    ) {
+        let Some(scope) = scope else {
+            return;
+        };
+        let Some(profile) = profile else {
+            return;
+        };
+        let policy = policy.normalized();
+        let committed_cache_tokens = committed_cache_tokens.max(0);
+        if profile.total_input_tokens < policy.min_total_input_tokens
+            || profile.lookup_points.is_empty()
+            || committed_cache_tokens < policy.min_segment_tokens.max(1)
+        {
+            return;
+        }
+
+        let ttl = bounds.effective_ttl(
+            profile
+                .breakpoints
+                .last()
+                .map(|breakpoint| breakpoint.ttl)
+                .unwrap_or_else(|| stable_segment_default_ttl(policy)),
+        );
+        let now = Utc::now();
+        let mut entries_by_scope = self.entries.lock();
+        prune_expired_locked(&mut entries_by_scope, now);
+        let entries = entries_by_scope.entry(scope).or_default();
+
+        for point in &profile.lookup_points {
+            if point.cumulative_tokens < policy.min_segment_tokens {
+                continue;
+            }
+            let cached_tokens = point.cumulative_tokens.min(committed_cache_tokens).max(0);
+            if cached_tokens < policy.min_segment_tokens.max(1) {
+                continue;
+            }
+            entries.insert(
+                point.fingerprint,
+                PromptCacheEntry {
+                    expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
+                    ttl,
+                    last_used_at: now,
+                    cached_tokens,
+                },
+            );
+        }
+        enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
+    }
+
     fn update_kiro_rs_tool_profile_with_bounds(
         &self,
         scope: Option<PromptCacheScope>,
@@ -786,6 +1015,82 @@ fn kiro_rs_tool_cache_blocks(
     blocks
 }
 
+fn stable_segment_cache_blocks(
+    req: &MessagesRequest,
+    policy: StableSegmentCachePolicy,
+) -> Vec<CacheBlock> {
+    let mut blocks = Vec::new();
+    let policy = policy.normalized();
+    let honor_explicit = policy.honor_explicit_cache_control;
+
+    let prelude = serde_json::json!({
+        "kind": "request_prelude",
+        "tool_choice": req.tool_choice,
+    });
+    append_stable_segment_cache_block(&mut blocks, prelude, None, honor_explicit, false);
+
+    if policy.include_tools
+        && let Some(tools) = &req.tools
+    {
+        for tool in tools {
+            append_stable_segment_tool_block(&mut blocks, tool, policy);
+        }
+    }
+
+    if policy.include_system
+        && let Some(system) = &req.system
+    {
+        for block in system {
+            append_stable_segment_system_block(&mut blocks, block, policy);
+        }
+    }
+
+    if policy.include_history {
+        let history_end = if req
+            .messages
+            .last()
+            .is_some_and(|msg| msg.role.eq_ignore_ascii_case("user"))
+        {
+            req.messages.len().saturating_sub(1)
+        } else {
+            req.messages.len()
+        };
+        let history = &req.messages[..history_end];
+        let start = if policy.history_message_limit == 0 {
+            0
+        } else {
+            history.len().saturating_sub(policy.history_message_limit)
+        };
+        for msg in &history[start..] {
+            append_stable_segment_message_blocks(
+                &mut blocks,
+                msg,
+                policy.auto_cache_history_message_ends,
+                policy,
+            );
+        }
+    }
+
+    if policy.cache_current_user_stable_prefix
+        && policy.current_user_stable_prefix_max_tokens > 0
+        && req
+            .messages
+            .last()
+            .is_some_and(|msg| msg.role.eq_ignore_ascii_case("user"))
+        && let Some(msg) = req.messages.last()
+        && !message_has_explicit_cache_control(msg)
+    {
+        append_current_user_stable_prefix_block(
+            &mut blocks,
+            msg,
+            policy.current_user_stable_prefix_max_tokens,
+            stable_segment_default_ttl(policy),
+        );
+    }
+
+    blocks
+}
+
 fn append_tool_block(blocks: &mut Vec<CacheBlock>, tool: &Tool) {
     let mut value = serde_json::json!({
         "kind": "tool",
@@ -799,6 +1104,43 @@ fn append_tool_block(blocks: &mut Vec<CacheBlock>, tool: &Tool) {
         value["cache_control"] = cache_control.clone();
     }
     append_cache_block(blocks, value, false);
+}
+
+fn append_stable_segment_tool_block(
+    blocks: &mut Vec<CacheBlock>,
+    tool: &Tool,
+    policy: StableSegmentCachePolicy,
+) {
+    let mut value = serde_json::json!({
+        "kind": "tool",
+        "type": tool.tool_type,
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": tool.input_schema,
+        "max_uses": tool.max_uses,
+    });
+    if policy.honor_explicit_cache_control
+        && let Some(cache_control) = &tool.cache_control
+    {
+        value["cache_control"] = cache_control.clone();
+    }
+    let explicit_ttl = tool
+        .cache_control
+        .as_ref()
+        .filter(|_| policy.honor_explicit_cache_control)
+        .and_then(|cache_control| stable_segment_explicit_ttl(cache_control, policy));
+    let ttl = explicit_ttl.or_else(|| {
+        policy
+            .auto_cache_tools
+            .then(|| stable_segment_default_ttl(policy))
+    });
+    append_stable_segment_cache_block(
+        blocks,
+        value,
+        ttl,
+        policy.honor_explicit_cache_control,
+        false,
+    );
 }
 
 fn append_system_block(blocks: &mut Vec<CacheBlock>, system: &SystemMessage) {
@@ -815,6 +1157,44 @@ fn append_system_block(blocks: &mut Vec<CacheBlock>, system: &SystemMessage) {
         "block": block
     });
     append_cache_block(blocks, value, false);
+}
+
+fn append_stable_segment_system_block(
+    blocks: &mut Vec<CacheBlock>,
+    system: &SystemMessage,
+    policy: StableSegmentCachePolicy,
+) {
+    let mut block = serde_json::json!({
+        "type": "text",
+        "text": system.text,
+    });
+    if policy.honor_explicit_cache_control
+        && let Some(cache_control) = &system.cache_control
+    {
+        block["cache_control"] = cache_control.clone();
+    }
+
+    let value = serde_json::json!({
+        "kind": "system",
+        "block": block
+    });
+    let explicit_ttl = system
+        .cache_control
+        .as_ref()
+        .filter(|_| policy.honor_explicit_cache_control)
+        .and_then(|cache_control| stable_segment_explicit_ttl(cache_control, policy));
+    let ttl = explicit_ttl.or_else(|| {
+        policy
+            .auto_cache_system
+            .then(|| stable_segment_default_ttl(policy))
+    });
+    append_stable_segment_cache_block(
+        blocks,
+        value,
+        ttl,
+        policy.honor_explicit_cache_control,
+        false,
+    );
 }
 
 fn append_message_blocks(blocks: &mut Vec<CacheBlock>, msg: &Message) {
@@ -848,6 +1228,79 @@ fn append_message_blocks(blocks: &mut Vec<CacheBlock>, msg: &Message) {
                 "block": other,
             });
             append_cache_block(blocks, value, true);
+        }
+        _ => {}
+    }
+}
+
+fn append_stable_segment_message_blocks(
+    blocks: &mut Vec<CacheBlock>,
+    msg: &Message,
+    auto_breakpoint_at_message_end: bool,
+    policy: StableSegmentCachePolicy,
+) {
+    match &msg.content {
+        Value::String(text) => {
+            let value = serde_json::json!({
+                "kind": "message",
+                "role": msg.role,
+                "block": {
+                    "type": "text",
+                    "text": text,
+                }
+            });
+            append_stable_segment_cache_block(
+                blocks,
+                value,
+                auto_breakpoint_at_message_end.then(|| stable_segment_default_ttl(policy)),
+                policy.honor_explicit_cache_control,
+                false,
+            );
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let value = serde_json::json!({
+                    "kind": "message",
+                    "role": msg.role,
+                    "block": item,
+                });
+                let explicit_ttl = item
+                    .get("cache_control")
+                    .filter(|_| policy.honor_explicit_cache_control)
+                    .and_then(|cache_control| stable_segment_explicit_ttl(cache_control, policy));
+                let ttl = explicit_ttl.or_else(|| {
+                    (auto_breakpoint_at_message_end && idx + 1 == items.len())
+                        .then(|| stable_segment_default_ttl(policy))
+                });
+                append_stable_segment_cache_block(
+                    blocks,
+                    value,
+                    ttl,
+                    policy.honor_explicit_cache_control,
+                    false,
+                );
+            }
+        }
+        other if !other.is_null() => {
+            let value = serde_json::json!({
+                "kind": "message",
+                "role": msg.role,
+                "block": other,
+            });
+            let explicit_ttl = other
+                .get("cache_control")
+                .filter(|_| policy.honor_explicit_cache_control)
+                .and_then(|cache_control| stable_segment_explicit_ttl(cache_control, policy));
+            let ttl = explicit_ttl.or_else(|| {
+                auto_breakpoint_at_message_end.then(|| stable_segment_default_ttl(policy))
+            });
+            append_stable_segment_cache_block(
+                blocks,
+                value,
+                ttl,
+                policy.honor_explicit_cache_control,
+                false,
+            );
         }
         _ => {}
     }
@@ -920,6 +1373,15 @@ fn append_kiro_rs_tool_current_user_stable_prefix_block(
     policy: KiroRsToolCachePolicy,
 ) {
     let max_tokens = policy.current_user_stable_prefix_max_tokens.max(0);
+    append_current_user_stable_prefix_block(blocks, msg, max_tokens, DEFAULT_PROMPT_CACHE_TTL);
+}
+
+fn append_current_user_stable_prefix_block(
+    blocks: &mut Vec<CacheBlock>,
+    msg: &Message,
+    max_tokens: i32,
+    ttl: Duration,
+) {
     if max_tokens <= 0 {
         return;
     }
@@ -942,7 +1404,7 @@ fn append_kiro_rs_tool_current_user_stable_prefix_block(
     let Some(value) = shrink_current_user_prefix_value_to_token_cap(value, max_tokens) else {
         return;
     };
-    append_cache_block_with_forced_ttl(blocks, value, Some(DEFAULT_PROMPT_CACHE_TTL));
+    append_cache_block_with_forced_ttl(blocks, value, Some(ttl));
 }
 
 fn shrink_current_user_prefix_value_to_token_cap(
@@ -1069,6 +1531,53 @@ fn append_cache_block_with_forced_ttl(
     });
 }
 
+fn append_stable_segment_cache_block(
+    blocks: &mut Vec<CacheBlock>,
+    mut value: Value,
+    ttl: Option<Duration>,
+    honor_explicit_cache_control: bool,
+    is_message_end: bool,
+) {
+    if !honor_explicit_cache_control {
+        strip_cache_control_from_value(&mut value);
+    }
+    let block_value = value.get("block").unwrap_or(&value);
+    if is_anthropic_billing_header_block(block_value) {
+        return;
+    }
+
+    let ttl = ttl.or_else(|| {
+        honor_explicit_cache_control
+            .then(|| extract_prompt_cache_ttl(block_value))
+            .flatten()
+    });
+    let canonical = canonicalize_cache_value(&value);
+    let tokens = token::count_tokens(&canonical) as i32;
+    blocks.push(CacheBlock {
+        value,
+        tokens,
+        ttl,
+        is_message_end,
+    });
+}
+
+fn strip_cache_control_from_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for nested in map.values_mut() {
+                strip_cache_control_from_value(nested);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_cache_control_from_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn extract_prompt_cache_ttl(value: &Value) -> Option<Duration> {
     let cache = value.get("cache_control")?;
     if cache.is_null() {
@@ -1083,6 +1592,31 @@ fn extract_prompt_cache_ttl(value: &Value) -> Option<Duration> {
         .and_then(parse_ttl)
         .unwrap_or(DEFAULT_PROMPT_CACHE_TTL);
     Some(normalize_ttl(ttl))
+}
+
+fn stable_segment_explicit_ttl(
+    value: &Value,
+    policy: StableSegmentCachePolicy,
+) -> Option<Duration> {
+    let ttl = if value.get("cache_control").is_some() {
+        extract_prompt_cache_ttl(value)
+    } else {
+        let wrapped = serde_json::json!({ "cache_control": value });
+        extract_prompt_cache_ttl(&wrapped)
+    }?;
+    if ttl >= HOUR_PROMPT_CACHE_TTL {
+        Some(stable_segment_extended_ttl(policy))
+    } else {
+        Some(stable_segment_default_ttl(policy))
+    }
+}
+
+fn stable_segment_default_ttl(policy: StableSegmentCachePolicy) -> Duration {
+    Duration::from_secs(policy.normalized().default_ttl_secs)
+}
+
+fn stable_segment_extended_ttl(policy: StableSegmentCachePolicy) -> Duration {
+    Duration::from_secs(policy.normalized().extended_ttl_secs)
 }
 
 fn parse_ttl(value: &Value) -> Option<Duration> {
@@ -1189,6 +1723,21 @@ fn is_valid_uuid(value: &str) -> bool {
 }
 
 fn apply_kiro_rs_tool_coverage_policy(covered_tokens: i32, policy: KiroRsToolCachePolicy) -> i32 {
+    let policy = policy.normalized();
+    let mut covered_tokens = covered_tokens.max(0);
+    if policy.coverage_ratio < 1.0 {
+        covered_tokens = ((covered_tokens as f64) * policy.coverage_ratio).floor() as i32;
+    }
+    if policy.max_coverage_tokens > 0 {
+        covered_tokens = covered_tokens.min(policy.max_coverage_tokens);
+    }
+    covered_tokens.max(0)
+}
+
+fn apply_stable_segment_coverage_policy(
+    covered_tokens: i32,
+    policy: StableSegmentCachePolicy,
+) -> i32 {
     let policy = policy.normalized();
     let mut covered_tokens = covered_tokens.max(0);
     if policy.coverage_ratio < 1.0 {
@@ -1844,6 +2393,114 @@ mod tests {
         );
         assert!(second.usage().cache_read_input_tokens > 0);
         assert_eq!(second.usage().cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn stable_segment_first_miss_then_success_commit_hits() {
+        let tracker = PromptCacheTracker::default();
+        let scope = PromptCacheScope::new("stable-session".to_string(), Some("/cc".to_string()));
+        let mut req = request("stable segment system prompt ".repeat(300));
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("stable history question"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!("stable history answer"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("current question"),
+            },
+        ];
+        let policy = StableSegmentCachePolicy {
+            max_new_creation_tokens_per_request: 0,
+            ..StableSegmentCachePolicy::default()
+        };
+
+        let first = tracker.compute_stable_segment_with_bounds(
+            Some(scope.clone()),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert!(first.usage().cache_creation_input_tokens > 0);
+        assert_eq!(first.usage().cache_read_input_tokens, 0);
+
+        tracker.commit_stable_segment_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+            policy,
+        );
+
+        let second = tracker.compute_stable_segment_with_bounds(
+            Some(scope),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert!(second.usage().cache_read_input_tokens > 0);
+        assert_eq!(second.usage().cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn stable_segment_respects_min_total_and_route_namespace_isolation() {
+        let tracker = PromptCacheTracker::default();
+        let scope_a = PromptCacheScope::new("stable-isolated".to_string(), Some("/cc".to_string()));
+        let scope_b = PromptCacheScope::new(
+            "stable-isolated".to_string(),
+            Some("/stable-other".to_string()),
+        );
+        let req = request("isolated stable system prompt ".repeat(300));
+        let policy = StableSegmentCachePolicy {
+            min_total_input_tokens: 4_096,
+            min_segment_tokens: 512,
+            max_new_creation_tokens_per_request: 0,
+            ..StableSegmentCachePolicy::default()
+        };
+
+        let short = tracker.compute_stable_segment_with_bounds(
+            Some(scope_a.clone()),
+            &req,
+            2_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(short.usage(), PromptCacheUsage::default());
+
+        let first = tracker.compute_stable_segment_with_bounds(
+            Some(scope_a.clone()),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert!(first.usage().cache_creation_input_tokens > 0);
+        tracker.commit_stable_segment_success_with_bounds(
+            Some(scope_a.clone()),
+            &first,
+            PromptCacheBounds::default(),
+            policy,
+        );
+
+        let isolated = tracker.compute_stable_segment_with_bounds(
+            Some(scope_b),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(isolated.usage().cache_read_input_tokens, 0);
+        assert!(isolated.usage().cache_creation_input_tokens > 0);
     }
 
     #[test]

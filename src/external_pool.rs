@@ -48,7 +48,7 @@ use crate::{
         pricing::PricingCatalog,
         prompt_cache::{
             KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
-            PromptCacheTracker,
+            PromptCacheTracker, StableSegmentPromptCachePlan,
         },
         prompt_cache_creation_control::PromptCacheCreationController,
         request_facts::{
@@ -76,7 +76,8 @@ use crate::{
         ExternalPoolCapacityMode, ExternalPoolModelUnavailableCooldownMode, ExternalPoolRouteMode,
         ExternalPoolStreamResponseMode, ExternalPoolsConfig, KiroRsToolCachePolicy,
         ModelMappingRule, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-        PromptCacheStrategyType, ReportedUsageConfig, normalize_route_rules, route_rule_matches,
+        PromptCacheStrategyType, ReportedUsageConfig, StableSegmentCachePolicy,
+        normalize_route_rules, route_rule_matches,
     },
     model::model_processing::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
@@ -1072,6 +1073,7 @@ pub struct ExternalRouteRequest {
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pub prompt_cache_bounds: PromptCacheBounds,
     pub kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
+    pub stable_segment_cache_policy: StableSegmentCachePolicy,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub request_id: String,

@@ -19,8 +19,9 @@ use crate::model::config::{
     KiroRsToolCachePolicy, MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig,
     ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
     PromptCacheSimulationMode, PromptCacheStrategyType, PromptSteeringConfig, ReportedUsageConfig,
-    ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, ThinkingTriggerMode,
-    normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
+    ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, StableSegmentCachePolicy,
+    ThinkingTriggerMode, normalize_defined_cache_route, normalize_defined_cache_routes,
+    resolve_cache_policy_for_path,
 };
 use crate::token;
 use anyhow::Error;
@@ -65,6 +66,7 @@ use super::payload_guard::{
 use super::payload_guard_runtime::prepare_kiro_request_body;
 use super::prompt_cache::{
     KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
+    StableSegmentPromptCachePlan,
 };
 use super::request_admission::{RequestRejectionAttribution, RequestRejectionReason};
 use super::request_body::MessagesBody;
@@ -281,6 +283,7 @@ struct RequestUsageContext {
     context_window_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
     kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
+    stable_segment_prompt_cache_plan: Option<StableSegmentPromptCachePlan>,
     prompt_cache_route_namespace: Option<String>,
     prompt_cache_strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
@@ -292,6 +295,7 @@ struct RequestUsageContext {
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
+    stable_segment_cache_policy: StableSegmentCachePolicy,
     reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
@@ -791,6 +795,7 @@ struct ExternalFallbackContext {
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
     kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
+    stable_segment_cache_policy: StableSegmentCachePolicy,
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
@@ -1110,6 +1115,7 @@ impl RequestRuntimeConfig {
                 estimated_bytes_limit: self.prompt_cache_bounds.estimated_bytes_limit,
             },
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
+            stable_segment: StableSegmentCachePolicy::default(),
         }
         .normalized()
     }
@@ -1158,7 +1164,8 @@ fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptC
         }
         PromptCacheStrategyType::NoCache
         | PromptCacheStrategyType::CurrentHighCache
-        | PromptCacheStrategyType::KiroRsTool => PromptCacheSimulationMode::Disabled,
+        | PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::StableSegmentCache => PromptCacheSimulationMode::Disabled,
     }
 }
 
@@ -1168,7 +1175,9 @@ fn prompt_cache_converter_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCa
         PromptCacheStrategyType::CurrentHighCache => {
             prompt_cache_simulation_mode_for_policy(policy)
         }
-        PromptCacheStrategyType::KiroRsTool => PromptCacheSimulationMode::HighCache,
+        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => {
+            PromptCacheSimulationMode::HighCache
+        }
     }
 }
 
@@ -1717,6 +1726,7 @@ fn raw_external_route_request_with_hints(
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
         kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        stable_segment_cache_policy: policy.stable_segment,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         request_id: request_id.clone(),
@@ -1787,6 +1797,7 @@ fn build_external_fallback_context(
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
         kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        stable_segment_cache_policy: policy.stable_segment,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         recorder: state.usage_recorder.clone(),
@@ -2288,6 +2299,7 @@ impl ExternalFallbackContext {
             prompt_cache_creation_control: self.prompt_cache_creation_control,
             prompt_cache_bounds: self.prompt_cache_bounds,
             kiro_rs_tool_cache_policy: self.kiro_rs_tool_cache_policy,
+            stable_segment_cache_policy: self.stable_segment_cache_policy,
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
             error_id: request_id.clone(),
@@ -3480,9 +3492,12 @@ impl RequestUsageContext {
     fn uses_local_prompt_cache_strategy(&self) -> bool {
         matches!(
             self.prompt_cache_strategy_type,
-            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::CurrentHighCache
+                | PromptCacheStrategyType::KiroRsTool
+                | PromptCacheStrategyType::StableSegmentCache
         ) && (self.simulation_mode == PromptCacheSimulationMode::HighCache
-            || self.kiro_rs_tool_prompt_cache_plan.is_some())
+            || self.kiro_rs_tool_prompt_cache_plan.is_some()
+            || self.stable_segment_prompt_cache_plan.is_some())
     }
 
     fn apply_unreported_local_standard_cache_guard(
@@ -3495,7 +3510,9 @@ impl RequestUsageContext {
         }
         if !matches!(
             self.prompt_cache_strategy_type,
-            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
+            PromptCacheStrategyType::CurrentHighCache
+                | PromptCacheStrategyType::KiroRsTool
+                | PromptCacheStrategyType::StableSegmentCache
         ) {
             return usage;
         }
@@ -3651,7 +3668,7 @@ fn should_apply_reported_usage(
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
-        PromptCacheStrategyType::KiroRsTool => false,
+        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => false,
     }
 }
 
@@ -3664,7 +3681,7 @@ fn should_build_local_prompt_cache_usage(
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
-        PromptCacheStrategyType::KiroRsTool => true,
+        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => true,
     }
 }
 
@@ -3998,9 +4015,13 @@ impl CredentialUsageContext {
     ) -> bool {
         matches!(
             self.request.prompt_cache_strategy_type,
-            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
-        ) && (self.request.prompt_cache_strategy_type == PromptCacheStrategyType::KiroRsTool
-            || self.request.simulation_mode == PromptCacheSimulationMode::HighCache)
+            PromptCacheStrategyType::CurrentHighCache
+                | PromptCacheStrategyType::KiroRsTool
+                | PromptCacheStrategyType::StableSegmentCache
+        ) && (matches!(
+            self.request.prompt_cache_strategy_type,
+            PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache
+        ) || self.request.simulation_mode == PromptCacheSimulationMode::HighCache)
             && metadata_usage.is_some_and(super::cache::metadata_cache_is_empty)
             && self.request.simulated_source == Some(UsageSource::LocalPromptCache)
             && super::cache::usage_has_cache(usage)
@@ -4211,6 +4232,18 @@ impl CredentialUsageContext {
                                 Some(scope),
                                 plan,
                                 self.request.prompt_cache_bounds,
+                            );
+                    }
+                }
+                PromptCacheStrategyType::StableSegmentCache => {
+                    if let Some(plan) = self.request.stable_segment_prompt_cache_plan.as_ref() {
+                        self.request
+                            .prompt_cache
+                            .commit_stable_segment_success_with_bounds(
+                                Some(scope),
+                                plan,
+                                self.request.prompt_cache_bounds,
+                                self.request.stable_segment_cache_policy,
                             );
                     }
                 }
@@ -4884,33 +4917,47 @@ fn prepare_usage_context_with_inference_attempt_budget(
     let scope = stable_conversation_id.as_ref().map(|conversation_id| {
         PromptCacheScope::new(conversation_id.clone(), cache_route.namespace.clone())
     });
-    let (prompt_cache_profile, kiro_rs_tool_prompt_cache_plan) = match strategy_type {
-        PromptCacheStrategyType::NoCache => (None, None),
-        PromptCacheStrategyType::CurrentHighCache => match simulation_mode {
-            PromptCacheSimulationMode::Disabled => (None, None),
-            PromptCacheSimulationMode::HighCache if prompt_cache_supported => (
-                state.prompt_cache.build_high_cache_profile_for_model(
+    let (prompt_cache_profile, kiro_rs_tool_prompt_cache_plan, stable_segment_prompt_cache_plan) =
+        match strategy_type {
+            PromptCacheStrategyType::NoCache => (None, None, None),
+            PromptCacheStrategyType::CurrentHighCache => match simulation_mode {
+                PromptCacheSimulationMode::Disabled => (None, None, None),
+                PromptCacheSimulationMode::HighCache if prompt_cache_supported => (
+                    state.prompt_cache.build_high_cache_profile_for_model(
+                        payload,
+                        input_tokens,
+                        prompt_cache_model,
+                    ),
+                    None,
+                    None,
+                ),
+                PromptCacheSimulationMode::HighCache => (None, None, None),
+            },
+            PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => (
+                None,
+                Some(state.prompt_cache.compute_kiro_rs_tool_with_bounds(
+                    scope.clone(),
                     payload,
                     input_tokens,
                     prompt_cache_model,
-                ),
+                    prompt_cache_bounds_for_policy(&policy),
+                    policy.kiro_rs_tool,
+                )),
                 None,
             ),
-            PromptCacheSimulationMode::HighCache => (None, None),
-        },
-        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => (
-            None,
-            Some(state.prompt_cache.compute_kiro_rs_tool_with_bounds(
-                scope.clone(),
-                payload,
-                input_tokens,
-                prompt_cache_model,
-                prompt_cache_bounds_for_policy(&policy),
-                policy.kiro_rs_tool,
-            )),
-        ),
-        PromptCacheStrategyType::KiroRsTool => (None, None),
-    };
+            PromptCacheStrategyType::KiroRsTool => (None, None, None),
+            PromptCacheStrategyType::StableSegmentCache if prompt_cache_supported => (
+                state.prompt_cache.build_stable_segment_profile_for_model(
+                    payload,
+                    input_tokens,
+                    prompt_cache_model,
+                    policy.stable_segment,
+                ),
+                None,
+                None,
+            ),
+            PromptCacheStrategyType::StableSegmentCache => (None, None, None),
+        };
     let (simulated_usage, simulated_source) = match strategy_type {
         PromptCacheStrategyType::NoCache => (None, None),
         PromptCacheStrategyType::CurrentHighCache => build_simulated_usage(
@@ -4933,6 +4980,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
                 simulated_usage.map(|_| UsageSource::LocalPromptCache),
             )
         }
+        PromptCacheStrategyType::StableSegmentCache => (None, None),
     };
     let request_id = envelope::request_id();
     let error_id = request_id.clone();
@@ -4998,6 +5046,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
             }),
         prompt_cache_profile,
         kiro_rs_tool_prompt_cache_plan,
+        stable_segment_prompt_cache_plan,
         prompt_cache_route_namespace: cache_route.namespace,
         prompt_cache_strategy_type: strategy_type,
         simulation_mode,
@@ -5009,6 +5058,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(&policy),
+        stable_segment_cache_policy: policy.stable_segment,
         reported_cache_usage_policy,
         simulated_usage,
         simulated_source,
@@ -5033,7 +5083,9 @@ fn prompt_cache_scope_conversation_id(
 ) -> Option<String> {
     match strategy_type {
         PromptCacheStrategyType::NoCache => None,
-        PromptCacheStrategyType::KiroRsTool => extract_stable_conversation_id(payload),
+        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => {
+            extract_stable_conversation_id(payload)
+        }
         PromptCacheStrategyType::CurrentHighCache => match mode {
             PromptCacheSimulationMode::Disabled => None,
             PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
@@ -5081,7 +5133,6 @@ fn prepare_credential_usage_context(
             .prompt_cache_scope_conversation_id
             .as_ref()
             .map(|conversation_id| {
-                let _ = credential_id;
                 PromptCacheScope::new(
                     conversation_id.clone(),
                     usage_context.prompt_cache_route_namespace.clone(),
@@ -5104,6 +5155,38 @@ fn prepare_credential_usage_context(
         } else {
             usage_context.simulated_source = None;
         }
+    } else if usage_context.prompt_cache_strategy_type
+        == PromptCacheStrategyType::StableSegmentCache
+    {
+        let policy = usage_context.stable_segment_cache_policy.normalized();
+        let scope = usage_context
+            .prompt_cache_scope_conversation_id
+            .as_ref()
+            .map(|conversation_id| {
+                PromptCacheScope::new(
+                    conversation_id.clone(),
+                    usage_context.prompt_cache_route_namespace.clone(),
+                )
+            });
+
+        let plan = usage_context
+            .prompt_cache
+            .compute_stable_segment_with_profile_bounds(
+                scope,
+                usage_context.prompt_cache_profile.clone(),
+                usage_context.prompt_cache_bounds,
+                policy,
+            );
+        let simulated_usage =
+            super::cache::CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
+                plan.usage(),
+                policy.reported_input_min_tokens,
+                policy.reported_input_max_tokens,
+                plan.cache_jitter_seed(),
+            );
+        usage_context.simulated_usage = simulated_usage;
+        usage_context.simulated_source = simulated_usage.map(|_| UsageSource::LocalPromptCache);
+        usage_context.stable_segment_prompt_cache_plan = Some(plan);
     }
 
     usage_context.attach_credential(
