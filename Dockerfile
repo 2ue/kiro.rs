@@ -15,6 +15,12 @@ RUN pnpm install --frozen-lockfile
 COPY ui ./
 RUN pnpm build
 
+WORKDIR /app/console
+COPY console/package.json console/pnpm-lock.yaml console/.npmrc console/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY console ./
+RUN pnpm build
+
 FROM rust:1.92.0-alpine3.23 AS rust-base
 
 RUN apk add --no-cache musl-dev perl make
@@ -61,6 +67,7 @@ COPY src ./src
 COPY data ./data
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 COPY --from=frontend-builder /app/ui/dist /app/ui/dist
+COPY --from=frontend-builder /app/console/dist /app/console/dist
 RUN cargo build --release --locked --bin kiro-rs \
     && ./target/release/kiro-rs --version
 

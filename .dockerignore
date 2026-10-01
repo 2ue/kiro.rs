@@ -9,6 +9,9 @@ admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/tsconfig.tsbuildinfo
 admin-ui/.vite/
+console/node_modules/
+console/dist/
+console/.vite/
 ui/node_modules/
 ui/dist/
 ui/tsconfig.tsbuildinfo

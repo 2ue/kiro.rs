@@ -33,6 +33,14 @@ struct NewUiAsset;
 #[cfg(debug_assertions)]
 struct NewUiAsset;
 
+/// 嵌入独立重构的运维控制台前端构建产物
+#[cfg(not(debug_assertions))]
+#[derive(Embed)]
+#[folder = "console/dist"]
+struct ConsoleAsset;
+#[cfg(debug_assertions)]
+struct ConsoleAsset;
+
 trait UiAsset {
     const BUILD_HINT: &'static str;
 
@@ -55,6 +63,20 @@ impl UiAsset for AdminAsset {
 
 impl UiAsset for NewUiAsset {
     const BUILD_HINT: &'static str = "New UI not built. Run 'pnpm build' in ui directory.";
+
+    #[cfg(not(debug_assertions))]
+    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
+        <Self as rust_embed::RustEmbed>::get(path)
+    }
+
+    #[cfg(debug_assertions)]
+    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
+        None
+    }
+}
+
+impl UiAsset for ConsoleAsset {
+    const BUILD_HINT: &'static str = "Console UI not built. Run 'pnpm build' in console directory.";
 
     #[cfg(not(debug_assertions))]
     fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
@@ -211,6 +233,19 @@ pub fn create_new_ui_router() -> Router {
         "ui/dist",
         "http://127.0.0.1:9023/ui",
         NewUiAsset::BUILD_HINT,
+    ))
+}
+
+/// 创建运维控制台 UI 路由
+pub fn create_console_ui_router() -> Router {
+    create_ui_router::<ConsoleAsset>(UiServeState::from_env(
+        "console",
+        "/console",
+        "KIRO_CONSOLE_UI",
+        None,
+        "console/dist",
+        "http://127.0.0.1:9027/console",
+        ConsoleAsset::BUILD_HINT,
     ))
 }
 
@@ -505,6 +540,11 @@ mod tests {
             .expect("ui index should be embedded");
         let new_ui = std::str::from_utf8(new_ui.data.as_ref()).expect("ui index is utf-8");
         assert!(new_ui.contains("/ui/assets/"));
+
+        let console = <ConsoleAsset as rust_embed::RustEmbed>::get("index.html")
+            .expect("console index should be embedded");
+        let console = std::str::from_utf8(console.data.as_ref()).expect("console index is utf-8");
+        assert!(console.contains("/console/assets/"));
     }
 
     #[test]

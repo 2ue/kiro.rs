@@ -115,6 +115,7 @@ jobs:
           cache-dependency-path: |
             admin-ui/pnpm-lock.yaml
             ui/pnpm-lock.yaml
+            console/pnpm-lock.yaml
 
       - name: Setup Node.js for release
         if: ${{ env.QUALITY_PROFILE == 'release' }}
@@ -156,6 +157,11 @@ jobs:
         working-directory: ui
         run: pnpm install --frozen-lockfile
 
+      - name: Install console dependencies
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        working-directory: console
+        run: pnpm install --frozen-lockfile
+
       - name: Check shared frontend contracts
         if: ${{ env.QUALITY_PROFILE == 'full' }}
         run: node scripts/check-frontend-contracts.mjs
@@ -168,6 +174,11 @@ jobs:
       - name: Build ui
         if: ${{ env.QUALITY_PROFILE == 'full' }}
         working-directory: ui
+        run: pnpm build
+
+      - name: Build console
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        working-directory: console
         run: pnpm build
 
       - name: Check Rust formatting
