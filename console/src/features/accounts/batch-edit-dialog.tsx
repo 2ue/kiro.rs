@@ -36,13 +36,7 @@ export function BatchEditDialog({ ids, open, onOpenChange, onDone }: { ids: numb
   }
 
   const any = Object.values(enabled).some(Boolean)
-  const Row = ({ k, label, children }: { k: FieldKey; label: string; children: React.ReactNode }) => (
-    <div className="grid grid-cols-[auto_8rem_1fr] items-center gap-3 py-2">
-      <Checkbox checked={enabled[k]} onCheckedChange={toggle(k)} aria-label={`修改${label}`} />
-      <span className="text-sm">{label}</span>
-      <div className={enabled[k] ? '' : 'pointer-events-none opacity-50'}>{children}</div>
-    </div>
-  )
+  const rowProps = (k: FieldKey) => ({ checked: enabled[k], onToggle: toggle(k) })
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -52,19 +46,19 @@ export function BatchEditDialog({ ids, open, onOpenChange, onDone }: { ids: numb
           <DialogDescription>只会修改勾选的字段</DialogDescription>
         </DialogHeader>
         <div className="divide-y">
-          <Row k="priority" label="优先级">
+          <Row {...rowProps('priority')} label="优先级">
             <NumberInput value={priority} min={0} onChange={(v) => setPriority(v ?? 0)} />
           </Row>
-          <Row k="concurrency" label="最大并发">
+          <Row {...rowProps('concurrency')} label="最大并发">
             <NumberInput value={concurrency} min={0} allowEmpty placeholder="继承全局" onChange={setConcurrency} />
           </Row>
-          <Row k="rpm" label="RPM 上限">
+          <Row {...rowProps('rpm')} label="RPM 上限">
             <NumberInput value={rpm} min={0} allowEmpty placeholder="继承全局" onChange={setRpm} />
           </Row>
-          <Row k="rateLimitAutoDisable" label="限流自动禁用">
+          <Row {...rowProps('rateLimitAutoDisable')} label="限流自动禁用">
             <Switch checked={autoDisable} onCheckedChange={setAutoDisable} />
           </Row>
-          <Row k="proxy" label="代理资源">
+          <Row {...rowProps('proxy')} label="代理资源">
             <SelectControl
               value={proxyId}
               onChange={setProxyId}
@@ -82,5 +76,15 @@ export function BatchEditDialog({ ids, open, onOpenChange, onDone }: { ids: numb
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function Row({ checked, onToggle, label, children }: { checked: boolean; onToggle: (v: boolean | 'indeterminate') => void; label: string; children: React.ReactNode }) {
+  return (
+    <div className="grid grid-cols-[auto_8rem_1fr] items-center gap-3 py-2">
+      <Checkbox checked={checked} onCheckedChange={onToggle} aria-label={`修改${label}`} />
+      <span className="text-sm">{label}</span>
+      <div className={checked ? '' : 'pointer-events-none opacity-50'}>{children}</div>
+    </div>
   )
 }

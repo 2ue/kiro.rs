@@ -10,13 +10,27 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AccessRouteImport } from './routes/access'
 import { Route as AccountsRouteImport } from './routes/accounts'
+import { Route as AuditRouteImport } from './routes/audit'
+import { Route as BillingRouteImport } from './routes/billing'
+import { Route as ModelsRouteImport } from './routes/models'
 import { Route as OverviewRouteImport } from './routes/overview'
+import { Route as PoolsRouteImport } from './routes/pools'
+import { Route as ProxiesRouteImport } from './routes/proxies'
 import { Route as RequestsRouteImport } from './routes/requests'
+import { Route as SchedulerRouteImport } from './routes/scheduler'
+import { Route as SettingsIndexRouteImport } from './routes/settings/index'
+import { Route as SettingsSectionRouteImport } from './routes/settings/$section'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AccessRoute = AccessRouteImport.update({
+  id: '/access',
+  path: '/access',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AccountsRoute = AccountsRouteImport.update({
@@ -24,9 +38,34 @@ const AccountsRoute = AccountsRouteImport.update({
   path: '/accounts',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AuditRoute = AuditRouteImport.update({
+  id: '/audit',
+  path: '/audit',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BillingRoute = BillingRouteImport.update({
+  id: '/billing',
+  path: '/billing',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ModelsRoute = ModelsRouteImport.update({
+  id: '/models',
+  path: '/models',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const OverviewRoute = OverviewRouteImport.update({
   id: '/overview',
   path: '/overview',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PoolsRoute = PoolsRouteImport.update({
+  id: '/pools',
+  path: '/pools',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProxiesRoute = ProxiesRouteImport.update({
+  id: '/proxies',
+  path: '/proxies',
   getParentRoute: () => rootRouteImport,
 } as any)
 const RequestsRoute = RequestsRouteImport.update({
@@ -34,39 +73,130 @@ const RequestsRoute = RequestsRouteImport.update({
   path: '/requests',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SchedulerRoute = SchedulerRouteImport.update({
+  id: '/scheduler',
+  path: '/scheduler',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsIndexRoute = SettingsIndexRouteImport.update({
+  id: '/settings/',
+  path: '/settings/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsSectionRoute = SettingsSectionRouteImport.update({
+  id: '/settings/$section',
+  path: '/settings/$section',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/access': typeof AccessRoute
   '/accounts': typeof AccountsRoute
+  '/audit': typeof AuditRoute
+  '/billing': typeof BillingRoute
+  '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
+  '/pools': typeof PoolsRoute
+  '/proxies': typeof ProxiesRoute
   '/requests': typeof RequestsRoute
+  '/scheduler': typeof SchedulerRoute
+  '/settings/$section': typeof SettingsSectionRoute
+  '/settings/': typeof SettingsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/access': typeof AccessRoute
   '/accounts': typeof AccountsRoute
+  '/audit': typeof AuditRoute
+  '/billing': typeof BillingRoute
+  '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
+  '/pools': typeof PoolsRoute
+  '/proxies': typeof ProxiesRoute
   '/requests': typeof RequestsRoute
+  '/scheduler': typeof SchedulerRoute
+  '/settings/$section': typeof SettingsSectionRoute
+  '/settings': typeof SettingsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/access': typeof AccessRoute
   '/accounts': typeof AccountsRoute
+  '/audit': typeof AuditRoute
+  '/billing': typeof BillingRoute
+  '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
+  '/pools': typeof PoolsRoute
+  '/proxies': typeof ProxiesRoute
   '/requests': typeof RequestsRoute
+  '/scheduler': typeof SchedulerRoute
+  '/settings/$section': typeof SettingsSectionRoute
+  '/settings/': typeof SettingsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/accounts' | '/overview' | '/requests'
+  fullPaths:
+    | '/'
+    | '/access'
+    | '/accounts'
+    | '/audit'
+    | '/billing'
+    | '/models'
+    | '/overview'
+    | '/pools'
+    | '/proxies'
+    | '/requests'
+    | '/scheduler'
+    | '/settings/$section'
+    | '/settings/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/accounts' | '/overview' | '/requests'
-  id: '__root__' | '/' | '/accounts' | '/overview' | '/requests'
+  to:
+    | '/'
+    | '/access'
+    | '/accounts'
+    | '/audit'
+    | '/billing'
+    | '/models'
+    | '/overview'
+    | '/pools'
+    | '/proxies'
+    | '/requests'
+    | '/scheduler'
+    | '/settings/$section'
+    | '/settings'
+  id:
+    | '__root__'
+    | '/'
+    | '/access'
+    | '/accounts'
+    | '/audit'
+    | '/billing'
+    | '/models'
+    | '/overview'
+    | '/pools'
+    | '/proxies'
+    | '/requests'
+    | '/scheduler'
+    | '/settings/$section'
+    | '/settings/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AccessRoute: typeof AccessRoute
   AccountsRoute: typeof AccountsRoute
+  AuditRoute: typeof AuditRoute
+  BillingRoute: typeof BillingRoute
+  ModelsRoute: typeof ModelsRoute
   OverviewRoute: typeof OverviewRoute
+  PoolsRoute: typeof PoolsRoute
+  ProxiesRoute: typeof ProxiesRoute
   RequestsRoute: typeof RequestsRoute
+  SchedulerRoute: typeof SchedulerRoute
+  SettingsSectionRoute: typeof SettingsSectionRoute
+  SettingsIndexRoute: typeof SettingsIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -78,11 +208,39 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/access': {
+      id: '/access'
+      path: '/access'
+      fullPath: '/access'
+      preLoaderRoute: typeof AccessRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/accounts': {
       id: '/accounts'
       path: '/accounts'
       fullPath: '/accounts'
       preLoaderRoute: typeof AccountsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/audit': {
+      id: '/audit'
+      path: '/audit'
+      fullPath: '/audit'
+      preLoaderRoute: typeof AuditRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/billing': {
+      id: '/billing'
+      path: '/billing'
+      fullPath: '/billing'
+      preLoaderRoute: typeof BillingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/models': {
+      id: '/models'
+      path: '/models'
+      fullPath: '/models'
+      preLoaderRoute: typeof ModelsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/overview': {
@@ -92,6 +250,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OverviewRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/pools': {
+      id: '/pools'
+      path: '/pools'
+      fullPath: '/pools'
+      preLoaderRoute: typeof PoolsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/proxies': {
+      id: '/proxies'
+      path: '/proxies'
+      fullPath: '/proxies'
+      preLoaderRoute: typeof ProxiesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/requests': {
       id: '/requests'
       path: '/requests'
@@ -99,14 +271,44 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RequestsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/scheduler': {
+      id: '/scheduler'
+      path: '/scheduler'
+      fullPath: '/scheduler'
+      preLoaderRoute: typeof SchedulerRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/': {
+      id: '/settings/'
+      path: '/settings'
+      fullPath: '/settings/'
+      preLoaderRoute: typeof SettingsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/$section': {
+      id: '/settings/$section'
+      path: '/settings/$section'
+      fullPath: '/settings/$section'
+      preLoaderRoute: typeof SettingsSectionRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AccessRoute: AccessRoute,
   AccountsRoute: AccountsRoute,
+  AuditRoute: AuditRoute,
+  BillingRoute: BillingRoute,
+  ModelsRoute: ModelsRoute,
   OverviewRoute: OverviewRoute,
+  PoolsRoute: PoolsRoute,
+  ProxiesRoute: ProxiesRoute,
   RequestsRoute: RequestsRoute,
+  SchedulerRoute: SchedulerRoute,
+  SettingsSectionRoute: SettingsSectionRoute,
+  SettingsIndexRoute: SettingsIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -433,7 +433,7 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
           )}
         </div>
 
-        <DialogFooter className="border-t p-4">
+        <DialogFooter className="m-0 rounded-b-xl border-t p-4">
           {step === 'source' && (
             <Button onClick={() => parse(text)} disabled={!text.trim()}>
               识别

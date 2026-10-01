@@ -9,15 +9,20 @@ case "$target" in
     dir="ui"
     url="http://127.0.0.1:9023/ui/runtime"
     ;;
+  console)
+    dir="console"
+    url="http://127.0.0.1:9027/console/overview"
+    ;;
   admin|old)
     dir="admin-ui"
     url="http://127.0.0.1:9025/admin/"
     ;;
   *)
     cat >&2 <<'USAGE'
-Usage: bash scripts/dev-ui.sh [ui|admin]
+Usage: bash scripts/dev-ui.sh [ui|console|admin]
 
 ui       New UI on http://127.0.0.1:9023/ui/runtime
+console  Ops console on http://127.0.0.1:9027/console/overview
 admin    Old Admin UI on http://127.0.0.1:9025/admin/
 
 Set VITE_API_PROXY_TARGET to override the backend API target.

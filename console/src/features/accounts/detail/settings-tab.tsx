@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { credentialsApi } from '@/api/endpoints/credentials'
@@ -58,9 +58,11 @@ export function SettingsTab({ row }: { row: AccountRow }) {
   const proxies = useProxies()
 
   // 服务端数据更新时，只有在用户未编辑时才同步
-  useEffect(() => {
+  const [syncedBase, setSyncedBase] = useState(base)
+  if (syncedBase !== base) {
+    setSyncedBase(base)
     if (!touched) setDraft(base)
-  }, [base, touched])
+  }
 
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) => {
     setTouched(true)

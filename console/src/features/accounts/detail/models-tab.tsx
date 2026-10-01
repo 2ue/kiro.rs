@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { RefreshCw, ScanSearch, X } from 'lucide-react'
 import { toast } from 'sonner'
@@ -11,9 +11,15 @@ import type { AccountRow } from '../queries'
 /** 账号模型白名单：为空表示不限制 */
 export function ModelsTab({ row }: { row: AccountRow }) {
   const queryClient = useQueryClient()
+  const source = (row.supportedModels ?? []).join('\n')
   const [models, setModels] = useState<string[]>(row.supportedModels ?? [])
+  const [synced, setSynced] = useState(source)
   const [input, setInput] = useState('')
-  useEffect(() => setModels(row.supportedModels ?? []), [row.supportedModels])
+  // 服务端白名单变化时同步本地编辑状态（React 推荐的"渲染期调整 state"写法）
+  if (synced !== source) {
+    setSynced(source)
+    setModels(row.supportedModels ?? [])
+  }
   const invalidate = () => queryClient.invalidateQueries({ queryKey: qk.credentials.all })
 
   const save = useMutation({
