@@ -1,8 +1,10 @@
-import type { ReactNode } from 'react'
+import { lazy, Suspense, type ReactNode } from 'react'
 import { ArrowDownRight, ArrowUpRight } from 'lucide-react'
-import { Area, AreaChart, ResponsiveContainer } from 'recharts'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
+
+// 图表库按需加载，避免进入首屏包
+const Sparkline = lazy(() => import('@/components/charts/sparkline'))
 
 export function KpiCard({
   label,
@@ -45,25 +47,13 @@ export function KpiCard({
           </span>
         )}
       </div>
-      {loading ? (
-        <Skeleton className="mt-1 h-7 w-24" />
-      ) : (
-        <div className="num truncate text-2xl font-semibold tracking-tight">{value}</div>
-      )}
+      {loading ? <Skeleton className="mt-1 h-7 w-24" /> : <div className="num truncate text-2xl font-semibold tracking-tight">{value}</div>}
       {hint && <div className="truncate text-xs text-muted-foreground">{hint}</div>}
       {spark && spark.length > 1 && (
         <div className="pointer-events-none mt-1 h-8" aria-hidden>
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={spark.map((v, i) => ({ i, v }))} margin={{ top: 2, bottom: 0, left: 0, right: 0 }}>
-              <defs>
-                <linearGradient id={`spark-${label}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={sparkColor} stopOpacity={0.35} />
-                  <stop offset="100%" stopColor={sparkColor} stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <Area type="monotone" dataKey="v" stroke={sparkColor} strokeWidth={1.5} fill={`url(#spark-${label})`} isAnimationActive={false} />
-            </AreaChart>
-          </ResponsiveContainer>
+          <Suspense fallback={null}>
+            <Sparkline values={spark} color={sparkColor} id={label} />
+          </Suspense>
         </div>
       )}
     </div>

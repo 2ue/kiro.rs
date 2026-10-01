@@ -93,8 +93,18 @@ export function SystemHealthButton() {
               <section className="space-y-3">
                 <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">用量写入链路</h3>
                 <QueueRow label="内存缓冲" enabled capacity={s.inMemoryLimit} available={s.inMemoryLimit - s.inMemoryRecords} />
-                <QueueRow label="Redis 队列" enabled={s.redisQueueEnabled} capacity={s.redisQueueCapacity} available={s.redisQueueAvailable} />
-                <QueueRow label="PostgreSQL 写入队列" enabled={s.writerQueueEnabled} capacity={s.writerQueueCapacity} available={s.writerQueueAvailable} />
+                <QueueRow
+                  label="Redis 队列"
+                  enabled={s.redisQueueEnabled}
+                  capacity={s.redisQueueCapacity}
+                  available={s.redisQueueAvailable}
+                />
+                <QueueRow
+                  label="PostgreSQL 写入队列"
+                  enabled={s.writerQueueEnabled}
+                  capacity={s.writerQueueCapacity}
+                  available={s.writerQueueAvailable}
+                />
                 <StatGrid>
                   <Stat label="Redis 背压">{fmtInt(s.backpressuredRedisRecords ?? 0)}</Stat>
                   <Stat label="Redis 丢弃">{fmtInt(s.droppedRedisRecords)}</Stat>

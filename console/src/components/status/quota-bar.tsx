@@ -46,7 +46,11 @@ export function QuotaBar({ quota, className, showText = true }: { quota: QuotaVi
           <div>
             已用 {fmtInt(quota.used)} / {fmtInt(quota.limit)}（剩余 {fmtInt(quota.remaining)}）
           </div>
-          {quota.nextResetAt && <div>重置于 {fmtDateTime(quota.nextResetAt.getTime())}（{fmtRelative(quota.nextResetAt.getTime())}）</div>}
+          {quota.nextResetAt && (
+            <div>
+              重置于 {fmtDateTime(quota.nextResetAt.getTime())}（{fmtRelative(quota.nextResetAt.getTime())}）
+            </div>
+          )}
           {quota.overageEnabled && <div>超额已开启{quota.overageUsd > 0 ? `，已产生 ${fmtUsd(quota.overageUsd)}` : ''}</div>}
           <div className="opacity-70">
             快照 {quota.checkedAt ? fmtRelative(quota.checkedAt.getTime()) : '—'}

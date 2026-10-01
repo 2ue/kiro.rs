@@ -1,4 +1,4 @@
-import { z } from 'zod'
+import { opt, searchSchema } from '@/lib/search-schema'
 
 export const STATUS_SEGMENTS = [
   { key: 'all', label: '全部' },
@@ -11,41 +11,48 @@ export const STATUS_SEGMENTS = [
 
 export type StatusSegment = (typeof STATUS_SEGMENTS)[number]['key']
 
-export const accountsSearchSchema = z.object({
-  q: z.string().optional().catch(undefined),
-  status: z.enum(['all', 'enabled', 'cooldown', 'rate_limited', 'error', 'disabled', 'proxy_blocked', 'custom_scheduling', 'unknown_subscription']).optional().catch(undefined),
+export const accountsSearchSchema = searchSchema({
+  q: opt.str(),
+  status: opt.enum([
+    'all',
+    'enabled',
+    'cooldown',
+    'rate_limited',
+    'error',
+    'disabled',
+    'proxy_blocked',
+    'custom_scheduling',
+    'unknown_subscription',
+  ]),
   /** 已禁用分段下的二级原因筛选（前端过滤，后端暂不支持） */
-  reason: z.string().optional().catch(undefined),
-  auth: z.string().optional().catch(undefined),
-  sub: z.string().optional().catch(undefined),
-  region: z.string().optional().catch(undefined),
-  proxy: z.number().int().optional().catch(undefined),
-  model: z.string().optional().catch(undefined),
-  sort: z
-    .enum([
-      'default',
-      'id',
-      'created_at',
-      'priority',
-      'last_used_at',
-      'failure_count',
-      'estimated_cost',
-      'usage_percentage',
-      'remaining_quota',
-      'in_flight_requests',
-      'scheduler_score',
-    ])
-    .optional()
-    .catch(undefined),
-  order: z.enum(['asc', 'desc']).optional().catch(undefined),
-  page: z.number().int().min(1).optional().catch(undefined),
-  size: z.number().int().optional().catch(undefined),
-  view: z.enum(['table', 'cards']).optional().catch(undefined),
+  reason: opt.str(),
+  auth: opt.str(),
+  sub: opt.str(),
+  region: opt.str(),
+  proxy: opt.int(),
+  model: opt.str(),
+  sort: opt.enum([
+    'default',
+    'id',
+    'created_at',
+    'priority',
+    'last_used_at',
+    'failure_count',
+    'estimated_cost',
+    'usage_percentage',
+    'remaining_quota',
+    'in_flight_requests',
+    'scheduler_score',
+  ]),
+  order: opt.enum(['asc', 'desc']),
+  page: opt.int(1),
+  size: opt.int(),
+  view: opt.enum(['table', 'cards']),
   /** 当前打开详情的账号 ID */
-  id: z.number().int().optional().catch(undefined),
-  tab: z.string().optional().catch(undefined),
+  id: opt.int(),
+  tab: opt.str(),
   /** 打开导入向导 */
-  import: z.boolean().optional().catch(undefined),
+  import: opt.bool(),
 })
 
-export type AccountsSearch = z.infer<typeof accountsSearchSchema>
+export type AccountsSearch = ReturnType<typeof accountsSearchSchema>

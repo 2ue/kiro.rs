@@ -20,7 +20,8 @@ export function validateConfig(c: RuntimeConfig): string[] {
   if (c.payloadGuardMaxBytes > 0 && c.payloadGuardMaxBytes < 65536) errors.push('请求大小阈值必须为 0 或不小于 65536 字节')
   if (c.payloadGuardMaxBytes > 0 && c.payloadGuardMaxBytes - c.payloadGuardSafetyMarginBytes < 65536)
     errors.push('请求大小阈值减去安全余量需不小于 65536 字节')
-  if (c.missingMaxTokens.defaultValue < 1 || c.missingMaxTokens.defaultValue > 200000) errors.push('max_tokens 补充值必须在 1 到 200000 之间')
+  if (c.missingMaxTokens.defaultValue < 1 || c.missingMaxTokens.defaultValue > 200000)
+    errors.push('max_tokens 补充值必须在 1 到 200000 之间')
   const bad = (c.definedCacheRoutes ?? []).find((r) => r.trim() && !DFCACHE.test(r.trim()))
   if (bad) errors.push(`自定义缓存路径 ${bad} 无效：必须是 /dfcache/{name}`)
   const ep = c.externalPools

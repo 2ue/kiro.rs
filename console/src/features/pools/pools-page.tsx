@@ -61,7 +61,12 @@ export function PoolsPage() {
           )
         }
       />
-      <Tabs value={tab} onValueChange={(v) => navigate({ search: (p) => ({ ...p, tab: v === 'pools' ? undefined : (v as 'policy') }), replace: true })}>
+      <Tabs
+        value={tab}
+        onValueChange={(v) =>
+          navigate({ search: (p) => ({ ...p, tab: v === 'pools' ? undefined : (v as 'policy'), focus: undefined }), replace: true })
+        }
+      >
         <TabsList variant="line" className="border-b">
           <TabsTrigger value="pools">外部池</TabsTrigger>
           <TabsTrigger value="policy">路由策略</TabsTrigger>
@@ -99,7 +104,7 @@ export function PoolsPage() {
           )}
         </TabsContent>
         <TabsContent value="policy" className="pt-4">
-          <PolicyTab />
+          <PolicyTab focus={search.focus} />
         </TabsContent>
       </Tabs>
 
@@ -109,12 +114,16 @@ export function PoolsPage() {
         onClose={() => navigate({ search: (s) => ({ ...s, id: undefined }), replace: true })}
         onEdit={() => selected && setEditing(selected.pool)}
       />
-      <PoolFormSheet pool={editing && editing !== 'new' ? editing : undefined} open={editing !== null} onOpenChange={(o) => !o && setEditing(null)} />
+      <PoolFormSheet
+        pool={editing && editing !== 'new' ? editing : undefined}
+        open={editing !== null}
+        onOpenChange={(o) => !o && setEditing(null)}
+      />
     </Page>
   )
 }
 
-function PolicyTab() {
+function PolicyTab({ focus }: { focus?: string }) {
   const cfg = useConfigDraft()
   if (!cfg.ready) return cfg.query.error ? <ErrorState error={cfg.query.error} /> : <LoadingRows rows={8} />
   const enabled = !!cfg.get('externalPools.externalPoolsEnabled')
@@ -130,7 +139,7 @@ function PolicyTab() {
         </AlertDescription>
       </Alert>
       {POOL_POLICY_GROUPS.map((g) => (
-        <GroupCard key={g.id} group={g} cfg={cfg} />
+        <GroupCard key={g.id} group={g} cfg={cfg} focus={focus} />
       ))}
       <DirtyBar cfg={cfg} />
     </div>

@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { Button } from '@/components/ui/button'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { ArrowRight, ChevronDown } from 'lucide-react'
@@ -12,6 +13,8 @@ import { Stat, StatGrid } from '@/components/patterns/stat'
 import { ToneBadge } from '@/components/status/tone-badge'
 import { attemptActionLabel, RECORD_STATUS_LABEL, routeLabel, USAGE_SOURCE_LABEL } from '@/domain/labels'
 import { fmtCompact, fmtFullDateTime, fmtInt, fmtMs, fmtUsd } from '@/lib/format'
+import { ErrorText } from '@/components/patterns/error-text'
+import { translateError } from '@/domain/upstream-error'
 import { recordTone } from './columns'
 
 function Block({ title, children, defaultOpen = true }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
@@ -29,13 +32,13 @@ function Block({ title, children, defaultOpen = true }: { title: string; childre
 function RawError({ raw }: { raw: RawUpstreamError }) {
   return (
     <div className="mt-2 rounded-md bg-muted/60 p-2">
-      <div className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
+      <div className="mb-1 flex items-center justify-between text-2xs text-muted-foreground">
         <span>
           {raw.source} · HTTP {raw.statusCode ?? '—'} · {fmtInt(raw.bodyBytes)} B{raw.truncated ? '（已截断）' : ''}
         </span>
         <CopyButton value={raw.body} label="复制原文" />
       </div>
-      <pre className="max-h-48 overflow-auto font-mono text-[11px] break-all whitespace-pre-wrap">{raw.body}</pre>
+      <pre className="max-h-48 overflow-auto font-mono text-2xs break-all whitespace-pre-wrap">{raw.body}</pre>
     </div>
   )
 }
@@ -74,7 +77,9 @@ function AttemptChain({ local, external }: { local?: KiroCredentialAttempt[]; ex
         const ok = a.action === 'success'
         return (
           <li key={a.key} className="relative">
-            <span className={`absolute top-1.5 -left-[21px] size-2.5 rounded-full border-2 border-background ${ok ? 'bg-success' : 'bg-danger'}`} />
+            <span
+              className={`absolute top-1.5 -left-[21px] size-2.5 rounded-full border-2 border-background ${ok ? 'bg-success' : 'bg-danger'}`}
+            />
             <div className="flex flex-wrap items-center gap-2 text-sm">
               <span className="text-xs text-muted-foreground">{a.kind}</span>
               {a.link ? (
@@ -89,7 +94,7 @@ function AttemptChain({ local, external }: { local?: KiroCredentialAttempt[]; ex
               <span className="num ml-auto text-xs text-muted-foreground">{fmtMs(a.ms)}</span>
             </div>
             {a.model && <div className="font-mono text-xs text-muted-foreground">{a.model}</div>}
-            {a.error && <p className="mt-0.5 text-xs break-all text-danger">{a.error}</p>}
+            {a.error && <ErrorText error={a.error} className="mt-0.5" />}
             {a.raw && <RawError raw={a.raw} />}
           </li>
         )
@@ -105,7 +110,7 @@ function JsonBlock({ value }: { value: unknown }) {
       <div className="absolute top-1 right-1">
         <CopyButton value={text} />
       </div>
-      <pre className="max-h-72 overflow-auto rounded-md bg-muted/60 p-3 font-mono text-[11px]">{text}</pre>
+      <pre className="max-h-72 overflow-auto rounded-md bg-muted/60 p-3 font-mono text-2xs">{text}</pre>
     </div>
   )
 }
@@ -122,7 +127,18 @@ function RecordDetail({ r }: { r: UsageRecord }) {
             {r.errorStatusCode ? ` · HTTP ${r.errorStatusCode}` : ''}
             {r.errorSource ? ` · ${r.errorSource}` : ''}
           </div>
-          <p className="mt-1 text-xs break-all">{r.errorMessage}</p>
+          {(() => {
+            const t = translateError(r.errorMessage)
+            return t && t.title !== t.raw ? (
+              <>
+                <p className="mt-1 text-sm">{t.title}</p>
+                {t.hint && <p className="text-xs text-muted-foreground">建议：{t.hint}</p>}
+                <p className="mt-1 font-mono text-2xs break-all text-muted-foreground">{r.errorMessage}</p>
+              </>
+            ) : (
+              <p className="mt-1 text-xs break-all">{r.errorMessage}</p>
+            )
+          })()}
           {r.publicErrorMessage && r.publicErrorMessage !== r.errorMessage && (
             <p className="mt-1 text-xs text-muted-foreground">返回给客户端：{r.publicErrorMessage}</p>
           )}
@@ -281,9 +297,14 @@ export function RequestSheet({
                     </span>
                   )}
                   {r.conversationId && (
-                    <button type="button" className="text-primary hover:underline" onClick={() => onFilterConversation(r.conversationId!)}>
+                    <Button
+                      variant="unstyled"
+                      size="none"
+                      className="text-primary hover:underline"
+                      onClick={() => onFilterConversation(r.conversationId!)}
+                    >
                       查看同会话请求
-                    </button>
+                    </Button>
                   )}
                 </div>
               )}
@@ -291,7 +312,15 @@ export function RequestSheet({
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1 overflow-y-auto pb-6">
-          {r ? <RecordDetail r={r} /> : q.error ? <ErrorState error={q.error} /> : <div className="p-4"><LoadingRows /></div>}
+          {r ? (
+            <RecordDetail r={r} />
+          ) : q.error ? (
+            <ErrorState error={q.error} />
+          ) : (
+            <div className="p-4">
+              <LoadingRows />
+            </div>
+          )}
         </div>
       </SheetContent>
     </Sheet>

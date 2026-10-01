@@ -18,7 +18,17 @@ import type { AccountRow } from '../queries'
 
 const FALLBACK_TEST_MODELS = ['claude-sonnet-4.5', 'claude-haiku-4.5', 'claude-opus-4.5', 'claude-sonnet-4.6', 'claude-opus-4.6']
 
-function ActionRow({ icon, title, description, children }: { icon: React.ReactNode; title: string; description: string; children: React.ReactNode }) {
+function ActionRow({
+  icon,
+  title,
+  description,
+  children,
+}: {
+  icon: React.ReactNode
+  title: string
+  description: string
+  children: React.ReactNode
+}) {
   return (
     <div className="flex items-start gap-3 py-3">
       <span className="mt-0.5 text-muted-foreground [&_svg]:size-4">{icon}</span>
@@ -37,7 +47,9 @@ export function MaintenanceTab({ row, onDeleted }: { row: AccountRow; onDeleted:
   const capabilities = useModelCapabilities()
   const invalidate = () => queryClient.invalidateQueries({ queryKey: qk.credentials.all })
 
-  const modelOptions = [...new Set([...(row.supportedModels ?? []), ...(capabilities.data?.models.map((m) => m.model) ?? []), ...FALLBACK_TEST_MODELS])]
+  const modelOptions = [
+    ...new Set([...(row.supportedModels ?? []), ...(capabilities.data?.models.map((m) => m.model) ?? []), ...FALLBACK_TEST_MODELS]),
+  ]
   const [testModel, setTestModel] = useState(modelOptions.find((m) => m !== 'auto') ?? FALLBACK_TEST_MODELS[0]!)
   const [testPrompt, setTestPrompt] = useState('hi')
   const test = useMutation({
@@ -102,7 +114,12 @@ export function MaintenanceTab({ row, onDeleted }: { row: AccountRow; onDeleted:
           </Button>
         </ActionRow>
         <ActionRow icon={<Eraser />} title="清理在途占用" description="回收长时间未结束的并发占用；仅在并发数异常卡住时使用">
-          <Button size="sm" variant="outline" onClick={() => clearInFlight.mutate()} disabled={clearInFlight.isPending || row.inFlightRequests === 0}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => clearInFlight.mutate()}
+            disabled={clearInFlight.isPending || row.inFlightRequests === 0}
+          >
             清理
           </Button>
         </ActionRow>
@@ -121,14 +138,34 @@ export function MaintenanceTab({ row, onDeleted }: { row: AccountRow; onDeleted:
         <p className="mb-3 text-xs text-muted-foreground">只提交填写的字段；适用于账号重新登录后替换凭据。</p>
         <div className="grid gap-2">
           {isApiKey ? (
-            <Input type="password" placeholder="新的 Kiro API Key (ksk_…)" value={auth.kiroApiKey ?? ''} onChange={(e) => setAuth((a) => ({ ...a, kiroApiKey: e.target.value }))} />
+            <Input
+              type="password"
+              placeholder="新的 Kiro API Key (ksk_…)"
+              value={auth.kiroApiKey ?? ''}
+              onChange={(e) => setAuth((a) => ({ ...a, kiroApiKey: e.target.value }))}
+            />
           ) : (
             <>
-              <Textarea rows={2} placeholder="新的 Refresh Token" className="font-mono text-xs" value={auth.refreshToken ?? ''} onChange={(e) => setAuth((a) => ({ ...a, refreshToken: e.target.value }))} />
+              <Textarea
+                rows={2}
+                placeholder="新的 Refresh Token"
+                className="font-mono text-xs"
+                value={auth.refreshToken ?? ''}
+                onChange={(e) => setAuth((a) => ({ ...a, refreshToken: e.target.value }))}
+              />
               {row.authMethod === 'idc' && (
                 <div className="grid gap-2 sm:grid-cols-2">
-                  <Input placeholder="clientId" value={auth.clientId ?? ''} onChange={(e) => setAuth((a) => ({ ...a, clientId: e.target.value }))} />
-                  <Input type="password" placeholder="clientSecret" value={auth.clientSecret ?? ''} onChange={(e) => setAuth((a) => ({ ...a, clientSecret: e.target.value }))} />
+                  <Input
+                    placeholder="clientId"
+                    value={auth.clientId ?? ''}
+                    onChange={(e) => setAuth((a) => ({ ...a, clientId: e.target.value }))}
+                  />
+                  <Input
+                    type="password"
+                    placeholder="clientSecret"
+                    value={auth.clientSecret ?? ''}
+                    onChange={(e) => setAuth((a) => ({ ...a, clientSecret: e.target.value }))}
+                  />
                 </div>
               )}
             </>
@@ -140,7 +177,11 @@ export function MaintenanceTab({ row, onDeleted }: { row: AccountRow; onDeleted:
                 同时清除冷却与失败计数
               </Label>
             </div>
-            <Button size="sm" onClick={() => updateAuth.mutate()} disabled={updateAuth.isPending || Object.keys(stripEmpty(auth)).length === 0}>
+            <Button
+              size="sm"
+              onClick={() => updateAuth.mutate()}
+              disabled={updateAuth.isPending || Object.keys(stripEmpty(auth)).length === 0}
+            >
               更新
             </Button>
           </div>
@@ -165,5 +206,7 @@ export function MaintenanceTab({ row, onDeleted }: { row: AccountRow; onDeleted:
 }
 
 function stripEmpty<T extends object>(obj: T): Partial<T> {
-  return Object.fromEntries(Object.entries(obj).filter(([, v]) => typeof v === 'string' ? v.trim() !== '' : v !== undefined)) as Partial<T>
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, v]) => (typeof v === 'string' ? v.trim() !== '' : v !== undefined)),
+  ) as Partial<T>
 }

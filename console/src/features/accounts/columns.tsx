@@ -39,7 +39,7 @@ export function accountColumns(): ColumnDef<AccountRow, unknown>[] {
       id: 'account',
       header: '账号',
       size: 240,
-      meta: { grow: true },
+      meta: { mobile: 'title', grow: true },
       cell: ({ row: { original: r } }) => (
         <div className="flex min-w-0 flex-col leading-tight">
           <span className="truncate font-medium">{r.label}</span>
@@ -61,6 +61,7 @@ export function accountColumns(): ColumnDef<AccountRow, unknown>[] {
       id: 'status',
       header: '状态',
       size: 140,
+      meta: { mobile: 'badge' },
       cell: ({ row: { original: r } }) => <CredentialStatusBadge view={r.status} />,
     },
     {
@@ -80,6 +81,7 @@ export function accountColumns(): ColumnDef<AccountRow, unknown>[] {
       id: 'quota',
       header: '额度',
       size: 170,
+      meta: { mobile: true },
       cell: ({ row: { original: r } }) => (
         <div className="flex items-center gap-2">
           <QuotaBar quota={r.quota} className="flex-1" />
@@ -93,7 +95,7 @@ export function accountColumns(): ColumnDef<AccountRow, unknown>[] {
       id: 'load',
       header: '在途/并发',
       size: 96,
-      meta: { align: 'right' },
+      meta: { mobile: true, align: 'right' },
       cell: ({ row: { original: r } }) => (
         <span className={r.inFlightRequests > 0 ? 'text-foreground' : 'text-muted-foreground'}>
           {r.inFlightRequests}
@@ -126,14 +128,16 @@ export function accountColumns(): ColumnDef<AccountRow, unknown>[] {
       meta: { align: 'right' },
       cell: ({ row: { original: r } }) => {
         const rate = r.recentErrorRate ?? 0
-        return <span className={rate >= 0.5 ? 'text-danger' : rate >= 0.1 ? 'text-warning' : 'text-muted-foreground'}>{fmtPct(rate, 0)}</span>
+        return (
+          <span className={rate >= 0.5 ? 'text-danger' : rate >= 0.1 ? 'text-warning' : 'text-muted-foreground'}>{fmtPct(rate, 0)}</span>
+        )
       },
     },
     {
       id: 'cost',
       header: '估算费用',
       size: 96,
-      meta: { align: 'right' },
+      meta: { mobile: true, align: 'right' },
       cell: ({ row: { original: r } }) => (
         <span title={`Kiro metering ${fmtCompact(r.kiroMeteringUsage)}`}>{fmtUsd(r.estimatedCostUsd)}</span>
       ),
@@ -146,7 +150,9 @@ export function accountColumns(): ColumnDef<AccountRow, unknown>[] {
         const blocked = r.effectiveProxySource === 'resource_disabled' || r.effectiveProxySource === 'resource_missing'
         return (
           <span className={blocked ? 'text-danger' : 'text-muted-foreground'} title={r.proxyResourceName ?? r.effectiveProxyUrl}>
-            {r.proxyResourceName && r.effectiveProxySource.startsWith('resource') ? r.proxyResourceName : PROXY_SOURCE_LABEL[r.effectiveProxySource]}
+            {r.proxyResourceName && r.effectiveProxySource.startsWith('resource')
+              ? r.proxyResourceName
+              : PROXY_SOURCE_LABEL[r.effectiveProxySource]}
           </span>
         )
       },
@@ -162,8 +168,10 @@ export function accountColumns(): ColumnDef<AccountRow, unknown>[] {
       id: 'lastUsed',
       header: '最近使用',
       size: 96,
-      meta: { align: 'right' },
-      cell: ({ row: { original: r } }) => <span className="text-muted-foreground">{r.lastUsedAt ? fmtRelative(r.lastUsedAt) : '从未'}</span>,
+      meta: { mobile: true, align: 'right' },
+      cell: ({ row: { original: r } }) => (
+        <span className="text-muted-foreground">{r.lastUsedAt ? fmtRelative(r.lastUsedAt) : '从未'}</span>
+      ),
     },
   ]
 }

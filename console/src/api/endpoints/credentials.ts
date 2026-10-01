@@ -48,8 +48,7 @@ export const credentialsApi = {
 
   add: (req: AddCredentialRequest) => http.post<AddCredentialResponse>('/credentials', req),
   import: (req: BatchCredentialImportRequest) => http.post<BatchCredentialImportResponse>('/credentials/import', req),
-  batchUpdate: (req: BatchUpdateCredentialsRequest) =>
-    http.post<BatchUpdateCredentialsResponse>('/credentials/batch-update', req),
+  batchUpdate: (req: BatchUpdateCredentialsRequest) => http.post<BatchUpdateCredentialsResponse>('/credentials/batch-update', req),
   export: (format: CredentialExportFormat, list?: number[]) =>
     http.get<Blob>('/credentials/export', { format, ids: list?.length ? list.join(',') : undefined }, { responseType: 'blob' }),
   remove: (id: number) => http.delete<SuccessResponse>(`/credentials/${id}`),
@@ -63,20 +62,17 @@ export const credentialsApi = {
   setRateLimitAutoDisable: (id: number, enabled: boolean) =>
     http.post<SuccessResponse>(`/credentials/${id}/rate-limit-auto-disable`, { enabled }),
   setRegions: (id: number, req: SetCredentialRegionsRequest) => http.post<SuccessResponse>(`/credentials/${id}/regions`, req),
-  setWarmup: (id: number, warmupRemaining: number) =>
-    http.post<SuccessResponse>(`/credentials/${id}/warmup`, { warmupRemaining }),
+  setWarmup: (id: number, warmupRemaining: number) => http.post<SuccessResponse>(`/credentials/${id}/warmup`, { warmupRemaining }),
   setProxy: (id: number, req: SetCredentialProxyRequest) => http.post<SuccessResponse>(`/credentials/${id}/proxy`, req),
   setOverage: (id: number, enabled: boolean) => http.post<BalanceResponse>(`/credentials/${id}/overage`, { enabled }),
   setSupportedModels: (id: number, supportedModels: string[]) =>
     http.post<SupportedModelsResponse>(`/credentials/${id}/supported-models`, { supportedModels }),
   syncSupportedModels: (id: number) => http.post<SupportedModelsResponse>(`/credentials/${id}/supported-models/sync`),
-  discoverSupportedModels: (id: number) =>
-    http.post<SupportedModelsResponse>(`/credentials/${id}/supported-models/discover`),
+  discoverSupportedModels: (id: number) => http.post<SupportedModelsResponse>(`/credentials/${id}/supported-models/discover`),
   updateAuth: (id: number, req: Partial<AddCredentialRequest> & { resetRuntimeState?: boolean }) =>
     http.patch<SuccessResponse>(`/credentials/${id}/auth`, req),
 
-  clearInFlight: (id: number, minIdleSecs?: number) =>
-    http.post<SuccessResponse>(`/credentials/${id}/in-flight/clear`, { minIdleSecs }),
+  clearInFlight: (id: number, minIdleSecs?: number) => http.post<SuccessResponse>(`/credentials/${id}/in-flight/clear`, { minIdleSecs }),
   resetFailures: (id: number) => http.post<SuccessResponse>(`/credentials/${id}/reset`),
   refreshToken: (id: number) => http.post<SuccessResponse>(`/credentials/${id}/refresh`),
   test: (id: number, req: TestCredentialRequest) => http.post<TestCredentialResponse>(`/credentials/${id}/test`, req),

@@ -43,7 +43,7 @@ export function Section({
   contentClassName?: string
 }) {
   return (
-    <section className={cn("min-w-0 rounded-xl border bg-card", className)}>
+    <section className={cn('min-w-0 rounded-xl border bg-card', className)}>
       {(title || actions) && (
         <header className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
           <div className="min-w-0">

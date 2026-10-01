@@ -29,12 +29,14 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'time',
       header: '时间',
       size: 128,
+      meta: { mobile: true },
       cell: ({ row: { original: r } }) => <span className="num text-muted-foreground">{fmtDateTime(r.createdAt, true)}</span>,
     },
     {
       id: 'status',
       header: '状态',
       size: 96,
+      meta: { mobile: 'badge' },
       cell: ({ row: { original: r } }) => (
         <ToneBadge tone={recordTone(r.status)} dot>
           {RECORD_STATUS_LABEL[r.status] ?? r.status}
@@ -46,13 +48,13 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'model',
       header: '模型',
       size: 200,
-      meta: { grow: true },
+      meta: { mobile: 'title', grow: true },
       cell: ({ row: { original: r } }) => (
         <div className="flex min-w-0 items-center gap-1.5">
           <span className="truncate font-mono text-xs">{r.model}</span>
-          {r.stream && <span className="rounded bg-muted px-1 text-[10px] text-muted-foreground">SSE</span>}
+          {r.stream && <span className="rounded bg-muted px-1 text-2xs text-muted-foreground">SSE</span>}
           {r.credentialAttempts && r.credentialAttempts.length > 1 && (
-            <span className="rounded bg-warning-subtle px-1 text-[10px] text-warning">×{r.credentialAttempts.length}</span>
+            <span className="rounded bg-warning-subtle px-1 text-2xs text-warning">×{r.credentialAttempts.length}</span>
           )}
         </div>
       ),
@@ -61,6 +63,7 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'route',
       header: '路由',
       size: 132,
+      meta: { mobile: true },
       cell: ({ row: { original: r } }) => (
         <span className={r.routeKind === 'external_pool' ? 'text-info' : 'text-muted-foreground'}>{routeLabel(r)}</span>
       ),
@@ -69,9 +72,12 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'target',
       header: '账号/外部池',
       size: 168,
+      meta: { mobile: true },
       cell: ({ row: { original: r } }) => (
         <span className="truncate text-muted-foreground">
-          {r.routeKind === 'external_pool' ? r.externalPoolName ?? `池 #${r.externalPoolId}` : r.credentialLabel ?? (r.credentialId ? `#${r.credentialId}` : '—')}
+          {r.routeKind === 'external_pool'
+            ? (r.externalPoolName ?? `池 #${r.externalPoolId}`)
+            : (r.credentialLabel ?? (r.credentialId ? `#${r.credentialId}` : '—'))}
         </span>
       ),
     },
@@ -79,7 +85,7 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'tokens',
       header: '输入→输出',
       size: 110,
-      meta: { align: 'right' },
+      meta: { mobile: true, align: 'right' },
       cell: ({ row: { original: r } }) => (
         <span>
           {fmtCompact(r.totalInputTokens)}
@@ -101,7 +107,7 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'cost',
       header: '费用',
       size: 84,
-      meta: { align: 'right' },
+      meta: { mobile: true, align: 'right' },
       cell: ({ row: { original: r } }) => (
         <span className={r.pricingAvailable ? '' : 'text-muted-foreground'} title={r.pricingAvailable ? undefined : '无价格数据'}>
           {fmtUsd(r.estimatedCostUsd)}
@@ -119,7 +125,7 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'duration',
       header: '耗时',
       size: 72,
-      meta: { align: 'right' },
+      meta: { mobile: true, align: 'right' },
       cell: ({ row: { original: r } }) => <span>{fmtMs(r.durationMs)}</span>,
     },
     {
@@ -132,7 +138,9 @@ export function requestColumns(): ColumnDef<UsageRecord, unknown>[] {
       id: 'key',
       header: '请求 Key',
       size: 110,
-      cell: ({ row: { original: r } }) => <span className="truncate font-mono text-xs text-muted-foreground">{r.requestApiKeyId ?? '—'}</span>,
+      cell: ({ row: { original: r } }) => (
+        <span className="truncate font-mono text-xs text-muted-foreground">{r.requestApiKeyId ?? '—'}</span>
+      ),
     },
   ]
 }

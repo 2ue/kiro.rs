@@ -1,15 +1,4 @@
-import {
-  Activity,
-  CircleCheck,
-  CircleSlash,
-  Eye,
-  Gauge,
-  Layers,
-  Sparkles,
-  Timer,
-  TriangleAlert,
-  type LucideIcon,
-} from 'lucide-react'
+import { Activity, CircleCheck, CircleSlash, Eye, Gauge, Layers, Sparkles, Timer, TriangleAlert, type LucideIcon } from 'lucide-react'
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
 import type { CredentialStatusView, PrimaryStatus } from '@/domain/credential-status'
 import { fmtDuration } from '@/lib/format'
@@ -31,8 +20,7 @@ export const STATUS_META: Record<PrimaryStatus, { label: string; tone: Tone; ico
 export function CredentialStatusBadge({ view, compact }: { view: CredentialStatusView; compact?: boolean }) {
   const meta = STATUS_META[view.primary]
   const Icon = meta.icon
-  const label =
-    view.primary === 'disabled' && view.disabledReason ? view.disabledReason.label : meta.label
+  const label = view.primary === 'disabled' && view.disabledReason ? view.disabledReason.label : meta.label
   const suffix = view.remainingSecs && view.remainingSecs > 0 ? fmtDuration(view.remainingSecs) : null
 
   return (

@@ -122,9 +122,7 @@ export function NumberInput({
         className={cn('num text-right', suffix && 'pr-14')}
       />
       {suffix && (
-        <span className="pointer-events-none absolute inset-y-0 right-2.5 flex items-center text-xs text-muted-foreground">
-          {suffix}
-        </span>
+        <span className="pointer-events-none absolute inset-y-0 right-2.5 flex items-center text-xs text-muted-foreground">{suffix}</span>
       )}
     </div>
   )
@@ -187,7 +185,11 @@ export function ListInput({
   disabled,
   placeholder,
   rows = 4,
-  parse = (raw) => raw.split(/[\r\n,]+/).map((v) => v.trim()).filter(Boolean),
+  parse = (raw) =>
+    raw
+      .split(/[\r\n,]+/)
+      .map((v) => v.trim())
+      .filter(Boolean),
 }: {
   id?: string
   value: string[]

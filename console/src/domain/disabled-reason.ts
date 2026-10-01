@@ -82,11 +82,13 @@ export const DISABLED_REASON_CODES = Object.keys(DISABLED_REASONS) as DisabledRe
 
 export function disabledReasonMeta(code: string | null | undefined): DisabledReasonMeta | undefined {
   if (!code) return undefined
-  return DISABLED_REASONS[code as DisabledReasonCode] ?? {
-    label: code,
-    hint: '未识别的禁用原因',
-    action: 'review',
-    actionLabel: '查看详情',
-    terminal: false,
-  }
+  return (
+    DISABLED_REASONS[code as DisabledReasonCode] ?? {
+      label: code,
+      hint: '未识别的禁用原因',
+      action: 'review',
+      actionLabel: '查看详情',
+      terminal: false,
+    }
+  )
 }

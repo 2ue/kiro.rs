@@ -39,6 +39,7 @@ function sectionDirtyCount(cfg: ConfigDraft, id: string): number {
 
 export function SettingsPage() {
   const { section } = route.useParams()
+  const { focus } = route.useSearch()
   const cfg = useConfigDraft()
   const [filter, setFilter] = useState('')
   const active = filter ? null : section
@@ -77,7 +78,9 @@ export function SettingsPage() {
                   onClick={() => setFilter('')}
                   className={cn(
                     'flex shrink-0 items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-sm transition-colors',
-                    active === s.id ? 'bg-accent font-medium text-accent-foreground' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                    active === s.id
+                      ? 'bg-accent font-medium text-accent-foreground'
+                      : 'text-muted-foreground hover:bg-muted hover:text-foreground',
                   )}
                 >
                   {s.title}
@@ -91,7 +94,8 @@ export function SettingsPage() {
         <div className="min-w-0 space-y-4">
           {active === 'balancing' && <BalancingSection />}
           {!cfg.ready ? (
-            active !== 'balancing' && (cfg.query.error ? <ErrorState error={cfg.query.error} onRetry={() => cfg.query.refetch()} /> : <LoadingRows rows={8} />)
+            active !== 'balancing' &&
+            (cfg.query.error ? <ErrorState error={cfg.query.error} onRetry={() => cfg.query.refetch()} /> : <LoadingRows rows={8} />)
           ) : (
             <>
               {visibleSections.map((s) => (
@@ -103,7 +107,7 @@ export function SettingsPage() {
                     </div>
                   )}
                   {s.groups.map((g) => (
-                    <GroupCard key={g.id} group={g} cfg={cfg} filter={filter} />
+                    <GroupCard key={g.id} group={g} cfg={cfg} filter={filter} focus={focus} />
                   ))}
                 </div>
               ))}
@@ -141,12 +145,20 @@ function BalancingSection() {
         <h3 className="text-sm font-semibold">负载均衡模式</h3>
         <p className="mt-0.5 text-xs text-muted-foreground">决定请求如何分配给本地账号；切换后立即生效，无需保存</p>
       </header>
-      <RadioGroup value={lb.data?.mode} onValueChange={(v) => set.mutate(v as LoadBalancingMode)} className="grid gap-2 p-4 sm:grid-cols-2" disabled={set.isPending}>
+      <RadioGroup
+        value={lb.data?.mode}
+        onValueChange={(v) => set.mutate(v as LoadBalancingMode)}
+        className="grid gap-2 p-4 sm:grid-cols-2"
+        disabled={set.isPending}
+      >
         {(Object.keys(LOAD_BALANCING_LABEL) as LoadBalancingMode[]).map((mode) => (
           <Label
             key={mode}
             htmlFor={`lb-${mode}`}
-            className={cn('flex cursor-pointer items-start gap-3 rounded-lg border p-3 font-normal', lb.data?.mode === mode && 'border-primary/60 bg-accent/40')}
+            className={cn(
+              'flex cursor-pointer items-start gap-3 rounded-lg border p-3 font-normal',
+              lb.data?.mode === mode && 'border-primary/60 bg-accent/40',
+            )}
           >
             <RadioGroupItem id={`lb-${mode}`} value={mode} className="mt-0.5" />
             <span>
@@ -186,7 +198,9 @@ function RuntimeReadonly() {
       <section className="rounded-xl border bg-card p-4">
         <h3 className="mb-3 text-sm font-semibold">Token 刷新准入</h3>
         <StatGrid cols={4}>
-          <Stat label="协调模式">{t.authority === 'redis_global' ? 'Redis 全局' : t.authority === 'process_local' ? '单进程' : 'Redis 降级'}</Stat>
+          <Stat label="协调模式">
+            {t.authority === 'redis_global' ? 'Redis 全局' : t.authority === 'process_local' ? '单进程' : 'Redis 降级'}
+          </Stat>
           <Stat label="配置 RPM / 突发">
             {t.configuredRpm} / {t.configuredBurst}
           </Stat>

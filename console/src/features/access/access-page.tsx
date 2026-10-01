@@ -6,7 +6,13 @@ import { systemApi } from '@/api/endpoints/system'
 import type { RequestAdmissionConfig, RequestApiKeyItem } from '@/api/types'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -51,10 +57,24 @@ export function AccessPage() {
     onSuccess: setData,
     meta: { error: '更新失败' },
   })
-  const remove = useMutation({ mutationFn: (id: string) => systemApi.deleteRequestKey(id), onSuccess: setData, meta: { success: 'Key 已删除', error: '删除失败' } })
+  const remove = useMutation({
+    mutationFn: (id: string) => systemApi.deleteRequestKey(id),
+    onSuccess: setData,
+    meta: { success: 'Key 已删除', error: '删除失败' },
+  })
 
-  if (keys.isLoading) return <Page><LoadingRows /></Page>
-  if (keys.error || !keys.data) return <Page><ErrorState error={keys.error} onRetry={() => keys.refetch()} /></Page>
+  if (keys.isLoading)
+    return (
+      <Page>
+        <LoadingRows />
+      </Page>
+    )
+  if (keys.error || !keys.data)
+    return (
+      <Page>
+        <ErrorState error={keys.error} onRetry={() => keys.refetch()} />
+      </Page>
+    )
   const d = keys.data
   const origin = window.location.origin
 
@@ -98,7 +118,15 @@ export function AccessPage() {
                 checked={k.enabled}
                 aria-label={`启用 ${k.name}`}
                 onCheckedChange={async (enabled) => {
-                  if (!enabled && !(await confirm({ title: `停用 Key「${k.name || k.id}」？`, description: '使用该 Key 的客户端会立即收到 401。', destructive: true, confirmText: '停用' })))
+                  if (
+                    !enabled &&
+                    !(await confirm({
+                      title: `停用 Key「${k.name || k.id}」？`,
+                      description: '使用该 Key 的客户端会立即收到 401。',
+                      destructive: true,
+                      confirmText: '停用',
+                    }))
+                  )
                     return
                   toggle.mutate({ id: k.id, enabled })
                 }}
@@ -118,7 +146,14 @@ export function AccessPage() {
                     variant="destructive"
                     disabled={d.requestApiKeys.length <= 1}
                     onSelect={async () => {
-                      if (await confirm({ title: `删除 Key「${k.name || k.id}」？`, description: '删除后使用该 Key 的客户端立即失效，不可恢复。', destructive: true, confirmText: '删除' }))
+                      if (
+                        await confirm({
+                          title: `删除 Key「${k.name || k.id}」？`,
+                          description: '删除后使用该 Key 的客户端立即失效，不可恢复。',
+                          destructive: true,
+                          confirmText: '删除',
+                        })
+                      )
                         remove.mutate(k.id)
                     }}
                   >
@@ -160,7 +195,13 @@ export function AccessPage() {
         </Tabs>
       </Section>
 
-      <KeyDialog item={editing === 'new' ? undefined : editing ?? undefined} defaults={d.defaultRequestAdmission} open={editing !== null} onOpenChange={(o) => !o && setEditing(null)} onSaved={setData} />
+      <KeyDialog
+        item={editing === 'new' ? undefined : (editing ?? undefined)}
+        defaults={d.defaultRequestAdmission}
+        open={editing !== null}
+        onOpenChange={(o) => !o && setEditing(null)}
+        onSaved={setData}
+      />
       <RotateDialog open={rotateOpen} onOpenChange={setRotateOpen} onSaved={setData} />
     </Page>
   )
@@ -207,8 +248,17 @@ function KeyDialog({
   const save = useMutation({
     mutationFn: () =>
       item
-        ? systemApi.updateRequestKey(item.id, { name: name.trim(), apiKey: apiKey.trim() || undefined, requestAdmission: custom ? adm : undefined })
-        : systemApi.createRequestKey({ name: name.trim(), apiKey: apiKey.trim(), enabled: true, requestAdmission: custom ? adm : undefined }),
+        ? systemApi.updateRequestKey(item.id, {
+            name: name.trim(),
+            apiKey: apiKey.trim() || undefined,
+            requestAdmission: custom ? adm : undefined,
+          })
+        : systemApi.createRequestKey({
+            name: name.trim(),
+            apiKey: apiKey.trim(),
+            enabled: true,
+            requestAdmission: custom ? adm : undefined,
+          }),
     onSuccess: (d) => {
       onSaved(d)
       onOpenChange(false)
@@ -274,7 +324,15 @@ function KeyDialog({
   )
 }
 
-function RotateDialog({ open, onOpenChange, onSaved }: { open: boolean; onOpenChange: (v: boolean) => void; onSaved: (d: Awaited<ReturnType<typeof systemApi.accessKeys>>) => void }) {
+function RotateDialog({
+  open,
+  onOpenChange,
+  onSaved,
+}: {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  onSaved: (d: Awaited<ReturnType<typeof systemApi.accessKeys>>) => void
+}) {
   const [value, setValue] = useState('')
   const [lastOpen, setLastOpen] = useState(false)
   if (open !== lastOpen) {

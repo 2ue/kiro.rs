@@ -42,7 +42,14 @@ export function AppSidebar() {
               <Link to="/overview">
                 <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
                   <svg viewBox="0 0 32 32" className="size-5" aria-hidden>
-                    <path d="M10 8v16M10 16l9-8M13.5 13l6.5 11" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+                    <path
+                      d="M10 8v16M10 16l9-8M13.5 13l6.5 11"
+                      stroke="currentColor"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      fill="none"
+                    />
                   </svg>
                 </span>
                 <span className="grid flex-1 text-left leading-tight">

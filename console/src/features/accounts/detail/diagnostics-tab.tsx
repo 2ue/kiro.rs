@@ -6,6 +6,7 @@ import { EmptyState, ErrorState, LoadingRows } from '@/components/patterns/data-
 import { ToneBadge } from '@/components/status/tone-badge'
 import { RECORD_STATUS_LABEL } from '@/domain/labels'
 import { fmtCompact, fmtDateTime, fmtMs, fmtUsd } from '@/lib/format'
+import { ErrorText } from '@/components/patterns/error-text'
 import { useDiagnostics } from '../queries'
 
 export function DiagnosticsTab({ id }: { id: number }) {
@@ -31,8 +32,9 @@ export function DiagnosticsTab({ id }: { id: number }) {
         <ul className="divide-y rounded-lg border">
           {records.map((r) => (
             <li key={r.id}>
-              <button
-                type="button"
+              <Button
+                variant="unstyled"
+                size="none"
                 onClick={() => navigate({ to: '/requests', search: { id: r.id } })}
                 className="flex w-full items-center gap-3 px-3 py-2 text-left text-xs hover:bg-muted/50"
               >
@@ -40,12 +42,14 @@ export function DiagnosticsTab({ id }: { id: number }) {
                   {RECORD_STATUS_LABEL[r.status] ?? r.status}
                 </ToneBadge>
                 <span className="min-w-0 flex-1 truncate font-mono">{r.model}</span>
-                <span className="num text-muted-foreground">{fmtCompact(r.totalInputTokens)}→{fmtCompact(r.outputTokens)}</span>
+                <span className="num text-muted-foreground">
+                  {fmtCompact(r.totalInputTokens)}→{fmtCompact(r.outputTokens)}
+                </span>
                 <span className="num w-14 text-right text-muted-foreground">{fmtMs(r.durationMs)}</span>
                 <span className="num w-16 text-right">{fmtUsd(r.estimatedCostUsd)}</span>
                 <span className="num w-24 text-right text-muted-foreground">{fmtDateTime(r.createdAt, true)}</span>
-              </button>
-              {r.errorMessage && <p className="truncate px-3 pb-2 text-xs text-danger">{r.errorMessage}</p>}
+              </Button>
+              {r.errorMessage && <ErrorText error={r.errorMessage} compact className="block truncate px-3 pb-2 text-xs" />}
             </li>
           ))}
         </ul>

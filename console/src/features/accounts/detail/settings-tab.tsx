@@ -144,19 +144,52 @@ export function SettingsTab({ row }: { row: AccountRow }) {
   return (
     <div className="flex h-full flex-col">
       <div className="divide-y">
-        <SettingRow label="优先级" description="数字越小越优先；仅在优先级模式下起决定作用" dirty={dirty.priority} onReset={() => set('priority', base.priority)}>
+        <SettingRow
+          label="优先级"
+          description="数字越小越优先；仅在优先级模式下起决定作用"
+          dirty={dirty.priority}
+          onReset={() => set('priority', base.priority)}
+        >
           <NumberInput value={draft.priority} min={0} onChange={(v) => set('priority', v ?? 0)} />
         </SettingRow>
-        <SettingRow label="最大并发" description="留空表示继承全局设置；0 表示不限制" dirty={dirty.concurrency} onReset={() => set('concurrency', base.concurrency)}>
-          <NumberInput value={draft.concurrency} min={0} allowEmpty placeholder="继承全局" suffix="并发" onChange={(v) => set('concurrency', v)} />
+        <SettingRow
+          label="最大并发"
+          description="留空表示继承全局设置；0 表示不限制"
+          dirty={dirty.concurrency}
+          onReset={() => set('concurrency', base.concurrency)}
+        >
+          <NumberInput
+            value={draft.concurrency}
+            min={0}
+            allowEmpty
+            placeholder="继承全局"
+            suffix="并发"
+            onChange={(v) => set('concurrency', v)}
+          />
         </SettingRow>
-        <SettingRow label="每分钟请求上限" description="留空表示继承全局设置；0 表示不限速" dirty={dirty.rpm} onReset={() => set('rpm', base.rpm)}>
+        <SettingRow
+          label="每分钟请求上限"
+          description="留空表示继承全局设置；0 表示不限速"
+          dirty={dirty.rpm}
+          onReset={() => set('rpm', base.rpm)}
+        >
           <NumberInput value={draft.rpm} min={0} allowEmpty placeholder="继承全局" suffix="RPM" onChange={(v) => set('rpm', v)} />
         </SettingRow>
-        <SettingRow label="限流后自动禁用" description="收到上游限流时直接禁用该账号，而不是冷却后重试" dirty={dirty.rateLimitAutoDisable} onReset={() => set('rateLimitAutoDisable', base.rateLimitAutoDisable)}>
+        <SettingRow
+          label="限流后自动禁用"
+          description="收到上游限流时直接禁用该账号，而不是冷却后重试"
+          dirty={dirty.rateLimitAutoDisable}
+          onReset={() => set('rateLimitAutoDisable', base.rateLimitAutoDisable)}
+        >
           <ToggleControl checked={draft.rateLimitAutoDisable} onChange={(v) => set('rateLimitAutoDisable', v)} />
         </SettingRow>
-        <SettingRow label="出站代理" description="账号代理优先于全局代理" dirty={dirty.proxy} onReset={() => setDraft((d) => ({ ...d, ...pickProxy(base) }))} stacked>
+        <SettingRow
+          label="出站代理"
+          description="账号代理优先于全局代理"
+          dirty={dirty.proxy}
+          onReset={() => setDraft((d) => ({ ...d, ...pickProxy(base) }))}
+          stacked
+        >
           <div className="space-y-2">
             <SelectControl
               value={draft.proxyMode}
@@ -177,9 +210,20 @@ export function SettingsTab({ row }: { row: AccountRow }) {
             )}
             {draft.proxyMode === 'custom' && (
               <div className="grid gap-2 sm:grid-cols-3">
-                <Input className="sm:col-span-3" placeholder="http://host:port 或 socks5://host:port" value={draft.proxyUrl} onChange={(e) => set('proxyUrl', e.target.value)} />
+                <Input
+                  className="sm:col-span-3"
+                  placeholder="http://host:port 或 socks5://host:port"
+                  value={draft.proxyUrl}
+                  onChange={(e) => set('proxyUrl', e.target.value)}
+                />
                 <Input placeholder="用户名（可选）" value={draft.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} />
-                <Input type="password" placeholder="密码（可选）" value={draft.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} className="sm:col-span-2" />
+                <Input
+                  type="password"
+                  placeholder="密码（可选）"
+                  value={draft.proxyPassword}
+                  onChange={(e) => set('proxyPassword', e.target.value)}
+                  className="sm:col-span-2"
+                />
               </div>
             )}
           </div>
@@ -192,14 +236,25 @@ export function SettingsTab({ row }: { row: AccountRow }) {
           高级设置
         </CollapsibleTrigger>
         <CollapsibleContent className="divide-y">
-          <SettingRow label="Region" description="同时设置认证与 API Region；留空使用默认" dirty={dirty.region} onReset={() => setDraft((d) => ({ ...d, region: base.region, authRegion: base.authRegion, apiRegion: base.apiRegion }))} stacked>
+          <SettingRow
+            label="Region"
+            description="同时设置认证与 API Region；留空使用默认"
+            dirty={dirty.region}
+            onReset={() => setDraft((d) => ({ ...d, region: base.region, authRegion: base.authRegion, apiRegion: base.apiRegion }))}
+            stacked
+          >
             <div className="grid gap-2 sm:grid-cols-3">
               <Input placeholder="region" value={draft.region} onChange={(e) => set('region', e.target.value)} />
               <Input placeholder="authRegion" value={draft.authRegion} onChange={(e) => set('authRegion', e.target.value)} />
               <Input placeholder="apiRegion" value={draft.apiRegion} onChange={(e) => set('apiRegion', e.target.value)} />
             </div>
           </SettingRow>
-          <SettingRow label="剩余预热请求" description="大于 0 时按预热比例参与调度" dirty={dirty.warmup} onReset={() => set('warmup', base.warmup)}>
+          <SettingRow
+            label="剩余预热请求"
+            description="大于 0 时按预热比例参与调度"
+            dirty={dirty.warmup}
+            onReset={() => set('warmup', base.warmup)}
+          >
             <NumberInput value={draft.warmup} min={0} suffix="次" onChange={(v) => set('warmup', v ?? 0)} />
           </SettingRow>
         </CollapsibleContent>
@@ -219,7 +274,15 @@ export function SettingsTab({ row }: { row: AccountRow }) {
             >
               放弃
             </Button>
-            <Button size="sm" onClick={() => save.mutate()} disabled={save.isPending || (draft.proxyMode === 'resource' && !draft.proxyResourceId) || (draft.proxyMode === 'custom' && !draft.proxyUrl.trim())}>
+            <Button
+              size="sm"
+              onClick={() => save.mutate()}
+              disabled={
+                save.isPending ||
+                (draft.proxyMode === 'resource' && !draft.proxyResourceId) ||
+                (draft.proxyMode === 'custom' && !draft.proxyUrl.trim())
+              }
+            >
               保存
             </Button>
           </div>
@@ -230,5 +293,11 @@ export function SettingsTab({ row }: { row: AccountRow }) {
 }
 
 function pickProxy(d: Draft): Partial<Draft> {
-  return { proxyMode: d.proxyMode, proxyResourceId: d.proxyResourceId, proxyUrl: d.proxyUrl, proxyUsername: d.proxyUsername, proxyPassword: d.proxyPassword }
+  return {
+    proxyMode: d.proxyMode,
+    proxyResourceId: d.proxyResourceId,
+    proxyUrl: d.proxyUrl,
+    proxyUsername: d.proxyUsername,
+    proxyPassword: d.proxyPassword,
+  }
 }

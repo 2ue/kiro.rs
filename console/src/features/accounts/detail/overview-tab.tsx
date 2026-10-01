@@ -9,6 +9,7 @@ import { modelCooldowns } from '@/domain/credential-status'
 import { authMethodLabel, PROXY_SOURCE_LABEL } from '@/domain/labels'
 import { fmtCompact, fmtDateTime, fmtDuration, fmtInt, fmtMs, fmtPct, fmtRelative, fmtUsd } from '@/lib/format'
 import { useAccountActions } from '../actions'
+import { ErrorText } from '@/components/patterns/error-text'
 import type { AccountRow } from '../queries'
 
 export function OverviewTab({ row }: { row: AccountRow }) {
@@ -83,14 +84,19 @@ export function OverviewTab({ row }: { row: AccountRow }) {
             </span>
           </div>
           {row.maxConcurrentRequests > 0 && (
-            <Meter value={row.inFlightRequests} max={row.maxConcurrentRequests} tone={row.inFlightRequests >= row.maxConcurrentRequests ? 'warning' : 'info'} />
+            <Meter
+              value={row.inFlightRequests}
+              max={row.maxConcurrentRequests}
+              tone={row.inFlightRequests >= row.maxConcurrentRequests ? 'warning' : 'info'}
+            />
           )}
         </div>
         <StatGrid cols={3}>
           <Stat label="调度评分（越低越优先）">{(row.schedulerScore ?? 0).toFixed(3)}</Stat>
           <Stat label="选择压力">{(row.schedulerSelectionPressure ?? 0).toFixed(2)}</Stat>
           <Stat label="选中次数 10s/60s/5m">
-            {row.recentSchedulerSelectionCount10s ?? 0} / {row.recentSchedulerSelectionCount60s ?? 0} / {row.recentSchedulerSelectionCount5m ?? 0}
+            {row.recentSchedulerSelectionCount10s ?? 0} / {row.recentSchedulerSelectionCount60s ?? 0} /{' '}
+            {row.recentSchedulerSelectionCount5m ?? 0}
           </Stat>
           <Stat label="近期错误率">{fmtPct(row.recentErrorRate ?? 0)}</Stat>
           <Stat label="延迟 EWMA">{fmtMs(row.latencyEwmaMs)}</Stat>
@@ -103,8 +109,8 @@ export function OverviewTab({ row }: { row: AccountRow }) {
         </StatGrid>
         {row.lastErrorKind && (
           <div className="rounded-lg border bg-danger-subtle/40 p-2.5 text-xs">
-            <div className="font-medium text-danger">最近错误：{row.lastErrorKind}</div>
-            {row.lastErrorReason && <p className="mt-0.5 break-all text-muted-foreground">{row.lastErrorReason}</p>}
+            <div className="mb-1 text-muted-foreground">最近错误 · {row.lastErrorKind}</div>
+            <ErrorText error={row.lastErrorReason ?? row.lastErrorKind} />
             {row.lastErrorAtMs && <p className="mt-0.5 text-muted-foreground">{fmtRelative(row.lastErrorAtMs)}</p>}
           </div>
         )}
@@ -159,16 +165,30 @@ export function OverviewTab({ row }: { row: AccountRow }) {
           <ShieldCheck className="size-4" /> 身份与连接
         </h3>
         <StatGrid cols={2}>
-          <Stat label="认证方式">{authMethodLabel(row.authMethod)}{row.provider ? ` · ${row.provider}` : ''}</Stat>
+          <Stat label="认证方式">
+            {authMethodLabel(row.authMethod)}
+            {row.provider ? ` · ${row.provider}` : ''}
+          </Stat>
           <Stat label="端点">{row.endpoint}</Stat>
           <Stat label="认证 Region">{row.effectiveAuthRegion}</Stat>
           <Stat label="API Region">{row.effectiveApiRegion}</Stat>
-          <Stat label="代理来源">{PROXY_SOURCE_LABEL[row.effectiveProxySource]}{row.proxyResourceName ? ` · ${row.proxyResourceName}` : ''}</Stat>
+          <Stat label="代理来源">
+            {PROXY_SOURCE_LABEL[row.effectiveProxySource]}
+            {row.proxyResourceName ? ` · ${row.proxyResourceName}` : ''}
+          </Stat>
           <Stat label="Token 过期">{row.expiresAt ? fmtRelative(row.expiresAt) : '—'}</Stat>
           <Stat label="Profile ARN">{row.hasProfileArn ? '已配置' : '未配置'}</Stat>
           <Stat label="创建时间">{fmtDateTime(row.createdAt)}</Stat>
-          {row.refreshTokenHash && <Stat label="Refresh Token 指纹" mono>{row.refreshTokenHash.slice(0, 16)}</Stat>}
-          {row.maskedApiKey && <Stat label="API Key" mono>{row.maskedApiKey}</Stat>}
+          {row.refreshTokenHash && (
+            <Stat label="Refresh Token 指纹" mono>
+              {row.refreshTokenHash.slice(0, 16)}
+            </Stat>
+          )}
+          {row.maskedApiKey && (
+            <Stat label="API Key" mono>
+              {row.maskedApiKey}
+            </Stat>
+          )}
         </StatGrid>
       </section>
     </div>

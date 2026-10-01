@@ -54,7 +54,11 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{options?.title}</AlertDialogTitle>
-            {options?.description && <AlertDialogDescription asChild><div>{options.description}</div></AlertDialogDescription>}
+            {options?.description && (
+              <AlertDialogDescription asChild>
+                <div>{options.description}</div>
+              </AlertDialogDescription>
+            )}
           </AlertDialogHeader>
           {options?.typeToConfirm && (
             <div className="space-y-1.5">

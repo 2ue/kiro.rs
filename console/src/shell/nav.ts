@@ -30,7 +30,13 @@ export const NAV: NavGroup[] = [
   {
     label: '监控',
     items: [
-      { to: '/overview', label: '总览', icon: LayoutDashboard, description: '容量水位、健康度与需要关注的问题', keywords: 'dashboard home' },
+      {
+        to: '/overview',
+        label: '总览',
+        icon: LayoutDashboard,
+        description: '容量水位、健康度与需要关注的问题',
+        keywords: 'dashboard home',
+      },
       { to: '/requests', label: '请求', icon: Activity, description: '逐条请求明细、尝试链与错误详情', keywords: 'usage logs records' },
     ],
   },
@@ -45,14 +51,26 @@ export const NAV: NavGroup[] = [
   {
     label: '分析',
     items: [
-      { to: '/billing', label: '成本与额度', icon: ChartPie, description: '费用拆分、额度生命周期、外部池盈亏', keywords: 'cost billing quota' },
+      {
+        to: '/billing',
+        label: '成本与额度',
+        icon: ChartPie,
+        description: '费用拆分、额度生命周期、外部池盈亏',
+        keywords: 'cost billing quota',
+      },
       { to: '/scheduler', label: '调度器', icon: Gauge, description: '账号评分、选中分布与不可调度原因', keywords: 'scheduler' },
     ],
   },
   {
     label: '系统',
     items: [
-      { to: '/settings', label: '运行配置', icon: Settings2, description: '调度、重试、流式、请求体与缓存参数', keywords: 'runtime config settings' },
+      {
+        to: '/settings',
+        label: '运行配置',
+        icon: Settings2,
+        description: '调度、重试、流式、请求体与缓存参数',
+        keywords: 'runtime config settings',
+      },
       { to: '/models', label: '模型', icon: Cpu, description: '模型能力与价格目录', keywords: 'models pricing' },
       { to: '/access', label: '访问控制', icon: KeyRound, description: 'Admin Key 与请求 API Key', keywords: 'security keys' },
       { to: '/audit', label: '审计日志', icon: FileClock, description: '管理操作记录', keywords: 'audit' },

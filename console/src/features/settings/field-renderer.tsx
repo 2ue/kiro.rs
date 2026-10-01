@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
@@ -16,18 +16,41 @@ function parseCodes(raw: string): number[] {
     .filter((c) => Number.isInteger(c) && c >= 100 && c <= 599 && !seen.has(c) && (seen.add(c), true))
 }
 
-function TextField({ value, onCommit, multiline, disabled }: { value: string; onCommit: (v: string) => void; multiline?: boolean; disabled?: boolean }) {
+function TextField({
+  value,
+  onCommit,
+  multiline,
+  disabled,
+}: {
+  value: string
+  onCommit: (v: string) => void
+  multiline?: boolean
+  disabled?: boolean
+}) {
   const [text, setText] = useState(value)
   useEffect(() => setText(value), [value])
   const commit = () => text !== value && onCommit(text)
   return multiline ? (
-    <Textarea rows={5} value={text} disabled={disabled} onChange={(e) => setText(e.target.value)} onBlur={commit} className="font-mono text-xs" />
+    <Textarea
+      rows={5}
+      value={text}
+      disabled={disabled}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      className="font-mono text-xs"
+    />
   ) : (
     <Input value={text} disabled={disabled} onChange={(e) => setText(e.target.value)} onBlur={commit} className="font-mono text-xs" />
   )
 }
 
-export function FieldControl({ field, cfg }: { field: FieldDef; cfg: ConfigDraft }) {
+export function FieldControl({ field, cfg, focused }: { field: FieldDef; cfg: ConfigDraft; focused?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!focused) return
+    ref.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    ref.current?.querySelector<HTMLElement>('input,textarea,button,[role=switch],[role=combobox]')?.focus({ preventScroll: true })
+  }, [focused])
   const value = cfg.get(field.path)
   const disabled = field.disabledWhen?.((p) => cfg.get(p)) ?? false
   const dirty = !deepEqual(value, cfg.baseValue(field.path))
@@ -38,13 +61,32 @@ export function FieldControl({ field, cfg }: { field: FieldDef; cfg: ConfigDraft
   let control: React.ReactNode
   switch (field.kind) {
     case 'number':
-      control = <NumberInput id={id} value={value as number} min={field.min} max={field.max} step={field.step} suffix={field.suffix} disabled={disabled} onChange={(v) => set(v ?? field.min ?? 0)} />
+      control = (
+        <NumberInput
+          id={id}
+          value={value as number}
+          min={field.min}
+          max={field.max}
+          step={field.step}
+          suffix={field.suffix}
+          disabled={disabled}
+          onChange={(v) => set(v ?? field.min ?? 0)}
+        />
+      )
       break
     case 'bool':
       control = <ToggleControl id={id} checked={!!value} disabled={disabled} onChange={set} />
       break
     case 'select':
-      control = <SelectControl id={id} value={String(value ?? field.options[0]?.value ?? '')} options={field.options} disabled={disabled} onChange={set} />
+      control = (
+        <SelectControl
+          id={id}
+          value={String(value ?? field.options[0]?.value ?? '')}
+          options={field.options}
+          disabled={disabled}
+          onChange={set}
+        />
+      )
       break
     case 'list':
       control = <ListInput id={id} value={(value as string[]) ?? []} disabled={disabled} onChange={set} rows={3} />
@@ -57,26 +99,29 @@ export function FieldControl({ field, cfg }: { field: FieldDef; cfg: ConfigDraft
       break
   }
   return (
-    <SettingRow
-      htmlFor={id}
-      label={field.label}
-      description={field.desc}
-      dirty={dirty}
-      onReset={() => cfg.reset(field.path)}
-      disabled={disabled}
-      stacked={stacked}
-    >
-      {control}
-    </SettingRow>
+    <div ref={ref} className={focused ? 'animate-[pulse_1s_ease-in-out_2] rounded-md bg-accent/40' : undefined}>
+      <SettingRow
+        htmlFor={id}
+        label={field.label}
+        description={field.desc}
+        dirty={dirty}
+        onReset={() => cfg.reset(field.path)}
+        disabled={disabled}
+        stacked={stacked}
+      >
+        {control}
+      </SettingRow>
+    </div>
   )
 }
 
-export function GroupCard({ group, cfg, filter }: { group: FieldGroup; cfg: ConfigDraft; filter?: string }) {
+export function GroupCard({ group, cfg, filter, focus }: { group: FieldGroup; cfg: ConfigDraft; filter?: string; focus?: string }) {
   const match = (f: FieldDef) => !filter || `${f.label} ${f.desc ?? ''} ${f.path}`.toLowerCase().includes(filter.toLowerCase())
   const basic = group.fields.filter((f) => !f.advanced && match(f))
   const advanced = group.fields.filter((f) => f.advanced && match(f))
   if (!basic.length && !advanced.length) return null
   const advancedDirty = advanced.some((f) => !deepEqual(cfg.get(f.path), cfg.baseValue(f.path)))
+  const focusAdvanced = !!focus && advanced.some((f) => f.path === focus)
   return (
     <section className="rounded-xl border bg-card">
       <header className="border-b px-4 py-3">
@@ -85,18 +130,18 @@ export function GroupCard({ group, cfg, filter }: { group: FieldGroup; cfg: Conf
       </header>
       <div className="divide-y px-4">
         {basic.map((f) => (
-          <FieldControl key={f.path} field={f} cfg={cfg} />
+          <FieldControl key={f.path} field={f} cfg={cfg} focused={focus === f.path} />
         ))}
       </div>
       {advanced.length > 0 && (
-        <Collapsible defaultOpen={!!filter || advancedDirty} className="border-t">
+        <Collapsible defaultOpen={!!filter || advancedDirty || focusAdvanced} key={focusAdvanced ? 'focus' : 'normal'} className="border-t">
           <CollapsibleTrigger className="group flex w-full items-center gap-1 px-4 py-2.5 text-xs font-medium text-muted-foreground hover:text-foreground">
             <ChevronDown className="size-3.5 transition-transform group-data-[state=open]:rotate-180" />
             高级（{advanced.length}）{advancedDirty && <span className="ml-1 size-1.5 rounded-full bg-primary" />}
           </CollapsibleTrigger>
           <CollapsibleContent className="divide-y border-t px-4">
             {advanced.map((f) => (
-              <FieldControl key={f.path} field={f} cfg={cfg} />
+              <FieldControl key={f.path} field={f} cfg={cfg} focused={focus === f.path} />
             ))}
           </CollapsibleContent>
         </Collapsible>

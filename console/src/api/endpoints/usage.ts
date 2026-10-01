@@ -46,8 +46,7 @@ export const usageApi = {
   poolRisk: (query: UsageExternalPoolRiskQuery) =>
     http.get<UsageExternalPoolRiskResponse>('/usage-dashboard/external-pool-risk', { timezone: TIMEZONE, ...query }),
 
-  cleanupPreview: (req: UsageCleanupRequest) =>
-    http.post<UsageCleanupPreviewResponse>('/usage-records/cleanup/preview', req),
+  cleanupPreview: (req: UsageCleanupRequest) => http.post<UsageCleanupPreviewResponse>('/usage-records/cleanup/preview', req),
   cleanupStart: (req: UsageCleanupRequest) => http.post<UsageCleanupStatusResponse>('/usage-records/cleanup/start', req),
   cleanupStatus: () => http.get<UsageCleanupStatusResponse>('/usage-records/cleanup/status'),
   cleanupCancel: () => http.post<UsageCleanupStatusResponse>('/usage-records/cleanup/cancel'),

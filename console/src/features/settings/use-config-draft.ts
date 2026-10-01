@@ -9,7 +9,13 @@ import { qk } from '@/queries/keys'
 import { useRuntimeConfig } from '@/queries/shared'
 
 /** 只读运行态字段，不参与编辑与提交 */
-const READONLY_KEYS: Array<keyof RuntimeConfig> = ['auxiliaryUpstreamRuntime', 'tokenRefreshAdmissionRuntime', 'proxyUrl', 'proxyUsername', 'proxyPassword']
+const READONLY_KEYS: Array<keyof RuntimeConfig> = [
+  'auxiliaryUpstreamRuntime',
+  'tokenRefreshAdmissionRuntime',
+  'proxyUrl',
+  'proxyUsername',
+  'proxyPassword',
+]
 
 function editable(c: RuntimeConfig): RuntimeConfig {
   const copy = { ...c }
@@ -45,17 +51,23 @@ export function useConfigDraft() {
   }, [query.data])
 
   const changes: FieldChange[] = useMemo(() => (base && draft ? diff(base, draft) : []), [base, draft])
-  const remoteChanged = useMemo(() => !!base && !!remote && changes.length > 0 && diff(base, remote).length > 0, [base, remote, changes.length])
+  const remoteChanged = useMemo(
+    () => !!base && !!remote && changes.length > 0 && diff(base, remote).length > 0,
+    [base, remote, changes.length],
+  )
   const dirty = changes.length > 0
 
   const get = useCallback(<V = unknown>(path: string) => (draft ? (getAt(draft, path) as V) : undefined), [draft])
   const baseValue = useCallback(<V = unknown>(path: string) => (base ? (getAt(base, path) as V) : undefined), [base])
   const set = useCallback((path: string, value: unknown) => setDraft((d) => (d ? setAt(d, path, value) : d)), [])
-  const reset = useCallback((path?: string) => {
-    if (!base) return
-    if (!path) setDraft(base)
-    else setDraft((d) => (d ? setAt(d, path, getAt(base, path)) : d))
-  }, [base])
+  const reset = useCallback(
+    (path?: string) => {
+      if (!base) return
+      if (!path) setDraft(base)
+      else setDraft((d) => (d ? setAt(d, path, getAt(base, path)) : d))
+    },
+    [base],
+  )
 
   const save = useMutation({
     mutationFn: async () => {

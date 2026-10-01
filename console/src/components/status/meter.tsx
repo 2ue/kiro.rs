@@ -1,4 +1,5 @@
 import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
 import { TONE_DOT, type Tone } from './tone'
 
 /** 细进度条，用于容量水位、并发占用等 */
@@ -58,7 +59,9 @@ export function SegmentBar({ items, className, onSelect }: { items: SegmentItem[
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
         {items.map((item) =>
           onSelect ? (
-            <button
+            <Button
+              variant="unstyled"
+              size="none"
               key={item.key}
               type="button"
               onClick={() => onSelect(item.key)}
@@ -67,7 +70,7 @@ export function SegmentBar({ items, className, onSelect }: { items: SegmentItem[
               <span className={cn('size-2 rounded-full', TONE_DOT[item.tone])} aria-hidden />
               {item.label}
               <span className="num font-medium text-foreground">{item.value}</span>
-            </button>
+            </Button>
           ) : (
             <span key={item.key} className="inline-flex items-center gap-1.5 text-muted-foreground">
               <span className={cn('size-2 rounded-full', TONE_DOT[item.tone])} aria-hidden />

@@ -15,7 +15,15 @@ describe('credential import', () => {
 
   it('parses KAM export with nested credentials', () => {
     const r = parseCredentialImportText(
-      JSON.stringify({ accounts: [{ email: 'a@x.com', tags: ['t1'], credentials: { refreshToken: 'rt', profileArn: 'arn:aws:codewhisperer:us-east-1:1:profile/x' } }] }),
+      JSON.stringify({
+        accounts: [
+          {
+            email: 'a@x.com',
+            tags: ['t1'],
+            credentials: { refreshToken: 'rt', profileArn: 'arn:aws:codewhisperer:us-east-1:1:profile/x' },
+          },
+        ],
+      }),
     )
     expect(r[0]).toMatchObject({ email: 'a@x.com', refreshToken: 'rt', apiRegion: 'us-east-1', tags: ['t1'] })
   })
@@ -26,7 +34,9 @@ describe('credential import', () => {
   })
 
   it('dedupes by token', () => {
-    const { unique, duplicates } = dedupeCredentials(parseCredentialImportText('[{"refreshToken":"a"},{"refreshToken":"a"},{"refreshToken":"b"}]'))
+    const { unique, duplicates } = dedupeCredentials(
+      parseCredentialImportText('[{"refreshToken":"a"},{"refreshToken":"a"},{"refreshToken":"b"}]'),
+    )
     expect(unique).toHaveLength(2)
     expect(duplicates).toBe(1)
   })

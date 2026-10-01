@@ -20,11 +20,16 @@ export function CostTab() {
   const series = useUsageSeries()
   const top = useUsageTop(windowKey)
   const navigate = useNavigate()
-  const breakdown = useQuery({ queryKey: qk.usage.breakdown(windowKey), queryFn: () => usageApi.breakdown(windowKey), refetchInterval: usePollInterval('normal') })
+  const breakdown = useQuery({
+    queryKey: qk.usage.breakdown(windowKey),
+    queryFn: () => usageApi.breakdown(windowKey),
+    refetchInterval: usePollInterval('normal'),
+  })
   const w = windows.data?.windows.find((x) => x.key === windowKey)?.summary
 
   const daily = useMemo(
-    () => (series.data?.series.daily7d ?? []).map((p) => ({ label: p.label, cost: p.totalEstimatedCostUsd, original: p.totalOriginalCostUsd })),
+    () =>
+      (series.data?.series.daily7d ?? []).map((p) => ({ label: p.label, cost: p.totalEstimatedCostUsd, original: p.totalOriginalCostUsd })),
     [series.data],
   )
   const tokens = useMemo(
@@ -38,11 +43,17 @@ export function CostTab() {
       <div className="flex items-start gap-2 rounded-lg border bg-muted/30 p-3 text-xs text-muted-foreground">
         <Info className="mt-0.5 size-3.5 shrink-0" />
         <p>
-          估算费用按模型价格目录计算，不等于 Kiro 上游实际扣费；原价为未计入缓存折扣的价格。Kiro metering 是上游返回的计量值。没有价格数据的请求不计入费用。
+          估算费用按模型价格目录计算，不等于 Kiro 上游实际扣费；原价为未计入缓存折扣的价格。Kiro metering
+          是上游返回的计量值。没有价格数据的请求不计入费用。
         </p>
       </div>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-        <KpiCard label="估算费用" value={fmtUsd(w?.totalEstimatedCostUsd)} hint={w ? `原价 ${fmtUsd(w.totalOriginalCostUsd)}` : undefined} loading={windows.isLoading} />
+        <KpiCard
+          label="估算费用"
+          value={fmtUsd(w?.totalEstimatedCostUsd)}
+          hint={w ? `原价 ${fmtUsd(w.totalOriginalCostUsd)}` : undefined}
+          loading={windows.isLoading}
+        />
         <KpiCard
           label="缓存节省"
           value={w ? fmtUsd(Math.max(0, w.totalOriginalCostUsd - w.totalEstimatedCostUsd)) : '—'}
@@ -50,8 +61,17 @@ export function CostTab() {
           loading={windows.isLoading}
         />
         <KpiCard label="Kiro metering" value={fmtCompact(w?.totalKiroMeteringUsage)} loading={windows.isLoading} />
-        <KpiCard label="计费输入 / 输出" value={w ? `${fmtCompact(w.billableInputTokens)} / ${fmtCompact(w.totalOutputTokens)}` : '—'} loading={windows.isLoading} />
-        <KpiCard label="无价请求" value={fmtInt(w?.unpricedRequests)} hint={w ? `有价 ${fmtInt(w.pricedRequests)}` : undefined} loading={windows.isLoading} />
+        <KpiCard
+          label="计费输入 / 输出"
+          value={w ? `${fmtCompact(w.billableInputTokens)} / ${fmtCompact(w.totalOutputTokens)}` : '—'}
+          loading={windows.isLoading}
+        />
+        <KpiCard
+          label="无价请求"
+          value={fmtInt(w?.unpricedRequests)}
+          hint={w ? `有价 ${fmtInt(w.pricedRequests)}` : undefined}
+          loading={windows.isLoading}
+        />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-2">
@@ -115,7 +135,12 @@ export function CostTab() {
               items={[...(top.data?.top.credentials ?? [])]
                 .sort((a, b) => b.totalEstimatedCostUsd - a.totalEstimatedCostUsd)
                 .slice(0, 10)
-                .map((m) => ({ key: m.key, label: m.label ?? `#${m.key}`, value: m.totalEstimatedCostUsd, sub: `${fmtInt(m.requests)} 次` }))}
+                .map((m) => ({
+                  key: m.key,
+                  label: m.label ?? `#${m.key}`,
+                  value: m.totalEstimatedCostUsd,
+                  sub: `${fmtInt(m.requests)} 次`,
+                }))}
             />
           )}
         </Section>
@@ -127,8 +152,18 @@ export function CostTab() {
               <RankList
                 color="var(--chart-4)"
                 items={[
-                  { key: 'read', label: '缓存读', value: w.totalCacheReadInputTokens, sub: fmtPct(cacheTotal ? w.totalCacheReadInputTokens / cacheTotal : 0, 0) },
-                  { key: 'write', label: '缓存写', value: w.totalCacheCreationInputTokens, sub: fmtPct(cacheTotal ? w.totalCacheCreationInputTokens / cacheTotal : 0, 0) },
+                  {
+                    key: 'read',
+                    label: '缓存读',
+                    value: w.totalCacheReadInputTokens,
+                    sub: fmtPct(cacheTotal ? w.totalCacheReadInputTokens / cacheTotal : 0, 0),
+                  },
+                  {
+                    key: 'write',
+                    label: '缓存写',
+                    value: w.totalCacheCreationInputTokens,
+                    sub: fmtPct(cacheTotal ? w.totalCacheCreationInputTokens / cacheTotal : 0, 0),
+                  },
                 ]}
               />
               {(breakdown.data?.usageSourceBreakdown ?? []).length > 0 ? (
@@ -146,7 +181,8 @@ export function CostTab() {
                 <EmptyState title="无用量来源数据" className="py-4" />
               )}
               <p className="text-xs text-muted-foreground">
-                会话粘性：{fmtInt(w.stickyBoundRequests)} 次绑定，{fmtInt(w.fallbackFromStickyRequests)} 次回退 · 缓存模拟 {fmtInt(w.simulatedRequests)} 次
+                会话粘性：{fmtInt(w.stickyBoundRequests)} 次绑定，{fmtInt(w.fallbackFromStickyRequests)} 次回退 · 缓存模拟{' '}
+                {fmtInt(w.simulatedRequests)} 次
               </p>
             </div>
           )}

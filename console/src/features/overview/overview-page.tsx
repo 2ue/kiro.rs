@@ -47,11 +47,24 @@ export function OverviewPage() {
       })),
     [points],
   )
-  const spark = (key: 'success' | 'error' | 'cost' | 'input') => (series.data?.series.hourly24h ?? []).map((p) =>
-    key === 'success' ? p.requests : key === 'error' ? p.errorRequests : key === 'cost' ? p.totalEstimatedCostUsd : p.totalInputTokens + p.totalOutputTokens,
-  )
+  const spark = (key: 'success' | 'error' | 'cost' | 'input') =>
+    (series.data?.series.hourly24h ?? []).map((p) =>
+      key === 'success'
+        ? p.requests
+        : key === 'error'
+          ? p.errorRequests
+          : key === 'cost'
+            ? p.totalEstimatedCostUsd
+            : p.totalInputTokens + p.totalOutputTokens,
+    )
 
-  const attention = buildAttention({ summary: summary.data, pools: pools.data, writer: writer.data, top: top.data?.top, errorRate: current?.errorRate })
+  const attention = buildAttention({
+    summary: summary.data,
+    pools: pools.data,
+    writer: writer.data,
+    top: top.data?.top,
+    errorRate: current?.errorRate,
+  })
   const s = summary.data
   const capacityMax = s?.globalMaxConcurrentRequests ?? 0
   const loading = windows.isLoading
@@ -109,7 +122,11 @@ export function OverviewPage() {
           icon={<CircleCheck className="size-3.5" />}
           loading={loading}
           value={fmtCompact(current?.totalRequests)}
-          hint={current ? `成功 ${fmtCompact(current.successRequests)} · 流式 ${fmtPct(current.totalRequests ? current.streamRequests / current.totalRequests : 0, 0)}` : undefined}
+          hint={
+            current
+              ? `成功 ${fmtCompact(current.successRequests)} · 流式 ${fmtPct(current.totalRequests ? current.streamRequests / current.totalRequests : 0, 0)}`
+              : undefined
+          }
           delta={delta(current?.totalRequests, prev?.totalRequests)}
           spark={spark('success')}
         />
@@ -146,7 +163,11 @@ export function OverviewPage() {
           icon={<Coins className="size-3.5" />}
           loading={loading}
           value={fmtUsd(current?.totalEstimatedCostUsd)}
-          hint={current ? `${fmtCompact(current.totalInputTokens + current.totalOutputTokens)} tokens · ${current.unpricedRequests} 个无价请求` : undefined}
+          hint={
+            current
+              ? `${fmtCompact(current.totalInputTokens + current.totalOutputTokens)} tokens · ${current.unpricedRequests} 个无价请求`
+              : undefined
+          }
           delta={delta(current?.totalEstimatedCostUsd, prev?.totalEstimatedCostUsd)}
           spark={spark('cost')}
           sparkColor="var(--chart-3)"
@@ -238,7 +259,9 @@ export function OverviewPage() {
           onSelect={(key) =>
             navigate({
               to: '/requests',
-              search: ['error', 'stream_error', 'upstream_timeout', 'client_dropped'].includes(key) ? { status: key as 'error' } : { q: key },
+              search: ['error', 'stream_error', 'upstream_timeout', 'client_dropped'].includes(key)
+                ? { status: key as 'error' }
+                : { q: key },
             })
           }
           loading={top.isLoading}
@@ -286,7 +309,9 @@ function TopSection<T extends { key: string; label?: string }>({
           items={items.slice(0, 8).map((i) => ({ key: i.key, label: i.label ?? i.key, value: valueOf(i), sub: sub?.(i) }))}
           footer={
             truncated || (total && total > 8) ? (
-              <p className="text-xs text-muted-foreground">仅显示前 {Math.min(8, items.length)} 项，共 {fmtInt(total)} 项</p>
+              <p className="text-xs text-muted-foreground">
+                仅显示前 {Math.min(8, items.length)} 项，共 {fmtInt(total)} 项
+              </p>
             ) : undefined
           }
         />

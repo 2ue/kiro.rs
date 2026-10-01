@@ -36,9 +36,7 @@ export const systemApi = {
   modelPricing: () => http.get<ModelPricingStatus>('/model-pricing'),
   syncModelPricing: () => http.post<ModelPricingStatus>('/model-pricing/sync'),
   modelCapabilities: () => http.get<ModelCapabilitiesStatus>('/model-capabilities'),
-  syncModelCapabilities: (req: SyncModelCapabilitiesRequest = {}) =>
-    http.post<ModelCapabilitiesStatus>('/model-capabilities/sync', req),
+  syncModelCapabilities: (req: SyncModelCapabilitiesRequest = {}) => http.post<ModelCapabilitiesStatus>('/model-capabilities/sync', req),
   upsertManualModel: (req: UpsertManualModelRequest) => http.post<ManualModelResponse>('/model-capabilities/manual', req),
-  deleteManualModel: (model: string) =>
-    http.delete<ManualModelResponse>(`/model-capabilities/manual/${encodeURIComponent(model)}`),
+  deleteManualModel: (model: string) => http.delete<ManualModelResponse>(`/model-capabilities/manual/${encodeURIComponent(model)}`),
 }

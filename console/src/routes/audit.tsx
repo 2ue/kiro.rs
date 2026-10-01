@@ -1,8 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { z } from 'zod'
+import { opt, searchSchema } from '@/lib/search-schema'
 import { AuditPage } from '@/features/audit/audit-page'
 
 export const Route = createFileRoute('/audit')({
-  validateSearch: z.object({ page: z.number().int().min(1).optional().catch(undefined) }),
+  validateSearch: searchSchema({ page: opt.int(1) }),
   component: AuditPage,
 })

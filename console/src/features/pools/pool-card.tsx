@@ -1,7 +1,13 @@
 import { Ban, CirclePlay, Eraser, MoreHorizontal, Pencil, ShieldCheck, Trash2 } from 'lucide-react'
 import type { ExternalPoolStatus, UsageExternalPoolBillingByPool } from '@/api/types'
 import { Button } from '@/components/ui/button'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Meter } from '@/components/status/meter'
 import { ToneBadge } from '@/components/status/tone-badge'
 import { fmtInt, fmtMs, fmtPct, fmtUsd } from '@/lib/format'

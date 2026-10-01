@@ -104,11 +104,14 @@ export interface ModelCapabilitiesStatus {
   lastSyncedAt?: string
   lastError?: string
   models: ModelCapabilityItem[]
-  reasoningFields?: Record<string, {
-    path: 'output_config' | 'reasoning'
-    efforts: string[]
-    defaultEffort?: string
-  }>
+  reasoningFields?: Record<
+    string,
+    {
+      path: 'output_config' | 'reasoning'
+      efforts: string[]
+      defaultEffort?: string
+    }
+  >
 }
 
 export interface SyncModelCapabilitiesRequest {

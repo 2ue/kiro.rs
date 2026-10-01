@@ -34,26 +34,34 @@ export function QuotaTab() {
   const rows = useMemo(() => (page.data?.credentials ?? []).map(toAccountRow), [page.data])
   const now = page.dataUpdatedAt
   const nearlyOut = rows.filter((r) => r.quota.level === 'high' || r.quota.level === 'over')
-  const resetting = rows.filter((r) => r.quota.nextResetAt && r.quota.nextResetAt.getTime() - now < WEEK).sort((a, b) => a.quota.nextResetAt!.getTime() - b.quota.nextResetAt!.getTime())
+  const resetting = rows
+    .filter((r) => r.quota.nextResetAt && r.quota.nextResetAt.getTime() - now < WEEK)
+    .sort((a, b) => a.quota.nextResetAt!.getTime() - b.quota.nextResetAt!.getTime())
   const overage = rows.filter((r) => r.quota.overageEnabled || r.quota.overageUsd > 0)
   const stale = rows.filter((r) => r.quota.stale)
 
   const c = credit.data
   const columns: ColumnDef<AccountRow, unknown>[] = [
-    { id: 'a', header: '账号', size: 200, meta: { grow: true }, cell: ({ row: { original: r } }) => <span className="truncate">{r.label}</span> },
-    { id: 'q', header: '使用率', size: 160, cell: ({ row: { original: r } }) => <QuotaBar quota={r.quota} /> },
+    {
+      id: 'a',
+      header: '账号',
+      size: 200,
+      meta: { mobile: 'title', grow: true },
+      cell: ({ row: { original: r } }) => <span className="truncate">{r.label}</span>,
+    },
+    { id: 'q', header: '使用率', size: 160, meta: { mobile: true }, cell: ({ row: { original: r } }) => <QuotaBar quota={r.quota} /> },
     {
       id: 'u',
       header: '已用 / 总量',
       size: 120,
-      meta: { align: 'right' },
+      meta: { mobile: true, align: 'right' },
       cell: ({ row: { original: r } }) => `${fmtInt(r.quota.used)} / ${fmtInt(r.quota.limit)}`,
     },
     {
       id: 'r',
       header: '重置',
       size: 130,
-      meta: { align: 'right' },
+      meta: { mobile: true, align: 'right' },
       cell: ({ row: { original: r } }) =>
         r.quota.nextResetAt ? (
           <span title={fmtDateTime(r.quota.nextResetAt.getTime())}>{fmtRelative(r.quota.nextResetAt.getTime())}</span>
@@ -67,14 +75,24 @@ export function QuotaTab() {
       size: 110,
       meta: { align: 'right' },
       cell: ({ row: { original: r } }) =>
-        r.quota.overageUsd > 0 ? fmtUsd(r.quota.overageUsd) : r.quota.overageEnabled ? <ToneBadge tone="warning">已开启</ToneBadge> : <span className="text-muted-foreground">—</span>,
+        r.quota.overageUsd > 0 ? (
+          fmtUsd(r.quota.overageUsd)
+        ) : r.quota.overageEnabled ? (
+          <ToneBadge tone="warning">已开启</ToneBadge>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
     },
     {
       id: 's',
       header: '快照',
       size: 90,
       meta: { align: 'right' },
-      cell: ({ row: { original: r } }) => <span className={r.quota.stale ? 'text-warning' : 'text-muted-foreground'}>{r.quota.checkedAt ? fmtRelative(r.quota.checkedAt.getTime()) : '未查询'}</span>,
+      cell: ({ row: { original: r } }) => (
+        <span className={r.quota.stale ? 'text-warning' : 'text-muted-foreground'}>
+          {r.quota.checkedAt ? fmtRelative(r.quota.checkedAt.getTime()) : '未查询'}
+        </span>
+      ),
     },
   ]
   const table = (data: AccountRow[], empty: string) =>
@@ -99,12 +117,26 @@ export function QuotaTab() {
         <KpiCard
           label="启用账号剩余积分"
           value={c ? fmtCompact(c.enabledCreditRemaining) : '—'}
-          hint={c ? `总额度 ${fmtCompact(c.enabledCreditLimit)} · 剩余 ${fmtPct(c.enabledCreditLimit ? c.enabledCreditRemaining / c.enabledCreditLimit : 0, 0)}` : undefined}
+          hint={
+            c
+              ? `总额度 ${fmtCompact(c.enabledCreditLimit)} · 剩余 ${fmtPct(c.enabledCreditLimit ? c.enabledCreditRemaining / c.enabledCreditLimit : 0, 0)}`
+              : undefined
+          }
           loading={credit.isLoading}
         />
         <KpiCard label="即将耗尽（≥80%）" value={fmtInt(nearlyOut.length)} hint={`共 ${rows.length} 个启用账号`} loading={page.isLoading} />
-        <KpiCard label="7 天内重置" value={fmtInt(resetting.length)} hint={resetting[0]?.quota.nextResetAt ? `最近：${fmtRelative(resetting[0].quota.nextResetAt.getTime())}` : undefined} loading={page.isLoading} />
-        <KpiCard label="快照过期" value={fmtInt(stale.length)} hint={c?.lastCheckedAt ? `最近查询 ${fmtRelative(c.lastCheckedAt)}` : '超过 30 分钟未刷新'} loading={page.isLoading} />
+        <KpiCard
+          label="7 天内重置"
+          value={fmtInt(resetting.length)}
+          hint={resetting[0]?.quota.nextResetAt ? `最近：${fmtRelative(resetting[0].quota.nextResetAt.getTime())}` : undefined}
+          loading={page.isLoading}
+        />
+        <KpiCard
+          label="快照过期"
+          value={fmtInt(stale.length)}
+          hint={c?.lastCheckedAt ? `最近查询 ${fmtRelative(c.lastCheckedAt)}` : '超过 30 分钟未刷新'}
+          loading={page.isLoading}
+        />
       </div>
 
       <Section
@@ -113,7 +145,12 @@ export function QuotaTab() {
         contentClassName="p-0"
         actions={
           stale.length > 0 && (
-            <Button size="xs" variant="outline" onClick={() => actions.refreshInfo.mutate(stale.map((r) => r.id))} disabled={actions.refreshInfo.isPending}>
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => actions.refreshInfo.mutate(stale.map((r) => r.id))}
+              disabled={actions.refreshInfo.isPending}
+            >
               <RefreshCw className={actions.refreshInfo.isPending ? 'animate-spin' : undefined} /> 刷新 {stale.length} 个过期快照
             </Button>
           )

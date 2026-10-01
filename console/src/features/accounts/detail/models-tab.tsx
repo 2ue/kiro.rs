@@ -46,7 +46,10 @@ export function ModelsTab({ row }: { row: AccountRow }) {
   const original = (row.supportedModels ?? []).join('\n')
   const dirty = models.join('\n') !== original
   const add = () => {
-    const values = input.split(/[\s,]+/).map((v) => v.trim()).filter(Boolean)
+    const values = input
+      .split(/[\s,]+/)
+      .map((v) => v.trim())
+      .filter(Boolean)
     if (!values.length) return
     setModels((m) => [...new Set([...m, ...values])])
     setInput('')
@@ -54,9 +57,7 @@ export function ModelsTab({ row }: { row: AccountRow }) {
 
   return (
     <div className="space-y-4">
-      <p className="text-xs text-muted-foreground">
-        白名单为空时，账号可服务所有模型。设置后，调度器只会把这些模型的请求分配给该账号。
-      </p>
+      <p className="text-xs text-muted-foreground">白名单为空时，账号可服务所有模型。设置后，调度器只会把这些模型的请求分配给该账号。</p>
       <div className="flex gap-2">
         <Button size="sm" variant="outline" onClick={() => discover.mutate()} disabled={discover.isPending}>
           <ScanSearch /> 探测
@@ -88,7 +89,12 @@ export function ModelsTab({ row }: { row: AccountRow }) {
           {models.map((m) => (
             <li key={m} className="inline-flex items-center gap-1 rounded-md border bg-muted/50 py-0.5 pr-0.5 pl-2 font-mono text-xs">
               {m}
-              <Button variant="ghost" size="icon-xs" aria-label={`移除 ${m}`} onClick={() => setModels((list) => list.filter((x) => x !== m))}>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`移除 ${m}`}
+                onClick={() => setModels((list) => list.filter((x) => x !== m))}
+              >
                 <X />
               </Button>
             </li>

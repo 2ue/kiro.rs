@@ -72,6 +72,10 @@ export const JSON_EDITORS: Array<{ path: string; title: string; description: str
   { path: 'definedCacheRoutes', title: '自定义缓存路径', description: '/dfcache/{name} 形式的自定义入口' },
   { path: 'reportedUsage', title: '上报用量整形', description: '对外上报 usage 的默认策略与按路径覆盖' },
   { path: 'promptCacheCreationControl', title: '缓存写入展示频次', description: '控制何时在对外 usage 中显示缓存写入' },
-  { path: 'modelMapping.rules', title: '模型映射规则', description: '{ enabled, source, target, kind: version_equivalent | alias | fallback, note }' },
+  {
+    path: 'modelMapping.rules',
+    title: '模型映射规则',
+    description: '{ enabled, source, target, kind: version_equivalent | alias | fallback, note }',
+  },
   { path: 'weightedCapacity.tiers', title: '加权容量分档', description: '命中不超过当前输入 token 的最高分档：{ minTokens, units }' },
 ]

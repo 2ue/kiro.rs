@@ -1,21 +1,41 @@
+import type { CachePolicyConfig, PromptCacheCreationControlConfig, ReportedUsageConfig } from './config-cache'
+
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
+
 export type KiroAgentModeStrategy = 'vibe' | 'spec' | 'auto'
+
 export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
+
 export type ThinkingTriggerMode = 'real_request' | 'always'
+
 export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
+
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
+
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
+
 export type ExternalPoolHeaderProfile = 'generic' | 'anthropic_passthrough' | 'claude_code_mimic'
+
 export type ExternalPoolWireProfile = 'default' | 'http1_title_case'
+
 export type ExternalPoolTlsProfile = 'default' | 'native_tls'
+
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
+
 export type ExternalPoolStreamResponseMode = 'event_passthrough'
+
 export type ExternalPoolStreamRetryMode = 'inherit' | 'enabled' | 'disabled'
+
 export type ExternalPoolModelUnavailableCooldownMode = 'disabled' | 'model' | 'pool'
+
 export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
+
 export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
+
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
+
 export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
+
 export type ExternalPoolRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
 
 export interface ExternalPoolModelMappingRule {
@@ -25,8 +45,6 @@ export interface ExternalPoolModelMappingRule {
   kind?: 'version_equivalent' | 'alias' | 'fallback'
   note?: string
 }
-
-export type ReportedUsageFieldMode = 'raw' | 'preserve' | 'sample-max' | 'sample-target'
 
 export interface ModelMappingRule {
   enabled: boolean
@@ -42,105 +60,8 @@ export interface ModelMappingConfig {
   rules: ModelMappingRule[]
 }
 
-export interface ReportedUsageFieldPolicy {
-  mode: ReportedUsageFieldMode
-  maxTokens: number
-  targetTokens: number
-  normalMaxMultiplier: number
-  moveDeltaToCacheRead: boolean
-}
-
-export interface ReportedUsagePathPolicy {
-  enabled: boolean
-  skipNonStreamUsageProjection: boolean
-  finalCacheReadMaxTokens: number
-  finalCacheReadJitterMinTokens: number
-  finalCacheReadJitterMaxTokens: number
-  finalCacheCreationMaxTokens: number
-  finalCacheCreationJitterMinTokens: number
-  finalCacheCreationJitterMaxTokens: number
-  finalOutputGuardEnabled: boolean
-  outputUpliftMinTokens: number
-  outputUpliftPercent: number
-  finalOutputMaxTokens: number
-  finalOutputJitterMinTokens: number
-  finalOutputJitterMaxTokens: number
-  input: ReportedUsageFieldPolicy
-  output: ReportedUsageFieldPolicy
-  cacheRead: ReportedUsageFieldPolicy
-  cacheCreation: ReportedUsageFieldPolicy
-}
-
-export interface ReportedUsageConfig {
-  default: ReportedUsagePathPolicy
-  pathOverrides: Record<string, ReportedUsagePathPolicy>
-}
-
-export interface CacheSimulationPolicyPatch {
-  enabled?: boolean
-  targetReadRatio?: number
-  tokenScale?: number
-  maxSimulatedInputTokens?: number
-  capJitterMinTokens?: number
-  capJitterMaxTokens?: number
-  scaleMinInputTokens?: number
-}
-
-export interface CachePointPolicyPatch {
-  enabled?: boolean
-  toolsOnly?: boolean
-  recordPlan?: boolean
-}
-
-export interface CacheBoundsPolicyPatch {
-  maxEntriesPerAccount?: number
-  maxEntriesGlobal?: number
-  entryTtlSecs?: number
-  estimatedBytesLimit?: number
-}
-
-export interface KiroRsToolCachePolicyPatch {
-  coverageRatio?: number
-  maxCoverageTokens?: number
-  incrementalCreateEnabled?: boolean
-  maxNewCreationTokensPerRequest?: number
-  cacheCurrentUserStablePrefix?: boolean
-  currentUserStablePrefixMaxTokens?: number
-}
-
-export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool'
-
-export interface CacheRoutePolicyPatch {
-  cacheType?: PromptCacheStrategyType
-  routeNamespace?: boolean
-  simulation?: CacheSimulationPolicyPatch
-  creationControl?: PromptCacheCreationControlConfig
-  reportedUsage?: ReportedUsagePathPolicy
-  cachePoint?: CachePointPolicyPatch
-  bounds?: CacheBoundsPolicyPatch
-  kiroRsTool?: KiroRsToolCachePolicyPatch
-}
-
-export interface CachePolicyConfig {
-  default: CacheRoutePolicyPatch
-  currentHighCache: CacheRoutePolicyPatch
-  kiroRsTool: CacheRoutePolicyPatch
-  pathOverrides: Record<string, CacheRoutePolicyPatch>
-}
-
-export interface PromptCacheCreationControlConfig {
-  enabled: boolean
-  scopeMode: 'credential_conversation_model' | 'conversation_model'
-  minSuccessfulRequestsBetweenCreation: number
-  minCreationIntervalSecs: number
-  minCreationDeltaTokens: number
-  maxCreationTokensPerEvent: number
-  creationBudgetWindowSecs: number
-  maxCreationTokensPerWindow: number
-  expireAfterIdleSecs: number
-}
-
 export type OversizedImageHandling = 'drop-with-placeholder' | 'reject'
+
 export type ImageProcessingMode = 'safe' | 'light'
 
 export interface ImageProcessingConfig {
@@ -164,6 +85,7 @@ export interface BodyConversionConfig {
 }
 
 export type PromptSteeringScope = 'route_rules' | 'cc_only' | 'claude_code_profile' | 'all_routes'
+
 export type PromptSteeringRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
 
 export interface PromptSteeringTextBlock {

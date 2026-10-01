@@ -24,7 +24,13 @@ export function buildAttention(input: {
 
   if (summary) {
     if (summary.total > 0 && summary.schedulable === 0) {
-      items.push({ id: 'no-schedulable', tone: 'danger', title: '没有可调度的本地账号', detail: '所有请求只能走外部池或失败', to: '/scheduler' })
+      items.push({
+        id: 'no-schedulable',
+        tone: 'danger',
+        title: '没有可调度的本地账号',
+        detail: '所有请求只能走外部池或失败',
+        to: '/scheduler',
+      })
     } else if (summary.total > 0 && summary.schedulable / Math.max(1, summary.available) < 0.3) {
       items.push({
         id: 'low-schedulable',
@@ -35,19 +41,52 @@ export function buildAttention(input: {
       })
     }
     if (summary.failing > 0)
-      items.push({ id: 'failing', tone: 'danger', title: `${summary.failing} 个账号近期异常`, detail: '查看错误原因并处置', to: '/accounts', search: { status: 'error' } })
+      items.push({
+        id: 'failing',
+        tone: 'danger',
+        title: `${summary.failing} 个账号近期异常`,
+        detail: '查看错误原因并处置',
+        to: '/accounts',
+        search: { status: 'error' },
+      })
     if (summary.disabled > 0)
-      items.push({ id: 'disabled', tone: 'neutral', title: `${summary.disabled} 个账号已禁用`, detail: '按禁用原因批量处置', to: '/accounts', search: { status: 'disabled' } })
+      items.push({
+        id: 'disabled',
+        tone: 'neutral',
+        title: `${summary.disabled} 个账号已禁用`,
+        detail: '按禁用原因批量处置',
+        to: '/accounts',
+        search: { status: 'disabled' },
+      })
     if (summary.queuedRequests > 0)
-      items.push({ id: 'queued', tone: 'warning', title: `${summary.queuedRequests} 个请求在排队`, detail: '本地容量不足，考虑扩容或调整并发', to: '/settings/capacity' })
+      items.push({
+        id: 'queued',
+        tone: 'warning',
+        title: `${summary.queuedRequests} 个请求在排队`,
+        detail: '本地容量不足，考虑扩容或调整并发',
+        to: '/settings/capacity',
+      })
     if (!summary.runtimeFresh)
-      items.push({ id: 'stale-runtime', tone: 'warning', title: '运行态快照可能滞后', detail: 'Redis 调度状态未及时同步', to: '/scheduler' })
+      items.push({
+        id: 'stale-runtime',
+        tone: 'warning',
+        title: '运行态快照可能滞后',
+        detail: 'Redis 调度状态未及时同步',
+        to: '/scheduler',
+      })
   }
 
   for (const p of pools?.pools ?? []) {
     if (!p.pool.enabled) continue
     if (p.pool.autoDisabled)
-      items.push({ id: `pool-ad-${p.pool.id}`, tone: 'danger', title: `外部池「${p.pool.name}」被自动禁用`, detail: p.pool.autoDisabledReason, to: '/pools', search: { id: p.pool.id } })
+      items.push({
+        id: `pool-ad-${p.pool.id}`,
+        tone: 'danger',
+        title: `外部池「${p.pool.name}」被自动禁用`,
+        detail: p.pool.autoDisabledReason,
+        to: '/pools',
+        search: { id: p.pool.id },
+      })
     else if (!p.dispatchable)
       items.push({
         id: `pool-${p.pool.id}`,
@@ -61,7 +100,14 @@ export function buildAttention(input: {
 
   const wh = writerHealth(writer)
   if (wh.tone === 'danger' || wh.tone === 'warning')
-    items.push({ id: 'writer', tone: wh.tone, title: `用量写入链路：${wh.label}`, detail: '部分请求记录可能延迟或丢失', to: '/overview', search: { health: true } })
+    items.push({
+      id: 'writer',
+      tone: wh.tone,
+      title: `用量写入链路：${wh.label}`,
+      detail: '部分请求记录可能延迟或丢失',
+      to: '/overview',
+      search: { health: true },
+    })
 
   if ((input.errorRate ?? 0) >= 0.1 && top?.errors[0])
     items.push({

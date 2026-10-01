@@ -45,7 +45,9 @@ export function SchedulerPage() {
   const top = [...rows].sort((a, b) => (b.recentSchedulerSelectionCount5m ?? 0) - (a.recentSchedulerSelectionCount5m ?? 0)).slice(0, 15)
   const top3Share = total5m > 0 ? top.slice(0, 3).reduce((s, r) => s + (r.recentSchedulerSelectionCount5m ?? 0), 0) / total5m : 0
 
-  const blockedGroups = BLOCKING.map((s) => ({ status: s, rows: blocked.filter((r) => r.status.primary === s) })).filter((g) => g.rows.length)
+  const blockedGroups = BLOCKING.map((s) => ({ status: s, rows: blocked.filter((r) => r.status.primary === s) })).filter(
+    (g) => g.rows.length,
+  )
 
   const columns = useMemo<ColumnDef<AccountRow, unknown>[]>(
     () => [
@@ -60,19 +62,25 @@ export function SchedulerPage() {
         id: 'account',
         header: '账号',
         size: 220,
-        meta: { grow: true },
+        meta: { mobile: 'title', grow: true },
         cell: ({ row: { original: r } }) => (
           <span className="truncate">
             {r.label} <span className="num text-xs text-muted-foreground">#{r.id}</span>
           </span>
         ),
       },
-      { id: 'status', header: '状态', size: 130, cell: ({ row: { original: r } }) => <CredentialStatusBadge view={r.status} /> },
+      {
+        id: 'status',
+        header: '状态',
+        size: 130,
+        meta: { mobile: 'badge' },
+        cell: ({ row: { original: r } }) => <CredentialStatusBadge view={r.status} />,
+      },
       {
         id: 'score',
         header: '评分',
         size: 90,
-        meta: { align: 'right' },
+        meta: { mobile: true, align: 'right' },
         cell: ({ row: { original: r } }) => (r.schedulerScore ?? 0).toFixed(3),
       },
       {
@@ -86,7 +94,7 @@ export function SchedulerPage() {
         id: 'sel',
         header: '选中 10s/60s/5m',
         size: 130,
-        meta: { align: 'right' },
+        meta: { mobile: true, align: 'right' },
         cell: ({ row: { original: r } }) => (
           <span>
             {r.recentSchedulerSelectionCount10s ?? 0}
@@ -101,17 +109,24 @@ export function SchedulerPage() {
         id: 'load',
         header: '在途',
         size: 72,
-        meta: { align: 'right' },
+        meta: { mobile: true, align: 'right' },
         cell: ({ row: { original: r } }) => `${r.inFlightRequests}/${r.maxConcurrentRequests || '∞'}`,
       },
-      { id: 'err', header: '错误率', size: 72, meta: { align: 'right' }, cell: ({ row: { original: r } }) => fmtPct(r.recentErrorRate ?? 0, 0) },
+      {
+        id: 'err',
+        header: '错误率',
+        size: 72,
+        meta: { mobile: true, align: 'right' },
+        cell: ({ row: { original: r } }) => fmtPct(r.recentErrorRate ?? 0, 0),
+      },
       { id: 'lat', header: '延迟', size: 72, meta: { align: 'right' }, cell: ({ row: { original: r } }) => fmtMs(r.latencyEwmaMs) },
       {
         id: 'prob',
         header: '观察期',
         size: 80,
         meta: { align: 'right' },
-        cell: ({ row: { original: r } }) => (r.inProbation ? fmtDuration(r.probationRemainingSecs) : <span className="text-muted-foreground">—</span>),
+        cell: ({ row: { original: r } }) =>
+          r.inProbation ? fmtDuration(r.probationRemainingSecs) : <span className="text-muted-foreground">—</span>,
       },
     ],
     [],
@@ -142,8 +157,18 @@ export function SchedulerPage() {
             </Link>
           }
         />
-        <KpiCard label="可调度 / 启用" value={`${fmtInt(schedulable.length)} / ${fmtInt(rows.length)}`} hint={`${blocked.length} 个暂不可调度`} loading={page.isLoading} />
-        <KpiCard label="5 分钟选中次数" value={fmtInt(total5m)} hint={summary.data ? `全局在途 ${summary.data.globalInFlightRequests}` : undefined} loading={page.isLoading} />
+        <KpiCard
+          label="可调度 / 启用"
+          value={`${fmtInt(schedulable.length)} / ${fmtInt(rows.length)}`}
+          hint={`${blocked.length} 个暂不可调度`}
+          loading={page.isLoading}
+        />
+        <KpiCard
+          label="5 分钟选中次数"
+          value={fmtInt(total5m)}
+          hint={summary.data ? `全局在途 ${summary.data.globalInFlightRequests}` : undefined}
+          loading={page.isLoading}
+        />
         <KpiCard
           label="流量集中度"
           value={fmtPct(top3Share, 0)}
@@ -213,7 +238,11 @@ export function SchedulerPage() {
                     <ul className="space-y-1">
                       {g.rows.slice(0, 8).map((r) => (
                         <li key={r.id}>
-                          <Link to="/accounts" search={{ id: r.id }} className="flex items-center justify-between gap-2 rounded px-1 text-xs hover:bg-muted">
+                          <Link
+                            to="/accounts"
+                            search={{ id: r.id }}
+                            className="flex items-center justify-between gap-2 rounded px-1 text-xs hover:bg-muted"
+                          >
                             <span className="truncate">{r.label}</span>
                             <span className="num shrink-0 text-muted-foreground">
                               {r.status.remainingSecs ? `${fmtDuration(r.status.remainingSecs)} 后恢复` : r.status.detail}
@@ -231,7 +260,9 @@ export function SchedulerPage() {
         </div>
       </div>
       {page.data && page.data.filteredTotal > rows.length && (
-        <p className="text-xs text-muted-foreground">启用账号共 {fmtInt(page.data.filteredTotal)} 个，这里只分析评分最优的前 {rows.length} 个。</p>
+        <p className="text-xs text-muted-foreground">
+          启用账号共 {fmtInt(page.data.filteredTotal)} 个，这里只分析评分最优的前 {rows.length} 个。
+        </p>
       )}
     </Page>
   )

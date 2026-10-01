@@ -1,17 +1,9 @@
 import type { CredentialStatusItem } from '@/api/types'
 import { disabledReasonMeta, type DisabledReasonMeta } from '@/domain/disabled-reason'
+import { translateError } from '@/domain/upstream-error'
 
 /** 全局唯一的账号状态集合；颜色/图标映射见 components/status/status-badge.tsx */
-export type PrimaryStatus =
-  | 'disabled'
-  | 'failing'
-  | 'rateLimited'
-  | 'cooling'
-  | 'saturated'
-  | 'probation'
-  | 'warmup'
-  | 'busy'
-  | 'healthy'
+export type PrimaryStatus = 'disabled' | 'failing' | 'rateLimited' | 'cooling' | 'saturated' | 'probation' | 'warmup' | 'busy' | 'healthy'
 
 export interface CredentialStatusView {
   primary: PrimaryStatus
@@ -75,8 +67,7 @@ export function deriveCredentialStatus(c: StatusInput): CredentialStatusView {
   const globalCooldown = c.cooledDown || (c.cooldowns ?? []).some((item) => item.global && item.remainingSecs > 0)
   if (globalCooldown) states.add('cooling')
   if (c.maxConcurrentRequests > 0 && c.inFlightRequests >= c.maxConcurrentRequests) states.add('saturated')
-  const failing =
-    (c.recentErrorRate ?? 0) >= FAILING_ERROR_RATE || c.failureCount > 0 || c.refreshFailureCount > 0
+  const failing = (c.recentErrorRate ?? 0) >= FAILING_ERROR_RATE || c.failureCount > 0 || c.refreshFailureCount > 0
   if (failing) states.add('failing')
   if (c.inProbation) states.add('probation')
   if (c.warmupRemaining > 0) states.add('warmup')
@@ -106,7 +97,7 @@ export function deriveCredentialStatus(c: StatusInput): CredentialStatusView {
       view.detail = `并发已满 ${c.inFlightRequests}/${c.maxConcurrentRequests}`
       break
     case 'failing':
-      view.detail = c.lastErrorReason || c.lastErrorKind || '近期出现错误'
+      view.detail = translateError(c.lastErrorReason || c.lastErrorKind)?.title ?? '近期出现错误'
       break
     case 'probation':
       view.remainingSecs = c.probationRemainingSecs

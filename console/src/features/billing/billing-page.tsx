@@ -14,7 +14,10 @@ export function BillingPage() {
   const windowKey = useUiPrefs((s) => s.windowKey)
   return (
     <Page>
-      <PageHeader title="成本与额度" description={`费用拆分、账号额度生命周期、外部池盈亏 · 统计窗口：${WINDOW_OPTIONS.find((w) => w.key === windowKey)?.label}`} />
+      <PageHeader
+        title="成本与额度"
+        description={`费用拆分、账号额度生命周期、外部池盈亏 · 统计窗口：${WINDOW_OPTIONS.find((w) => w.key === windowKey)?.label}`}
+      />
       <Tabs value={tab} onValueChange={(v) => navigate({ search: { tab: v === 'cost' ? undefined : (v as 'quota') }, replace: true })}>
         <TabsList variant="line" className="border-b">
           <TabsTrigger value="cost">费用</TabsTrigger>

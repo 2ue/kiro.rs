@@ -1,71 +1,32 @@
 import { useMemo, useState } from 'react'
+import { useMutation } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
 import type { RowSelectionState, VisibilityState } from '@tanstack/react-table'
-import {
-  Ban,
-  CirclePlay,
-  Download,
-  FileUp,
-  ListFilter,
-  MoreHorizontal,
-  Pencil,
-  RefreshCw,
-  Search,
-  Stethoscope,
-  Trash2,
-  X,
-} from 'lucide-react'
-import { toast } from 'sonner'
+import { Ban, Download, FileUp, MoreHorizontal, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
-import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { DataTable } from '@/components/data-table/data-table'
 import { Pager } from '@/components/data-table/pager'
-import { BulkBar } from '@/components/data-table/selection'
-import { ColumnToggle } from '@/components/data-table/column-toggle'
 import { EmptyState, ErrorState } from '@/components/patterns/data-state'
 import { Page, PageHeader } from '@/components/patterns/page-header'
-import { SelectControl } from '@/components/patterns/fields'
-import { useConfirm } from '@/components/patterns/confirm'
 import { credentialsApi } from '@/api/endpoints/credentials'
-import { DISABLED_REASONS, DISABLED_REASON_CODES } from '@/domain/disabled-reason'
 import { usePersistedState } from '@/lib/use-persisted-state'
 import { cn } from '@/lib/utils'
 import { fmtInt } from '@/lib/format'
-import { useCredentialSummary, useProxies } from '@/queries/shared'
+import { useCredentialSummary } from '@/queries/shared'
 import { usePaletteActions } from '@/shell/command-palette'
 import { useAccountActions } from './actions'
-import { ACCOUNT_COLUMN_LABELS, accountColumns } from './columns'
+import { accountColumns } from './columns'
 import { AccountSheet } from './detail/account-sheet'
 import { BatchEditDialog } from './batch-edit-dialog'
 import { ImportWizard } from './import-wizard'
-import { useAccountsPage, type AccountRow } from './queries'
+import { AccountsBulkBar, DisabledTriage } from './accounts-toolbars'
+import { AccountsFilterBar } from './accounts-filter-bar'
+import { searchToQuery, useAccountsPage, type AccountRow } from './queries'
 import { STATUS_SEGMENTS, type AccountsSearch } from './search'
 import { AccountCards } from './account-cards'
 
 const route = getRouteApi('/accounts')
-
-const SORT_OPTIONS: Array<{ value: NonNullable<AccountsSearch['sort']>; label: string }> = [
-  { value: 'default', label: '默认排序' },
-  { value: 'priority', label: '优先级' },
-  { value: 'usage_percentage', label: '额度使用率' },
-  { value: 'remaining_quota', label: '剩余额度' },
-  { value: 'in_flight_requests', label: '在途请求' },
-  { value: 'scheduler_score', label: '调度评分' },
-  { value: 'failure_count', label: '失败次数' },
-  { value: 'estimated_cost', label: '估算费用' },
-  { value: 'last_used_at', label: '最近使用' },
-  { value: 'created_at', label: '创建时间' },
-  { value: 'id', label: 'ID' },
-]
 
 export function AccountsPage() {
   const search = route.useSearch()
@@ -75,15 +36,52 @@ export function AccountsPage() {
 
   const page = useAccountsPage(search)
   const summary = useCredentialSummary()
-  const proxies = useProxies()
   const actions = useAccountActions()
-  const confirm = useConfirm()
   const [selection, setSelection] = useState<RowSelectionState>({})
   const [visibility, setVisibility] = usePersistedState<VisibilityState>('accounts.columns', {})
   const [batchEditOpen, setBatchEditOpen] = useState(false)
   const [qText, setQText] = useState(search.q ?? '')
   const columns = useMemo(() => accountColumns(), [])
-  const selectedIds = Object.keys(selection).filter((k) => selection[k]).map(Number)
+  /** 跨页"全选筛选结果"：保存完整的 ID 列表，翻页或改筛选时失效 */
+  const [allMatching, setAllMatching] = useState<number[] | null>(null)
+  const pageIds = Object.keys(selection)
+    .filter((k) => selection[k])
+    .map(Number)
+  const selectedIds = allMatching ?? pageIds
+  const clearSelection = () => {
+    setSelection({})
+    setAllMatching(null)
+  }
+  const filterKey = JSON.stringify({ ...search, id: undefined, tab: undefined, import: undefined, view: undefined })
+  const [lastFilterKey, setLastFilterKey] = useState(filterKey)
+  if (filterKey !== lastFilterKey) {
+    setLastFilterKey(filterKey)
+    setSelection({})
+    setAllMatching(null)
+  }
+  const selectAllMatching = useMutation({
+    mutationFn: async () => {
+      const query = searchToQuery(search)
+      const ids: number[] = []
+      for (let p = 1; ; p++) {
+        const res = await credentialsApi.list({ ...query, page: p, limit: 500 })
+        ids.push(...res.items.map((i) => i.id))
+        if (p >= res.totalPages) break
+      }
+      const reason = search.status === 'disabled' ? search.reason : undefined
+      if (!reason) return ids
+      // 禁用原因是前端筛选，需要再取一次带原因的分页数据
+      const keep = new Set<number>()
+      for (let p = 1; ; p++) {
+        const res = await credentialsApi.page({ ...query, page: p, limit: 500 })
+        res.credentials.filter((c) => (c.disabledReason ?? 'Manual') === reason).forEach((c) => keep.add(c.id))
+        if (p >= res.totalPages) break
+      }
+      return ids.filter((id) => keep.has(id))
+    },
+    onSuccess: setAllMatching,
+    meta: { error: '获取全部筛选结果失败' },
+  })
   const view = search.view ?? 'table'
   const activeStatus = search.status ?? 'all'
 
@@ -121,25 +119,11 @@ export function AccountsPage() {
     }
   }
 
-  const deleteByReason = async (reason?: string) => {
-    if (!reason) {
-      const ok = await confirm({
-        title: `删除全部 ${summary.data?.disabled ?? ''} 个已禁用账号？`,
-        description: '会删除所有处于禁用状态的账号（包括手动禁用）。操作不可撤销，建议先导出备份。',
-        confirmText: '全部删除',
-        destructive: true,
-        typeToConfirm: '删除',
-      })
-      if (!ok) return
-      const res = await credentialsApi.removeDisabled()
-      toast.success(`已删除 ${res.success} 个账号${res.failed ? `，${res.failed} 个失败` : ''}`)
-      page.refetch()
-      return
-    }
-    // 按原因删除：只作用于当前页筛选结果
-    const ids = page.rows.map((r) => r.id)
-    await actions.confirmRemove(ids, `原因为「${DISABLED_REASONS[reason as keyof typeof DISABLED_REASONS]?.label ?? reason}」的 ${ids.length} 个账号`)
-  }
+  const viewSearch = Object.fromEntries(
+    Object.entries({ ...search, id: undefined, tab: undefined, import: undefined, page: undefined, view: undefined }).filter(
+      ([, v]) => v !== undefined,
+    ),
+  ) as AccountsSearch
 
   const openRow = (r: AccountRow) => navigate({ search: (prev) => ({ ...prev, id: r.id, tab: undefined }) })
 
@@ -190,7 +174,9 @@ export function AccountsPage() {
             const count = segmentCount(seg.key)
             const active = activeStatus === seg.key
             return (
-              <button
+              <Button
+                variant="unstyled"
+                size="none"
                 key={seg.key}
                 type="button"
                 onClick={() => setSearch({ status: seg.key === 'all' ? undefined : seg.key, reason: undefined })}
@@ -201,153 +187,39 @@ export function AccountsPage() {
               >
                 {seg.label}
                 {typeof count === 'number' && (
-                  <span className={cn('num rounded-full px-1.5 text-xs', active ? 'bg-accent text-accent-foreground' : 'bg-muted')}>{count}</span>
+                  <span className={cn('num rounded-full px-1.5 text-xs', active ? 'bg-accent text-accent-foreground' : 'bg-muted')}>
+                    {count}
+                  </span>
                 )}
-              </button>
+              </Button>
             )
           })}
         </div>
 
         {activeStatus === 'disabled' && (
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="mr-1 text-xs text-muted-foreground">禁用原因</span>
-            <Button size="xs" variant={!search.reason ? 'secondary' : 'ghost'} onClick={() => setSearch({ reason: undefined })}>
-              全部
-            </Button>
-            {DISABLED_REASON_CODES.map((code) => (
-              <Button key={code} size="xs" variant={search.reason === code ? 'secondary' : 'ghost'} onClick={() => setSearch({ reason: code })}>
-                {DISABLED_REASONS[code].label}
-              </Button>
-            ))}
-            <div className="ml-auto">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button size="xs" variant="outline">
-                    按原因处置
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-64">
-                  <DropdownMenuLabel>当前筛选（{page.rows.length} 个）</DropdownMenuLabel>
-                  {search.reason && DISABLED_REASONS[search.reason as keyof typeof DISABLED_REASONS] ? (
-                    <>
-                      <DropdownMenuItem onSelect={() => actions.toggleDisabled(page.rows.map((r) => r.id), false)}>
-                        <CirclePlay /> 全部重新启用
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onSelect={() => actions.resetAndCheck(page.rows.map((r) => r.id))}>
-                        <Stethoscope /> 重置失败计数并体检
-                      </DropdownMenuItem>
-                      <DropdownMenuItem variant="destructive" onSelect={() => deleteByReason(search.reason)}>
-                        <Trash2 /> 删除当前页这些账号
-                      </DropdownMenuItem>
-                    </>
-                  ) : (
-                    <DropdownMenuItem variant="destructive" onSelect={() => deleteByReason()}>
-                      <Trash2 /> 删除全部已禁用账号
-                    </DropdownMenuItem>
-                  )}
-                  <DropdownMenuSeparator />
-                  <p className="px-2 py-1.5 text-xs text-muted-foreground">
-                    {search.reason ? DISABLED_REASONS[search.reason as keyof typeof DISABLED_REASONS]?.hint : '先选择一个禁用原因以执行对应处置'}
-                  </p>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          </div>
+          <DisabledTriage
+            reason={search.reason}
+            rows={page.rows}
+            disabledTotal={summary.data?.disabled}
+            onReason={(reason) => setSearch({ reason })}
+            onDeletedAll={() => page.refetch()}
+          />
         )}
 
-        <div className="flex flex-wrap items-center gap-2">
-          <form
-            className="w-full sm:w-72"
-            onSubmit={(e) => {
-              e.preventDefault()
-              setSearch({ q: qText.trim() || undefined })
-            }}
-          >
-            <InputGroup>
-              <InputGroupAddon>
-                <Search />
-              </InputGroupAddon>
-              <InputGroupInput placeholder="邮箱、#ID、标签…" value={qText} onChange={(e) => setQText(e.target.value)} onBlur={() => qText !== (search.q ?? '') && setSearch({ q: qText.trim() || undefined })} />
-              {qText && (
-                <InputGroupAddon align="inline-end">
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="清除搜索"
-                    onClick={() => {
-                      setQText('')
-                      setSearch({ q: undefined })
-                    }}
-                  >
-                    <X />
-                  </Button>
-                </InputGroupAddon>
-              )}
-            </InputGroup>
-          </form>
-          <FilterSelect
-            value={search.auth}
-            placeholder="认证方式"
-            onChange={(v) => setSearch({ auth: v })}
-            options={[
-              { value: 'social', label: 'Social' },
-              { value: 'idc', label: 'IdC' },
-              { value: 'external_idp', label: '外部 IdP' },
-              { value: 'api_key', label: 'API Key' },
-            ]}
-          />
-          <FilterSelect
-            value={search.sub}
-            placeholder="订阅"
-            onChange={(v) => setSearch({ sub: v })}
-            options={[
-              { value: 'power', label: 'Power' },
-              { value: 'pro_max', label: 'Pro Max' },
-              { value: 'pro_plus', label: 'Pro+' },
-              { value: 'pro', label: 'Pro' },
-              { value: 'free', label: 'Free' },
-              { value: 'unknown', label: '未知' },
-            ]}
-          />
-          <FilterSelect
-            value={search.proxy !== undefined ? String(search.proxy) : undefined}
-            placeholder="代理资源"
-            onChange={(v) => setSearch({ proxy: v ? Number(v) : undefined })}
-            options={(proxies.data?.resources ?? []).map((p) => ({ value: String(p.id), label: p.name }))}
-          />
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="sm" className={cn(search.status && !STATUS_SEGMENTS.some((s) => s.key === search.status) && 'text-primary')}>
-                <ListFilter /> 更多筛选
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent className="w-52">
-              <DropdownMenuItem onSelect={() => setSearch({ status: 'proxy_blocked' })}>代理不可用</DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => setSearch({ status: 'custom_scheduling' })}>自定义了调度参数</DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => setSearch({ status: 'unknown_subscription' })}>订阅未知</DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <div className="ml-auto flex items-center gap-2">
-            <SelectControl
-              className="h-7 w-32"
-              value={search.sort ?? 'default'}
-              onChange={(v) => setSearch({ sort: v === 'default' ? undefined : v })}
-              options={SORT_OPTIONS}
-            />
-            <Button variant="ghost" size="icon-sm" onClick={() => setSearch({ order: (search.order ?? 'desc') === 'desc' ? 'asc' : 'desc' })} aria-label="切换排序方向">
-              <span className="text-xs">{(search.order ?? 'desc') === 'desc' ? '↓' : '↑'}</span>
-            </Button>
-            {view === 'table' && <ColumnToggle columns={ACCOUNT_COLUMN_LABELS} visibility={visibility} onChange={setVisibility} />}
-            <ToggleGroup type="single" size="sm" variant="outline" value={view} onValueChange={(v) => v && setSearch({ view: v === 'table' ? undefined : (v as 'cards') }, false)}>
-              <ToggleGroupItem value="table" aria-label="表格视图">
-                表格
-              </ToggleGroupItem>
-              <ToggleGroupItem value="cards" aria-label="卡片视图">
-                卡片
-              </ToggleGroupItem>
-            </ToggleGroup>
-          </div>
-        </div>
+        <AccountsFilterBar
+          search={search}
+          setSearch={setSearch}
+          qText={qText}
+          setQText={setQText}
+          view={view}
+          viewSearch={viewSearch}
+          onApplyView={(v) => {
+            setQText(v.q ?? '')
+            navigate({ search: { ...v, view: search.view }, replace: true })
+          }}
+          visibility={visibility}
+          setVisibility={setVisibility}
+        />
 
         {page.error && !page.data ? (
           <ErrorState error={page.error} onRetry={() => page.refetch()} />
@@ -361,7 +233,10 @@ export function AccountsPage() {
             onRowClick={openRow}
             activeRowId={search.id !== undefined ? String(search.id) : undefined}
             rowSelection={selection}
-            onRowSelectionChange={setSelection}
+            onRowSelectionChange={(u) => {
+              setAllMatching(null)
+              setSelection(u)
+            }}
             columnVisibility={visibility}
             onColumnVisibilityChange={setVisibility}
             loading={page.isFetching && !page.isLoading}
@@ -399,46 +274,22 @@ export function AccountsPage() {
         )}
       </div>
 
-      <BulkBar count={selectedIds.length} onClear={() => setSelection({})}>
-        <Button size="sm" variant="ghost" onClick={() => actions.toggleDisabled(selectedIds, false).then(() => setSelection({}))}>
-          <CirclePlay /> 启用
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => actions.toggleDisabled(selectedIds, true).then(() => setSelection({}))}>
-          <Ban /> 禁用
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={async () => {
-            const res = await actions.validate.mutateAsync(selectedIds)
-            toast.success(`体检完成：成功 ${res.success}，失败 ${res.failed}，升级 ${res.upgraded}，降级 ${res.downgraded}`)
-          }}
-          disabled={actions.validate.isPending}
-        >
-          <Stethoscope /> 体检
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => actions.refreshInfo.mutate(selectedIds)} disabled={actions.refreshInfo.isPending}>
-          <RefreshCw /> 刷新额度
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => setBatchEditOpen(true)}>
-          <Pencil /> 修改
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => actions.exportCredentials.mutate({ format: 'backup-json', ids: selectedIds })}>
-          <Download /> 导出
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="text-danger"
-          onClick={async () => {
-            if (await actions.confirmRemove(selectedIds)) setSelection({})
-          }}
-        >
-          <Trash2 /> 删除
-        </Button>
-      </BulkBar>
+      <AccountsBulkBar
+        selectedIds={selectedIds}
+        clearSelection={clearSelection}
+        onEdit={() => setBatchEditOpen(true)}
+        extra={
+          allMatching ? (
+            <span className="text-xs whitespace-nowrap text-primary">（全部筛选结果）</span>
+          ) : page.data && pageIds.length === page.rows.length && page.data.filteredTotal > page.rows.length ? (
+            <Button size="xs" variant="link" onClick={() => selectAllMatching.mutate()} disabled={selectAllMatching.isPending}>
+              选中全部 {page.data.filteredTotal} 条
+            </Button>
+          ) : null
+        }
+      />
 
-      <BatchEditDialog ids={selectedIds} open={batchEditOpen} onOpenChange={setBatchEditOpen} onDone={() => setSelection({})} />
+      <BatchEditDialog ids={selectedIds} open={batchEditOpen} onOpenChange={setBatchEditOpen} onDone={clearSelection} />
       <ImportWizard open={!!search.import} onOpenChange={(open) => !open && setSearch({ import: undefined }, false)} />
       <AccountSheet
         id={search.id}
@@ -447,26 +298,5 @@ export function AccountsPage() {
         onClose={() => navigate({ search: (prev) => ({ ...prev, id: undefined, tab: undefined }), replace: true })}
       />
     </Page>
-  )
-}
-
-function FilterSelect({
-  value,
-  placeholder,
-  options,
-  onChange,
-}: {
-  value: string | undefined
-  placeholder: string
-  options: Array<{ value: string; label: string }>
-  onChange: (v: string | undefined) => void
-}) {
-  return (
-    <SelectControl
-      className={cn('h-7 w-auto min-w-24', value && 'border-primary/40 text-primary')}
-      value={value ?? '__all'}
-      onChange={(v) => onChange(v === '__all' ? undefined : v)}
-      options={[{ value: '__all', label: `${placeholder}：全部` }, ...options]}
-    />
   )
 }

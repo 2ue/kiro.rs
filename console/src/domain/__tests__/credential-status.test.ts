@@ -48,7 +48,15 @@ describe('deriveCredentialStatus', () => {
   })
 
   it('priority: disabled > rateLimited > cooling > saturated > failing', () => {
-    const all = { ...base, rateLimited: true, rateLimitRemainingSecs: 30, cooledDown: true, cooldownRemainingSecs: 10, inFlightRequests: 4, failureCount: 2 }
+    const all = {
+      ...base,
+      rateLimited: true,
+      rateLimitRemainingSecs: 30,
+      cooledDown: true,
+      cooldownRemainingSecs: 10,
+      inFlightRequests: 4,
+      failureCount: 2,
+    }
     expect(deriveCredentialStatus({ ...all, disabled: true }).primary).toBe('disabled')
     const rl = deriveCredentialStatus(all)
     expect(rl.primary).toBe('rateLimited')

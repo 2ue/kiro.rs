@@ -18,6 +18,8 @@ const buttonVariants = cva(
         destructive:
           "bg-destructive/10 text-destructive hover:bg-destructive/20 focus-visible:border-destructive/40 focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:hover:bg-destructive/30 dark:focus-visible:ring-destructive/40",
         link: "text-primary underline-offset-4 hover:underline",
+        // 仅保留焦点与禁用态，供整块可点击区域（卡片、列表行）使用
+        unstyled: "h-auto rounded-md p-0 font-normal whitespace-normal active:not-aria-[haspopup]:translate-y-0",
       },
       size: {
         default:
@@ -31,6 +33,7 @@ const buttonVariants = cva(
         "icon-sm":
           "size-7 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg",
         "icon-lg": "size-9",
+        none: "",
       },
     },
     defaultVariants: {

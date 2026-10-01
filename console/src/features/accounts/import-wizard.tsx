@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { Check, ChevronDown, CircleAlert, FileUp, Loader2, Trash2 } from 'lucide-react'
+import { Check, CircleAlert, FileUp, Loader2, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { credentialsApi } from '@/api/endpoints/credentials'
 import type {
@@ -11,19 +11,17 @@ import type {
 } from '@/api/types'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-import { NumberInput, SelectControl } from '@/components/patterns/fields'
 import { ToneBadge } from '@/components/status/tone-badge'
 import { authMethodLabel, SUBSCRIPTION_LABEL, subscriptionTier } from '@/domain/labels'
 import { dedupeCredentials, parseCredentialImportText } from '@/lib/credential-import'
 import { cn } from '@/lib/utils'
 import { qk } from '@/queries/keys'
+import { translateError } from '@/domain/upstream-error'
 import { useProxies } from '@/queries/shared'
+import { ImportDefaults, ImportResult, type ProxyMode } from './import-steps'
 
 type Step = 'source' | 'check' | 'defaults' | 'done'
 
@@ -61,7 +59,7 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
   const [dupes, setDupes] = useState(0)
   const [defaults, setDefaults] = useState<BatchCredentialImportDefaults>({ priority: 0, tags: [] })
   const [tagsText, setTagsText] = useState('')
-  const [proxyMode, setProxyMode] = useState<'none' | 'single' | 'roundrobin'>('none')
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('none')
   const [proxyIds, setProxyIds] = useState<number[]>([])
   const [duplicateMode, setDuplicateMode] = useState<'skip' | 'error'>('skip')
   const [autoDiscover, setAutoDiscover] = useState(false)
@@ -146,7 +144,10 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
 
   const submit = useMutation({
     mutationFn: () => {
-      const tags = tagsText.split(/[,，\n]/).map((t) => t.trim()).filter(Boolean)
+      const tags = tagsText
+        .split(/[,，\n]/)
+        .map((t) => t.trim())
+        .filter(Boolean)
       const payload: BatchCredentialImportDefaults = {
         ...defaults,
         tags,
@@ -193,7 +194,7 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
               <li key={s.key} className="flex items-center gap-2">
                 <span
                   className={cn(
-                    'flex size-5 items-center justify-center rounded-full border text-[11px] font-medium',
+                    'flex size-5 items-center justify-center rounded-full border text-2xs font-medium',
                     i < stepIndex && 'border-primary bg-primary text-primary-foreground',
                     i === stepIndex && 'border-primary text-primary',
                     i > stepIndex && 'text-muted-foreground',
@@ -232,7 +233,8 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
                 <Button size="sm" variant="outline" onClick={() => fileRef.current?.click()}>
                   选择文件
                 </Button>
-                <input
+                {/* ui-rules-allow: 文件选择必须使用原生 input */}
+                <input // ui-rules-allow: file input
                   ref={fileRef}
                   type="file"
                   multiple
@@ -285,9 +287,7 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
                     <label key={i} className="flex cursor-pointer items-center gap-3 px-3 py-2 text-sm hover:bg-muted/40">
                       <Checkbox
                         checked={c.include}
-                        onCheckedChange={(v) =>
-                          setCandidates((list) => list.map((x, j) => (j === i ? { ...x, include: v === true } : x)))
-                        }
+                        onCheckedChange={(v) => setCandidates((list) => list.map((x, j) => (j === i ? { ...x, include: v === true } : x)))}
                       />
                       <span className="num w-8 text-xs text-muted-foreground">{i + 1}</span>
                       <span className="min-w-0 flex-1 truncate">{credentialHint(c.credential)}</span>
@@ -299,7 +299,7 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
                           <ToneBadge tone="success">{c.check.subscriptionTitle ? SUBSCRIPTION_LABEL[tier] : '可用'}</ToneBadge>
                         ) : (
                           <ToneBadge tone="danger" title={c.check.error ?? undefined}>
-                            失败
+                            {c.check.error ? translateError(c.check.error)?.title : '失败'}
                           </ToneBadge>
                         )
                       ) : (
@@ -313,124 +313,26 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
           )}
 
           {step === 'defaults' && (
-            <div className="space-y-4">
-              <p className="text-xs text-muted-foreground">以下参数只应用到未单独设置该字段的账号。</p>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div className="space-y-1.5">
-                  <Label>优先级</Label>
-                  <NumberInput value={defaults.priority ?? 0} min={0} onChange={(v) => setDefaults((d) => ({ ...d, priority: v ?? 0 }))} />
-                </div>
-                <div className="space-y-1.5">
-                  <Label>最大并发</Label>
-                  <NumberInput
-                    value={defaults.maxConcurrentRequests ?? null}
-                    allowEmpty
-                    min={0}
-                    placeholder="继承全局"
-                    onChange={(v) => setDefaults((d) => ({ ...d, maxConcurrentRequests: v }))}
-                  />
-                </div>
-                <div className="space-y-1.5 sm:col-span-2">
-                  <Label htmlFor="import-tags">标签</Label>
-                  <Input id="import-tags" value={tagsText} onChange={(e) => setTagsText(e.target.value)} placeholder="逗号分隔，例如 team-a, 生产" />
-                </div>
-                <div className="space-y-1.5 sm:col-span-2">
-                  <Label>出站代理</Label>
-                  <SelectControl
-                    value={proxyMode}
-                    onChange={(v) => {
-                      setProxyMode(v)
-                      setProxyIds([])
-                    }}
-                    options={[
-                      { value: 'none', label: '不绑定（继承全局）' },
-                      { value: 'single', label: '全部绑定同一个代理资源' },
-                      { value: 'roundrobin', label: '按顺序轮流绑定多个代理资源' },
-                    ]}
-                  />
-                  {proxyMode !== 'none' && (
-                    <div className="flex flex-wrap gap-1.5 pt-1">
-                      {proxyOptions.length === 0 && <span className="text-xs text-muted-foreground">没有可用的代理资源</span>}
-                      {proxyOptions.map((p) => {
-                        const on = proxyIds.includes(p.id)
-                        return (
-                          <Button
-                            key={p.id}
-                            size="xs"
-                            variant={on ? 'default' : 'outline'}
-                            onClick={() =>
-                              setProxyIds((ids) =>
-                                proxyMode === 'single' ? [p.id] : on ? ids.filter((x) => x !== p.id) : [...ids, p.id],
-                              )
-                            }
-                          >
-                            {p.name}
-                          </Button>
-                        )
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
-              <Collapsible>
-                <CollapsibleTrigger className="group flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-                  <ChevronDown className="size-3.5 transition-transform group-data-[state=open]:rotate-180" />
-                  高级
-                </CollapsibleTrigger>
-                <CollapsibleContent className="mt-3 grid gap-4 sm:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <Label>每分钟请求上限</Label>
-                    <NumberInput value={defaults.rpm ?? null} allowEmpty min={0} placeholder="继承全局" onChange={(v) => setDefaults((d) => ({ ...d, rpm: v }))} />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>预热请求数</Label>
-                    <NumberInput value={defaults.warmupRemaining ?? null} allowEmpty min={0} placeholder="使用全局" onChange={(v) => setDefaults((d) => ({ ...d, warmupRemaining: v ?? undefined }))} />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label>重复账号</Label>
-                    <SelectControl
-                      value={duplicateMode}
-                      onChange={setDuplicateMode}
-                      options={[
-                        { value: 'skip', label: '跳过已存在的账号' },
-                        { value: 'error', label: '视为错误' },
-                      ]}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <ToggleLine label="导入后先保持禁用" checked={!!defaults.disabled} onChange={(v) => setDefaults((d) => ({ ...d, disabled: v }))} />
-                    <ToggleLine label="导入后开启超额" checked={!!defaults.enableOverageAfterImport} onChange={(v) => setDefaults((d) => ({ ...d, enableOverageAfterImport: v }))} />
-                    <ToggleLine label="自动发现支持的模型" checked={autoDiscover} onChange={setAutoDiscover} />
-                  </div>
-                </CollapsibleContent>
-              </Collapsible>
-            </div>
+            <ImportDefaults
+              {...{
+                defaults,
+                setDefaults,
+                tagsText,
+                setTagsText,
+                proxyMode,
+                setProxyMode,
+                proxyIds,
+                setProxyIds,
+                duplicateMode,
+                setDuplicateMode,
+                autoDiscover,
+                setAutoDiscover,
+                proxyOptions,
+              }}
+            />
           )}
 
-          {step === 'done' && result && (
-            <div className="space-y-4">
-              <div className="grid grid-cols-3 gap-3">
-                <ResultStat label="成功" value={result.success} tone="text-success" />
-                <ResultStat label="跳过" value={result.skipped} tone="text-muted-foreground" />
-                <ResultStat label="失败" value={result.failed} tone="text-danger" />
-              </div>
-              {result.items.some((i) => !i.ok || i.warning) && (
-                <div className="divide-y rounded-lg border text-xs">
-                  {result.items
-                    .filter((i) => !i.ok || i.warning)
-                    .map((i) => (
-                      <div key={i.index} className="flex gap-3 px-3 py-2">
-                        <span className="num w-8 text-muted-foreground">{i.index + 1}</span>
-                        <span className="min-w-0 flex-1 truncate">{i.email ?? (i.credentialId ? `#${i.credentialId}` : '')}</span>
-                        <span className={i.ok ? 'text-warning' : i.skipped ? 'text-muted-foreground' : 'text-danger'}>
-                          {i.error ?? i.warning ?? (i.skipped ? '已跳过' : '')}
-                        </span>
-                      </div>
-                    ))}
-                </div>
-              )}
-            </div>
-          )}
+          {step === 'done' && result && <ImportResult result={result} />}
         </div>
 
         <DialogFooter className="m-0 rounded-b-xl border-t p-4">
@@ -478,23 +380,5 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  )
-}
-
-function ToggleLine({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <label className="flex items-center justify-between gap-2 text-sm">
-      {label}
-      <Switch checked={checked} onCheckedChange={onChange} />
-    </label>
-  )
-}
-
-function ResultStat({ label, value, tone }: { label: string; value: number; tone: string }) {
-  return (
-    <div className="rounded-lg border p-3 text-center">
-      <div className={cn('num text-2xl font-semibold', tone)}>{value}</div>
-      <div className="text-xs text-muted-foreground">{label}</div>
-    </div>
   )
 }

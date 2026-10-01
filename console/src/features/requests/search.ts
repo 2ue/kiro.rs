@@ -1,23 +1,23 @@
-import { z } from 'zod'
+import { opt, searchSchema } from '@/lib/search-schema'
 
-export const requestsSearchSchema = z.object({
-  q: z.string().optional().catch(undefined),
-  status: z.enum(['success', 'error', 'stream_error', 'upstream_timeout', 'client_dropped']).optional().catch(undefined),
-  route: z.enum(['local_credential', 'external_pool']).optional().catch(undefined),
-  model: z.string().optional().catch(undefined),
-  endpoint: z.string().optional().catch(undefined),
-  credentialId: z.number().int().optional().catch(undefined),
-  poolId: z.number().int().optional().catch(undefined),
-  keyId: z.string().optional().catch(undefined),
-  conversationId: z.string().optional().catch(undefined),
-  stream: z.boolean().optional().catch(undefined),
-  minTtft: z.number().optional().catch(undefined),
-  minCacheRead: z.number().optional().catch(undefined),
-  since: z.string().optional().catch(undefined),
-  until: z.string().optional().catch(undefined),
-  page: z.number().int().min(1).optional().catch(undefined),
+export const requestsSearchSchema = searchSchema({
+  q: opt.str(),
+  status: opt.enum(['success', 'error', 'stream_error', 'upstream_timeout', 'client_dropped']),
+  route: opt.enum(['local_credential', 'external_pool']),
+  model: opt.str(),
+  endpoint: opt.str(),
+  credentialId: opt.int(),
+  poolId: opt.int(),
+  keyId: opt.str(),
+  conversationId: opt.str(),
+  stream: opt.bool(),
+  minTtft: opt.num(),
+  minCacheRead: opt.num(),
+  since: opt.str(),
+  until: opt.str(),
+  page: opt.int(1),
   /** 打开详情的请求 ID */
-  id: z.string().optional().catch(undefined),
+  id: opt.str(),
 })
 
-export type RequestsSearch = z.infer<typeof requestsSearchSchema>
+export type RequestsSearch = ReturnType<typeof requestsSearchSchema>

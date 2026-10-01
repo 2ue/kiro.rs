@@ -99,7 +99,8 @@ export function CleanupDialog({ open, onOpenChange }: { open: boolean; onOpenCha
         </div>
         {preview.data && (
           <p className="text-sm">
-            将删除 <span className="num font-semibold">{fmtInt(preview.data.matchedRows)}</span> 条早于 {fmtDateTime(preview.data.cutoffAt)} 的记录
+            将删除 <span className="num font-semibold">{fmtInt(preview.data.matchedRows)}</span> 条早于 {fmtDateTime(preview.data.cutoffAt)}{' '}
+            的记录
           </p>
         )}
         <DialogFooter>

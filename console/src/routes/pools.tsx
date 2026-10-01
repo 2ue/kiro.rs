@@ -1,11 +1,12 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { z } from 'zod'
+import { opt, searchSchema } from '@/lib/search-schema'
 import { PoolsPage } from '@/features/pools/pools-page'
 
 export const Route = createFileRoute('/pools')({
-  validateSearch: z.object({
-    id: z.number().int().optional().catch(undefined),
-    tab: z.enum(['pools', 'policy']).optional().catch(undefined),
+  validateSearch: searchSchema({
+    id: opt.int(),
+    tab: opt.enum(['pools', 'policy']),
+    focus: opt.str(),
   }),
   component: PoolsPage,
 })

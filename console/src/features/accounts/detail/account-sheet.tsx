@@ -67,7 +67,12 @@ export function AccountSheet({
                   <Ban /> 禁用
                 </Button>
               )}
-              <Button size="sm" variant="outline" onClick={() => actions.refreshInfo.mutate([row.id])} disabled={actions.refreshInfo.isPending}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => actions.refreshInfo.mutate([row.id])}
+                disabled={actions.refreshInfo.isPending}
+              >
                 刷新额度
               </Button>
             </div>

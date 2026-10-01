@@ -89,10 +89,8 @@ async function request<T>(method: string, path: string, options: RequestOptions 
 }
 
 export const http = {
-  get: <T>(path: string, query?: Query, options?: Omit<RequestOptions, 'query' | 'body'>) =>
-    request<T>('GET', path, { ...options, query }),
-  post: <T>(path: string, body?: unknown, options?: Omit<RequestOptions, 'body'>) =>
-    request<T>('POST', path, { ...options, body }),
+  get: <T>(path: string, query?: Query, options?: Omit<RequestOptions, 'query' | 'body'>) => request<T>('GET', path, { ...options, query }),
+  post: <T>(path: string, body?: unknown, options?: Omit<RequestOptions, 'body'>) => request<T>('POST', path, { ...options, body }),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, { body }),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, { body }),
   delete: <T>(path: string) => request<T>('DELETE', path),

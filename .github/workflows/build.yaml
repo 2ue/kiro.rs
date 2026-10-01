@@ -176,10 +176,15 @@ jobs:
         working-directory: ui
         run: pnpm build
 
+      - name: Check console
+        if: ${{ env.QUALITY_PROFILE == 'full' }}
+        working-directory: console
+        run: pnpm check && pnpm test
+
       - name: Build console
         if: ${{ env.QUALITY_PROFILE == 'full' }}
         working-directory: console
-        run: pnpm build
+        run: pnpm build && pnpm size
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check

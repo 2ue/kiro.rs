@@ -1,10 +1,4 @@
-import type {
-  CredentialStatusItem,
-  LoadBalancingMode,
-  UsageRecord,
-  UsageRecordStatus,
-  UsageSource,
-} from '@/api/types'
+import type { CredentialStatusItem, LoadBalancingMode, UsageRecord, UsageRecordStatus, UsageSource } from '@/api/types'
 
 export function authMethodLabel(method: string | null | undefined): string {
   switch (method) {

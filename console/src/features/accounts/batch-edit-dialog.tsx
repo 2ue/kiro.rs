@@ -11,10 +11,26 @@ import { useAccountActions } from './actions'
 type FieldKey = 'priority' | 'concurrency' | 'rpm' | 'rateLimitAutoDisable' | 'proxy'
 
 /** 批量修改：勾选要修改的字段，未勾选的字段保持原值 */
-export function BatchEditDialog({ ids, open, onOpenChange, onDone }: { ids: number[]; open: boolean; onOpenChange: (v: boolean) => void; onDone: () => void }) {
+export function BatchEditDialog({
+  ids,
+  open,
+  onOpenChange,
+  onDone,
+}: {
+  ids: number[]
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  onDone: () => void
+}) {
   const actions = useAccountActions()
   const proxies = useProxies()
-  const [enabled, setEnabled] = useState<Record<FieldKey, boolean>>({ priority: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false })
+  const [enabled, setEnabled] = useState<Record<FieldKey, boolean>>({
+    priority: false,
+    concurrency: false,
+    rpm: false,
+    rateLimitAutoDisable: false,
+    proxy: false,
+  })
   const [priority, setPriority] = useState(0)
   const [concurrency, setConcurrency] = useState<number | null>(null)
   const [rpm, setRpm] = useState<number | null>(null)
@@ -62,7 +78,10 @@ export function BatchEditDialog({ ids, open, onOpenChange, onDone }: { ids: numb
             <SelectControl
               value={proxyId}
               onChange={setProxyId}
-              options={[{ value: 'none', label: '解除绑定（继承全局）' }, ...(proxies.data?.resources ?? []).map((p) => ({ value: String(p.id), label: p.name }))]}
+              options={[
+                { value: 'none', label: '解除绑定（继承全局）' },
+                ...(proxies.data?.resources ?? []).map((p) => ({ value: String(p.id), label: p.name })),
+              ]}
             />
           </Row>
         </div>
@@ -79,7 +98,17 @@ export function BatchEditDialog({ ids, open, onOpenChange, onDone }: { ids: numb
   )
 }
 
-function Row({ checked, onToggle, label, children }: { checked: boolean; onToggle: (v: boolean | 'indeterminate') => void; label: string; children: React.ReactNode }) {
+function Row({
+  checked,
+  onToggle,
+  label,
+  children,
+}: {
+  checked: boolean
+  onToggle: (v: boolean | 'indeterminate') => void
+  label: string
+  children: React.ReactNode
+}) {
   return (
     <div className="grid grid-cols-[auto_8rem_1fr] items-center gap-3 py-2">
       <Checkbox checked={checked} onCheckedChange={onToggle} aria-label={`修改${label}`} />

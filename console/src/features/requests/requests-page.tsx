@@ -15,6 +15,7 @@ import { ColumnToggle } from '@/components/data-table/column-toggle'
 import { EmptyState, ErrorState } from '@/components/patterns/data-state'
 import { Page, PageHeader } from '@/components/patterns/page-header'
 import { SelectControl } from '@/components/patterns/fields'
+import { SavedViews } from '@/components/patterns/saved-views'
 import { usePersistedState } from '@/lib/use-persisted-state'
 import { usePollInterval } from '@/stores/ui-prefs'
 import { usePoolsList } from '@/queries/shared'
@@ -55,7 +56,7 @@ function toQuery(s: RequestsSearch): Omit<UsageRecordsPageQuery, 'page' | 'limit
     stream: s.stream,
     minFirstTokenLatencyMs: s.minTtft,
     minCacheRead: s.minCacheRead,
-    since: s.since ? presetSince(s.since) ?? s.since : undefined,
+    since: s.since ? (presetSince(s.since) ?? s.since) : undefined,
     until: s.until,
   }
 }
@@ -83,9 +84,17 @@ export function RequestsPage() {
   const columns = useMemo(() => requestColumns(), [])
   const cached = search.id ? records.find((r) => r.id === search.id) : undefined
 
+  const viewSearch = Object.fromEntries(
+    Object.entries({ ...search, id: undefined, page: undefined }).filter(([, v]) => v !== undefined),
+  ) as RequestsSearch
+
   const activeFilters: Array<{ key: keyof RequestsSearch; label: string }> = []
   if (search.credentialId) activeFilters.push({ key: 'credentialId', label: `账号 #${search.credentialId}` })
-  if (search.poolId) activeFilters.push({ key: 'poolId', label: `外部池 ${pools.data?.pools.find((p) => p.id === search.poolId)?.name ?? `#${search.poolId}`}` })
+  if (search.poolId)
+    activeFilters.push({
+      key: 'poolId',
+      label: `外部池 ${pools.data?.pools.find((p) => p.id === search.poolId)?.name ?? `#${search.poolId}`}`,
+    })
   if (search.conversationId) activeFilters.push({ key: 'conversationId', label: `会话 ${search.conversationId.slice(0, 12)}…` })
   if (search.keyId) activeFilters.push({ key: 'keyId', label: `Key ${search.keyId}` })
   if (search.model) activeFilters.push({ key: 'model', label: `模型 ${search.model}` })
@@ -175,6 +184,15 @@ export function RequestsPage() {
           ]}
         />
         <AdvancedFilters search={search} onApply={setSearch} />
+        <SavedViews
+          scope="requests"
+          current={viewSearch}
+          isEmpty={Object.keys(viewSearch).length === 0}
+          onApply={(v) => {
+            setQText(v.q ?? '')
+            navigate({ search: v, replace: true })
+          }}
+        />
         <div className="ml-auto">
           <ColumnToggle columns={REQUEST_COLUMN_LABELS} visibility={visibility} onChange={setVisibility} />
         </div>
@@ -193,9 +211,7 @@ export function RequestsPage() {
           <Button
             variant="link"
             size="xs"
-            onClick={() =>
-              setSearch(Object.fromEntries(activeFilters.map((f) => [f.key, undefined])) as Partial<RequestsSearch>)
-            }
+            onClick={() => setSearch(Object.fromEntries(activeFilters.map((f) => [f.key, undefined])) as Partial<RequestsSearch>)}
           >
             清除全部
           </Button>
@@ -217,7 +233,13 @@ export function RequestsPage() {
           maxHeight="calc(100svh - 17rem)"
           loading={q.isFetching && !q.isFetchingNextPage && !q.isLoading}
           rowClassName={(r) => cn(r.status !== 'success' && 'bg-danger-subtle/20')}
-          empty={q.isLoading ? <div className="p-6 text-center text-sm text-muted-foreground">加载中…</div> : <EmptyState title="没有匹配的请求" />}
+          empty={
+            q.isLoading ? (
+              <div className="p-6 text-center text-sm text-muted-foreground">加载中…</div>
+            ) : (
+              <EmptyState title="没有匹配的请求" />
+            )
+          }
         />
       )}
       <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -256,7 +278,12 @@ function AdvancedFilters({ search, onApply }: { search: RequestsSearch; onApply:
   const field = (key: keyof typeof draft, label: string, placeholder?: string) => (
     <div className="space-y-1">
       <Label className="text-xs">{label}</Label>
-      <Input value={draft[key]} placeholder={placeholder} onChange={(e) => setDraft((d) => ({ ...d, [key]: e.target.value }))} className="h-7" />
+      <Input
+        value={draft[key]}
+        placeholder={placeholder}
+        onChange={(e) => setDraft((d) => ({ ...d, [key]: e.target.value }))}
+        className="h-7"
+      />
     </div>
   )
   return (

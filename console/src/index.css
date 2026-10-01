@@ -8,6 +8,8 @@
 @theme inline {
   --font-sans: 'Geist Variable', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
   --font-heading: var(--font-sans);
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
   --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
 
   --color-background: var(--background);

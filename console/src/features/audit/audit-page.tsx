@@ -67,8 +67,9 @@ export function AuditPage() {
               <ol className="relative ml-2 space-y-1 border-l pl-5">
                 {g.items.map((r) => (
                   <li key={r.id}>
-                    <button
-                      type="button"
+                    <Button
+                      variant="unstyled"
+                      size="none"
                       onClick={() => setSelected(r)}
                       className="relative flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted/60"
                     >
@@ -85,7 +86,7 @@ export function AuditPage() {
                       </span>
                       {!r.success && <ToneBadge tone="danger">失败</ToneBadge>}
                       <span className="shrink-0 text-xs text-muted-foreground">{r.actor}</span>
-                    </button>
+                    </Button>
                   </li>
                 ))}
               </ol>
@@ -96,7 +97,12 @@ export function AuditPage() {
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span className="num">第 {page} 页</span>
         <div className="flex gap-1">
-          <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => navigate({ search: { page: page - 1 > 1 ? page - 1 : undefined } })}>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={page <= 1}
+            onClick={() => navigate({ search: { page: page - 1 > 1 ? page - 1 : undefined } })}
+          >
             <ChevronLeft /> 上一页
           </Button>
           <Button size="sm" variant="outline" disabled={!q.data?.hasNext} onClick={() => navigate({ search: { page: page + 1 } })}>
@@ -120,13 +126,17 @@ export function AuditPage() {
                   <Stat label="对象类型">{OBJECT_LABEL[selected.objectType] ?? selected.objectType}</Stat>
                   <Stat label="对象 ID">{selected.objectId ?? '—'}</Stat>
                 </StatGrid>
-                {selected.errorMessage && <p className="rounded-lg border border-danger/30 bg-danger-subtle/40 p-3 text-xs text-danger">{selected.errorMessage}</p>}
+                {selected.errorMessage && (
+                  <p className="rounded-lg border border-danger/30 bg-danger-subtle/40 p-3 text-xs text-danger">{selected.errorMessage}</p>
+                )}
                 <div className="relative">
                   <div className="mb-1 text-xs text-muted-foreground">详情</div>
                   <div className="absolute top-6 right-1">
                     <CopyButton value={JSON.stringify(selected.detail, null, 2)} />
                   </div>
-                  <pre className="max-h-[60svh] overflow-auto rounded-md bg-muted/60 p-3 font-mono text-[11px]">{JSON.stringify(selected.detail, null, 2)}</pre>
+                  <pre className="max-h-[60svh] overflow-auto rounded-md bg-muted/60 p-3 font-mono text-2xs">
+                    {JSON.stringify(selected.detail, null, 2)}
+                  </pre>
                 </div>
               </div>
             </>

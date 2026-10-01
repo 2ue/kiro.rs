@@ -1,6 +1,7 @@
 import { MutationCache, QueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { ApiError, errorMessage } from '@/api/client'
+import { translateError } from '@/domain/upstream-error'
 
 declare module '@tanstack/react-query' {
   interface Register {
@@ -33,7 +34,9 @@ export const queryClient = new QueryClient({
     onError: (error, _vars, _ctx, mutation) => {
       const prefix = mutation.meta?.error
       if (prefix === false) return
-      toast.error(prefix ? `${prefix}：${errorMessage(error)}` : errorMessage(error))
+      const t = translateError(errorMessage(error))
+      const title = t?.title ?? errorMessage(error)
+      toast.error(prefix ? `${prefix}：${title}` : title, { description: t?.hint })
     },
   }),
 })

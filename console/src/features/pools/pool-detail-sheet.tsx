@@ -13,6 +13,7 @@ import { Stat, StatGrid } from '@/components/patterns/stat'
 import { ToneBadge } from '@/components/status/tone-badge'
 import { fmtDateTime, fmtDuration, fmtInt, fmtMs, fmtPct, fmtUsd } from '@/lib/format'
 import { qk } from '@/queries/keys'
+import { ErrorText } from '@/components/patterns/error-text'
 import { poolState } from './queries'
 
 const STANDARD_TEST_MODELS = ['claude-sonnet-4-5', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-6', 'claude-opus-4-5']
@@ -41,7 +42,9 @@ export function PoolDetailSheet({
 }) {
   const queryClient = useQueryClient()
   const p = status?.pool
-  const options = [...new Set([...(p?.supportedModels ?? []).map(toStandardModelId).filter((m): m is string => !!m), ...STANDARD_TEST_MODELS])]
+  const options = [
+    ...new Set([...(p?.supportedModels ?? []).map(toStandardModelId).filter((m): m is string => !!m), ...STANDARD_TEST_MODELS]),
+  ]
   const [model, setModel] = useState(options[0] ?? 'claude-sonnet-4-5')
   const [prompt, setPrompt] = useState('hi')
   const test = useMutation({ mutationFn: () => poolsApi.test(p!.id, { model, prompt }), meta: { error: '测试失败' } })
@@ -82,8 +85,8 @@ export function PoolDetailSheet({
               {st.reason && <p className="rounded-lg border bg-muted/40 p-3 text-xs">{st.reason}</p>}
               {p.autoDisabled && p.autoDisabledLastError && (
                 <div className="rounded-lg border border-danger/30 bg-danger-subtle/40 p-3 text-xs">
-                  <div className="font-medium text-danger">触发自动禁用的错误</div>
-                  <p className="mt-1 break-all">{p.autoDisabledLastError}</p>
+                  <div className="mb-1 text-muted-foreground">触发自动禁用的错误</div>
+                  <ErrorText error={p.autoDisabledLastError} />
                   {p.autoDisabledAt && <p className="mt-1 text-muted-foreground">{fmtDateTime(p.autoDisabledAt)}</p>}
                 </div>
               )}
@@ -103,7 +106,9 @@ export function PoolDetailSheet({
                     {q?.sampleCount ?? 0}
                     {q && !q.scoringActive ? '（未生效）' : ''}
                   </Stat>
-                  <Stat label="降级">{q?.inProbation ? `层级 ${q.probationLevel} · 剩余 ${fmtDuration(q.probationRemainingSecs)}` : '无'}</Stat>
+                  <Stat label="降级">
+                    {q?.inProbation ? `层级 ${q.probationLevel} · 剩余 ${fmtDuration(q.probationRemainingSecs)}` : '无'}
+                  </Stat>
                 </StatGrid>
               </section>
               {billing && (
@@ -159,7 +164,9 @@ export function PoolDetailSheet({
                       {test.data.ok ? '成功' : '失败'}
                       {test.data.status ? ` · HTTP ${test.data.status}` : ''} · {test.data.message}
                     </div>
-                    {test.data.response && <p className="mt-1 line-clamp-4 whitespace-pre-wrap text-muted-foreground">{test.data.response}</p>}
+                    {test.data.response && (
+                      <p className="mt-1 line-clamp-4 whitespace-pre-wrap text-muted-foreground">{test.data.response}</p>
+                    )}
                   </div>
                 )}
               </section>

@@ -133,8 +133,25 @@ export function PoolFormSheet({ pool, open, onOpenChange }: { pool?: ExternalPoo
             )}
             <SettingRow label="支持的模型" description="为空表示不限制；调度时只把这些模型的请求发给该池" stacked>
               <div className="space-y-2">
-                <ListInput value={d.supportedModels} onChange={(v) => set('supportedModels', v)} rows={3} parse={(raw) => [...new Set(raw.split(/[\s,，;；]+/).map((v) => v.trim()).filter(Boolean))]} />
-                <Button size="xs" variant="outline" onClick={() => discover.mutate()} disabled={discover.isPending || !d.baseUrl.trim() || (!pool && !d.apiKey.trim())}>
+                <ListInput
+                  value={d.supportedModels}
+                  onChange={(v) => set('supportedModels', v)}
+                  rows={3}
+                  parse={(raw) => [
+                    ...new Set(
+                      raw
+                        .split(/[\s,，;；]+/)
+                        .map((v) => v.trim())
+                        .filter(Boolean),
+                    ),
+                  ]}
+                />
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() => discover.mutate()}
+                  disabled={discover.isPending || !d.baseUrl.trim() || (!pool && !d.apiKey.trim())}
+                >
                   <ScanSearch /> 从上游发现
                 </Button>
               </div>
@@ -154,20 +171,41 @@ export function PoolFormSheet({ pool, open, onOpenChange }: { pool?: ExternalPoo
             {d.modelMappingMode !== 'passthrough' && (
               <>
                 <SettingRow label="映射规则" description="每行一条：源模型 -> 目标模型" stacked>
-                  <Textarea rows={4} value={d.modelMappingText} onChange={(e) => set('modelMappingText', e.target.value)} className="font-mono text-xs" placeholder="claude-sonnet-4.5 -> claude-sonnet-4-5" />
+                  <Textarea
+                    rows={4}
+                    value={d.modelMappingText}
+                    onChange={(e) => set('modelMappingText', e.target.value)}
+                    className="font-mono text-xs"
+                    placeholder="claude-sonnet-4.5 -> claude-sonnet-4-5"
+                  />
                 </SettingRow>
                 <SettingRow label="必须命中映射" description="未命中任何规则时拒绝请求">
                   <ToggleControl checked={d.modelMappingRequireMatch} onChange={(v) => set('modelMappingRequireMatch', v)} />
                 </SettingRow>
-                <SettingRow label="未命中时点号转横杠" description="例如 claude-opus-4.8 → claude-opus-4-8" disabled={d.modelMappingRequireMatch}>
-                  <ToggleControl checked={d.normalizeModelVersionDots} disabled={d.modelMappingRequireMatch} onChange={(v) => set('normalizeModelVersionDots', v)} />
+                <SettingRow
+                  label="未命中时点号转横杠"
+                  description="例如 claude-opus-4.8 → claude-opus-4-8"
+                  disabled={d.modelMappingRequireMatch}
+                >
+                  <ToggleControl
+                    checked={d.normalizeModelVersionDots}
+                    disabled={d.modelMappingRequireMatch}
+                    onChange={(v) => set('normalizeModelVersionDots', v)}
+                  />
                 </SettingRow>
               </>
             )}
           </Group>
 
           <Group title="协议细节">
-            <SettingRow label="请求体处理" description={d.requestBodyMode === 'raw_passthrough' ? '请求体不经过本系统的解析与修正，原样转发' : '经过标准 Anthropic 处理链路（图片、请求体保护、thinking 兼容等）'}>
+            <SettingRow
+              label="请求体处理"
+              description={
+                d.requestBodyMode === 'raw_passthrough'
+                  ? '请求体不经过本系统的解析与修正，原样转发'
+                  : '经过标准 Anthropic 处理链路（图片、请求体保护、thinking 兼容等）'
+              }
+            >
               <SelectControl
                 value={d.requestBodyMode}
                 onChange={(v) => set('requestBodyMode', v)}
@@ -179,7 +217,10 @@ export function PoolFormSheet({ pool, open, onOpenChange }: { pool?: ExternalPoo
             </SettingRow>
             {d.requestBodyMode === 'raw_passthrough' && (
               <SettingRow label="写回顶层 model" description="按模型映射规则改写 raw JSON 的顶层 model">
-                <ToggleControl checked={d.rawModelMode === 'rewrite_top_level'} onChange={(v) => set('rawModelMode', v ? 'rewrite_top_level' : 'none')} />
+                <ToggleControl
+                  checked={d.rawModelMode === 'rewrite_top_level'}
+                  onChange={(v) => set('rawModelMode', v ? 'rewrite_top_level' : 'none')}
+                />
               </SettingRow>
             )}
             <SettingRow label="下游 usage 口径">
@@ -219,7 +260,12 @@ export function PoolFormSheet({ pool, open, onOpenChange }: { pool?: ExternalPoo
               </SettingRow>
             )}
             <SettingRow label="请求头覆盖" description="每行一个 name: value" stacked>
-              <Textarea rows={3} value={d.headerOverridesText} onChange={(e) => set('headerOverridesText', e.target.value)} className="font-mono text-xs" />
+              <Textarea
+                rows={3}
+                value={d.headerOverridesText}
+                onChange={(e) => set('headerOverridesText', e.target.value)}
+                className="font-mono text-xs"
+              />
             </SettingRow>
             <SettingRow label="保留请求路径" description="把入口路径拼接到 Base URL 后">
               <ToggleControl checked={d.preservePath} onChange={(v) => set('preservePath', v)} />
