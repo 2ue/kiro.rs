@@ -66,6 +66,7 @@ function TwoCol({ children }: { children: React.ReactNode }) {
 
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
 type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
+type StableSegmentPatch = NonNullable<CacheRoutePolicyPatch['stableSegment']>
 type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
 
 const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
@@ -108,6 +109,32 @@ function defaultKiroRsToolPatch(): KiroRsToolPatch {
   }
 }
 
+// 与后端 StableSegmentCachePolicy::default() 保持一致
+function defaultStableSegmentPatch(): StableSegmentPatch {
+  return {
+    coverageRatio: 0.9,
+    maxCoverageTokens: 120000,
+    minTotalInputTokens: 4096,
+    minSegmentTokens: 1024,
+    incrementalCreateEnabled: true,
+    maxNewCreationTokensPerRequest: 30000,
+    includeTools: true,
+    includeSystem: true,
+    includeHistory: true,
+    historyMessageLimit: 40,
+    honorExplicitCacheControl: true,
+    autoCacheSystem: true,
+    autoCacheTools: true,
+    autoCacheHistoryMessageEnds: true,
+    cacheCurrentUserStablePrefix: false,
+    currentUserStablePrefixMaxTokens: 0,
+    defaultTtlSecs: 300,
+    extendedTtlSecs: 3600,
+    reportedInputMinTokens: 32,
+    reportedInputMaxTokens: 256,
+  }
+}
+
 function defaultUsagePatch(prefix: string): ReportedUsagePathPolicy {
   if (prefix === '/cc') return pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000))
   if (prefix === '/ha') return pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy())
@@ -135,6 +162,14 @@ function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): Ca
       kiroRsTool: defaultKiroRsToolPatch(),
     }
   }
+  if (cacheType === 'stable_segment_cache') {
+    return {
+      cacheType: 'stable_segment_cache',
+      routeNamespace: defaultRouteNamespace(prefix),
+      reportedUsage: defaultUsagePatch(prefix),
+      stableSegment: defaultStableSegmentPatch(),
+    }
+  }
   return {
     cacheType: 'current_high_cache',
     routeNamespace: defaultRouteNamespace(prefix),
@@ -150,6 +185,9 @@ function cacheTypeDesc(cacheType: CacheRoutePolicyPatch['cacheType']): string {
   }
   if (cacheType === 'kiro_rs_tool') {
     return '按 Kiro-RS Tool 的会话和路径规则计算缓存；第一次请求不会显示缓存读取，失败请求不会写入缓存。'
+  }
+  if (cacheType === 'stable_segment_cache') {
+    return '按请求里稳定不变的 tools、system 和历史消息计算缓存，只按会话和路径隔离；切换账号或外部池后缓存仍然保留，失败请求不会写入缓存。'
   }
   return '使用当前系统的本地模拟缓存逻辑，把原始用量换算成对外显示的缓存用量。'
 }
@@ -476,6 +514,196 @@ function KiroRsToolPolicyForm({
   )
 }
 
+function StableSegmentPolicyForm({
+  value,
+  onChange,
+}: {
+  value: StableSegmentPatch
+  onChange: (next: StableSegmentPatch) => void
+}) {
+  const merged = { ...defaultStableSegmentPatch(), ...value }
+  const set = <K extends keyof StableSegmentPatch>(key: K) => (nextValue: StableSegmentPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-5">
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">覆盖范围</div>
+        <TwoCol>
+          <NumField
+            label="缓存覆盖比例"
+            desc="本轮最多把多少比例的输入算作缓存覆盖，范围 0 到 1。"
+            value={merged.coverageRatio ?? 0.9}
+            min={0}
+            max={1}
+            step={0.05}
+            suffix="比例"
+            onChange={set('coverageRatio')}
+          />
+          <NumField
+            label="覆盖上限"
+            desc="单次最多覆盖多少 Token。0 表示不额外限制。"
+            value={merged.maxCoverageTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('maxCoverageTokens')}
+          />
+          <NumField
+            label="最小总输入"
+            desc="请求总输入低于这个值时不产生缓存，避免短请求制造缓存。"
+            value={merged.minTotalInputTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('minTotalInputTokens')}
+          />
+          <NumField
+            label="最小稳定段"
+            desc="稳定内容累计低于这个值时不建立缓存点。"
+            value={merged.minSegmentTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('minSegmentTokens')}
+          />
+        </TwoCol>
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">缓存创建</div>
+        <TwoCol>
+          <NumField
+            label="单次新增创建上限"
+            desc="一次请求最多新增多少缓存。0 表示不限制。"
+            value={merged.maxNewCreationTokensPerRequest ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('maxNewCreationTokensPerRequest')}
+          />
+          <NumField
+            label="当前用户前缀上限"
+            desc="开启下方选项后，最多取当前用户文本前段多少 Token。"
+            value={merged.currentUserStablePrefixMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            disabled={!merged.cacheCurrentUserStablePrefix}
+            onChange={set('currentUserStablePrefixMaxTokens')}
+          />
+        </TwoCol>
+        <TogField
+          label="允许后续继续创建"
+          desc="命中已有缓存后，如果又出现新的稳定尾部，是否继续补创建。"
+          checked={merged.incrementalCreateEnabled ?? true}
+          onChange={set('incrementalCreateEnabled')}
+        />
+        <TogField
+          label="缓存当前用户稳定前缀"
+          desc="默认关闭。开启后把当前用户消息的稳定前段也纳入缓存，适合确实有固定长前缀的请求。"
+          checked={merged.cacheCurrentUserStablePrefix ?? false}
+          onChange={set('cacheCurrentUserStablePrefix')}
+        />
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">稳定内容来源</div>
+        <TogField
+          label="包含 tools"
+          desc="工具定义是否参与稳定内容计算。"
+          checked={merged.includeTools ?? true}
+          onChange={set('includeTools')}
+        />
+        <TogField
+          label="包含 system"
+          desc="system 提示词是否参与稳定内容计算。"
+          checked={merged.includeSystem ?? true}
+          onChange={set('includeSystem')}
+        />
+        <TogField
+          label="包含历史消息"
+          desc="历史消息是否参与稳定内容计算。"
+          checked={merged.includeHistory ?? true}
+          onChange={set('includeHistory')}
+        />
+        <NumField
+          label="历史消息条数上限"
+          desc="最多纳入多少条历史消息。0 表示不限制。"
+          value={merged.historyMessageLimit ?? 0}
+          min={0}
+          suffix="条"
+          disabled={!merged.includeHistory}
+          onChange={set('historyMessageLimit')}
+        />
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">缓存点规则</div>
+        <TogField
+          label="识别请求里的 cache_control"
+          desc="开启后按客户端显式标记的 cache_control 和 TTL 建立缓存点。"
+          checked={merged.honorExplicitCacheControl ?? true}
+          onChange={set('honorExplicitCacheControl')}
+        />
+        <TogField
+          label="自动缓存 system"
+          desc="请求没有显式 cache_control 时，自动在 system 结尾建立缓存点。"
+          checked={merged.autoCacheSystem ?? true}
+          onChange={set('autoCacheSystem')}
+        />
+        <TogField
+          label="自动缓存 tools"
+          desc="请求没有显式 cache_control 时，自动在 tools 结尾建立缓存点。"
+          checked={merged.autoCacheTools ?? true}
+          onChange={set('autoCacheTools')}
+        />
+        <TogField
+          label="自动缓存历史消息边界"
+          desc="在历史消息的边界自动建立缓存点。"
+          checked={merged.autoCacheHistoryMessageEnds ?? true}
+          onChange={set('autoCacheHistoryMessageEnds')}
+        />
+        <TwoCol>
+          <NumField
+            label="默认 TTL"
+            desc="普通缓存点的有效期，必须大于 0。"
+            value={merged.defaultTtlSecs ?? 300}
+            min={1}
+            suffix="秒"
+            onChange={set('defaultTtlSecs')}
+          />
+          <NumField
+            label="长 TTL"
+            desc="客户端标记 1 小时缓存时使用，不能小于默认 TTL。"
+            value={merged.extendedTtlSecs ?? 3600}
+            min={1}
+            suffix="秒"
+            onChange={set('extendedTtlSecs')}
+          />
+        </TwoCol>
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">返回的 input_tokens</div>
+        <TwoCol>
+          <NumField
+            label="最小值"
+            desc="扣除缓存部分后，返回给客户端的 input_tokens 不低于这个值。"
+            value={merged.reportedInputMinTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('reportedInputMinTokens')}
+          />
+          <NumField
+            label="最大值"
+            desc="返回给客户端的 input_tokens 不高于这个值。0 表示不限制；大于 0 时不能小于最小值。"
+            value={merged.reportedInputMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('reportedInputMaxTokens')}
+          />
+        </TwoCol>
+      </div>
+    </div>
+  )
+}
+
 function NonStreamCacheToggle({
   value,
   fallbackPrefix,
@@ -507,6 +735,13 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
       cacheType: 'kiro_rs_tool',
       reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
       kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
+    }
+  }
+  if (cacheType === 'stable_segment_cache') {
+    return {
+      cacheType: 'stable_segment_cache',
+      reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
+      stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(),
     }
   }
   return {
@@ -545,6 +780,7 @@ function StrategyTemplateEditor({
   const setCreationControl = (creationControl: PromptCacheCreationControlConfig) => onChange({ ...template, creationControl })
   const setReportedUsage = (reportedUsage: ReportedUsagePathPolicy) => onChange({ ...template, reportedUsage })
   const setKiroRsTool = (kiroRsTool: KiroRsToolPatch) => onChange({ ...template, kiroRsTool })
+  const setStableSegment = (stableSegment: StableSegmentPatch) => onChange({ ...template, stableSegment })
 
   return (
     <div className="space-y-4 rounded-lg bg-background p-4 shadow-sm">
@@ -566,6 +802,18 @@ function StrategyTemplateEditor({
             <div className="text-sm font-semibold">最终用量显示</div>
             <PathPolicyEditor policy={template.reportedUsage ?? defaultUsagePatch('/v1')} onChange={setReportedUsage} />
           </div>
+        </>
+      ) : cacheType === 'stable_segment_cache' ? (
+        <>
+          <NonStreamCacheToggle
+            value={template.reportedUsage}
+            fallbackPrefix="/v1"
+            onChange={setReportedUsage}
+          />
+          <StableSegmentPolicyForm
+            value={template.stableSegment ?? defaultStableSegmentPatch()}
+            onChange={setStableSegment}
+          />
         </>
       ) : (
         <>
@@ -593,7 +841,9 @@ function pathPolicyWithStrategyDefaults(
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
   const template = cacheType === 'kiro_rs_tool'
     ? cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
-    : cachePolicyForStrategyTemplate(
+    : cacheType === 'stable_segment_cache'
+      ? cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, 'stable_segment_cache')
+      : cachePolicyForStrategyTemplate(
         {
           ...(cachePolicy.default ?? {}),
           ...(cachePolicy.currentHighCache ?? {}),
@@ -611,10 +861,16 @@ function pathPolicyWithStrategyDefaults(
           creationControl: policy.creationControl ?? template.creationControl ?? defaultPromptCacheCreationControl(),
           reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
         }
-      : {
-          reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
-          kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
-        }),
+      : cacheType === 'stable_segment_cache'
+        ? {
+            routeNamespace: policy.routeNamespace ?? defaultRouteNamespace(prefix),
+            reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
+            stableSegment: policy.stableSegment ?? template.stableSegment ?? defaultStableSegmentPatch(),
+          }
+        : {
+            reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
+            kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
+          }),
   }
 }
 
@@ -749,6 +1005,7 @@ function PathStrategyBindingCard({
             <SelectItem value="no_cache">无缓存</SelectItem>
             <SelectItem value="current_high_cache">本地模拟缓存策略</SelectItem>
             <SelectItem value="kiro_rs_tool">Kiro-RS Tool 缓存策略</SelectItem>
+            <SelectItem value="stable_segment_cache">稳定片段缓存策略</SelectItem>
           </SelectContent>
         </Select>
         <div className="text-xs leading-5 text-muted-foreground">{cacheTypeDesc(effectiveCacheType)}</div>
@@ -778,6 +1035,30 @@ function PathStrategyBindingCard({
           <PathPolicyEditor
             policy={effectivePolicy.reportedUsage ?? defaultUsagePatch(prefix)}
             onChange={(reportedUsage) => patch({ reportedUsage })}
+          />
+        </div>
+      ) : effectiveCacheType === 'stable_segment_cache' ? (
+        <div className="space-y-4">
+          <div>
+            <div className="text-sm font-semibold">本路径策略参数</div>
+            <div className="mt-1 text-xs leading-5 text-muted-foreground">
+              这里只展示稳定片段缓存策略自己需要的参数，不读取其他策略的参数。
+            </div>
+          </div>
+          <TogField
+            label="独立路径缓存空间"
+            desc="开启后这个路径的缓存只在本路径内读取和写入；关闭后与其他未开启的路径共享同一会话的缓存。"
+            checked={Boolean(effectivePolicy.routeNamespace)}
+            onChange={(routeNamespace) => patch({ routeNamespace })}
+          />
+          <NonStreamCacheToggle
+            value={effectivePolicy.reportedUsage}
+            fallbackPrefix={prefix}
+            onChange={(reportedUsage) => patch({ reportedUsage })}
+          />
+          <StableSegmentPolicyForm
+            value={effectivePolicy.stableSegment ?? defaultStableSegmentPatch()}
+            onChange={(stableSegment) => patch({ stableSegment })}
           />
         </div>
       ) : (
@@ -838,7 +1119,7 @@ export function CachePolicySettingsSection({
     const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
     const legacyReportedUsage = reportedUsageForPrefix(config.reportedUsage.pathOverrides, normalizedPrefix)
     if (existing) {
-      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool') {
+      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool' || existing.cacheType === 'stable_segment_cache') {
         return existing
       }
       return legacyReportedUsage ? { ...existing, reportedUsage: existing.reportedUsage ?? legacyReportedUsage } : existing
@@ -952,7 +1233,12 @@ export function CachePolicySettingsSection({
     { ...(cachePolicy.default ?? {}), ...(cachePolicy.currentHighCache ?? {}) },
     'current_high_cache'
   )
+  const setStableSegmentTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({ ...cachePolicy, stableSegmentCache: next })
+  }
+
   const kiroTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
+  const stableSegmentTemplate = cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, 'stable_segment_cache')
 
   return (
     <div className="space-y-6">
@@ -971,13 +1257,20 @@ export function CachePolicySettingsSection({
           policy={kiroTemplate}
           onChange={setKiroTemplate}
         />
+        <StrategyTemplateEditor
+          title="稳定片段缓存策略默认参数"
+          desc="使用本策略的路径只读取这里属于稳定片段缓存的参数，再合并路径自己的参数。"
+          cacheType="stable_segment_cache"
+          policy={stableSegmentTemplate}
+          onChange={setStableSegmentTemplate}
+        />
       </div>
 
       <div className="space-y-4">
         <div>
           <div className="text-sm font-semibold">路径绑定</div>
           <div className="mt-1 text-xs leading-5 text-muted-foreground">
-            每个路径都显式选择无缓存、本地模拟缓存策略或 Kiro-RS Tool 缓存策略。
+            每个路径都显式选择无缓存、本地模拟缓存策略、Kiro-RS Tool 缓存策略或稳定片段缓存策略。
           </div>
         </div>
         <div className="flex flex-col gap-2 md:flex-row md:items-end">

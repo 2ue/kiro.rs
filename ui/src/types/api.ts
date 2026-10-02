@@ -1525,7 +1525,30 @@ export interface KiroRsToolCachePolicyPatch {
   currentUserStablePrefixMaxTokens?: number
 }
 
-export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool'
+export interface StableSegmentCachePolicyPatch {
+  coverageRatio?: number
+  maxCoverageTokens?: number
+  minTotalInputTokens?: number
+  minSegmentTokens?: number
+  incrementalCreateEnabled?: boolean
+  maxNewCreationTokensPerRequest?: number
+  includeTools?: boolean
+  includeSystem?: boolean
+  includeHistory?: boolean
+  historyMessageLimit?: number
+  honorExplicitCacheControl?: boolean
+  autoCacheSystem?: boolean
+  autoCacheTools?: boolean
+  autoCacheHistoryMessageEnds?: boolean
+  cacheCurrentUserStablePrefix?: boolean
+  currentUserStablePrefixMaxTokens?: number
+  defaultTtlSecs?: number
+  extendedTtlSecs?: number
+  reportedInputMinTokens?: number
+  reportedInputMaxTokens?: number
+}
+
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool' | 'stable_segment_cache'
 
 export interface CacheRoutePolicyPatch {
   cacheType?: PromptCacheStrategyType
@@ -1536,12 +1559,14 @@ export interface CacheRoutePolicyPatch {
   cachePoint?: CachePointPolicyPatch
   bounds?: CacheBoundsPolicyPatch
   kiroRsTool?: KiroRsToolCachePolicyPatch
+  stableSegment?: StableSegmentCachePolicyPatch
 }
 
 export interface CachePolicyConfig {
   default: CacheRoutePolicyPatch
   currentHighCache: CacheRoutePolicyPatch
   kiroRsTool: CacheRoutePolicyPatch
+  stableSegmentCache: CacheRoutePolicyPatch
   pathOverrides: Record<string, CacheRoutePolicyPatch>
 }
 
