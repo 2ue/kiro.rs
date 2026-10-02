@@ -42,6 +42,7 @@ export const credentialsApi = {
   creditSummary: () => http.get<CredentialCreditSummaryResponse>('/credentials/credit-summary'),
   diagnostics: (id: number, page = 1, limit = 20) =>
     http.get<CredentialDiagnosticsResponse>(`/credentials/${id}/diagnostics`, { page, limit }),
+  balance: (id: number) => http.get<BalanceResponse>(`/credentials/${id}/balance`),
   info: (id: number, force = true) => http.get<BalanceResponse>(`/credentials/${id}/info`, { force }),
   refreshInfo: (list: number[], force = true) =>
     http.post<CredentialInfoRefreshResponse>('/credentials/info/refresh', { ids: list, force }),

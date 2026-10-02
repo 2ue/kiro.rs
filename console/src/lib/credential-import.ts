@@ -264,3 +264,32 @@ export function dedupeCredentials(list: AddCredentialRequest[]): { unique: AddCr
   }
   return { unique, duplicates: list.length - unique.length }
 }
+
+export interface CredentialImportEntry {
+  credential: AddCredentialRequest
+  /** 来源文件里的账号状态（如 KAM 导出的 status: "error"），用于"跳过 error 状态账号" */
+  sourceStatus?: string
+}
+
+/** 与 parseCredentialImportText 相同，但保留来源状态并按凭据去重 */
+export function parseCredentialImportEntries(text: string): { entries: CredentialImportEntry[]; duplicates: number } {
+  const plain = parsePlainKiroApiKeys(text)
+  const raw: CredentialImportEntry[] = plain
+    ? plain.map((credential) => ({ credential }))
+    : parseJsonOrJsonl(text)
+        .flatMap(extractCredentialItems)
+        .flatMap((item) => {
+          const credential = normalizeCredentialImportItem(item)
+          if (!credential) return []
+          const status = isObject(item) && typeof item.status === 'string' ? item.status.trim().toLowerCase() : undefined
+          return [{ credential, sourceStatus: status || undefined }]
+        })
+  const seen = new Set<string>()
+  const entries = raw.filter((e) => {
+    const key = credentialIdentity(e.credential)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  return { entries, duplicates: raw.length - entries.length }
+}
