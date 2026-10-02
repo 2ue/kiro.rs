@@ -1,35 +1,28 @@
 import { useMemo, useRef, useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQueryClient } from '@tanstack/react-query'
 import { Check, CircleAlert, FileUp, Loader2, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { credentialsApi } from '@/api/endpoints/credentials'
 import type {
-  AddCredentialRequest,
   BatchCredentialImportDefaults,
+  BatchCredentialImportItem,
   BatchCredentialImportResponse,
   CredentialValidationItem,
 } from '@/api/types'
 import { Button } from '@/components/ui/button'
-import { Checkbox } from '@/components/ui/checkbox'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
-import { ToneBadge } from '@/components/status/tone-badge'
-import { authMethodLabel, SUBSCRIPTION_LABEL, subscriptionTier } from '@/domain/labels'
 import { dedupeCredentials, parseCredentialImportText } from '@/lib/credential-import'
 import { cn } from '@/lib/utils'
 import { qk } from '@/queries/keys'
-import { translateError } from '@/domain/upstream-error'
 import { useProxies } from '@/queries/shared'
 import { ImportDefaults, ImportResult, type ProxyMode } from './import-steps'
+import { ImportProgress } from './import-progress'
+import { CandidateList, type Candidate } from './import-candidates'
+import { useChunkedRunner } from './import-runner'
 
 type Step = 'source' | 'check' | 'defaults' | 'done'
-
-interface Candidate {
-  credential: AddCredentialRequest
-  include: boolean
-  check?: CredentialValidationItem
-}
 
 const STEPS: Array<{ key: Step; label: string }> = [
   { key: 'source', label: '来源' },
@@ -37,13 +30,6 @@ const STEPS: Array<{ key: Step; label: string }> = [
   { key: 'defaults', label: '导入参数' },
   { key: 'done', label: '结果' },
 ]
-
-function credentialHint(c: AddCredentialRequest): string {
-  if (c.email) return c.email
-  if (c.kiroApiKey) return `${c.kiroApiKey.slice(0, 8)}…${c.kiroApiKey.slice(-4)}`
-  if (c.refreshToken) return `refresh …${c.refreshToken.slice(-8)}`
-  return '未知'
-}
 
 /**
  * 导入向导：替代原"添加账号 / 批量导入 / KAM 导入"三个入口。
@@ -63,7 +49,7 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
   const [proxyIds, setProxyIds] = useState<number[]>([])
   const [duplicateMode, setDuplicateMode] = useState<'skip' | 'error'>('skip')
   const [autoDiscover, setAutoDiscover] = useState(false)
-  const [result, setResult] = useState<BatchCredentialImportResponse | null>(null)
+  const [result, setResult] = useState<(BatchCredentialImportResponse & { stopped?: boolean }) | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const [dragging, setDragging] = useState(false)
 
@@ -74,9 +60,15 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
     setCandidates([])
     setDupes(0)
     setResult(null)
+    precheckRunner.reset()
+    importRunner.reset()
   }
 
   const close = (next: boolean) => {
+    if (!next && busy) {
+      toast.info('正在处理，请先停止或等待完成')
+      return
+    }
     if (!next) {
       onOpenChange(false)
       setTimeout(reset, 200)
@@ -119,56 +111,84 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
     parse(combined)
   }
 
-  const precheck = useMutation({
-    mutationFn: () =>
-      credentialsApi.validateExternal({
-        credentials: candidates.map((c) => c.credential),
+  // 预检与导入都按批提交：后端逐个账号访问上游（每个约 1~3 秒），分批后可以实时显示进度
+  const precheckRunner = useChunkedRunner<number, CredentialValidationItem>({ chunkSize: 5, concurrency: 2 })
+  const importRunner = useChunkedRunner<Candidate, BatchCredentialImportItem>({ chunkSize: 3, concurrency: 2 })
+  const busy = precheckRunner.running || importRunner.running
+
+  const runPrecheck = async () => {
+    const indexes = candidates.map((_, i) => i)
+    const { items, errors, stopped } = await precheckRunner.run(indexes, async (chunk, offset) => {
+      const res = await credentialsApi.validateExternal({
+        credentials: chunk.map((i) => candidates[i]!.credential),
         querySubscription: true,
         queryUsage: true,
         checkLiveness: false,
-      }),
-    onSuccess: (res) => {
-      const byIndex = new Map<number, CredentialValidationItem>()
-      // 后端 index 从 1 开始
-      res.groups.forEach((g) => g.items.forEach((item) => typeof item.index === 'number' && byIndex.set(item.index - 1, item)))
+      })
+      // 后端 index 是本批内从 1 开始的序号，换算回全局下标
+      const items = res.groups
+        .flatMap((g) => g.items)
+        .map((item) => ({ ...item, index: typeof item.index === 'number' ? offset + item.index - 1 : item.index }))
       setCandidates((list) =>
         list.map((c, i) => {
-          const check = byIndex.get(i)
-          return { ...c, check, include: check ? check.ok && !check.matchedExistingCredentialId : c.include }
+          const check = items.find((x) => x.index === i)
+          return check ? { ...c, check, include: check.ok && !check.matchedExistingCredentialId } : c
         }),
       )
-      toast.success(`预检完成：${res.success} 个可用，${res.failed} 个失败`)
-    },
-    meta: { error: '预检失败' },
-  })
+      return { items, ok: res.success, failed: res.failed, skipped: 0 }
+    })
+    const ok = items.filter((i) => i.ok).length
+    if (errors.length)
+      toast.warning(`预检${stopped ? '已停止' : '完成'}：${ok} 个可用，${errors.reduce((n, e) => n + e.count, 0)} 个因请求失败未检查`)
+    else toast.success(`预检${stopped ? '已停止' : '完成'}：${ok} 个可用，${items.length - ok} 个失败`)
+  }
 
-  const submit = useMutation({
-    mutationFn: () => {
-      const tags = tagsText
-        .split(/[,，\n]/)
-        .map((t) => t.trim())
-        .filter(Boolean)
-      const payload: BatchCredentialImportDefaults = {
-        ...defaults,
-        tags,
-        proxyResourceId: proxyMode === 'single' ? (proxyIds[0] ?? null) : undefined,
-        proxyResourceIds: proxyMode === 'roundrobin' ? proxyIds : undefined,
-      }
-      return credentialsApi.import({
-        credentials: candidates.filter((c) => c.include).map((c) => c.credential),
-        defaults: payload,
+  const runImport = async () => {
+    const tags = tagsText
+      .split(/[,，\n]/)
+      .map((t) => t.trim())
+      .filter(Boolean)
+    const defaultsPayload: BatchCredentialImportDefaults = {
+      ...defaults,
+      tags,
+      proxyResourceId: proxyMode === 'single' ? (proxyIds[0] ?? null) : undefined,
+    }
+    const selected = candidates.filter((c) => c.include)
+    const { items, errors, stopped, progress } = await importRunner.run(selected, async (chunk, offset) => {
+      const res = await credentialsApi.import({
+        // 轮流绑定代理按全局顺序预先分配，避免分批后每批都从第一个代理开始
+        credentials: chunk.map((c, i) =>
+          proxyMode === 'roundrobin' && proxyIds.length && c.credential.proxyResourceId == null && !c.credential.proxyUrl
+            ? { ...c.credential, proxyResourceId: proxyIds[(offset + i) % proxyIds.length] }
+            : c.credential,
+        ),
+        defaults: defaultsPayload,
         duplicateMode,
         continueOnError: true,
         autoDiscoverSupportedModels: autoDiscover,
       })
-    },
-    onSuccess: (res) => {
-      setResult(res)
-      setStep('done')
-      queryClient.invalidateQueries({ queryKey: qk.credentials.all })
-    },
-    meta: { error: '导入失败' },
-  })
+      return {
+        items: res.items.map((item) => ({ ...item, index: offset + item.index - 1 })),
+        ok: res.success,
+        failed: res.failed,
+        skipped: res.skipped,
+      }
+    })
+    // 整批请求失败的账号也要出现在结果里
+    const failedChunks = errors.flatMap((e) =>
+      Array.from({ length: e.count }, (_, k) => ({
+        index: e.offset + k,
+        ok: false,
+        skipped: false,
+        email: selected[e.offset + k]?.credential.email,
+        error: (e.error as Error)?.message ?? '请求失败',
+      })),
+    )
+    const all = [...items, ...failedChunks].sort((a, b) => a.index - b.index)
+    setResult({ total: selected.length, success: progress.ok, skipped: progress.skipped, failed: progress.failed, items: all, stopped })
+    setStep('done')
+    queryClient.invalidateQueries({ queryKey: qk.credentials.all })
+  }
 
   const included = candidates.filter((c) => c.include).length
   const stepIndex = STEPS.findIndex((s) => s.key === step)
@@ -270,49 +290,33 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
                   {dupes > 0 && <span className="text-muted-foreground">（已合并 {dupes} 个重复项）</span>}
                   ，将导入 <span className="num font-semibold">{included}</span> 个
                 </p>
-                <Button size="sm" variant="outline" onClick={() => precheck.mutate()} disabled={precheck.isPending}>
-                  {precheck.isPending && <Loader2 className="animate-spin" />}
-                  上游预检（查询订阅与额度）
-                </Button>
+                {!precheckRunner.running && (
+                  <Button size="sm" variant="outline" onClick={() => void runPrecheck()} disabled={busy}>
+                    上游预检（查询订阅与额度）
+                  </Button>
+                )}
               </div>
+              {precheckRunner.progress && (precheckRunner.running || precheckRunner.progress.done < precheckRunner.progress.total) && (
+                <ImportProgress
+                  label="预检"
+                  progress={precheckRunner.progress}
+                  running={precheckRunner.running}
+                  onStop={precheckRunner.stop}
+                />
+              )}
               {counts.checked > 0 && (
                 <p className="text-xs text-muted-foreground">
                   预检 {counts.checked} 个：可用 {counts.ok}，已存在 {counts.existing}。失败和已存在的账号已自动取消勾选。
                 </p>
               )}
-              <div className="divide-y rounded-lg border">
-                {candidates.map((c, i) => {
-                  const tier = subscriptionTier(c.check?.subscriptionTitle)
-                  return (
-                    <label key={i} className="flex cursor-pointer items-center gap-3 px-3 py-2 text-sm hover:bg-muted/40">
-                      <Checkbox
-                        checked={c.include}
-                        onCheckedChange={(v) => setCandidates((list) => list.map((x, j) => (j === i ? { ...x, include: v === true } : x)))}
-                      />
-                      <span className="num w-8 text-xs text-muted-foreground">{i + 1}</span>
-                      <span className="min-w-0 flex-1 truncate">{credentialHint(c.credential)}</span>
-                      <span className="text-xs text-muted-foreground">{authMethodLabel(c.credential.authMethod)}</span>
-                      {c.check ? (
-                        c.check.matchedExistingCredentialId ? (
-                          <ToneBadge tone="neutral">已存在 #{c.check.matchedExistingCredentialId}</ToneBadge>
-                        ) : c.check.ok ? (
-                          <ToneBadge tone="success">{c.check.subscriptionTitle ? SUBSCRIPTION_LABEL[tier] : '可用'}</ToneBadge>
-                        ) : (
-                          <ToneBadge tone="danger" title={c.check.error ?? undefined}>
-                            {c.check.error ? translateError(c.check.error)?.title : '失败'}
-                          </ToneBadge>
-                        )
-                      ) : (
-                        <ToneBadge tone="neutral">未预检</ToneBadge>
-                      )}
-                    </label>
-                  )
-                })}
-              </div>
+              <CandidateList
+                candidates={candidates}
+                onToggle={(i, include) => setCandidates((list) => list.map((x, j) => (j === i ? { ...x, include } : x)))}
+              />
             </div>
           )}
 
-          {step === 'defaults' && (
+          {step === 'defaults' && !importRunner.running && (
             <ImportDefaults
               {...{
                 defaults,
@@ -332,6 +336,16 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
             />
           )}
 
+          {step === 'defaults' && importRunner.progress && (
+            <ImportProgress
+              label="导入"
+              progress={importRunner.progress}
+              running={importRunner.running}
+              onStop={importRunner.stop}
+              className="mt-4"
+            />
+          )}
+
           {step === 'done' && result && <ImportResult result={result} />}
         </div>
 
@@ -343,29 +357,29 @@ export function ImportWizard({ open, onOpenChange }: { open: boolean; onOpenChan
           )}
           {step === 'check' && (
             <>
-              <Button variant="ghost" onClick={() => setStep('source')}>
+              <Button variant="ghost" onClick={() => setStep('source')} disabled={busy}>
                 上一步
               </Button>
               <Button
                 variant="ghost"
                 onClick={() => setCandidates((list) => list.filter((c) => c.include))}
-                disabled={included === candidates.length}
+                disabled={busy || included === candidates.length}
               >
                 <Trash2 /> 移除未勾选
               </Button>
-              <Button onClick={() => setStep('defaults')} disabled={included === 0}>
+              <Button onClick={() => setStep('defaults')} disabled={busy || included === 0}>
                 下一步
               </Button>
             </>
           )}
           {step === 'defaults' && (
             <>
-              <Button variant="ghost" onClick={() => setStep('check')}>
+              <Button variant="ghost" onClick={() => setStep('check')} disabled={busy}>
                 上一步
               </Button>
-              <Button onClick={() => submit.mutate()} disabled={submit.isPending || (proxyMode !== 'none' && proxyIds.length === 0)}>
-                {submit.isPending && <Loader2 className="animate-spin" />}
-                导入 {included} 个账号
+              <Button onClick={() => void runImport()} disabled={busy || (proxyMode !== 'none' && proxyIds.length === 0)}>
+                {importRunner.running && <Loader2 className="animate-spin" />}
+                {importRunner.running ? '导入中…' : `导入 ${included} 个账号`}
               </Button>
             </>
           )}

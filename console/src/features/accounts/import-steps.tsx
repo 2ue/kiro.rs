@@ -164,7 +164,8 @@ export function ImportDefaults({
 }
 
 /** 第 4 步：导入结果汇总与失败明细 */
-export function ImportResult({ result }: { result: BatchCredentialImportResponse }) {
+export function ImportResult({ result }: { result: BatchCredentialImportResponse & { stopped?: boolean } }) {
+  const notRun = result.total - result.success - result.skipped - result.failed
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-3 gap-3">
@@ -172,6 +173,11 @@ export function ImportResult({ result }: { result: BatchCredentialImportResponse
         <ResultStat label="跳过" value={result.skipped} tone="text-muted-foreground" />
         <ResultStat label="失败" value={result.failed} tone="text-danger" />
       </div>
+      {result.stopped && notRun > 0 && (
+        <p className="rounded-lg border bg-warning-subtle/40 p-2.5 text-xs text-warning">
+          已手动停止，剩余 {notRun} 个账号未导入。点击"继续导入"可重新粘贴剩余账号。
+        </p>
+      )}
       {result.items.some((i) => !i.ok || i.warning) && (
         <div className="divide-y rounded-lg border text-xs">
           {result.items
