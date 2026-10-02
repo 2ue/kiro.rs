@@ -6,7 +6,8 @@ use crate::anthropic::pricing::ModelPricing;
 use crate::anthropic::usage::UsageRecord;
 use crate::kiro::token_manager::CredentialIdentitySnapshot;
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
+    DEFAULT_LANGUAGE_CONSTRAINT_PROMPT, DEFAULT_TASK_QUALITY_PROMPT, ExternalPoolsConfig,
     ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
     ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
     PromptCacheCreationControlConfig, PromptSteeringConfig, ReportedUsageConfig,
@@ -1683,6 +1684,22 @@ pub struct TokenRefreshAdmissionRuntimeResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PromptSteeringDefaults {
+    pub language_constraint_prompt: &'static str,
+    pub task_quality_prompt: &'static str,
+}
+
+impl Default for PromptSteeringDefaults {
+    fn default() -> Self {
+        Self {
+            language_constraint_prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim(),
+            task_quality_prompt: DEFAULT_TASK_QUALITY_PROMPT.trim(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeConfigResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
@@ -1757,6 +1774,8 @@ pub struct RuntimeConfigResponse {
     pub image_processing: ImageProcessingConfig,
     pub body_conversion: BodyConversionConfig,
     pub prompt_steering: PromptSteeringConfig,
+    /// Built-in prompt texts, so admin consoles restore defaults without keeping their own copy.
+    pub prompt_steering_defaults: PromptSteeringDefaults,
     pub missing_max_tokens: MissingMaxTokensConfig,
     pub payload_guard_enabled: bool,
     pub payload_guard_mode: PayloadGuardMode,

@@ -1623,6 +1623,11 @@ export interface ChunkedWritePromptSteeringConfig {
   toolDescriptionEnabled: boolean
 }
 
+export interface PromptSteeringDefaults {
+  languageConstraintPrompt: string
+  taskQualityPrompt: string
+}
+
 export interface PromptSteeringConfig {
   enabled: boolean
   scope: PromptSteeringScope
@@ -2029,6 +2034,8 @@ export interface RuntimeConfig {
   imageProcessing: ImageProcessingConfig
   bodyConversion: BodyConversionConfig
   promptSteering: PromptSteeringConfig
+  /** Built-in prompt texts from the backend, used by "restore default". */
+  promptSteeringDefaults?: PromptSteeringDefaults
   missingMaxTokens: MissingMaxTokensConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode

@@ -1558,7 +1558,7 @@ export function RuntimePage() {
                     />
                     <TogField
                       label="语言约束"
-                      desc="减少“让me / let我 / 我will / 日语葡语串台”这类非自然语言拼接；不禁止正常技术英文。"
+                      desc="默认关闭。开启后在 system 顶部注入一次：优先用户明确要求的语言，其次客户端声明的语言（如 Claude Code 的 language 设置），否则跟随用户自己的消息。关闭时不注入任何语言提示词。"
                       checked={draft.promptSteering.languageConstraint.enabled}
                       onChange={setPromptSteeringText('languageConstraint', 'enabled')}
                     />
@@ -1612,9 +1612,9 @@ export function RuntimePage() {
                       <div className="mb-3 flex items-center justify-between gap-3">
                         <div>
                           <div className="text-sm font-medium">语言约束提示词</div>
-                          <div className="mt-1 text-xs leading-5 text-muted-foreground">目标是减少非自然语言的跨语言语法拼接，不是禁止正常技术英文。</div>
+                          <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在“语言约束”开启时注入；留空保存时使用内置默认。</div>
                         </div>
-                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('languageConstraint', 'prompt')(defaultPromptSteering().languageConstraint.prompt)}>
+                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('languageConstraint', 'prompt')(config.data?.promptSteeringDefaults?.languageConstraintPrompt ?? '')}>
                           恢复默认
                         </Button>
                       </div>
@@ -1630,7 +1630,7 @@ export function RuntimePage() {
                           <div className="text-sm font-medium">任务质量提示词</div>
                           <div className="mt-1 text-xs leading-5 text-muted-foreground">用于减少追问被忽视、任务边界错误、没有真实证据却声称完成等问题。</div>
                         </div>
-                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('taskQuality', 'prompt')(defaultPromptSteering().taskQuality.prompt)}>
+                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('taskQuality', 'prompt')(config.data?.promptSteeringDefaults?.taskQualityPrompt ?? '')}>
                           恢复默认
                         </Button>
                       </div>

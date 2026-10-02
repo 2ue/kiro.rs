@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn cc_messages_get_default_language_and_task_prompt() {
+    fn cc_messages_get_default_task_prompt_without_language_prompt() {
         let mut req = request();
 
         assert!(apply_to_messages_request(
@@ -207,8 +207,62 @@ mod tests {
         let system = req.system.expect("system injected");
         assert_eq!(system.len(), 1);
         assert!(system[0].text.contains(PROMPT_STEERING_MARKER));
-        assert!(system[0].text.contains("Do not mix languages"));
         assert!(system[0].text.contains("任务"));
+        assert!(!system[0].text.contains("<language_constraint>"));
+    }
+
+    #[test]
+    fn language_prompt_is_injected_once_at_the_top_only_when_enabled() {
+        let mut config = PromptSteeringConfig::default();
+        config.task_quality.enabled = false;
+
+        // Disabled with nothing else enabled: no system block at all.
+        let mut off = request();
+        assert!(!apply_to_messages_request(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+            &mut off,
+        ));
+        assert!(off.system.is_none());
+
+        config.language_constraint.enabled = true;
+        let mut on = request();
+        on.system = Some(vec![SystemMessage {
+            text: "client system".to_string(),
+            cache_control: None,
+        }]);
+        assert!(apply_to_messages_request(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+            &mut on,
+        ));
+        let system = on.system.as_ref().expect("system kept");
+        assert_eq!(system.len(), 2);
+        assert!(system[0].text.contains("<language_constraint>"));
+        assert!(system[0].text.contains("client settings"));
+        assert_eq!(system[1].text, "client system");
+        // The current user turn is never touched.
+        assert_eq!(
+            serde_json::to_value(&on.messages).unwrap(),
+            serde_json::to_value(&request().messages).unwrap()
+        );
+
+        assert!(!apply_to_messages_request(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+            &mut on,
+        ));
+        assert_eq!(
+            on.system
+                .iter()
+                .flatten()
+                .filter(|block| block.text.contains("<language_constraint>"))
+                .count(),
+            1
+        );
     }
 
     #[test]

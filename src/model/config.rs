@@ -222,6 +222,12 @@ impl Default for BodyConversionConfig {
 }
 
 pub const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT: &str = r#"<language_constraint>
+Reply language, in priority order: the language the user explicitly asks for; else a response language set by the system prompt or client settings; else the main language of the user's own messages (not tool results, system reminders, file contents, or command output). Use it for all visible text, including progress notes between tool calls. Keep code, identifiers, names, and quoted terms in their original form, but do not blend languages within a sentence. Do not restate these rules.
+</language_constraint>"#;
+
+/// Built-in language prompt before v11. It followed the latest message, which inside a tool loop
+/// is usually an English tool result.
+const LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V2: &str = r#"<language_constraint>
 Reply in the language the user asks for. If they don't specify one, match the main language of their latest message.
 
 Do not mix languages within a sentence. Write each sentence in one language, the way a fluent speaker would, rather than assembling it word by word from another language.
@@ -229,6 +235,22 @@ Do not mix languages within a sentence. Write each sentence in one language, the
 This is about unnatural blending, not about forcing everything into one script. Words that a fluent speaker would normally leave in their original form stay as-is, and that does not count as mixing. This commonly includes code, identifiers, names, and other terms the user is quoting or asking about, but it is not limited to them.
 
 Do not restate these rules in your reply.
+</language_constraint>"#;
+
+/// Original built-in language prompt; both admin consoles also shipped and persisted this copy.
+const LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V1: &str = r#"<language_constraint>
+面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
+
+允许保留以下内容的英文或其他原文：
+- 代码、命令、路径、文件名、配置项、JSON 字段、HTTP header、API 名称；
+- 产品名、模型名、库名、协议名、错误原文、日志原文；
+- 用户正在询问、引用或要求翻译的外语词句，例如“product 怎么翻译”。
+
+禁止把英文、日文、葡语等非用户指定语言混入中文语法骨架中。
+错误示例：让me、let我、我will、you需要、Você 有道理、続けて处理。
+遇到这类表达时，必须改写为自然中文，例如：让我、我来、我会、你需要、你说得对、继续处理。
+
+不要在可见回答中复述本规则。
 </language_constraint>"#;
 
 pub const DEFAULT_TASK_QUALITY_PROMPT: &str = r#"<task_quality_policy>
@@ -364,8 +386,13 @@ impl Default for PromptSteeringTextBlock {
     }
 }
 
+/// Off by default: clients such as Claude Code already declare a response language, so the
+/// proxy only adds its own language prompt when an operator turns it on.
 fn default_language_constraint_block() -> PromptSteeringTextBlock {
-    PromptSteeringTextBlock::with_prompt(DEFAULT_LANGUAGE_CONSTRAINT_PROMPT)
+    PromptSteeringTextBlock {
+        enabled: false,
+        prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.to_string(),
+    }
 }
 
 fn default_task_quality_block() -> PromptSteeringTextBlock {
@@ -4644,7 +4671,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 10;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 11;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -6093,6 +6120,24 @@ impl Config {
                     .insert(0, 404);
             }
             self.runtime_config_migration_version = 10;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 11 {
+            // The language prompt now resolves the reply language from the client (explicit user
+            // request, then a client-declared language such as Claude Code's `language` setting,
+            // then the user's own messages). Replace only the exact built-in bytes; operator-edited
+            // prompt text stays authoritative.
+            let prompt = self.prompt_steering.language_constraint.prompt.trim();
+            if prompt == LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V1.trim()
+                || prompt == LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V2.trim()
+            {
+                self.prompt_steering.language_constraint.prompt =
+                    DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim().to_string();
+            }
+            // The proxy language prompt is now opt-in. Older configs materialized the former
+            // default `enabled: true`, so turn it off once; operators can enable it again.
+            self.prompt_steering.language_constraint.enabled = false;
+            self.runtime_config_migration_version = 11;
             changed = true;
         }
         changed
@@ -8602,6 +8647,48 @@ mod tests {
         }))
         .unwrap();
         assert!(!current_without_field.prompt_steering.apply_to_external_pool);
+    }
+
+    #[test]
+    fn runtime_config_migration_replaces_only_built_in_language_prompts_once() {
+        for legacy in [
+            LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V1,
+            LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V2,
+        ] {
+            let mut config = Config {
+                runtime_config_migration_version: 10,
+                ..Config::default()
+            };
+            config.prompt_steering.language_constraint.enabled = true;
+            config.prompt_steering.language_constraint.prompt = legacy.to_string();
+
+            assert!(config.apply_runtime_config_migrations());
+            assert!(!config.prompt_steering.language_constraint.enabled);
+            assert_eq!(
+                config.prompt_steering.language_constraint.prompt,
+                DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim()
+            );
+            assert_eq!(
+                config.runtime_config_migration_version,
+                CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+            );
+
+            // Once migrated, an operator may re-enable it or restore the old wording on purpose.
+            config.prompt_steering.language_constraint.enabled = true;
+            config.prompt_steering.language_constraint.prompt = legacy.to_string();
+            assert!(!config.apply_runtime_config_migrations());
+            assert!(config.prompt_steering.language_constraint.enabled);
+            assert_eq!(config.prompt_steering.language_constraint.prompt, legacy);
+        }
+
+        let custom = "<language_constraint>始终使用简体中文。</language_constraint>";
+        let mut edited = Config {
+            runtime_config_migration_version: 10,
+            ..Config::default()
+        };
+        edited.prompt_steering.language_constraint.prompt = custom.to_string();
+        assert!(edited.apply_runtime_config_migrations());
+        assert_eq!(edited.prompt_steering.language_constraint.prompt, custom);
     }
 
     #[test]

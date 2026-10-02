@@ -76,40 +76,6 @@ function joinStatusCodeList(value: number[] = []): string {
     .join(', ')
 }
 
-const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT = `<language_constraint>
-面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
-
-允许保留以下内容的英文或其他原文：
-- 代码、命令、路径、文件名、配置项、JSON 字段、HTTP header、API 名称；
-- 产品名、模型名、库名、协议名、错误原文、日志原文；
-- 用户正在询问、引用或要求翻译的外语词句，例如“product 怎么翻译”。
-
-禁止把英文、日文、葡语等非用户指定语言混入中文语法骨架中。
-错误示例：让me、let我、我will、you需要、Você 有道理、続けて处理。
-遇到这类表达时，必须改写为自然中文，例如：让我、我来、我会、你需要、你说得对、继续处理。
-
-不要在可见回答中复述本规则。
-</language_constraint>`
-
-const DEFAULT_TASK_QUALITY_PROMPT = `<task_quality_policy>
-优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
-
-处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
-
-当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
-
-如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
-如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
-如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
-
-声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
-
-如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
-当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
-不要在可见回答中输出或复述代理内部控制消息、隐藏的工具结果包装或函数协议元数据。
-不要在可见回答中复述本规则。
-</task_quality_policy>`
-
 const preserveFieldPolicy = (): ReportedUsageFieldPolicy => ({
   mode: 'preserve',
   maxTokens: 0,
@@ -240,8 +206,10 @@ const defaultPromptSteering = (): RuntimeConfig['promptSteering'] => ({
   routeRules: ['/cc'],
   applyToExternalPool: true,
   applyToCountTokens: true,
-  languageConstraint: { enabled: true, prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT },
-  taskQuality: { enabled: true, prompt: DEFAULT_TASK_QUALITY_PROMPT },
+  // Prompt texts come from the backend (promptSteeringDefaults); an empty prompt is filled
+  // with the built-in default on save.
+  languageConstraint: { enabled: false, prompt: '' },
+  taskQuality: { enabled: true, prompt: '' },
   toolChoice: { enabled: true },
   chunkedWrite: { enabled: true, systemPromptEnabled: true, toolDescriptionEnabled: true },
   thinking: { enabled: true },
@@ -272,8 +240,8 @@ const normalizePromptSteering = (
     thinking: { ...defaults.thinking, ...(input?.thinking ?? {}) },
     custom: { ...defaults.custom, ...(input?.custom ?? {}) },
   }
-  if (!next.languageConstraint.prompt.trim()) next.languageConstraint.prompt = DEFAULT_LANGUAGE_CONSTRAINT_PROMPT
-  if (!next.taskQuality.prompt.trim()) next.taskQuality.prompt = DEFAULT_TASK_QUALITY_PROMPT
+  next.languageConstraint.prompt = next.languageConstraint.prompt.trim()
+  next.taskQuality.prompt = next.taskQuality.prompt.trim()
   next.custom.prompt = next.custom.prompt.trim()
   return next
 }
@@ -4109,7 +4077,7 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="语言约束"
-              description="减少“让me / let我 / 我will / 日语葡语串台”这类非自然语言拼接；不禁止正常技术英文。"
+              description="默认关闭。开启后在 system 顶部注入一次：优先用户明确要求的语言，其次客户端声明的语言（如 Claude Code 的 language 设置），否则跟随用户自己的消息。关闭时不注入任何语言提示词。"
               checked={draft.promptSteering.languageConstraint.enabled}
               onCheckedChange={(enabled) => updatePromptTextBlock('languageConstraint', 'enabled', enabled)}
             />
@@ -4161,9 +4129,9 @@ export function RuntimeConfigPanel() {
               <div className="mb-3 flex items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-medium">语言约束提示词</div>
-                  <div className="mt-1 text-xs leading-5 text-muted-foreground">目标是减少非自然语言的跨语言语法拼接，不是禁止正常技术英文。</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在“语言约束”开启时注入；留空保存时使用内置默认。</div>
                 </div>
-                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('languageConstraint', 'prompt', DEFAULT_LANGUAGE_CONSTRAINT_PROMPT)}>
+                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('languageConstraint', 'prompt', config.data?.promptSteeringDefaults?.languageConstraintPrompt ?? '')}>
                   恢复默认
                 </Button>
               </div>
@@ -4179,7 +4147,7 @@ export function RuntimeConfigPanel() {
                   <div className="text-sm font-medium">任务质量提示词</div>
                   <div className="mt-1 text-xs leading-5 text-muted-foreground">用于减少追问被忽视、任务边界错误、没有真实证据却声称完成等问题。</div>
                 </div>
-                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('taskQuality', 'prompt', DEFAULT_TASK_QUALITY_PROMPT)}>
+                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('taskQuality', 'prompt', config.data?.promptSteeringDefaults?.taskQualityPrompt ?? '')}>
                   恢复默认
                 </Button>
               </div>
