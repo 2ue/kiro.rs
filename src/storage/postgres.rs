@@ -919,7 +919,7 @@ impl PostgresStore {
             .usage_cleanup_batch_size_constraint_is_current()
             .await?
         {
-            missing.push("usage_cleanup_jobs.batch_size_check<=5000".to_string());
+            missing.push("usage_cleanup_jobs.batch_size_check<=10000".to_string());
         }
         if missing.is_empty() {
             return Ok(());
@@ -944,7 +944,7 @@ impl PostgresStore {
     async fn usage_cleanup_batch_size_constraint_is_current(&self) -> anyhow::Result<bool> {
         sqlx::query_scalar(
             r#"
-            SELECT COALESCE(bool_or(pg_get_constraintdef(c.oid) LIKE '%<= 5000%'), false)
+            SELECT COALESCE(bool_or(pg_get_constraintdef(c.oid) LIKE '%<= 10000%'), false)
             FROM pg_constraint c
             JOIN pg_class t ON t.oid = c.conrelid
             JOIN pg_namespace n ON n.oid = t.relnamespace
@@ -1053,6 +1053,12 @@ impl PostgresStore {
                     &mut tx,
                     "usage-cleanup-batch-size-limit-v1",
                     USAGE_CLEANUP_BATCH_SIZE_LIMIT_SQL,
+                )
+                .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "usage-cleanup-batch-size-limit-v2",
+                    USAGE_CLEANUP_BATCH_SIZE_LIMIT_V2_SQL,
                 )
                 .await?;
                 run_versioned_migration_in_tx(
@@ -12674,7 +12680,7 @@ CREATE TABLE IF NOT EXISTS usage_cleanup_jobs (
     mode TEXT NOT NULL CHECK (mode IN ('soft_delete', 'hard_delete')),
     include_summary BOOLEAN NOT NULL DEFAULT false,
     cutoff_at TIMESTAMPTZ NOT NULL,
-    batch_size INTEGER NOT NULL CHECK (batch_size > 0 AND batch_size <= 5000),
+    batch_size INTEGER NOT NULL CHECK (batch_size > 0 AND batch_size <= 10000),
     max_batches INTEGER NOT NULL CHECK (max_batches > 0 AND max_batches <= 10000),
     max_rows BIGINT CHECK (max_rows IS NULL OR max_rows >= 0),
     pause_ms_between_batches BIGINT NOT NULL CHECK (
@@ -13162,6 +13168,15 @@ ALTER TABLE usage_cleanup_jobs
     CHECK (batch_size > 0 AND batch_size <= 5000);
 "#;
 
+const USAGE_CLEANUP_BATCH_SIZE_LIMIT_V2_SQL: &str = r#"
+ALTER TABLE usage_cleanup_jobs
+    DROP CONSTRAINT IF EXISTS usage_cleanup_jobs_batch_size_check;
+
+ALTER TABLE usage_cleanup_jobs
+    ADD CONSTRAINT usage_cleanup_jobs_batch_size_check
+    CHECK (batch_size > 0 AND batch_size <= 10000);
+"#;
+
 const USAGE_CLEANUP_SEMANTICS_SQL: &str = r#"
 ALTER TABLE usage_cleanup_jobs
     ADD COLUMN IF NOT EXISTS include_summary BOOLEAN NOT NULL DEFAULT false,
@@ -13524,7 +13539,7 @@ mod tests {
         clean(&store).await;
 
         sqlx::query(
-            "DELETE FROM schema_migrations WHERE version = 'usage-cleanup-batch-size-limit-v1'",
+            "DELETE FROM schema_migrations WHERE version IN ('usage-cleanup-batch-size-limit-v1', 'usage-cleanup-batch-size-limit-v2')",
         )
         .execute(store.pool())
         .await
@@ -13570,7 +13585,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(compatibility_error.contains("usage_cleanup_jobs.batch_size_check<=5000"));
+        assert!(compatibility_error.contains("usage_cleanup_jobs.batch_size_check<=10000"));
 
         store.migrate_with_options(false).await.unwrap();
         store
@@ -13585,14 +13600,14 @@ mod tests {
                     mode: "soft_delete",
                     include_summary: false,
                     cutoff_at: Utc::now(),
-                    batch_size: 5_000,
+                    batch_size: 10_000,
                     max_batches: 100,
                     max_rows: None,
                     pause_ms_between_batches: 0,
                 })
                 .await
                 .unwrap(),
-            "expanded cleanup batch-size constraint must accept 5000"
+            "expanded cleanup batch-size constraint must accept 10000"
         );
 
         store.drop_test_schema().await.unwrap();

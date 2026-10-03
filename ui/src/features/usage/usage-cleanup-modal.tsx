@@ -16,7 +16,8 @@ import { Callout, ModalShell, useConfirm } from '@/components/patterns'
 const CLEANUP_MAX_OLDER_THAN_DAYS = 3650
 const CLEANUP_DEFAULT_OLDER_THAN_DAYS = 0
 const CLEANUP_DEFAULT_MAX_ROWS = 10_000
-const CLEANUP_DEFAULT_BATCH_SIZE = 5_000
+const CLEANUP_DEFAULT_BATCH_SIZE = 10_000
+const CLEANUP_MAX_BATCH_SIZE = 10_000
 const CLEANUP_MAX_ROWS = 50_000_000
 const CLEANUP_MAX_PAUSE_MS = 10_000
 const CLEANUP_DEFAULT_PAUSE_MS = 10
@@ -53,6 +54,7 @@ function statusLabel(status: string): string {
 export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [olderThanDays, setOlderThanDays] = useState(String(CLEANUP_DEFAULT_OLDER_THAN_DAYS))
   const [maxRows, setMaxRows] = useState(String(CLEANUP_DEFAULT_MAX_ROWS))
+  const [batchSize, setBatchSize] = useState(String(CLEANUP_DEFAULT_BATCH_SIZE))
   const [pauseMs, setPauseMs] = useState(String(CLEANUP_DEFAULT_PAUSE_MS))
   const [includeSummary, setIncludeSummary] = useState(false)
   const [physicalDelete, setPhysicalDelete] = useState(false)
@@ -85,7 +87,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
     maxRows: includeSummary
       ? 0
       : boundedInteger(maxRows, CLEANUP_DEFAULT_MAX_ROWS, 0, CLEANUP_MAX_ROWS),
-    batchSize: CLEANUP_DEFAULT_BATCH_SIZE,
+    batchSize: boundedInteger(batchSize, CLEANUP_DEFAULT_BATCH_SIZE, 1, CLEANUP_MAX_BATCH_SIZE),
     pauseMsBetweenBatches: boundedInteger(pauseMs, CLEANUP_DEFAULT_PAUSE_MS, 0, CLEANUP_MAX_PAUSE_MS),
   })
 
@@ -228,6 +230,26 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
                 }}
               />
               <span className="text-xs text-muted-foreground">ms</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-[1fr_auto] items-center gap-3">
+            <label htmlFor="usage-cleanup-batch-size" className="text-xs text-muted-foreground">
+              每批清理
+            </label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="usage-cleanup-batch-size"
+                type="number"
+                min={1}
+                max={CLEANUP_MAX_BATCH_SIZE}
+                className="h-8 w-32 text-xs"
+                value={batchSize}
+                onChange={(event) => {
+                  setBatchSize(event.target.value)
+                  setPreviewResult(null)
+                }}
+              />
+              <span className="text-xs text-muted-foreground">条</span>
             </div>
           </div>
           <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/5 p-3">

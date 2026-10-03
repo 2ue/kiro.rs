@@ -806,7 +806,7 @@ pub struct UsageCleanupRequest {
     /// 自定义 cutoff，优先级高于 older_than_days。
     #[serde(default)]
     pub cutoff_before: Option<String>,
-    /// 每批处理行数，默认 5000。
+    /// 每批处理行数，默认 10000。
     #[serde(default)]
     pub batch_size: Option<usize>,
     /// 兼容旧客户端的内部安全批次上限；页面不再暴露这个参数。

@@ -33,13 +33,13 @@ const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
 const EXPORT_LIMIT = 10_000
 const SLOW_FIRST_TOKEN_MS = 10_000
-const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS = 3
+const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS = 0
 const USAGE_CLEANUP_MAX_OLDER_THAN_DAYS = 3650
-const USAGE_CLEANUP_DEFAULT_BATCH_SIZE = 5_000
-const USAGE_CLEANUP_MAX_BATCH_SIZE = 5000
+const USAGE_CLEANUP_DEFAULT_BATCH_SIZE = 10_000
+const USAGE_CLEANUP_MAX_BATCH_SIZE = 10_000
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES = 10_000
 const USAGE_CLEANUP_MAX_BATCHES = 10_000
-const USAGE_CLEANUP_DEFAULT_PAUSE_MS = 100
+const USAGE_CLEANUP_DEFAULT_PAUSE_MS = 10
 const USAGE_CLEANUP_MAX_PAUSE_MS = 10000
 
 type BillingDeltaTone = 'loss' | 'profit' | 'even'
@@ -1868,7 +1868,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
           <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3">
             <div className="text-xs font-semibold text-destructive">危险操作</div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              0 表示以任务启动时刻为 cutoff。下面的软删除、物理删除和全量清理都会沿用当前参数，默认保留 3 天、每批 5000 条。任务状态会持久化，可取消并审计。
+              0 表示以任务启动时刻为 cutoff。下面的软删除、物理删除和全量清理都会沿用当前参数，默认从当前时刻开始、每批 10000 条。任务状态会持久化，可取消并审计。
             </p>
             <Button
               className="mt-3 w-full text-destructive"
@@ -1881,7 +1881,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
           </div>
 
           <div className="rounded-md border border-kiro-warning-soft bg-kiro-warning-soft p-3 text-kiro-warning">
-            这是手动任务，不会定时执行。系统会自动分批清理；每次执行最多 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批，达到上限后暂停并等待管理员显式恢复。默认保留 {USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS} 天，每批 {formatNumber(USAGE_CLEANUP_DEFAULT_BATCH_SIZE)} 条；软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup，硬删除只物理删除已软删的记录。
+            这是手动任务，不会定时执行。系统会自动分批清理；每次执行最多 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批，达到上限后暂停并等待管理员显式恢复。默认从当前时刻开始清理，每批 {formatNumber(USAGE_CLEANUP_DEFAULT_BATCH_SIZE)} 条；软删除会同步扣除命中记录对应的顶部统计、费用和 Dashboard rollup，硬删除只物理删除已软删的记录。
           </div>
 
           <div className="grid gap-3 md:grid-cols-2">
