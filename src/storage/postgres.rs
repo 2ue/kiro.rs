@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -27,10 +27,13 @@ use crate::anthropic::usage::{
     UsageExternalPoolRiskCostStats, UsageExternalPoolRiskFilters, UsageExternalPoolRiskGroup,
     UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageExternalPoolRiskSample,
     UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals, UsageExternalPoolRiskWindow,
-    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
-    UsageRecordsResult, UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary,
-    UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
-    usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
+    UsageOverviewAccountRow, UsageOverviewExternal, UsageOverviewLocal, UsageOverviewMetrics,
+    UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewSeriesMetrics,
+    UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals, UsageRealtimeStats,
+    UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
+    UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
+    usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
+    usage_dashboard_window_spec_for_key, usage_dashboard_windows,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -164,6 +167,14 @@ const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
         table_name: "usage_cleanup_jobs",
         column_name: "batch_size",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_cleanup_jobs",
+        column_name: "include_summary",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_cleanup_jobs",
+        column_name: "max_rows",
     },
     RequiredPostgresColumn {
         table_name: "usage_records",
@@ -1042,6 +1053,12 @@ impl PostgresStore {
                     &mut tx,
                     "usage-cleanup-batch-size-limit-v1",
                     USAGE_CLEANUP_BATCH_SIZE_LIMIT_SQL,
+                )
+                .await?;
+                run_versioned_migration_in_tx(
+                    &mut tx,
+                    "usage-cleanup-semantics-v2",
+                    USAGE_CLEANUP_SEMANTICS_SQL,
                 )
                 .await?;
                 run_versioned_migration_in_tx(
@@ -5371,9 +5388,11 @@ pub struct UsageCleanupBatchResult {
 pub struct UsageCleanupJobRow {
     pub job_id: String,
     pub mode: String,
+    pub include_summary: bool,
     pub cutoff_at: DateTime<Utc>,
     pub batch_size: usize,
     pub max_batches: usize,
+    pub max_rows: Option<u64>,
     pub pause_ms_between_batches: u64,
     pub status: String,
     pub phase: String,
@@ -5401,9 +5420,11 @@ pub struct UsageCleanupJobRow {
 pub struct NewUsageCleanupJob<'a> {
     pub job_id: &'a str,
     pub mode: &'a str,
+    pub include_summary: bool,
     pub cutoff_at: DateTime<Utc>,
     pub batch_size: usize,
     pub max_batches: usize,
+    pub max_rows: Option<u64>,
     pub pause_ms_between_batches: u64,
 }
 
@@ -5437,18 +5458,20 @@ impl PostgresUsageStore {
         let result = sqlx::query(
             r#"
             INSERT INTO usage_cleanup_jobs (
-                job_id, mode, cutoff_at, batch_size, max_batches,
+                job_id, mode, include_summary, cutoff_at, batch_size, max_batches, max_rows,
                 pause_ms_between_batches, status, phase, started_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'queued', 'postgres', now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', 'postgres', now(), now())
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(job.job_id)
         .bind(job.mode)
+        .bind(job.include_summary)
         .bind(job.cutoff_at)
         .bind(usize_to_i64(job.batch_size))
         .bind(usize_to_i64(job.max_batches))
+        .bind(job.max_rows.map(u64_to_i64))
         .bind(u64_to_i64(job.pause_ms_between_batches))
         .execute(self.store.pool())
         .await?;
@@ -5458,7 +5481,7 @@ impl PostgresUsageStore {
     pub async fn latest_cleanup_job(&self) -> anyhow::Result<Option<UsageCleanupJobRow>> {
         let row = sqlx::query(
             r#"
-            SELECT job_id, mode, cutoff_at, batch_size, max_batches,
+            SELECT job_id, mode, include_summary, cutoff_at, batch_size, max_batches, max_rows,
                    pause_ms_between_batches, status, phase, matched_rows,
                    remaining_rows, processed_rows, last_batch_rows, batches,
                    cancel_requested, stop_reason, last_error, redis_deleted_keys,
@@ -5479,7 +5502,7 @@ impl PostgresUsageStore {
     pub async fn cleanup_job(&self, job_id: &str) -> anyhow::Result<Option<UsageCleanupJobRow>> {
         let row = sqlx::query(
             r#"
-            SELECT job_id, mode, cutoff_at, batch_size, max_batches,
+            SELECT job_id, mode, include_summary, cutoff_at, batch_size, max_batches, max_rows,
                    pause_ms_between_batches, status, phase, matched_rows,
                    remaining_rows, processed_rows, last_batch_rows, batches,
                    cancel_requested, stop_reason, last_error, redis_deleted_keys,
@@ -5500,7 +5523,7 @@ impl PostgresUsageStore {
     pub async fn recoverable_cleanup_job(&self) -> anyhow::Result<Option<UsageCleanupJobRow>> {
         let row = sqlx::query(
             r#"
-            SELECT job_id, mode, cutoff_at, batch_size, max_batches,
+            SELECT job_id, mode, include_summary, cutoff_at, batch_size, max_batches, max_rows,
                    pause_ms_between_batches, status, phase, matched_rows,
                    remaining_rows, processed_rows, last_batch_rows, batches,
                    cancel_requested, stop_reason, last_error, redis_deleted_keys,
@@ -5541,7 +5564,7 @@ impl PostgresUsageStore {
                     status = 'queued'
                     OR (status = 'running' AND (lease_until IS NULL OR lease_until < now()))
               )
-            RETURNING job_id, mode, cutoff_at, batch_size, max_batches,
+            RETURNING job_id, mode, include_summary, cutoff_at, batch_size, max_batches, max_rows,
                       pause_ms_between_batches, status, phase, matched_rows,
                       remaining_rows, processed_rows, last_batch_rows, batches,
                       cancel_requested, stop_reason, last_error, redis_deleted_keys,
@@ -5668,7 +5691,7 @@ impl PostgresUsageStore {
                 updated_at = now()
             WHERE job_id = $1
               AND status IN ('queued', 'running')
-            RETURNING job_id, mode, cutoff_at, batch_size, max_batches,
+            RETURNING job_id, mode, include_summary, cutoff_at, batch_size, max_batches, max_rows,
                       pause_ms_between_batches, status, phase, matched_rows,
                       remaining_rows, processed_rows, last_batch_rows, batches,
                       cancel_requested, stop_reason, last_error, redis_deleted_keys,
@@ -5702,7 +5725,7 @@ impl PostgresUsageStore {
                 updated_at = now()
             WHERE job_id = $1
               AND status IN ('failed', 'cancelled', 'paused')
-            RETURNING job_id, mode, cutoff_at, batch_size, max_batches,
+            RETURNING job_id, mode, include_summary, cutoff_at, batch_size, max_batches, max_rows,
                       pause_ms_between_batches, status, phase, matched_rows,
                       remaining_rows, processed_rows, last_batch_rows, batches,
                       cancel_requested, stop_reason, last_error, redis_deleted_keys,
@@ -5792,6 +5815,308 @@ impl PostgresUsageStore {
             );
         }
         Ok(())
+    }
+
+    /// Rollup-first overview split for the redesigned admin dashboard.
+    ///
+    /// The query intentionally reads only complete UTC hour buckets. Local usage
+    /// is derived as global minus external-pool rows so the response can expose
+    /// an auditable all = local + external reconciliation without scanning the
+    /// request-level table.
+    pub async fn dashboard_overview(
+        &self,
+        spec: &UsageOverviewSpec,
+    ) -> anyhow::Result<UsageOverviewResponse> {
+        let dimensions = vec![
+            "global".to_string(),
+            "external_pool".to_string(),
+            "credential".to_string(),
+            "model".to_string(),
+            "endpoint".to_string(),
+            "request_api_key".to_string(),
+            "error".to_string(),
+        ];
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_dashboard_read_transaction(&mut tx).await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                bucket_start,
+                dimension,
+                dimension_key,
+                NULLIF(BTRIM(dimension_label), '') AS dimension_label,
+                requests,
+                success_requests,
+                error_requests,
+                total_input_tokens,
+                total_output_tokens,
+                total_cache_read_input_tokens,
+                total_cache_creation_input_tokens,
+                total_estimated_cost_usd,
+                CASE
+                    WHEN COALESCE(total_original_cost_usd, 0) <> 0
+                    THEN total_original_cost_usd
+                    ELSE COALESCE(total_estimated_cost_usd, 0)
+                END::double precision AS total_original_cost_usd,
+                total_kiro_metering_usage,
+                priced_requests,
+                unpriced_requests,
+                duration_ms_sum,
+                duration_ms_count,
+                external_pool_cost_floor_applied_requests,
+                external_pool_raw_cost_usd,
+                external_pool_shaped_cost_usd,
+                external_pool_uplifted_cost_usd,
+                external_pool_reported_cost_usd,
+                external_pool_billable_cost_usd,
+                external_pool_profit_usd,
+                external_pool_cost_floor_delta_usd
+            FROM usage_rollup_time_buckets
+            WHERE dimension = ANY($1::text[])
+              AND bucket_start >= $2
+              AND bucket_start < $3
+            ORDER BY bucket_start, dimension, dimension_key
+            "#,
+        )
+        .bind(&dimensions)
+        .bind(spec.from)
+        .bind(spec.to)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let mut all = OverviewAccumulator::default();
+        let mut external = OverviewAccumulator::default();
+        let mut series = HashMap::<String, OverviewSeriesAccumulator>::new();
+        let mut pools = HashMap::<String, OverviewPoolAccumulator>::new();
+        let mut accounts = HashMap::<String, OverviewAccumulator>::new();
+        let mut account_labels = HashMap::<String, String>::new();
+        let mut models = HashMap::<String, OverviewRankAccumulator>::new();
+        let mut keys = HashMap::<String, OverviewRankAccumulator>::new();
+        let mut paths = HashMap::<String, OverviewRankAccumulator>::new();
+        let mut errors = HashMap::<String, OverviewRankAccumulator>::new();
+
+        for row in rows {
+            let bucket_start: DateTime<Utc> = row.try_get("bucket_start")?;
+            let dimension: String = row.try_get("dimension")?;
+            let dimension_key: String = row.try_get("dimension_key")?;
+            let dimension_label: Option<String> = row.try_get("dimension_label")?;
+            let metrics = OverviewAccumulator::from_row(&row)?;
+            let series_key = overview_series_key(spec, bucket_start);
+
+            match dimension.as_str() {
+                "global" if dimension_key == "all" => {
+                    all.add(metrics);
+                    series.entry(series_key).or_default().all.add(metrics);
+                }
+                "external_pool" => {
+                    external.add(metrics);
+                    series
+                        .entry(series_key.clone())
+                        .or_default()
+                        .external
+                        .add(metrics);
+                    let pool = pools.entry(dimension_key.clone()).or_default();
+                    pool.metrics.add(metrics);
+                    pool.raw_cost_usd += row.try_get::<f64, _>("external_pool_raw_cost_usd")?;
+                    pool.shaped_cost_usd +=
+                        row.try_get::<f64, _>("external_pool_shaped_cost_usd")?;
+                    pool.uplifted_cost_usd +=
+                        row.try_get::<f64, _>("external_pool_uplifted_cost_usd")?;
+                    pool.reported_cost_usd +=
+                        row.try_get::<f64, _>("external_pool_reported_cost_usd")?;
+                    pool.billable_cost_usd +=
+                        row.try_get::<f64, _>("external_pool_billable_cost_usd")?;
+                    pool.profit_usd += row.try_get::<f64, _>("external_pool_profit_usd")?;
+                    pool.cost_floor_delta_usd +=
+                        row.try_get::<f64, _>("external_pool_cost_floor_delta_usd")?;
+                    pool.cost_floor_applied_requests =
+                        pool.cost_floor_applied_requests.saturating_add(
+                            row.try_get::<i64, _>("external_pool_cost_floor_applied_requests")?
+                                .max(0) as usize,
+                        );
+                    if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
+                        pool.label = Some(label.to_string());
+                    }
+                }
+                "credential" => {
+                    let account = accounts.entry(dimension_key.clone()).or_default();
+                    account.add(metrics);
+                    if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
+                        account_labels.insert(dimension_key, label.to_string());
+                    }
+                }
+                "model" => {
+                    let rank = models.entry(dimension_key.clone()).or_default();
+                    rank.add(metrics);
+                    if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
+                        rank.label = label.to_string();
+                    }
+                }
+                "endpoint" => {
+                    let rank = paths.entry(dimension_key.clone()).or_default();
+                    rank.add(metrics);
+                    if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
+                        rank.label = label.to_string();
+                    }
+                }
+                "request_api_key" => {
+                    let rank = keys.entry(dimension_key.clone()).or_default();
+                    rank.add(metrics);
+                    if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
+                        rank.label = label.to_string();
+                    }
+                }
+                "error" => {
+                    let rank = errors.entry(dimension_key.clone()).or_default();
+                    rank.add(metrics);
+                    if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
+                        rank.label = label.to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let series_points = overview_series_points(spec, series);
+        let external_metrics = external.to_metrics();
+        let local_metrics = all.subtract(&external);
+
+        let cost_floor_applied_requests = pools
+            .values()
+            .map(|pool| pool.cost_floor_applied_requests)
+            .sum::<usize>();
+        let mut pool_rows = pools
+            .into_iter()
+            .filter_map(|(pool_id, pool)| {
+                let Ok(pool_id) = pool_id.parse::<u64>() else {
+                    return None;
+                };
+                Some(UsageOverviewPoolRow {
+                    pool_id,
+                    pool_name: pool.label.unwrap_or_else(|| format!("#{}", pool_id)),
+                    metrics: pool.metrics.to_metrics(),
+                    raw_cost_usd: pool.raw_cost_usd,
+                    shaped_cost_usd: pool.shaped_cost_usd,
+                    uplifted_cost_usd: pool.uplifted_cost_usd,
+                    reported_cost_usd: pool.reported_cost_usd,
+                    billable_cost_usd: pool.billable_cost_usd,
+                    profit_usd: pool.profit_usd,
+                    cost_floor_delta_usd: pool.cost_floor_delta_usd,
+                    cost_floor_applied_requests: pool.cost_floor_applied_requests,
+                })
+            })
+            .collect::<Vec<_>>();
+        pool_rows.sort_by(|left, right| {
+            right
+                .billable_cost_usd
+                .total_cmp(&left.billable_cost_usd)
+                .then_with(|| right.metrics.requests.cmp(&left.metrics.requests))
+                .then_with(|| left.pool_id.cmp(&right.pool_id))
+        });
+
+        let mut account_rows = accounts
+            .into_iter()
+            .filter_map(|(credential_id, metrics)| {
+                let Ok(credential_id) = credential_id.parse::<u64>() else {
+                    return None;
+                };
+                Some(UsageOverviewAccountRow {
+                    credential_id,
+                    label: account_labels
+                        .get(&credential_id.to_string())
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{}", credential_id)),
+                    metrics: metrics.to_metrics(),
+                })
+            })
+            .filter(|row| row.metrics.requests > 0)
+            .collect::<Vec<_>>();
+        account_rows.sort_by(|left, right| {
+            right
+                .metrics
+                .estimated_cost_usd
+                .total_cmp(&left.metrics.estimated_cost_usd)
+                .then_with(|| right.metrics.requests.cmp(&left.metrics.requests))
+                .then_with(|| left.credential_id.cmp(&right.credential_id))
+        });
+        let accounts_total = account_rows.len();
+        let active_accounts = accounts_total;
+        let mut top_accounts = account_rows
+            .iter()
+            .map(|row| UsageOverviewRankRow {
+                key: row.credential_id.to_string(),
+                label: row.label.clone(),
+                requests: row.metrics.requests,
+                error_requests: row.metrics.error_requests,
+                estimated_cost_usd: row.metrics.estimated_cost_usd,
+            })
+            .collect::<Vec<_>>();
+        top_accounts.sort_by(|left, right| {
+            right
+                .estimated_cost_usd
+                .total_cmp(&left.estimated_cost_usd)
+                .then_with(|| right.requests.cmp(&left.requests))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        top_accounts.truncate(spec.top_n);
+
+        let mut top_models = ranked_overview_rows(models);
+        top_models.truncate(spec.top_n);
+        let mut top_keys = ranked_overview_rows(keys);
+        top_keys.truncate(spec.top_n);
+        let mut top_paths = ranked_overview_rows(paths);
+        top_paths.truncate(spec.top_n);
+        let mut top_errors = ranked_overview_rows(errors);
+        top_errors.sort_by(|left, right| {
+            right
+                .error_requests
+                .cmp(&left.error_requests)
+                .then_with(|| right.requests.cmp(&left.requests))
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        top_errors.truncate(spec.top_n);
+
+        Ok(UsageOverviewResponse {
+            generated_at: Utc::now().to_rfc3339(),
+            timezone: spec.timezone.clone(),
+            range: crate::anthropic::usage::UsageOverviewRange {
+                key: spec.range_key.clone(),
+                requested_from: spec.requested_from.to_rfc3339(),
+                requested_to: spec.requested_to.to_rfc3339(),
+                from: spec.from.to_rfc3339(),
+                to: spec.to.to_rfc3339(),
+                data_through: spec.data_through.to_rfc3339(),
+                granularity: spec.granularity.clone(),
+            },
+            totals: UsageOverviewTotals {
+                all: all.to_metrics(),
+                local: local_metrics.to_metrics(),
+                external: external_metrics,
+            },
+            external: UsageOverviewExternal {
+                raw_cost_usd: pool_rows.iter().map(|pool| pool.raw_cost_usd).sum(),
+                shaped_cost_usd: pool_rows.iter().map(|pool| pool.shaped_cost_usd).sum(),
+                uplifted_cost_usd: pool_rows.iter().map(|pool| pool.uplifted_cost_usd).sum(),
+                reported_cost_usd: pool_rows.iter().map(|pool| pool.reported_cost_usd).sum(),
+                billable_cost_usd: pool_rows.iter().map(|pool| pool.billable_cost_usd).sum(),
+                profit_usd: pool_rows.iter().map(|pool| pool.profit_usd).sum(),
+                cost_floor_delta_usd: pool_rows.iter().map(|pool| pool.cost_floor_delta_usd).sum(),
+                cost_floor_applied_requests,
+                pools: pool_rows,
+            },
+            local: UsageOverviewLocal {
+                active_accounts,
+                accounts_total,
+                accounts: account_rows,
+            },
+            series: series_points,
+            top_models,
+            top_accounts,
+            top_keys,
+            top_paths,
+            top_errors,
+        })
     }
 
     pub async fn query(&self, query: UsageRecordQuery) -> anyhow::Result<UsageRecordsResult> {
@@ -5904,8 +6229,10 @@ impl PostgresUsageStore {
                 MIN(created_at) AS oldest_created_at,
                 MAX(created_at) AS newest_created_at
             FROM usage_records
-            WHERE deleted_at IS NOT NULL
-              AND deleted_at < $1
+            WHERE (
+                (deleted_at IS NULL AND created_at < $1)
+                OR (deleted_at IS NOT NULL AND deleted_at < $1)
+            )
             "#,
         )
         .bind(cutoff)
@@ -5954,10 +6281,33 @@ impl PostgresUsageStore {
             .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub async fn soft_delete_cleanup_batch(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: usize,
+    ) -> anyhow::Result<UsageCleanupBatchResult> {
+        self.soft_delete_cleanup_batch_with_summary(cutoff, batch_size, true)
+            .await
+    }
+
+    /// Soft-delete detail rows while keeping their already-materialized summaries.
+    /// This is the path used by the admin cleanup job unless the caller explicitly
+    /// asks to clear all historical summaries.
+    pub async fn soft_delete_cleanup_batch_preserving_summary(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> anyhow::Result<UsageCleanupBatchResult> {
+        self.soft_delete_cleanup_batch_with_summary(cutoff, batch_size, false)
+            .await
+    }
+
+    async fn soft_delete_cleanup_batch_with_summary(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+        include_summary: bool,
     ) -> anyhow::Result<UsageCleanupBatchResult> {
         if let Err(err) = self.advance_soft_delete_cleanup_watermark(cutoff).await {
             if is_postgres_cleanup_retryable_timeout_error(&err) {
@@ -5990,7 +6340,9 @@ impl PostgresUsageStore {
                     FOR UPDATE SKIP LOCKED
                 )
                 UPDATE usage_records AS u
-                SET deleted_at = now(), rollup_active = false, updated_at = now()
+                SET deleted_at = now(),
+                    rollup_active = CASE WHEN $3 THEN false ELSE true END,
+                    updated_at = now()
                 FROM victims AS v
                 WHERE u.id = v.id
                 RETURNING v.data, v.rollup_active
@@ -5998,19 +6350,22 @@ impl PostgresUsageStore {
             )
             .bind(cutoff)
             .bind(usize_to_i64(batch_size))
+            .bind(include_summary)
             .fetch_all(&mut *tx)
             .await?;
             let processed_rows = victim_rows.len() as u64;
-            let mut rollups = UsageRollupBatchDelta::default();
-            for row in victim_rows {
-                if row.try_get::<bool, _>("rollup_active")? {
-                    let value: serde_json::Value = row.try_get("data")?;
-                    let mut record: UsageRecord = serde_json::from_value(value)?;
-                    apply_usage_record_legacy_cost_compatibility(&mut record);
-                    rollups.add_record(&record, -1);
+            if include_summary {
+                let mut rollups = UsageRollupBatchDelta::default();
+                for row in victim_rows {
+                    if row.try_get::<bool, _>("rollup_active")? {
+                        let value: serde_json::Value = row.try_get("data")?;
+                        let mut record: UsageRecord = serde_json::from_value(value)?;
+                        apply_usage_record_legacy_cost_compatibility(&mut record);
+                        rollups.add_record(&record, -1);
+                    }
                 }
+                rollups.apply(&mut tx).await?;
             }
-            rollups.apply(&mut tx).await?;
             let has_remaining = if processed_rows < batch_size as u64 {
                 Some(
                     sqlx::query_scalar::<_, bool>(
@@ -6073,10 +6428,34 @@ impl PostgresUsageStore {
         .map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub async fn hard_delete_cleanup_batch(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: usize,
+    ) -> anyhow::Result<UsageCleanupBatchResult> {
+        self.hard_delete_cleanup_batch_with_summary(cutoff, batch_size, true)
+            .await
+    }
+
+    /// Physically delete matching detail rows without touching rollups. This
+    /// includes active rows matched by `created_at` and older tombstones matched
+    /// by `deleted_at`; the admin cleanup worker uses this default-preserving
+    /// path and leaves rollups unchanged.
+    pub async fn hard_delete_cleanup_batch_preserving_summary(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> anyhow::Result<UsageCleanupBatchResult> {
+        self.hard_delete_cleanup_batch_with_summary(cutoff, batch_size, false)
+            .await
+    }
+
+    async fn hard_delete_cleanup_batch_with_summary(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+        include_summary: bool,
     ) -> anyhow::Result<UsageCleanupBatchResult> {
         let mut tx = self.store.pool().begin().await?;
         configure_usage_cleanup_transaction(&mut tx).await?;
@@ -6093,9 +6472,11 @@ impl PostgresUsageStore {
                 WITH victims AS (
                     SELECT id, data, rollup_active
                     FROM usage_records
-                    WHERE deleted_at IS NOT NULL
-                      AND deleted_at < $1
-                    ORDER BY deleted_at ASC, id ASC
+                    WHERE (
+                        (deleted_at IS NULL AND created_at < $1)
+                        OR (deleted_at IS NOT NULL AND deleted_at < $1)
+                    )
+                    ORDER BY COALESCE(deleted_at, created_at) ASC, id ASC
                     LIMIT $2
                     FOR UPDATE SKIP LOCKED
                 )
@@ -6110,16 +6491,18 @@ impl PostgresUsageStore {
             .fetch_all(&mut *tx)
             .await?;
             let processed_rows = victim_rows.len() as u64;
-            let mut rollups = UsageRollupBatchDelta::default();
-            for row in victim_rows {
-                if row.try_get::<bool, _>("rollup_active")? {
-                    let value: serde_json::Value = row.try_get("data")?;
-                    let mut record: UsageRecord = serde_json::from_value(value)?;
-                    apply_usage_record_legacy_cost_compatibility(&mut record);
-                    rollups.add_record(&record, -1);
+            if include_summary {
+                let mut rollups = UsageRollupBatchDelta::default();
+                for row in victim_rows {
+                    if row.try_get::<bool, _>("rollup_active")? {
+                        let value: serde_json::Value = row.try_get("data")?;
+                        let mut record: UsageRecord = serde_json::from_value(value)?;
+                        apply_usage_record_legacy_cost_compatibility(&mut record);
+                        rollups.add_record(&record, -1);
+                    }
                 }
+                rollups.apply(&mut tx).await?;
             }
-            rollups.apply(&mut tx).await?;
             let has_remaining = if processed_rows < batch_size as u64 {
                 Some(
                     sqlx::query_scalar::<_, bool>(
@@ -6127,8 +6510,10 @@ impl PostgresUsageStore {
                         SELECT EXISTS (
                             SELECT 1
                             FROM usage_records
-                            WHERE deleted_at IS NOT NULL
-                              AND deleted_at < $1
+                            WHERE (
+                                (deleted_at IS NULL AND created_at < $1)
+                                OR (deleted_at IS NOT NULL AND deleted_at < $1)
+                            )
                         )
                         "#,
                     )
@@ -6171,8 +6556,10 @@ impl PostgresUsageStore {
             SELECT EXISTS (
                 SELECT 1
                 FROM usage_records
-                WHERE deleted_at IS NOT NULL
-                  AND deleted_at < $1
+                WHERE (
+                    (deleted_at IS NULL AND created_at < $1)
+                    OR (deleted_at IS NOT NULL AND deleted_at < $1)
+                )
             )
             "#,
         )
@@ -6180,6 +6567,61 @@ impl PostgresUsageStore {
         .fetch_one(self.store.pool())
         .await
         .map_err(Into::into)
+    }
+
+    /// Recreate persisted usage aggregates from the currently visible detail rows.
+    ///
+    /// Summary-inclusive cleanup first soft-deletes rows older than its cutoff. New
+    /// traffic may still be accepted after that cutoff, so a plain TRUNCATE of the
+    /// rollup tables would erase fresh rollups and make the live service look empty
+    /// until enough new writes accumulate. Rebuilding from active details in the
+    /// same reset transaction preserves those post-cutoff records.
+    pub async fn reset_usage_rollups_from_active_records(&self) -> anyhow::Result<()> {
+        let mut tx = self.store.pool().begin().await?;
+        configure_usage_cleanup_transaction(&mut tx).await?;
+        acquire_usage_writer_commit_guard(&mut tx).await?;
+        for statement in [
+            "TRUNCATE TABLE usage_credential_cost_summary",
+            "TRUNCATE TABLE usage_duration_rollup_time_buckets",
+            "TRUNCATE TABLE usage_cache_read_rollup_time_buckets",
+            "TRUNCATE TABLE usage_cache_read_totals",
+            "TRUNCATE TABLE usage_rollup_time_buckets",
+            "TRUNCATE TABLE usage_rollup_totals",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        let mut last_id: Option<String> = None;
+        loop {
+            let rows = sqlx::query(
+                r#"
+                SELECT id, data
+                FROM usage_records
+                WHERE deleted_at IS NULL
+                  AND rollup_active
+                  AND ($1::text IS NULL OR id > $1)
+                ORDER BY id ASC
+                LIMIT 500
+                "#,
+            )
+            .bind(last_id.as_deref())
+            .fetch_all(&mut *tx)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut rollups = UsageRollupBatchDelta::default();
+            for row in rows {
+                last_id = Some(row.try_get("id")?);
+                let value: serde_json::Value = row.try_get("data")?;
+                let mut record: UsageRecord = serde_json::from_value(value)?;
+                apply_usage_record_legacy_cost_compatibility(&mut record);
+                rollups.add_record(&record, 1);
+            }
+            rollups.apply(&mut tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn summary(&self, high_cache_threshold: i32) -> anyhow::Result<UsageSummary> {
@@ -8790,9 +9232,11 @@ fn usage_cleanup_job_from_row(row: PgRow) -> anyhow::Result<UsageCleanupJobRow> 
     Ok(UsageCleanupJobRow {
         job_id: row.try_get("job_id")?,
         mode: row.try_get("mode")?,
+        include_summary: row.try_get("include_summary")?,
         cutoff_at: row.try_get("cutoff_at")?,
         batch_size: nonnegative_int("batch_size")?,
         max_batches: nonnegative_int("max_batches")?,
+        max_rows: optional_u64("max_rows")?,
         pause_ms_between_batches: row_i64_to_u64(&row, "pause_ms_between_batches")?,
         status: row.try_get("status")?,
         phase: row.try_get("phase")?,
@@ -9216,6 +9660,14 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
             include_time_bucket: true,
         },
     ];
+
+    let request_api_key = non_empty_or_unknown(record.request_api_key_id.as_deref().unwrap_or(""));
+    dimensions.push(UsageRollupDimension {
+        dimension: "request_api_key",
+        key: request_api_key,
+        label: None,
+        include_time_bucket: true,
+    });
 
     if let Some(credential_id) = record.credential_id {
         dimensions.push(UsageRollupDimension {
@@ -10470,6 +10922,345 @@ fn push_dashboard_external_pool_segments_cte(builder: &mut QueryBuilder<'_, Post
 fn row_i64_to_usize(row: &PgRow, column: &str) -> anyhow::Result<usize> {
     let value: i64 = row.try_get(column)?;
     Ok(value.max(0) as usize)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OverviewAccumulator {
+    requests: i64,
+    success_requests: i64,
+    error_requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    estimated_cost_usd: f64,
+    original_cost_usd: f64,
+    kiro_metering_usage: f64,
+    priced_requests: i64,
+    unpriced_requests: i64,
+    duration_ms_sum: i64,
+    duration_ms_count: i64,
+    external_pool_cost_floor_applied_requests: i64,
+}
+
+impl OverviewAccumulator {
+    fn from_row(row: &PgRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            requests: row.try_get("requests")?,
+            success_requests: row.try_get("success_requests")?,
+            error_requests: row.try_get("error_requests")?,
+            input_tokens: row.try_get("total_input_tokens")?,
+            output_tokens: row.try_get("total_output_tokens")?,
+            cache_read_input_tokens: row.try_get("total_cache_read_input_tokens")?,
+            cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
+            estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+            original_cost_usd: row.try_get("total_original_cost_usd")?,
+            kiro_metering_usage: row.try_get("total_kiro_metering_usage")?,
+            priced_requests: row.try_get("priced_requests")?,
+            unpriced_requests: row.try_get("unpriced_requests")?,
+            duration_ms_sum: row.try_get("duration_ms_sum")?,
+            duration_ms_count: row.try_get("duration_ms_count")?,
+            external_pool_cost_floor_applied_requests: row
+                .try_get("external_pool_cost_floor_applied_requests")?,
+        })
+    }
+
+    fn add(&mut self, other: Self) {
+        self.requests += other.requests;
+        self.success_requests += other.success_requests;
+        self.error_requests += other.error_requests;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.estimated_cost_usd += other.estimated_cost_usd;
+        self.original_cost_usd += other.original_cost_usd;
+        self.kiro_metering_usage += other.kiro_metering_usage;
+        self.priced_requests += other.priced_requests;
+        self.unpriced_requests += other.unpriced_requests;
+        self.duration_ms_sum += other.duration_ms_sum;
+        self.duration_ms_count += other.duration_ms_count;
+        self.external_pool_cost_floor_applied_requests +=
+            other.external_pool_cost_floor_applied_requests;
+    }
+
+    fn subtract(&self, other: &Self) -> Self {
+        Self {
+            requests: overview_subtract_i64(self.requests, other.requests, "requests"),
+            success_requests: overview_subtract_i64(
+                self.success_requests,
+                other.success_requests,
+                "success_requests",
+            ),
+            error_requests: overview_subtract_i64(
+                self.error_requests,
+                other.error_requests,
+                "error_requests",
+            ),
+            input_tokens: overview_subtract_i64(
+                self.input_tokens,
+                other.input_tokens,
+                "input_tokens",
+            ),
+            output_tokens: overview_subtract_i64(
+                self.output_tokens,
+                other.output_tokens,
+                "output_tokens",
+            ),
+            cache_read_input_tokens: overview_subtract_i64(
+                self.cache_read_input_tokens,
+                other.cache_read_input_tokens,
+                "cache_read_input_tokens",
+            ),
+            cache_creation_input_tokens: overview_subtract_i64(
+                self.cache_creation_input_tokens,
+                other.cache_creation_input_tokens,
+                "cache_creation_input_tokens",
+            ),
+            estimated_cost_usd: overview_subtract_f64(
+                self.estimated_cost_usd,
+                other.estimated_cost_usd,
+                "estimated_cost_usd",
+            ),
+            original_cost_usd: overview_subtract_f64(
+                self.original_cost_usd,
+                other.original_cost_usd,
+                "original_cost_usd",
+            ),
+            kiro_metering_usage: overview_subtract_f64(
+                self.kiro_metering_usage,
+                other.kiro_metering_usage,
+                "kiro_metering_usage",
+            ),
+            priced_requests: overview_subtract_i64(
+                self.priced_requests,
+                other.priced_requests,
+                "priced_requests",
+            ),
+            unpriced_requests: overview_subtract_i64(
+                self.unpriced_requests,
+                other.unpriced_requests,
+                "unpriced_requests",
+            ),
+            duration_ms_sum: overview_subtract_i64(
+                self.duration_ms_sum,
+                other.duration_ms_sum,
+                "duration_ms_sum",
+            ),
+            duration_ms_count: overview_subtract_i64(
+                self.duration_ms_count,
+                other.duration_ms_count,
+                "duration_ms_count",
+            ),
+            external_pool_cost_floor_applied_requests: 0,
+        }
+    }
+
+    fn to_metrics(self) -> UsageOverviewMetrics {
+        let requests = self.requests.max(0) as usize;
+        let error_requests = self.error_requests.max(0) as usize;
+        UsageOverviewMetrics {
+            requests,
+            success_requests: self.success_requests.max(0) as usize,
+            error_requests,
+            error_rate: usage_ratio(error_requests, requests),
+            input_tokens: self.input_tokens.max(0),
+            output_tokens: self.output_tokens.max(0),
+            cache_read_input_tokens: self.cache_read_input_tokens.max(0),
+            cache_creation_input_tokens: self.cache_creation_input_tokens.max(0),
+            estimated_cost_usd: self.estimated_cost_usd.max(0.0),
+            original_cost_usd: self.original_cost_usd.max(0.0),
+            kiro_metering_usage: self.kiro_metering_usage.max(0.0),
+            priced_requests: self.priced_requests.max(0) as usize,
+            unpriced_requests: self.unpriced_requests.max(0) as usize,
+            average_duration_ms: if self.duration_ms_count > 0 {
+                self.duration_ms_sum.max(0) as f64 / self.duration_ms_count as f64
+            } else {
+                0.0
+            },
+        }
+    }
+
+    fn to_series_metrics(self) -> UsageOverviewSeriesMetrics {
+        let metrics = self.to_metrics();
+        UsageOverviewSeriesMetrics {
+            requests: metrics.requests,
+            error_requests: metrics.error_requests,
+            input_tokens: metrics.input_tokens,
+            output_tokens: metrics.output_tokens,
+            cache_read_input_tokens: metrics.cache_read_input_tokens,
+            cache_creation_input_tokens: metrics.cache_creation_input_tokens,
+            estimated_cost_usd: metrics.estimated_cost_usd,
+            original_cost_usd: metrics.original_cost_usd,
+            kiro_metering_usage: metrics.kiro_metering_usage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OverviewSeriesAccumulator {
+    all: OverviewAccumulator,
+    external: OverviewAccumulator,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OverviewPoolAccumulator {
+    metrics: OverviewAccumulator,
+    label: Option<String>,
+    raw_cost_usd: f64,
+    shaped_cost_usd: f64,
+    uplifted_cost_usd: f64,
+    reported_cost_usd: f64,
+    billable_cost_usd: f64,
+    profit_usd: f64,
+    cost_floor_delta_usd: f64,
+    cost_floor_applied_requests: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OverviewRankAccumulator {
+    label: String,
+    requests: usize,
+    error_requests: usize,
+    estimated_cost_usd: f64,
+}
+
+impl OverviewRankAccumulator {
+    fn add(&mut self, metrics: OverviewAccumulator) {
+        self.requests = self
+            .requests
+            .saturating_add(metrics.requests.max(0) as usize);
+        self.error_requests = self
+            .error_requests
+            .saturating_add(metrics.error_requests.max(0) as usize);
+        self.estimated_cost_usd += metrics.estimated_cost_usd.max(0.0);
+    }
+}
+
+fn overview_subtract_i64(left: i64, right: i64, metric: &str) -> i64 {
+    if left < right {
+        tracing::warn!(
+            metric,
+            left,
+            right,
+            "usage overview 本地拆分出现负数，已截断为 0"
+        );
+        0
+    } else {
+        left - right
+    }
+}
+
+fn overview_subtract_f64(left: f64, right: f64, metric: &str) -> f64 {
+    if left + 1e-9 < right {
+        tracing::warn!(
+            metric,
+            left,
+            right,
+            "usage overview 本地费用拆分出现负数，已截断为 0"
+        );
+        0.0
+    } else {
+        (left - right).max(0.0)
+    }
+}
+
+fn overview_series_key(spec: &UsageOverviewSpec, bucket_start: DateTime<Utc>) -> String {
+    if spec.granularity == "hour" {
+        format!("hour:{}", bucket_start.to_rfc3339())
+    } else {
+        format!(
+            "day:{}",
+            bucket_start.with_timezone(&spec.offset).date_naive()
+        )
+    }
+}
+
+fn overview_series_slots(spec: &UsageOverviewSpec) -> Vec<(String, DateTime<Utc>, String)> {
+    if spec.granularity == "hour" {
+        let mut slots = Vec::new();
+        let mut cursor = spec.from;
+        while cursor < spec.to {
+            slots.push((
+                overview_series_key(spec, cursor),
+                cursor,
+                cursor
+                    .with_timezone(&spec.offset)
+                    .format("%m-%d %H:00")
+                    .to_string(),
+            ));
+            cursor += ChronoDuration::hours(1);
+        }
+        return slots;
+    }
+
+    let start = spec.from.with_timezone(&spec.offset).date_naive();
+    let end = (spec.to - ChronoDuration::seconds(1))
+        .with_timezone(&spec.offset)
+        .date_naive();
+    let mut date = start;
+    let mut slots = Vec::new();
+    while date <= end {
+        let local_midnight = spec
+            .offset
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+            .single()
+            .expect("fixed offset local midnight")
+            .with_timezone(&Utc);
+        slots.push((
+            format!("day:{}", date),
+            local_midnight,
+            date.format("%m-%d").to_string(),
+        ));
+        date += ChronoDuration::days(1);
+    }
+    slots
+}
+
+fn overview_series_points(
+    spec: &UsageOverviewSpec,
+    series: HashMap<String, OverviewSeriesAccumulator>,
+) -> Vec<UsageOverviewSeriesPoint> {
+    overview_series_slots(spec)
+        .into_iter()
+        .map(|(key, bucket_start, label)| {
+            let values = series.get(&key).copied().unwrap_or_default();
+            UsageOverviewSeriesPoint {
+                bucket_start: bucket_start.to_rfc3339(),
+                label,
+                all: values.all.to_series_metrics(),
+                local: values.all.subtract(&values.external).to_series_metrics(),
+                external: values.external.to_series_metrics(),
+            }
+        })
+        .collect()
+}
+
+fn ranked_overview_rows(
+    values: HashMap<String, OverviewRankAccumulator>,
+) -> Vec<UsageOverviewRankRow> {
+    let mut rows = values
+        .into_iter()
+        .map(|(key, value)| UsageOverviewRankRow {
+            label: if value.label.is_empty() {
+                key.clone()
+            } else {
+                value.label
+            },
+            key,
+            requests: value.requests,
+            error_requests: value.error_requests,
+            estimated_cost_usd: value.estimated_cost_usd,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then_with(|| right.estimated_cost_usd.total_cmp(&left.estimated_cost_usd))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    rows
 }
 
 fn row_i64_to_u64(row: &PgRow, column: &str) -> anyhow::Result<u64> {
@@ -11881,9 +12672,11 @@ CREATE TABLE IF NOT EXISTS usage_cleanup_watermarks (
 CREATE TABLE IF NOT EXISTS usage_cleanup_jobs (
     job_id TEXT PRIMARY KEY,
     mode TEXT NOT NULL CHECK (mode IN ('soft_delete', 'hard_delete')),
+    include_summary BOOLEAN NOT NULL DEFAULT false,
     cutoff_at TIMESTAMPTZ NOT NULL,
     batch_size INTEGER NOT NULL CHECK (batch_size > 0 AND batch_size <= 5000),
     max_batches INTEGER NOT NULL CHECK (max_batches > 0 AND max_batches <= 10000),
+    max_rows BIGINT CHECK (max_rows IS NULL OR max_rows >= 0),
     pause_ms_between_batches BIGINT NOT NULL CHECK (
         pause_ms_between_batches >= 0 AND pause_ms_between_batches <= 10000
     ),
@@ -12369,6 +13162,19 @@ ALTER TABLE usage_cleanup_jobs
     CHECK (batch_size > 0 AND batch_size <= 5000);
 "#;
 
+const USAGE_CLEANUP_SEMANTICS_SQL: &str = r#"
+ALTER TABLE usage_cleanup_jobs
+    ADD COLUMN IF NOT EXISTS include_summary BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS max_rows BIGINT;
+
+ALTER TABLE usage_cleanup_jobs
+    DROP CONSTRAINT IF EXISTS usage_cleanup_jobs_max_rows_check;
+
+ALTER TABLE usage_cleanup_jobs
+    ADD CONSTRAINT usage_cleanup_jobs_max_rows_check
+    CHECK (max_rows IS NULL OR max_rows >= 0);
+"#;
+
 const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL: &str = r#"
 CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
 SELECT
@@ -12777,9 +13583,11 @@ mod tests {
                 .create_cleanup_job(NewUsageCleanupJob {
                     job_id: "cleanup-new-limit-accepted",
                     mode: "soft_delete",
+                    include_summary: false,
                     cutoff_at: Utc::now(),
                     batch_size: 5_000,
                     max_batches: 100,
+                    max_rows: None,
                     pause_ms_between_batches: 0,
                 })
                 .await
@@ -12931,9 +13739,11 @@ mod tests {
                 .create_cleanup_job(NewUsageCleanupJob {
                     job_id: "cleanup-job-a",
                     mode: "soft_delete",
+                    include_summary: false,
                     cutoff_at: cutoff,
                     batch_size: 250,
                     max_batches: 100,
+                    max_rows: None,
                     pause_ms_between_batches: 10,
                 })
                 .await
@@ -12944,9 +13754,11 @@ mod tests {
                 .create_cleanup_job(NewUsageCleanupJob {
                     job_id: "cleanup-job-b",
                     mode: "soft_delete",
+                    include_summary: false,
                     cutoff_at: cutoff,
                     batch_size: 250,
                     max_batches: 100,
+                    max_rows: None,
                     pause_ms_between_batches: 10,
                 })
                 .await
@@ -13096,9 +13908,11 @@ mod tests {
                 .create_cleanup_job(NewUsageCleanupJob {
                     job_id: &job_id,
                     mode: "soft_delete",
+                    include_summary: false,
                     cutoff_at: Utc::now() - chrono::Duration::days(7),
                     batch_size: 250,
                     max_batches: 100,
+                    max_rows: None,
                     pause_ms_between_batches: 10,
                 })
                 .await
@@ -13165,9 +13979,11 @@ mod tests {
                 .create_cleanup_job(NewUsageCleanupJob {
                     job_id: &job_id,
                     mode: "soft_delete",
+                    include_summary: false,
                     cutoff_at: Utc::now(),
                     batch_size: 10,
                     max_batches: 10,
+                    max_rows: None,
                     pause_ms_between_batches: 0,
                 })
                 .await
@@ -13470,6 +14286,16 @@ mod tests {
         }
     }
 
+    async fn assert_active_usage_detail_rows(store: &PostgresStore, expected: i64, context: &str) {
+        let active_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM usage_records WHERE deleted_at IS NULL",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(active_rows, expected, "{context}: active detail rows");
+    }
+
     async fn zero_stored_usage_json_original_cost(store: &PostgresStore, id: &str) {
         let updated = sqlx::query(
             r#"
@@ -13697,6 +14523,181 @@ mod tests {
                 &format!("soft round {round}"),
             )
             .await;
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_detail_cleanup_preserves_summary_until_explicit_purge_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            clean(&store).await;
+            let mut record = usage_record(&format!("cleanup-preserve-summary-round-{round}"), 600);
+            record.created_at = Utc::now().to_rfc3339();
+            record.estimated_cost_usd = 0.42;
+            record.original_cost_usd = 0.45;
+            record.kiro_metering_usage = 12.0;
+            usage_store.record(record).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+            let before = usage_store.summary(500).await.unwrap();
+            assert_eq!(before.total_requests, 1, "round {round}: summary before");
+            assert!((before.total_estimated_cost_usd - 0.42).abs() < 1e-12);
+
+            let soft = usage_store
+                .soft_delete_cleanup_batch_preserving_summary(Utc::now(), 10)
+                .await
+                .unwrap();
+            assert_eq!(soft.processed_rows, 1, "round {round}: soft detail cleanup");
+            assert_eq!(soft.has_remaining, Some(false), "round {round}");
+            assert_active_usage_detail_rows(
+                &store,
+                0,
+                &format!("round {round}: after soft detail cleanup"),
+            )
+            .await;
+
+            let after_soft = usage_store.summary(500).await.unwrap();
+            assert_eq!(
+                after_soft.total_requests, 1,
+                "round {round}: preserved summary"
+            );
+            assert!((after_soft.total_estimated_cost_usd - 0.42).abs() < 1e-12);
+            let costs = usage_store.credential_cost_summary().await.unwrap();
+            let credential = costs
+                .get(&7)
+                .expect("credential summary remains after detail cleanup");
+            assert_eq!(
+                credential
+                    .priced_requests
+                    .saturating_add(credential.unpriced_requests),
+                1,
+                "round {round}: credential requests"
+            );
+            assert!((credential.estimated_cost_usd - 0.42).abs() < 1e-12);
+
+            let hard = usage_store
+                .hard_delete_cleanup_batch_preserving_summary(
+                    Utc::now() + chrono::Duration::seconds(1),
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(hard.processed_rows, 1, "round {round}: hard detail cleanup");
+            assert_eq!(hard.has_remaining, Some(false), "round {round}");
+            let physical_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_records")
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(physical_rows, 0, "round {round}: physical detail rows");
+            assert_eq!(
+                usage_store.summary(500).await.unwrap().total_requests,
+                1,
+                "round {round}: summary survives hard detail cleanup"
+            );
+
+            let mut live_record =
+                usage_record(&format!("cleanup-preserve-summary-live-round-{round}"), 700);
+            live_record.created_at = Utc::now().to_rfc3339();
+            live_record.estimated_cost_usd = 0.07;
+            live_record.original_cost_usd = 0.09;
+            usage_store.record(live_record).await.unwrap();
+
+            let before_reset = usage_store.summary(500).await.unwrap();
+            assert_eq!(
+                before_reset.total_requests, 2,
+                "round {round}: preserved stale summary plus live row before reset"
+            );
+
+            usage_store
+                .reset_usage_rollups_from_active_records()
+                .await
+                .unwrap();
+            let after_reset = usage_store.summary(500).await.unwrap();
+            assert_eq!(
+                after_reset.total_requests, 1,
+                "round {round}: summary reset keeps live detail rows"
+            );
+            assert!((after_reset.total_estimated_cost_usd - 0.07).abs() < 1e-12);
+
+            let costs = usage_store.credential_cost_summary().await.unwrap();
+            let credential = costs
+                .get(&7)
+                .expect("live credential summary remains after summary reset");
+            assert_eq!(
+                credential
+                    .priced_requests
+                    .saturating_add(credential.unpriced_requests),
+                1,
+                "round {round}: only live credential request remains after reset"
+            );
+            assert!((credential.estimated_cost_usd - 0.07).abs() < 1e-12);
+        }
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_physical_cleanup_preserves_rollups_for_active_rows_for_three_rounds() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        let usage_store = PostgresUsageStore::new(store.clone());
+
+        for round in 0..3 {
+            clean(&store).await;
+            let mut old_record = usage_record(&format!("physical-old-round-{round}"), 800);
+            old_record.created_at = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+            old_record.estimated_cost_usd = 0.31;
+            old_record.original_cost_usd = 0.36;
+
+            let mut fresh_record = usage_record(&format!("physical-fresh-round-{round}"), 900);
+            fresh_record.created_at = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+            fresh_record.estimated_cost_usd = 0.17;
+            fresh_record.original_cost_usd = 0.19;
+            usage_store
+                .record_batch(vec![old_record, fresh_record])
+                .await
+                .unwrap();
+
+            let before = usage_store.summary(500).await.unwrap();
+            assert_eq!(before.total_requests, 2, "round {round}: summary before");
+            assert!((before.total_estimated_cost_usd - 0.48).abs() < 1e-12);
+
+            let result = usage_store
+                .hard_delete_cleanup_batch_preserving_summary(Utc::now(), 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.processed_rows, 1,
+                "round {round}: physical row count"
+            );
+            assert_eq!(result.has_remaining, Some(false), "round {round}");
+
+            let physical_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_records")
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(physical_rows, 1, "round {round}: fresh row remains");
+
+            let after = usage_store.summary(500).await.unwrap();
+            assert_eq!(
+                after.total_requests, 2,
+                "round {round}: physical cleanup preserves summary"
+            );
+            assert!((after.total_estimated_cost_usd - 0.48).abs() < 1e-12);
         }
 
         store.drop_test_schema().await.unwrap();

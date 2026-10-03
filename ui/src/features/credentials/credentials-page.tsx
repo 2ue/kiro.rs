@@ -22,6 +22,7 @@ import {
   forceRefreshToken,
   getCredentialAccountInfo,
   getCredentialInfo,
+  getCredentialRuntime,
   getCredentialUsageSummary,
   refreshCredentialInfo,
   testCredential,
@@ -50,10 +51,9 @@ import {
   StatCard,
   StatGrid,
   Toolbar,
-  ToolbarActions,
   useConfirm,
 } from '@/components/patterns'
-import { formatCompact, formatCredits, formatFullDate, formatNumber, formatUsdFixed2 } from '@/lib/format'
+import { formatCredits, formatFullDate, formatNumber, formatUsdFixed2 } from '@/lib/format'
 import {
   buildTestModelOptions,
   defaultTestModelForOptions,
@@ -98,7 +98,13 @@ import {
   KamImportModal,
   type VerifyResult,
 } from './credential-dialogs'
-import { mapById, mergeCredentialPlanes } from './credential-utils'
+import {
+  CREDENTIAL_SUBSCRIPTION_OPTIONS,
+  credentialCreditStatus,
+  credentialSubscriptionLabel,
+  mapById,
+  mergeCredentialPlanes,
+} from './credential-utils'
 import {
   buildCredentialRefreshReport,
   refreshCredentialInfoInBatches,
@@ -121,8 +127,8 @@ function CredentialFilterField({
   className?: string
 }) {
   return (
-    <label className={className}>
-      <span className="mb-1 block text-[0.68rem] font-medium text-muted-foreground">{label}</span>
+    <label className={`block min-w-0 ${className ?? ''}`}>
+      <span className="mb-1 block h-4 whitespace-nowrap text-[0.68rem] font-medium leading-4 text-muted-foreground">{label}</span>
       {children}
     </label>
   )
@@ -142,14 +148,18 @@ interface CreditDetailRow {
   creditRemaining?: number
   creditLimit?: number
   checkedAt?: string
+  consumedCredits: number
   estimatedCostUsd: number
   originalCostUsd: number
   disabled: boolean
+  creditEstimateBlocked: boolean
+  creditEstimateBlockedReason?: string
+  estimatedRemainingCostUsd?: number
 }
 
 function compareCreditDetailRows(left: CreditDetailRow, right: CreditDetailRow): number {
-  if (left.disabled !== right.disabled) {
-    return Number(left.disabled) - Number(right.disabled)
+  if (left.creditEstimateBlocked !== right.creditEstimateBlocked) {
+    return Number(left.creditEstimateBlocked) - Number(right.creditEstimateBlocked)
   }
   return left.id - right.id
 }
@@ -180,22 +190,14 @@ export function CredentialsPage() {
   const [page, setPage] = useState(1)
   const [allExpanded, setAllExpanded] = useState(true)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
-  const [queryText, setQueryText] = useState('')
-  const [credentialIdQuery, setCredentialIdQuery] = useState('')
-  const [accountQuery, setAccountQuery] = useState('')
-  const [regionQuery, setRegionQuery] = useState('')
+  const [quickQuery, setQuickQuery] = useState('')
   const [modelQuery, setModelQuery] = useState('')
-  const [endpointQuery, setEndpointQuery] = useState('')
-  const [priorityQuery, setPriorityQuery] = useState('')
-  const [rpmQuery, setRpmQuery] = useState('')
-  const [concurrencyQuery, setConcurrencyQuery] = useState('')
+  const [regionFilter, setRegionFilter] = useState('__all__')
   const [statusFilter, setStatusFilter] = useState('__all__')
-  const [authFilter, setAuthFilter] = useState('__all__')
   const [subscriptionFilter, setSubscriptionFilter] = useState('__all__')
   const [proxyFilter, setProxyFilter] = useState('__all__')
   const [sortBy, setSortBy] = useState<CredentialSortBy>('default')
   const [sortOrder, setSortOrder] = useState<CredentialSortOrder>('desc')
-  const [showFilters, setShowFilters] = useState(false)
   const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [batchOpen, setBatchOpen] = useState(false)
@@ -219,51 +221,40 @@ export function CredentialsPage() {
     [modelCapabilities.data?.models]
   )
   const batchTestModel = defaultTestModelForOptions(testModelOptions)
+  const modelFilterOptions = useMemo(
+    () => [...(modelCapabilities.data?.models ?? [])]
+      .filter((item) => item.model.trim() && item.model.trim().toLowerCase() !== 'auto')
+      .sort((left, right) => left.model.localeCompare(right.model)),
+    [modelCapabilities.data?.models],
+  )
 
   const confirmDialog = useConfirm()
   const queryClient = useQueryClient()
 
   // Derived filter params — sentinel '__all__' avoids empty-string in Select
-  const debouncedQueryText = useDebouncedValue(queryText)
-  const debouncedCredentialIdQuery = useDebouncedValue(credentialIdQuery)
-  const debouncedAccountQuery = useDebouncedValue(accountQuery)
-  const debouncedRegionQuery = useDebouncedValue(regionQuery)
+  const debouncedQuickQuery = useDebouncedValue(quickQuery)
   const debouncedModelQuery = useDebouncedValue(modelQuery)
-  const debouncedEndpointQuery = useDebouncedValue(endpointQuery)
-  const debouncedPriorityQuery = useDebouncedValue(priorityQuery)
-  const debouncedRpmQuery = useDebouncedValue(rpmQuery)
-  const debouncedConcurrencyQuery = useDebouncedValue(concurrencyQuery)
+  const quickCredentialId = numericQueryValue(debouncedQuickQuery)
+  const quickText = debouncedQuickQuery.trim()
   const listQuery = useMemo(() => ({
     page,
     limit: PAGE_SIZE,
-    q: debouncedQueryText.trim() || undefined,
-    credentialId: numericQueryValue(debouncedCredentialIdQuery),
-    account: debouncedAccountQuery.trim() || undefined,
-    region: debouncedRegionQuery.trim() || undefined,
+    q: quickCredentialId === undefined ? quickText || undefined : undefined,
+    credentialId: quickCredentialId,
     model: debouncedModelQuery.trim() || undefined,
-    endpoint: debouncedEndpointQuery.trim() || undefined,
-    priority: numericQueryValue(debouncedPriorityQuery),
-    rpm: numericQueryValue(debouncedRpmQuery),
-    concurrency: numericQueryValue(debouncedConcurrencyQuery),
+    region: regionFilter !== '__all__' ? regionFilter : undefined,
     status: statusFilter !== '__all__' ? statusFilter : undefined,
-    authMethod: authFilter !== '__all__' ? authFilter : undefined,
     subscription: subscriptionFilter !== '__all__' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== '__all__' ? Number(proxyFilter) : undefined,
     sortBy: sortBy !== 'default' ? sortBy : undefined,
     sortOrder: sortBy !== 'default' ? sortOrder : undefined,
   }), [
     page,
-    debouncedQueryText,
-    debouncedCredentialIdQuery,
-    debouncedAccountQuery,
-    debouncedRegionQuery,
+    quickCredentialId,
+    quickText,
     debouncedModelQuery,
-    debouncedEndpointQuery,
-    debouncedPriorityQuery,
-    debouncedRpmQuery,
-    debouncedConcurrencyQuery,
+    regionFilter,
     statusFilter,
-    authFilter,
     subscriptionFilter,
     proxyFilter,
     sortBy,
@@ -271,6 +262,7 @@ export function CredentialsPage() {
   ])
 
   const credentials = useCredentialList(listQuery)
+  const credentialCatalog = useCredentialList({ page: 1, limit: 500 })
   const allCredentials = useCredentials({
     enabled: batchOpen || kamOpen || creditDetailsOpen || queryingCreditInfo,
   })
@@ -288,6 +280,27 @@ export function CredentialsPage() {
   const deleteDisabledCredentials = useDeleteDisabledCredentials()
   const batchUpdateCredentials = useBatchUpdateCredentials()
   const resetFailure = useResetFailure()
+  const regionOptions = useMemo(() => {
+    const regions = new Set<string>()
+    const items = [
+      ...(credentialCatalog.data?.items ?? []),
+      ...(credentials.data?.items ?? []),
+    ]
+    for (const credential of items) {
+      for (const value of [
+        credential.region,
+        credential.authRegion,
+        credential.apiRegion,
+        credential.effectiveAuthRegion,
+        credential.effectiveApiRegion,
+      ]) {
+        const trimmed = value?.trim()
+        if (trimmed) regions.add(trimmed)
+      }
+    }
+    if (regionFilter !== '__all__') regions.add(regionFilter)
+    return Array.from(regions).sort((left, right) => left.localeCompare(right))
+  }, [credentialCatalog.data?.items, credentials.data?.items, regionFilter])
 
   const currentCredentials = useMemo(() => {
     const runtimeById = mapById(credentialRuntime.data?.items)
@@ -308,34 +321,27 @@ export function CredentialsPage() {
     (credentials.isPlaceholderData || (credentials.isFetching && credentials.data.page !== page))
   )
   const hasTextFilters = Boolean(
-    queryText.trim() ||
-    credentialIdQuery.trim() ||
-    accountQuery.trim() ||
-    regionQuery.trim() ||
-    modelQuery.trim() ||
-    endpointQuery.trim() ||
-    priorityQuery.trim() ||
-    rpmQuery.trim() ||
-    concurrencyQuery.trim(),
+    quickQuery.trim() ||
+    modelQuery.trim(),
   )
-  const hasActiveFilters = statusFilter !== '__all__' || authFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
+  const hasActiveFilters = regionFilter !== '__all__' || statusFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
   const hasAnyFilters = hasTextFilters || hasActiveFilters
-  const activeFilterCount =
-    [statusFilter, authFilter, subscriptionFilter, proxyFilter].filter((f) => f !== '__all__').length +
-    [queryText, credentialIdQuery, accountQuery, regionQuery, modelQuery, endpointQuery, priorityQuery, rpmQuery, concurrencyQuery]
-      .filter((value) => value.trim()).length
   const selectedCredentials = currentCredentials.filter((c) => selectedIds.has(c.id))
   const selectedDisabledCount = selectedCredentials.filter((c) => c.disabled).length
   const selectedPriorityOverrideCount = selectedCredentials.filter((c) => c.priority !== 0).length
   const selectedConcurrencyOverrideCount = selectedCredentials.filter((c) => typeof c.maxConcurrentRequestsOverride === 'number').length
   const selectedRpmOverrideCount = selectedCredentials.filter((c) => typeof c.rpmOverride === 'number').length
   const creditDetailStats = useMemo(() => {
-    const enabled = creditDetailRows.filter((row) => !row.disabled)
+    const available = creditDetailRows.filter((row) => !row.creditEstimateBlocked && row.creditRemaining != null)
     return {
-      enabledCreditRemaining: enabled.reduce((sum, row) => sum + (row.creditRemaining ?? 0), 0),
+      availableCreditRemaining: available.reduce((sum, row) => sum + (row.creditRemaining ?? 0), 0),
       totalCreditLimit: creditDetailRows.reduce((sum, row) => sum + (row.creditLimit ?? 0), 0),
+      totalConsumedCredits: creditDetailRows.reduce((sum, row) => sum + row.consumedCredits, 0),
       totalEstimatedCostUsd: creditDetailRows.reduce((sum, row) => sum + row.estimatedCostUsd, 0),
       totalOriginalCostUsd: creditDetailRows.reduce((sum, row) => sum + row.originalCostUsd, 0),
+      totalEstimatedRemainingCostUsd: available.reduce((sum, row) => sum + (row.estimatedRemainingCostUsd ?? 0), 0),
+      unavailableCount: creditDetailRows.filter((row) => row.creditEstimateBlocked).length,
+      unqueriedCount: creditDetailRows.filter((row) => !row.creditEstimateBlocked && row.creditRemaining == null).length,
     }
   }, [creditDetailRows])
   const orderedCreditDetailRows = useMemo(
@@ -348,17 +354,10 @@ export function CredentialsPage() {
     setPage(1)
     setSelectedIds(new Set())
   }, [
-    debouncedQueryText,
-    debouncedCredentialIdQuery,
-    debouncedAccountQuery,
-    debouncedRegionQuery,
+    debouncedQuickQuery,
     debouncedModelQuery,
-    debouncedEndpointQuery,
-    debouncedPriorityQuery,
-    debouncedRpmQuery,
-    debouncedConcurrencyQuery,
+    regionFilter,
     statusFilter,
-    authFilter,
     subscriptionFilter,
     proxyFilter,
     sortBy,
@@ -435,16 +434,29 @@ export function CredentialsPage() {
       for (let i = 0; i < ids.length; i += CREDIT_INFO_DETAIL_BATCH_SIZE) {
         idBatches.push(ids.slice(i, i + CREDIT_INFO_DETAIL_BATCH_SIZE))
       }
-      const [accountInfoResponses, usageResponses] = await Promise.all([
+      const [accountInfoResponses, usageResponses, runtimeResponse] = await Promise.all([
         Promise.all(idBatches.map((batch) => getCredentialAccountInfo(batch))),
         Promise.all(idBatches.map((batch) => getCredentialUsageSummary(batch))),
+        getCredentialRuntime(ids),
       ])
       const accountById = new Map(accountInfoResponses.flatMap((response) => response.items).map((item) => [item.id, item]))
       const usageById = new Map(usageResponses.flatMap((response) => response.items).map((item) => [item.id, item]))
+      const runtimeById = new Map(runtimeResponse.items.map((item) => [item.id, item]))
       setCreditDetailRows(
         allItems.map((cred) => {
           const info = accountById.get(cred.id)
           const usage = usageById.get(cred.id)
+          const runtime = runtimeById.get(cred.id)
+          const creditStatus = credentialCreditStatus({
+            disabled: cred.disabled,
+            disabledReason: cred.disabledReason,
+            lastErrorKind: runtime?.lastErrorKind,
+            lastErrorReason: runtime?.lastErrorReason,
+          })
+          const consumedCredits = usage?.kiroMeteringUsage ?? 0
+          const estimatedRemainingCostUsd = creditStatus.available && info && consumedCredits > 0
+            ? (usage?.estimatedCostUsd ?? 0) / consumedCredits * info.creditRemaining
+            : undefined
           return {
             id: cred.id,
             email: cred.email,
@@ -452,9 +464,13 @@ export function CredentialsPage() {
             creditRemaining: info?.creditRemaining,
             creditLimit: info?.creditLimit,
             checkedAt: info?.checkedAt,
+            consumedCredits,
             estimatedCostUsd: usage?.estimatedCostUsd ?? 0,
             originalCostUsd: usage?.originalCostUsd ?? 0,
             disabled: cred.disabled,
+            creditEstimateBlocked: !creditStatus.available,
+            creditEstimateBlockedReason: creditStatus.reason,
+            estimatedRemainingCostUsd,
           }
         })
       )
@@ -569,17 +585,10 @@ export function CredentialsPage() {
     else setSelectedIds(new Set(currentCredentials.map((c) => c.id)))
   }
   const clearFilters = () => {
-    setQueryText('')
-    setCredentialIdQuery('')
-    setAccountQuery('')
-    setRegionQuery('')
+    setQuickQuery('')
     setModelQuery('')
-    setEndpointQuery('')
-    setPriorityQuery('')
-    setRpmQuery('')
-    setConcurrencyQuery('')
+    setRegionFilter('__all__')
     setStatusFilter('__all__')
-    setAuthFilter('__all__')
     setSubscriptionFilter('__all__')
     setProxyFilter('__all__')
   }
@@ -792,38 +801,39 @@ export function CredentialsPage() {
             <>
               <StatCard
                 title="账号"
-                value={`${formatCompact(enabled)} / ${formatCompact(total)}`}
+                value={`${formatNumber(enabled)} / ${formatNumber(total)}`}
                 valueTitle={`启用 ${formatNumber(enabled)} / 共 ${formatNumber(total)}`}
-                desc={disabledCount > 0 ? `已禁用 ${formatNumber(disabledCount)}` : '全部启用'}
+                desc={(
+                  <>
+                    <span className={schedulable > 0 ? 'text-success' : 'text-muted-foreground'}>
+                      可调度 {formatNumber(schedulable)}
+                    </span>
+                    <span className="text-muted-foreground"> · </span>
+                    <span className={failing > 0 ? 'text-warning' : 'text-muted-foreground'}>
+                      异常 {formatNumber(failing)}
+                    </span>
+                    <span className="text-muted-foreground"> · </span>
+                    <span className={disabledCount > 0 ? 'text-destructive' : 'text-muted-foreground'}>
+                      禁用 {formatNumber(disabledCount)}
+                    </span>
+                  </>
+                )}
                 icon={<Server className="h-5 w-5" />}
+                tone="default"
               />
               <StatCard
-                title="可调度"
-                value={formatCompact(schedulable)}
-                valueTitle={formatNumber(schedulable)}
-                desc={coolingDown > 0 ? `冷却中 ${formatNumber(coolingDown)}` : '无冷却'}
-                tone={schedulable === 0 && enabled > 0 ? 'warning' : 'success'}
-              />
-              <StatCard
-                title="正在服务"
-                value={`${formatCompact(inFlight)}${maxInFlight > 0 ? ` / ${formatCompact(maxInFlight)}` : ''}`}
+                title="并发"
+                value={`${formatNumber(inFlight)}${maxInFlight > 0 ? ` / ${formatNumber(maxInFlight)}` : ''}`}
                 valueTitle={maxInFlight > 0 ? `进行中 ${inFlight} / 上限 ${maxInFlight}` : `进行中 ${inFlight}，不限制`}
-                desc={`占用账号 ${formatNumber(inUse)} · 排队 ${formatNumber(queued)}`}
+                desc={`占用账号 ${formatNumber(inUse)} · 排队 ${formatNumber(queued)}${coolingDown > 0 ? ` · 冷却 ${formatNumber(coolingDown)}` : ''}`}
                 tone={queued > 0 ? 'warning' : 'info'}
               />
               <StatCard
-                title="近期请求"
-                value={`${formatCompact(realtime?.rpm ?? 0)} RPM`}
+                title="RPM"
+                value={formatNumber(realtime?.rpm ?? 0)}
                 valueTitle={`${realtime?.windowSeconds ?? 60} 秒内 ${formatNumber(requests)} 次请求`}
-                desc={`${formatCompact(realtime?.totalTpm ?? 0)} TPM · 错误率 ${(errorRate * 100).toFixed(1)}%`}
+                desc={`${formatNumber(realtime?.totalTpm ?? 0)} TPM · 错误率 ${(errorRate * 100).toFixed(1)}%`}
                 tone={errorRate >= 0.1 ? 'warning' : 'info'}
-              />
-              <StatCard
-                title="异常账号"
-                value={formatCompact(failing)}
-                valueTitle={formatNumber(failing)}
-                desc="近期调用或刷新失败"
-                tone={failing > 0 ? 'warning' : 'default'}
               />
             </>
           )
@@ -838,7 +848,7 @@ export function CredentialsPage() {
           <div className="flex items-start justify-between gap-2 pl-2.5">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5 text-[0.72rem] font-semibold text-muted-foreground">
-                剩余可用积分
+                积分
                 {creditSummary.isFetching && <Spinner size="sm" />}
               </div>
               <div className="mt-1 break-words text-2xl font-semibold tracking-tight tabular-nums text-success">
@@ -848,7 +858,7 @@ export function CredentialsPage() {
             <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60 mt-1" />
           </div>
           <div className="mt-2 truncate pl-2.5 text-[0.72rem] text-muted-foreground">
-            已记录：{formatUsdFixed2(creditSummary.data?.enabledEstimatedCostUsd ?? 0)} · 原始 {formatUsdFixed2(creditSummary.data?.enabledOriginalCostUsd ?? 0)}
+            历史估算：{formatUsdFixed2(creditSummary.data?.totalEstimatedCostUsd ?? 0)} · 原始 {formatUsdFixed2(creditSummary.data?.totalOriginalCostUsd ?? 0)}
           </div>
           <div className="mt-1 truncate pl-2.5 text-[0.72rem] text-muted-foreground">
             最近查询：{creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}
@@ -867,107 +877,16 @@ export function CredentialsPage() {
       >
         {/* Toolbar */}
         <Toolbar className="mb-3">
-          <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-5">
-            <CredentialFilterField label="ID">
+          <div className="grid w-full min-w-0 items-end gap-2 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1.5fr)_140px_minmax(180px,1fr)_130px_140px] 2xl:grid-cols-[minmax(230px,1.25fr)_130px_minmax(170px,0.95fr)_120px_130px_minmax(130px,0.85fr)_140px_90px_auto]">
+            <CredentialFilterField label="快速定位">
               <Input
-                value={credentialIdQuery}
-                onChange={(e) => setCredentialIdQuery(e.target.value)}
-                placeholder="#473"
-                inputMode="numeric"
+                value={quickQuery}
+                onChange={(e) => setQuickQuery(e.target.value)}
+                placeholder="#ID / 邮箱 / Key / 错误"
                 className="h-8 text-xs"
               />
             </CredentialFilterField>
-            <CredentialFilterField label="邮箱 / Key">
-              <Input
-                value={accountQuery}
-                onChange={(e) => setAccountQuery(e.target.value)}
-                placeholder="user@example.com / key hash"
-                className="h-8 text-xs"
-              />
-            </CredentialFilterField>
-            <CredentialFilterField label="Region">
-              <Input
-                value={regionQuery}
-                onChange={(e) => setRegionQuery(e.target.value)}
-                placeholder="us-east-1"
-                className="h-8 text-xs"
-              />
-            </CredentialFilterField>
-            <CredentialFilterField label="可用模型">
-              <Input
-                value={modelQuery}
-                onChange={(e) => setModelQuery(e.target.value)}
-                placeholder="claude-opus-4.8"
-                className="h-8 text-xs"
-              />
-            </CredentialFilterField>
-            <CredentialFilterField label="Endpoint">
-              <Input
-                value={endpointQuery}
-                onChange={(e) => setEndpointQuery(e.target.value)}
-                placeholder="ide / kiro"
-                className="h-8 text-xs"
-              />
-            </CredentialFilterField>
-          </div>
-          <ToolbarActions>
-            <Select value={sortBy} onValueChange={(v) => setSortBy(v as CredentialSortBy)}>
-              <SelectTrigger size="sm" className="w-36"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {SORT_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            <Select value={sortOrder} onValueChange={(v) => setSortOrder(v as CredentialSortOrder)} disabled={sortBy === 'default'}>
-              <SelectTrigger size="sm" className="w-20"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="desc">降序</SelectItem>
-                <SelectItem value="asc">升序</SelectItem>
-              </SelectContent>
-            </Select>
-            <Button
-              variant="outline"
-              size="sm"
-              className={hasAnyFilters ? 'border-primary text-primary' : ''}
-              onClick={() => setShowFilters((v) => !v)}
-            >
-              <Filter className="h-3.5 w-3.5" />
-              筛选
-              {activeFilterCount > 0 && <Badge tone="primary">{activeFilterCount}</Badge>}
-            </Button>
-          </ToolbarActions>
-        </Toolbar>
-
-        {/* Filter Panel */}
-        {showFilters && (
-          <div className="mb-3 rounded-lg bg-muted/30 p-3 animate-in fade-in-0 duration-150">
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-              <Input
-                value={queryText}
-                onChange={(e) => setQueryText(e.target.value)}
-                placeholder="模糊搜索：订阅、代理、错误、priority:0、rpm:60..."
-                className="h-8 text-xs"
-              />
-              <Input
-                value={priorityQuery}
-                onChange={(e) => setPriorityQuery(e.target.value)}
-                placeholder="优先级 = 0"
-                inputMode="numeric"
-                className="h-8 text-xs"
-              />
-              <Input
-                value={rpmQuery}
-                onChange={(e) => setRpmQuery(e.target.value)}
-                placeholder="RPM = 60"
-                inputMode="numeric"
-                className="h-8 text-xs"
-              />
-              <Input
-                value={concurrencyQuery}
-                onChange={(e) => setConcurrencyQuery(e.target.value)}
-                placeholder="并发 = 3"
-                inputMode="numeric"
-                className="h-8 text-xs"
-              />
+            <CredentialFilterField label="状态">
               <Select value={statusFilter} onValueChange={setStatusFilter}>
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -978,37 +897,54 @@ export function CredentialsPage() {
                   <SelectItem value="cooldown">冷却中</SelectItem>
                   <SelectItem value="rate_limited">限流中</SelectItem>
                   <SelectItem value="proxy_blocked">代理不可用</SelectItem>
-                  <SelectItem value="custom_scheduling">有调度覆盖</SelectItem>
-                  <SelectItem value="custom_priority">自定义优先级</SelectItem>
-                  <SelectItem value="custom_concurrency">自定义并发</SelectItem>
-                  <SelectItem value="custom_rpm">自定义 RPM</SelectItem>
                   <SelectItem value="error">有错误</SelectItem>
-                  <SelectItem value="unknown_subscription">未知订阅</SelectItem>
+                  <SelectItem value="custom_scheduling">有调度覆盖</SelectItem>
+                  <SelectItem value="unknown_subscription">订阅未知</SelectItem>
                 </SelectContent>
               </Select>
-              <Select value={authFilter} onValueChange={setAuthFilter}>
+            </CredentialFilterField>
+            <CredentialFilterField label="可用模型">
+              <Select
+                value={modelQuery || '__all__'}
+                onValueChange={(value) => setModelQuery(value === '__all__' ? '' : value)}
+              >
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__all__">全部认证</SelectItem>
-                  <SelectItem value="social">Social</SelectItem>
-                  <SelectItem value="idc">IdC</SelectItem>
-                  <SelectItem value="external_idp">External IdP</SelectItem>
-                  <SelectItem value="api_key">API Key</SelectItem>
+                  <SelectItem value="__all__">全部模型</SelectItem>
+                  {modelFilterOptions.map((item) => (
+                    <SelectItem key={item.model} value={item.model}>
+                      {item.displayName && item.displayName !== item.model
+                        ? `${item.displayName} · ${item.model}`
+                        : item.model}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
+            </CredentialFilterField>
+            <CredentialFilterField label="订阅">
               <Select value={subscriptionFilter} onValueChange={setSubscriptionFilter}>
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__all__">全部订阅</SelectItem>
-                  <SelectItem value="power">Power</SelectItem>
-                  <SelectItem value="pro_max">Pro Max</SelectItem>
-                  <SelectItem value="pro_plus">Pro+</SelectItem>
-                  <SelectItem value="pro">Pro</SelectItem>
-                  <SelectItem value="trial">试用</SelectItem>
-                  <SelectItem value="free">Free</SelectItem>
-                  <SelectItem value="unknown">未知</SelectItem>
+                  {CREDENTIAL_SUBSCRIPTION_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                  ))}
+                  <SelectItem value="unknown">未知订阅</SelectItem>
                 </SelectContent>
               </Select>
+            </CredentialFilterField>
+            <CredentialFilterField label="区域">
+              <Select value={regionFilter} onValueChange={setRegionFilter}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部区域</SelectItem>
+                  {regionOptions.map((region) => (
+                    <SelectItem key={region} value={region}>{region}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </CredentialFilterField>
+            <CredentialFilterField label="代理">
               <Select value={proxyFilter} onValueChange={setProxyFilter}>
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -1018,16 +954,33 @@ export function CredentialsPage() {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
-            {hasAnyFilters && (
-              <div className="mt-2 flex justify-end">
-                <Button variant="ghost" size="xs" onClick={clearFilters}>
-                  <X className="h-3.5 w-3.5" />清除筛选
+            </CredentialFilterField>
+            <CredentialFilterField label="排序">
+              <Select value={sortBy} onValueChange={(v) => setSortBy(v as CredentialSortBy)}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {SORT_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </CredentialFilterField>
+            <CredentialFilterField label="方向">
+              <Select value={sortOrder} onValueChange={(v) => setSortOrder(v as CredentialSortOrder)} disabled={sortBy === 'default'}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="desc">降序</SelectItem>
+                  <SelectItem value="asc">升序</SelectItem>
+                </SelectContent>
+              </Select>
+            </CredentialFilterField>
+            <div className="flex min-w-[4.5rem] items-end">
+              {hasAnyFilters && (
+                <Button variant="ghost" size="sm" onClick={clearFilters} className="h-8 w-full">
+                  <X className="h-3.5 w-3.5" />清除
                 </Button>
-              </div>
-            )}
+              )}
+            </div>
           </div>
-        )}
+        </Toolbar>
 
         {/* Batch actions bar */}
         {selectedIds.size > 0 && (
@@ -1172,39 +1125,52 @@ export function CredentialsPage() {
           <div className="space-y-4">
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
               <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-                <div className="text-xs text-muted-foreground">可用剩余积分</div>
-                <div className="mt-1 text-lg font-semibold tabular-nums text-success">{formatCredits(creditDetailStats.enabledCreditRemaining)}</div>
-                <div className="text-[0.68rem] text-muted-foreground">仅启用账号</div>
+                <div className="text-xs text-muted-foreground">积分</div>
+                <div className="mt-1 text-lg font-semibold tabular-nums text-success">{formatCredits(creditDetailStats.availableCreditRemaining)}</div>
+                <div className="text-[0.68rem] text-muted-foreground">仅当前可用账号</div>
               </div>
               <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-                <div className="text-xs text-muted-foreground">总购买额度</div>
-                <div className="mt-1 text-lg font-semibold tabular-nums">{formatCredits(creditDetailStats.totalCreditLimit)}</div>
-                <div className="text-[0.68rem] text-muted-foreground">所有账号</div>
+                <div className="text-xs text-muted-foreground">已消耗积分</div>
+                <div className="mt-1 text-lg font-semibold tabular-nums">{formatCredits(creditDetailStats.totalConsumedCredits)}</div>
+                <div className="text-[0.68rem] text-muted-foreground">所有账号历史记录</div>
               </div>
               <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-                <div className="text-xs text-muted-foreground">已记录消耗</div>
+                <div className="text-xs text-muted-foreground">估算计费</div>
                 <div className="mt-1 text-lg font-semibold tabular-nums">{formatUsdFixed2(creditDetailStats.totalEstimatedCostUsd)}</div>
-                <div className="text-[0.68rem] text-muted-foreground">所有账号</div>
+                <div className="text-[0.68rem] text-muted-foreground">所有账号历史记录</div>
               </div>
               <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-                <div className="text-xs text-muted-foreground">原始消耗</div>
-                <div className="mt-1 text-lg font-semibold tabular-nums">{formatUsdFixed2(creditDetailStats.totalOriginalCostUsd)}</div>
-                <div className="text-[0.68rem] text-muted-foreground">所有账号</div>
+                <div className="text-xs text-muted-foreground">预估剩余估算费用</div>
+                <div className="mt-1 text-lg font-semibold tabular-nums text-success">{formatUsdFixed2(creditDetailStats.totalEstimatedRemainingCostUsd)}</div>
+                <div className="text-[0.68rem] text-muted-foreground">
+                  {creditDetailStats.unavailableCount > 0
+                    ? `已排除 ${formatNumber(creditDetailStats.unavailableCount)} 个不可用账号`
+                    : creditDetailStats.unqueriedCount > 0
+                      ? `${formatNumber(creditDetailStats.unqueriedCount)} 个账号未查询余额`
+                      : '按历史积分单价估算'}
+                </div>
               </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              <span>总购买额度：{formatCredits(creditDetailStats.totalCreditLimit)}</span>
+              <span>原始计费：{formatUsdFixed2(creditDetailStats.totalOriginalCostUsd)}</span>
+              <span>估算公式：估算计费 / 已消耗积分 × 剩余积分</span>
             </div>
             <div className="overflow-hidden rounded-lg bg-card shadow-sm">
               <div className="max-h-[60vh] overflow-auto">
-                <table className="w-full min-w-[920px] text-sm">
+                <table className="w-full min-w-[1300px] text-sm">
                   <thead className="sticky top-0 z-10 bg-card">
                     <tr>
                       <th className="w-16 px-3 py-2 text-left font-semibold text-muted-foreground">序号</th>
                       <th className="w-20 px-3 py-2 text-left font-semibold text-muted-foreground">ID</th>
                       <th className="px-3 py-2 text-left font-semibold text-muted-foreground">账号</th>
                       <th className="w-28 px-3 py-2 text-left font-semibold text-muted-foreground">订阅</th>
-                      <th className="w-28 px-3 py-2 text-right font-semibold text-muted-foreground">剩余</th>
+                      <th className="w-28 px-3 py-2 text-right font-semibold text-muted-foreground">剩余积分</th>
                       <th className="w-28 px-3 py-2 text-right font-semibold text-muted-foreground">总额</th>
-                      <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">已记录消耗</th>
-                      <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">原始消耗</th>
+                      <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">已消耗积分</th>
+                      <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">估算计费</th>
+                      <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">原始计费</th>
+                      <th className="w-36 px-3 py-2 text-right font-semibold text-muted-foreground">预估剩余费用</th>
                       <th className="w-24 px-3 py-2 text-left font-semibold text-muted-foreground">状态</th>
                       <th className="w-44 px-3 py-2 text-left font-semibold text-muted-foreground">最近查询</th>
                     </tr>
@@ -1215,13 +1181,29 @@ export function CredentialsPage() {
                         <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{i + 1}</td>
                         <td className="px-3 py-2 font-mono text-xs text-muted-foreground">#{row.id}</td>
                         <td className="max-w-[240px] truncate px-3 py-2 font-medium">{row.email || `账号 #${row.id}`}</td>
-                        <td className="px-3 py-2 text-muted-foreground">{row.subscriptionTitle || '未知'}</td>
-                        <td className="px-3 py-2 text-right font-semibold tabular-nums text-success">{formatCredits(row.creditRemaining)}</td>
+                        <td className="px-3 py-2 text-muted-foreground">{credentialSubscriptionLabel(row.subscriptionTitle)}</td>
+                        <td className="px-3 py-2 text-right font-semibold tabular-nums text-success">
+                          {row.creditEstimateBlocked ? (
+                            <span className="text-destructive" title={row.creditEstimateBlockedReason}>不可用</span>
+                          ) : row.creditRemaining != null ? formatCredits(row.creditRemaining) : (
+                            <span className="text-muted-foreground">未查询</span>
+                          )}
+                        </td>
                         <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatCredits(row.creditLimit)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatCredits(row.consumedCredits)}</td>
                         <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatUsdFixed2(row.estimatedCostUsd)}</td>
                         <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatUsdFixed2(row.originalCostUsd)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-success">
+                          {row.creditEstimateBlocked
+                            ? <span className="text-destructive" title={row.creditEstimateBlockedReason}>不可估算</span>
+                            : row.estimatedRemainingCostUsd != null
+                              ? formatUsdFixed2(row.estimatedRemainingCostUsd)
+                              : <span className="text-muted-foreground">无法估算</span>}
+                        </td>
                         <td className="px-3 py-2">
-                          <span className={row.disabled ? 'text-destructive' : 'text-success'}>{row.disabled ? '已禁用' : '启用'}</span>
+                          <span className={row.creditEstimateBlocked ? 'text-destructive' : 'text-success'}>
+                            {row.creditEstimateBlocked ? (row.disabled ? '已禁用' : '不可用') : '启用'}
+                          </span>
                         </td>
                         <td className="px-3 py-2 text-xs text-muted-foreground">{row.checkedAt ? formatFullDate(row.checkedAt) : '未查询'}</td>
                       </tr>

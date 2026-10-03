@@ -24,6 +24,9 @@ use super::{
         get_runtime_config, get_system_version, get_usage_cleanup_status, get_usage_dashboard,
         get_usage_dashboard_accounts, get_usage_dashboard_breakdown,
         get_usage_dashboard_external_pool_billing, get_usage_dashboard_external_pool_risk,
+        get_usage_dashboard_overview, get_usage_dashboard_overview_external,
+        get_usage_dashboard_overview_local, get_usage_dashboard_overview_rankings,
+        get_usage_dashboard_overview_series, get_usage_dashboard_overview_summary,
         get_usage_dashboard_series, get_usage_dashboard_top, get_usage_dashboard_windows,
         get_usage_records, get_usage_records_page, get_usage_summary, get_usage_writer_stats,
         import_proxy_resources, preview_usage_cleanup, refresh_credentials_info,
@@ -206,6 +209,30 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage-records/cleanup/cancel", post(cancel_usage_cleanup))
         .route("/usage-summary", get(get_usage_summary))
         .route("/usage-dashboard", get(get_usage_dashboard))
+        .route(
+            "/usage-dashboard/overview",
+            get(get_usage_dashboard_overview),
+        )
+        .route(
+            "/usage-dashboard/overview/summary",
+            get(get_usage_dashboard_overview_summary),
+        )
+        .route(
+            "/usage-dashboard/overview/series",
+            get(get_usage_dashboard_overview_series),
+        )
+        .route(
+            "/usage-dashboard/overview/local",
+            get(get_usage_dashboard_overview_local),
+        )
+        .route(
+            "/usage-dashboard/overview/external",
+            get(get_usage_dashboard_overview_external),
+        )
+        .route(
+            "/usage-dashboard/overview/rankings",
+            get(get_usage_dashboard_overview_rankings),
+        )
         .route("/usage-dashboard/windows", get(get_usage_dashboard_windows))
         .route("/usage-dashboard/series", get(get_usage_dashboard_series))
         .route("/usage-dashboard/top", get(get_usage_dashboard_top))

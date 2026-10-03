@@ -508,15 +508,18 @@ export type UsageCleanupPhase = 'idle' | 'postgres' | 'redis_admin_cache' | 'red
 
 export interface UsageCleanupRequest {
   mode?: UsageCleanupMode
+  includeSummary?: boolean
   olderThanDays?: number
   cutoffBefore?: string
   batchSize?: number
   maxBatches?: number
+  maxRows?: number
   pauseMsBetweenBatches?: number
 }
 
 export interface UsageCleanupPreviewResponse {
   mode: UsageCleanupMode
+  includeSummary: boolean
   cutoffAt: string
   matchedRows: number
   oldestCreatedAt?: string
@@ -528,9 +531,11 @@ export interface UsageCleanupStatusResponse {
   status: UsageCleanupJobStatus
   phase: UsageCleanupPhase
   mode?: UsageCleanupMode
+  includeSummary: boolean
   cutoffAt?: string
   batchSize: number
   maxBatches: number
+  maxRows?: number
   pauseMsBetweenBatches: number
   matchedRows?: number
   remainingRows?: number
@@ -1066,6 +1071,168 @@ export interface UsageDashboardResponse {
   windows: UsageDashboardWindow[]
   series: UsageDashboardSeries
   top: UsageDashboardTop
+}
+
+export interface UsageOverviewMetrics {
+  requests: number
+  successRequests: number
+  errorRequests: number
+  errorRate: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  estimatedCostUsd: number
+  originalCostUsd: number
+  kiroMeteringUsage: number
+  pricedRequests: number
+  unpricedRequests: number
+  averageDurationMs: number
+}
+
+export interface UsageOverviewSeriesMetrics {
+  requests: number
+  errorRequests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  estimatedCostUsd: number
+  originalCostUsd: number
+  kiroMeteringUsage: number
+}
+
+export interface UsageOverviewSeriesPoint {
+  bucketStart: string
+  label: string
+  all: UsageOverviewSeriesMetrics
+  local: UsageOverviewSeriesMetrics
+  external: UsageOverviewSeriesMetrics
+}
+
+export interface UsageOverviewPoolRow {
+  poolId: number
+  poolName: string
+  metrics: UsageOverviewMetrics
+  rawCostUsd: number
+  shapedCostUsd: number
+  upliftedCostUsd: number
+  reportedCostUsd: number
+  billableCostUsd: number
+  profitUsd: number
+  costFloorDeltaUsd: number
+  costFloorAppliedRequests: number
+}
+
+export interface UsageOverviewAccountRow {
+  credentialId: number
+  label: string
+  metrics: UsageOverviewMetrics
+}
+
+export interface UsageOverviewRankRow {
+  key: string
+  label: string
+  requests: number
+  errorRequests: number
+  estimatedCostUsd: number
+}
+
+export interface UsageOverviewResponse {
+  generatedAt: string
+  timezone: string
+  range: {
+    key?: string | null
+    requestedFrom: string
+    requestedTo: string
+    from: string
+    to: string
+    dataThrough: string
+    granularity: 'hour' | 'day' | string
+  }
+  totals: {
+    all: UsageOverviewMetrics
+    local: UsageOverviewMetrics
+    external: UsageOverviewMetrics
+  }
+  external: {
+    rawCostUsd: number
+    shapedCostUsd: number
+    upliftedCostUsd: number
+    reportedCostUsd: number
+    billableCostUsd: number
+    profitUsd: number
+    costFloorDeltaUsd: number
+    costFloorAppliedRequests: number
+    pools: UsageOverviewPoolRow[]
+  }
+  local: {
+    activeAccounts: number
+    accountsTotal: number
+    accounts: UsageOverviewAccountRow[]
+  }
+  series: UsageOverviewSeriesPoint[]
+  topModels: UsageOverviewRankRow[]
+  topAccounts: UsageOverviewRankRow[]
+  topKeys: UsageOverviewRankRow[]
+  topPaths: UsageOverviewRankRow[]
+  topErrors: UsageOverviewRankRow[]
+}
+
+export interface UsageOverviewSummaryResponse {
+  generatedAt: string
+  timezone: string
+  range: UsageOverviewResponse['range']
+  totals: UsageOverviewResponse['totals']
+  external: {
+    rawCostUsd: number
+    shapedCostUsd: number
+    upliftedCostUsd: number
+    reportedCostUsd: number
+    billableCostUsd: number
+    profitUsd: number
+    costFloorDeltaUsd: number
+    costFloorAppliedRequests: number
+  }
+  local: {
+    activeAccounts: number
+    accountsTotal: number
+  }
+}
+
+export interface UsageOverviewSeriesResponse {
+  generatedAt: string
+  timezone: string
+  range: UsageOverviewResponse['range']
+  series: UsageOverviewSeriesPoint[]
+}
+
+export interface UsageOverviewLocalResponse {
+  generatedAt: string
+  timezone: string
+  range: UsageOverviewResponse['range']
+  local: UsageOverviewResponse['local']
+}
+
+export interface UsageOverviewExternalResponse {
+  generatedAt: string
+  timezone: string
+  range: UsageOverviewResponse['range']
+  external: UsageOverviewResponse['external']
+}
+
+export interface UsageOverviewRankingsResponse {
+  generatedAt: string
+  timezone: string
+  range: UsageOverviewResponse['range']
+  totalRequests: number
+  totalLocalRequests: number
+  totalErrors: number
+  topModels: UsageOverviewRankRow[]
+  topAccounts: UsageOverviewRankRow[]
+  topKeys: UsageOverviewRankRow[]
+  topPaths: UsageOverviewRankRow[]
+  topErrors: UsageOverviewRankRow[]
 }
 
 export interface UsageDashboardWindowsResponse {

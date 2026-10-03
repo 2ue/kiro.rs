@@ -59,8 +59,11 @@ use crate::anthropic::{
     request_admission::RequestAdmissionController,
     usage::{
         UsageDashboardCredentialAggregate, UsageDashboardResponse, UsageExternalPoolRiskCostConfig,
-        UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageRecordQuery, UsageRecorder,
-        UsageRecorderStats, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
+        UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageOverviewExternalResponse,
+        UsageOverviewLocalResponse, UsageOverviewRankingsResponse, UsageOverviewResponse,
+        UsageOverviewSeriesResponse, UsageOverviewSpec, UsageOverviewSummaryResponse,
+        UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
+        UsageRecordsResult, UsageSummary, resolve_usage_overview_spec,
     },
 };
 use crate::common::auth::{RequestApiKeyStore, request_api_key_id as stable_request_api_key_id};
@@ -193,9 +196,10 @@ fn claude_code_model_name(model: &str) -> String {
     format!("{family}-{version}{thinking}{suffix}")
 }
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
-const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS: u32 = 3;
+const USAGE_CLEANUP_DEFAULT_OLDER_THAN_DAYS: u32 = 0;
 const USAGE_CLEANUP_DEFAULT_BATCH_SIZE: usize = 5_000;
 const USAGE_CLEANUP_MAX_BATCH_SIZE: usize = 5_000;
+const USAGE_CLEANUP_MAX_ROWS: u64 = 50_000_000;
 const USAGE_CLEANUP_LEASE_SECS: u64 = 30;
 const USAGE_CLEANUP_HEARTBEAT_ATTEMPT_TIMEOUT_MS: u64 = 2_000;
 const USAGE_CLEANUP_HEARTBEAT_MAX_ATTEMPTS: usize = 3;
@@ -359,6 +363,7 @@ struct CachedBalance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CredentialCreditTier {
     Free,
+    Students,
     Pro,
     ProPlus,
     Power,
@@ -388,7 +393,10 @@ fn credit_snapshot_for_subscription(
         };
     };
 
-    if tier == CredentialCreditTier::Free {
+    if matches!(
+        tier,
+        CredentialCreditTier::Free | CredentialCreditTier::Students
+    ) {
         let limit = if usage_limit > 0.0 {
             usage_limit
         } else {
@@ -453,6 +461,7 @@ fn credit_snapshot_from_persisted_fields(
 fn credential_credit_base(tier: CredentialCreditTier) -> f64 {
     match tier {
         CredentialCreditTier::Free => 50.0,
+        CredentialCreditTier::Students => 1_000.0,
         CredentialCreditTier::Pro => 1_000.0,
         CredentialCreditTier::ProPlus => 2_000.0,
         CredentialCreditTier::Power => 10_000.0,
@@ -461,8 +470,10 @@ fn credential_credit_base(tier: CredentialCreditTier) -> f64 {
 }
 
 fn has_overage_credit_from_usage_limit(tier: CredentialCreditTier, usage_limit: f64) -> bool {
-    tier != CredentialCreditTier::Free
-        && usage_limit >= credential_credit_base(tier) + 10_000.0 - f64::EPSILON
+    !matches!(
+        tier,
+        CredentialCreditTier::Free | CredentialCreditTier::Students
+    ) && usage_limit >= credential_credit_base(tier) + 10_000.0 - f64::EPSILON
 }
 
 fn credential_credit_tier(subscription_title: Option<&str>) -> Option<CredentialCreditTier> {
@@ -476,6 +487,9 @@ fn credential_credit_tier(subscription_title: Option<&str>) -> Option<Credential
         .collect();
     if title.contains("free") {
         return Some(CredentialCreditTier::Free);
+    }
+    if compact.contains("student") {
+        return Some(CredentialCreditTier::Students);
     }
     if title.contains("power") {
         return Some(CredentialCreditTier::Power);
@@ -509,6 +523,27 @@ fn admin_usage_dashboard_cache_key(timezone: Option<&str>, high_cache_threshold:
     format!(
         "admin_cache:usage:dashboard:{}:{}",
         timezone, high_cache_threshold
+    )
+}
+
+fn admin_usage_overview_cache_key(spec: &UsageOverviewSpec) -> String {
+    let timezone = spec.timezone.trim().replace([':', '/', ' '], "_");
+    let range_identity = match spec.range_key.as_deref() {
+        Some(key) => format!("preset:{}", key),
+        None => format!(
+            "custom:{}:{}",
+            spec.requested_from.to_rfc3339(),
+            spec.requested_to.to_rfc3339()
+        ),
+    };
+    format!(
+        "admin_cache:usage:overview:{}:{}:{}:{}:{}:{}",
+        timezone,
+        range_identity,
+        spec.from.to_rfc3339(),
+        spec.to.to_rfc3339(),
+        spec.granularity,
+        spec.top_n
     )
 }
 
@@ -682,9 +717,11 @@ pub struct AdminServiceDependencies {
 #[derive(Debug, Clone)]
 struct UsageCleanupPlan {
     mode: UsageCleanupMode,
+    include_summary: bool,
     cutoff: DateTime<Utc>,
     batch_size: usize,
     max_batches: usize,
+    max_rows: Option<u64>,
     pause_ms_between_batches: u64,
 }
 
@@ -709,9 +746,11 @@ impl Default for UsageCleanupRuntime {
                 status: UsageCleanupJobStatus::Idle,
                 phase: "idle".to_string(),
                 mode: None,
+                include_summary: false,
                 cutoff_at: None,
                 batch_size: 0,
                 max_batches: 0,
+                max_rows: None,
                 pause_ms_between_batches: 0,
                 matched_rows: None,
                 remaining_rows: None,
@@ -4227,6 +4266,207 @@ impl AdminService {
         Ok(dashboard)
     }
 
+    pub fn get_usage_dashboard_overview(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        granularity: Option<String>,
+        top_n: Option<usize>,
+    ) -> Result<UsageOverviewResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            granularity.as_deref(),
+            top_n,
+        )?;
+        self.get_cached_usage_dashboard_overview(spec)
+    }
+
+    fn get_cached_usage_dashboard_overview(
+        &self,
+        spec: UsageOverviewSpec,
+    ) -> Result<UsageOverviewResponse, AdminServiceError> {
+        let cache_key = admin_usage_overview_cache_key(&spec);
+        if let Some(cached) = self.read_admin_cache::<UsageOverviewResponse>(&cache_key) {
+            return Ok(cached);
+        }
+
+        let overview = self
+            .usage_recorder
+            .dashboard_overview(spec)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_usage_admin_cache(cache_key, overview.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        Ok(overview)
+    }
+
+    fn resolve_usage_overview_spec(
+        &self,
+        timezone: Option<&str>,
+        range: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        granularity: Option<&str>,
+        top_n: Option<usize>,
+    ) -> Result<crate::anthropic::usage::UsageOverviewSpec, AdminServiceError> {
+        resolve_usage_overview_spec(Utc::now(), timezone, range, from, to, granularity, top_n)
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))
+    }
+
+    pub fn get_usage_dashboard_overview_summary(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        granularity: Option<String>,
+        top_n: Option<usize>,
+    ) -> Result<UsageOverviewSummaryResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            granularity.as_deref(),
+            top_n,
+        )?;
+        let overview = self.get_cached_usage_dashboard_overview(spec)?;
+        Ok(UsageOverviewSummaryResponse {
+            generated_at: overview.generated_at.clone(),
+            timezone: overview.timezone.clone(),
+            range: overview.range.clone(),
+            totals: overview.totals,
+            external: crate::anthropic::usage::UsageOverviewExternalSummary {
+                raw_cost_usd: overview.external.raw_cost_usd,
+                shaped_cost_usd: overview.external.shaped_cost_usd,
+                uplifted_cost_usd: overview.external.uplifted_cost_usd,
+                reported_cost_usd: overview.external.reported_cost_usd,
+                billable_cost_usd: overview.external.billable_cost_usd,
+                profit_usd: overview.external.profit_usd,
+                cost_floor_delta_usd: overview.external.cost_floor_delta_usd,
+                cost_floor_applied_requests: overview.external.cost_floor_applied_requests,
+            },
+            local: crate::anthropic::usage::UsageOverviewLocalSummary {
+                active_accounts: overview.local.active_accounts,
+                accounts_total: overview.local.accounts_total,
+            },
+        })
+    }
+
+    pub fn get_usage_dashboard_overview_series(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        granularity: Option<String>,
+        top_n: Option<usize>,
+    ) -> Result<UsageOverviewSeriesResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            granularity.as_deref(),
+            top_n,
+        )?;
+        let overview = self.get_cached_usage_dashboard_overview(spec)?;
+        Ok(UsageOverviewSeriesResponse {
+            generated_at: overview.generated_at,
+            timezone: overview.timezone,
+            range: overview.range,
+            series: overview.series,
+        })
+    }
+
+    pub fn get_usage_dashboard_overview_local(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        granularity: Option<String>,
+        top_n: Option<usize>,
+    ) -> Result<UsageOverviewLocalResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            granularity.as_deref(),
+            top_n,
+        )?;
+        let overview = self.get_cached_usage_dashboard_overview(spec)?;
+        Ok(UsageOverviewLocalResponse {
+            generated_at: overview.generated_at,
+            timezone: overview.timezone,
+            range: overview.range,
+            local: overview.local,
+        })
+    }
+
+    pub fn get_usage_dashboard_overview_external(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        granularity: Option<String>,
+        top_n: Option<usize>,
+    ) -> Result<UsageOverviewExternalResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            granularity.as_deref(),
+            top_n,
+        )?;
+        let overview = self.get_cached_usage_dashboard_overview(spec)?;
+        Ok(UsageOverviewExternalResponse {
+            generated_at: overview.generated_at,
+            timezone: overview.timezone,
+            range: overview.range,
+            external: overview.external,
+        })
+    }
+
+    pub fn get_usage_dashboard_overview_rankings(
+        &self,
+        timezone: Option<String>,
+        range: Option<String>,
+        from: Option<String>,
+        to: Option<String>,
+        granularity: Option<String>,
+        top_n: Option<usize>,
+    ) -> Result<UsageOverviewRankingsResponse, AdminServiceError> {
+        let spec = self.resolve_usage_overview_spec(
+            timezone.as_deref(),
+            range.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            granularity.as_deref(),
+            top_n,
+        )?;
+        let overview = self.get_cached_usage_dashboard_overview(spec)?;
+        Ok(UsageOverviewRankingsResponse {
+            generated_at: overview.generated_at,
+            timezone: overview.timezone,
+            range: overview.range,
+            total_requests: overview.totals.all.requests,
+            total_local_requests: overview.totals.local.requests,
+            total_errors: overview.totals.all.error_requests,
+            top_models: overview.top_models,
+            top_accounts: overview.top_accounts,
+            top_keys: overview.top_keys,
+            top_paths: overview.top_paths,
+            top_errors: overview.top_errors,
+        })
+    }
+
     pub fn get_usage_dashboard_windows(
         &self,
         timezone: Option<String>,
@@ -4823,10 +5063,12 @@ impl AdminService {
     ) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
         self.start_usage_cleanup(request.unwrap_or(UsageCleanupRequest {
             mode: UsageCleanupMode::SoftDelete,
+            include_summary: false,
             older_than_days: Some(0),
             cutoff_before: None,
             batch_size: Some(USAGE_CLEANUP_DEFAULT_BATCH_SIZE),
             max_batches: None,
+            max_rows: None,
             pause_ms_between_batches: None,
         }))
     }
@@ -4851,6 +5093,7 @@ impl AdminService {
 
         Ok(UsageCleanupPreviewResponse {
             mode: plan.mode,
+            include_summary: plan.include_summary,
             cutoff_at: plan.cutoff.to_rfc3339(),
             matched_rows: preview.matched_rows,
             oldest_created_at: preview.oldest_created_at.map(|value| value.to_rfc3339()),
@@ -4875,9 +5118,11 @@ impl AdminService {
                     .create_cleanup_job(NewUsageCleanupJob {
                         job_id: &job_id,
                         mode: usage_cleanup_mode_value(plan.mode),
+                        include_summary: plan.include_summary,
                         cutoff_at: plan.cutoff,
                         batch_size: plan.batch_size,
                         max_batches: plan.max_batches,
+                        max_rows: plan.max_rows,
                         pause_ms_between_batches: plan.pause_ms_between_batches,
                     })
                     .await
@@ -4896,9 +5141,11 @@ impl AdminService {
             status: UsageCleanupJobStatus::Queued,
             phase: "postgres".to_string(),
             mode: Some(plan.mode),
+            include_summary: plan.include_summary,
             cutoff_at: Some(plan.cutoff.to_rfc3339()),
             batch_size: plan.batch_size,
             max_batches: plan.max_batches,
+            max_rows: plan.max_rows,
             pause_ms_between_batches: plan.pause_ms_between_batches,
             matched_rows: None,
             remaining_rows: None,
@@ -4934,9 +5181,11 @@ impl AdminService {
             json!({
                 "jobId": job_id,
                 "mode": plan.mode,
+                "includeSummary": plan.include_summary,
                 "cutoffAt": plan.cutoff.to_rfc3339(),
                 "batchSize": plan.batch_size,
                 "maxBatches": plan.max_batches,
+                "maxRows": plan.max_rows,
                 "submissionMode": "bounded_background_job",
             }),
         );
@@ -7821,15 +8070,11 @@ fn credential_matches_query(
     }
 
     if let Some(subscription) = query.subscription.as_deref() {
-        let expected = subscription.trim().to_lowercase();
-        if !expected.is_empty() && expected != "all" {
+        let expected = subscription_filter_key(subscription);
+        if expected.is_some() {
             let title = credential_subscription_title(credential);
             let key = subscription_key(title.as_deref());
-            let title_match = title
-                .as_deref()
-                .map(|value| value.to_lowercase().contains(&expected))
-                .unwrap_or(false);
-            if key != expected && !title_match {
+            if expected.as_deref() != Some(key.as_str()) {
                 return false;
             }
         }
@@ -7977,15 +8222,10 @@ fn credential_base_matches_query(
     }
 
     if let Some(subscription) = query.subscription.as_deref() {
-        let expected = subscription.trim().to_lowercase();
-        if !expected.is_empty() && expected != "all" {
+        let expected = subscription_filter_key(subscription);
+        if expected.is_some() {
             let key = subscription_key(credential.subscription_title.as_deref());
-            let title_match = credential
-                .subscription_title
-                .as_deref()
-                .map(|value| value.to_lowercase().contains(&expected))
-                .unwrap_or(false);
-            if key != expected && !title_match {
+            if expected.as_deref() != Some(key.as_str()) {
                 return false;
             }
         }
@@ -8030,6 +8270,15 @@ fn credential_subscription_title(credential: &CredentialStatusItem) -> Option<St
         .or_else(|| credential.subscription_title.clone())
 }
 
+fn subscription_search_terms(title: Option<&str>) -> Vec<String> {
+    let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    let key = subscription_key(Some(title));
+    let label = subscription_label(&key);
+    vec![title.to_string(), key, label.to_string()]
+}
+
 fn credential_search_text(credential: &CredentialStatusItem) -> String {
     [
         Some(credential.id.to_string()),
@@ -8040,6 +8289,10 @@ fn credential_search_text(credential: &CredentialStatusItem) -> String {
         credential.refresh_token_hash.clone(),
         credential.api_key_hash.clone(),
         credential_subscription_title(credential),
+        Some(
+            subscription_search_terms(credential_subscription_title(credential).as_deref())
+                .join(" "),
+        ),
         credential.proxy_resource_name.clone(),
         credential.proxy_url.clone(),
         credential.effective_proxy_url.clone(),
@@ -8087,6 +8340,7 @@ fn credential_base_search_text(credential: &CredentialListItem) -> String {
         credential.refresh_token_hash.clone(),
         credential.api_key_hash.clone(),
         credential.subscription_title.clone(),
+        Some(subscription_search_terms(credential.subscription_title.as_deref()).join(" ")),
         credential.proxy_resource_name.clone(),
         credential.proxy_url.clone(),
         credential.effective_proxy_url.clone(),
@@ -8205,11 +8459,16 @@ fn subscription_key(title: Option<&str>) -> String {
         return "unknown".to_string();
     };
     let lower = title.trim().to_lowercase();
+    if lower.is_empty() {
+        return "unknown".to_string();
+    }
     let compact: String = lower
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect();
-    if compact.contains("power") {
+    if compact.contains("student") {
+        "students".to_string()
+    } else if compact.contains("power") {
         "power".to_string()
     } else if compact.contains("promax") {
         "pro_max".to_string()
@@ -8221,7 +8480,9 @@ fn subscription_key(title: Option<&str>) -> String {
     {
         "pro_plus".to_string()
     } else if lower.contains("trial") || lower.contains("试用") {
-        "trial".to_string()
+        // Kiro no longer publishes Trial as a subscription tier. Treat legacy
+        // trial labels as the current Free tier for filtering and display.
+        "free".to_string()
     } else if lower.contains("free") || lower.contains("免费") {
         "free".to_string()
     } else if lower.contains("pro") {
@@ -8234,7 +8495,7 @@ fn subscription_key(title: Option<&str>) -> String {
 fn subscription_rank(title: Option<&str>) -> u8 {
     match subscription_key(title).as_str() {
         "free" => 1,
-        "trial" => 2,
+        "students" => 2,
         "pro" => 3,
         "pro_plus" => 4,
         "pro_max" => 5,
@@ -8255,13 +8516,44 @@ fn validation_group_title(key: &str) -> String {
         "failed" => "查询失败".to_string(),
         "downgraded" => "疑似订阅掉级".to_string(),
         "upgraded" => "订阅升级".to_string(),
-        "pro_plus" => "Pro+".to_string(),
-        "pro" => "Pro".to_string(),
-        "trial" => "试用".to_string(),
-        "free" => "Free".to_string(),
+        "students" => "Kiro Students".to_string(),
+        "pro_plus" => "Kiro Pro+".to_string(),
+        "pro" => "Kiro Pro".to_string(),
+        "pro_max" => "Kiro Pro Max".to_string(),
+        "power" => "Kiro Power".to_string(),
+        "free" => "Kiro Free".to_string(),
         "unknown" => "未知订阅".to_string(),
         "external" => "外部校验".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn subscription_filter_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    let key = subscription_key(Some(value));
+    if key == "unknown"
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "unknown" | "unknown_subscription" | "unknown-subscription" | "未知" | "未知订阅"
+        )
+    {
+        return None;
+    }
+    Some(key)
+}
+
+fn subscription_label(key: &str) -> &'static str {
+    match key {
+        "free" => "Kiro Free",
+        "students" => "Kiro Students",
+        "pro" => "Kiro Pro",
+        "pro_plus" => "Kiro Pro+",
+        "pro_max" => "Kiro Pro Max",
+        "power" => "Kiro Power",
+        _ => "未知订阅",
     }
 }
 
@@ -8292,9 +8584,11 @@ fn build_validation_response(items: Vec<CredentialValidationItem>) -> Credential
         "downgraded",
         "failed",
         "upgraded",
+        "power",
+        "pro_max",
         "pro_plus",
         "pro",
-        "trial",
+        "students",
         "free",
         "external",
         "unknown",
@@ -8338,7 +8632,7 @@ fn normalize_usage_cleanup_request(
     request: UsageCleanupRequest,
 ) -> Result<UsageCleanupPlan, AdminServiceError> {
     let now = Utc::now();
-    let cutoff = if let Some(value) = request
+    let requested_cutoff = if let Some(value) = request
         .cutoff_before
         .as_deref()
         .map(str::trim)
@@ -8364,11 +8658,20 @@ fn normalize_usage_cleanup_request(
         now - ChronoDuration::days(days as i64)
     };
 
-    if cutoff > now {
+    if requested_cutoff > now {
         return Err(AdminServiceError::InvalidCredential(
             "cutoffBefore 必须早于当前时间".to_string(),
         ));
     }
+
+    // The explicit summary option is deliberately a simple, all-history action.
+    // It is not combined with a partial date range or a row cap, which avoids
+    // leaving the operator with a partially rebuilt set of aggregates.
+    let cutoff = if request.include_summary {
+        now
+    } else {
+        requested_cutoff
+    };
 
     let batch_size = request
         .batch_size
@@ -8380,6 +8683,27 @@ fn normalize_usage_cleanup_request(
         )));
     }
 
+    let max_rows = request
+        .max_rows
+        .filter(|value| *value > 0)
+        .map(|value| {
+            if value > USAGE_CLEANUP_MAX_ROWS {
+                Err(AdminServiceError::InvalidCredential(format!(
+                    "maxRows 不能超过 {}",
+                    USAGE_CLEANUP_MAX_ROWS
+                )))
+            } else {
+                Ok(value)
+            }
+        })
+        .transpose()?;
+
+    let max_rows = if request.include_summary {
+        None
+    } else {
+        max_rows
+    };
+
     let max_batches = request
         .max_batches
         .filter(|value| *value > 0)
@@ -8390,18 +8714,26 @@ fn normalize_usage_cleanup_request(
         ));
     }
 
-    let pause_ms_between_batches = request.pause_ms_between_batches.unwrap_or(100);
+    let pause_ms_between_batches = request.pause_ms_between_batches.unwrap_or(10);
     if pause_ms_between_batches > 10_000 {
         return Err(AdminServiceError::InvalidCredential(
             "pauseMsBetweenBatches 不能超过 10000".to_string(),
         ));
     }
 
+    let mode = if request.include_summary {
+        UsageCleanupMode::SoftDelete
+    } else {
+        request.mode
+    };
+
     Ok(UsageCleanupPlan {
-        mode: request.mode,
+        mode,
+        include_summary: request.include_summary,
         cutoff,
         batch_size,
         max_batches,
+        max_rows,
         pause_ms_between_batches,
     })
 }
@@ -8451,9 +8783,11 @@ fn usage_cleanup_status_from_row(job: &UsageCleanupJobRow) -> UsageCleanupStatus
         status: usage_cleanup_status_from_value(&job.status),
         phase: job.phase.clone(),
         mode: usage_cleanup_mode_from_value(&job.mode),
+        include_summary: job.include_summary,
         cutoff_at: Some(job.cutoff_at.to_rfc3339()),
         batch_size: job.batch_size,
         max_batches: job.max_batches,
+        max_rows: job.max_rows,
         pause_ms_between_batches: job.pause_ms_between_batches,
         matched_rows: job.matched_rows,
         remaining_rows: job.remaining_rows,
@@ -8694,9 +9028,11 @@ async fn run_usage_cleanup_job(
     };
     let plan = UsageCleanupPlan {
         mode,
+        include_summary: job.include_summary,
         cutoff: job.cutoff_at,
         batch_size: job.batch_size,
         max_batches: job.max_batches,
+        max_rows: job.max_rows,
         pause_ms_between_batches: job.pause_ms_between_batches,
     };
     let cleanup_watermark = match plan.mode {
@@ -8809,15 +9145,46 @@ async fn run_usage_cleanup_job(
                 break;
             }
 
+            if let Some(max_rows) = plan.max_rows {
+                let remaining_budget = max_rows.saturating_sub(processed_rows);
+                if remaining_budget == 0 {
+                    match usage_cleanup_has_remaining(&store, &plan).await {
+                        Ok(false) => {
+                            remaining_rows = Some(0);
+                            postgres_complete = true;
+                        }
+                        Ok(true) => {
+                            final_status = UsageCleanupJobStatus::Paused;
+                            stop_reason = Some("max_rows_reached".to_string());
+                        }
+                        Err(err) => {
+                            final_status = UsageCleanupJobStatus::Failed;
+                            stop_reason = Some("postgres_completion_probe_failed".to_string());
+                            last_error = Some(err.to_string());
+                        }
+                    }
+                    break;
+                }
+            }
+
+            let batch_limit = plan
+                .max_rows
+                .map(|max_rows| {
+                    max_rows
+                        .saturating_sub(processed_rows)
+                        .min(plan.batch_size as u64) as usize
+                })
+                .filter(|limit| *limit > 0)
+                .unwrap_or(plan.batch_size);
             let batch_result = match plan.mode {
                 UsageCleanupMode::SoftDelete => {
                     store
-                        .soft_delete_cleanup_batch(plan.cutoff, plan.batch_size)
+                        .soft_delete_cleanup_batch_preserving_summary(plan.cutoff, batch_limit)
                         .await
                 }
                 UsageCleanupMode::HardDelete => {
                     store
-                        .hard_delete_cleanup_batch(plan.cutoff, plan.batch_size)
+                        .hard_delete_cleanup_batch_preserving_summary(plan.cutoff, batch_limit)
                         .await
                 }
             };
@@ -8910,9 +9277,24 @@ async fn run_usage_cleanup_job(
         }
     }
 
-    let needs_cache_cleanup = processed_rows > 0 || phase != "postgres";
+    if plan.include_summary && postgres_complete && final_status == UsageCleanupJobStatus::Completed
+    {
+        if let Err(err) = store.reset_usage_rollups_from_active_records().await {
+            final_status = UsageCleanupJobStatus::Failed;
+            stop_reason = Some("postgres_summary_cleanup_failed".to_string());
+            last_error = Some(err.to_string());
+            postgres_complete = false;
+        } else {
+            usage_recorder.invalidate_derived_caches();
+        }
+    }
+
+    let needs_cache_cleanup = processed_rows > 0 || phase != "postgres" || plan.include_summary;
     if needs_cache_cleanup {
-        if plan.mode == UsageCleanupMode::SoftDelete {
+        if matches!(
+            plan.mode,
+            UsageCleanupMode::SoftDelete | UsageCleanupMode::HardDelete
+        ) {
             usage_recorder.remove_memory_records_before(plan.cutoff);
         }
         if cancel.load(Ordering::Acquire) && final_status == UsageCleanupJobStatus::Completed {

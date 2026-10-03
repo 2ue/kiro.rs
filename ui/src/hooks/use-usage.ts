@@ -9,6 +9,12 @@ import {
   getModelCapabilities,
   getModelPricing,
   getUsageDashboard,
+  getUsageOverview,
+  getUsageOverviewExternal,
+  getUsageOverviewLocal,
+  getUsageOverviewRankings,
+  getUsageOverviewSeries,
+  getUsageOverviewSummary,
   getUsageDashboardAccounts,
   getUsageDashboardBreakdown,
   getUsageDashboardExternalPoolBilling,
@@ -69,6 +75,106 @@ export function useUsageDashboard(timezone = 'Asia/Shanghai', refetchInterval: R
     queryKey: ['usage-dashboard', timezone],
     queryFn: () => getUsageDashboard(timezone),
     refetchInterval,
+  })
+}
+
+export function useUsageOverview(
+  params: {
+    timezone?: string
+    range?: string
+    from?: string
+    to?: string
+    granularity?: 'hour' | 'day'
+    topN?: number
+  } = {},
+  refetchInterval: RefetchInterval = false,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['usage-overview', params],
+    queryFn: () => getUsageOverview(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+type UsageOverviewQuery = {
+  timezone?: string
+  range?: string
+  from?: string
+  to?: string
+  granularity?: 'hour' | 'day'
+  topN?: number
+}
+
+export function useUsageOverviewSummary(
+  params: UsageOverviewQuery = {},
+  refetchInterval: RefetchInterval = false,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['usage-overview-summary', params],
+    queryFn: () => getUsageOverviewSummary(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useUsageOverviewSeries(
+  params: UsageOverviewQuery = {},
+  refetchInterval: RefetchInterval = false,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['usage-overview-series', params],
+    queryFn: () => getUsageOverviewSeries(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useUsageOverviewLocal(
+  params: UsageOverviewQuery = {},
+  refetchInterval: RefetchInterval = false,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['usage-overview-local', params],
+    queryFn: () => getUsageOverviewLocal(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useUsageOverviewExternal(
+  params: UsageOverviewQuery = {},
+  refetchInterval: RefetchInterval = false,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['usage-overview-external', params],
+    queryFn: () => getUsageOverviewExternal(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useUsageOverviewRankings(
+  params: UsageOverviewQuery = {},
+  refetchInterval: RefetchInterval = false,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: ['usage-overview-rankings', params],
+    queryFn: () => getUsageOverviewRankings(params),
+    refetchInterval,
+    enabled,
+    placeholderData: (previousData) => previousData,
   })
 }
 
@@ -173,6 +279,12 @@ export function useUsageDashboardExternalPoolRisk(
 
 function invalidateUsageDashboardQueries(queryClient: ReturnType<typeof useQueryClient>) {
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-overview'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-overview-summary'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-overview-series'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-overview-local'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-overview-external'] })
+  queryClient.invalidateQueries({ queryKey: ['usage-overview-rankings'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-windows'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-series'] })
   queryClient.invalidateQueries({ queryKey: ['usage-dashboard-top'] })

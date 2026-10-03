@@ -465,15 +465,18 @@ export type UsageCleanupPhase = 'idle' | 'postgres' | 'redis_admin_cache' | 'red
 
 export interface UsageCleanupRequest {
   mode?: UsageCleanupMode
+  includeSummary?: boolean
   olderThanDays?: number
   cutoffBefore?: string
   batchSize?: number
   maxBatches?: number
+  maxRows?: number
   pauseMsBetweenBatches?: number
 }
 
 export interface UsageCleanupPreviewResponse {
   mode: UsageCleanupMode
+  includeSummary: boolean
   cutoffAt: string
   matchedRows: number
   oldestCreatedAt?: string
@@ -485,9 +488,11 @@ export interface UsageCleanupStatusResponse {
   status: UsageCleanupJobStatus
   phase: UsageCleanupPhase
   mode?: UsageCleanupMode
+  includeSummary: boolean
   cutoffAt?: string
   batchSize: number
   maxBatches: number
+  maxRows?: number
   pauseMsBetweenBatches: number
   matchedRows?: number
   remainingRows?: number

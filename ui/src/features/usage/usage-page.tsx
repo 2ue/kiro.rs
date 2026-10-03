@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   Activity,
@@ -191,6 +192,13 @@ function toDatetimeLocalValue(date: Date): string {
     ':',
     pad(date.getMinutes()),
   ].join('')
+}
+
+function isoToDatetimeLocalValue(value: string | null): string {
+  if (!value) return ''
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return ''
+  return toDatetimeLocalValue(parsed)
 }
 
 function datetimeLocalToIso(value: string): string | undefined {
@@ -574,6 +582,7 @@ function RecordsView({
   onViewDetail: (r: UsageRecord) => void
   autoRefreshInterval: number | false
 }) {
+  const [searchParams] = useSearchParams()
   const [page, setPage] = useState(1)
   const [q, setQ] = useState('')
   const [requestId, setRequestId] = useState('')
@@ -581,15 +590,32 @@ function RecordsView({
   const [model, setModel] = useState('')
   const [endpoint, setEndpoint] = useState('')
   const [conversationId, setConversationId] = useState('')
-  const [routeSelection, setRouteSelection] = useState<RouteSelectionValue>('all')
-  const [routeKind, setRouteKind] = useState<UsageRouteKindFilter | '__all__'>('__all__')
+  const initialRouteKind = searchParams.get('routeKind')
+  const initialCredentialId = Number(searchParams.get('credentialId'))
+  const initialExternalPoolId = Number(searchParams.get('externalPoolId'))
+  const initialRouteSelection: RouteSelectionValue =
+    Number.isFinite(initialCredentialId) && initialCredentialId > 0
+      ? `credential:${initialCredentialId}`
+      : Number.isFinite(initialExternalPoolId) && initialExternalPoolId > 0
+        ? `external:${initialExternalPoolId}`
+        : 'all'
+  const initialRouteFilter: UsageRouteKindFilter | '__all__' =
+    initialRouteKind === 'local_credential' || initialRouteKind === 'external_pool'
+      ? initialRouteKind
+      : initialRouteSelection === 'all'
+        ? '__all__'
+        : initialRouteSelection.startsWith('credential:')
+          ? 'local_credential'
+          : 'external_pool'
+  const [routeSelection, setRouteSelection] = useState<RouteSelectionValue>(initialRouteSelection)
+  const [routeKind, setRouteKind] = useState<UsageRouteKindFilter | '__all__'>(initialRouteFilter)
   const [status, setStatus] = useState<UsageRecordStatus | '__all__'>('__all__')
   const [source, setSource] = useState<UsageSource | '__all__'>('__all__')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
   const [minFirstTokenLatencyMs, setMinFirstTokenLatencyMs] = useState('')
-  const [since, setSince] = useState('')
-  const [until, setUntil] = useState('')
+  const [since, setSince] = useState(() => isoToDatetimeLocalValue(searchParams.get('since')))
+  const [until, setUntil] = useState(() => isoToDatetimeLocalValue(searchParams.get('until')))
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [exporting, setExporting] = useState(false)
 

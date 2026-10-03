@@ -159,6 +159,17 @@ pub struct UsageDashboardQueryParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageOverviewQueryParams {
+    pub timezone: Option<String>,
+    pub range: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub granularity: Option<String>,
+    pub top_n: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageDashboardWindowQueryParams {
     pub timezone: Option<String>,
     pub window_key: Option<String>,
@@ -1429,6 +1440,115 @@ pub async fn get_usage_dashboard(
     Query(params): Query<UsageDashboardQueryParams>,
 ) -> impl IntoResponse {
     match state.service.get_usage_dashboard(params.timezone) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/overview
+/// 获取按合计 / 本地账号池 / 外部池拆分的 rollup-first 总览。
+pub async fn get_usage_dashboard_overview(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageOverviewQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_overview(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+        params.granularity,
+        params.top_n,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/overview/summary
+pub async fn get_usage_dashboard_overview_summary(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageOverviewQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_overview_summary(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+        params.granularity,
+        params.top_n,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/overview/series
+pub async fn get_usage_dashboard_overview_series(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageOverviewQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_overview_series(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+        params.granularity,
+        params.top_n,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/overview/local
+pub async fn get_usage_dashboard_overview_local(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageOverviewQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_overview_local(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+        params.granularity,
+        params.top_n,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/overview/external
+pub async fn get_usage_dashboard_overview_external(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageOverviewQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_overview_external(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+        params.granularity,
+        params.top_n,
+    ) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/overview/rankings
+pub async fn get_usage_dashboard_overview_rankings(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageOverviewQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_overview_rankings(
+        params.timezone,
+        params.range,
+        params.from,
+        params.to,
+        params.granularity,
+        params.top_n,
+    ) {
         Ok(data) => Json(data).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

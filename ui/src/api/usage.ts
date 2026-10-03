@@ -14,6 +14,12 @@ import type {
   UsageDashboardSeriesResponse,
   UsageDashboardTopResponse,
   UsageDashboardWindowsResponse,
+  UsageOverviewResponse,
+  UsageOverviewExternalResponse,
+  UsageOverviewLocalResponse,
+  UsageOverviewRankingsResponse,
+  UsageOverviewSeriesResponse,
+  UsageOverviewSummaryResponse,
   UsageCleanupPreviewResponse,
   UsageCleanupRequest,
   UsageCleanupStatusResponse,
@@ -50,6 +56,76 @@ export async function getUsageWriterStats(): Promise<UsageRecorderStats> {
 export async function getUsageDashboard(timezone = 'Asia/Shanghai'): Promise<UsageDashboardResponse> {
   const { data } = await api.get<UsageDashboardResponse>('/usage-dashboard', {
     params: { timezone },
+  })
+  return data
+}
+
+export async function getUsageOverview(params: {
+  timezone?: string
+  range?: string
+  from?: string
+  to?: string
+  granularity?: 'hour' | 'day'
+  topN?: number
+} = {}): Promise<UsageOverviewResponse> {
+  const { data } = await api.get<UsageOverviewResponse>('/usage-dashboard/overview', {
+    params: {
+      timezone: 'Asia/Shanghai',
+      range: 'today',
+      ...params,
+    },
+  })
+  return data
+}
+
+type UsageOverviewQuery = {
+  timezone?: string
+  range?: string
+  from?: string
+  to?: string
+  granularity?: 'hour' | 'day'
+  topN?: number
+}
+
+function usageOverviewParams(params: UsageOverviewQuery = {}) {
+  return {
+    timezone: 'Asia/Shanghai',
+    range: 'today',
+    ...params,
+  }
+}
+
+export async function getUsageOverviewSummary(params: UsageOverviewQuery = {}): Promise<UsageOverviewSummaryResponse> {
+  const { data } = await api.get<UsageOverviewSummaryResponse>('/usage-dashboard/overview/summary', {
+    params: usageOverviewParams(params),
+  })
+  return data
+}
+
+export async function getUsageOverviewSeries(params: UsageOverviewQuery = {}): Promise<UsageOverviewSeriesResponse> {
+  const { data } = await api.get<UsageOverviewSeriesResponse>('/usage-dashboard/overview/series', {
+    params: usageOverviewParams(params),
+  })
+  return data
+}
+
+export async function getUsageOverviewLocal(params: UsageOverviewQuery = {}): Promise<UsageOverviewLocalResponse> {
+  const { data } = await api.get<UsageOverviewLocalResponse>('/usage-dashboard/overview/local', {
+    params: usageOverviewParams(params),
+  })
+  return data
+}
+
+export async function getUsageOverviewExternal(params: UsageOverviewQuery = {}): Promise<UsageOverviewExternalResponse> {
+  const { data } = await api.get<UsageOverviewExternalResponse>('/usage-dashboard/overview/external', {
+    params: usageOverviewParams(params),
+  })
+  return data
+}
+
+export async function getUsageOverviewRankings(params: UsageOverviewQuery = {}): Promise<UsageOverviewRankingsResponse> {
+  const { data } = await api.get<UsageOverviewRankingsResponse>('/usage-dashboard/overview/rankings', {
+    params: usageOverviewParams(params),
   })
   return data
 }

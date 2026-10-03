@@ -48,4 +48,16 @@ pub enum MaintenanceCommand {
     UsageLegacyCostBackfill,
     /// 显式压缩历史 usage rollup 小桶到小时桶；必须先停止并排空所有网关实例
     UsageRollupCompression,
+    /// 向隔离的 overview demo 数据库写入可重复的本地/外部用量样本
+    UsageDemoSeed {
+        /// 生成最近多少天的数据
+        #[arg(long, default_value_t = 8)]
+        days: u32,
+        /// 固定随机种子，保证每次演示结果可复现
+        #[arg(long, default_value_t = 20261002)]
+        seed: u64,
+        /// 清空 demo 库中的 usage 表后重新造数
+        #[arg(long)]
+        reset: bool,
+    },
 }

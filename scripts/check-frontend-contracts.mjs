@@ -12,6 +12,18 @@ const adminContractPath = path.join(root, 'admin-ui/src/types/api.ts')
 const virtualCheckPath = path.join(root, 'scripts/.frontend-contract-check.ts')
 
 const intentionallyUiOnly = new Set([
+  'UsageOverviewAccountRow',
+  'UsageOverviewExternalResponse',
+  'UsageOverviewLocalResponse',
+  'UsageOverviewMetrics',
+  'UsageOverviewPoolRow',
+  'UsageOverviewRankRow',
+  'UsageOverviewRankingsResponse',
+  'UsageOverviewResponse',
+  'UsageOverviewSeriesMetrics',
+  'UsageOverviewSeriesPoint',
+  'UsageOverviewSeriesResponse',
+  'UsageOverviewSummaryResponse',
   'UsageRouteKindFilter',
   'UsageExternalPoolRiskBucket',
   'UsageExternalPoolRiskCacheStats',

@@ -1323,6 +1323,345 @@ pub struct UsageDashboardTop {
     pub errors_order_by: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewMetrics {
+    pub requests: usize,
+    pub success_requests: usize,
+    pub error_requests: usize,
+    pub error_rate: f64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub estimated_cost_usd: f64,
+    pub original_cost_usd: f64,
+    pub kiro_metering_usage: f64,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
+    pub average_duration_ms: f64,
+}
+
+impl Default for UsageOverviewMetrics {
+    fn default() -> Self {
+        Self {
+            requests: 0,
+            success_requests: 0,
+            error_requests: 0,
+            error_rate: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            estimated_cost_usd: 0.0,
+            original_cost_usd: 0.0,
+            kiro_metering_usage: 0.0,
+            priced_requests: 0,
+            unpriced_requests: 0,
+            average_duration_ms: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewSeriesMetrics {
+    pub requests: usize,
+    pub error_requests: usize,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub estimated_cost_usd: f64,
+    pub original_cost_usd: f64,
+    pub kiro_metering_usage: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewSeriesPoint {
+    pub bucket_start: String,
+    pub label: String,
+    pub all: UsageOverviewSeriesMetrics,
+    pub local: UsageOverviewSeriesMetrics,
+    pub external: UsageOverviewSeriesMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewPoolRow {
+    pub pool_id: u64,
+    pub pool_name: String,
+    pub metrics: UsageOverviewMetrics,
+    pub raw_cost_usd: f64,
+    pub shaped_cost_usd: f64,
+    pub uplifted_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub profit_usd: f64,
+    pub cost_floor_delta_usd: f64,
+    pub cost_floor_applied_requests: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewAccountRow {
+    pub credential_id: u64,
+    pub label: String,
+    pub metrics: UsageOverviewMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewRankRow {
+    pub key: String,
+    pub label: String,
+    pub requests: usize,
+    pub error_requests: usize,
+    pub estimated_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewRange {
+    pub key: Option<String>,
+    pub requested_from: String,
+    pub requested_to: String,
+    pub from: String,
+    pub to: String,
+    pub data_through: String,
+    pub granularity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub totals: UsageOverviewTotals,
+    pub external: UsageOverviewExternal,
+    pub local: UsageOverviewLocal,
+    pub series: Vec<UsageOverviewSeriesPoint>,
+    pub top_models: Vec<UsageOverviewRankRow>,
+    pub top_accounts: Vec<UsageOverviewRankRow>,
+    pub top_keys: Vec<UsageOverviewRankRow>,
+    pub top_paths: Vec<UsageOverviewRankRow>,
+    pub top_errors: Vec<UsageOverviewRankRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewSummaryResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub totals: UsageOverviewTotals,
+    pub external: UsageOverviewExternalSummary,
+    pub local: UsageOverviewLocalSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewSeriesResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub series: Vec<UsageOverviewSeriesPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewLocalResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub local: UsageOverviewLocal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewExternalResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub external: UsageOverviewExternal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewRankingsResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub range: UsageOverviewRange,
+    pub total_requests: usize,
+    pub total_local_requests: usize,
+    pub total_errors: usize,
+    pub top_models: Vec<UsageOverviewRankRow>,
+    pub top_accounts: Vec<UsageOverviewRankRow>,
+    pub top_keys: Vec<UsageOverviewRankRow>,
+    pub top_paths: Vec<UsageOverviewRankRow>,
+    pub top_errors: Vec<UsageOverviewRankRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewExternalSummary {
+    pub raw_cost_usd: f64,
+    pub shaped_cost_usd: f64,
+    pub uplifted_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub profit_usd: f64,
+    pub cost_floor_delta_usd: f64,
+    pub cost_floor_applied_requests: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewLocalSummary {
+    pub active_accounts: usize,
+    pub accounts_total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewTotals {
+    pub all: UsageOverviewMetrics,
+    pub local: UsageOverviewMetrics,
+    pub external: UsageOverviewMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewExternal {
+    pub raw_cost_usd: f64,
+    pub shaped_cost_usd: f64,
+    pub uplifted_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub profit_usd: f64,
+    pub cost_floor_delta_usd: f64,
+    pub cost_floor_applied_requests: usize,
+    pub pools: Vec<UsageOverviewPoolRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewLocal {
+    pub active_accounts: usize,
+    pub accounts_total: usize,
+    pub accounts: Vec<UsageOverviewAccountRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageOverviewSpec {
+    pub timezone: String,
+    pub offset: FixedOffset,
+    pub range_key: Option<String>,
+    pub requested_from: DateTime<Utc>,
+    pub requested_to: DateTime<Utc>,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub data_through: DateTime<Utc>,
+    pub granularity: String,
+    pub top_n: usize,
+}
+
+pub fn resolve_usage_overview_spec(
+    now: DateTime<Utc>,
+    timezone: Option<&str>,
+    range: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    granularity: Option<&str>,
+    top_n: Option<usize>,
+) -> anyhow::Result<UsageOverviewSpec> {
+    let (timezone_name, offset) = usage_dashboard_timezone(timezone);
+    let (range_key, requested_from, requested_to) = match (from, to) {
+        (Some(from), Some(to)) => (
+            None,
+            parse_usage_overview_datetime(from, "from")?,
+            parse_usage_overview_datetime(to, "to")?,
+        ),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("自定义时间范围必须同时提供 from 和 to")
+        }
+        (None, None) => {
+            let key = range
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("today");
+            let known = matches!(
+                key,
+                "today" | "yesterday" | "last24h" | "last7d" | "last30d" | "thisMonth"
+            );
+            if !known {
+                anyhow::bail!(
+                    "range 只支持 today、yesterday、last24h、last7d、last30d、thisMonth（收到 {}）",
+                    key
+                );
+            }
+            let window = usage_dashboard_window_spec_for_key(now, offset, key);
+            (Some(key.to_string()), window.from, window.to)
+        }
+    };
+    if requested_from >= requested_to {
+        anyhow::bail!("时间范围要求 from 小于 to")
+    }
+    if requested_to - requested_from > ChronoDuration::days(90) {
+        anyhow::bail!("时间范围不能超过 90 天")
+    }
+
+    let aligned_from = floor_to_hour(requested_from);
+    let aligned_to = ceil_to_hour(requested_to);
+    let span = aligned_to - aligned_from;
+    let granularity = match granularity.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("hour") => "hour",
+        Some("day") => "day",
+        Some(other) => anyhow::bail!("granularity 只支持 hour 或 day（收到 {}）", other),
+        None if span <= ChronoDuration::hours(48) => "hour",
+        None => "day",
+    }
+    .to_string();
+
+    Ok(UsageOverviewSpec {
+        timezone: timezone_name,
+        offset,
+        range_key,
+        requested_from,
+        requested_to,
+        from: aligned_from,
+        to: aligned_to,
+        data_through: aligned_to.min(now),
+        granularity,
+        top_n: top_n.unwrap_or(10).clamp(1, 50),
+    })
+}
+
+fn parse_usage_overview_datetime(value: &str, field: &str) -> anyhow::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| anyhow::anyhow!("{} 必须是 RFC 3339 时间: {}", field, error))
+}
+
+fn floor_to_hour(value: DateTime<Utc>) -> DateTime<Utc> {
+    value
+        .with_minute(0)
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .unwrap_or(value)
+}
+
+fn ceil_to_hour(value: DateTime<Utc>) -> DateTime<Utc> {
+    let floor = floor_to_hour(value);
+    if floor == value {
+        floor
+    } else {
+        floor + ChronoDuration::hours(1)
+    }
+}
+
 fn default_dashboard_top_order_by() -> String {
     "estimated_cost_usd".to_string()
 }
@@ -2853,6 +3192,21 @@ impl UsageRecorder {
         anyhow::bail!("usage dashboard 的精确窗口与 P95 需要 PgSQL 聚合存储")
     }
 
+    pub fn dashboard_overview(
+        &self,
+        spec: UsageOverviewSpec,
+    ) -> anyhow::Result<UsageOverviewResponse> {
+        let Some(store) = &self.postgres_store else {
+            anyhow::bail!("usage overview 需要 PgSQL 聚合存储");
+        };
+        let store = store.clone();
+        self.dashboard_query(
+            "PgSQL usage overview",
+            USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS,
+            async move { store.dashboard_overview(&spec).await },
+        )
+    }
+
     pub fn dashboard_windows(
         &self,
         timezone: Option<&str>,
@@ -3406,6 +3760,14 @@ impl UsageRecorder {
                 .unwrap_or(true)
         });
         before.saturating_sub(records.len())
+    }
+
+    /// Drop in-process Postgres-derived dashboard caches after an explicit
+    /// summary purge. Normal detail cleanup changes the cleanup watermark and
+    /// naturally invalidates these revisions; a full aggregate purge does not.
+    pub fn invalidate_derived_caches(&self) {
+        *self.postgres_summary_cache.lock() = None;
+        *self.postgres_dashboard_cache.lock() = None;
     }
 }
 
@@ -4027,6 +4389,40 @@ mod tests {
 
         let empty = serde_json::to_value(UsageLatencyTrace::default()).expect("empty trace JSON");
         assert_eq!(empty, serde_json::json!({}));
+    }
+
+    #[test]
+    fn usage_overview_range_rejects_unknown_preset_and_aligns_custom_range() {
+        let now = DateTime::parse_from_rfc3339("2026-10-02T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let unknown = resolve_usage_overview_spec(
+            now,
+            Some("Asia/Shanghai"),
+            Some("not-a-range"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("unknown overview range must be rejected");
+        assert!(unknown.to_string().contains("range 只支持"));
+
+        let custom = resolve_usage_overview_spec(
+            now,
+            Some("Asia/Shanghai"),
+            None,
+            Some("2026-10-02T00:15:00+08:00"),
+            Some("2026-10-02T02:20:00+08:00"),
+            Some("hour"),
+            Some(99),
+        )
+        .expect("custom overview range");
+        assert_eq!(custom.from.to_rfc3339(), "2026-10-01T16:00:00+00:00");
+        assert_eq!(custom.to.to_rfc3339(), "2026-10-01T19:00:00+00:00");
+        assert_eq!(custom.granularity, "hour");
+        assert_eq!(custom.top_n, 50);
     }
 
     fn record_with_time(

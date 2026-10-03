@@ -795,8 +795,12 @@ pub struct UsageCleanupRequest {
     /// 清理模式；默认 soft_delete。
     #[serde(default)]
     pub mode: UsageCleanupMode,
-    /// 清理多少天之前的数据；soft_delete 对应 created_at，hard_delete 对应 deleted_at。
-    /// 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录；未传默认 3 天；最大 3650。
+    /// 是否同时清理历史汇总。默认 false：只清理明细，保留汇总。
+    #[serde(default)]
+    pub include_summary: bool,
+    /// 清理多少天之前的数据；soft_delete 按 created_at 匹配，hard_delete 对活跃明细按
+    /// created_at 匹配、对已软删除明细按 deleted_at 匹配。
+    /// 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录；未传默认 0；最大 3650。
     #[serde(default)]
     pub older_than_days: Option<u32>,
     /// 自定义 cutoff，优先级高于 older_than_days。
@@ -805,10 +809,13 @@ pub struct UsageCleanupRequest {
     /// 每批处理行数，默认 5000。
     #[serde(default)]
     pub batch_size: Option<usize>,
-    /// 内部安全批次上限；不传或传 0 时默认 10000，页面默认不暴露这个参数。
+    /// 兼容旧客户端的内部安全批次上限；页面不再暴露这个参数。
     #[serde(default)]
     pub max_batches: Option<usize>,
-    /// 批次之间暂停毫秒数，默认 100。
+    /// 本轮最多清理多少条；不传或传 0 表示清理全部匹配明细。
+    #[serde(default)]
+    pub max_rows: Option<u64>,
+    /// 批次之间暂停毫秒数，默认 10。
     #[serde(default)]
     pub pause_ms_between_batches: Option<u64>,
 }
@@ -823,6 +830,7 @@ pub struct UsageCleanupResumeRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UsageCleanupPreviewResponse {
     pub mode: UsageCleanupMode,
+    pub include_summary: bool,
     pub cutoff_at: String,
     pub matched_rows: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -840,10 +848,13 @@ pub struct UsageCleanupStatusResponse {
     pub phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<UsageCleanupMode>,
+    pub include_summary: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cutoff_at: Option<String>,
     pub batch_size: usize,
     pub max_batches: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u64>,
     pub pause_ms_between_batches: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_rows: Option<u64>,

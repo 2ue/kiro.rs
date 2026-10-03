@@ -446,6 +446,22 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
   return next
 }
 
+function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
+  const editable = { ...config }
+  delete editable.proxyUrl
+  delete editable.proxyUsername
+  delete editable.proxyPassword
+  return editable
+}
+
+function runtimeConfigForSave(config: RuntimeConfig): RuntimeConfig {
+  return stripReadOnlyRuntimeFields(normalizeConfig(config))
+}
+
+function runtimeConfigFingerprint(config: RuntimeConfig): string {
+  return JSON.stringify(runtimeConfigForSave(config))
+}
+
 // ─── RuntimePage ──────────────────────────────────────────────────────────────
 
 export function RuntimePage() {
@@ -455,6 +471,7 @@ export function RuntimePage() {
   const setLbMode = useSetLoadBalancingMode()
   const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
+  const [savedDraft, setSavedDraft] = useState<RuntimeConfig | null>(null)
   const [activeSection, setActiveSection] = useState<RuntimeSectionKey>('loadBalancing')
   const [externalRouteRulesText, setExternalRouteRulesText] = useState('')
   const [localRouteRulesText, setLocalRouteRulesText] = useState('')
@@ -473,7 +490,7 @@ export function RuntimePage() {
         },
         thinking: { enabled: bodyConversion.thinkingPromptControls },
       })
-      setDraft({
+      const hydratedDraft: RuntimeConfig = {
         ...emptyRuntimeConfig,
         ...config.data,
         requestAdmission: {
@@ -507,7 +524,9 @@ export function RuntimePage() {
         cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
-      })
+      }
+      setDraft(hydratedDraft)
+      setSavedDraft(hydratedDraft)
       setExternalRouteRulesText(ruleText(config.data.externalPools?.externalPoolRouteRules))
       setLocalRouteRulesText(ruleText(config.data.externalPools?.localPoolRouteRules))
       setPromptSteeringRouteRulesText(ruleText(promptSteering.routeRules))
@@ -615,7 +634,10 @@ export function RuntimePage() {
       },
     }))
 
+  const hasPendingChanges = savedDraft !== null && runtimeConfigFingerprint(draft) !== runtimeConfigFingerprint(savedDraft)
+
   const save = () => {
+    if (!hasPendingChanges) return
     const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
     if (invalidDefinedCacheRoute)
       return toast.error('缓存策略里的 /dfcache 路径必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
@@ -632,12 +654,13 @@ export function RuntimePage() {
       return toast.error('安全余量不能过大,处理阈值减去安全余量需不小于 65536 字节')
     if (next.missingMaxTokens.defaultValue < 1 || next.missingMaxTokens.defaultValue > 200000)
       return toast.error('缺失 max_tokens 的补充值必须在 1 到 200000 之间')
-    const editable = { ...next }
-    delete editable.proxyUrl
-    delete editable.proxyUsername
-    delete editable.proxyPassword
+    const editable = stripReadOnlyRuntimeFields(next)
     updateConfig.mutate(editable, {
-      onSuccess: () => toast.success('配置已保存，新请求立即生效'),
+      onSuccess: () => {
+        setDraft(next)
+        setSavedDraft(next)
+        toast.success('配置已保存，新请求立即生效')
+      },
       onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),
     })
   }
@@ -663,18 +686,13 @@ export function RuntimePage() {
   const payloadGuardMode = (draft.payloadGuardMode ?? 'preemptive') as PayloadGuardMode
   const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
   const activeMeta = runtimeSections.find((section) => section.key === activeSection) ?? runtimeSections[0]!
+  const saveDisabled = updateConfig.isPending || !hasPendingChanges
 
   return (
-    <PageContainer>
+    <PageContainer className="pb-24">
       <PageHeader
         title="运行配置"
         subtitle="调度、限流、冷却、缓存与兼容等运行时参数，保存后新请求立即生效"
-        actions={
-          <Button size="sm" onClick={save} disabled={updateConfig.isPending}>
-            {updateConfig.isPending ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}
-            保存配置
-          </Button>
-        }
       />
 
       <div className="grid gap-4 lg:grid-cols-[17rem_minmax(0,1fr)]">
@@ -1872,13 +1890,19 @@ export function RuntimePage() {
         </section>
       </div>
 
-      {/* 底部操作栏 */}
-      <div className="flex items-center justify-between rounded-xl bg-muted/30 px-4 py-3">
-        <span className="text-xs text-muted-foreground">保存后，新的请求会立即使用这些配置。</span>
-        <Button size="sm" onClick={save} disabled={updateConfig.isPending}>
-          {updateConfig.isPending ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}
-          保存配置
-        </Button>
+      <div className="fixed inset-x-0 bottom-0 z-40 border-t border-border/80 bg-background/95 px-4 py-3 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur">
+        <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold">
+              {hasPendingChanges ? '运行配置有未保存改动' : '运行配置已是最新'}
+            </div>
+            <div className="mt-0.5 text-xs text-muted-foreground">保存后，新的请求会立即使用这些配置。</div>
+          </div>
+          <Button size="sm" onClick={save} disabled={saveDisabled}>
+            {updateConfig.isPending ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}
+            保存配置
+          </Button>
+        </div>
       </div>
     </PageContainer>
   )

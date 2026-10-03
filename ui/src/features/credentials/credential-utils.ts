@@ -25,20 +25,74 @@ export function authLabel(authMethod: string | null | undefined) {
 
 type BadgeTone = 'neutral' | 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info'
 
+export type CredentialSubscriptionKey =
+  | 'free'
+  | 'students'
+  | 'pro'
+  | 'pro_plus'
+  | 'pro_max'
+  | 'power'
+  | 'unknown'
+
+export const CREDENTIAL_SUBSCRIPTION_OPTIONS: Array<{
+  value: Exclude<CredentialSubscriptionKey, 'unknown'>
+  label: string
+}> = [
+  { value: 'free', label: 'Kiro Free' },
+  { value: 'students', label: 'Kiro Students' },
+  { value: 'pro', label: 'Kiro Pro' },
+  { value: 'pro_plus', label: 'Kiro Pro+' },
+  { value: 'pro_max', label: 'Kiro Pro Max' },
+  { value: 'power', label: 'Kiro Power' },
+]
+
+const CREDENTIAL_SUBSCRIPTION_LABELS: Record<CredentialSubscriptionKey, string> = {
+  free: 'Kiro Free',
+  students: 'Kiro Students',
+  pro: 'Kiro Pro',
+  pro_plus: 'Kiro Pro+',
+  pro_max: 'Kiro Pro Max',
+  power: 'Kiro Power',
+  unknown: '未知订阅',
+}
+
+export function credentialSubscriptionKey(title?: string | null): CredentialSubscriptionKey {
+  const normalized = (title || '').trim().toLowerCase()
+  if (!normalized) return 'unknown'
+  const compact = normalized.replace(/[^a-z0-9]/g, '')
+  if (compact.includes('student')) return 'students'
+  if (compact.includes('power')) return 'power'
+  if (compact.includes('promax')) return 'pro_max'
+  if (normalized.includes('pro+') || compact.includes('proplus')) return 'pro_plus'
+  if (normalized.includes('trial') || normalized.includes('试用')) return 'free'
+  if (normalized.includes('free') || normalized.includes('免费')) return 'free'
+  if (compact.includes('pro')) return 'pro'
+  return 'unknown'
+}
+
+export function credentialSubscriptionLabel(title?: string | null): string {
+  const key = credentialSubscriptionKey(title)
+  if (key !== 'unknown') return CREDENTIAL_SUBSCRIPTION_LABELS[key]
+  return title?.trim() || CREDENTIAL_SUBSCRIPTION_LABELS.unknown
+}
+
 export function subscriptionBadgeMeta(
   cred: Pick<CredentialStatusItem, 'subscriptionTitle' | 'accountInfo'>,
   balance?: BalanceResponse
 ): { label: string; tone: BadgeTone; title?: string } {
   const raw = balance?.subscriptionTitle || cred.accountInfo?.subscriptionTitle || cred.subscriptionTitle || ''
-  if (!raw) return { label: '未知套餐', tone: 'secondary' }
-  const normalized = raw.toLowerCase().replace(/[_\s-]+/g, ' ')
-  if (normalized.includes('power')) return { label: 'Power', tone: 'primary', title: raw }
-  if (normalized.includes('pro max')) return { label: 'Pro Max', tone: 'primary', title: raw }
-  if (normalized.includes('pro plus') || normalized.includes('pro+')) return { label: 'Pro+', tone: 'primary', title: raw }
-  if (normalized.includes('pro')) return { label: 'Pro', tone: 'primary', title: raw }
-  if (normalized.includes('free')) return { label: 'Free', tone: 'secondary', title: raw }
-  if (normalized.includes('trial') || normalized.includes('试用')) return { label: 'Trial', tone: 'info', title: raw }
-  return { label: raw.length > 12 ? raw.slice(0, 12) + '…' : raw, tone: 'neutral', title: raw }
+  const key = credentialSubscriptionKey(raw)
+  const label = credentialSubscriptionLabel(raw)
+  if (key === 'power' || key === 'pro_max' || key === 'pro_plus' || key === 'pro') {
+    return { label, tone: 'primary', title: raw || undefined }
+  }
+  if (key === 'students') return { label, tone: 'info', title: raw || undefined }
+  if (key === 'free') return { label, tone: 'secondary', title: raw || undefined }
+  return {
+    label: label.length > 12 ? label.slice(0, 12) + '…' : label,
+    tone: 'neutral',
+    title: raw || undefined,
+  }
 }
 
 
@@ -126,6 +180,37 @@ export function accountInfoValue(
   balance?: BalanceResponse
 ): CredentialAccountInfo | undefined {
   return (balance as CredentialAccountInfo | undefined) || c.accountInfo
+}
+
+const CREDIT_UNAVAILABLE_PATTERNS = [
+  /\b403\b/i,
+  /forbidden/i,
+  /permission/i,
+  /not[\s_-]*authori[sz]ed/i,
+  /access[\s_-]*denied/i,
+  /\bauth(?:entication|orization)?\b/i,
+  /account[\s_-]*(?:suspend|lock)/i,
+  /invalid[_\s-]*(?:token|refresh[_\s-]*token)/i,
+]
+
+/**
+ * A stored balance is historical data. Only count it as spendable when the
+ * account is still usable; historical usage and cost remain valid even for
+ * accounts that later became unavailable.
+ */
+export function credentialCreditStatus(
+  credential: Pick<CredentialStatusItem, 'disabled' | 'disabledReason' | 'lastErrorKind' | 'lastErrorReason'>
+): { available: boolean; reason?: string } {
+  if (credential.disabled) {
+    return { available: false, reason: credential.disabledReason || '账号已禁用' }
+  }
+  const errorText = [credential.lastErrorKind, credential.lastErrorReason]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join(' ')
+  if (errorText && CREDIT_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(errorText))) {
+    return { available: false, reason: errorText }
+  }
+  return { available: true }
 }
 
 // ============================================================================

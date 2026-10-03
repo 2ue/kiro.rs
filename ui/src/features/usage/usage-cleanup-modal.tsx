@@ -2,19 +2,24 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatDate, formatNumber } from '@/lib/format'
-import { usePreviewUsageCleanup, useStartUsageCleanup, useCancelUsageCleanup, useUsageCleanupStatus, useResumeUsageCleanup } from '@/hooks/use-usage'
+import {
+  useCancelUsageCleanup,
+  usePreviewUsageCleanup,
+  useResumeUsageCleanup,
+  useStartUsageCleanup,
+  useUsageCleanupStatus,
+} from '@/hooks/use-usage'
 import type { UsageCleanupRequest } from '@/types/api'
-import { ModalShell, Callout, useConfirm } from '@/components/patterns'
-import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui'
+import { Badge, Button, Checkbox, Input } from '@/components/ui'
+import { Callout, ModalShell, useConfirm } from '@/components/patterns'
 
 const CLEANUP_MAX_OLDER_THAN_DAYS = 3650
-const CLEANUP_DEFAULT_OLDER_THAN_DAYS = 3
+const CLEANUP_DEFAULT_OLDER_THAN_DAYS = 0
+const CLEANUP_DEFAULT_MAX_ROWS = 10_000
 const CLEANUP_DEFAULT_BATCH_SIZE = 5_000
-const CLEANUP_DEFAULT_MAX_BATCHES = 10_000
-const CLEANUP_MAX_BATCHES = 10_000
-const CLEANUP_MAX_BATCH_SIZE = 5000
-const CLEANUP_MAX_PAUSE_MS = 10000
-const CLEANUP_DEFAULT_PAUSE_MS = 100
+const CLEANUP_MAX_ROWS = 50_000_000
+const CLEANUP_MAX_PAUSE_MS = 10_000
+const CLEANUP_DEFAULT_PAUSE_MS = 10
 
 function boundedInteger(value: string, fallback: number, min: number, max: number): number {
   const parsed = Number(value)
@@ -23,16 +28,42 @@ function boundedInteger(value: string, fallback: number, min: number, max: numbe
 }
 
 function cleanupRangeLabel(days: number): string {
-  return days === 0 ? '当前时刻之前' : `${days} 天前`
+  return days === 0 ? '任务开始前的全部明细' : `${days} 天前的明细`
+}
+
+function statusLabel(status: string): string {
+  switch (status) {
+    case 'queued':
+      return '排队中'
+    case 'running':
+      return '执行中'
+    case 'paused':
+      return '已暂停'
+    case 'completed':
+      return '已完成'
+    case 'cancelled':
+      return '已取消'
+    case 'failed':
+      return '失败'
+    default:
+      return status
+  }
 }
 
 export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [olderThanDays, setOlderThanDays] = useState(String(CLEANUP_DEFAULT_OLDER_THAN_DAYS))
-  const [mode, setMode] = useState<'soft_delete' | 'hard_delete'>('soft_delete')
-  const [batchSize, setBatchSize] = useState(String(CLEANUP_DEFAULT_BATCH_SIZE))
-  const [maxBatches, setMaxBatches] = useState(String(CLEANUP_DEFAULT_MAX_BATCHES))
+  const [maxRows, setMaxRows] = useState(String(CLEANUP_DEFAULT_MAX_ROWS))
   const [pauseMs, setPauseMs] = useState(String(CLEANUP_DEFAULT_PAUSE_MS))
-  const [previewResult, setPreviewResult] = useState<{ matchedRows: number; cutoffAt: string; oldestCreatedAt?: string; newestCreatedAt?: string } | null>(null)
+  const [includeSummary, setIncludeSummary] = useState(false)
+  const [physicalDelete, setPhysicalDelete] = useState(false)
+  const [previewResult, setPreviewResult] = useState<{
+    mode: UsageCleanupRequest['mode']
+    matchedRows: number
+    cutoffAt: string
+    oldestCreatedAt?: string
+    newestCreatedAt?: string
+    includeSummary: boolean
+  } | null>(null)
   const [previewing, setPreviewing] = useState(false)
 
   const preview = usePreviewUsageCleanup()
@@ -42,14 +73,19 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
   const cleanupStatus = useUsageCleanupStatus()
   const confirm = useConfirm()
 
-  const isRunning = ['queued', 'running'].includes(cleanupStatus.data?.status || '')
   const status = cleanupStatus.data
+  const isRunning = ['queued', 'running'].includes(status?.status || '')
 
   const buildRequest = (): UsageCleanupRequest => ({
-    mode,
-    olderThanDays: boundedInteger(olderThanDays, CLEANUP_DEFAULT_OLDER_THAN_DAYS, 0, CLEANUP_MAX_OLDER_THAN_DAYS),
-    batchSize: boundedInteger(batchSize, CLEANUP_DEFAULT_BATCH_SIZE, 1, CLEANUP_MAX_BATCH_SIZE),
-    maxBatches: boundedInteger(maxBatches, CLEANUP_DEFAULT_MAX_BATCHES, 1, CLEANUP_MAX_BATCHES),
+    mode: physicalDelete && !includeSummary ? 'hard_delete' : 'soft_delete',
+    includeSummary,
+    olderThanDays: includeSummary
+      ? 0
+      : boundedInteger(olderThanDays, CLEANUP_DEFAULT_OLDER_THAN_DAYS, 0, CLEANUP_MAX_OLDER_THAN_DAYS),
+    maxRows: includeSummary
+      ? 0
+      : boundedInteger(maxRows, CLEANUP_DEFAULT_MAX_ROWS, 0, CLEANUP_MAX_ROWS),
+    batchSize: CLEANUP_DEFAULT_BATCH_SIZE,
     pauseMsBetweenBatches: boundedInteger(pauseMs, CLEANUP_DEFAULT_PAUSE_MS, 0, CLEANUP_MAX_PAUSE_MS),
   })
 
@@ -58,49 +94,52 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
     try {
       const result = await preview.mutateAsync(buildRequest())
       setPreviewResult(result)
-    } catch (e) {
-      toast.error(`预览失败: ${extractErrorMessage(e)}`)
+    } catch (error) {
+      toast.error(`预览失败：${extractErrorMessage(error)}`)
     } finally {
       setPreviewing(false)
     }
   }
 
-  const submitCleanup = async (request: UsageCleanupRequest, title: string) => {
-    const currentRequest = buildRequest()
-    const sharesPreview = request.olderThanDays === currentRequest.olderThanDays
-    const previewText = previewResult && sharesPreview
+  const handleStart = async () => {
+    const request = buildRequest()
+    const previewText = previewResult
+      && previewResult.mode === request.mode
+      && previewResult.includeSummary === request.includeSummary
       ? `预计命中 ${formatNumber(previewResult.matchedRows)} 条，`
       : ''
+    const summaryText = request.includeSummary
+      ? '同时清空历史汇总，完成后无法恢复'
+      : request.mode === 'hard_delete'
+        ? '明细将直接从数据库删除，历史汇总会保留'
+        : '历史汇总会保留'
     const ok = await confirm({
-      title,
-      message: `将${previewText}清理 ${cleanupRangeLabel(request.olderThanDays ?? 0)}的记录（${request.mode === 'hard_delete' ? '物理删除，不可恢复' : '软删除'}）。\n每批 ${formatNumber(request.batchSize ?? CLEANUP_DEFAULT_BATCH_SIZE)} 条，单次上限 ${formatNumber(request.maxBatches ?? CLEANUP_DEFAULT_MAX_BATCHES)} 批，批次间隔 ${formatNumber(request.pauseMsBetweenBatches ?? CLEANUP_DEFAULT_PAUSE_MS)}ms。确认执行？`,
-      confirmText: '执行清理',
-      tone: 'danger',
+      title: request.includeSummary
+        ? '确认清理全部历史数据'
+        : request.mode === 'hard_delete'
+          ? '确认物理删除用量明细'
+          : '确认清理用量明细',
+      message: `将${previewText}清理${cleanupRangeLabel(request.olderThanDays ?? 0)}；${summaryText}。`,
+      confirmText: '开始清理',
+      tone: request.includeSummary || request.mode === 'hard_delete' ? 'danger' : 'default',
     })
     if (!ok) return
+
     try {
       await startCleanup.mutateAsync(request)
       toast.success('清理任务已启动')
       setPreviewResult(null)
-    } catch (e) {
-      toast.error(`启动失败: ${extractErrorMessage(e)}`)
+    } catch (error) {
+      toast.error(`启动失败：${extractErrorMessage(error)}`)
     }
-  }
-
-  const handleStart = async () => {
-    await submitCleanup(buildRequest(), '确认清理')
-  }
-
-  const handleClearAll = async () => {
-    await submitCleanup({ ...buildRequest(), olderThanDays: 0 }, '确认全量清理')
   }
 
   const handleCancel = async () => {
     try {
       await cancelCleanup.mutateAsync()
-      toast.success('已取消清理任务')
-    } catch (e) {
-      toast.error(`取消失败: ${extractErrorMessage(e)}`)
+      toast.success('已请求停止清理')
+    } catch (error) {
+      toast.error(`取消失败：${extractErrorMessage(error)}`)
     }
   }
 
@@ -109,192 +148,187 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
     try {
       await resumeCleanup.mutateAsync(status.jobId)
       toast.success('清理任务已重新排队')
-    } catch (e) {
-      toast.error(`恢复失败: ${extractErrorMessage(e)}`)
+    } catch (error) {
+      toast.error(`恢复失败：${extractErrorMessage(error)}`)
     }
   }
 
+  const handleSummaryChange = (checked: boolean) => {
+    setIncludeSummary(checked)
+    if (checked) {
+      setOlderThanDays('0')
+      setPhysicalDelete(false)
+    }
+    setPreviewResult(null)
+  }
+
   return (
-    <ModalShell open={open} onClose={onClose} title="清理用量记录" width="max-w-xl">
-      <div className="space-y-4 text-sm">
-        {/* 危险区：清空全部 */}
-        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 space-y-2">
-          <div className="text-xs font-semibold text-destructive">危险操作</div>
+    <ModalShell open={open} onClose={onClose} title="清理用量" width="max-w-lg">
+      <div className="space-y-5 text-sm">
+        <div className="space-y-1">
+          <div className="font-medium">清理范围</div>
           <p className="text-xs text-muted-foreground">
-            0 表示以任务启动时刻为 cutoff。下面的软删除、物理删除和全量清理都会沿用当前参数，默认保留 3 天、每批 5000 条。任务状态会持久化，可取消并审计。
+            默认从任务开始时刻往前清理，0 表示当前之前的全部明细。
           </p>
-          <Button
-            variant="outline"
-            size="sm"
-            className="text-destructive border-destructive/40 hover:bg-destructive/10 w-full"
-            onClick={handleClearAll}
-            disabled={startCleanup.isPending || isRunning}
-          >
-            {isRunning ? '清理任务执行中' : '清理全部历史明细（按当前设置）'}
-          </Button>
-        </div>
-
-        {/* 当前任务状态 */}
-        {status && status.status !== 'idle' && (
-          <div className="rounded-lg bg-muted/30 p-3 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="font-medium">清理任务状态</span>
-              <Badge tone={
-                ['queued', 'running'].includes(status.status) ? 'warning'
-                : status.status === 'completed' ? 'success'
-                : status.status === 'failed' ? 'error'
-                : 'neutral'
-              }>
-                {status.status === 'queued' ? '排队中'
-                  : status.status === 'running' ? '执行中'
-                  : status.status === 'paused' ? '已暂停'
-                  : status.status === 'completed' ? '已完成'
-                  : status.status === 'failed' ? '失败'
-                  : status.status === 'cancelled' ? '已取消'
-                  : status.status}
-              </Badge>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
-              {status.jobId && <span className="col-span-2">任务 ID: {status.jobId}</span>}
-              <span>已处理: {formatNumber(status.processedRows)} 条</span>
-              <span>阶段: {status.phase}</span>
-              {status.matchedRows && <span>匹配: {formatNumber(status.matchedRows)} 条</span>}
-              {status.remainingRows !== undefined && <span>剩余: {formatNumber(status.remainingRows)} 条</span>}
-              <span>累计批次: {status.batches}</span>
-              <span>单次执行上限: {status.maxBatches}</span>
-              {status.lastBatchRows > 0 && <span>最后一批: {formatNumber(status.lastBatchRows)} 条</span>}
-              {status.stopReason && <span className="col-span-2">停止原因: {status.stopReason}</span>}
-              {status.redisDeleteCommands > 0 && <span className="col-span-2">Redis: {formatNumber(status.redisDeletedKeys)} keys / {formatNumber(status.redisDeleteCommands)} commands / 最大批 {formatNumber(status.redisMaxCommandKeys)}</span>}
-            </div>
-            {status.lastError && (
-              <div className="text-xs text-destructive">{status.lastError}</div>
-            )}
-            {isRunning && (
-              <Button variant="outline" size="sm" className="text-destructive w-full" onClick={handleCancel} disabled={cancelCleanup.isPending}>
-                取消清理任务
-              </Button>
-            )}
-            {!isRunning && ['paused', 'failed', 'cancelled'].includes(status.status) && status.jobId && (
-              <Button variant="outline" size="sm" className="w-full" onClick={handleResume} disabled={resumeCleanup.isPending}>
-                {resumeCleanup.isPending ? '恢复中...' : '恢复此任务'}
-              </Button>
-            )}
-          </div>
-        )}
-
-        {/* 配置区 */}
-        <div className="space-y-3">
-          <div className="flex items-center gap-3">
-            <label className="text-xs text-muted-foreground w-20 shrink-0">删除模式</label>
-            <Select value={mode} onValueChange={(v) => {
-              setMode(v as 'soft_delete' | 'hard_delete')
-              setPreviewResult(null)
-            }}>
-              <SelectTrigger size="sm" className="flex-1"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="soft_delete">软删除（标记删除）</SelectItem>
-                <SelectItem value="hard_delete">物理删除（不可恢复）</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="flex items-center gap-3">
-            <label className="text-xs text-muted-foreground w-20 shrink-0">保留天数</label>
+          <div className="grid grid-cols-[1fr_auto] items-center gap-3">
             <Input
               type="number"
               min={0}
               max={CLEANUP_MAX_OLDER_THAN_DAYS}
-              className="flex-1 h-8 text-xs"
               value={olderThanDays}
-              onChange={(e) => {
-                setOlderThanDays(e.target.value)
+              disabled={includeSummary}
+              onChange={(event) => {
+                setOlderThanDays(event.target.value)
                 setPreviewResult(null)
               }}
+              aria-label="清理多少天前"
             />
-            <span className="text-xs text-muted-foreground">天前的记录</span>
+            <span className="text-xs text-muted-foreground">天前</span>
           </div>
-          <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">默认保留 {CLEANUP_DEFAULT_OLDER_THAN_DAYS} 天；允许填 0，表示以任务开始时间作为截止点，清理当前时刻之前的全部匹配记录。</p>
-          <div className="space-y-1">
-            <div className="flex items-center gap-3">
-              <label className="text-xs text-muted-foreground w-20 shrink-0">每批数量</label>
+        </div>
+
+        <div className="space-y-3">
+          <div className="font-medium">清理选项</div>
+          <div className="grid grid-cols-[1fr_auto] items-center gap-3">
+            <label htmlFor="usage-cleanup-max-rows" className="text-xs text-muted-foreground">
+              本次最多清理
+            </label>
+            <div className="flex items-center gap-2">
               <Input
+                id="usage-cleanup-max-rows"
                 type="number"
-                min={1}
-                max={CLEANUP_MAX_BATCH_SIZE}
-                className="flex-1 h-8 text-xs"
-                value={batchSize}
-                onChange={(e) => {
-                  setBatchSize(e.target.value)
+                min={0}
+                max={CLEANUP_MAX_ROWS}
+                className="h-8 w-32 text-xs"
+                value={maxRows}
+                disabled={includeSummary}
+                onChange={(event) => {
+                  setMaxRows(event.target.value)
                   setPreviewResult(null)
                 }}
-                placeholder={String(CLEANUP_DEFAULT_BATCH_SIZE)}
               />
-              <span className="text-xs text-muted-foreground/60">条</span>
+              <span className="text-xs text-muted-foreground">条，0 = 全部</span>
             </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批短事务，默认 {formatNumber(CLEANUP_DEFAULT_BATCH_SIZE)}，后端安全上限 {formatNumber(CLEANUP_MAX_BATCH_SIZE)}；单批过大时任务可能因锁争用暂停，可降低后恢复。</p>
           </div>
-          <div className="space-y-1">
-            <div className="flex items-center gap-3">
-              <label className="text-xs text-muted-foreground w-20 shrink-0">单次上限</label>
+          <div className="grid grid-cols-[1fr_auto] items-center gap-3">
+            <label htmlFor="usage-cleanup-pause" className="text-xs text-muted-foreground">
+              批次间隔
+            </label>
+            <div className="flex items-center gap-2">
               <Input
-                type="number"
-                min={1}
-                max={CLEANUP_MAX_BATCHES}
-                className="flex-1 h-8 text-xs"
-                value={maxBatches}
-                onChange={(e) => {
-                  setMaxBatches(e.target.value)
-                  setPreviewResult(null)
-                }}
-                placeholder={String(CLEANUP_DEFAULT_MAX_BATCHES)}
-              />
-              <span className="text-xs text-muted-foreground/60">批</span>
-            </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">达到上限会进入暂停状态，可由管理员显式恢复下一轮；默认 {formatNumber(CLEANUP_DEFAULT_MAX_BATCHES)} 批。</p>
-          </div>
-          <div className="space-y-1">
-            <div className="flex items-center gap-3">
-              <label className="text-xs text-muted-foreground w-20 shrink-0">批次间隔</label>
-              <Input
+                id="usage-cleanup-pause"
                 type="number"
                 min={0}
                 max={CLEANUP_MAX_PAUSE_MS}
-                className="flex-1 h-8 text-xs"
+                className="h-8 w-32 text-xs"
                 value={pauseMs}
-                onChange={(e) => {
-                  setPauseMs(e.target.value)
+                onChange={(event) => {
+                  setPauseMs(event.target.value)
                   setPreviewResult(null)
                 }}
-                placeholder="100"
               />
-              <span className="text-xs text-muted-foreground/60">ms</span>
+              <span className="text-xs text-muted-foreground">ms</span>
             </div>
-            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批之间的等待毫秒，后端安全上限 {formatNumber(CLEANUP_MAX_PAUSE_MS)}ms，默认 {CLEANUP_DEFAULT_PAUSE_MS}ms。</p>
           </div>
-          <div className="text-xs text-muted-foreground/60">每次执行受 maxBatches 保护，达到上限后进入暂停状态，可由管理员显式恢复下一轮。</div>
+          <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/5 p-3">
+            <Checkbox
+              checked={includeSummary}
+              onCheckedChange={(value) => handleSummaryChange(Boolean(value))}
+              className="mt-0.5"
+            />
+            <span className="space-y-0.5">
+              <span className="block font-medium text-destructive">清理全部历史数据（包含汇总）</span>
+              <span className="block text-xs text-muted-foreground">
+                自动使用当前时刻作为范围，明细、趋势、排行和费用汇总都会清空。
+              </span>
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/5 p-3">
+            <Checkbox
+              checked={physicalDelete}
+              disabled={includeSummary}
+              onCheckedChange={(value) => {
+                setPhysicalDelete(Boolean(value))
+                setPreviewResult(null)
+              }}
+              className="mt-0.5"
+            />
+            <span className="space-y-0.5">
+              <span className="block font-medium text-destructive">物理删除明细</span>
+              <span className="block text-xs text-muted-foreground">
+                直接从数据库删除命中的活跃明细或旧软删除明细，无法恢复；历史汇总默认保留。
+              </span>
+            </span>
+          </label>
         </div>
 
-        {mode === 'hard_delete' && (
-          <Callout tone="error">物理删除无法恢复，请谨慎操作。</Callout>
+        {includeSummary && (
+          <Callout tone="error">汇总也会被清空，清理完成后无法恢复。默认不勾选。</Callout>
+        )}
+        {physicalDelete && !includeSummary && (
+          <Callout tone="error">
+            当前为物理删除模式，明细删除后无法恢复；汇总不会同步扣减，只有勾选“包含汇总”时才会重建汇总。
+          </Callout>
         )}
 
-        {/* 预览结果 */}
         {previewResult && (
-          <div className="rounded-lg bg-muted/30 p-3 space-y-1 text-xs">
+          <div className="space-y-1 rounded-lg bg-muted/30 p-3 text-xs">
             <div className="font-medium">预览结果</div>
-            <div>匹配记录: <span className="font-semibold tabular-nums">{formatNumber(previewResult.matchedRows)}</span> 条</div>
-            <div>截止时间: <span className="tabular-nums">{formatDate(previewResult.cutoffAt)}</span></div>
-            {previewResult.oldestCreatedAt && <div>最旧记录: {formatDate(previewResult.oldestCreatedAt)}</div>}
-            {previewResult.newestCreatedAt && <div>最新记录: {formatDate(previewResult.newestCreatedAt)}</div>}
+            <div>
+              明细：<span className="font-semibold tabular-nums">{formatNumber(previewResult.matchedRows)}</span> 条
+            </div>
+            <div>方式：{previewResult.mode === 'hard_delete' ? '物理删除' : '软删除'}</div>
+            <div>汇总：{previewResult.includeSummary ? '将清空' : '保留'}</div>
+            <div>截止：{formatDate(previewResult.cutoffAt)}</div>
+            {previewResult.oldestCreatedAt && <div>最早：{formatDate(previewResult.oldestCreatedAt)}</div>}
+            {previewResult.newestCreatedAt && <div>最近：{formatDate(previewResult.newestCreatedAt)}</div>}
           </div>
         )}
 
-        {/* 操作按钮 */}
-        <div className="flex flex-wrap gap-2 justify-end pt-1">
+        {status && status.status !== 'idle' && (
+          <div className="space-y-3 rounded-lg border bg-muted/20 p-3">
+            <div className="flex items-center justify-between">
+              <span className="font-medium">最近任务</span>
+              <Badge tone={
+                ['queued', 'running'].includes(status.status)
+                  ? 'warning'
+                  : status.status === 'completed'
+                    ? 'success'
+                    : status.status === 'failed'
+                      ? 'error'
+                      : 'neutral'
+              }>
+                {statusLabel(status.status)}
+              </Badge>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
+              <span>已处理 {formatNumber(status.processedRows)} 条</span>
+              <span>批次 {formatNumber(status.batches)}</span>
+              {status.remainingRows !== undefined && <span>剩余 {formatNumber(status.remainingRows)} 条</span>}
+              <span>{status.mode === 'hard_delete' ? '物理删除' : '软删除'}</span>
+              <span>{status.includeSummary ? '包含汇总' : '保留汇总'}</span>
+            </div>
+            {status.stopReason && <div className="text-xs text-muted-foreground">{status.stopReason}</div>}
+            {status.lastError && <div className="text-xs text-destructive">{status.lastError}</div>}
+            {isRunning && (
+              <Button variant="outline" size="sm" className="w-full" onClick={handleCancel} disabled={cancelCleanup.isPending}>
+                取消任务
+              </Button>
+            )}
+            {!isRunning && ['paused', 'failed', 'cancelled'].includes(status.status) && status.jobId && (
+              <Button variant="outline" size="sm" className="w-full" onClick={handleResume} disabled={resumeCleanup.isPending}>
+                {resumeCleanup.isPending ? '恢复中...' : '恢复任务'}
+              </Button>
+            )}
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 border-t pt-4">
           <Button variant="outline" size="sm" onClick={handlePreview} disabled={previewing || isRunning}>
             {previewing ? '预览中...' : '预览'}
           </Button>
           <Button size="sm" onClick={handleStart} disabled={startCleanup.isPending || isRunning}>
-            {startCleanup.isPending ? '启动中...' : '执行清理'}
+            {startCleanup.isPending ? '启动中...' : '开始清理'}
           </Button>
         </div>
       </div>

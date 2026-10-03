@@ -1,58 +1,58 @@
 import { useMemo, useState } from 'react'
-import type { ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   Activity,
-  CheckCircle2,
+  AlertTriangle,
+  ArrowLeft,
   Clock3,
-  Database,
   DollarSign,
-  ChevronLeft,
-  ChevronRight,
+  ExternalLink,
+  Layers3,
   RefreshCw,
-  ShieldAlert,
   TrendingUp,
-  Users,
+  Wallet,
   Zap,
 } from 'lucide-react'
-import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
+import { getExternalPools } from '@/api/credentials'
 import {
-  useUsageDashboardAccounts,
-  useUsageDashboardBreakdown,
-  useUsageDashboardExternalPoolBilling,
-  useUsageDashboardSeries,
-  useUsageDashboardTop,
-  useUsageDashboardWindows,
-  useUsageSummary,
-  useUsageWriterStats,
+  useUsageOverviewExternal,
+  useUsageOverviewLocal,
+  useUsageOverviewRankings,
+  useUsageOverviewSeries,
+  useUsageOverviewSummary,
 } from '@/hooks/use-usage'
-import { useCredentialSummary } from '@/hooks/use-credentials'
-import { formatCompact, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
+import {
+  useCredentials,
+  useCredentialAccountInfo,
+  useCredentialRuntime,
+} from '@/hooks/use-credentials'
+import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
+import { formatCompact, formatCredits, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import { ExternalPoolBillingPanel } from '../usage/usage-billing'
+import { credentialCreditStatus, credentialLabel, mapById } from '@/features/credentials/credential-utils'
+import { billingDeltaTextClass, billingDeltaTone } from '@/features/usage/usage-helpers'
 import type {
-  UsageBreakdownItem,
-  UsageDashboardTop,
-  UsageDashboardWindow,
-  UsageExternalPoolBillingSummary,
-  UsageSeriesPoint,
-  UsageTopAggregate,
-  UsageDashboardAccountsResponse,
-  UsageRecorderStats,
+  CredentialAccountInfo,
+  CredentialStatusItem,
+  ExternalPool,
+  UsageOverviewMetrics,
+  UsageOverviewRankRow,
+  UsageOverviewSeriesPoint,
 } from '@/types/api'
 import {
+  Callout,
+  EmptyState,
+  ErrorState,
+  LoadingState,
   PageContainer,
   PageHeader,
   SectionCard,
   StatCard,
-  EmptyState,
-  LoadingState,
-  ErrorState,
-  Callout,
 } from '@/components/patterns'
 import {
   Badge,
   Button,
-  Switch,
   Input,
   Table,
   TableBody,
@@ -64,583 +64,625 @@ import {
   TabsContent,
   TabsList,
   TabsTrigger,
+  Tooltip,
 } from '@/components/ui'
-import {
-  TrendAreaChart,
-  TrendBarChart,
-  ProgressRing,
-  CHART_COLORS,
-} from '@/components/charts'
 
-// ─── 常量 ─────────────────────────────────────────────────────────────────────
+const TIMEZONE = 'Asia/Shanghai'
+const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:overview'
 
-const OVERVIEW_TIMEZONE = 'Asia/Shanghai'
-const OVERVIEW_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:overview'
+type PresetRange = 'today' | 'yesterday' | 'last24h' | 'last7d' | 'last30d' | 'thisMonth'
+type TrendMetric = 'requests' | 'estimatedCostUsd' | 'originalCostUsd' | 'kiroMeteringUsage' | 'tokens'
+type OverviewTab = 'summary' | 'local' | 'external' | 'rankings'
+type RankingDimension = 'models' | 'accounts' | 'keys' | 'paths' | 'errors'
+type TokenUsageMetrics = Pick<UsageOverviewMetrics, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens'>
 
-const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
+type LocalAccountOverviewRow = {
+  credential: CredentialStatusItem
+  credentialId: number
+  label: string
+  metrics: UsageOverviewMetrics
+  accountInfo?: CredentialAccountInfo
+  creditEstimateBlocked: boolean
+  creditEstimateBlockedReason?: string
+  estimatedRemainingCostUsd?: number
+}
+
+type ExternalUsagePool = {
+  poolId: number
+  poolName: string
+  metrics: UsageOverviewMetrics
+  rawCostUsd: number
+  shapedCostUsd: number
+  upliftedCostUsd: number
+  reportedCostUsd: number
+  billableCostUsd: number
+  profitUsd: number
+  costFloorDeltaUsd: number
+  costFloorAppliedRequests: number
+}
+
+const EMPTY_OVERVIEW_METRICS: UsageOverviewMetrics = {
   requests: 0,
+  successRequests: 0,
+  errorRequests: 0,
+  errorRate: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadInputTokens: 0,
+  cacheCreationInputTokens: 0,
+  estimatedCostUsd: 0,
+  originalCostUsd: 0,
+  kiroMeteringUsage: 0,
   pricedRequests: 0,
   unpricedRequests: 0,
-  costFloorAppliedRequests: 0,
-  rawCostUsd: 0,
-  shapedCostUsd: 0,
-  upliftedCostUsd: 0,
-  profitUsd: 0,
-  reportedCostUsd: 0,
-  billableCostUsd: 0,
-  costFloorDeltaUsd: 0,
+  averageDurationMs: 0,
 }
 
-type RankDimension = 'models' | 'errors' | 'endpoints' | 'credentials'
-type DashboardSection = 'operations' | 'traffic' | 'billing' | 'accounts' | 'errors'
-type AccountStatusFilter = 'all' | 'enabled' | 'disabled' | 'active' | 'idle'
-
-const rankDimensions: Array<{ key: RankDimension; label: string }> = [
-  { key: 'models', label: '模型' },
-  { key: 'errors', label: '错误' },
-  { key: 'endpoints', label: '入口' },
-  { key: 'credentials', label: '账号' },
+const PRESETS: Array<{ key: PresetRange; label: string }> = [
+  { key: 'today', label: '今天' },
+  { key: 'yesterday', label: '昨天' },
+  { key: 'last24h', label: '24 小时' },
+  { key: 'last7d', label: '7 天' },
+  { key: 'last30d', label: '30 天' },
+  { key: 'thisMonth', label: '本月' },
 ]
 
-const accountStatusFilters: Array<{ key: AccountStatusFilter; label: string }> = [
-  { key: 'all', label: '全部' },
-  { key: 'enabled', label: '启用' },
-  { key: 'disabled', label: '禁用' },
-  { key: 'active', label: '窗口活跃' },
-  { key: 'idle', label: '窗口空闲' },
+const TREND_METRICS: Array<{ key: TrendMetric; label: string }> = [
+  { key: 'requests', label: '请求' },
+  { key: 'estimatedCostUsd', label: '估算计费' },
+  { key: 'originalCostUsd', label: '原始计费' },
+  { key: 'kiroMeteringUsage', label: 'Kiro 积分' },
+  { key: 'tokens', label: 'Token' },
 ]
 
-const EMPTY_TOP: UsageDashboardTop = {
-  windowKey: '',
-  models: [] as UsageTopAggregate[],
-  credentials: [] as UsageTopAggregate[],
-  endpoints: [] as UsageTopAggregate[],
-  errors: [] as UsageTopAggregate[],
-  modelsTotal: 0,
-  credentialsTotal: 0,
-  endpointsTotal: 0,
-  errorsTotal: 0,
-  modelsTruncated: false,
-  credentialsTruncated: false,
-  endpointsTruncated: false,
-  errorsTruncated: false,
-  orderBy: 'estimated_cost_usd',
-  errorsOrderBy: 'error_requests',
+function localDateTimeValue(value?: string | null): string {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-// ─── 工具函数 ──────────────────────────────────────────────────────────────────
-
-function activeWindow(windows: UsageDashboardWindow[], key: string): UsageDashboardWindow | undefined {
-  return windows.find((w) => w.key === key) ?? windows[0]
+function localDateTimeToIso(value: string): string | undefined {
+  if (!value.trim()) return undefined
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
 }
 
-function seriesPointToChartRow(p: UsageSeriesPoint): Record<string, number | string> {
+function rangeLabel(range: { key?: string | null; from: string; to: string }): string {
+  if (range.key) return PRESETS.find((item) => item.key === range.key)?.label ?? range.key
+  return `${formatDate(range.from)} - ${formatDate(range.to)}`
+}
+
+function metricsShare(part: number, total: number): number {
+  return total > 0 ? part / total : 0
+}
+
+function costMultiplier(rawCostUsd: number, shapedCostUsd: number): string {
+  if (!(rawCostUsd > 0) || !(shapedCostUsd > 0)) return '-'
+  return (rawCostUsd / shapedCostUsd).toFixed(3)
+}
+
+function costDeltaPercent(deltaUsd: number, rawCostUsd: number): string {
+  if (!(rawCostUsd > 0)) return '-'
+  return `${((deltaUsd / rawCostUsd) * 100).toFixed(2)}%`
+}
+
+function localCostDiffInfo(estimatedCostUsd: number, originalCostUsd: number) {
+  const deltaUsd = estimatedCostUsd - originalCostUsd
+  const percentText = originalCostUsd > 0
+    ? ` (${deltaUsd >= 0 ? '+' : ''}${formatPercent(deltaUsd / originalCostUsd)})`
+    : ''
   return {
-    label: p.label,
-    requests: p.requests,
-    errors: p.errorRequests,
-    cost: p.totalEstimatedCostUsd,
-    originalCost: p.totalOriginalCostUsd,
-    inputTokens: p.totalInputTokens,
-    outputTokens: p.totalOutputTokens,
-    kiroMetering: p.totalKiroMeteringUsage ?? 0,
+    deltaUsd,
+    text: `${deltaUsd >= 0 ? '+' : '-'}${formatUsdFixed2(Math.abs(deltaUsd))}`,
+    percentText,
+    textClass: deltaUsd === 0 ? 'text-muted-foreground' : 'text-info',
   }
 }
 
-function formatDuration(ms: number): string {
-  if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}m`
-  if (ms >= 1_000) return `${(ms / 1_000).toFixed(1)}s`
-  return `${Math.round(ms)}ms`
+function creditCostRate(costUsd: number, usedCredits: number): number | undefined {
+  if (!(usedCredits > 0)) return undefined
+  return costUsd / usedCredits
 }
 
-function getRankCoverage(top: UsageDashboardTop, key: RankDimension) {
-  switch (key) {
-    case 'models':
-      return {
-        total: top.modelsTotal,
-        returned: top.models.length,
-        truncated: top.modelsTruncated,
-      }
-    case 'errors':
-      return {
-        total: top.errorsTotal,
-        returned: top.errors.length,
-        truncated: top.errorsTruncated,
-      }
-    case 'endpoints':
-      return {
-        total: top.endpointsTotal,
-        returned: top.endpoints.length,
-        truncated: top.endpointsTruncated,
-      }
-    case 'credentials':
-      return {
-        total: top.credentialsTotal,
-        returned: top.credentials.length,
-        truncated: top.credentialsTruncated,
-      }
+function formatCreditCostRate(value: number | undefined): string {
+  if (value === undefined) return '-'
+  return `${new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 3,
+    maximumFractionDigits: 3,
+  }).format(value)}/积分`
+}
+
+function mergeCredentialRuntime(base: CredentialStatusItem, runtime?: Partial<CredentialStatusItem>): CredentialStatusItem {
+  if (!runtime) return base
+  return {
+    ...base,
+    ...runtime,
+    maxConcurrentRequests: runtime.maxConcurrentRequests ?? base.maxConcurrentRequests,
+    rpm: runtime.rpm ?? base.rpm,
+    warmupRemaining: runtime.warmupRemaining ?? base.warmupRemaining,
   }
 }
 
-// ─── 子组件：趋势图区 ──────────────────────────────────────────────────────────
+function totalTokenUsage(metrics: TokenUsageMetrics): number {
+  return metrics.inputTokens + metrics.outputTokens + metrics.cacheReadInputTokens + metrics.cacheCreationInputTokens
+}
 
-function TrendSection({
-  hourly,
-  daily,
+function seriesMetricValue(point: UsageOverviewSeriesPoint, scope: 'all' | 'local' | 'external', key: TrendMetric): number {
+  const metrics = point[scope]
+  if (key === 'tokens') return totalTokenUsage(metrics)
+  return metrics[key]
+}
+
+function trendDisplayValue(point: UsageOverviewSeriesPoint, key: TrendMetric, showLocal: boolean, showExternal: boolean): number {
+  const local = seriesMetricValue(point, 'local', key)
+  const external = seriesMetricValue(point, 'external', key)
+  return (showLocal ? local : 0) + (showExternal ? external : 0)
+}
+
+function trendTooltip(point: UsageOverviewSeriesPoint, key: TrendMetric, showLocal: boolean, showExternal: boolean): string {
+  const displayed = trendDisplayValue(point, key, showLocal, showExternal)
+  const local = seriesMetricValue(point, 'local', key)
+  const external = seriesMetricValue(point, 'external', key)
+  return `${point.label} · 当前显示 ${formatTrendValue(displayed, key)} · 本地 ${formatTrendValue(local, key)} · 外部 ${formatTrendValue(external, key)}`
+}
+
+function formatTrendValue(value: number, key: TrendMetric): string {
+  if (key === 'estimatedCostUsd' || key === 'originalCostUsd') return formatUsdFixed2(value)
+  return formatCompact(value)
+}
+
+function trendAxisTicks(max: number): number[] {
+  return [1, 0.75, 0.5, 0.25, 0].map((ratio) => max * ratio)
+}
+
+function TrendTooltipContent({
+  point,
+  metric,
+  showLocal,
+  showExternal,
 }: {
-  hourly: UsageSeriesPoint[]
-  daily: UsageSeriesPoint[]
+  point: UsageOverviewSeriesPoint
+  metric: TrendMetric
+  showLocal: boolean
+  showExternal: boolean
 }) {
-  const hourlyData = hourly.map(seriesPointToChartRow)
-  const dailyData = daily.map(seriesPointToChartRow)
-  const hourlyErrors = hourly.reduce((s, p) => s + p.errorRequests, 0)
-  const dailyErrors = daily.reduce((s, p) => s + p.errorRequests, 0)
+  const displayed = trendDisplayValue(point, metric, showLocal, showExternal)
+  const local = seriesMetricValue(point, 'local', metric)
+  const external = seriesMetricValue(point, 'external', metric)
 
   return (
-    <div className="grid gap-3 xl:grid-cols-2">
-      <SectionCard
-        title="最近 24 小时趋势"
-        description="按小时聚合；不受当前窗口切换影响"
-        actions={
-          hourlyErrors > 0
-            ? <Badge tone="error" title={formatNumber(hourlyErrors)}>错误 {formatCompact(hourlyErrors)}</Badge>
-            : <Badge tone="success">无错误</Badge>
-        }
-      >
-        {hourlyData.length === 0 ? (
-          <EmptyState title="暂无数据" className="py-8" />
-        ) : (
-          <TrendAreaChart
-            data={hourlyData}
-            xKey="label"
-            series={[
-              { key: 'requests', name: '请求', color: CHART_COLORS[0] },
-              { key: 'errors', name: '错误', color: CHART_COLORS[4] },
-            ]}
-            height={200}
-            valueFormatter={(v) => formatNumber(Number(v))}
-          />
-        )}
-      </SectionCard>
-      <SectionCard
-        title="最近 7 天趋势"
-        description="按天聚合；不受当前窗口切换影响"
-        actions={
-          dailyErrors > 0
-            ? <Badge tone="error" title={formatNumber(dailyErrors)}>错误 {formatCompact(dailyErrors)}</Badge>
-            : <Badge tone="success">无错误</Badge>
-        }
-      >
-        {dailyData.length === 0 ? (
-          <EmptyState title="暂无数据" className="py-8" />
-        ) : (
-          <TrendBarChart
-            data={dailyData}
-            xKey="label"
-            series={[
-              { key: 'requests', name: '请求', color: CHART_COLORS[0] },
-              { key: 'errors', name: '错误', color: CHART_COLORS[4] },
-            ]}
-            height={200}
-            valueFormatter={(v) => formatNumber(Number(v))}
-          />
-        )}
-      </SectionCard>
+    <div className="w-44 space-y-2 font-normal">
+      <div className="font-semibold text-secondary-foreground">{point.label}</div>
+      <div className="space-y-1 font-mono tabular-nums">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-secondary-foreground/70">当前显示</span>
+          <span>{formatTrendValue(displayed, metric)}</span>
+        </div>
+        <div className={cn('flex items-center justify-between gap-3', !showLocal && 'opacity-45')}>
+          <span className="inline-flex items-center gap-1.5 text-secondary-foreground/70">
+            <span className="size-2 rounded-full bg-primary" />
+            本地
+          </span>
+          <span>{formatTrendValue(local, metric)}</span>
+        </div>
+        <div className={cn('flex items-center justify-between gap-3', !showExternal && 'opacity-45')}>
+          <span className="inline-flex items-center gap-1.5 text-secondary-foreground/70">
+            <span className="size-2 rounded-full bg-info" />
+            外部
+          </span>
+          <span>{formatTrendValue(external, metric)}</span>
+        </div>
+        <div className="flex items-center justify-between gap-3 border-t border-secondary-foreground/15 pt-1">
+          <span className="text-secondary-foreground/70">本地占比</span>
+          <span>{formatPercent(metricsShare(local, local + external))}</span>
+        </div>
+      </div>
     </div>
   )
 }
 
-// ─── 子组件：账号池状态 ────────────────────────────────────────────────────────
+function usageLink(
+  navigate: ReturnType<typeof useNavigate>,
+  params: { routeKind: 'local_credential' | 'external_pool'; credentialId?: number; externalPoolId?: number; since: string; until: string },
+) {
+  const search = new URLSearchParams()
+  search.set('routeKind', params.routeKind)
+  if (params.credentialId) search.set('credentialId', String(params.credentialId))
+  if (params.externalPoolId) search.set('externalPoolId', String(params.externalPoolId))
+  if (params.since) search.set('since', localDateTimeValue(params.since))
+  if (params.until) search.set('until', localDateTimeValue(params.until))
+  navigate(`/usage?${search.toString()}`)
+}
 
-function CredentialPoolPanel() {
-  const { data, isLoading } = useCredentialSummary()
-
-  if (isLoading || !data) {
-    return (
-      <SectionCard title="账号池" description="可用 / 禁用 / 并发">
-        <LoadingState text="加载账号池..." className="py-6" />
-      </SectionCard>
-    )
-  }
-
-  const total = data.total ?? 0
-  const available = data.available ?? 0
-  const disabled = data.disabled ?? 0
-  const cooling = total - available - disabled
-  const concurrency = data.globalInFlightRequests ?? 0
-  const maxConcurrency = data.globalMaxConcurrentRequests ?? 0
-  const queued = data.queuedRequests ?? 0
-  const availRatio = total > 0 ? available / total : 0
-  const concRatio = maxConcurrency > 0 ? concurrency / maxConcurrency : 0
-
+function OverallSummarySection({ metrics }: { metrics: UsageOverviewMetrics }) {
   return (
-    <SectionCard
-      title="账号池"
-      description="实时可用状态与并发占用"
-      icon={<Users />}
-      actions={
-        available === 0
-          ? <Badge tone="error">无可用账号</Badge>
-          : availRatio < 0.3
-            ? <Badge tone="warning">可用偏低</Badge>
-            : <Badge tone="success">正常</Badge>
-      }
-    >
-      <div className="flex flex-wrap items-center gap-6">
-        <ProgressRing
-          value={availRatio * 100}
-          size={72}
-          strokeWidth={7}
-          color="hsl(var(--success))"
-          trackColor="hsl(var(--muted))"
-          label={<span className="text-[0.68rem] font-bold">{Math.round(availRatio * 100)}%</span>}
-        />
-        <div className="grid flex-1 grid-cols-2 gap-x-6 gap-y-2 text-xs min-w-[180px]">
-          <PoolStatRow label="可用" value={available} tone="success" />
-          <PoolStatRow label="禁用" value={disabled} tone="error" />
-          <PoolStatRow label="冷却" value={Math.max(0, cooling)} tone="warning" />
-          <PoolStatRow label="合计" value={total} tone="default" />
-        </div>
-        <div className="grid gap-2 text-xs min-w-[160px]">
-          <div className="flex items-center justify-between gap-4">
-            <span className="text-muted-foreground">并发占用</span>
-            <span className="tabular-nums font-semibold text-foreground">
-              {formatNumber(concurrency)}{maxConcurrency > 0 ? ` / ${formatNumber(maxConcurrency)}` : ''}
-            </span>
-          </div>
-          {maxConcurrency > 0 && (
-            <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-              <div
-                className={cn('h-full rounded-full transition-all', concRatio > 0.8 ? 'bg-warning' : 'bg-primary')}
-                style={{ width: `${Math.min(100, concRatio * 100)}%` }}
-              />
-            </div>
-          )}
-          {queued > 0 && (
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-warning">排队请求</span>
-              <span className="tabular-nums font-semibold text-warning">{formatNumber(queued)}</span>
-            </div>
-          )}
-        </div>
+    <SectionCard>
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard title="请求数" value={formatCompact(metrics.requests)} valueTitle={formatNumber(metrics.requests)} desc={`${formatCompact(metrics.successRequests)} 成功 · ${formatCompact(metrics.errorRequests)} 错误`} icon={<Activity />} tone="primary" />
+        <StatCard title="成功率" value={formatPercent(metricsShare(metrics.successRequests, metrics.requests))} desc={`错误率 ${formatPercent(metrics.errorRate)}`} icon={<TrendingUp />} tone={metrics.errorRate > 0.05 ? 'warning' : 'success'} />
+        <TokenSummaryCard metrics={metrics} className="sm:col-span-2" />
+        <StatCard title="估算计费" value={formatUsdFixed2(metrics.estimatedCostUsd)} icon={<DollarSign />} tone="primary" />
+        <StatCard title="原始计费" value={formatUsdFixed2(metrics.originalCostUsd)} icon={<DollarSign />} tone="warning" />
+        <StatCard title="Kiro 积分" value={formatCompact(metrics.kiroMeteringUsage)} valueTitle={formatNumber(metrics.kiroMeteringUsage)} icon={<Zap />} tone="info" />
+        <StatCard title="平均耗时" value={`${Math.round(metrics.averageDurationMs)} ms`} desc={`${formatCompact(metrics.pricedRequests)} 个请求已计价`} icon={<Clock3 />} tone="default" />
       </div>
     </SectionCard>
   )
 }
 
-function PoolStatRow({
+function TokenSummaryCard({
+  metrics,
+  className,
+}: {
+  metrics: UsageOverviewMetrics
+  className?: string
+}) {
+  const total = totalTokenUsage(metrics)
+  return (
+    <div className={cn(
+      'relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition hover:shadow-md',
+      className,
+    )}>
+      <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-amber-500" />
+      <div className="flex items-start justify-between gap-2 pl-2.5">
+        <div className="min-w-0 flex-1">
+          <div className="text-[0.72rem] font-semibold text-muted-foreground">Token</div>
+          <div className="mt-1 break-words text-2xl font-semibold tracking-tight tabular-nums text-amber-600 dark:text-amber-400" title={formatNumber(total)}>
+            {formatCompact(total)}
+          </div>
+        </div>
+        <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-amber-600 dark:text-amber-400 [&_svg]:size-4">
+          <Layers3 />
+        </div>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 pl-2.5 text-[0.72rem] leading-4 sm:grid-cols-4">
+        <TokenBreakdownItem label="输入" value={metrics.inputTokens} className="text-emerald-600 dark:text-emerald-400" />
+        <TokenBreakdownItem label="输出" value={metrics.outputTokens} className="text-violet-600 dark:text-violet-400" />
+        <TokenBreakdownItem label="缓存读" value={metrics.cacheReadInputTokens} className="text-sky-600 dark:text-sky-400" />
+        <TokenBreakdownItem label="缓存写" value={metrics.cacheCreationInputTokens} className="text-amber-600 dark:text-amber-400" />
+      </div>
+    </div>
+  )
+}
+
+function TokenBreakdownItem({
   label,
   value,
-  tone,
+  className,
 }: {
   label: string
   value: number
-  tone: 'success' | 'error' | 'warning' | 'default'
+  className: string
 }) {
-  const cls = {
-    success: 'text-success',
-    error: 'text-destructive',
-    warning: 'text-warning',
-    default: 'text-foreground',
-  }[tone]
   return (
-    <div className="flex items-center justify-between gap-2">
-      <span className="text-muted-foreground">{label}</span>
-      <span className={cn('tabular-nums font-semibold', cls)}>{formatNumber(value)}</span>
+    <div className="min-w-0">
+      <div className="text-muted-foreground">{label}</div>
+      <div className={cn('truncate font-semibold tabular-nums', className)} title={formatNumber(value)}>
+        {formatCompact(value)}
+      </div>
     </div>
   )
 }
 
-// ─── 子组件：异常摘要 ──────────────────────────────────────────────────────────
-
-function ErrorSummaryPanel({
-  totalErrors,
-  errorRate,
-  items,
+function TrendPanel({
+  points,
+  metric,
+  onMetricChange,
+  onDrillDown,
 }: {
-  totalErrors: number
-  errorRate: number
-  items: UsageTopAggregate[]
+  points: UsageOverviewSeriesPoint[]
+  metric: TrendMetric
+  onMetricChange: (metric: TrendMetric) => void
+  onDrillDown: (point: UsageOverviewSeriesPoint) => void
 }) {
-  const visible = items.filter((i) => i.requests > 0).slice(0, 5)
-  const isHigh = errorRate >= 0.2
-  const hasAny = totalErrors > 0
+  const [showLocal, setShowLocal] = useState(true)
+  const [showExternal, setShowExternal] = useState(true)
+  const maxValue = Math.max(
+    0,
+    ...points.map((point) => trendDisplayValue(point, metric, showLocal, showExternal)),
+  )
+  const axisMax = Math.max(1, maxValue)
+  const plotHeight = 190
+  const plotTopPadding = 28
+  const chartHeight = plotHeight + plotTopPadding
+  const ticks = trendAxisTicks(axisMax)
+  const bucketWidth = points.length > 24 ? 64 : points.length > 12 ? 70 : 76
+  const plotMinWidth = Math.max(680, points.length * bucketWidth)
 
   return (
     <SectionCard
-      title="异常摘要"
-      description="需要排障的错误聚合，完整明细到用量页筛选"
-      icon={<ShieldAlert />}
-      actions={
-        hasAny
-          ? <Badge tone={isHigh ? 'error' : 'warning'} title={formatNumber(totalErrors)}>{formatCompact(totalErrors)} 错误</Badge>
-          : <Badge tone="success">正常</Badge>
-      }
-    >
-      {hasAny && (
-        <Callout tone={isHigh ? 'error' : 'warning'} className="mb-3">
-          {isHigh
-            ? `错误率 ${formatPercent(errorRate)} — 已超过 20%，建议立即排查。`
-            : `当前窗口存在 ${formatNumber(totalErrors)} 个错误请求（${formatPercent(errorRate)}），请关注。`}
-        </Callout>
-      )}
-      <div className="space-y-2">
-        {visible.length === 0 ? (
-          <div className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
-            <CheckCircle2 className="size-4 shrink-0 text-success" />
-            当前窗口无错误聚合
-          </div>
-        ) : (
-          visible.map((item, idx) => (
-            <div
-              key={`${item.key}-${idx}`}
-              className="relative overflow-hidden rounded-lg bg-card px-3 py-2.5 shadow-sm"
-            >
-              <div className="absolute inset-y-3 left-0 w-0.5 rounded-r bg-destructive/70" />
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0 pl-1.5">
-                  <div className="truncate text-xs font-semibold text-destructive" title={item.label ?? item.key}>
-                    {item.label ?? item.key}
-                  </div>
-                  {item.label && (
-                    <div className="truncate font-mono text-[0.62rem] text-muted-foreground/60">{item.key}</div>
-                  )}
-                </div>
-                <Badge tone="error" title={formatNumber(item.requests)}>{formatCompact(item.requests)}</Badge>
-              </div>
-              <div className="mt-1.5 grid grid-cols-3 gap-1 pl-1.5 text-[0.62rem] text-muted-foreground/60">
-                <span>占全部错误 {formatPercent(totalErrors > 0 ? item.requests / totalErrors : 0)}</span>
-                <span className="text-right">估 {formatUsdFixed2(item.totalEstimatedCostUsd)}</span>
-                <span className="text-right">原 {formatUsdFixed2(item.totalOriginalCostUsd)}</span>
-              </div>
-            </div>
-          ))
-        )}
-      </div>
-    </SectionCard>
-  )
-}
-
-// ─── 子组件：运行信号 ──────────────────────────────────────────────────────────
-
-function SignalRow({
-  label,
-  value,
-  ratio,
-  barColor = 'bg-primary/65',
-  title,
-}: {
-  label: string
-  value: ReactNode
-  ratio?: number
-  barColor?: string
-  title?: string
-}) {
-  const width = Number.isFinite(ratio ?? NaN)
-    ? Math.min(100, Math.max(0, (ratio as number) * 100))
-    : 0
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between gap-2 text-xs">
-        <span className="truncate font-medium text-foreground/75" title={title}>{label}{title && <span className="ml-1 cursor-help text-muted-foreground/50">ⓘ</span>}</span>
-        <span className="shrink-0 font-mono text-xs text-muted-foreground">{value}</span>
-      </div>
-      {ratio !== undefined && (
-        <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-          <div className={cn('h-full rounded-full', barColor)} style={{ width: `${width}%` }} />
-        </div>
-      )}
-    </div>
-  )
-}
-
-function ScopeNote({
-  label,
-  text,
-}: {
-  label: string
-  text: string
-}) {
-  return (
-    <div className="inline-flex items-center gap-1 rounded-full bg-muted/50 px-2 py-1 text-[0.68rem] text-muted-foreground">
-      <span className="font-semibold text-foreground/70">{label}</span>
-      <span>{text}</span>
-    </div>
-  )
-}
-
-function UsageWriterHealthPanel({
-  stats,
-  error,
-}: {
-  stats?: UsageRecorderStats
-  error?: unknown
-}) {
-  if (error) {
-    return (
-      <SectionCard title="统计健康" description="usage writer 与统计持久化状态" icon={<Database />}>
-        <ErrorState title="统计健康加载失败" message={extractErrorMessage(error)} />
-      </SectionCard>
-    )
-  }
-
-  if (!stats) {
-    return (
-      <SectionCard title="统计健康" description="usage writer 与统计持久化状态" icon={<Database />}>
-        <LoadingState text="加载统计健康..." className="py-6" />
-      </SectionCard>
-    )
-  }
-
-  const persistCapacity = stats.writerQueueCapacity ?? 0
-  const persistAvailable = stats.writerQueueAvailable ?? 0
-  const persistUsed = Math.max(0, persistCapacity - persistAvailable)
-  const persistRatio = persistCapacity > 0 ? persistUsed / persistCapacity : 0
-  const redisCapacity = stats.redisQueueCapacity ?? 0
-  const redisAvailable = stats.redisQueueAvailable ?? 0
-  const redisUsed = Math.max(0, redisCapacity - redisAvailable)
-  const redisRatio = redisCapacity > 0 ? redisUsed / redisCapacity : 0
-  const dropped = (stats.droppedPersistRecords ?? 0) + (stats.droppedRedisRecords ?? 0)
-
-  return (
-    <SectionCard
-      title="统计健康"
-      description="观测写入状态；异常只应影响统计，不应阻塞模型请求"
-      icon={<Database />}
-      actions={
-        dropped > 0
-          ? <Badge tone="warning" title={formatNumber(dropped)}>已丢弃统计</Badge>
-          : <Badge tone="success">无丢弃</Badge>
-      }
-    >
-      <div className="grid gap-3 sm:grid-cols-2">
-        <SignalRow
-          label="PgSQL writer 队列"
-          value={`${formatCompact(persistUsed)} / ${formatCompact(persistCapacity)}`}
-          ratio={persistRatio}
-          barColor={persistRatio > 0.8 ? 'bg-warning/80' : 'bg-primary/70'}
-        />
-        <SignalRow
-          label="Redis writer 队列"
-          value={`${formatCompact(redisUsed)} / ${formatCompact(redisCapacity)}`}
-          ratio={redisRatio}
-          barColor={redisRatio > 0.8 ? 'bg-warning/80' : 'bg-info/70'}
-        />
-        <SignalRow
-          label="内存保留记录"
-          value={`${formatCompact(stats.inMemoryRecords)} / ${formatCompact(stats.inMemoryLimit)}`}
-          ratio={stats.inMemoryLimit > 0 ? stats.inMemoryRecords / stats.inMemoryLimit : 0}
-        />
-        <SignalRow
-          label="丢弃统计记录"
-          value={formatCompact(dropped)}
-          ratio={dropped > 0 ? 1 : 0}
-          barColor={dropped > 0 ? 'bg-warning/80' : 'bg-success/70'}
-          title="包括 PgSQL/Redis 统计队列满时被保护性丢弃的记录"
-        />
-      </div>
-      <div className="mt-3 flex flex-wrap gap-2 text-[0.68rem] text-muted-foreground">
-        <ScopeNote label="PgSQL" text={stats.postgresEnabled ? '启用' : '未启用'} />
-        <ScopeNote label="Redis" text={stats.redisEnabled ? '启用' : '未启用'} />
-        <ScopeNote label="Redis队列" text={stats.redisQueueEnabled ? '启用' : '未启用'} />
-      </div>
-    </SectionCard>
-  )
-}
-
-// ─── 子组件：维度排行 ──────────────────────────────────────────────────────────
-
-function DimensionRankPanel({
-  top,
-  activeKey,
-  onActiveKeyChange,
-  totalErrors,
-}: {
-  top: UsageDashboardTop
-  activeKey: RankDimension
-  onActiveKeyChange: (k: RankDimension) => void
-  totalErrors: number
-}) {
-  const items = top[activeKey] ?? []
-  const isErrorRank = activeKey === 'errors'
-  const countLabel = isErrorRank ? '发生次数' : '请求'
-  const shareLabel = isErrorRank ? '占全部错误' : '错误率'
-  const coverage = getRankCoverage(top, activeKey)
-  const coverageText = `Top ${formatNumber(coverage.returned)} / 共 ${formatNumber(coverage.total)}${coverage.truncated ? ' · 已截断' : ''}`
-  const description = isErrorRank
-    ? `错误维度排行；共 ${formatNumber(totalErrors)} 个错误请求`
-    : '维度排行只显示 Top N 结果，不能当作全量统计。'
-
-  return (
-    <SectionCard
-      title="维度排行"
-      description={description}
+      title="趋势"
       icon={<TrendingUp />}
       actions={
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex overflow-hidden rounded-lg bg-muted/40 p-0.5">
-            {rankDimensions.map((dim) => (
-              <Button
-                key={dim.key}
-                variant={dim.key === activeKey ? 'default' : 'ghost'}
-                size="xs"
-                className="rounded-none"
-                onClick={() => onActiveKeyChange(dim.key)}
-              >
-                {dim.label}
-              </Button>
-            ))}
-          </div>
-          <Badge tone={coverage.truncated ? 'warning' : 'success'} title={coverage.truncated ? '排行结果已截断，当前只显示 Top N' : '排行结果完整'}>
-            {coverageText}
-          </Badge>
+        <div className="flex flex-wrap gap-1">
+          {TREND_METRICS.map((item) => (
+            <Button
+              key={item.key}
+              size="xs"
+              variant={metric === item.key ? 'secondary' : 'ghost'}
+              onClick={() => onMetricChange(item.key)}
+            >
+              {item.label}
+            </Button>
+          ))}
         </div>
       }
-      noPadding
     >
-      {items.length === 0 ? (
-        <div className="px-4 py-3 text-xs text-muted-foreground/60">暂无排行数据</div>
+      {points.length === 0 ? (
+        <EmptyState title="暂无趋势数据" className="py-8" />
       ) : (
-        <div className="scrollbar-thin overflow-x-auto">
-              <Table className="min-w-[760px]">
+        <div className="flex pt-1">
+          <div className="relative w-16 shrink-0 pr-2" style={{ height: chartHeight }}>
+            {ticks.map((tick) => {
+              const top = plotTopPadding + ((axisMax - tick) / axisMax) * plotHeight
+              return (
+                <span
+                  key={tick}
+                  className="absolute right-2 -translate-y-1/2 whitespace-nowrap font-mono text-[0.62rem] tabular-nums text-muted-foreground"
+                  style={{ top }}
+                >
+                  {formatTrendValue(tick, metric)}
+                </span>
+              )
+            })}
+          </div>
+          <div className="min-w-0 flex-1 overflow-x-auto pb-2">
+            <div style={{ minWidth: plotMinWidth }}>
+              <div
+                className="relative flex-1 border-b border-l border-border/70"
+                style={{ height: chartHeight, minWidth: plotMinWidth }}
+              >
+                {ticks.map((tick) => {
+                  const top = plotTopPadding + ((axisMax - tick) / axisMax) * plotHeight
+                  return (
+                    <span
+                      key={tick}
+                      className="absolute left-0 right-0 border-t border-dashed border-border/60"
+                      style={{ top }}
+                    />
+                  )
+                })}
+                <div className="absolute inset-x-3 bottom-0 z-10 flex items-end gap-3" style={{ height: plotHeight }}>
+                  {points.map((point) => {
+                    const local = seriesMetricValue(point, 'local', metric)
+                    const external = seriesMetricValue(point, 'external', metric)
+                    const displayed = trendDisplayValue(point, metric, showLocal, showExternal)
+                    const localHeight = showLocal && local > 0 ? Math.max(2, (local / axisMax) * plotHeight) : 0
+                    const externalHeight = showExternal && external > 0 ? Math.max(2, (external / axisMax) * plotHeight) : 0
+                    const totalHeight = Math.min(plotHeight, localHeight + externalHeight)
+
+                    return (
+                      <Tooltip
+                        key={point.bucketStart}
+                        label={<TrendTooltipContent point={point} metric={metric} showLocal={showLocal} showExternal={showExternal} />}
+                      >
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          className="group relative flex h-full flex-1 items-end justify-center overflow-visible rounded-sm px-1 pb-0 pt-0 hover:bg-muted/40"
+                          title={`${trendTooltip(point, metric, showLocal, showExternal)}，点击查看`}
+                          onClick={() => onDrillDown(point)}
+                        >
+                          <span
+                            className="relative flex w-full max-w-12 flex-col items-stretch justify-end"
+                            style={{ height: `${totalHeight}px` }}
+                          >
+                            {displayed > 0 && (
+                              <span className="absolute bottom-full left-1/2 mb-1 max-w-16 -translate-x-1/2 truncate rounded-sm bg-background/95 px-1 font-mono text-[0.58rem] font-semibold tabular-nums text-foreground shadow-sm ring-1 ring-border/80">
+                                {formatTrendValue(displayed, metric)}
+                              </span>
+                            )}
+                            <span className="w-full rounded-t-sm bg-info/75 transition group-hover:bg-info" style={{ height: `${externalHeight}px` }} />
+                            <span className="w-full rounded-b-sm bg-primary/80 transition group-hover:bg-primary" style={{ height: `${localHeight}px` }} />
+                          </span>
+                        </Button>
+                      </Tooltip>
+                    )
+                  })}
+                </div>
+              </div>
+              <div className="mt-1 flex flex-1 gap-3 px-3" style={{ minWidth: plotMinWidth }}>
+                {points.map((point) => (
+                  <span key={`${point.bucketStart}-label`} className="flex-1 whitespace-nowrap text-center text-[0.62rem] text-muted-foreground">
+                    {point.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="mt-3 flex flex-wrap items-center gap-4 text-[0.68rem] text-muted-foreground">
+        <Button
+          size="xs"
+          variant={showLocal ? 'secondary' : 'ghost'}
+          className="h-6 gap-1.5 px-2 text-[0.68rem]"
+          aria-pressed={showLocal}
+          onClick={() => setShowLocal((value) => !value)}
+        >
+          <span className={cn('size-2 rounded-full', showLocal ? 'bg-primary/80' : 'bg-muted-foreground/30')} />
+          本地账号池
+        </Button>
+        <Button
+          size="xs"
+          variant={showExternal ? 'secondary' : 'ghost'}
+          className="h-6 gap-1.5 px-2 text-[0.68rem]"
+          aria-pressed={showExternal}
+          onClick={() => setShowExternal((value) => !value)}
+        >
+          <span className={cn('size-2 rounded-full', showExternal ? 'bg-info/75' : 'bg-muted-foreground/30')} />
+          外部池
+        </Button>
+      </div>
+    </SectionCard>
+  )
+}
+
+function LocalPoolSection({
+  metrics,
+  accountRows,
+  accountsLoading,
+  range,
+  navigate,
+}: {
+  metrics: UsageOverviewMetrics
+  accountRows: LocalAccountOverviewRow[]
+  accountsLoading: boolean
+  range: { from: string; to: string }
+  navigate: ReturnType<typeof useNavigate>
+}) {
+  const availableCreditRows = accountRows.filter((account) => (
+    !account.creditEstimateBlocked &&
+    account.accountInfo?.creditRemaining != null
+  ))
+  const availableCreditRemaining = availableCreditRows.reduce(
+    (sum, account) => sum + (account.accountInfo?.creditRemaining ?? 0),
+    0,
+  )
+  const estimatedRemainingCostUsd = availableCreditRows.reduce(
+    (sum, account) => sum + (account.estimatedRemainingCostUsd ?? 0),
+    0,
+  )
+  const unavailableCreditCount = accountRows.filter((account) => account.creditEstimateBlocked).length
+  const unqueriedCreditCount = accountRows.filter((account) => (
+    !account.creditEstimateBlocked &&
+    account.accountInfo?.creditRemaining == null
+  )).length
+  const localCostDiff = localCostDiffInfo(metrics.estimatedCostUsd, metrics.originalCostUsd)
+  const estimatedCreditRate = creditCostRate(metrics.estimatedCostUsd, metrics.kiroMeteringUsage)
+  const originalCreditRate = creditCostRate(metrics.originalCostUsd, metrics.kiroMeteringUsage)
+
+  return (
+    <SectionCard>
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
+        <StatCard title="已消耗积分" value={formatNumber(metrics.kiroMeteringUsage)} valueTitle={formatNumber(metrics.kiroMeteringUsage)} desc="请求级 meteringEvent 消耗，包含已失效账号" icon={<Zap />} tone="info" />
+        <StatCard
+          title="估算费用"
+          value={formatUsdFixed2(metrics.estimatedCostUsd)}
+          desc={(
+            <span>
+              原始计费 {formatUsdFixed2(metrics.originalCostUsd)} ·{' '}
+              <span className={localCostDiff.textClass}>
+                差值 {localCostDiff.text}{localCostDiff.percentText}
+              </span>
+            </span>
+          )}
+          icon={<DollarSign />}
+          tone="primary"
+        />
+        <StatCard
+          title="积分转换率"
+          value={formatCreditCostRate(estimatedCreditRate)}
+          desc={`原始 ${formatCreditCostRate(originalCreditRate)}`}
+          icon={<TrendingUp />}
+          tone="info"
+        />
+        <StatCard
+          title="剩余积分"
+          value={formatCredits(availableCreditRemaining)}
+          desc={unavailableCreditCount > 0
+            ? `已排除 ${formatNumber(unavailableCreditCount)} 个不可用账号`
+            : unqueriedCreditCount > 0
+              ? `${formatNumber(unqueriedCreditCount)} 个账号未查询余额`
+              : '当前可用账号余额'}
+          icon={<Wallet />}
+          tone="success"
+        />
+        <StatCard
+          title="预估估算费用"
+          value={formatUsdFixed2(estimatedRemainingCostUsd)}
+          desc="估算计费 / 已消耗积分 × 剩余积分"
+          icon={<DollarSign />}
+          tone="success"
+        />
+        <StatCard title="错误率" value={formatPercent(metrics.errorRate)} desc={`${formatCompact(metrics.errorRequests)} 个错误请求`} icon={<AlertTriangle />} tone={metrics.errorRate > 0.05 ? 'error' : metrics.errorRate > 0 ? 'warning' : 'success'} />
+      </div>
+      <div className="mt-4 flex justify-end">
+        <Button size="xs" variant="outline" onClick={() => navigate('/credentials')}>
+          账号管理 <ExternalLink className="size-3.5" />
+        </Button>
+      </div>
+      {accountsLoading ? (
+        <LoadingState text="加载本地账号数据..." className="mt-3 py-8" />
+      ) : accountRows.length === 0 ? (
+        <EmptyState title="暂无本地账号" className="mt-3 py-8" />
+      ) : (
+        <div className="mt-2 overflow-x-auto">
+          <Table className="min-w-[1040px]">
             <TableHeader>
               <TableRow>
-                <TableHead className="w-8">#</TableHead>
-                <TableHead>名称</TableHead>
-                <TableHead className="text-right">{countLabel}</TableHead>
-                <TableHead className="text-right">{shareLabel}</TableHead>
-                <TableHead className="text-right">估算成本</TableHead>
-                <TableHead className="text-right">原始计费</TableHead>
-                <TableHead className="text-right">Kiro 积分</TableHead>
+                <TableHead>账号</TableHead>
+                <TableHead className="text-right">请求</TableHead>
+                <TableHead className="text-right">已消耗积分</TableHead>
+                <TableHead className="text-right">估算费用</TableHead>
+                <TableHead className="text-right">积分转换率</TableHead>
+                <TableHead className="text-right">剩余积分</TableHead>
+                <TableHead className="text-right">预估估算费用</TableHead>
+                <TableHead className="text-right">错误率</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {items.map((item, idx) => (
-                <TableRow key={`${item.key}-${idx}`}>
-                  <TableCell className="text-muted-foreground/60 font-mono text-xs">{idx + 1}</TableCell>
-                  <TableCell>
-                    <div className="max-w-[200px] truncate text-xs font-semibold" title={item.label ?? item.key}>
-                      {item.label ?? item.key}
-                    </div>
-                    {item.label && (
-                      <div className="font-mono text-[0.62rem] text-muted-foreground/60 truncate max-w-[200px]">
-                        {item.key}
+              {accountRows.map((account) => {
+                const accountCostDiff = localCostDiffInfo(account.metrics.estimatedCostUsd, account.metrics.originalCostUsd)
+                const accountEstimatedRate = creditCostRate(account.metrics.estimatedCostUsd, account.metrics.kiroMeteringUsage)
+                const accountOriginalRate = creditCostRate(account.metrics.originalCostUsd, account.metrics.kiroMeteringUsage)
+                return (
+                  <TableRow key={account.credentialId} className={account.credential.disabled ? 'opacity-65' : undefined}>
+                    <TableCell>
+                      <Button
+                        variant="link"
+                        size="xs"
+                        className="h-auto max-w-[260px] justify-start truncate px-0 text-left"
+                        title={`账号 #${account.credentialId} · 查看 Usage 明细`}
+                        onClick={() => usageLink(navigate, {
+                          routeKind: 'local_credential',
+                          credentialId: account.credentialId,
+                          since: range.from,
+                          until: range.to,
+                        })}
+                      >
+                        #{account.credentialId} {account.label}
+                      </Button>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.requests)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.kiroMeteringUsage)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      <div>{formatUsdFixed2(account.metrics.estimatedCostUsd)}</div>
+                      <div className="text-[0.62rem] text-muted-foreground">原始 {formatUsdFixed2(account.metrics.originalCostUsd)}</div>
+                      <div className={cn('text-[0.62rem]', accountCostDiff.textClass)} title="估算费用 - 原始计费">
+                        差值 {accountCostDiff.text}{accountCostDiff.percentText}
                       </div>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-xs">
-                    <span title={formatNumber(item.requests)}>{formatCompact(item.requests)}</span>
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-xs">
-                    {isErrorRank
-                      ? formatPercent(totalErrors > 0 ? item.requests / totalErrors : 0)
-                      : formatPercent(item.requests > 0 ? item.errorRequests / item.requests : 0)}
-                  </TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(item.totalEstimatedCostUsd)}</TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(item.totalOriginalCostUsd)}</TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatCompact(item.totalKiroMeteringUsage ?? 0)}</TableCell>
-                </TableRow>
-              ))}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      <div>{formatCreditCostRate(accountEstimatedRate)}</div>
+                      <div className="text-[0.62rem] text-muted-foreground">原始 {formatCreditCostRate(accountOriginalRate)}</div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      {account.creditEstimateBlocked ? (
+                        <span className="text-destructive" title={account.creditEstimateBlockedReason}>不可用</span>
+                      ) : account.accountInfo?.creditRemaining != null ? (
+                        formatCredits(account.accountInfo.creditRemaining)
+                      ) : (
+                        <span className="text-muted-foreground">未查询</span>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">
+                      {account.creditEstimateBlocked ? (
+                        <span className="text-destructive" title={account.creditEstimateBlockedReason}>不可估算</span>
+                      ) : account.estimatedRemainingCostUsd != null ? (
+                        formatUsdFixed2(account.estimatedRemainingCostUsd)
+                      ) : (
+                        <span className="text-muted-foreground">无法估算</span>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">{formatPercent(account.metrics.errorRate)}</TableCell>
+                  </TableRow>
+                )
+              })}
             </TableBody>
           </Table>
         </div>
@@ -649,709 +691,609 @@ function DimensionRankPanel({
   )
 }
 
-// ─── 子组件：占比分解面板（Tab 合并版） ────────────────────────────────────────
-
-const BREAKDOWN_TONES: Record<string, string> = {
-  success: 'bg-success/80',
-  timeout: 'bg-warning/80',
-  upstream_timeout: 'bg-warning/80',
-  client_error: 'bg-destructive/70',
-  stream_error: 'bg-destructive/70',
-  error: 'bg-destructive/70',
-  upstream_metadata: 'bg-primary/65',
-  local_prompt_cache: 'bg-success/70',
-  context_estimate: 'bg-info/70',
-  request_estimate: 'bg-info/60',
-}
-
-function breakdownBarColor(key: string): string {
-  return BREAKDOWN_TONES[key] ?? 'bg-muted-foreground/40'
-}
-
-type BreakdownTab = 'status' | 'source'
-
-function BreakdownTabPanel({
-  statusItems,
-  sourceItems,
+function ExternalPoolSection({
+  external,
+  pools,
+  range,
+  navigate,
 }: {
-  statusItems: UsageBreakdownItem[]
-  sourceItems: UsageBreakdownItem[]
-}) {
-  const [activeTab, setActiveTab] = useState<BreakdownTab>('status')
-  const items = activeTab === 'status' ? statusItems : sourceItems
-  const emptyText = activeTab === 'status' ? '暂无状态样本。' : '暂无来源样本。'
-
-  return (
-    <SectionCard
-      title={activeTab === 'status' ? '状态分布' : '用量来源'}
-      description={activeTab === 'status' ? '成功、超时、客户端错误等整体占比' : '用量来自服务返回、缓存展示或系统补充的占比'}
-      actions={
-        <div className="inline-flex overflow-hidden rounded-lg bg-muted/40 p-0.5">
-          <Button
-            variant={activeTab === 'status' ? 'default' : 'ghost'}
-            size="xs"
-            className="rounded-none"
-            onClick={() => setActiveTab('status')}
-          >
-            状态分布
-          </Button>
-          <Button
-            variant={activeTab === 'source' ? 'default' : 'ghost'}
-            size="xs"
-            className="rounded-none"
-            onClick={() => setActiveTab('source')}
-          >
-            用量来源
-          </Button>
-        </div>
-      }
-    >
-      <div className="space-y-3">
-        {items.length === 0 ? (
-          <div className="rounded-lg bg-muted/30 px-3 py-3 text-sm text-muted-foreground/60">
-            {emptyText}
-          </div>
-        ) : (
-          items.slice(0, 6).map((item) => {
-            const width = Number.isFinite(item.ratio) ? Math.min(100, Math.max(0, item.ratio * 100)) : 0
-            const barColor = breakdownBarColor(item.key)
-            return (
-              <div key={item.key} className="space-y-1.5">
-                <div className="flex items-center justify-between gap-2 text-xs">
-                  <span className="truncate font-medium text-foreground/75">{item.label}</span>
-                  <span className="shrink-0 font-mono text-muted-foreground" title={formatNumber(item.requests)}>
-                    {formatCompact(item.requests)} · {formatPercent(item.ratio)}
-                  </span>
-                </div>
-                <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-                  <div className={cn('h-full rounded-full', barColor)} style={{ width: `${width}%` }} />
-                </div>
-              </div>
-            )
-          })
-        )}
-      </div>
-    </SectionCard>
-  )
-}
-
-// ─── 子组件：轻量实时状态 ──────────────────────────────────────────────────────
-
-function LoadingSkeletonCard() {
-  return (
-    <div className="min-h-[6.5rem] animate-pulse rounded-xl bg-card p-4 shadow-sm">
-      <div className="h-3 w-20 rounded bg-muted" />
-      <div className="mt-4 h-7 w-24 rounded bg-muted" />
-      <div className="mt-5 h-2 w-full rounded bg-muted" />
-      <div className="mt-2 h-2 w-2/3 rounded bg-muted" />
-    </div>
-  )
-}
-
-function DashboardLoadingSkeleton() {
-  return (
-    <div className="space-y-3">
-      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, index) => (
-          <LoadingSkeletonCard key={index} />
-        ))}
-      </div>
-      <div className="grid gap-3 xl:grid-cols-2">
-        <SectionCard title="运行状态" description="正在加载实时状态">
-          <LoadingState text="加载实时状态..." className="py-6" />
-        </SectionCard>
-        <SectionCard title="账号池" description="正在加载账号池状态">
-          <LoadingState text="加载账号池..." className="py-6" />
-        </SectionCard>
-      </div>
-    </div>
-  )
-}
-
-function RealtimeUsagePanel({
-  summary,
-  error,
-}: {
-  summary?: ReturnType<typeof useUsageSummary>['data']
-  error?: unknown
-}) {
-  if (error) {
-    return (
-      <SectionCard title="实时负载" description="最近 60 秒请求、错误、Token 速率" icon={<Activity />}>
-        <ErrorState title="实时负载加载失败" message={extractErrorMessage(error)} />
-      </SectionCard>
-    )
+  external: {
+    rawCostUsd: number
+    shapedCostUsd: number
+    upliftedCostUsd: number
+    reportedCostUsd: number
+    billableCostUsd: number
+    profitUsd: number
+    costFloorDeltaUsd: number
+    costFloorAppliedRequests: number
+    pools: ExternalUsagePool[]
   }
-
-  if (!summary) {
-    return (
-      <SectionCard title="实时负载" description="最近 60 秒请求、错误、Token 速率" icon={<Activity />}>
-        <LoadingState text="加载实时负载..." className="py-6" />
-      </SectionCard>
-    )
-  }
-
-  const realtime = summary.realtime
-  const errorRate = realtime.requests > 0 ? (realtime.errorRequests ?? 0) / realtime.requests : 0
-
-  return (
-    <SectionCard
-      title="实时负载"
-      description={`最近 ${realtime.windowSeconds} 秒，判断是否正在被打爆或错误放大`}
-      icon={<Activity />}
-      actions={
-        errorRate > 0.2
-          ? <Badge tone="error">错误偏高</Badge>
-          : realtime.rpm > 0
-            ? <Badge tone="success">有流量</Badge>
-            : <Badge tone="secondary">空闲</Badge>
-      }
-    >
-      <div className="grid gap-3 sm:grid-cols-2">
-        <SignalRow label="RPM" value={formatNumber(realtime.rpm)} ratio={realtime.rpm > 0 ? 1 : 0} barColor="bg-primary/70" />
-        <SignalRow label="错误 RPM" value={formatNumber(realtime.errorRpm ?? 0)} ratio={errorRate} barColor={errorRate > 0 ? 'bg-destructive/75' : 'bg-muted-foreground/30'} />
-        <SignalRow label="总 TPM" value={formatNumber(realtime.totalTpm)} ratio={realtime.totalTpm > 0 ? 1 : 0} barColor="bg-info/70" />
-        <SignalRow label="计费 TPM" value={formatNumber(realtime.billableTpm)} ratio={realtime.totalTpm > 0 ? realtime.billableTpm / realtime.totalTpm : 0} barColor="bg-success/70" />
-      </div>
-      <div className="mt-3 rounded-lg bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        请求 {formatNumber(realtime.requests)} · 成功 {formatNumber(realtime.successRequests ?? 0)} · 错误 {formatNumber(realtime.errorRequests ?? 0)}
-      </div>
-    </SectionCard>
-  )
-}
-
-function WindowHealthPanel({
-  summary,
-}: {
-  summary: UsageDashboardWindow['summary']
+  pools: ExternalPool[]
+  range: { from: string; to: string }
+  navigate: ReturnType<typeof useNavigate>
 }) {
-  const successRate = summary.totalRequests > 0
-    ? summary.successRequests / summary.totalRequests
-    : 0
-  const latencyTone: 'warning' | 'info' = summary.p95DurationMs >= 60_000 ? 'warning' : 'info'
-
+  const usageById = new Map(external.pools.map((item) => [item.poolId, item]))
+  const configuredIds = new Set(pools.map((pool) => pool.id))
+  const rows = [
+    ...pools.map((pool) => ({
+      pool,
+      poolId: pool.id,
+      poolName: pool.name,
+      priority: pool.priority,
+      usage: usageById.get(pool.id),
+    })),
+    ...external.pools
+      .filter((usage) => !configuredIds.has(usage.poolId))
+      .map((usage) => ({
+        pool: undefined,
+        poolId: usage.poolId,
+        poolName: usage.poolName || `#${usage.poolId}`,
+        priority: Number.MAX_SAFE_INTEGER,
+        usage,
+      })),
+  ]
+    .sort((left, right) => (
+      (right.usage?.billableCostUsd ?? 0) - (left.usage?.billableCostUsd ?? 0) ||
+      (right.usage?.metrics.requests ?? 0) - (left.usage?.metrics.requests ?? 0) ||
+      left.priority - right.priority ||
+      left.poolId - right.poolId
+    ))
+  const totalRequests = rows.reduce((sum, item) => sum + (item.usage?.metrics.requests ?? 0), 0)
+  const pricedRequests = rows.reduce((sum, item) => sum + (item.usage?.metrics.pricedRequests ?? 0), 0)
+  const unpricedRequests = rows.reduce((sum, item) => sum + (item.usage?.metrics.unpricedRequests ?? 0), 0)
+  const shapedCost = external.shapedCostUsd ?? external.reportedCostUsd ?? 0
+  const upliftedCost = external.upliftedCostUsd ?? external.reportedCostUsd ?? external.billableCostUsd ?? 0
+  const billableCost = external.billableCostUsd ?? upliftedCost
+  const delta = external.profitUsd
+  const deltaTone = billingDeltaTone(delta)
   return (
-    <SectionCard
-      title="窗口健康"
-      description="当前所选时间窗口；与最近 60 秒实时负载分开统计"
-      icon={<CheckCircle2 />}
-      actions={
-        summary.errorRequests > 0
-          ? <Badge tone={summary.errorRate >= 0.2 ? 'error' : 'warning'}>{formatCompact(summary.errorRequests)} 个错误</Badge>
-          : <Badge tone="success">无错误</Badge>
-      }
-    >
-      <div className="grid gap-3 sm:grid-cols-2">
-        <SignalRow
-          label="请求量"
-          value={<span title={formatNumber(summary.totalRequests)}>{formatCompact(summary.totalRequests)}</span>}
-          ratio={summary.totalRequests > 0 ? 1 : 0}
+    <SectionCard>
+      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          title="外部池请求"
+          value={formatNumber(totalRequests)}
+          desc={`可计价 ${formatNumber(pricedRequests)} / 未计价 ${formatNumber(unpricedRequests)}`}
+          icon={<Zap />}
+          tone="info"
         />
-        <SignalRow
-          label="成功率"
-          value={formatPercent(successRate)}
-          ratio={successRate}
-          barColor={successRate >= 0.95 ? 'bg-success/70' : successRate >= 0.8 ? 'bg-warning/80' : 'bg-destructive/75'}
+        <StatCard title="上游原始成本" value={formatUsdFixed2(external.rawCostUsd)} icon={<DollarSign />} tone="warning" />
+        <StatCard
+          title="展示计费"
+          value={formatUsdFixed2(shapedCost)}
+          desc="整形后的中间成本口径"
+          icon={<DollarSign />}
+          tone="primary"
         />
-        <SignalRow
-          label="P95 耗时"
-          value={formatDuration(summary.p95DurationMs)}
-          ratio={summary.p95DurationMs > 0 ? Math.min(1, summary.p95DurationMs / 60_000) : 0}
-          barColor={latencyTone === 'warning' ? 'bg-warning/80' : 'bg-info/70'}
-        />
-        <SignalRow
-          label="错误请求"
-          value={<span title={formatNumber(summary.errorRequests)}>{formatCompact(summary.errorRequests)}</span>}
-          ratio={summary.errorRate}
-          barColor={summary.errorRequests > 0 ? 'bg-destructive/75' : 'bg-success/70'}
-        />
-      </div>
-    </SectionCard>
-  )
-}
-
-function AccountStatusFilterBar({
-  status,
-  onStatusChange,
-}: {
-  status: AccountStatusFilter
-  onStatusChange: (status: AccountStatusFilter) => void
-}) {
-  return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <span className="mr-1 text-xs font-medium text-muted-foreground">快捷筛选</span>
-      {accountStatusFilters.map((filter) => (
-        <Button
-          key={filter.key}
-          type="button"
-          size="xs"
-          variant={status === filter.key ? 'default' : 'ghost'}
-          onClick={() => onStatusChange(filter.key)}
-        >
-          {filter.label}
-        </Button>
-      ))}
-    </div>
-  )
-}
-
-function AccountQualityPanel({
-  data,
-  loading,
-  onPageChange,
-  status,
-  onStatusChange,
-}: {
-  data?: UsageDashboardAccountsResponse
-  loading: boolean
-  onPageChange: (page: number) => void
-  status: AccountStatusFilter
-  onStatusChange: (status: AccountStatusFilter) => void
-}) {
-  return (
-    <SectionCard
-      title="本地账号统计"
-      description="全量本地账号按窗口用量分页展示；窗口积分来自请求 meteringEvent，余额快照单独展示；统计只读，不触发余额查询、Token 刷新或调度"
-      icon={<Users />}
-      actions={
-        data
-          ? <Badge tone={data.complete ? 'success' : 'warning'}>{data.complete ? '统计完整' : '降级快照'}</Badge>
-          : undefined
-      }
-      noPadding
-    >
-      {loading ? (
-        <div className="p-4">
-          <LoadingState text="加载全量账号统计..." className="py-8" />
-        </div>
-      ) : !data || data.filteredTotal === 0 ? (
-        <div className="p-4">
-          <AccountStatusFilterBar status={status} onStatusChange={onStatusChange} />
-          <EmptyState title="暂无匹配账号" description="当前窗口没有可展示的本地账号。" className="py-8" />
-        </div>
-      ) : (
-        <div>
-          {!data.complete && (
-            <div className="border-b border-warning/20 bg-warning/10 px-4 py-2 text-xs text-warning">
-              账号统计不完整：{data.reason ?? '聚合查询暂时不可用'}。已保留运行态和零值账号。
-            </div>
-          )}
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 px-4 py-3">
-            <AccountStatusFilterBar status={status} onStatusChange={onStatusChange} />
-            <span className="text-[0.68rem] text-muted-foreground">
-              按窗口请求量排序 · 零请求账号保留
-            </span>
-          </div>
-          <div className="scrollbar-thin overflow-x-auto">
-            <Table className="min-w-[1240px]">
-              <TableHeader>
-                <TableRow>
-                  <TableHead>账号</TableHead>
-                  <TableHead>运行态</TableHead>
-                  <TableHead className="text-right">并发</TableHead>
-                  <TableHead className="text-right">窗口请求</TableHead>
-                  <TableHead className="text-right">窗口积分消耗</TableHead>
-                  <TableHead className="text-right">余额快照<br />已用 / 总额</TableHead>
-                  <TableHead className="text-right">窗口实际费用<br /><span className="font-normal">原始计费</span></TableHead>
-                  <TableHead className="text-right">窗口估算成本</TableHead>
-                  <TableHead className="text-right">累计实际费用<br /><span className="font-normal">原始计费</span></TableHead>
-                  <TableHead className="text-right">累计估算成本</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.items.map((account) => {
-                  return (
-                    <TableRow key={account.id}>
-                      <TableCell>
-                        <div className="max-w-[220px] truncate text-xs font-semibold" title={account.email ?? account.label}>
-                          #{account.id} {account.label}
-                        </div>
-                        <div className="mt-0.5 flex gap-1 text-[0.62rem] text-muted-foreground/60">
-                          <span>{account.authMethod ?? 'oauth'}</span>
-                          <span>·</span>
-                          <span>{account.endpoint}</span>
-                          {account.subscriptionTitle && <><span>·</span><span>{account.subscriptionTitle}</span></>}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-wrap gap-1">
-                          <Badge tone={account.disabled ? 'secondary' : 'success'}>
-                            {account.disabled ? '禁用' : '启用'}
-                          </Badge>
-                          {account.isCurrent && <Badge tone="info">当前</Badge>}
-                          {account.rateLimited && <Badge tone="warning">限流</Badge>}
-                          {account.cooledDown && <Badge tone="warning">冷却</Badge>}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs" title={`当前在途 ${formatNumber(account.inFlightRequests)}，并发上限 ${account.maxConcurrentRequests > 0 ? formatNumber(account.maxConcurrentRequests) : '不限'}`}>
-                        {formatCompact(account.inFlightRequests)}/{account.maxConcurrentRequests > 0 ? formatCompact(account.maxConcurrentRequests) : '∞'}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        <div title={formatNumber(account.windowRequests)}>{formatCompact(account.windowRequests)}</div>
-                        <div className={account.windowErrorRequests > 0 ? 'text-[0.62rem] text-warning' : 'text-[0.62rem] text-muted-foreground/60'} title={formatNumber(account.windowErrorRequests)}>
-                          错误 {formatCompact(account.windowErrorRequests)}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        <div title={`窗口请求对应的 Kiro meteringEvent 消耗；累计 ${formatNumber(account.lifetimeKiroMeteringUsage)}`}>
-                          {formatCompact(account.windowKiroMeteringUsage)}
-                        </div>
-                        <div className="text-[0.62rem] text-muted-foreground/60">
-                          累计 {formatCompact(account.lifetimeKiroMeteringUsage)}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        {account.creditUsed != null && account.creditLimit != null
-                          ? <div title={`已用 ${formatNumber(account.creditUsed)}，剩余 ${formatNumber(account.creditRemaining ?? 0)}，快照 ${account.accountInfoCheckedAt ?? '未知'}`}>
-                            {formatCompact(account.creditUsed)} / {formatCompact(account.creditLimit)}
-                          </div>
-                          : <div className="text-muted-foreground" title="暂无已保存的账号积分快照">-</div>}
-                        {account.creditRemaining != null && (
-                          <div className="text-[0.62rem] text-muted-foreground/60">
-                            剩余 {formatCompact(account.creditRemaining)}
-                          </div>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        <div title="优先按上游原始 usage 计费；上游没有原始 usage 时后端回退估算成本">
-                          {formatUsdFixed2(account.windowOriginalCostUsd)}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        {formatUsdFixed2(account.windowEstimatedCostUsd)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        <div title="优先按上游原始 usage 计费；上游没有原始 usage 时后端回退估算成本">
-                          {formatUsdFixed2(account.lifetimeOriginalCostUsd)}
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        {formatUsdFixed2(account.lifetimeEstimatedCostUsd)}
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 px-4 py-3 text-xs text-muted-foreground">
+        <StatCard
+          title="外部池可计费"
+          value={formatUsdFixed2(billableCost)}
+          desc={(
             <span>
-              显示 {(data.page - 1) * data.pageSize + (data.items.length ? 1 : 0)}{data.items.length ? `-${(data.page - 1) * data.pageSize + data.items.length}` : ''} / {formatNumber(data.filteredTotal)} 个匹配账号 · 窗口活跃 {formatNumber(data.windowActiveLocalAccounts)} · 空闲 {formatNumber(data.windowIdleLocalAccounts)}
+              补偿后计费 {formatUsdFixed2(upliftedCost)} ·{' '}
+              <span className={billingDeltaTextClass(deltaTone)}>
+                {delta >= 0 ? '+' : '-'}{formatUsdFixed2(Math.abs(delta))}
+              </span>
             </span>
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="xs"
-                aria-label="上一页"
-                disabled={data.page <= 1}
-                onClick={() => onPageChange(data.page - 1)}
-              >
-                <ChevronLeft className="size-3.5" />
-              </Button>
-              <span className="font-mono tabular-nums">{data.page} / {Math.max(1, data.totalPages)}</span>
-              <Button
-                variant="outline"
-                size="xs"
-                aria-label="下一页"
-                disabled={data.page >= data.totalPages}
-                onClick={() => onPageChange(data.page + 1)}
-              >
-                <ChevronRight className="size-3.5" />
-              </Button>
-            </div>
-          </div>
+          )}
+          icon={<TrendingUp />}
+          tone={deltaTone === 'loss' ? 'error' : deltaTone === 'profit' ? 'warning' : 'success'}
+        />
+      </div>
+      <div className="mt-3 rounded-lg bg-muted/25 px-3 py-2 text-xs text-muted-foreground">
+        <span className="font-medium text-foreground/75" title="按整形后的展示 usage 计算的中间成本">展示计费</span>
+        {' '}是整形后的中间口径；
+        <span className="ml-1 font-medium text-foreground/75" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</span>
+        {' '}是最终上报口径，外部池可计费取最终可计费金额。
+      </div>
+      {rows.length === 0 ? (
+        <EmptyState title="暂无外部池配置" className="mt-3 py-8" />
+      ) : (
+        <div className="mt-4 scrollbar-thin overflow-x-auto">
+          <Table className="min-w-[980px] text-xs">
+            <TableHeader>
+              <TableRow>
+                <TableHead>外部池</TableHead>
+                <TableHead className="text-right">请求</TableHead>
+                <TableHead className="text-right">上游原始成本</TableHead>
+                <TableHead className="text-right" title="按整形后的展示 usage 计算的中间成本">展示计费</TableHead>
+                <TableHead className="text-right" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</TableHead>
+                <TableHead className="text-right">差额占原始</TableHead>
+                <TableHead className="text-right">原始/整形倍率</TableHead>
+                <TableHead className="text-right">未计价</TableHead>
+                <TableHead className="text-right">兜底</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map(({ pool, poolId, poolName, usage }) => {
+                const metrics = usage?.metrics ?? EMPTY_OVERVIEW_METRICS
+                const rawCostUsd = usage?.rawCostUsd ?? 0
+                const shapedCostUsd = usage?.shapedCostUsd ?? usage?.reportedCostUsd ?? 0
+                const upliftedCostUsd = usage?.upliftedCostUsd ?? usage?.reportedCostUsd ?? usage?.billableCostUsd ?? 0
+                const poolDelta = usage?.profitUsd ?? (upliftedCostUsd - rawCostUsd)
+                const poolTone = billingDeltaTone(poolDelta)
+                return (
+                  <TableRow key={poolId}>
+                    <TableCell>
+                      <div className="flex min-w-[180px] flex-wrap items-center gap-1.5">
+                        <Button
+                          variant="link"
+                          size="xs"
+                          className="h-auto max-w-[260px] justify-start truncate px-0 text-left text-xs font-semibold"
+                          title={`外部池 #${poolId} · 查看 Usage 明细`}
+                          onClick={() => usageLink(navigate, {
+                            routeKind: 'external_pool',
+                            externalPoolId: poolId,
+                            since: range.from,
+                            until: range.to,
+                          })}
+                        >
+                          #{poolId} {poolName}
+                        </Button>
+                        {pool && <Badge tone={pool.enabled ? 'success' : 'neutral'} size="xs">{pool.enabled ? '启用' : '停用'}</Badge>}
+                        {pool?.autoDisabled && <Badge tone="error" size="xs">自动禁用</Badge>}
+                        {metrics.requests === 0 && <Badge tone="secondary" size="xs">无流量</Badge>}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono" title={formatNumber(metrics.requests)}>{formatNumber(metrics.requests)}</TableCell>
+                    <TableCell className="text-right font-mono">{formatUsdFixed2(rawCostUsd)}</TableCell>
+                    <TableCell
+                      className="text-right font-mono"
+                      title="整形后的中间成本口径"
+                    >
+                      {formatUsdFixed2(shapedCostUsd)}
+                    </TableCell>
+                    <TableCell
+                      className="text-right font-mono"
+                      title="最终上报/补偿后成本口径；当前用于外部池可计费金额"
+                    >
+                      {formatUsdFixed2(upliftedCostUsd)}
+                    </TableCell>
+                    <TableCell className={cn('text-right font-mono', billingDeltaTextClass(poolTone))}>
+                      <div>{poolDelta >= 0 ? '+' : ''}{formatUsdFixed2(poolDelta)}</div>
+                      <div className="text-[0.62rem]" title="当前池差额 ÷ 当前池上游原始成本">{costDeltaPercent(poolDelta, rawCostUsd)}</div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono" title="上游原始成本 ÷ 整形后展示成本">
+                      {costMultiplier(rawCostUsd, shapedCostUsd)}
+                    </TableCell>
+                    <TableCell className="text-right font-mono" title={formatNumber(metrics.unpricedRequests)}>{formatNumber(metrics.unpricedRequests)}</TableCell>
+                    <TableCell className="text-right font-mono" title={formatNumber(usage?.costFloorAppliedRequests ?? 0)}>{formatNumber(usage?.costFloorAppliedRequests ?? 0)}</TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
         </div>
       )}
     </SectionCard>
   )
 }
 
-// ─── 主页 ──────────────────────────────────────────────────────────────────────
+function RankPanel({
+  rows,
+  total,
+  errorRank = false,
+}: {
+  rows: UsageOverviewRankRow[]
+  total: number
+  errorRank?: boolean
+}) {
+  return (
+    <div className="mt-3">
+      {rows.length === 0 ? (
+        <EmptyState title="暂无排行数据" className="py-8" />
+      ) : (
+        <Table className="min-w-[560px]">
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-10">#</TableHead>
+              <TableHead>名称</TableHead>
+              <TableHead className="text-right">{errorRank ? '错误数' : '请求数'}</TableHead>
+              <TableHead className="text-right">{errorRank ? '占错误' : '占请求'}</TableHead>
+              <TableHead className="text-right">估算计费</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row, index) => (
+              <TableRow key={row.key}>
+                <TableCell className="font-mono text-xs text-muted-foreground">{index + 1}</TableCell>
+                <TableCell>
+                  <div className="max-w-[250px] truncate text-xs font-semibold" title={row.label}>{row.label}</div>
+                  {row.label !== row.key && <div className="max-w-[250px] truncate font-mono text-[0.62rem] text-muted-foreground/60">{row.key}</div>}
+                </TableCell>
+                <TableCell className="text-right font-mono text-xs">{formatCompact(errorRank ? row.errorRequests : row.requests)}</TableCell>
+                <TableCell className="text-right font-mono text-xs">{formatPercent(metricsShare(errorRank ? row.errorRequests : row.requests, total))}</TableCell>
+                <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(row.estimatedCostUsd)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </div>
+  )
+}
+
+function RankingsSection({
+  rankings,
+}: {
+  rankings: {
+    totalRequests: number
+    totalLocalRequests: number
+    totalErrors: number
+    topModels: UsageOverviewRankRow[]
+    topAccounts: UsageOverviewRankRow[]
+    topKeys: UsageOverviewRankRow[]
+    topPaths: UsageOverviewRankRow[]
+    topErrors: UsageOverviewRankRow[]
+  }
+}) {
+  const [dimension, setDimension] = useState<RankingDimension>('models')
+  const rankViews: Array<{
+    key: RankingDimension
+    label: string
+    rows: UsageOverviewRankRow[]
+    total: number
+    errorRank?: boolean
+  }> = [
+    { key: 'models', label: '模型', rows: rankings.topModels, total: rankings.totalRequests },
+    { key: 'accounts', label: '账号', rows: rankings.topAccounts, total: rankings.totalLocalRequests },
+    { key: 'keys', label: '秘钥', rows: rankings.topKeys, total: rankings.totalRequests },
+    { key: 'paths', label: '路径', rows: rankings.topPaths, total: rankings.totalRequests },
+    { key: 'errors', label: '错误', rows: rankings.topErrors, total: rankings.totalErrors, errorRank: true },
+  ]
+
+  return (
+    <SectionCard>
+      <Tabs value={dimension} onValueChange={(value) => setDimension(value as RankingDimension)}>
+        <TabsList className="w-full justify-start overflow-x-auto">
+          {rankViews.map((view) => (
+            <TabsTrigger key={view.key} value={view.key}>{view.label}</TabsTrigger>
+          ))}
+        </TabsList>
+        {rankViews.map((view) => (
+          <TabsContent key={view.key} value={view.key}>
+            <RankPanel
+              rows={view.rows}
+              total={view.total}
+              errorRank={view.errorRank}
+            />
+          </TabsContent>
+        ))}
+      </Tabs>
+    </SectionCard>
+  )
+}
 
 export function OverviewPage() {
-  const autoRefresh = useAutoRefreshPreference(OVERVIEW_AUTO_REFRESH_KEY, 30)
-  const windowsQuery = useUsageDashboardWindows(OVERVIEW_TIMEZONE, autoRefresh.refetchInterval)
-  const [selectedWindowKey, setSelectedWindowKey] = useState('today')
-  const [rankDimension, setRankDimension] = useState<RankDimension>('models')
-  const [activeSection, setActiveSection] = useState<DashboardSection>('operations')
-  const [accountsPage, setAccountsPage] = useState(1)
-  const [accountStatus, setAccountStatus] = useState<AccountStatusFilter>('all')
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const autoRefresh = useAutoRefreshPreference(AUTO_REFRESH_KEY, 30)
 
-  const data = windowsQuery.data
-  const selectedWindow = useMemo(
-    () => activeWindow(data?.windows ?? [], selectedWindowKey),
-    [data?.windows, selectedWindowKey]
+  const tabParam = searchParams.get('tab')
+  const activeTab: OverviewTab = tabParam === 'local' || tabParam === 'external' || tabParam === 'rankings'
+    ? tabParam
+    : 'summary'
+  const externalPools = useQuery({
+    queryKey: ['external-pools'],
+    queryFn: getExternalPools,
+    enabled: activeTab === 'external',
+    refetchInterval: autoRefresh.refetchInterval || 30000,
+  })
+  const rangeParam = searchParams.get('range')
+  const isPreset = PRESETS.some((item) => item.key === rangeParam)
+  const rangeKey = (isPreset ? rangeParam : undefined) as PresetRange | undefined
+  const fromParam = searchParams.get('from') ?? ''
+  const toParam = searchParams.get('to') ?? ''
+  const [customFrom, setCustomFrom] = useState(() => localDateTimeValue(fromParam))
+  const [customTo, setCustomTo] = useState(() => localDateTimeValue(toParam))
+  const [customError, setCustomError] = useState('')
+  const [trendMetric, setTrendMetric] = useState<TrendMetric>('requests')
+
+  const queryParams = useMemo(() => {
+    if (rangeKey) return { timezone: TIMEZONE, range: rangeKey }
+    if (fromParam && toParam) return { timezone: TIMEZONE, from: fromParam, to: toParam, granularity: searchParams.get('granularity') === 'hour' ? 'hour' as const : 'day' as const }
+    return { timezone: TIMEZONE, range: 'today' }
+  }, [fromParam, rangeKey, searchParams, toParam])
+  const rankingQueryParams = useMemo(() => ({ ...queryParams, topN: 50 as number }), [queryParams])
+
+  const refreshInterval = rangeKey && ['today', 'last24h', 'thisMonth'].includes(rangeKey)
+    ? autoRefresh.refetchInterval
+    : false
+  const summary = useUsageOverviewSummary(queryParams, refreshInterval, activeTab === 'summary' || activeTab === 'local' || activeTab === 'external' || activeTab === 'rankings')
+  const series = useUsageOverviewSeries(queryParams, refreshInterval, activeTab === 'summary' && !summary.isError)
+  const local = useUsageOverviewLocal(queryParams, refreshInterval, activeTab === 'local' && !summary.isError)
+  const external = useUsageOverviewExternal(queryParams, refreshInterval, activeTab === 'external' && !summary.isError)
+  const rankings = useUsageOverviewRankings(rankingQueryParams, refreshInterval, activeTab === 'rankings' && !summary.isError)
+  const localCredentials = useCredentials({
+    enabled: activeTab === 'local',
+    refetchInterval: refreshInterval || 30000,
+  })
+  const localCredentialIds = useMemo(
+    () => (localCredentials.data?.credentials ?? []).map((credential) => credential.id),
+    [localCredentials.data?.credentials],
   )
-  const effectiveWindowKey = selectedWindow?.key ?? selectedWindowKey
-  const usageSummaryQuery = useUsageSummary(autoRefresh.refetchInterval)
-  const writerStatsQuery = useUsageWriterStats(autoRefresh.refetchInterval)
-  const seriesQuery = useUsageDashboardSeries(
-    OVERVIEW_TIMEZONE,
-    autoRefresh.refetchInterval,
-    activeSection === 'traffic'
-  )
-  const topQuery = useUsageDashboardTop(
-    OVERVIEW_TIMEZONE,
-    effectiveWindowKey,
-    autoRefresh.refetchInterval,
-    activeSection === 'traffic' || activeSection === 'errors'
-  )
-  const accountsQuery = useUsageDashboardAccounts(
-    {
-      timezone: OVERVIEW_TIMEZONE,
-      windowKey: effectiveWindowKey,
-      page: accountsPage,
-      pageSize: 50,
-      status: accountStatus,
-      sortBy: 'window_requests',
-      sortOrder: 'desc',
-    },
-    autoRefresh.refetchInterval,
-    activeSection === 'accounts'
-  )
-  const breakdownQuery = useUsageDashboardBreakdown(
-    OVERVIEW_TIMEZONE,
-    effectiveWindowKey,
-    autoRefresh.refetchInterval,
-    activeSection === 'errors'
-  )
-  const externalPoolBillingQuery = useUsageDashboardExternalPoolBilling(
-    OVERVIEW_TIMEZONE,
-    effectiveWindowKey,
-    autoRefresh.refetchInterval,
-    activeSection === 'billing'
-  )
-  // 加载态
-  if (windowsQuery.isLoading) {
-    return (
-      <PageContainer>
-        <PageHeader title="总览" subtitle="实时健康、关键指标与异常" />
-        <DashboardLoadingSkeleton />
-      </PageContainer>
-    )
+  const localCredentialRuntime = useCredentialRuntime(localCredentialIds)
+  const localCredentialAccountInfo = useCredentialAccountInfo(localCredentialIds, {
+    enabled: activeTab === 'local',
+    refetchInterval: refreshInterval || 60000,
+  })
+  const localAccountRows = useMemo(() => {
+    const usageByCredentialId = new Map((local.data?.local.accounts ?? []).map((account) => [account.credentialId, account]))
+    const runtimeById = mapById(localCredentialRuntime.data?.items)
+    const accountInfoById = mapById(localCredentialAccountInfo.data?.items)
+    return (localCredentials.data?.credentials ?? [])
+      .map((base) => {
+        const credential = mergeCredentialRuntime(base, runtimeById.get(base.id))
+        const metrics = usageByCredentialId.get(base.id)?.metrics ?? EMPTY_OVERVIEW_METRICS
+        const accountInfo = accountInfoById.get(base.id)
+        const creditStatus = credentialCreditStatus(credential)
+        const estimatedRemainingCostUsd = creditStatus.available && accountInfo && metrics.kiroMeteringUsage > 0
+          ? metrics.estimatedCostUsd / metrics.kiroMeteringUsage * accountInfo.creditRemaining
+          : undefined
+        return {
+          credential,
+          credentialId: base.id,
+          label: credentialLabel(credential),
+          metrics,
+          accountInfo,
+          creditEstimateBlocked: !creditStatus.available,
+          creditEstimateBlockedReason: creditStatus.reason,
+          estimatedRemainingCostUsd,
+        }
+      })
+      .sort((left, right) =>
+        right.metrics.estimatedCostUsd - left.metrics.estimatedCostUsd ||
+        right.metrics.requests - left.metrics.requests ||
+        left.credentialId - right.credentialId
+      )
+  }, [
+    local.data?.local.accounts,
+    localCredentialAccountInfo.data?.items,
+    localCredentialRuntime.data?.items,
+    localCredentials.data?.credentials,
+  ])
+
+  const setOverviewTab = (tab: OverviewTab) => {
+    const next = new URLSearchParams(searchParams)
+    if (tab === 'summary') next.delete('tab')
+    else next.set('tab', tab)
+    setSearchParams(next)
   }
 
-  // 错误态
-  if (windowsQuery.error) {
-    return (
-      <PageContainer>
-        <PageHeader title="总览" subtitle="实时健康、关键指标与异常" />
-        <ErrorState title="总览加载失败" message={extractErrorMessage(windowsQuery.error)} />
-      </PageContainer>
-    )
+  const applyPreset = (key: PresetRange) => {
+    const next = new URLSearchParams(searchParams)
+    next.delete('from')
+    next.delete('to')
+    next.delete('granularity')
+    next.delete('backRange')
+    next.delete('backFrom')
+    next.delete('backTo')
+    next.set('range', key)
+    setSearchParams(next)
+    setCustomError('')
   }
 
-  // 空态
-  if (!data || !selectedWindow) {
-    return (
-      <PageContainer>
-        <PageHeader title="总览" subtitle="实时健康、关键指标与异常" />
-        <EmptyState title="暂无总览数据" description="当前还没有可聚合的请求记录。" />
-      </PageContainer>
-    )
+  const applyCustom = () => {
+    const from = localDateTimeToIso(customFrom)
+    const to = localDateTimeToIso(customTo)
+    if (!from || !to || new Date(from) >= new Date(to)) {
+      setCustomError('请输入有效的起止时间，且起点必须早于终点。')
+      return
+    }
+    const next = new URLSearchParams(searchParams)
+    next.delete('range')
+    next.delete('backRange')
+    next.delete('backFrom')
+    next.delete('backTo')
+    next.set('from', from)
+    next.set('to', to)
+    next.set('granularity', 'day')
+    setSearchParams(next)
+    setCustomError('')
   }
 
-  const summary = selectedWindow.summary
-  const top = topQuery.data?.top ?? EMPTY_TOP
-  const series = seriesQuery.data?.series ?? { hourly24h: [], daily7d: [] }
-  const statusBreakdown = breakdownQuery.data?.statusBreakdown ?? summary.statusBreakdown ?? []
-  const usageSourceBreakdown = breakdownQuery.data?.usageSourceBreakdown ?? summary.usageSourceBreakdown ?? []
-  const externalPoolBillingByPool =
-    externalPoolBillingQuery.data?.externalPoolBillingByPool ??
-    summary.externalPoolBillingByPool ??
-    []
+  const drillDown = (point: UsageOverviewSeriesPoint) => {
+    const current = new URLSearchParams(searchParams)
+    const start = new Date(point.bucketStart)
+    const end = new Date(start)
+    if (summary.data?.range.granularity === 'day') end.setUTCDate(end.getUTCDate() + 1)
+    else end.setUTCHours(end.getUTCHours() + 1)
+    const next = new URLSearchParams(searchParams)
+    next.delete('tab')
+    next.set('from', start.toISOString())
+    next.set('to', end.toISOString())
+    next.set('granularity', 'hour')
+    if (current.get('range')) next.set('backRange', current.get('range') as string)
+    if (current.get('from')) next.set('backFrom', current.get('from') as string)
+    if (current.get('to')) next.set('backTo', current.get('to') as string)
+    setSearchParams(next)
+  }
 
-  const pricedRatio = summary.totalRequests > 0 ? summary.pricedRequests / summary.totalRequests : 0
+  const returnFromDrillDown = () => {
+    const next = new URLSearchParams(searchParams)
+    next.delete('backRange')
+    next.delete('backFrom')
+    next.delete('backTo')
+    const backRange = searchParams.get('backRange')
+    const backFrom = searchParams.get('backFrom')
+    const backTo = searchParams.get('backTo')
+    if (backRange) next.set('range', backRange)
+    else if (backFrom && backTo) {
+      next.set('from', backFrom)
+      next.set('to', backTo)
+      next.set('granularity', 'day')
+    } else next.set('range', 'today')
+    setSearchParams(next)
+  }
+
+  const summaryData = summary.data
+  const isDrilled = Boolean(searchParams.get('backRange') || searchParams.get('backFrom'))
   const partialErrors = [
-    usageSummaryQuery.error ? `实时：${extractErrorMessage(usageSummaryQuery.error)}` : '',
-    writerStatsQuery.error ? `统计健康：${extractErrorMessage(writerStatsQuery.error)}` : '',
-    seriesQuery.error ? `趋势：${extractErrorMessage(seriesQuery.error)}` : '',
-    topQuery.error ? `排行：${extractErrorMessage(topQuery.error)}` : '',
-    accountsQuery.error ? `账号统计：${extractErrorMessage(accountsQuery.error)}` : '',
-    breakdownQuery.error ? `分布：${extractErrorMessage(breakdownQuery.error)}` : '',
-    externalPoolBillingQuery.error ? `外部池计费：${extractErrorMessage(externalPoolBillingQuery.error)}` : '',
+    series.error ? `趋势：${extractErrorMessage(series.error)}` : '',
+    local.error ? `本地账号池：${extractErrorMessage(local.error)}` : '',
+    localCredentials.error ? `本地账号列表：${extractErrorMessage(localCredentials.error)}` : '',
+    localCredentialRuntime.error ? `本地账号状态：${extractErrorMessage(localCredentialRuntime.error)}` : '',
+    localCredentialAccountInfo.error ? `本地账号余额：${extractErrorMessage(localCredentialAccountInfo.error)}` : '',
+    external.error ? `外部池：${extractErrorMessage(external.error)}` : '',
+    externalPools.error ? `外部池配置：${extractErrorMessage(externalPools.error)}` : '',
+    rankings.error ? `排行：${extractErrorMessage(rankings.error)}` : '',
   ].filter(Boolean)
 
   const headerActions = (
-    <div className="flex flex-wrap items-center gap-2">
-      {/* 时间窗口 */}
-      <div className="inline-flex overflow-hidden rounded-lg bg-muted/40 p-0.5">
-        {data.windows.map((w) => (
+    <div className="flex w-full flex-wrap items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {PRESETS.map((item) => (
           <Button
-            key={w.key}
-            variant={w.key === selectedWindow.key ? 'default' : 'ghost'}
+            key={item.key}
             size="sm"
-            className="rounded-none"
-            onClick={() => {
-              setSelectedWindowKey(w.key)
-              setAccountsPage(1)
-            }}
+            variant={rangeKey === item.key || (!rangeKey && !fromParam && item.key === 'today') ? 'default' : 'outline'}
+            onClick={() => applyPreset(item.key)}
           >
-            {w.label}
+            {item.label}
           </Button>
         ))}
+        {isDrilled && (
+          <Button size="sm" variant="secondary" onClick={returnFromDrillDown}>
+            <ArrowLeft className="size-3.5" />返回整体范围
+          </Button>
+        )}
       </div>
-      {/* 自动刷新 */}
-      <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer select-none">
-        <Switch checked={autoRefresh.enabled} onCheckedChange={autoRefresh.setEnabled} />
-        自动刷新
-      </label>
-      <div className="flex items-center gap-1">
-        <Input
-          type="number"
-          min={5}
-          max={3600}
-          className="h-8 w-16 text-xs"
-          value={autoRefresh.intervalSeconds}
-          disabled={!autoRefresh.enabled}
-          onChange={(e) => autoRefresh.setIntervalSeconds(Number(e.target.value))}
-          onBlur={(e) => {
-            const v = Math.max(5, Math.min(3600, Number(e.target.value) || 30))
-            autoRefresh.setIntervalSeconds(v)
-          }}
-        />
-        <span className="text-xs text-muted-foreground">秒</span>
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span>自定义</span>
+          <Input type="datetime-local" value={customFrom} onChange={(event) => setCustomFrom(event.target.value)} className="h-8 w-[172px] text-xs" />
+          <span>至</span>
+          <Input type="datetime-local" value={customTo} onChange={(event) => setCustomTo(event.target.value)} className="h-8 w-[172px] text-xs" />
+          <Button size="sm" variant="outline" onClick={applyCustom}>应用</Button>
+        </label>
+        <Button size="icon-sm" variant="ghost" title="刷新总览" onClick={() => {
+          void summary.refetch()
+          void series.refetch()
+          void local.refetch()
+          void localCredentials.refetch()
+          if (localCredentialIds.length > 0) void localCredentialRuntime.refetch()
+          if (localCredentialIds.length > 0) void localCredentialAccountInfo.refetch()
+          void external.refetch()
+          void externalPools.refetch()
+          void rankings.refetch()
+        }}>
+          <RefreshCw className={cn('size-4', summary.isFetching && 'animate-spin')} />
+        </Button>
       </div>
-      <ScopeNote label="时间窗口" text="只控制窗口统计，不控制实时/累计/统计健康" />
-      {(windowsQuery.isFetching ||
-        seriesQuery.isFetching ||
-        topQuery.isFetching ||
-        breakdownQuery.isFetching ||
-        externalPoolBillingQuery.isFetching ||
-        accountsQuery.isFetching) && (
-        <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />
-      )}
     </div>
   )
 
+  if (summary.isLoading && !summaryData) {
+    return (
+      <PageContainer>
+        <PageHeader title="总览" actions={headerActions} />
+        <LoadingState text="加载整体概览..." />
+      </PageContainer>
+    )
+  }
+
+  if (summary.error || !summaryData) {
+    return (
+      <PageContainer>
+        <PageHeader title="总览" actions={headerActions} />
+        <ErrorState title="整体概览加载失败" message={extractErrorMessage(summary.error)} action={<Button size="sm" onClick={() => void summary.refetch()}>重试</Button>} />
+      </PageContainer>
+    )
+  }
+
   return (
     <PageContainer>
-      <PageHeader title="总览" subtitle="实时健康、流量、费用、账号质量与异常诊断" actions={headerActions} />
+      <PageHeader title="总览" actions={headerActions} />
 
-      {partialErrors.length > 0 && (
-        <Callout tone="warning">
-          部分 dashboard 数据加载失败：{partialErrors.join('；')}
-        </Callout>
-      )}
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <span className="font-semibold text-foreground">{rangeLabel(summaryData.range)}</span>
+        <span>·</span>
+        <span>数据截至 {formatDate(summaryData.range.dataThrough)}</span>
+        <span>·</span>
+        <span>范围已按整点对齐：{formatDate(summaryData.range.from)} - {formatDate(summaryData.range.to)}</span>
+        {summaryData.range.granularity === 'day' && <Badge tone="neutral">按天聚合</Badge>}
+        {refreshInterval && <Badge tone="success">每 {autoRefresh.intervalSeconds} 秒刷新</Badge>}
+      </div>
 
-      <Tabs value={activeSection} onValueChange={(value) => setActiveSection(value as DashboardSection)}>
-        <TabsList className="flex h-auto flex-wrap justify-start">
-          <TabsTrigger value="operations">实时</TabsTrigger>
-          <TabsTrigger value="traffic">流量</TabsTrigger>
-          <TabsTrigger value="billing">费用</TabsTrigger>
-          <TabsTrigger value="accounts">账号质量</TabsTrigger>
-          <TabsTrigger value="errors">异常诊断</TabsTrigger>
+      {customError && <Callout tone="warning">{customError}</Callout>}
+      {partialErrors.length > 0 && <Callout tone="warning">部分分区加载失败：{partialErrors.join('；')}</Callout>}
+
+      <Tabs value={activeTab} onValueChange={(value) => setOverviewTab(value as OverviewTab)}>
+        <TabsList className="w-full justify-start overflow-x-auto">
+          <TabsTrigger value="summary">汇总</TabsTrigger>
+          <TabsTrigger value="local">本地账号</TabsTrigger>
+          <TabsTrigger value="external">外部池</TabsTrigger>
+          <TabsTrigger value="rankings">排行</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="operations" className="space-y-3">
-          <div className="grid gap-3 xl:grid-cols-2">
-            <RealtimeUsagePanel summary={usageSummaryQuery.data} error={usageSummaryQuery.error} />
-            <CredentialPoolPanel />
+        <TabsContent value="summary">
+          <div className="space-y-3">
+            <OverallSummarySection metrics={summaryData.totals.all} />
+            <TrendPanel
+              points={series.data?.series ?? []}
+              metric={trendMetric}
+              onMetricChange={setTrendMetric}
+              onDrillDown={drillDown}
+            />
           </div>
-          <WindowHealthPanel summary={summary} />
         </TabsContent>
 
-        <TabsContent value="traffic" className="space-y-3">
-          {seriesQuery.isLoading ? (
-            <SectionCard title="趋势" description="按小时/天聚合">
-              <LoadingState text="加载趋势..." className="py-8" />
-            </SectionCard>
+        <TabsContent value="local">
+          {local.isLoading && !local.data ? (
+            <LoadingState text="加载本地账号池..." />
           ) : (
-            <TrendSection hourly={series.hourly24h ?? []} daily={series.daily7d ?? []} />
-          )}
-
-          {topQuery.isLoading ? (
-            <SectionCard title="维度排行" description="按当前窗口聚合">
-              <LoadingState text="加载排行..." className="py-8" />
-            </SectionCard>
-          ) : (
-            <DimensionRankPanel
-              top={top}
-              activeKey={rankDimension}
-              onActiveKeyChange={setRankDimension}
-              totalErrors={summary.errorRequests}
+            <LocalPoolSection
+              metrics={summaryData.totals.local}
+              accountRows={localAccountRows}
+              accountsLoading={localCredentials.isLoading || (localCredentialIds.length > 0 && localCredentialRuntime.isLoading)}
+              range={summaryData.range}
+              navigate={navigate}
             />
           )}
         </TabsContent>
 
-        <TabsContent value="billing" className="space-y-3">
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
-            <StatCard title="窗口估算成本" value={formatUsdFixed2(summary.totalEstimatedCostUsd)} desc={`最终 usage × 价格表 · 计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign />} tone="primary" />
-            <StatCard title="窗口原始计费" value={formatUsdFixed2(summary.totalOriginalCostUsd)} desc="优先上游原始 usage；缺失时回退估算" icon={<DollarSign />} tone="warning" />
-            <StatCard title="窗口 Kiro 积分消耗" value={formatCompact(summary.totalKiroMeteringUsage ?? 0)} valueTitle={formatNumber(summary.totalKiroMeteringUsage ?? 0)} desc="请求级 meteringEvent，不是余额快照" icon={<DollarSign />} tone="info" />
-            <StatCard title="未计价请求" value={formatCompact(summary.unpricedRequests)} valueTitle={formatNumber(summary.unpricedRequests)} desc={`已计价 ${formatCompact(summary.pricedRequests)}`} icon={<DollarSign />} tone={summary.unpricedRequests > 0 ? 'warning' : 'success'} />
-            <StatCard title="外部池可计费" value={formatUsdFixed2(summary.externalPoolBilling?.billableCostUsd ?? 0)} desc={`原始成本 ${formatUsdFixed2(summary.externalPoolBilling?.rawCostUsd ?? 0)}`} icon={<DollarSign />} tone="info" />
-          </div>
-          {externalPoolBillingQuery.isLoading ? (
-            <SectionCard title="外部池计费" description="按当前窗口拆分">
-              <LoadingState text="加载外部池计费..." className="py-8" />
-            </SectionCard>
+        <TabsContent value="external">
+          {external.isLoading && !external.data ? (
+            <LoadingState text="加载外部池..." />
           ) : (
-            <ExternalPoolBillingPanel
-              billing={summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING}
-              billingByPool={externalPoolBillingByPool}
+            <ExternalPoolSection
+              external={external.data?.external ?? {
+                rawCostUsd: 0,
+                shapedCostUsd: 0,
+                upliftedCostUsd: 0,
+                reportedCostUsd: 0,
+                billableCostUsd: 0,
+                profitUsd: 0,
+                costFloorDeltaUsd: 0,
+                costFloorAppliedRequests: 0,
+                pools: [],
+              }}
+              pools={externalPools.data?.pools ?? []}
+              range={summaryData.range}
+              navigate={navigate}
             />
           )}
         </TabsContent>
 
-        <TabsContent value="accounts" className="space-y-3">
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard title="已配置本地账号" value={formatCompact(accountsQuery.data?.configuredLocalAccounts ?? 0)} desc="纳入统计的全部本地账号" icon={<Users />} tone="primary" />
-            <StatCard title="窗口活跃账号" value={formatCompact(accountsQuery.data?.windowActiveLocalAccounts ?? 0)} desc="当前窗口有请求" icon={<Activity />} tone="info" />
-            <StatCard title="窗口空闲账号" value={formatCompact(accountsQuery.data?.windowIdleLocalAccounts ?? 0)} desc="已配置但当前窗口无请求" icon={<Clock3 />} tone="default" />
-            <StatCard title="当前筛选命中" value={formatCompact(accountsQuery.data?.filteredTotal ?? 0)} desc="表格可分页查看全部" icon={<Users />} tone="info" />
-          </div>
-          <AccountQualityPanel
-            data={accountsQuery.data}
-            loading={accountsQuery.isLoading}
-            onPageChange={setAccountsPage}
-            status={accountStatus}
-            onStatusChange={(nextStatus) => {
-              setAccountStatus(nextStatus)
-              setAccountsPage(1)
-            }}
-          />
-        </TabsContent>
-
-        <TabsContent value="errors" className="space-y-3">
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需查看 Top 错误' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert /> : <CheckCircle2 />} tone={summary.errorRate >= 0.2 ? 'error' : summary.errorRate > 0 ? 'warning' : 'success'} />
-            <StatCard title="错误请求" value={formatCompact(summary.errorRequests)} valueTitle={formatNumber(summary.errorRequests)} desc={`成功 ${formatCompact(summary.successRequests)}`} icon={<ShieldAlert />} tone={summary.errorRequests > 0 ? 'warning' : 'success'} />
-            <StatCard title="Sticky 回退" value={formatCompact(summary.fallbackFromStickyRequests)} valueTitle={formatNumber(summary.fallbackFromStickyRequests)} desc={`绑定 ${formatCompact(summary.stickyBoundRequests)}`} icon={<Zap />} tone={summary.fallbackFromStickyRequests > 0 ? 'warning' : 'success'} />
-          </div>
-          <div className="grid gap-3 xl:grid-cols-[0.9fr_1.1fr]">
-            <ErrorSummaryPanel totalErrors={summary.errorRequests} errorRate={summary.errorRate} items={top.errors ?? []} />
-            <BreakdownTabPanel statusItems={statusBreakdown} sourceItems={usageSourceBreakdown} />
-          </div>
-          <UsageWriterHealthPanel
-            stats={writerStatsQuery.data}
-            error={writerStatsQuery.error}
-          />
+        <TabsContent value="rankings">
+          {rankings.isLoading && !rankings.data ? (
+            <LoadingState text="加载排行..." />
+          ) : (
+            <RankingsSection
+              rankings={{
+                totalRequests: rankings.data?.totalRequests ?? summaryData.totals.all.requests,
+                totalLocalRequests: rankings.data?.totalLocalRequests ?? summaryData.totals.local.requests,
+                totalErrors: rankings.data?.totalErrors ?? summaryData.totals.all.errorRequests,
+                topModels: rankings.data?.topModels ?? [],
+                topAccounts: rankings.data?.topAccounts ?? [],
+                topKeys: rankings.data?.topKeys ?? [],
+                topPaths: rankings.data?.topPaths ?? [],
+                topErrors: rankings.data?.topErrors ?? [],
+              }}
+            />
+          )}
         </TabsContent>
       </Tabs>
 
-      {/* 9. 底部状态栏 */}
-      <div className="rounded-xl bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
-        <div className="flex flex-wrap items-center gap-2">
-          <span>总览 · {selectedWindow.label}</span>
-          <span className="text-muted-foreground/40">·</span>
-          <span>{formatDate(selectedWindow.from)} — {formatDate(selectedWindow.to)}</span>
-          <span className="text-muted-foreground/40">·</span>
-          <span>时区 {OVERVIEW_TIMEZONE}</span>
-          <span className="text-muted-foreground/40">·</span>
-          <span>
-            {autoRefresh.enabled
-              ? `每 ${autoRefresh.intervalSeconds} 秒自动刷新`
-              : '自动刷新已关闭'}
-          </span>
-          {data.generatedAt && (
-            <>
-              <span className="text-muted-foreground/40">·</span>
-              <span>生成于 {formatDate(data.generatedAt)}</span>
-            </>
-          )}
-        </div>
-      </div>
     </PageContainer>
   )
 }

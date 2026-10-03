@@ -41,6 +41,7 @@ use model::config::Config;
 use serde_json::{Value, json};
 use storage::postgres::{PostgresStore, PostgresUsageLifecycleGuard, PostgresUsageStore};
 use storage::redis_cache::RedisStore;
+use storage::usage_demo_seed::seed_usage_demo;
 
 const STARTUP_DEPENDENCY_MAX_WAIT: StdDuration = StdDuration::from_secs(60);
 const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: StdDuration = StdDuration::from_secs(30);
@@ -1495,6 +1496,19 @@ async fn handle_maintenance_command(
         MaintenanceCommand::UsageRollupCompression => {
             store.compress_usage_rollups_to_hour_buckets().await?;
             println!("usage rollup compression completed");
+        }
+        MaintenanceCommand::UsageDemoSeed { days, seed, reset } => {
+            let report = seed_usage_demo(&store, days, seed, reset).await?;
+            println!(
+                "usage demo seed completed: database={} days={} records={} local={} external={} accounts={} pools={}",
+                report.database,
+                report.days,
+                report.records,
+                report.local_records,
+                report.external_records,
+                report.accounts,
+                report.pools
+            );
         }
     }
     maintenance_guard.release().await?;

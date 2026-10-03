@@ -37,5 +37,6 @@ Greenfield work must preserve the compatibility and dispatch semantics above unl
 4. [Config and capability information architecture](topics/config-capability-information-architecture.md)
 5. [Regression plan](topics/regression-plan.md)
 6. [Dashboard 运营统计设计](topics/dashboard-statistics-design.md)
-7. [Roadmap](roadmap.md)
-8. [Historical implementation snapshot](history/implementation-snapshot-2026-07-07.md)
+7. [总览页重构：按 Tab 拆分汇总 / 本地账号 / 外部池 / 排行（Implemented，2026-10-02）](topics/overview-redesign-local-external-split-20261002.md)：取代第 6 项中总览、流量、费用 tab 的信息架构
+8. [Roadmap](roadmap.md)
+9. [Historical implementation snapshot](history/implementation-snapshot-2026-07-07.md)

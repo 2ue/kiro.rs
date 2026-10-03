@@ -40,6 +40,7 @@ import {
 } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatNumber } from '@/lib/format'
+import { credentialSubscriptionLabel } from '@/features/credentials/credential-utils'
 import {
   useDeleteManualModel,
   useModelCapabilities,
@@ -395,7 +396,7 @@ function SyncCapabilitiesDialog({ open, onClose }: { open: boolean; onClose: () 
                     />
                     <span className="w-12 shrink-0 font-mono text-xs text-muted-foreground">#{credential.id}</span>
                     <span className="min-w-0 flex-1 truncate">{account}</span>
-                    <Badge tone="neutral">{credential.subscriptionTitle || '订阅未知'}</Badge>
+                    <Badge tone="neutral">{credentialSubscriptionLabel(credential.subscriptionTitle)}</Badge>
                     {credential.disabled && <Badge tone="error">已禁用</Badge>}
                   </label>
                 )

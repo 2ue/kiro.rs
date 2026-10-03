@@ -54,6 +54,7 @@ import type {
 } from '@/types/api'
 import { SecretInput } from './credential-inputs'
 import { CredentialTagsField } from '@/components/credential-tags-field'
+import { credentialSubscriptionLabel } from './credential-utils'
 
 // ============================================================================
 // ImportProgressList — 共用进度列表（BatchImportModal + KamImportModal 共用）
@@ -316,7 +317,7 @@ async function verifyImportedCredential(
 ): Promise<{ model: string; response: string }> {
   if (mode === 'subscription_only') {
     const info = await getCredentialBalance(credentialId)
-    return { model: '订阅查询', response: `订阅: ${info.subscriptionTitle || '未知'}，用量 ${info.currentUsage}/${info.usageLimit}` }
+    return { model: '订阅查询', response: `订阅: ${credentialSubscriptionLabel(info.subscriptionTitle)}，用量 ${info.currentUsage}/${info.usageLimit}` }
   }
   const tested = await testCredential(credentialId, { model, prompt: DEFAULT_TEST_PROMPT })
   if (refreshInfoAfterModelTest) {
@@ -621,7 +622,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
         if (data.warning) toast.warning(data.warning)
         try {
           const info = await getCredentialBalance(data.credentialId)
-          toast.success(`${data.message}，订阅: ${info.subscriptionTitle || '未知'}`)
+          toast.success(`${data.message}，订阅: ${credentialSubscriptionLabel(info.subscriptionTitle)}`)
         } catch (err) {
           toast.warning(`${data.message}，但查询订阅失败: ${extractErrorMessage(err)}`)
         }

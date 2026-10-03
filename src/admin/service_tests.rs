@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn cleanup_request() -> UsageCleanupRequest {
     UsageCleanupRequest {
         mode: UsageCleanupMode::SoftDelete,
+        include_summary: false,
         older_than_days: None,
         cutoff_before: None,
         batch_size: None,
         max_batches: None,
+        max_rows: None,
         pause_ms_between_batches: None,
     }
 }
@@ -599,6 +601,13 @@ fn credit_snapshot_uses_overage_bonus_for_all_paid_tiers() {
     assert_eq!(power_with_overage.remaining, 19_874.75);
     assert_eq!(power_with_overage.base, 10_000.0);
     assert_eq!(power_with_overage.bonus, 10_000.0);
+
+    let students_without_overage =
+        credit_snapshot_for_subscription(Some("KIRO STUDENT"), 125.25, 0.0, 0.0);
+    assert_eq!(students_without_overage.limit, 1_000.0);
+    assert_eq!(students_without_overage.remaining, 874.75);
+    assert_eq!(students_without_overage.base, 1_000.0);
+    assert_eq!(students_without_overage.bonus, 0.0);
 }
 
 #[test]
@@ -613,6 +622,46 @@ fn subscription_key_and_rank_distinguish_pro_max_from_pro() {
     assert_eq!(subscription_rank(Some("Kiro Pro+")), 4);
     assert_eq!(subscription_key(Some("Kiro Power")), "power");
     assert_eq!(subscription_rank(Some("Kiro Power")), 6);
+    assert_eq!(subscription_key(Some("KIRO STUDENT")), "students");
+    assert_eq!(subscription_key(Some("Kiro Students")), "students");
+    assert_eq!(subscription_rank(Some("Kiro Students")), 2);
+    assert_eq!(subscription_key(Some("legacy trial")), "free");
+}
+
+#[test]
+fn subscription_filter_uses_canonical_official_tiers() {
+    let mut credential = credential_item(10, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None);
+    credential.subscription_title = Some("KIRO PRO+".to_string());
+
+    for expected in ["pro_plus", "Kiro Pro+", "pro-plus"] {
+        let query = CredentialListQuery {
+            subscription: Some(expected.to_string()),
+            ..Default::default()
+        };
+        assert!(credential_matches_query(&credential, &query), "{expected}");
+    }
+
+    let pro_query = CredentialListQuery {
+        subscription: Some("pro".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        !credential_matches_query(&credential, &pro_query),
+        "Kiro Pro+ must not match the narrower Kiro Pro filter"
+    );
+
+    credential.subscription_title = Some("KIRO STUDENT".to_string());
+    let students_query = CredentialListQuery {
+        subscription: Some("students".to_string()),
+        ..Default::default()
+    };
+    assert!(credential_matches_query(&credential, &students_query));
+
+    let student_alias_query = CredentialListQuery {
+        subscription: Some("student".to_string()),
+        ..Default::default()
+    };
+    assert!(credential_matches_query(&credential, &student_alias_query));
 }
 
 #[test]
@@ -899,11 +948,13 @@ fn usage_cleanup_request_uses_safe_manual_defaults() {
     let after = Utc::now();
 
     assert_eq!(plan.mode, UsageCleanupMode::SoftDelete);
+    assert!(!plan.include_summary);
     assert_eq!(plan.batch_size, USAGE_CLEANUP_DEFAULT_BATCH_SIZE);
     assert_eq!(plan.max_batches, USAGE_CLEANUP_DEFAULT_MAX_BATCHES);
-    assert_eq!(plan.pause_ms_between_batches, 100);
-    assert!(plan.cutoff >= before - ChronoDuration::days(3) - ChronoDuration::seconds(1));
-    assert!(plan.cutoff <= after - ChronoDuration::days(3) + ChronoDuration::seconds(1));
+    assert_eq!(plan.max_rows, None);
+    assert_eq!(plan.pause_ms_between_batches, 10);
+    assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
+    assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
 }
 
 #[test]
@@ -915,6 +966,7 @@ fn usage_cleanup_request_cutoff_before_overrides_days() {
     request.cutoff_before = Some(cutoff.to_rfc3339());
     request.batch_size = Some(USAGE_CLEANUP_MAX_BATCH_SIZE);
     request.max_batches = Some(10_000);
+    request.max_rows = Some(123);
     request.pause_ms_between_batches = Some(0);
 
     let plan = normalize_usage_cleanup_request(request).expect("valid request");
@@ -923,6 +975,7 @@ fn usage_cleanup_request_cutoff_before_overrides_days() {
     assert_eq!(plan.cutoff, cutoff);
     assert_eq!(plan.batch_size, USAGE_CLEANUP_MAX_BATCH_SIZE);
     assert_eq!(plan.max_batches, 10_000);
+    assert_eq!(plan.max_rows, Some(123));
     assert_eq!(plan.pause_ms_between_batches, 0);
 
     let mut above_legacy_limit = cleanup_request();
@@ -967,6 +1020,32 @@ fn usage_cleanup_request_rejects_unsafe_bounds() {
         normalize_usage_cleanup_request(future_cutoff),
         Err(AdminServiceError::InvalidCredential(_))
     ));
+
+    let mut too_many_rows = cleanup_request();
+    too_many_rows.max_rows = Some(USAGE_CLEANUP_MAX_ROWS + 1);
+    assert!(matches!(
+        normalize_usage_cleanup_request(too_many_rows),
+        Err(AdminServiceError::InvalidCredential(_))
+    ));
+}
+
+#[test]
+fn usage_cleanup_include_summary_is_simple_full_history_mode() {
+    let before = Utc::now();
+    let mut request = cleanup_request();
+    request.mode = UsageCleanupMode::HardDelete;
+    request.include_summary = true;
+    request.older_than_days = Some(30);
+    request.max_rows = Some(25);
+
+    let plan = normalize_usage_cleanup_request(request).expect("summary cleanup is valid");
+    let after = Utc::now();
+
+    assert!(plan.include_summary);
+    assert_eq!(plan.mode, UsageCleanupMode::SoftDelete);
+    assert_eq!(plan.max_rows, None);
+    assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
+    assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
 }
 
 #[test]
@@ -1020,9 +1099,11 @@ async fn usage_cleanup_lease_renewal_recovers_from_transient_row_lock_for_three_
             .create_cleanup_job(NewUsageCleanupJob {
                 job_id: &job_id,
                 mode: "soft_delete",
+                include_summary: false,
                 cutoff_at: Utc::now() - ChronoDuration::days(7),
                 batch_size: USAGE_CLEANUP_DEFAULT_BATCH_SIZE,
                 max_batches: 100,
+                max_rows: None,
                 pause_ms_between_batches: 10,
             })
             .await

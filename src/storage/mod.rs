@@ -1,5 +1,6 @@
 pub mod postgres;
 pub mod redis_cache;
+pub mod usage_demo_seed;
 
 #[cfg(test)]
 pub(crate) fn integration_test_url(variable: &'static str) -> Option<String> {
