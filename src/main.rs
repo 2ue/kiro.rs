@@ -112,8 +112,23 @@ fn model_capability_retry_delay(consecutive_failures: u32) -> StdDuration {
     StdDuration::from_secs(seconds)
 }
 
-#[tokio::main]
-async fn main() {
+/// tokio 工作线程与 blocking 线程栈大小。
+///
+/// 消息处理链的 async 状态机在 poll 时占用大量栈：实测 debug 构建单个请求约需 2.1 MiB，
+/// 超过 tokio 默认的 2 MiB 直接栈溢出；release 构建约 0.5~1 MiB，余量也不足 2 倍。
+/// 栈空间按需提交物理页，调大只增加虚拟地址预留，不增加常驻内存。
+const RUNTIME_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(RUNTIME_THREAD_STACK_SIZE)
+        .build()
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     // 解析命令行参数
     let args = Args::parse();
 
