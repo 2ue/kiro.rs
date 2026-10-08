@@ -88,24 +88,37 @@
 - 没有更早（48 小时以前）"80%~90%"时期的数据，无法确认当时的流量构成是否相同。
 - 证据文件：`tmp/prod-cache-20261007/`（`minea_24h.csv`、`local_test_records.csv`、`cache_config_snapshot.json`、分析脚本）。已去掉密钥和凭据。
 
-## 实施结果（2026-10-07，未发布）
+## 实施结果（v0.0.186）
 
-| 改动 | 位置 |
+新增路由级配置 `hitShaping`（UI 名称：命中率与小值整形），对 `current_high_cache`、`kiro_rs_tool`、`stable_segment_cache` 三种策略生效，`no_cache` 不生效。
+
+默认关闭。关闭时下游 usage 和 creation control 都保持原有逻辑，有逐轮对比的回归测试保证（`hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round`）。现网升级后，在需要的路径上手动开启。
+
+开启后的规则，优先级从高到低：
+
+1. 写入频次：是否写入只由 creation control 决定。被拦下的请求写入为 0，计费差额记进 input，这时 input 可以超过 reportedUsage.input 的上限。creation control 改用稳定窗口：抖动只作用于窗口总额度，部分放行低于 1024 时整笔延后。
+2. 不亏损：计费不低于原始用量计费 × `minCostRatio`（默认 1）。
+3. 读写上限：读取不超过原始输入 × `maxReadMultiplier`；放行写入时，写入不低于原始输入 × `minCreationRatio`。两项默认都是 0，即不限制。
+4. 命中率：按 `targetHitRatio` + `ratioJitter` 分配读取，会话首请求不受约束。
+5. 小值：非零读写低于 `minCacheReadTokens` / `minCacheCreationTokens` 时抬到最小值。
+
+| 配置项 | 默认值 |
 | --- | --- |
-| 修复根因 A：放大后按未放大的读写占比拆分 | `src/anthropic/cache.rs` `to_target_ratio_usage` |
-| 修复根因 B：抖动只作用于窗口总额度；部分放行低于 1024 时整笔延后 | `src/anthropic/prompt_cache_creation_control.rs` |
-| 新增 `hitShaping`（目标命中率、浮动、读写最小值），挂在缓存路由策略上，三种缓存策略都生效，`no_cache` 关闭 | `src/model/config.rs` `CacheHitShapingPolicy`；出口在 `handlers.rs` 的 canonical usage 与 `message_start` 预览 |
-| UI 配置项 | `ui/` 与 `admin-ui/` 的策略模板和路径卡片 |
+| enabled | false |
+| targetHitRatio / ratioJitter | 0.9 / 0.04 |
+| minCacheReadTokens / minCacheCreationTokens | 1024 / 1024 |
+| minCostRatio | 1 |
+| maxReadMultiplier / minCreationRatio | 0 / 0 |
 
-默认值：启用，目标 0.9，浮动 0.04，读写最小值都是 1024。现网配置不需要改动，发布后 minea 会自动继承这组默认值。
+本地真实账号验证（现网 runtime config 原样导入，minea 开启 hitShaping，读取上限 6 倍，最小写入 1 倍）：
 
-本地真实账号验证（现网 runtime config 原样导入，未加 hitShaping）：
+| 模型 | 请求数 | 命中率 | 读取最大 | 写入最低 | 1~1023 读写 | 计费 / 原始 |
+| --- | --- | --- | --- | --- | --- | --- |
+| sonnet-4.5 | 22 | 0.819 | 6.00 倍 | 1.00 倍 | 0 | 2.11 倍（单次最低 1.85） |
+| haiku-4.5 | 21 | 0.829 | 6.00 倍 | 1.00 倍 | 0 | 2.02 倍（单次最低 1.28） |
 
-| 模型 | 请求数 | 命中率 | 有读时的最低单次命中率 | 1~1023 的读写 |
-| --- | --- | --- | --- | --- |
-| sonnet-4.5 | 23 | 0.931 | 0.924 | 0 |
-| haiku-4.5 | 20 | 0.923 | 0.916 | 0 |
+命中率上限约为 读取上限 ÷（读取上限 + 最小写入 + input），想要 0.9 需要相应放宽读取上限或降低最小写入。
 
-把 minea 改成目标 0.8、最小值 2048 后，又跑了 15 次请求：命中率 0.909，单次最低 0.853，1~2047 的读写 0 条。
+这轮验证发生在"写入频次只由 creation control 决定"之前，当时被拦下的请求仍会被计费下限强制写入。改为由 creation control 决定后，只做了单元测试和 handler 级测试，上线开启时需要再观察写入频次。
 
-未覆盖：根因 C（追踪器状态放内存）没有改。不过只要请求里带有历史消息，重启后的第一轮也会按目标命中率整形，影响只剩会话首请求。外部池路径也没有改。
+未覆盖：根因 C（追踪器状态只在内存）没有改；外部池路径没有改。
