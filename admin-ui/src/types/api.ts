@@ -221,6 +221,11 @@ export interface BulkCredentialActionResponse {
   errors: BulkCredentialActionError[]
 }
 
+export interface BatchDeleteCredentialsRequest {
+  ids: number[]
+  disableFirst?: boolean
+}
+
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number

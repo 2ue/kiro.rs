@@ -4194,6 +4194,10 @@ impl RedisStore {
             local ttl_secs = tonumber(ARGV[7])
             local request_weight = tonumber(ARGV[8])
 
+            if redis.call('EXISTS', KEYS[12]) == 1 then
+                return {0, -2}
+            end
+
             if redis.call('SISMEMBER', KEYS[11], lease_id) == 1 then
                 return {0, -1}
             end
@@ -4258,6 +4262,10 @@ impl RedisStore {
                 return {0, global_count}
             end
 
+            if redis.call('EXISTS', KEYS[12]) == 1 then
+                return {0, -2}
+            end
+
             if redis.call('SISMEMBER', KEYS[11], lease_id) == 1 then
                 return {0, -1}
             end
@@ -4291,7 +4299,7 @@ impl RedisStore {
         let mut manager = self.scheduler_capacity_manager();
         let result: Vec<i64> = redis::cmd("EVAL")
             .arg(script)
-            .arg(11)
+            .arg(12)
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&keys.kind))
@@ -4303,6 +4311,7 @@ impl RedisStore {
             .arg(self.key(&global_keys.weight))
             .arg(self.key(&global_keys.count))
             .arg(self.key(&keys.released))
+            .arg(self.key(scheduler_dispatch_block_key(credential_id)))
             .arg(now)
             .arg(max_age_ms)
             .arg(max_concurrent_requests)
@@ -6452,6 +6461,29 @@ impl RedisStore {
             .await?;
         decode_token_refresh_bucket_decision(&values, burst)
     }
+
+    /// Prevent stale instances from creating a new lease after a credential is disabled or while
+    /// it is being deleted. The block is separate from lease state, so existing requests can
+    /// finish and release their own leases normally.
+    pub async fn set_scheduler_dispatch_block(
+        &self,
+        credential_id: u64,
+        ttl_secs: usize,
+    ) -> anyhow::Result<()> {
+        let mut manager = self.scheduler_capacity_manager();
+        let _: () = manager
+            .set_ex(
+                self.key(scheduler_dispatch_block_key(credential_id)),
+                "1",
+                ttl_secs.max(1) as u64,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear_scheduler_dispatch_block(&self, credential_id: u64) -> anyhow::Result<()> {
+        self.del(scheduler_dispatch_block_key(credential_id)).await
+    }
 }
 
 fn now_ms() -> i64 {
@@ -7351,6 +7383,10 @@ fn scheduler_refresh_lock_key(credential_id: u64) -> String {
 
 fn scheduler_refresh_outcome_key(credential_id: u64) -> String {
     format!("scheduler:refresh_outcome:v1:{}", credential_id)
+}
+
+fn scheduler_dispatch_block_key(credential_id: u64) -> String {
+    format!("scheduler:dispatch_block:{}", credential_id)
 }
 
 fn token_refresh_bucket_key() -> &'static str {

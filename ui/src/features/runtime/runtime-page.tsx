@@ -454,12 +454,8 @@ function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
   return editable
 }
 
-function runtimeConfigForSave(config: RuntimeConfig): RuntimeConfig {
-  return stripReadOnlyRuntimeFields(normalizeConfig(config))
-}
-
-function runtimeConfigFingerprint(config: RuntimeConfig): string {
-  return JSON.stringify(runtimeConfigForSave(config))
+function runtimeConfigDraftFingerprint(config: RuntimeConfig): string {
+  return JSON.stringify(stripReadOnlyRuntimeFields(config))
 }
 
 // ─── RuntimePage ──────────────────────────────────────────────────────────────
@@ -634,10 +630,10 @@ export function RuntimePage() {
       },
     }))
 
-  const hasPendingChanges = savedDraft !== null && runtimeConfigFingerprint(draft) !== runtimeConfigFingerprint(savedDraft)
+  const hasDraftChanges = savedDraft !== null && runtimeConfigDraftFingerprint(draft) !== runtimeConfigDraftFingerprint(savedDraft)
 
   const save = () => {
-    if (!hasPendingChanges) return
+    if (!hasDraftChanges) return
     const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
     if (invalidDefinedCacheRoute)
       return toast.error('缓存策略里的 /dfcache 路径必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
@@ -686,7 +682,7 @@ export function RuntimePage() {
   const payloadGuardMode = (draft.payloadGuardMode ?? 'preemptive') as PayloadGuardMode
   const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
   const activeMeta = runtimeSections.find((section) => section.key === activeSection) ?? runtimeSections[0]!
-  const saveDisabled = updateConfig.isPending || !hasPendingChanges
+  const saveDisabled = updateConfig.isPending || !hasDraftChanges
 
   return (
     <PageContainer className="pb-24">
@@ -1894,7 +1890,7 @@ export function RuntimePage() {
         <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-sm font-semibold">
-              {hasPendingChanges ? '运行配置有未保存改动' : '运行配置已是最新'}
+              {hasDraftChanges ? '运行配置有未保存改动' : '运行配置已是最新'}
             </div>
             <div className="mt-0.5 text-xs text-muted-foreground">保存后，新的请求会立即使用这些配置。</div>
           </div>

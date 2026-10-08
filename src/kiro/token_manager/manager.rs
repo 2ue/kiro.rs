@@ -1066,6 +1066,7 @@ const TOKEN_REFRESH_NEGATIVE_STREAK_RESET_AFTER: StdDuration = StdDuration::from
 const TOKEN_REFRESH_NEGATIVE_BACKOFF_MAX_STREAK: u8 = 16;
 const LOCAL_REDIS_LEASE_COUNTER_SPACE: u64 = 1_000_000_000;
 const LOCAL_REDIS_LEASE_NAMESPACE_COUNT: u64 = 9_000_000_000;
+const SCHEDULER_DISPATCH_BLOCK_TTL_SECS: usize = 24 * 60 * 60;
 static LOCAL_REDIS_LEASE_NAMESPACE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4193,6 +4194,12 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let global_in_flight: u32 = entries.iter().map(|entry| entry.in_flight_requests).sum();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            // The credential may have been selected immediately before an Admin disable. Do not
+            // create a new lease after the disable becomes visible locally; an already-created
+            // lease is intentionally allowed to drain through its guard.
+            if entry.disabled {
+                return false;
+            }
             let mut lease_weight_units =
                 effective_weight_for_limit(request_weight_units, max_concurrent_requests);
             lease_weight_units =
@@ -4243,6 +4250,12 @@ impl MultiTokenManager {
         let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
             return false;
         };
+        // Re-check the flag after candidate selection and before reserving local capacity. This
+        // closes the small race where disable happens while a request is waiting for the Redis
+        // lease confirmation path.
+        if entry.disabled {
+            return false;
+        }
         let locally_owned_credential_in_flight = entry
             .in_flight_leases
             .iter()
@@ -5733,6 +5746,7 @@ impl MultiTokenManager {
 
     /// 请求热路径禁用凭据后的调度清理：本地调度状态立即清理，Redis best-effort。
     fn clear_disabled_credential_request_state(&self, credential_id: u64) {
+        self.set_scheduler_dispatch_block_for_credential_deferred(credential_id);
         self.unbind_sessions_for_credential_deferred(credential_id);
         self.clear_scheduler_state_for_credential(credential_id, false);
     }
@@ -10322,6 +10336,58 @@ impl MultiTokenManager {
         clear_scheduler_state_for_credential_redis(self.redis_store.as_ref(), id, clear_in_flight);
     }
 
+    fn set_scheduler_dispatch_block_for_credential(&self, id: u64) -> anyhow::Result<()> {
+        let Some(redis) = &self.redis_store else {
+            return Ok(());
+        };
+        let redis = redis.clone();
+        block_on_storage("设置 Redis 凭据调度阻断", async move {
+            redis
+                .set_scheduler_dispatch_block(id, SCHEDULER_DISPATCH_BLOCK_TTL_SECS)
+                .await
+        })?;
+        Ok(())
+    }
+
+    fn clear_scheduler_dispatch_block_for_credential(&self, id: u64) -> anyhow::Result<()> {
+        let Some(redis) = &self.redis_store else {
+            return Ok(());
+        };
+        let redis = redis.clone();
+        block_on_storage("清理 Redis 凭据调度阻断", async move {
+            redis.clear_scheduler_dispatch_block(id).await
+        })?;
+        Ok(())
+    }
+
+    fn set_scheduler_dispatch_block_for_credential_deferred(&self, id: u64) {
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        let redis = redis.clone();
+        spawn_best_effort_storage_task("异步设置 Redis 凭据调度阻断", async move {
+            redis
+                .set_scheduler_dispatch_block(id, SCHEDULER_DISPATCH_BLOCK_TTL_SECS)
+                .await
+        });
+    }
+
+    /// Read the scheduler state before a destructive credential operation. Redis is authoritative
+    /// when enabled, so a stale local snapshot must not make an active credential look idle.
+    fn in_flight_requests_for_credential(&self, id: u64) -> anyhow::Result<u32> {
+        self.cleanup_expired_in_flight_leases_local_first();
+        if self.redis_store.is_some() {
+            self.refresh_scheduler_state_from_redis_for_ids(&HashSet::from([id]))?;
+        }
+        Ok(self
+            .entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.in_flight_requests)
+            .unwrap_or(0))
+    }
+
     /// 报告指定凭据 API 调用成功
     ///
     /// 重置该凭据的失败计数
@@ -10353,8 +10419,7 @@ impl MultiTokenManager {
         };
         if disabled {
             self.select_highest_priority();
-            self.unbind_sessions_for_credential(id);
-            self.clear_scheduler_state_for_credential(id, false);
+            self.clear_disabled_credential_request_state(id);
         }
         self.record_scheduler_success_health(id, model, latency, success.alpha);
         self.notify_dispatch_state_changed();
@@ -10804,8 +10869,7 @@ impl MultiTokenManager {
 
         if disabled {
             self.select_highest_priority();
-            self.unbind_sessions_for_credential(id);
-            self.clear_scheduler_state_for_credential(id, false);
+            self.clear_disabled_credential_request_state(id);
         }
         if auto_disabled {
             self.record_scheduler_credential_audit(
@@ -10965,8 +11029,7 @@ impl MultiTokenManager {
                 false
             }
         };
-        self.unbind_sessions_for_credential(id);
-        self.clear_scheduler_state_for_credential(id, false);
+        self.clear_disabled_credential_request_state(id);
         self.persist_disabled_state(
             id,
             expected_generation,
@@ -11140,8 +11203,7 @@ impl MultiTokenManager {
             }
         };
         let circuit = self.record_local_pool_risk_circuit_failure(id, reason);
-        self.unbind_sessions_for_credential(id);
-        self.clear_scheduler_state_for_credential(id, false);
+        self.clear_disabled_credential_request_state(id);
         self.persist_disabled_state(
             id,
             expected_generation,
@@ -11432,8 +11494,7 @@ impl MultiTokenManager {
 
         if disabled {
             self.select_highest_priority();
-            self.unbind_sessions_for_credential(id);
-            self.clear_scheduler_state_for_credential(id, false);
+            self.clear_disabled_credential_request_state(id);
         }
         if auto_disabled {
             self.record_scheduler_credential_audit(
@@ -11507,8 +11568,7 @@ impl MultiTokenManager {
                 false
             }
         };
-        self.unbind_sessions_for_credential(id);
-        self.clear_scheduler_state_for_credential(id, false);
+        self.clear_disabled_credential_request_state(id);
         self.persist_disabled_state(
             id,
             expected_generation,
@@ -12095,9 +12155,11 @@ impl MultiTokenManager {
             entry.rate_limit_available_at = None;
         }
         if disabled {
+            self.set_scheduler_dispatch_block_for_credential(id)?;
             self.unbind_sessions_for_credential(id);
             self.clear_scheduler_state_for_credential(id, false);
         } else {
+            self.clear_scheduler_dispatch_block_for_credential(id)?;
             self.clear_scheduler_state_for_credential(id, false);
             self.select_highest_priority();
         }
@@ -12333,6 +12395,7 @@ impl MultiTokenManager {
             entry.model_health.clear();
             entry.selection_events.clear();
             drop(entries);
+            self.clear_scheduler_dispatch_block_for_credential(id)?;
             self.clear_scheduler_state_for_credential(id, false);
         } else {
             self.persist_credential_update(&base, &credential)?;
@@ -12440,6 +12503,7 @@ impl MultiTokenManager {
             entry.rate_limit_available_at = None;
         }
         self.select_highest_priority();
+        self.clear_scheduler_dispatch_block_for_credential(id)?;
         self.clear_scheduler_state_for_credential(id, false);
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
@@ -12963,6 +13027,16 @@ impl MultiTokenManager {
             }
         }
 
+        self.set_scheduler_dispatch_block_for_credential(id)?;
+        let in_flight_requests = self.in_flight_requests_for_credential(id)?;
+        if in_flight_requests > 0 {
+            anyhow::bail!(
+                "凭据 #{} 仍有 {} 个请求正在执行，请等待请求完成后再删除",
+                id,
+                in_flight_requests
+            );
+        }
+
         // 行级软删除，并清理该凭据的统计/运行态残留。成功后再更新本进程快照。
         let refresh_state = self.refresh_state_for_credential(id);
         let _refresh_guard = refresh_state
@@ -12985,7 +13059,10 @@ impl MultiTokenManager {
             self.select_highest_priority();
         }
         self.unbind_sessions_for_credential(id);
-        self.clear_scheduler_state_for_credential(id, true);
+        // The precondition above guarantees this process currently sees no active lease. Keep
+        // the non-destructive cleanup mode so an in-flight guard owned by another instance can
+        // still release naturally instead of having its capacity erased underneath it.
+        self.clear_scheduler_state_for_credential(id, false);
         self.remove_refresh_state_for_credential(id);
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();

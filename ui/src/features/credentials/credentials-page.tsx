@@ -69,8 +69,8 @@ import {
   useCredentialUsageSummary,
   useCredentialCreditSummary,
   useCredentials,
-  useDeleteCredential,
   useDeleteDisabledCredentials,
+  useBatchDeleteCredentials,
   useBatchUpdateCredentials,
   useLoadBalancingMode,
   useProxyResources,
@@ -276,8 +276,8 @@ export function CredentialsPage() {
   const loadBalancing = useLoadBalancingMode()
   const usageSummary = useUsageSummary(10_000)
   const setLoadBalancingMutation = useSetLoadBalancingMode()
-  const deleteCredential = useDeleteCredential()
   const deleteDisabledCredentials = useDeleteDisabledCredentials()
+  const batchDeleteCredentials = useBatchDeleteCredentials()
   const batchUpdateCredentials = useBatchUpdateCredentials()
   const resetFailure = useResetFailure()
   const regionOptions = useMemo(() => {
@@ -328,6 +328,7 @@ export function CredentialsPage() {
   const hasAnyFilters = hasTextFilters || hasActiveFilters
   const selectedCredentials = currentCredentials.filter((c) => selectedIds.has(c.id))
   const selectedDisabledCount = selectedCredentials.filter((c) => c.disabled).length
+  const selectedEnabledCount = selectedCredentials.length - selectedDisabledCount
   const selectedPriorityOverrideCount = selectedCredentials.filter((c) => c.priority !== 0).length
   const selectedConcurrencyOverrideCount = selectedCredentials.filter((c) => typeof c.maxConcurrentRequestsOverride === 'number').length
   const selectedRpmOverrideCount = selectedCredentials.filter((c) => typeof c.rpmOverride === 'number').length
@@ -608,18 +609,72 @@ export function CredentialsPage() {
   }
 
   const batchDelete = async () => {
-    if (batchRefreshing) return
+    if (batchRefreshing || batchDeleteCredentials.isPending) return
     const disabledIds = Array.from(selectedIds).filter((id) => currentCredentials.find((c) => c.id === id)?.disabled)
     if (!disabledIds.length) return toast.error('选中项中没有已禁用账号')
-    const ok = await confirmDialog({ title: '批量删除', message: `确定删除 ${disabledIds.length} 个已禁用账号？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
-    if (!ok) return
+    const skippedCount = selectedIds.size - disabledIds.length
+    const firstConfirmed = await confirmDialog({
+      title: '批量删除账号',
+      message: `将删除 ${disabledIds.length} 个已禁用账号${skippedCount ? `，跳过 ${skippedCount} 个未禁用账号` : ''}。删除后无法恢复。是否继续？`,
+      confirmText: '继续删除',
+      tone: 'danger',
+    })
+    if (!firstConfirmed) return
+    const secondConfirmed = await confirmDialog({
+      title: '再次确认删除',
+      message: `这是最后一次确认：永久删除这 ${disabledIds.length} 个账号及其运行数据？`,
+      confirmText: '确认永久删除',
+      tone: 'danger',
+    })
+    if (!secondConfirmed) return
     setBatchRefreshing(true)
-    let success = 0; let fail = 0
-    for (const id of disabledIds) { try { await deleteCredential.mutateAsync(id); success++ } catch { fail++ } }
-    setBatchRefreshing(false)
-    setSelectedIds(new Set())
-    if (fail === 0) toast.success(`成功删除 ${success} 个账号`)
-    else toast.warning(`删除：成功 ${success}，失败 ${fail}`)
+    try {
+      const result = await batchDeleteCredentials.mutateAsync(disabledIds)
+      setSelectedIds(new Set())
+      if (result.failed === 0) toast.success(`成功删除 ${result.success} 个账号`)
+      else {
+        const firstError = result.errors[0]?.message
+        toast.warning(`删除：成功 ${result.success}，失败 ${result.failed}${firstError ? `；首个失败：${firstError}` : ''}`)
+      }
+    } catch (e) {
+      toast.error(`批量删除失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setBatchRefreshing(false)
+    }
+  }
+
+  const batchDisableAndDelete = async () => {
+    if (batchRefreshing || batchDeleteCredentials.isPending) return
+    const ids = Array.from(selectedIds)
+    if (!ids.length) return toast.error('请先选择账号')
+    const firstConfirmed = await confirmDialog({
+      title: '禁用并删除账号',
+      message: `将先禁用 ${ids.length} 个账号，其中 ${selectedEnabledCount} 个当前可用账号会立即停止接收新请求。正在执行的请求会继续完成；仍有请求执行的账号不会被删除，但会保持禁用状态。是否继续？`,
+      confirmText: '继续禁用并删除',
+      tone: 'danger',
+    })
+    if (!firstConfirmed) return
+    const secondConfirmed = await confirmDialog({
+      title: '再次确认危险操作',
+      message: `这是最后一次确认：禁用并尝试永久删除这 ${ids.length} 个账号及其运行数据？`,
+      confirmText: '确认禁用并删除',
+      tone: 'danger',
+    })
+    if (!secondConfirmed) return
+    setBatchRefreshing(true)
+    try {
+      const result = await batchDeleteCredentials.mutateAsync({ ids, disableFirst: true })
+      setSelectedIds(new Set())
+      if (result.failed === 0) toast.success(`成功禁用并删除 ${result.success} 个账号`)
+      else {
+        const firstError = result.errors[0]?.message
+        toast.warning(`禁用并删除：已删除 ${result.success}，未删除 ${result.failed}${firstError ? `；首个失败：${firstError}` : ''}`)
+      }
+    } catch (e) {
+      toast.error(`禁用并删除失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setBatchRefreshing(false)
+    }
   }
 
   const batchResetFailure = async () => {
@@ -700,6 +755,8 @@ export function CredentialsPage() {
     if (!disabledCount) return toast.error('没有可清除的已禁用账号')
     const ok = await confirmDialog({ title: '清除已禁用账号', message: `确定清除所有 ${disabledCount} 个已禁用账号？此操作无法撤销。`, confirmText: '清除全部', tone: 'danger' })
     if (!ok) return
+    const secondOk = await confirmDialog({ title: '再次确认清除', message: `这是最后一次确认：永久清除全部 ${disabledCount} 个已禁用账号及其运行数据？`, confirmText: '确认清除全部', tone: 'danger' })
+    if (!secondOk) return
     try {
       const result = await deleteDisabledCredentials.mutateAsync()
       setSelectedIds(new Set())
@@ -1031,10 +1088,20 @@ export function CredentialsPage() {
             <Button
               variant="outline" size="xs"
               className="text-destructive hover:bg-destructive/10"
-              onClick={batchDelete}
-              disabled={selectedDisabledCount === 0}
+              onClick={batchDisableAndDelete}
+              disabled={selectedIds.size === 0 || batchRefreshing || batchDeleteCredentials.isPending}
             >
-              <Trash2 className="h-3.5 w-3.5" />删除已禁用 ({selectedDisabledCount})
+              {batchDeleteCredentials.isPending ? <Spinner size="sm" /> : <Trash2 className="h-3.5 w-3.5" />}
+              禁用并删除 ({selectedIds.size})
+            </Button>
+            <Button
+              variant="outline" size="xs"
+              className="text-destructive hover:bg-destructive/10"
+              onClick={batchDelete}
+              disabled={selectedDisabledCount === 0 || batchRefreshing || batchDeleteCredentials.isPending}
+            >
+              {batchDeleteCredentials.isPending ? <Spinner size="sm" /> : <Trash2 className="h-3.5 w-3.5" />}
+              {batchDeleteCredentials.isPending ? '删除中...' : `删除已禁用 (${selectedDisabledCount})`}
             </Button>
             <Button variant="ghost" size="xs" onClick={() => setSelectedIds(new Set())}>取消</Button>
           </div>

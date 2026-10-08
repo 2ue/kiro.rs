@@ -7,10 +7,10 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, batch_import_credentials, batch_update_credentials, cancel_usage_cleanup,
-        clear_credential_in_flight, clear_external_pool_auto_disabled,
-        clear_external_pool_cooldown, clear_usage_records, create_external_pool,
-        create_proxy_resource, create_request_api_key, delete_credential,
+        add_credential, batch_delete_credentials, batch_import_credentials,
+        batch_update_credentials, cancel_usage_cleanup, clear_credential_in_flight,
+        clear_external_pool_auto_disabled, clear_external_pool_cooldown, clear_usage_records,
+        create_external_pool, create_proxy_resource, create_request_api_key, delete_credential,
         delete_disabled_credentials, delete_external_pool, delete_manual_model,
         delete_proxy_resource, delete_request_api_key, discover_credential_supported_models,
         discover_external_pool_supported_models,
@@ -52,6 +52,7 @@ use super::{
 /// - `GET /credentials-paged` - 分页获取凭据状态
 /// - `POST /credentials` - 添加新凭据
 /// - `DELETE /credentials/:id` - 删除凭据
+/// - `POST /credentials/batch-delete` - 按 ID 批量删除已禁用凭据
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
 /// - `POST /credentials/:id/priority` - 设置凭据优先级
 /// - `POST /credentials/:id/reset` - 重置失败计数
@@ -74,6 +75,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/import", post(batch_import_credentials))
         .route("/credentials/batch-update", post(batch_update_credentials))
+        .route("/credentials/batch-delete", post(batch_delete_credentials))
         .route("/credentials/export", get(export_credentials))
         .route(
             "/credentials/credit-summary",

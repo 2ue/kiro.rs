@@ -342,6 +342,11 @@ export interface BulkCredentialActionResponse {
   errors: Array<{ id: number; message: string }>
 }
 
+export interface BatchDeleteCredentialsRequest {
+  ids: number[]
+  disableFirst?: boolean
+}
+
 export interface CredentialCooldown {
   model?: string
   global: boolean

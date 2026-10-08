@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   addCredential,
   batchUpdateCredentials,
+  batchDeleteCredentials,
   clearCredentialInFlight,
   createProxyResource,
   deleteCredential,
@@ -45,6 +46,7 @@ import {
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
+  BatchDeleteCredentialsRequest,
   BatchUpdateCredentialsRequest,
   CreateProxyResourceRequest,
   BatchProxyResourceImportRequest,
@@ -384,6 +386,15 @@ export function useDeleteDisabledCredentials() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: deleteDisabledCredentials,
+    onSuccess: () => invalidateCredentialCaches(queryClient),
+  })
+}
+
+export function useBatchDeleteCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (request: number[] | BatchDeleteCredentialsRequest) =>
+      batchDeleteCredentials(Array.isArray(request) ? { ids: request } : request),
     onSuccess: () => invalidateCredentialCaches(queryClient),
   })
 }

@@ -727,6 +727,7 @@ async fn main() {
         tracing::info!("  GET  /api/admin/credentials/account-info");
         tracing::info!("  GET  /api/admin/credentials/usage-summary");
         tracing::info!("  GET  /api/admin/credentials-paged");
+        tracing::info!("  POST /api/admin/credentials/batch-delete");
         tracing::info!("  GET  /api/admin/credentials/export");
         tracing::info!("  GET  /api/admin/usage-records");
         tracing::info!("  GET  /api/admin/usage-records-paged");

@@ -35,8 +35,8 @@ import {
   useCredentialsUsageSummary,
   useBatchUpdateCredentials,
   useCredentialCreditSummary,
-  useDeleteCredential,
   useDeleteDisabledCredentials,
+  useBatchDeleteCredentials,
   useLoadBalancingMode,
   useProxyResources,
   useResetFailure,
@@ -282,7 +282,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     [creditDetailRows],
   )
 
-  const { mutate: deleteCredential } = useDeleteCredential()
+  const batchDeleteCredentials = useBatchDeleteCredentials()
   const deleteDisabled = useDeleteDisabledCredentials()
   const batchUpdateCredentials = useBatchUpdateCredentials()
   const { mutate: resetFailure } = useResetFailure()
@@ -404,6 +404,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     return Boolean(credential?.disabled)
   }).length
   const selectedCredentials = currentCredentials.filter((credential) => selectedIds.has(credential.id))
+  const selectedEnabledCount = selectedCredentials.length - selectedDisabledCount
   const selectedPriorityOverrideCount = selectedCredentials.filter((credential) => credential.priority !== 0).length
   const selectedConcurrencyOverrideCount = selectedCredentials.filter((credential) => typeof credential.maxConcurrentRequestsOverride === 'number').length
   const selectedRpmOverrideCount = selectedCredentials.filter((credential) => typeof credential.rpmOverride === 'number').length
@@ -548,38 +549,51 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const skippedCount = selectedIds.size - disabledIds.length
     const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
 
-    if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
+    if (!confirm(`警告：将删除 ${disabledIds.length} 个已禁用凭据${skippedText}。删除后无法恢复。是否继续？`)) {
+      return
+    }
+    if (!confirm(`最后确认：永久删除这 ${disabledIds.length} 个凭据及其运行数据？`)) {
+      return
+    }
+    try {
+      const response = await batchDeleteCredentials.mutateAsync(disabledIds)
+      const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
+      if (response.failed === 0) {
+        toast.success(`成功删除 ${response.success} 个已禁用凭据${skippedResultText}`)
+      } else {
+        const firstError = response.errors[0]?.message
+        toast.warning(`删除已禁用凭据：成功 ${response.success} 个，失败 ${response.failed} 个${skippedResultText}${firstError ? `；首个失败：${firstError}` : ''}`)
+      }
+    } catch (error) {
+      toast.error(`批量删除失败: ${extractErrorMessage(error)}`)
+    }
+
+    deselectAll()
+  }
+
+  const handleBatchDisableAndDelete = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要禁用并删除的凭据')
       return
     }
 
-    let successCount = 0
-    let failCount = 0
-
-    for (const id of disabledIds) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
-      }
+    const ids = Array.from(selectedIds)
+    if (!confirm(`警告：将先禁用 ${ids.length} 个凭据，其中 ${selectedEnabledCount} 个当前可用凭据会立即停止接收新请求。正在执行的请求会继续完成；仍有请求执行的凭据不会被删除，但会保持禁用状态。是否继续？`)) {
+      return
     }
-
-    const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
-
-    if (failCount === 0) {
-      toast.success(`成功删除 ${successCount} 个已禁用凭据${skippedResultText}`)
-    } else {
-      toast.warning(`删除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个${skippedResultText}`)
+    if (!confirm(`最后确认：禁用并尝试永久删除这 ${ids.length} 个凭据及其运行数据？`)) {
+      return
+    }
+    try {
+      const response = await batchDeleteCredentials.mutateAsync({ ids, disableFirst: true })
+      if (response.failed === 0) {
+        toast.success(`成功禁用并删除 ${response.success} 个凭据`)
+      } else {
+        const firstError = response.errors[0]?.message
+        toast.warning(`禁用并删除：已删除 ${response.success} 个，未删除 ${response.failed} 个${firstError ? `；首个失败：${firstError}` : ''}`)
+      }
+    } catch (error) {
+      toast.error(`禁用并删除失败: ${extractErrorMessage(error)}`)
     }
 
     deselectAll()
@@ -811,6 +825,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     if (!confirm(`确定要清除所有 ${disabledCredentialCount} 个已禁用凭据吗？此操作无法撤销。`)) {
+      return
+    }
+    if (!confirm(`最后确认：永久清除全部 ${disabledCredentialCount} 个已禁用凭据及其运行数据？`)) {
       return
     }
 
@@ -1341,14 +1358,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     恢复异常
                   </Button>
                   <Button
+                    onClick={handleBatchDisableAndDelete}
+                    size="sm"
+                    variant="destructive"
+                    disabled={selectedIds.size === 0 || batchDeleteCredentials.isPending}
+                  >
+                    <Trash2 className={`h-4 w-4 mr-2 ${batchDeleteCredentials.isPending ? 'animate-pulse' : ''}`} />
+                    {batchDeleteCredentials.isPending ? '删除中...' : `禁用并删除 (${selectedIds.size})`}
+                  </Button>
+                  <Button
                     onClick={handleBatchDelete}
                     size="sm"
                     variant="destructive"
-                    disabled={selectedDisabledCount === 0}
+                    disabled={selectedDisabledCount === 0 || batchDeleteCredentials.isPending}
                     title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
                   >
-                    <Trash2 className="h-4 w-4 mr-2" />
-                    批量删除
+                    <Trash2 className={`h-4 w-4 mr-2 ${batchDeleteCredentials.isPending ? 'animate-pulse' : ''}`} />
+                    {batchDeleteCredentials.isPending ? '删除中...' : '批量删除'}
                   </Button>
                 </>
               )}

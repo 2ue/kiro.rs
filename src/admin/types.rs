@@ -321,6 +321,14 @@ pub struct BulkCredentialActionError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteCredentialsRequest {
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub disable_first: bool,
+}
+
 /// 轻量凭据列表响应。
 ///
 /// 该响应只包含列表首屏和筛选分页需要的基础字段，不携带运行态、账号额度或费用聚合。
@@ -2405,5 +2413,28 @@ mod tests {
         assert_eq!(req.rpm.unwrap().rpm, None);
         assert!(req.regions.is_none());
         assert!(req.proxy.is_none());
+    }
+
+    #[test]
+    fn batch_delete_credentials_request_accepts_camel_case_ids() {
+        let req: BatchDeleteCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [7, 3, 7],
+            "disableFirst": true
+        }))
+        .unwrap();
+
+        assert_eq!(req.ids, vec![7, 3, 7]);
+        assert!(req.disable_first);
+    }
+
+    #[test]
+    fn batch_delete_credentials_request_defaults_disable_first_to_false() {
+        let req: BatchDeleteCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [7, 3, 7]
+        }))
+        .unwrap();
+
+        assert_eq!(req.ids, vec![7, 3, 7]);
+        assert!(!req.disable_first);
     }
 }

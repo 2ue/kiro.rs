@@ -18,22 +18,23 @@ use super::types::{
     AccessKeysResponse, AddCredentialRequest, AddCredentialResponse,
     AuxiliaryUpstreamRuntimeResponse, BalanceResponse, BatchCredentialImportDefaults,
     BatchCredentialImportDuplicateMode, BatchCredentialImportItem, BatchCredentialImportRequest,
-    BatchCredentialImportResponse, BatchProxyResourceImportItem, BatchProxyResourceImportRequest,
-    BatchProxyResourceImportResponse, BatchUpdateCredentialItem, BatchUpdateCredentialsRequest,
-    BatchUpdateCredentialsResponse, BulkCredentialActionError, BulkCredentialActionResponse,
-    ClearInFlightRequest, CreateProxyResourceRequest, CreateRequestApiKeyRequest,
-    CredentialAccountInfo, CredentialAccountInfoItem, CredentialAccountInfoListResponse,
-    CredentialCooldown, CredentialCreditSummaryResponse, CredentialDiagnosticsResponse,
-    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialListItem,
-    CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
-    CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
-    CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
-    CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
-    DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest, LoadBalancingModeResponse,
-    ManualModelResponse, PromptSteeringDefaults, ProxyResourceImportEntry, ProxyResourceResponse,
-    ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
-    RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
-    SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
+    BatchCredentialImportResponse, BatchDeleteCredentialsRequest, BatchProxyResourceImportItem,
+    BatchProxyResourceImportRequest, BatchProxyResourceImportResponse, BatchUpdateCredentialItem,
+    BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, BulkCredentialActionError,
+    BulkCredentialActionResponse, ClearInFlightRequest, CreateProxyResourceRequest,
+    CreateRequestApiKeyRequest, CredentialAccountInfo, CredentialAccountInfoItem,
+    CredentialAccountInfoListResponse, CredentialCooldown, CredentialCreditSummaryResponse,
+    CredentialDiagnosticsResponse, CredentialInfoRefreshItem, CredentialInfoRefreshResponse,
+    CredentialListItem, CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse,
+    CredentialStatusItem, CredentialSummaryResponse, CredentialUsageSummaryItem,
+    CredentialUsageSummaryResponse, CredentialValidationGroup, CredentialValidationInfo,
+    CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
+    CredentialsStatusResponse, DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest,
+    LoadBalancingModeResponse, ManualModelResponse, PromptSteeringDefaults,
+    ProxyResourceImportEntry, ProxyResourceResponse, ProxyResourceTestRequest,
+    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
+    RequestApiKeyItem, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
+    SetCredentialOverageRequest, SetCredentialProxyRequest,
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
     SetLoadBalancingModeRequest, SetSupportedModelsRequest, SetWarmupRequest,
     SupportedModelsResponse, TestCredentialRequest, TestCredentialResponse,
@@ -4217,6 +4218,83 @@ impl AdminService {
         })
     }
 
+    /// 按指定 ID 批量删除凭据。每个 ID 都会在服务端重新校验禁用状态。
+    pub fn batch_delete_credentials(
+        &self,
+        request: BatchDeleteCredentialsRequest,
+    ) -> Result<BulkCredentialActionResponse, AdminServiceError> {
+        let disable_first = request.disable_first;
+        let mut ids = request.ids;
+        ids.sort_unstable();
+        ids.dedup();
+        let total_matched = ids.len();
+        let mut success = 0usize;
+        let mut disabled_before_delete = 0usize;
+        let mut errors = Vec::new();
+
+        for id in ids {
+            let mut disabled_for_delete = false;
+            if disable_first {
+                let current = self
+                    .token_manager
+                    .base_snapshot()
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.id == id);
+                if let Some(entry) = current {
+                    disabled_for_delete = true;
+                    if !entry.disabled {
+                        match self.set_disabled(id, true) {
+                            Ok(()) => disabled_before_delete += 1,
+                            Err(err) => {
+                                errors.push(BulkCredentialActionError {
+                                    id,
+                                    message: err.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            match self.delete_credential(id) {
+                Ok(()) => success += 1,
+                Err(err) => {
+                    let mut message = err.to_string();
+                    if disable_first && disabled_for_delete {
+                        message = format!("已禁用但未删除：{}", message);
+                    }
+                    errors.push(BulkCredentialActionError { id, message });
+                }
+            }
+        }
+
+        let failed = errors.len();
+        self.audit(
+            "batch_delete_credentials",
+            "credential",
+            None,
+            failed == 0,
+            (failed > 0).then(|| format!("{} 个账号删除失败", failed)),
+            json!({
+                "total": total_matched,
+                "success": success,
+                "failed": failed,
+                "disableFirst": disable_first,
+                "disabledBeforeDelete": disabled_before_delete,
+            }),
+        );
+
+        Ok(BulkCredentialActionResponse {
+            total_matched,
+            total_attempted: total_matched,
+            success,
+            failed,
+            skipped: 0,
+            errors,
+        })
+    }
+
     /// 查询请求级 usage 记录。
     pub fn get_usage_records(&self, query: UsageRecordQuery) -> UsageRecordsResult {
         self.usage_recorder.query(query)
@@ -6482,6 +6560,8 @@ impl AdminService {
         } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
         {
             AdminServiceError::InvalidCredential(msg)
+        } else if msg.contains("正在执行") || msg.contains("正在刷新 Token") {
+            AdminServiceError::Conflict(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }

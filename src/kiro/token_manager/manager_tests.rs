@@ -1910,6 +1910,49 @@ fn delete_credential_clears_pending_persistence_for_that_id() {
 }
 
 #[test]
+fn disabled_credential_cannot_acquire_new_in_flight_lease() {
+    let mut credential = api_key_credential("disabled-no-new-lease");
+    credential.id = Some(1);
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+    manager.set_disabled(1, true).unwrap();
+
+    assert!(manager.acquire_in_flight_lease_for_test(1).is_none());
+    let entries = manager.entries.lock();
+    assert_eq!(entries[0].in_flight_requests, 0);
+}
+
+#[test]
+fn delete_disabled_credential_rejects_active_in_flight_until_drained() {
+    let mut credential = api_key_credential("delete-active-inflight");
+    credential.id = Some(1);
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+    let lease = manager
+        .acquire_in_flight_lease_for_test(1)
+        .expect("enabled credential should acquire a lease");
+    manager.set_disabled(1, true).unwrap();
+
+    let error = manager.delete_credential(1).unwrap_err();
+    assert!(
+        error.to_string().contains("仍有 1 个请求正在执行"),
+        "{error}"
+    );
+    {
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(entry.disabled);
+        assert_eq!(entry.in_flight_requests, 1);
+    }
+
+    drop(lease);
+    manager.delete_credential(1).unwrap();
+    assert_eq!(manager.entries.lock().len(), 0);
+}
+
+#[test]
 fn invalid_warmup_is_rejected_without_quarantine_or_retry() {
     let mut credential = api_key_credential("invalid-warmup");
     credential.id = Some(1);

@@ -25,6 +25,7 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   BatchUpdateCredentialsRequest,
+  BatchDeleteCredentialsRequest,
   BatchUpdateCredentialsResponse,
   BulkCredentialActionResponse,
   AccessKeysResponse,
@@ -212,6 +213,11 @@ export async function getCredentialsUsageSummary(ids: number[]): Promise<Credent
 
 export async function deleteDisabledCredentials(): Promise<BulkCredentialActionResponse> {
   const { data } = await api.delete<BulkCredentialActionResponse>('/credentials/disabled')
+  return data
+}
+
+export async function batchDeleteCredentials(req: BatchDeleteCredentialsRequest): Promise<BulkCredentialActionResponse> {
+  const { data } = await api.post<BulkCredentialActionResponse>('/credentials/batch-delete', req)
   return data
 }
 

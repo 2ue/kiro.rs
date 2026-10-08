@@ -14,19 +14,19 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
-        BatchProxyResourceImportRequest, BatchUpdateCredentialsRequest, ClearInFlightRequest,
-        CreateProxyResourceRequest, CreateRequestApiKeyRequest,
-        DiscoverExternalPoolSupportedModelsRequest, ExportCredentialsQuery,
-        ExternalPoolTestRequest, ProxyResourceTestRequest, RefreshCredentialInfoRequest,
-        SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
-        SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
-        SetCredentialRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
-        SyncModelCapabilitiesRequest, SystemVersionResponse, TestCredentialRequest,
-        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-        UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        BatchDeleteCredentialsRequest, BatchProxyResourceImportRequest,
+        BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
+        CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
+        ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
+        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
+        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+        SetCredentialRegionsRequest, SetCredentialRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
+        SetWarmupRequest, SuccessResponse, SyncModelCapabilitiesRequest, SystemVersionResponse,
+        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -545,6 +545,24 @@ pub async fn get_credentials_usage_summary(
 /// DELETE /api/admin/credentials/disabled
 pub async fn delete_disabled_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.delete_disabled_credentials() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/batch-delete
+pub async fn batch_delete_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchDeleteCredentialsRequest>,
+) -> impl IntoResponse {
+    if payload.ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request("至少选择一个账号")),
+        )
+            .into_response();
+    }
+    match state.service.batch_delete_credentials(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
