@@ -1732,6 +1732,18 @@ export interface CacheRoutePolicyPatch {
   bounds?: CacheBoundsPolicyPatch
   kiroRsTool?: KiroRsToolCachePolicyPatch
   stableSegment?: StableSegmentCachePolicyPatch
+  hitShaping?: CacheHitShapingPolicyPatch
+}
+
+export interface CacheHitShapingPolicyPatch {
+  enabled?: boolean
+  targetHitRatio?: number
+  ratioJitter?: number
+  minCacheReadTokens?: number
+  minCacheCreationTokens?: number
+  minCostRatio?: number
+  maxReadMultiplier?: number
+  minCreationRatio?: number
 }
 
 export interface CachePolicyConfig {

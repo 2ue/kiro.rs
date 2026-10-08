@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
-import { defaultPromptCacheCreationControl, inputSamplePolicy, pathPolicy, preserveFieldPolicy, writerSamplePolicy } from '@/lib/runtime-config-defaults'
+import { defaultCacheHitShaping, defaultPromptCacheCreationControl, inputSamplePolicy, pathPolicy, preserveFieldPolicy, writerSamplePolicy } from '@/lib/runtime-config-defaults'
 import type {
   ModelCapabilitiesStatus,
   CachePolicyConfig,
@@ -67,6 +67,7 @@ function TwoCol({ children }: { children: React.ReactNode }) {
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
 type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
 type StableSegmentPatch = NonNullable<CacheRoutePolicyPatch['stableSegment']>
+type CacheHitShapingPatch = NonNullable<CacheRoutePolicyPatch['hitShaping']>
 type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
 
 const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
@@ -359,6 +360,102 @@ function SimulationOverrideForm({
         min={0}
         suffix="Token"
         onChange={set('capJitterMaxTokens')}
+      />
+    </div>
+  )
+}
+
+function CacheHitShapingForm({
+  value,
+  onChange,
+}: {
+  value: CacheHitShapingPatch
+  onChange: (next: CacheHitShapingPatch) => void
+}) {
+  const merged = { ...defaultCacheHitShaping(), ...value }
+  const set = <K extends keyof CacheHitShapingPatch>(key: K) => (nextValue: CacheHitShapingPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-4">
+      <TogField
+        label="启用命中率与小值整形"
+        desc="在最终显示给下游的用量上执行：在输入、读取、写入的总量内按目标命中率重新分配，写入保持较大量级，并保证计费不低于原始用量。"
+        checked={merged.enabled}
+        onChange={set('enabled')}
+      />
+      <NumField
+        label="目标命中率"
+        desc="缓存读取 ÷（输入 + 读取 + 写入），口径与 sub2api 的 Token 使用趋势一致。会话首请求不受此约束；会受计费下限约束，放大倍数越高越容易达到。"
+        value={merged.targetHitRatio}
+        min={0}
+        max={0.99}
+        step={0.01}
+        suffix="比例"
+        disabled={!merged.enabled}
+        onChange={set('targetHitRatio')}
+      />
+      <NumField
+        label="命中率浮动"
+        desc="在目标值之上随机多出的幅度，避免每次都精确等于目标值；例如目标 0.9、浮动 0.04，实际落在 0.90~0.94。"
+        value={merged.ratioJitter}
+        min={0}
+        max={0.2}
+        step={0.01}
+        suffix="比例"
+        disabled={!merged.enabled}
+        onChange={set('ratioJitter')}
+      />
+      <NumField
+        label="缓存读取最小值"
+        desc="非零的缓存读取低于这个值时抬到这个值。0 表示不处理。"
+        value={merged.minCacheReadTokens}
+        min={0}
+        suffix="Token"
+        disabled={!merged.enabled}
+        onChange={set('minCacheReadTokens')}
+      />
+      <NumField
+        label="缓存写入最小值"
+        desc="非零的缓存写入低于这个值时抬到这个值。0 表示不处理。"
+        value={merged.minCacheCreationTokens}
+        min={0}
+        suffix="Token"
+        disabled={!merged.enabled}
+        onChange={set('minCacheCreationTokens')}
+      />
+      <NumField
+        label="计费下限倍数"
+        desc="整形后的计费不低于原始用量计费的这个倍数；与目标命中率冲突时以这里为准。1 表示不亏损，0 表示不限制。"
+        value={merged.minCostRatio}
+        min={0}
+        max={5}
+        step={0.05}
+        suffix="倍"
+        disabled={!merged.enabled}
+        onChange={set('minCostRatio')}
+      />
+      <NumField
+        label="缓存读取上限倍数"
+        desc="缓存读取最多为原始输入的多少倍，用来控制读取数值不过大；触及上限后命中率可以低于目标，计费下限仍然生效。0 表示不限制。"
+        value={merged.maxReadMultiplier}
+        min={0}
+        max={50}
+        step={0.5}
+        suffix="倍"
+        disabled={!merged.enabled}
+        onChange={set('maxReadMultiplier')}
+      />
+      <NumField
+        label="最小写入比例"
+        desc="本次允许写入时，缓存写入至少为原始输入的这个比例，用来把写入调大；不允许写入的请求不受影响。0 表示不限制。"
+        value={merged.minCreationRatio}
+        min={0}
+        max={5}
+        step={0.05}
+        suffix="倍"
+        disabled={!merged.enabled}
+        onChange={set('minCreationRatio')}
       />
     </div>
   )
@@ -735,6 +832,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
       cacheType: 'kiro_rs_tool',
       reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
       kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
+      hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
     }
   }
   if (cacheType === 'stable_segment_cache') {
@@ -742,6 +840,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
       cacheType: 'stable_segment_cache',
       reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
       stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(),
+      hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
     }
   }
   return {
@@ -749,6 +848,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
     simulation: policy.simulation ?? defaultSimulationPatch(),
     creationControl: policy.creationControl ?? defaultPromptCacheCreationControl(),
     reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
+    hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
   }
 }
 
@@ -759,6 +859,7 @@ function currentHighCachePathDefaults(prefix: string, reportedUsage?: ReportedUs
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
     reportedUsage: reportedUsage ?? defaultUsagePatch(prefix),
+    hitShaping: defaultCacheHitShaping(),
   }
 }
 
@@ -781,6 +882,13 @@ function StrategyTemplateEditor({
   const setReportedUsage = (reportedUsage: ReportedUsagePathPolicy) => onChange({ ...template, reportedUsage })
   const setKiroRsTool = (kiroRsTool: KiroRsToolPatch) => onChange({ ...template, kiroRsTool })
   const setStableSegment = (stableSegment: StableSegmentPatch) => onChange({ ...template, stableSegment })
+  const setHitShaping = (hitShaping: CacheHitShapingPatch) => onChange({ ...template, hitShaping })
+  const hitShapingSection = (
+    <div className="space-y-3">
+      <div className="text-sm font-semibold">命中率与小值整形</div>
+      <CacheHitShapingForm value={template.hitShaping ?? defaultCacheHitShaping()} onChange={setHitShaping} />
+    </div>
+  )
 
   return (
     <div className="space-y-4 rounded-lg bg-background p-4 shadow-sm">
@@ -802,6 +910,7 @@ function StrategyTemplateEditor({
             <div className="text-sm font-semibold">最终用量显示</div>
             <PathPolicyEditor policy={template.reportedUsage ?? defaultUsagePatch('/v1')} onChange={setReportedUsage} />
           </div>
+          {hitShapingSection}
         </>
       ) : cacheType === 'stable_segment_cache' ? (
         <>
@@ -814,6 +923,7 @@ function StrategyTemplateEditor({
             value={template.stableSegment ?? defaultStableSegmentPatch()}
             onChange={setStableSegment}
           />
+          {hitShapingSection}
         </>
       ) : (
         <>
@@ -826,6 +936,7 @@ function StrategyTemplateEditor({
             value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
             onChange={setKiroRsTool}
           />
+          {hitShapingSection}
         </>
       )}
     </div>
@@ -854,6 +965,7 @@ function pathPolicyWithStrategyDefaults(
     ...template,
     ...policy,
     cacheType,
+    hitShaping: policy.hitShaping ?? template.hitShaping ?? defaultCacheHitShaping(),
     ...(cacheType === 'current_high_cache'
       ? {
           routeNamespace: policy.routeNamespace ?? template.routeNamespace ?? defaultRouteNamespace(prefix),
@@ -1036,6 +1148,13 @@ function PathStrategyBindingCard({
             policy={effectivePolicy.reportedUsage ?? defaultUsagePatch(prefix)}
             onChange={(reportedUsage) => patch({ reportedUsage })}
           />
+          <div className="space-y-3">
+            <div className="text-sm font-semibold">命中率与小值整形</div>
+            <CacheHitShapingForm
+              value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
+              onChange={(hitShaping) => patch({ hitShaping })}
+            />
+          </div>
         </div>
       ) : effectiveCacheType === 'stable_segment_cache' ? (
         <div className="space-y-4">
@@ -1060,6 +1179,13 @@ function PathStrategyBindingCard({
             value={effectivePolicy.stableSegment ?? defaultStableSegmentPatch()}
             onChange={(stableSegment) => patch({ stableSegment })}
           />
+          <div className="space-y-3">
+            <div className="text-sm font-semibold">命中率与小值整形</div>
+            <CacheHitShapingForm
+              value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
+              onChange={(hitShaping) => patch({ hitShaping })}
+            />
+          </div>
         </div>
       ) : (
         <div className="space-y-4">
@@ -1078,6 +1204,13 @@ function PathStrategyBindingCard({
             value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
             onChange={(kiroRsTool) => patch({ kiroRsTool })}
           />
+          <div className="space-y-3">
+            <div className="text-sm font-semibold">命中率与小值整形</div>
+            <CacheHitShapingForm
+              value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
+              onChange={(hitShaping) => patch({ hitShaping })}
+            />
+          </div>
         </div>
       )}
     </div>

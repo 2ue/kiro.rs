@@ -83,6 +83,20 @@ impl PromptCacheCreationController {
         credential_key: Option<&str>,
         model: Option<&str>,
     ) -> CacheUsage {
+        self.preview_success_with_mode(scope, config, usage, credential_key, model, false)
+    }
+
+    /// `stable_window` 为 true 时（命中率整形开启）使用修正后的窗口额度：抖动只作用于
+    /// 窗口总额度，部分放行低于 1024 时整笔延后；为 false 时保持原有逻辑。
+    pub fn preview_success_with_mode(
+        &self,
+        scope: Option<&PromptCacheScope>,
+        config: PromptCacheCreationControlConfig,
+        usage: CacheUsage,
+        credential_key: Option<&str>,
+        model: Option<&str>,
+        stable_window: bool,
+    ) -> CacheUsage {
         let config = config.normalized();
         if !config.enabled {
             return usage;
@@ -102,7 +116,8 @@ impl PromptCacheCreationController {
         prune_idle_states(&mut states, now, config);
         let mut state = states.get(&key).cloned().unwrap_or_default();
         prune_window_events(&mut state, now, config);
-        let allowed_creation = allowed_creation_tokens(&key, &state, config, usage, creation, now);
+        let allowed_creation =
+            allowed_creation_tokens(&key, &state, config, usage, creation, now, stable_window);
         with_allowed_creation(usage, allowed_creation)
     }
 
@@ -123,6 +138,19 @@ impl PromptCacheCreationController {
         usage: CacheUsage,
         credential_key: Option<&str>,
         model: Option<&str>,
+    ) -> CacheUsage {
+        self.apply_success_with_mode(scope, config, usage, credential_key, model, false)
+    }
+
+    /// `stable_window` 含义同 [`Self::preview_success_with_mode`]。
+    pub fn apply_success_with_mode(
+        &self,
+        scope: Option<&PromptCacheScope>,
+        config: PromptCacheCreationControlConfig,
+        usage: CacheUsage,
+        credential_key: Option<&str>,
+        model: Option<&str>,
+        stable_window: bool,
     ) -> CacheUsage {
         let config = config.normalized();
         if !config.enabled {
@@ -150,7 +178,8 @@ impl PromptCacheCreationController {
 
         let state = states.entry(key.clone()).or_default();
         prune_window_events(state, now, config);
-        let allowed_creation = allowed_creation_tokens(&key, state, config, usage, creation, now);
+        let allowed_creation =
+            allowed_creation_tokens(&key, state, config, usage, creation, now, stable_window);
         let adjusted = with_allowed_creation(usage, allowed_creation);
 
         state.last_seen_at = Some(now);
@@ -176,6 +205,40 @@ impl PromptCacheCreationController {
         adjusted
     }
 
+    /// 最终整形改变了上报的写入量时，把差额记入同一控制维度的窗口额度，
+    /// 让频次与额度按下游真正看到的写入计算。只调整已经放行写入的请求。
+    pub fn record_final_creation_adjustment(
+        &self,
+        scope: Option<&PromptCacheScope>,
+        config: PromptCacheCreationControlConfig,
+        credential_key: Option<&str>,
+        model: Option<&str>,
+        controlled_creation: i32,
+        final_creation: i32,
+    ) {
+        let config = config.normalized();
+        if !config.enabled || controlled_creation <= 0 {
+            return;
+        }
+        let Some(scope) = scope else {
+            return;
+        };
+        let delta = final_creation
+            .max(0)
+            .saturating_sub(controlled_creation.max(0));
+        if delta == 0 {
+            return;
+        }
+        let key = CreationControlKey::from_scope(scope, config.scope_mode, credential_key, model);
+        let mut states = self.states.lock();
+        let Some(state) = states.get_mut(&key) else {
+            return;
+        };
+        if let Some(event) = state.window_events.back_mut() {
+            event.tokens = event.tokens.saturating_add(delta).max(0);
+        }
+    }
+
     pub fn clear_credential(&self, credential_id: u64) {
         let credential_key = format!("credential:{credential_id}");
         self.states.lock().retain(|key, _| {
@@ -193,6 +256,7 @@ fn allowed_creation_tokens(
     usage: CacheUsage,
     creation: i32,
     now: DateTime<Utc>,
+    stable_window: bool,
 ) -> i32 {
     let mut allowed = creation.max(0);
     if allowed <= 0 {
@@ -249,15 +313,28 @@ fn allowed_creation_tokens(
             .max_creation_tokens_per_window
             .saturating_sub(used)
             .max(0);
-        let remaining = jittered_creation_limit(
-            remaining,
-            creation_cap_seed(key, state, config, usage, creation, 0xc2a4_5d13_8e9f_62b7),
-        );
+        let seed = creation_cap_seed(key, state, config, usage, creation, 0xc2a4_5d13_8e9f_62b7);
+        let remaining = if stable_window {
+            // 抖动只作用于窗口总额度，不作用于剩余额度：对剩余额度反复取 88%~97% 会让
+            // 额度几何衰减，最终放行 179、6、1 这类不可能出现的写入值。
+            let window_cap = jittered_creation_limit(config.max_creation_tokens_per_window, seed);
+            remaining.min(window_cap.saturating_sub(used).max(0))
+        } else {
+            jittered_creation_limit(remaining, seed)
+        };
         allowed = allowed.min(remaining);
+    }
+
+    // 部分放行时，余量低于最小可缓存长度就整笔延后，不上报碎片写入。
+    if stable_window && allowed < creation && allowed < MIN_PARTIAL_CREATION_TOKENS {
+        return 0;
     }
 
     allowed.max(0)
 }
+
+/// 部分放行写入的最小值，与 Anthropic 最小可缓存长度（1024）一致。
+const MIN_PARTIAL_CREATION_TOKENS: i32 = 1024;
 
 fn jittered_creation_limit(max_tokens: i32, seed: u64) -> i32 {
     let max_tokens = max_tokens.max(0);

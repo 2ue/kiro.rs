@@ -1884,6 +1884,253 @@ impl CacheBoundsPolicyPatch {
     }
 }
 
+/// 下游缓存命中率与小值整形。
+///
+/// 默认关闭，开启后在所有缓存策略（`no_cache` 除外）的最终下游 usage 上执行：
+///
+/// - 按目标命中率分配读取（口径与 sub2api 一致：`read / (input + read + creation)`）；
+/// - 计费不低于原始计费 × `min_cost_ratio`；
+/// - 是否写入由 creation control 决定，写入大小受 `min_creation_ratio` 约束；
+/// - 非零但过小的缓存读写抬到最小值。
+///
+/// 优先级：写入频次控制 > 不亏损 > 读写上限 > 命中率。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheHitShapingPolicy {
+    /// 总开关，默认关闭。关闭时下游 usage 与 creation control 保持原有逻辑。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 目标命中率下限，范围 0~0.99。会话首请求（没有可读前缀）不受此约束。
+    #[serde(default = "default_cache_hit_target_ratio")]
+    pub target_hit_ratio: f64,
+
+    /// 在目标值之上的确定性抖动幅度，避免每次都精确等于目标值。范围 0~0.2。
+    #[serde(default = "default_cache_hit_ratio_jitter")]
+    pub ratio_jitter: f64,
+
+    /// 非零缓存读取的最小值；低于该值时抬到该值。0 表示不处理。
+    #[serde(default = "default_cache_hit_min_tokens")]
+    pub min_cache_read_tokens: i32,
+
+    /// 非零缓存写入的最小值；低于该值时抬到该值（本次不允许写入时并回 input）。0 表示不处理。
+    #[serde(default = "default_cache_hit_min_tokens")]
+    pub min_cache_creation_tokens: i32,
+
+    /// 下游计费下限：整形后的计费不低于原始计费的这个倍数，范围 0~5，0 表示不限制。
+    #[serde(default = "default_cache_hit_min_cost_ratio")]
+    pub min_cost_ratio: f64,
+
+    /// 缓存读取上限：不超过原始输入的这个倍数，范围 0~50，0 表示不限制。
+    /// 触及上限后命中率可以低于目标，计费下限仍然生效。
+    #[serde(default)]
+    pub max_read_multiplier: f64,
+
+    /// 最小写入：放行写入时，写入不低于原始输入的这个比例，范围 0~5，0 表示不限制。
+    #[serde(default)]
+    pub min_creation_ratio: f64,
+}
+
+impl Default for CacheHitShapingPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_hit_ratio: default_cache_hit_target_ratio(),
+            ratio_jitter: default_cache_hit_ratio_jitter(),
+            min_cache_read_tokens: default_cache_hit_min_tokens(),
+            min_cache_creation_tokens: default_cache_hit_min_tokens(),
+            min_cost_ratio: default_cache_hit_min_cost_ratio(),
+            max_read_multiplier: 0.0,
+            min_creation_ratio: 0.0,
+        }
+    }
+}
+
+impl CacheHitShapingPolicy {
+    pub const MAX_TARGET_HIT_RATIO: f64 = 0.99;
+    pub const MAX_RATIO_JITTER: f64 = 0.2;
+    pub const MAX_MIN_COST_RATIO: f64 = 5.0;
+    pub const MAX_READ_MULTIPLIER: f64 = 50.0;
+    pub const MAX_MIN_CREATION_RATIO: f64 = 5.0;
+
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        if !self.target_hit_ratio.is_finite() {
+            self.target_hit_ratio = default_cache_hit_target_ratio();
+        }
+        self.target_hit_ratio = self.target_hit_ratio.clamp(0.0, Self::MAX_TARGET_HIT_RATIO);
+        if !self.ratio_jitter.is_finite() {
+            self.ratio_jitter = default_cache_hit_ratio_jitter();
+        }
+        self.ratio_jitter = self.ratio_jitter.clamp(0.0, Self::MAX_RATIO_JITTER);
+        self.min_cache_read_tokens = self.min_cache_read_tokens.max(0);
+        self.min_cache_creation_tokens = self.min_cache_creation_tokens.max(0);
+        if !self.min_cost_ratio.is_finite() {
+            self.min_cost_ratio = default_cache_hit_min_cost_ratio();
+        }
+        self.min_cost_ratio = self.min_cost_ratio.clamp(0.0, Self::MAX_MIN_COST_RATIO);
+        if !self.max_read_multiplier.is_finite() {
+            self.max_read_multiplier = 0.0;
+        }
+        self.max_read_multiplier = self
+            .max_read_multiplier
+            .clamp(0.0, Self::MAX_READ_MULTIPLIER);
+        if !self.min_creation_ratio.is_finite() {
+            self.min_creation_ratio = 0.0;
+        }
+        self.min_creation_ratio = self
+            .min_creation_ratio
+            .clamp(0.0, Self::MAX_MIN_CREATION_RATIO);
+        self
+    }
+
+    pub fn validate(self, label: &str) -> Result<(), String> {
+        if !self.target_hit_ratio.is_finite()
+            || !(0.0..=Self::MAX_TARGET_HIT_RATIO).contains(&self.target_hit_ratio)
+        {
+            return Err(format!("{label}.targetHitRatio 必须在 0 到 0.99 之间"));
+        }
+        if !self.ratio_jitter.is_finite()
+            || !(0.0..=Self::MAX_RATIO_JITTER).contains(&self.ratio_jitter)
+        {
+            return Err(format!("{label}.ratioJitter 必须在 0 到 0.2 之间"));
+        }
+        if self.min_cache_read_tokens < 0 {
+            return Err(format!("{label}.minCacheReadTokens 不能小于 0"));
+        }
+        if self.min_cache_creation_tokens < 0 {
+            return Err(format!("{label}.minCacheCreationTokens 不能小于 0"));
+        }
+        if !self.min_cost_ratio.is_finite()
+            || !(0.0..=Self::MAX_MIN_COST_RATIO).contains(&self.min_cost_ratio)
+        {
+            return Err(format!("{label}.minCostRatio 必须在 0 到 5 之间"));
+        }
+        if !self.max_read_multiplier.is_finite()
+            || !(0.0..=Self::MAX_READ_MULTIPLIER).contains(&self.max_read_multiplier)
+        {
+            return Err(format!("{label}.maxReadMultiplier 必须在 0 到 50 之间"));
+        }
+        if !self.min_creation_ratio.is_finite()
+            || !(0.0..=Self::MAX_MIN_CREATION_RATIO).contains(&self.min_creation_ratio)
+        {
+            return Err(format!("{label}.minCreationRatio 必须在 0 到 5 之间"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheHitShapingPolicyPatch {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub target_hit_ratio: Option<f64>,
+    #[serde(default)]
+    pub ratio_jitter: Option<f64>,
+    #[serde(default)]
+    pub min_cache_read_tokens: Option<i32>,
+    #[serde(default)]
+    pub min_cache_creation_tokens: Option<i32>,
+    #[serde(default)]
+    pub min_cost_ratio: Option<f64>,
+    #[serde(default)]
+    pub max_read_multiplier: Option<f64>,
+    #[serde(default)]
+    pub min_creation_ratio: Option<f64>,
+}
+
+impl CacheHitShapingPolicyPatch {
+    fn apply_to(self, mut policy: CacheHitShapingPolicy) -> CacheHitShapingPolicy {
+        if let Some(value) = self.enabled {
+            policy.enabled = value;
+        }
+        if let Some(value) = self.target_hit_ratio {
+            policy.target_hit_ratio = value;
+        }
+        if let Some(value) = self.ratio_jitter {
+            policy.ratio_jitter = value;
+        }
+        if let Some(value) = self.min_cache_read_tokens {
+            policy.min_cache_read_tokens = value;
+        }
+        if let Some(value) = self.min_cache_creation_tokens {
+            policy.min_cache_creation_tokens = value;
+        }
+        if let Some(value) = self.min_cost_ratio {
+            policy.min_cost_ratio = value;
+        }
+        if let Some(value) = self.max_read_multiplier {
+            policy.max_read_multiplier = value;
+        }
+        if let Some(value) = self.min_creation_ratio {
+            policy.min_creation_ratio = value;
+        }
+        policy.normalized()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.target_hit_ratio.is_none()
+            && self.ratio_jitter.is_none()
+            && self.min_cache_read_tokens.is_none()
+            && self.min_cache_creation_tokens.is_none()
+            && self.min_cost_ratio.is_none()
+            && self.max_read_multiplier.is_none()
+            && self.min_creation_ratio.is_none()
+    }
+
+    fn validate_raw(&self, label: &str) -> Result<(), String> {
+        if let Some(value) = self.target_hit_ratio
+            && (!value.is_finite()
+                || !(0.0..=CacheHitShapingPolicy::MAX_TARGET_HIT_RATIO).contains(&value))
+        {
+            return Err(format!("{label}.targetHitRatio 必须在 0 到 0.99 之间"));
+        }
+        if let Some(value) = self.ratio_jitter
+            && (!value.is_finite()
+                || !(0.0..=CacheHitShapingPolicy::MAX_RATIO_JITTER).contains(&value))
+        {
+            return Err(format!("{label}.ratioJitter 必须在 0 到 0.2 之间"));
+        }
+        if self.min_cache_read_tokens.is_some_and(|value| value < 0) {
+            return Err(format!("{label}.minCacheReadTokens 不能小于 0"));
+        }
+        if self
+            .min_cache_creation_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.minCacheCreationTokens 不能小于 0"));
+        }
+        if let Some(value) = self.min_cost_ratio
+            && (!value.is_finite()
+                || !(0.0..=CacheHitShapingPolicy::MAX_MIN_COST_RATIO).contains(&value))
+        {
+            return Err(format!("{label}.minCostRatio 必须在 0 到 5 之间"));
+        }
+        if let Some(value) = self.max_read_multiplier
+            && (!value.is_finite()
+                || !(0.0..=CacheHitShapingPolicy::MAX_READ_MULTIPLIER).contains(&value))
+        {
+            return Err(format!("{label}.maxReadMultiplier 必须在 0 到 50 之间"));
+        }
+        if let Some(value) = self.min_creation_ratio
+            && (!value.is_finite()
+                || !(0.0..=CacheHitShapingPolicy::MAX_MIN_CREATION_RATIO).contains(&value))
+        {
+            return Err(format!("{label}.minCreationRatio 必须在 0 到 5 之间"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroRsToolCachePolicy {
@@ -2445,6 +2692,8 @@ pub struct CacheRoutePolicyPatch {
     /// several times, which otherwise bloats every `Config` copy on debug-build stacks.
     #[serde(default)]
     pub stable_segment: Option<Box<StableSegmentCachePolicyPatch>>,
+    #[serde(default)]
+    pub hit_shaping: Option<CacheHitShapingPolicyPatch>,
 }
 
 impl CacheRoutePolicyPatch {
@@ -2478,6 +2727,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.stable_segment.as_deref() {
             policy.stable_segment = patch.apply_to(policy.stable_segment);
         }
+        if let Some(patch) = self.hit_shaping {
+            policy.hit_shaping = patch.apply_to(policy.hit_shaping);
+        }
         policy.normalized()
     }
 
@@ -2504,6 +2756,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = &self.stable_segment {
             patch.validate_raw(&format!("{label}.stableSegment"))?;
+        }
+        if let Some(patch) = &self.hit_shaping {
+            patch.validate_raw(&format!("{label}.hitShaping"))?;
         }
         let policy = self.apply_route_to(base);
         policy.validate(label)
@@ -2541,6 +2796,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.kiro_rs_tool {
             policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
         }
+        if let Some(patch) = self.hit_shaping {
+            policy.hit_shaping = patch.apply_to(policy.hit_shaping);
+        }
         policy.normalized()
     }
 
@@ -2559,6 +2817,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.stable_segment.as_deref() {
             policy.stable_segment = patch.apply_to(policy.stable_segment);
+        }
+        if let Some(patch) = self.hit_shaping {
+            policy.hit_shaping = patch.apply_to(policy.hit_shaping);
         }
         policy.normalized()
     }
@@ -2600,6 +2861,10 @@ impl CacheRoutePolicyPatch {
                 .stable_segment
                 .as_deref()
                 .is_none_or(StableSegmentCachePolicyPatch::is_empty)
+            && self
+                .hit_shaping
+                .as_ref()
+                .is_none_or(CacheHitShapingPolicyPatch::is_empty)
     }
 }
 
@@ -2730,6 +2995,7 @@ impl CachePolicyConfig {
             bounds: base.bounds,
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
             stable_segment: base.stable_segment,
+            hit_shaping: base.hit_shaping,
         };
         self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
     }
@@ -2757,6 +3023,7 @@ impl CachePolicyConfig {
             bounds: base.bounds,
             kiro_rs_tool: base.kiro_rs_tool,
             stable_segment: StableSegmentCachePolicy::default(),
+            hit_shaping: base.hit_shaping,
         };
         self.stable_segment_cache
             .apply_stable_segment_fields_to(neutral)
@@ -2783,6 +3050,7 @@ impl CachePolicyConfig {
             bounds: base.bounds,
             kiro_rs_tool: base.kiro_rs_tool,
             stable_segment: base.stable_segment,
+            hit_shaping: CacheHitShapingPolicy::disabled(),
         }
         .normalized()
     }
@@ -2823,6 +3091,7 @@ pub struct CacheRoutePolicy {
     pub bounds: CacheBoundsPolicy,
     pub kiro_rs_tool: KiroRsToolCachePolicy,
     pub stable_segment: StableSegmentCachePolicy,
+    pub hit_shaping: CacheHitShapingPolicy,
 }
 
 impl CacheRoutePolicy {
@@ -2832,11 +3101,13 @@ impl CacheRoutePolicy {
         self.reported_usage = self.reported_usage.normalized();
         self.kiro_rs_tool = self.kiro_rs_tool.normalized();
         self.stable_segment = self.stable_segment.normalized();
+        self.hit_shaping = self.hit_shaping.normalized();
         self
     }
 
     pub fn validate(&self, label: &str) -> Result<(), String> {
         self.simulation.validate(&format!("{label}.simulation"))?;
+        self.hit_shaping.validate(&format!("{label}.hitShaping"))?;
         self.creation_control
             .validate()
             .map_err(|err| format!("{label}.creationControl: {err}"))?;
@@ -5077,6 +5348,22 @@ fn default_prompt_cache_target_read_ratio() -> f64 {
     0.98
 }
 
+fn default_cache_hit_target_ratio() -> f64 {
+    0.9
+}
+
+fn default_cache_hit_ratio_jitter() -> f64 {
+    0.04
+}
+
+fn default_cache_hit_min_tokens() -> i32 {
+    1024
+}
+
+fn default_cache_hit_min_cost_ratio() -> f64 {
+    1.0
+}
+
 fn default_kiro_rs_tool_coverage_ratio() -> f64 {
     1.0
 }
@@ -5873,6 +6160,7 @@ impl Config {
             },
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
             stable_segment: StableSegmentCachePolicy::default(),
+            hit_shaping: CacheHitShapingPolicy::default(),
         }
         .normalized()
     }
@@ -6331,6 +6619,79 @@ mod tests {
             Config::default().kiro_agent_mode_strategy,
             KiroAgentModeStrategy::Vibe
         );
+    }
+
+    #[test]
+    fn cache_hit_shaping_round_trips_and_resolves_per_strategy() {
+        let json = r#"{
+            "pathOverrides": {
+                "/dfcache/minea": {
+                    "cacheType": "current_high_cache",
+                    "hitShaping": { "targetHitRatio": 0.85, "minCacheCreationTokens": 2048 }
+                },
+                "/dfcache/kiro": { "cacheType": "kiro_rs_tool" },
+                "/na": { "cacheType": "no_cache" }
+            }
+        }"#;
+        let cache_policy: CachePolicyConfig = serde_json::from_str(json).unwrap();
+        let round_trip: CachePolicyConfig =
+            serde_json::from_str(&serde_json::to_string(&cache_policy).unwrap()).unwrap();
+        assert_eq!(round_trip, cache_policy);
+
+        let config = Config {
+            cache_policy,
+            ..Config::default()
+        };
+        let minea = config
+            .cache_policy_for_path("/dfcache/minea/v1/messages")
+            .policy
+            .hit_shaping;
+        // 没有显式开启时保持关闭。
+        assert!(!minea.enabled);
+        assert_eq!(minea.target_hit_ratio, 0.85);
+        assert_eq!(minea.min_cache_creation_tokens, 2048);
+        assert_eq!(minea.min_cache_read_tokens, 1024);
+
+        // 默认关闭，没有单独配置的策略继承默认值。
+        assert!(!CacheHitShapingPolicy::default().enabled);
+        let kiro = config
+            .cache_policy_for_path("/dfcache/kiro/v1/messages")
+            .policy
+            .hit_shaping;
+        assert_eq!(kiro, CacheHitShapingPolicy::default());
+        let v1 = config
+            .cache_policy_for_path("/v1/messages")
+            .policy
+            .hit_shaping;
+        assert_eq!(v1, CacheHitShapingPolicy::default());
+
+        // no_cache 不整形。
+        let na = config
+            .cache_policy_for_path("/na/v1/messages")
+            .policy
+            .hit_shaping;
+        assert!(!na.enabled);
+    }
+
+    #[test]
+    fn cache_hit_shaping_rejects_out_of_range_values() {
+        let patch = CacheRoutePolicyPatch {
+            hit_shaping: Some(CacheHitShapingPolicyPatch {
+                target_hit_ratio: Some(1.2),
+                ..CacheHitShapingPolicyPatch::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
+        let base = Config::default().legacy_cache_route_policy_default();
+        assert!(patch.validate("test", base.clone()).is_err());
+        let patch = CacheRoutePolicyPatch {
+            hit_shaping: Some(CacheHitShapingPolicyPatch {
+                min_cache_read_tokens: Some(-1),
+                ..CacheHitShapingPolicyPatch::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
+        assert!(patch.validate("test", base).is_err());
     }
 
     #[test]

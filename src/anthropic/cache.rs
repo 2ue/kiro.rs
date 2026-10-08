@@ -1,9 +1,11 @@
 use serde_json::json;
 
+use crate::anthropic::pricing::ModelPricing;
 use crate::anthropic::prompt_cache::PromptCacheUsage;
 use crate::kiro::model::events::MetadataTokenUsage;
 use crate::model::config::{
-    ReportedUsageFieldMode, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
+    CacheHitShapingPolicy, ReportedUsageFieldMode, ReportedUsageFieldPolicy,
+    ReportedUsagePathPolicy,
 };
 
 /// Usage split used for Anthropic prompt-cache compatible responses.
@@ -692,6 +694,35 @@ impl ReportedCacheUsagePolicy {
         }
     }
 
+    /// 下游 input 的允许上限（sample-max / sample-target 的上限，0 表示不限）。
+    pub fn reported_input_max_tokens(&self) -> i32 {
+        if !self.reports_local_prompt_cache() {
+            return 0;
+        }
+        let field = self.policy.input.normalized();
+        match field.mode {
+            ReportedUsageFieldMode::SampleMax => field.max_tokens.max(0),
+            ReportedUsageFieldMode::SampleTarget => ReportedCacheCreationPolicy {
+                target_tokens: field.target_tokens.max(0),
+                normal_max_multiplier: field.normal_max_multiplier,
+                seed: self.seed,
+            }
+            .normal_max_tokens(),
+            ReportedUsageFieldMode::Raw | ReportedUsageFieldMode::Preserve => 0,
+        }
+    }
+
+    /// 下游 cache_read / cache_creation 的最终有效上限（0 表示不限）。
+    pub fn final_cache_caps(&self, usage: CacheUsage) -> (i32, i32) {
+        if !self.reports_local_prompt_cache() {
+            return (0, 0);
+        }
+        (
+            self.final_cache_read_effective_cap(usage).unwrap_or(0),
+            self.final_cache_creation_effective_cap(usage).unwrap_or(0),
+        )
+    }
+
     fn final_cache_read_effective_cap(&self, usage: CacheUsage) -> Option<i32> {
         let max_tokens = self.policy.final_cache_read_max_tokens.max(0);
         if max_tokens <= 0 {
@@ -966,6 +997,340 @@ fn cap_cache_creation_breakdown(cache5m: i32, cache1h: i32, limit: i32) -> (i32,
     (capped_5m, capped_1h)
 }
 
+/// 命中率整形的请求级输入。
+#[derive(Debug, Clone, Copy)]
+pub struct CacheHitShapingInput {
+    pub policy: CacheHitShapingPolicy,
+    /// 请求带历史或本地前缀命中，说明存在可复用前缀。
+    pub has_reusable_prefix: bool,
+    /// creation control 是否放行本次写入；不放行时优先用 input 承担非读取部分。
+    pub creation_allowed: bool,
+    /// 原始（未整形）usage，作为计费下限的基准。
+    pub raw: CacheUsage,
+    /// 模型单价；None 时跳过计费下限。
+    pub pricing: Option<ModelPricing>,
+    /// 下游 input 的允许范围（来自 reportedUsage.input）；max 为 0 表示不限。
+    pub input_min_tokens: i32,
+    pub input_max_tokens: i32,
+    /// 下游 cache_read / cache_creation 最终上限（0 表示不限）。
+    pub max_cache_read_tokens: i32,
+    pub max_cache_creation_tokens: i32,
+    pub seed: u64,
+}
+
+/// 在最终下游 usage 上执行命中率、计费下限和小值整形。
+///
+/// 总量 `input + read + creation` 保持不变，在总量内重新分配：
+/// 1. 按目标命中率（含浮动）确定读取占比，其余为非读取部分；
+///    放行写入时非读取部分优先记为写入（input 保持原值），不放行时记为读取 / input；
+/// 2. 计费低于原始计费 × `min_cost_ratio` 时降低读取占比，直到不亏损；
+/// 3. 非零但过小的读写抬到最小值。
+///
+/// 是否写入只由 creation control 决定：未放行的请求最终写入为 0，计费差额全部由 input
+/// 补足（此时 input 可以超过 reportedUsage.input 上限）。
+/// 优先级：写入频次控制 > 不亏损 > 读写上限 > 命中率。
+pub fn shape_cache_hit_usage(usage: CacheUsage, input: CacheHitShapingInput) -> CacheUsage {
+    let policy = input.policy.normalized();
+    if !policy.enabled {
+        return usage;
+    }
+    let usage = normalize_shaped_cache_usage(usage);
+    let total = usage.reported_total_input_tokens();
+    if total <= 1 {
+        return usage;
+    }
+
+    let bounds = ShapingBounds::new(&usage, &input);
+    let floor = input
+        .pricing
+        .filter(|_| policy.min_cost_ratio > 0.0)
+        .map(|pricing| pricing.estimate(input.raw) * policy.min_cost_ratio);
+    let mut shaped = usage;
+
+    let reusable = input.has_reusable_prefix || usage.cache_read_input_tokens > 0;
+    let jitter_unit = (splitmix64(input.seed ^ 0x3c6e_f372_fe94_f82b) % 10_001) as f64 / 10_000.0;
+    let target = (policy.target_hit_ratio + policy.ratio_jitter * jitter_unit)
+        .min(CacheHitShapingPolicy::MAX_TARGET_HIT_RATIO);
+    let shape_ratio = reusable && policy.target_hit_ratio > 0.0;
+    if shape_ratio {
+        shaped = solve_split(
+            &usage,
+            total,
+            target,
+            &bounds,
+            policy,
+            input.creation_allowed,
+        );
+        if let (Some(floor), Some(pricing)) = (floor, input.pricing)
+            && !meets_floor(pricing, &shaped, floor)
+        {
+            shaped = lossless_split(
+                &usage, total, target, &bounds, policy, &input, pricing, floor,
+            )
+            .unwrap_or(shaped);
+        }
+    }
+
+    raise_small_cache_fields(&mut shaped, policy, &bounds, input.creation_allowed);
+    if !input.creation_allowed && shaped.cache_creation_input_tokens > 0 {
+        // creation control 未放行：本次不上报写入，并回 input。
+        shaped.input_tokens = shaped
+            .input_tokens
+            .saturating_add(shaped.cache_creation_input_tokens);
+        shaped.cache_creation_input_tokens = 0;
+    }
+    if let (Some(floor), Some(pricing)) = (floor, input.pricing) {
+        raise_cost_to_floor(
+            &mut shaped,
+            pricing,
+            floor,
+            policy,
+            &bounds,
+            input.creation_allowed,
+        );
+    }
+    // 放行写入时把写入抬到最小比例，然后再补读取保持命中率。
+    raise_creation_to_min(&mut shaped, &input, policy, &bounds);
+    if shape_ratio {
+        // 总量内受计费下限限制达不到目标时，在总量之外追加读取：只增不减，计费不会下降。
+        raise_read_to_ratio(&mut shaped, target, bounds.read_cap);
+    }
+    normalize_shaped_cache_usage(shaped)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShapingBounds {
+    input_min: i32,
+    input_max: i32,
+    read_cap: i32,
+    creation_cap: i32,
+}
+
+impl ShapingBounds {
+    fn new(usage: &CacheUsage, input: &CacheHitShapingInput) -> Self {
+        let cap = |value: i32| if value > 0 { value } else { i32::MAX };
+        let input_max = cap(input.input_max_tokens);
+        let input_min = input.input_min_tokens.max(0).min(input_max);
+        // input 已经超过上限时（上游 usage 本身更大），不强行压低。
+        let input_max = input_max.max(usage.input_tokens.min(input_min.max(input_max)));
+        let policy = input.policy.normalized();
+        let mut read_cap = cap(input.max_cache_read_tokens);
+        if policy.max_read_multiplier > 0.0 {
+            let raw_input = input.raw.reported_total_input_tokens().max(1) as f64;
+            let multiplier_cap = (raw_input * policy.max_read_multiplier)
+                .round()
+                .clamp(1.0, i32::MAX as f64) as i32;
+            read_cap = read_cap.min(multiplier_cap);
+        }
+        Self {
+            input_min,
+            input_max,
+            read_cap,
+            creation_cap: cap(input.max_cache_creation_tokens),
+        }
+    }
+}
+
+/// 放行写入时，把写入抬到原始输入 × `min_creation_ratio`。
+fn raise_creation_to_min(
+    usage: &mut CacheUsage,
+    input: &CacheHitShapingInput,
+    policy: CacheHitShapingPolicy,
+    bounds: &ShapingBounds,
+) {
+    if !input.creation_allowed || policy.min_creation_ratio <= 0.0 {
+        return;
+    }
+    let raw_input = input.raw.reported_total_input_tokens().max(0) as f64;
+    let min_creation = (raw_input * policy.min_creation_ratio)
+        .round()
+        .clamp(0.0, i32::MAX as f64) as i32;
+    let min_creation = min_creation
+        .max(policy.min_cache_creation_tokens.max(0))
+        .min(bounds.creation_cap);
+    if usage.cache_creation_input_tokens < min_creation {
+        usage.cache_creation_input_tokens = min_creation;
+    }
+}
+
+/// 在总量 `total` 内按读取占比 `ratio` 分配。
+fn solve_split(
+    usage: &CacheUsage,
+    total: i32,
+    ratio: f64,
+    bounds: &ShapingBounds,
+    policy: CacheHitShapingPolicy,
+    allow_creation: bool,
+) -> CacheUsage {
+    let ratio = ratio.clamp(0.0, CacheHitShapingPolicy::MAX_TARGET_HIT_RATIO);
+    let mut read = ((total as f64) * ratio).round() as i32;
+    read = read.clamp(0, total).min(bounds.read_cap);
+    let non_read = total - read;
+
+    let min_creation = policy.min_cache_creation_tokens.max(0);
+    let (mut input, mut creation) = if allow_creation {
+        let input = usage
+            .input_tokens
+            .clamp(bounds.input_min, bounds.input_max)
+            .min(non_read);
+        (input, non_read - input)
+    } else {
+        // 未放行写入：非读取部分记为 input，超出 input 上限的部分并入读取，
+        // 读取到上限后仍有剩余时留在 input（允许超过 input 上限），不记写入。
+        let input = non_read
+            .clamp(bounds.input_min, bounds.input_max)
+            .min(non_read);
+        let overflow = non_read - input;
+        let to_read = overflow.min(bounds.read_cap.saturating_sub(read).max(0));
+        (input.saturating_add(overflow - to_read), 0)
+    };
+    if creation > 0 && creation < min_creation {
+        if allow_creation && non_read.saturating_sub(min_creation) >= bounds.input_min {
+            creation = min_creation;
+            input = non_read - creation;
+        } else if non_read <= bounds.input_max {
+            input = non_read;
+            creation = 0;
+        }
+    }
+    if creation > bounds.creation_cap {
+        let excess = creation - bounds.creation_cap;
+        creation = bounds.creation_cap;
+        input = input.saturating_add(excess);
+    }
+    let read = total - input - creation;
+    CacheUsage {
+        input_tokens: input,
+        cache_read_input_tokens: read.max(0),
+        cache_creation_input_tokens: creation,
+        ..*usage
+    }
+}
+
+/// 计费不足时降低读取占比，找到不亏损的最大占比。
+#[allow(clippy::too_many_arguments)]
+fn lossless_split(
+    usage: &CacheUsage,
+    total: i32,
+    target: f64,
+    bounds: &ShapingBounds,
+    policy: CacheHitShapingPolicy,
+    input: &CacheHitShapingInput,
+    pricing: ModelPricing,
+    floor: f64,
+) -> Option<CacheUsage> {
+    let allow_creation = input.creation_allowed;
+    {
+        let split = |ratio: f64| solve_split(usage, total, ratio, bounds, policy, allow_creation);
+        if !meets_floor(pricing, &split(0.0), floor) {
+            return None;
+        }
+        let (mut low, mut high) = (0.0_f64, target);
+        for _ in 0..40 {
+            let mid = (low + high) / 2.0;
+            if meets_floor(pricing, &split(mid), floor) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        // 触及不亏损上限时向下浮动，避免每次都是同一个占比。
+        let jitter_unit =
+            (splitmix64(input.seed ^ 0x9f1d_2b7c_44e8_a613) % 10_001) as f64 / 10_000.0;
+        let ratio = (low - policy.ratio_jitter * jitter_unit).max(0.0);
+        let shaped = split(ratio);
+        if meets_floor(pricing, &shaped, floor) {
+            return Some(shaped);
+        }
+        Some(split(low))
+    }
+}
+
+/// 增加 read 使 read / (input + read + creation) >= ratio。
+fn raise_read_to_ratio(usage: &mut CacheUsage, ratio: f64, read_cap: i32) {
+    let others = usage
+        .input_tokens
+        .max(0)
+        .saturating_add(usage.cache_creation_input_tokens.max(0)) as f64;
+    if others <= 0.0 || ratio <= 0.0 {
+        return;
+    }
+    let needed = ((ratio * others) / (1.0 - ratio))
+        .ceil()
+        .min(read_cap as f64) as i32;
+    if usage.cache_read_input_tokens < needed {
+        usage.cache_read_input_tokens = needed;
+    }
+}
+
+fn meets_floor(pricing: ModelPricing, usage: &CacheUsage, floor: f64) -> bool {
+    pricing.estimate(*usage) >= floor * (1.0 - 1e-9)
+}
+
+/// 总量内已无法不亏损时（例如总量本身过小）补足计费：
+/// 放行写入时先增加写入、写入到上限后增加 input；未放行时只增加 input，不受 input 上限约束。
+fn raise_cost_to_floor(
+    usage: &mut CacheUsage,
+    pricing: ModelPricing,
+    floor: f64,
+    policy: CacheHitShapingPolicy,
+    bounds: &ShapingBounds,
+    creation_allowed: bool,
+) {
+    if meets_floor(pricing, usage, floor) {
+        return;
+    }
+    if creation_allowed && pricing.cache_creation_input_token_cost > 0.0 {
+        let gap = floor - pricing.estimate(*usage);
+        let existing = usage.cache_creation_input_tokens.max(0) as i64;
+        let mut tokens = (gap / pricing.cache_creation_input_token_cost).ceil() as i64;
+        let min_creation = policy.min_cache_creation_tokens.max(0) as i64;
+        if existing + tokens < min_creation {
+            tokens = min_creation - existing;
+        }
+        let room = (bounds.creation_cap as i64 - existing).max(0);
+        let add = tokens.min(room).max(0);
+        if existing + add >= min_creation || existing > 0 {
+            usage.cache_creation_input_tokens = (existing + add).min(i32::MAX as i64) as i32;
+        }
+    }
+    if !meets_floor(pricing, usage, floor) && pricing.input_cost_per_token > 0.0 {
+        let gap = floor - pricing.estimate(*usage);
+        let tokens = (gap / pricing.input_cost_per_token).ceil() as i32;
+        let room = if creation_allowed {
+            bounds.input_max.saturating_sub(usage.input_tokens).max(0)
+        } else {
+            i32::MAX
+        };
+        usage.input_tokens = usage.input_tokens.saturating_add(tokens.min(room).max(0));
+    }
+}
+
+/// 非零但低于最小值的读写抬到最小值；未放行写入或写入超过上限时，小写入并回 input。
+fn raise_small_cache_fields(
+    usage: &mut CacheUsage,
+    policy: CacheHitShapingPolicy,
+    bounds: &ShapingBounds,
+    creation_allowed: bool,
+) {
+    let min_read = policy.min_cache_read_tokens.max(0);
+    let read = usage.cache_read_input_tokens.max(0);
+    if read > 0 && read < min_read {
+        usage.cache_read_input_tokens = min_read.min(bounds.read_cap);
+    }
+
+    let min_creation = policy.min_cache_creation_tokens.max(0);
+    let creation = usage.cache_creation_input_tokens.max(0);
+    if creation > 0 && creation < min_creation {
+        if creation_allowed && min_creation <= bounds.creation_cap {
+            usage.cache_creation_input_tokens = min_creation;
+        } else {
+            usage.input_tokens = usage.input_tokens.saturating_add(creation);
+            usage.cache_creation_input_tokens = 0;
+        }
+    }
+}
+
 fn normalize_cache_usage_breakdown(mut usage: CacheUsage) -> CacheUsage {
     usage.input_tokens = usage.input_tokens.max(0);
     usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(0);
@@ -978,6 +1343,29 @@ fn normalize_cache_usage_breakdown(mut usage: CacheUsage) -> CacheUsage {
     usage.cache_creation_5m_input_tokens = cache5m;
     usage.cache_creation_1h_input_tokens = cache1h;
     usage.total_input_tokens = usage.reported_total_input_tokens();
+    usage
+}
+
+/// 命中率整形专用：在 [`normalize_cache_usage_breakdown`] 基础上，把被抬高的写入按已有
+/// TTL 归属补齐（只有 1h 时归入 1h，否则归入 5m），保证 5m + 1h == creation。
+fn normalize_shaped_cache_usage(usage: CacheUsage) -> CacheUsage {
+    let mut usage = normalize_cache_usage_breakdown(usage);
+    let assigned = usage
+        .cache_creation_5m_input_tokens
+        .saturating_add(usage.cache_creation_1h_input_tokens);
+    let remainder = usage
+        .cache_creation_input_tokens
+        .saturating_sub(assigned)
+        .max(0);
+    if usage.cache_creation_1h_input_tokens > 0 && usage.cache_creation_5m_input_tokens == 0 {
+        usage.cache_creation_1h_input_tokens = usage
+            .cache_creation_1h_input_tokens
+            .saturating_add(remainder);
+    } else {
+        usage.cache_creation_5m_input_tokens = usage
+            .cache_creation_5m_input_tokens
+            .saturating_add(remainder);
+    }
     usage
 }
 
@@ -1378,6 +1766,8 @@ impl CacheSimulation {
         let (cache_read_input_tokens, cache_creation_input_tokens) = match (has_read, has_creation)
         {
             (true, true) => {
+                // 前缀增长时：读取取未放大的匹配量，放大后的差额整体记为写入。
+                // 这样每次前缀变化都会产生较大的写入；命中率由最终 hitShaping 补读取保证。
                 let read = self.cache_read_input_tokens.max(0).min(target_cached);
                 (read, target_cached.saturating_sub(read))
             }
@@ -3033,5 +3423,316 @@ mod tests {
         assert!(values.windows(2).any(|pair| pair[1] < pair[0]));
         assert!(values.iter().any(|value| value % 10 != 0));
         assert!(values.iter().any(|value| *value > 25));
+    }
+
+    fn hit_ratio(usage: CacheUsage) -> f64 {
+        let total =
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+        usage.cache_read_input_tokens as f64 / total as f64
+    }
+
+    fn sonnet_pricing() -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: 0.000003,
+            output_cost_per_token: 0.000015,
+            cache_creation_input_token_cost: 0.00000375,
+            cache_read_input_token_cost: 0.0000003,
+        }
+    }
+
+    fn shaping(target: f64, min_tokens: i32, min_cost_ratio: f64) -> CacheHitShapingPolicy {
+        CacheHitShapingPolicy {
+            enabled: true,
+            target_hit_ratio: target,
+            ratio_jitter: 0.04,
+            min_cache_read_tokens: min_tokens,
+            min_cache_creation_tokens: min_tokens,
+            min_cost_ratio,
+            max_read_multiplier: 0.0,
+            min_creation_ratio: 0.0,
+        }
+    }
+
+    fn raw_input(tokens: i32, output: i32) -> CacheUsage {
+        RawUsage::uncached(tokens, output).to_cache_usage()
+    }
+
+    fn input(policy: CacheHitShapingPolicy, raw: CacheUsage) -> CacheHitShapingInput {
+        CacheHitShapingInput {
+            policy,
+            has_reusable_prefix: true,
+            creation_allowed: true,
+            raw,
+            pricing: Some(sonnet_pricing()),
+            input_min_tokens: 1,
+            input_max_tokens: 20_000,
+            max_cache_read_tokens: 0,
+            max_cache_creation_tokens: 0,
+            seed: 0,
+        }
+    }
+
+    fn usage(input: i32, read: i32, creation: i32, output: i32) -> CacheUsage {
+        CacheUsage {
+            total_input_tokens: input + read + creation,
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: creation,
+            cache_read_input_tokens: read,
+            cache_creation_5m_input_tokens: creation,
+            cache_creation_1h_input_tokens: 0,
+        }
+    }
+
+    fn sum(usage: CacheUsage) -> i32 {
+        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    }
+
+    #[test]
+    fn hit_shaping_reaches_target_keeps_total_and_writes() {
+        // minea 放大后的典型请求：总量约 3.9 倍原始上下文。
+        let base = usage(1_114, 23_463, 48_773, 78);
+        let raw = raw_input(24_650, 78);
+        for seed in 0..64 {
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    seed,
+                    ..input(shaping(0.8, 1024, 1.0), raw)
+                },
+            );
+            assert!(sum(shaped) >= sum(base), "seed {seed}");
+            assert!(hit_ratio(shaped) >= 0.8 - 1e-6, "seed {seed}: {shaped:?}");
+            assert!(
+                shaped.cache_creation_input_tokens >= 1024,
+                "writes kept: {shaped:?}"
+            );
+            assert!(
+                sonnet_pricing().estimate(shaped) >= sonnet_pricing().estimate(raw) * (1.0 - 1e-9)
+            );
+            assert_eq!(
+                shaped.cache_creation_5m_input_tokens + shaped.cache_creation_1h_input_tokens,
+                shaped.cache_creation_input_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn hit_shaping_lowers_ratio_instead_of_losing_money() {
+        // 总量只有 1 倍原始上下文时，90% 读取必然亏损，降到不亏损的最大占比。
+        let base = usage(3_000, 20_000, 7_000, 10);
+        let raw = raw_input(30_000, 10);
+        let shaped = shape_cache_hit_usage(base, input(shaping(0.9, 1024, 1.0), raw));
+        assert!(sum(shaped) >= 30_000);
+        assert!(sonnet_pricing().estimate(shaped) >= sonnet_pricing().estimate(raw) * (1.0 - 1e-9));
+        assert!(hit_ratio(shaped) >= 0.9 - 1e-6, "{shaped:?}");
+
+        // 读取触及最终上限时，以计费下限为准，命中率可以低于目标。
+        let shaped = shape_cache_hit_usage(
+            base,
+            CacheHitShapingInput {
+                max_cache_read_tokens: 25_000,
+                ..input(shaping(0.9, 1024, 1.0), raw)
+            },
+        );
+        assert!(shaped.cache_read_input_tokens <= 25_000);
+        assert!(sonnet_pricing().estimate(shaped) >= sonnet_pricing().estimate(raw) * (1.0 - 1e-9));
+        assert!(hit_ratio(shaped) < 0.9);
+
+        // 关闭计费下限时按目标值走。
+        let shaped = shape_cache_hit_usage(base, input(shaping(0.9, 1024, 0.0), raw));
+        assert!(hit_ratio(shaped) >= 0.9 - 1e-6);
+    }
+
+    #[test]
+    fn hit_shaping_never_writes_when_creation_control_suppresses() {
+        // 写入被 creation control 拦下的请求：最终写入必须为 0，计费仍不亏损。
+        for (base, raw_tokens) in [
+            (usage(3_599, 112_215, 0, 64), 29_836),
+            (usage(20_000, 23_695, 4_298, 64), 27_410),
+            (usage(1_114, 23_463, 48_773, 64), 24_650),
+        ] {
+            let raw = raw_input(raw_tokens, 64);
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    creation_allowed: false,
+                    ..input(shaping(0.9, 1024, 1.0), raw)
+                },
+            );
+            assert_eq!(
+                shaped.cache_creation_input_tokens, 0,
+                "{base:?} -> {shaped:?}"
+            );
+            assert!(
+                sonnet_pricing().estimate(shaped) >= sonnet_pricing().estimate(raw) * (1.0 - 1e-9),
+                "{base:?} -> {shaped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_shaping_does_not_invent_reads_without_reusable_prefix() {
+        let base = usage(3_971, 0, 92_521, 101);
+        let raw = raw_input(24_865, 101);
+        let shaped = shape_cache_hit_usage(
+            base,
+            CacheHitShapingInput {
+                has_reusable_prefix: false,
+                ..input(shaping(0.9, 1024, 1.0), raw)
+            },
+        );
+        assert_eq!(shaped.cache_read_input_tokens, 0);
+        assert_eq!(shaped.cache_creation_input_tokens, 92_521);
+    }
+
+    #[test]
+    fn hit_shaping_raises_small_cache_values() {
+        for creation in [1, 6, 179, 1_023] {
+            let base = usage(4_000, 90_000, creation, 9);
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    has_reusable_prefix: false,
+                    ..input(shaping(0.0, 1024, 0.0), raw_input(10_000, 9))
+                },
+            );
+            assert_eq!(
+                shaped.cache_creation_input_tokens, 1024,
+                "creation {creation}"
+            );
+        }
+        let base = usage(5_000, 300, 0, 9);
+        let shaped = shape_cache_hit_usage(
+            base,
+            CacheHitShapingInput {
+                has_reusable_prefix: false,
+                ..input(shaping(0.0, 1024, 0.0), raw_input(5_000, 9))
+            },
+        );
+        assert_eq!(shaped.cache_read_input_tokens, 1024);
+    }
+
+    #[test]
+    fn hit_shaping_never_outputs_small_values_or_loses_money() {
+        let mut state = 0x1234_u64;
+        for _ in 0..5_000 {
+            state = splitmix64(state);
+            let raw_tokens = ((splitmix64(state ^ 3) % 150_000) + 2) as i32;
+            let scale = 1.0 + (state % 300) as f64 / 100.0;
+            let total = ((raw_tokens as f64) * scale) as i32;
+            let read = (splitmix64(state ^ 1) % (total as u64 + 1)) as i32
+                * ((!state.is_multiple_of(3)) as i32);
+            let creation = (splitmix64(state ^ 2) % ((total - read) as u64 + 1)) as i32;
+            let inp = total - read - creation;
+            let base = usage(inp, read, creation, 1);
+            let target = (state % 100) as f64 / 100.0;
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    has_reusable_prefix: state.is_multiple_of(2),
+                    creation_allowed: !state.is_multiple_of(5),
+                    seed: state,
+                    ..input(shaping(target, 1024, 1.0), raw_input(raw_tokens, 1))
+                },
+            );
+            let r = shaped.cache_read_input_tokens;
+            let c = shaped.cache_creation_input_tokens;
+            if state.is_multiple_of(5) {
+                assert_eq!(c, 0, "suppressed request wrote {c}: {base:?}");
+            }
+            assert!(r == 0 || r >= 1024, "read {r} from {base:?}");
+            assert!(c == 0 || c >= 1024, "creation {c} from {base:?}");
+            assert!(
+                sonnet_pricing().estimate(shaped)
+                    >= sonnet_pricing().estimate(raw_input(raw_tokens, 1)) * (1.0 - 1e-6),
+                "loss: {base:?} -> {shaped:?} raw {raw_tokens}"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_shaping_read_multiplier_caps_reads_and_keeps_cost_floor() {
+        let base = usage(1_114, 23_463, 48_773, 78);
+        let raw = raw_input(24_650, 78);
+        let policy = CacheHitShapingPolicy {
+            max_read_multiplier: 4.0,
+            ..shaping(0.95, 1024, 1.0)
+        };
+        let shaped = shape_cache_hit_usage(base, input(policy, raw));
+        assert!(shaped.cache_read_input_tokens <= 98_600, "{shaped:?}");
+        assert!(sonnet_pricing().estimate(shaped) >= sonnet_pricing().estimate(raw) * (1.0 - 1e-9));
+        assert!(hit_ratio(shaped) < 0.95);
+
+        // 0 表示不限制，可以达到目标。
+        let shaped = shape_cache_hit_usage(base, input(shaping(0.95, 1024, 1.0), raw));
+        assert!(hit_ratio(shaped) >= 0.95 - 1e-6);
+    }
+
+    #[test]
+    fn hit_shaping_min_creation_ratio_raises_writes_when_allowed() {
+        let base = usage(1_114, 23_463, 48_773, 78);
+        let raw = raw_input(24_650, 78);
+        let policy = CacheHitShapingPolicy {
+            min_creation_ratio: 1.5,
+            ..shaping(0.8, 1024, 1.0)
+        };
+        let shaped = shape_cache_hit_usage(base, input(policy, raw));
+        assert!(shaped.cache_creation_input_tokens >= 36_975, "{shaped:?}");
+        assert!(hit_ratio(shaped) >= 0.8 - 1e-6, "{shaped:?}");
+
+        // 未放行写入时永远不产生写入：计费差额由 input 补足（允许超过 input 上限）。
+        let base = usage(20_000, 148_206, 0, 64);
+        let raw = raw_input(24_701, 64);
+        let shaped = shape_cache_hit_usage(
+            base,
+            CacheHitShapingInput {
+                creation_allowed: false,
+                ..input(policy, raw)
+            },
+        );
+        assert_eq!(shaped.cache_creation_input_tokens, 0, "{shaped:?}");
+        assert!(sonnet_pricing().estimate(shaped) >= sonnet_pricing().estimate(raw) * (1.0 - 1e-9));
+
+        // 未放行且计费已足够时不产生写入。
+        let base = usage(3_599, 112_215, 0, 64);
+        let shaped = shape_cache_hit_usage(
+            base,
+            CacheHitShapingInput {
+                creation_allowed: false,
+                ..input(policy, raw_input(2_000, 64))
+            },
+        );
+        assert_eq!(shaped.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn hit_shaping_disabled_is_identity() {
+        let base = usage(10_000, 0, 6, 1);
+        let shaped = shape_cache_hit_usage(
+            base,
+            input(CacheHitShapingPolicy::disabled(), raw_input(10_000, 1)),
+        );
+        assert_eq!(shaped, base);
+    }
+
+    #[test]
+    fn amplified_growth_reports_full_amplified_creation() {
+        // 前缀增长时，放大后的差额整体记为写入，写入保持较大量级。
+        let simulation = CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 1_000,
+                cache_read_input_tokens: 30_000,
+                cache_creation_5m_input_tokens: 1_000,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: Some(0.99),
+            },
+            0.99,
+            Some(CacheAmplification::new(3.0, 0, 0, 0, 3_000, 0)),
+        )
+        .unwrap();
+        let usage = simulation.to_usage(31_400, 10);
+        assert_eq!(usage.cache_read_input_tokens, 30_000);
+        assert!(usage.cache_creation_input_tokens > 55_000, "{usage:?}");
     }
 }
