@@ -1385,6 +1385,7 @@ fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response>
         .map_err(|error| error.to_response(&request_id))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_raw_external_direct_response(
     state: &AppState,
     headers: HeaderMap,
@@ -1392,6 +1393,7 @@ async fn maybe_raw_external_direct_response(
     endpoint: &str,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
+    ingress_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<Response> {
     let provider = state.kiro_provider.as_ref()?.clone();
@@ -1438,6 +1440,7 @@ async fn maybe_raw_external_direct_response(
         None,
         inference_attempt_budget,
         request_api_key_id,
+        ingress_id,
         raw_probe,
     );
     if let Some(resolution) = direct_model_resolution {
@@ -1449,6 +1452,7 @@ async fn maybe_raw_external_direct_response(
     Some(manager.forward_with_failover(config, route).await)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_raw_external_preflight_response(
     state: &AppState,
     headers: HeaderMap,
@@ -1456,6 +1460,7 @@ async fn maybe_raw_external_preflight_response(
     endpoint: &str,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
+    ingress_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> Option<RawExternalPreflightDecision> {
     let provider = state.kiro_provider.as_ref()?.clone();
@@ -1531,6 +1536,7 @@ async fn maybe_raw_external_preflight_response(
         })),
         inference_attempt_budget.clone(),
         request_api_key_id,
+        ingress_id,
         raw_probe.clone(),
     );
 
@@ -1645,6 +1651,7 @@ fn raw_external_route_request(
         local_preflight,
         inference_attempt_budget,
         request_api_key_id,
+        None,
         raw_probe,
     )
 }
@@ -1664,6 +1671,7 @@ fn raw_external_route_request_with_hints(
     local_preflight: Option<serde_json::Value>,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
+    ingress_id: Option<String>,
     raw_probe: Arc<RawMessagesBodyProbe>,
 ) -> ExternalRouteRequest {
     let model_hint = raw_probe.model.clone();
@@ -1676,6 +1684,7 @@ fn raw_external_route_request_with_hints(
             "stream": stream_hint,
             "routeSubtype": format!("{route_subtype:?}"),
             "requestApiKeyId": request_api_key_id,
+            "ingressId": ingress_id,
             "headers": crate::diagnostics::capture::http_headers_json(&headers),
             "rawBody": crate::diagnostics::capture::body_json(&raw_body),
         })
@@ -6473,7 +6482,7 @@ pub async fn post_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     attribution: Option<Extension<RequestRejectionAttribution>>,
-    MessagesBody(raw_body, request_api_key_id): MessagesBody,
+    MessagesBody(raw_body, request_api_key_id, ingress_id): MessagesBody,
 ) -> Response {
     post_messages_for_endpoint(
         state,
@@ -6481,6 +6490,7 @@ pub async fn post_messages(
         raw_body,
         "/v1/messages".to_string(),
         request_api_key_id,
+        ingress_id,
         attribution.map(|Extension(value)| value),
     )
     .await
@@ -6493,7 +6503,7 @@ pub async fn post_messages_na(
     State(state): State<AppState>,
     headers: HeaderMap,
     attribution: Option<Extension<RequestRejectionAttribution>>,
-    MessagesBody(raw_body, request_api_key_id): MessagesBody,
+    MessagesBody(raw_body, request_api_key_id, ingress_id): MessagesBody,
 ) -> Response {
     post_messages_for_endpoint(
         state,
@@ -6501,6 +6511,7 @@ pub async fn post_messages_na(
         raw_body,
         "/na/v1/messages".to_string(),
         request_api_key_id,
+        ingress_id,
         attribution.map(|Extension(value)| value),
     )
     .await
@@ -6513,7 +6524,7 @@ pub async fn post_messages_ha(
     State(state): State<AppState>,
     headers: HeaderMap,
     attribution: Option<Extension<RequestRejectionAttribution>>,
-    MessagesBody(raw_body, request_api_key_id): MessagesBody,
+    MessagesBody(raw_body, request_api_key_id, ingress_id): MessagesBody,
 ) -> Response {
     post_messages_for_endpoint(
         state,
@@ -6521,6 +6532,7 @@ pub async fn post_messages_ha(
         raw_body,
         "/ha/v1/messages".to_string(),
         request_api_key_id,
+        ingress_id,
         attribution.map(|Extension(value)| value),
     )
     .await
@@ -6534,7 +6546,7 @@ pub async fn post_messages_dfcache(
     Path(route): Path<String>,
     headers: HeaderMap,
     attribution: Option<Extension<RequestRejectionAttribution>>,
-    MessagesBody(raw_body, request_api_key_id): MessagesBody,
+    MessagesBody(raw_body, request_api_key_id, ingress_id): MessagesBody,
 ) -> Response {
     let endpoint = format!("/dfcache/{route}/v1/messages");
     let prefix = match resolve_defined_cache_route(&state, &route) {
@@ -6556,6 +6568,7 @@ pub async fn post_messages_dfcache(
         raw_body,
         endpoint,
         request_api_key_id,
+        ingress_id,
         attribution.map(|Extension(value)| value),
     )
     .await
@@ -6567,6 +6580,7 @@ async fn post_messages_for_endpoint(
     raw_body: Bytes,
     endpoint: String,
     request_api_key_id: Option<String>,
+    ingress_id: Option<String>,
     attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
     request_entry::handle_messages_endpoint(
@@ -6575,11 +6589,13 @@ async fn post_messages_for_endpoint(
         raw_body,
         endpoint,
         request_api_key_id,
+        ingress_id,
         attribution,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn post_messages_inner(
     state: AppState,
     headers: HeaderMap,
@@ -6590,6 +6606,7 @@ async fn post_messages_inner(
     endpoint: String,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
+    ingress_id: Option<String>,
     requires_normalized_body: bool,
     attribution: Option<RequestRejectionAttribution>,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
@@ -7120,6 +7137,7 @@ async fn post_messages_inner(
             "stream": payload.stream,
             "conversationId": conversation_id,
             "requestApiKeyId": usage_context.request_api_key_id,
+            "ingressId": ingress_id,
             "headers": crate::diagnostics::capture::http_headers_json(&headers),
             "rawBody": capture_bodies
                 .as_ref()
@@ -9370,6 +9388,9 @@ fn finish_stream_with_recorded_error(
     usage_guard: &StreamUsageGuard,
     status: UsageRecordStatus,
     terminal_reason: StreamTerminalReason,
+    decoder: &EventStreamDecoder,
+    attempt_number: u32,
+    downstream_committed: bool,
 ) -> Vec<Result<Bytes, Infallible>> {
     let error_detail = ctx.stream_error_detail();
     let final_events = ctx.generate_final_events();
@@ -9381,6 +9402,14 @@ fn finish_stream_with_recorded_error(
         .context()
         .request
         .mark_stream_events(&final_events);
+    record_upstream_stream_end(
+        usage_guard,
+        terminal_reason,
+        error_detail.as_ref().map(|(_, detail)| detail.clone()),
+        attempt_number,
+        decoder,
+        downstream_committed,
+    );
     usage_guard.context().record_stream_failure_from_context(
         status,
         ctx.final_usage(),
@@ -9394,6 +9423,37 @@ fn finish_stream_with_recorded_error(
         .into_iter()
         .map(|event| Ok(Bytes::from(event.to_sse_string())))
         .collect()
+}
+
+fn record_upstream_stream_end(
+    usage_guard: &StreamUsageGuard,
+    terminal_reason: StreamTerminalReason,
+    detail: Option<String>,
+    attempt_number: u32,
+    decoder: &EventStreamDecoder,
+    downstream_committed: bool,
+) {
+    if !crate::diagnostics::capture::is_active() {
+        return;
+    }
+    let reason = serde_json::to_string(&terminal_reason)
+        .unwrap_or_else(|_| "\"internal_error\"".to_string())
+        .trim_matches('"')
+        .to_string();
+    crate::diagnostics::capture::record(
+        "upstream_stream_end",
+        Some(&usage_guard.context().request.request_id),
+        || {
+            json!({
+                "reason": reason,
+                "detail": detail,
+                "attempt": attempt_number,
+                "framesDecoded": decoder.frames_decoded(),
+                "pendingBytes": decoder.pending_bytes(),
+                "downstreamCommitted": downstream_committed,
+            })
+        },
+    );
 }
 
 fn sse_bytes_from_events(events: Vec<SseEvent>) -> Vec<Result<Bytes, Infallible>> {
@@ -9779,6 +9839,9 @@ fn create_sse_stream(
                                         &state.usage_guard,
                                         UsageRecordStatus::StreamError,
                                         StreamTerminalReason::UpstreamJsonException,
+                                        &state.decoder,
+                                        state.attempt_number,
+                                        state.downstream_committed,
                                     );
                                     let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
                                     state.finished = true;
@@ -9820,6 +9883,9 @@ fn create_sse_stream(
                                     &state.usage_guard,
                                     UsageRecordStatus::StreamError,
                                     StreamTerminalReason::InternalError,
+                                    &state.decoder,
+                                    state.attempt_number,
+                                    state.downstream_committed,
                                 );
                                 let bytes =
                                     prepend_initial_bytes_if_needed(&mut state, bytes, true);
@@ -9982,6 +10048,9 @@ fn create_sse_stream(
                                     } else {
                                         StreamTerminalReason::InternalError
                                     },
+                                    &state.decoder,
+                                    state.attempt_number,
+                                    state.downstream_committed,
                                 );
                                 let bytes =
                                     prepend_initial_bytes_if_needed(&mut state, bytes, true);
@@ -10042,6 +10111,9 @@ fn create_sse_stream(
                                 &state.usage_guard,
                                 UsageRecordStatus::StreamError,
                                 StreamTerminalReason::InternalError,
+                                &state.decoder,
+                                state.attempt_number,
+                                state.downstream_committed,
                             );
                             let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
                             state.finished = true;
@@ -10087,6 +10159,9 @@ fn create_sse_stream(
                                     &state.usage_guard,
                                     UsageRecordStatus::StreamError,
                                     StreamTerminalReason::UpstreamJsonException,
+                                    &state.decoder,
+                                    state.attempt_number,
+                                    state.downstream_committed,
                                 );
                                 let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
                                 state.finished = true;
@@ -10185,6 +10260,9 @@ fn create_sse_stream(
                                     &state.usage_guard,
                                     UsageRecordStatus::StreamError,
                                     StreamTerminalReason::InternalError,
+                                    &state.decoder,
+                                    state.attempt_number,
+                                    state.downstream_committed,
                                 );
                                 let bytes =
                                     prepend_initial_bytes_if_needed(&mut state, bytes, true);
@@ -10266,6 +10344,9 @@ fn create_sse_stream(
                                         &state.usage_guard,
                                         UsageRecordStatus::StreamError,
                                         StreamTerminalReason::ProtocolContamination,
+                                        &state.decoder,
+                                        state.attempt_number,
+                                        state.downstream_committed,
                                     );
                                     let bytes =
                                         prepend_initial_bytes_if_needed(&mut state, bytes, true);
@@ -10283,19 +10364,30 @@ fn create_sse_stream(
                             } else {
                                 state.completion.report_success();
                             }
+                            let terminal_reason = if had_stream_error {
+                                if protocol_contamination {
+                                    StreamTerminalReason::ProtocolContamination
+                                } else {
+                                    StreamTerminalReason::UpstreamStatusError
+                                }
+                            } else {
+                                StreamTerminalReason::Completed
+                            };
                             state
                                 .usage_guard
                                 .context()
                                 .request
-                                .mark_stream_terminal(if had_stream_error {
-                                    if protocol_contamination {
-                                        StreamTerminalReason::ProtocolContamination
-                                    } else {
-                                        StreamTerminalReason::UpstreamStatusError
-                                    }
-                                } else {
-                                    StreamTerminalReason::Completed
-                                });
+                                .mark_stream_terminal(terminal_reason);
+                            record_upstream_stream_end(
+                                &state.usage_guard,
+                                terminal_reason,
+                                error_detail
+                                    .as_ref()
+                                    .map(|(_, detail)| detail.clone()),
+                                state.attempt_number,
+                                &state.decoder,
+                                state.downstream_committed,
+                            );
                             state
                                 .usage_guard
                                 .context()
@@ -10354,6 +10446,9 @@ fn create_sse_stream(
                         &state.usage_guard,
                         UsageRecordStatus::UpstreamTimeout,
                         StreamTerminalReason::UpstreamIdleTimeout,
+                        &state.decoder,
+                        state.attempt_number,
+                        state.downstream_committed,
                     );
                     let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
                     state.finished = true;
@@ -10395,6 +10490,9 @@ fn create_sse_stream(
                         &state.usage_guard,
                         UsageRecordStatus::UpstreamTimeout,
                         StreamTerminalReason::FirstOutputTimeout,
+                        &state.decoder,
+                        state.attempt_number,
+                        state.downstream_committed,
                     );
                     let bytes = prepend_initial_bytes_if_needed(&mut state, bytes, true);
                     state.finished = true;
@@ -12358,6 +12456,7 @@ async fn count_tokens_for_endpoint(
     mut payload: CountTokensRequest,
     endpoint: &str,
 ) -> Response {
+    let capture_request_id = crate::diagnostics::capture::is_active().then(envelope::request_id);
     tracing::info!(
         endpoint,
         model = %payload.model,
@@ -12389,17 +12488,31 @@ async fn count_tokens_for_endpoint(
         }
     };
 
-    let total_tokens = token::count_all_tokens(
+    let (total_tokens, calculation) = token::count_all_tokens_with_source(
         &payload.model,
         payload.system.as_deref(),
         &payload.messages,
         payload.tools.as_deref(),
-    ) as i32;
-
-    Json(CountTokensResponse {
-        input_tokens: total_tokens.max(1) as i32,
-    })
-    .into_response()
+        capture_request_id.as_deref(),
+    );
+    let input_tokens = total_tokens.max(1) as i32;
+    if let Some(request_id) = capture_request_id.as_deref() {
+        crate::diagnostics::capture::record("count_tokens_result", Some(request_id), || {
+            serde_json::json!({
+                "endpoint": endpoint,
+                "model": payload.model,
+                "inputTokens": input_tokens,
+                "calculation": calculation,
+            })
+        });
+    }
+    let mut response = Json(CountTokensResponse { input_tokens }).into_response();
+    if let Some(request_id) = capture_request_id {
+        response
+            .extensions_mut()
+            .insert(crate::diagnostics::capture::CaptureRequestId(request_id));
+    }
+    response
 }
 
 /// POST /dfcache/:route/v1/messages/count_tokens
@@ -12425,7 +12538,7 @@ pub async fn post_messages_cc(
     State(state): State<AppState>,
     headers: HeaderMap,
     attribution: Option<Extension<RequestRejectionAttribution>>,
-    MessagesBody(raw_body, request_api_key_id): MessagesBody,
+    MessagesBody(raw_body, request_api_key_id, ingress_id): MessagesBody,
 ) -> Response {
     post_messages_for_endpoint(
         state,
@@ -12433,6 +12546,7 @@ pub async fn post_messages_cc(
         raw_body,
         "/cc/v1/messages".to_string(),
         request_api_key_id,
+        ingress_id,
         attribution.map(|Extension(value)| value),
     )
     .await

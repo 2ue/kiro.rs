@@ -515,6 +515,43 @@ const EVENT_TYPE_DOCS: &[(&str, &str)] = &[
         "外部号池转发请求：URL、请求头、请求体",
     ),
     ("external_upstream_response", "外部号池响应状态与响应头"),
+    (
+        "http_ingress",
+        "HTTP 入口原始请求：method、path、query、脱敏请求头与请求体；ingressId 用于关联被拒请求",
+    ),
+    (
+        "http_egress",
+        "HTTP 入口返回状态与脱敏响应头；通过 ingressId 关联 requestId",
+    ),
+    (
+        "count_tokens_result",
+        "count_tokens 结果：模型、input tokens 与 local/remote 计算方式",
+    ),
+    (
+        "count_tokens_upstream_request",
+        "外部 count_tokens 请求：URL、脱敏请求头与请求体",
+    ),
+    (
+        "count_tokens_upstream_response",
+        "外部 count_tokens 响应：状态、脱敏响应头与响应体",
+    ),
+    (
+        "external_upstream_chunk",
+        "外部号池上游原始流式响应分块（投影前）",
+    ),
+    (
+        "external_upstream_body",
+        "外部号池上游原始非流式响应体（投影前）",
+    ),
+    ("mcp_response_body", "WebSearch/MCP 原始响应体"),
+    (
+        "upstream_stream_end",
+        "上游流终止原因、尝试次数、解码帧数与下游提交状态",
+    ),
+    (
+        "request_summary",
+        "请求最终 usage 汇总、凭据尝试链、计费字段、状态与耗时",
+    ),
 ];
 
 fn fill_counters(status: &mut CaptureStatus, counters: &Counters) {
@@ -645,6 +682,19 @@ pub fn body_json(bytes: &[u8]) -> Value {
 pub fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// 入口请求在尚未生成业务 request id 时使用的关联标识。
+#[derive(Debug, Clone)]
+pub struct IngressId(pub String);
+
+/// 仅用于进程内采集关联的响应扩展，不写入 HTTP 响应头。
+#[derive(Debug, Clone)]
+pub struct CaptureRequestId(pub String);
+
+/// 从 request extensions 读取入口关联标识。
+pub fn ingress_id_from_extensions(extensions: &http::Extensions) -> Option<String> {
+    extensions.get::<IngressId>().map(|value| value.0.clone())
 }
 
 /// 记录一个 AWS EventStream 帧。

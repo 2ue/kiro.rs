@@ -7139,6 +7139,8 @@ impl ExternalPoolManager {
             }
             route.latency_trace.mark_upstream_header(route.started_at);
             let mut body_stream = response.bytes_stream();
+            let upstream_chunk_index =
+                crate::diagnostics::capture::is_active().then(|| Arc::new(AtomicU64::new(0)));
             let stream_plan = ExternalStreamProcessingPlan::for_pool(pool, config);
             let projection_context = build_external_usage_projection_context(
                 route,
@@ -7177,6 +7179,10 @@ impl ExternalPoolManager {
             let mut last_chunk_at = Instant::now();
             let stream_keepalive_interval =
                 external_pool_stream_keepalive_interval(stream_idle_timeout);
+            let capture_request_id = upstream_chunk_index
+                .as_ref()
+                .map(|_| route.request_id.clone());
+            let capture_pool_id = pool.id;
             if effective_external_pool_pre_output_stream_retry_enabled(pool, config) {
                 last_chunk_at = match pre_read_external_stream_before_commit(
                     &mut body_stream,
@@ -7193,6 +7199,7 @@ impl ExternalPoolManager {
                     &transcript_state,
                     stream_idle_timeout,
                     &outbound_model,
+                    upstream_chunk_index.as_deref(),
                 )
                 .await
                 {
@@ -7227,6 +7234,8 @@ impl ExternalPoolManager {
                     let latency_trace = latency_trace.clone();
                     let stream_error_mask = stream_error_mask.clone();
                     let transcript_state = transcript_state.clone();
+                    let upstream_chunk_index = upstream_chunk_index.clone();
+                    let capture_request_id = capture_request_id.clone();
                     async move {
                         if finished {
                             return None;
@@ -7276,6 +7285,12 @@ impl ExternalPoolManager {
                                 chunk = body_stream.next() => {
                                     match chunk {
                                         Some(Ok(chunk)) => {
+                                            record_external_upstream_chunk(
+                                                capture_request_id.as_deref(),
+                                                capture_pool_id,
+                                                upstream_chunk_index.as_deref(),
+                                                &chunk,
+                                            );
                                             latency_trace
                                                 .mark_first_upstream_chunk(route_started_at);
                                             last_chunk_at = Instant::now();
@@ -7549,6 +7564,17 @@ impl ExternalPoolManager {
                 config.external_pool_usage_projection_output_uplift_percent,
             );
             let upstream_body = bytes.clone();
+            crate::diagnostics::capture::record(
+                "external_upstream_body",
+                Some(&route.request_id),
+                || {
+                    serde_json::json!({
+                        "poolId": pool.id,
+                        "status": status.as_u16(),
+                        "body": crate::diagnostics::capture::body_json(&upstream_body),
+                    })
+                },
+            );
             let projected = process_non_stream_response_usage(
                 bytes,
                 Some(route),
@@ -9597,6 +9623,8 @@ impl ExternalPoolManager {
             response_content_type,
             chunks_before_first_output: 0,
             events_before_first_output: 0,
+            downstream_chunks_forwarded: 0,
+            downstream_bytes_forwarded: 0,
             estimated_output_tokens: 0,
             completed: false,
         };
@@ -9606,6 +9634,7 @@ impl ExternalPoolManager {
                 match data_stream.next().await {
                     Some(Ok(chunk)) => {
                         if let Some(guard_ref) = guard.as_mut() {
+                            guard_ref.record_downstream_chunk(&chunk);
                             if !chunk.is_empty() {
                                 guard_ref
                                     .route
@@ -9885,11 +9914,49 @@ struct ExternalStreamUsageGuard {
     response_content_type: Option<String>,
     chunks_before_first_output: u32,
     events_before_first_output: u32,
+    downstream_chunks_forwarded: u64,
+    downstream_bytes_forwarded: u64,
     estimated_output_tokens: i32,
     completed: bool,
 }
 
+fn record_external_stream_end(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    attempts: &[ExternalPoolAttempt],
+    reason: &str,
+    detail: Option<&str>,
+    chunks_forwarded: u64,
+    bytes_forwarded: u64,
+) {
+    if !crate::diagnostics::capture::is_active() {
+        return;
+    }
+    let downstream_committed = route
+        .inference_attempt_budget
+        .snapshot()
+        .downstream_committed;
+    crate::diagnostics::capture::record("upstream_stream_end", Some(&route.request_id), || {
+        json!({
+            "poolId": pool.id,
+            "reason": reason,
+            "detail": detail,
+            "attempt": attempts.len(),
+            "chunksForwarded": chunks_forwarded,
+            "bytesForwarded": bytes_forwarded,
+            "downstreamCommitted": downstream_committed,
+        })
+    });
+}
+
 impl ExternalStreamUsageGuard {
+    fn record_downstream_chunk(&mut self, chunk: &Bytes) {
+        self.downstream_chunks_forwarded = self.downstream_chunks_forwarded.saturating_add(1);
+        self.downstream_bytes_forwarded = self
+            .downstream_bytes_forwarded
+            .saturating_add(chunk.len() as u64);
+    }
+
     fn mark_first_token_if_output(&mut self, chunk: &Bytes) {
         self.estimated_output_tokens = self
             .estimated_output_tokens
@@ -9931,6 +9998,15 @@ impl ExternalStreamUsageGuard {
             .as_ref()
             .and_then(|capture| capture.lock().stream_error_message.clone());
         if let Some(message) = stream_error_message {
+            record_external_stream_end(
+                &self.route,
+                &self.pool,
+                &self.attempts,
+                "upstream_status_error",
+                Some(&message),
+                self.downstream_chunks_forwarded,
+                self.downstream_bytes_forwarded,
+            );
             // SSE error events arrive with an HTTP 2xx response and therefore
             // bypass the outer request error path. They are still genuine
             // upstream failures and must feed passive pool quality.
@@ -10044,6 +10120,15 @@ impl ExternalStreamUsageGuard {
             estimated_output_tokens: self.estimated_output_tokens,
             terminal_message: None,
         });
+        record_external_stream_end(
+            &self.route,
+            &self.pool,
+            &self.attempts,
+            "completed",
+            None,
+            self.downstream_chunks_forwarded,
+            self.downstream_bytes_forwarded,
+        );
         self.manager.record_external_success(
             &self.config,
             &self.route,
@@ -10059,6 +10144,15 @@ impl ExternalStreamUsageGuard {
         if self.completed {
             return;
         }
+        record_external_stream_end(
+            &self.route,
+            &self.pool,
+            &self.attempts,
+            "internal_error",
+            Some(message),
+            self.downstream_chunks_forwarded,
+            self.downstream_bytes_forwarded,
+        );
         // A body/read failure happens after response headers were returned, so
         // the outer dispatch loop cannot record it. Count it here instead.
         self.manager
@@ -10121,6 +10215,15 @@ impl ExternalStreamUsageGuard {
             return;
         }
         let message = "external stream body dropped before completion";
+        record_external_stream_end(
+            &self.route,
+            &self.pool,
+            &self.attempts,
+            "client_dropped",
+            Some(message),
+            self.downstream_chunks_forwarded,
+            self.downstream_bytes_forwarded,
+        );
         external_pool_usage_debug_stream_record(ExternalUsageDebugStreamRecordContext {
             config: &self.config,
             route: &self.route,
@@ -11100,6 +11203,36 @@ fn openai_stream_data_commits_pre_output(value: &serde_json::Value) -> bool {
     })
 }
 
+fn record_external_upstream_chunk(
+    request_id: Option<&str>,
+    pool_id: u64,
+    index: Option<&AtomicU64>,
+    chunk: &Bytes,
+) {
+    if !crate::diagnostics::capture::is_active() {
+        return;
+    }
+    let (Some(request_id), Some(index)) = (request_id, index) else {
+        return;
+    };
+    let index = index.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diagnostics::capture::record("external_upstream_chunk", Some(request_id), || {
+        match std::str::from_utf8(chunk) {
+            Ok(text) => json!({
+                "poolId": pool_id,
+                "index": index,
+                "text": text,
+            }),
+            Err(_) => json!({
+                "poolId": pool_id,
+                "index": index,
+                "base64": crate::diagnostics::capture::base64_encode(chunk),
+                "bytes": chunk.len(),
+            }),
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pre_read_external_stream_before_commit<S>(
     body_stream: &mut S,
@@ -11116,6 +11249,7 @@ async fn pre_read_external_stream_before_commit<S>(
     transcript_state: &Arc<SyncMutex<ExternalAnthropicTranscriptState>>,
     stream_idle_timeout: Option<Duration>,
     outbound_model: &Option<String>,
+    upstream_chunk_index: Option<&AtomicU64>,
 ) -> Result<Instant, ExternalForwardError>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
@@ -11194,6 +11328,12 @@ where
             chunk = body_stream.next() => {
                 match chunk {
                     Some(Ok(chunk)) => {
+                        record_external_upstream_chunk(
+                            Some(&route.request_id),
+                            pool.id,
+                            upstream_chunk_index,
+                            &chunk,
+                        );
                         route.latency_trace.mark_first_upstream_chunk(route.started_at);
                         last_chunk_at = Instant::now();
                         buffer.extend_from_slice(&chunk);

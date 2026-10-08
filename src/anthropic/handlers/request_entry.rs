@@ -8,6 +8,7 @@ pub(super) async fn handle_messages_endpoint(
     mut raw_body: Bytes,
     endpoint: String,
     request_api_key_id: Option<String>,
+    ingress_id: Option<String>,
     attribution: Option<RequestRejectionAttribution>,
 ) -> Response {
     let runtime_config = state
@@ -203,6 +204,7 @@ pub(super) async fn handle_messages_endpoint(
             &endpoint,
             inference_attempt_budget.clone(),
             request_api_key_id.clone(),
+            ingress_id.clone(),
             effective_raw_probe.clone(),
         )
         .await
@@ -217,6 +219,7 @@ pub(super) async fn handle_messages_endpoint(
             &endpoint,
             inference_attempt_budget.clone(),
             request_api_key_id.clone(),
+            ingress_id.clone(),
             effective_raw_probe.clone(),
         )
         .await
@@ -238,6 +241,7 @@ pub(super) async fn handle_messages_endpoint(
             endpoint,
             inference_attempt_budget,
             request_api_key_id,
+            ingress_id,
             requires_normalized_body,
             attribution,
             raw_preflight_failure,
@@ -254,6 +258,7 @@ pub(super) async fn handle_messages_endpoint(
         endpoint,
         inference_attempt_budget,
         request_api_key_id,
+        ingress_id,
         requires_normalized_body,
         attribution,
         None,
@@ -272,6 +277,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
     endpoint: String,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
+    ingress_id: Option<String>,
     requires_normalized_body: bool,
     attribution: Option<RequestRejectionAttribution>,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
@@ -315,6 +321,7 @@ async fn continue_messages_endpoint_after_raw_external_routes(
         endpoint,
         inference_attempt_budget,
         request_api_key_id,
+        ingress_id,
         requires_normalized_body,
         attribution,
         raw_preflight_failure,
@@ -1283,6 +1290,7 @@ mod tests {
                         HeaderMap::new(),
                         Bytes::copy_from_slice(body),
                         endpoint.to_string(),
+                        None,
                         None,
                         None,
                     )

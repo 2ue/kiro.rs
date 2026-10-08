@@ -311,13 +311,28 @@ def _assemble_sse(chunks: list[str]) -> dict[str, object]:
 
 
 def render_readable(events_path: pathlib.Path, max_bytes: int | None = None) -> str:
+    all_events = list(iter_events(events_path))
+    ingress_to_request: dict[str, str] = {}
+    for event in all_events:
+        if event.get("type") != "http_egress":
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        ingress_id = data.get("ingressId")
+        request_id = event.get("requestId") or data.get("requestId")
+        if ingress_id and request_id:
+            ingress_to_request[str(ingress_id)] = str(request_id)
+
     requests: "OrderedDict[str, list[dict]]" = OrderedDict()
     orphan: list[dict] = []
     type_counts: dict[str, int] = {}
-    for event in iter_events(events_path):
+    for event in all_events:
         kind = str(event.get("type"))
         type_counts[kind] = type_counts.get(kind, 0) + 1
         request_id = event.get("requestId")
+        if not request_id:
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            ingress_id = data.get("ingressId")
+            request_id = ingress_to_request.get(str(ingress_id)) if ingress_id else None
         if request_id:
             requests.setdefault(str(request_id), []).append(event)
         else:
@@ -343,10 +358,31 @@ def render_readable(events_path: pathlib.Path, max_bytes: int | None = None) -> 
         lines.append("#" * 72)
         frames: list[dict] = []
         sse_chunks: list[str] = []
+        external_chunks: list[dict] = []
         for event in events:
             kind = event.get("type")
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
-            if kind == "client_request":
+            if kind == "http_ingress":
+                lines.append("")
+                lines.append(
+                    f"HTTP 入口  {data.get('method')} {data.get('path')}"
+                    + (f"?{data.get('query')}" if data.get("query") else "")
+                    + f" ingressId={data.get('ingressId')}"
+                )
+                lines.append("  请求头：")
+                lines.append(_indent(_dump(data.get("headers")), "    "))
+                if data.get("bodyTruncated"):
+                    lines.append(f"  请求体已截断，大小={data.get('bodyBytes')}")
+                else:
+                    lines.append("  请求体：")
+                    lines.append(_indent(_dump(_body_value(data.get("body"))), "    "))
+            elif kind == "http_egress":
+                lines.append(
+                    f"HTTP 出口  status={data.get('status')} "
+                    f"ingressId={data.get('ingressId')} requestId={data.get('requestId')}"
+                )
+                lines.append(_indent(_dump(data.get("headers")), "    "))
+            elif kind == "client_request":
                 _render_client_request(lines, data)
             elif kind in {"upstream_request", "external_upstream_request"}:
                 lines.append("")
@@ -370,6 +406,11 @@ def render_readable(events_path: pathlib.Path, max_bytes: int | None = None) -> 
                 lines.append(_indent(_dump(_body_value(data.get("body")))))
             elif kind == "upstream_frame":
                 frames.append(data)
+            elif kind == "external_upstream_chunk":
+                external_chunks.append(data)
+            elif kind in {"external_upstream_body", "mcp_response_body"}:
+                lines.append(f"{kind}  status={data.get('status')}:")
+                lines.append(_indent(_dump(_body_value(data.get("body")))))
             elif kind in {"upstream_body", "upstream_decode_error", "upstream_stream_json_error"}:
                 lines.append(f"{kind}：")
                 lines.append(_indent(_dump(data)))
@@ -391,6 +432,25 @@ def render_readable(events_path: pathlib.Path, max_bytes: int | None = None) -> 
                     f"客户端流结束  outcome={data.get('outcome')} chunks={data.get('chunks')} "
                     f"bytes={data.get('bytes')} elapsed={data.get('elapsedMs')}ms"
                 )
+            elif kind == "upstream_stream_end":
+                lines.append(
+                    f"上游流结束  reason={data.get('reason')} attempt={data.get('attempt')} "
+                    f"frames={data.get('framesDecoded')} pending={data.get('pendingBytes')} "
+                    f"downstreamCommitted={data.get('downstreamCommitted')}"
+                )
+                if data.get("detail"):
+                    lines.append(_indent(str(data.get("detail")), "    "))
+            elif kind == "count_tokens_result":
+                lines.append(
+                    f"count_tokens  model={data.get('model')} inputTokens={data.get('inputTokens')} "
+                    f"calculation={data.get('calculation')}"
+                )
+            elif kind in {"count_tokens_upstream_request", "count_tokens_upstream_response"}:
+                lines.append(f"{kind}：")
+                lines.append(_indent(_dump(data)))
+            elif kind == "request_summary":
+                lines.append("请求汇总：")
+                lines.append(_indent(_dump(data)))
         if frames:
             lines.append("")
             lines.append(f"上游 EventStream 帧（{len(frames)} 个）：")
@@ -411,6 +471,17 @@ def render_readable(events_path: pathlib.Path, max_bytes: int | None = None) -> 
                 lines.append(_indent("".join(tool.get("input") or [])))
             for other in assembled["others"]:
                 lines.append(f"  其他事件 {other}")
+        if external_chunks:
+            external_chunks.sort(key=lambda item: item.get("index") or 0)
+            raw = "".join(
+                str(chunk.get("text", ""))
+                if chunk.get("text") is not None
+                else f"<base64 {chunk.get('bytes')} bytes> {chunk.get('base64', '')}"
+                for chunk in external_chunks
+            )
+            lines.append("")
+            lines.append(f"外部号池上游原始 SSE（{len(external_chunks)} 个分块）：")
+            lines.append(_indent(raw))
         if sse_chunks:
             sse = _assemble_sse(sse_chunks)
             lines.append("")

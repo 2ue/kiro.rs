@@ -1,14 +1,22 @@
 //! Anthropic API 中间件
 
-use std::sync::Arc;
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
+use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
+use http_body::{Body as HttpBody, Frame, SizeHint};
+use uuid::Uuid;
 
 use crate::common::auth;
 use crate::common::auth::RequestApiKeyStore;
@@ -33,6 +41,219 @@ use super::{
     tool_format_debug::ToolFormatDebugRecorder,
     usage::UsageRecorder,
 };
+use super::{files::MAX_FILE_UPLOAD_BODY_SIZE, request_body::MAX_MESSAGES_BODY_SIZE};
+
+/// 入口层明文采集。仅在采集会话运行时旁路复制请求体，并把入口关联 id 传给下游。
+pub async fn capture_http_ingress(mut request: Request<Body>, next: Next) -> Response {
+    if !crate::diagnostics::capture::is_active() {
+        return next.run(request).await;
+    }
+
+    let ingress_id = format!("ingress-{}", Uuid::new_v4().simple());
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let content_length = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let body_limit = ingress_body_limit(uri.path());
+    request
+        .extensions_mut()
+        .insert(crate::diagnostics::capture::IngressId(ingress_id.clone()));
+    let started_at = Utc::now();
+
+    // 已知超限时不要读 body，交给原有 DefaultBodyLimit 保持 413 行为。
+    if content_length.is_some_and(|length| length > body_limit as u64) {
+        crate::diagnostics::capture::record("http_ingress", None, || {
+            serde_json::json!({
+                "ingressId": ingress_id,
+                "method": method.as_str(),
+                "path": uri.path(),
+                "query": uri.query(),
+                "headers": crate::diagnostics::capture::http_headers_json(&headers),
+                "startedAt": started_at.to_rfc3339(),
+                "bodyTruncated": true,
+                "bodyBytes": content_length,
+                "bodyReadError": null,
+            })
+        });
+        let response = next.run(request).await;
+        return record_http_egress(response, &ingress_id);
+    }
+
+    let (parts, body) = request.into_parts();
+    let capture_body = IngressCaptureBody::new(
+        body,
+        IngressCaptureState {
+            ingress_id: ingress_id.clone(),
+            method: method.as_str().to_string(),
+            path: uri.path().to_string(),
+            query: uri.query().map(str::to_string),
+            headers,
+            started_at,
+            body_limit,
+            body_bytes: 0,
+            body_truncated: false,
+            body: BytesMut::new(),
+            recorded: false,
+        },
+    );
+    let request = Request::from_parts(parts, Body::new(capture_body));
+    let response = next.run(request).await;
+    record_http_egress(response, &ingress_id)
+}
+
+fn ingress_body_limit(path: &str) -> usize {
+    if path.ends_with("/v1/files") {
+        MAX_FILE_UPLOAD_BODY_SIZE
+    } else {
+        MAX_MESSAGES_BODY_SIZE
+    }
+}
+
+struct IngressCaptureBody {
+    inner: Body,
+    state: IngressCaptureState,
+}
+
+impl IngressCaptureBody {
+    fn new(inner: Body, state: IngressCaptureState) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl HttpBody for IngressCaptureBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(cx);
+        match result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.state.observe(data);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                let message = error.to_string();
+                self.state.record(Some(message), false);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.state.record(None, true);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for IngressCaptureBody {
+    fn drop(&mut self) {
+        self.state
+            .record(Some("body dropped before EOF".to_string()), false);
+    }
+}
+
+struct IngressCaptureState {
+    ingress_id: String,
+    method: String,
+    path: String,
+    query: Option<String>,
+    headers: HeaderMap,
+    started_at: DateTime<Utc>,
+    body_limit: usize,
+    body_bytes: usize,
+    body_truncated: bool,
+    body: BytesMut,
+    recorded: bool,
+}
+
+impl IngressCaptureState {
+    fn observe(&mut self, bytes: &Bytes) {
+        self.body_bytes = self.body_bytes.saturating_add(bytes.len());
+        if self.body.len() < self.body_limit {
+            let remaining = self.body_limit - self.body.len();
+            let keep = remaining.min(bytes.len());
+            self.body.extend_from_slice(&bytes[..keep]);
+            if keep < bytes.len() {
+                self.body_truncated = true;
+            }
+        } else if !bytes.is_empty() {
+            self.body_truncated = true;
+        }
+        if self.body_bytes > self.body_limit {
+            self.body_truncated = true;
+        }
+    }
+
+    fn record(&mut self, body_read_error: Option<String>, complete: bool) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let body_truncated = self.body_truncated || !complete;
+        let body = (!body_truncated)
+            .then(|| crate::diagnostics::capture::body_json(&self.body))
+            .unwrap_or(serde_json::Value::Null);
+        crate::diagnostics::capture::record("http_ingress", None, || {
+            serde_json::json!({
+                "ingressId": self.ingress_id,
+                "method": self.method,
+                "path": self.path,
+                "query": self.query,
+                "headers": crate::diagnostics::capture::http_headers_json(&self.headers),
+                "startedAt": self.started_at.to_rfc3339(),
+                "bodyTruncated": body_truncated,
+                "bodyBytes": self.body_bytes,
+                "bodyReadError": body_read_error,
+                "body": body,
+            })
+        });
+        self.body.clear();
+    }
+}
+
+fn record_http_egress(response: Response, ingress_id: &str) -> Response {
+    if !crate::diagnostics::capture::is_active() {
+        return response;
+    }
+    let request_id = response
+        .extensions()
+        .get::<crate::diagnostics::capture::CaptureRequestId>()
+        .map(|value| value.0.clone())
+        .or_else(|| {
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+    let status = response.status();
+    let headers = crate::diagnostics::capture::http_headers_json(response.headers());
+    crate::diagnostics::capture::record("http_egress", request_id.as_deref(), || {
+        serde_json::json!({
+            "ingressId": ingress_id,
+            "requestId": request_id,
+            "status": status.as_u16(),
+            "headers": headers,
+        })
+    });
+    response
+}
 
 /// 应用共享状态
 #[derive(Clone)]

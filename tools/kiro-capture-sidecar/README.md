@@ -37,8 +37,12 @@ Event types: `client_request`, `upstream_request`, `upstream_response`,
 `upstream_error_body`, `upstream_frame`, `upstream_body`,
 `upstream_decode_error`, `upstream_stream_json_error`, `client_sse`,
 `client_response`, `client_stream_end`, `external_upstream_request`,
-`external_upstream_response`. Local Kiro, external-pool, and WebSearch/MCP
-routes are all covered.
+`external_upstream_response`, `http_ingress`, `http_egress`,
+`count_tokens_result`, `count_tokens_upstream_request`,
+`count_tokens_upstream_response`, `external_upstream_chunk`,
+`external_upstream_body`, `mcp_response_body`, `upstream_stream_end`,
+`request_summary`. Local Kiro, external-pool, and WebSearch/MCP routes are all
+covered.
 
 Authorization, x-api-key, Cookie, and similar header values are redacted to
 `[redacted] (len=N)` by default. Use `--app-capture-include-secrets` to keep
@@ -53,9 +57,9 @@ session on its own after `maxDurationSecs`, even if the sidecar dies.
 
 Known gaps:
 
-- Requests rejected before model resolution and body conversion produce only
-  their `client_response` error, not a `client_request`.
-- `count_tokens` is not captured.
+- The ingress body is intentionally not buffered twice: requests whose
+  `Content-Length` is already above the 50 MiB limit are recorded as
+  `bodyTruncated` and continue through the normal 413 path.
 
 Drop `--no-pcap` to also run the packet capture described below.
 

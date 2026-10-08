@@ -12623,6 +12623,121 @@ async fn run_llm_capture_records_full_local_round_trip() {
         request_ids.push((stream, request_id));
     }
 
+    let count_tokens_body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "CAPTURE_COUNT_TOKENS_MARKER"}]
+    })
+    .to_string();
+    let active_count_tokens = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "b07-handler-key")
+                .body(Body::from(count_tokens_body.clone()))
+                .expect("build active count_tokens request"),
+        )
+        .await
+        .expect("active count_tokens response");
+    let active_count_status = active_count_tokens.status();
+    let active_count_headers = active_count_tokens.headers().clone();
+    let active_count_body = axum::body::to_bytes(active_count_tokens.into_body(), 64 * 1024)
+        .await
+        .expect("active count_tokens body");
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "wrong-capture-key")
+                .body(Body::from(
+                    json!({
+                        "model": "capture-rejected-model",
+                        "messages": [{"role": "user", "content": "CAPTURE_REJECTED_MARKER"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("build rejected capture request"),
+        )
+        .await
+        .expect("rejected capture response");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let rejected_request_id = rejected
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("rejected request id")
+        .to_string();
+    let _ = axum::body::to_bytes(rejected.into_body(), 64 * 1024)
+        .await
+        .expect("rejected capture body");
+
+    let active_oversized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "b07-handler-key")
+                .body(Body::from_stream(futures::stream::iter([
+                    Ok::<_, std::convert::Infallible>(Bytes::from(vec![
+                        b'x';
+                        crate::anthropic::request_body::MAX_MESSAGES_BODY_SIZE
+                    ])),
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b"y")),
+                ])))
+                .expect("build active oversized request"),
+        )
+        .await
+        .expect("active oversized response");
+    assert_eq!(active_oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        active_oversized
+            .headers()
+            .get("x-should-retry")
+            .and_then(|value| value.to_str().ok()),
+        Some("false")
+    );
+    let active_oversized_request_id = active_oversized
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("active oversized request id")
+        .to_string();
+    let active_oversized_body = axum::body::to_bytes(active_oversized.into_body(), 64 * 1024)
+        .await
+        .expect("active oversized body");
+    let active_oversized_json: Value =
+        serde_json::from_slice(&active_oversized_body).expect("active oversized json");
+    assert_eq!(active_oversized_json["type"], "error");
+    assert_eq!(active_oversized_json["error"]["type"], "request_too_large");
+    assert_eq!(
+        active_oversized_json["request_id"],
+        active_oversized_request_id.as_str()
+    );
+
+    let websearch_upstream = WebSearchHandlerUpstream::start().await;
+    let (websearch_app, _websearch_usage) =
+        websearch_handler_test_router(&websearch_upstream.base_url);
+    let websearch_response = websearch_app
+        .oneshot(multimodal_handler_request(
+            "/v1/messages",
+            single_query_websearch_body("CAPTURE_MCP_MARKER", false),
+        ))
+        .await
+        .expect("capture WebSearch response");
+    assert_eq!(websearch_response.status(), StatusCode::OK);
+    let websearch_request_id = response_request_id(&websearch_response);
+    let _ = axum::body::to_bytes(websearch_response.into_body(), 1024 * 1024)
+        .await
+        .expect("capture WebSearch body");
+
     let manager_for_stop = manager.clone();
     let stopped = tokio::task::spawn_blocking(move || manager_for_stop.stop("test"))
         .await
@@ -12630,6 +12745,67 @@ async fn run_llm_capture_records_full_local_round_trip() {
         .expect("stop capture");
     assert_eq!(stopped.state, "stopped");
     assert!(manager.archive_path(&session_id).is_some());
+
+    let inactive_count_tokens = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "b07-handler-key")
+                .body(Body::from(count_tokens_body))
+                .expect("build inactive count_tokens request"),
+        )
+        .await
+        .expect("inactive count_tokens response");
+    assert_eq!(inactive_count_tokens.status(), active_count_status);
+    let mut active_count_header_names: Vec<_> = active_count_headers
+        .keys()
+        .map(|name| name.as_str())
+        .collect();
+    let mut inactive_count_header_names: Vec<_> = inactive_count_tokens
+        .headers()
+        .keys()
+        .map(|name| name.as_str())
+        .collect();
+    active_count_header_names.sort_unstable();
+    inactive_count_header_names.sort_unstable();
+    assert_eq!(
+        inactive_count_header_names, active_count_header_names,
+        "capture must not change count_tokens response headers"
+    );
+    for name in ["request-id", "anthropic-request-id"] {
+        assert!(
+            active_count_headers.contains_key(name),
+            "active count_tokens response missing {name}"
+        );
+        assert!(
+            inactive_count_tokens.headers().contains_key(name),
+            "inactive count_tokens response missing {name}"
+        );
+    }
+    for name in inactive_count_tokens.headers().keys() {
+        if matches!(name.as_str(), "request-id" | "anthropic-request-id") {
+            continue;
+        }
+        let inactive_values: Vec<_> = inactive_count_tokens
+            .headers()
+            .get_all(name)
+            .iter()
+            .collect();
+        let active_values: Vec<_> = active_count_headers.get_all(name).iter().collect();
+        assert_eq!(
+            inactive_values, active_values,
+            "capture must not change count_tokens response header {name}"
+        );
+    }
+    let inactive_count_body = axum::body::to_bytes(inactive_count_tokens.into_body(), 64 * 1024)
+        .await
+        .expect("inactive count_tokens body");
+    assert_eq!(
+        inactive_count_body, active_count_body,
+        "capture must not change count_tokens response bytes"
+    );
 
     let events: Vec<Value> = std::fs::read_to_string(root.join(&session_id).join("events.jsonl"))
         .expect("events file")
@@ -12656,9 +12832,11 @@ async fn run_llm_capture_records_full_local_round_trip() {
         if stream {
             assert!(types.contains(&"client_sse"), "{types:?}");
             assert!(types.contains(&"client_stream_end"), "{types:?}");
+            assert!(types.contains(&"upstream_stream_end"), "{types:?}");
         } else {
             assert!(types.contains(&"client_response"), "{types:?}");
         }
+        assert!(types.contains(&"request_summary"), "{types:?}");
         let joined = events
             .iter()
             .filter(|event| event["requestId"] == request_id.as_str())
@@ -12669,6 +12847,95 @@ async fn run_llm_capture_records_full_local_round_trip() {
         assert!(joined.contains("capture_tool_marker"));
         assert!(joined.contains("inline-ok"));
     }
+
+    let rejected_egress = events
+        .iter()
+        .find(|event| {
+            event["type"] == "http_egress"
+                && event["requestId"] == rejected_request_id.as_str()
+                && event["data"]["status"] == 401
+        })
+        .expect("rejected request http_egress");
+    let rejected_ingress_id = rejected_egress["data"]["ingressId"]
+        .as_str()
+        .expect("rejected ingress id");
+    let rejected_ingress = events
+        .iter()
+        .find(|event| {
+            event["type"] == "http_ingress" && event["data"]["ingressId"] == rejected_ingress_id
+        })
+        .expect("rejected request http_ingress");
+    assert_eq!(rejected_ingress["data"]["method"], "POST");
+    assert_eq!(rejected_ingress["data"]["path"], "/v1/messages");
+    assert_eq!(rejected_ingress["data"]["body"], Value::Null);
+    assert_eq!(rejected_ingress["data"]["bodyBytes"], 0);
+    assert_eq!(rejected_ingress["data"]["bodyTruncated"], true);
+    assert_eq!(
+        rejected_ingress["data"]["bodyReadError"],
+        "body dropped before EOF"
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "client_response"
+            && event["requestId"] == rejected_request_id.as_str()
+            && event["data"]["status"] == 401
+    }));
+
+    let oversized_egress = events
+        .iter()
+        .find(|event| {
+            event["type"] == "http_egress"
+                && event["requestId"] == active_oversized_request_id.as_str()
+                && event["data"]["status"] == 413
+        })
+        .expect("active oversized http_egress");
+    let oversized_ingress_id = oversized_egress["data"]["ingressId"]
+        .as_str()
+        .expect("active oversized ingress id");
+    let oversized_ingress = events
+        .iter()
+        .find(|event| {
+            event["type"] == "http_ingress" && event["data"]["ingressId"] == oversized_ingress_id
+        })
+        .expect("active oversized http_ingress");
+    assert_eq!(oversized_ingress["data"]["bodyTruncated"], true);
+    assert!(
+        oversized_ingress["data"]["bodyBytes"].as_u64().is_some_and(
+            |bytes| bytes > crate::anthropic::request_body::MAX_MESSAGES_BODY_SIZE as u64
+        )
+    );
+
+    let count_tokens_ingress_id = events
+        .iter()
+        .find(|event| {
+            event["type"] == "http_ingress" && event["data"]["path"] == "/v1/messages/count_tokens"
+        })
+        .and_then(|event| event["data"]["ingressId"].as_str())
+        .expect("count_tokens http_ingress")
+        .to_string();
+    let count_tokens_egress = events
+        .iter()
+        .find(|event| {
+            event["type"] == "http_egress"
+                && event["data"]["status"] == 200
+                && event["data"]["ingressId"] == count_tokens_ingress_id.as_str()
+                && event["data"]["requestId"].is_string()
+        })
+        .expect("count_tokens http_egress");
+    let count_tokens_request_id = count_tokens_egress["requestId"]
+        .as_str()
+        .expect("count_tokens request id");
+    assert!(events.iter().any(|event| {
+        event["type"] == "count_tokens_result"
+            && event["requestId"] == count_tokens_request_id
+            && event["data"]["inputTokens"].is_number()
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "mcp_response_body"
+            && event["requestId"] == websearch_request_id
+            && event["data"]["body"]
+                .to_string()
+                .contains("CAPTURE_MCP_MARKER")
+    }));
     let upstream_request = events
         .iter()
         .find(|event| event["type"] == "upstream_request")

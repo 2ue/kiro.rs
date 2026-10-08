@@ -138,6 +138,130 @@ class RenderTests(unittest.TestCase):
             text = app_capture.render_readable(path, max_bytes=200)
         self.assertIn("已截断", text)
 
+    def test_readable_report_renders_ingress_count_tokens_external_and_summary_events(self):
+        rid = "req_rejected_capture"
+        events = [
+            {
+                "seq": 1,
+                "ts": "t1",
+                "type": "http_ingress",
+                "requestId": None,
+                "data": {
+                    "ingressId": "ingress-1",
+                    "method": "POST",
+                    "path": "/v1/messages/count_tokens",
+                    "query": "x=1",
+                    "headers": {"x-api-key": "[redacted] (len=3)"},
+                    "body": {"encoding": "json", "json": {"model": "m"}},
+                },
+            },
+            {
+                "seq": 2,
+                "ts": "t2",
+                "type": "http_egress",
+                "requestId": rid,
+                "data": {
+                    "ingressId": "ingress-1",
+                    "requestId": rid,
+                    "status": 401,
+                    "headers": {},
+                },
+            },
+            {
+                "seq": 3,
+                "ts": "t3",
+                "type": "count_tokens_result",
+                "requestId": rid,
+                "data": {"model": "m", "inputTokens": 12, "calculation": "local"},
+            },
+            {
+                "seq": 4,
+                "ts": "t4",
+                "type": "external_upstream_chunk",
+                "requestId": rid,
+                "data": {"index": 1, "text": "data: one\n\n"},
+            },
+            {
+                "seq": 5,
+                "ts": "t5",
+                "type": "mcp_response_body",
+                "requestId": rid,
+                "data": {"status": 200, "body": {"encoding": "text", "text": "MCP_MARKER"}},
+            },
+            {
+                "seq": 6,
+                "ts": "t6",
+                "type": "upstream_stream_end",
+                "requestId": rid,
+                "data": {"reason": "completed", "attempt": 1, "framesDecoded": 2},
+            },
+            {
+                "seq": 7,
+                "ts": "t7",
+                "type": "request_summary",
+                "requestId": rid,
+                "data": {"status": "success", "outputTokens": 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "events.jsonl"
+            path.write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+            text = app_capture.render_readable(path)
+        for marker in (
+            "HTTP 入口",
+            "status=401",
+            "count_tokens",
+            "inputTokens=12",
+            "外部号池上游原始 SSE",
+            "data: one",
+            "MCP_MARKER",
+            "上游流结束",
+            "请求汇总",
+        ):
+            self.assertIn(marker, text)
+
+    def test_readable_report_keeps_headers_for_truncated_ingress(self):
+        events = [
+            {
+                "seq": 1,
+                "ts": "t1",
+                "type": "http_ingress",
+                "requestId": None,
+                "data": {
+                    "ingressId": "ingress-rejected",
+                    "method": "POST",
+                    "path": "/v1/messages",
+                    "headers": {
+                        "x-api-key": "[redacted] (len=16)",
+                        "x-e2e-marker": "TRUNCATED_HEADER_MARKER",
+                    },
+                    "bodyTruncated": True,
+                    "bodyBytes": 0,
+                    "bodyReadError": "request body was not read",
+                },
+            },
+            {
+                "seq": 2,
+                "ts": "t2",
+                "type": "http_egress",
+                "requestId": "req_rejected",
+                "data": {
+                    "ingressId": "ingress-rejected",
+                    "requestId": "req_rejected",
+                    "status": 401,
+                    "headers": {},
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "events.jsonl"
+            path.write_text("\n".join(json.dumps(e) for e in events), encoding="utf-8")
+            text = app_capture.render_readable(path)
+
+        self.assertIn("请求头", text)
+        self.assertIn("TRUNCATED_HEADER_MARKER", text)
+        self.assertIn("请求体已截断，大小=0", text)
+
 
 class NoPcapCollectorTests(unittest.TestCase):
     def setUp(self):
