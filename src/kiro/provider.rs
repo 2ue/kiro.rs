@@ -257,6 +257,80 @@ struct ApiUpstreamBody {
     bytes: usize,
 }
 
+/// LLM 明文采集：记录即将发出的上游请求（URL、最终请求头、完整请求体）。
+fn capture_upstream_request(
+    request_id: Option<&str>,
+    phase: &'static str,
+    attempt: usize,
+    credential_id: u64,
+    request: &reqwest::RequestBuilder,
+) {
+    if !crate::diagnostics::capture::is_active() {
+        return;
+    }
+    // 克隆后构建以读取 decorate 之后的最终头部；字符串请求体可无损克隆。
+    let Some(built) = request.try_clone().and_then(|builder| builder.build().ok()) else {
+        return;
+    };
+    crate::diagnostics::capture::record("upstream_request", request_id, || {
+        serde_json::json!({
+            "phase": phase,
+            "attempt": attempt + 1,
+            "credentialId": credential_id,
+            "method": built.method().as_str(),
+            "url": built.url().as_str(),
+            "headers": crate::diagnostics::capture::http_headers_json(built.headers()),
+            "body": built
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .map(crate::diagnostics::capture::body_json),
+        })
+    });
+}
+
+/// LLM 明文采集：记录上游响应状态与响应头。
+fn capture_upstream_response(
+    request_id: Option<&str>,
+    phase: &'static str,
+    attempt: usize,
+    credential_id: u64,
+    response: &reqwest::Response,
+    header_wait: Duration,
+) {
+    crate::diagnostics::capture::record("upstream_response", request_id, || {
+        serde_json::json!({
+            "phase": phase,
+            "attempt": attempt + 1,
+            "credentialId": credential_id,
+            "status": response.status().as_u16(),
+            "httpVersion": format!("{:?}", response.version()),
+            "headerWaitMs": header_wait.as_millis() as u64,
+            "headers": crate::diagnostics::capture::http_headers_json(response.headers()),
+        })
+    });
+}
+
+/// LLM 明文采集：记录上游非成功响应体。
+fn capture_upstream_error_body(
+    request_id: Option<&str>,
+    phase: &'static str,
+    attempt: usize,
+    credential_id: u64,
+    status: reqwest::StatusCode,
+    body: &ApiUpstreamBody,
+) {
+    crate::diagnostics::capture::record("upstream_error_body", request_id, || {
+        serde_json::json!({
+            "phase": phase,
+            "attempt": attempt + 1,
+            "credentialId": credential_id,
+            "status": status.as_u16(),
+            "bytes": body.bytes,
+            "body": crate::diagnostics::capture::body_json(body.text.as_bytes()),
+        })
+    });
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ApiUpstreamBodyReadFailure {
     kind: ApiUpstreamFailureKind,
@@ -10806,6 +10880,7 @@ impl KiroProvider {
                 .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
+            capture_upstream_request(request_id, "mcp", attempt, ctx.id, &request);
 
             if let Err(rejection) = inference_attempt_budget.reserve(InferenceAttemptKind::Mcp, 0) {
                 tracing::warn!(
@@ -10914,6 +10989,14 @@ impl KiroProvider {
                 }
             };
 
+            capture_upstream_response(
+                request_id,
+                "mcp",
+                attempt,
+                ctx.id,
+                &response,
+                upstream_header_started_at.elapsed(),
+            );
             let status = response.status();
             // 成功响应
             if status.is_success() {
@@ -11885,6 +11968,7 @@ impl KiroProvider {
                 .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
+            capture_upstream_request(request_id, "api", attempt, ctx.id, &request);
 
             if let Some(budget) = inference_attempt_budget {
                 if let Err(rejection) = budget.reserve(
@@ -11993,6 +12077,14 @@ impl KiroProvider {
                 }
             };
 
+            capture_upstream_response(
+                request_id,
+                "api",
+                attempt,
+                ctx.id,
+                &response,
+                upstream_header_started_at.elapsed(),
+            );
             let status = response.status();
             let retry_after = Self::retry_after_duration(response.headers());
 
@@ -12056,7 +12148,10 @@ impl KiroProvider {
             )
             .await
             {
-                Ok(body) => body,
+                Ok(body) => {
+                    capture_upstream_error_body(request_id, "api", attempt, ctx.id, status, &body);
+                    body
+                }
                 Err(read_failure) => {
                     let message = Self::api_failure_diagnostic(
                         read_failure.kind,
@@ -12737,6 +12832,13 @@ impl KiroProvider {
                     .header("content-type", endpoint.content_type())
                     .header("Connection", "close");
                 let retry_request = endpoint.decorate_api(retry_base, &retry_rctx);
+                capture_upstream_request(
+                    request_id,
+                    "thinking_signature_retry",
+                    attempt,
+                    ctx.id,
+                    &retry_request,
+                );
                 let upstream_header_started_at = Instant::now();
                 let retry_response_result = send_with_response_header_timeout(
                     retry_request,
@@ -12781,6 +12883,14 @@ impl KiroProvider {
                         ));
                     }
                 };
+                capture_upstream_response(
+                    request_id,
+                    "thinking_signature_retry",
+                    attempt,
+                    ctx.id,
+                    &retry_response,
+                    upstream_header_started_at.elapsed(),
+                );
                 let retry_status = retry_response.status();
                 let retry_after = Self::retry_after_duration(retry_response.headers());
                 let retry_content_kind = Self::upstream_content_kind(&retry_response);
@@ -12833,7 +12943,17 @@ impl KiroProvider {
                 )
                 .await;
                 let retry_upstream_body = match retry_body_result {
-                    Ok(body) => body,
+                    Ok(body) => {
+                        capture_upstream_error_body(
+                            request_id,
+                            "thinking_signature_retry",
+                            attempt,
+                            ctx.id,
+                            retry_status,
+                            &body,
+                        );
+                        body
+                    }
                     Err(read_failure) => {
                         let message = Self::thinking_signature_retry_failure_diagnostic(
                             "thinking_signature_retry_response_read_failed",

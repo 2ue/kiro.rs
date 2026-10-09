@@ -1347,6 +1347,9 @@ async fn call_mcp_api(
         .map_err(|error| WebSearchFailure::from_provider_error(&error))?;
     let (response, completion) = response.into_parts();
 
+    let response_status = response.status();
+    let response_headers = crate::diagnostics::capture::is_active()
+        .then(|| crate::diagnostics::capture::http_headers_json(response.headers()));
     let body = match response_bytes_with_limit_and_body_timeout(
         response,
         provider
@@ -1386,6 +1389,15 @@ async fn call_mcp_api(
             return Err(failure.with_attribution(completion.attribution()));
         }
     };
+    if let Some(headers) = response_headers {
+        crate::diagnostics::capture::record("mcp_response_body", Some(request_id), || {
+            serde_json::json!({
+                "status": response_status.as_u16(),
+                "headers": headers,
+                "body": crate::diagnostics::capture::body_json(&body),
+            })
+        });
+    }
     let body = match std::str::from_utf8(&body) {
         Ok(body) => body,
         Err(_) => {

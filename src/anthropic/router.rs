@@ -33,7 +33,7 @@ use super::{
         get_model, get_model_dfcache, get_models, get_models_dfcache, post_messages,
         post_messages_cc, post_messages_dfcache, post_messages_ha, post_messages_na,
     },
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, auth_middleware, capture_http_ingress, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
@@ -439,6 +439,7 @@ pub fn create_router_with_provider(
         .layer(middleware::map_response(mark_non_retryable_client_errors))
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_MESSAGES_BODY_SIZE))
+        .layer(middleware::from_fn(capture_http_ingress))
 }
 
 /// Claude Code preconnects with `HEAD <ANTHROPIC_BASE_URL>/api/hello` at startup and only needs

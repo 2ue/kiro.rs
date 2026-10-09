@@ -7,7 +7,10 @@ use futures::StreamExt;
 use reqwest::{Client, Proxy, Request, RequestBuilder, Response};
 use serde::Deserialize;
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -458,7 +461,11 @@ pub fn build_client(
 
     match tls_backend {
         TlsBackend::Rustls => {
-            builder = builder.use_rustls_tls();
+            if let Some(keylog_config) = build_keylog_tls_config() {
+                builder = builder.use_preconfigured_tls(keylog_config);
+            } else {
+                builder = builder.use_rustls_tls();
+            }
         }
         TlsBackend::NativeTls => {
             #[cfg(feature = "native-tls")]
@@ -488,6 +495,73 @@ pub fn build_client(
     }
 
     Ok(builder.build()?)
+}
+
+#[derive(Debug)]
+struct FileKeyLog(Mutex<File>);
+
+impl rustls::KeyLog for FileKeyLog {
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        let Ok(mut file) = self.0.lock() else {
+            return;
+        };
+        if write!(file, "{label} ").is_err() {
+            return;
+        }
+        for byte in client_random {
+            if write!(file, "{byte:02x}").is_err() {
+                return;
+            }
+        }
+        if write!(file, " ").is_err() {
+            return;
+        }
+        for byte in secret {
+            if write!(file, "{byte:02x}").is_err() {
+                return;
+            }
+        }
+        let _ = writeln!(file);
+        let _ = file.flush();
+    }
+}
+
+fn build_keylog_tls_config() -> Option<rustls::ClientConfig> {
+    let path = std::env::var_os("KIRO_TLS_KEYLOG_FILE")
+        .or_else(|| std::env::var_os("SSLKEYLOGFILE"))
+        .map(std::path::PathBuf::from)?;
+    let file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "TLS key log could not be opened; continuing without TLS decryption keys");
+            return None;
+        }
+    };
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let native = rustls_native_certs::load_native_certs();
+    for certificate in native.certs {
+        if let Err(error) = roots.add(certificate) {
+            tracing::debug!(%error, "ignored invalid native root certificate while building key-log TLS client");
+        }
+    }
+    for error in native.errors {
+        tracing::debug!(%error, "ignored native root certificate loader error while building key-log TLS client");
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider);
+    let Ok(builder) = builder.with_safe_default_protocol_versions() else {
+        tracing::warn!(
+            "TLS key-log client could not select safe protocol versions; continuing without TLS decryption keys"
+        );
+        return None;
+    };
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.key_log = Arc::new(FileKeyLog(Mutex::new(file)));
+    Some(config)
 }
 
 #[cfg(test)]
