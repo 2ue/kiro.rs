@@ -114,30 +114,41 @@ pub(crate) fn count_all_tokens(
     messages: &[Message],
     tools: Option<&[Tool]>,
 ) -> u64 {
-    // 检查是否配置了远程 API
-    if let Some(config) = get_config() {
-        if let Some(api_url) = &config.api_url {
-            // 尝试调用远程 API
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
-                ))
-            });
+    count_all_tokens_with_source(model, system, messages, tools, None).0
+}
 
-            match result {
-                Ok(tokens) => {
-                    tracing::debug!("远程 count_tokens API 返回: {}", tokens);
-                    return tokens;
-                }
-                Err(e) => {
-                    tracing::warn!("远程 count_tokens API 调用失败，回退到本地计算: {}", e);
-                }
+/// 计算 token 数量并返回实际采用的计算方式，供诊断采集使用。
+pub(crate) fn count_all_tokens_with_source(
+    model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
+    request_id: Option<&str>,
+) -> (u64, &'static str) {
+    // 检查是否配置了远程 API
+    if let Some(config) = get_config()
+        && let Some(api_url) = &config.api_url
+    {
+        // 尝试调用远程 API
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
+                api_url, config, model, &system, &messages, &tools, request_id,
+            ))
+        });
+
+        match result {
+            Ok(tokens) => {
+                tracing::debug!("远程 count_tokens API 返回: {}", tokens);
+                return (tokens, "remote");
+            }
+            Err(e) => {
+                tracing::warn!("远程 count_tokens API 调用失败，回退到本地计算: {}", e);
             }
         }
     }
 
     // 本地计算
-    count_all_tokens_local(system, messages, tools)
+    (count_all_tokens_local(system, messages, tools), "local")
 }
 
 /// 调用远程 count_tokens API
@@ -148,6 +159,7 @@ async fn call_remote_count_tokens(
     system: &Option<&[SystemMessage]>,
     messages: &&[Message],
     tools: &Option<&[Tool]>,
+    request_id: Option<&str>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
 
@@ -171,6 +183,27 @@ async fn call_remote_count_tokens(
         }
     }
 
+    let capture_active = request_id.is_some();
+    let capture_body = capture_active.then(|| serde_json::to_vec(&request).unwrap_or_default());
+    if let Some(body) = capture_body.as_ref()
+        && let Some(built) = req_builder.try_clone().and_then(|builder| {
+            builder
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .build()
+                .ok()
+        })
+    {
+        crate::diagnostics::capture::record("count_tokens_upstream_request", request_id, || {
+            serde_json::json!({
+                "url": built.url().as_str(),
+                "method": built.method().as_str(),
+                "headers": crate::diagnostics::capture::http_headers_json(built.headers()),
+                "body": crate::diagnostics::capture::body_json(body),
+            })
+        });
+    }
+
     // 发送请求
     let response = req_builder
         .header("Content-Type", "application/json")
@@ -178,13 +211,50 @@ async fn call_remote_count_tokens(
         .send()
         .await?;
 
-    if !response.status().is_success() {
-        return Err(format!("API 返回错误状态: {}", response.status()).into());
+    let status = response.status();
+    let response_headers =
+        capture_active.then(|| crate::diagnostics::capture::http_headers_json(response.headers()));
+    if !status.is_success() && !capture_active {
+        return Err(format!("API 返回错误状态: {}", status).into());
     }
-
-    let body =
-        response_bytes_with_limit_and_body_timeout(response, 300, COUNT_TOKENS_RESPONSE_MAX_BYTES)
-            .await?;
+    let body = match response_bytes_with_limit_and_body_timeout(
+        response,
+        300,
+        COUNT_TOKENS_RESPONSE_MAX_BYTES,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) if !status.is_success() => {
+            if let Some(headers) = response_headers {
+                crate::diagnostics::capture::record(
+                    "count_tokens_upstream_response",
+                    request_id,
+                    || {
+                        serde_json::json!({
+                            "status": status.as_u16(),
+                            "headers": headers,
+                            "bodyReadError": error.to_string(),
+                        })
+                    },
+                );
+            }
+            return Err(format!("API 返回错误状态: {}", status).into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(headers) = response_headers {
+        crate::diagnostics::capture::record("count_tokens_upstream_response", request_id, || {
+            serde_json::json!({
+                "status": status.as_u16(),
+                "headers": headers,
+                "body": crate::diagnostics::capture::body_json(&body),
+            })
+        });
+    }
+    if !status.is_success() {
+        return Err(format!("API 返回错误状态: {}", status).into());
+    }
     let result: CountTokensResponse = serde_json::from_slice(&body)?;
     Ok(result.input_tokens as u64)
 }

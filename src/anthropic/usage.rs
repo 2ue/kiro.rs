@@ -2537,6 +2537,9 @@ impl UsageRecorder {
             return UsageRecordOutcome::RejectedShuttingDown;
         }
         let record = normalize_error_diagnostics(record);
+        crate::diagnostics::capture::record("request_summary", Some(&record.id), || {
+            serde_json::to_value(&record).unwrap_or(Value::Null)
+        });
         let record_micros = parse_record_time(&record.created_at)
             .unwrap_or_else(Utc::now)
             .timestamp_micros()

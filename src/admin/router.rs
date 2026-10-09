@@ -6,6 +6,7 @@ use axum::{
 };
 
 use super::{
+    capture_handlers::{download_capture, get_capture_overview, start_capture, stop_capture},
     handlers::{
         add_credential, batch_import_credentials, batch_update_credentials, cancel_usage_cleanup,
         clear_credential_in_flight, clear_external_pool_auto_disabled,
@@ -263,6 +264,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_runtime_config).put(update_runtime_config),
         )
         .route("/system/version", get(get_system_version))
+        .route("/diagnostics/capture", get(get_capture_overview))
+        .route("/diagnostics/capture/start", post(start_capture))
+        .route("/diagnostics/capture/stop", post(stop_capture))
+        .route("/diagnostics/capture/{id}/download", get(download_capture))
         .route("/security/keys", get(get_access_keys))
         .route("/security/admin-key", put(update_admin_api_key))
         .route("/security/request-keys", post(create_request_api_key))

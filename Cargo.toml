@@ -15,6 +15,9 @@ strip = true
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset", "gzip"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["unbounded_depth"] }
 base64 = "0.22"
@@ -44,6 +47,7 @@ rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
 pdf-extract = "0.7"   # PDF 文本抽取
 url = "2"             # URL 解析（SSRF 防护）
+zip = { version = "2.2", default-features = false, features = ["deflate"] }  # 诊断采集归档
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

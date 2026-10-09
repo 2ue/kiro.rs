@@ -19,7 +19,11 @@ const BODY_LIMIT_MESSAGE: &str = "The request body exceeds the 50 MiB limit.";
 ///
 /// A `413` observed here can only be the `Bytes` buffering limit rejection.
 /// Downstream handler or upstream `413` responses never pass through this code.
-pub(crate) struct MessagesBody(pub(crate) Bytes, pub(crate) Option<String>);
+pub(crate) struct MessagesBody(
+    pub(crate) Bytes,
+    pub(crate) Option<String>,
+    pub(crate) Option<String>,
+);
 
 impl<S> FromRequest<S> for MessagesBody
 where
@@ -42,9 +46,11 @@ where
                     .copied()
                     .map(RequestApiKeyIdentity::stable_id)
             });
+        let ingress_id =
+            crate::diagnostics::capture::ingress_id_from_extensions(request.extensions());
         let uri = request.uri().clone();
         match Bytes::from_request(request, state).await {
-            Ok(body) => Ok(Self(body, request_api_key_id)),
+            Ok(body) => Ok(Self(body, request_api_key_id, ingress_id)),
             Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
                 let request_id = envelope::request_id();
                 if let Some(attribution) = attribution.as_ref() {
@@ -120,13 +126,13 @@ mod tests {
 
     use super::*;
 
-    async fn body_len(MessagesBody(body, _): MessagesBody) -> String {
+    async fn body_len(MessagesBody(body, _, _): MessagesBody) -> String {
         body.len().to_string()
     }
 
     async fn counted_body(
         State(hits): State<Arc<AtomicUsize>>,
-        MessagesBody(body, _): MessagesBody,
+        MessagesBody(body, _, _): MessagesBody,
     ) -> String {
         hits.fetch_add(1, Ordering::SeqCst);
         body.len().to_string()

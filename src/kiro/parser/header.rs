@@ -117,6 +117,28 @@ impl Headers {
     pub fn error_code(&self) -> Option<&str> {
         self.get_string(":error-code")
     }
+
+    /// 以 JSON 形式导出全部头部（键排序），供诊断采集使用。
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut names: Vec<&String> = self.inner.keys().collect();
+        names.sort_unstable();
+        let mut object = serde_json::Map::with_capacity(names.len());
+        for name in names {
+            let value = match &self.inner[name] {
+                HeaderValue::Bool(v) => serde_json::json!(v),
+                HeaderValue::Byte(v) => serde_json::json!(v),
+                HeaderValue::Short(v) => serde_json::json!(v),
+                HeaderValue::Integer(v) => serde_json::json!(v),
+                HeaderValue::Long(v) => serde_json::json!(v),
+                HeaderValue::Timestamp(v) => serde_json::json!(v),
+                HeaderValue::String(v) => serde_json::json!(v),
+                HeaderValue::ByteArray(v) => serde_json::json!(hex::encode(v)),
+                HeaderValue::Uuid(v) => serde_json::json!(uuid::Uuid::from_bytes(*v).to_string()),
+            };
+            object.insert(name.clone(), value);
+        }
+        serde_json::Value::Object(object)
+    }
 }
 
 /// 从字节流解析头部
