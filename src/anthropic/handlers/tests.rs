@@ -13077,7 +13077,7 @@ async fn run_llm_capture_records_full_local_round_trip() {
 
 #[test]
 fn llm_capture_records_full_local_round_trip() {
-    run_handler_fixture_on_four_mib_thread("llm-capture-round-trip", || async {
+    run_handler_fixture_on_large_stack_thread("llm-capture-round-trip", || async {
         run_llm_capture_records_full_local_round_trip().await;
     });
 }

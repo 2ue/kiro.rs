@@ -206,9 +206,11 @@ impl IngressCaptureState {
         }
         self.recorded = true;
         let body_truncated = self.body_truncated || !complete;
-        let body = (!body_truncated)
-            .then(|| crate::diagnostics::capture::body_json(&self.body))
-            .unwrap_or(serde_json::Value::Null);
+        let body = if !body_truncated {
+            crate::diagnostics::capture::body_json(&self.body)
+        } else {
+            serde_json::Value::Null
+        };
         crate::diagnostics::capture::record("http_ingress", None, || {
             serde_json::json!({
                 "ingressId": self.ingress_id,
