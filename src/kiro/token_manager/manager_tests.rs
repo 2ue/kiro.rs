@@ -7104,6 +7104,104 @@ async fn test_health_balanced_mode_penalizes_recent_selection_pressure() {
 }
 
 #[tokio::test]
+async fn balanced_mode_prefers_configured_priority_before_recent_spread() {
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+
+    let mut preferred = test_access_token_credential("preferred-token", "Pro");
+    preferred.priority = 0;
+    let mut fallback = test_access_token_credential("fallback-token", "Pro");
+    fallback.priority = 10;
+
+    let manager =
+        MultiTokenManager::new(config, vec![preferred, fallback], None, None, false).unwrap();
+    {
+        let mut entries = manager.entries.lock();
+        entries[0].health.recent_selection_count_10s = 50;
+        entries[0].health.recent_selection_count_60s = 50;
+        entries[0].success_count = 1_000;
+        entries[0].total_selection_count = 1_000;
+    }
+
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(
+        ctx.id, 1,
+        "balanced mode should concentrate new unbound requests on the lower priority value when it is dispatchable"
+    );
+    ctx.release_in_flight();
+}
+
+#[tokio::test]
+async fn balanced_mode_falls_back_when_preferred_priority_is_full() {
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+    config.credential_max_concurrent_requests = 1;
+
+    let mut preferred = test_access_token_credential("preferred-token", "Pro");
+    preferred.priority = 0;
+    let mut fallback = test_access_token_credential("fallback-token", "Pro");
+    fallback.priority = 10;
+
+    let manager =
+        MultiTokenManager::new(config, vec![preferred, fallback], None, None, false).unwrap();
+    let mut first = manager.acquire_context(None).await.unwrap();
+    assert_eq!(first.id, 1);
+
+    let mut second = manager.acquire_context(None).await.unwrap();
+    assert_eq!(
+        second.id, 2,
+        "lower-priority credentials remain fallback capacity when the preferred tier is full"
+    );
+
+    second.release_in_flight();
+    first.release_in_flight();
+}
+
+#[tokio::test]
+async fn balanced_mode_priority_update_preserves_existing_sticky_and_moves_new_sessions() {
+    let mut config = Config::default();
+    config.load_balancing_mode = "balanced".to_string();
+
+    let first = test_access_token_credential("first-token", "Pro");
+    let second = test_access_token_credential("second-token", "Pro");
+    let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+    let empty = HashSet::new();
+
+    let mut bound = manager
+        .acquire_context_for_session(None, Some("priority-sticky-existing"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(bound.id, 1);
+    bound.release_in_flight();
+
+    manager.set_priority(1, 10).unwrap();
+    manager.set_priority(2, 0).unwrap();
+
+    let mut rebound = manager
+        .acquire_context_for_session(None, Some("priority-sticky-existing"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        rebound.id, 1,
+        "priority changes must not hard-cut an existing sticky session while its bound credential is usable"
+    );
+    assert!(rebound.sticky_bound);
+
+    let mut new_session = manager
+        .acquire_context_for_session(None, Some("priority-sticky-new"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        new_session.id, 2,
+        "new sessions should move to the newly preferred credential immediately"
+    );
+    assert!(!new_session.sticky_bound);
+
+    new_session.release_in_flight();
+    rebound.release_in_flight();
+}
+
+#[tokio::test]
 async fn test_balanced_mode_rotates_all_warming_credentials_by_recent_selection() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();

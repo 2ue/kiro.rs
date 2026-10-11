@@ -7722,6 +7722,34 @@ fn thinking_suffix_sonnet_4_6_uses_adaptive_by_default() {
 }
 
 #[test]
+fn thinking_suffix_public_5x_models_use_adaptive_by_default() {
+    for model in [
+        "claude-sonnet-5-thinking",
+        "claude-sonnet-5-5-thinking",
+        "claude-opus-5-thinking",
+        "claude-opus-5-5-thinking",
+        "claude-opus-5.5[1m]-thinking",
+        "claude-haiku-5-5-thinking",
+        "fable-thinking",
+        "claude-fable-5-thinking",
+        "claude-fable-5-1-thinking",
+        "claude-fable-5.1[1m]-thinking",
+    ] {
+        let mut payload = messages_request_for_model(model);
+
+        override_thinking_from_model_name(&mut payload)
+            .unwrap_or_else(|error| panic!("{model}: {error}"));
+
+        let thinking = payload
+            .thinking
+            .unwrap_or_else(|| panic!("{model}: thinking should be set"));
+        assert_eq!(thinking.thinking_type, "adaptive", "{model}");
+        assert_eq!(thinking.budget_tokens, 0, "{model}");
+        assert!(payload.output_config.is_none(), "{model}");
+    }
+}
+
+#[test]
 fn thinking_suffix_sonnet_alias_uses_adaptive_by_default() {
     let mut payload = messages_request_for_model("sonnet-thinking");
 
@@ -8011,7 +8039,14 @@ fn synthetic_thinking_activation_never_forges_client_effort_five_rounds() {
         for model in [
             "claude-opus-4-7-thinking",
             "claude-opus-4-8-thinking",
+            "claude-opus-5-5-thinking",
+            "claude-sonnet-5-5-thinking",
+            "claude-haiku-5-5-thinking",
+            "fable-thinking",
+            "claude-fable-5-thinking",
+            "claude-fable-5-1-thinking",
             "claude-sonnet-4-6-thinking",
+            "claude-sonnet-5-thinking",
         ] {
             let mut payload = messages_request_for_model(model);
             override_thinking_from_model_name(&mut payload)

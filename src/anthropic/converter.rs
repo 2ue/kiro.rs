@@ -735,6 +735,7 @@ mod tests {
         assert_eq!(map_model("best"), Some("claude-opus-4.7".to_string()));
         assert_eq!(map_model("default"), Some("claude-opus-4.7".to_string()));
         assert_eq!(map_model("sonnet"), Some("claude-sonnet-4.6".to_string()));
+        assert_eq!(map_model("fable"), Some("claude-fable-5.1".to_string()));
         assert_eq!(
             map_model("claude-opus-4-7[1m]"),
             Some("claude-opus-4.7".to_string())
@@ -758,6 +759,83 @@ mod tests {
         assert_eq!(
             map_model("Claude-Sonnet-4-9-20270101-thinking[1m]"),
             Some("claude-sonnet-4-9-20270101".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_public_fable_and_opus_55_variants() {
+        for requested in [
+            "claude-fable-5",
+            "claude-fable-5-thinking",
+            "claude-fable-5[1m]-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested),
+                Some("claude-fable-5".to_string()),
+                "{requested}"
+            );
+        }
+        assert_eq!(map_model("fable5"), None);
+
+        for requested in [
+            "claude-fable-5-1",
+            "claude-fable-5.1",
+            "claude-fable-5-1-thinking",
+            "claude-fable-5.1[1m]-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested),
+                Some("claude-fable-5.1".to_string()),
+                "{requested}"
+            );
+        }
+
+        for requested in [
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5[1m]-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested),
+                Some("claude-opus-5.5".to_string()),
+                "{requested}"
+            );
+        }
+
+        for requested in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "claude-sonnet-5-5-thinking",
+            "claude-sonnet-5.5[1m]-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested),
+                Some("claude-sonnet-5.5".to_string()),
+                "{requested}"
+            );
+        }
+
+        for requested in [
+            "claude-haiku-5-5",
+            "claude-haiku-5.5",
+            "claude-haiku-5-5-thinking",
+            "claude-haiku-5.5[1m]-thinking",
+        ] {
+            assert_eq!(
+                map_model(requested),
+                Some("claude-haiku-5.5".to_string()),
+                "{requested}"
+            );
+        }
+
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-8-thinking"),
+            Some("claude-opus-4.8".to_string())
         );
     }
 
@@ -990,6 +1068,31 @@ mod tests {
         assert_eq!(get_context_window_size("auto"), 1_000_000);
         assert_eq!(get_context_window_size("sonnet"), 200_000);
         assert_eq!(get_context_window_size("opus"), 200_000);
+        assert_eq!(
+            get_context_window_size("claude-fable-5-1-thinking"),
+            1_000_000
+        );
+        assert_eq!(
+            get_context_window_size("claude-fable-5-thinking"),
+            1_000_000
+        );
+        assert_eq!(
+            get_context_window_size("claude-opus-5-5-thinking"),
+            1_000_000
+        );
+        assert_eq!(
+            get_context_window_size("claude-sonnet-5-5-thinking"),
+            1_000_000
+        );
+        assert_eq!(
+            get_context_window_size("claude-haiku-5-5-thinking"),
+            1_000_000
+        );
+        assert_eq!(get_context_window_size("claude-opus-5-thinking"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-sonnet-5-thinking"),
+            1_000_000
+        );
         assert_eq!(get_context_window_size("claude-opus-4.8"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4.7"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-4.6"), 1_000_000);

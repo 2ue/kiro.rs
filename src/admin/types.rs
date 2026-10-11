@@ -1587,7 +1587,7 @@ pub struct CredentialValidationResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority"、"balanced" 或 "health_balanced"）
+    /// 当前模式（"priority"、"balanced"、"health_balanced" 或 "weighted_least_inflight"）
     pub mode: String,
 }
 
@@ -1603,7 +1603,7 @@ pub struct SystemVersionResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority"、"balanced" 或 "health_balanced"）
+    /// 模式（"priority"、"balanced"、"health_balanced" 或 "weighted_least_inflight"）
     pub mode: String,
 }
 

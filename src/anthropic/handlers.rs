@@ -12372,16 +12372,30 @@ struct ThinkingModelDefaults {
     budget_tokens: i32,
 }
 
-fn claude_minor_version(model: &str, family: &str) -> Option<u32> {
-    let prefix = format!("claude-{family}-4");
+fn claude_public_version(model: &str, family: &str) -> Option<(u32, Option<u32>)> {
+    let prefix = format!("claude-{family}-");
     let rest = model.strip_prefix(&prefix)?;
-    let rest = rest.strip_prefix(['-', '.'])?;
-    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        None
-    } else {
-        digits.parse().ok()
+    let major_digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if major_digits.is_empty() {
+        return None;
     }
+    let major = major_digits.parse().ok()?;
+    let rest = &rest[major_digits.len()..];
+    if rest.is_empty() {
+        return Some((major, None));
+    }
+    let rest = rest.strip_prefix(['-', '.'])?;
+    let minor_digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if minor_digits.is_empty() || minor_digits.len() > 3 {
+        return None;
+    }
+    Some((major, Some(minor_digits.parse().ok()?)))
+}
+
+fn model_version_uses_adaptive_thinking(model: &str, family: &str) -> bool {
+    claude_public_version(model, family).is_some_and(|(major, minor)| {
+        major >= 5 || (major == 4 && minor.is_some_and(|minor| minor >= 6))
+    })
 }
 
 fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
@@ -12395,12 +12409,14 @@ fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
         "opus" | "opusplan" | "best" | "default"
     );
     let is_sonnet_alias = model_base == "sonnet";
-    let opus_minor = claude_minor_version(&model_base, "opus");
-    let sonnet_minor = claude_minor_version(&model_base, "sonnet");
+    let is_fable_alias = model_base == "fable";
     let adaptive = is_opus_alias
         || is_sonnet_alias
-        || opus_minor.is_some_and(|minor| minor >= 6)
-        || sonnet_minor.is_some_and(|minor| minor >= 6);
+        || is_fable_alias
+        || model_version_uses_adaptive_thinking(&model_base, "opus")
+        || model_version_uses_adaptive_thinking(&model_base, "sonnet")
+        || model_version_uses_adaptive_thinking(&model_base, "haiku")
+        || model_version_uses_adaptive_thinking(&model_base, "fable");
     Some(ThinkingModelDefaults {
         thinking_type: if adaptive { "adaptive" } else { "enabled" },
         budget_tokens: if adaptive { 0 } else { 20000 },

@@ -114,7 +114,7 @@ import {
 // Constants
 // ============================================================================
 
-const PAGE_SIZE = 15
+const PAGE_SIZE_OPTIONS = [15, 30, 60, 120]
 const CREDIT_INFO_DETAIL_BATCH_SIZE = 500
 
 function CredentialFilterField({
@@ -188,6 +188,7 @@ const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
 export function CredentialsPage() {
   const modelCapabilities = useModelCapabilities()
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(PAGE_SIZE_OPTIONS[0])
   const [allExpanded, setAllExpanded] = useState(true)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [quickQuery, setQuickQuery] = useState('')
@@ -238,7 +239,7 @@ export function CredentialsPage() {
   const quickText = debouncedQuickQuery.trim()
   const listQuery = useMemo(() => ({
     page,
-    limit: PAGE_SIZE,
+    limit: pageSize,
     q: quickCredentialId === undefined ? quickText || undefined : undefined,
     credentialId: quickCredentialId,
     model: debouncedModelQuery.trim() || undefined,
@@ -250,6 +251,7 @@ export function CredentialsPage() {
     sortOrder: sortBy !== 'default' ? sortOrder : undefined,
   }), [
     page,
+    pageSize,
     quickCredentialId,
     quickText,
     debouncedModelQuery,
@@ -262,16 +264,40 @@ export function CredentialsPage() {
   ])
 
   const credentials = useCredentialList(listQuery)
-  const credentialCatalog = useCredentialList({ page: 1, limit: 500 })
+  const pageTransitionPending = Boolean(
+    credentials.data?.page !== undefined &&
+    (credentials.isPlaceholderData || (credentials.isFetching && credentials.data.page !== page))
+  )
+  const currentIds = useMemo(() => (credentials.data?.items || []).map((i) => i.id), [credentials.data?.items])
+  const detailQueriesEnabled = currentIds.length > 0 && !credentials.isLoading && !pageTransitionPending
+  const credentialCatalog = useCredentialList(
+    { page: 1, limit: 500 },
+    {
+      enabled: Boolean(credentials.data) && (credentials.data?.total ?? 0) > (credentials.data?.items.length ?? 0),
+      refetchInterval: false,
+      staleTime: 5 * 60 * 1000,
+    }
+  )
   const allCredentials = useCredentials({
     enabled: batchOpen || kamOpen || creditDetailsOpen || queryingCreditInfo,
+    refetchInterval: false,
   })
-  const currentIds = useMemo(() => (credentials.data?.items || []).map((i) => i.id), [credentials.data?.items])
   const credentialSummary = useCredentialSummary()
-  const credentialRuntime = useCredentialRuntime(currentIds)
-  const credentialAccountInfo = useCredentialAccountInfo(currentIds)
-  const credentialUsage = useCredentialUsageSummary(currentIds)
-  const creditSummary = useCredentialCreditSummary()
+  const credentialRuntime = useCredentialRuntime(currentIds, { enabled: detailQueriesEnabled })
+  const credentialAccountInfo = useCredentialAccountInfo(currentIds, {
+    enabled: detailQueriesEnabled,
+    refetchInterval: false,
+    staleTime: 5 * 60 * 1000,
+  })
+  const credentialUsage = useCredentialUsageSummary(currentIds, {
+    enabled: detailQueriesEnabled,
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  })
+  const creditSummary = useCredentialCreditSummary({
+    refetchInterval: 120_000,
+    staleTime: 60_000,
+  })
   const proxyResources = useProxyResources()
   const loadBalancing = useLoadBalancingMode()
   const usageSummary = useUsageSummary(10_000)
@@ -316,10 +342,6 @@ export function CredentialsPage() {
   const filteredTotal = credentials.data?.filteredTotal ?? credentials.data?.total ?? 0
   const grandTotal = credentials.data?.total ?? 0
   const disabledCount = credentialSummary.data?.disabled ?? Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
-  const pageTransitionPending = Boolean(
-    credentials.data?.page !== undefined &&
-    (credentials.isPlaceholderData || (credentials.isFetching && credentials.data.page !== page))
-  )
   const hasTextFilters = Boolean(
     quickQuery.trim() ||
     modelQuery.trim(),
@@ -365,9 +387,16 @@ export function CredentialsPage() {
     sortOrder,
   ])
   useEffect(() => { setSelectedIds(new Set()) }, [page])
+  useEffect(() => { setSelectedIds(new Set()) }, [pageSize])
   useEffect(() => {
     if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) setPage(Math.max(credentials.data.totalPages, 1))
   }, [credentials.data, page])
+
+  const handlePageSizeChange = (nextPageSize: number) => {
+    setPageSize(nextPageSize)
+    setPage(1)
+    setSelectedIds(new Set())
+  }
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
@@ -1170,14 +1199,16 @@ export function CredentialsPage() {
         )}
 
         {/* Pagination */}
-        {totalPages > 1 && (
+        {filteredTotal > 0 && (
           <div className="mt-4">
             <Pagination
               page={page}
               pageCount={totalPages}
               total={filteredTotal}
-              pageSize={PAGE_SIZE}
+              pageSize={pageSize}
+              pageSizeOptions={PAGE_SIZE_OPTIONS}
               onPageChange={setPage}
+              onPageSizeChange={handlePageSizeChange}
               pending={pageTransitionPending}
             />
           </div>

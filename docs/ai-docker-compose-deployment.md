@@ -310,7 +310,7 @@ docker compose run --rm kiro-rs ./kiro-rs -c /app/config/config.json maintenance
 
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
-| `loadBalancingMode` | `priority` 或 `balanced` | 控制多凭据调度方式。 |
+| `loadBalancingMode` | `priority` 或 `balanced` | 控制多凭据调度方式；`balanced` 会先尊重账号优先级，再在同优先级账号内均衡。 |
 | `credentialRpm` | `null` | 控制每个凭据的本地请求速率限制。`null` 或 `0` 表示关闭。 |
 | `credentialMaxConcurrentRequests` | `0` | 控制每个凭据最多同时处理多少个请求。`0` 表示不限制。 |
 | `credentialTransientCooldownSecs` | `10` | 控制上游临时错误但没有 `Retry-After` 时，单个凭据临时冷却多少秒。 |

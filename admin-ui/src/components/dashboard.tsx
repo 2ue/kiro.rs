@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef, type FormEvent } from 'react'
 import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2, LayoutDashboard, SlidersHorizontal, Wallet, X } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -67,6 +67,37 @@ import type {
 } from '@/types/api'
 
 const CREDIT_INFO_DETAIL_BATCH_SIZE = 500
+const PAGE_SIZE_OPTIONS = [12, 24, 48, 96]
+
+type PageItem = number | 'ellipsis-left' | 'ellipsis-right'
+
+function clampPage(page: number, pageCount: number) {
+  return Math.min(Math.max(page, 1), Math.max(pageCount, 1))
+}
+
+function buildPageItems(page: number, pageCount: number): PageItem[] {
+  if (pageCount <= 7) {
+    return Array.from({ length: pageCount }, (_, index) => index + 1)
+  }
+
+  const pages = new Set<number>([1, pageCount, page, page - 1, page + 1])
+  if (page <= 4) {
+    for (let value = 2; value <= 5; value += 1) pages.add(value)
+  }
+  if (page >= pageCount - 3) {
+    for (let value = pageCount - 4; value < pageCount; value += 1) pages.add(value)
+  }
+
+  const sorted = Array.from(pages)
+    .filter((value) => value >= 1 && value <= pageCount)
+    .sort((left, right) => left - right)
+
+  return sorted.flatMap<PageItem>((value, index) => {
+    const previous = sorted[index - 1]
+    if (index === 0 || value === previous + 1) return [value]
+    return [previous === 1 ? 'ellipsis-left' : 'ellipsis-right', value]
+  })
+}
 
 interface CreditDetailRow {
   id: number
@@ -214,7 +245,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [creditDetailRows, setCreditDetailRows] = useState<CreditDetailRow[]>([])
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
-  const itemsPerPage = 12
+  const [itemsPerPage, setItemsPerPage] = useState(PAGE_SIZE_OPTIONS[0])
+  const [pageJumpInput, setPageJumpInput] = useState('1')
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
       return document.documentElement.classList.contains('dark')
@@ -243,7 +275,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       sortBy: sortBy !== 'default' ? sortBy : undefined,
       sortOrder: sortBy !== 'default' ? sortOrder : undefined,
     }),
-    [accountQuery, authFilter, concurrencyQuery, credentialIdQuery, currentPage, endpointQuery, modelQuery, priorityQuery, proxyFilter, queryText, regionQuery, rpmQuery, sortBy, sortOrder, statusFilter, subscriptionFilter]
+    [accountQuery, authFilter, concurrencyQuery, credentialIdQuery, currentPage, endpointQuery, itemsPerPage, modelQuery, priorityQuery, proxyFilter, queryText, regionQuery, rpmQuery, sortBy, sortOrder, statusFilter, subscriptionFilter]
   )
   const {
     data: listData,
@@ -263,9 +295,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
     () => listData?.items.map((credential) => credential.id) || [],
     [listData?.items]
   )
-  const runtimeQuery = useCredentialsRuntime(visibleCredentialIds)
-  const accountInfoQuery = useCredentialsAccountInfo(visibleCredentialIds)
-  const usageSummaryQuery = useCredentialsUsageSummary(visibleCredentialIds)
+  const pageTransitionPending = listData?.page !== undefined && (isListPlaceholderData || (isListFetching && listData.page !== currentPage))
+  const detailQueriesEnabled = visibleCredentialIds.length > 0 && !isListLoading && !pageTransitionPending
+  const runtimeQuery = useCredentialsRuntime(visibleCredentialIds, { enabled: detailQueriesEnabled })
+  const accountInfoQuery = useCredentialsAccountInfo(visibleCredentialIds, {
+    enabled: detailQueriesEnabled,
+    refetchInterval: false,
+    staleTime: 5 * 60 * 1000,
+  })
+  const usageSummaryQuery = useCredentialsUsageSummary(visibleCredentialIds, {
+    enabled: detailQueriesEnabled,
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  })
   const allCredentialsQuery = useCredentials({ enabled: false, refetchInterval: false })
 
   const refinedCreditStats = useMemo(() => {
@@ -290,7 +332,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: proxyResourcesData } = useProxyResources()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const usageStatsQuery = useUsageSummary(10_000)
-  const creditSummary = useCredentialCreditSummary()
+  const creditSummary = useCredentialCreditSummary({
+    refetchInterval: 120_000,
+    staleTime: 60_000,
+  })
   const refetch = () => {
     refetchList()
     refetchSummary()
@@ -351,10 +396,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 计算分页
   const totalPages = listData?.totalPages || 0
-  const credentialsPage = listData?.page
+  const paginationItems = useMemo(
+    () => buildPageItems(clampPage(currentPage, totalPages), Math.max(totalPages, 1)),
+    [currentPage, totalPages],
+  )
   const isLoading = isListLoading || isSummaryLoading
   const error = listError || summaryError
-  const pageTransitionPending = credentialsPage !== undefined && (isListPlaceholderData || (isListFetching && credentialsPage !== currentPage))
   const data = useMemo(() => {
     if (!listData && !summaryData) {
       return undefined
@@ -377,7 +424,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       filteredTotal: listData?.filteredTotal ?? 0,
       filteredAvailable: listData?.filteredAvailable ?? 0,
     }
-  }, [currentPage, listData, summaryData])
+  }, [currentPage, itemsPerPage, listData, summaryData])
   const currentCredentials = useMemo(() => {
     const runtimeById = new Map((runtimeQuery.data?.items || []).map((item) => [item.id, item]))
     const accountById = new Map((accountInfoQuery.data?.items || []).map((item) => [item.id, item]))
@@ -456,13 +503,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }, [currentPage, data])
 
   useEffect(() => {
-    setSelectedIds(prev => prev.size === 0 ? prev : new Set())
+    setPageJumpInput(String(currentPage))
   }, [currentPage])
+
+  useEffect(() => {
+    setSelectedIds(prev => prev.size === 0 ? prev : new Set())
+  }, [currentPage, itemsPerPage])
 
   useEffect(() => {
     setCurrentPage(1)
     setSelectedIds(new Set())
   }, [accountQuery, authFilter, concurrencyQuery, credentialIdQuery, endpointQuery, modelQuery, priorityQuery, proxyFilter, queryText, regionQuery, rpmQuery, sortBy, sortOrder, statusFilter, subscriptionFilter])
+
+  const handlePageSizeChange = (value: string) => {
+    setItemsPerPage(Number(value))
+    setCurrentPage(1)
+    setSelectedIds(new Set())
+  }
+
+  const handlePageJump = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const nextPage = clampPage(Number(pageJumpInput), totalPages)
+    if (Number.isFinite(nextPage)) {
+      setCurrentPage(nextPage)
+      setPageJumpInput(String(nextPage))
+    }
+  }
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -1599,27 +1665,82 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
 
               {/* 分页控件 */}
-              {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage === 1 || pageTransitionPending}
-                  >
-                    上一页
-                  </Button>
-                  <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.filteredTotal ?? data?.total ?? 0} 个匹配凭据）
+              {((data?.filteredTotal ?? data?.total) || 0) > 0 && (
+                <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+                  <span className="text-sm tabular-nums text-muted-foreground">
+                    第 {(currentPage - 1) * itemsPerPage + 1}-{Math.min(currentPage * itemsPerPage, data?.filteredTotal ?? data?.total ?? 0)} / 共 {data?.filteredTotal ?? data?.total ?? 0} 个匹配凭据
+                    {pageTransitionPending ? ' · 加载中' : ''}
                   </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage === totalPages || pageTransitionPending}
-                  >
-                    下一页
-                  </Button>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <span className="whitespace-nowrap">每页</span>
+                      <select
+                        className="h-8 rounded-md border bg-background px-2 text-xs"
+                        value={itemsPerPage}
+                        disabled={pageTransitionPending}
+                        onChange={event => handlePageSizeChange(event.target.value)}
+                      >
+                        {PAGE_SIZE_OPTIONS.map((value) => (
+                          <option key={value} value={value}>{value} 条</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 px-2"
+                        onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                        disabled={currentPage === 1 || pageTransitionPending}
+                      >
+                        上一页
+                      </Button>
+                      {paginationItems.map((item) => item === 'ellipsis-left' || item === 'ellipsis-right' ? (
+                        <span
+                          key={item}
+                          className="flex h-8 min-w-[2rem] items-center justify-center text-xs text-muted-foreground"
+                          aria-hidden="true"
+                        >
+                          ...
+                        </span>
+                      ) : (
+                        <Button
+                          key={item}
+                          variant={item === currentPage ? 'default' : 'outline'}
+                          size="sm"
+                          className="h-8 min-w-[2rem] px-2 tabular-nums"
+                          aria-current={item === currentPage ? 'page' : undefined}
+                          disabled={pageTransitionPending}
+                          onClick={() => item !== currentPage && setCurrentPage(item)}
+                        >
+                          {item}
+                        </Button>
+                      ))}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 px-2"
+                        onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                        disabled={currentPage === totalPages || pageTransitionPending}
+                      >
+                        下一页
+                      </Button>
+                    </div>
+                    <form className="flex items-center gap-1.5" onSubmit={handlePageJump}>
+                      <Input
+                        className="h-8 w-16 px-2 text-center text-xs tabular-nums"
+                        value={pageJumpInput}
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        disabled={pageTransitionPending}
+                        aria-label="跳转页码"
+                        onChange={event => setPageJumpInput(event.target.value.replace(/\D/g, ''))}
+                      />
+                      <Button variant="outline" size="sm" className="h-8 px-2" disabled={pageTransitionPending || totalPages <= 1} type="submit">
+                        跳转
+                      </Button>
+                    </form>
+                  </div>
                 </div>
               )}
             </>

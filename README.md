@@ -20,7 +20,7 @@
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
-- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
+- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（优先级内均衡分配）两种模式
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **数据库持久化**: 运行配置、凭据、凭据运行态、usage 记录和模型价格使用 PgSQL；会话绑定、冷却、限流、并发 lease、刷新锁和余额缓存使用 Redis
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -259,7 +259,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `postgres.compressUsageRollupsOnStart` | boolean | `false` | 已废弃的兼容字段；设置为 `true` 会在连接数据库前拒绝启动。请先停止并排空所有网关实例，再运行 `maintenance usage-rollup-compression` |
 | `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
 | `redis.keyPrefix` | string | `kiro_rs:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（优先级内均衡分配） |
 | `credentialRpm` | number/null | `null` | 单凭据本地 RPM 限速；`null` 或 `0` 表示关闭。开启后会优先分流到其他可用凭据 |
 | `credentialMaxConcurrentRequests` | number | `0` | 单凭据最大并发请求数；`0` 表示不限制。开启后同一凭据达到并发上限时，新请求会优先换其他可用凭据 |
 | `credentialTransientCooldownSecs` | number | `10` | 上游 408/429/5xx 且没有 Retry-After 时的凭据临时冷却秒数；只有存在其他可用凭据时才冷却当前凭据 |

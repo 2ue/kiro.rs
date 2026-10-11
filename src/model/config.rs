@@ -4468,7 +4468,8 @@ pub struct Config {
     #[serde(default = "default_kiro_cache_point_record_plan")]
     pub kiro_cache_point_record_plan: bool,
 
-    /// 负载均衡模式（"priority" 或 "balanced"）
+    /// 负载均衡模式（"priority" 或 "balanced"）。balanced 先按账号优先级分层，
+    /// 再在同优先级账号内按负载与近期选中次数均衡。
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 

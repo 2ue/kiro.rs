@@ -79,6 +79,7 @@ function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClien
 interface UseCredentialsOptions {
   enabled?: boolean
   refetchInterval?: number | false
+  staleTime?: number
 }
 
 // 查询凭据列表
@@ -88,14 +89,17 @@ export function useCredentials(options: UseCredentialsOptions = {}) {
     queryFn: getCredentials,
     enabled: options.enabled ?? true,
     refetchInterval: options.refetchInterval ?? 30000, // 每 30 秒刷新一次
+    staleTime: options.staleTime,
   })
 }
 
-export function useCredentialsList(query: CredentialsPageQuery) {
+export function useCredentialsList(query: CredentialsPageQuery, options: UseCredentialsOptions = {}) {
   return useQuery({
     queryKey: ['credentials-list', query],
     queryFn: () => getCredentialsList(query),
-    refetchInterval: 30000,
+    enabled: options.enabled ?? true,
+    refetchInterval: options.refetchInterval ?? 30000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
@@ -108,41 +112,46 @@ export function useCredentialsSummary() {
   })
 }
 
-export function useCredentialsRuntime(ids: number[]) {
+export function useCredentialsRuntime(ids: number[], options: UseCredentialsOptions = {}) {
   return useQuery({
     queryKey: ['credentials-runtime', ids],
     queryFn: () => getCredentialsRuntime(ids),
-    enabled: ids.length > 0,
-    refetchInterval: 5000,
+    enabled: (options.enabled ?? true) && ids.length > 0,
+    refetchInterval: options.refetchInterval ?? 5000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
 
-export function useCredentialsAccountInfo(ids: number[]) {
+export function useCredentialsAccountInfo(ids: number[], options: UseCredentialsOptions = {}) {
   return useQuery({
     queryKey: ['credentials-account-info', ids],
     queryFn: () => getCredentialsAccountInfo(ids),
-    enabled: ids.length > 0,
-    refetchInterval: 60000,
+    enabled: (options.enabled ?? true) && ids.length > 0,
+    refetchInterval: options.refetchInterval ?? 60000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
 
-export function useCredentialsUsageSummary(ids: number[]) {
+export function useCredentialsUsageSummary(ids: number[], options: UseCredentialsOptions = {}) {
   return useQuery({
     queryKey: ['credentials-usage-summary', ids],
     queryFn: () => getCredentialsUsageSummary(ids),
-    enabled: ids.length > 0,
-    refetchInterval: 30000,
+    enabled: (options.enabled ?? true) && ids.length > 0,
+    refetchInterval: options.refetchInterval ?? 30000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
 
-export function useCredentialCreditSummary() {
+export function useCredentialCreditSummary(options: UseCredentialsOptions = {}) {
   return useQuery({
     queryKey: ['credential-credit-summary'],
     queryFn: getCredentialCreditSummary,
-    refetchInterval: 60000,
+    enabled: options.enabled ?? true,
+    refetchInterval: options.refetchInterval ?? 60000,
+    staleTime: options.staleTime,
   })
 }
 

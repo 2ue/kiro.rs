@@ -63,6 +63,12 @@ import type {
   UpdateRuntimeConfigRequest,
 } from '@/types/api'
 
+interface QueryRefreshOptions {
+  enabled?: boolean
+  refetchInterval?: number | false
+  staleTime?: number
+}
+
 function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
   queryClient.invalidateQueries({ queryKey: ['credential-list'] })
@@ -76,29 +82,34 @@ function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClien
   else queryClient.invalidateQueries({ queryKey: ['credential-balance'] })
 }
 
-export function useCredentials(options: { enabled?: boolean; refetchInterval?: number | false } = {}) {
+export function useCredentials(options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
     enabled: options.enabled ?? true,
     refetchInterval: options.refetchInterval ?? 30000,
+    staleTime: options.staleTime,
   })
 }
 
-export function useCredentialsPage(query: CredentialsPageQuery) {
+export function useCredentialsPage(query: CredentialsPageQuery, options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credentials-page', query],
     queryFn: () => getCredentialsPage(query),
-    refetchInterval: 30000,
+    enabled: options.enabled ?? true,
+    refetchInterval: options.refetchInterval ?? 30000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
 
-export function useCredentialList(query: CredentialsPageQuery) {
+export function useCredentialList(query: CredentialsPageQuery, options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-list', query],
     queryFn: () => getCredentialList(query),
-    refetchInterval: 30000,
+    enabled: options.enabled ?? true,
+    refetchInterval: options.refetchInterval ?? 30000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
@@ -111,12 +122,13 @@ export function useCredentialSummary() {
   })
 }
 
-export function useCredentialRuntime(ids: number[]) {
+export function useCredentialRuntime(ids: number[], options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-runtime', ids],
     queryFn: () => getCredentialRuntime(ids),
-    enabled: ids.length > 0,
-    refetchInterval: 5000,
+    enabled: (options.enabled ?? true) && ids.length > 0,
+    refetchInterval: options.refetchInterval ?? 5000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
@@ -130,22 +142,24 @@ export function useCredentialDiagnostics(id: number | null, page = 1, enabled = 
   })
 }
 
-export function useCredentialAccountInfo(ids: number[], options: { enabled?: boolean; refetchInterval?: number | false } = {}) {
+export function useCredentialAccountInfo(ids: number[], options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-account-info', ids],
     queryFn: () => getCredentialAccountInfo(ids),
     enabled: (options.enabled ?? true) && ids.length > 0,
     refetchInterval: options.refetchInterval ?? 60000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
 
-export function useCredentialUsageSummary(ids: number[], options: { enabled?: boolean; refetchInterval?: number | false } = {}) {
+export function useCredentialUsageSummary(ids: number[], options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-usage-summary', ids],
     queryFn: () => getCredentialUsageSummary(ids),
     enabled: (options.enabled ?? true) && ids.length > 0,
     refetchInterval: options.refetchInterval ?? 30000,
+    staleTime: options.staleTime,
     placeholderData: (previousData) => previousData,
   })
 }
@@ -159,11 +173,13 @@ export function useCredentialBalance(id: number | null) {
   })
 }
 
-export function useCredentialCreditSummary() {
+export function useCredentialCreditSummary(options: QueryRefreshOptions = {}) {
   return useQuery({
     queryKey: ['credential-credit-summary'],
     queryFn: getCredentialCreditSummary,
-    refetchInterval: 30000,
+    enabled: options.enabled ?? true,
+    refetchInterval: options.refetchInterval ?? 30000,
+    staleTime: options.staleTime,
   })
 }
 
