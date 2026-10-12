@@ -8477,6 +8477,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -8590,6 +8591,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: Some(UsageSource::LocalPromptCache),
@@ -8681,6 +8683,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
             PromptCacheSimulationMode::HighCache,
@@ -8777,6 +8780,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -8908,6 +8912,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -8989,6 +8994,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::KiroRsTool,
             PromptCacheSimulationMode::Disabled,
@@ -9134,6 +9140,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -9471,6 +9478,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -9646,6 +9654,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         },
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
             PromptCacheSimulationMode::HighCache,
@@ -9685,10 +9694,12 @@ fn creation_control_preserves_reported_usage_input_policy() {
 
     assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
+    // 本地前缀未命中（首个请求）：input 差额记为写入，但 input + 写入不超过真实输入。
     let input_delta = usage.input_tokens.saturating_sub(reported.input_tokens);
-    assert!(
-        (input_delta.saturating_add(26_400)..input_delta.saturating_add(30_000))
-            .contains(&reported.cache_creation_input_tokens)
+    assert_eq!(reported.cache_creation_input_tokens, input_delta);
+    assert_eq!(
+        reported.input_tokens + reported.cache_creation_input_tokens,
+        usage.input_tokens
     );
     assert_eq!(
         reported.total_input_tokens,
@@ -9750,6 +9761,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -9837,6 +9849,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -10463,6 +10476,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: Some(UsageSource::LocalPromptCache),
@@ -10562,6 +10576,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping: CacheHitShapingContext::default(),
         reported_cache_usage_policy: None,
         simulated_usage: Some(cache::CacheSimulation {
             cache_creation_input_tokens: 3968,
@@ -13115,4 +13130,543 @@ fn llm_capture_records_full_local_round_trip() {
     run_handler_fixture_on_large_stack_thread("llm-capture-round-trip", || async {
         run_llm_capture_records_full_local_round_trip().await;
     });
+}
+
+/// 现网 minea 参数：新会话首个请求、以及带历史但本地前缀未命中的请求（fork / resume / 重启后），
+/// 下游不得出现读取，`input + 写入` 不超过真实输入；命中之后的轮次仍按命中率整形参数执行。
+#[test]
+fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/dfcache/minea".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(false),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.99),
+                token_scale: Some(3.0),
+                max_simulated_input_tokens: Some(600_000),
+                cap_jitter_min_tokens: Some(12_000),
+                cap_jitter_max_tokens: Some(24_000),
+                scale_min_input_tokens: Some(3_000),
+            }),
+            creation_control: Some(PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode:
+                    crate::model::config::PromptCacheCreationControlScopeMode::ConversationModel,
+                min_successful_requests_between_creation: 0,
+                min_creation_interval_secs: 6,
+                min_creation_delta_tokens: 12_000,
+                max_creation_tokens_per_event: 300_000,
+                creation_budget_window_secs: 300,
+                max_creation_tokens_per_window: 600_000,
+                expire_after_idle_secs: 3_600,
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy {
+                    move_delta_to_cache_read: true,
+                    ..ReportedUsageFieldPolicy::sample_input_max(20_000)
+                },
+                final_cache_read_max_tokens: 500_000,
+                final_cache_read_jitter_min_tokens: 23_456,
+                final_cache_read_jitter_max_tokens: 54_321,
+                final_cache_creation_max_tokens: 500_000,
+                ..ReportedUsagePathPolicy::default()
+            }),
+            hit_shaping: Some(crate::model::config::CacheHitShapingPolicyPatch {
+                enabled: Some(true),
+                target_hit_ratio: Some(0.9),
+                ratio_jitter: Some(0.08),
+                min_cost_ratio: Some(0.78),
+                max_read_multiplier: Some(0.0),
+                min_creation_ratio: Some(0.0),
+                min_cache_read_tokens: Some(1_024),
+                min_cache_creation_tokens: Some(1_024),
+            }),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(256)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.99,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let endpoint = "/dfcache/minea/v1/messages";
+    let cache_route = RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path(endpoint);
+    let target = cache_route.policy.hit_shaping.target_hit_ratio;
+
+    let payload_for = |session_id: &str, messages: Vec<Message>| MessagesRequest {
+        model: "claude-sonnet-4-5".to_string(),
+        max_tokens: 32_000,
+        messages,
+        stream: true,
+        system: Some(vec![SystemMessage {
+            text: "stable claude code system prompt ".repeat(900),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: Some(Metadata {
+            user_id: Some(format!("user_test_account__session_{session_id}")),
+        }),
+        stop_sequences: None,
+    };
+    let run = |payload: &MessagesRequest, raw_input: i32| {
+        let conversation_id = extract_stable_conversation_id(payload).expect("session id");
+        let context = prepare_usage_context(
+            &state,
+            cache_route.clone(),
+            endpoint,
+            true,
+            payload,
+            None,
+            Some(conversation_id.clone()),
+            Some(conversation_id),
+            raw_input,
+        );
+        let credential_usage = attach_test_credential_usage(context, 1);
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            raw_input,
+            120,
+            credential_usage.request.simulated_usage,
+            true,
+        );
+        let source = credential_usage.usage_source(&body, None, false);
+        let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+        credential_usage.record_success_reported(reported, source, Some(body));
+        reported
+    };
+    let total = |usage: cache::CacheUsage| {
+        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    };
+
+    // 1. 全新会话：首个请求只有 user 消息。
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: json!([{ "type": "text", "text": "hi" }]),
+    }];
+    let raw_input = 25_973;
+    let first = run(
+        &payload_for("9b1f0c2e-1d3a-4e5b-8c6d-7e8f9a0b1c2d", messages.clone()),
+        raw_input,
+    );
+    assert_eq!(
+        first.cache_read_input_tokens, 0,
+        "first turn read {first:?}"
+    );
+    assert!(total(first) <= raw_input, "first turn total {first:?}");
+    assert!(
+        first.input_tokens <= 20_000,
+        "input sampling still applies {first:?}"
+    );
+
+    // 2. 后续轮次命中本地前缀，命中率整形按参数生效。
+    let mut later_hits = 0;
+    for round in 1..6 {
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: json!([{ "type": "text", "text": format!("answer {round} ").repeat(60) }]),
+        });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": format!("next {round} ").repeat(60) }]),
+        });
+        let reported = run(
+            &payload_for("9b1f0c2e-1d3a-4e5b-8c6d-7e8f9a0b1c2d", messages.clone()),
+            raw_input + round * 400,
+        );
+        if reported.cache_read_input_tokens > 0 {
+            later_hits += 1;
+            let ratio = reported.cache_read_input_tokens as f64 / total(reported) as f64;
+            assert!(
+                ratio >= target - 1e-6,
+                "round {round}: ratio {ratio} {reported:?}"
+            );
+        }
+    }
+    assert!(
+        later_hits >= 4,
+        "later rounds should keep hit shaping, hits={later_hits}"
+    );
+
+    // 3. 带完整历史但 conversation id 是新的（fork / resume / 服务重启后）：本地前缀未命中。
+    let forked = run(
+        &payload_for("0c2d3e4f-5a6b-4c7d-8e9f-a0b1c2d3e4f5", messages.clone()),
+        raw_input + 2_400,
+    );
+    assert_eq!(
+        forked.cache_read_input_tokens, 0,
+        "cold forked read {forked:?}"
+    );
+    assert!(
+        total(forked) <= raw_input + 2_400,
+        "cold forked total {forked:?}"
+    );
+}
+
+/// 现网 /dfcache/minea 配置下模拟 Claude Code 多轮增长会话：
+/// 每轮都按真实出口（creation control → reported usage → hit shaping）计算下游 usage，
+/// 检查后续轮次命中率不低于目标值，且不出现 1~1023 的缓存读写。
+#[test]
+fn minea_like_route_keeps_target_hit_ratio_and_no_small_cache_values() {
+    let prompt_cache = Arc::new(PromptCacheTracker::default());
+    let usage_recorder = Arc::new(UsageRecorder::new(64));
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/dfcache/minea".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(false),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.99),
+                token_scale: Some(3.0),
+                max_simulated_input_tokens: Some(600_000),
+                cap_jitter_min_tokens: Some(12_000),
+                cap_jitter_max_tokens: Some(24_000),
+                scale_min_input_tokens: Some(3_000),
+            }),
+            creation_control: Some(PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode:
+                    crate::model::config::PromptCacheCreationControlScopeMode::ConversationModel,
+                min_successful_requests_between_creation: 0,
+                min_creation_interval_secs: 0,
+                min_creation_delta_tokens: 12_000,
+                max_creation_tokens_per_event: 300_000,
+                creation_budget_window_secs: 300,
+                max_creation_tokens_per_window: 600_000,
+                expire_after_idle_secs: 3_600,
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(20_000),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            hit_shaping: Some(crate::model::config::CacheHitShapingPolicyPatch {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        usage_recorder,
+        prompt_cache,
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.99,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let endpoint = "/dfcache/minea/v1/messages";
+    let cache_route = RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path(endpoint);
+    assert!(cache_route.policy.hit_shaping.enabled);
+    let target = cache_route.policy.hit_shaping.target_hit_ratio;
+
+    let session_id = "3f0c7e1a-9b2d-4c55-8e6f-1a2b3c4d5e6f";
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: json!([{ "type": "text", "text": "start ".repeat(400) }]),
+    }];
+    let (mut later_read, mut later_total) = (0_i64, 0_i64);
+    let mut write_rounds = 0;
+    let pricing = PricingCatalog::new()
+        .model_pricing("claude-sonnet-4-5")
+        .expect("builtin sonnet pricing");
+    for round in 0..24 {
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 32_000,
+            messages: messages.clone(),
+            stream: true,
+            system: Some(vec![SystemMessage {
+                text: "stable claude code system prompt ".repeat(900),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_test_account__session_{session_id}")),
+            }),
+            stop_sequences: None,
+        };
+        let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
+        let raw_input = 24_000 + round * 650;
+        let context = prepare_usage_context(
+            &state,
+            cache_route.clone(),
+            endpoint,
+            true,
+            &payload,
+            None,
+            Some(conversation_id.clone()),
+            Some(conversation_id),
+            raw_input,
+        );
+        let mut credential_usage = attach_test_credential_usage(context, 1);
+        if credential_usage
+            .request
+            .simulated_usage
+            .is_some_and(|simulation| simulation.cache_read_input_tokens > 0)
+        {
+            credential_usage.request.cache_hit_shaping.reusable_prefix = true;
+        }
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            raw_input,
+            120,
+            credential_usage.request.simulated_usage,
+            true,
+        );
+        let source = credential_usage.usage_source(&body, None, false);
+        let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+        credential_usage.record_success_reported(reported, source, Some(body));
+
+        for value in [
+            reported.cache_read_input_tokens,
+            reported.cache_creation_input_tokens,
+        ] {
+            assert!(
+                value == 0 || value >= 1024,
+                "round {round}: small cache value {reported:?}"
+            );
+        }
+        let raw_cost = pricing.estimate(cache::RawUsage::uncached(raw_input, 120).to_cache_usage());
+        assert!(
+            pricing.estimate(reported) >= raw_cost * (1.0 - 1e-9),
+            "round {round}: billed below raw {reported:?}"
+        );
+        if reported.cache_creation_input_tokens > 0 {
+            write_rounds += 1;
+        }
+        if round > 0 {
+            let total = reported.input_tokens
+                + reported.cache_read_input_tokens
+                + reported.cache_creation_input_tokens;
+            let ratio = reported.cache_read_input_tokens as f64 / total as f64;
+            assert!(
+                ratio >= target - 1e-6,
+                "round {round}: ratio {ratio} {reported:?}"
+            );
+            later_read += reported.cache_read_input_tokens as i64;
+            later_total += total as i64;
+        }
+
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: json!([{ "type": "text", "text": format!("answer {round} ").repeat(60) }]),
+        });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": format!("next {round} ").repeat(60) }]),
+        });
+    }
+    let aggregate = later_read as f64 / later_total as f64;
+    assert!(aggregate >= target, "aggregate ratio {aggregate}");
+    assert!(
+        write_rounds >= 20,
+        "writes should appear on most rounds, got {write_rounds}"
+    );
+}
+
+/// 命中率整形默认关闭时，最终下游 usage 必须与引入整形之前的计算逐轮一致：
+/// creation control → reported usage → record 守护，且 creation control 使用原有窗口逻辑。
+#[test]
+fn hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round() {
+    fn minea_state(controller: Arc<PromptCacheCreationController>) -> AppState {
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/dfcache/minea".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                route_namespace: Some(false),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    target_read_ratio: Some(0.99),
+                    token_scale: Some(3.0),
+                    max_simulated_input_tokens: Some(600_000),
+                    cap_jitter_min_tokens: Some(12_000),
+                    cap_jitter_max_tokens: Some(24_000),
+                    scale_min_input_tokens: Some(3_000),
+                }),
+                creation_control: Some(PromptCacheCreationControlConfig {
+                    enabled: true,
+                    scope_mode:
+                        crate::model::config::PromptCacheCreationControlScopeMode::ConversationModel,
+                    min_successful_requests_between_creation: 0,
+                    min_creation_interval_secs: 0,
+                    min_creation_delta_tokens: 12_000,
+                    max_creation_tokens_per_event: 300_000,
+                    creation_budget_window_secs: 300,
+                    max_creation_tokens_per_window: 120_000,
+                    expire_after_idle_secs: 3_600,
+                }),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(20_000),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(64)),
+            Arc::new(PromptCacheTracker::default()),
+            controller,
+            PromptCacheSimulationMode::HighCache,
+            0.99,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy)
+    }
+
+    let endpoint = "/dfcache/minea/v1/messages";
+    let new_controller = Arc::new(PromptCacheCreationController::default());
+    let legacy_controller = Arc::new(PromptCacheCreationController::default());
+    let new_state = minea_state(new_controller);
+    let legacy_state = minea_state(legacy_controller.clone());
+    let route = RequestRuntimeConfig::from_app_state(&new_state).cache_policy_for_path(endpoint);
+    assert!(
+        !route.policy.hit_shaping.enabled,
+        "hit shaping must default to off"
+    );
+
+    let session_id = "7a1c2e3f-4b5d-4e6f-8a9b-0c1d2e3f4a5b";
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: json!([{ "type": "text", "text": "start ".repeat(400) }]),
+    }];
+    let mut saw_write = false;
+    let mut saw_suppressed = false;
+    for round in 0..20 {
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 32_000,
+            messages: messages.clone(),
+            stream: true,
+            system: Some(vec![SystemMessage {
+                text: "stable claude code system prompt ".repeat(900),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_test_account__session_{session_id}")),
+            }),
+            stop_sequences: None,
+        };
+        let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
+        let raw_input = 24_000 + round * 1_300;
+        let run = |state: &AppState| {
+            let route = RequestRuntimeConfig::from_app_state(state).cache_policy_for_path(endpoint);
+            let context = prepare_usage_context(
+                state,
+                route,
+                endpoint,
+                true,
+                &payload,
+                None,
+                Some(conversation_id.clone()),
+                Some(conversation_id.clone()),
+                raw_input,
+            );
+            let credential_usage = attach_test_credential_usage(context, 1);
+            let body = cache::build_usage_with_simulation_policy(
+                None,
+                raw_input,
+                120,
+                credential_usage.request.simulated_usage,
+                true,
+            );
+            let source = credential_usage.usage_source(&body, None, false);
+            (credential_usage, body, source)
+        };
+
+        // 同一个请求上下文（同一随机种子）分别走新出口与旧管线。
+        let (new_usage, body, source) = run(&new_state);
+        let (legacy_usage, legacy_body, legacy_source) = run(&legacy_state);
+        assert_eq!(body, legacy_body, "round {round}: simulated body diverged");
+        assert_eq!(source, legacy_source);
+        let mut legacy_usage = legacy_usage;
+        legacy_usage.request.reported_cache_usage_policy =
+            new_usage.request.reported_cache_usage_policy.clone();
+
+        let reported = new_usage.canonical_reported_usage_for_success(body, source);
+        new_usage.record_success_reported(reported, source, Some(body));
+
+        // 旧逻辑：按引入整形之前的顺序计算，creation control 使用原有窗口逻辑。
+        let scope = legacy_usage.scope();
+        let controlled = if legacy_source == UsageSource::LocalPromptCache {
+            legacy_controller.apply_success_with_context(
+                scope.as_ref(),
+                legacy_usage.request.prompt_cache_creation_control,
+                legacy_body,
+                None,
+                Some(legacy_usage.creation_control_model()),
+            )
+        } else {
+            legacy_body
+        };
+        let legacy = legacy_usage
+            .request
+            .reported_usage_for_downstream(controlled, legacy_source);
+        let legacy = legacy_usage
+            .request
+            .ensure_reported_usage_for_record(legacy, legacy_source);
+        // 本地前缀未命中的请求（首轮）不论整形是否开启，都不得超过真实输入；命中后与旧管线一致。
+        let legacy = legacy_usage.constrain_cold_reported_usage(
+            legacy,
+            cache::RawUsage::uncached(raw_input, legacy.output_tokens).to_cache_usage(),
+        );
+        legacy_usage.record_success_reported(legacy, legacy_source, Some(legacy_body));
+
+        assert_eq!(
+            reported, legacy,
+            "round {round}: disabled shaping changed usage"
+        );
+        if round == 0 {
+            assert_eq!(reported.cache_read_input_tokens, 0);
+            assert!(
+                reported.input_tokens + reported.cache_creation_input_tokens <= raw_input,
+                "round 0 must stay within raw input: {reported:?}"
+            );
+        }
+        saw_write |= reported.cache_creation_input_tokens > 0 && round > 0;
+        saw_suppressed |= body.cache_creation_input_tokens > 0
+            && reported.cache_creation_input_tokens < body.cache_creation_input_tokens;
+
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: json!([{ "type": "text", "text": format!("answer {round} ").repeat(60) }]),
+        });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": format!("next {round} ").repeat(60) }]),
+        });
+    }
+    assert!(saw_write, "scenario should exercise creation");
+    assert!(
+        saw_suppressed,
+        "scenario should exercise creation control suppression"
+    );
 }

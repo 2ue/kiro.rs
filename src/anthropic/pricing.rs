@@ -158,6 +158,29 @@ impl PricingCatalog {
         self.inner.read().status()
     }
 
+    /// 按与 `estimate` 相同的候选顺序返回模型单价；找不到可用价格时返回 None。
+    pub fn model_pricing(&self, model: &str) -> Option<ModelPricing> {
+        let pricing_candidates = pricing_model_candidates(model);
+        let inner = self.inner.read();
+        let configured = pricing_candidates.iter().find_map(|candidate| {
+            inner
+                .prices
+                .get(candidate)
+                .copied()
+                .filter(|pricing| pricing.is_usable())
+        });
+        drop(inner);
+        configured.or_else(|| {
+            let builtin_prices = fallback_prices();
+            pricing_candidates.iter().find_map(|candidate| {
+                builtin_prices
+                    .get(candidate)
+                    .copied()
+                    .filter(|pricing| pricing.is_usable())
+            })
+        })
+    }
+
     pub fn estimate(&self, model: &str, usage: CacheUsage) -> PricingEstimate {
         let pricing_candidates = pricing_model_candidates(model);
         let fallback_model = pricing_candidates

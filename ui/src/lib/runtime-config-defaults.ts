@@ -1,4 +1,5 @@
 import type {
+  CacheHitShapingPolicyPatch,
   CachePolicyConfig,
   CacheRoutePolicyPatch,
   BodyConversionConfig,
@@ -265,6 +266,19 @@ export function normalizeImageProcessing(input?: Partial<ImageProcessingConfig> 
     safeMaterializeFileSources: Boolean(next.safeMaterializeFileSources),
     safeDownloadRemoteSources: Boolean(next.safeDownloadRemoteSources),
     safeNormalizeBase64MediaTypes: Boolean(next.safeNormalizeBase64MediaTypes),
+  }
+}
+
+export function defaultCacheHitShaping(): Required<CacheHitShapingPolicyPatch> {
+  return {
+    enabled: false,
+    targetHitRatio: 0.9,
+    ratioJitter: 0.04,
+    minCacheReadTokens: 1024,
+    minCacheCreationTokens: 1024,
+    minCostRatio: 1,
+    maxReadMultiplier: 0,
+    minCreationRatio: 0,
   }
 }
 
@@ -683,7 +697,7 @@ function canonicalCachePolicyPath(prefix: string): string {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.stableSegment
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.stableSegment && !policy.hitShaping
 }
 
 export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
