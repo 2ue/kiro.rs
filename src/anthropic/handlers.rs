@@ -3545,6 +3545,15 @@ impl RequestUsageContext {
         }
     }
 
+    /// 本地前缀追踪本次是否命中（有可读取的缓存）。
+    ///
+    /// 只看本次 tracker 的计算结果，不看请求是否带历史：新会话、fork / resume 后的首个请求、
+    /// 服务重启后的首个请求都没有命中。未命中时下游 usage 走冷请求约束，与命中率整形是否开启无关。
+    fn local_prompt_cache_hit(&self) -> bool {
+        self.simulated_usage
+            .is_some_and(|simulation| simulation.cache_read_input_tokens > 0)
+    }
+
     fn uses_local_prompt_cache_strategy(&self) -> bool {
         matches!(
             self.prompt_cache_strategy_type,
@@ -4002,8 +4011,80 @@ impl CredentialUsageContext {
         self.shape_final_cache_hit(reported_usage, controlled, raw_usage)
     }
 
-    /// 最终命中率 / 计费下限 / 小值整形，并把写入增量记回 creation control 窗口。
+    /// 最终下游 usage：命中率 / 计费下限 / 小值整形，再对冷请求施加真实输入约束。
     fn shape_final_cache_hit(
+        &self,
+        reported_usage: super::cache::CacheUsage,
+        controlled: super::cache::CacheUsage,
+        raw_usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        let shaped = self.shape_final_cache_hit_ratio(reported_usage, controlled, raw_usage);
+        let constrained = self.constrain_cold_reported_usage(shaped, raw_usage);
+        self.record_final_creation_adjustment(controlled, constrained);
+        constrained
+    }
+
+    /// 把最终下游写入相对 creation control 放行量的增量记回窗口。
+    fn record_final_creation_adjustment(
+        &self,
+        controlled: super::cache::CacheUsage,
+        final_usage: super::cache::CacheUsage,
+    ) {
+        if self.request.cache_hit_shaping.policy.is_none()
+            || self.request.simulation_mode != PromptCacheSimulationMode::HighCache
+        {
+            return;
+        }
+        let scope = self.scope();
+        let credential_key = self
+            .credential_id
+            .map(|credential_id| format!("credential:{credential_id}"));
+        self.request
+            .prompt_cache_creation_controller
+            .record_final_creation_adjustment(
+                scope.as_ref(),
+                self.request.prompt_cache_creation_control,
+                credential_key.as_deref(),
+                Some(self.creation_control_model()),
+                controlled.cache_creation_input_tokens,
+                final_usage.cache_creation_input_tokens,
+            );
+    }
+
+    /// 本地前缀追踪本次未命中时，下游 usage 不得出现读取，`input + 写入` 不超过真实输入。
+    ///
+    /// 只作用于本地 prompt-cache 投影；上游 metadata 带回的真实缓存字段保持原样。
+    fn constrain_cold_reported_usage(
+        &self,
+        usage: super::cache::CacheUsage,
+        raw_usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        if !self.request.uses_local_prompt_cache_strategy() || self.request.local_prompt_cache_hit()
+        {
+            return usage;
+        }
+        let input_max_tokens = self
+            .request
+            .reported_cache_usage_policy
+            .as_ref()
+            .map(|policy| policy.reported_input_max_tokens())
+            .unwrap_or(0);
+        let min_cache_creation_tokens = self
+            .request
+            .cache_hit_shaping
+            .policy
+            .map(|policy| policy.normalized().min_cache_creation_tokens)
+            .unwrap_or(0);
+        super::cache::constrain_cold_cache_usage(
+            usage,
+            raw_usage,
+            input_max_tokens,
+            min_cache_creation_tokens,
+        )
+    }
+
+    /// 命中率 / 计费下限 / 小值整形。
+    fn shape_final_cache_hit_ratio(
         &self,
         reported_usage: super::cache::CacheUsage,
         controlled: super::cache::CacheUsage,
@@ -4014,7 +4095,7 @@ impl CredentialUsageContext {
         }
         let creation_allowed = self.creation_allowed_after_control(controlled);
         let reported_policy = self.request.reported_cache_usage_policy.clone();
-        let shaped = self.request.cache_hit_shaping.apply(
+        self.request.cache_hit_shaping.apply(
             reported_usage,
             CacheHitShapingRequest {
                 raw: raw_usage,
@@ -4025,24 +4106,7 @@ impl CredentialUsageContext {
                     .model_pricing(self.creation_control_model()),
                 reported_policy: reported_policy.as_ref(),
             },
-        );
-        if self.request.simulation_mode == PromptCacheSimulationMode::HighCache {
-            let scope = self.scope();
-            let credential_key = self
-                .credential_id
-                .map(|credential_id| format!("credential:{credential_id}"));
-            self.request
-                .prompt_cache_creation_controller
-                .record_final_creation_adjustment(
-                    scope.as_ref(),
-                    self.request.prompt_cache_creation_control,
-                    credential_key.as_deref(),
-                    Some(self.creation_control_model()),
-                    controlled.cache_creation_input_tokens,
-                    shaped.cache_creation_input_tokens,
-                );
-        }
-        shaped
+        )
     }
 
     /// creation control 关闭、或本次已放行写入时，整形可以增加写入。
@@ -7950,7 +8014,7 @@ impl StreamContextTemplate {
                     super::cache::RawUsage::uncached(credential_usage.request.input_tokens, 0)
                         .to_cache_usage();
                 let reported_policy = credential_usage.request.reported_cache_usage_policy.clone();
-                credential_usage.request.cache_hit_shaping.apply(
+                let shaped = credential_usage.request.cache_hit_shaping.apply(
                     preview,
                     CacheHitShapingRequest {
                         raw,
@@ -7961,7 +8025,8 @@ impl StreamContextTemplate {
                             .model_pricing(credential_usage.creation_control_model()),
                         reported_policy: reported_policy.as_ref(),
                     },
-                )
+                );
+                credential_usage.constrain_cold_reported_usage(shaped, raw)
             });
         (ctx, initial_events)
     }

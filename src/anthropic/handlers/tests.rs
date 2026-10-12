@@ -9659,10 +9659,12 @@ fn creation_control_preserves_reported_usage_input_policy() {
 
     assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
+    // 本地前缀未命中（首个请求）：input 差额记为写入，但 input + 写入不超过真实输入。
     let input_delta = usage.input_tokens.saturating_sub(reported.input_tokens);
-    assert!(
-        (input_delta.saturating_add(26_400)..input_delta.saturating_add(30_000))
-            .contains(&reported.cache_creation_input_tokens)
+    assert_eq!(reported.cache_creation_input_tokens, input_delta);
+    assert_eq!(
+        reported.input_tokens + reported.cache_creation_input_tokens,
+        usage.input_tokens
     );
     assert_eq!(
         reported.total_input_tokens,
@@ -12712,6 +12714,189 @@ async fn oversized_current_image_response_is_official_400_without_retry() {
 
 /// 现网 /dfcache/minea 配置下模拟 Claude Code 多轮增长会话：
 /// 每轮都按真实出口（creation control → reported usage → hit shaping）计算下游 usage，
+/// 现网 minea 参数：新会话首个请求、以及带历史但本地前缀未命中的请求（fork / resume / 重启后），
+/// 下游不得出现读取，`input + 写入` 不超过真实输入；命中之后的轮次仍按命中率整形参数执行。
+#[test]
+fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/dfcache/minea".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            route_namespace: Some(false),
+            simulation: Some(CacheSimulationPolicyPatch {
+                enabled: Some(true),
+                target_read_ratio: Some(0.99),
+                token_scale: Some(3.0),
+                max_simulated_input_tokens: Some(600_000),
+                cap_jitter_min_tokens: Some(12_000),
+                cap_jitter_max_tokens: Some(24_000),
+                scale_min_input_tokens: Some(3_000),
+            }),
+            creation_control: Some(PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode:
+                    crate::model::config::PromptCacheCreationControlScopeMode::ConversationModel,
+                min_successful_requests_between_creation: 0,
+                min_creation_interval_secs: 6,
+                min_creation_delta_tokens: 12_000,
+                max_creation_tokens_per_event: 300_000,
+                creation_budget_window_secs: 300,
+                max_creation_tokens_per_window: 600_000,
+                expire_after_idle_secs: 3_600,
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy {
+                    move_delta_to_cache_read: true,
+                    ..ReportedUsageFieldPolicy::sample_input_max(20_000)
+                },
+                final_cache_read_max_tokens: 500_000,
+                final_cache_read_jitter_min_tokens: 23_456,
+                final_cache_read_jitter_max_tokens: 54_321,
+                final_cache_creation_max_tokens: 500_000,
+                ..ReportedUsagePathPolicy::default()
+            }),
+            hit_shaping: Some(crate::model::config::CacheHitShapingPolicyPatch {
+                enabled: Some(true),
+                target_hit_ratio: Some(0.9),
+                ratio_jitter: Some(0.08),
+                min_cost_ratio: Some(0.78),
+                max_read_multiplier: Some(0.0),
+                min_creation_ratio: Some(0.0),
+                min_cache_read_tokens: Some(1_024),
+                min_cache_creation_tokens: Some(1_024),
+            }),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(256)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.99,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let endpoint = "/dfcache/minea/v1/messages";
+    let cache_route = RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path(endpoint);
+    let target = cache_route.policy.hit_shaping.target_hit_ratio;
+
+    let payload_for = |session_id: &str, messages: Vec<Message>| MessagesRequest {
+        model: "claude-sonnet-4-5".to_string(),
+        max_tokens: 32_000,
+        messages,
+        stream: true,
+        system: Some(vec![SystemMessage {
+            text: "stable claude code system prompt ".repeat(900),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: Some(Metadata {
+            user_id: Some(format!("user_test_account__session_{session_id}")),
+        }),
+        stop_sequences: None,
+    };
+    let run = |payload: &MessagesRequest, raw_input: i32| {
+        let conversation_id = extract_stable_conversation_id(payload).expect("session id");
+        let context = prepare_usage_context(
+            &state,
+            cache_route.clone(),
+            endpoint,
+            true,
+            payload,
+            None,
+            Some(conversation_id.clone()),
+            Some(conversation_id),
+            raw_input,
+        );
+        let credential_usage = attach_test_credential_usage(context, 1);
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            raw_input,
+            120,
+            credential_usage.request.simulated_usage,
+            true,
+        );
+        let source = credential_usage.usage_source(&body, None, false);
+        let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+        credential_usage.record_success_reported(reported, source, Some(body));
+        reported
+    };
+    let total = |usage: cache::CacheUsage| {
+        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    };
+
+    // 1. 全新会话：首个请求只有 user 消息。
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: json!([{ "type": "text", "text": "hi" }]),
+    }];
+    let raw_input = 25_973;
+    let first = run(
+        &payload_for("9b1f0c2e-1d3a-4e5b-8c6d-7e8f9a0b1c2d", messages.clone()),
+        raw_input,
+    );
+    assert_eq!(
+        first.cache_read_input_tokens, 0,
+        "first turn read {first:?}"
+    );
+    assert!(total(first) <= raw_input, "first turn total {first:?}");
+    assert!(
+        first.input_tokens <= 20_000,
+        "input sampling still applies {first:?}"
+    );
+
+    // 2. 后续轮次命中本地前缀，命中率整形按参数生效。
+    let mut later_hits = 0;
+    for round in 1..6 {
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: json!([{ "type": "text", "text": format!("answer {round} ").repeat(60) }]),
+        });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": format!("next {round} ").repeat(60) }]),
+        });
+        let reported = run(
+            &payload_for("9b1f0c2e-1d3a-4e5b-8c6d-7e8f9a0b1c2d", messages.clone()),
+            raw_input + round * 400,
+        );
+        if reported.cache_read_input_tokens > 0 {
+            later_hits += 1;
+            let ratio = reported.cache_read_input_tokens as f64 / total(reported) as f64;
+            assert!(
+                ratio >= target - 1e-6,
+                "round {round}: ratio {ratio} {reported:?}"
+            );
+        }
+    }
+    assert!(
+        later_hits >= 4,
+        "later rounds should keep hit shaping, hits={later_hits}"
+    );
+
+    // 3. 带完整历史但 conversation id 是新的（fork / resume / 服务重启后）：本地前缀未命中。
+    let forked = run(
+        &payload_for("0c2d3e4f-5a6b-4c7d-8e9f-a0b1c2d3e4f5", messages.clone()),
+        raw_input + 2_400,
+    );
+    assert_eq!(
+        forked.cache_read_input_tokens, 0,
+        "cold forked read {forked:?}"
+    );
+    assert!(
+        total(forked) <= raw_input + 2_400,
+        "cold forked total {forked:?}"
+    );
+}
+
 /// 检查后续轮次命中率不低于目标值，且不出现 1~1023 的缓存读写。
 #[test]
 fn minea_like_route_keeps_target_hit_ratio_and_no_small_cache_values() {
@@ -13028,12 +13213,24 @@ fn hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round() {
         let legacy = legacy_usage
             .request
             .ensure_reported_usage_for_record(legacy, legacy_source);
+        // 本地前缀未命中的请求（首轮）不论整形是否开启，都不得超过真实输入；命中后与旧管线一致。
+        let legacy = legacy_usage.constrain_cold_reported_usage(
+            legacy,
+            cache::RawUsage::uncached(raw_input, legacy.output_tokens).to_cache_usage(),
+        );
         legacy_usage.record_success_reported(legacy, legacy_source, Some(legacy_body));
 
         assert_eq!(
             reported, legacy,
             "round {round}: disabled shaping changed usage"
         );
+        if round == 0 {
+            assert_eq!(reported.cache_read_input_tokens, 0);
+            assert!(
+                reported.input_tokens + reported.cache_creation_input_tokens <= raw_input,
+                "round 0 must stay within raw input: {reported:?}"
+            );
+        }
         saw_write |= reported.cache_creation_input_tokens > 0 && round > 0;
         saw_suppressed |= body.cache_creation_input_tokens > 0
             && reported.cache_creation_input_tokens < body.cache_creation_input_tokens;

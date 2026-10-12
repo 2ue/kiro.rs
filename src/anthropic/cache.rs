@@ -1098,6 +1098,68 @@ pub fn shape_cache_hit_usage(usage: CacheUsage, input: CacheHitShapingInput) -> 
     normalize_shaped_cache_usage(shaped)
 }
 
+/// 冷请求（本次没有任何真实或本地缓存命中）的最终下游 usage 约束。
+///
+/// 没有可读取的前缀时：读取必须为 0，`input + 写入` 不超过真实输入总量 `raw`，
+/// 放大、命中率整形和 input 差额都不能在真实输入之外凭空产生读取 / 写入。
+/// - `raw` 带缓存字段（上游 metadata 的真实缓存）时不做约束；
+/// - 有写入时：input 保留已按 reportedUsage.input 采样的值，真实总量的其余部分记为写入；
+/// - 没有写入（creation control 未放行）但原先带缓存字段时：全部记为 input；
+/// - 原先没有任何缓存字段时：只把 input 截到真实总量，不改变 input 采样结果；
+/// - input 超过 `input_max_tokens`（0 表示不限）且有写入时，超出部分记为写入；
+/// - 非零但低于 `min_cache_creation_tokens` 的写入并回 input。
+pub fn constrain_cold_cache_usage(
+    usage: CacheUsage,
+    raw: CacheUsage,
+    input_max_tokens: i32,
+    min_cache_creation_tokens: i32,
+) -> CacheUsage {
+    if usage_has_cache(&raw) {
+        return usage;
+    }
+    let raw_total = raw.reported_total_input_tokens();
+    let mut usage = usage;
+    let had_cache = usage_has_cache(&usage);
+    usage.cache_read_input_tokens = 0;
+
+    let writes = usage.cache_creation_input_tokens > 0;
+    let mut input = usage.input_tokens.max(0).min(raw_total);
+    if raw_total > 0 && input == 0 {
+        input = 1;
+    }
+    let mut creation = if writes {
+        if input < raw_total {
+            raw_total - input
+        } else {
+            // input 已占满真实总量（如 reportedUsage.input 为 raw）：写入从 input 中拆出，
+            // 不超过本次写入，input 至少保留 1。
+            let creation = usage
+                .cache_creation_input_tokens
+                .min(raw_total.saturating_sub(1))
+                .max(0);
+            input = raw_total - creation;
+            creation
+        }
+    } else {
+        if had_cache {
+            input = raw_total;
+        }
+        0
+    };
+    if writes && input_max_tokens > 0 && input > input_max_tokens {
+        creation += input - input_max_tokens;
+        input = input_max_tokens;
+    }
+    if creation > 0 && creation < min_cache_creation_tokens.max(0) {
+        input += creation;
+        creation = 0;
+    }
+
+    usage.input_tokens = input;
+    usage.cache_creation_input_tokens = creation;
+    normalize_shaped_cache_usage(usage)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ShapingBounds {
     input_min: i32,
@@ -3734,5 +3796,137 @@ mod tests {
         let usage = simulation.to_usage(31_400, 10);
         assert_eq!(usage.cache_read_input_tokens, 30_000);
         assert!(usage.cache_creation_input_tokens > 55_000, "{usage:?}");
+    }
+
+    #[test]
+    fn cold_constraint_drops_read_and_keeps_total_within_raw() {
+        // 现网 minea 首轮：真实 13_512，放大 + 整形后上报 read 351_618 / creation 1_735。
+        let raw = raw_input(13_512, 678);
+        let shaped = usage(9_427, 351_618, 1_735, 678);
+        let cold = constrain_cold_cache_usage(shaped, raw, 20_000, 1_024);
+        assert_eq!(cold.cache_read_input_tokens, 0);
+        assert_eq!(cold.input_tokens, 9_427, "input sampling is preserved");
+        assert_eq!(cold.cache_creation_input_tokens, 13_512 - 9_427);
+        assert_eq!(sum(cold), 13_512);
+        assert_eq!(cold.total_input_tokens, 13_512);
+        assert_eq!(cold.output_tokens, 678, "output is untouched");
+        assert_eq!(
+            cold.cache_creation_5m_input_tokens + cold.cache_creation_1h_input_tokens,
+            cold.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn cold_constraint_caps_amplified_first_turn_creation() {
+        // 本地复现的新会话 hi：真实 25_973，上报 input 3_929 + creation 98_970。
+        let raw = raw_input(25_973, 107);
+        let cold = constrain_cold_cache_usage(usage(3_929, 0, 98_970, 107), raw, 20_000, 1_024);
+        assert_eq!(cold.input_tokens, 3_929);
+        assert_eq!(cold.cache_creation_input_tokens, 25_973 - 3_929);
+        assert_eq!(cold.cache_read_input_tokens, 0);
+        assert_eq!(sum(cold), 25_973);
+    }
+
+    #[test]
+    fn cold_constraint_moves_input_over_cap_into_creation() {
+        let raw = raw_input(60_000, 10);
+        let cold = constrain_cold_cache_usage(usage(60_000, 0, 5_000, 10), raw, 20_000, 1_024);
+        assert_eq!(cold.input_tokens, 20_000);
+        assert_eq!(cold.cache_creation_input_tokens, 40_000);
+        assert_eq!(sum(cold), 60_000);
+    }
+
+    #[test]
+    fn cold_constraint_without_creation_reports_raw_input() {
+        // creation control 未放行写入：读取被清掉后全部记为 input，不超过真实总量。
+        let raw = raw_input(30_000, 10);
+        let cold = constrain_cold_cache_usage(usage(2_000, 400_000, 0, 10), raw, 20_000, 1_024);
+        assert_eq!(cold.input_tokens, 30_000);
+        assert_eq!(cold.cache_creation_input_tokens, 0);
+        assert_eq!(cold.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn cold_constraint_splits_creation_out_of_raw_input() {
+        // reportedUsage.input 为 raw：input 已等于真实总量，写入从中拆出，不叠加在真实输入之外。
+        let raw = raw_input(24_000, 10);
+        let cold = constrain_cold_cache_usage(usage(24_000, 0, 70_389, 10), raw, 0, 1_024);
+        assert_eq!(cold.input_tokens, 1);
+        assert_eq!(cold.cache_creation_input_tokens, 23_999);
+        let cold = constrain_cold_cache_usage(usage(24_000, 0, 5_000, 10), raw, 0, 1_024);
+        assert_eq!(cold.input_tokens, 19_000);
+        assert_eq!(cold.cache_creation_input_tokens, 5_000);
+        assert_eq!(sum(cold), 24_000);
+    }
+
+    #[test]
+    fn cold_constraint_merges_small_creation_into_input() {
+        let raw = raw_input(10_000, 10);
+        let cold = constrain_cold_cache_usage(usage(9_500, 0, 40_000, 10), raw, 0, 1_024);
+        assert_eq!(cold.input_tokens, 10_000);
+        assert_eq!(cold.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn cold_constraint_keeps_uncached_input_sampling() {
+        // 原先没有缓存字段：只截到真实总量，不把 input 采样抬回真实值。
+        let raw = raw_input(30_000, 10);
+        let sampled = usage(1_200, 0, 0, 10);
+        assert_eq!(
+            constrain_cold_cache_usage(sampled, raw, 20_000, 1_024),
+            normalize_shaped_cache_usage(sampled)
+        );
+        let over = constrain_cold_cache_usage(usage(45_000, 0, 0, 10), raw, 0, 0);
+        assert_eq!(over.input_tokens, 30_000);
+    }
+
+    #[test]
+    fn cold_constraint_preserves_upstream_metadata_cache() {
+        // 上游 metadata 带回真实缓存时不做约束。
+        let raw = usage(1_000, 50_000, 2_000, 10);
+        let reported = usage(1_000, 50_000, 2_000, 10);
+        assert_eq!(
+            constrain_cold_cache_usage(reported, raw, 20_000, 1_024),
+            reported
+        );
+    }
+
+    #[test]
+    fn cold_constraint_sweep_never_exceeds_raw_or_reports_read() {
+        let mut state = 0x5eed_u64;
+        for _ in 0..20_000 {
+            state = splitmix64(state);
+            let raw_total = 1 + (state % 900_000) as i32;
+            let input = (splitmix64(state ^ 1) % 700_000) as i32;
+            let read = (splitmix64(state ^ 2) % 700_000) as i32;
+            let creation = (splitmix64(state ^ 3) % 700_000) as i32;
+            let input_cap = (splitmix64(state ^ 4) % 40_000) as i32;
+            let min_creation = (splitmix64(state ^ 5) % 4_096) as i32;
+            let base = usage(input, read, creation, 7);
+            let cold =
+                constrain_cold_cache_usage(base, raw_input(raw_total, 7), input_cap, min_creation);
+            assert_eq!(cold.cache_read_input_tokens, 0, "{base:?} -> {cold:?}");
+            assert!(sum(cold) <= raw_total, "{raw_total} {base:?} -> {cold:?}");
+            assert!(cold.input_tokens >= 1, "{base:?} -> {cold:?}");
+            assert!(
+                cold.cache_creation_input_tokens == 0
+                    || cold.cache_creation_input_tokens >= min_creation,
+                "{base:?} -> {cold:?}"
+            );
+            if cold.cache_creation_input_tokens > 0 {
+                assert_eq!(sum(cold), raw_total, "{base:?} -> {cold:?}");
+                if input_cap > 0 {
+                    assert!(
+                        cold.input_tokens <= input_cap.max(1),
+                        "{base:?} -> {cold:?}"
+                    );
+                }
+            }
+            assert_eq!(cold.total_input_tokens, sum(cold));
+            assert_eq!(
+                cold.cache_creation_5m_input_tokens + cold.cache_creation_1h_input_tokens,
+                cold.cache_creation_input_tokens
+            );
+        }
     }
 }
