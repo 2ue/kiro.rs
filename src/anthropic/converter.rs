@@ -1066,8 +1066,8 @@ mod tests {
     #[test]
     fn test_context_window_size_for_kiro_auto_and_dash_variants() {
         assert_eq!(get_context_window_size("auto"), 1_000_000);
-        assert_eq!(get_context_window_size("sonnet"), 200_000);
-        assert_eq!(get_context_window_size("opus"), 200_000);
+        assert_eq!(get_context_window_size("sonnet"), 1_000_000);
+        assert_eq!(get_context_window_size("opus"), 1_000_000);
         assert_eq!(
             get_context_window_size("claude-fable-5-1-thinking"),
             1_000_000
@@ -1101,8 +1101,8 @@ mod tests {
             1_000_000
         );
         assert_eq!(get_context_window_size("claude-sonnet-4-6[1m]"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-opus-4-7"), 200_000);
-        assert_eq!(get_context_window_size("claude-sonnet-4-6"), 200_000);
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4-6"), 1_000_000);
     }
 
     #[test]
