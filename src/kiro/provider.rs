@@ -11249,7 +11249,9 @@ impl KiroProvider {
                     status,
                     response_body_bytes
                 );
-                let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted_deferred_with_account_info_refresh(ctx.id);
                 let failure_kind = Self::mcp_failure_kind_for_status(status);
                 Self::push_mcp_attempt(
                     attribution_sink.as_ref(),
@@ -11351,7 +11353,9 @@ impl KiroProvider {
                     .token_manager
                     .is_credential_account_quota_blocked(ctx.id)
                 {
-                    let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
+                    let has_available = self
+                        .token_manager
+                        .report_quota_exhausted_deferred_with_account_info_refresh(ctx.id);
                     let can_retry = has_available && attempt + 1 < max_retries;
                     Self::push_mcp_attempt(
                         attribution_sink.as_ref(),
@@ -12541,7 +12545,9 @@ impl KiroProvider {
                     "Kiro API credential quota is exhausted"
                 );
 
-                let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted_deferred_with_account_info_refresh(ctx.id);
                 if let Some(session_id) = conversation_id.as_deref() {
                     self.token_manager
                         .unbind_session_if_bound_to_deferred(session_id, ctx.id);
@@ -13209,7 +13215,9 @@ impl KiroProvider {
                     .token_manager
                     .is_credential_account_quota_blocked(ctx.id)
                 {
-                    let has_available = self.token_manager.report_quota_exhausted_deferred(ctx.id);
+                    let has_available = self
+                        .token_manager
+                        .report_quota_exhausted_deferred_with_account_info_refresh(ctx.id);
                     let can_retry = has_available && attempt + 1 < max_retries;
                     Self::push_attempt(
                         &mut attempts,

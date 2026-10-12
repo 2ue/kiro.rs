@@ -71,6 +71,14 @@ const PAGE_SIZE_OPTIONS = [12, 24, 48, 96]
 
 type PageItem = number | 'ellipsis-left' | 'ellipsis-right'
 
+function isUsageQuotaExhausted(info?: { currentUsage: number; usageLimit: number } | null): boolean {
+  if (!info) return false
+  return Number.isFinite(info.currentUsage) &&
+    Number.isFinite(info.usageLimit) &&
+    info.usageLimit > 0 &&
+    info.currentUsage >= info.usageLimit
+}
+
 function clampPage(page: number, pageCount: number) {
   return Math.min(Math.max(page, 1), Math.max(pageCount, 1))
 }
@@ -948,15 +956,45 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
+  const filterIdsWithAvailableUsageQuota = async (ids: number[]) => {
+    const batches: number[][] = []
+    for (let start = 0; start < ids.length; start += CREDIT_INFO_DETAIL_BATCH_SIZE) {
+      batches.push(ids.slice(start, start + CREDIT_INFO_DETAIL_BATCH_SIZE))
+    }
+    const responses = await Promise.all(batches.map((batch) => getCredentialsAccountInfo(batch)))
+    const accountInfoById = new Map(
+      responses.flatMap((response) => response.items).map((item) => [item.id, item]),
+    )
+    const queryableIds = ids.filter((id) => !isUsageQuotaExhausted(accountInfoById.get(id)))
+    return {
+      ids: queryableIds,
+      skippedQuotaExhausted: ids.length - queryableIds.length,
+    }
+  }
+
   // 查询账号信息。后端批量接口会逐个查询并返回每个凭据的结果，避免前端制造请求风暴。
   const handleQueryCurrentPageInfo = async (queryAllCredentials = false) => {
-    const ids = queryAllCredentials
-      ? ((allCredentialsQuery.data ?? (await allCredentialsQuery.refetch()).data)?.credentials || [])
-        .map(credential => credential.id)
-      : currentCredentials.map(credential => credential.id)
+    let filtered: { ids: number[]; skippedQuotaExhausted: number }
+    try {
+      const allIds = queryAllCredentials
+        ? ((allCredentialsQuery.data ?? (await allCredentialsQuery.refetch()).data)?.credentials || [])
+          .map(credential => credential.id)
+        : currentCredentials.map(credential => credential.id)
+      filtered = queryAllCredentials
+        ? await filterIdsWithAvailableUsageQuota(allIds)
+        : { ids: allIds, skippedQuotaExhausted: 0 }
+    } catch (error) {
+      toast.error(`查询信息失败: ${extractErrorMessage(error)}`)
+      return
+    }
+    const ids = filtered.ids
 
     if (ids.length === 0) {
-      toast.error(queryAllCredentials ? '没有凭据可查询' : '当前页没有可查询信息的凭据')
+      toast.error(
+        queryAllCredentials && filtered.skippedQuotaExhausted > 0
+          ? '没有需要查询的账号：已保存快照显示全部账号额度已用尽'
+          : queryAllCredentials ? '没有凭据可查询' : '当前页没有可查询信息的凭据'
+      )
       return
     }
 
@@ -999,10 +1037,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
       queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
 
       toast.dismiss(toastId)
+      const skippedText = filtered.skippedQuotaExhausted > 0 ? `，跳过额度用尽 ${filtered.skippedQuotaExhausted} 个` : ''
       if (report.failed === 0) {
-        toast.success(`查询完成：成功 ${report.success}/${report.total}`)
+        toast.success(`查询完成：成功 ${report.success}/${report.total}${skippedText}`)
       } else {
-        toast.warning(`查询完成：成功 ${report.success} 个，失败 ${report.failed} 个`)
+        toast.warning(`查询完成：成功 ${report.success} 个，失败 ${report.failed} 个${skippedText}`)
       }
     } catch (error) {
       toast.dismiss(toastId)

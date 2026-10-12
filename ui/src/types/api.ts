@@ -715,25 +715,40 @@ export interface CreateProxyResourceRequest {
   notes?: string
 }
 
-export interface BatchProxyResourceImportRequest {
-  content: string
-  namePrefix?: string
+export interface ProxyResourceImportEntry {
+  name?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
   enabled?: boolean
+  notes?: string
+}
+
+export interface BatchProxyResourceImportRequest {
+  content?: string
+  resources?: ProxyResourceImportEntry[]
+  namePrefix?: string
+  defaultProtocol?: string
+  enabled?: boolean
+  deduplicate?: boolean
   continueOnError?: boolean
 }
 
 export interface BatchProxyResourceImportItem {
   index: number
   ok: boolean
+  skipped?: boolean
   resourceId?: number
   name?: string
   proxyUrl?: string
   error?: string
+  warning?: string
 }
 
 export interface BatchProxyResourceImportResponse {
   total: number
   success: number
+  skipped: number
   failed: number
   items: BatchProxyResourceImportItem[]
 }

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { KeyRound } from 'lucide-react'
+import { Eye, EyeOff, KeyRound } from 'lucide-react'
 import { ADMIN_API_KEY_FIELD, storage } from '@/lib/storage'
 import { validateAdminApiKey } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -16,6 +16,7 @@ export function LoginPage({ onLogin, initialError = '' }: LoginPageProps) {
   const [adminApiKey, setAdminApiKey] = useState('')
   const [error, setError] = useState(initialError)
   const [submitting, setSubmitting] = useState(false)
+  const [showAdminApiKey, setShowAdminApiKey] = useState(false)
 
   useEffect(() => {
     const savedAdminApiKey = storage.getApiKey()
@@ -65,16 +66,29 @@ export function LoginPage({ onLogin, initialError = '' }: LoginPageProps) {
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
-              <Input
-                type="password"
-                placeholder={`管理后台 Key（${ADMIN_API_KEY_FIELD}）`}
-                value={adminApiKey}
-                onChange={(e) => {
-                  setAdminApiKey(e.target.value)
-                  setError('')
-                }}
-                className="text-center"
-              />
+              <div className="relative">
+                <Input
+                  type={showAdminApiKey ? 'text' : 'password'}
+                  placeholder={`管理后台 Key（${ADMIN_API_KEY_FIELD}）`}
+                  value={adminApiKey}
+                  onChange={(e) => {
+                    setAdminApiKey(e.target.value)
+                    setError('')
+                  }}
+                  className="pr-10 text-center"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="absolute right-0 top-1/2 h-9 w-9 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  onClick={() => setShowAdminApiKey((visible) => !visible)}
+                  aria-label={showAdminApiKey ? '隐藏登录 Key' : '显示登录 Key'}
+                  title={showAdminApiKey ? '隐藏登录 Key' : '显示登录 Key'}
+                >
+                  {showAdminApiKey ? <EyeOff /> : <Eye />}
+                </Button>
+              </div>
               <p className="text-xs leading-5 text-muted-foreground">
                 对应配置字段 <span className="font-mono">{ADMIN_API_KEY_FIELD}</span>，请求时会作为 <span className="font-mono">x-api-key</span> 发送；它不是 Kiro 凭据的 API Key。
               </p>

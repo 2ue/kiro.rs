@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Activity, Database, KeyRound, Route, ShieldCheck } from 'lucide-react'
+import { Activity, Database, Eye, EyeOff, KeyRound, Route, ShieldCheck } from 'lucide-react'
 import { storage } from '@/lib/storage'
 import { validateAdminApiKey } from '@/api/http'
 import { extractErrorMessage } from '@/lib/utils'
@@ -22,6 +22,7 @@ export function LoginPage({
   const [adminApiKey, setAdminApiKey] = React.useState(storage.getApiKey() || '')
   const [error, setError] = React.useState(initialError)
   const [submitting, setSubmitting] = React.useState(false)
+  const [showAdminApiKey, setShowAdminApiKey] = React.useState(false)
 
   React.useEffect(() => {
     setError(initialError)
@@ -119,8 +120,8 @@ export function LoginPage({
                 <div className="relative">
                   <KeyRound className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                   <Input
-                    type="password"
-                    className="pl-9"
+                    type={showAdminApiKey ? 'text' : 'password'}
+                    className="pl-9 pr-10"
                     value={adminApiKey}
                     onChange={(event) => {
                       setAdminApiKey(event.target.value)
@@ -129,6 +130,17 @@ export function LoginPage({
                     placeholder="请输入登录 Key"
                     autoFocus
                   />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    onClick={() => setShowAdminApiKey((visible) => !visible)}
+                    aria-label={showAdminApiKey ? '隐藏登录 Key' : '显示登录 Key'}
+                    title={showAdminApiKey ? '隐藏登录 Key' : '显示登录 Key'}
+                  >
+                    {showAdminApiKey ? <EyeOff /> : <Eye />}
+                  </Button>
                 </div>
                 <p className="text-xs leading-5 text-muted-foreground">
                   请使用管理员提供的后台登录 Key。

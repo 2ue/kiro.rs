@@ -288,6 +288,31 @@ fn proxy_import_parser_supports_common_formats_and_default_http() {
 }
 
 #[test]
+fn proxy_import_default_protocol_can_be_selected() {
+    assert_eq!(
+        validate_proxy_url_with_default_protocol("1.2.3.4:1080", "socks5").unwrap(),
+        "socks5://1.2.3.4:1080"
+    );
+    assert_eq!(
+        validate_proxy_import_default_protocol(Some("socks5h://".to_string())).unwrap(),
+        "socks5h"
+    );
+    assert!(validate_proxy_import_default_protocol(Some("ftp".to_string())).is_err());
+}
+
+#[test]
+fn proxy_resource_dedupe_key_ignores_url_case_and_trailing_slash() {
+    assert_eq!(
+        proxy_resource_dedupe_key("HTTP://Proxy.EXAMPLE:8080/", Some("user"), Some("pass")),
+        proxy_resource_dedupe_key("http://proxy.example:8080", Some("user"), Some("pass"))
+    );
+    assert_ne!(
+        proxy_resource_dedupe_key("http://proxy.example:8080", Some("user"), Some("pass")),
+        proxy_resource_dedupe_key("http://proxy.example:8080", Some("user2"), Some("pass"))
+    );
+}
+
+#[test]
 fn proxy_import_parser_supports_json_and_jsonl() {
     let parsed = parse_proxy_resource_import_content(
         r#"[{"name":"a","proxyUrl":"10.0.0.1:80","proxyUsername":"u","proxyPassword":"p"},{"proxyUrl":"socks5://127.0.0.1:1080"}]"#,

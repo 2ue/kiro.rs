@@ -8035,6 +8035,86 @@ impl MultiTokenManager {
         changed
     }
 
+    fn account_info_row_from_usage_limits(
+        usage_limits: &UsageLimitsResponse,
+    ) -> CredentialAccountInfoRow {
+        let current_usage = usage_limits.current_usage();
+        let usage_limit = usage_limits.usage_limit();
+        let remaining = (usage_limit - current_usage).max(0.0);
+        let usage_percentage = if usage_limit > 0.0 {
+            (current_usage / usage_limit * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        let credit_bonus = usage_limits.active_bonus_limit().max(0.0);
+        let credit_base = (usage_limit - credit_bonus).max(0.0);
+
+        CredentialAccountInfoRow {
+            subscription_title: usage_limits.subscription_title().map(str::to_string),
+            current_usage,
+            usage_limit,
+            remaining,
+            usage_percentage,
+            credit_limit: usage_limit,
+            credit_remaining: remaining,
+            credit_base,
+            credit_bonus,
+            overage_status: usage_limits.overage_status(),
+            overage_capability: usage_limits.overage_capability().map(str::to_string),
+            overage_cap: usage_limits.overage_cap(),
+            overage_rate: usage_limits.overage_rate(),
+            current_overages: usage_limits.current_overages(),
+            next_reset_at: usage_limits.next_date_reset,
+            checked_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    async fn refresh_quota_exhausted_account_info_snapshot(&self, id: u64) -> anyhow::Result<()> {
+        let usage_limits = self.get_usage_limits_for(id).await?;
+        let info = Self::account_info_row_from_usage_limits(&usage_limits);
+        if let Some(store) = &self.postgres_store {
+            store.save_credential_account_info(id, &info).await?;
+        }
+        self.apply_account_info_snapshot_for_credential(id, &info);
+        self.publish_credentials_changed("credential_quota_account_info_refreshed");
+        Ok(())
+    }
+
+    fn spawn_quota_exhausted_account_info_refresh(self: &Arc<Self>, id: u64) {
+        if self.postgres_store.is_none() {
+            tracing::debug!(
+                credential_id = id,
+                "QuotaExceeded 首次打标后跳过主动额度查询：未配置 PgSQL 账号信息快照存储"
+            );
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!(
+                credential_id = id,
+                "QuotaExceeded 首次打标后跳过主动额度查询：当前线程没有 tokio runtime"
+            );
+            return;
+        }
+
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            match manager
+                .refresh_quota_exhausted_account_info_snapshot(id)
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    credential_id = id,
+                    "QuotaExceeded 首次打标后已主动刷新账号额度快照"
+                ),
+                Err(err) => tracing::warn!(
+                    credential_id = id,
+                    "QuotaExceeded 首次打标后主动刷新账号额度快照失败: {}",
+                    err
+                ),
+            }
+        });
+    }
+
     fn apply_loaded_account_info(
         &self,
         account_info: &HashMap<u64, CredentialAccountInfoRow>,
@@ -11055,7 +11135,24 @@ impl MultiTokenManager {
     }
 
     /// 请求热路径版本：额度耗尽先本地禁用并切换，PgSQL 禁用 mutation 异步重放。
+    #[allow(dead_code)]
     pub fn report_quota_exhausted_deferred(&self, id: u64) -> bool {
+        self.report_quota_exhausted_deferred_inner(id).0
+    }
+
+    /// 请求热路径版本，并在首次标记 QuotaExceeded 后异步补齐账号额度快照。
+    pub fn report_quota_exhausted_deferred_with_account_info_refresh(
+        self: &Arc<Self>,
+        id: u64,
+    ) -> bool {
+        let (result, first_marked_quota_exceeded) = self.report_quota_exhausted_deferred_inner(id);
+        if first_marked_quota_exceeded {
+            self.spawn_quota_exhausted_account_info_refresh(id);
+        }
+        result
+    }
+
+    fn report_quota_exhausted_deferred_inner(&self, id: u64) -> (bool, bool) {
         let last_used_at: String;
         let expected_generation: u64;
         let result = {
@@ -11064,11 +11161,11 @@ impl MultiTokenManager {
 
             let entry = match entries.iter_mut().find(|entry| entry.id == id) {
                 Some(entry) => entry,
-                None => return Self::any_scheduler_available(&entries),
+                None => return (Self::any_scheduler_available(&entries), false),
             };
 
             if entry.disabled {
-                return Self::any_scheduler_available(&entries);
+                return (Self::any_scheduler_available(&entries), false);
             }
             expected_generation = entry.runtime_generation;
 
@@ -11120,7 +11217,7 @@ impl MultiTokenManager {
         self.publish_credentials_changed("credential_quota_exhausted");
         self.invalidate_model_capability_cohorts();
         self.notify_dispatch_state_changed();
-        result
+        (result, true)
     }
 
     /// 报告指定凭据被上游明确风控、暂停或锁定。

@@ -1,5 +1,18 @@
 import * as React from 'react'
-import { Activity, Edit3, Eye, EyeOff, Plus, Trash2, Upload, Users } from 'lucide-react'
+import {
+  Activity,
+  AlertCircle,
+  CheckCircle2,
+  Edit3,
+  Eye,
+  EyeOff,
+  Loader2,
+  Plus,
+  Trash2,
+  Upload,
+  Users,
+  XCircle,
+} from 'lucide-react'
 import { toast } from 'sonner'
 import { formatDate } from '@/lib/format'
 import { extractErrorMessage, cn } from '@/lib/utils'
@@ -12,9 +25,28 @@ import {
   useTestProxyResource,
   useUpdateProxyResource,
 } from '@/hooks/use-credentials'
-import type { CredentialStatusItem, ProxyResource, ProxyResourceTestResponse } from '@/types/api'
+import type {
+  CredentialStatusItem,
+  ProxyResource,
+  ProxyResourceImportEntry,
+  ProxyResourceTestResponse,
+} from '@/types/api'
 import { ModalShell, Field, FieldGrid, EmptyState, LoadingState, useConfirm } from '@/components/patterns'
-import { Badge, Button, Checkbox, Input, Textarea, Switch, Spinner } from '@/components/ui'
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Input,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Textarea,
+  Switch,
+  Spinner,
+  Progress,
+} from '@/components/ui'
 
 // ============================================================================
 // ProxyTestResult
@@ -136,6 +168,298 @@ const formFromResource = (r: ProxyResource): ProxyForm => ({
   name: r.name, proxyUrl: r.proxyUrl, proxyUsername: r.proxyUsername || '',
   proxyPassword: r.proxyPassword || '', notes: r.notes || '', enabled: r.enabled,
 })
+
+const PROXY_PROTOCOLS = new Set(['http', 'https', 'socks5', 'socks5h'])
+
+type ProxyImportItemStatus = 'pending' | 'testing' | 'passed' | 'failed' | 'skipped' | 'importing' | 'imported'
+
+type ProxyImportProgressItem = {
+  index: number
+  label: string
+  entry?: ProxyResourceImportEntry
+  status: ProxyImportItemStatus
+  message?: string
+  result?: ProxyResourceTestResponse
+  resourceId?: number
+}
+
+function decodeProxyPart(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function looksLikeHostPort(value: string): boolean {
+  const trimmed = value.trim()
+  if (trimmed.startsWith('[')) {
+    const close = trimmed.indexOf(']:')
+    return close >= 0 && /^\d+$/.test(trimmed.slice(close + 2))
+  }
+  const port = trimmed.slice(trimmed.lastIndexOf(':') + 1)
+  return /^\d+$/.test(port)
+}
+
+function parseProxyImportLine(line: string): ProxyResourceImportEntry {
+  const value = line.trim()
+  if (!value) throw new Error('代理项不能为空')
+
+  if (value.includes('://')) {
+    try {
+      const parsed = new URL(value)
+      const username = decodeProxyPart(parsed.username)
+      const password = parsed.password ? decodeProxyPart(parsed.password) : undefined
+      if (username || password) {
+        parsed.username = ''
+        parsed.password = ''
+        return {
+          proxyUrl: parsed.toString(),
+          proxyUsername: username || undefined,
+          proxyPassword: password,
+        }
+      }
+    } catch {
+      // Let the normalizer return the same validation error as the backend.
+    }
+    return { proxyUrl: value }
+  }
+
+  const at = value.indexOf('@')
+  if (at > 0) {
+    const credentials = value.slice(0, at)
+    const address = value.slice(at + 1)
+    const separator = credentials.indexOf(':')
+    if (separator > 0) {
+      return {
+        proxyUrl: address.trim(),
+        proxyUsername: credentials.slice(0, separator).trim(),
+        proxyPassword: credentials.slice(separator + 1).trim(),
+      }
+    }
+  }
+
+  if (value.startsWith('[')) {
+    const close = value.indexOf(']:')
+    if (close >= 0) {
+      const address = value.slice(0, close + 1)
+      const fields = value.slice(close + 2).split(':')
+      if (fields.length >= 3 && /^\d+$/.test(fields[0])) {
+        const port = fields.shift()!
+        const username = fields.shift()?.trim() || undefined
+        const password = fields.join(':').trim() || undefined
+        return {
+          proxyUrl: `${address}:${port}`,
+          proxyUsername: username,
+          proxyPassword: password,
+        }
+      }
+    }
+  }
+
+  let parts: string[]
+  let separator: 'colon' | 'named'
+  if (value.includes('----')) {
+    parts = value.split('----').map((part) => part.trim())
+    separator = 'named'
+  } else if (value.includes('|')) {
+    parts = value.split('|').map((part) => part.trim())
+    separator = 'named'
+  } else if (value.includes('\t')) {
+    parts = value.split('\t').map((part) => part.trim())
+    separator = 'named'
+  } else if (value.includes(',')) {
+    parts = value.split(',').map((part) => part.trim())
+    separator = 'named'
+  } else {
+    const colonParts = value.split(':')
+    parts = colonParts.length >= 4
+      ? [colonParts[0], colonParts[1], colonParts[2], colonParts.slice(3).join(':')]
+      : colonParts
+    separator = 'colon'
+  }
+
+  if (separator === 'colon' && parts.length === 4) {
+    return {
+      proxyUrl: `${parts[0]}:${parts[1]}`,
+      proxyUsername: parts[2] || undefined,
+      proxyPassword: parts[3] || undefined,
+    }
+  }
+  if (separator === 'named' && parts.length === 4) {
+    return {
+      name: parts[0] || undefined,
+      proxyUrl: parts[1] || undefined,
+      proxyUsername: parts[2] || undefined,
+      proxyPassword: parts[3] || undefined,
+    }
+  }
+  if (parts.length === 3) {
+    if (separator === 'named' && looksLikeHostPort(parts[0])) {
+      return {
+        proxyUrl: parts[0],
+        proxyUsername: parts[1] || undefined,
+        proxyPassword: parts[2] || undefined,
+      }
+    }
+    if (separator === 'named') {
+      return {
+        name: parts[0] || undefined,
+        proxyUrl: parts[1] || undefined,
+        proxyUsername: parts[2] || undefined,
+      }
+    }
+  }
+  if (separator === 'named' && parts.length === 2) {
+    return { name: parts[0] || undefined, proxyUrl: parts[1] || undefined }
+  }
+  return { proxyUrl: value }
+}
+
+function entryFromProxyImportValue(value: unknown): ProxyResourceImportEntry {
+  if (typeof value === 'string') return parseProxyImportLine(value)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('代理项必须是字符串或对象')
+  }
+  const object = value as Record<string, unknown>
+  const stringValue = (key: string, ...aliases: string[]) => {
+    const raw = [key, ...aliases].map((candidate) => object[candidate]).find((candidate) => typeof candidate === 'string')
+    return typeof raw === 'string' ? raw : undefined
+  }
+  return {
+    name: stringValue('name'),
+    proxyUrl: stringValue('proxyUrl', 'url', 'proxy', 'address'),
+    proxyUsername: stringValue('proxyUsername', 'username', 'user'),
+    proxyPassword: stringValue('proxyPassword', 'password', 'pass'),
+    enabled: typeof object.enabled === 'boolean' ? object.enabled : undefined,
+    notes: stringValue('notes'),
+  }
+}
+
+function parseProxyImportValues(content: string): unknown[] {
+  const trimmed = content.trim()
+  if (!trimmed) return []
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    return Array.isArray(parsed) ? parsed : [parsed]
+  } catch {
+    return trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => {
+      if (line.startsWith('{') || line.startsWith('[')) {
+        try {
+          const parsed: unknown = JSON.parse(line)
+          return Array.isArray(parsed) ? parsed : parsed
+        } catch {
+          if (line.startsWith('{')) throw new Error('JSONL 解析失败')
+        }
+      }
+      return line
+    }).flat()
+  }
+}
+
+function normalizeProxyImportEntry(
+  entry: ProxyResourceImportEntry,
+  defaultProtocol: string,
+  namePrefix: string,
+  index: number,
+): ProxyResourceImportEntry {
+  const rawUrl = entry.proxyUrl?.trim()
+  if (!rawUrl) throw new Error('代理 URL 不能为空')
+  const protocol = defaultProtocol.trim().replace(/:\/+$/, '').toLowerCase()
+  const normalizedUrl = rawUrl.includes('://') ? rawUrl : `${protocol}://${rawUrl}`
+  const parsed = new URL(normalizedUrl)
+  const scheme = parsed.protocol.replace(/:$/, '').toLowerCase()
+  if (!PROXY_PROTOCOLS.has(scheme)) {
+    throw new Error(`不支持的代理协议: ${scheme}`)
+  }
+  if (!parsed.hostname || (!parsed.port && scheme !== 'http' && scheme !== 'https')) {
+    throw new Error('代理 URL 必须包含主机名和端口')
+  }
+  let username = entry.proxyUsername?.trim() || undefined
+  let password = entry.proxyPassword?.trim() || undefined
+  if (!username && parsed.username) username = decodeProxyPart(parsed.username)
+  if (!password && parsed.password) password = decodeProxyPart(parsed.password)
+  parsed.username = ''
+  parsed.password = ''
+  return {
+    ...entry,
+    name: entry.name?.trim() || `${namePrefix}-${index}`,
+    proxyUrl: parsed.toString(),
+    proxyUsername: username,
+    proxyPassword: password,
+  }
+}
+
+function proxyImportDedupeKey(entry: ProxyResourceImportEntry): string {
+  return [
+    (entry.proxyUrl || '').trim().replace(/\/$/, '').toLowerCase(),
+    (entry.proxyUsername || '').trim(),
+    (entry.proxyPassword || '').trim(),
+  ].join('\n')
+}
+
+function buildProxyImportProgress(
+  content: string,
+  defaultProtocol: string,
+  namePrefix: string,
+  deduplicate: boolean,
+): ProxyImportProgressItem[] {
+  const seen = new Set<string>()
+  return parseProxyImportValues(content).map((value, offset) => {
+    const index = offset + 1
+    try {
+      const normalized = normalizeProxyImportEntry(
+        entryFromProxyImportValue(value),
+        defaultProtocol,
+        namePrefix || 'proxy',
+        index,
+      )
+      if (deduplicate) {
+        const key = proxyImportDedupeKey(normalized)
+        if (!seen.has(key)) {
+          seen.add(key)
+        } else {
+          return {
+            index,
+            label: normalized.name || `${namePrefix || 'proxy'}-${index}`,
+            entry: normalized,
+            status: 'skipped',
+            message: '本次内容中重复，已跳过',
+          }
+        }
+      }
+      return {
+        index,
+        label: normalized.name || `${namePrefix || 'proxy'}-${index}`,
+        entry: normalized,
+        status: 'pending',
+      }
+    } catch (error) {
+      return {
+        index,
+        label: `${namePrefix || 'proxy'}-${index}`,
+        status: 'failed',
+        message: error instanceof Error ? error.message : '代理格式无效',
+      }
+    }
+  })
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let cursor = 0
+  const workerCount = Math.min(Math.max(concurrency, 1), items.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const item = items[cursor]
+      cursor += 1
+      await worker(item)
+    }
+  }))
+}
 
 export function ProxyEditorModal({ open, resource, onClose }: {
   open: boolean; resource: ProxyResource | null; onClose: () => void
@@ -320,35 +644,186 @@ export function ProxyEditorModal({ open, resource, onClose }: {
   )
 }
 
-export function ProxyImportModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function ProxyImportModal({
+  open,
+  onClose,
+  onImported,
+}: {
+  open: boolean
+  onClose: () => void
+  onImported?: (items: Array<{ resourceId: number; result: ProxyResourceTestResponse }>) => void
+}) {
   const [content, setContent] = React.useState('')
   const [namePrefix, setNamePrefix] = React.useState('proxy')
+  const [defaultProtocol, setDefaultProtocol] = React.useState('http')
+  const [deduplicate, setDeduplicate] = React.useState(true)
+  const [testBeforeImport, setTestBeforeImport] = React.useState(true)
+  const [progressItems, setProgressItems] = React.useState<ProxyImportProgressItem[]>([])
+  const [running, setRunning] = React.useState(false)
+  const [completedRun, setCompletedRun] = React.useState(false)
   const importResources = useImportProxyResources()
+  const testProxy = useTestProxyResource()
 
   React.useEffect(() => {
     if (open) {
       setContent('')
       setNamePrefix('proxy')
+      setDefaultProtocol('http')
+      setDeduplicate(true)
+      setTestBeforeImport(true)
+      setProgressItems([])
+      setRunning(false)
+      setCompletedRun(false)
     }
   }, [open])
 
+  const updateProgressItem = React.useCallback((index: number, patch: Partial<ProxyImportProgressItem>) => {
+    setProgressItems((previous) => previous.map((item) => (
+      item.index === index ? { ...item, ...patch } : item
+    )))
+  }, [])
+
   const submit = async () => {
     if (!content.trim()) return toast.error('请粘贴代理内容或选择文件')
+    if (running) return
+
+    if (!testBeforeImport) {
+      setRunning(true)
+      try {
+        const result = await importResources.mutateAsync({
+          content,
+          namePrefix: namePrefix.trim() || 'proxy',
+          defaultProtocol,
+          deduplicate,
+          continueOnError: true,
+        })
+        const skippedText = result.skipped > 0 ? `，跳过重复 ${result.skipped}` : ''
+        if (result.failed > 0) {
+          toast.warning(`代理导入完成：成功 ${result.success}${skippedText}，失败 ${result.failed}`)
+        } else {
+          toast.success(`已导入 ${result.success} 个代理${skippedText}`)
+        }
+        setCompletedRun(true)
+      } catch (error) {
+        toast.error(`代理导入失败: ${extractErrorMessage(error)}`)
+      } finally {
+        setRunning(false)
+      }
+      return
+    }
+
+    let parsed: ProxyImportProgressItem[]
+    try {
+      parsed = buildProxyImportProgress(
+        content,
+        defaultProtocol,
+        namePrefix.trim() || 'proxy',
+        deduplicate,
+      )
+    } catch (error) {
+      toast.error(`代理内容解析失败: ${extractErrorMessage(error)}`)
+      return
+    }
+    if (!parsed.length) return toast.error('没有解析到有效的代理内容')
+
+    setProgressItems(parsed)
+    setCompletedRun(false)
+    setRunning(true)
+
+    const testable = parsed.filter((item) => item.status === 'pending' && item.entry)
+    const testResults = new Map<number, ProxyResourceTestResponse>()
+    await runWithConcurrency(testable, 6, async (item) => {
+      updateProgressItem(item.index, { status: 'testing', message: '正在测活…' })
+      try {
+        const result = await testProxy.mutateAsync({
+          request: {
+            proxyUrl: item.entry?.proxyUrl,
+            proxyUsername: item.entry?.proxyUsername,
+            proxyPassword: item.entry?.proxyPassword,
+          },
+        })
+        testResults.set(item.index, result)
+        updateProgressItem(item.index, {
+          status: result.success ? 'passed' : 'failed',
+          message: result.success ? `测活通过 · ${result.durationMs}ms` : result.message,
+          result,
+        })
+      } catch (error) {
+        updateProgressItem(item.index, {
+          status: 'failed',
+          message: `测活请求失败: ${extractErrorMessage(error)}`,
+        })
+      }
+    })
+
+    const passedItems = testable.filter((item) => testResults.get(item.index)?.success)
+    if (!passedItems.length) {
+      setRunning(false)
+      setCompletedRun(true)
+      toast.warning(`代理测活完成：通过 0/${testable.length}，没有代理写入数据库`)
+      return
+    }
+
+    setProgressItems((previous) => previous.map((item) => (
+      passedItems.some((passed) => passed.index === item.index)
+        ? { ...item, status: 'importing', message: '测活通过，正在写入数据库…' }
+        : item
+    )))
+
     try {
       const result = await importResources.mutateAsync({
-        content,
+        resources: passedItems.map((item) => item.entry!),
         namePrefix: namePrefix.trim() || 'proxy',
+        defaultProtocol,
+        deduplicate,
         continueOnError: true,
       })
-      if (result.failed > 0) {
-        const details = result.items.filter((item) => !item.ok).slice(0, 3).map((item) => `${item.index}: ${item.error}`).join('；')
-        toast.warning(`代理导入完成：成功 ${result.success}，失败 ${result.failed}${details ? `（${details}）` : ''}`)
-      } else {
-        toast.success(`已导入 ${result.success} 个代理`)
+      const imported = result.items
+        .map((item) => ({ item, progress: passedItems[item.index - 1] }))
+        .filter((value): value is {
+          item: (typeof result.items)[number]
+          progress: ProxyImportProgressItem
+        } => Boolean(value.progress))
+      const importedWithResults: Array<{ resourceId: number; result: ProxyResourceTestResponse }> = []
+      for (const { item, progress } of imported) {
+        const testResult = testResults.get(progress.index)
+        if (item.ok && typeof item.resourceId === 'number' && testResult) {
+          importedWithResults.push({ resourceId: item.resourceId, result: testResult })
+          updateProgressItem(progress.index, {
+            status: 'imported',
+            resourceId: item.resourceId,
+            message: `已导入 · ${testResult.durationMs}ms`,
+            result: testResult,
+          })
+        } else if (item.skipped) {
+          updateProgressItem(progress.index, {
+            status: 'skipped',
+            message: item.warning || '数据库中已存在，跳过导入',
+          })
+        } else {
+          updateProgressItem(progress.index, {
+            status: 'failed',
+            message: item.error || '写入数据库失败',
+          })
+        }
       }
-      onClose()
+      onImported?.(importedWithResults)
+      const skippedText = result.skipped > 0 ? `，跳过重复 ${result.skipped}` : ''
+      if (result.failed > 0) {
+        toast.warning(`代理测活并导入完成：成功 ${result.success}${skippedText}，失败 ${result.failed}`)
+      } else {
+        toast.success(`代理测活并导入完成：成功 ${result.success}${skippedText}`)
+      }
+      setCompletedRun(true)
     } catch (error) {
+      setProgressItems((previous) => previous.map((item) => (
+        item.status === 'importing'
+          ? { ...item, status: 'failed', message: `写入数据库失败: ${extractErrorMessage(error)}` }
+          : item
+      )))
       toast.error(`代理导入失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setRunning(false)
     }
   }
 
@@ -356,41 +831,127 @@ export function ProxyImportModal({ open, onClose }: { open: boolean; onClose: ()
     const file = event.target.files?.[0]
     if (!file) return
     setContent(await file.text())
+    setProgressItems([])
+    setCompletedRun(false)
     event.target.value = ''
+  }
+
+  const processedCount = progressItems.filter((item) => (
+    item.status !== 'pending' && item.status !== 'testing' && item.status !== 'importing'
+  )).length
+  const passedCount = progressItems.filter((item) => item.status === 'passed' || item.status === 'imported').length
+  const failedCount = progressItems.filter((item) => item.status === 'failed').length
+  const progressValue = progressItems.length ? Math.round((processedCount / progressItems.length) * 100) : 0
+  const isBusy = running || importResources.isPending
+
+  const progressIcon = (status: ProxyImportItemStatus) => {
+    if (status === 'testing' || status === 'importing') return <Loader2 className="size-4 animate-spin text-primary" />
+    if (status === 'passed' || status === 'imported') return <CheckCircle2 className="size-4 text-success" />
+    if (status === 'failed') return <XCircle className="size-4 text-destructive" />
+    if (status === 'skipped') return <AlertCircle className="size-4 text-warning" />
+    return <span className="size-4 rounded-full bg-muted" />
   }
 
   return (
     <ModalShell
       open={open}
-      onClose={() => !importResources.isPending && onClose()}
+      onClose={() => !isBusy && onClose()}
       title="批量导入代理"
       width="max-w-3xl"
       footer={(
         <>
-          <Button variant="outline" size="sm" onClick={onClose} disabled={importResources.isPending}>取消</Button>
-          <Button size="sm" onClick={submit} disabled={importResources.isPending || !content.trim()}>
-            {importResources.isPending ? <Spinner size="sm" /> : <Upload className="size-4" />}
-            导入代理
+          <Button variant="outline" size="sm" onClick={onClose} disabled={isBusy}>关闭</Button>
+          <Button size="sm" onClick={submit} disabled={isBusy || !content.trim()}>
+            {isBusy ? <Spinner size="sm" /> : <Upload className="size-4" />}
+            {isBusy ? `处理中 ${processedCount}/${progressItems.length || '…'}` : completedRun ? '再次导入' : testBeforeImport ? '测活并导入' : '导入代理'}
           </Button>
         </>
       )}
     >
       <div className="space-y-4">
-        <Field label="默认名称前缀">
-          <Input value={namePrefix} onChange={(event) => setNamePrefix(event.target.value)} placeholder="proxy" />
-        </Field>
-        <Field label="代理内容" description="每行一个；支持 host:port、host:port:username:password、username:password@host:port、|、----、逗号、JSON 数组和 JSONL。缺少协议头时按 http 解析。">
+        <FieldGrid>
+          <Field label="默认名称前缀">
+            <Input value={namePrefix} onChange={(event) => setNamePrefix(event.target.value)} placeholder="proxy" />
+          </Field>
+          <Field label="缺省协议">
+            <Select value={defaultProtocol} onValueChange={setDefaultProtocol}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="http">http</SelectItem>
+                <SelectItem value="https">https</SelectItem>
+                <SelectItem value="socks5">socks5</SelectItem>
+                <SelectItem value="socks5h">socks5h</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+        </FieldGrid>
+        <div className="grid gap-2 rounded-lg bg-muted/30 p-3 sm:grid-cols-2">
+          <label className="flex items-start gap-2 text-sm">
+            <Checkbox checked={deduplicate} onCheckedChange={(checked) => setDeduplicate(Boolean(checked))} />
+            <span>
+              <span className="block font-medium">自动去重</span>
+              <span className="block text-xs text-muted-foreground">跳过本次和已有资源里的相同代理。</span>
+            </span>
+          </label>
+          <label className="flex items-start gap-2 text-sm">
+            <Checkbox checked={testBeforeImport} onCheckedChange={(checked) => setTestBeforeImport(Boolean(checked))} disabled={isBusy} />
+            <span>
+              <span className="block font-medium">测活通过后导入</span>
+              <span className="block text-xs text-muted-foreground">并发测试代理，只有测活通过的代理才会写入数据库。</span>
+            </span>
+          </label>
+        </div>
+        <Field label="代理内容" description={`每行一个；支持 host:port、host:port:username:password、username:password@host:port、|、----、逗号、JSON 数组和 JSONL。缺少协议头时按 ${defaultProtocol} 解析。`}>
           <Textarea
             rows={12}
             value={content}
             onChange={(event) => setContent(event.target.value)}
             placeholder={'1.2.3.4:8080:user:pass\nuser:pass@2.3.4.5:3128\nsocks5://127.0.0.1:1080'}
+            disabled={isBusy}
           />
         </Field>
         <div className="flex items-center gap-3">
-          <Input type="file" accept=".txt,.json,.jsonl,.csv,text/plain,application/json" onChange={readFile} />
+          <Input type="file" accept=".txt,.json,.jsonl,.csv,text/plain,application/json" onChange={readFile} disabled={isBusy} />
           <span className="shrink-0 text-xs text-muted-foreground">导入文件会覆盖当前文本</span>
         </div>
+        {progressItems.length > 0 && (
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+              <div className="font-semibold">
+                {running ? '代理测活进度' : '代理导入结果'}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                已处理 {processedCount}/{progressItems.length} · 通过 {passedCount} · 失败 {failedCount}
+              </div>
+            </div>
+            <Progress value={progressValue} tone={failedCount > 0 ? 'warning' : 'primary'} className="h-1.5" />
+            <div className="max-h-64 space-y-1 overflow-y-auto scrollbar-thin">
+              {progressItems.map((item) => (
+                <div key={item.index} className="flex items-start gap-2 rounded-lg bg-muted/30 px-3 py-2">
+                  <div className="mt-0.5 shrink-0">{progressIcon(item.status)}</div>
+                  <div className="min-w-0 flex-1 text-xs">
+                    <div className="truncate font-semibold">{item.label}</div>
+                    {item.status === 'passed' || item.status === 'imported' ? (
+                      <div className="mt-1 flex items-center gap-2">
+                        <Badge tone={item.result && item.result.durationMs < 200 ? 'success' : item.result && item.result.durationMs <= 500 ? 'info' : 'warning'}>
+                          {item.result?.durationMs ?? 0}ms
+                        </Badge>
+                        <span className="truncate text-muted-foreground">{item.message}</span>
+                      </div>
+                    ) : (
+                      <div className={cn(
+                        'mt-1 truncate',
+                        item.status === 'failed' ? 'text-destructive' : item.status === 'testing' || item.status === 'importing' ? 'text-primary' : 'text-muted-foreground',
+                      )}>
+                        {item.message || (item.status === 'pending' ? '等待测活…' : '已跳过')}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </ModalShell>
   )

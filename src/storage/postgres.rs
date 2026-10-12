@@ -503,6 +503,12 @@ pub struct UpdateProxyResourceRow {
     pub notes: Option<Option<String>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DeleteProxyResourceOutcome {
+    pub cleared_disabled_credentials: u64,
+    pub enabled_credential_count: u64,
+}
+
 fn proxy_resource_from_row(row: PgRow) -> anyhow::Result<ProxyResourceRow> {
     let id: i64 = row.try_get("id")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
@@ -2836,10 +2842,10 @@ impl PostgresStore {
         row.map(proxy_resource_from_row).transpose()
     }
 
-    pub async fn soft_delete_proxy_resource_if_unbound(
+    pub async fn soft_delete_proxy_resource_clearing_disabled_bindings(
         &self,
         id: u64,
-    ) -> anyhow::Result<Option<u64>> {
+    ) -> anyhow::Result<Option<DeleteProxyResourceOutcome>> {
         let mut tx = self.pool.begin().await?;
         let exists = sqlx::query_scalar::<_, i64>(
             r#"
@@ -2858,11 +2864,12 @@ impl PostgresStore {
             return Ok(None);
         }
 
-        let credential_count = sqlx::query_scalar::<_, i64>(
+        let enabled_credential_count = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)
             FROM credentials
             WHERE deleted_at IS NULL
+              AND disabled = false
               AND (data->>'proxyResourceId') ~ '^[0-9]+$'
               AND (data->>'proxyResourceId')::BIGINT = $1
             "#,
@@ -2870,28 +2877,45 @@ impl PostgresStore {
         .bind(id as i64)
         .fetch_one(&mut *tx)
         .await?;
-        let credential_count = credential_count.max(0) as u64;
+        let enabled_credential_count = enabled_credential_count.max(0) as u64;
 
-        if credential_count > 0 {
-            tx.rollback().await?;
-            return Ok(Some(credential_count));
-        }
-
-        sqlx::query(
+        let cleared_disabled_credentials = sqlx::query(
             r#"
-            UPDATE proxy_resources
-            SET deleted_at = now(),
-                enabled = false,
-                updated_at = now()
-            WHERE id = $1 AND deleted_at IS NULL
+            UPDATE credentials
+            SET data = data - 'proxyResourceId',
+                updated_at = now(),
+                revision = revision + 1
+            WHERE deleted_at IS NULL
+              AND disabled = true
+              AND (data->>'proxyResourceId') ~ '^[0-9]+$'
+              AND (data->>'proxyResourceId')::BIGINT = $1
             "#,
         )
         .bind(id as i64)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+
+        if enabled_credential_count == 0 {
+            sqlx::query(
+                r#"
+                UPDATE proxy_resources
+                SET deleted_at = now(),
+                    enabled = false,
+                    updated_at = now()
+                WHERE id = $1 AND deleted_at IS NULL
+                "#,
+            )
+            .bind(id as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
-        Ok(Some(0))
+        Ok(Some(DeleteProxyResourceOutcome {
+            cleared_disabled_credentials,
+            enabled_credential_count,
+        }))
     }
 
     pub async fn insert_proxy_resource(
@@ -5837,7 +5861,6 @@ impl PostgresUsageStore {
             "global".to_string(),
             "external_pool".to_string(),
             "credential".to_string(),
-            "local_route".to_string(),
             "model".to_string(),
             "endpoint".to_string(),
             "request_api_key".to_string(),
@@ -5890,6 +5913,54 @@ impl PostgresUsageStore {
         .bind(spec.to)
         .fetch_all(&mut *tx)
         .await?;
+
+        let local_endpoint_rows = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(NULLIF(BTRIM(endpoint), ''), 'unknown') AS dimension_key,
+                COUNT(*)::bigint AS requests,
+                COUNT(*) FILTER (WHERE status = 'success')::bigint AS success_requests,
+                COUNT(*) FILTER (WHERE status <> 'success')::bigint AS error_requests,
+                COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(cache_read_input_tokens), 0)::bigint
+                    AS total_cache_read_input_tokens,
+                COALESCE(SUM(cache_creation_input_tokens), 0)::bigint
+                    AS total_cache_creation_input_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0)::double precision
+                    AS total_estimated_cost_usd,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(original_cost_usd, 0) <> 0
+                        THEN original_cost_usd
+                        ELSE COALESCE(estimated_cost_usd, 0)
+                    END
+                ), 0)::double precision AS total_original_cost_usd,
+                COALESCE(SUM(kiro_metering_usage), 0)::double precision
+                    AS total_kiro_metering_usage,
+                COUNT(*) FILTER (WHERE pricing_available)::bigint AS priced_requests,
+                COUNT(*) FILTER (WHERE NOT pricing_available)::bigint AS unpriced_requests,
+                COALESCE(SUM(duration_ms), 0)::bigint AS duration_ms_sum,
+                COUNT(*)::bigint AS duration_ms_count,
+                0::bigint AS external_pool_cost_floor_applied_requests
+            FROM usage_records
+            WHERE deleted_at IS NULL
+              AND rollup_active
+              AND created_at >= $1
+              AND created_at < $2
+              AND credential_id IS NOT NULL
+              AND COALESCE(NULLIF(data->>'routeKind', ''), 'local_credential') = 'local_credential'
+            GROUP BY COALESCE(NULLIF(BTRIM(endpoint), ''), 'unknown')
+            ORDER BY total_kiro_metering_usage DESC,
+                     total_estimated_cost_usd DESC,
+                     requests DESC,
+                     dimension_key ASC
+            "#,
+        )
+        .bind(spec.from)
+        .bind(spec.to)
+        .fetch_all(&mut *tx)
+        .await?;
         tx.commit().await?;
 
         let mut all = OverviewAccumulator::default();
@@ -5898,7 +5969,6 @@ impl PostgresUsageStore {
         let mut pools = HashMap::<String, OverviewPoolAccumulator>::new();
         let mut accounts = HashMap::<String, OverviewAccumulator>::new();
         let mut account_labels = HashMap::<String, String>::new();
-        let mut local_routes = HashMap::<String, OverviewAccumulator>::new();
         let mut models = HashMap::<String, OverviewRankAccumulator>::new();
         let mut keys = HashMap::<String, OverviewRankAccumulator>::new();
         let mut paths = HashMap::<String, OverviewRankAccumulator>::new();
@@ -5953,10 +6023,6 @@ impl PostgresUsageStore {
                     if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
                         account_labels.insert(dimension_key, label.to_string());
                     }
-                }
-                "local_route" => {
-                    let route = local_routes.entry(dimension_key.clone()).or_default();
-                    route.add(metrics);
                 }
                 "model" => {
                     let rank = models.entry(dimension_key.clone()).or_default();
@@ -6054,13 +6120,23 @@ impl PostgresUsageStore {
         });
         let accounts_total = account_rows.len();
         let active_accounts = accounts_total;
-        let mut route_rows = local_routes
+        let mut route_rows = local_endpoint_rows
             .into_iter()
-            .map(|(key, value)| UsageOverviewRouteRow {
-                label: usage_local_route_label(&key),
-                key,
-                metrics: value.to_metrics(),
+            .map(|row| {
+                let key: String = row.try_get("dimension_key")?;
+                let label = if key == "unknown" {
+                    "未记录路径".to_string()
+                } else {
+                    key.clone()
+                };
+                Ok(UsageOverviewRouteRow {
+                    label,
+                    key,
+                    metrics: OverviewAccumulator::from_row(&row)?.to_metrics(),
+                })
             })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
             .filter(|row| row.metrics.requests > 0)
             .collect::<Vec<_>>();
         route_rows.sort_by(|left, right| {

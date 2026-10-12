@@ -288,12 +288,13 @@ function TrendTooltipContent({
 
 function usageLink(
   navigate: ReturnType<typeof useNavigate>,
-  params: { routeKind: 'local_credential' | 'external_pool'; credentialId?: number; externalPoolId?: number; since: string; until: string },
+  params: { routeKind: 'local_credential' | 'external_pool'; credentialId?: number; externalPoolId?: number; endpoint?: string; since: string; until: string },
 ) {
   const search = new URLSearchParams()
   search.set('routeKind', params.routeKind)
   if (params.credentialId) search.set('credentialId', String(params.credentialId))
   if (params.externalPoolId) search.set('externalPoolId', String(params.externalPoolId))
+  if (params.endpoint) search.set('endpoint', params.endpoint)
   if (params.since) search.set('since', localDateTimeValue(params.since))
   if (params.until) search.set('until', localDateTimeValue(params.until))
   navigate(`/usage?${search.toString()}`)
@@ -611,21 +612,22 @@ function LocalPoolSection({
       </div>
       <div className="mt-4">
         <div className="mb-2 flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold">路由积分消耗</h3>
-          <span className="text-[0.68rem] text-muted-foreground">{formatNumber(routes.length)} 个路由</span>
+          <h3 className="text-sm font-semibold">本地路径积分消耗</h3>
+          <span className="text-[0.68rem] text-muted-foreground">{formatNumber(routes.length)} 个路径</span>
         </div>
         {routes.length === 0 ? (
-          <EmptyState title="暂无路由数据" className="py-6" />
+          <EmptyState title="暂无本地路径数据" className="py-6" />
         ) : (
           <div className="overflow-x-auto">
-            <Table className="min-w-[760px]">
+            <Table className="min-w-[860px]">
               <TableHeader>
                 <TableRow>
-                  <TableHead>路由</TableHead>
+                  <TableHead>路径</TableHead>
                   <TableHead className="text-right">请求</TableHead>
-                  <TableHead className="text-right">已消耗积分</TableHead>
+                  <TableHead className="text-right">积分</TableHead>
                   <TableHead className="text-right">估算费用</TableHead>
-                  <TableHead className="text-right">积分转换率</TableHead>
+                  <TableHead className="text-right">原始费用</TableHead>
+                  <TableHead className="text-right">积分比</TableHead>
                   <TableHead className="text-right">错误率</TableHead>
                 </TableRow>
               </TableHeader>
@@ -641,13 +643,26 @@ function LocalPoolSection({
                   )
                   return (
                     <TableRow key={route.key}>
-                      <TableCell className="font-medium">{route.label}</TableCell>
+                      <TableCell>
+                        <Button
+                          variant="link"
+                          size="xs"
+                          className="h-auto max-w-[280px] justify-start truncate px-0 text-left font-mono"
+                          title={`${route.label} · 查看本地账号 Usage 明细`}
+                          onClick={() => usageLink(navigate, {
+                            routeKind: 'local_credential',
+                            endpoint: route.key === 'unknown' ? undefined : route.key,
+                            since: range.from,
+                            until: range.to,
+                          })}
+                        >
+                          {route.label}
+                        </Button>
+                      </TableCell>
                       <TableCell className="text-right font-mono text-xs">{formatNumber(route.metrics.requests)}</TableCell>
                       <TableCell className="text-right font-mono text-xs">{formatNumber(route.metrics.kiroMeteringUsage)}</TableCell>
-                      <TableCell className="text-right font-mono text-xs">
-                        <div>{formatUsdFixed2(route.metrics.estimatedCostUsd)}</div>
-                        <div className="text-[0.62rem] text-muted-foreground">原始 {formatUsdFixed2(route.metrics.originalCostUsd)}</div>
-                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(route.metrics.estimatedCostUsd)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs">{formatUsdFixed2(route.metrics.originalCostUsd)}</TableCell>
                       <TableCell className="text-right font-mono text-xs">
                         <div>{formatCreditCostRate(estimatedRate)}</div>
                         <div className="text-[0.62rem] text-muted-foreground">原始 {formatCreditCostRate(originalRate)}</div>

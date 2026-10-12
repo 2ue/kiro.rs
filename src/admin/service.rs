@@ -3733,6 +3733,22 @@ impl AdminService {
         }
 
         let prefix = optional_trimmed(req.name_prefix).unwrap_or_else(|| "proxy".to_string());
+        let default_protocol = validate_proxy_import_default_protocol(req.default_protocol)?;
+        let mut seen_keys = HashSet::new();
+        if req.deduplicate {
+            let existing = block_on_admin_store({
+                let store = self.postgres_store.clone();
+                async move { store.load_proxy_resources().await }
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+            seen_keys.extend(existing.into_iter().map(|resource| {
+                proxy_resource_dedupe_key(
+                    &resource.proxy_url,
+                    resource.proxy_username.as_deref(),
+                    resource.proxy_password.as_deref(),
+                )
+            }));
+        }
         let mut items = Vec::with_capacity(candidates.len());
         let mut created_count = 0usize;
 
@@ -3744,10 +3760,12 @@ impl AdminService {
                     items.push(BatchProxyResourceImportItem {
                         index,
                         ok: false,
+                        skipped: false,
                         resource_id: None,
                         name: None,
                         proxy_url: None,
                         error: Some(error),
+                        warning: None,
                     });
                     if !req.continue_on_error {
                         break;
@@ -3767,10 +3785,12 @@ impl AdminService {
                     items.push(BatchProxyResourceImportItem {
                         index,
                         ok: false,
+                        skipped: false,
                         resource_id: None,
                         name: Some(name),
                         proxy_url: None,
                         error: Some("代理 URL 不能为空".to_string()),
+                        warning: None,
                     });
                     if !req.continue_on_error {
                         break;
@@ -3778,28 +3798,53 @@ impl AdminService {
                     continue;
                 }
             };
-            let proxy_url = match validate_proxy_url(&raw_proxy_url) {
-                Ok(value) => value,
-                Err(error) => {
+            let proxy_url =
+                match validate_proxy_url_with_default_protocol(&raw_proxy_url, &default_protocol) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        items.push(BatchProxyResourceImportItem {
+                            index,
+                            ok: false,
+                            skipped: false,
+                            resource_id: None,
+                            name: Some(name),
+                            proxy_url: Some(raw_proxy_url),
+                            error: Some(error.to_string()),
+                            warning: None,
+                        });
+                        if !req.continue_on_error {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+            let proxy_username = optional_trimmed(entry.proxy_username);
+            let proxy_password = optional_trimmed(entry.proxy_password);
+            if req.deduplicate {
+                let dedupe_key = proxy_resource_dedupe_key(
+                    &proxy_url,
+                    proxy_username.as_deref(),
+                    proxy_password.as_deref(),
+                );
+                if !seen_keys.insert(dedupe_key) {
                     items.push(BatchProxyResourceImportItem {
                         index,
                         ok: false,
+                        skipped: true,
                         resource_id: None,
                         name: Some(name),
-                        proxy_url: Some(raw_proxy_url),
-                        error: Some(error.to_string()),
+                        proxy_url: Some(proxy_url),
+                        error: None,
+                        warning: Some("重复代理，已跳过".to_string()),
                     });
-                    if !req.continue_on_error {
-                        break;
-                    }
                     continue;
                 }
-            };
+            }
             let row = CreateProxyResourceRow {
                 name: name.clone(),
                 proxy_url: proxy_url.clone(),
-                proxy_username: optional_trimmed(entry.proxy_username),
-                proxy_password: optional_trimmed(entry.proxy_password),
+                proxy_username,
+                proxy_password,
                 enabled: entry.enabled.unwrap_or(req.enabled),
                 notes: optional_trimmed(entry.notes),
             };
@@ -3814,20 +3859,24 @@ impl AdminService {
                     items.push(BatchProxyResourceImportItem {
                         index,
                         ok: true,
+                        skipped: false,
                         resource_id: Some(created.id),
                         name: Some(created.name),
                         proxy_url: Some(created.proxy_url),
                         error: None,
+                        warning: None,
                     });
                 }
                 Err(error) => {
                     items.push(BatchProxyResourceImportItem {
                         index,
                         ok: false,
+                        skipped: false,
                         resource_id: None,
                         name: Some(name),
                         proxy_url: Some(proxy_url),
                         error: Some(error.to_string()),
+                        warning: None,
                     });
                     if !req.continue_on_error {
                         break;
@@ -3840,18 +3889,20 @@ impl AdminService {
             self.reload_proxy_resources_after_admin_change();
         }
         let success = items.iter().filter(|item| item.ok).count();
-        let failed = items.len().saturating_sub(success);
+        let skipped = items.iter().filter(|item| item.skipped).count();
+        let failed = items.len().saturating_sub(success + skipped);
         self.audit(
             "batch_import_proxy_resources",
             "proxy_resource",
             None,
             failed == 0,
             (failed > 0).then(|| format!("{} 条导入失败", failed)),
-            json!({ "total": items.len(), "success": success, "failed": failed }),
+            json!({ "total": items.len(), "success": success, "skipped": skipped, "failed": failed }),
         );
         Ok(BatchProxyResourceImportResponse {
             total: items.len(),
             success,
+            skipped,
             failed,
             items,
         })
@@ -3913,15 +3964,31 @@ impl AdminService {
     pub fn delete_proxy_resource(&self, id: u64) -> Result<(), AdminServiceError> {
         let delete_result = block_on_admin_store({
             let store = self.postgres_store.clone();
-            async move { store.soft_delete_proxy_resource_if_unbound(id).await }
+            async move {
+                store
+                    .soft_delete_proxy_resource_clearing_disabled_bindings(id)
+                    .await
+            }
         })
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         match delete_result {
             None => return Err(AdminServiceError::NotFound { id }),
-            Some(credential_count) if credential_count > 0 => {
+            Some(outcome) if outcome.enabled_credential_count > 0 => {
+                if outcome.cleared_disabled_credentials > 0 {
+                    self.invalidate_all_credential_caches();
+                    self.reload_proxy_resources_after_admin_change();
+                }
                 return Err(AdminServiceError::Conflict(format!(
-                    "代理资源仍有 {} 个凭据绑定，请先解绑后再删除",
-                    credential_count
+                    "代理资源仍有 {} 个启用账号绑定，请先更换这些账号的代理后再删除{}",
+                    outcome.enabled_credential_count,
+                    if outcome.cleared_disabled_credentials > 0 {
+                        format!(
+                            "；已自动清除 {} 个已禁用账号的关联",
+                            outcome.cleared_disabled_credentials
+                        )
+                    } else {
+                        String::new()
+                    }
                 )));
             }
             Some(_) => {}
@@ -6747,11 +6814,37 @@ fn normalize_proxy_url(value: Option<String>) -> Result<Option<String>, AdminSer
 }
 
 fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
+    validate_proxy_url_with_default_protocol(value, "http")
+}
+
+fn validate_proxy_import_default_protocol(
+    value: Option<String>,
+) -> Result<String, AdminServiceError> {
+    let protocol = value
+        .as_deref()
+        .unwrap_or("http")
+        .trim()
+        .trim_end_matches("://")
+        .to_lowercase();
+    match protocol.as_str() {
+        "http" | "https" | "socks5" | "socks5h" => Ok(protocol),
+        "" => Ok("http".to_string()),
+        other => Err(AdminServiceError::InvalidCredential(format!(
+            "不支持的默认代理协议: {}，仅支持 http/https/socks5/socks5h",
+            other
+        ))),
+    }
+}
+
+fn validate_proxy_url_with_default_protocol(
+    value: &str,
+    default_protocol: &str,
+) -> Result<String, AdminServiceError> {
     let value = value.trim();
     let normalized = if value.contains("://") {
         value.to_string()
     } else {
-        format!("http://{}", value)
+        format!("{}://{}", default_protocol, value)
     };
     let parsed = url::Url::parse(&normalized).map_err(|_| {
         AdminServiceError::InvalidCredential(
@@ -6773,6 +6866,19 @@ fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
             scheme
         ))),
     }
+}
+
+fn proxy_resource_dedupe_key(
+    proxy_url: &str,
+    proxy_username: Option<&str>,
+    proxy_password: Option<&str>,
+) -> String {
+    format!(
+        "{}\n{}\n{}",
+        proxy_url.trim().trim_end_matches('/').to_lowercase(),
+        proxy_username.unwrap_or("").trim(),
+        proxy_password.unwrap_or("").trim()
+    )
 }
 
 fn parse_proxy_resource_import_content(

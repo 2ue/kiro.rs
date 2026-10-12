@@ -10,6 +10,7 @@
 |------|------|----------|------|
 | 后端 API | `http://127.0.0.1:9022` | 见下方后端启动命令 | 当前仓库本地 `config.json` 的端口。debug 下 `/ui` 等入口会跳到 Vite。 |
 | UI | `http://127.0.0.1:9023/ui/runtime` | `bash scripts/dev-ui.sh ui` | 主要开发入口，改源码后热更新。 |
+| 本地调试登录 Key | `dev123` | 写在本地 `config.json` 的 `adminApiKey` | 仅用于本机开发调试；线上或共享环境不要使用这个短 Key。 |
 
 如果后端没有跑在 9022，前端支持用 `VITE_API_PROXY_TARGET` 改代理目标：
 
@@ -53,7 +54,7 @@ bash scripts/dev-ui.sh ui
 http://127.0.0.1:9023/ui/runtime
 ```
 
-登录 Key 使用 `config.json` 里的实际 `adminApiKey`，不要按旧文档或记忆里的默认值猜。
+登录 Key 使用 `config.json` 里的实际 `adminApiKey`。本仓库本地调试默认是 `dev123`；如果你临时改过本地配置，以当前 `config.json` 为准，不要按旧文档或记忆里的默认值猜。
 
 ## pnpm dev、build、preview 的区别
 

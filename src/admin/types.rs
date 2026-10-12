@@ -1224,9 +1224,13 @@ pub struct BatchProxyResourceImportRequest {
     pub content: Option<String>,
     /// 结构化导入项。与 content 二选一。
     pub resources: Option<Vec<ProxyResourceImportEntry>>,
+    /// 缺少协议头时使用的默认协议。
+    pub default_protocol: Option<String>,
     #[serde(default = "default_proxy_resource_enabled")]
     pub enabled: bool,
     pub name_prefix: Option<String>,
+    #[serde(default = "default_proxy_resource_deduplicate")]
+    pub deduplicate: bool,
     #[serde(default = "default_batch_import_continue_on_error")]
     pub continue_on_error: bool,
 }
@@ -1236,6 +1240,8 @@ pub struct BatchProxyResourceImportRequest {
 pub struct BatchProxyResourceImportItem {
     pub index: usize,
     pub ok: bool,
+    #[serde(default)]
+    pub skipped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1244,6 +1250,8 @@ pub struct BatchProxyResourceImportItem {
     pub proxy_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1251,6 +1259,7 @@ pub struct BatchProxyResourceImportItem {
 pub struct BatchProxyResourceImportResponse {
     pub total: usize,
     pub success: usize,
+    pub skipped: usize,
     pub failed: usize,
     pub items: Vec<BatchProxyResourceImportItem>,
 }
@@ -1336,6 +1345,10 @@ pub struct ExternalPoolTestRequest {
 }
 
 fn default_proxy_resource_enabled() -> bool {
+    true
+}
+
+fn default_proxy_resource_deduplicate() -> bool {
     true
 }
 

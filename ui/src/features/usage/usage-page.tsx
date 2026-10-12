@@ -588,7 +588,7 @@ function RecordsView({
   const [requestId, setRequestId] = useState('')
   const [requestApiKeyId, setRequestApiKeyId] = useState('')
   const [model, setModel] = useState('')
-  const [endpoint, setEndpoint] = useState('')
+  const [endpoint, setEndpoint] = useState(() => searchParams.get('endpoint') ?? '')
   const [conversationId, setConversationId] = useState('')
   const initialRouteKind = searchParams.get('routeKind')
   const initialCredentialId = Number(searchParams.get('credentialId'))

@@ -117,6 +117,14 @@ import {
 const PAGE_SIZE_OPTIONS = [15, 30, 60, 120]
 const CREDIT_INFO_DETAIL_BATCH_SIZE = 500
 
+function isUsageQuotaExhausted(info?: { currentUsage: number; usageLimit: number } | null): boolean {
+  if (!info) return false
+  return Number.isFinite(info.currentUsage) &&
+    Number.isFinite(info.usageLimit) &&
+    info.usageLimit > 0 &&
+    info.currentUsage >= info.usageLimit
+}
+
 function CredentialFilterField({
   label,
   children,
@@ -516,15 +524,31 @@ export function CredentialsPage() {
     loadCreditDetails()
   }
 
+  const filterIdsWithAvailableUsageQuota = async (ids: number[]) => {
+    const idBatches: number[][] = []
+    for (let i = 0; i < ids.length; i += CREDIT_INFO_DETAIL_BATCH_SIZE) {
+      idBatches.push(ids.slice(i, i + CREDIT_INFO_DETAIL_BATCH_SIZE))
+    }
+    const responses = await Promise.all(idBatches.map((batch) => getCredentialAccountInfo(batch)))
+    const accountInfoById = new Map(responses.flatMap((response) => response.items).map((item) => [item.id, item]))
+    const queryableIds = ids.filter((id) => !isUsageQuotaExhausted(accountInfoById.get(id)))
+    return {
+      ids: queryableIds,
+      skippedQuotaExhausted: ids.length - queryableIds.length,
+    }
+  }
+
   const queryAllCreditInfo = async () => {
     setQueryingCreditInfo(true)
     let ids: number[] = []
     try {
       const snapshot = (await allCredentials.refetch()).data
-      ids = (snapshot?.credentials || [])
+      const allIds = (snapshot?.credentials || [])
         .map((credential) => credential.id)
+      const filtered = await filterIdsWithAvailableUsageQuota(allIds)
+      ids = filtered.ids
       if (!ids.length) {
-        toast.error('没有账号可查询积分')
+        toast.error(filtered.skippedQuotaExhausted > 0 ? '没有需要查询的账号：已保存快照显示全部账号额度已用尽' : '没有账号可查询积分')
         return
       }
       setLoadingBalanceIds((prev) => {
@@ -552,8 +576,9 @@ export function CredentialsPage() {
       invalidate()
       await creditSummary.refetch()
       if (creditDetailsOpen) await loadCreditDetails()
-      if (report.failed === 0) toast.success(`全部账号积分已更新：成功 ${report.success}/${report.total}`)
-      else toast.warning(`全部账号积分更新完成：成功 ${report.success}，失败 ${report.failed}`)
+      const skippedText = filtered.skippedQuotaExhausted > 0 ? `，跳过额度用尽 ${filtered.skippedQuotaExhausted} 个` : ''
+      if (report.failed === 0) toast.success(`全部账号积分已更新：成功 ${report.success}/${report.total}${skippedText}`)
+      else toast.warning(`全部账号积分更新完成：成功 ${report.success}，失败 ${report.failed}${skippedText}`)
     } catch (e) {
       toast.error(`查询全部账号积分失败: ${extractErrorMessage(e)}`)
     } finally {
