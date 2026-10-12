@@ -57,6 +57,9 @@ use parking_lot::Mutex;
 /// 自动模式下单个下游请求共享的 provider 尝试预算，避免随凭据池规模放大上游 RPM。
 const DEFAULT_AUTO_RETRY_ATTEMPTS: usize = 3;
 
+/// Kiro 上游模型容量不足时返回的 `reason`。
+const MODEL_TEMPORARILY_UNAVAILABLE_REASON: &str = "MODEL_TEMPORARILY_UNAVAILABLE";
+
 /// Global model discovery is an auxiliary operation, not an inference request. Keep its
 /// credential fan-out independent from the size of the configured account pool.
 const MODEL_DISCOVERY_MAX_CREDENTIAL_ATTEMPTS: usize = 4;
@@ -1099,6 +1102,7 @@ mod tests {
         TooManyRequestsWithRetryAfter,
         RiskControl,
         ServerError,
+        ModelTemporarilyUnavailable,
         BadRequest,
         Forbidden,
         Success,
@@ -1254,6 +1258,15 @@ mod tests {
                 Json(serde_json::json!({"message": "boom"})),
             )
                 .into_response(),
+            // 现网 Kiro 上游原文：模型容量不足。
+            RotationReply::ModelTemporarilyUnavailable => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "message": "Encountered unexpectedly high load when processing the request, please try again.",
+                    "reason": "MODEL_TEMPORARILY_UNAVAILABLE"
+                })),
+            )
+                .into_response(),
             RotationReply::BadRequest => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"message": "malformed"})),
@@ -1371,6 +1384,188 @@ mod tests {
 
     fn rule_always(reply: RotationReply) -> RotationRule {
         Arc::new(move |_| reply)
+    }
+
+    /// 现网参数：`credentialRetryMaxAttempts = 0`（默认 3 次）+ 请求级推理预算。
+    async fn call_prod_like_rotation_provider(
+        server: &RotationServer,
+        pool_size: usize,
+        budget: Arc<InferenceAttemptBudget>,
+    ) -> Result<(), anyhow::Error> {
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some(server.base_url.clone());
+        config.kiro_upstream_response_timeout_secs = 5;
+        config.credential_retry_max_attempts = 0;
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                fake_bad_request_credentials(pool_size),
+                None,
+                None,
+                false,
+            )
+            .expect("prod-like rotation token manager"),
+        );
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "conv-model-unavailable",
+                "currentMessage": {
+                    "userInputMessage": {"content": "test", "modelId": "claude-sonnet-4"}
+                }
+            }
+        })
+        .to_string();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.call_api_with_context_with_request_id_and_attempt_budget(
+                &request_body,
+                Some("req-model-unavailable"),
+                AcquireMode::WaitForCapacity,
+                1,
+                Some("claude-sonnet-4"),
+                budget,
+                false,
+            ),
+        )
+        .await
+        .expect("prod-like rotation provider call timed out")
+        .map(|_| ())
+    }
+
+    fn distinct_accounts(attempts: &[RotationAttempt]) -> usize {
+        attempts
+            .iter()
+            .map(|attempt| attempt.account)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// 模型容量不足：换号次数放宽到请求级预算（5），而不是默认的 3 次；每次都换新账号。
+    #[tokio::test]
+    async fn model_temporarily_unavailable_rotates_accounts_up_to_inference_budget() {
+        // 前 4 个账号都容量不足，第 5 个成功：默认 3 次会失败，放宽后应成功。
+        let rule: RotationRule = Arc::new(|attempt: &RotationAttempt| {
+            if attempt.account <= 4 {
+                RotationReply::ModelTemporarilyUnavailable
+            } else {
+                RotationReply::Success
+            }
+        });
+        let server = RotationServer::start(rule).await;
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        // 账号按优先级依次选取；只有第 5 个能成功。
+        let result = call_prod_like_rotation_provider(&server, 5, budget.clone()).await;
+        let attempts = server.state.attempts();
+        assert!(result.is_ok(), "fifth account should succeed: {attempts:?}");
+        assert_eq!(attempts.len(), 5, "{attempts:?}");
+        assert_eq!(
+            distinct_accounts(&attempts),
+            5,
+            "each retry must switch account"
+        );
+        assert_eq!(budget.snapshot().consumed, 5);
+
+        // 全部容量不足：用满预算 5 次后失败，不超发。
+        let server =
+            RotationServer::start(rule_always(RotationReply::ModelTemporarilyUnavailable)).await;
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        let error = call_prod_like_rotation_provider(&server, 8, budget.clone())
+            .await
+            .expect_err("all accounts unavailable");
+        let attempts = server.state.attempts();
+        assert_eq!(attempts.len(), 5, "{attempts:?}");
+        assert_eq!(distinct_accounts(&attempts), 5);
+        assert_eq!(budget.snapshot().consumed, 5);
+        let traced = KiroProvider::attempts_from_error(&error);
+        assert_eq!(traced.len(), 5);
+        assert_eq!(traced.last().unwrap().action, "fail");
+        assert!(traced[..4].iter().all(|a| a.action == "transient_retry"));
+
+        // 账号不够多时，账号耗尽即停止，不在同一账号上重复。
+        let server =
+            RotationServer::start(rule_always(RotationReply::ModelTemporarilyUnavailable)).await;
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        call_prod_like_rotation_provider(&server, 2, budget)
+            .await
+            .expect_err("only two accounts");
+        let attempts = server.state.attempts();
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert_eq!(distinct_accounts(&attempts), 2);
+    }
+
+    /// 普通 5xx 不受影响：仍是默认 3 次。
+    #[tokio::test]
+    async fn plain_server_error_keeps_default_retry_limit() {
+        let server = RotationServer::start(rule_always(RotationReply::ServerError)).await;
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        call_prod_like_rotation_provider(&server, 8, budget.clone())
+            .await
+            .expect_err("plain 5xx exhausts default retries");
+        let attempts = server.state.attempts();
+        assert_eq!(
+            attempts.len(),
+            super::DEFAULT_AUTO_RETRY_ATTEMPTS,
+            "{attempts:?}"
+        );
+        assert_eq!(
+            budget.snapshot().consumed as usize,
+            super::DEFAULT_AUTO_RETRY_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn model_temporarily_unavailable_detection_uses_structured_reason() {
+        assert!(KiroProvider::is_model_temporarily_unavailable(
+            r#"{"message":"Encountered unexpectedly high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
+        assert!(KiroProvider::is_model_temporarily_unavailable(
+            r#"{"error":{"reason":"model_temporarily_unavailable"}}"#
+        ));
+        // 只在消息文本里出现、或不是结构化字段时不算。
+        assert!(!KiroProvider::is_model_temporarily_unavailable(
+            r#"{"message":"MODEL_TEMPORARILY_UNAVAILABLE"}"#
+        ));
+        assert!(!KiroProvider::is_model_temporarily_unavailable(
+            "MODEL_TEMPORARILY_UNAVAILABLE"
+        ));
+        assert!(!KiroProvider::is_model_temporarily_unavailable(
+            r#"{"message":"boom"}"#
+        ));
+    }
+
+    #[test]
+    fn model_unavailable_retry_limit_respects_budget_and_send_cap() {
+        let budget = InferenceAttemptBudget::new(5);
+        budget
+            .reserve(InferenceAttemptKind::LocalCredential, 0)
+            .expect("first send");
+        // 第 1 次发送后：已完成 1，剩余 4 → 上限 5。
+        assert_eq!(
+            KiroProvider::model_unavailable_retry_limit(3, 0, 0, Some(&budget), false, None),
+            5
+        );
+        // 为外部池预留 1 次 → 上限 4。
+        assert_eq!(
+            KiroProvider::model_unavailable_retry_limit(3, 0, 0, Some(&budget), true, None),
+            4
+        );
+        // 显式发送上限（扣除已发生的原地重试）优先。
+        assert_eq!(
+            KiroProvider::model_unavailable_retry_limit(3, 0, 1, Some(&budget), false, Some(4)),
+            3
+        );
+        // 只升不降，没有预算时保持原值。
+        assert_eq!(
+            KiroProvider::model_unavailable_retry_limit(7, 0, 0, Some(&budget), false, None),
+            7
+        );
+        assert_eq!(
+            KiroProvider::model_unavailable_retry_limit(3, 0, 0, None, false, None),
+            3
+        );
     }
 
     #[derive(Clone, Default)]
@@ -2027,6 +2222,33 @@ mod tests {
                 )
                     .into_response();
             }
+            // 每轮 3 次请求：带 reasoning → 签名错误；同账号去 reasoning 重试 → 容量不足；
+            // 换号后（仍是去 reasoning 的请求体）→ 成功。
+            "thinking_signature_model_unavailable_then_switch"
+                if !has_history_reasoning_content && state.scenario_hits(&scenario) % 3 == 2 =>
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "message": "Encountered unexpectedly high load when processing the request, please try again.",
+                        "reason": "MODEL_TEMPORARILY_UNAVAILABLE"
+                    })),
+                )
+                    .into_response();
+            }
+            "thinking_signature_model_unavailable_then_switch"
+                if !has_history_reasoning_content =>
+            {
+                return (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/vnd.amazon.eventstream",
+                    )],
+                    Vec::<u8>::new(),
+                )
+                    .into_response();
+            }
             "thinking_signature_too_long_second"
                 if !has_history_reasoning_content && state.scenario_hits(&scenario) == 2 =>
             {
@@ -2117,6 +2339,7 @@ mod tests {
             | "thinking_signature_repeat"
             | "thinking_signature_unexpected_second"
             | "thinking_signature_rate_limited_second"
+            | "thinking_signature_model_unavailable_then_switch"
             | "thinking_signature_too_long_second"
             | "thinking_signature_read_failure"
             | "thinking_signature_root_without_builder" => serde_json::json!({
@@ -5276,7 +5499,9 @@ mod tests {
                     .await
                     .expect_err("retryable second response must surface as transient failure");
 
-                    assert_eq!(server.state.scenario_hits(scenario) - hits_before, 2);
+                    // 签名重试（同账号 2 次发送）后，瞬态错误继续换号，直到请求级预算 4 用完；
+                    // 签名重试占用的发送计入预算，每个账号都返回同类错误，以瞬态失败结束。
+                    assert_eq!(server.state.scenario_hits(scenario) - hits_before, 4);
                     assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
                     assert!(
                         error
@@ -5299,17 +5524,28 @@ mod tests {
                     );
                     assert_eq!(KiroProvider::call_failure_kind_from_error(&error), None);
                     let attempts = KiroProvider::attempts_from_error(&error);
-                    assert_eq!(attempts.len(), 2);
+                    assert_eq!(attempts.len(), 4, "{attempts:?}");
                     assert_eq!(
                         attempts[0].error_type.as_deref(),
                         Some("thinking_signature_invalid")
                     );
-                    assert_eq!(attempts[1].status, Some(expected_status));
-                    assert_eq!(attempts[1].error_type.as_deref(), Some(expected_class));
                     assert_eq!(attempts[0].credential_id, attempts[1].credential_id);
+                    for attempt in &attempts[1..] {
+                        assert_eq!(attempt.status, Some(expected_status));
+                        assert_eq!(attempt.error_type.as_deref(), Some(expected_class));
+                    }
+                    assert_eq!(attempts[1].action, "transient_retry", "{attempts:?}");
+                    assert_eq!(attempts[2].action, "transient_retry", "{attempts:?}");
+                    assert_eq!(attempts[3].action, "fail", "{attempts:?}");
+                    // 换号后不再回到失败账号。
+                    let switched = attempts[1..]
+                        .iter()
+                        .map(|attempt| attempt.credential_id)
+                        .collect::<HashSet<_>>();
+                    assert_eq!(switched.len(), 3, "{attempts:?}");
                     let snapshot = budget.snapshot();
-                    assert_eq!(snapshot.consumed, 2);
-                    assert_eq!(snapshot.local_attempts, 2);
+                    assert_eq!(snapshot.consumed, 4);
+                    assert_eq!(snapshot.local_attempts, 4);
                     assert_eq!(snapshot.external_attempts, 0);
                     let manager_snapshot = manager.snapshot();
                     assert!(
@@ -5333,6 +5569,81 @@ mod tests {
                         cooldown_reasons
                     );
                 }
+            }
+        }
+    }
+
+    /// 现网 8 条样本：签名重试后撞上 MODEL_TEMPORARILY_UNAVAILABLE，旧逻辑直接失败不换号。
+    /// 修复后换到另一个账号，并沿用去掉历史 reasoning 的请求体。
+    #[tokio::test]
+    async fn thinking_signature_retry_model_unavailable_switches_account_for_five_rounds() {
+        let server = FakeBadRequestServer::start().await;
+        let scenario = "thinking_signature_model_unavailable_then_switch";
+        for is_stream in [false, true] {
+            let (provider, _manager) = fake_thinking_signature_provider(&server.base_url, 20);
+            for round in 1..=5 {
+                let request_body = thinking_signature_request_body(scenario, round);
+                let retry_body = strip_reasoning_content_for_provider_test(&request_body);
+                let builder_calls = Arc::new(AtomicUsize::new(0));
+                let builder_counter = builder_calls.clone();
+                let budget = Arc::new(InferenceAttemptBudget::new(5));
+                let requests_before = server.state.signature_requests(scenario).len();
+                let (credential_id, attempts) = call_thinking_signature_retry(
+                    &provider,
+                    &request_body,
+                    is_stream,
+                    budget.clone(),
+                    false,
+                    None,
+                    move || {
+                        builder_counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(retry_body)
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("stream={is_stream} round={round}: should switch account: {error}")
+                });
+
+                assert_eq!(builder_calls.load(Ordering::SeqCst), 1);
+                let requests = server.state.signature_requests(scenario);
+                let requests = &requests[requests_before..];
+                assert_eq!(requests.len(), 3, "stream={is_stream} round={round}");
+                // 签名重试在同一账号上，换号后是另一个账号。
+                assert_eq!(requests[0].authorization, requests[1].authorization);
+                assert_ne!(requests[1].authorization, requests[2].authorization);
+                // 换号后的请求不再带历史 reasoning，且会话标识已刷新。
+                assert!(
+                    requests[2]
+                        .body
+                        .pointer(
+                            "/conversationState/history/0/assistantResponseMessage/reasoningContent"
+                        )
+                        .is_none(),
+                    "stream={is_stream} round={round}: {:?}",
+                    requests[2].body
+                );
+                assert_ne!(
+                    requests[2]
+                        .body
+                        .pointer("/conversationState/conversationId"),
+                    requests[1]
+                        .body
+                        .pointer("/conversationState/conversationId"),
+                );
+
+                assert_eq!(attempts.len(), 3, "{attempts:?}");
+                assert_eq!(
+                    attempts[0].error_type.as_deref(),
+                    Some("thinking_signature_invalid")
+                );
+                assert_eq!(attempts[1].action, "transient_retry");
+                assert_eq!(attempts[1].status, Some(500));
+                assert_eq!(attempts[2].credential_id, credential_id);
+                assert_ne!(attempts[2].credential_id, attempts[1].credential_id);
+                let snapshot = budget.snapshot();
+                assert_eq!(snapshot.consumed, 3);
+                assert_eq!(snapshot.local_attempts, 3);
             }
         }
     }
@@ -11696,8 +12007,15 @@ impl KiroProvider {
                 ))
             });
         let mut thinking_signature_retry_body_builder = thinking_signature_retry_body_builder;
+        // 同一次尝试内额外发送的次数（thinking 签名原地重试），用于按真实发送次数核算预算。
+        let mut extra_sends: usize = 0;
 
-        for attempt in 0..max_retries {
+        // `max_retries` 在循环中可能被调整（MODEL_TEMPORARILY_UNAVAILABLE 放宽换号次数、
+        // 签名原地重试占用发送），因此用 while 每轮重新判断上限。
+        let mut next_attempt: usize = 0;
+        while next_attempt < max_retries {
+            let attempt = next_attempt;
+            next_attempt += 1;
             // 获取调用上下文（绑定 index、credentials、token）
             let acquire_started_at = Instant::now();
             let acquire_result = self
@@ -12924,13 +13242,39 @@ impl KiroProvider {
                         max_retries,
                         "Kiro API thinking-signature retry returned a retryable upstream status"
                     );
+                    // 去掉历史 reasoning 的请求体已经通过签名校验；上游此时的 5xx/429/408
+                    // 与签名无关（如 MODEL_TEMPORARILY_UNAVAILABLE 容量不足），换号重试时沿用该
+                    // 请求体，并刷新会话标识。签名重试本身占用了一次发送。
+                    // 签名重试多占用了一次发送：下调循环上限，后续 `attempt + 1 < max_retries`
+                    // 判断仍按真实发送次数计算。
+                    extra_sends = extra_sends.saturating_add(1);
+                    max_retries = max_retries.saturating_sub(1);
+                    if Self::is_model_temporarily_unavailable(&retry_upstream_body.text) {
+                        max_retries = Self::model_unavailable_retry_limit(
+                            max_retries,
+                            attempt,
+                            extra_sends,
+                            inference_attempt_budget,
+                            preserve_external_attempt,
+                            max_sends,
+                        );
+                    }
+                    let can_retry = attempt + 1 < max_retries;
+                    if can_retry {
+                        refreshed_request_body = Some(retry_body.clone());
+                        Self::refresh_request_identity_for_retry(
+                            &mut refreshed_request_body,
+                            &retry_body,
+                            request_id,
+                        );
+                    }
                     Self::push_attempt(
                         &mut attempts,
                         attempt.saturating_add(1),
                         ctx.id,
                         &credential_label,
                         Some(retry_status),
-                        "fail",
+                        if can_retry { "transient_retry" } else { "fail" },
                         Some(failure_kind.as_error_type()),
                         Some(message.clone()),
                         retry_started_at,
@@ -12971,14 +13315,22 @@ impl KiroProvider {
                         &credential_label,
                         &mut excluded_ids,
                     );
-                    self.maybe_exclude_after_transient_failure(
+                    let retry_target_available = self.maybe_exclude_after_transient_failure(
                         model.as_deref(),
                         ctx.id,
                         &credential_label,
                         &mut excluded_ids,
                     );
-                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
+                    if can_retry && retry_target_available {
+                        last_error = Some(anyhow::anyhow!(message.clone()));
+                        sleep(Self::retry_delay(attempt)).await;
+                        continue;
+                    }
+                    if let Some(last) = attempts.last_mut() {
+                        last.action = "fail".to_string();
+                    }
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     return Err(Self::traced_error(message, &attempts));
                 }
 
@@ -13528,6 +13880,16 @@ impl KiroProvider {
                     max_retries,
                     "Kiro API returned a retryable upstream status"
                 );
+                if status.is_server_error() && Self::is_model_temporarily_unavailable(&body) {
+                    max_retries = Self::model_unavailable_retry_limit(
+                        max_retries,
+                        attempt,
+                        extra_sends,
+                        inference_attempt_budget,
+                        preserve_external_attempt,
+                        max_sends,
+                    );
+                }
                 let mut can_retry = attempt + 1 < max_retries;
                 // 5xx/408: the upstream already started processing the turn. 429: production
                 // shows the same "Improperly formed request" on every resend with the same ids
@@ -13822,6 +14184,40 @@ impl KiroProvider {
     #[cfg(test)]
     pub(crate) fn test_extract_conversation_id_from_request(request_body: &str) -> Option<String> {
         Self::extract_conversation_id_from_request(request_body)
+    }
+
+    /// 上游返回 `MODEL_TEMPORARILY_UNAVAILABLE`：模型容量不足（"unexpectedly high load"），
+    /// 与账号无关但换号往往能成功。
+    fn is_model_temporarily_unavailable(body: &str) -> bool {
+        Self::structured_upstream_error_codes(body)
+            .iter()
+            .any(|code| code.eq_ignore_ascii_case(MODEL_TEMPORARILY_UNAVAILABLE_REASON))
+    }
+
+    /// `MODEL_TEMPORARILY_UNAVAILABLE` 时的换号次数上限（循环计数）。
+    ///
+    /// 普通瞬态错误沿用 `credentialRetryMaxAttempts` / 默认 3 次；模型容量不足时
+    /// 放宽到请求级推理预算允许的全部本地发送（受显式 `max_sends` 约束），只升不降。
+    /// `extra_sends` 是同一请求内已额外发生的原地重试次数，不计入循环但占用预算。
+    fn model_unavailable_retry_limit(
+        current: usize,
+        attempt: usize,
+        extra_sends: usize,
+        budget: Option<&InferenceAttemptBudget>,
+        preserve_external_attempt: bool,
+        max_sends: Option<usize>,
+    ) -> usize {
+        let Some(budget) = budget else {
+            return current;
+        };
+        // 已完成的发送 = 本次（attempt 从 0 计）+ 额外原地重试；剩余预算即可继续换号的次数。
+        let completed = attempt.saturating_add(1);
+        let remaining = budget.available_attempts(u32::from(preserve_external_attempt)) as usize;
+        let mut limit = completed.saturating_add(remaining);
+        if let Some(max_sends) = max_sends {
+            limit = limit.min(max_sends.saturating_sub(extra_sends));
+        }
+        current.max(limit)
     }
 
     fn max_retry_attempts(_total_credentials: usize, config: &Config) -> usize {
