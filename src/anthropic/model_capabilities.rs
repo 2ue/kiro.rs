@@ -1249,18 +1249,21 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
         return ModelResolution::resolved(requested, target, ModelResolutionSource::Alias);
     }
 
-    if let Some(candidate) = explicit_model_alias_families(&base)
-        .and_then(|families| pick_family_available(&available, &families))
-        .filter(|_| model_mapping.auto_generate_rules)
-    {
-        return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
-    }
-
     if let Some(alias) = explicit_model_alias_candidates(&base)
         .and_then(|candidates| pick_available(&available, &candidates))
         .filter(|_| model_mapping.auto_generate_rules)
     {
         return ModelResolution::resolved(requested, alias, ModelResolutionSource::Alias);
+    }
+
+    // Bare aliases prefer their configured/canonical model spelling. Only when that
+    // version is absent should the resolver select the highest available model in the
+    // requested family.
+    if let Some(candidate) = explicit_model_alias_families(&base)
+        .and_then(|families| pick_family_available(&available, &families))
+        .filter(|_| model_mapping.auto_generate_rules)
+    {
+        return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
     }
 
     if !mode.allows_family_fallback() {
@@ -1395,6 +1398,12 @@ fn explicit_model_alias_candidates(model: &str) -> Option<Vec<&'static str>> {
             "claude-haiku-4.5",
             "claude-haiku-4-5-20251001",
             "claude-haiku-4-5-20251001-thinking",
+        ]),
+        "fable" => Some(vec![
+            "fable",
+            "claude-fable-5.1",
+            "claude-fable-5-1",
+            "claude-fable-5",
         ]),
         "claude-sonnet-4-20250514" => Some(vec![
             "claude-sonnet-4",
@@ -2935,20 +2944,79 @@ mod tests {
     }
 
     #[test]
-    fn resolver_aliases_pick_highest_synced_family_model_before_static_candidates() {
+    fn resolver_aliases_prefer_canonical_synced_family_model_before_highest_fallback() {
         let models = vec![
             "claude-opus-4.7".to_string(),
             "claude-opus-4.8".to_string(),
             "claude-sonnet-4.6".to_string(),
+            "claude-sonnet-5.5".to_string(),
+            "claude-haiku-4.5".to_string(),
+            "claude-haiku-5.5".to_string(),
+            "claude-fable-5".to_string(),
+            "claude-fable-5.1".to_string(),
         ];
 
         let opus = resolve_model_with_catalog("opus", &models);
         assert_eq!(opus.source, ModelResolutionSource::Alias);
-        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4.7"));
 
         let default = resolve_model_with_catalog("default", &models);
         assert_eq!(default.source, ModelResolutionSource::Alias);
-        assert_eq!(default.upstream_model.as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(default.upstream_model.as_deref(), Some("claude-opus-4.7"));
+
+        let sonnet = resolve_model_with_catalog("sonnet", &models);
+        assert_eq!(sonnet.source, ModelResolutionSource::Alias);
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4.6"));
+
+        let haiku = resolve_model_with_catalog("haiku", &models);
+        assert_eq!(haiku.source, ModelResolutionSource::Alias);
+        assert_eq!(haiku.upstream_model.as_deref(), Some("claude-haiku-4.5"));
+
+        let fable = resolve_model_with_catalog("fable", &models);
+        assert_eq!(fable.source, ModelResolutionSource::Alias);
+        assert_eq!(fable.upstream_model.as_deref(), Some("claude-fable-5.1"));
+
+        let newer_only = resolve_model_with_catalog(
+            "sonnet",
+            &[
+                "claude-sonnet-5".to_string(),
+                "claude-sonnet-5.5".to_string(),
+            ],
+        );
+        assert_eq!(newer_only.source, ModelResolutionSource::Alias);
+        assert_eq!(
+            newer_only.upstream_model.as_deref(),
+            Some("claude-sonnet-5.5")
+        );
+    }
+
+    #[test]
+    fn resolver_explicit_versions_prefer_same_family_and_minor_before_newer_models() {
+        let models = vec![
+            "claude-haiku-4.5".to_string(),
+            "claude-haiku-5.5".to_string(),
+            "claude-sonnet-4.6".to_string(),
+            "claude-sonnet-5.5".to_string(),
+            "claude-opus-4.7".to_string(),
+            "claude-opus-5.5".to_string(),
+            "claude-fable-5".to_string(),
+            "claude-fable-5.1".to_string(),
+        ];
+
+        for (requested, expected) in [
+            ("claude-haiku-4-5-20251001", "claude-haiku-4.5"),
+            ("claude-haiku-4-5-20251001-thinking", "claude-haiku-4.5"),
+            ("claude-sonnet-4-6", "claude-sonnet-4.6"),
+            ("claude-opus-4-7", "claude-opus-4.7"),
+            ("claude-fable-5-1", "claude-fable-5.1"),
+        ] {
+            let result = resolve_model_with_catalog(requested, &models);
+            assert_eq!(
+                result.upstream_model.as_deref(),
+                Some(expected),
+                "{requested} must not drift to a newer family model"
+            );
+        }
     }
 
     #[test]
@@ -3043,9 +3111,9 @@ mod tests {
         .map(str::to_string)
         .to_vec();
         for (requested, expected_upstream) in [
-            ("sonnet-thinking", "claude-sonnet-5.5"),
-            ("opus-thinking", "claude-opus-5.5"),
-            ("haiku-thinking", "claude-haiku-5.5"),
+            ("sonnet-thinking", "claude-sonnet-4.6"),
+            ("opus-thinking", "claude-opus-4.7"),
+            ("haiku-thinking", "claude-haiku-4.5"),
             ("claude-sonnet-4-5-thinking", "claude-sonnet-4.5"),
             ("claude-opus-4-5-thinking", "claude-opus-4.5"),
             ("claude-haiku-4-5-thinking", "claude-haiku-4.5"),
@@ -3075,8 +3143,8 @@ mod tests {
                 "claude-haiku-4-5-20251001",
             ),
             ("claude-sonnet-4-20250514-thinking", "claude-sonnet-4"),
-            ("sonnet[1m]-thinking", "claude-sonnet-5.5"),
-            ("opus-thinking[1m]", "claude-opus-5.5"),
+            ("sonnet[1m]-thinking", "claude-sonnet-4.6"),
+            ("opus-thinking[1m]", "claude-opus-4.7"),
             ("claude-sonnet-4-6-thinking[1m]", "claude-sonnet-4-6"),
             ("claude-sonnet-4-6[1m]-thinking", "claude-sonnet-4-6"),
             ("claude-opus-4-8-thinking[1m]", "claude-opus-4.8"),

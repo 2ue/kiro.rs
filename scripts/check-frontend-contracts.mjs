@@ -20,6 +20,7 @@ const intentionallyUiOnly = new Set([
   'UsageOverviewRankRow',
   'UsageOverviewRankingsResponse',
   'UsageOverviewResponse',
+  'UsageOverviewRouteRow',
   'UsageOverviewSeriesMetrics',
   'UsageOverviewSeriesPoint',
   'UsageOverviewSeriesResponse',

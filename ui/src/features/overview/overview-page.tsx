@@ -38,6 +38,7 @@ import type {
   ExternalPool,
   UsageOverviewMetrics,
   UsageOverviewRankRow,
+  UsageOverviewRouteRow,
   UsageOverviewSeriesPoint,
 } from '@/types/api'
 import {
@@ -524,12 +525,14 @@ function TrendPanel({
 
 function LocalPoolSection({
   metrics,
+  routes,
   accountRows,
   accountsLoading,
   range,
   navigate,
 }: {
   metrics: UsageOverviewMetrics
+  routes: UsageOverviewRouteRow[]
   accountRows: LocalAccountOverviewRow[]
   accountsLoading: boolean
   range: { from: string; to: string }
@@ -605,6 +608,58 @@ function LocalPoolSection({
         <Button size="xs" variant="outline" onClick={() => navigate('/credentials')}>
           账号管理 <ExternalLink className="size-3.5" />
         </Button>
+      </div>
+      <div className="mt-4">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold">路由积分消耗</h3>
+          <span className="text-[0.68rem] text-muted-foreground">{formatNumber(routes.length)} 个路由</span>
+        </div>
+        {routes.length === 0 ? (
+          <EmptyState title="暂无路由数据" className="py-6" />
+        ) : (
+          <div className="overflow-x-auto">
+            <Table className="min-w-[760px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>路由</TableHead>
+                  <TableHead className="text-right">请求</TableHead>
+                  <TableHead className="text-right">已消耗积分</TableHead>
+                  <TableHead className="text-right">估算费用</TableHead>
+                  <TableHead className="text-right">积分转换率</TableHead>
+                  <TableHead className="text-right">错误率</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {routes.map((route) => {
+                  const estimatedRate = creditCostRate(
+                    route.metrics.estimatedCostUsd,
+                    route.metrics.kiroMeteringUsage,
+                  )
+                  const originalRate = creditCostRate(
+                    route.metrics.originalCostUsd,
+                    route.metrics.kiroMeteringUsage,
+                  )
+                  return (
+                    <TableRow key={route.key}>
+                      <TableCell className="font-medium">{route.label}</TableCell>
+                      <TableCell className="text-right font-mono text-xs">{formatNumber(route.metrics.requests)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs">{formatNumber(route.metrics.kiroMeteringUsage)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs">
+                        <div>{formatUsdFixed2(route.metrics.estimatedCostUsd)}</div>
+                        <div className="text-[0.62rem] text-muted-foreground">原始 {formatUsdFixed2(route.metrics.originalCostUsd)}</div>
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs">
+                        <div>{formatCreditCostRate(estimatedRate)}</div>
+                        <div className="text-[0.62rem] text-muted-foreground">原始 {formatCreditCostRate(originalRate)}</div>
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs">{formatPercent(route.metrics.errorRate)}</TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          </div>
+        )}
       </div>
       {accountsLoading ? (
         <LoadingState text="加载本地账号数据..." className="mt-3 py-8" />
@@ -1243,6 +1298,7 @@ export function OverviewPage() {
           ) : (
             <LocalPoolSection
               metrics={summaryData.totals.local}
+              routes={local.data?.local.routes ?? []}
               accountRows={localAccountRows}
               accountsLoading={localCredentials.isLoading || (localCredentialIds.length > 0 && localCredentialRuntime.isLoading)}
               range={summaryData.range}

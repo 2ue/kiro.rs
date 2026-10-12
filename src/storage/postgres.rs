@@ -28,12 +28,12 @@ use crate::anthropic::usage::{
     UsageExternalPoolRiskQuery, UsageExternalPoolRiskResponse, UsageExternalPoolRiskSample,
     UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals, UsageExternalPoolRiskWindow,
     UsageOverviewAccountRow, UsageOverviewExternal, UsageOverviewLocal, UsageOverviewMetrics,
-    UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewSeriesMetrics,
-    UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals, UsageRealtimeStats,
-    UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
-    UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
-    usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
-    usage_dashboard_window_spec_for_key, usage_dashboard_windows,
+    UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewRouteRow,
+    UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals,
+    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
+    UsageRecordsResult, UsageRouteKind, UsageRouteSubtype, UsageSeriesPoint, UsageSource,
+    UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
+    usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -5837,6 +5837,7 @@ impl PostgresUsageStore {
             "global".to_string(),
             "external_pool".to_string(),
             "credential".to_string(),
+            "local_route".to_string(),
             "model".to_string(),
             "endpoint".to_string(),
             "request_api_key".to_string(),
@@ -5897,6 +5898,7 @@ impl PostgresUsageStore {
         let mut pools = HashMap::<String, OverviewPoolAccumulator>::new();
         let mut accounts = HashMap::<String, OverviewAccumulator>::new();
         let mut account_labels = HashMap::<String, String>::new();
+        let mut local_routes = HashMap::<String, OverviewAccumulator>::new();
         let mut models = HashMap::<String, OverviewRankAccumulator>::new();
         let mut keys = HashMap::<String, OverviewRankAccumulator>::new();
         let mut paths = HashMap::<String, OverviewRankAccumulator>::new();
@@ -5951,6 +5953,10 @@ impl PostgresUsageStore {
                     if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
                         account_labels.insert(dimension_key, label.to_string());
                     }
+                }
+                "local_route" => {
+                    let route = local_routes.entry(dimension_key.clone()).or_default();
+                    route.add(metrics);
                 }
                 "model" => {
                     let rank = models.entry(dimension_key.clone()).or_default();
@@ -6048,6 +6054,29 @@ impl PostgresUsageStore {
         });
         let accounts_total = account_rows.len();
         let active_accounts = accounts_total;
+        let mut route_rows = local_routes
+            .into_iter()
+            .map(|(key, value)| UsageOverviewRouteRow {
+                label: usage_local_route_label(&key),
+                key,
+                metrics: value.to_metrics(),
+            })
+            .filter(|row| row.metrics.requests > 0)
+            .collect::<Vec<_>>();
+        route_rows.sort_by(|left, right| {
+            right
+                .metrics
+                .kiro_metering_usage
+                .total_cmp(&left.metrics.kiro_metering_usage)
+                .then_with(|| {
+                    right
+                        .metrics
+                        .estimated_cost_usd
+                        .total_cmp(&left.metrics.estimated_cost_usd)
+                })
+                .then_with(|| right.metrics.requests.cmp(&left.metrics.requests))
+                .then_with(|| left.key.cmp(&right.key))
+        });
         let mut top_accounts = account_rows
             .iter()
             .map(|row| UsageOverviewRankRow {
@@ -6115,6 +6144,7 @@ impl PostgresUsageStore {
                 active_accounts,
                 accounts_total,
                 accounts: account_rows,
+                routes: route_rows,
             },
             series: series_points,
             top_models,
@@ -9689,6 +9719,20 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
         });
     }
 
+    if record.route_kind == Some(UsageRouteKind::LocalCredential) {
+        let route_key = record
+            .route_subtype
+            .map(usage_route_subtype_value)
+            .unwrap_or("local_unknown")
+            .to_string();
+        dimensions.push(UsageRollupDimension {
+            dimension: "local_route",
+            label: Some(usage_local_route_label(&route_key)),
+            key: route_key,
+            include_time_bucket: true,
+        });
+    }
+
     if let Some(external_pool_id) = record.external_pool_id {
         dimensions.push(UsageRollupDimension {
             dimension: "external_pool",
@@ -12250,6 +12294,31 @@ fn usage_route_kind_value(route_kind: UsageRouteKind) -> &'static str {
     }
 }
 
+fn usage_route_subtype_value(route_subtype: UsageRouteSubtype) -> &'static str {
+    match route_subtype {
+        UsageRouteSubtype::LocalSuccess => "local_success",
+        UsageRouteSubtype::LocalErrorNoFallback => "local_error_no_fallback",
+        UsageRouteSubtype::LocalRescueAfterExternal => "local_rescue_after_external",
+        UsageRouteSubtype::ExternalFallbackPreflight => "external_fallback_preflight",
+        UsageRouteSubtype::ExternalFallbackAfterLocalAttempts => {
+            "external_fallback_after_local_attempts"
+        }
+        UsageRouteSubtype::ExternalDirectPolicy => "external_direct_policy",
+        UsageRouteSubtype::ExternalRoutePolicy => "external_route_policy",
+        UsageRouteSubtype::ExternalError => "external_error",
+    }
+}
+
+fn usage_local_route_label(value: &str) -> String {
+    match value {
+        "local_success" => "本地直连成功".to_string(),
+        "local_error_no_fallback" => "本地失败（未回退）".to_string(),
+        "local_rescue_after_external" => "外部失败后本地救援".to_string(),
+        "local_unknown" => "本地未知路由".to_string(),
+        _ => format!("本地 · {value}"),
+    }
+}
+
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS runtime_config (
     id TEXT PRIMARY KEY,
@@ -13679,6 +13748,37 @@ mod tests {
             payload_breakdown: None,
             payload_guard_report: None,
         }
+    }
+
+    #[test]
+    fn usage_rollup_dimensions_include_local_route_subtype_only_for_local_routes() {
+        let mut local = usage_record("local-route", 0);
+        local.route_kind = Some(UsageRouteKind::LocalCredential);
+        local.route_subtype = Some(UsageRouteSubtype::LocalRescueAfterExternal);
+        let local_route = usage_rollup_dimensions(&local)
+            .into_iter()
+            .find(|dimension| dimension.dimension == "local_route")
+            .expect("local route rollup dimension");
+        assert_eq!(local_route.key, "local_rescue_after_external");
+        assert_eq!(local_route.label.as_deref(), Some("外部失败后本地救援"));
+        assert!(local_route.include_time_bucket);
+
+        local.route_kind = Some(UsageRouteKind::ExternalPool);
+        assert!(
+            usage_rollup_dimensions(&local)
+                .into_iter()
+                .all(|dimension| dimension.dimension != "local_route")
+        );
+    }
+
+    #[test]
+    fn usage_local_route_labels_keep_unknown_subtypes_visible() {
+        assert_eq!(usage_local_route_label("local_success"), "本地直连成功");
+        assert_eq!(usage_local_route_label("local_unknown"), "本地未知路由");
+        assert_eq!(
+            usage_local_route_label("unexpected_route"),
+            "本地 · unexpected_route"
+        );
     }
 
     fn fixed_utc(value: &str) -> DateTime<Utc> {

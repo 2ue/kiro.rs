@@ -1135,6 +1135,12 @@ export interface UsageOverviewAccountRow {
   metrics: UsageOverviewMetrics
 }
 
+export interface UsageOverviewRouteRow {
+  key: string
+  label: string
+  metrics: UsageOverviewMetrics
+}
+
 export interface UsageOverviewRankRow {
   key: string
   label: string
@@ -1175,6 +1181,7 @@ export interface UsageOverviewResponse {
     activeAccounts: number
     accountsTotal: number
     accounts: UsageOverviewAccountRow[]
+    routes: UsageOverviewRouteRow[]
   }
   series: UsageOverviewSeriesPoint[]
   topModels: UsageOverviewRankRow[]

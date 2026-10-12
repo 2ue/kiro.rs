@@ -1413,6 +1413,14 @@ pub struct UsageOverviewAccountRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageOverviewRouteRow {
+    pub key: String,
+    pub label: String,
+    pub metrics: UsageOverviewMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageOverviewRankRow {
     pub key: String,
     pub label: String,
@@ -1552,6 +1560,8 @@ pub struct UsageOverviewLocal {
     pub active_accounts: usize,
     pub accounts_total: usize,
     pub accounts: Vec<UsageOverviewAccountRow>,
+    #[serde(default)]
+    pub routes: Vec<UsageOverviewRouteRow>,
 }
 
 #[derive(Debug, Clone)]
