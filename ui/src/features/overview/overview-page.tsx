@@ -547,10 +547,6 @@ function LocalPoolSection({
     (sum, account) => sum + (account.accountInfo?.creditRemaining ?? 0),
     0,
   )
-  const estimatedRemainingCostUsd = availableCreditRows.reduce(
-    (sum, account) => sum + (account.estimatedRemainingCostUsd ?? 0),
-    0,
-  )
   const unavailableCreditCount = accountRows.filter((account) => account.creditEstimateBlocked).length
   const unqueriedCreditCount = accountRows.filter((account) => (
     !account.creditEstimateBlocked &&
@@ -559,6 +555,9 @@ function LocalPoolSection({
   const localCostDiff = localCostDiffInfo(metrics.estimatedCostUsd, metrics.originalCostUsd)
   const estimatedCreditRate = creditCostRate(metrics.estimatedCostUsd, metrics.kiroMeteringUsage)
   const originalCreditRate = creditCostRate(metrics.originalCostUsd, metrics.kiroMeteringUsage)
+  const estimatedRemainingCostUsd = estimatedCreditRate == null
+    ? undefined
+    : estimatedCreditRate * availableCreditRemaining
 
   return (
     <SectionCard>
@@ -598,10 +597,12 @@ function LocalPoolSection({
         />
         <StatCard
           title="预估估算费用"
-          value={formatUsdFixed2(estimatedRemainingCostUsd)}
-          desc="估算计费 / 已消耗积分 × 剩余积分"
+          value={estimatedRemainingCostUsd == null ? '无法估算' : formatUsdFixed2(estimatedRemainingCostUsd)}
+          desc={estimatedCreditRate == null
+            ? '没有已消耗积分，无法估算'
+            : '总估算费用 / 总已消耗积分 × 剩余积分'}
           icon={<DollarSign />}
-          tone="success"
+          tone={estimatedRemainingCostUsd == null ? 'warning' : 'success'}
         />
         <StatCard title="错误率" value={formatPercent(metrics.errorRate)} desc={`${formatCompact(metrics.errorRequests)} 个错误请求`} icon={<AlertTriangle />} tone={metrics.errorRate > 0.05 ? 'error' : metrics.errorRate > 0 ? 'warning' : 'success'} />
       </div>
