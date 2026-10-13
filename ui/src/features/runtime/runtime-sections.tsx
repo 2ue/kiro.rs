@@ -845,12 +845,15 @@ function NonStreamCacheToggle({
 
 function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
+  // 只透传已配置的值，不补默认：未配置的模板保持关闭且不新增字段。
+  const coldRequestGuard = policy.coldRequestGuard ? { coldRequestGuard: policy.coldRequestGuard } : {}
   if (cacheType === 'kiro_rs_tool') {
     return {
       cacheType: 'kiro_rs_tool',
       reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
       kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
       hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
+      ...coldRequestGuard,
     }
   }
   if (cacheType === 'stable_segment_cache') {
@@ -859,6 +862,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
       reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
       stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(),
       hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
+      ...coldRequestGuard,
     }
   }
   return {
@@ -867,6 +871,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
     creationControl: policy.creationControl ?? defaultPromptCacheCreationControl(),
     reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
     hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
+    ...coldRequestGuard,
   }
 }
 

@@ -2526,9 +2526,13 @@ function StrategyTemplateCard({
 function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
   const hitShaping = policy.hitShaping ?? defaultCacheHitShaping()
-  if (cacheType === 'kiro_rs_tool') return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(), hitShaping }
+  // 只透传已配置的值，不补默认：未配置的模板保持关闭且不新增字段。
+  const coldRequestGuard = policy.coldRequestGuard ? { coldRequestGuard: policy.coldRequestGuard } : {}
+  if (cacheType === 'kiro_rs_tool') {
+    return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(), hitShaping, ...coldRequestGuard }
+  }
   if (cacheType === 'stable_segment_cache') {
-    return { cacheType: 'stable_segment_cache', stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(), hitShaping }
+    return { cacheType: 'stable_segment_cache', stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(), hitShaping, ...coldRequestGuard }
   }
   return {
     cacheType: 'current_high_cache',
@@ -2536,6 +2540,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
     creationControl: policy.creationControl ?? defaultPromptCacheCreationControl(),
     reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
     hitShaping,
+    ...coldRequestGuard,
   }
 }
 
