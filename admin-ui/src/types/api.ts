@@ -1439,6 +1439,12 @@ export interface CacheRoutePolicyPatch {
   kiroRsTool?: KiroRsToolCachePolicyPatch
   stableSegment?: StableSegmentCachePolicyPatch
   hitShaping?: CacheHitShapingPolicyPatch
+  coldRequestGuard?: ColdRequestGuardPolicyPatch
+}
+
+/** 冷请求 usage 约束：默认关闭，关闭时与未引入该约束的行为一致。 */
+export interface ColdRequestGuardPolicyPatch {
+  enabled?: boolean
 }
 
 export interface CacheHitShapingPolicyPatch {

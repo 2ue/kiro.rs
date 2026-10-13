@@ -697,7 +697,7 @@ function canonicalCachePolicyPath(prefix: string): string {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.stableSegment && !policy.hitShaping
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard
 }
 
 export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {

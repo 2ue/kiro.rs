@@ -68,6 +68,7 @@ type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
 type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
 type StableSegmentPatch = NonNullable<CacheRoutePolicyPatch['stableSegment']>
 type CacheHitShapingPatch = NonNullable<CacheRoutePolicyPatch['hitShaping']>
+type ColdRequestGuardPatch = NonNullable<CacheRoutePolicyPatch['coldRequestGuard']>
 type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
 
 const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
@@ -362,6 +363,23 @@ function SimulationOverrideForm({
         onChange={set('capJitterMaxTokens')}
       />
     </div>
+  )
+}
+
+function ColdRequestGuardToggle({
+  value,
+  onChange,
+}: {
+  value: ColdRequestGuardPatch | undefined
+  onChange: (next: ColdRequestGuardPatch) => void
+}) {
+  return (
+    <TogField
+      label="冷请求用量约束"
+      desc="默认关闭，关闭时与未开启前完全一致。开启后，本地缓存没有命中的请求（新会话首轮、fork / resume 后、服务重启后的第一条）缓存读取为 0，输入 + 写入不超过真实输入；命中之后的轮次仍按上面的参数整形。"
+      checked={Boolean(value?.enabled)}
+      onChange={(enabled) => onChange({ enabled })}
+    />
   )
 }
 
@@ -887,6 +905,10 @@ function StrategyTemplateEditor({
     <div className="space-y-3">
       <div className="text-sm font-semibold">命中率与小值整形</div>
       <CacheHitShapingForm value={template.hitShaping ?? defaultCacheHitShaping()} onChange={setHitShaping} />
+      <ColdRequestGuardToggle
+        value={template.coldRequestGuard}
+        onChange={(coldRequestGuard) => onChange({ ...template, coldRequestGuard })}
+      />
     </div>
   )
 
@@ -1154,6 +1176,10 @@ function PathStrategyBindingCard({
               value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
               onChange={(hitShaping) => patch({ hitShaping })}
             />
+            <ColdRequestGuardToggle
+              value={effectivePolicy.coldRequestGuard}
+              onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
+            />
           </div>
         </div>
       ) : effectiveCacheType === 'stable_segment_cache' ? (
@@ -1185,6 +1211,10 @@ function PathStrategyBindingCard({
               value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
               onChange={(hitShaping) => patch({ hitShaping })}
             />
+            <ColdRequestGuardToggle
+              value={effectivePolicy.coldRequestGuard}
+              onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
+            />
           </div>
         </div>
       ) : (
@@ -1209,6 +1239,10 @@ function PathStrategyBindingCard({
             <CacheHitShapingForm
               value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
               onChange={(hitShaping) => patch({ hitShaping })}
+            />
+            <ColdRequestGuardToggle
+              value={effectivePolicy.coldRequestGuard}
+              onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
             />
           </div>
         </div>

@@ -1991,7 +1991,7 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.stableSegment && !policy.hitShaping
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard
 }
 
 function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -2018,6 +2018,7 @@ type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
 type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
 type StableSegmentPatch = NonNullable<CacheRoutePolicyPatch['stableSegment']>
 type CacheHitShapingPatch = NonNullable<CacheRoutePolicyPatch['hitShaping']>
+type ColdRequestGuardPatch = NonNullable<CacheRoutePolicyPatch['coldRequestGuard']>
 
 const defaultCacheHitShaping = (): Required<CacheHitShapingPatch> => ({
   enabled: false,
@@ -2295,6 +2296,23 @@ function SimulationOverrideForm({
   )
 }
 
+function ColdRequestGuardToggle({
+  value,
+  onChange,
+}: {
+  value: ColdRequestGuardPatch | undefined
+  onChange: (next: ColdRequestGuardPatch) => void
+}) {
+  return (
+    <ToggleField
+      title="冷请求用量约束"
+      description="默认关闭，关闭时与未开启前完全一致。开启后，本地缓存没有命中的请求（新会话首轮、fork / resume 后、服务重启后的第一条）缓存读取为 0，输入 + 写入不超过真实输入；命中之后的轮次仍按上面的参数整形。"
+      checked={Boolean(value?.enabled)}
+      onCheckedChange={(enabled) => onChange({ enabled })}
+    />
+  )
+}
+
 function CacheHitShapingForm({
   value,
   onChange,
@@ -2445,10 +2463,16 @@ function StrategyTemplateCard({
   const setKiroRsTool = (kiroRsTool: KiroRsToolPatch) => onChange({ ...template, kiroRsTool })
   const setStableSegment = (stableSegment: StableSegmentPatch) => onChange({ ...template, stableSegment })
   const hitShapingSection = (
-    <CacheHitShapingForm
-      value={template.hitShaping ?? defaultCacheHitShaping()}
-      onChange={(hitShaping) => onChange({ ...template, hitShaping })}
-    />
+    <>
+      <CacheHitShapingForm
+        value={template.hitShaping ?? defaultCacheHitShaping()}
+        onChange={(hitShaping) => onChange({ ...template, hitShaping })}
+      />
+      <ColdRequestGuardToggle
+        value={template.coldRequestGuard}
+        onChange={(coldRequestGuard) => onChange({ ...template, coldRequestGuard })}
+      />
+    </>
   )
 
   return (
@@ -2739,6 +2763,10 @@ function PathCachePolicyCard({
             value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
             onChange={(hitShaping) => patch({ hitShaping })}
           />
+          <ColdRequestGuardToggle
+            value={effectivePolicy.coldRequestGuard}
+            onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
+          />
         </div>
       ) : effectiveCacheType === 'stable_segment_cache' ? (
         <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
@@ -2760,6 +2788,10 @@ function PathCachePolicyCard({
             value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
             onChange={(hitShaping) => patch({ hitShaping })}
           />
+          <ColdRequestGuardToggle
+            value={effectivePolicy.coldRequestGuard}
+            onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
+          />
         </div>
       ) : (
         <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
@@ -2774,6 +2806,10 @@ function PathCachePolicyCard({
           <CacheHitShapingForm
             value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
             onChange={(hitShaping) => patch({ hitShaping })}
+          />
+          <ColdRequestGuardToggle
+            value={effectivePolicy.coldRequestGuard}
+            onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
           />
         </div>
       )}

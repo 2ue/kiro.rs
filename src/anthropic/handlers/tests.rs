@@ -8478,6 +8478,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -8592,6 +8593,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: Some(UsageSource::LocalPromptCache),
@@ -8684,6 +8686,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
             PromptCacheSimulationMode::HighCache,
@@ -8781,6 +8784,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -8913,6 +8917,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -8995,6 +9000,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::KiroRsTool,
             PromptCacheSimulationMode::Disabled,
@@ -9141,6 +9147,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -9479,6 +9486,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -9655,6 +9663,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
             PromptCacheSimulationMode::HighCache,
@@ -9694,12 +9703,10 @@ fn creation_control_preserves_reported_usage_input_policy() {
 
     assert!((1..=96).contains(&reported.input_tokens));
     assert_eq!(reported.cache_read_input_tokens, 0);
-    // 本地前缀未命中（首个请求）：input 差额记为写入，但 input + 写入不超过真实输入。
     let input_delta = usage.input_tokens.saturating_sub(reported.input_tokens);
-    assert_eq!(reported.cache_creation_input_tokens, input_delta);
-    assert_eq!(
-        reported.input_tokens + reported.cache_creation_input_tokens,
-        usage.input_tokens
+    assert!(
+        (input_delta.saturating_add(26_400)..input_delta.saturating_add(30_000))
+            .contains(&reported.cache_creation_input_tokens)
     );
     assert_eq!(
         reported.total_input_tokens,
@@ -9762,6 +9769,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -9850,6 +9858,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -10477,6 +10486,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: Some(UsageSource::LocalPromptCache),
@@ -10577,6 +10587,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         prompt_cache_bounds: PromptCacheBounds::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
         reported_cache_usage_policy: None,
         simulated_usage: Some(cache::CacheSimulation {
             cache_creation_input_tokens: 3968,
@@ -13132,6 +13143,180 @@ fn llm_capture_records_full_local_round_trip() {
     });
 }
 
+/// `coldRequestGuard` 默认关闭：同一路由开关前后，关闭时首轮 usage 与未引入约束时完全一致，
+/// 开启时首轮读取为 0 且 `input + 写入` 不超过真实输入；命中后的轮次两者一致。
+#[test]
+fn cold_request_guard_is_off_by_default_and_only_changes_cold_requests_when_on() {
+    fn minea_state(guard: Option<bool>) -> AppState {
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/dfcache/minea".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                route_namespace: Some(false),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    target_read_ratio: Some(0.99),
+                    token_scale: Some(3.0),
+                    max_simulated_input_tokens: Some(600_000),
+                    cap_jitter_min_tokens: Some(12_000),
+                    cap_jitter_max_tokens: Some(24_000),
+                    scale_min_input_tokens: Some(3_000),
+                }),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy {
+                        move_delta_to_cache_read: true,
+                        ..ReportedUsageFieldPolicy::sample_input_max(20_000)
+                    },
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                hit_shaping: Some(crate::model::config::CacheHitShapingPolicyPatch {
+                    enabled: Some(true),
+                    target_hit_ratio: Some(0.9),
+                    min_cost_ratio: Some(0.78),
+                    ..Default::default()
+                }),
+                cold_request_guard: guard.map(|enabled| {
+                    crate::model::config::ColdRequestGuardPolicyPatch {
+                        enabled: Some(enabled),
+                    }
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(64)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.99,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy)
+    }
+    let endpoint = "/dfcache/minea/v1/messages";
+    let payload = |messages: Vec<Message>| MessagesRequest {
+        model: "claude-sonnet-4-5".to_string(),
+        max_tokens: 32_000,
+        messages,
+        stream: true,
+        system: Some(vec![SystemMessage {
+            text: "stable claude code system prompt ".repeat(900),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: Some(Metadata {
+            user_id: Some(
+                "user_test_account__session_4d5e6f70-8192-4a3b-8c4d-5e6f708192a3".to_string(),
+            ),
+        }),
+        stop_sequences: None,
+    };
+    let run = |state: &AppState, payload: &MessagesRequest, raw_input: i32| {
+        let route = RequestRuntimeConfig::from_app_state(state).cache_policy_for_path(endpoint);
+        let conversation_id = extract_stable_conversation_id(payload).expect("session id");
+        let context = prepare_usage_context(
+            state,
+            route,
+            endpoint,
+            true,
+            payload,
+            None,
+            Some(conversation_id.clone()),
+            Some(conversation_id),
+            raw_input,
+        );
+        let credential_usage = attach_test_credential_usage(context, 1);
+        let body = cache::build_usage_with_simulation_policy(
+            None,
+            raw_input,
+            120,
+            credential_usage.request.simulated_usage,
+            true,
+        );
+        let source = credential_usage.usage_source(&body, None, false);
+        let reported = credential_usage.canonical_reported_usage_for_success(body, source);
+        credential_usage.record_success_reported(reported, source, Some(body));
+        reported
+    };
+
+    // 默认（未配置）与显式关闭都不改变路由策略。
+    let unset = minea_state(None);
+    let off = minea_state(Some(false));
+    let on = minea_state(Some(true));
+    for state in [&unset, &off] {
+        assert!(
+            !RequestRuntimeConfig::from_app_state(state)
+                .cache_policy_for_path(endpoint)
+                .policy
+                .cold_request_guard
+                .enabled
+        );
+    }
+    assert!(
+        RequestRuntimeConfig::from_app_state(&on)
+            .cache_policy_for_path(endpoint)
+            .policy
+            .cold_request_guard
+            .enabled
+    );
+
+    let raw_input = 25_973;
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: json!([{ "type": "text", "text": "hi" }]),
+    }];
+    let first_unset = run(&unset, &payload(messages.clone()), raw_input);
+    let first_off = run(&off, &payload(messages.clone()), raw_input);
+    let first_on = run(&on, &payload(messages.clone()), raw_input);
+    let total = |usage: cache::CacheUsage| {
+        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+    };
+    // 关闭：首轮写入仍按放大参数计算（超过真实输入），与未引入约束时一致。
+    assert_eq!(
+        first_unset.cache_read_input_tokens,
+        first_off.cache_read_input_tokens
+    );
+    assert_eq!(
+        first_unset.input_tokens + first_unset.cache_creation_input_tokens,
+        first_off.input_tokens + first_off.cache_creation_input_tokens
+    );
+    assert!(
+        total(first_off) > raw_input,
+        "guard off keeps amplified first turn: {first_off:?}"
+    );
+    // 开启：首轮读取为 0，input + 写入不超过真实输入。
+    assert_eq!(first_on.cache_read_input_tokens, 0);
+    assert!(
+        total(first_on) <= raw_input,
+        "guard on caps first turn: {first_on:?}"
+    );
+
+    // 命中后的轮次：开关不影响整形结果的量级（都有读取，命中率整形照常生效）。
+    messages.push(Message {
+        role: "assistant".to_string(),
+        content: json!([{ "type": "text", "text": "answer ".repeat(60) }]),
+    });
+    messages.push(Message {
+        role: "user".to_string(),
+        content: json!([{ "type": "text", "text": "next ".repeat(60) }]),
+    });
+    let second_off = run(&off, &payload(messages.clone()), raw_input + 400);
+    let second_on = run(&on, &payload(messages), raw_input + 400);
+    assert!(second_off.cache_read_input_tokens > 0, "{second_off:?}");
+    assert!(second_on.cache_read_input_tokens > 0, "{second_on:?}");
+    assert!(
+        total(second_on) > raw_input,
+        "hit rounds keep configured shaping: {second_on:?}"
+    );
+}
+
 /// 现网 minea 参数：新会话首个请求、以及带历史但本地前缀未命中的请求（fork / resume / 重启后），
 /// 下游不得出现读取，`input + 写入` 不超过真实输入；命中之后的轮次仍按命中率整形参数执行。
 #[test]
@@ -13183,6 +13368,9 @@ fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
                 min_creation_ratio: Some(0.0),
                 min_cache_read_tokens: Some(1_024),
                 min_cache_creation_tokens: Some(1_024),
+            }),
+            cold_request_guard: Some(crate::model::config::ColdRequestGuardPolicyPatch {
+                enabled: Some(true),
             }),
             ..CacheRoutePolicyPatch::default()
         },
@@ -13633,24 +13821,12 @@ fn hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round() {
         let legacy = legacy_usage
             .request
             .ensure_reported_usage_for_record(legacy, legacy_source);
-        // 本地前缀未命中的请求（首轮）不论整形是否开启，都不得超过真实输入；命中后与旧管线一致。
-        let legacy = legacy_usage.constrain_cold_reported_usage(
-            legacy,
-            cache::RawUsage::uncached(raw_input, legacy.output_tokens).to_cache_usage(),
-        );
         legacy_usage.record_success_reported(legacy, legacy_source, Some(legacy_body));
 
         assert_eq!(
             reported, legacy,
             "round {round}: disabled shaping changed usage"
         );
-        if round == 0 {
-            assert_eq!(reported.cache_read_input_tokens, 0);
-            assert!(
-                reported.input_tokens + reported.cache_creation_input_tokens <= raw_input,
-                "round 0 must stay within raw input: {reported:?}"
-            );
-        }
         saw_write |= reported.cache_creation_input_tokens > 0 && round > 0;
         saw_suppressed |= body.cache_creation_input_tokens > 0
             && reported.cache_creation_input_tokens < body.cache_creation_input_tokens;

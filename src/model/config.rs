@@ -2026,6 +2026,45 @@ impl CacheHitShapingPolicy {
     }
 }
 
+/// 冷请求下游 usage 约束（默认关闭）。
+///
+/// 开启后，本地前缀追踪本次未命中的请求（新会话首轮、fork / resume 后、服务重启后的首个
+/// 请求）在最终下游 usage 上：读取为 0，`input + 写入` 不超过真实输入；input 仍按
+/// reportedUsage.input 采样，其余记为写入。命中之后的轮次不受影响。
+/// 关闭时与未引入该约束的行为完全一致。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ColdRequestGuardPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl ColdRequestGuardPolicy {
+    pub fn disabled() -> Self {
+        Self { enabled: false }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ColdRequestGuardPolicyPatch {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl ColdRequestGuardPolicyPatch {
+    fn apply_to(self, mut policy: ColdRequestGuardPolicy) -> ColdRequestGuardPolicy {
+        if let Some(value) = self.enabled {
+            policy.enabled = value;
+        }
+        policy
+    }
+
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheHitShapingPolicyPatch {
@@ -2694,6 +2733,8 @@ pub struct CacheRoutePolicyPatch {
     pub stable_segment: Option<Box<StableSegmentCachePolicyPatch>>,
     #[serde(default)]
     pub hit_shaping: Option<CacheHitShapingPolicyPatch>,
+    #[serde(default)]
+    pub cold_request_guard: Option<ColdRequestGuardPolicyPatch>,
 }
 
 impl CacheRoutePolicyPatch {
@@ -2729,6 +2770,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.hit_shaping {
             policy.hit_shaping = patch.apply_to(policy.hit_shaping);
+        }
+        if let Some(patch) = self.cold_request_guard {
+            policy.cold_request_guard = patch.apply_to(policy.cold_request_guard);
         }
         policy.normalized()
     }
@@ -2799,6 +2843,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.hit_shaping {
             policy.hit_shaping = patch.apply_to(policy.hit_shaping);
         }
+        if let Some(patch) = self.cold_request_guard {
+            policy.cold_request_guard = patch.apply_to(policy.cold_request_guard);
+        }
         policy.normalized()
     }
 
@@ -2820,6 +2867,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.hit_shaping {
             policy.hit_shaping = patch.apply_to(policy.hit_shaping);
+        }
+        if let Some(patch) = self.cold_request_guard {
+            policy.cold_request_guard = patch.apply_to(policy.cold_request_guard);
         }
         policy.normalized()
     }
@@ -2865,6 +2915,10 @@ impl CacheRoutePolicyPatch {
                 .hit_shaping
                 .as_ref()
                 .is_none_or(CacheHitShapingPolicyPatch::is_empty)
+            && self
+                .cold_request_guard
+                .as_ref()
+                .is_none_or(ColdRequestGuardPolicyPatch::is_empty)
     }
 }
 
@@ -2996,6 +3050,7 @@ impl CachePolicyConfig {
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
             stable_segment: base.stable_segment,
             hit_shaping: base.hit_shaping,
+            cold_request_guard: base.cold_request_guard,
         };
         self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
     }
@@ -3024,6 +3079,7 @@ impl CachePolicyConfig {
             kiro_rs_tool: base.kiro_rs_tool,
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: base.hit_shaping,
+            cold_request_guard: base.cold_request_guard,
         };
         self.stable_segment_cache
             .apply_stable_segment_fields_to(neutral)
@@ -3051,6 +3107,7 @@ impl CachePolicyConfig {
             kiro_rs_tool: base.kiro_rs_tool,
             stable_segment: base.stable_segment,
             hit_shaping: CacheHitShapingPolicy::disabled(),
+            cold_request_guard: ColdRequestGuardPolicy::disabled(),
         }
         .normalized()
     }
@@ -3092,6 +3149,7 @@ pub struct CacheRoutePolicy {
     pub kiro_rs_tool: KiroRsToolCachePolicy,
     pub stable_segment: StableSegmentCachePolicy,
     pub hit_shaping: CacheHitShapingPolicy,
+    pub cold_request_guard: ColdRequestGuardPolicy,
 }
 
 impl CacheRoutePolicy {
@@ -6162,6 +6220,7 @@ impl Config {
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: CacheHitShapingPolicy::default(),
+            cold_request_guard: ColdRequestGuardPolicy::default(),
         }
         .normalized()
     }
@@ -6672,6 +6731,76 @@ mod tests {
             .policy
             .hit_shaping;
         assert!(!na.enabled);
+    }
+
+    #[test]
+    fn cold_request_guard_defaults_off_and_resolves_per_route() {
+        let mut config = Config::default();
+        assert!(
+            !config
+                .cache_policy_for_path("/dfcache/minea/v1/messages")
+                .policy
+                .cold_request_guard
+                .enabled
+        );
+        let patch: CacheRoutePolicyPatch = serde_json::from_value(serde_json::json!({
+            "cacheType": "current_high_cache",
+            "coldRequestGuard": {"enabled": true}
+        }))
+        .expect("patch json");
+        assert_eq!(
+            patch.cold_request_guard,
+            Some(ColdRequestGuardPolicyPatch {
+                enabled: Some(true)
+            })
+        );
+        assert!(!patch.is_empty());
+        config
+            .cache_policy
+            .path_overrides
+            .insert("/dfcache/minea".to_string(), patch.clone());
+        assert!(
+            config
+                .cache_policy_for_path("/dfcache/minea/v1/messages")
+                .policy
+                .cold_request_guard
+                .enabled
+        );
+        // 其他路由不受影响；no_cache 路由始终关闭。
+        assert!(
+            !config
+                .cache_policy_for_path("/dfcache/mineb/v1/messages")
+                .policy
+                .cold_request_guard
+                .enabled
+        );
+        config.cache_policy.path_overrides.insert(
+            "/na".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::NoCache),
+                ..patch
+            },
+        );
+        assert!(
+            !config
+                .cache_policy_for_path("/na/v1/messages")
+                .policy
+                .cold_request_guard
+                .enabled
+        );
+        // 序列化往返：未配置时不输出多余字段以外的变化。
+        let empty = CacheRoutePolicyPatch::default();
+        assert!(empty.is_empty());
+        let round_trip: CacheRoutePolicyPatch = serde_json::from_value(
+            serde_json::to_value(&config.cache_policy.path_overrides["/dfcache/minea"]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            round_trip.cold_request_guard,
+            Some(ColdRequestGuardPolicyPatch {
+                enabled: Some(true)
+            })
+        );
     }
 
     #[test]

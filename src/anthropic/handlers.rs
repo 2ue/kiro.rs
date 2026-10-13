@@ -352,6 +352,8 @@ struct RequestUsageContext {
     stable_segment_cache_policy: StableSegmentCachePolicy,
     reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     cache_hit_shaping: CacheHitShapingContext,
+    /// 冷请求下游 usage 约束开关（路由 `coldRequestGuard.enabled`，默认关闭）。
+    cold_request_guard: bool,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     payload_breakdown: Option<PayloadByteBreakdown>,
@@ -1172,6 +1174,7 @@ impl RequestRuntimeConfig {
             kiro_rs_tool: KiroRsToolCachePolicy::default(),
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: crate::model::config::CacheHitShapingPolicy::default(),
+            cold_request_guard: crate::model::config::ColdRequestGuardPolicy::default(),
         }
         .normalized()
     }
@@ -4072,7 +4075,8 @@ impl CredentialUsageContext {
             );
     }
 
-    /// 本地前缀追踪本次未命中时，下游 usage 不得出现读取，`input + 写入` 不超过真实输入。
+    /// 路由开启 `coldRequestGuard` 且本地前缀追踪本次未命中时，下游 usage 不得出现读取，
+    /// `input + 写入` 不超过真实输入。开关关闭时原样返回。
     ///
     /// 只作用于本地 prompt-cache 投影；上游 metadata 带回的真实缓存字段保持原样。
     fn constrain_cold_reported_usage(
@@ -4080,7 +4084,9 @@ impl CredentialUsageContext {
         usage: super::cache::CacheUsage,
         raw_usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
-        if !self.request.uses_local_prompt_cache_strategy() || self.request.local_prompt_cache_hit()
+        if !self.request.cold_request_guard
+            || !self.request.uses_local_prompt_cache_strategy()
+            || self.request.local_prompt_cache_hit()
         {
             return usage;
         }
@@ -5269,6 +5275,8 @@ fn prepare_usage_context_with_inference_attempt_budget(
                 .any(|message| message.role.eq_ignore_ascii_case("assistant")),
             seed: reported_cache_creation_seed,
         },
+        cold_request_guard: strategy_type != PromptCacheStrategyType::NoCache
+            && policy.cold_request_guard.enabled,
         simulated_usage,
         simulated_source,
         payload_breakdown: None,
