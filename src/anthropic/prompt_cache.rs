@@ -21,6 +21,9 @@ const DEFAULT_MAX_ENTRIES_GLOBAL: usize = 20_000;
 const DEFAULT_MAX_ENTRY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_ESTIMATED_BYTES_LIMIT: u64 = 256 * 1024 * 1024;
 const ESTIMATED_ENTRY_BYTES: u64 = 256;
+/// 全表过期清理的最小间隔。读写路径逐条检查 `expires_at`，过期条目不会被命中；
+/// 全表清理只负责回收内存，不需要每次进锁都遍历全部条目。
+const PRUNE_EXPIRED_MIN_INTERVAL: chrono::Duration = chrono::Duration::seconds(1);
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PromptCacheScope {
@@ -174,9 +177,95 @@ impl PromptCacheBounds {
     }
 }
 
+type ScopeEntries = HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>;
+
 #[derive(Debug, Default)]
 pub struct PromptCacheTracker {
-    entries: Mutex<HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>>,
+    entries: Mutex<PromptCacheState>,
+}
+
+/// 缓存条目及其维护元数据，全部由同一把锁保护。
+///
+/// `total_entries` 必须始终等于 `by_scope` 中的条目总数；所有增删都经过下面的方法，
+/// 这样全局上限检查是 O(1)，只有真正超限时才排序淘汰。
+#[derive(Debug, Default)]
+struct PromptCacheState {
+    by_scope: ScopeEntries,
+    total_entries: usize,
+    last_pruned_at: Option<DateTime<Utc>>,
+}
+
+impl PromptCacheState {
+    fn prune_expired_if_due(&mut self, now: DateTime<Utc>) {
+        if self
+            .last_pruned_at
+            .is_some_and(|last| now - last < PRUNE_EXPIRED_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.prune_expired(now);
+    }
+
+    fn prune_expired(&mut self, now: DateTime<Utc>) {
+        prune_expired_locked(&mut self.by_scope, now);
+        self.total_entries = total_cache_entries(&self.by_scope);
+        self.last_pruned_at = Some(now);
+    }
+
+    fn insert(&mut self, scope: &PromptCacheScope, fingerprint: [u8; 32], entry: PromptCacheEntry) {
+        let entries = match self.by_scope.get_mut(scope) {
+            Some(entries) => entries,
+            None => self.by_scope.entry(scope.clone()).or_default(),
+        };
+        if entries.insert(fingerprint, entry).is_none() {
+            self.total_entries += 1;
+        }
+    }
+
+    /// 只检查本次写入的 scope：其他 scope 在各自写入时已经满足单 scope 上限。
+    fn enforce_bounds(
+        &mut self,
+        written_scope: &PromptCacheScope,
+        bounds: PromptCacheBounds,
+        now: DateTime<Utc>,
+    ) {
+        if bounds.max_entries_per_account > 0
+            && let Some(entries) = self.by_scope.get_mut(written_scope)
+            && entries.len() > bounds.max_entries_per_account
+        {
+            // 全表清理是节流的，本 scope 里可能还留着已过期条目；先清掉它们，
+            // 避免按 last_used_at 淘汰时误删仍有效的条目（与改动前每次全表清理的结果一致）。
+            let before = entries.len();
+            entries.retain(|_, entry| entry.expires_at > now);
+            self.total_entries -= before - entries.len();
+            let overflow = entries.len().saturating_sub(bounds.max_entries_per_account);
+            if overflow > 0 {
+                self.total_entries -=
+                    remove_oldest_entries_locked(&mut self.by_scope, overflow, |scope| {
+                        scope == written_scope
+                    });
+            } else if entries.is_empty() {
+                self.by_scope.remove(written_scope);
+            }
+        }
+
+        let global_entry_limit = if bounds.max_entries_global == 0 {
+            usize::MAX
+        } else {
+            bounds.max_entries_global
+        }
+        .min(bounds.max_entries_by_bytes());
+        if self.total_entries > global_entry_limit {
+            // 超限时先回收过期条目，避免把仍有效的条目当作最旧条目淘汰（与改动前语义一致）。
+            self.prune_expired(now);
+        }
+        if self.total_entries > global_entry_limit {
+            let overflow = self.total_entries - global_entry_limit;
+            self.total_entries -=
+                remove_oldest_entries_locked(&mut self.by_scope, overflow, |_| true);
+        }
+        debug_assert_eq!(self.total_entries, total_cache_entries(&self.by_scope));
+    }
 }
 
 impl PromptCacheTracker {
@@ -470,10 +559,10 @@ impl PromptCacheTracker {
         }
         let now = Utc::now();
 
-        let mut entries_by_scope = self.entries.lock();
-        prune_expired_locked(&mut entries_by_scope, now);
+        let mut state = self.entries.lock();
+        state.prune_expired_if_due(now);
 
-        let Some(entries) = entries_by_scope.get_mut(&scope) else {
+        let Some(entries) = state.by_scope.get_mut(&scope) else {
             return creation_only_usage(profile, target_tokens, effective_ratio);
         };
 
@@ -565,9 +654,8 @@ impl PromptCacheTracker {
                 .unwrap_or(DEFAULT_PROMPT_CACHE_TTL),
         );
         let now = Utc::now();
-        let mut entries_by_scope = self.entries.lock();
-        prune_expired_locked(&mut entries_by_scope, now);
-        let entries = entries_by_scope.entry(scope).or_default();
+        let mut state = self.entries.lock();
+        state.prune_expired_if_due(now);
 
         for point in &profile.lookup_points {
             let scaled_tokens = ((point.cumulative_tokens as f64 / flat_total_tokens as f64)
@@ -577,7 +665,8 @@ impl PromptCacheTracker {
             if cached_tokens < min_tokens {
                 continue;
             }
-            entries.insert(
+            state.insert(
+                &scope,
                 point.fingerprint,
                 PromptCacheEntry {
                     expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
@@ -587,7 +676,7 @@ impl PromptCacheTracker {
                 },
             );
         }
-        enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
+        state.enforce_bounds(&scope, bounds, now);
     }
 
     fn compute_kiro_rs_tool_profile_with_bounds(
@@ -620,11 +709,11 @@ impl PromptCacheTracker {
         }
 
         let now = Utc::now();
-        let mut entries_by_scope = self.entries.lock();
-        prune_expired_locked(&mut entries_by_scope, now);
+        let mut state = self.entries.lock();
+        state.prune_expired_if_due(now);
 
         let mut read_tokens = 0;
-        if let Some(entries) = entries_by_scope.get_mut(&scope) {
+        if let Some(entries) = state.by_scope.get_mut(&scope) {
             for point in profile.lookup_points.iter().rev() {
                 let Some(entry) = entries.get_mut(&point.fingerprint) else {
                     continue;
@@ -693,11 +782,11 @@ impl PromptCacheTracker {
         }
 
         let now = Utc::now();
-        let mut entries_by_scope = self.entries.lock();
-        prune_expired_locked(&mut entries_by_scope, now);
+        let mut state = self.entries.lock();
+        state.prune_expired_if_due(now);
 
         let mut read_tokens = 0;
-        if let Some(entries) = entries_by_scope.get_mut(&scope) {
+        if let Some(entries) = state.by_scope.get_mut(&scope) {
             for point in profile.lookup_points.iter().rev() {
                 if point.cumulative_tokens < policy.min_segment_tokens {
                     continue;
@@ -770,9 +859,8 @@ impl PromptCacheTracker {
                 .unwrap_or_else(|| stable_segment_default_ttl(policy)),
         );
         let now = Utc::now();
-        let mut entries_by_scope = self.entries.lock();
-        prune_expired_locked(&mut entries_by_scope, now);
-        let entries = entries_by_scope.entry(scope).or_default();
+        let mut state = self.entries.lock();
+        state.prune_expired_if_due(now);
 
         for point in &profile.lookup_points {
             if point.cumulative_tokens < policy.min_segment_tokens {
@@ -782,7 +870,8 @@ impl PromptCacheTracker {
             if cached_tokens < policy.min_segment_tokens.max(1) {
                 continue;
             }
-            entries.insert(
+            state.insert(
+                &scope,
                 point.fingerprint,
                 PromptCacheEntry {
                     expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
@@ -792,7 +881,7 @@ impl PromptCacheTracker {
                 },
             );
         }
-        enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
+        state.enforce_bounds(&scope, bounds, now);
     }
 
     fn update_kiro_rs_tool_profile_with_bounds(
@@ -821,16 +910,16 @@ impl PromptCacheTracker {
                 .unwrap_or(DEFAULT_PROMPT_CACHE_TTL),
         );
         let now = Utc::now();
-        let mut entries_by_scope = self.entries.lock();
-        prune_expired_locked(&mut entries_by_scope, now);
-        let entries = entries_by_scope.entry(scope).or_default();
+        let mut state = self.entries.lock();
+        state.prune_expired_if_due(now);
 
         for point in &profile.lookup_points {
             let cached_tokens = point.cumulative_tokens.min(committed_cache_tokens).max(0);
             if cached_tokens <= 0 {
                 continue;
             }
-            entries.insert(
+            state.insert(
+                &scope,
                 point.fingerprint,
                 PromptCacheEntry {
                     expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
@@ -840,7 +929,7 @@ impl PromptCacheTracker {
                 },
             );
         }
-        enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
+        state.enforce_bounds(&scope, bounds, now);
     }
 
     pub fn clear_credential(&self, credential_id: u64) {
@@ -849,58 +938,28 @@ impl PromptCacheTracker {
 
     #[cfg(test)]
     fn entry_count(&self) -> usize {
-        self.entries.lock().values().map(HashMap::len).sum()
+        let state = self.entries.lock();
+        assert_eq!(
+            state.total_entries,
+            total_cache_entries(&state.by_scope),
+            "prompt cache entry counter drifted from the real entry count"
+        );
+        state.total_entries
     }
 }
 
-fn enforce_cache_bounds_locked(
-    entries_by_scope: &mut HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>,
-    bounds: PromptCacheBounds,
-) {
-    if entries_by_scope.is_empty() {
-        return;
-    }
-
-    if bounds.max_entries_per_account > 0 {
-        let scope_counts: Vec<_> = entries_by_scope
-            .iter()
-            .map(|(scope, entries)| (scope.clone(), entries.len()))
-            .collect();
-        for (target_scope, count) in scope_counts {
-            let overflow = count.saturating_sub(bounds.max_entries_per_account);
-            if overflow > 0 {
-                remove_oldest_entries_locked(entries_by_scope, overflow, |scope| {
-                    scope == &target_scope
-                });
-            }
-        }
-    }
-
-    let global_entry_limit = if bounds.max_entries_global == 0 {
-        usize::MAX
-    } else {
-        bounds.max_entries_global
-    }
-    .min(bounds.max_entries_by_bytes());
-    let total = total_cache_entries(entries_by_scope);
-    if total > global_entry_limit {
-        remove_oldest_entries_locked(entries_by_scope, total - global_entry_limit, |_| true);
-    }
-}
-
-fn total_cache_entries(
-    entries_by_scope: &HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>,
-) -> usize {
+fn total_cache_entries(entries_by_scope: &ScopeEntries) -> usize {
     entries_by_scope.values().map(HashMap::len).sum()
 }
 
+/// 按 (last_used_at, expires_at, scope, fingerprint) 淘汰最旧条目，返回实际删除数量。
 fn remove_oldest_entries_locked(
-    entries_by_scope: &mut HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>,
+    entries_by_scope: &mut ScopeEntries,
     remove_count: usize,
     include_scope: impl Fn(&PromptCacheScope) -> bool,
-) {
+) -> usize {
     if remove_count == 0 {
-        return;
+        return 0;
     }
 
     let mut candidates = Vec::new();
@@ -927,12 +986,16 @@ fn remove_oldest_entries_locked(
         )
     });
 
+    let mut removed = 0usize;
     for (_, _, scope, fingerprint) in candidates.into_iter().take(remove_count) {
-        if let Some(entries) = entries_by_scope.get_mut(&scope) {
-            entries.remove(&fingerprint);
+        if let Some(entries) = entries_by_scope.get_mut(&scope)
+            && entries.remove(&fingerprint).is_some()
+        {
+            removed += 1;
         }
     }
     entries_by_scope.retain(|_, entries| !entries.is_empty());
+    removed
 }
 
 #[derive(Debug)]
@@ -1724,14 +1787,11 @@ fn is_valid_uuid(value: &str) -> bool {
 
 fn apply_kiro_rs_tool_coverage_policy(covered_tokens: i32, policy: KiroRsToolCachePolicy) -> i32 {
     let policy = policy.normalized();
-    let mut covered_tokens = covered_tokens.max(0);
-    if policy.coverage_ratio < 1.0 {
-        covered_tokens = ((covered_tokens as f64) * policy.coverage_ratio).floor() as i32;
-    }
-    if policy.max_coverage_tokens > 0 {
-        covered_tokens = covered_tokens.min(policy.max_coverage_tokens);
-    }
-    covered_tokens.max(0)
+    apply_coverage_limits(
+        covered_tokens,
+        policy.coverage_ratio,
+        policy.max_coverage_tokens,
+    )
 }
 
 fn apply_stable_segment_coverage_policy(
@@ -1739,12 +1799,24 @@ fn apply_stable_segment_coverage_policy(
     policy: StableSegmentCachePolicy,
 ) -> i32 {
     let policy = policy.normalized();
+    apply_coverage_limits(
+        covered_tokens,
+        policy.coverage_ratio,
+        policy.max_coverage_tokens,
+    )
+}
+
+fn apply_coverage_limits(
+    covered_tokens: i32,
+    coverage_ratio: f64,
+    max_coverage_tokens: i32,
+) -> i32 {
     let mut covered_tokens = covered_tokens.max(0);
-    if policy.coverage_ratio < 1.0 {
-        covered_tokens = ((covered_tokens as f64) * policy.coverage_ratio).floor() as i32;
+    if coverage_ratio < 1.0 {
+        covered_tokens = ((covered_tokens as f64) * coverage_ratio).floor() as i32;
     }
-    if policy.max_coverage_tokens > 0 {
-        covered_tokens = covered_tokens.min(policy.max_coverage_tokens);
+    if max_coverage_tokens > 0 {
+        covered_tokens = covered_tokens.min(max_coverage_tokens);
     }
     covered_tokens.max(0)
 }
@@ -1791,10 +1863,7 @@ fn target_ttl_breakdown(profile: &PromptCacheProfile, creation: i32) -> (i32, i3
     }
 }
 
-fn prune_expired_locked(
-    entries_by_scope: &mut HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>,
-    now: DateTime<Utc>,
-) {
+fn prune_expired_locked(entries_by_scope: &mut ScopeEntries, now: DateTime<Utc>) {
     entries_by_scope.retain(|_, entries| {
         entries.retain(|_, entry| entry.expires_at > now);
         !entries.is_empty()
@@ -2049,8 +2118,9 @@ mod tests {
 
         tracker.update_with_bounds(Some(scope.clone()), Some(&profile), 0.85, bounds);
         {
-            let mut entries_by_scope = tracker.entries.lock();
-            let entries = entries_by_scope
+            let mut state = tracker.entries.lock();
+            let entries = state
+                .by_scope
                 .get_mut(&scope)
                 .expect("entry should be written");
             assert!(
@@ -3036,6 +3106,115 @@ mod tests {
             "text": "same content"
         }));
         assert_ne!(stable_business_id, changed_business_id);
+    }
+
+    fn cacheable_profile(tracker: &PromptCacheTracker, seed: &str) -> PromptCacheProfile {
+        let mut req = request(format!("counter system {seed} ").repeat(900));
+        req.messages[0].content = json!([
+            {
+                "type": "text",
+                "text": format!("counter body {seed} ").repeat(900),
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+        tracker.build_profile(&req, 8_192).expect("profile")
+    }
+
+    #[test]
+    fn prompt_cache_entry_counter_matches_real_entries_across_bounds_and_expiry() {
+        let tracker = PromptCacheTracker::default();
+        let scoped = PromptCacheBounds {
+            max_entries_per_account: 3,
+            max_entries_global: 12,
+            entry_ttl: std::time::Duration::from_secs(3_600),
+            estimated_bytes_limit: 0,
+        };
+        let byte_limited = PromptCacheBounds {
+            estimated_bytes_limit: 5 * ESTIMATED_ENTRY_BYTES,
+            ..scoped
+        };
+
+        for round in 0..40 {
+            let profile = cacheable_profile(&tracker, &format!("r{round}"));
+            let scope = test_scope(&format!("counter-scope-{}", round % 7));
+            let bounds = if round % 5 == 4 { byte_limited } else { scoped };
+            tracker.update_with_bounds(Some(scope.clone()), Some(&profile), 0.85, bounds);
+            // 覆盖写同一批指纹不应改变计数。
+            tracker.update_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
+            let count = tracker.entry_count();
+            assert!(count <= scoped.max_entries_global, "round {round}: {count}");
+
+            if round % 9 == 8 {
+                let mut state = tracker.entries.lock();
+                for entries in state.by_scope.values_mut() {
+                    for entry in entries.values_mut().take(1) {
+                        entry.expires_at = Utc::now() - chrono::Duration::seconds(1);
+                    }
+                }
+                state.last_pruned_at = None;
+            }
+        }
+
+        let mut state = tracker.entries.lock();
+        state.prune_expired(Utc::now());
+        assert_eq!(state.total_entries, total_cache_entries(&state.by_scope));
+    }
+
+    #[test]
+    fn throttled_prune_never_serves_expired_entries() {
+        let tracker = PromptCacheTracker::default();
+        let bounds = PromptCacheBounds::default();
+        let profile = cacheable_profile(&tracker, "throttle");
+        let scope = test_scope("throttle-session");
+
+        tracker.update_with_bounds(Some(scope.clone()), Some(&profile), 0.85, bounds);
+        let hit = tracker.compute_with_bounds(Some(scope.clone()), Some(&profile), 0.85, bounds);
+        assert!(hit.cache_read_input_tokens > 0);
+
+        {
+            let mut state = tracker.entries.lock();
+            // 刚刚 prune 过：节流窗口内不会再全表清理，读路径必须自己跳过过期条目。
+            state.last_pruned_at = Some(Utc::now());
+            for entries in state.by_scope.values_mut() {
+                for entry in entries.values_mut() {
+                    entry.expires_at = Utc::now() - chrono::Duration::seconds(1);
+                }
+            }
+        }
+
+        let expired = tracker.compute_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
+        assert_eq!(expired.cache_read_input_tokens, 0);
+        assert!(expired.cache_creation_input_tokens > 0);
+        assert!(
+            tracker.entry_count() > 0,
+            "expired entries stay in memory until the throttled prune runs"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: cargo test --release prompt_cache_hot_path_benchmark -- --ignored --nocapture"]
+    fn prompt_cache_hot_path_benchmark() {
+        let tracker = PromptCacheTracker::default();
+        let bounds = PromptCacheBounds::default();
+        let profiles: Vec<_> = (0..64)
+            .map(|idx| cacheable_profile(&tracker, &format!("bench{idx}")))
+            .collect();
+        for idx in 0..bounds.max_entries_global {
+            let scope = test_scope(&format!("bench-fill-{idx}"));
+            tracker.update_with_bounds(Some(scope), Some(&profiles[idx % 64]), 0.85, bounds);
+        }
+        let started = std::time::Instant::now();
+        for idx in 0..10_000 {
+            let scope = test_scope(&format!("bench-hot-{}", idx % 500));
+            let profile = &profiles[idx % 64];
+            let _ = tracker.compute_with_bounds(Some(scope.clone()), Some(profile), 0.85, bounds);
+            tracker.update_with_bounds(Some(scope), Some(profile), 0.85, bounds);
+        }
+        eprintln!(
+            "prompt cache: 10k compute+update with {} entries took {:?}",
+            tracker.entry_count(),
+            started.elapsed()
+        );
     }
 
     #[test]

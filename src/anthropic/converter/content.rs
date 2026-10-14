@@ -1,6 +1,7 @@
 //! Anthropic content block conversion, including images, documents, and tool results.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::cell::Cell;
+use std::sync::Once;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
@@ -302,44 +303,60 @@ fn extract_text_from_pdf_bytes(bytes: &[u8]) -> Option<String> {
 fn extract_pdf_text_with_panic_guard(
     bytes: &[u8],
 ) -> Result<Result<String, pdf_extract::OutputError>, ()> {
-    let _guard = pdf_extract_panic_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous_hook = std::panic::take_hook();
-    let previous_hook_slot = Arc::new(Mutex::new(Some(previous_hook)));
-    let hook_slot = Arc::clone(&previous_hook_slot);
-    std::panic::set_hook(Box::new(move |info| {
-        if is_pdf_extract_panic(info) {
-            return;
-        }
-        if let Some(hook) = hook_slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
-            hook(info);
-        }
-    }));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    install_pdf_extract_panic_filter();
+    let _scope = PdfExtractPanicScope::enter();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(bytes)
-    }));
-    let previous_hook = previous_hook_slot
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-        .unwrap_or_else(|| Box::new(|_| {}));
-    std::panic::set_hook(previous_hook);
-    result.map_err(|_| ())
+    }))
+    .map_err(|_| ())
 }
 
-fn is_pdf_extract_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
-    info.location()
-        .is_some_and(|location| location.file().contains("pdf-extract"))
+thread_local! {
+    static IN_PDF_EXTRACT: Cell<bool> = const { Cell::new(false) };
 }
 
-fn pdf_extract_panic_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// 标记当前线程正在执行 pdf-extract；drop 时（包括 panic 展开）清除标记。
+struct PdfExtractPanicScope {
+    previous: bool,
+}
+
+impl PdfExtractPanicScope {
+    fn enter() -> Self {
+        Self {
+            previous: IN_PDF_EXTRACT.with(|flag| flag.replace(true)),
+        }
+    }
+}
+
+impl Drop for PdfExtractPanicScope {
+    fn drop(&mut self) {
+        IN_PDF_EXTRACT.with(|flag| flag.set(self.previous));
+    }
+}
+
+/// 进程内只安装一次的 panic hook：只静默当前线程处于 pdf-extract 调用期间、且源自
+/// pdf-extract 的 panic（它们会被 `catch_unwind` 转成回退解析），其余 panic 一律交给原 hook。
+///
+/// 早期实现每次抽取都 take/set 全局 hook 并持有全局锁，导致并发 PDF 请求串行，且替换期间
+/// 其他线程的 panic 也会经过临时 hook。前提：本仓库只有这里调用 `std::panic::set_hook`，
+/// 安装后不会被别处覆盖。
+fn install_pdf_extract_panic_filter() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let in_pdf_extract = IN_PDF_EXTRACT.try_with(Cell::get).unwrap_or(false);
+            let location = info.location().map(|location| location.file());
+            if should_suppress_pdf_extract_panic(in_pdf_extract, location) {
+                return;
+            }
+            previous(info);
+        }));
+    });
+}
+
+fn should_suppress_pdf_extract_panic(in_pdf_extract: bool, location_file: Option<&str>) -> bool {
+    in_pdf_extract && location_file.is_some_and(|file| file.contains("pdf-extract"))
 }
 
 /// 简易 PDF 文本抽取兜底：仅处理未压缩的 `(...) Tj` / `TJ` 形态。
@@ -897,6 +914,64 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    const SIMPLE_PDF: &[u8] = b"%PDF-1.1\nBT /F1 12 Tf 20 100 Td (kiro-pdf-test) Tj ET\n%%EOF";
+    /// 页面对象缺 MediaBox 等必需字段的畸形 PDF，用于覆盖 pdf-extract 内部 panic/错误分支。
+    const MALFORMED_PDF: &[u8] = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R>>endobj\nxref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000052 00000 n \n0000000101 00000 n \ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n145\n%%EOF";
+
+    #[test]
+    fn concurrent_pdf_extraction_is_correct_and_not_serialized_by_a_global_lock() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..20 {
+                        let text = extract_text_from_pdf_bytes(SIMPLE_PDF)
+                            .expect("simple PDF text should be extracted");
+                        assert!(text.contains("kiro-pdf-test"));
+                        // 畸形 PDF 无论走 panic 还是错误分支，都必须安全返回而不是传播 panic。
+                        let _ = extract_text_from_pdf_bytes(MALFORMED_PDF);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .expect("PDF extraction must never propagate a panic");
+        }
+    }
+
+    #[test]
+    fn pdf_panic_filter_only_suppresses_pdf_extract_panics_inside_the_scope() {
+        let pdf_file = Some("/registry/src/pdf-extract-0.7.12/src/lib.rs");
+        let other_file = Some("src/anthropic/handlers.rs");
+        assert!(should_suppress_pdf_extract_panic(true, pdf_file));
+        assert!(!should_suppress_pdf_extract_panic(false, pdf_file));
+        assert!(!should_suppress_pdf_extract_panic(true, other_file));
+        assert!(!should_suppress_pdf_extract_panic(true, None));
+    }
+
+    #[test]
+    fn pdf_extract_scope_flag_is_restored_on_return_nesting_and_unwind() {
+        let flags = std::thread::spawn(|| {
+            let before = IN_PDF_EXTRACT.with(Cell::get);
+            let nested_restored = {
+                let _outer = PdfExtractPanicScope::enter();
+                drop(PdfExtractPanicScope::enter());
+                IN_PDF_EXTRACT.with(Cell::get)
+            };
+            let after_return = IN_PDF_EXTRACT.with(Cell::get);
+            let _ = std::panic::catch_unwind(|| {
+                let _scope = PdfExtractPanicScope::enter();
+                panic!("unwinding through the pdf scope");
+            });
+            let after_unwind = IN_PDF_EXTRACT.with(Cell::get);
+            (before, nested_restored, after_return, after_unwind)
+        })
+        .join()
+        .expect("thread should not die");
+        assert_eq!(flags, (false, true, false, false));
+    }
 
     fn assert_empty_image_error(err: ConversionError) {
         match err {
