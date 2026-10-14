@@ -962,39 +962,55 @@ fn remove_oldest_entries_locked(
         return 0;
     }
 
-    let mut candidates = Vec::new();
-    for (scope, entries) in entries_by_scope.iter() {
-        if !include_scope(scope) {
-            continue;
-        }
-        for (fingerprint, entry) in entries {
-            candidates.push((
-                entry.last_used_at,
-                entry.expires_at,
-                scope.clone(),
-                *fingerprint,
-            ));
-        }
-    }
-    candidates.sort_by_key(|(last_used_at, expires_at, scope, fingerprint)| {
+    // 只借用候选，比较时不分配；缓存写满后每次写入都会走到这里，原先按 key 克隆 String 的
+    // 全量排序是锁内主要开销。排序键是全序（含 scope 与 fingerprint），用 select_nth 选出
+    // 最小的 remove_count 个，结果集合与全量排序后取前 remove_count 个完全相同。
+    let mut candidates: Vec<(&PromptCacheScope, &[u8; 32], &PromptCacheEntry)> = entries_by_scope
+        .iter()
+        .filter(|(scope, _)| include_scope(scope))
+        .flat_map(|(scope, entries)| {
+            entries
+                .iter()
+                .map(move |(fingerprint, entry)| (scope, fingerprint, entry))
+        })
+        .collect();
+    let compare = |a: &(&PromptCacheScope, &[u8; 32], &PromptCacheEntry),
+                   b: &(&PromptCacheScope, &[u8; 32], &PromptCacheEntry)| {
         (
-            *last_used_at,
-            *expires_at,
-            scope.conversation_id.clone(),
-            scope.route_namespace.clone(),
-            *fingerprint,
+            a.2.last_used_at,
+            a.2.expires_at,
+            &a.0.conversation_id,
+            &a.0.route_namespace,
+            a.1,
         )
-    });
+            .cmp(&(
+                b.2.last_used_at,
+                b.2.expires_at,
+                &b.0.conversation_id,
+                &b.0.route_namespace,
+                b.1,
+            ))
+    };
+    if remove_count < candidates.len() {
+        candidates.select_nth_unstable_by(remove_count, compare);
+        candidates.truncate(remove_count);
+    }
+    let to_remove: Vec<(PromptCacheScope, [u8; 32])> = candidates
+        .into_iter()
+        .map(|(scope, fingerprint, _)| (scope.clone(), *fingerprint))
+        .collect();
 
     let mut removed = 0usize;
-    for (_, _, scope, fingerprint) in candidates.into_iter().take(remove_count) {
+    for (scope, fingerprint) in to_remove {
         if let Some(entries) = entries_by_scope.get_mut(&scope)
             && entries.remove(&fingerprint).is_some()
         {
             removed += 1;
+            if entries.is_empty() {
+                entries_by_scope.remove(&scope);
+            }
         }
     }
-    entries_by_scope.retain(|_, entries| !entries.is_empty());
     removed
 }
 
@@ -3158,6 +3174,77 @@ mod tests {
         let mut state = tracker.entries.lock();
         state.prune_expired(Utc::now());
         assert_eq!(state.total_entries, total_cache_entries(&state.by_scope));
+    }
+
+    #[test]
+    fn eviction_selects_the_same_entries_as_a_full_sort() {
+        let base = Utc::now();
+        let mut by_scope = ScopeEntries::new();
+        let mut reference = Vec::new();
+        for scope_idx in 0..9u8 {
+            let scope = PromptCacheScope::new(
+                format!("evict-{}", scope_idx % 4),
+                (scope_idx % 3 == 0).then(|| format!("route-{scope_idx}")),
+            );
+            for entry_idx in 0..25u8 {
+                let mut fingerprint = [0u8; 32];
+                fingerprint[0] = scope_idx;
+                fingerprint[1] = entry_idx;
+                // 刻意制造大量相同的时间戳，覆盖排序键后几位的并列判定。
+                let last_used_at = base + chrono::Duration::seconds(i64::from(entry_idx % 5));
+                let expires_at = last_used_at + chrono::Duration::seconds(i64::from(entry_idx % 2));
+                by_scope.entry(scope.clone()).or_default().insert(
+                    fingerprint,
+                    PromptCacheEntry {
+                        expires_at,
+                        ttl: DEFAULT_PROMPT_CACHE_TTL,
+                        last_used_at,
+                        cached_tokens: 1,
+                    },
+                );
+                reference.push((
+                    last_used_at,
+                    expires_at,
+                    scope.conversation_id.clone(),
+                    scope.route_namespace.clone(),
+                    fingerprint,
+                ));
+            }
+        }
+        reference.sort();
+        for remove_count in [0, 1, 7, 64, 199, 225, 300] {
+            let mut entries = by_scope.clone();
+            let removed = remove_oldest_entries_locked(&mut entries, remove_count, |_| true);
+            assert_eq!(removed, remove_count.min(reference.len()));
+            let mut expected: std::collections::HashSet<_> = reference
+                .iter()
+                .skip(remove_count)
+                .map(|(_, _, conversation, route, fingerprint)| {
+                    (conversation.clone(), route.clone(), *fingerprint)
+                })
+                .collect();
+            for (scope, scope_entries) in &entries {
+                for fingerprint in scope_entries.keys() {
+                    assert!(
+                        expected.remove(&(
+                            scope.conversation_id.clone(),
+                            scope.route_namespace.clone(),
+                            *fingerprint
+                        )),
+                        "remove_count={remove_count}: an entry outside the oldest set survived"
+                    );
+                }
+            }
+            assert!(
+                expected.is_empty(),
+                "remove_count={remove_count}: wrong entries evicted"
+            );
+            assert!(
+                entries
+                    .values()
+                    .all(|scope_entries| !scope_entries.is_empty())
+            );
+        }
     }
 
     #[test]
