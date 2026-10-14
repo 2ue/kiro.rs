@@ -6072,6 +6072,73 @@ async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
 }
 
 #[tokio::test]
+async fn acquire_auto_heal_outside_selection_gate_terminates_when_healed_credentials_are_excluded()
+{
+    let cred1 = test_access_token_credential("t1", "Pro");
+    let cred2 = test_access_token_credential("t2", "Pro");
+    let manager =
+        MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, false).unwrap();
+    for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+        manager.report_failure(1);
+        manager.report_failure(2);
+    }
+    assert_eq!(manager.available_count(), 0);
+
+    let excluded = HashSet::from([1, 2]);
+    let result = tokio::time::timeout(
+        StdDuration::from_secs(5),
+        manager.acquire_context_for_session(None, None, &excluded),
+    )
+    .await
+    .expect("auto-heal followed by an all-excluded pool must not loop forever");
+    let err = result.err().expect("all healed credentials are excluded");
+    assert!(
+        err.to_string().contains("临时排除了所有可用账号"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(manager.available_count(), 2, "auto-heal still ran");
+    assert!(
+        manager.selection_reservation_gate.try_lock().is_some(),
+        "selection gate must be released after acquire returns"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_acquire_auto_heal_persists_without_the_sync_storage_bridge() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credential = test_access_token_credential("pg-heal-token", "Pro");
+    credential.id = Some(1);
+    store.save_credentials(&[credential.clone()]).await.unwrap();
+    let manager = MultiTokenManager::new_with_stores(
+        Config::default(),
+        vec![credential],
+        None,
+        None,
+        false,
+        Some(store.clone()),
+        None,
+    )
+    .unwrap();
+    for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+        manager.report_failure(1);
+    }
+    assert_eq!(manager.available_count(), 0);
+
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 1);
+    ctx.release_in_flight();
+
+    let runtime_state = store.load_credential_runtime_state().await.unwrap();
+    let state = runtime_state.get(&1).unwrap();
+    assert!(state.disabled_reason.is_none());
+    assert_eq!(state.failure_count, 0);
+}
+
+#[tokio::test]
 async fn test_multi_token_manager_acquire_context_balanced_request_excludes_bad_configuration() {
     let mut config = Config::default();
     config.load_balancing_mode = "balanced".to_string();

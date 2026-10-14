@@ -6930,6 +6930,7 @@ async fn post_messages_inner(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
+    let request_body_bytes = raw_body.len().max(effective_raw_body.len());
     record_external_pool_wire_debug_handler_ingress(
         &runtime_config.external_pools,
         &endpoint,
@@ -7354,14 +7355,17 @@ async fn post_messages_inner(
                 .reasoning_capability_state_for(model, &capability_cohort_keys)
         })
         .unwrap_or(KiroReasoningCapabilityState::Unknown);
-    let prepared_local = match local_body_pipeline::prepare(
-        &endpoint,
-        &payload,
-        &runtime_config,
-        &local_cache_route,
-        &model_resolution,
-        native_reasoning_capability,
-    ) {
+    let prepare_result = local_body_pipeline::run_cpu_heavy_in_place(request_body_bytes, || {
+        local_body_pipeline::prepare(
+            &endpoint,
+            &payload,
+            &runtime_config,
+            &local_cache_route,
+            &model_resolution,
+            native_reasoning_capability,
+        )
+    });
+    let prepared_local = match prepare_result {
         Ok(prepared) => prepared,
         Err(error) => {
             record_pre_usage_rejection_with_metadata_for_request(

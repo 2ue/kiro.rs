@@ -129,6 +129,25 @@ fn bounded_diagnostic_text(value: String) -> String {
     sanitized
 }
 
+/// 超过该大小的请求体在转换、PDF 抽取和 payload guard 反复序列化上会占用可观的 CPU 时间。
+/// 小请求保持原路径，避免 `block_in_place` 移交 worker 的额外开销。
+const CPU_HEAVY_BODY_BYTES: usize = 256 * 1024;
+
+/// 大请求的本地 body 准备是纯同步 CPU 工作；在多线程运行时里用 `block_in_place` 执行，
+/// 让当前 worker 上排队的其他任务（含 SSE keepalive）迁移到其他线程继续运行。
+/// current_thread 运行时（以及无运行时）不支持 `block_in_place`，直接同步执行。
+pub(super) fn run_cpu_heavy_in_place<T>(body_bytes: usize, work: impl FnOnce() -> T) -> T {
+    if body_bytes < CPU_HEAVY_BODY_BYTES {
+        return work();
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 pub(super) fn prepare(
     endpoint: &str,
     payload: &MessagesRequest,
@@ -477,6 +496,35 @@ mod tests {
             tool_cache_point_insert_after: Vec::new(),
             cache_point_plan_recording_enabled: true,
         }
+    }
+
+    #[test]
+    fn cpu_heavy_helper_runs_inline_without_a_multi_thread_runtime() {
+        assert_eq!(run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES, || 7), 7);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let value =
+            runtime.block_on(async { run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES * 4, || 11) });
+        assert_eq!(value, 11);
+    }
+
+    #[test]
+    fn cpu_heavy_helper_uses_block_in_place_only_for_large_bodies_on_multi_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("multi-thread runtime");
+        let (small, large) = runtime.block_on(async {
+            tokio::spawn(async {
+                let small = run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES - 1, || 1);
+                let large = run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES, || 2);
+                (small, large)
+            })
+            .await
+            .expect("task should complete")
+        });
+        assert_eq!((small, large), (1, 2));
     }
 
     #[test]

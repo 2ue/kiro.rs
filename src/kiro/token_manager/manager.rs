@@ -3266,6 +3266,11 @@ impl MultiTokenManager {
             self.cleanup_expired_local_in_flight_leases(max_age, Instant::now());
         }
 
+        // 恢复探测是同步 Redis ping（最长 SCHEDULER_REDIS_HOT_OP_TIMEOUT），必须在拿 entries /
+        // proxy_resources 锁之前执行，否则探测期间所有线程上的调度读写都会阻塞在这两把锁上。
+        if refresh_scheduler_state && !risk_circuit.open {
+            self.probe_scheduler_redis_capacity_recovery_if_due();
+        }
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let total = entries.len();
@@ -3281,9 +3286,6 @@ impl MultiTokenManager {
             config.dispatch_global_max_concurrent_requests,
             1,
         );
-        if refresh_scheduler_state && !risk_circuit.open {
-            self.probe_scheduler_redis_capacity_recovery_if_due();
-        }
         let scheduler_redis_retry_after_secs = self.scheduler_redis_degraded_retry_after_secs();
         let mut model_usable = 0usize;
         let mut usable = 0usize;
@@ -3405,31 +3407,9 @@ impl MultiTokenManager {
     }
 
     fn auto_heal_too_many_failures_if_applicable(&self) -> bool {
-        let candidate_ids = {
-            let entries = self.entries.lock();
-            if !entries.iter().any(|entry| {
-                entry.disabled
-                    && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                    && !entry.runtime_persistence_degraded
-            }) {
-                return false;
-            }
-
-            tracing::warn!(
-                "所有可调度凭据均不可用且存在连续失败自动禁用凭据，执行自愈：重置失败计数并重新启用"
-            );
-
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry.disabled
-                        && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        && !entry.runtime_persistence_degraded
-                })
-                .map(|entry| entry.id)
-                .collect::<Vec<_>>()
+        let Some(candidate_ids) = self.auto_heal_candidate_ids() else {
+            return false;
         };
-
         let mut healed_ids = Vec::new();
         for id in candidate_ids {
             let persisted_state = if let Some(store) = &self.postgres_store {
@@ -3447,31 +3427,113 @@ impl MultiTokenManager {
             } else {
                 None
             };
-            let mut entries = self.entries.lock();
-            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
-                continue;
-            };
-            if entry.disabled_reason != Some(DisabledReason::TooManyFailures) {
-                continue;
+            if self.apply_auto_heal_result(id, persisted_state.as_ref()) {
+                healed_ids.push(id);
             }
-            if let Some(state) = persisted_state.as_ref() {
-                if state.revision <= entry.runtime_revision {
-                    continue;
+        }
+        self.finish_auto_heal(healed_ids)
+    }
+
+    /// 请求调度路径使用的自愈：PgSQL 写入直接 await，不经过同步存储桥，
+    /// 调用方必须在不持有任何调度锁的情况下调用。
+    async fn auto_heal_too_many_failures_if_applicable_async(&self) -> bool {
+        let Some(candidate_ids) = self.auto_heal_candidate_ids() else {
+            return false;
+        };
+        let mut healed_ids = Vec::new();
+        for id in candidate_ids {
+            let persisted_state = if let Some(store) = &self.postgres_store {
+                let store = store.clone();
+                let operation = "原子恢复 PgSQL 连续失败禁用凭据";
+                match credential_pgsql_sync_with_timeout(
+                    operation,
+                    CREDENTIAL_PGSQL_SYNC_TIMEOUT,
+                    async move { store.heal_credential_api_failures(id).await },
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("{}失败: {}", operation, err))
+                {
+                    Ok(Some(state)) => Some(state),
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(credential_id = id, "{}", err);
+                        continue;
+                    }
                 }
-                entry.credentials.disabled = false;
-                Self::apply_runtime_state_if_newer(entry, state);
             } else {
-                entry.failure_count = 0;
-                entry.credentials.disabled = false;
-                entry.disabled = false;
-                entry.disabled_reason = None;
+                None
+            };
+            if self.apply_auto_heal_result(id, persisted_state.as_ref()) {
+                healed_ids.push(id);
             }
-            if entry.disabled {
-                continue;
-            }
-            healed_ids.push(id);
+        }
+        self.finish_auto_heal(healed_ids)
+    }
+
+    fn has_auto_heal_candidates(&self) -> bool {
+        self.entries.lock().iter().any(|entry| {
+            entry.disabled
+                && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                && !entry.runtime_persistence_degraded
+        })
+    }
+
+    fn auto_heal_candidate_ids(&self) -> Option<Vec<u64>> {
+        let entries = self.entries.lock();
+        if !entries.iter().any(|entry| {
+            entry.disabled
+                && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                && !entry.runtime_persistence_degraded
+        }) {
+            return None;
         }
 
+        tracing::warn!(
+            "所有可调度凭据均不可用且存在连续失败自动禁用凭据，执行自愈：重置失败计数并重新启用"
+        );
+
+        Some(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.disabled
+                        && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+                        && !entry.runtime_persistence_degraded
+                })
+                .map(|entry| entry.id)
+                .collect(),
+        )
+    }
+
+    /// 把自愈结果写回本地 entry，返回该凭据是否已恢复为可用。
+    fn apply_auto_heal_result(
+        &self,
+        id: u64,
+        persisted_state: Option<&CredentialRuntimeStateRow>,
+    ) -> bool {
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+            return false;
+        };
+        if entry.disabled_reason != Some(DisabledReason::TooManyFailures) {
+            return false;
+        }
+        if let Some(state) = persisted_state {
+            if state.revision <= entry.runtime_revision {
+                return false;
+            }
+            entry.credentials.disabled = false;
+            Self::apply_runtime_state_if_newer(entry, state);
+        } else {
+            entry.failure_count = 0;
+            entry.credentials.disabled = false;
+            entry.disabled = false;
+            entry.disabled_reason = None;
+        }
+        !entry.disabled
+    }
+
+    fn finish_auto_heal(&self, healed_ids: Vec<u64>) -> bool {
         if healed_ids.is_empty() {
             return false;
         }
@@ -5939,6 +6001,8 @@ impl MultiTokenManager {
         }
         enum AcquireDecision {
             Selected(u64, KiroCredentials, bool, bool),
+            /// 本轮没有可选凭据但存在可自愈的连续失败禁用凭据；释放门锁后执行自愈。
+            AutoHeal,
             WaitForDispatch {
                 reason: DispatchWaitReason,
                 available: usize,
@@ -5963,6 +6027,10 @@ impl MultiTokenManager {
         let mut local_excluded_ids = excluded_ids.clone();
         let mut slot_race_excluded_count = 0usize;
         let mut sticky_bound_release_grace_waited = false;
+        // 上一轮已经尝试过自愈：本轮按自愈后的状态正常判定，不再立即重复自愈。
+        // 自愈只会把 TooManyFailures 禁用的凭据恢复为可用，所以"自愈轮"与"普通判定轮"交替出现，
+        // 普通判定轮的终止条件（选中、排队超时、bail）与原逻辑一致，不会无限循环。
+        let mut auto_heal_just_attempted = false;
         let mut auxiliary_refresh_error: Option<anyhow::Error> = None;
         let mut health_neutral_refresh_error: Option<anyhow::Error> = None;
         let request_bound_id = match session_id {
@@ -6087,22 +6155,23 @@ impl MultiTokenManager {
                     let fallback_from_sticky = request_bound_id.is_some();
                     {
                         // 根据负载均衡策略选择；priority 模式也会在同优先级账号之间优先低并发。
-                        let mut best = self.select_next_credential_excluding(
+                        let best = self.select_next_credential_excluding(
                             model,
                             &local_excluded_ids,
                             request_weight_units,
                         );
 
-                        // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                        if best.is_none() && self.auto_heal_too_many_failures_if_applicable() {
-                            best = self.select_next_credential_excluding(
-                                model,
-                                &local_excluded_ids,
-                                request_weight_units,
-                            );
-                        }
+                        // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈。
+                        // 自愈要写 PgSQL，不能在持有 selection_reservation_gate 时执行；这里只做本地
+                        // 判断，真正的自愈在释放门锁后 await，完成后重新进入循环选择。
+                        let defer_auto_heal = best.is_none()
+                            && !auto_heal_just_attempted
+                            && self.has_auto_heal_candidates();
+                        auto_heal_just_attempted = false;
 
-                        if let Some((new_id, new_creds)) = best {
+                        if defer_auto_heal {
+                            AcquireDecision::AutoHeal
+                        } else if let Some((new_id, new_creds)) = best {
                             // 更新 current_id
                             let mut current_id = self.current_id.lock();
                             *current_id = new_id;
@@ -6352,13 +6421,19 @@ impl MultiTokenManager {
                 AcquireDecision::Selected(id, _, _, _) => {
                     self.prepare_in_flight_slot(*id, request_weight_units)
                 }
-                AcquireDecision::WaitForDispatch { .. } => None,
+                AcquireDecision::WaitForDispatch { .. } | AcquireDecision::AutoHeal => None,
             };
             drop(selection_reservation_guard);
 
             let (id, credentials, sticky_bound, fallback_from_sticky) = match decision {
                 AcquireDecision::Selected(id, credentials, sticky_bound, fallback_from_sticky) => {
                     (id, credentials, sticky_bound, fallback_from_sticky)
+                }
+                AcquireDecision::AutoHeal => {
+                    let healed = self.auto_heal_too_many_failures_if_applicable_async().await;
+                    tracing::debug!(healed, "调度门锁外完成连续失败自愈，重新选择凭据");
+                    auto_heal_just_attempted = true;
+                    continue;
                 }
                 AcquireDecision::WaitForDispatch {
                     reason,
