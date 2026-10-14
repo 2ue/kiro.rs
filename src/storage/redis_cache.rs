@@ -605,7 +605,29 @@ const USAGE_RECORDS_TTL_SECS: usize = 35 * 24 * 60 * 60;
 const USAGE_RECORDS_MAX_CACHED: usize = 100_000;
 const DEFAULT_USAGE_SUMMARY_WRITE_PERMITS: usize = 1;
 const SCHEDULER_STATE_BATCH_SIZE: usize = 16;
+/// 本地凭据 in-flight lease 的 release 墓碑存活时间。墓碑只用于拦截本实例已放弃、但在 Redis 上
+/// 迟到成功的 acquire；lease_id 来自本实例的命名空间计数器，墓碑不需要跨版本共享。
+const SCHEDULER_RELEASED_LEASE_TOMBSTONE_TTL_SECS: i64 = 120;
+/// 每次写会话绑定时，从 `scheduler:sessions_by_credential:{id}` 中随机抽样检查的成员数。
+///
+/// 反向索引集合每次写入都会刷新整体 TTL，成员却不会随各自的 session key 过期而移除；只要凭据持续有
+/// 流量，集合就会无限增长。每次写入最多新增 1 个成员，同时抽样 N 个成员并移除 session key 已不存在的
+/// 死成员：稳态下死成员比例约为 1/N，集合大小约为存活会话数 × N/(N-1)。保持 SET 类型不变，
+/// 新旧版本实例可以同时读写。
+const SESSION_INDEX_PRUNE_SAMPLE: usize = 4;
+/// 在已 SADD 本次成员之后执行的有界惰性清理。session key 由前缀与成员拼接，不在 KEYS 中：
+/// 本项目只支持单机 Redis（见 external pool 协调相关注释），与 `delete_sessions_for_credential` 做法一致。
+/// 约定：ARGV[1] = 本次 session hash，`session_key_prefix`/`index_key`/`sample` 由调用脚本定义。
+const SESSION_INDEX_PRUNE_LUA: &str = r#"
+            for _, member in ipairs(redis.call('SRANDMEMBER', index_key, sample)) do
+                if member ~= ARGV[1] and redis.call('EXISTS', session_key_prefix .. member) == 0 then
+                    redis.call('SREM', index_key, member)
+                end
+            end
+"#;
 const SCHEDULER_STATE_BATCH_SCRIPT: &str = r#"
+    -- 选择窗口分数由各实例本地时钟写入（record_scheduler_selection），这里仍用调用方本地时间计数；
+    -- 跨实例时钟漂移对选择计数的影响是已知残留，in-flight lease 已统一改用 Redis TIME。
     local query_now = tonumber(ARGV[1])
     local values = {}
     local credentials = math.floor(#KEYS / 9)
@@ -623,6 +645,9 @@ const SCHEDULER_STATE_BATCH_SCRIPT: &str = r#"
         table.insert(values, redis.call('ZCOUNT', KEYS[base + 8], query_now - 300000, '+inf'))
         table.insert(values, redis.call('HGETALL', KEYS[base + 9]))
     end
+    -- 最后一项是 Redis 服务器时间（毫秒）：lease 分数由 Redis TIME 写入，调用方据此换算到本地时钟。
+    local redis_time = redis.call('TIME')
+    table.insert(values, tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000))
     return values
 "#;
 const USAGE_CLEANUP_WATERMARK_KEY: &str = "usage:cleanup:soft_delete_cutoff_micros";
@@ -3360,7 +3385,8 @@ impl RedisStore {
     ) -> anyhow::Result<SchedulerSessionBinding> {
         let encoded = serde_json::to_string(binding)?;
         let session_hash = session_hash(session_id);
-        let script = r#"
+        let script = format!(
+            r#"
             local old = redis.call('GET', KEYS[1])
             local next = cjson.decode(ARGV[3])
             if old then
@@ -3378,11 +3404,16 @@ impl RedisStore {
             redis.call('SET', KEYS[1], next_encoded, 'EX', ARGV[4])
             redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[1])
             redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
+            local index_key = ARGV[5] .. ARGV[2]
+            local session_key_prefix = ARGV[6]
+            local sample = tonumber(ARGV[7])
+            {SESSION_INDEX_PRUNE_LUA}
             return next_encoded
-        "#;
+        "#
+        );
         let mut manager = self.scheduler_manager();
         let actual: String = redis::cmd("EVAL")
-            .arg(script)
+            .arg(&script)
             .arg(1)
             .arg(self.key(session_binding_key(session_id)))
             .arg(&session_hash)
@@ -3390,6 +3421,8 @@ impl RedisStore {
             .arg(encoded)
             .arg(ttl_secs.max(1))
             .arg(self.key("scheduler:sessions_by_credential:"))
+            .arg(self.key("scheduler:session:"))
+            .arg(SESSION_INDEX_PRUNE_SAMPLE)
             .query_async(&mut manager)
             .await?;
         Ok(serde_json::from_str(&actual)?)
@@ -3477,7 +3510,8 @@ impl RedisStore {
         ttl_secs: usize,
     ) -> anyhow::Result<Option<SchedulerSessionBinding>> {
         let session_hash = session_hash(session_id);
-        let script = r#"
+        let script = format!(
+            r#"
             local raw = redis.call('GET', KEYS[1])
             if not raw then
                 return nil
@@ -3495,11 +3529,16 @@ impl RedisStore {
             redis.call('SET', KEYS[1], encoded, 'EX', ARGV[4])
             redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[1])
             redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
+            local index_key = ARGV[5] .. ARGV[2]
+            local session_key_prefix = ARGV[6]
+            local sample = tonumber(ARGV[7])
+            {SESSION_INDEX_PRUNE_LUA}
             return encoded
-        "#;
+        "#
+        );
         let mut manager = self.scheduler_manager();
         let encoded: Option<String> = redis::cmd("EVAL")
-            .arg(script)
+            .arg(&script)
             .arg(1)
             .arg(self.key(session_binding_key(session_id)))
             .arg(&session_hash)
@@ -3507,6 +3546,8 @@ impl RedisStore {
             .arg(Utc::now().to_rfc3339())
             .arg(ttl_secs.max(1))
             .arg(self.key("scheduler:sessions_by_credential:"))
+            .arg(self.key("scheduler:session:"))
+            .arg(SESSION_INDEX_PRUNE_SAMPLE)
             .query_async(&mut manager)
             .await?;
         encoded
@@ -3535,7 +3576,8 @@ impl RedisStore {
         ttl_secs: usize,
     ) -> anyhow::Result<Option<SchedulerSessionBinding>> {
         let session_hash = session_hash(session_id);
-        let script = r#"
+        let script = format!(
+            r#"
             local raw = redis.call('GET', KEYS[1])
             if not raw then
                 return nil
@@ -3553,11 +3595,16 @@ impl RedisStore {
             redis.call('SET', KEYS[1], encoded, 'EX', ARGV[4])
             redis.call('SADD', ARGV[5] .. ARGV[2], ARGV[1])
             redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
+            local index_key = ARGV[5] .. ARGV[2]
+            local session_key_prefix = ARGV[6]
+            local sample = tonumber(ARGV[7])
+            {SESSION_INDEX_PRUNE_LUA}
             return encoded
-        "#;
+        "#
+        );
         let mut manager = self.scheduler_manager();
         let encoded: Option<String> = redis::cmd("EVAL")
-            .arg(script)
+            .arg(&script)
             .arg(1)
             .arg(self.key(session_binding_key(session_id)))
             .arg(&session_hash)
@@ -3565,6 +3612,8 @@ impl RedisStore {
             .arg(Utc::now().to_rfc3339())
             .arg(ttl_secs.max(1))
             .arg(self.key("scheduler:sessions_by_credential:"))
+            .arg(self.key("scheduler:session:"))
+            .arg(SESSION_INDEX_PRUNE_SAMPLE)
             .query_async(&mut manager)
             .await?;
         encoded
@@ -4178,27 +4227,29 @@ impl RedisStore {
         max_age: Option<StdDuration>,
         kind: &str,
     ) -> anyhow::Result<Option<usize>> {
-        let now = now_ms();
         let request_weight_units = request_weight_units.clamp(1, 64);
         let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
         let ttl_secs = max_age
             .map(|age| age.as_secs().saturating_mul(2).max(60) as i64)
             .unwrap_or(0);
         let script = r#"
-            local now = tonumber(ARGV[1])
-            local max_age_ms = tonumber(ARGV[2])
-            local max_count = tonumber(ARGV[3])
-            local global_max_count = tonumber(ARGV[4])
-            local lease_id = ARGV[5]
-            local kind = ARGV[6]
-            local ttl_secs = tonumber(ARGV[7])
-            local request_weight = tonumber(ARGV[8])
+            local redis_time = redis.call('TIME')
+            local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+            local max_age_ms = tonumber(ARGV[1])
+            local max_count = tonumber(ARGV[2])
+            local global_max_count = tonumber(ARGV[3])
+            local lease_id = ARGV[4]
+            local kind = ARGV[5]
+            local ttl_secs = tonumber(ARGV[6])
+            local request_weight = tonumber(ARGV[7])
 
             if redis.call('EXISTS', KEYS[12]) == 1 then
                 return {0, -2}
             end
 
-            if redis.call('SISMEMBER', KEYS[11], lease_id) == 1 then
+            if redis.call('EXISTS', KEYS[13]) == 1
+                or redis.call('SISMEMBER', KEYS[11], lease_id) == 1
+            then
                 return {0, -1}
             end
 
@@ -4266,7 +4317,9 @@ impl RedisStore {
                 return {0, -2}
             end
 
-            if redis.call('SISMEMBER', KEYS[11], lease_id) == 1 then
+            if redis.call('EXISTS', KEYS[13]) == 1
+                or redis.call('SISMEMBER', KEYS[11], lease_id) == 1
+            then
                 return {0, -1}
             end
 
@@ -4296,10 +4349,11 @@ impl RedisStore {
         "#;
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
+        let lease_id_arg = lease_id.to_string();
         let mut manager = self.scheduler_capacity_manager();
         let result: Vec<i64> = redis::cmd("EVAL")
             .arg(script)
-            .arg(12)
+            .arg(13)
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&keys.kind))
@@ -4312,11 +4366,14 @@ impl RedisStore {
             .arg(self.key(&global_keys.count))
             .arg(self.key(&keys.released))
             .arg(self.key(scheduler_dispatch_block_key(credential_id)))
-            .arg(now)
+            .arg(self.key(in_flight_released_tombstone_key(
+                credential_id,
+                &lease_id_arg,
+            )))
             .arg(max_age_ms)
             .arg(max_concurrent_requests)
             .arg(global_max_concurrent_requests)
-            .arg(lease_id.to_string())
+            .arg(&lease_id_arg)
             .arg(kind)
             .arg(ttl_secs)
             .arg(request_weight_units)
@@ -4648,10 +4705,7 @@ impl RedisStore {
             local ttl_secs = tonumber(ARGV[3])
 
             if tombstone == 1 then
-                redis.call('SADD', KEYS[11], lease_id)
-                if ttl_secs > 0 then
-                    redis.call('EXPIRE', KEYS[11], ttl_secs)
-                end
+                redis.call('SET', KEYS[11], '1', 'EX', ttl_secs)
             end
 
             local local_weight = tonumber(redis.call('HGET', KEYS[4], lease_id) or '1')
@@ -4683,7 +4737,6 @@ impl RedisStore {
             end
             return removed
         "#;
-        let tombstone_ttl_secs = 120i64;
         let removed: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(12)
@@ -4697,11 +4750,11 @@ impl RedisStore {
             .arg(self.key(&global_keys.kind))
             .arg(self.key(&global_keys.weight))
             .arg(self.key(&global_keys.count))
-            .arg(self.key(&keys.released))
+            .arg(self.key(in_flight_released_tombstone_key(credential_id, &lease_id)))
             .arg(self.dispatch_wakeup_channel())
             .arg(&lease_id)
             .arg(if tombstone { 1 } else { 0 })
-            .arg(tombstone_ttl_secs)
+            .arg(SCHEDULER_RELEASED_LEASE_TOMBSTONE_TTL_SECS)
             .arg(wakeup_payload.unwrap_or_default())
             .query_async(&mut manager)
             .await?;
@@ -5664,8 +5717,9 @@ impl RedisStore {
         let mut manager = self.scheduler_capacity_manager();
         let lease_id = lease_id.to_string();
         let script = r#"
-            local now = tonumber(ARGV[1])
-            local lease_id = ARGV[2]
+            local redis_time = redis.call('TIME')
+            local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+            local lease_id = ARGV[1]
 
             if not redis.call('ZSCORE', KEYS[2], lease_id)
                 or not redis.call('ZSCORE', KEYS[4], lease_id)
@@ -5686,7 +5740,6 @@ impl RedisStore {
             .arg(self.key(&keys.acquired))
             .arg(self.key(&global_keys.last_seen))
             .arg(self.key(&global_keys.acquired))
-            .arg(now_ms())
             .arg(&lease_id)
             .query_async(&mut manager)
             .await?;
@@ -5704,9 +5757,10 @@ impl RedisStore {
         let lease_id = lease_id.to_string();
         let mut manager = self.scheduler_capacity_manager();
         let script = r#"
-            local now = tonumber(ARGV[1])
-            local lease_id = ARGV[2]
-            local kind = ARGV[3]
+            local redis_time = redis.call('TIME')
+            local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+            local lease_id = ARGV[1]
+            local kind = ARGV[2]
 
             if not redis.call('ZSCORE', KEYS[2], lease_id)
                 or not redis.call('ZSCORE', KEYS[5], lease_id)
@@ -5733,7 +5787,6 @@ impl RedisStore {
             .arg(self.key(&global_keys.last_seen))
             .arg(self.key(&global_keys.acquired))
             .arg(self.key(&global_keys.kind))
-            .arg(now_ms())
             .arg(&lease_id)
             .arg(kind)
             .query_async(&mut manager)
@@ -5746,11 +5799,11 @@ impl RedisStore {
         credential_ids: &[u64],
         max_age: StdDuration,
     ) -> anyhow::Result<usize> {
-        let now = now_ms();
         let max_age_ms = max_age.as_millis() as i64;
         let script = r#"
-            local now = tonumber(ARGV[1])
-            local max_age_ms = tonumber(ARGV[2])
+            local redis_time = redis.call('TIME')
+            local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+            local max_age_ms = tonumber(ARGV[1])
             local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - max_age_ms)
             for _, member in ipairs(expired) do
                 local local_weight = tonumber(redis.call('HGET', KEYS[4], member) or '1')
@@ -5796,7 +5849,6 @@ impl RedisStore {
                 .arg(self.key(&global_keys.kind))
                 .arg(self.key(&global_keys.weight))
                 .arg(self.key(&global_keys.count))
-                .arg(now)
                 .arg(max_age_ms)
                 .query_async(&mut manager)
                 .await?;
@@ -5814,9 +5866,11 @@ impl RedisStore {
         let global_keys = global_in_flight_keys();
         let mut manager = self.scheduler_capacity_manager();
         if let Some(min_idle) = min_idle {
-            let cutoff = now_ms() - min_idle.as_millis() as i64;
+            let min_idle_ms = min_idle.as_millis() as i64;
             let script = r#"
-                local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+                local redis_time = redis.call('TIME')
+                local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+                local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - tonumber(ARGV[1]))
                 for _, member in ipairs(expired) do
                     local local_weight = tonumber(redis.call('HGET', KEYS[4], member) or '1')
                     local global_weight = tonumber(redis.call('HGET', KEYS[9], member) or '1')
@@ -5856,7 +5910,7 @@ impl RedisStore {
                 .arg(self.key(&global_keys.kind))
                 .arg(self.key(&global_keys.weight))
                 .arg(self.key(&global_keys.count))
-                .arg(cutoff)
+                .arg(min_idle_ms)
                 .query_async(&mut manager)
                 .await?;
             return Ok(removed.max(0) as usize);
@@ -5911,6 +5965,7 @@ impl RedisStore {
         let query_now = now_ms();
         let mut manager = self.scheduler_manager();
         let mut values = Vec::with_capacity(credential_ids.len() * 11);
+        let mut lease_clock_offsets_ms = Vec::with_capacity(credential_ids.len());
         for batch in credential_ids.chunks(SCHEDULER_STATE_BATCH_SIZE) {
             let mut command = redis::cmd("EVAL");
             command
@@ -5939,14 +5994,19 @@ impl RedisStore {
                     tokio::time::sleep(StdDuration::from_millis(delay_millis)).await;
                 }
             }
-            let batch_values: Vec<redis::Value> = command.query_async(&mut manager).await?;
-            if batch_values.len() != batch.len() * 11 {
+            let mut batch_values: Vec<redis::Value> = command.query_async(&mut manager).await?;
+            if batch_values.len() != batch.len() * 11 + 1 {
                 anyhow::bail!(
                     "Redis 调度状态批量读取返回数量异常：期望 {}，实际 {}",
-                    batch.len() * 11,
+                    batch.len() * 11 + 1,
                     batch_values.len()
                 );
             }
+            let redis_now_ms: i64 =
+                redis::from_redis_value(&batch_values.pop().expect("length checked above"))?;
+            // 本地时钟领先 Redis 的毫秒数；同一批次内的 lease 分数统一按这个偏移换算。
+            let batch_clock_offset_ms = now_ms() - redis_now_ms;
+            lease_clock_offsets_ms.extend(std::iter::repeat_n(batch_clock_offset_ms, batch.len()));
             values.extend(batch_values);
             tokio::task::yield_now().await;
         }
@@ -6001,9 +6061,12 @@ impl RedisStore {
             health.recent_selection_count_10s = recent_10s.max(0).min(u32::MAX as i64) as u32;
             health.recent_selection_count_60s = recent_60s.max(0).min(u32::MAX as i64) as u32;
             health.recent_selection_count_5m = recent_5m.max(0).min(u32::MAX as i64) as u32;
+            // lease 分数是 Redis 服务器时间；换算到本地时钟后，下游按本地 `Utc::now()` 判断
+            // 新鲜度时不受实例与 Redis 之间的时钟漂移影响。
+            let clock_offset_ms = lease_clock_offsets_ms[index];
             let acquired_map: HashMap<String, i64> = acquired
                 .into_iter()
-                .map(|(member, score)| (member, score as i64))
+                .map(|(member, score)| (member, score as i64 + clock_offset_ms))
                 .collect();
             let in_flight_leases = last_seen
                 .into_iter()
@@ -6013,7 +6076,7 @@ impl RedisStore {
                     Some(SchedulerInFlightLease {
                         id,
                         acquired_at_ms,
-                        last_seen_at_ms: last_seen_score as i64,
+                        last_seen_at_ms: last_seen_score as i64 + clock_offset_ms,
                         kind: kinds
                             .get(&member)
                             .cloned()
@@ -7439,6 +7502,13 @@ struct InFlightKeys {
     weight: String,
     count: String,
     released: String,
+}
+
+/// 单个本地 lease 的 release 墓碑 key（带 TTL）。旧版本写入的是整体刷新 TTL 的
+/// `scheduler:inflight:{id}:released` SET，成员永不单独过期；该 SET 现在只读兼容，
+/// 升级后最多 120 秒自然过期，之后的版本可以删除对它的读取。
+fn in_flight_released_tombstone_key(credential_id: u64, lease_id: &str) -> String {
+    format!("scheduler:inflight:{credential_id}:released:{lease_id}")
 }
 
 fn in_flight_keys(credential_id: u64) -> InFlightKeys {
@@ -11861,6 +11931,236 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    async fn redis_now_ms_for_test(store: &RedisStore) -> i64 {
+        let mut manager = store.scheduler_capacity_manager();
+        let (secs, micros): (i64, i64) =
+            redis::cmd("TIME").query_async(&mut manager).await.unwrap();
+        secs * 1_000 + micros / 1_000
+    }
+
+    #[tokio::test]
+    async fn redis_session_index_prunes_expired_session_members_on_write() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let credential_id = 91;
+        let binding = SchedulerSessionBinding {
+            credential_id,
+            last_used_at: Utc::now(),
+            soft_failure_count: 0,
+        };
+        for idx in 0..500 {
+            store
+                .set_session_binding(&format!("expiring-{idx}"), &binding, 1)
+                .await
+                .unwrap();
+        }
+        // 生产中凭据持续有流量，集合整体 TTL 一直被刷新；这里用一次长 TTL 写入模拟这一点，
+        // 否则集合会随最后一次短 TTL 写入整体过期，测不到成员泄漏。
+        store
+            .set_session_binding("live-0", &binding, 600)
+            .await
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(2_100)).await;
+
+        let live_sessions = 50;
+        for round in 0..300 {
+            store
+                .set_session_binding(&format!("live-{}", round % live_sessions), &binding, 600)
+                .await
+                .unwrap();
+        }
+
+        let index_key = store.key(sessions_by_credential_key(credential_id));
+        let mut manager = store.scheduler_manager();
+        let members: i64 = redis::cmd("SCARD")
+            .arg(&index_key)
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert!(
+            members <= (live_sessions * 2 + 20) as i64,
+            "dead session members must be pruned on write, got {members}"
+        );
+        assert!(members >= live_sessions as i64, "live members must be kept");
+        assert_eq!(
+            store
+                .delete_sessions_for_credential(credential_id)
+                .await
+                .unwrap(),
+            live_sessions
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_scheduler_release_tombstones_are_per_lease_keys_with_ttl() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let credential_id = 92;
+        let mut last_lease_id = 0;
+        for _ in 0..2_000 {
+            last_lease_id = store.next_in_flight_lease_id().await.unwrap();
+            store
+                .release_in_flight_lease_with_tombstone(credential_id, last_lease_id)
+                .await
+                .unwrap();
+        }
+
+        let mut manager = store.scheduler_capacity_manager();
+        let legacy_set: i64 = redis::cmd("EXISTS")
+            .arg(store.key(&in_flight_keys(credential_id).released))
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy_set, 0,
+            "release must not grow the legacy tombstone SET"
+        );
+        let ttl_ms: i64 = redis::cmd("PTTL")
+            .arg(store.key(in_flight_released_tombstone_key(
+                credential_id,
+                &last_lease_id.to_string(),
+            )))
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert!(
+            ttl_ms > 0 && ttl_ms <= SCHEDULER_RELEASED_LEASE_TOMBSTONE_TTL_SECS * 1_000,
+            "per-lease tombstone must carry its own TTL, got {ttl_ms}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_scheduler_legacy_tombstone_set_still_blocks_late_acquire() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let credential_id = 93;
+        let lease_id = store.next_in_flight_lease_id().await.unwrap();
+        let mut manager = store.scheduler_capacity_manager();
+        let _: () = redis::cmd("SADD")
+            .arg(store.key(&in_flight_keys(credential_id).released))
+            .arg(lease_id.to_string())
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .acquire_in_flight_lease(
+                    credential_id,
+                    lease_id,
+                    1,
+                    Some(StdDuration::from_secs(60)),
+                    "stream",
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "tombstones written by an older instance must still block the late acquire"
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_in_flight_lease_expiry_uses_redis_time_not_caller_clock() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let credential_id = 94;
+        let max_age = StdDuration::from_secs(60);
+        let redis_now = redis_now_ms_for_test(&store).await;
+        let stale = redis_now - (max_age.as_millis() as i64 + 5_000);
+        let fresh = redis_now - (max_age.as_millis() as i64 - 5_000);
+        let keys = in_flight_keys(credential_id);
+        let global_keys = global_in_flight_keys();
+        let mut manager = store.scheduler_capacity_manager();
+        for (member, score) in [("stale-lease", stale), ("fresh-lease", fresh)] {
+            let _: () = redis::pipe()
+                .cmd("ZADD")
+                .arg(store.key(&keys.last_seen))
+                .arg(score)
+                .arg(member)
+                .cmd("ZADD")
+                .arg(store.key(&keys.acquired))
+                .arg(score)
+                .arg(member)
+                .cmd("ZADD")
+                .arg(store.key(&global_keys.last_seen))
+                .arg(score)
+                .arg(member)
+                .cmd("ZADD")
+                .arg(store.key(&global_keys.acquired))
+                .arg(score)
+                .arg(member)
+                .query_async(&mut manager)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .cleanup_expired_in_flight_leases(&[credential_id], max_age)
+                .await
+                .unwrap(),
+            1
+        );
+        let remaining: Vec<String> = redis::cmd("ZRANGE")
+            .arg(store.key(&keys.last_seen))
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert_eq!(remaining, vec!["fresh-lease".to_string()]);
+        let _ = store.clear_in_flight_leases(credential_id, None).await;
+    }
+
+    #[tokio::test]
+    async fn redis_scheduler_state_reports_lease_idle_time_on_local_clock() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+        let store = RedisStore::connect(&config).await.unwrap();
+        let credential_id = 95;
+        let idle_ms = 7_000;
+        let score = redis_now_ms_for_test(&store).await - idle_ms;
+        let keys = in_flight_keys(credential_id);
+        let mut manager = store.scheduler_capacity_manager();
+        let _: () = redis::pipe()
+            .cmd("ZADD")
+            .arg(store.key(&keys.last_seen))
+            .arg(score)
+            .arg("12345")
+            .cmd("ZADD")
+            .arg(store.key(&keys.acquired))
+            .arg(score)
+            .arg("12345")
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+
+        let states = store
+            .scheduler_state_for_credentials(&[credential_id])
+            .await
+            .unwrap();
+        let lease = &states.get(&credential_id).unwrap().in_flight_leases[0];
+        let observed_idle = now_ms() - lease.last_seen_at_ms;
+        assert!(
+            (observed_idle - idle_ms).abs() < 1_000,
+            "lease idle time must match Redis-side idle time on the local clock, got {observed_idle}ms"
+        );
+        let _ = store.clear_in_flight_leases(credential_id, None).await;
     }
 
     #[tokio::test]
