@@ -265,7 +265,11 @@ Last reviewed: 2026-09-28 Asia/Shanghai
 2. Perform read-only `v0.0.134` production observation and update the issue/evidence
    indexes without changing usage semantics.
 3. Close the Claude Code/Kiro interop follow-ups above before widening fallback behavior.
-4. Continue the independent documentation archive and scheduler observability follow-ups.
+4. Review and accept the [OpenAI/Kiro protocol interop refactor plan](topics/openai-kiro-protocol-interop-refactor-plan.md);
+   no implementation is authorized until the P0 field contract, internal event model,
+   upstream protocol matrix, model/catalog policy, reasoning exposure and rollback gates
+   are explicitly accepted.
+5. Continue the independent documentation archive and scheduler observability follow-ups.
 
 ## Deferred
 

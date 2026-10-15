@@ -11,8 +11,17 @@ import type {
 // Label helpers
 // ============================================================================
 
-export function credentialLabel(c: Pick<CredentialStatusItem, 'id' | 'email' | 'maskedApiKey'>) {
-  return c.email || c.maskedApiKey || `账号 #${c.id}`
+export function credentialLabel(
+  c: Pick<CredentialStatusItem, 'id' | 'email' | 'maskedApiKey'>,
+  showEmailSuffix = true,
+) {
+  const email = c.email?.trim()
+  if (email) {
+    if (showEmailSuffix) return email
+    const at = email.indexOf('@')
+    return at > 0 ? `${email.slice(0, at)}***` : `${email}***`
+  }
+  return c.maskedApiKey || `账号 #${c.id}`
 }
 
 export function authLabel(authMethod: string | null | undefined) {

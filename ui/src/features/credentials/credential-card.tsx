@@ -1,7 +1,5 @@
 import {
   Activity,
-  ChevronDown,
-  ChevronUp,
   MoreHorizontal,
   RefreshCw,
   RotateCcw,
@@ -32,13 +30,11 @@ import { ProgressRing } from '@/components/charts'
 import {
   formatApproxElapsedMs,
   formatCompact,
-  formatCredits,
   formatFullDate,
   formatLastUsed,
   formatMeteringUsage,
   formatNumber,
-  formatQuota,
-  formatUsd,
+  formatQuotaFixed,
   formatUsdFixed2,
 } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
@@ -53,7 +49,6 @@ import {
   useSetCredentialConcurrency,
   useSetCredentialProxy,
   useSetCredentialRegions,
-  useSetCredentialOverage,
   useSetCredentialRpm,
   useSetCredentialRateLimitAutoDisable,
   useSetCredentialSupportedModels,
@@ -67,9 +62,7 @@ import {
   accountInfoValue,
   authLabel,
   credentialLabel,
-  dispatchStatusLabel,
   endpointLabel,
-  formatResetAt,
   numberOrZero,
   proxySummary,
   subscriptionBadgeMeta,
@@ -99,6 +92,49 @@ function SummaryCell({ label, value, error, onClick }: { label: string; value: R
     )
   }
   return <div className="flex flex-col gap-0.5 min-w-0">{content}</div>
+}
+
+function ConcurrencySummaryCell({
+  value,
+  detail,
+  ringValue,
+  ringColor,
+  ringLabel,
+  error,
+  onClick,
+}: {
+  value: string
+  detail: React.ReactNode
+  ringValue: number
+  ringColor: string
+  ringLabel: React.ReactNode
+  error?: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title="修改并发"
+      className="flex min-w-0 items-center gap-2 rounded px-1 py-0.5 -mx-1 text-left transition-colors hover:bg-muted/60"
+    >
+      <ProgressRing
+        value={ringValue}
+        size={34}
+        strokeWidth={4}
+        color={ringColor}
+        label={<span className="text-[0.55rem] tabular">{ringLabel}</span>}
+        className="shrink-0"
+      />
+      <span className="flex min-w-0 flex-col gap-0.5">
+        <span className="text-[0.68rem] font-medium text-muted-foreground uppercase tracking-wide truncate">并发</span>
+        <span className={`text-xs font-semibold tabular truncate ${error ? 'text-destructive' : 'text-primary'}`}>
+          {value}
+        </span>
+        <span className="truncate text-[0.65rem] text-muted-foreground">{detail}</span>
+      </span>
+    </button>
+  )
 }
 
 function MetaItem({ label, value, detail, error }: {
@@ -134,10 +170,11 @@ export interface CredentialCardProps {
   balance?: BalanceResponse
   loadingBalance: boolean
   expanded: boolean
+  showEmailSuffix: boolean
 }
 
 export function CredentialCard({
-  credential, selected, onToggleSelect, onQueryBalance, onTest, balance, loadingBalance, expanded,
+  credential, selected, onToggleSelect, onQueryBalance, onTest, balance, loadingBalance, expanded, showEmailSuffix,
 }: CredentialCardProps) {
   const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
@@ -175,7 +212,6 @@ export function CredentialCard({
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
-  const setCredentialOverage = useSetCredentialOverage()
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
   const discoverCredentialSupportedModels = useDiscoverCredentialSupportedModels()
@@ -200,44 +236,33 @@ export function CredentialCard({
   const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
   const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
-  const dispatchStatus = dispatchStatusLabel(credential, probationRemainingSecs)
   const subMeta = subscriptionBadgeMeta(credential, balance)
   const epLabel = endpointLabel(credential.endpoint)
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const canClearInFlight = credential.inFlightRequests > 0
-  const quotaDetail = accountInfo
-    ? `剩余 ${formatCredits(accountInfo.remaining)} · 检查 ${formatFullDate(accountInfo.checkedAt)}${accountInfo.nextResetAt ? ` · 重置 ${formatResetAt(accountInfo.nextResetAt)}` : ''}`
-    : undefined
   const quotaUsagePercent = accountInfo && accountInfo.usageLimit > 0
     ? Math.min(100, Math.max(0, (accountInfo.currentUsage / accountInfo.usageLimit) * 100))
     : 0
   const quotaProgressTone = quotaUsagePercent >= 95 ? 'error' : quotaUsagePercent >= 80 ? 'warning' : 'success'
-  const overageStatus = (accountInfo?.overageStatus || '').toUpperCase()
-  const overageCapability = (accountInfo?.overageCapability || '').toUpperCase()
-  const overageEnabled = overageStatus === 'ENABLED'
-  const overageCapable = overageCapability === '' || overageCapability === 'OVERAGE_CAPABLE'
-  const overageKnown = overageStatus === 'ENABLED' || overageStatus === 'DISABLED'
-  const overageLabel = accountInfo
-    ? !overageCapable
-      ? '不支持'
-      : overageStatus === 'ENABLED'
-        ? '已开启'
-        : overageStatus === 'DISABLED'
-          ? '已关闭'
-          : '未知'
-    : '未查询'
-  const overageDetail = accountInfo
-    ? [
-        accountInfo.overageCap > 0 ? `上限 ${formatUsd(accountInfo.overageCap)}` : null,
-        accountInfo.overageRate > 0 ? `单价 ${formatUsd(accountInfo.overageRate)}` : null,
-        accountInfo.currentOverages > 0 ? `已用 ${formatUsd(accountInfo.currentOverages)}` : null,
-      ].filter(Boolean).join(' · ') || (overageKnown ? '额度耗尽后是否继续计费' : '查询额度后同步状态')
-    : undefined
+  const displayCredentialLabel = credentialLabel(credential, showEmailSuffix)
 
   const concurrencyPct =
     credential.maxConcurrentRequests > 0
       ? Math.round((credential.inFlightRequests / credential.maxConcurrentRequests) * 100)
       : 0
+  const concurrencySummaryValue =
+    credential.maxConcurrentRequests > 0
+      ? `${credential.inFlightRequests}/${credential.maxConcurrentRequests}`
+      : `${credential.inFlightRequests}/∞`
+  const concurrencySummaryDetail =
+    credential.inFlightRequests > 0
+      ? `最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`
+      : typeof credential.maxConcurrentRequestsOverride === 'number'
+        ? `账号覆盖：${credential.maxConcurrentRequestsOverride}`
+        : credential.maxConcurrentRequests > 0
+          ? `继承全局：${credential.maxConcurrentRequests}`
+          : '不限制'
+  const concurrencyError = credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests
   const ringColor =
     concurrencyPct >= 90
       ? 'hsl(var(--destructive))'
@@ -288,16 +313,6 @@ export function CredentialCard({
     if (!Number.isInteger(p) || p < 0) { toast.error('优先级必须是非负整数'); return }
     setPriority.mutate({ id: credential.id, priority: p }, {
       onSuccess: (res) => { toast.success(res.message); setEditingPriority(false) },
-      onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
-    })
-  }
-
-  const adjustPriority = (delta: number) => {
-    if (setPriority.isPending) return
-    const p = Math.max(0, credential.priority + delta)
-    if (p === credential.priority) return
-    setPriority.mutate({ id: credential.id, priority: p }, {
-      onSuccess: (res) => toast.success(res.message),
       onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
     })
   }
@@ -354,13 +369,6 @@ export function CredentialCard({
     setCredentialRateLimitAutoDisable.mutate({ id: credential.id, request: { enabled } }, {
       onSuccess: (res) => toast.success(res.message),
       onError: (e) => toast.error(`429 自动禁用设置失败: ${extractErrorMessage(e)}`),
-    })
-  }
-
-  const toggleOverage = (enabled: boolean) => {
-    setCredentialOverage.mutate({ id: credential.id, enabled }, {
-      onSuccess: () => toast.success(`超额调用已${enabled ? '开启' : '关闭'}`),
-      onError: (e) => toast.error(`超额开关设置失败: ${extractErrorMessage(e)}`),
     })
   }
 
@@ -422,8 +430,8 @@ export function CredentialCard({
         <Checkbox checked={selected} onCheckedChange={onToggleSelect} className="mt-0.5 shrink-0" />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="max-w-[220px] truncate text-sm font-semibold" title={credentialLabel(credential)}>
-              {credentialLabel(credential)}
+            <span className="max-w-[220px] truncate text-sm font-semibold" title={displayCredentialLabel}>
+              {displayCredentialLabel}
             </span>
             <span className="tabular text-xs text-muted-foreground font-mono">#{credential.id}</span>
             {credential.isCurrent && <Badge tone="primary">当前</Badge>}
@@ -436,8 +444,6 @@ export function CredentialCard({
             </Badge>
             {epLabel && <Badge title={credential.endpoint}>{epLabel}</Badge>}
             {credential.hasProxy && <Badge tone="info">代理</Badge>}
-            {typeof credential.maxConcurrentRequestsOverride === 'number' && <Badge tone="info">并发覆盖</Badge>}
-            {typeof credential.rpmOverride === 'number' && <Badge tone="info">RPM覆盖</Badge>}
             {credential.rateLimitAutoDisableEnabled === false && <Badge tone="warning">429仅冷却</Badge>}
             {supportedModels.length > 0 && <Badge tone="secondary" title={supportedModels.join('\n')}>模型 {supportedModels.length}</Badge>}
             {credential.hasProfileArn && <Badge tone="secondary">Profile ARN</Badge>}
@@ -467,16 +473,15 @@ export function CredentialCard({
       </div>
 
       {/* ── Summary Row ── */}
-      <div className="grid grid-cols-6 gap-2 px-3 pb-2 pt-1">
+      <div className="grid grid-cols-2 gap-2 px-3 pb-2 pt-1 sm:grid-cols-5">
         <SummaryCell label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} />
-        <SummaryCell
-          label="并发"
-          value={
-            credential.maxConcurrentRequests > 0
-              ? `${credential.inFlightRequests}/${credential.maxConcurrentRequests}`
-              : `${credential.inFlightRequests}/∞`
-          }
-          error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}
+        <ConcurrencySummaryCell
+          value={concurrencySummaryValue}
+          detail={concurrencySummaryDetail}
+          ringValue={concurrencyPct}
+          ringColor={ringColor}
+          ringLabel={credential.inFlightRequests}
+          error={concurrencyError}
           onClick={() => setEditingConcurrency(true)}
         />
         <SummaryCell
@@ -485,9 +490,27 @@ export function CredentialCard({
           error={credential.rpm > 0 && recentSelection60s >= credential.rpm}
           onClick={() => setEditingRpm(true)}
         />
-        <SummaryCell label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
         <SummaryCell label="成功" value={<span title={formatNumber(credential.successCount)}>{formatCompact(credential.successCount)}</span>} />
         <SummaryCell label="最近" value={formatLastUsed(credential.lastUsedAt)} />
+      </div>
+
+      <div className="mx-3 mb-2 rounded-md border border-border/70 bg-muted/25 px-3 py-2">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">额度</span>
+          <span className="truncate text-xs font-semibold tabular text-foreground">
+            {loadingBalance
+              ? '…'
+              : accountInfo
+                ? `${formatQuotaFixed(accountInfo.currentUsage)} / ${formatQuotaFixed(accountInfo.usageLimit)}`
+                : '- / -'}
+          </span>
+        </div>
+        <Progress
+          value={quotaUsagePercent}
+          tone={quotaProgressTone}
+          className="mt-2 h-1.5"
+          aria-label="额度使用进度"
+        />
       </div>
 
       {/* ── Action Strip ── */}
@@ -525,13 +548,6 @@ export function CredentialCard({
           })}>
           <RotateCcw className="h-3.5 w-3.5" /> 恢复异常
         </Button>
-        <Button type="button" variant="ghost" size="xs" disabled={setPriority.isPending || credential.priority === 0} onClick={() => adjustPriority(-1)}>
-          <ChevronUp className="h-3.5 w-3.5" /> 优先级
-        </Button>
-        <Button type="button" variant="ghost" size="xs" disabled={setPriority.isPending} onClick={() => adjustPriority(1)}>
-          <ChevronDown className="h-3.5 w-3.5" /> 优先级
-        </Button>
-
         {/* 低频/危险操作：收入 ... 菜单 */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -598,32 +614,7 @@ export function CredentialCard({
 
           {/* 调度运行态 */}
           <div>
-            <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">调度 / 运行态</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              <div className="flex items-center gap-3">
-                {credential.inFlightRequests > 0 && credential.maxConcurrentRequests > 0 ? (
-                  <ProgressRing
-                    value={concurrencyPct}
-                    size={44}
-                    strokeWidth={5}
-                    color={ringColor}
-                    label={<span className="text-[0.6rem] tabular">{credential.inFlightRequests}</span>}
-                  />
-                ) : null}
-                <MetaItem
-                  label="在途请求"
-                  value={`${credential.inFlightRequests}${credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / ∞'}`}
-                  detail={
-                    credential.inFlightRequests > 0
-                      ? `最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`
-                      : typeof credential.maxConcurrentRequestsOverride === 'number'
-                        ? `账号覆盖：${credential.maxConcurrentRequestsOverride}`
-                        : credential.maxConcurrentRequests > 0
-                          ? `继承全局：${credential.maxConcurrentRequests}`
-                          : '不限制'
-                  }
-                />
-              </div>
               <MetaItem
                 label="429自动禁用"
                 value={
@@ -638,7 +629,6 @@ export function CredentialCard({
                 }
               />
               <MetaItem label="近期错误率" value={`${(recentErrorRate * 100).toFixed(1)}%`} error={recentErrorRate > 0} />
-              <MetaItem label="延迟 EWMA" value={credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`} />
               <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />
               <MetaItem label="总调度" value={<span title={formatNumber(schedulerSelectionCount)}>{formatCompact(schedulerSelectionCount)}</span>} />
               <MetaItem
@@ -661,10 +651,6 @@ export function CredentialCard({
                 detail={supportedModels.length > 0 ? '账号调度白名单' : '未设置，不限制模型'}
               />
               <MetaItem label="失败/刷新失败" value={`${credential.failureCount} / ${credential.refreshFailureCount}`} error={hasFailures} />
-              <MetaItem
-                label="Lease 回收"
-                value={credential.inFlightLeaseMaxSecs > 0 ? `${credential.inFlightLeaseMaxSecs}s` : '-'}
-              />
               {credential.warmupRemaining > 0 && (
                 <MetaItem label="预热剩余" value={credential.warmupRemaining} />
               )}
@@ -697,49 +683,12 @@ export function CredentialCard({
             )}
           </div>
 
-          {/* 额度 */}
           <div>
-            <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">额度与费用</div>
+            <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">计费与积分</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              <div className="flex flex-col gap-1.5">
-                <span className="text-[0.68rem] font-medium text-muted-foreground">用量额度</span>
-                <span className="text-sm font-semibold truncate">
-                  {loadingBalance ? <Spinner size="sm" /> : accountInfo
-                    ? `${formatQuota(accountInfo.currentUsage)} / ${formatQuota(accountInfo.usageLimit)}`
-                    : '未查询'}
-                </span>
-                {accountInfo && (
-                  <Progress
-                    value={quotaUsagePercent}
-                    tone={quotaProgressTone}
-                    className="h-1.5"
-                    aria-label="用量额度已用比例"
-                  />
-                )}
-                {quotaDetail && <span className="text-xs text-muted-foreground truncate">{quotaDetail}</span>}
-              </div>
-              <div className="flex flex-col gap-1">
-                <span className="text-[0.68rem] font-medium text-muted-foreground">超额调用</span>
-                <div className="flex min-h-6 items-center gap-2">
-                  {setCredentialOverage.isPending ? (
-                    <Spinner size="sm" />
-                  ) : (
-                    <Switch
-                      checked={overageEnabled}
-                      disabled={!accountInfo || !overageCapable}
-                      onCheckedChange={toggleOverage}
-                      aria-label="切换超额调用"
-                    />
-                  )}
-                  <span className={`text-sm font-semibold ${overageEnabled ? 'text-warning' : !overageCapable ? 'text-muted-foreground' : ''}`}>
-                    {overageLabel}
-                  </span>
-                </div>
-                {overageDetail && <span className="text-xs text-muted-foreground truncate">{overageDetail}</span>}
-              </div>
-              <MetaItem label="估算成本" value={formatUsdFixed2(credential.estimatedCostUsd)} />
+              <MetaItem label="估算计费" value={formatUsdFixed2(credential.estimatedCostUsd)} />
               <MetaItem label="原始计费" value={formatUsdFixed2(credential.originalCostUsd)} />
-              <MetaItem label="Kiro计量" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
+              <MetaItem label="使用积分" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
             </div>
           </div>
 
@@ -793,7 +742,7 @@ export function CredentialCard({
       )}
 
       {/* ── Priority Modal ── */}
-      <ModalShell open={editingPriority} title={`优先级：${credentialLabel(credential)}`} width="max-w-md"
+        <ModalShell open={editingPriority} title={`优先级：${displayCredentialLabel}`} width="max-w-md"
         onClose={() => { setEditingPriority(false); setPriorityValue(String(credential.priority)) }}>
         <div className="space-y-3">
           <div className="rounded-lg bg-muted/30 px-3 py-2 text-sm">
@@ -817,7 +766,7 @@ export function CredentialCard({
       </ModalShell>
 
       {/* ── Concurrency Modal ── */}
-      <ModalShell open={editingConcurrency} title={`并发限制：${credentialLabel(credential)}`} width="max-w-lg"
+      <ModalShell open={editingConcurrency} title={`并发限制：${displayCredentialLabel}`} width="max-w-lg"
         onClose={() => setEditingConcurrency(false)}>
         <div className="space-y-3">
           <div className="rounded-lg bg-muted/30 px-3 py-2 text-sm">
@@ -852,7 +801,7 @@ export function CredentialCard({
       </ModalShell>
 
       {/* ── RPM Modal ── */}
-      <ModalShell open={editingRpm} title={`RPM 限制：${credentialLabel(credential)}`} width="max-w-lg"
+      <ModalShell open={editingRpm} title={`RPM 限制：${displayCredentialLabel}`} width="max-w-lg"
         onClose={() => setEditingRpm(false)}>
         <div className="space-y-3">
           <div className="rounded-lg bg-muted/30 px-3 py-2 text-sm">
@@ -891,7 +840,7 @@ export function CredentialCard({
       </ModalShell>
 
       {/* ── Supported Models Modal ── */}
-      <ModalShell open={editingSupportedModels} title={`支持模型：${credentialLabel(credential)}`} width="max-w-xl"
+      <ModalShell open={editingSupportedModels} title={`支持模型：${displayCredentialLabel}`} width="max-w-xl"
         onClose={() => {
           if (setCredentialSupportedModels.isPending || discoverCredentialSupportedModels.isPending) return
           setSupportedModelsDraft(supportedModels)
@@ -937,7 +886,7 @@ export function CredentialCard({
       </ModalShell>
 
       {/* ── Regions Modal ── */}
-      <ModalShell open={editingRegions} title={`Region：${credentialLabel(credential)}`} width="max-w-lg"
+      <ModalShell open={editingRegions} title={`Region：${displayCredentialLabel}`} width="max-w-lg"
         onClose={() => { if (setCredentialRegions.isPending) return; setEditingRegions(false) }}>
         <div className="space-y-3">
           <div className="rounded-lg bg-muted/30 p-3 text-sm grid gap-2 sm:grid-cols-2">
@@ -981,7 +930,7 @@ export function CredentialCard({
       </ModalShell>
 
       {/* ── Proxy Modal ── */}
-      <ModalShell open={editingProxy} title={`绑定代理：${credentialLabel(credential)}`} width="max-w-xl"
+      <ModalShell open={editingProxy} title={`绑定代理：${displayCredentialLabel}`} width="max-w-xl"
         onClose={() => { if (setCredentialProxy.isPending) return; resetProxyDraft(); setEditingProxy(false) }}>
         <div className="space-y-3">
           <button type="button"
@@ -1049,7 +998,7 @@ export function CredentialCard({
       {/* ── Diagnostics ── */}
       <ModalShell
         open={showDiagnostics}
-        title={`账号诊断：${credentialLabel(credential)}`}
+        title={`账号诊断：${displayCredentialLabel}`}
         width="max-w-5xl"
         onClose={() => setShowDiagnostics(false)}
       >
@@ -1062,18 +1011,7 @@ export function CredentialCard({
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                <MetaItem
-                  label="调度状态"
-                  value={diagnostics.data?.runtime
-                    ? diagnostics.data.runtime.cooledDown
-                      ? '冷却中'
-                      : diagnostics.data.runtime.rateLimited
-                        ? '限流中'
-                        : '可调度'
-                    : dispatchStatus}
-                  error={diagnostics.data?.runtime?.cooledDown || diagnostics.data?.runtime?.rateLimited || dispatchStatus !== '可调度'}
-                />
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 <MetaItem
                   label="冷却"
                   value={diagnostics.data?.runtime?.cooledDown ? `${diagnostics.data.runtime.cooldownRemainingSecs}s` : '无'}
@@ -1156,7 +1094,7 @@ export function CredentialCard({
         <div className="space-y-3 text-sm">
           <p>此操作会永久删除该账号，无法撤销。</p>
           <div className="rounded-lg bg-muted/30 px-3 py-2">
-            <div className="font-semibold">{credentialLabel(credential)}</div>
+            <div className="font-semibold">{displayCredentialLabel}</div>
             <div className="mt-1 text-xs text-muted-foreground">只有已禁用账号允许删除。</div>
           </div>
           <div className="flex justify-end gap-2">

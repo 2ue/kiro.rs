@@ -34,6 +34,7 @@ Authority:
    - [Thinking signature 协议安全](topics/thinking-signature-protocol-safety.md)
    - [生产 Thinking Signature 错误审计 2026-09-28](topics/production-thinking-signature-error-20260928.md)
    - [sub2api-kiro 协议互转优化执行计划](topics/sub2api-kiro-protocol-interop-optimization.md)
+   - [OpenAI 官方协议与 Kiro 协议互转改造方案](topics/openai-kiro-protocol-interop-refactor-plan.md)
    - [服务问题审计与并发积压因果](topics/service-audit-and-backlog-causality.md)
    - [闲置账号后台 Token 主动刷新](topics/background-token-refresh.md)
    - [导入账号标签属性](topics/credential-import-tags.md)
@@ -78,6 +79,7 @@ Out of scope:
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |
 | 生产 `THINKING_SIGNATURE_INVALID`、stream read error、retry 后 too-long 归因 | Completed read-only audits; retry-state-machine, observability and protocol follow-ups open | [Production Thinking Signature audit](topics/production-thinking-signature-error-20260928.md) |
 | Claude Code / Kiro reasoning 400 与入口拒绝记录 `model=unknown`、内容/诊断缺失 | Audit complete; explicit reasoning fallback fixed locally and verified with real Claude Code CLI; release/deploy validation pending | [Official Claude Code / Anthropic 与 Kiro protocol audit](topics/official-claude-code-kiro-protocol-audit-20260928.md) |
+| OpenAI 官方 Chat/Responses ↔ Kiro 协议互转入口缺失 | Planning only; current service exposes Anthropic Messages routes and has no `/v1/chat/completions` or `/v1/responses` | [OpenAI/Kiro protocol interop refactor plan](topics/openai-kiro-protocol-interop-refactor-plan.md) |
 | 真实 CLI / load chaos / release gates 未全量闭环 | Open validation | [Validation and release gates](topics/validation-and-release-gates.md) |
 | 项目文档状态漂移、旧分析未归档 | In progress | [Document disposition](indexes/document-disposition.md) |
 | 本地账号 WebSearch/tools/image Wave 1 | WebSearch and tool parsing focused verified; image/model/multi-tool-history follow-up open | [Current issue status index](../../../../feature/issues/current-issue-status-index-20260731.md), [analysis priority queue](../../../../feature/issues/issue-analysis-priority-queue-20260731.md) |

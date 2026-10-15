@@ -38,6 +38,7 @@ import {
   SelectTrigger,
   SelectValue,
   Spinner,
+  Switch,
 } from '@/components/ui'
 import {
   EmptyState,
@@ -114,8 +115,9 @@ import {
 // Constants
 // ============================================================================
 
-const PAGE_SIZE_OPTIONS = [15, 30, 60, 120]
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200, 500]
 const CREDIT_INFO_DETAIL_BATCH_SIZE = 500
+const EMAIL_SUFFIX_VISIBILITY_STORAGE_KEY = 'kiro-console:credentials:show-email-suffix'
 
 function isUsageQuotaExhausted(info?: { currentUsage: number; usageLimit: number } | null): boolean {
   if (!info) return false
@@ -197,6 +199,13 @@ export function CredentialsPage() {
   const modelCapabilities = useModelCapabilities()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(PAGE_SIZE_OPTIONS[0])
+  const [showEmailSuffix, setShowEmailSuffix] = useState(() => {
+    try {
+      return window.localStorage.getItem(EMAIL_SUFFIX_VISIBILITY_STORAGE_KEY) !== 'false'
+    } catch {
+      return true
+    }
+  })
   const [allExpanded, setAllExpanded] = useState(true)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [quickQuery, setQuickQuery] = useState('')
@@ -396,6 +405,13 @@ export function CredentialsPage() {
   ])
   useEffect(() => { setSelectedIds(new Set()) }, [page])
   useEffect(() => { setSelectedIds(new Set()) }, [pageSize])
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(EMAIL_SUFFIX_VISIBILITY_STORAGE_KEY, String(showEmailSuffix))
+    } catch {
+      // Ignore unavailable browser storage; this is only a display preference.
+    }
+  }, [showEmailSuffix])
   useEffect(() => {
     if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) setPage(Math.max(credentials.data.totalPages, 1))
   }, [credentials.data, page])
@@ -1090,6 +1106,15 @@ export function CredentialsPage() {
                 </Button>
               )}
             </div>
+            <div className="flex h-8 items-center gap-2 self-end whitespace-nowrap">
+              <Switch
+                checked={showEmailSuffix}
+                onCheckedChange={setShowEmailSuffix}
+                aria-label="显示邮箱后缀"
+                title="关闭后邮箱后缀显示为 ***"
+              />
+              <span className="text-xs text-muted-foreground">显示邮箱后缀</span>
+            </div>
           </div>
         </Toolbar>
 
@@ -1218,6 +1243,7 @@ export function CredentialsPage() {
                 balance={balanceMap.get(credential.id)}
                 loadingBalance={loadingBalanceIds.has(credential.id)}
                 expanded={allExpanded}
+                showEmailSuffix={showEmailSuffix}
               />
             ))}
           </div>
