@@ -3546,6 +3546,7 @@ enum HandlerEventStreamFault {
     IncompleteStatusBeforeOutput,
     ProtocolContaminationBeforeOutput,
     UnknownEventOnly,
+    ReasoningOnlyNoStatus,
     MissingCompletionAfterText,
     LegacyTextWithMetadataNoStatus,
     TextWithMeteringNoStatus,
@@ -3908,6 +3909,21 @@ async fn handler_eventstream_fault_upstream(
         HandlerEventStreamFault::UsageOnlyMeteringNoStatus
         | HandlerEventStreamFault::UsageOnlyEveryAttempt => {
             handler_eventstream_bytes_response(handler_eventstream_usage_only_body())
+        }
+        HandlerEventStreamFault::ReasoningOnlyNoStatus => {
+            let mut body = eventstream_test_frame(
+                "reasoningContentEvent",
+                json!({"text":"partial upstream reasoning"}),
+            );
+            body.extend(eventstream_test_frame(
+                "contextUsageEvent",
+                json!({"contextUsagePercentage":0.01}),
+            ));
+            body.extend(eventstream_test_frame(
+                "meteringEvent",
+                json!({"usage":0.24,"inputTokens":123,"outputTokens":7}),
+            ));
+            handler_eventstream_bytes_response(body)
         }
         HandlerEventStreamFault::CompleteToolWithoutStatus => {
             handler_eventstream_bytes_response(eventstream_test_frame(
@@ -5603,6 +5619,53 @@ fn handler_unknown_event_only_retries_before_empty_success_for_five_rounds() {
     run_handler_fixture_on_large_stack_thread(
         "unknown-event-terminal-fixture",
         run_handler_unknown_event_only_matrix,
+    );
+}
+
+/// Reasoning-only EOF is a recoverable thinking-only turn. The handler must
+/// flush the reasoning block and complete a normal Claude Code turn without
+/// manufacturing an API error or a retry storm.
+async fn run_handler_reasoning_only_eof_matrix() {
+    for round in 1..=5 {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::ReasoningOnlyNoStatus)
+                .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+
+        assert_eq!(status, StatusCode::OK, "reasoning-only round={round}");
+        assert!(
+            body.contains(r#""stop_reason":"end_turn""#),
+            "round={round} body={body}"
+        );
+        assert!(
+            !body.contains(r#""type":"error""#),
+            "round={round} body={body}"
+        );
+        assert!(body.contains("partial upstream reasoning"), "round={round}");
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert_eq!(upstream.hits(), 1, "reasoning-only round={round}");
+        assert_fault_usage(&usage_recorder, &request_id, UsageRecordStatus::Success, 1);
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let trace = record
+            .latency_trace
+            .as_ref()
+            .expect("reasoning-only latency trace");
+        assert_eq!(trace.stream_retry_attempts, None);
+        assert_eq!(
+            trace.terminal_reason,
+            Some(StreamTerminalReason::Completed),
+            "reasoning-only round {round}"
+        );
+    }
+}
+
+#[test]
+fn handler_reasoning_only_eof_finishes_as_success_for_five_rounds() {
+    run_handler_fixture_on_large_stack_thread(
+        "reasoning-only-eof-terminal-fixture",
+        run_handler_reasoning_only_eof_matrix,
     );
 }
 

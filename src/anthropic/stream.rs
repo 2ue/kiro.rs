@@ -4026,15 +4026,18 @@ impl StreamContext {
             return events;
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.extract_xml_thinking
-            && self.thinking_block_index.is_some()
+        // 如果整个流只产生了 thinking（包括 Kiro 原生 reasoning），补一个最小
+        // text block 并正常以 end_turn 收尾。Anthropic/Claude Code 需要一个完整
+        // 的 content block 生命周期来消费只有 thinking 的轮次；把它误报成
+        // max_tokens 或 error 会让本来可恢复的对话被中断。
+        let thinking_only = self.thinking_enabled
             && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
+            && (self.native_reasoning_seen
+                || (self.extract_xml_thinking && self.thinking_block_index.is_some()));
+        if thinking_only {
+            if self.state_manager.explicit_stop_reason().is_none() {
+                self.state_manager.set_stop_reason("end_turn");
+            }
             events.extend(self.create_sanitized_text_delta_events(" "));
         }
 
@@ -4462,6 +4465,55 @@ mod tests {
                 thinking_context_usage_only.upstream_terminal_failure_detail(),
                 Some(UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL),
                 "thinking context usage only round {round}"
+            );
+
+            let mut reasoning_only =
+                StreamContext::new_with_thinking("test-model", 8, true, HashMap::new());
+            reasoning_only.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: "partial reasoning".to_string(),
+                    ..Default::default()
+                },
+            ));
+            reasoning_only.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 3.9,
+            }));
+            reasoning_only.process_kiro_event(&Event::Metering(MeteringEvent {
+                usage: 0.01,
+                input_tokens: 42,
+                ..Default::default()
+            }));
+            assert_eq!(
+                reasoning_only.upstream_terminal_failure_detail(),
+                None,
+                "reasoning-only round {round}"
+            );
+            let final_events = reasoning_only.generate_final_events();
+            assert!(
+                final_events.iter().all(|event| event.event != "error"),
+                "reasoning-only round {round}"
+            );
+            assert!(
+                final_events.iter().any(|event| {
+                    event.event == "content_block_delta"
+                        && event.data["delta"]["type"] == "text_delta"
+                        && event.data["delta"]["text"] == " "
+                }),
+                "reasoning-only round {round}"
+            );
+            assert_eq!(
+                final_events
+                    .iter()
+                    .find(|event| event.event == "message_delta")
+                    .and_then(|event| event.data["delta"]["stop_reason"].as_str()),
+                Some("end_turn"),
+                "reasoning-only round {round}"
+            );
+            assert!(
+                final_events
+                    .iter()
+                    .any(|event| event.event == "message_stop"),
+                "reasoning-only round {round}"
             );
 
             let mut partial_tool =
@@ -5113,6 +5165,47 @@ mod tests {
             "Let me check the request 发压缩。\n\n"
         );
         assert_eq!(collect_text_content(&all_events), "answer");
+    }
+
+    #[test]
+    fn native_reasoning_only_without_xml_fallback_finishes_as_end_turn() {
+        use crate::kiro::model::events::{ContextUsageEvent, MeteringEvent, ReasoningContentEvent};
+
+        let mut ctx = StreamContext::new_with_simulation(
+            "claude-opus-5.5",
+            1,
+            1_000_000,
+            true,
+            false,
+            HashMap::new(),
+            None,
+            PromptCacheSimulationMode::Disabled,
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: "partial reasoning".to_string(),
+                signature: None,
+                redacted_content: None,
+            })),
+        );
+        events.extend(
+            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 3.9,
+            })),
+        );
+        events.extend(ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            usage: 0.24,
+            input_tokens: 123,
+            output_tokens: 7,
+        })));
+        events.extend(ctx.generate_final_events());
+
+        assert!(events.iter().all(|event| event.event != "error"));
+        assert_eq!(final_stop_reason(&events).as_deref(), Some("end_turn"));
+        assert_eq!(collect_thinking_content(&events), "partial reasoning");
+        assert_eq!(collect_text_content(&events), " ");
+        assert!(events.iter().any(|event| event.event == "message_stop"));
     }
 
     #[test]
@@ -8223,8 +8316,8 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
+    fn test_thinking_only_finishes_with_end_turn_stop_reason() {
+        // 整个流只有 thinking 块，没有 text 也没有 tool_use，按可恢复轮次正常收尾。
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
@@ -8238,8 +8331,8 @@ mod tests {
             .expect("should have message_delta event");
 
         assert_eq!(
-            message_delta.data["delta"]["stop_reason"], "max_tokens",
-            "stop_reason should be max_tokens when only thinking is produced"
+            message_delta.data["delta"]["stop_reason"], "end_turn",
+            "stop_reason should be end_turn when only thinking is produced"
         );
 
         // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
