@@ -6245,11 +6245,14 @@ async fn postgres_concurrent_route_state_checks_auto_heal_with_a_single_pgsql_pa
             })
         })
         .collect();
+    let mut kinds = Vec::new();
     for handle in handles {
-        tokio::time::timeout(StdDuration::from_secs(10), handle)
-            .await
-            .expect("route-state auto-heal must not stall")
-            .unwrap();
+        kinds.push(
+            tokio::time::timeout(StdDuration::from_secs(10), handle)
+                .await
+                .expect("route-state auto-heal must not stall")
+                .unwrap(),
+        );
     }
 
     assert_eq!(manager.available_count(), 3);
@@ -6257,6 +6260,13 @@ async fn postgres_concurrent_route_state_checks_auto_heal_with_a_single_pgsql_pa
         manager.auto_heal_pgsql_attempts.load(Ordering::Relaxed),
         3,
         "sync single-flight: one PgSQL heal per disabled credential, not one per caller"
+    );
+    // 自愈进行中到达的调用方必须等它完成后按恢复后的状态返回，而不是看到 AllDisabled 被快速失败。
+    assert!(
+        kinds
+            .iter()
+            .all(|kind| *kind == LocalPoolRouteStateKind::Ready),
+        "concurrent callers must observe the healed pool: {kinds:?}"
     );
     assert_eq!(
         manager.local_pool_route_state_cached(None).kind,

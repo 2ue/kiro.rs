@@ -1058,6 +1058,17 @@ const SOFT_PENDING_RUNTIME_MUTATIONS_TOTAL: usize = 65_536;
 const RUNTIME_MUTATION_FLUSH_LIMIT: usize = 256;
 const RUNTIME_MUTATION_FLUSH_BUDGET: StdDuration = StdDuration::from_secs(10);
 const CREDENTIAL_PGSQL_SYNC_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+/// 同步路由预检等待并发自愈完成的上限；超时后按当前状态继续（快速失败或转外部池）。
+const AUTO_HEAL_CONCURRENT_WAIT_MAX: StdDuration = StdDuration::from_secs(30);
+const AUTO_HEAL_CONCURRENT_WAIT_POLL: StdDuration = StdDuration::from_millis(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAutoHealOutcome {
+    Healed,
+    NothingHealed,
+    /// 另一个调用方正持有自愈 single-flight。
+    InProgressElsewhere,
+}
 const CREDENTIAL_PGSQL_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const REFRESH_REDIS_LOCK_OP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const TOKEN_REFRESH_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(90);
@@ -2891,7 +2902,7 @@ impl MultiTokenManager {
 
     pub fn local_pool_route_state_fresh(&self, model: Option<&str>) -> LocalPoolRouteState {
         let mut state = self.compute_local_pool_route_state(model, true);
-        if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {
+        if state.kind.should_route_external() && self.auto_heal_for_route_state() {
             state = self.compute_local_pool_route_state(model, true);
         }
         state
@@ -2906,7 +2917,7 @@ impl MultiTokenManager {
     /// still refreshed by normal dispatch/preflight paths before a local upstream call is made.
     pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
         let mut state = self.compute_local_pool_route_state(model, false);
-        if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {
+        if state.kind.should_route_external() && self.auto_heal_for_route_state() {
             state = self.compute_local_pool_route_state(model, false);
         }
         state
@@ -3414,18 +3425,64 @@ impl MultiTokenManager {
         }
     }
 
+    #[cfg(test)]
     fn auto_heal_too_many_failures_if_applicable(&self) -> bool {
-        if !self.has_auto_heal_candidates() {
-            return false;
+        matches!(self.auto_heal_sync(), SyncAutoHealOutcome::Healed)
+    }
+
+    /// 路由预检/入口快速失败使用的自愈：返回 true 表示调用方应重新计算路由状态。
+    ///
+    /// 已有自愈在进行时不再重复写 PgSQL，而是等它完成后按最新状态重算；否则并发请求会在
+    /// 自愈窗口内看到 AllDisabled 而被快速失败或转外部池（实测 40 并发时 39 个直接 503）。
+    fn auto_heal_for_route_state(&self) -> bool {
+        match self.auto_heal_sync() {
+            SyncAutoHealOutcome::Healed => true,
+            SyncAutoHealOutcome::NothingHealed => false,
+            SyncAutoHealOutcome::InProgressElsewhere => self.wait_for_concurrent_auto_heal(),
         }
-        // 同步路径（入口快速失败、路由预检）与 acquire 共用同一个 single-flight。同步调用不能等锁：
-        // 已有自愈在进行时直接返回 false，调用方按当前状态继续（入口会快速失败，或交给 acquire
-        // 在锁后看到自愈结果）。实测账号池全灭时 32 个并发入口请求各自串行写 PgSQL 共 3561 次。
+    }
+
+    /// 等待其他调用方正在执行的自愈结束；返回是否等到了结束。
+    ///
+    /// 多线程运行时内用 `block_in_place` 等待，当前 worker 上的其他任务会迁移到别的线程继续；
+    /// current_thread 运行时不能阻塞（持锁的异步自愈可能就在同一线程上），直接按当前状态返回。
+    fn wait_for_concurrent_auto_heal(&self) -> bool {
+        let wait = || {
+            let deadline = Instant::now() + AUTO_HEAL_CONCURRENT_WAIT_MAX;
+            loop {
+                if self.auto_heal_gate.try_lock().is_ok() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    tracing::warn!(
+                        max_wait_ms = AUTO_HEAL_CONCURRENT_WAIT_MAX.as_millis() as u64,
+                        "等待并发中的连续失败自愈超时，按当前路由状态继续"
+                    );
+                    return false;
+                }
+                std::thread::sleep(AUTO_HEAL_CONCURRENT_WAIT_POLL);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(wait)
+            }
+            Ok(_) => false,
+            Err(_) => wait(),
+        }
+    }
+
+    fn auto_heal_sync(&self) -> SyncAutoHealOutcome {
+        if !self.has_auto_heal_candidates() {
+            return SyncAutoHealOutcome::NothingHealed;
+        }
+        // 同步路径（入口快速失败、路由预检）与 acquire 共用同一个 single-flight，同步调用只 try_lock。
+        // 实测账号池全灭时 40 个并发请求在旧实现下各自串行执行一遍自愈。
         let Ok(_single_flight) = self.auto_heal_gate.try_lock() else {
-            return false;
+            return SyncAutoHealOutcome::InProgressElsewhere;
         };
         let Some(candidate_ids) = self.auto_heal_candidate_ids() else {
-            return false;
+            return SyncAutoHealOutcome::NothingHealed;
         };
         let mut healed_ids = Vec::new();
         for id in candidate_ids {
@@ -3451,7 +3508,11 @@ impl MultiTokenManager {
                 healed_ids.push(id);
             }
         }
-        self.finish_auto_heal(healed_ids)
+        if self.finish_auto_heal(healed_ids) {
+            SyncAutoHealOutcome::Healed
+        } else {
+            SyncAutoHealOutcome::NothingHealed
+        }
     }
 
     /// 请求调度路径使用的自愈：PgSQL 写入直接 await，不经过同步存储桥，
