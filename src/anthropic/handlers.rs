@@ -7355,16 +7355,21 @@ async fn post_messages_inner(
                 .reasoning_capability_state_for(model, &capability_cohort_keys)
         })
         .unwrap_or(KiroReasoningCapabilityState::Unknown);
-    let prepare_result = local_body_pipeline::run_cpu_heavy_in_place(request_body_bytes, || {
-        local_body_pipeline::prepare(
-            &endpoint,
-            &payload,
-            &runtime_config,
-            &local_cache_route,
-            &model_resolution,
-            native_reasoning_capability,
-        )
-    });
+    let prepare_has_documents = local_body_pipeline::payload_has_documents(&payload);
+    let prepare_result = local_body_pipeline::run_cpu_heavy_in_place(
+        request_body_bytes,
+        prepare_has_documents,
+        || {
+            local_body_pipeline::prepare(
+                &endpoint,
+                &payload,
+                &runtime_config,
+                &local_cache_route,
+                &model_resolution,
+                native_reasoning_capability,
+            )
+        },
+    );
     let prepared_local = match prepare_result {
         Ok(prepared) => prepared,
         Err(error) => {

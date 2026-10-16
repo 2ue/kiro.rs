@@ -133,11 +133,16 @@ fn bounded_diagnostic_text(value: String) -> String {
 /// 小请求保持原路径，避免 `block_in_place` 移交 worker 的额外开销。
 const CPU_HEAVY_BODY_BYTES: usize = 256 * 1024;
 
-/// 大请求的本地 body 准备是纯同步 CPU 工作；在多线程运行时里用 `block_in_place` 执行，
-/// 让当前 worker 上排队的其他任务（含 SSE keepalive）迁移到其他线程继续运行。
-/// current_thread 运行时（以及无运行时）不支持 `block_in_place`，直接同步执行。
-pub(super) fn run_cpu_heavy_in_place<T>(body_bytes: usize, work: impl FnOnce() -> T) -> T {
-    if body_bytes < CPU_HEAVY_BODY_BYTES {
+/// 本地 body 准备是纯同步 CPU 工作；大请求或带 document 块（可能触发 PDF 抽取）的请求在
+/// 多线程运行时里用 `block_in_place` 执行，让当前 worker 上排队的其他任务（含 SSE keepalive）
+/// 迁移到其他线程继续运行。current_thread 运行时（以及无运行时）不支持 `block_in_place`，
+/// 直接同步执行。
+pub(super) fn run_cpu_heavy_in_place<T>(
+    body_bytes: usize,
+    has_documents: bool,
+    work: impl FnOnce() -> T,
+) -> T {
+    if body_bytes < CPU_HEAVY_BODY_BYTES && !has_documents {
         return work();
     }
     match tokio::runtime::Handle::try_current() {
@@ -146,6 +151,20 @@ pub(super) fn run_cpu_heavy_in_place<T>(body_bytes: usize, work: impl FnOnce() -
         }
         _ => work(),
     }
+}
+
+/// 请求里是否带 document 块。PDF 抽取只发生在 document 块上，单个 PDF 抽取可能耗时数百毫秒，
+/// 即使请求体不大也不应占用 tokio worker。
+pub(super) fn payload_has_documents(payload: &MessagesRequest) -> bool {
+    payload
+        .messages
+        .iter()
+        .any(|message| match &message.content {
+            serde_json::Value::Array(blocks) => blocks.iter().any(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("document")
+            }),
+            _ => false,
+        })
 }
 
 pub(super) fn prepare(
@@ -499,13 +518,27 @@ mod tests {
     }
 
     #[test]
+    fn payload_document_detection_only_matches_document_blocks() {
+        let mut payload = messages_request(None, None);
+        assert!(!payload_has_documents(&payload));
+        payload.messages[0].content = serde_json::json!([
+            {"type": "text", "text": "summarize this"},
+            {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "x"}}
+        ]);
+        assert!(payload_has_documents(&payload));
+        payload.messages[0].content = serde_json::json!("document as plain text");
+        assert!(!payload_has_documents(&payload));
+    }
+
+    #[test]
     fn cpu_heavy_helper_runs_inline_without_a_multi_thread_runtime() {
-        assert_eq!(run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES, || 7), 7);
+        assert_eq!(run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES, false, || 7), 7);
+        assert_eq!(run_cpu_heavy_in_place(0, true, || 8), 8);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("current-thread runtime");
-        let value =
-            runtime.block_on(async { run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES * 4, || 11) });
+        let value = runtime
+            .block_on(async { run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES * 4, true, || 11) });
         assert_eq!(value, 11);
     }
 
@@ -517,9 +550,10 @@ mod tests {
             .expect("multi-thread runtime");
         let (small, large) = runtime.block_on(async {
             tokio::spawn(async {
-                let small = run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES - 1, || 1);
-                let large = run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES, || 2);
-                (small, large)
+                let small = run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES - 1, false, || 1);
+                let large = run_cpu_heavy_in_place(CPU_HEAVY_BODY_BYTES, false, || 2);
+                let small_with_document = run_cpu_heavy_in_place(1, true, || 3);
+                (small, large + small_with_document - 3)
             })
             .await
             .expect("task should complete")

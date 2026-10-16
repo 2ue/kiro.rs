@@ -197,9 +197,10 @@ struct PromptCacheState {
 
 impl PromptCacheState {
     fn prune_expired_if_due(&mut self, now: DateTime<Utc>) {
+        // 墙钟回拨（NTP 校正）时 now < last，按"已到期"处理，避免节流窗口被无限拉长。
         if self
             .last_pruned_at
-            .is_some_and(|last| now - last < PRUNE_EXPIRED_MIN_INTERVAL)
+            .is_some_and(|last| now >= last && now - last < PRUNE_EXPIRED_MIN_INTERVAL)
         {
             return;
         }
@@ -223,6 +224,8 @@ impl PromptCacheState {
     }
 
     /// 只检查本次写入的 scope：其他 scope 在各自写入时已经满足单 scope 上限。
+    /// 运行时调小 `max_entries_per_account` 后，其他 scope 要到下次写入才收缩；
+    /// 期间总量仍受全局上限约束，读路径也不受影响。
     fn enforce_bounds(
         &mut self,
         written_scope: &PromptCacheScope,
@@ -3245,6 +3248,25 @@ mod tests {
                     .all(|scope_entries| !scope_entries.is_empty())
             );
         }
+    }
+
+    #[test]
+    fn throttled_prune_runs_after_a_backwards_clock_jump() {
+        let mut state = PromptCacheState::default();
+        let now = Utc::now();
+        state.last_pruned_at = Some(now + chrono::Duration::minutes(10));
+        state.prune_expired_if_due(now);
+        assert_eq!(
+            state.last_pruned_at,
+            Some(now),
+            "a wall clock moved backwards must not suspend expiry sweeps"
+        );
+        state.prune_expired_if_due(now + chrono::Duration::milliseconds(10));
+        assert_eq!(
+            state.last_pruned_at,
+            Some(now),
+            "still throttled inside the window"
+        );
     }
 
     #[test]

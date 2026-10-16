@@ -1007,6 +1007,11 @@ pub struct MultiTokenManager {
     /// Serializes only candidate selection plus the local provisional reservation.
     /// Redis and upstream awaits always run after this guard is dropped.
     selection_reservation_gate: Mutex<()>,
+    /// 异步自愈 single-flight：账号池全灭时大量并发请求会同时走到自愈分支，
+    /// 只让一个请求写 PgSQL，其余请求等它完成后按最新状态重新选择。
+    auto_heal_gate: TokioMutex<()>,
+    #[cfg(test)]
+    auto_heal_pgsql_attempts: AtomicU64,
     /// Secret-free capability cohorts are rebuilt only after a relevant credential/config/proxy
     /// mutation. Request reads clone one Arc and never scan the account pool.
     model_capability_cohort_generation: AtomicU64,
@@ -2469,6 +2474,9 @@ impl MultiTokenManager {
             next_in_flight_lease_id: AtomicU64::new(initial_lease_id),
             queued_requests: Arc::new(AtomicU32::new(0)),
             selection_reservation_gate: Mutex::new(()),
+            auto_heal_gate: TokioMutex::new(()),
+            #[cfg(test)]
+            auto_heal_pgsql_attempts: AtomicU64::new(0),
             model_capability_cohort_generation: AtomicU64::new(1),
             model_capability_cohort_cache: Mutex::new(ModelCapabilityCohortCache::default()),
         };
@@ -3407,12 +3415,24 @@ impl MultiTokenManager {
     }
 
     fn auto_heal_too_many_failures_if_applicable(&self) -> bool {
+        if !self.has_auto_heal_candidates() {
+            return false;
+        }
+        // 同步路径（入口快速失败、路由预检）与 acquire 共用同一个 single-flight。同步调用不能等锁：
+        // 已有自愈在进行时直接返回 false，调用方按当前状态继续（入口会快速失败，或交给 acquire
+        // 在锁后看到自愈结果）。实测账号池全灭时 32 个并发入口请求各自串行写 PgSQL 共 3561 次。
+        let Ok(_single_flight) = self.auto_heal_gate.try_lock() else {
+            return false;
+        };
         let Some(candidate_ids) = self.auto_heal_candidate_ids() else {
             return false;
         };
         let mut healed_ids = Vec::new();
         for id in candidate_ids {
             let persisted_state = if let Some(store) = &self.postgres_store {
+                #[cfg(test)]
+                self.auto_heal_pgsql_attempts
+                    .fetch_add(1, Ordering::Relaxed);
                 let store = store.clone();
                 match block_on_credential_pgsql("原子恢复 PgSQL 连续失败禁用凭据", async move {
                     store.heal_credential_api_failures(id).await
@@ -3437,22 +3457,42 @@ impl MultiTokenManager {
     /// 请求调度路径使用的自愈：PgSQL 写入直接 await，不经过同步存储桥，
     /// 调用方必须在不持有任何调度锁的情况下调用。
     async fn auto_heal_too_many_failures_if_applicable_async(&self) -> bool {
+        if !self.has_auto_heal_candidates() {
+            return false;
+        }
+        let _single_flight = self.auto_heal_gate.lock().await;
+        // 等锁期间其他请求可能已经完成自愈；候选在锁内重新收集，已恢复的凭据不会再写 PgSQL。
+        // 返回 false 时调用方会重新选择，届时能看到前一个请求自愈出来的凭据。
         let Some(candidate_ids) = self.auto_heal_candidate_ids() else {
             return false;
         };
         let mut healed_ids = Vec::new();
         for id in candidate_ids {
             let persisted_state = if let Some(store) = &self.postgres_store {
+                #[cfg(test)]
+                self.auto_heal_pgsql_attempts
+                    .fetch_add(1, Ordering::Relaxed);
                 let store = store.clone();
                 let operation = "原子恢复 PgSQL 连续失败禁用凭据";
-                match credential_pgsql_sync_with_timeout(
+                let started_at = Instant::now();
+                let result = credential_pgsql_sync_with_timeout(
                     operation,
                     CREDENTIAL_PGSQL_SYNC_TIMEOUT,
                     async move { store.heal_credential_api_failures(id).await },
                 )
                 .await
-                .map_err(|err| anyhow::anyhow!("{}失败: {}", operation, err))
-                {
+                .map_err(|err| anyhow::anyhow!("{}失败: {}", operation, err));
+                let elapsed = started_at.elapsed();
+                if elapsed >= StdDuration::from_millis(100) {
+                    // 与同步存储桥的慢操作告警保持一致，便于对照排查。
+                    tracing::warn!(
+                        operation,
+                        credential_id = id,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "异步存储操作耗时较长"
+                    );
+                }
+                match result {
                     Ok(Some(state)) => Some(state),
                     Ok(None) => continue,
                     Err(err) => {

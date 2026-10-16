@@ -616,7 +616,8 @@ const SCHEDULER_RELEASED_LEASE_TOMBSTONE_TTL_SECS: i64 = 120;
 /// 新旧版本实例可以同时读写。
 const SESSION_INDEX_PRUNE_SAMPLE: usize = 4;
 /// 在已 SADD 本次成员之后执行的有界惰性清理。session key 由前缀与成员拼接，不在 KEYS 中：
-/// 本项目只支持单机 Redis（见 external pool 协调相关注释），与 `delete_sessions_for_credential` 做法一致。
+/// 本项目只支持单机 Redis（见 external pool 协调相关注释），这三个脚本原本就用 ARGV 拼接
+/// 反向索引 key，这里沿用同一约定。
 /// 约定：ARGV[1] = 本次 session hash，`session_key_prefix`/`index_key`/`sample` 由调用脚本定义。
 const SESSION_INDEX_PRUNE_LUA: &str = r#"
             for _, member in ipairs(redis.call('SRANDMEMBER', index_key, sample)) do

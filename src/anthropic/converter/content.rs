@@ -1,7 +1,7 @@
 //! Anthropic content block conversion, including images, documents, and tool results.
 
 use std::cell::Cell;
-use std::sync::Once;
+use std::sync::{Condvar, Mutex, Once, OnceLock};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
@@ -304,6 +304,7 @@ fn extract_pdf_text_with_panic_guard(
     bytes: &[u8],
 ) -> Result<Result<String, pdf_extract::OutputError>, ()> {
     install_pdf_extract_panic_filter();
+    let _slot = PdfExtractSlot::acquire();
     let _scope = PdfExtractPanicScope::enter();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem(bytes)
@@ -313,6 +314,68 @@ fn extract_pdf_text_with_panic_guard(
 
 thread_local! {
     static IN_PDF_EXTRACT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 进程内同时执行 pdf-extract 的上限。PDF 抽取是纯 CPU + 内存工作，单个大 PDF 可能占用数百
+/// 毫秒到数秒；不设上限时一批大 PDF 会同时把所有核心和内存打满。早期实现用全局互斥锁串行化，
+/// 现在放宽到 CPU 核数：并发 PDF 请求不再互相串行，但总量仍然有界。
+fn pdf_extract_max_concurrency() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .clamp(1, 16)
+    })
+}
+
+struct PdfExtractGate {
+    running: Mutex<usize>,
+    available: Condvar,
+}
+
+fn pdf_extract_gate() -> &'static PdfExtractGate {
+    static GATE: OnceLock<PdfExtractGate> = OnceLock::new();
+    GATE.get_or_init(|| PdfExtractGate {
+        running: Mutex::new(0),
+        available: Condvar::new(),
+    })
+}
+
+/// 占用一个 pdf-extract 并发名额；drop 时（包括 panic 展开）归还并唤醒一个等待者。
+/// 调用方都在同步转换路径上：大请求已经通过 `block_in_place` 移出 tokio worker。
+struct PdfExtractSlot;
+
+impl PdfExtractSlot {
+    fn acquire() -> Self {
+        let gate = pdf_extract_gate();
+        let limit = pdf_extract_max_concurrency();
+        let mut running = gate
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *running >= limit {
+            running = gate
+                .available
+                .wait(running)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *running += 1;
+        Self
+    }
+}
+
+impl Drop for PdfExtractSlot {
+    fn drop(&mut self) {
+        let gate = pdf_extract_gate();
+        let mut running = gate
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *running = running.saturating_sub(1);
+        drop(running);
+        gate.available.notify_one();
+    }
 }
 
 /// 标记当前线程正在执行 pdf-extract；drop 时（包括 panic 展开）清除标记。
@@ -911,6 +974,8 @@ pub(super) fn sanitize_tool_use_id(id: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
 
     use super::*;
@@ -939,6 +1004,45 @@ mod tests {
                 .join()
                 .expect("PDF extraction must never propagate a panic");
         }
+    }
+
+    #[test]
+    fn pdf_extract_slots_never_exceed_the_concurrency_limit() {
+        let limit = pdf_extract_max_concurrency();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles: Vec<_> = (0..limit * 4)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                std::thread::spawn(move || {
+                    let _slot = PdfExtractSlot::acquire();
+                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("slot holder must not panic");
+        }
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak >= 1 && peak <= limit,
+            "peak {peak} exceeded limit {limit}"
+        );
+
+        // panic 展开时名额也必须归还，否则之后的 PDF 请求会永久阻塞。
+        let _ = std::panic::catch_unwind(|| {
+            let _slot = PdfExtractSlot::acquire();
+            panic!("release the slot while unwinding");
+        });
+        let running = *pdf_extract_gate()
+            .running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(running < limit, "slot leaked after unwinding: {running}");
     }
 
     #[test]

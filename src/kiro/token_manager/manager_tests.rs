@@ -6138,6 +6138,132 @@ async fn postgres_acquire_auto_heal_persists_without_the_sync_storage_bridge() {
     assert_eq!(state.failure_count, 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_acquires_auto_heal_with_a_single_pgsql_pass() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credentials = Vec::new();
+    for id in 1..=3u64 {
+        let mut credential = test_access_token_credential(&format!("pg-herd-{id}"), "Pro");
+        credential.id = Some(id);
+        credentials.push(credential);
+    }
+    store.save_credentials(&credentials).await.unwrap();
+    let mut config = Config::default();
+    config.credential_max_concurrent_requests = 64;
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            config,
+            credentials,
+            None,
+            None,
+            false,
+            Some(store.clone()),
+            None,
+        )
+        .unwrap(),
+    );
+    for id in 1..=3u64 {
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(id);
+        }
+    }
+    assert_eq!(manager.available_count(), 0);
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(24));
+    let tasks: Vec<_> = (0..24)
+        .map(|_| {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let mut ctx = manager.acquire_context(None).await.expect("healed pool");
+                ctx.release_in_flight();
+            })
+        })
+        .collect();
+    for task in tasks {
+        tokio::time::timeout(StdDuration::from_secs(10), task)
+            .await
+            .expect("concurrent auto-heal must not stall")
+            .unwrap();
+    }
+
+    assert_eq!(manager.available_count(), 3);
+    assert_eq!(
+        manager.auto_heal_pgsql_attempts.load(Ordering::Relaxed),
+        3,
+        "single-flight: one PgSQL heal per disabled credential, not one per request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_route_state_checks_auto_heal_with_a_single_pgsql_pass() {
+    let Some(store) = test_postgres_store().await else {
+        eprintln!("跳过 PgSQL TokenManager 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+        return;
+    };
+
+    let mut credentials = Vec::new();
+    for id in 1..=3u64 {
+        let mut credential = test_access_token_credential(&format!("pg-route-herd-{id}"), "Pro");
+        credential.id = Some(id);
+        credentials.push(credential);
+    }
+    store.save_credentials(&credentials).await.unwrap();
+    let manager = Arc::new(
+        MultiTokenManager::new_with_stores(
+            Config::default(),
+            credentials,
+            None,
+            None,
+            false,
+            Some(store.clone()),
+            None,
+        )
+        .unwrap(),
+    );
+    for id in 1..=3u64 {
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(id);
+        }
+    }
+    assert_eq!(manager.available_count(), 0);
+
+    // 入口快速失败与路由预检走同步自愈；并发调用不能各自重复写 PgSQL。
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                manager.local_pool_route_state_cached(None).kind
+            })
+        })
+        .collect();
+    for handle in handles {
+        tokio::time::timeout(StdDuration::from_secs(10), handle)
+            .await
+            .expect("route-state auto-heal must not stall")
+            .unwrap();
+    }
+
+    assert_eq!(manager.available_count(), 3);
+    assert_eq!(
+        manager.auto_heal_pgsql_attempts.load(Ordering::Relaxed),
+        3,
+        "sync single-flight: one PgSQL heal per disabled credential, not one per caller"
+    );
+    assert_eq!(
+        manager.local_pool_route_state_cached(None).kind,
+        LocalPoolRouteStateKind::Ready
+    );
+}
+
 #[tokio::test]
 async fn test_multi_token_manager_acquire_context_balanced_request_excludes_bad_configuration() {
     let mut config = Config::default();
