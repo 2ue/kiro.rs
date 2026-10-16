@@ -1329,8 +1329,9 @@ fn meets_floor(pricing: ModelPricing, usage: &CacheUsage, floor: f64) -> bool {
     pricing.estimate(*usage) >= floor * (1.0 - 1e-9)
 }
 
-/// 总量内已无法不亏损时（例如总量本身过小）补足计费：
-/// 放行写入时先增加写入、写入到上限后增加 input；未放行时只增加 input，不受 input 上限约束。
+/// 总量内已无法不亏损时（例如总量本身过小，或写入被最终上限截断）补足计费：
+/// 放行写入时先增加写入、写入到上限后增加 input；未放行时只增加 input。
+/// 补到 input 的部分不受 input 上限约束，保证计费下限优先于读写上限。
 fn raise_cost_to_floor(
     usage: &mut CacheUsage,
     pricing: ModelPricing,
@@ -1356,15 +1357,13 @@ fn raise_cost_to_floor(
             usage.cache_creation_input_tokens = (existing + add).min(i32::MAX as i64) as i32;
         }
     }
+    // 写入到达上限（或本次未放行写入）后仍不足时，差额全部记入 input，不受 input 上限约束：
+    // 计费下限优先于读写上限，否则超长上下文会被写入上限截断后低于下限。
     if !meets_floor(pricing, usage, floor) && pricing.input_cost_per_token > 0.0 {
         let gap = floor - pricing.estimate(*usage);
-        let tokens = (gap / pricing.input_cost_per_token).ceil() as i32;
-        let room = if creation_allowed {
-            bounds.input_max.saturating_sub(usage.input_tokens).max(0)
-        } else {
-            i32::MAX
-        };
-        usage.input_tokens = usage.input_tokens.saturating_add(tokens.min(room).max(0));
+        let tokens = (gap / pricing.input_cost_per_token).ceil();
+        let tokens = tokens.clamp(0.0, i32::MAX as f64) as i32;
+        usage.input_tokens = usage.input_tokens.saturating_add(tokens);
     }
 }
 
@@ -3766,6 +3765,42 @@ mod tests {
             },
         );
         assert_eq!(shaped.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn hit_shaping_cost_floor_holds_when_creation_hits_final_cap() {
+        // 现网 22:32 的超长上下文请求：原始输入 96.9 万，无可复用前缀，
+        // 写入被最终上限（50 万减抖动）截断后计费只有原始的 0.61 倍。
+        let opus = ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: 0.00000625,
+            cache_read_input_token_cost: 0.0000005,
+        };
+        let raw = raw_input(968_653, 1);
+        let floor = opus.estimate(raw) * 0.8;
+        let base = usage(20_000, 0, 457_678, 1);
+        for creation_allowed in [true, false] {
+            let shaped = shape_cache_hit_usage(
+                base,
+                CacheHitShapingInput {
+                    has_reusable_prefix: false,
+                    creation_allowed,
+                    pricing: Some(opus),
+                    max_cache_creation_tokens: 457_678,
+                    ..input(shaping(0.9, 1024, 0.8), raw)
+                },
+            );
+            assert!(
+                opus.estimate(shaped) >= floor * (1.0 - 1e-9),
+                "creation_allowed={creation_allowed}: {shaped:?}"
+            );
+            assert!(shaped.cache_creation_input_tokens <= 457_678, "{shaped:?}");
+            if !creation_allowed {
+                assert_eq!(shaped.cache_creation_input_tokens, 0, "{shaped:?}");
+            }
+            assert_eq!(shaped.cache_read_input_tokens, 0, "{shaped:?}");
+        }
     }
 
     #[test]
