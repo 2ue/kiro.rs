@@ -773,7 +773,7 @@ const TOKEN_REFRESH_BEGIN_SCRIPT: &str = r#"
                 redis.call('HGET', KEYS[2], 'health_action_required') or '0', ''
             }
         end
-    elseif state == 'succeeded' and stored_identity == identity then
+    elseif state == 'succeeded' and stored_identity == identity and ARGV[10] ~= '1' then
         return {
             'succeeded', tostring(generation), '', '', '', '', '', '', '', '', '', '',
             redis.call('HGET', KEYS[2], 'storage_revision') or '0', ''
@@ -2225,6 +2225,7 @@ impl RedisStore {
         Ok((count, claimed))
     }
 
+    #[cfg(test)]
     pub async fn set_nx_ex(
         &self,
         key: impl AsRef<str>,
@@ -2243,6 +2244,7 @@ impl RedisStore {
         Ok(result.as_deref() == Some("OK"))
     }
 
+    #[cfg(test)]
     pub async fn release_lock(
         &self,
         key: impl AsRef<str>,
@@ -6303,6 +6305,7 @@ impl RedisStore {
         Ok(count.max(0) as u32)
     }
 
+    #[cfg(test)]
     pub async fn acquire_refresh_lock(
         &self,
         credential_id: u64,
@@ -6315,6 +6318,7 @@ impl RedisStore {
         Ok(acquired.then_some(token))
     }
 
+    #[cfg(test)]
     pub async fn release_refresh_lock(
         &self,
         credential_id: u64,
@@ -6340,12 +6344,31 @@ impl RedisStore {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_token_refresh_after_observed_generation(
         &self,
         credential_id: u64,
         identity: [u8; 32],
         caller_can_claim_health: bool,
         observed_generation: Option<u64>,
+    ) -> anyhow::Result<RedisRefreshBegin> {
+        self.begin_token_refresh_after_observed_generation_with_force(
+            credential_id,
+            identity,
+            caller_can_claim_health,
+            observed_generation,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_token_refresh_after_observed_generation_with_force(
+        &self,
+        credential_id: u64,
+        identity: [u8; 32],
+        caller_can_claim_health: bool,
+        observed_generation: Option<u64>,
+        force: bool,
     ) -> anyhow::Result<RedisRefreshBegin> {
         let owner = uuid::Uuid::new_v4().to_string();
         let health_claim_token = uuid::Uuid::new_v4().to_string();
@@ -6364,6 +6387,7 @@ impl RedisStore {
             .arg(TOKEN_REFRESH_POLL_AFTER_MS)
             .arg(TOKEN_REFRESH_NEGATIVE_STREAK_RESET_MS)
             .arg(observed_generation.unwrap_or_default())
+            .arg(if force { 1 } else { 0 })
             .query_async(&mut manager)
             .await?;
         decode_refresh_begin(

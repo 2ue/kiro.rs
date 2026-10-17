@@ -496,6 +496,192 @@ async fn token_refresh_two_manager_rotating_and_non_rotating_share_one_send_and_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_refresh_success_outcome_is_reused_by_ordinary_peer() {
+    run_refresh_cluster_fixture(|postgres, redis| async move {
+        let marker = "force-outcome-reuse";
+        let endpoint = spawn_cluster_refresh_endpoint(
+            ClusterEndpointMode::Success,
+            "force-access-reuse".to_string(),
+            Some(format!("force-refresh-reuse-{}", "n".repeat(150))),
+        )
+        .await;
+        let inserted = postgres[0]
+            .insert_credential(&expired_cluster_credential(endpoint.url.clone(), marker))
+            .await
+            .unwrap();
+        let managers = cluster_managers(&inserted, &postgres, &redis);
+        managers[0]
+            .force_refresh_token_for(inserted.id.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 1);
+
+        let context = managers[1]
+            .try_ensure_token_with_budgets(
+                inserted.id.unwrap(),
+                &inserted,
+                false,
+                CLUSTER_REFRESH_BUDGETS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(context.token, "force-access-reuse");
+        assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_refresh_waits_for_ordinary_leader_without_second_upstream_send() {
+    run_refresh_cluster_fixture(|postgres, redis| async move {
+        let marker = "force-waits-for-ordinary";
+        let endpoint = spawn_cluster_refresh_endpoint(
+            ClusterEndpointMode::PendingFirstThenSuccess,
+            "force-access-after-ordinary".to_string(),
+            None,
+        )
+        .await;
+        let inserted = postgres[0]
+            .insert_credential(&expired_cluster_credential(endpoint.url.clone(), marker))
+            .await
+            .unwrap();
+        let managers = cluster_managers(&inserted, &postgres, &redis);
+        let ordinary_manager = managers[0].clone();
+        let ordinary_credential = inserted.clone();
+        let ordinary = tokio::spawn(async move {
+            ordinary_manager
+                .try_ensure_token_with_budgets(
+                    ordinary_credential.id.unwrap(),
+                    &ordinary_credential,
+                    false,
+                    CLUSTER_REFRESH_BUDGETS,
+                )
+                .await
+        });
+        tokio::time::timeout(
+            CLUSTER_REFRESH_BUDGETS.coordination,
+            endpoint.state.request_received.notified(),
+        )
+        .await
+        .expect("ordinary refresh did not become leader");
+
+        let force_manager = managers[1].clone();
+        let force = tokio::spawn(async move {
+            force_manager
+                .force_refresh_token_for(inserted.id.unwrap())
+                .await
+        });
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            !force.is_finished(),
+            "force refresh must wait for ordinary leader"
+        );
+        endpoint
+            .state
+            .set_success("force-access-after-ordinary".to_string(), None);
+        let ordinary_result = tokio::time::timeout(StdDuration::from_secs(5), ordinary)
+            .await
+            .expect("ordinary refresh did not finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ordinary_result.token, "force-access-after-ordinary");
+        tokio::time::timeout(StdDuration::from_secs(5), force)
+            .await
+            .expect("force refresh did not reuse ordinary success")
+            .unwrap()
+            .unwrap();
+        assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_refresh_after_success_starts_a_new_upstream_request() {
+    run_refresh_cluster_fixture(|postgres, redis| async move {
+        let marker = "force-after-success";
+        let endpoint = spawn_cluster_refresh_endpoint(
+            ClusterEndpointMode::Success,
+            "force-access-first".to_string(),
+            None,
+        )
+        .await;
+        let inserted = postgres[0]
+            .insert_credential(&expired_cluster_credential(endpoint.url.clone(), marker))
+            .await
+            .unwrap();
+        let manager = cluster_managers(&inserted, &postgres, &redis)[0].clone();
+        manager
+            .force_refresh_token_for(inserted.id.unwrap())
+            .await
+            .unwrap();
+        endpoint
+            .state
+            .set_success("force-access-second".to_string(), None);
+        manager
+            .force_refresh_token_for(inserted.id.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(endpoint.state.hits.load(Ordering::Acquire), 2);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_refresh_coordination_timeout_does_not_hold_local_gate() {
+    run_refresh_cluster_fixture(|postgres, redis| async move {
+        let marker = "force-coordination-timeout";
+        let inserted = postgres[0]
+            .insert_credential(&expired_cluster_credential(
+                "http://127.0.0.1:1/never-called".to_string(),
+                marker,
+            ))
+            .await
+            .unwrap();
+        let managers = cluster_managers(&inserted, &postgres, &redis);
+        let identity = refresh_identity_for_manager(managers[0].as_ref(), inserted.id.unwrap());
+        let leader = redis[0]
+            .begin_token_refresh(inserted.id.unwrap(), identity.0, false)
+            .await
+            .unwrap();
+        assert!(matches!(leader, RedisRefreshBegin::Leader(_)));
+
+        let force_manager = managers[1].clone();
+        let force = tokio::spawn(async move {
+            force_manager
+                .force_refresh_token_for_with_budgets(
+                    inserted.id.unwrap(),
+                    TokenRefreshBudgets {
+                        workflow: StdDuration::from_millis(250),
+                        coordination: StdDuration::from_millis(80),
+                        reconciliation: StdDuration::from_millis(50),
+                    },
+                )
+                .await
+        });
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+        let gate_started = tokio::time::Instant::now();
+        let refresh_state = managers[1].refresh_state_for_credential(inserted.id.unwrap());
+        let gate = tokio::time::timeout(StdDuration::from_millis(50), refresh_state.gate.lock())
+            .await
+            .expect("force coordination wait must not hold local gate");
+        assert!(gate_started.elapsed() < StdDuration::from_millis(50));
+        drop(gate);
+
+        let error = tokio::time::timeout(StdDuration::from_secs(1), force)
+            .await
+            .expect("force coordination timeout did not finish")
+            .unwrap()
+            .unwrap_err();
+        let failure = error
+            .downcast_ref::<RefreshFailure>()
+            .expect("force coordination timeout must remain typed");
+        assert_eq!(failure.stage, RefreshFailureStage::Coordination);
+        assert_eq!(failure.kind, RefreshFailureKind::Timeout);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_refresh_two_manager_pg_cas_fences_stale_rotating_and_non_rotating_results_for_five_rounds()
  {
     run_refresh_cluster_fixture(|postgres, redis| async move {
