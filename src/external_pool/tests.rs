@@ -362,18 +362,51 @@ enum TestRawHttpBody {
     GzipJson(Vec<u8>),
 }
 
+/// 读取一个 HTTP/1.1 请求的头部和按 Content-Length 声明的 body；读取失败或超时就停止。
+async fn read_full_test_http_request(socket: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let read = match tokio::time::timeout_at(deadline, socket.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+            Ok(Ok(read)) => read,
+        };
+        request.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if request.len() >= header_end + 4 + content_length {
+            return;
+        }
+    }
+}
+
 async fn spawn_test_raw_http_response(
     status: StatusCode,
     body: TestRawHttpBody,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = [0u8; 4096];
-        let _ = socket.read(&mut request).await;
+        // 必须读完整个请求（含 body）再回写响应：请求体超过一次 read 的长度时，带着未读数据
+        // 关闭 socket 会让内核发送 RST，客户端读响应体时就会报 decode error，掩盖真实行为。
+        read_full_test_http_request(&mut socket).await;
         let reason = status.canonical_reason().unwrap_or("Test");
         match body {
             TestRawHttpBody::DeclaredOnly(length) => {
@@ -1363,6 +1396,8 @@ async fn external_pool_slow_upstream_status_keeps_status_and_error_body_fragment
     let config = ExternalPoolsConfig {
         external_pools_enabled: true,
         external_pool_retry_max_attempts: 1,
+        // 这里只验证单次 524 的诊断，不覆盖默认启用的同池重试。
+        external_pool_same_pool_retry_count: 0,
         external_pool_request_timeout_secs: 2,
         external_pool_server_error_cooldown_secs: 1,
         external_pool_transient_failure_cooldown_threshold: 0,
@@ -1398,10 +1433,9 @@ async fn external_pool_slow_upstream_status_keeps_status_and_error_body_fragment
         "status attempt duration should reflect upstream delay, got {}ms",
         attempt.duration_ms
     );
-    let raw = attempt
-        .raw_upstream_error
-        .as_ref()
-        .expect("HTTP status error should keep bounded upstream error fragment");
+    let raw = attempt.raw_upstream_error.as_ref().unwrap_or_else(|| {
+        panic!("HTTP status error should keep bounded upstream error fragment: {attempt:?}")
+    });
     assert_eq!(raw.status_code, Some(524));
     assert!(raw.body.contains("cf edge timeout marker"));
 
@@ -1457,7 +1491,7 @@ async fn external_pool_no_response_headers_becomes_client_timeout_without_raw_bo
     let ExternalPoolForwardOutcome::FinalError(error) = outcome else {
         panic!("single stalled pool must return a final error");
     };
-    assert_eq!(error.attempts.len(), 1);
+    assert_eq!(error.attempts.len(), 1, "final error: {error:?}");
     let attempt = &error.attempts[0];
     assert_eq!(attempt.pool_id, pool.id);
     assert_eq!(attempt.status, None);
@@ -1518,6 +1552,8 @@ async fn external_pool_retry_send_timeout_uses_remaining_dispatch_deadline() {
     let config = ExternalPoolsConfig {
         external_pools_enabled: true,
         external_pool_retry_max_attempts: 2,
+        // 只验证跨池重试共享 dispatch deadline，不覆盖默认启用的同池重试。
+        external_pool_same_pool_retry_count: 0,
         external_pool_request_timeout_secs: 2,
         external_pool_server_error_cooldown_secs: 1,
         external_pool_network_error_cooldown_secs: 1,
@@ -1716,14 +1752,15 @@ async fn external_pool_stream_pre_output_error_event_fails_over_and_keeps_succes
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn external_pool_stream_keepalive_emits_ping_during_silent_gap_before_output() {
+async fn external_pool_stream_keepalive_emits_ping_during_silent_gap_after_output() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
     };
     let upstream = ExternalStreamFakeServer::start(vec![
         ExternalStreamFakeStep::chunk(external_sse_message_start("msg_keepalive_a", 111)),
-        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
         ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("before-gap")),
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
         ExternalStreamFakeStep::chunk(external_sse_text_delta("after-gap")),
         ExternalStreamFakeStep::chunk(external_sse_text_stop()),
         ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
@@ -1734,9 +1771,12 @@ async fn external_pool_stream_keepalive_emits_ping_during_silent_gap_before_outp
 
     let request_id = "req_stream_keepalive_ping";
     let (route, recorder) = external_stream_route(request_id, "err_stream_keepalive_ping");
+    let mut config = external_stream_config_for_test();
+    // 预输出阶段缓冲语义事件以支持重试；输出提交后再验证 keepalive。
+    config.external_pool_stream_idle_timeout_secs = 3;
     let response = match timeout(
         Duration::from_secs(8),
-        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+        manager.forward_with_failover_result(config, route),
     )
     .await
     .expect("keepalive stream should finish")
@@ -1765,8 +1805,8 @@ async fn external_pool_stream_keepalive_emits_ping_during_silent_gap_before_outp
         "ping must come after initial stream output"
     );
     assert!(
-        ping_pos < text_start_pos,
-        "ping must arrive before delayed semantic output"
+        text_start_pos < ping_pos,
+        "semantic output must be committed before the keepalive interval"
     );
 
     let record = usage_record_for_request(&recorder, request_id);
@@ -6288,7 +6328,8 @@ async fn legacy_zero_external_wait_reaches_a_bounded_final_error() {
         panic!("legacy zero wait must terminate at the safe default deadline");
     };
     assert_eq!(error.route_error_type, "external_pool_wait_timeout");
-    assert!(!error.retryable);
+    // 容量等待超时属于可重试容量错误，与容量已满保持一致。
+    assert!(error.retryable);
     assert!(queue_guard.is_none());
 
     postgres.drop_test_schema().await.unwrap();
