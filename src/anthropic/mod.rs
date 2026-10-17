@@ -43,6 +43,7 @@ pub(crate) mod envelope;
 pub(crate) mod files;
 mod handlers;
 pub(crate) mod inference_attempt_budget;
+pub(crate) mod language_preference;
 mod middleware;
 pub(crate) mod model_capabilities;
 pub(crate) mod payload_guard;

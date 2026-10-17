@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::anthropic::body_capabilities::KiroConverterPlan;
+use crate::anthropic::language_preference::ClientLanguagePreference;
 use crate::anthropic::model_capabilities::{KiroReasoningCapabilityState, ModelResolution};
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
@@ -132,6 +133,7 @@ pub struct ConverterOptions {
     pub(crate) explicit_reasoning_request: bool,
     pub(crate) native_reasoning_capability: KiroReasoningCapabilityState,
     pub prompt_steering: PromptSteeringConfig,
+    pub(crate) language_turn_reminder: Option<ClientLanguagePreference>,
 }
 
 impl Default for ConverterOptions {
@@ -147,6 +149,7 @@ impl Default for ConverterOptions {
             explicit_reasoning_request: false,
             native_reasoning_capability: KiroReasoningCapabilityState::LegacyFallback,
             prompt_steering: PromptSteeringConfig::default(),
+            language_turn_reminder: None,
         }
     }
 }
@@ -192,6 +195,29 @@ impl ConverterOptions {
 
     fn tool_choice_steering_enabled(&self) -> bool {
         self.conversion.tool_choice_steering.is_enabled()
+    }
+
+    fn language_turn_reminder_text(&self) -> Option<String> {
+        let prompt_steering = self.prompt_steering.clone().normalized();
+        if self.is_strict()
+            || !prompt_steering.enabled
+            || !prompt_steering.language_constraint.enabled
+            || !prompt_steering.language_turn_reminder.enabled
+        {
+            return None;
+        }
+
+        let preference = self.language_turn_reminder.as_ref()?;
+        let prompt = match preference {
+            ClientLanguagePreference::Explicit(language) => prompt_steering
+                .language_turn_reminder
+                .explicit_prompt
+                .replace("{language}", language),
+            ClientLanguagePreference::FollowUser => {
+                prompt_steering.language_turn_reminder.follow_user_prompt
+            }
+        };
+        (!prompt.trim().is_empty()).then_some(prompt)
     }
 }
 
@@ -594,6 +620,10 @@ fn convert_request_with_model_id(
     }
     if let Some(reminder) = generate_tool_choice_turn_reminder(req, &tool_name_map, options.clone())
     {
+        content.push_str("\n\n");
+        content.push_str(&reminder);
+    }
+    if let Some(reminder) = options.language_turn_reminder_text() {
         content.push_str("\n\n");
         content.push_str(&reminder);
     }
@@ -4381,6 +4411,195 @@ mod tests {
             output_config: None,
             metadata: None,
             stop_sequences: None,
+        }
+    }
+
+    fn language_reminder_options(preference: ClientLanguagePreference) -> ConverterOptions {
+        let mut options = ConverterOptions::default();
+        options.prompt_steering.language_constraint.enabled = true;
+        options.language_turn_reminder = Some(preference);
+        options
+    }
+
+    fn current_message_content(result: &ConversionResult) -> &str {
+        &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content
+    }
+
+    #[test]
+    fn language_turn_reminder_explicit_only_changes_current_message() {
+        let mut req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
+        req.system = Some(vec![super::super::types::SystemMessage {
+            text: "Keep the system instruction intact.".to_string(),
+            cache_control: None,
+        }]);
+        let baseline = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+        let result = convert_request_with_options(
+            &req,
+            language_reminder_options(ClientLanguagePreference::Explicit("简体中文".to_string())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            current_message_content(&result),
+            format!(
+                "{}\n\n<language_reminder>Respond in 简体中文 for all user-facing text, including progress notes between tool calls. Keep code and identifiers unchanged.</language_reminder>",
+                current_message_content(&baseline)
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&result.conversation_state.history).unwrap(),
+            serde_json::to_value(&baseline.conversation_state.history).unwrap()
+        );
+        let mut result_current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .unwrap();
+        result_current["content"] = serde_json::json!(current_message_content(&baseline));
+        assert_eq!(
+            result_current,
+            serde_json::to_value(
+                &baseline
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+            )
+            .unwrap()
+        );
+
+        let mut repeated_prompt_options =
+            language_reminder_options(ClientLanguagePreference::Explicit("简体中文".to_string()));
+        repeated_prompt_options
+            .prompt_steering
+            .language_turn_reminder
+            .explicit_prompt =
+            "<language_reminder>{language}/{language}</language_reminder>".to_string();
+        let repeated_prompt_result =
+            convert_request_with_options(&req, repeated_prompt_options).unwrap();
+        assert!(
+            current_message_content(&repeated_prompt_result)
+                .ends_with("<language_reminder>简体中文/简体中文</language_reminder>")
+        );
+    }
+
+    #[test]
+    fn language_turn_reminder_follow_user_uses_configured_prompt() {
+        let req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
+        let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
+        options
+            .prompt_steering
+            .language_turn_reminder
+            .follow_user_prompt =
+            "<language_reminder>Use the user's latest language.</language_reminder>".to_string();
+        let result = convert_request_with_options(&req, options).unwrap();
+
+        assert!(
+            current_message_content(&result).ends_with(
+                "<language_reminder>Use the user's latest language.</language_reminder>"
+            )
+        );
+    }
+
+    #[test]
+    fn language_turn_reminder_follows_tool_result_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("call the tool"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![test_tool("read_file")]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            stop_sequences: None,
+        };
+        let result = convert_request_with_options(
+            &req,
+            language_reminder_options(ClientLanguagePreference::FollowUser),
+        )
+        .unwrap();
+        let content = current_message_content(&result);
+
+        assert!(content.starts_with(TOOL_RESULTS_PROVIDED_PLACEHOLDER));
+        assert!(content.contains("<language_reminder>"));
+        assert!(
+            content.find(TOOL_RESULTS_PROVIDED_PLACEHOLDER).unwrap()
+                < content.find("<language_reminder>").unwrap()
+        );
+    }
+
+    #[test]
+    fn tool_choice_reminder_precedes_language_turn_reminder() {
+        let req = base_tool_choice_request(serde_json::json!({"type": "any"}));
+        let result = convert_request_with_options(
+            &req,
+            language_reminder_options(ClientLanguagePreference::FollowUser),
+        )
+        .unwrap();
+        let content = current_message_content(&result);
+        let tool_choice = content.find("<tool_choice_reminder>").unwrap();
+        let language = content.find("<language_reminder>").unwrap();
+
+        assert!(tool_choice < language);
+    }
+
+    #[test]
+    fn language_turn_reminder_requires_all_injection_gates() {
+        let req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
+        assert!(ConverterOptions::default().language_turn_reminder.is_none());
+        let cases = [
+            ConverterOptions {
+                language_turn_reminder: None,
+                ..language_reminder_options(ClientLanguagePreference::FollowUser)
+            },
+            {
+                let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
+                options.prompt_steering.language_constraint.enabled = false;
+                options
+            },
+            {
+                let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
+                options.prompt_steering.enabled = false;
+                options
+            },
+            {
+                let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
+                options.prompt_steering.language_turn_reminder.enabled = false;
+                options
+            },
+            {
+                let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
+                options.compat_profile = CompatProfile::AnthropicStrict;
+                options
+            },
+        ];
+
+        for options in cases {
+            let result = convert_request_with_options(&req, options).unwrap();
+            assert!(!current_message_content(&result).contains("<language_reminder>"));
         }
     }
 

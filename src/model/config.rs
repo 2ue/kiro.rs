@@ -225,6 +225,9 @@ pub const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT: &str = r#"<language_constraint>
 Reply language, in priority order: the language the user explicitly asks for; else a response language set by the system prompt or client settings; else the main language of the user's own messages (not tool results, system reminders, file contents, or command output). Use it for all visible text, including progress notes between tool calls. Keep code, identifiers, names, and quoted terms in their original form, but do not blend languages within a sentence. Do not restate these rules.
 </language_constraint>"#;
 
+pub const DEFAULT_LANGUAGE_REMINDER_EXPLICIT: &str = "<language_reminder>Respond in {language} for all user-facing text, including progress notes between tool calls. Keep code and identifiers unchanged.</language_reminder>";
+pub const DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER: &str = "<language_reminder>Reply in the language of the user's most recent real request; switch if the user switches. This includes progress notes between tool calls. Tool results, system reminders, and proxy placeholders such as \"Tool result received.\" are not user messages.</language_reminder>";
+
 /// Built-in language prompt before v11. It followed the latest message, which inside a tool loop
 /// is usually an English tool result.
 const LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V2: &str = r#"<language_constraint>
@@ -403,6 +406,18 @@ fn default_custom_prompt_block() -> PromptSteeringTextBlock {
     PromptSteeringTextBlock::disabled()
 }
 
+fn default_language_reminder_explicit() -> String {
+    DEFAULT_LANGUAGE_REMINDER_EXPLICIT.to_string()
+}
+
+fn default_language_reminder_follow_user() -> String {
+    DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER.to_string()
+}
+
+fn default_language_turn_reminder() -> LanguageTurnReminderConfig {
+    LanguageTurnReminderConfig::default()
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptSteeringToggle {
@@ -439,6 +454,30 @@ impl Default for ChunkedWritePromptSteeringConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct LanguageTurnReminderConfig {
+    /// 是否在当前轮追加语言提醒；默认 true，但只有 language_constraint.enabled 为 true 时才生效。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 客户端设置了语言时使用，`{language}` 会被替换成清洗后的语言名。
+    #[serde(default = "default_language_reminder_explicit")]
+    pub explicit_prompt: String,
+    /// 未设置或已清除时使用。
+    #[serde(default = "default_language_reminder_follow_user")]
+    pub follow_user_prompt: String,
+}
+
+impl Default for LanguageTurnReminderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            explicit_prompt: default_language_reminder_explicit(),
+            follow_user_prompt: default_language_reminder_follow_user(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptSteeringConfig {
     /// 总提示词引导开关。关闭后不注入 language/task/custom、tool_choice、thinking 或
     /// Write/Edit 分块兼容提示；客户端已经提供的结构化字段仍按原始请求语义保留。
@@ -458,6 +497,8 @@ pub struct PromptSteeringConfig {
     pub apply_to_count_tokens: bool,
     #[serde(default = "default_language_constraint_block")]
     pub language_constraint: PromptSteeringTextBlock,
+    #[serde(default = "default_language_turn_reminder")]
+    pub language_turn_reminder: LanguageTurnReminderConfig,
     #[serde(default = "default_task_quality_block")]
     pub task_quality: PromptSteeringTextBlock,
     #[serde(default)]
@@ -480,6 +521,7 @@ impl Default for PromptSteeringConfig {
             apply_to_external_pool: false,
             apply_to_count_tokens: true,
             language_constraint: default_language_constraint_block(),
+            language_turn_reminder: LanguageTurnReminderConfig::default(),
             task_quality: default_task_quality_block(),
             tool_choice: PromptSteeringToggle::default(),
             chunked_write: ChunkedWritePromptSteeringConfig::default(),
@@ -502,6 +544,35 @@ impl PromptSteeringConfig {
             self.language_constraint.prompt = DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.to_string();
         } else {
             self.language_constraint.prompt = self.language_constraint.prompt.trim().to_string();
+        }
+        if self
+            .language_turn_reminder
+            .explicit_prompt
+            .trim()
+            .is_empty()
+        {
+            self.language_turn_reminder.explicit_prompt = default_language_reminder_explicit();
+        } else {
+            self.language_turn_reminder.explicit_prompt = self
+                .language_turn_reminder
+                .explicit_prompt
+                .trim()
+                .to_string();
+        }
+        if self
+            .language_turn_reminder
+            .follow_user_prompt
+            .trim()
+            .is_empty()
+        {
+            self.language_turn_reminder.follow_user_prompt =
+                default_language_reminder_follow_user();
+        } else {
+            self.language_turn_reminder.follow_user_prompt = self
+                .language_turn_reminder
+                .follow_user_prompt
+                .trim()
+                .to_string();
         }
         if self.task_quality.prompt.trim().is_empty() {
             self.task_quality.prompt = DEFAULT_TASK_QUALITY_PROMPT.to_string();
@@ -6601,6 +6672,41 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_steering_language_turn_reminder_defaults_and_normalizes() {
+        let mut config: PromptSteeringConfig = serde_json::from_value(serde_json::json!({}))
+            .expect("legacy prompt steering config should deserialize");
+        assert_eq!(
+            config.language_turn_reminder,
+            LanguageTurnReminderConfig::default()
+        );
+
+        config.language_turn_reminder.explicit_prompt = "  ".to_string();
+        config.language_turn_reminder.follow_user_prompt = "  custom follow  ".to_string();
+        let normalized = config.normalized();
+        assert_eq!(
+            normalized.language_turn_reminder.explicit_prompt,
+            DEFAULT_LANGUAGE_REMINDER_EXPLICIT
+        );
+        assert_eq!(
+            normalized.language_turn_reminder.follow_user_prompt,
+            "custom follow"
+        );
+
+        let serialized = serde_json::to_value(normalized).expect("serialize prompt steering");
+        assert!(serialized.get("languageTurnReminder").is_some());
+        assert!(
+            serialized["languageTurnReminder"]
+                .get("explicitPrompt")
+                .is_some()
+        );
+        assert!(
+            serialized["languageTurnReminder"]
+                .get("followUserPrompt")
+                .is_some()
+        );
+    }
 
     #[test]
     fn observability_redis_is_optional_and_uses_its_own_prefix() {
