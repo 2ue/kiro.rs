@@ -27,9 +27,7 @@ pub fn map_model(model: &str) -> Option<String> {
     ) {
         return Some(model_base);
     }
-    let Some(rest) = model_base.strip_prefix("claude-") else {
-        return None;
-    };
+    let rest = model_base.strip_prefix("claude-")?;
     let has_known_family = rest
         .split(['-', '.'])
         .any(|part| matches!(part, "opus" | "sonnet" | "haiku" | "fable"));
