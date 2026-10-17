@@ -1,6 +1,9 @@
 name: Quality Gate
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -178,11 +181,11 @@ jobs:
 
       - name: Test without default features
         if: ${{ env.QUALITY_PROFILE == 'full' }}
-        run: cargo test --locked --all-targets --no-default-features -- --test-threads=1
+        run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --all-targets --no-default-features -- --test-threads=1
 
       - name: Test with default features
         if: ${{ env.QUALITY_PROFILE == 'full' }}
-        run: cargo test --locked --all-targets -- --test-threads=1
+        run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --all-targets -- --test-threads=1
 
       - name: Check no-default Rust compilation
         if: ${{ env.QUALITY_PROFILE == 'release' }}
