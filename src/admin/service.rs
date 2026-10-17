@@ -88,6 +88,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
+    RefreshFailure, RefreshFailureKind, RefreshFailureStage,
 };
 use crate::model::config::{
     Config, ExternalPoolsConfig, MAX_LOCAL_BERSERK_ROUND_DELAY_MS, MAX_LOCAL_BERSERK_ROUNDS,
@@ -110,6 +111,10 @@ const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 const MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 1;
 const MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY: u32 = 16;
+const MAX_LOCAL_RATE_LIMIT_RETRIES: u32 = 20;
+const CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET: StdDuration = StdDuration::from_secs(120);
+const MIN_LOCAL_RATE_LIMIT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const MAX_LOCAL_RATE_LIMIT_RETRY_DELAY: StdDuration = StdDuration::from_secs(5);
 const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
@@ -226,6 +231,57 @@ fn effective_credential_info_refresh_concurrency(config: &Config) -> usize {
         MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY,
         MAX_CREDENTIAL_INFO_REFRESH_CONCURRENCY,
     ) as usize
+}
+
+fn local_rate_limit_retry_after(error: &anyhow::Error) -> Option<StdDuration> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RefreshFailure>())
+        .filter(|failure| {
+            failure.stage == RefreshFailureStage::Coordination
+                && failure.kind == RefreshFailureKind::RateLimited
+        })
+        .and_then(|failure| failure.retry_after)
+}
+
+fn local_rate_limit_retry_delay(retry_after: StdDuration) -> StdDuration {
+    retry_after.clamp(
+        MIN_LOCAL_RATE_LIMIT_RETRY_DELAY,
+        MAX_LOCAL_RATE_LIMIT_RETRY_DELAY,
+    )
+}
+
+async fn retry_local_rate_limited<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    mut refresh: F,
+) -> (Result<T, AdminServiceError>, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AdminServiceError>>,
+{
+    let mut retries = 0;
+    loop {
+        match refresh().await {
+            Err(error @ AdminServiceError::LocalRateLimited { retry_after, .. })
+                if retries < MAX_LOCAL_RATE_LIMIT_RETRIES =>
+            {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return (Err(error), retries);
+                }
+
+                let delay = local_rate_limit_retry_delay(retry_after);
+                if delay >= remaining {
+                    tokio::time::sleep(remaining).await;
+                    return (Err(error), retries);
+                }
+
+                tokio::time::sleep(delay).await;
+                retries += 1;
+            }
+            result => return (result, retries),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2651,13 +2707,17 @@ impl AdminService {
             )));
         }
 
+        let deadline = tokio::time::Instant::now() + CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET;
         let concurrency =
             effective_credential_info_refresh_concurrency(&self.token_manager.runtime_config());
         let labels = self.credential_lookup();
         let mut items = stream::iter(ids.into_iter().map(|id| {
             let label = labels.get(&id).cloned();
             async move {
-                match self.get_account_info(id, req.force).await {
+                let (result, _) =
+                    retry_local_rate_limited(deadline, || self.get_account_info(id, req.force))
+                        .await;
+                match result {
                     Ok(info) => CredentialInfoRefreshItem {
                         id,
                         email: label.as_ref().and_then(|item| item.email.clone()),
@@ -6533,7 +6593,18 @@ impl AdminService {
     /// 分类账号信息查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
+        let classified = self.classify_balance_error_message(msg.clone(), id);
+        let Some(retry_after) = local_rate_limit_retry_after(&e) else {
+            return classified;
+        };
 
+        AdminServiceError::LocalRateLimited {
+            source: Box::new(classified),
+            retry_after,
+        }
+    }
+
+    fn classify_balance_error_message(&self, msg: String, id: u64) -> AdminServiceError {
         // 1. 凭据不存在
         if msg.contains("不存在") {
             return AdminServiceError::NotFound { id };
