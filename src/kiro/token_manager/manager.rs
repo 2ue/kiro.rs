@@ -1074,6 +1074,7 @@ const REFRESH_REDIS_LOCK_OP_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const TOKEN_REFRESH_WORKFLOW_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 const TOKEN_REFRESH_COORDINATION_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const TOKEN_REFRESH_RECONCILIATION_RESERVE: StdDuration = StdDuration::from_secs(15);
+#[cfg(test)]
 const TOKEN_REFRESH_REDIS_LOCK_TTL_SECS: usize = 120;
 const TOKEN_REFRESH_NEGATIVE_BACKOFF_BASE: StdDuration = StdDuration::from_millis(500);
 const TOKEN_REFRESH_NEGATIVE_BACKOFF_MAX: StdDuration = StdDuration::from_secs(30);
@@ -1739,86 +1740,6 @@ async fn refresh_token_until(
         refresh_token_with_client(&credentials, &config, client, admission).await
     })
     .await
-}
-
-struct RedisRefreshLockGuard {
-    redis: Arc<RedisStore>,
-    credential_id: u64,
-    lock_token: Option<String>,
-}
-
-impl RedisRefreshLockGuard {
-    fn new(redis: Arc<RedisStore>, credential_id: u64, lock_token: String) -> Self {
-        Self {
-            redis,
-            credential_id,
-            lock_token: Some(lock_token),
-        }
-    }
-
-    async fn release(mut self) {
-        let Some(lock_token) = self.lock_token.as_deref() else {
-            return;
-        };
-        match tokio::time::timeout(
-            REFRESH_REDIS_LOCK_OP_TIMEOUT,
-            self.redis
-                .release_refresh_lock(self.credential_id, lock_token),
-        )
-        .await
-        {
-            Ok(Ok(true)) => {
-                self.lock_token.take();
-            }
-            Ok(Ok(false)) => {
-                tracing::warn!(
-                    credential_id = self.credential_id,
-                    "Redis Token 刷新锁已过期或不再属于本实例"
-                );
-                self.lock_token.take();
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    credential_id = self.credential_id,
-                    "释放 Redis Token 刷新锁失败，将提交 critical cleanup: {}",
-                    err
-                );
-            }
-            Err(_) => tracing::warn!(
-                credential_id = self.credential_id,
-                "释放 Redis Token 刷新锁超过 {}ms，将提交 critical cleanup",
-                REFRESH_REDIS_LOCK_OP_TIMEOUT.as_millis()
-            ),
-        }
-    }
-}
-
-impl Drop for RedisRefreshLockGuard {
-    fn drop(&mut self) {
-        let Some(lock_token) = self.lock_token.take() else {
-            return;
-        };
-        let redis = self.redis.clone();
-        let credential_id = self.credential_id;
-        let accepted = spawn_critical_storage_task("释放取消中的 Redis Token 刷新锁", async move {
-            let released = tokio::time::timeout(
-                REFRESH_REDIS_LOCK_OP_TIMEOUT,
-                redis.release_refresh_lock(credential_id, &lock_token),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("取消清理 Redis Token 刷新锁超时"))??;
-            if !released {
-                tracing::debug!(credential_id, "取消清理时 Redis Token 刷新锁已过期或已转移");
-            }
-            Ok(())
-        });
-        if !accepted {
-            tracing::error!(
-                credential_id,
-                "critical storage lane 拒绝 Redis Token 刷新锁 cleanup；等待 TTL 兜底"
-            );
-        }
-    }
 }
 
 struct RedisRefreshLeaseDropGuard {
@@ -4031,6 +3952,26 @@ impl MultiTokenManager {
         caller_can_claim_health: bool,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<DistributedRefreshDecision> {
+        self.begin_distributed_refresh_until_with_observed_generation(
+            id,
+            identity,
+            caller_can_claim_health,
+            None,
+            false,
+            deadline,
+        )
+        .await
+    }
+
+    async fn begin_distributed_refresh_once_until(
+        &self,
+        id: u64,
+        identity: RefreshAttemptIdentity,
+        caller_can_claim_health: bool,
+        observed_generation: Option<u64>,
+        force: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<RedisRefreshBegin> {
         let redis = self.redis_store.as_ref().ok_or_else(|| {
             anyhow::Error::new(RefreshFailure::new(
                 RefreshFailureStage::Coordination,
@@ -4040,7 +3981,59 @@ impl MultiTokenManager {
                 false,
             ))
         })?;
-        let mut observed_generation = None;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Timeout,
+                None,
+                None,
+                false,
+            )
+            .into());
+        }
+        let begin = tokio::time::timeout_at(
+            deadline,
+            redis.begin_token_refresh_after_observed_generation_with_force(
+                id,
+                identity.0,
+                caller_can_claim_health,
+                observed_generation,
+                force,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Timeout,
+                None,
+                None,
+                false,
+            ))
+        })?
+        .map_err(|_| {
+            anyhow::Error::new(RefreshFailure::new(
+                RefreshFailureStage::Coordination,
+                RefreshFailureKind::Coordination,
+                None,
+                None,
+                false,
+            ))
+        })?;
+        Ok(begin)
+    }
+
+    async fn begin_distributed_refresh_until_with_observed_generation(
+        &self,
+        id: u64,
+        identity: RefreshAttemptIdentity,
+        caller_can_claim_health: bool,
+        initial_observed_generation: Option<u64>,
+        force: bool,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<DistributedRefreshDecision> {
+        let mut observed_generation = initial_observed_generation;
+        let mut force = force;
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(RefreshFailure::new(
@@ -4052,34 +4045,16 @@ impl MultiTokenManager {
                 )
                 .into());
             }
-            let begin = tokio::time::timeout_at(
-                deadline,
-                redis.begin_token_refresh_after_observed_generation(
+            let begin = self
+                .begin_distributed_refresh_once_until(
                     id,
-                    identity.0,
+                    identity,
                     caller_can_claim_health,
                     observed_generation,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::Error::new(RefreshFailure::new(
-                    RefreshFailureStage::Coordination,
-                    RefreshFailureKind::Timeout,
-                    None,
-                    None,
-                    false,
-                ))
-            })?
-            .map_err(|_| {
-                anyhow::Error::new(RefreshFailure::new(
-                    RefreshFailureStage::Coordination,
-                    RefreshFailureKind::Coordination,
-                    None,
-                    None,
-                    false,
-                ))
-            })?;
+                    force,
+                    deadline,
+                )
+                .await?;
             match begin {
                 RedisRefreshBegin::Leader(lease) => {
                     return Ok(DistributedRefreshDecision::Leader(lease));
@@ -4088,12 +4063,15 @@ impl MultiTokenManager {
                     generation,
                     poll_after,
                 } => {
-                    if let Some(generation) = generation {
-                        observed_generation = Some(
-                            observed_generation
-                                .map_or(generation, |current: u64| current.max(generation)),
-                        );
+                    if !force {
+                        if let Some(generation) = generation {
+                            observed_generation = Some(
+                                observed_generation
+                                    .map_or(generation, |current: u64| current.max(generation)),
+                            );
+                        }
                     }
+                    force = false;
                     let wake_at = (tokio::time::Instant::now() + poll_after).min(deadline);
                     tokio::time::sleep_until(wake_at).await;
                 }
@@ -13826,71 +13804,161 @@ impl MultiTokenManager {
         id: u64,
         budgets: TokenRefreshBudgets,
     ) -> anyhow::Result<()> {
-        if !self.entries.lock().iter().any(|entry| entry.id == id) {
-            anyhow::bail!("凭据不存在: {}", id);
-        }
+        let initial_credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
         let deadlines = budgets.deadlines()?;
-        // 获取该凭据的刷新锁，防止同一账号并发刷新。
         let refresh_state = self.refresh_state_for_credential(id);
-        let _guard =
-            acquire_refresh_lock_until(&refresh_state.gate, deadlines.coordination, id).await?;
-        let mut redis_refresh_lock: Option<RedisRefreshLockGuard> = None;
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            while tokio::time::Instant::now() < deadlines.coordination {
-                let remaining = deadlines
-                    .coordination
-                    .saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(
-                    remaining.min(REFRESH_REDIS_LOCK_OP_TIMEOUT),
-                    redis.acquire_refresh_lock(id, TOKEN_REFRESH_REDIS_LOCK_TTL_SECS),
-                )
-                .await
-                {
-                    Ok(Ok(Some(lock_token))) => {
-                        redis_refresh_lock =
-                            Some(RedisRefreshLockGuard::new(redis.clone(), id, lock_token));
-                        break;
-                    }
-                    Ok(Ok(None)) => {
-                        let now = tokio::time::Instant::now();
-                        tokio::time::sleep_until(
-                            (now + StdDuration::from_millis(500)).min(deadlines.coordination),
-                        )
-                        .await;
-                    }
-                    Ok(Err(_)) => {
-                        return Err(RefreshFailure::new(
-                            RefreshFailureStage::Coordination,
-                            RefreshFailureKind::Coordination,
-                            None,
-                            None,
-                            false,
-                        )
-                        .into());
-                    }
-                    Err(_) => {
-                        return Err(RefreshFailure::new(
-                            RefreshFailureStage::Coordination,
-                            RefreshFailureKind::Timeout,
-                            None,
-                            None,
-                            false,
-                        )
-                        .into());
-                    }
-                }
-            }
-            if redis_refresh_lock.is_none() {
-                return Err(RefreshFailure::new(
-                    RefreshFailureStage::Coordination,
-                    RefreshFailureKind::Timeout,
+        let credentials_for_proxy = self
+            .resolve_proxy_for_credential(initial_credentials.clone())
+            .map_err(|_| {
+                anyhow::Error::new(RefreshFailure::new(
+                    RefreshFailureStage::Validation,
+                    RefreshFailureKind::InvalidConfiguration,
                     None,
                     None,
                     false,
-                )
-                .into());
+                ))
+            })?;
+        let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
+        let refresh_identity = {
+            let config = self.config.lock();
+            RefreshAttemptIdentity::from_refresh_request(
+                &credentials_for_proxy,
+                &config,
+                effective_proxy.as_ref(),
+            )
+        };
+
+        let mut local_guard = None;
+        let mut redis_refresh_lease = None;
+        let mut redis_lease_drop_guard = None;
+        if self.redis_store.is_some() {
+            let mut force_begin = true;
+            loop {
+                let begin = self
+                    .begin_distributed_refresh_once_until(
+                        id,
+                        refresh_identity,
+                        false,
+                        None,
+                        force_begin,
+                        deadlines.coordination,
+                    )
+                    .await?;
+                match begin {
+                    RedisRefreshBegin::Leader(lease) => {
+                        if local_guard.is_none() {
+                            match refresh_state.gate.try_lock() {
+                                Ok(guard) => local_guard = Some(guard),
+                                Err(_) => {
+                                    self.cancel_distributed_refresh_until(
+                                        &lease,
+                                        false,
+                                        deadlines.coordination,
+                                    )
+                                    .await?;
+                                    local_guard = Some(
+                                        acquire_refresh_lock_until(
+                                            &refresh_state.gate,
+                                            deadlines.coordination,
+                                            id,
+                                        )
+                                        .await?,
+                                    );
+                                    force_begin = false;
+                                    continue;
+                                }
+                            }
+                        }
+                        redis_lease_drop_guard = self.redis_store.as_ref().map(|redis| {
+                            RedisRefreshLeaseDropGuard::new(
+                                redis.clone(),
+                                self.postgres_store.clone(),
+                                lease.clone(),
+                                Arc::new(AtomicBool::new(false)),
+                                Arc::new(AtomicU64::new(0)),
+                                initial_credentials.access_token.clone(),
+                            )
+                        });
+                        redis_refresh_lease = Some(lease);
+                        break;
+                    }
+                    RedisRefreshBegin::Wait { poll_after, .. } => {
+                        drop(local_guard.take());
+                        force_begin = false;
+                        let wake_at =
+                            (tokio::time::Instant::now() + poll_after).min(deadlines.coordination);
+                        tokio::time::sleep_until(wake_at).await;
+                    }
+                    RedisRefreshBegin::Replay {
+                        outcome,
+                        health_claim,
+                    } => {
+                        drop(local_guard.take());
+                        let failure = refresh_failure_from_redis(&outcome.failure);
+                        if let Some(claim) = health_claim.as_ref() {
+                            self.apply_refresh_health_action(
+                                id,
+                                &failure,
+                                Some(claim),
+                                deadlines.coordination,
+                            )
+                            .await?;
+                        }
+                        return Err(failure.into_shared_failure_wave().into());
+                    }
+                    RedisRefreshBegin::Succeeded {
+                        generation,
+                        storage_revision,
+                    } => {
+                        let latest = self
+                            .reload_credential_for_refresh_until(id, deadlines.coordination)
+                            .await?;
+                        if storage_revision == 0 || latest.storage_revision < storage_revision {
+                            return Err(RefreshFailure::new(
+                                RefreshFailureStage::Coordination,
+                                RefreshFailureKind::Coordination,
+                                None,
+                                None,
+                                false,
+                            )
+                            .into());
+                        }
+                        {
+                            let mut entries = self.entries.lock();
+                            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                                Self::merge_refresh_fields(&mut entry.credentials, &latest);
+                            }
+                        }
+                        drop(local_guard.take());
+                        refresh_state.clear_failure();
+                        tracing::info!(
+                            credential_id = id,
+                            refresh_generation = generation,
+                            "凭据 #{} Token 已由并发刷新完成",
+                            id
+                        );
+                        return Ok(());
+                    }
+                }
             }
+        } else {
+            local_guard = Some(
+                acquire_refresh_lock_until(&refresh_state.gate, deadlines.coordination, id).await?,
+            );
+        }
+
+        let send_started = Arc::new(AtomicBool::new(false));
+        let persisted_storage_revision = Arc::new(AtomicU64::new(0));
+        if let Some(guard) = redis_lease_drop_guard.as_mut() {
+            guard.send_started = send_started.clone();
+            guard.persisted_storage_revision = persisted_storage_revision.clone();
         }
 
         let refresh_and_publish_result = async {
@@ -13902,56 +13970,52 @@ impl MultiTokenManager {
                     .map(|entry| entry.credentials.clone())
                     .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
             };
-            // 无条件调用 refresh_token。
-            let mut new_creds = match self.resolve_proxy_for_credential(credentials.clone()) {
-                Ok(credentials_for_proxy) => {
-                    let effective_proxy =
-                        credentials_for_proxy.effective_proxy(self.proxy.as_ref());
-                    let config = self.runtime_config();
-                    let admission = RefreshSendAdmission::new(
-                        None,
-                        self.auxiliary_concurrency_controller(),
-                        self.auxiliary_runtime.token_refresh_admission_controller(),
-                    );
-                    let client = self
-                        .refresh_http_client(config.tls_backend, effective_proxy.as_ref())
-                        .await
-                        .map_err(|_| {
-                            anyhow::Error::new(RefreshFailure::new(
-                                RefreshFailureStage::Internal,
-                                RefreshFailureKind::Internal,
-                                None,
-                                None,
-                                false,
-                            ))
-                        })?;
-                    refresh_token_until(
-                        &credentials_for_proxy,
-                        &config,
-                        client,
-                        Some(admission),
-                        deadlines.work,
-                        "强制刷新 Token 上游阶段",
-                    )
-                    .await?
-                }
-                Err(_) => {
-                    return Err(RefreshFailure::new(
-                        RefreshFailureStage::Validation,
-                        RefreshFailureKind::InvalidConfiguration,
-                        None,
-                        None,
-                        false,
-                    )
-                    .into());
-                }
+            let mut new_creds = {
+                let credentials_for_proxy = self
+                    .resolve_proxy_for_credential(credentials.clone())
+                    .map_err(|_| {
+                        anyhow::Error::new(RefreshFailure::new(
+                            RefreshFailureStage::Validation,
+                            RefreshFailureKind::InvalidConfiguration,
+                            None,
+                            None,
+                            false,
+                        ))
+                    })?;
+                let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
+                let config = self.runtime_config();
+                let admission = RefreshSendAdmission::new_with_send_started_marker(
+                    None,
+                    self.auxiliary_concurrency_controller(),
+                    self.auxiliary_runtime.token_refresh_admission_controller(),
+                    send_started.clone(),
+                );
+                let client = self
+                    .refresh_http_client(config.tls_backend, effective_proxy.as_ref())
+                    .await
+                    .map_err(|_| {
+                        anyhow::Error::new(RefreshFailure::new(
+                            RefreshFailureStage::Internal,
+                            RefreshFailureKind::Internal,
+                            None,
+                            None,
+                            false,
+                        ))
+                    })?;
+                refresh_token_until(
+                    &credentials_for_proxy,
+                    &config,
+                    client,
+                    Some(admission),
+                    deadlines.work,
+                    "强制刷新 Token 上游阶段",
+                )
+                .await?
             };
             new_creds.proxy_url = credentials.proxy_url.clone();
             new_creds.proxy_username = credentials.proxy_username.clone();
             new_creds.proxy_password = credentials.proxy_password.clone();
             new_creds.proxy_resource_id = credentials.proxy_resource_id;
-
-            // PgSQL 是多实例的权威凭据存储。字段级 CAS 成功后才能更新本机并通知其他实例。
             new_creds = self
                 .persist_refreshed_credential_fields(
                     id,
@@ -13972,7 +14036,7 @@ impl MultiTokenManager {
                         true,
                     ))
                 })?;
-
+            persisted_storage_revision.store(new_creds.storage_revision, Ordering::Release);
             let expected_generation = {
                 let mut entries = self.entries.lock();
                 let entry = entries
@@ -13993,7 +14057,6 @@ impl MultiTokenManager {
                 deadlines.total,
             )
             .await;
-
             if let Some(store) = &self.postgres_store {
                 let store = store.clone();
                 spawn_best_effort_storage_task("记录强制刷新凭据事件到 PgSQL", async move {
@@ -14036,17 +14099,64 @@ impl MultiTokenManager {
         }
         .await;
 
-        // 所有成功步骤和任一失败路径都在释放分布式锁后再返回。
-        if let Some(redis_refresh_lock) = redis_refresh_lock {
-            redis_refresh_lock.release().await;
-        }
-        refresh_and_publish_result?;
+        let result = match (redis_refresh_lease.as_ref(), refresh_and_publish_result) {
+            (Some(lease), Ok(())) => {
+                self.complete_or_cancel_distributed_refresh_success_until(
+                    lease,
+                    persisted_storage_revision.load(Ordering::Acquire),
+                    deadlines.total,
+                )
+                .await?;
+                if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                    guard.disarm();
+                }
+                Ok(())
+            }
+            (Some(lease), Err(error)) => {
+                let synthetic_failure = RefreshFailure::new(
+                    RefreshFailureStage::Coordination,
+                    RefreshFailureKind::Coordination,
+                    None,
+                    None,
+                    false,
+                );
+                let failure = error
+                    .downcast_ref::<RefreshFailure>()
+                    .unwrap_or(&synthetic_failure);
+                let shared = if self.postgres_store.is_some() {
+                    self.complete_or_cancel_distributed_refresh_failure_until(
+                        lease,
+                        failure,
+                        false,
+                        deadlines.total,
+                    )
+                    .await?
+                } else {
+                    self.cancel_distributed_refresh_until(
+                        lease,
+                        failure.send_committed,
+                        deadlines.total,
+                    )
+                    .await?;
+                    failure.clone()
+                };
+                if let Some(guard) = redis_lease_drop_guard.as_mut() {
+                    guard.disarm();
+                }
+                if error.downcast_ref::<RefreshFailure>().is_some() {
+                    Err(shared.into())
+                } else {
+                    Err(error)
+                }
+            }
+            (None, result) => result,
+        };
+        drop(local_guard.take());
+        result?;
         refresh_state.clear_failure();
-
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
     }
-
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
         self.load_balancing_mode.lock().clone()
