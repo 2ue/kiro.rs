@@ -1072,6 +1072,7 @@ pub struct ExternalRouteRequest {
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pub prompt_cache_bounds: PromptCacheBounds,
     pub kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
+    pub kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy,
     pub stable_segment_cache_policy: StableSegmentCachePolicy,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
@@ -15352,10 +15353,28 @@ fn project_usage_value(
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         });
+    let plus_shaper = projection.kiro_rs_tool_plus.map(|plus| plus.shaper());
+    let computed = plus_shaper
+        .map(|shaper| shaper.amplify(computed))
+        .unwrap_or(computed);
     if commit_cache_state {
         projection.mark_committed(computed);
     }
-    let controlled = if projection.cache_state_enabled && projection.reported_policy.is_some() {
+    let controlled = if let Some(shaper) = plus_shaper {
+        match shaper.frequency_control() {
+            Some(config) if projection.cache_state_enabled => projection
+                .prompt_cache_creation_controller
+                .preview_success_with_mode(
+                    projection.scope.as_ref(),
+                    config,
+                    computed,
+                    projection.credential_key.as_deref(),
+                    Some(projection.model.as_str()),
+                    true,
+                ),
+            _ => computed,
+        }
+    } else if projection.cache_state_enabled && projection.reported_policy.is_some() {
         projection
             .prompt_cache_creation_controller
             .preview_success_with_context(
@@ -15386,6 +15405,18 @@ fn project_usage_value(
         .map(|policy| {
             let shaped = policy.apply_final_input_guard(shaped);
             policy.apply_final_standard_cache_guards(shaped)
+        })
+        .unwrap_or(shaped);
+    let shaped = plus_shaper
+        .map(|shaper| {
+            shaper.finalize(
+                computed,
+                controlled,
+                projection
+                    .pricing_catalog
+                    .model_pricing(projection.model.as_str()),
+                raw_usage.to_cache_usage(),
+            )
         })
         .unwrap_or(shaped);
     let projected = shaped

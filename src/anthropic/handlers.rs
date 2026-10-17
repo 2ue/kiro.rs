@@ -263,6 +263,14 @@ struct CacheHitShapingContext {
     seed: u64,
 }
 
+/// Kiro-RS Tool Plus 策略的请求级整形参数。
+#[derive(Debug, Clone, Copy)]
+struct KiroRsToolPlusRequest {
+    policy: crate::model::config::KiroRsToolPlusCachePolicy,
+    /// 同一请求内 message_start 预览与最终 usage 使用同一种子，浮动结果一致。
+    seed: u64,
+}
+
 /// 一次整形调用的外部条件。
 struct CacheHitShapingRequest<'a> {
     raw: super::cache::CacheUsage,
@@ -354,6 +362,8 @@ struct RequestUsageContext {
     cache_hit_shaping: CacheHitShapingContext,
     /// 冷请求下游 usage 约束开关（路由 `coldRequestGuard.enabled`，默认关闭）。
     cold_request_guard: bool,
+    /// Kiro-RS Tool Plus 策略：下游 usage 由该策略独立整形。
+    kiro_rs_tool_plus: Option<KiroRsToolPlusRequest>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     payload_breakdown: Option<PayloadByteBreakdown>,
@@ -852,6 +862,7 @@ struct ExternalFallbackContext {
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
     kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
+    kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy,
     stable_segment_cache_policy: StableSegmentCachePolicy,
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
@@ -1175,6 +1186,7 @@ impl RequestRuntimeConfig {
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: crate::model::config::CacheHitShapingPolicy::default(),
             cold_request_guard: crate::model::config::ColdRequestGuardPolicy::default(),
+            kiro_rs_tool_plus: crate::model::config::KiroRsToolPlusCachePolicy::default(),
         }
         .normalized()
     }
@@ -1224,6 +1236,7 @@ fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptC
         PromptCacheStrategyType::NoCache
         | PromptCacheStrategyType::CurrentHighCache
         | PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::KiroRsToolPlus
         | PromptCacheStrategyType::StableSegmentCache => PromptCacheSimulationMode::Disabled,
     }
 }
@@ -1234,9 +1247,9 @@ fn prompt_cache_converter_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCa
         PromptCacheStrategyType::CurrentHighCache => {
             prompt_cache_simulation_mode_for_policy(policy)
         }
-        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => {
-            PromptCacheSimulationMode::HighCache
-        }
+        PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::KiroRsToolPlus
+        | PromptCacheStrategyType::StableSegmentCache => PromptCacheSimulationMode::HighCache,
     }
 }
 
@@ -1798,6 +1811,7 @@ fn raw_external_route_request_with_hints(
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
         kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        kiro_rs_tool_plus_cache_policy: policy.kiro_rs_tool_plus,
         stable_segment_cache_policy: policy.stable_segment,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
@@ -1869,6 +1883,7 @@ fn build_external_fallback_context(
         prompt_cache_creation_control: policy.creation_control,
         prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
         kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        kiro_rs_tool_plus_cache_policy: policy.kiro_rs_tool_plus,
         stable_segment_cache_policy: policy.stable_segment,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
@@ -2371,6 +2386,7 @@ impl ExternalFallbackContext {
             prompt_cache_creation_control: self.prompt_cache_creation_control,
             prompt_cache_bounds: self.prompt_cache_bounds,
             kiro_rs_tool_cache_policy: self.kiro_rs_tool_cache_policy,
+            kiro_rs_tool_plus_cache_policy: self.kiro_rs_tool_plus_cache_policy,
             stable_segment_cache_policy: self.stable_segment_cache_policy,
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
@@ -3575,6 +3591,7 @@ impl RequestUsageContext {
             self.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache
                 | PromptCacheStrategyType::KiroRsTool
+                | PromptCacheStrategyType::KiroRsToolPlus
                 | PromptCacheStrategyType::StableSegmentCache
         ) && (self.simulation_mode == PromptCacheSimulationMode::HighCache
             || self.kiro_rs_tool_prompt_cache_plan.is_some()
@@ -3593,6 +3610,7 @@ impl RequestUsageContext {
             self.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache
                 | PromptCacheStrategyType::KiroRsTool
+                | PromptCacheStrategyType::KiroRsToolPlus
                 | PromptCacheStrategyType::StableSegmentCache
         ) {
             return usage;
@@ -3749,7 +3767,9 @@ fn should_apply_reported_usage(
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
-        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => false,
+        PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::KiroRsToolPlus
+        | PromptCacheStrategyType::StableSegmentCache => false,
     }
 }
 
@@ -3762,7 +3782,9 @@ fn should_build_local_prompt_cache_usage(
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
-        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => true,
+        PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::KiroRsToolPlus
+        | PromptCacheStrategyType::StableSegmentCache => true,
     }
 }
 
@@ -3997,6 +4019,9 @@ impl CredentialUsageContext {
     ) -> super::cache::CacheUsage {
         let raw = super::cache::RawUsage::uncached(self.request.input_tokens, usage.output_tokens)
             .to_cache_usage();
+        if self.request.kiro_rs_tool_plus.is_some() {
+            return self.kiro_rs_tool_plus_reported_usage(usage, usage_source, raw, true);
+        }
         let controlled = self.apply_creation_frequency_control(usage, usage_source);
         let reported_usage = self
             .request
@@ -4013,6 +4038,9 @@ impl CredentialUsageContext {
         usage_source: UsageSource,
         raw_usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
+        if self.request.kiro_rs_tool_plus.is_some() {
+            return self.kiro_rs_tool_plus_reported_usage(usage, usage_source, raw_usage, true);
+        }
         let controlled = self.apply_creation_frequency_control(usage, usage_source);
         let reported_usage = self.request.reported_usage_for_downstream_with_raw(
             controlled,
@@ -4025,6 +4053,74 @@ impl CredentialUsageContext {
             raw_usage_to_reported_raw(raw_usage),
         );
         self.shape_final_cache_hit(reported_usage, controlled, raw_usage)
+    }
+
+    /// Kiro-RS Tool Plus：放大 → 写入频次控制 → 上下限 / 计费下限。
+    ///
+    /// `commit` 为 true 时更新写入频次状态（最终 usage）；为 false 时只预览（message_start）。
+    fn kiro_rs_tool_plus_reported_usage(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        raw_usage: super::cache::CacheUsage,
+        commit: bool,
+    ) -> super::cache::CacheUsage {
+        let Some(plus) = self.request.kiro_rs_tool_plus else {
+            return usage;
+        };
+        let base = if usage_source == UsageSource::UpstreamMetadata {
+            raw_usage
+        } else {
+            usage
+        };
+        let shaper = super::kiro_plus_shaping::KiroPlusShaper::new(
+            plus.policy,
+            self.request.stream,
+            self.request.input_tokens,
+            plus.seed,
+        );
+        let amplified = shaper.amplify(base);
+        let frequency = shaper
+            .frequency_control()
+            .filter(|_| usage_source == UsageSource::LocalPromptCache);
+        let scope = self.scope();
+        let credential_key = self
+            .credential_id
+            .map(|credential_id| format!("credential:{credential_id}"));
+        let model = self.creation_control_model();
+        let controller = &self.request.prompt_cache_creation_controller;
+        let controlled = match frequency {
+            Some(config) if commit => controller.apply_success_with_mode(
+                scope.as_ref(),
+                config,
+                amplified,
+                credential_key.as_deref(),
+                Some(model),
+                true,
+            ),
+            Some(config) => controller.preview_success_with_mode(
+                scope.as_ref(),
+                config,
+                amplified,
+                credential_key.as_deref(),
+                Some(model),
+                true,
+            ),
+            None => amplified,
+        };
+        let pricing = self.request.pricing_catalog.model_pricing(model);
+        let shaped = shaper.finalize(amplified, controlled, pricing, raw_usage);
+        if let Some(config) = frequency.filter(|_| commit) {
+            controller.record_final_creation_adjustment(
+                scope.as_ref(),
+                config,
+                credential_key.as_deref(),
+                Some(model),
+                controlled.cache_creation_input_tokens,
+                shaped.cache_creation_input_tokens,
+            );
+        }
+        shaped
     }
 
     /// 最终下游 usage：命中率 / 计费下限 / 小值整形，再对冷请求施加真实输入约束。
@@ -4208,10 +4304,13 @@ impl CredentialUsageContext {
             self.request.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache
                 | PromptCacheStrategyType::KiroRsTool
+                | PromptCacheStrategyType::KiroRsToolPlus
                 | PromptCacheStrategyType::StableSegmentCache
         ) && (matches!(
             self.request.prompt_cache_strategy_type,
-            PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache
+            PromptCacheStrategyType::KiroRsTool
+                | PromptCacheStrategyType::KiroRsToolPlus
+                | PromptCacheStrategyType::StableSegmentCache
         ) || self.request.simulation_mode == PromptCacheSimulationMode::HighCache)
             && metadata_usage.is_some_and(super::cache::metadata_cache_is_empty)
             && self.request.simulated_source == Some(UsageSource::LocalPromptCache)
@@ -4415,7 +4514,7 @@ impl CredentialUsageContext {
                         self.request.prompt_cache_bounds,
                     );
                 }
-                PromptCacheStrategyType::KiroRsTool => {
+                PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::KiroRsToolPlus => {
                     if let Some(plan) = self.request.kiro_rs_tool_prompt_cache_plan.as_ref() {
                         self.request
                             .prompt_cache
@@ -5143,6 +5242,19 @@ fn prepare_usage_context_with_inference_attempt_budget(
                 None,
             ),
             PromptCacheStrategyType::KiroRsTool => (None, None, None),
+            PromptCacheStrategyType::KiroRsToolPlus if prompt_cache_supported => (
+                None,
+                Some(state.prompt_cache.compute_kiro_rs_tool_with_bounds(
+                    scope.clone(),
+                    payload,
+                    input_tokens,
+                    prompt_cache_model,
+                    prompt_cache_bounds_for_policy(&policy),
+                    policy.kiro_rs_tool_plus.tracker_policy(),
+                )),
+                None,
+            ),
+            PromptCacheStrategyType::KiroRsToolPlus => (None, None, None),
             PromptCacheStrategyType::StableSegmentCache if prompt_cache_supported => (
                 state.prompt_cache.build_stable_segment_profile_for_model(
                     payload,
@@ -5177,8 +5289,21 @@ fn prepare_usage_context_with_inference_attempt_budget(
                 simulated_usage.map(|_| UsageSource::LocalPromptCache),
             )
         }
+        PromptCacheStrategyType::KiroRsToolPlus => {
+            let simulated_usage = kiro_rs_tool_prompt_cache_plan.as_ref().and_then(|plan| {
+                super::cache::CacheSimulation::from_prompt_cache_split_input(plan.usage())
+            });
+            (
+                simulated_usage,
+                simulated_usage.map(|_| UsageSource::LocalPromptCache),
+            )
+        }
         PromptCacheStrategyType::StableSegmentCache => (None, None),
     };
+    let kiro_rs_tool_prompt_cache_plan_seed = kiro_rs_tool_prompt_cache_plan
+        .as_ref()
+        .map(|plan| plan.cache_jitter_seed())
+        .unwrap_or(0);
     let request_id = envelope::request_id();
     let error_id = request_id.clone();
     let reported_cache_creation_seed = prompt_cache_profile
@@ -5269,6 +5394,12 @@ fn prepare_usage_context_with_inference_attempt_budget(
         },
         cold_request_guard: strategy_type != PromptCacheStrategyType::NoCache
             && policy.cold_request_guard.enabled,
+        kiro_rs_tool_plus: (strategy_type == PromptCacheStrategyType::KiroRsToolPlus).then(|| {
+            KiroRsToolPlusRequest {
+                policy: policy.kiro_rs_tool_plus,
+                seed: kiro_rs_tool_prompt_cache_plan_seed ^ fastrand::u64(..),
+            }
+        }),
         simulated_usage,
         simulated_source,
         payload_breakdown: None,
@@ -5292,9 +5423,9 @@ fn prompt_cache_scope_conversation_id(
 ) -> Option<String> {
     match strategy_type {
         PromptCacheStrategyType::NoCache => None,
-        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::StableSegmentCache => {
-            extract_stable_conversation_id(payload)
-        }
+        PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::KiroRsToolPlus
+        | PromptCacheStrategyType::StableSegmentCache => extract_stable_conversation_id(payload),
         PromptCacheStrategyType::CurrentHighCache => match mode {
             PromptCacheSimulationMode::Disabled => None,
             PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
@@ -8045,6 +8176,17 @@ impl StreamContextTemplate {
 
         let initial_events =
             ctx.generate_initial_events_with_reported_usage_mapper(|reported_usage| {
+                if credential_usage.request.kiro_rs_tool_plus.is_some() {
+                    let raw =
+                        super::cache::RawUsage::uncached(credential_usage.request.input_tokens, 0)
+                            .to_cache_usage();
+                    return credential_usage.kiro_rs_tool_plus_reported_usage(
+                        reported_usage,
+                        UsageSource::LocalPromptCache,
+                        raw,
+                        false,
+                    );
+                }
                 let preview = credential_usage.preview_creation_frequency_control(
                     reported_usage,
                     UsageSource::LocalPromptCache,

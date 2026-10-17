@@ -66,6 +66,11 @@ function TwoCol({ children }: { children: React.ReactNode }) {
 
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
 type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
+type KiroRsToolPlusPatch = NonNullable<CacheRoutePolicyPatch['kiroRsToolPlus']>
+type UsageShapingProfilePatch = NonNullable<KiroRsToolPlusPatch['shaping']>
+type UsageFieldShapingPatch = NonNullable<UsageShapingProfilePatch['input']>
+type UsageShapingMode = NonNullable<NonNullable<KiroRsToolPlusPatch['nonStream']>['mode']>
+type SuppressedCreationTarget = NonNullable<KiroRsToolPlusPatch['suppressedCreationTarget']>
 type StableSegmentPatch = NonNullable<CacheRoutePolicyPatch['stableSegment']>
 type CacheHitShapingPatch = NonNullable<CacheRoutePolicyPatch['hitShaping']>
 type ColdRequestGuardPatch = NonNullable<CacheRoutePolicyPatch['coldRequestGuard']>
@@ -109,6 +114,70 @@ function defaultKiroRsToolPatch(): KiroRsToolPatch {
     cacheCurrentUserStablePrefix: false,
     currentUserStablePrefixMaxTokens: 0,
   }
+}
+
+// 与后端 KiroRsToolPlusCachePolicy::default() 保持一致
+type FullFieldShaping = Required<UsageFieldShapingPatch>
+type FullShapingProfile = {
+  input: FullFieldShaping
+  output: FullFieldShaping
+  cacheRead: FullFieldShaping
+  cacheCreation: FullFieldShaping
+  capOverflowToInput: boolean
+  minCostRatio: number
+}
+
+function mergeUsageFieldShaping(value?: UsageFieldShapingPatch): FullFieldShaping {
+  return {
+    multiplier: value?.multiplier ?? 1,
+    jitterRatio: value?.jitterRatio ?? 0,
+    minTokens: value?.minTokens ?? 0,
+    maxTokens: value?.maxTokens ?? 0,
+    maxJitterTokens: value?.maxJitterTokens ?? 0,
+  }
+}
+
+function mergeUsageShapingProfile(value?: UsageShapingProfilePatch): FullShapingProfile {
+  return {
+    input: mergeUsageFieldShaping(value?.input),
+    output: mergeUsageFieldShaping(value?.output),
+    cacheRead: mergeUsageFieldShaping(value?.cacheRead),
+    cacheCreation: mergeUsageFieldShaping(value?.cacheCreation),
+    capOverflowToInput: value?.capOverflowToInput ?? false,
+    minCostRatio: value?.minCostRatio ?? 0,
+  }
+}
+
+function defaultKiroRsToolPlusPatch(): KiroRsToolPlusPatch {
+  return mergeKiroRsToolPlusPatch()
+}
+
+function mergeKiroRsToolPlusPatch(value?: KiroRsToolPlusPatch) {
+  return {
+    coverageRatio: value?.coverageRatio ?? 1,
+    maxCoverageTokens: value?.maxCoverageTokens ?? 0,
+    incrementalCreateEnabled: value?.incrementalCreateEnabled ?? true,
+    cacheCurrentUserStablePrefix: value?.cacheCurrentUserStablePrefix ?? false,
+    currentUserStablePrefixMaxTokens: value?.currentUserStablePrefixMaxTokens ?? 0,
+    creationFrequency: {
+      ...defaultPromptCacheCreationControl(),
+      enabled: false,
+      ...value?.creationFrequency,
+    },
+    suppressedCreationTarget: value?.suppressedCreationTarget ?? 'input',
+    shaping: mergeUsageShapingProfile(value?.shaping),
+    nonStream: {
+      mode: value?.nonStream?.mode ?? 'inherit',
+      profile: mergeUsageShapingProfile(value?.nonStream?.profile),
+    },
+    smallRequest: {
+      enabled: value?.smallRequest?.enabled ?? false,
+      maxInputTokens: value?.smallRequest?.maxInputTokens ?? 1024,
+      disableCache: value?.smallRequest?.disableCache ?? false,
+      mode: value?.smallRequest?.mode ?? 'inherit',
+      profile: mergeUsageShapingProfile(value?.smallRequest?.profile),
+    },
+  } satisfies KiroRsToolPlusPatch
 }
 
 // 与后端 StableSegmentCachePolicy::default() 保持一致
@@ -172,6 +241,10 @@ function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): Ca
       stableSegment: defaultStableSegmentPatch(),
     }
   }
+  if (cacheType === 'kiro_rs_tool_plus') {
+    // 不写入参数：路径沿用 Plus 模板，编辑后才保存路径自己的整套参数。
+    return { cacheType: 'kiro_rs_tool_plus' }
+  }
   return {
     cacheType: 'current_high_cache',
     routeNamespace: defaultRouteNamespace(prefix),
@@ -187,6 +260,9 @@ function cacheTypeDesc(cacheType: CacheRoutePolicyPatch['cacheType']): string {
   }
   if (cacheType === 'kiro_rs_tool') {
     return '按 Kiro-RS Tool 的会话和路径规则计算缓存；第一次请求不会显示缓存读取，失败请求不会写入缓存。'
+  }
+  if (cacheType === 'kiro_rs_tool_plus') {
+    return '在 Kiro-RS Tool 前缀追踪基础上，单独控制输入、输出、缓存读取、缓存写入的放大倍数（可大于 1）和上下限，支持写入频次限制，流式 / 非流式 / 小请求可以用不同参数。不叠加命中率整形和最终用量显示配置。'
   }
   if (cacheType === 'stable_segment_cache') {
     return '按请求里稳定不变的 tools、system 和历史消息计算缓存，只按会话和路径隔离；切换账号或外部池后缓存仍然保留，失败请求不会写入缓存。'
@@ -629,6 +705,244 @@ function KiroRsToolPolicyForm({
   )
 }
 
+function UsageFieldShapingForm({
+  title,
+  desc,
+  value,
+  onChange,
+}: {
+  title: string
+  desc: string
+  value: FullFieldShaping
+  onChange: (next: FullFieldShaping) => void
+}) {
+  const set = <K extends keyof UsageFieldShapingPatch>(key: K) => (nextValue: number) =>
+    onChange({ ...value, [key]: nextValue })
+  return (
+    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
+      <div>
+        <div className="text-sm font-semibold">{title}</div>
+        <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{desc}</div>
+      </div>
+      <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-5">
+        <NumField label="放大倍数" desc="可大于 1；0 表示上报为 0。" value={value.multiplier} min={0} max={1000} step={0.05} suffix="倍" onChange={set('multiplier')} />
+        <NumField label="浮动比例" desc="结果在 ×(1±比例) 内确定性浮动。" value={value.jitterRatio} min={0} max={1} step={0.01} suffix="比例" onChange={set('jitterRatio')} />
+        <NumField label="下限" desc="非零时不低于该值；0 不限。" value={value.minTokens} min={0} suffix="Token" onChange={set('minTokens')} />
+        <NumField label="上限" desc="不超过该值；0 不限。" value={value.maxTokens} min={0} suffix="Token" onChange={set('maxTokens')} />
+        <NumField label="上限浮动" desc="触及上限时随机少报 0~该值。" value={value.maxJitterTokens} min={0} suffix="Token" disabled={value.maxTokens <= 0} onChange={set('maxJitterTokens')} />
+      </div>
+    </div>
+  )
+}
+
+function UsageShapingProfileForm({
+  value,
+  onChange,
+}: {
+  value: FullShapingProfile
+  onChange: (next: FullShapingProfile) => void
+}) {
+  const setField = (key: 'input' | 'output' | 'cacheRead' | 'cacheCreation') =>
+    (next: FullFieldShaping) => onChange({ ...value, [key]: next })
+  return (
+    <div className="space-y-3">
+      <UsageFieldShapingForm title="缓存读取 cache_read" desc="前缀命中部分。放大后再执行上下限。" value={value.cacheRead} onChange={setField('cacheRead')} />
+      <UsageFieldShapingForm title="缓存写入 cache_creation" desc="新增前缀部分。放大后先经过写入频次控制，再执行上下限。" value={value.cacheCreation} onChange={setField('cacheCreation')} />
+      <UsageFieldShapingForm title="输入 input" desc="未缓存部分。上下限作用于最终 input（含转入部分），计费下限补足的部分不受上限约束。" value={value.input} onChange={setField('input')} />
+      <UsageFieldShapingForm title="输出 output" desc="上报的输出 Token。" value={value.output} onChange={setField('output')} />
+      <TwoCol>
+        <TogField
+          label="读写超出上限转入 input"
+          desc="关闭时被上限裁掉的缓存读取 / 写入直接丢弃；开启后计入 input。"
+          checked={value.capOverflowToInput}
+          onChange={(capOverflowToInput) => onChange({ ...value, capOverflowToInput })}
+        />
+        <NumField
+          label="计费下限倍数"
+          desc="整形后的计费不低于真实输入计费的这个倍数，差额补到 input；0 表示关闭，最大 100。"
+          value={value.minCostRatio}
+          min={0}
+          max={100}
+          step={0.05}
+          suffix="倍"
+          onChange={(minCostRatio) => onChange({ ...value, minCostRatio })}
+        />
+      </TwoCol>
+    </div>
+  )
+}
+
+function UsageShapingModeSelect({
+  value,
+  onChange,
+}: {
+  value: UsageShapingMode
+  onChange: (next: UsageShapingMode) => void
+}) {
+  return (
+    <Select value={value} onValueChange={(next) => onChange(next as UsageShapingMode)}>
+      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="inherit">沿用默认整形参数</SelectItem>
+        <SelectItem value="custom">使用单独参数</SelectItem>
+        <SelectItem value="raw">不整形（上报前缀拆分原值，不做频次控制）</SelectItem>
+      </SelectContent>
+    </Select>
+  )
+}
+
+function KiroRsToolPlusPolicyForm({
+  value,
+  onChange,
+}: {
+  value: KiroRsToolPlusPatch
+  onChange: (next: KiroRsToolPlusPatch) => void
+}) {
+  const merged = mergeKiroRsToolPlusPatch(value)
+  const set = <K extends keyof KiroRsToolPlusPatch>(key: K) => (nextValue: KiroRsToolPlusPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-5">
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">前缀追踪</div>
+        <TwoCol>
+          <NumField
+            label="缓存覆盖比例"
+            desc="本轮最多把多少稳定前缀纳入缓存，范围 0 到 1。放大请用下方各字段的放大倍数。"
+            value={merged.coverageRatio ?? 1}
+            min={0}
+            max={1}
+            step={0.05}
+            suffix="比例"
+            onChange={set('coverageRatio')}
+          />
+          <NumField
+            label="覆盖上限"
+            desc="单次最多纳入多少 Token。0 表示不限制。"
+            value={merged.maxCoverageTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('maxCoverageTokens')}
+          />
+          <NumField
+            label="当前用户前缀上限"
+            desc="开启“缓存当前用户稳定前缀”后，最多取当前用户文本前段多少 Token。"
+            value={merged.currentUserStablePrefixMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            disabled={!merged.cacheCurrentUserStablePrefix}
+            onChange={set('currentUserStablePrefixMaxTokens')}
+          />
+        </TwoCol>
+        <TogField
+          label="允许后续继续创建"
+          desc="命中旧缓存后出现新的稳定内容时是否继续补创建。"
+          checked={merged.incrementalCreateEnabled ?? true}
+          onChange={set('incrementalCreateEnabled')}
+        />
+        <TogField
+          label="缓存当前用户稳定前缀"
+          desc="开启后只取当前用户文本前段，适合有稳定长前缀的请求。"
+          checked={merged.cacheCurrentUserStablePrefix ?? false}
+          onChange={set('cacheCurrentUserStablePrefix')}
+        />
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">写入频次限制</div>
+        <div className="text-xs leading-5 text-muted-foreground">
+          在放大之后、上下限之前执行，额度按放大后的写入计算。小请求关闭缓存或选择“不整形”时不参与。
+        </div>
+        <CreationControlOverrideForm
+          value={merged.creationFrequency}
+          onChange={(creationFrequency) => onChange({ ...merged, creationFrequency })}
+        />
+        <div className="space-y-1.5">
+          <div className="text-sm font-semibold text-foreground">被拦下的写入记为</div>
+          <Select
+            value={merged.suppressedCreationTarget ?? 'input'}
+            onValueChange={(next) => onChange({ ...merged, suppressedCreationTarget: next as SuppressedCreationTarget })}
+          >
+            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="input">输入 input</SelectItem>
+              <SelectItem value="cache_read">缓存读取 cache_read</SelectItem>
+              <SelectItem value="drop">直接丢弃</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">默认整形（流式请求）</div>
+        <div className="text-xs leading-5 text-muted-foreground">
+          执行顺序：放大与浮动 → 写入频次限制 → 读写上下限 → 输入 / 输出上下限 → 计费下限。
+        </div>
+        <UsageShapingProfileForm value={merged.shaping} onChange={set('shaping')} />
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">非流式请求整形</div>
+        <UsageShapingModeSelect
+          value={merged.nonStream.mode}
+          onChange={(mode) => onChange({ ...merged, nonStream: { ...merged.nonStream, mode } })}
+        />
+        {merged.nonStream.mode === 'custom' && (
+          <UsageShapingProfileForm
+            value={merged.nonStream.profile}
+            onChange={(profile) => onChange({ ...merged, nonStream: { ...merged.nonStream, profile } })}
+          />
+        )}
+      </div>
+
+      <div className="space-y-3">
+        <div className="text-sm font-semibold">小请求整形</div>
+        <div className="text-xs leading-5 text-muted-foreground">
+          真实输入不超过阈值的请求，优先级高于非流式整形。
+        </div>
+        <TogField
+          label="启用小请求整形"
+          checked={merged.smallRequest.enabled ?? false}
+          onChange={(enabled) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, enabled } })}
+        />
+        <TwoCol>
+          <NumField
+            label="小请求阈值"
+            desc="真实输入 Token 不超过该值视为小请求。"
+            value={merged.smallRequest.maxInputTokens ?? 1024}
+            min={0}
+            suffix="Token"
+            disabled={!merged.smallRequest.enabled}
+            onChange={(maxInputTokens) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, maxInputTokens } })}
+          />
+          <TogField
+            label="小请求不上报缓存"
+            desc="缓存读取和写入全部并回 input，也不消耗写入频次额度。"
+            checked={merged.smallRequest.disableCache ?? false}
+            disabled={!merged.smallRequest.enabled}
+            onChange={(disableCache) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, disableCache } })}
+          />
+        </TwoCol>
+        {merged.smallRequest.enabled && (
+          <>
+            <UsageShapingModeSelect
+              value={merged.smallRequest.mode ?? 'inherit'}
+              onChange={(mode) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, mode } })}
+            />
+            {merged.smallRequest.mode === 'custom' && (
+              <UsageShapingProfileForm
+                value={merged.smallRequest.profile}
+                onChange={(profile) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, profile } })}
+              />
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function StableSegmentPolicyForm({
   value,
   onChange,
@@ -856,6 +1170,12 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
       ...coldRequestGuard,
     }
   }
+  if (cacheType === 'kiro_rs_tool_plus') {
+    return {
+      cacheType: 'kiro_rs_tool_plus',
+      kiroRsToolPlus: policy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch(),
+    }
+  }
   if (cacheType === 'stable_segment_cache') {
     return {
       cacheType: 'stable_segment_cache',
@@ -939,6 +1259,11 @@ function StrategyTemplateEditor({
           </div>
           {hitShapingSection}
         </>
+      ) : cacheType === 'kiro_rs_tool_plus' ? (
+        <KiroRsToolPlusPolicyForm
+          value={template.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch()}
+          onChange={(kiroRsToolPlus) => onChange({ ...template, kiroRsToolPlus })}
+        />
       ) : cacheType === 'stable_segment_cache' ? (
         <>
           <NonStreamCacheToggle
@@ -977,6 +1302,14 @@ function pathPolicyWithStrategyDefaults(
 ): CacheRoutePolicyPatch {
   const cacheType = policy.cacheType ?? 'no_cache'
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
+  if (cacheType === 'kiro_rs_tool_plus') {
+    const plusTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsToolPlus ?? {}, 'kiro_rs_tool_plus')
+    return {
+      ...policy,
+      cacheType,
+      kiroRsToolPlus: policy.kiroRsToolPlus ?? plusTemplate.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch(),
+    }
+  }
   const template = cacheType === 'kiro_rs_tool'
     ? cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
     : cacheType === 'stable_segment_cache'
@@ -1145,6 +1478,7 @@ function PathStrategyBindingCard({
             <SelectItem value="current_high_cache">本地模拟缓存策略</SelectItem>
             <SelectItem value="kiro_rs_tool">Kiro-RS Tool 缓存策略</SelectItem>
             <SelectItem value="stable_segment_cache">稳定片段缓存策略</SelectItem>
+            <SelectItem value="kiro_rs_tool_plus">Kiro-RS Tool Plus 缓存策略</SelectItem>
           </SelectContent>
         </Select>
         <div className="text-xs leading-5 text-muted-foreground">{cacheTypeDesc(effectiveCacheType)}</div>
@@ -1186,6 +1520,19 @@ function PathStrategyBindingCard({
               onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
             />
           </div>
+        </div>
+      ) : effectiveCacheType === 'kiro_rs_tool_plus' ? (
+        <div className="space-y-4">
+          <div>
+            <div className="text-sm font-semibold">本路径策略参数</div>
+            <div className="mt-1 text-xs leading-5 text-muted-foreground">
+              路径参数整体替换 Plus 模板参数；缓存按路径独立。
+            </div>
+          </div>
+          <KiroRsToolPlusPolicyForm
+            value={effectivePolicy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch()}
+            onChange={(kiroRsToolPlus) => patch({ kiroRsToolPlus })}
+          />
         </div>
       ) : effectiveCacheType === 'stable_segment_cache' ? (
         <div className="space-y-4">
@@ -1291,7 +1638,7 @@ export function CachePolicySettingsSection({
     const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
     const legacyReportedUsage = reportedUsageForPrefix(config.reportedUsage.pathOverrides, normalizedPrefix)
     if (existing) {
-      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool' || existing.cacheType === 'stable_segment_cache') {
+      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool' || existing.cacheType === 'kiro_rs_tool_plus' || existing.cacheType === 'stable_segment_cache') {
         return existing
       }
       return legacyReportedUsage ? { ...existing, reportedUsage: existing.reportedUsage ?? legacyReportedUsage } : existing
@@ -1410,6 +1757,10 @@ export function CachePolicySettingsSection({
   }
 
   const kiroTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
+  const kiroPlusTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsToolPlus ?? {}, 'kiro_rs_tool_plus')
+  const setKiroPlusTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({ ...cachePolicy, kiroRsToolPlus: next })
+  }
   const stableSegmentTemplate = cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, 'stable_segment_cache')
 
   return (
@@ -1436,13 +1787,20 @@ export function CachePolicySettingsSection({
           policy={stableSegmentTemplate}
           onChange={setStableSegmentTemplate}
         />
+        <StrategyTemplateEditor
+          title="Kiro-RS Tool Plus 缓存策略默认参数"
+          desc="使用本策略且没有单独配置参数的路径读取这里的参数。可分别控制输入、输出、缓存读取、缓存写入的放大倍数和上下限，并限制写入频次。"
+          cacheType="kiro_rs_tool_plus"
+          policy={kiroPlusTemplate}
+          onChange={setKiroPlusTemplate}
+        />
       </div>
 
       <div className="space-y-4">
         <div>
           <div className="text-sm font-semibold">路径绑定</div>
           <div className="mt-1 text-xs leading-5 text-muted-foreground">
-            每个路径都显式选择无缓存、本地模拟缓存策略、Kiro-RS Tool 缓存策略或稳定片段缓存策略。
+            每个路径都显式选择无缓存、本地模拟缓存策略、Kiro-RS Tool 缓存策略、Kiro-RS Tool Plus 缓存策略或稳定片段缓存策略。
           </div>
         </div>
         <div className="flex flex-col gap-2 md:flex-row md:items-end">

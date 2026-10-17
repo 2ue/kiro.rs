@@ -384,6 +384,42 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 
 每个路径策略还会在所有字段改写完成后应用 `finalCacheReadMaxTokens` 和 `finalCacheCreationMaxTokens`。默认把最终 `cache_read_input_tokens` 限制在 `700000` 以内，并把最终 `cache_creation_input_tokens` 限制在 `400000 - deterministic_jitter(20000..45000)` 以内。`finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` 与 `finalCacheCreationJitterMinTokens` / `finalCacheCreationJitterMaxTokens` 可让触顶值在上限以下确定性波动；守护只会向下裁剪，不会抬高原本较小的读取或写入缓存值。
 
+#### Kiro-RS Tool Plus 缓存策略（`kiro_rs_tool_plus`）
+
+在 Kiro-RS Tool 前缀追踪的基础上，对下游 usage 的 `input`、`output`、`cache_read`、`cache_creation` 分别整形，不叠加 `hitShaping`、`coldRequestGuard` 和 `reportedUsage`。模板写在 `cachePolicy.kiroRsToolPlus.kiroRsToolPlus`，路径级 `pathOverrides[...].kiroRsToolPlus` 会整体替换模板参数（缺省字段取默认值）。默认参数下的行为与 Kiro-RS Tool 的前缀拆分一致。
+
+执行顺序：放大与浮动 → 写入频次限制 → 读写上下限 → input / output 上下限 → 计费下限。
+
+```json
+{
+  "cachePolicy": {
+    "pathOverrides": {
+      "/dfcache/plus": {
+        "cacheType": "kiro_rs_tool_plus",
+        "kiroRsToolPlus": {
+          "creationFrequency": { "enabled": true, "minSuccessfulRequestsBetweenCreation": 3, "minCreationIntervalSecs": 60 },
+          "suppressedCreationTarget": "cache_read",
+          "shaping": {
+            "cacheRead": { "multiplier": 2.5, "jitterRatio": 0.05, "maxTokens": 600000, "maxJitterTokens": 20000 },
+            "cacheCreation": { "multiplier": 1.5, "minTokens": 1024, "maxTokens": 80000 },
+            "input": { "minTokens": 32, "maxTokens": 4096 },
+            "output": { "multiplier": 1.0 },
+            "minCostRatio": 1.0
+          },
+          "nonStream": { "mode": "custom", "profile": { "cacheRead": { "multiplier": 1.5 } } },
+          "smallRequest": { "enabled": true, "maxInputTokens": 1024, "disableCache": true }
+        }
+      }
+    }
+  }
+}
+```
+
+- 字段整形（`shaping.input|output|cacheRead|cacheCreation`）：`multiplier` 放大倍数（0~1000，可大于 1），`jitterRatio` 确定性浮动（结果在 `×(1±r)` 内），`minTokens` 非零值下限，`maxTokens` 上限，`maxJitterTokens` 触顶时随机少报 0~该值；0 表示不限。
+- `capOverflowToInput`：读写被上限裁掉的部分是否转入 input，默认丢弃。`minCostRatio`：计费不低于真实输入计费 × 该倍数（0~100），差额补到 input，不受 input 上限约束。
+- `creationFrequency`：参数同 `promptCacheCreationControl`，默认关闭；额度按放大后的写入计算。`suppressedCreationTarget` 决定被拦下的写入记为 `input`（默认）、`cache_read` 或 `drop`。
+- `nonStream.mode` / `smallRequest.mode`：`inherit` 沿用 `shaping`，`custom` 使用本节 `profile`，`raw` 不整形也不做频次控制。小请求（真实输入 ≤ `maxInputTokens`）优先于非流式；`disableCache` 让小请求的读写全部并回 input。
+
 ### credentials.json
 
 支持单对象格式（向后兼容）或数组格式（多凭据）。

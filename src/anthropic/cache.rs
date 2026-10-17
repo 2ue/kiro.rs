@@ -1409,7 +1409,7 @@ fn normalize_cache_usage_breakdown(mut usage: CacheUsage) -> CacheUsage {
 
 /// 命中率整形专用：在 [`normalize_cache_usage_breakdown`] 基础上，把被抬高的写入按已有
 /// TTL 归属补齐（只有 1h 时归入 1h，否则归入 5m），保证 5m + 1h == creation。
-fn normalize_shaped_cache_usage(usage: CacheUsage) -> CacheUsage {
+pub(crate) fn normalize_shaped_cache_usage(usage: CacheUsage) -> CacheUsage {
     let mut usage = normalize_cache_usage_breakdown(usage);
     let assigned = usage
         .cache_creation_5m_input_tokens

@@ -6,6 +6,26 @@ struct ExternalUsageProjectionState {
     observed_cache_read_evidence: bool,
 }
 
+/// Kiro-RS Tool Plus 策略在外部池上的整形参数。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExternalKiroRsToolPlusProjection {
+    pub(super) policy: crate::model::config::KiroRsToolPlusCachePolicy,
+    pub(super) stream: bool,
+    pub(super) raw_input_tokens: i32,
+    pub(super) seed: u64,
+}
+
+impl ExternalKiroRsToolPlusProjection {
+    pub(super) fn shaper(&self) -> crate::anthropic::kiro_plus_shaping::KiroPlusShaper {
+        crate::anthropic::kiro_plus_shaping::KiroPlusShaper::new(
+            self.policy,
+            self.stream,
+            self.raw_input_tokens,
+            self.seed,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ExternalUsageProjectionContext {
     pub(super) mode: ExternalPoolUsageProjectionMode,
@@ -31,6 +51,7 @@ pub(super) struct ExternalUsageProjectionContext {
     pub(super) cost_floor_margin_percent: u32,
     pub(super) output_uplift_min_tokens: i32,
     pub(super) output_uplift_percent: u32,
+    pub(super) kiro_rs_tool_plus: Option<ExternalKiroRsToolPlusProjection>,
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
@@ -57,6 +78,7 @@ pub(super) struct ExternalUsageProjectionTemplate {
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pricing_catalog: Arc<PricingCatalog>,
+    kiro_rs_tool_plus: Option<ExternalKiroRsToolPlusProjection>,
 }
 
 impl ExternalUsageProjectionTemplate {
@@ -128,6 +150,7 @@ impl ExternalUsageProjectionTemplate {
             cost_floor_margin_percent: self.cost_floor_margin_percent,
             output_uplift_min_tokens: self.output_uplift_min_tokens,
             output_uplift_percent: self.output_uplift_percent,
+            kiro_rs_tool_plus: self.kiro_rs_tool_plus,
             state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
         }
     }
@@ -293,6 +316,18 @@ fn build_template(
                     );
                 (None, Some(plan), None, simulated_usage)
             }
+            PromptCacheStrategyType::KiroRsToolPlus if prompt_cache_supported => {
+                let plan = route.prompt_cache.compute_kiro_rs_tool_with_bounds(
+                    scope.clone(),
+                    payload,
+                    raw_input_tokens,
+                    &model,
+                    route.prompt_cache_bounds,
+                    route.kiro_rs_tool_plus_cache_policy.tracker_policy(),
+                );
+                let simulated_usage = CacheSimulation::from_prompt_cache_split_input(plan.usage());
+                (None, Some(plan), None, simulated_usage)
+            }
             PromptCacheStrategyType::StableSegmentCache if prompt_cache_supported => {
                 let profile = route.prompt_cache.build_stable_segment_profile_for_model(
                     payload,
@@ -328,8 +363,21 @@ fn build_template(
             .flatten(),
         PromptCacheStrategyType::CurrentHighCache
         | PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::KiroRsToolPlus
         | PromptCacheStrategyType::StableSegmentCache => None,
     };
+    let kiro_rs_tool_plus = (route.prompt_cache_strategy_type
+        == PromptCacheStrategyType::KiroRsToolPlus)
+        .then(|| ExternalKiroRsToolPlusProjection {
+            policy: route.kiro_rs_tool_plus_cache_policy,
+            stream,
+            raw_input_tokens,
+            seed: kiro_rs_tool_prompt_cache_plan
+                .as_ref()
+                .map(|plan| plan.cache_jitter_seed())
+                .unwrap_or(0)
+                ^ fastrand::u64(..),
+        });
     Some(ExternalUsageProjectionTemplate {
         uplift_percent,
         cost_floor_enabled,
@@ -352,6 +400,7 @@ fn build_template(
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
         prompt_cache_creation_control: route.prompt_cache_creation_control,
         pricing_catalog: route.pricing_catalog.clone(),
+        kiro_rs_tool_plus,
     })
 }
 
@@ -395,7 +444,20 @@ impl ExternalUsageProjectionContext {
         if !self.cache_state_enabled {
             return;
         }
-        if self.reported_policy.is_some() {
+        if let Some(plus) = self.kiro_rs_tool_plus {
+            if let Some(config) = plus.shaper().frequency_control() {
+                let _ = self
+                    .prompt_cache_creation_controller
+                    .apply_success_with_mode(
+                        self.scope.as_ref(),
+                        config,
+                        usage,
+                        self.credential_key.as_deref(),
+                        Some(self.model.as_str()),
+                        true,
+                    );
+            }
+        } else if self.reported_policy.is_some() {
             let _ = self
                 .prompt_cache_creation_controller
                 .apply_success_with_context(

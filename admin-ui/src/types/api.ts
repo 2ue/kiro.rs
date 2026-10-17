@@ -1396,6 +1396,45 @@ export interface CacheBoundsPolicyPatch {
   estimatedBytesLimit?: number
 }
 
+/** Kiro-RS Tool Plus：单个 usage 字段的放大、浮动与上下限。 */
+export interface UsageFieldShaping {
+  multiplier?: number
+  jitterRatio?: number
+  minTokens?: number
+  maxTokens?: number
+  maxJitterTokens?: number
+}
+
+export interface UsageShapingProfile {
+  input?: UsageFieldShaping
+  output?: UsageFieldShaping
+  cacheRead?: UsageFieldShaping
+  cacheCreation?: UsageFieldShaping
+  capOverflowToInput?: boolean
+  minCostRatio?: number
+}
+
+export type UsageShapingProfileMode = 'inherit' | 'custom' | 'raw'
+
+export interface KiroRsToolPlusCachePolicy {
+  coverageRatio?: number
+  maxCoverageTokens?: number
+  incrementalCreateEnabled?: boolean
+  cacheCurrentUserStablePrefix?: boolean
+  currentUserStablePrefixMaxTokens?: number
+  creationFrequency?: PromptCacheCreationControlConfig
+  suppressedCreationTarget?: 'input' | 'cache_read' | 'drop'
+  shaping?: UsageShapingProfile
+  nonStream?: { mode?: UsageShapingProfileMode; profile?: UsageShapingProfile }
+  smallRequest?: {
+    enabled?: boolean
+    maxInputTokens?: number
+    disableCache?: boolean
+    mode?: UsageShapingProfileMode
+    profile?: UsageShapingProfile
+  }
+}
+
 export interface KiroRsToolCachePolicyPatch {
   coverageRatio?: number
   maxCoverageTokens?: number
@@ -1428,7 +1467,7 @@ export interface StableSegmentCachePolicyPatch {
   reportedInputMaxTokens?: number
 }
 
-export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool' | 'stable_segment_cache'
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool' | 'stable_segment_cache' | 'kiro_rs_tool_plus'
 
 export interface CacheRoutePolicyPatch {
   cacheType?: PromptCacheStrategyType
@@ -1439,6 +1478,7 @@ export interface CacheRoutePolicyPatch {
   cachePoint?: CachePointPolicyPatch
   bounds?: CacheBoundsPolicyPatch
   kiroRsTool?: KiroRsToolCachePolicyPatch
+  kiroRsToolPlus?: KiroRsToolPlusCachePolicy
   stableSegment?: StableSegmentCachePolicyPatch
   hitShaping?: CacheHitShapingPolicyPatch
   coldRequestGuard?: ColdRequestGuardPolicyPatch
@@ -1465,6 +1505,7 @@ export interface CachePolicyConfig {
   currentHighCache: CacheRoutePolicyPatch
   kiroRsTool: CacheRoutePolicyPatch
   stableSegmentCache: CacheRoutePolicyPatch
+  kiroRsToolPlus?: CacheRoutePolicyPatch
   pathOverrides: Record<string, CacheRoutePolicyPatch>
 }
 
