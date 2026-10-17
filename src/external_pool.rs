@@ -6296,6 +6296,11 @@ impl ExternalPoolManager {
 
         loop {
             if dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                // 已经有具体池的失败时，用它作为最终错误；合成的 deadline 错误会丢掉
+                // attempts 和上游错误详情（与 synthetic capacity error 的处理一致）。
+                if last_error.is_some() {
+                    break;
+                }
                 return self.external_dispatch_deadline_outcome(&route, attempts, &config);
             }
             let mut capacity_waiter = self.capacity_signal.register();
@@ -6518,6 +6523,9 @@ impl ExternalPoolManager {
             drop(queue_guard.take());
             if dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 drop(lease);
+                if last_error.is_some() {
+                    break;
+                }
                 return self.external_dispatch_deadline_outcome(&route, attempts, &config);
             }
             let started = std::time::Instant::now();

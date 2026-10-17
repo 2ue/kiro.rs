@@ -5492,7 +5492,8 @@ async fn postgres_admin_capacity_update_defers_runtime_patch_during_recovery() {
         assert_eq!(entry.warmup_remaining, 0);
         assert_eq!(entry.runtime_generation, 1);
         assert!(entry.runtime_persistence_degraded);
-        assert!(entry.runtime_persistence_quarantined);
+        // 仅推进 generation 的容量编辑不改变调度状态，因此不再隔离该账号。
+        assert!(!entry.runtime_persistence_quarantined);
     }
     assert_eq!(manager.runtime_mutation_backlog().0, 2);
     assert!(
@@ -5511,13 +5512,14 @@ async fn postgres_admin_capacity_update_defers_runtime_patch_during_recovery() {
     let states = store.load_credential_runtime_state().await.unwrap();
     let state = states.get(&1).unwrap();
     assert_eq!(state.generation, 1);
-    assert_eq!(state.warmup_remaining, 7);
+    // 60eb117 起容量变更只推进 generation、不重置 warmup，持久化后仍保持原值 0。
+    assert_eq!(state.warmup_remaining, 0);
     {
         let entries = manager.entries.lock();
         let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
         assert!(!entry.runtime_persistence_degraded);
         assert!(!entry.runtime_persistence_quarantined);
-        assert_eq!(entry.warmup_remaining, 7);
+        assert_eq!(entry.warmup_remaining, 0);
     }
 
     store.drop_test_schema().await.unwrap();
@@ -13697,7 +13699,8 @@ async fn postgres_add_credential_is_atomic_with_initial_runtime_state() {
         .into_iter()
         .find(|credential| credential.id == Some(id))
         .unwrap();
-    assert_eq!(persisted.storage_revision, 1);
+    // 新增后补齐账号 identity profile 会再写一次凭据 revision；运行态仍原子初始化。
+    assert_eq!(persisted.storage_revision, 2);
     let runtime = store
         .load_credential_runtime_state()
         .await
@@ -13709,7 +13712,7 @@ async fn postgres_add_credential_is_atomic_with_initial_runtime_state() {
     {
         let entries = manager.entries.lock();
         let local = entries.iter().find(|entry| entry.id == id).unwrap();
-        assert_eq!(local.credentials.storage_revision, 1);
+        assert_eq!(local.credentials.storage_revision, 2);
         assert_eq!(local.runtime_revision, 1);
         assert_eq!(local.warmup_remaining, 99);
     }

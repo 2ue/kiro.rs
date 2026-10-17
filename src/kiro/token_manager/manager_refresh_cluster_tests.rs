@@ -185,6 +185,11 @@ fn expired_cluster_credential(endpoint: String, marker: &str) -> KiroCredentials
         refresh_token: Some(format!("refresh-{marker}-{}", "r".repeat(150))),
         client_id: Some(format!("cluster-client-{marker}")),
         machine_id: Some("0".repeat(64)),
+        // 完整身份元数据避免 manager 初始化的 profile 回写污染 CAS revision 断言。
+        machine_id_source: Some("stored_credential".to_string()),
+        fingerprint_version: Some(
+            crate::kiro::machine_id::MACHINE_ID_DERIVATION_VERSION.to_string(),
+        ),
         token_endpoint: Some(endpoint),
         scopes: Some("offline_access codewhisperer:conversations".to_string()),
         expires_at: Some((Utc::now() - Duration::hours(1)).to_rfc3339()),

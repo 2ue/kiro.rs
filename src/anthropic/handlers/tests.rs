@@ -2133,12 +2133,13 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
         assert_eq!(record.model, "claude-opus-4-6-thinking", "stream={stream}");
         assert_eq!(
             record.upstream_model.as_deref(),
-            Some("claude-opus-4.6"),
+            // 外部直连保留调用方模型；标准 Claude Code 模型映射只作用于实际出站字段。
+            Some("claude-opus-4-6-thinking"),
             "stream={stream}"
         );
         assert_eq!(
             record.external_outbound_model.as_deref(),
-            Some("claude-opus-4.6"),
+            Some("claude-opus-4-6-thinking"),
             "stream={stream}"
         );
         assert!(record.model_resolution_source.is_some(), "stream={stream}");
@@ -2158,7 +2159,8 @@ async fn run_normalized_external_direct_policy_skips_raw_preparse_without_raw_po
     assert_eq!(bodies.len(), 2);
     for body in bodies {
         let outbound: Value = serde_json::from_str(&body).expect("external body json");
-        assert_eq!(outbound["model"], "claude-opus-4.6");
+        // 透传池没有模型映射规则；旧的处理器级 dotted 映射已移入池级 pipeline。
+        assert_eq!(outbound["model"], "claude-opus-4-6-thinking");
     }
     assert_eq!(
         kiro_upstream.state.normal_hits(),
