@@ -1,6 +1,10 @@
 use super::*;
 use crate::anthropic::body_capabilities::{BodyStageState, LocalKiroBodyPlan};
+use crate::anthropic::language_preference::{
+    ClientLanguagePreference, detect_client_language_preference,
+};
 use crate::anthropic::payload_guard::sanitize_anthropic_messages_for_external_forwarding;
+use crate::anthropic::prompt_steering::language_turn_reminder_applies;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 use crate::anthropic::tool_use_policy::ResponseToolPolicy;
 use crate::model::config::PayloadShapingConfig;
@@ -167,6 +171,25 @@ pub(super) fn payload_has_documents(payload: &MessagesRequest) -> bool {
         })
 }
 
+fn language_turn_reminder_for_payload(
+    endpoint: &str,
+    compat_profile: CompatProfile,
+    config: &PromptSteeringConfig,
+    payload: &MessagesRequest,
+) -> Option<ClientLanguagePreference> {
+    // count_tokens 使用本地 token 计数，不经过 converter 注入。
+    language_turn_reminder_applies(endpoint, compat_profile, config)
+        .then(|| detect_client_language_preference(payload))
+}
+
+fn language_reminder_log_value(preference: Option<&ClientLanguagePreference>) -> &'static str {
+    match preference {
+        Some(ClientLanguagePreference::Explicit(_)) => "explicit",
+        Some(ClientLanguagePreference::FollowUser) => "follow_user",
+        None => "off",
+    }
+}
+
 pub(super) fn prepare(
     endpoint: &str,
     payload: &MessagesRequest,
@@ -206,6 +229,13 @@ pub(super) fn prepare_with_plan(
         &native_reasoning_capability,
         KiroReasoningCapabilityState::Supported(_)
     );
+    // 语言识别必须基于进入转换前的完整 payload，不能使用后续裁剪后的副本。
+    let language_turn_reminder = language_turn_reminder_for_payload(
+        endpoint,
+        runtime_config.compat_profile,
+        &runtime_config.prompt_steering,
+        payload,
+    );
     let converter_options = ConverterOptions {
         compat_profile: runtime_config.compat_profile,
         conversion: plan.converter,
@@ -217,6 +247,7 @@ pub(super) fn prepare_with_plan(
         explicit_reasoning_request: false,
         native_reasoning_capability,
         prompt_steering: runtime_config.prompt_steering.clone().normalized(),
+        language_turn_reminder: language_turn_reminder.clone(),
     };
     // Historical thinking is discarded before conversion for every request when the configured
     // shaping allows it, matching the external-pool path. The protected tool-continuation
@@ -378,6 +409,7 @@ pub(super) fn prepare_with_plan(
         current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
         current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
         current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
+        language_reminder = language_reminder_log_value(language_turn_reminder.as_ref()),
         "Kiro request prepared"
     );
     let input_tokens = if plan.token_counting.is_enabled() {
@@ -528,6 +560,103 @@ mod tests {
         assert!(payload_has_documents(&payload));
         payload.messages[0].content = serde_json::json!("document as plain text");
         assert!(!payload_has_documents(&payload));
+    }
+
+    #[test]
+    fn language_turn_reminder_uses_route_and_original_payload() {
+        let mut config = PromptSteeringConfig::default();
+        config.language_constraint.enabled = true;
+        config.route_rules = vec!["/cc".to_string()];
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("# Language\nAlways respond in Korean."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("continue"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            stop_sequences: None,
+        };
+
+        let matched_preference = language_turn_reminder_for_payload(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+            &payload,
+        );
+        assert_eq!(
+            matched_preference,
+            Some(ClientLanguagePreference::Explicit("Korean".to_string()))
+        );
+        let matched_result = crate::anthropic::converter::convert_request_with_options(
+            &payload,
+            ConverterOptions {
+                prompt_steering: config.clone(),
+                language_turn_reminder: matched_preference,
+                ..ConverterOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            matched_result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .contains("Respond in Korean for all user-facing text")
+        );
+
+        let unmatched_preference = language_turn_reminder_for_payload(
+            "/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+            &payload,
+        );
+        assert!(unmatched_preference.is_none());
+        let unmatched_result = crate::anthropic::converter::convert_request_with_options(
+            &payload,
+            ConverterOptions {
+                prompt_steering: config,
+                language_turn_reminder: unmatched_preference,
+                ..ConverterOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !unmatched_result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .contains("<language_reminder>")
+        );
+    }
+
+    #[test]
+    fn language_reminder_log_value_reports_only_preference_kind() {
+        assert_eq!(
+            language_reminder_log_value(Some(&ClientLanguagePreference::Explicit(
+                "Korean".to_string()
+            ))),
+            "explicit"
+        );
+        assert_eq!(
+            language_reminder_log_value(Some(&ClientLanguagePreference::FollowUser)),
+            "follow_user"
+        );
+        assert_eq!(language_reminder_log_value(None), "off");
     }
 
     #[test]

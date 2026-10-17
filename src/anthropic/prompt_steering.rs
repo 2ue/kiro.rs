@@ -64,6 +64,21 @@ pub(crate) fn should_apply_to_external_pool(
         )
 }
 
+pub(crate) fn language_turn_reminder_applies(
+    endpoint: &str,
+    compat_profile: CompatProfile,
+    config: &PromptSteeringConfig,
+) -> bool {
+    let config = config.clone().normalized();
+    should_apply(
+        endpoint,
+        compat_profile,
+        &config,
+        PromptSteeringEndpointKind::Messages,
+    ) && config.language_constraint.enabled
+        && config.language_turn_reminder.enabled
+}
+
 fn should_apply(
     endpoint: &str,
     compat_profile: CompatProfile,
@@ -277,6 +292,43 @@ mod tests {
         ));
 
         assert!(req.system.is_none());
+    }
+
+    #[test]
+    fn language_turn_reminder_uses_prompt_steering_route_and_language_gates() {
+        let mut config = PromptSteeringConfig::default();
+        config.language_constraint.enabled = true;
+
+        assert!(language_turn_reminder_applies(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+        ));
+        assert!(!language_turn_reminder_applies(
+            "/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+        ));
+        assert!(!language_turn_reminder_applies(
+            "/cc/v1/messages",
+            CompatProfile::AnthropicStrict,
+            &config,
+        ));
+
+        config.enabled = false;
+        assert!(!language_turn_reminder_applies(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+        ));
+        config.enabled = true;
+
+        config.language_turn_reminder.enabled = false;
+        assert!(!language_turn_reminder_applies(
+            "/cc/v1/messages",
+            CompatProfile::ClaudeCode,
+            &config,
+        ));
     }
 
     #[test]

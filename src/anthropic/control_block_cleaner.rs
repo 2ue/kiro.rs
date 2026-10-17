@@ -2,8 +2,8 @@
 //!
 //! prompt 兼容模式下，代理会在上游请求里注入 `<thinking_mode>` / `<thinking_effort>` /
 //! `<max_thinking_length>` / `<thinking_output_policy>` 等控制提示。用户请求含 `<thinking>`
-//! 的模板时，模型可能把这些控制块原样写进正文。这里只移除与注入内容逐字一致的完整块：
-//! 标签名、取值和策略正文都必须与代理生成的模板相同，其余同名文字一律保留。
+//! 的模板时，模型可能把这些控制块原样写进正文。固定控制块必须与注入内容逐字一致，
+//! 语言提醒块则按标签和长度识别，其余同名文字一律保留。
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -19,11 +19,15 @@ const CONTROL_TAG_NAMES: &[&str] = &[
     "<thinking_effort>",
     "<max_thinking_length>",
     "<thinking_output_policy>",
+    "<language_reminder>",
 ];
 const MAX_LENGTH_OPEN: &str = "<max_thinking_length>";
 const MAX_LENGTH_CLOSE: &str = "</max_thinking_length>";
 /// `max_thinking_length` 取值为 i32 预算，最多 10 位数字。
 const MAX_LENGTH_DIGITS: usize = 10;
+const LANGUAGE_REMINDER_OPEN: &str = "<language_reminder>";
+const LANGUAGE_REMINDER_CLOSE: &str = "</language_reminder>";
+const LANGUAGE_REMINDER_MAX_BYTES: usize = 1024;
 
 /// 代理可能注入的全部固定控制块（逐字）。
 fn literal_blocks() -> &'static [String] {
@@ -90,6 +94,23 @@ fn find_max_length_block(text: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// 在 `text[from..]` 中查找长度不超过 1024 字节的完整语言提醒块。
+fn find_language_reminder_block(text: &str) -> Option<(usize, usize)> {
+    let mut search = 0;
+    while let Some(rel) = text[search..].find(LANGUAGE_REMINDER_OPEN) {
+        let start = search + rel;
+        let content_start = start + LANGUAGE_REMINDER_OPEN.len();
+        if let Some(close_rel) = text[content_start..].find(LANGUAGE_REMINDER_CLOSE) {
+            let end = content_start + close_rel + LANGUAGE_REMINDER_CLOSE.len();
+            if end - start <= LANGUAGE_REMINDER_MAX_BYTES {
+                return Some((start, end));
+            }
+        }
+        search = start + LANGUAGE_REMINDER_OPEN.len();
+    }
+    None
+}
+
 /// 最早出现的完整控制块（起止字节）。
 fn find_control_block(text: &str) -> Option<(usize, usize)> {
     literal_blocks()
@@ -99,6 +120,7 @@ fn find_control_block(text: &str) -> Option<(usize, usize)> {
                 .map(|pos| (pos, pos + block.len()))
         })
         .chain(find_max_length_block(text))
+        .chain(find_language_reminder_block(text))
         .min_by_key(|(start, _)| *start)
 }
 
@@ -140,6 +162,13 @@ fn is_partial_control_block(candidate: &str) -> bool {
     {
         return true;
     }
+    if LANGUAGE_REMINDER_OPEN.starts_with(candidate) {
+        return true;
+    }
+    if let Some(after_open) = candidate.strip_prefix(LANGUAGE_REMINDER_OPEN) {
+        return candidate.len() <= LANGUAGE_REMINDER_MAX_BYTES
+            && !after_open.contains(LANGUAGE_REMINDER_CLOSE);
+    }
     if MAX_LENGTH_OPEN.starts_with(candidate) {
         return true;
     }
@@ -148,9 +177,13 @@ fn is_partial_control_block(candidate: &str) -> bool {
     };
     let digits = after_open.bytes().take_while(u8::is_ascii_digit).count();
     let tail = &after_open[digits..];
-    digits <= MAX_LENGTH_DIGITS
+    if digits <= MAX_LENGTH_DIGITS
         && tail.len() < MAX_LENGTH_CLOSE.len()
         && MAX_LENGTH_CLOSE.starts_with(tail)
+    {
+        return true;
+    }
+    false
 }
 
 /// 需要暂缓下发的尾部起点：从最早一个可能构成控制块前缀的 `<` 开始。
@@ -160,6 +193,7 @@ fn held_start(text: &str) -> Option<usize> {
         .map(String::len)
         .max()
         .unwrap_or(0)
+        .max(LANGUAGE_REMINDER_MAX_BYTES)
         .max(MAX_LENGTH_OPEN.len() + MAX_LENGTH_DIGITS + MAX_LENGTH_CLOSE.len());
     let window_start = text.len().saturating_sub(longest);
     text.char_indices()
@@ -402,5 +436,103 @@ mod tests {
         ];
         strip_control_blocks_in_content(&mut content);
         assert_eq!(content, vec![json!({"type": "text", "text": "answer"})]);
+    }
+
+    #[test]
+    fn non_stream_removes_language_reminder_block() {
+        let mut content = vec![json!({
+            "type": "text",
+            "text": "before<language_reminder>任意内容</language_reminder>after"
+        })];
+        strip_control_blocks_in_content(&mut content);
+        assert_eq!(
+            content,
+            vec![json!({"type": "text", "text": "beforeafter"})]
+        );
+    }
+
+    #[test]
+    fn language_reminder_complete_block_limit_is_1024_bytes() {
+        let payload_bytes = LANGUAGE_REMINDER_MAX_BYTES
+            - LANGUAGE_REMINDER_OPEN.len()
+            - LANGUAGE_REMINDER_CLOSE.len();
+        let payload = format!(
+            "{}{}",
+            "简".repeat(payload_bytes / "简".len()),
+            "x".repeat(payload_bytes % "简".len())
+        );
+        let within_limit = format!("{LANGUAGE_REMINDER_OPEN}{payload}{LANGUAGE_REMINDER_CLOSE}");
+        let over_limit = format!("{LANGUAGE_REMINDER_OPEN}{payload}x{LANGUAGE_REMINDER_CLOSE}");
+        assert_eq!(within_limit.len(), LANGUAGE_REMINDER_MAX_BYTES);
+        assert_eq!(over_limit.len(), LANGUAGE_REMINDER_MAX_BYTES + 1);
+        assert_eq!(strip_control_blocks(&within_limit), "");
+        assert_eq!(strip_control_blocks(&over_limit), over_limit);
+
+        for (input, expected) in [(&within_limit, ""), (&over_limit, over_limit.as_str())] {
+            let mut cleaner = ControlBlockCleaner::new();
+            let out = cleaner.apply(vec![
+                SseEvent::new(
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+                ),
+                delta(input),
+                SseEvent::new(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 0}),
+                ),
+            ]);
+            assert_eq!(collect_text(&out), expected);
+        }
+    }
+
+    #[test]
+    fn streaming_removes_language_reminder_split_byte_by_byte() {
+        let text = "before<language_reminder>Respond in Chinese</language_reminder>after";
+        let mut cleaner = ControlBlockCleaner::new();
+        let mut out = cleaner.apply(vec![SseEvent::new(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        )]);
+        for byte in text.bytes() {
+            out.extend(cleaner.apply(vec![delta(&String::from_utf8(vec![byte]).unwrap())]));
+        }
+        out.extend(cleaner.apply(vec![SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        )]));
+        assert_eq!(collect_text(&out), "beforeafter");
+    }
+
+    #[test]
+    fn oversized_unclosed_language_reminder_is_released_unchanged() {
+        let text = format!("before<language_reminder>{}", "x".repeat(1024));
+        assert_eq!(strip_control_blocks(&text), text);
+
+        let mut cleaner = ControlBlockCleaner::new();
+        let mut out = cleaner.apply(vec![SseEvent::new(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        )]);
+        out.extend(cleaner.apply(vec![delta(&text[..text.len() - 1])]));
+        out.extend(cleaner.apply(vec![delta(&text[text.len() - 1..])]));
+        out.extend(cleaner.apply(vec![SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        )]));
+        assert_eq!(collect_text(&out), text);
+    }
+
+    #[test]
+    fn language_reminder_in_user_message_disables_cleaning() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 16,
+            "messages": [{
+                "role": "user",
+                "content": "Please explain <language_reminder> in this text"
+            }]
+        }))
+        .unwrap();
+        assert!(request_mentions_control_tags(&req));
     }
 }
