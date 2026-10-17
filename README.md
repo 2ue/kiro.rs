@@ -210,6 +210,8 @@ curl http://127.0.0.1:8990/v1/messages \
 docker compose -f docker-compose.database.yml up -d
 ```
 
+普通升级请将 `scripts/deploy/upgrade-app.sh` 按目标版本对应的发布 tag 下载到 Compose 文件和 `.env` 所在的部署目录后执行，步骤见[部署文档 §11](docs/ai-docker-compose-deployment.md#11-停止重启升级)。
+
 需要将首次导入用的 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.database.yml`。
 
 使用已发布镜像部署：

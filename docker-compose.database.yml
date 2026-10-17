@@ -1,4 +1,5 @@
 services:
+  # 依赖镜像使用固定主版本 tag；普通升级只更新 kiro-rs-app，命令见 scripts/deploy/upgrade-app.sh。
   kiro-rs-postgres:
     image: postgres:18-alpine
     container_name: kiro-rs-postgres
@@ -19,6 +20,7 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # 依赖镜像使用固定主版本 tag；普通升级只更新 kiro-rs-app，命令见 scripts/deploy/upgrade-app.sh。
   kiro-rs-redis:
     image: redis:7-alpine
     container_name: kiro-rs-redis

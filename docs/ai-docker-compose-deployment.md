@@ -259,9 +259,12 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 普通升级只需要：
 
 ```bash
-docker compose pull
-docker compose up -d
+curl -fsSL -o upgrade-app.sh https://raw.githubusercontent.com/2ue/kiro.rs/v0.0.19/scripts/deploy/upgrade-app.sh && chmod +x upgrade-app.sh
+./upgrade-app.sh -v 0.0.19
 ```
+
+请在 Compose 文件和 `.env` 所在的部署目录执行；下载 URL 中的 tag 应与目标版本一致。
+该脚本只拉取并重建应用服务，依赖服务保持运行。
 
 默认启动迁移不会回填历史 `usage_records`，也不会在大表上无条件创建缺失索引。如果历史 usage 表很大且缺少 usage/rollup 索引，服务会跳过启动创建并写出 warning。需要补齐时，应在低峰期手动运行：
 
@@ -479,8 +482,27 @@ docker compose restart kiro-rs
 
 ```bash
 cd /opt/kiro-rs
-KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose pull
-KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强密码' docker compose up -d
+curl -fsSL -o upgrade-app.sh https://raw.githubusercontent.com/2ue/kiro.rs/v0.0.19/scripts/deploy/upgrade-app.sh && chmod +x upgrade-app.sh
+./upgrade-app.sh -f docker-compose.yml -v 0.0.19
+```
+
+将下载 URL 中的 tag 与 `-v` 指定的目标版本保持一致；脚本应下载到部署目录后再执行。
+
+手工执行时只操作应用服务：
+
+```bash
+docker compose pull kiro-rs
+docker compose up -d --no-deps kiro-rs
+```
+
+不要对整套服务执行 `docker compose pull` 后再 `up -d`。Redis 被重启后，外部池协调器会进入约 35 秒恢复窗口，期间请求可能返回 `external_pool_coordinator_unavailable`。
+
+### 升级 PostgreSQL / Redis
+
+只在计划内维护窗口单独升级 PostgreSQL 或 Redis。Redis 重启后，外部账号池预计约 35 秒不可用，本地账号池不受影响。单独升级 Redis：
+
+```bash
+docker compose pull kiro-rs-redis && docker compose up -d kiro-rs-redis
 ```
 
 ## 12. 常见问题
