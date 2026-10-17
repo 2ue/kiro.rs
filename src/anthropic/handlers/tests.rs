@@ -25,7 +25,7 @@ use crate::kiro::call_trace::{
 use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::MetadataTokenUsage;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{LocalSchedulerError, LocalSchedulerErrorKind, MultiTokenManager};
 use crate::model::config::{
     CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch, CacheSimulationPolicyPatch,
     PromptCacheCreationControlConfig, PromptSteeringRouteMode, PromptSteeringScope,
@@ -10027,6 +10027,191 @@ fn upstream_rate_limit_does_not_enable_local_admission_backoff() {
     );
 
     assert_eq!(local_temporary_admission_backoff_secs(&err, None), None);
+}
+
+#[test]
+fn typed_scheduler_error_classification_matches_string_fallback_for_every_kind() {
+    let config = ExternalPoolsConfig {
+        fallback_on_unsupported_model: true,
+        ..ExternalPoolsConfig::default()
+    };
+    let attempts = Vec::new();
+    let cases = [
+        (
+            LocalSchedulerErrorKind::AllDisabled,
+            "所有账号均已禁用（1/1）",
+            false,
+        ),
+        (
+            LocalSchedulerErrorKind::NoModelCompatible,
+            "没有支持当前模型的可用账号（可用: 1/1）",
+            false,
+        ),
+        (
+            LocalSchedulerErrorKind::ProxyBlocked,
+            "所有可用账号均因代理资源不可用而不可调度（可用: 1/1, 代理不可用: 1）",
+            false,
+        ),
+        (
+            LocalSchedulerErrorKind::AllCoolingDown,
+            "所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0）",
+            false,
+        ),
+        (
+            LocalSchedulerErrorKind::RequestExcludedAll,
+            "本次请求临时排除了所有可用账号（可用: 1/1, 临时排除: 1）",
+            false,
+        ),
+        (
+            LocalSchedulerErrorKind::CapacityUnavailable,
+            "本地账号调度容量暂不可用（可用: 1/1, 临时可调度: 0）",
+            true,
+        ),
+        (
+            LocalSchedulerErrorKind::QueueFull,
+            "账号调度等待队列已满（max_queued_requests=1, global_max_concurrent_requests=1）",
+            true,
+        ),
+        (
+            LocalSchedulerErrorKind::QueueTimeout,
+            "账号调度排队等待超时（可用: 1/1, 临时可调度: 0, retry_after_secs=1）",
+            true,
+        ),
+        (
+            LocalSchedulerErrorKind::TokenUnavailable,
+            "所有账号均无法获取有效 Token（可用: 0/1）",
+            false,
+        ),
+        (
+            LocalSchedulerErrorKind::RiskCircuitOpen,
+            "本地账号池风险保护已打开（retry_after_secs=7）",
+            true,
+        ),
+    ];
+
+    SCHEDULER_ERROR_STRING_FALLBACKS.store(0, Ordering::Relaxed);
+    for (kind, message, temporary) in cases {
+        let typed: Error = LocalSchedulerError::new(kind, message).into();
+        let typed_classification = classify_local_error_for_external_fallback_with_scheduler_kind(
+            message,
+            &attempts,
+            &config,
+            None,
+            local_scheduler_error_kind(&typed),
+        );
+        let string_classification =
+            classify_local_error_for_external_fallback(message, &attempts, &config);
+        assert_eq!(typed_classification, string_classification, "{kind:?}");
+        assert_eq!(
+            is_local_temporary_scheduler_error(&typed),
+            temporary,
+            "{kind:?}"
+        );
+        assert_eq!(
+            is_local_temporary_scheduler_error(&typed),
+            is_local_temporary_scheduler_error_string(message),
+            "{kind:?} string fallback"
+        );
+    }
+
+    let typed_fallbacks = SCHEDULER_ERROR_STRING_FALLBACKS.load(Ordering::Relaxed);
+    assert!(
+        typed_fallbacks >= 1,
+        "string comparison cases use the fallback path"
+    );
+
+    SCHEDULER_ERROR_STRING_FALLBACKS.store(0, Ordering::Relaxed);
+    let typed: Error = LocalSchedulerError::new(
+        LocalSchedulerErrorKind::CapacityUnavailable,
+        "本地账号调度容量暂不可用（retry_after_secs=1）",
+    )
+    .into();
+    assert!(is_local_temporary_scheduler_error(&typed));
+    assert_eq!(SCHEDULER_ERROR_STRING_FALLBACKS.load(Ordering::Relaxed), 0);
+    assert!(is_local_temporary_scheduler_error_string(
+        &typed.to_string()
+    ));
+    assert_eq!(SCHEDULER_ERROR_STRING_FALLBACKS.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn typed_scheduler_error_provider_mapping_matches_string_fallback_for_every_kind() {
+    let cases = [
+        (
+            LocalSchedulerErrorKind::AllDisabled,
+            "所有账号均已禁用（0/1）",
+        ),
+        (
+            LocalSchedulerErrorKind::NoModelCompatible,
+            "没有支持当前模型的可用账号（可用: 1/1）",
+        ),
+        (
+            LocalSchedulerErrorKind::ProxyBlocked,
+            "所有可用账号均因代理资源不可用而不可调度（可用: 1/1, 代理不可用: 1）",
+        ),
+        (
+            LocalSchedulerErrorKind::AllCoolingDown,
+            "所有可用账号均处于上游临时冷却（可用: 1/1, 临时可调度: 0, retry_after_secs=4）",
+        ),
+        (
+            LocalSchedulerErrorKind::RequestExcludedAll,
+            "本次请求临时排除了所有可用账号（可用: 1/1, 临时排除: 1）",
+        ),
+        (
+            LocalSchedulerErrorKind::CapacityUnavailable,
+            "本地账号调度容量暂不可用（retry_after_secs=4）",
+        ),
+        (
+            LocalSchedulerErrorKind::QueueFull,
+            "账号调度等待队列已满（max_queued_requests=1, global_max_concurrent_requests=1）",
+        ),
+        (
+            LocalSchedulerErrorKind::QueueTimeout,
+            "账号调度排队等待超时（retry_after_secs=4）",
+        ),
+        (
+            LocalSchedulerErrorKind::TokenUnavailable,
+            "所有账号均无法获取有效 Token（可用: 0/1）",
+        ),
+        (
+            LocalSchedulerErrorKind::RiskCircuitOpen,
+            "本地账号池风险保护已打开（retry_after_secs=4）",
+        ),
+    ];
+
+    for (kind, message) in cases {
+        let typed_response = map_provider_error(
+            LocalSchedulerError::new(kind, message).into(),
+            Some("req_scheduler_mapping"),
+            Some("err_scheduler_mapping"),
+            None,
+            None,
+        );
+        let string_response = map_provider_error(
+            anyhow::anyhow!("{message}"),
+            Some("req_scheduler_mapping"),
+            Some("err_scheduler_mapping"),
+            None,
+            None,
+        );
+        assert_eq!(
+            typed_response.status(),
+            string_response.status(),
+            "{kind:?}"
+        );
+        assert_eq!(
+            typed_response.headers().get("retry-after"),
+            string_response.headers().get("retry-after"),
+            "{kind:?} retry-after"
+        );
+        let typed_body = axum::body::to_bytes(typed_response.into_body(), usize::MAX)
+            .await
+            .expect("read typed scheduler response");
+        let string_body = axum::body::to_bytes(string_response.into_body(), usize::MAX)
+            .await
+            .expect("read string scheduler response");
+        assert_eq!(typed_body, string_body, "{kind:?} response body");
+    }
 }
 
 #[tokio::test]

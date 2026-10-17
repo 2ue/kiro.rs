@@ -108,6 +108,7 @@ use super::rpm::{
     effective_rpm, entry_rate_limit_remaining, entry_rate_limit_window_remaining,
     rate_limit_interval_for_rpm,
 };
+use super::scheduler_error::{LocalSchedulerError, LocalSchedulerErrorKind};
 use super::sticky::{
     MAX_SESSION_SOFT_FAILURES, SESSION_BINDING_TTL_SECS,
     bind_session_to_credential as bind_sticky_session_to_credential,
@@ -139,6 +140,12 @@ use super::refresh::{
 use super::strategy::scheduler_score_with_config;
 #[cfg(test)]
 use chrono::Duration;
+
+macro_rules! local_scheduler_bail {
+    ($kind:expr, $($arg:tt)*) => {
+        return Err(LocalSchedulerError::new($kind, format!($($arg)*)).into())
+    };
+}
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -5168,14 +5175,17 @@ impl MultiTokenManager {
             .await
         {
             SchedulerRedisHotOutcome::Completed(()) => Ok(()),
-            SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {
-                anyhow::bail!("本地账号调度容量暂不可用（本地 scheduler admission 已饱和）")
-            }
-            SchedulerRedisHotOutcome::Skipped => anyhow::bail!(
+            SchedulerRedisHotOutcome::LocalSchedulerOverloaded => local_scheduler_bail!(
+                LocalSchedulerErrorKind::CapacityUnavailable,
+                "本地账号调度容量暂不可用（本地 scheduler admission 已饱和）"
+            ),
+            SchedulerRedisHotOutcome::Skipped => local_scheduler_bail!(
+                LocalSchedulerErrorKind::CapacityUnavailable,
                 "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
                 self.scheduler_redis_retry_after_secs()
             ),
-            SchedulerRedisHotOutcome::Failed { .. } => anyhow::bail!(
+            SchedulerRedisHotOutcome::Failed { .. } => local_scheduler_bail!(
+                LocalSchedulerErrorKind::CapacityUnavailable,
                 "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
                 self.scheduler_redis_retry_after_secs()
             ),
@@ -5199,11 +5209,17 @@ impl MultiTokenManager {
                 self.scheduler_redis_release_dispatcher.as_ref().cloned()
             else {
                 self.queued_requests.fetch_sub(1, Ordering::AcqRel);
-                anyhow::bail!("本地账号调度容量暂不可用（release reconciliation 未初始化）");
+                local_scheduler_bail!(
+                    LocalSchedulerErrorKind::CapacityUnavailable,
+                    "本地账号调度容量暂不可用（release reconciliation 未初始化）"
+                );
             };
             let Some(release_reservation) = release_dispatcher.try_reserve() else {
                 self.queued_requests.fetch_sub(1, Ordering::AcqRel);
-                anyhow::bail!("本地账号调度容量暂不可用（release reconciliation 已饱和）");
+                local_scheduler_bail!(
+                    LocalSchedulerErrorKind::CapacityUnavailable,
+                    "本地账号调度容量暂不可用（release reconciliation 已饱和）"
+                );
             };
             let mut guard = DispatchQueueGuard::new(
                 self.redis_store.clone(),
@@ -5244,7 +5260,8 @@ impl MultiTokenManager {
                         guard.confirm_redis_not_acquired();
                     }
                     drop(guard);
-                    anyhow::bail!(
+                    local_scheduler_bail!(
+                        LocalSchedulerErrorKind::CapacityUnavailable,
                         "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
                         self.scheduler_redis_retry_after_secs()
                     );
@@ -5252,7 +5269,8 @@ impl MultiTokenManager {
                 SchedulerRedisHotOutcome::Skipped => {
                     guard.confirm_redis_not_acquired();
                     drop(guard);
-                    anyhow::bail!(
+                    local_scheduler_bail!(
+                        LocalSchedulerErrorKind::CapacityUnavailable,
                         "本地账号调度容量暂不可用（Redis 调度协调状态不可用，retry_after_secs={}）",
                         self.scheduler_redis_retry_after_secs()
                     );
@@ -5260,7 +5278,10 @@ impl MultiTokenManager {
                 SchedulerRedisHotOutcome::LocalSchedulerOverloaded => {
                     guard.confirm_redis_not_acquired();
                     drop(guard);
-                    anyhow::bail!("本地账号调度容量暂不可用（本地 scheduler admission 已饱和）");
+                    local_scheduler_bail!(
+                        LocalSchedulerErrorKind::CapacityUnavailable,
+                        "本地账号调度容量暂不可用（本地 scheduler admission 已饱和）"
+                    );
                 }
             }
         }
@@ -6122,7 +6143,8 @@ impl MultiTokenManager {
                 .local_pool_risk_circuit_snapshot(Instant::now())
                 .retry_after
             {
-                anyhow::bail!(
+                local_scheduler_bail!(
+                    LocalSchedulerErrorKind::RiskCircuitOpen,
                     "本地账号池风险保护已打开（retry_after_secs={}）",
                     retry_after.as_secs().saturating_add(1).max(1)
                 );
@@ -6171,7 +6193,8 @@ impl MultiTokenManager {
                     .expect("checked health-neutral refresh error"));
             }
             if attempt_count >= max_attempts {
-                anyhow::bail!(
+                local_scheduler_bail!(
+                    LocalSchedulerErrorKind::TokenUnavailable,
                     "所有账号均无法获取有效 Token（可用: {}/{}）",
                     self.available_count(),
                     total
@@ -6345,7 +6368,8 @@ impl MultiTokenManager {
                                 .count();
                             if usable > 0 && excluded_usable >= usable {
                                 if acquire_mode.is_fail_fast() && slot_race_excluded_count > 0 {
-                                    anyhow::bail!(
+                                    local_scheduler_bail!(
+                                        LocalSchedulerErrorKind::CapacityUnavailable,
                                         "本地账号调度容量暂不可用（本次请求因并发槽竞争临时排除了所有可用账号，可用: {}/{}, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}）",
                                         available,
                                         total,
@@ -6353,7 +6377,8 @@ impl MultiTokenManager {
                                         effective_concurrency_range
                                     );
                                 }
-                                anyhow::bail!(
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::RequestExcludedAll,
                                     "本次请求临时排除了所有可用账号（可用: {}/{}, 临时排除: {}）",
                                     available,
                                     total,
@@ -6361,14 +6386,16 @@ impl MultiTokenManager {
                                 );
                             }
                             if available > 0 && model_usable == 0 && model.is_some() {
-                                anyhow::bail!(
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::NoModelCompatible,
                                     "没有支持当前模型的可用账号（可用: {}/{}）",
                                     available,
                                     total
                                 );
                             }
                             if model_usable > 0 && usable == 0 && proxy_blocked >= model_usable {
-                                anyhow::bail!(
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::ProxyBlocked,
                                     "所有可用账号均因代理资源不可用而不可调度（可用: {}/{}, 代理不可用: {}）",
                                     available,
                                     total,
@@ -6423,7 +6450,8 @@ impl MultiTokenManager {
                                         .map(|duration| duration.as_secs().saturating_add(1))
                                         .unwrap_or(1)
                                         .max(1);
-                                    anyhow::bail!(
+                                    local_scheduler_bail!(
+                                        LocalSchedulerErrorKind::AllCoolingDown,
                                         "所有可用账号均处于上游临时冷却（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
                                         available,
                                         total,
@@ -6490,7 +6518,12 @@ impl MultiTokenManager {
                                     }
                                 }
                             } else {
-                                anyhow::bail!("所有账号均已禁用（{}/{}）", available, total);
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::AllDisabled,
+                                    "所有账号均已禁用（{}/{}）",
+                                    available,
+                                    total
+                                );
                             }
                         }
                     }
@@ -6528,14 +6561,16 @@ impl MultiTokenManager {
                             .unwrap_or(1)
                             .max(1);
                         if reason == DispatchWaitReason::RpmLimited {
-                            anyhow::bail!(
+                            local_scheduler_bail!(
+                                LocalSchedulerErrorKind::CapacityUnavailable,
                                 "本地账号调度容量暂不可用（凭据 RPM 限制，可用: {}/{}, 临时可调度: 0, retry_after_secs={}）",
                                 available,
                                 total,
                                 retry_after_secs
                             );
                         } else {
-                            anyhow::bail!(
+                            local_scheduler_bail!(
+                                LocalSchedulerErrorKind::CapacityUnavailable,
                                 "本地账号调度容量暂不可用（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
                                 available,
                                 total,
@@ -6548,7 +6583,8 @@ impl MultiTokenManager {
                     if queue_guard.is_none() {
                         queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                         if queue_guard.is_none() {
-                            anyhow::bail!(
+                            local_scheduler_bail!(
+                                LocalSchedulerErrorKind::QueueFull,
                                 "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
                                 self.max_queued_requests(),
                                 self.global_max_concurrent_requests()
@@ -6565,7 +6601,8 @@ impl MultiTokenManager {
                         now,
                     ) {
                         if reason == DispatchWaitReason::RpmLimited {
-                            anyhow::bail!(
+                            local_scheduler_bail!(
+                                LocalSchedulerErrorKind::QueueTimeout,
                                 "账号调度排队等待超时（凭据 RPM 限制，可用: {}/{}, 临时可调度: 0, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
                                 available,
                                 total,
@@ -6574,7 +6611,8 @@ impl MultiTokenManager {
                                 retry_after_secs.max(1)
                             );
                         } else {
-                            anyhow::bail!(
+                            local_scheduler_bail!(
+                                LocalSchedulerErrorKind::QueueTimeout,
                                 "账号调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
                                 available,
                                 total,
@@ -6627,16 +6665,25 @@ impl MultiTokenManager {
                             .is_some_and(|guard| guard.has_redis_lease())
                         {
                             drop(queue_guard.take());
-                            return Err(err);
+                            return Err(LocalSchedulerError::new(
+                                LocalSchedulerErrorKind::CapacityUnavailable,
+                                err.to_string(),
+                            )
+                            .into());
                         }
                         if acquire_mode.is_redis_degraded_fail_fast() {
-                            return Err(err);
+                            return Err(LocalSchedulerError::new(
+                                LocalSchedulerErrorKind::CapacityUnavailable,
+                                err.to_string(),
+                            )
+                            .into());
                         }
                         if queue_guard.is_none() {
                             queue_guard =
                                 self.try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                             if queue_guard.is_none() {
-                                anyhow::bail!(
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::QueueFull,
                                     "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
                                     self.max_queued_requests(),
                                     self.global_max_concurrent_requests()
@@ -6649,7 +6696,8 @@ impl MultiTokenManager {
                             dispatch_wait_started_at,
                             now,
                         ) {
-                            anyhow::bail!(
+                            local_scheduler_bail!(
+                                LocalSchedulerErrorKind::QueueTimeout,
                                 "账号调度排队等待超时（Redis 调度协调状态不可用，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
                                 waited.as_secs(),
                                 max_wait.as_secs(),
@@ -6772,7 +6820,8 @@ impl MultiTokenManager {
                 if queue_guard.is_none() {
                     queue_guard = self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                     if queue_guard.is_none() {
-                        anyhow::bail!(
+                        local_scheduler_bail!(
+                            LocalSchedulerErrorKind::QueueFull,
                             "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
                             self.max_queued_requests(),
                             self.global_max_concurrent_requests()
@@ -6797,7 +6846,8 @@ impl MultiTokenManager {
                             ),
                         )
                     };
-                    anyhow::bail!(
+                    local_scheduler_bail!(
+                        LocalSchedulerErrorKind::QueueTimeout,
                         "账号调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs=1）",
                         self.available_count(),
                         total,
@@ -6852,16 +6902,25 @@ impl MultiTokenManager {
                                 .is_some_and(|guard| guard.has_redis_lease())
                             {
                                 drop(queue_guard.take());
-                                return Err(err);
+                                return Err(LocalSchedulerError::new(
+                                    LocalSchedulerErrorKind::CapacityUnavailable,
+                                    err.to_string(),
+                                )
+                                .into());
                             }
                             if acquire_mode.is_redis_degraded_fail_fast() {
-                                return Err(err);
+                                return Err(LocalSchedulerError::new(
+                                    LocalSchedulerErrorKind::CapacityUnavailable,
+                                    err.to_string(),
+                                )
+                                .into());
                             }
                             if queue_guard.is_none() {
                                 queue_guard = self
                                     .try_enter_local_only_dispatch_queue(redis_degraded_max_wait);
                                 if queue_guard.is_none() {
-                                    anyhow::bail!(
+                                    local_scheduler_bail!(
+                                        LocalSchedulerErrorKind::QueueFull,
                                         "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
                                         self.max_queued_requests(),
                                         self.global_max_concurrent_requests()
@@ -6874,7 +6933,8 @@ impl MultiTokenManager {
                                 dispatch_wait_started_at,
                                 now,
                             ) {
-                                anyhow::bail!(
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::QueueTimeout,
                                     "账号调度排队等待超时（Redis 调度协调状态不可用，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
                                     waited.as_secs(),
                                     max_wait.as_secs(),
@@ -6927,7 +6987,8 @@ impl MultiTokenManager {
                         SchedulerRedisSelectionAdmission::RateLimited(wait) => {
                             drop(in_flight_lease);
                             if acquire_mode.is_fail_fast() {
-                                anyhow::bail!(
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::CapacityUnavailable,
                                     "本地账号调度容量暂不可用（凭据 RPM 限制，retry_after_secs={}）",
                                     wait.retry_after.as_secs().saturating_add(1).max(1)
                                 );
@@ -6936,7 +6997,8 @@ impl MultiTokenManager {
                                 queue_guard =
                                     self.try_enter_dispatch_queue(dispatch_max_wait).await?;
                                 if queue_guard.is_none() {
-                                    anyhow::bail!(
+                                    local_scheduler_bail!(
+                                        LocalSchedulerErrorKind::QueueFull,
                                         "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
                                         self.max_queued_requests(),
                                         self.global_max_concurrent_requests()
@@ -6949,7 +7011,8 @@ impl MultiTokenManager {
                                 dispatch_wait_started_at,
                                 now,
                             ) {
-                                anyhow::bail!(
+                                local_scheduler_bail!(
+                                    LocalSchedulerErrorKind::QueueTimeout,
                                     "账号调度排队等待超时（凭据 RPM 限制，waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
                                     waited.as_secs(),
                                     max_wait.as_secs(),
@@ -7093,7 +7156,11 @@ impl MultiTokenManager {
                     drop(in_flight_lease);
                     attempt_count += 1;
                     if !has_available {
-                        anyhow::bail!("所有账号均已禁用（0/{}）", total);
+                        local_scheduler_bail!(
+                            LocalSchedulerErrorKind::AllDisabled,
+                            "所有账号均已禁用（0/{}）",
+                            total
+                        );
                     }
                 }
             }

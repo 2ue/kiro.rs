@@ -10,6 +10,7 @@ mod redis_runtime;
 mod refresh;
 mod route_state;
 mod rpm;
+mod scheduler_error;
 mod sticky;
 pub(crate) mod storage_task;
 mod strategy;
@@ -34,6 +35,10 @@ pub use manager::{
     StatsFlushWorkerHandle,
 };
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
+#[allow(unused_imports)]
+pub use scheduler_error::{
+    LocalSchedulerError, LocalSchedulerErrorKind, local_scheduler_error_kind,
+};
 #[allow(unused_imports)]
 pub use storage_task::{
     StorageTaskDrainReport, StorageTaskShutdownReport, StorageTaskStats,
