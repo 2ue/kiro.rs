@@ -78,6 +78,134 @@ async fn credential_info_refresh_stream_limits_concurrency_and_completes_all_ite
     assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 
+fn local_rate_limited_error(retry_after: std::time::Duration) -> AdminServiceError {
+    AdminServiceError::LocalRateLimited {
+        source: Box::new(AdminServiceError::InternalError(
+            "token refresh failed: stage=coordination kind=rate_limited".to_string(),
+        )),
+        retry_after,
+    }
+}
+
+#[tokio::test]
+async fn credential_info_refresh_retries_local_rate_limit_and_clamps_wait() {
+    let mut attempts = 0;
+    let started = tokio::time::Instant::now();
+    let deadline = started + CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET;
+    let (result, retries) = retry_local_rate_limited(deadline, || {
+        attempts += 1;
+        let attempt = attempts;
+        async move {
+            match attempt {
+                1 => Err(local_rate_limited_error(std::time::Duration::from_millis(
+                    1,
+                ))),
+                2 => Err(local_rate_limited_error(std::time::Duration::from_secs(6))),
+                _ => Ok("refreshed"),
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(result.unwrap(), "refreshed");
+    assert_eq!(attempts, 3);
+    assert_eq!(retries, 2);
+    assert!(tokio::time::Instant::now() - started >= std::time::Duration::from_millis(5_050));
+    assert_eq!(
+        local_rate_limit_retry_delay(std::time::Duration::from_millis(1)),
+        std::time::Duration::from_millis(50)
+    );
+    assert_eq!(
+        local_rate_limit_retry_delay(std::time::Duration::from_secs(6)),
+        std::time::Duration::from_secs(5)
+    );
+}
+
+#[tokio::test]
+async fn credential_info_refresh_stops_after_local_rate_limit_retry_limit() {
+    let mut attempts = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (result, retries) = retry_local_rate_limited(deadline, || {
+        attempts += 1;
+        async { Err::<(), _>(local_rate_limited_error(std::time::Duration::ZERO)) }
+    })
+    .await;
+
+    let error = result.unwrap_err();
+    assert_eq!(attempts, MAX_LOCAL_RATE_LIMIT_RETRIES as usize + 1);
+    assert_eq!(retries, MAX_LOCAL_RATE_LIMIT_RETRIES);
+    assert_eq!(
+        error.to_string(),
+        "内部错误: token refresh failed: stage=coordination kind=rate_limited"
+    );
+}
+
+#[tokio::test]
+async fn credential_info_refresh_does_not_retry_non_rate_limit_errors() {
+    let mut attempts = 0;
+    let deadline = tokio::time::Instant::now() + CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET;
+    let (result, retries) = retry_local_rate_limited(deadline, || {
+        attempts += 1;
+        async {
+            Err::<(), _>(AdminServiceError::UpstreamError(
+                "credential_auth: upstream rejected refresh".to_string(),
+            ))
+        }
+    })
+    .await;
+
+    assert_eq!(attempts, 1);
+    assert_eq!(retries, 0);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "上游服务错误: credential_auth: upstream rejected refresh"
+    );
+}
+
+#[tokio::test]
+async fn credential_info_refresh_stops_retrying_at_total_budget() {
+    let mut attempts = 0;
+    let started = tokio::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(75);
+    let (result, retries) = retry_local_rate_limited(deadline, || {
+        attempts += 1;
+        async { Err::<(), _>(local_rate_limited_error(std::time::Duration::from_secs(1))) }
+    })
+    .await;
+
+    assert_eq!(attempts, 1);
+    assert_eq!(retries, 0);
+    assert!(tokio::time::Instant::now() - started >= std::time::Duration::from_millis(75));
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "内部错误: token refresh failed: stage=coordination kind=rate_limited"
+    );
+}
+
+#[test]
+fn credential_info_refresh_only_recognizes_local_coordination_rate_limits() {
+    let rate_limited = anyhow::Error::new(RefreshFailure::new(
+        RefreshFailureStage::Coordination,
+        RefreshFailureKind::RateLimited,
+        None,
+        Some(std::time::Duration::from_millis(123)),
+        false,
+    ));
+    assert_eq!(
+        local_rate_limit_retry_after(&rate_limited),
+        Some(std::time::Duration::from_millis(123))
+    );
+
+    let credential_auth = anyhow::Error::new(RefreshFailure::new(
+        RefreshFailureStage::ResponseStatus,
+        RefreshFailureKind::CredentialAuth,
+        Some(403),
+        Some(std::time::Duration::from_secs(1)),
+        true,
+    ));
+    assert_eq!(local_rate_limit_retry_after(&credential_auth), None);
+}
+
 #[test]
 fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
     let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
