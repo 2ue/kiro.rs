@@ -730,15 +730,15 @@ mod tests {
 
     #[test]
     fn test_map_model_claude_code_aliases() {
-        assert_eq!(map_model("opus"), Some("claude-opus-4.7".to_string()));
-        assert_eq!(map_model("opusplan"), Some("claude-opus-4.7".to_string()));
-        assert_eq!(map_model("best"), Some("claude-opus-4.7".to_string()));
-        assert_eq!(map_model("default"), Some("claude-opus-4.7".to_string()));
-        assert_eq!(map_model("sonnet"), Some("claude-sonnet-4.6".to_string()));
-        assert_eq!(map_model("fable"), Some("claude-fable-5.1".to_string()));
+        assert_eq!(map_model("opus"), Some("opus".to_string()));
+        assert_eq!(map_model("opusplan"), Some("opusplan".to_string()));
+        assert_eq!(map_model("best"), Some("best".to_string()));
+        assert_eq!(map_model("default"), Some("default".to_string()));
+        assert_eq!(map_model("sonnet"), Some("sonnet".to_string()));
+        assert_eq!(map_model("fable"), Some("fable".to_string()));
         assert_eq!(
             map_model("claude-opus-4-7[1m]"),
-            Some("claude-opus-4.7".to_string())
+            Some("claude-opus-4-7".to_string())
         );
     }
 
@@ -785,7 +785,9 @@ mod tests {
         ] {
             assert_eq!(
                 map_model(requested),
-                Some("claude-fable-5.1".to_string()),
+                Some(
+                    crate::anthropic::model_capabilities::strip_model_compat_suffixes(requested).0
+                ),
                 "{requested}"
             );
         }
@@ -798,7 +800,9 @@ mod tests {
         ] {
             assert_eq!(
                 map_model(requested),
-                Some("claude-opus-5.5".to_string()),
+                Some(
+                    crate::anthropic::model_capabilities::strip_model_compat_suffixes(requested).0
+                ),
                 "{requested}"
             );
         }
@@ -811,7 +815,9 @@ mod tests {
         ] {
             assert_eq!(
                 map_model(requested),
-                Some("claude-sonnet-5.5".to_string()),
+                Some(
+                    crate::anthropic::model_capabilities::strip_model_compat_suffixes(requested).0
+                ),
                 "{requested}"
             );
         }
@@ -824,7 +830,9 @@ mod tests {
         ] {
             assert_eq!(
                 map_model(requested),
-                Some("claude-haiku-5.5".to_string()),
+                Some(
+                    crate::anthropic::model_capabilities::strip_model_compat_suffixes(requested).0
+                ),
                 "{requested}"
             );
         }
@@ -835,7 +843,7 @@ mod tests {
         );
         assert_eq!(
             map_model("claude-opus-4-8-thinking"),
-            Some("claude-opus-4.8".to_string())
+            Some("claude-opus-4-8".to_string())
         );
     }
 
@@ -1039,70 +1047,61 @@ mod tests {
     fn test_map_model_thinking_suffix_sonnet() {
         // thinking 后缀不应影响 sonnet 模型映射
         let result = map_model("claude-sonnet-4-5-20250929-thinking");
-        assert_eq!(result, Some("claude-sonnet-4.5".to_string()));
+        assert_eq!(result, Some("claude-sonnet-4-5-20250929".to_string()));
     }
 
     #[test]
     fn test_map_model_thinking_suffix_opus_4_5() {
         // thinking 后缀不应影响 opus 4.5 模型映射
         let result = map_model("claude-opus-4-5-20251101-thinking");
-        assert_eq!(result, Some("claude-opus-4.5".to_string()));
+        assert_eq!(result, Some("claude-opus-4-5-20251101".to_string()));
     }
 
     #[test]
     fn test_map_model_thinking_suffix_opus_4_6() {
         // thinking 后缀不应影响 opus 4.6 模型映射
         let result = map_model("claude-opus-4-6-thinking");
-        assert_eq!(result, Some("claude-opus-4.6".to_string()));
+        assert_eq!(result, Some("claude-opus-4-6".to_string()));
     }
 
     #[test]
     fn test_map_model_thinking_suffix_haiku() {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
-        assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+        assert_eq!(result, Some("claude-haiku-4-5-20251001".to_string()));
     }
 
     #[test]
     fn test_context_window_size_for_kiro_auto_and_dash_variants() {
-        assert_eq!(get_context_window_size("auto"), 1_000_000);
-        assert_eq!(get_context_window_size("sonnet"), 1_000_000);
-        assert_eq!(get_context_window_size("opus"), 1_000_000);
+        assert_eq!(get_context_window_size("auto"), 200_000);
+        assert_eq!(get_context_window_size("sonnet"), 200_000);
+        assert_eq!(get_context_window_size("opus"), 200_000);
         assert_eq!(
             get_context_window_size("claude-fable-5-1-thinking"),
-            1_000_000
+            200_000
         );
-        assert_eq!(
-            get_context_window_size("claude-fable-5-thinking"),
-            1_000_000
-        );
-        assert_eq!(
-            get_context_window_size("claude-opus-5-5-thinking"),
-            1_000_000
-        );
+        assert_eq!(get_context_window_size("claude-fable-5-thinking"), 200_000);
+        assert_eq!(get_context_window_size("claude-opus-5-5-thinking"), 200_000);
         assert_eq!(
             get_context_window_size("claude-sonnet-5-5-thinking"),
-            1_000_000
+            200_000
         );
         assert_eq!(
             get_context_window_size("claude-haiku-5-5-thinking"),
-            1_000_000
+            200_000
         );
-        assert_eq!(get_context_window_size("claude-opus-5-thinking"), 1_000_000);
-        assert_eq!(
-            get_context_window_size("claude-sonnet-5-thinking"),
-            1_000_000
-        );
-        assert_eq!(get_context_window_size("claude-opus-4.8"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-opus-4.7"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-sonnet-4.6"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-5-thinking"), 200_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5-thinking"), 200_000);
+        assert_eq!(get_context_window_size("claude-opus-4.8"), 200_000);
+        assert_eq!(get_context_window_size("claude-opus-4.7"), 200_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4.6"), 200_000);
         assert_eq!(
             get_context_window_size("claude-opus-4.7-thinking[1m]"),
             1_000_000
         );
         assert_eq!(get_context_window_size("claude-sonnet-4-6[1m]"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
-        assert_eq!(get_context_window_size("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 200_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4-6"), 200_000);
     }
 
     #[test]

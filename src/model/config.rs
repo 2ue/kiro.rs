@@ -3428,9 +3428,10 @@ impl ModelMappingRule {
 
 /// 模型映射配置。
 ///
-/// 解析顺序固定为：上游模型列表精确匹配 -> 版本等价 -> 显式别名 ->
-/// 兜底规则 -> 透传。关闭 `enabled`，或关闭自动规则且规则列表为空时，
-/// 未精确匹配的模型会直接透传给上游，不再在本地做隐式降级。
+/// 解析顺序固定为：显式映射 -> 上游模型列表精确匹配 -> 后缀兼容 ->
+/// 同版本格式兼容 -> 自动别名/同族跨版本 -> 可选跨族兜底 -> 透传。
+/// 关闭 `enabled` 后，规则和自动兼容解析都不生效；关闭自动规则且规则列表为空时，
+/// 未精确匹配的模型会直接透传给上游。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelMappingConfig {
@@ -3438,6 +3439,17 @@ pub struct ModelMappingConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub auto_generate_rules: bool,
+    /// 允许已知 Claude 模型在同族内跨小版本解析到当前可用模型。
+    ///
+    /// 例如请求一个已下线的 dated Sonnet 4，目录只有 Sonnet 4.5 时，
+    /// 可以选择将请求解析到 4.5。关闭后仍保留同版本的点号/短横线兼容。
+    #[serde(default = "default_true")]
+    pub allow_version_fallback: bool,
+    /// 允许在请求模型所属族完全没有可用模型时跨 Claude 族兜底。
+    ///
+    /// 默认关闭，避免 Sonnet/Opus/Haiku 之间静默改变能力语义。
+    #[serde(default)]
+    pub allow_cross_family_fallback: bool,
     #[serde(default)]
     pub rules: Vec<ModelMappingRule>,
 }
@@ -3447,6 +3459,8 @@ impl Default for ModelMappingConfig {
         Self {
             enabled: true,
             auto_generate_rules: true,
+            allow_version_fallback: true,
+            allow_cross_family_fallback: false,
             rules: Vec::new(),
         }
     }

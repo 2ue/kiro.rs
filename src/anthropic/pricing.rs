@@ -6,8 +6,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use super::cache::CacheUsage;
-use super::converter::map_model;
-
 pub const DEFAULT_PRICING_SOURCE_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
@@ -344,10 +342,17 @@ pub fn canonical_pricing_model(model: &str) -> String {
     let model = model.trim().to_ascii_lowercase();
     let model = model.strip_suffix("[1m]").unwrap_or(&model);
     let model = model.strip_suffix("-thinking").unwrap_or(model);
-
-    map_model(model)
-        .unwrap_or_else(|| model.to_string())
-        .replace('.', "-")
+    let mut parts = model.split('-').collect::<Vec<_>>();
+    // Dated Claude ids are request aliases for their versioned pricing entry.
+    // Remove any trailing YYYYMMDD segment generically; no model/date allowlist
+    // should be needed as upstream catalogs add or retire dated ids.
+    if parts
+        .last()
+        .is_some_and(|value| value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        parts.pop();
+    }
+    parts.join("-").replace('.', "-")
 }
 
 fn parse_litellm_prices(
@@ -656,7 +661,7 @@ mod tests {
 
     #[test]
     fn canonical_pricing_model_maps_aliases_and_thinking_suffixes() {
-        assert_eq!(canonical_pricing_model("opus"), "claude-opus-4-7");
+        assert_eq!(canonical_pricing_model("opus"), "opus");
         assert_eq!(
             canonical_pricing_model("claude-opus-4-5-20251101-thinking"),
             "claude-opus-4-5"

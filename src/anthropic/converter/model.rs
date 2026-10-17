@@ -9,130 +9,31 @@ use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig, KiroThinkingConfig,
 };
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
+/// Normalize a request-side Claude model without selecting a Kiro model version.
+///
+/// Version selection belongs to `ModelCapabilitiesCatalog`, which has the current
+/// account-derived model directory and the configured mapping switches. This helper
+/// is retained for legacy conversion call sites that do not have a catalog;
+/// it must therefore never invent a concrete Sonnet/Opus/Haiku target.
 pub fn map_model(model: &str) -> Option<String> {
     let (model_base, _) = strip_model_compat_suffixes(model);
-    let model_base = model_base.as_str();
-
-    if matches!(model_base, "opus" | "opusplan" | "best" | "default") {
-        Some("claude-opus-4.7".to_string())
-    } else if model_base == "sonnet" {
-        Some("claude-sonnet-4.6".to_string())
-    } else if model_base == "haiku" {
-        Some("claude-haiku-4.5".to_string())
-    } else if let Some(fable_model) = public_fable_model(model_base) {
-        Some(fable_model.to_string())
-    } else if is_native_claude_family_model(model_base, "sonnet") {
-        if is_public_claude_version(model_base, "sonnet", 5, Some(5)) {
-            Some("claude-sonnet-5.5".to_string())
-        } else if is_public_claude_version(model_base, "sonnet", 5, None) {
-            Some("claude-sonnet-5".to_string())
-        } else if is_public_claude_version(model_base, "sonnet", 4, Some(6)) {
-            Some("claude-sonnet-4.6".to_string())
-        } else if is_public_claude_version(model_base, "sonnet", 4, Some(5)) {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            Some(model_base.to_string())
-        }
-    } else if model_base.contains("sonnet") {
-        if model_base.contains("4-6") || model_base.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_base.contains("4-5") || model_base.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else if model_base.contains("4")
-            || model_base.contains("3-5")
-            || model_base.contains("3.5")
-        {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
-        }
-    } else if is_native_claude_family_model(model_base, "opus") {
-        if is_public_claude_version(model_base, "opus", 5, Some(5)) {
-            Some("claude-opus-5.5".to_string())
-        } else if is_public_claude_version(model_base, "opus", 5, None) {
-            Some("claude-opus-5".to_string())
-        } else if is_public_claude_version(model_base, "opus", 4, Some(8)) {
-            Some("claude-opus-4.8".to_string())
-        } else if is_public_claude_version(model_base, "opus", 4, Some(7)) {
-            Some("claude-opus-4.7".to_string())
-        } else if is_public_claude_version(model_base, "opus", 4, Some(6)) {
-            Some("claude-opus-4.6".to_string())
-        } else if is_public_claude_version(model_base, "opus", 4, Some(5)) {
-            Some("claude-opus-4.5".to_string())
-        } else {
-            Some(model_base.to_string())
-        }
-    } else if model_base.contains("opus") {
-        if model_base.contains("4-5") || model_base.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_base.contains("4-6") || model_base.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_base.contains("4-7") || model_base.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_base.contains("4") {
-            Some("claude-opus-4.7".to_string())
-        } else {
-            None
-        }
-    } else if is_native_claude_family_model(model_base, "haiku") {
-        if is_public_claude_version(model_base, "haiku", 5, Some(5)) {
-            Some("claude-haiku-5.5".to_string())
-        } else if is_public_claude_version(model_base, "haiku", 4, Some(5)) {
-            Some("claude-haiku-4.5".to_string())
-        } else {
-            Some(model_base.to_string())
-        }
-    } else if model_base.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
-    }
-}
-
-fn parse_public_claude_version(model: &str, family: &str) -> Option<(u32, Option<u32>)> {
-    let rest = model.strip_prefix(&format!("claude-{family}-"))?;
-    let major_digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    if major_digits.is_empty() {
+    let model_base = model_base.trim().to_ascii_lowercase();
+    if model_base.is_empty() {
         return None;
     }
-    let major = major_digits.parse().ok()?;
-    let rest = &rest[major_digits.len()..];
-    if rest.is_empty() {
-        return Some((major, None));
+    if matches!(
+        model_base.as_str(),
+        "auto" | "best" | "default" | "opus" | "opusplan" | "sonnet" | "haiku" | "fable"
+    ) {
+        return Some(model_base);
     }
-    let rest = rest.strip_prefix(['-', '.'])?;
-    let minor_digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    if minor_digits.is_empty() || minor_digits.len() > 3 {
+    let Some(rest) = model_base.strip_prefix("claude-") else {
         return None;
-    }
-    let after_minor = &rest[minor_digits.len()..];
-    if !after_minor.is_empty() && !after_minor.starts_with('-') {
-        return None;
-    }
-    Some((major, Some(minor_digits.parse().ok()?)))
-}
-
-fn is_public_claude_version(model: &str, family: &str, major: u32, minor: Option<u32>) -> bool {
-    parse_public_claude_version(model, family) == Some((major, minor))
-}
-
-fn public_fable_model(model: &str) -> Option<&'static str> {
-    if is_public_claude_version(model, "fable", 5, None) {
-        Some("claude-fable-5")
-    } else if model == "fable" || is_public_claude_version(model, "fable", 5, Some(1)) {
-        Some("claude-fable-5.1")
-    } else {
-        None
-    }
-}
-
-fn is_native_claude_family_model(model: &str, family: &str) -> bool {
-    model
-        .strip_prefix("claude-")
-        .and_then(|rest| rest.strip_prefix(family))
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']))
+    };
+    let has_known_family = rest
+        .split(['-', '.'])
+        .any(|part| matches!(part, "opus" | "sonnet" | "haiku" | "fable"));
+    has_known_family.then_some(model_base)
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
@@ -142,27 +43,7 @@ fn is_native_claude_family_model(model: &str, family: &str) -> bool {
 /// 账号池中可能是 200K 或 1M，不能仅凭普通别名把 free Sonnet 误抬成 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     let model_lower = model.to_lowercase();
-    let explicit_one_m = model_lower.contains("[1m]");
-    let (base, _) = strip_model_compat_suffixes(&model_lower);
-    let mapped = map_model(&base).unwrap_or(base);
-
-    if mapped == "auto" {
-        return 1_000_000;
-    }
-
-    if explicit_one_m
-        || mapped == "claude-fable-5.1"
-        || mapped == "claude-fable-5"
-        || mapped == "claude-opus-5.5"
-        || mapped == "claude-opus-5"
-        || mapped == "claude-sonnet-5.5"
-        || mapped == "claude-sonnet-5"
-        || mapped == "claude-haiku-5.5"
-        || mapped == "claude-opus-4.8"
-        || mapped == "claude-opus-4.7"
-        || mapped == "claude-opus-4.6"
-        || mapped == "claude-sonnet-4.6"
-    {
+    if model_lower.contains("[1m]") {
         return 1_000_000;
     }
 
@@ -173,13 +54,27 @@ const EFFORTS_WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const EFFORTS_WITHOUT_XHIGH: &[&str] = &["low", "medium", "high", "max"];
 
 fn legacy_native_reasoning_capability(model_id: &str) -> Option<KiroReasoningFieldCapability> {
-    let (efforts, default_effort) = match model_id {
-        "claude-opus-4.8" | "claude-opus-4-8" | "claude-opus-4.7" | "claude-opus-4-7" => {
-            (EFFORTS_WITH_XHIGH, "xhigh")
-        }
-        "claude-opus-4.6" | "claude-opus-4-6" | "claude-sonnet-4.6" | "claude-sonnet-4-6" => {
-            (EFFORTS_WITHOUT_XHIGH, "high")
-        }
+    let (base, _) = strip_model_compat_suffixes(model_id);
+    let mut parts = base.split('-');
+    if parts.next() != Some("claude") {
+        return None;
+    }
+    let family = parts.next()?;
+    if !matches!(family, "opus" | "sonnet") {
+        return None;
+    }
+    let version = parts.next()?;
+    let (major, minor) = if let Some((major, minor)) = version.split_once('.') {
+        (major.parse::<u32>().ok()?, minor.parse::<u32>().ok())
+    } else {
+        (
+            version.parse::<u32>().ok()?,
+            parts.next().and_then(|value| value.parse::<u32>().ok()),
+        )
+    };
+    let (efforts, default_effort) = match (family, major, minor) {
+        ("opus", 4, Some(minor)) if minor >= 7 => (EFFORTS_WITH_XHIGH, "xhigh"),
+        ("opus", 4, Some(6)) | ("sonnet", 4, Some(6)) => (EFFORTS_WITHOUT_XHIGH, "high"),
         _ => return None,
     };
     Some(KiroReasoningFieldCapability {

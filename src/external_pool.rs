@@ -31,7 +31,6 @@ use crate::{
         cache::{
             CacheAmplification, CacheSimulation, CacheUsage, RawUsage, ReportedCacheUsagePolicy,
         },
-        converter::map_model,
         envelope,
         inference_attempt_budget::{
             InferenceAttemptBudget, InferenceAttemptKind, InferenceAttemptRejection,
@@ -11615,12 +11614,30 @@ fn external_pool_matches_body_mode_filter(
 fn normalize_external_pool_support_candidates<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
+    normalize_external_pool_models(candidates, false)
+}
+
+fn normalize_external_pool_allowlist_models<'a>(
+    models: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    normalize_external_pool_models(models, true)
+}
+
+fn normalize_external_pool_models<'a>(
+    models: impl IntoIterator<Item = &'a str>,
+    add_family_alias: bool,
+) -> Vec<String> {
     let mut normalized = Vec::new();
-    for candidate in candidates {
-        let Some(candidate) = normalize_model_id(candidate) else {
+    for model in models {
+        let Some(model) = normalize_model_id(model) else {
             continue;
         };
-        for variant in external_pool_model_support_variants(&candidate) {
+        let variants = if add_family_alias {
+            external_pool_model_allowlist_variants(&model)
+        } else {
+            external_pool_model_request_variants(&model)
+        };
+        for variant in variants {
             if !normalized.iter().any(|existing| existing == &variant) {
                 normalized.push(variant);
             }
@@ -11633,41 +11650,26 @@ fn normalize_external_pool_support_candidates<'a>(
 /// resolved route may carry a Kiro model id. Keep this expansion local to
 /// external-pool matching so the local credential model-support contract stays
 /// exact-only.
-fn external_pool_model_support_variants(model: &str) -> Vec<String> {
-    const CLAUDE_CODE_ALIASES: &[&str] = &[
-        "opus",
-        "opusplan",
-        "best",
-        "default",
-        "sonnet",
-        "haiku",
-        "sonnet-4.5",
-        "sonnet-4-5",
-        "sonnet-4.6",
-        "sonnet-4-6",
-        "haiku-4.5",
-        "haiku-4-5",
-        "opus-4.5",
-        "opus-4-5",
-        "opus-4.6",
-        "opus-4-6",
-        "opus-4.7",
-        "opus-4-7",
-    ];
+fn external_pool_model_request_variants(model: &str) -> Vec<String> {
+    external_pool_model_variants(model, false)
+}
 
+fn external_pool_model_allowlist_variants(model: &str) -> Vec<String> {
+    external_pool_model_variants(model, true)
+}
+
+fn external_pool_model_variants(model: &str, add_family_alias: bool) -> Vec<String> {
     let (base, thinking, one_m) = split_external_pool_model_suffix(model);
     let mut variants = vec![model.to_string()];
-    let known_model = CLAUDE_CODE_ALIASES.contains(&base.as_str())
-        || is_external_pool_official_claude_model(&base);
-    let mapped_base = known_model.then(|| map_model(&base)).flatten();
 
     let mut add_base_variants = |value: &str| {
         let value = value.trim();
         if value.is_empty() {
             return;
         }
-        let seeds = if is_external_pool_official_claude_model(value) {
-            expand_claude_supported_model_variants(vec![value.to_string()])
+        let official_model = official_claude_model_reference(value);
+        let seeds = if let Some(official_model) = official_model.as_deref() {
+            expand_claude_supported_model_variants(vec![official_model.to_string()])
         } else {
             Vec::new()
         };
@@ -11682,23 +11684,38 @@ fn external_pool_model_support_variants(model: &str) -> Vec<String> {
                     &mut variants,
                     apply_external_pool_model_suffix(&seed, thinking, one_m),
                 );
+                if let Some(short) = seed.strip_prefix("claude-") {
+                    push_external_pool_model_variant(
+                        &mut variants,
+                        apply_external_pool_model_suffix(short, thinking, one_m),
+                    );
+                }
             }
+        }
+
+        // These are compatibility identifiers, not concrete version choices.
+        // They let an allowlist expressed as a concrete Claude family accept
+        // a Claude Code alias without changing the outbound model id.
+        if add_family_alias
+            && let Some(family) = official_claude_family(value)
+            && is_external_pool_official_claude_model(value)
+        {
+            push_external_pool_model_variant(
+                &mut variants,
+                apply_external_pool_model_suffix(family, thinking, one_m),
+            );
+            let without_claude = value.strip_prefix("claude-").unwrap_or(value);
+            push_external_pool_model_variant(
+                &mut variants,
+                apply_external_pool_model_suffix(without_claude, thinking, one_m),
+            );
         }
     };
 
-    if let Some(mapped_base) = mapped_base.as_deref() {
-        add_base_variants(mapped_base);
-        for alias in CLAUDE_CODE_ALIASES {
-            if map_model(alias).as_deref() == Some(mapped_base) {
-                push_external_pool_model_variant(
-                    &mut variants,
-                    apply_external_pool_model_suffix(alias, thinking, one_m),
-                );
-            }
-        }
-    } else {
-        add_base_variants(&base);
-    }
+    // External pools use their own Claude Code mapping rules. This helper only
+    // expands protocol spellings (dot/dash, dated/base, thinking and [1m]);
+    // it must never select a local Kiro model version.
+    add_base_variants(&base);
 
     variants
 }
@@ -11738,6 +11755,48 @@ fn is_external_pool_official_claude_model(model: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn official_claude_family(model: &str) -> Option<&'static str> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if !matches!(
+        normalized.as_str(),
+        "opus" | "opusplan" | "sonnet" | "haiku"
+    ) && !is_external_pool_official_claude_model(&normalized)
+    {
+        return None;
+    }
+    match normalized.as_str() {
+        "opus" | "opusplan" => Some("opus"),
+        "sonnet" => Some("sonnet"),
+        "haiku" => Some("haiku"),
+        _ if normalized.starts_with("claude-opus-") => Some("opus"),
+        _ if normalized.starts_with("claude-sonnet-") => Some("sonnet"),
+        _ if normalized.starts_with("claude-haiku-") => Some("haiku"),
+        _ => None,
+    }
+}
+
+/// Return a canonical `claude-*` spelling for an official Claude Code model
+/// reference, including the short family forms used by pool allowlists.
+fn official_claude_model_reference(model: &str) -> Option<String> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "opus" | "opusplan" | "sonnet" | "haiku"
+    ) {
+        return Some(format!("claude-{normalized}"));
+    }
+    if is_external_pool_official_claude_model(&normalized) {
+        return Some(normalized);
+    }
+    let short = normalized
+        .strip_prefix("opus-")
+        .or_else(|| normalized.strip_prefix("sonnet-"))
+        .or_else(|| normalized.strip_prefix("haiku-"))?;
+    let family = normalized.split('-').next()?;
+    let candidate = format!("claude-{family}-{short}");
+    is_external_pool_official_claude_model(&candidate).then_some(candidate)
 }
 
 fn is_yyyymmdd(value: &str) -> bool {
@@ -11785,9 +11844,11 @@ fn external_pool_matches_supported_models_normalized(
     let Some(model_candidates) = model_candidates else {
         return false;
     };
+    let supported_models =
+        normalize_external_pool_allowlist_models(pool.supported_models.iter().map(String::as_str));
     model_candidates
         .iter()
-        .any(|candidate| pool.supported_models.iter().any(|model| model == candidate))
+        .any(|candidate| supported_models.iter().any(|model| model == candidate))
 }
 
 fn external_pool_route_policy_allows(
@@ -11830,9 +11891,11 @@ fn external_pool_eligibility_matches_supported_models(
     let Some(model_candidates) = model_candidates else {
         return false;
     };
+    let supported_models =
+        normalize_external_pool_allowlist_models(pool.supported_models.iter().map(String::as_str));
     model_candidates
         .iter()
-        .any(|candidate| pool.supported_models.contains(candidate))
+        .any(|candidate| supported_models.iter().any(|model| model == candidate))
 }
 
 fn deterministic_duration_jitter(base: Duration, percent: u8, seed: u64) -> Duration {

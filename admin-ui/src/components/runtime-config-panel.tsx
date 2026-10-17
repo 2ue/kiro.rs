@@ -412,6 +412,8 @@ export const defaultExternalPoolsConfig = () => ({
 const defaultModelMappingConfig = (): ModelMappingConfig => ({
   enabled: true,
   autoGenerateRules: true,
+  allowVersionFallback: true,
+  allowCrossFamilyFallback: false,
   rules: [],
 })
 
@@ -1468,6 +1470,20 @@ function ModelMappingRulesField({
           checked={value.autoGenerateRules}
           onCheckedChange={(autoGenerateRules) => onChange({ ...value, autoGenerateRules })}
           disabled={!value.enabled}
+        />
+        <ToggleField
+          title="允许同族跨版本解析"
+          description="同一模型族的旧版本不可用时，解析到当前模型列表中最近的可用版本。默认开启。"
+          checked={value.allowVersionFallback}
+          onCheckedChange={(allowVersionFallback) => onChange({ ...value, allowVersionFallback })}
+          disabled={!value.enabled || !value.autoGenerateRules}
+        />
+        <ToggleField
+          title="允许跨族兜底解析"
+          description="请求模型所属族完全没有可用模型时，才允许切换到其他模型族。默认关闭。"
+          checked={value.allowCrossFamilyFallback}
+          onCheckedChange={(allowCrossFamilyFallback) => onChange({ ...value, allowCrossFamilyFallback })}
+          disabled={!value.enabled || !value.autoGenerateRules}
         />
       </div>
       <div className="mt-4 rounded-md border">

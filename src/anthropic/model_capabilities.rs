@@ -678,7 +678,15 @@ impl ModelCapabilitiesCatalog {
         model_mapping: &ModelMappingConfig,
     ) -> ModelResolution {
         let inner = self.inner.read();
-        let models = inner.models.keys().cloned().collect::<Vec<_>>();
+        // The built-in seed is protocol/listing knowledge only. It must never become a
+        // scheduler target before a real account catalog has been synchronized; otherwise a
+        // request could silently acquire a credential for a model that no account advertised.
+        let models = inner
+            .models
+            .values()
+            .filter(|item| item.source.as_deref() != Some(SEED_SOURCE))
+            .map(|item| item.model.clone())
+            .collect::<Vec<_>>();
         let manual_models = inner
             .models
             .values()
@@ -775,7 +783,6 @@ impl ModelCapabilitiesCatalog {
         let mut merged: BTreeMap<String, ModelCapabilityItem> = BTreeMap::new();
         let mut reasoning_fields = BTreeMap::new();
         let mut reasoning_states = BTreeMap::new();
-        let mut upstream_model_ids = HashSet::new();
         for model in models {
             let reasoning_state = if cohort_complete {
                 match model.additional_model_request_fields_schema.as_ref() {
@@ -788,7 +795,6 @@ impl ModelCapabilitiesCatalog {
                 KiroReasoningCapabilityState::Unknown
             };
             if let Some(item) = model_capability_from_kiro(model) {
-                upstream_model_ids.insert(item.model.clone());
                 if let KiroReasoningCapabilityState::Supported(capability) = &reasoning_state {
                     reasoning_fields.insert(item.model.clone(), capability.clone());
                 }
@@ -825,29 +831,6 @@ impl ModelCapabilitiesCatalog {
                     );
                     reasoning_fields.remove(model);
                 }
-            }
-        }
-        if !using_seed_fallback && !contains_claude_model_id(merged.keys().map(String::as_str)) {
-            let previous_claude_models = inner
-                .models
-                .values()
-                .filter(|item| is_claude_model_id(&item.model))
-                .cloned()
-                .collect::<Vec<_>>();
-            let fallback_claude_models = if previous_claude_models.is_empty() {
-                seed_model_capabilities()
-                    .into_iter()
-                    .filter(|item| is_claude_model_id(&item.model))
-                    .collect::<Vec<_>>()
-            } else {
-                previous_claude_models
-            };
-            for item in fallback_claude_models {
-                if !upstream_model_ids.contains(&item.model) {
-                    reasoning_states
-                        .insert(item.model.clone(), KiroReasoningCapabilityState::Unknown);
-                }
-                merged.entry(item.model.clone()).or_insert(item);
             }
         }
         let manual_models = inner
@@ -1185,13 +1168,48 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
     }
     let model_mapping = model_mapping.clone().normalized();
 
-    let mut available: std::collections::HashSet<String> = upstream_models
+    let available: std::collections::HashSet<String> = upstream_models
         .iter()
         .map(|model| normalize_model_id(model))
         .filter(|model| !model.is_empty())
         .collect();
-    if available.is_empty() {
-        available.extend(seed_model_capabilities().into_iter().map(|item| item.model));
+
+    if !model_mapping.enabled {
+        if available.contains(&requested) {
+            return ModelResolution::exact(requested);
+        }
+        return if mode == ModelResolutionMode::ExactOnly {
+            ModelResolution::unsupported(requested)
+        } else {
+            ModelResolution::pass_through(requested)
+        };
+    }
+
+    let (base, requested_thinking) = strip_model_compat_suffixes(&requested);
+
+    // Operator-authored mappings always win over generated compatibility rules,
+    // regardless of their declared kind. This keeps an explicit target stable when
+    // the upstream catalog later gains another equivalent spelling or version.
+    if let Some((target, kind)) = pick_configured_mapping_rule(
+        &model_mapping,
+        &requested,
+        &base,
+        &[
+            ModelMappingRuleKind::VersionEquivalent,
+            ModelMappingRuleKind::Alias,
+            ModelMappingRuleKind::Fallback,
+        ],
+    ) {
+        return ModelResolution::resolved(
+            requested,
+            target,
+            match kind {
+                ModelMappingRuleKind::Fallback => ModelResolutionSource::FamilyNormalized,
+                ModelMappingRuleKind::VersionEquivalent | ModelMappingRuleKind::Alias => {
+                    ModelResolutionSource::Alias
+                }
+            },
+        );
     }
 
     if available.contains(&requested) {
@@ -1202,75 +1220,50 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
         return ModelResolution::unsupported(requested);
     }
 
-    if !model_mapping.enabled {
-        return ModelResolution::pass_through(requested);
-    }
-
     if !model_mapping.auto_generate_rules && model_mapping.rules.is_empty() {
         return ModelResolution::pass_through(requested);
     }
 
-    let one_m_base = strip_model_1m_suffix(&requested);
-    if one_m_base != requested && available.contains(&one_m_base) {
-        return ModelResolution::resolved(requested, one_m_base, ModelResolutionSource::Alias);
-    }
+    if model_mapping.auto_generate_rules {
+        let one_m_base = strip_model_1m_suffix(&requested);
+        if one_m_base != requested && available.contains(&one_m_base) {
+            return ModelResolution::resolved(requested, one_m_base, ModelResolutionSource::Alias);
+        }
 
-    let (base, requested_thinking) = strip_model_compat_suffixes(&requested);
-    if requested_thinking && available.contains(&base) {
-        return ModelResolution::resolved(requested, base, ModelResolutionSource::Alias);
-    }
-    if base != requested && available.contains(&base) {
-        return ModelResolution::resolved(requested, base, ModelResolutionSource::Alias);
-    }
+        if requested_thinking && available.contains(&base) {
+            return ModelResolution::resolved(requested, base, ModelResolutionSource::Alias);
+        }
+        if base != requested && available.contains(&base) {
+            return ModelResolution::resolved(requested, base, ModelResolutionSource::Alias);
+        }
 
-    if let Some(target) = pick_configured_mapping_rule(
-        &model_mapping,
-        &requested,
-        &base,
-        &[ModelMappingRuleKind::VersionEquivalent],
-    ) {
-        return ModelResolution::resolved(requested, target, ModelResolutionSource::Alias);
-    }
+        // A version-equivalent spelling is safe even when cross-version fallback
+        // is disabled: it preserves the requested semantic version.
+        if let Some(candidate) =
+            pick_version_equivalent_available(&available, &base, requested_thinking)
+        {
+            return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
+        }
 
-    if let Some(candidate) = model_mapping
-        .auto_generate_rules
-        .then(|| pick_version_equivalent_available(&available, &base, requested_thinking))
-        .flatten()
-    {
-        return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
-    }
-
-    if let Some(target) = pick_configured_mapping_rule(
-        &model_mapping,
-        &requested,
-        &base,
-        &[ModelMappingRuleKind::Alias],
-    ) {
-        return ModelResolution::resolved(requested, target, ModelResolutionSource::Alias);
-    }
-
-    if let Some(alias) = explicit_model_alias_candidates(&base)
-        .and_then(|candidates| pick_available(&available, &candidates))
-        .filter(|_| model_mapping.auto_generate_rules)
-    {
-        return ModelResolution::resolved(requested, alias, ModelResolutionSource::Alias);
-    }
-
-    // Bare aliases prefer their configured/canonical model spelling. Only when that
-    // version is absent should the resolver select the highest available model in the
-    // requested family.
-    if let Some(candidate) = explicit_model_alias_families(&base)
-        .and_then(|families| pick_family_available(&available, &families))
-        .filter(|_| model_mapping.auto_generate_rules)
-    {
-        return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
+        // Bare aliases prefer their configured/canonical model spelling. Only when that
+        // version is absent should the resolver select the highest available model in the
+        // requested family.
+        if let Some(candidate) = explicit_model_alias_families(&base).and_then(|families| {
+            pick_family_available(
+                &available,
+                &families,
+                model_mapping.allow_cross_family_fallback,
+            )
+        }) {
+            return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
+        }
     }
 
     if !mode.allows_family_fallback() {
         return ModelResolution::pass_through(requested);
     }
 
-    if let Some(target) = pick_configured_mapping_rule(
+    if let Some((target, _)) = pick_configured_mapping_rule(
         &model_mapping,
         &requested,
         &base,
@@ -1288,15 +1281,21 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
     }
 
     if let Some(requested_version) = parse_claude_minor_version(&base) {
-        // An explicit Claude minor version is a contract selection, not a family alias, so
-        // an unrecognized version (typo, invented id) passes through and the upstream reports
-        // the real error. A version this project knows as a real Anthropic model that no
-        // catalog account serves is mapped to the closest same-family model instead, keeping
-        // the Claude Code session alive; the note records the substitution.
-        if !is_known_anthropic_model(&base) {
-            return ModelResolution::pass_through(requested);
-        }
-        return match pick_closest_family_version(&available, requested_version) {
+        // A syntactically valid Claude version is resolved only against the current account
+        // catalog. The resolver deliberately has no built-in "known version" allowlist:
+        // Anthropic can add or retire versions without requiring a code change, and the target
+        // must always come from `available`, never from a hard-coded model name.
+        return match model_mapping
+            .allow_version_fallback
+            .then(|| {
+                pick_closest_family_version(
+                    &available,
+                    requested_version,
+                    model_mapping.allow_cross_family_fallback,
+                )
+            })
+            .flatten()
+        {
             Some(candidate) => {
                 let mut resolution = ModelResolution::resolved(
                     requested,
@@ -1312,19 +1311,13 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
         };
     }
 
-    if let Some(candidate) = family_model_candidates(&base)
-        .and_then(|candidates| pick_available(&available, &candidates))
-    {
-        return ModelResolution::resolved(
-            requested,
-            candidate,
-            ModelResolutionSource::FamilyNormalized,
-        );
-    }
-
-    if let Some(candidate) =
-        model_family(&base).and_then(|family| pick_family_available(&available, &[family]))
-    {
+    if let Some(candidate) = model_family(&base).and_then(|family| {
+        pick_family_available(
+            &available,
+            &[family],
+            model_mapping.allow_cross_family_fallback,
+        )
+    }) {
         return ModelResolution::resolved(
             requested,
             candidate,
@@ -1333,110 +1326,6 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
     }
 
     ModelResolution::pass_through(requested)
-}
-
-fn explicit_model_alias_candidates(model: &str) -> Option<Vec<&'static str>> {
-    match model {
-        "auto" => Some(vec![
-            "auto",
-            "best",
-            "default",
-            "claude-opus-4.7",
-            "claude-opus-4-7",
-            "claude-opus-4.6",
-            "claude-opus-4-6",
-            "claude-sonnet-4.6",
-            "claude-sonnet-4-6",
-        ]),
-        "opus" | "opusplan" => Some(vec![
-            "opus",
-            "claude-opus-4.7",
-            "claude-opus-4-7",
-            "claude-opus-4.6",
-            "claude-opus-4-6",
-            "claude-opus-4.5",
-            "claude-opus-4-5-20251101",
-        ]),
-        "best" => Some(vec![
-            "best",
-            "auto",
-            "opus",
-            "claude-opus-4.7",
-            "claude-opus-4-7",
-            "claude-opus-4.6",
-            "claude-opus-4-6",
-            "claude-opus-4.5",
-            "claude-opus-4-5-20251101",
-            "claude-sonnet-4.6",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4.5",
-        ]),
-        "default" => Some(vec![
-            "default",
-            "auto",
-            "opus",
-            "claude-opus-4.7",
-            "claude-opus-4-7",
-            "claude-opus-4.6",
-            "claude-opus-4-6",
-            "claude-opus-4.5",
-            "claude-opus-4-5-20251101",
-            "claude-sonnet-4.6",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4.5",
-        ]),
-        "sonnet" => Some(vec![
-            "sonnet",
-            "claude-sonnet-4.6",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4.5",
-            "claude-sonnet-4-5-20250929",
-            "claude-sonnet-4",
-        ]),
-        "haiku" => Some(vec![
-            "haiku",
-            "claude-haiku-4.5",
-            "claude-haiku-4-5-20251001",
-            "claude-haiku-4-5-20251001-thinking",
-        ]),
-        "fable" => Some(vec![
-            "fable",
-            "claude-fable-5.1",
-            "claude-fable-5-1",
-            "claude-fable-5",
-        ]),
-        "claude-sonnet-4-20250514" => Some(vec![
-            "claude-sonnet-4",
-            "claude-sonnet-4.5",
-            "claude-sonnet-4-5-20250929",
-        ]),
-        "claude-opus-4-20250514" => Some(vec![
-            "claude-opus-4",
-            "claude-opus-4.5",
-            "claude-opus-4-5-20251101",
-        ]),
-        "claude-opus-4-1-20250805" => Some(vec![
-            "claude-opus-4.5",
-            "claude-opus-4-5-20251101",
-            "claude-opus-4.6",
-        ]),
-        "claude-3-7-sonnet-20250219" => Some(vec![
-            "claude-sonnet-4.5",
-            "claude-sonnet-4-5-20250929",
-            "claude-sonnet-4.6",
-        ]),
-        "claude-3-5-sonnet-20240620" | "claude-3-5-sonnet-20241022" => Some(vec![
-            "claude-sonnet-4.5",
-            "claude-sonnet-4-5-20250929",
-            "claude-sonnet-4",
-        ]),
-        "claude-3-5-haiku-20241022" => Some(vec![
-            "claude-haiku-4.5",
-            "claude-haiku-4-5-20251001",
-            "haiku",
-        ]),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1453,7 +1342,7 @@ fn pick_configured_mapping_rule(
     requested: &str,
     base: &str,
     kinds: &[ModelMappingRuleKind],
-) -> Option<String> {
+) -> Option<(String, ModelMappingRuleKind)> {
     model_mapping
         .rules
         .iter()
@@ -1462,7 +1351,7 @@ fn pick_configured_mapping_rule(
                 && kinds.contains(&rule.kind)
                 && (rule.source == requested || rule.source == base)
         })
-        .map(|rule| rule.target.clone())
+        .map(|rule| (rule.target.clone(), rule.kind))
 }
 
 fn pick_version_equivalent_available(
@@ -1471,6 +1360,12 @@ fn pick_version_equivalent_available(
     requested_thinking: bool,
 ) -> Option<String> {
     let requested_version = parse_claude_minor_version(requested_base)?;
+    // A dated major id identifies a retired concrete model, not a spelling
+    // variant of the bare major id. It must reach the generic closest-version
+    // ranking so a current minor such as 4.5 can win over bare 4.
+    if requested_version.has_date_suffix && requested_version.minor.is_none() {
+        return None;
+    }
     let mut candidates = available
         .iter()
         .filter_map(|candidate| {
@@ -1514,7 +1409,7 @@ fn parse_claude_minor_version(model: &str) -> Option<ClaudeMinorVersion> {
             return parse_claude_minor_version_rest(family, rest);
         }
     }
-    None
+    parse_legacy_claude_minor_version(&base)
 }
 
 fn parse_claude_minor_version_rest(family: &'static str, rest: &str) -> Option<ClaudeMinorVersion> {
@@ -1540,21 +1435,86 @@ fn parse_claude_minor_version_rest(family: &'static str, rest: &str) -> Option<C
     }
 
     let rest = rest.strip_prefix('-')?;
-    let minor_digits = rest
+    let digits = rest
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
-    if minor_digits.is_empty() || minor_digits.len() > 3 {
+    if digits.is_empty() {
         return None;
     }
-    let minor = minor_digits.parse::<u32>().ok()?;
-    let rest = &rest[minor_digits.len()..];
+    if digits.len() >= 6 {
+        return (digits.len() == 8 && rest.len() == 8).then_some(ClaudeMinorVersion {
+            family,
+            major,
+            minor: None,
+            uses_dot_minor: false,
+            has_date_suffix: true,
+        });
+    }
+    if digits.len() > 3 {
+        return None;
+    }
+    let minor = digits.parse::<u32>().ok()?;
+    let rest = &rest[digits.len()..];
     Some(ClaudeMinorVersion {
         family,
         major,
         minor: Some(minor),
         uses_dot_minor: false,
         has_date_suffix: has_date_suffix(rest),
+    })
+}
+
+fn parse_legacy_claude_minor_version(model: &str) -> Option<ClaudeMinorVersion> {
+    let rest = model.strip_prefix("claude-")?;
+    let parts = rest.split('-').collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return None;
+    }
+    if let Some((major, minor)) = parts.first().and_then(|value| value.split_once('.')) {
+        let major = major.parse::<u32>().ok()?;
+        let minor = minor.parse::<u32>().ok()?;
+        let family = match *parts.get(1)? {
+            "opus" => "opus",
+            "sonnet" => "sonnet",
+            "haiku" => "haiku",
+            "fable" => "fable",
+            _ => return None,
+        };
+        let date = parts.get(2).copied();
+        let has_date_suffix = date.is_some_and(is_yyyymmdd);
+        if date.is_some() && !has_date_suffix {
+            return None;
+        }
+        return Some(ClaudeMinorVersion {
+            family,
+            major,
+            minor: Some(minor),
+            uses_dot_minor: true,
+            has_date_suffix,
+        });
+    }
+
+    let major = parts.first()?.parse::<u32>().ok()?;
+    let minor = parts.get(1)?.parse::<u32>().ok()?;
+    let family = match *parts.get(2)? {
+        "opus" => "opus",
+        "sonnet" => "sonnet",
+        "haiku" => "haiku",
+        "fable" => "fable",
+        _ => return None,
+    };
+    let date = parts.get(3).copied();
+    let has_date_suffix = date.is_some_and(is_yyyymmdd);
+    if date.is_some() && !has_date_suffix {
+        return None;
+    }
+    Some(ClaudeMinorVersion {
+        family,
+        major,
+        minor: Some(minor),
+        uses_dot_minor: false,
+        has_date_suffix,
     })
 }
 
@@ -1578,71 +1538,8 @@ fn has_date_suffix(rest: &str) -> bool {
     digits >= 6
 }
 
-/// Claude family/major/minor versions of real Anthropic models this project ships knowledge
-/// of (the static model list and the built-in Kiro seed catalog).
-fn known_anthropic_versions() -> &'static HashSet<(&'static str, u32, Option<u32>)> {
-    static KNOWN: std::sync::OnceLock<HashSet<(&'static str, u32, Option<u32>)>> =
-        std::sync::OnceLock::new();
-    KNOWN.get_or_init(|| {
-        static_anthropic_models()
-            .into_iter()
-            .map(|model| model.id)
-            .chain(seed_model_capabilities().into_iter().map(|item| item.model))
-            .chain(
-                LEGACY_ALIAS_TABLE_MODELS
-                    .iter()
-                    .map(|model| model.to_string()),
-            )
-            .chain(
-                PUBLIC_KNOWN_MODEL_VERSIONS
-                    .iter()
-                    .map(|model| model.to_string()),
-            )
-            .filter_map(|model| parse_claude_minor_version(&model))
-            .map(|version| (version.family, version.major, version.minor))
-            .collect()
-    })
-}
-
-/// Dated Anthropic ids that only appear as keys of the explicit alias table.
-const LEGACY_ALIAS_TABLE_MODELS: [&str; 1] = ["claude-opus-4-1-20250805"];
-
-/// Public model versions known to the protocol layer but intentionally not advertised by the
-/// fallback `/v1/models` list. The list endpoint must remain driven by the real Kiro catalog;
-/// these entries only let request parsing understand version-equivalent spellings when the
-/// upstream catalog contains the model.
-const PUBLIC_KNOWN_MODEL_VERSIONS: [&str; 8] = [
-    "claude-fable-5",
-    "claude-fable-5.1",
-    "claude-haiku-5.5",
-    "claude-sonnet-5",
-    "claude-sonnet-5.5",
-    "claude-opus-5",
-    "claude-opus-5.5",
-    "claude-opus-4.8",
-];
-
-fn is_public_known_model_id(model: &str) -> bool {
-    PUBLIC_KNOWN_MODEL_VERSIONS.iter().any(|known| {
-        let known = normalize_model_id(known);
-        model == known || model == claude_listing_id(&known)
-    })
-}
-
-/// "Known but unavailable" versus "completely unknown": a model is known when it is a Claude
-/// Code alias (`sonnet`, `opus`, `default`, ...), a legacy id from the explicit alias table,
-/// or its explicit Claude version matches a model in the static list, seed catalog or alias
-/// table in any spelling (`claude-opus-4-8`, `claude-opus-4.8`, dated, `-thinking`, `[1m]`).
-/// Anything else, including invented versions of a real family such as `claude-sonnet-4-7`,
-/// is unknown and keeps passing through so the upstream reports it.
-pub(crate) fn is_known_anthropic_model(model: &str) -> bool {
-    let (base, _) = strip_model_compat_suffixes(model);
-    explicit_model_alias_families(&base).is_some()
-        || explicit_model_alias_candidates(&base).is_some()
-        || is_public_known_model_id(&base)
-        || parse_claude_minor_version(&base).is_some_and(|version| {
-            known_anthropic_versions().contains(&(version.family, version.major, version.minor))
-        })
+fn is_yyyymmdd(value: &str) -> bool {
+    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Closest same-family model in `available` by version distance; ties prefer the newer
@@ -1651,23 +1548,63 @@ pub(crate) fn is_known_anthropic_model(model: &str) -> bool {
 fn pick_closest_family_version(
     available: &HashSet<String>,
     requested: ClaudeMinorVersion,
+    allow_cross_family_fallback: bool,
 ) -> Option<String> {
-    let requested_rank =
-        i64::from(requested.major) * 1_000 + i64::from(requested.minor.unwrap_or(0));
-    available
+    let mut candidates = available
         .iter()
         .filter_map(|candidate| {
             let version = parse_claude_minor_version(candidate)?;
             (version.family == requested.family).then_some((candidate, version))
         })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() && allow_cross_family_fallback {
+        candidates = available
+            .iter()
+            .filter_map(|candidate| {
+                let version = parse_claude_minor_version(candidate)?;
+                Some((candidate, version))
+            })
+            .collect();
+    }
+    candidates
+        .into_iter()
         .max_by(|(a, a_version), (b, b_version)| {
             let rank = |version: &ClaudeMinorVersion| {
                 i64::from(version.major) * 1_000 + i64::from(version.minor.unwrap_or(0))
             };
+            let dated_major_minor = |version: &ClaudeMinorVersion| {
+                version.family == requested.family
+                    && version.major == requested.major
+                    && requested.minor.is_none()
+                    && requested.has_date_suffix
+                    && version.minor.is_some()
+            };
+            let same_requested_minor = |version: &ClaudeMinorVersion| {
+                requested
+                    .minor
+                    .zip(version.minor)
+                    .is_some_and(|(requested, candidate)| requested == candidate)
+            };
+            let major_distance = |version: &ClaudeMinorVersion| {
+                i64::from(version.major).abs_diff(i64::from(requested.major))
+            };
+            let minor_distance = |version: &ClaudeMinorVersion| {
+                requested
+                    .minor
+                    .unwrap_or_default()
+                    .abs_diff(version.minor.unwrap_or_default())
+            };
             let key = |model: &str, version: &ClaudeMinorVersion| {
                 (
+                    version.family == requested.family,
+                    dated_major_minor(version),
+                    same_requested_minor(version),
+                    // Prefer the closest major before comparing minor distance. This keeps a
+                    // legacy 3.5 request on a current 4.5 model instead of a bare 4 model, while
+                    // still selecting 4.6 for an unavailable 4.8 request.
+                    std::cmp::Reverse(major_distance(version)),
+                    std::cmp::Reverse(minor_distance(version)),
                     !model.ends_with("-thinking"),
-                    -(rank(version) - requested_rank).abs(),
                     rank(version),
                     version_equivalent_score(model, *version, false),
                 )
@@ -1704,98 +1641,6 @@ fn model_family(model: &str) -> Option<&'static str> {
     }
 }
 
-fn family_model_candidates(model: &str) -> Option<Vec<&'static str>> {
-    if model.contains("sonnet") {
-        if model.contains("4-6") || model.contains("4.6") {
-            Some(vec![
-                "claude-sonnet-4.6",
-                "claude-sonnet-4-6",
-                "claude-sonnet-4-6-thinking",
-            ])
-        } else if model.contains("4-5") || model.contains("4.5") {
-            Some(vec![
-                "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4.5",
-                "claude-sonnet-4-5-20250929-thinking",
-            ])
-        } else if model.contains("4-20250514") || model.contains("sonnet-4") {
-            Some(vec![
-                "claude-sonnet-4",
-                "claude-sonnet-4.5",
-                "claude-sonnet-4-5-20250929",
-            ])
-        } else if model.contains("3-7") || model.contains("3.7") {
-            Some(vec![
-                "claude-sonnet-4.5",
-                "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4.6",
-            ])
-        } else if model.contains("3-5") || model.contains("3.5") {
-            Some(vec![
-                "claude-sonnet-4.5",
-                "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4",
-            ])
-        } else {
-            Some(vec![
-                "sonnet",
-                "claude-sonnet-4.6",
-                "claude-sonnet-4-6",
-                "claude-sonnet-4.5",
-            ])
-        }
-    } else if model.contains("opus") {
-        if model.contains("4-7") || model.contains("4.7") {
-            Some(vec![
-                "claude-opus-4.7",
-                "claude-opus-4-7",
-                "claude-opus-4-7-thinking",
-            ])
-        } else if model.contains("4-6") || model.contains("4.6") {
-            Some(vec![
-                "claude-opus-4.6",
-                "claude-opus-4-6",
-                "claude-opus-4-6-thinking",
-            ])
-        } else if model.contains("4-5") || model.contains("4.5") {
-            Some(vec![
-                "claude-opus-4-5-20251101",
-                "claude-opus-4.5",
-                "claude-opus-4-5-20251101-thinking",
-            ])
-        } else if model.contains("4-1") || model.contains("4-20250514") || model.contains("opus-4")
-        {
-            Some(vec![
-                "claude-opus-4.5",
-                "claude-opus-4-5-20251101",
-                "claude-opus-4.6",
-            ])
-        } else {
-            Some(vec![
-                "opus",
-                "claude-opus-4.7",
-                "claude-opus-4-7",
-                "claude-opus-4.6",
-            ])
-        }
-    } else if model.contains("haiku") {
-        Some(vec![
-            "claude-haiku-4.5",
-            "claude-haiku-4-5-20251001",
-            "claude-haiku-4-5-20251001-thinking",
-            "haiku",
-        ])
-    } else if is_fable_request_model(model) {
-        Some(vec![
-            "claude-fable-5.1",
-            "claude-fable-5-1",
-            "claude-fable-5",
-        ])
-    } else {
-        None
-    }
-}
-
 fn is_fable_request_model(model: &str) -> bool {
     model == "fable" || model.starts_with("claude-fable-")
 }
@@ -1803,6 +1648,7 @@ fn is_fable_request_model(model: &str) -> bool {
 fn pick_family_available(
     available: &std::collections::HashSet<String>,
     families: &[&'static str],
+    allow_cross_family_fallback: bool,
 ) -> Option<String> {
     for family in families {
         let mut candidates = available
@@ -1822,26 +1668,20 @@ fn pick_family_available(
             return Some(candidate);
         }
     }
+    if allow_cross_family_fallback {
+        let mut candidates = available.iter().cloned().collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            family_candidate_key(a)
+                .cmp(&family_candidate_key(b))
+                .then_with(|| a.cmp(b))
+        });
+        return candidates.pop();
+    }
     None
 }
 
 fn model_matches_family(model: &str, family: &str) -> bool {
     model == family || model.starts_with(&format!("claude-{}", family))
-}
-
-fn contains_claude_model_id<'a>(models: impl IntoIterator<Item = &'a str>) -> bool {
-    models.into_iter().any(is_claude_model_id)
-}
-
-fn is_claude_model_id(model: &str) -> bool {
-    [
-        "claude-opus-",
-        "claude-sonnet-",
-        "claude-haiku-",
-        "claude-fable-",
-    ]
-    .into_iter()
-    .any(|prefix| model.starts_with(prefix))
 }
 
 fn family_candidate_key(model: &str) -> (bool, bool, Vec<u32>, bool) {
@@ -1873,16 +1713,6 @@ fn model_version_numbers(model: &str) -> Vec<u32> {
         }
     }
     numbers
-}
-
-fn pick_available(
-    available: &std::collections::HashSet<String>,
-    candidates: &[&'static str],
-) -> Option<String> {
-    candidates
-        .iter()
-        .map(|candidate| normalize_model_id(candidate))
-        .find(|candidate| available.contains(candidate))
 }
 
 fn static_model_capabilities() -> Vec<ModelCapabilityItem> {
@@ -2715,7 +2545,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_kiro_models_preserves_claude_alias_targets_when_sync_omits_all_claude_models() {
+    fn sync_from_kiro_models_does_not_invent_claude_models_when_sync_omits_them() {
         let catalog = ModelCapabilitiesCatalog::new();
         let status = catalog.sync_from_kiro_models(vec![KiroAvailableModel {
             model_id: "deepseek-3.2".to_string(),
@@ -2735,18 +2565,28 @@ mod tests {
                 .any(|model| model.model == "deepseek-3.2")
         );
         assert!(
-            status
+            !status
                 .models
                 .iter()
                 .any(|model| model.model.contains("sonnet"))
         );
         let sonnet = catalog.resolve_model("sonnet");
-        assert_eq!(sonnet.source, ModelResolutionSource::Alias);
-        assert!(
-            sonnet
-                .upstream_model
-                .as_deref()
-                .is_some_and(|model| model.starts_with("claude-sonnet-"))
+        assert_eq!(sonnet.source, ModelResolutionSource::PassThrough);
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn fresh_catalog_does_not_dispatch_against_seed_model_ids() {
+        let catalog = ModelCapabilitiesCatalog::new();
+        let resolution = catalog.resolve_model("sonnet");
+        assert_eq!(resolution.source, ModelResolutionSource::PassThrough);
+        assert_eq!(resolution.upstream_model.as_deref(), Some("sonnet"));
+
+        let dated = catalog.resolve_model("claude-sonnet-4-20250514");
+        assert_eq!(dated.source, ModelResolutionSource::PassThrough);
+        assert_eq!(
+            dated.upstream_model.as_deref(),
+            Some("claude-sonnet-4-20250514")
         );
     }
 
@@ -2813,8 +2653,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         let sonnet = resolve_model_with_catalog("claude-sonnet-4-20250514", &models);
-        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4"));
-        assert_eq!(sonnet.source, ModelResolutionSource::Alias);
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
+        assert_eq!(sonnet.source, ModelResolutionSource::FamilyNormalized);
 
         let old_sonnet = resolve_model_with_catalog("claude-3-5-sonnet-20241022", &models);
         assert_eq!(
@@ -2886,6 +2726,88 @@ mod tests {
     }
 
     #[test]
+    fn resolver_maps_dated_major_to_nearest_current_same_family_model() {
+        let models = vec![
+            "claude-sonnet-4".to_string(),
+            "claude-sonnet-4.5".to_string(),
+        ];
+        let result = resolve_model_with_catalog("claude-sonnet-4-20250514", &models);
+        assert_eq!(result.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
+    }
+
+    #[test]
+    fn resolver_respects_disabled_cross_version_fallback() {
+        let models = vec!["claude-sonnet-4.5".to_string()];
+        let mapping = ModelMappingConfig {
+            allow_version_fallback: false,
+            ..ModelMappingConfig::default()
+        };
+        let result = resolve_model_with_catalog_mapping_and_mode(
+            "claude-sonnet-4-20250514",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+        assert_eq!(result.source, ModelResolutionSource::PassThrough);
+        assert_eq!(
+            result.upstream_model.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+    }
+
+    #[test]
+    fn explicit_mapping_wins_over_automatic_model_resolution() {
+        let models = vec!["claude-sonnet-4.5".to_string()];
+        let mapping = ModelMappingConfig {
+            rules: vec![crate::model::config::ModelMappingRule {
+                enabled: true,
+                source: "claude-sonnet-4-20250514".to_string(),
+                target: "custom-sonnet".to_string(),
+                kind: ModelMappingRuleKind::Alias,
+                note: None,
+            }],
+            ..ModelMappingConfig::default()
+        };
+        let result = resolve_model_with_catalog_mapping_and_mode(
+            "claude-sonnet-4-20250514",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+        assert_eq!(result.source, ModelResolutionSource::Alias);
+        assert_eq!(result.upstream_model.as_deref(), Some("custom-sonnet"));
+    }
+
+    #[test]
+    fn resolver_does_not_cross_families_by_default() {
+        let models = vec!["claude-opus-4.7".to_string()];
+        let result = resolve_model_with_catalog("claude-sonnet-4-20250514", &models);
+        assert_eq!(result.source, ModelResolutionSource::PassThrough);
+        assert_eq!(
+            result.upstream_model.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+    }
+
+    #[test]
+    fn resolver_can_cross_families_only_when_enabled() {
+        let models = vec!["claude-opus-4.7".to_string()];
+        let mapping = ModelMappingConfig {
+            allow_cross_family_fallback: true,
+            ..ModelMappingConfig::default()
+        };
+        let result = resolve_model_with_catalog_mapping_and_mode(
+            "claude-sonnet-4-20250514",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+        assert_eq!(result.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4.7"));
+    }
+
+    #[test]
     fn resolver_matches_synced_fable_models_from_official_request_forms() {
         let models = vec!["claude-fable-5".to_string(), "claude-fable-5.1".to_string()];
 
@@ -2944,7 +2866,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_aliases_prefer_canonical_synced_family_model_before_highest_fallback() {
+    fn resolver_aliases_choose_highest_current_model_in_requested_family() {
         let models = vec![
             "claude-opus-4.7".to_string(),
             "claude-opus-4.8".to_string(),
@@ -2958,19 +2880,19 @@ mod tests {
 
         let opus = resolve_model_with_catalog("opus", &models);
         assert_eq!(opus.source, ModelResolutionSource::Alias);
-        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4.7"));
+        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4.8"));
 
         let default = resolve_model_with_catalog("default", &models);
         assert_eq!(default.source, ModelResolutionSource::Alias);
-        assert_eq!(default.upstream_model.as_deref(), Some("claude-opus-4.7"));
+        assert_eq!(default.upstream_model.as_deref(), Some("claude-opus-4.8"));
 
         let sonnet = resolve_model_with_catalog("sonnet", &models);
         assert_eq!(sonnet.source, ModelResolutionSource::Alias);
-        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-5.5"));
 
         let haiku = resolve_model_with_catalog("haiku", &models);
         assert_eq!(haiku.source, ModelResolutionSource::Alias);
-        assert_eq!(haiku.upstream_model.as_deref(), Some("claude-haiku-4.5"));
+        assert_eq!(haiku.upstream_model.as_deref(), Some("claude-haiku-5.5"));
 
         let fable = resolve_model_with_catalog("fable", &models);
         assert_eq!(fable.source, ModelResolutionSource::Alias);
@@ -3048,26 +2970,28 @@ mod tests {
     }
 
     #[test]
-    fn resolver_keeps_unknown_minor_versions_for_upstream_rejection() {
+    fn resolver_uses_same_family_catalog_for_unlisted_minor_versions() {
         let models = vec![
             "claude-opus-4.5".to_string(),
             "claude-sonnet-4.6".to_string(),
         ];
 
-        for requested in [
-            "claude-sonnet-4-7",
-            "claude-sonnet-4-7-thinking",
-            "claude-opus-4-9",
-            "claude-haiku-4-6",
+        for (requested, expected) in [
+            ("claude-sonnet-4-7", "claude-sonnet-4.6"),
+            ("claude-sonnet-4-7-thinking", "claude-sonnet-4.6"),
+            ("claude-opus-4-9", "claude-opus-4.5"),
         ] {
             let result = resolve_model_with_catalog(requested, &models);
             assert_eq!(
                 result.source,
-                ModelResolutionSource::PassThrough,
+                ModelResolutionSource::FamilyNormalized,
                 "{requested}"
             );
-            assert_eq!(result.upstream_model.as_deref(), Some(requested));
+            assert_eq!(result.upstream_model.as_deref(), Some(expected));
         }
+        let haiku = resolve_model_with_catalog("claude-haiku-4-6", &models);
+        assert_eq!(haiku.source, ModelResolutionSource::PassThrough);
+        assert_eq!(haiku.upstream_model.as_deref(), Some("claude-haiku-4-6"));
         for requested in ["claude-foo-9-9", "gpt-4o"] {
             let result = resolve_model_with_catalog(requested, &models);
             assert_eq!(
@@ -3111,9 +3035,9 @@ mod tests {
         .map(str::to_string)
         .to_vec();
         for (requested, expected_upstream) in [
-            ("sonnet-thinking", "claude-sonnet-4.6"),
-            ("opus-thinking", "claude-opus-4.7"),
-            ("haiku-thinking", "claude-haiku-4.5"),
+            ("sonnet-thinking", "claude-sonnet-5.5"),
+            ("opus-thinking", "claude-opus-5.5"),
+            ("haiku-thinking", "claude-haiku-5.5"),
             ("claude-sonnet-4-5-thinking", "claude-sonnet-4.5"),
             ("claude-opus-4-5-thinking", "claude-opus-4.5"),
             ("claude-haiku-4-5-thinking", "claude-haiku-4.5"),
@@ -3142,9 +3066,9 @@ mod tests {
                 "claude-haiku-4-5-20251001-thinking",
                 "claude-haiku-4-5-20251001",
             ),
-            ("claude-sonnet-4-20250514-thinking", "claude-sonnet-4"),
-            ("sonnet[1m]-thinking", "claude-sonnet-4.6"),
-            ("opus-thinking[1m]", "claude-opus-4.7"),
+            ("claude-sonnet-4-20250514-thinking", "claude-sonnet-4.5"),
+            ("sonnet[1m]-thinking", "claude-sonnet-5.5"),
+            ("opus-thinking[1m]", "claude-opus-5.5"),
             ("claude-sonnet-4-6-thinking[1m]", "claude-sonnet-4-6"),
             ("claude-sonnet-4-6[1m]-thinking", "claude-sonnet-4-6"),
             ("claude-opus-4-8-thinking[1m]", "claude-opus-4.8"),
@@ -3164,9 +3088,12 @@ mod tests {
                 strip_model_compat_suffixes(requested).1,
                 "{requested} must keep the thinking mode"
             );
-            // Scheduling sees explicit ids verbatim (aliases are resolved first), so an explicit
-            // `-thinking`/`[1m]` id must match credentials that list only the base model.
-            if requested.starts_with("claude-") {
+            // Same-spelling and suffix-only requests still need to match a credential listing
+            // the resolved base model. Cross-version requests are matched by the resolved
+            // catalog id at the scheduler boundary, so the raw dated id is intentionally not
+            // used as a credential capability probe here.
+            let (requested_base, _) = strip_model_compat_suffixes(requested);
+            if requested.starts_with("claude-") && expected_upstream == requested_base {
                 assert!(
                     crate::model::model_support::model_is_supported_by_list(
                         &[expected_upstream.to_string()],
@@ -3179,48 +3106,27 @@ mod tests {
     }
 
     #[test]
-    fn known_anthropic_model_distinguishes_known_from_invented_ids() {
-        for known in [
-            "sonnet",
-            "opus-thinking",
-            "haiku[1m]",
-            "fable",
-            "default",
-            "claude-opus-4-8",
-            "claude-opus-4.8-thinking",
-            "claude-sonnet-4-6[1m]",
-            "claude-sonnet-4-5-20250929",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5-thinking",
-            "claude-opus-4-1",
-            "claude-opus-4-1-20250805",
-            "claude-sonnet-4-20250514",
-            "claude-3-5-sonnet-20241022",
-            "claude-sonnet-5",
-            "claude-sonnet-5-5",
-            "claude-haiku-5-5",
-            "claude-opus-5",
-            "claude-opus-5-5",
-            "claude-fable-5",
-            "claude-fable-5-1",
-            "claude-fable-5.1-thinking",
-        ] {
-            assert!(is_known_anthropic_model(known), "{known} should be known");
-        }
-        for unknown in [
-            "claude-foo-9-9",
-            "claude-fable-5-2",
-            "fable5",
+    fn resolver_uses_catalog_for_any_structurally_valid_claude_version() {
+        let models = vec!["claude-sonnet-4.5".to_string()];
+        for requested in [
             "claude-sonnet-4-7",
-            "claude-opus-9-9",
-            "gpt-4o",
-            "",
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-99-1",
         ] {
-            assert!(
-                !is_known_anthropic_model(unknown),
-                "{unknown} should be unknown"
+            let result = resolve_model_with_catalog(requested, &models);
+            assert_eq!(
+                result.upstream_model.as_deref(),
+                Some("claude-sonnet-4.5"),
+                "{requested} must use the current same-family catalog"
             );
+            assert_eq!(result.source, ModelResolutionSource::FamilyNormalized);
         }
+        assert_eq!(
+            resolve_model_with_catalog("claude-foo-9-9", &models)
+                .upstream_model
+                .as_deref(),
+            Some("claude-foo-9-9")
+        );
     }
 
     #[test]
@@ -3288,6 +3194,8 @@ mod tests {
         let mapping = ModelMappingConfig {
             enabled: false,
             auto_generate_rules: false,
+            allow_version_fallback: true,
+            allow_cross_family_fallback: false,
             rules: vec![],
         };
 
@@ -3308,6 +3216,8 @@ mod tests {
         let mapping = ModelMappingConfig {
             enabled: true,
             auto_generate_rules: false,
+            allow_version_fallback: true,
+            allow_cross_family_fallback: false,
             rules: vec![],
         };
 
@@ -3348,6 +3258,8 @@ mod tests {
         let mapping = ModelMappingConfig {
             enabled: true,
             auto_generate_rules: false,
+            allow_version_fallback: true,
+            allow_cross_family_fallback: false,
             rules: vec![crate::model::config::ModelMappingRule {
                 enabled: true,
                 source: "opus".to_string(),

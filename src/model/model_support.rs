@@ -101,9 +101,6 @@ fn claude_base_model_variants(model: &str) -> Vec<String> {
                 .unwrap_or_else(|| format!("claude-{family}-{major}-{date}"));
             push_unique_model(&mut out, dated);
         }
-        if let Some(known_dated) = known_anthropic_dated_model(&base) {
-            push_unique_model(&mut out, known_dated.to_string());
-        }
         return out;
     }
 
@@ -112,9 +109,6 @@ fn claude_base_model_variants(model: &str) -> Vec<String> {
         push_unique_model(&mut out, format!("claude-3.5-{family}"));
         if let Some(date) = date {
             push_unique_model(&mut out, format!("claude-3-5-{family}-{date}"));
-        }
-        if let Some(known_dated) = known_anthropic_dated_model(&format!("claude-3-5-{family}")) {
-            push_unique_model(&mut out, known_dated.to_string());
         }
     }
 
@@ -189,19 +183,6 @@ fn parse_legacy_claude_35_model<'a>(parts: &'a [&str]) -> Option<(&'a str, Optio
 
 fn is_yyyymmdd(value: &str) -> bool {
     value.len() == 8 && value.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn known_anthropic_dated_model(model: &str) -> Option<&'static str> {
-    match model {
-        "claude-sonnet-4" => Some("claude-sonnet-4-20250514"),
-        "claude-opus-4" => Some("claude-opus-4-20250514"),
-        "claude-sonnet-4-5" => Some("claude-sonnet-4-5-20250929"),
-        "claude-opus-4-5" => Some("claude-opus-4-5-20251101"),
-        "claude-haiku-4-5" => Some("claude-haiku-4-5-20251001"),
-        "claude-3-5-sonnet" => Some("claude-3-5-sonnet-20241022"),
-        "claude-3-5-haiku" => Some("claude-3-5-haiku-20241022"),
-        _ => None,
-    }
 }
 
 /// `[1m]` selects the 1M context window of the same model, so it never changes which
@@ -341,7 +322,6 @@ mod tests {
             vec![
                 "claude-sonnet-4.5",
                 "claude-sonnet-4-5",
-                "claude-sonnet-4-5-20250929",
                 "claude-opus-4.8",
                 "claude-opus-4-8",
             ]

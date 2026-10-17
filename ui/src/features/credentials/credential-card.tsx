@@ -494,7 +494,7 @@ export function CredentialCard({
         <SummaryCell label="最近" value={formatLastUsed(credential.lastUsedAt)} />
       </div>
 
-      <div className="mx-3 mb-2 rounded-md border border-border/70 bg-muted/25 px-3 py-2">
+      <div className="mx-3 mb-2 px-3 py-2">
         <div className="flex items-center justify-between gap-3">
           <span className="text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">额度</span>
           <span className="truncate text-xs font-semibold tabular text-foreground">

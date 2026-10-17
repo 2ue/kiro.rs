@@ -46,7 +46,7 @@ use super::body_capabilities::ParsedAnthropicBodyPlan;
 use super::body_processing;
 use super::converter::{
     ConversionError, ConverterOptions, ProxyWarnings, convert_request_with_resolved_model,
-    extract_stable_conversation_id, map_model,
+    extract_stable_conversation_id,
 };
 use super::envelope;
 use super::inference_attempt_budget::{
@@ -55,7 +55,7 @@ use super::inference_attempt_budget::{
 };
 use super::middleware::AppState;
 use super::model_capabilities::{
-    KiroReasoningCapabilityState, ModelResolution, ModelResolutionSource, is_known_anthropic_model,
+    KiroReasoningCapabilityState, ModelResolution, ModelResolutionSource, normalize_model_id,
     resolve_model_with_catalog_mapping_and_mode, strip_model_compat_suffixes,
 };
 use super::payload_guard::{
@@ -1495,15 +1495,7 @@ async fn maybe_raw_external_direct_response(
     let direct_model_resolution = raw_probe
         .model
         .as_deref()
-        .map(|model| {
-            state.model_capabilities.resolve_model_with_mapping(
-                model,
-                runtime_config.model_resolution_mode,
-                &runtime_config.model_mapping,
-            )
-        })
-        .filter(|resolution| resolution.source != ModelResolutionSource::Unsupported)
-        .map(external_route_model_resolution);
+        .map(external_request_model_resolution);
     let mut route = raw_external_route_request_with_hints(
         state,
         &runtime_config,
@@ -6225,7 +6217,7 @@ fn resolve_request_model(
         .kiro_provider
         .as_ref()
         .and_then(|provider| provider.usable_explicit_model_catalog());
-    let resolution = remap_known_model_for_usable_catalog(
+    let resolution = remap_model_for_usable_catalog(
         resolution,
         usable_catalog.as_deref(),
         runtime_config,
@@ -6271,10 +6263,10 @@ fn resolve_request_model(
 
 /// The merged catalog can list a model that only unusable credentials (disabled, quota
 /// blocked) serve. When every usable credential has an explicit catalog and none lists the
-/// resolved model, a known Anthropic model or Claude Code alias is re-resolved against the
-/// usable catalogs so it lands on the closest same-family model instead of failing. Unknown
-/// models, and pools with any unknown-catalog credential, keep the original resolution.
-fn remap_known_model_for_usable_catalog(
+/// resolved model, the request is re-resolved against the usable catalogs. The resolver itself
+/// decides whether the request is structurally eligible for same-family fallback; it does not use
+/// a hard-coded list of model versions.
+fn remap_model_for_usable_catalog(
     resolution: ModelResolution,
     usable_catalog: Option<&[String]>,
     runtime_config: &RequestRuntimeConfig,
@@ -6285,9 +6277,7 @@ fn remap_known_model_for_usable_catalog(
     else {
         return resolution;
     };
-    if !is_known_anthropic_model(&resolution.requested_model)
-        || crate::model::model_support::model_is_supported_by_list(catalog, &[Some(upstream_model)])
-    {
+    if crate::model::model_support::model_is_supported_by_list(catalog, &[Some(upstream_model)]) {
         return resolution;
     }
     let remapped = resolve_model_with_catalog_mapping_and_mode(
@@ -6319,30 +6309,18 @@ fn remap_known_model_for_usable_catalog(
     }
 }
 
-fn external_route_model_resolution(mut resolution: ModelResolution) -> ModelResolution {
-    if !matches!(
-        resolution.source,
-        ModelResolutionSource::ExactUpstream | ModelResolutionSource::PassThrough
-    ) {
-        return resolution;
-    }
+fn external_route_model_resolution(resolution: ModelResolution) -> ModelResolution {
+    // External pools speak the standard Claude Code protocol. A local Kiro
+    // resolution must never leak its dotted Kiro model id into that route;
+    // pool-level mapping is applied later by external_pool::model_pipeline.
+    external_request_model_resolution(&resolution.requested_model)
+}
 
-    let Some(mapped_model) = map_model(&resolution.requested_model)
-        .map(|model| model.trim().to_string())
-        .filter(|model| !model.is_empty())
-    else {
-        return resolution;
-    };
-    if resolution.upstream_model.as_deref() == Some(mapped_model.as_str()) {
-        return resolution;
-    }
-
-    resolution.upstream_model = Some(mapped_model.clone());
-    resolution.source = ModelResolutionSource::Alias;
-    resolution.note = Some(format!(
-        "{} -> {}",
-        resolution.requested_model, mapped_model
-    ));
+fn external_request_model_resolution(requested_model: &str) -> ModelResolution {
+    let mut resolution = ModelResolution::pass_through(normalize_model_id(requested_model));
+    // External pools apply their own mapping pipeline. Do not expose the local
+    // resolver's diagnostic note for a deliberate external pass-through.
+    resolution.note = None;
     resolution
 }
 
@@ -6985,14 +6963,7 @@ async fn post_messages_inner(
         if let Some(external) = external_fallback.as_mut() {
             external.refresh_payload(&payload);
             let request_id = envelope::request_id();
-            let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping(
-                &payload.model,
-                runtime_config.model_resolution_mode,
-                &runtime_config.model_mapping,
-            );
-            let direct_model_resolution = (direct_model_resolution.source
-                != ModelResolutionSource::Unsupported)
-                .then(|| external_route_model_resolution(direct_model_resolution));
+            let direct_model_resolution = Some(external_request_model_resolution(&payload.model));
             if let Some(response) = external
                 .route_policy_response(&request_id, direct_model_resolution)
                 .await
@@ -7069,14 +7040,7 @@ async fn post_messages_inner(
     }
     if let Some(external) = external_fallback.as_ref() {
         let request_id = envelope::request_id();
-        let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping(
-            &payload.model,
-            runtime_config.model_resolution_mode,
-            &runtime_config.model_mapping,
-        );
-        let direct_model_resolution = (direct_model_resolution.source
-            != ModelResolutionSource::Unsupported)
-            .then(|| external_route_model_resolution(direct_model_resolution));
+        let direct_model_resolution = Some(external_request_model_resolution(&payload.model));
         if let Some(response) = external
             .direct_policy_response(&request_id, direct_model_resolution)
             .await

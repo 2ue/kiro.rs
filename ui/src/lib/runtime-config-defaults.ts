@@ -389,6 +389,8 @@ export function defaultModelMappingConfig() {
   return {
     enabled: true,
     autoGenerateRules: true,
+    allowVersionFallback: true,
+    allowCrossFamilyFallback: false,
     rules: [],
   }
 }

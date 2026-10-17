@@ -2180,6 +2180,22 @@ export function ModelMappingSection({
           onChange={(v) => onChange({ ...mapping, autoGenerateRules: v })}
         />
       </TwoCol>
+      <TwoCol>
+        <TogField
+          label="允许同族跨版本解析"
+          desc="同一模型族的旧版本不可用时，解析到当前列表中最近的可用版本。默认开启。"
+          checked={mapping.allowVersionFallback}
+          onChange={(v) => onChange({ ...mapping, allowVersionFallback: v })}
+          disabled={!mapping.enabled || !mapping.autoGenerateRules}
+        />
+        <TogField
+          label="允许跨族兜底解析"
+          desc="当前模型族完全没有可用模型时，才允许切换到其他模型族。默认关闭。"
+          checked={mapping.allowCrossFamilyFallback}
+          onChange={(v) => onChange({ ...mapping, allowCrossFamilyFallback: v })}
+          disabled={!mapping.enabled || !mapping.autoGenerateRules}
+        />
+      </TwoCol>
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-2">
           <span className="text-sm font-semibold">映射规则</span>

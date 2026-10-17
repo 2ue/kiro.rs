@@ -1650,6 +1650,8 @@ export interface ModelMappingRule {
 export interface ModelMappingConfig {
   enabled: boolean
   autoGenerateRules: boolean
+  allowVersionFallback: boolean
+  allowCrossFamilyFallback: boolean
   rules: ModelMappingRule[]
 }
 

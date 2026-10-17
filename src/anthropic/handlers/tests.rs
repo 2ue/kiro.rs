@@ -6803,37 +6803,41 @@ fn direct_external_policy_resolves_model_before_route_request() {
     let source = include_str!("../handlers.rs");
 
     assert!(
-        source.contains(
+        !source.contains(
             "let direct_model_resolution = state.model_capabilities.resolve_model_with_mapping("
         ),
-        "direct external policy must compute 模型（本地解析） before bypassing local credentials"
+        "direct external policy must not invoke the local Kiro model resolver"
     );
     assert!(
-        source.contains(".direct_policy_response(&request_id, direct_model_resolution)"),
-        "direct external policy must pass 模型（本地解析） into the external route"
+        source.contains(
+            "let direct_model_resolution = Some(external_request_model_resolution(&payload.model));"
+        ),
+        "direct external policy must preserve the caller model for the external route"
     );
     assert!(
         source.contains("external.model_resolution = model_resolution;"),
-        "external direct route must retain 模型（本地解析） for external 模型处理"
+        "parsed external routes must retain their own model-processing context"
     );
     assert!(
-        source.contains("external_route_model_resolution(direct_model_resolution)"),
-        "direct external policy must use the same processed 模型（上游） that local Kiro dispatch would use"
+        source.contains(
+            "let direct_model_resolution = Some(external_request_model_resolution(&payload.model));"
+        ),
+        "direct external policy must use the external pool model pipeline"
     );
 }
 
 #[test]
-fn external_route_model_resolution_prefers_local_processed_model_for_cc_aliases() {
+fn external_route_model_resolution_preserves_caller_model_for_external_mapping() {
     let resolved = external_route_model_resolution(ModelResolution::exact(
         "claude-opus-4-6-thinking".to_string(),
     ));
 
-    assert_eq!(resolved.source, ModelResolutionSource::Alias);
-    assert_eq!(resolved.upstream_model.as_deref(), Some("claude-opus-4.6"));
+    assert_eq!(resolved.source, ModelResolutionSource::PassThrough);
     assert_eq!(
-        resolved.note.as_deref(),
-        Some("claude-opus-4-6-thinking -> claude-opus-4.6")
+        resolved.upstream_model.as_deref(),
+        Some("claude-opus-4-6-thinking")
     );
+    assert!(resolved.note.is_none());
 }
 
 #[test]
@@ -12743,7 +12747,7 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
                 "claude-opus-4.6",
             ),
         ] {
-            let result = remap_known_model_for_usable_catalog(
+            let result = remap_model_for_usable_catalog(
                 resolved(requested, upstream),
                 Some(&usable),
                 &runtime_config,
@@ -12760,7 +12764,7 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
         }
 
         // Completely unknown models are left for the upstream (and the 404 mapping).
-        let unknown = remap_known_model_for_usable_catalog(
+        let unknown = remap_model_for_usable_catalog(
             ModelResolution::pass_through("claude-foo-9-9".to_string()),
             Some(&usable),
             &runtime_config,
@@ -12770,7 +12774,7 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
         assert_eq!(unknown.upstream_model.as_deref(), Some("claude-foo-9-9"));
 
         // A usable credential already lists the model: nothing changes.
-        let served = remap_known_model_for_usable_catalog(
+        let served = remap_model_for_usable_catalog(
             resolved("sonnet", "claude-sonnet-4.6"),
             Some(&usable),
             &runtime_config,
@@ -12780,7 +12784,7 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
         assert_eq!(served.source, ModelResolutionSource::Alias);
 
         // Unknown-catalog credentials might serve it, so the resolution is kept.
-        let unknown_catalog = remap_known_model_for_usable_catalog(
+        let unknown_catalog = remap_model_for_usable_catalog(
             resolved("sonnet", "claude-sonnet-5"),
             None,
             &runtime_config,
