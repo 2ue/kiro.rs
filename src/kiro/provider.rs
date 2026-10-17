@@ -49,7 +49,8 @@ use crate::kiro::token_manager::{
     AcquireMode, AutomaticTokenRecoveryOutcome, AuxiliaryConcurrencyKind,
     AuxiliaryConcurrencySaturated, CallContext, CredentialRiskControlReason,
     EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind, InFlightLeaseGuard, LocalPoolRouteState,
-    MultiTokenManager, RefreshFailure, TokenRefreshAdmissionRejected, TransientFailureKind,
+    LocalSchedulerErrorKind, MultiTokenManager, RefreshFailure, TokenRefreshAdmissionRejected,
+    TransientFailureKind, local_scheduler_error_kind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -8674,16 +8675,20 @@ impl KiroProvider {
             .into()
     }
 
-    fn traced_error_with_selection_failure(
+    fn traced_error_with_selection_failure_and_scheduler_kind(
         message: impl Into<String>,
         attempts: &[KiroCredentialAttempt],
         selection_failure: Option<SelectionFailureSummary>,
         failure_kind: Option<KiroCallFailureKind>,
+        scheduler_error_kind: Option<LocalSchedulerErrorKind>,
     ) -> anyhow::Error {
         let mut error = KiroCallError::new(message, attempts.to_vec())
             .with_selection_failure(selection_failure);
         if let Some(failure_kind) = failure_kind {
             error = error.with_failure_kind(failure_kind);
+        }
+        if let Some(kind) = scheduler_error_kind {
+            error = error.with_scheduler_error_kind(kind);
         }
         error.into()
     }
@@ -12071,6 +12076,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut last_selection_failure: Option<SelectionFailureSummary> = None;
         let mut last_call_failure_kind: Option<KiroCallFailureKind> = None;
+        let mut last_scheduler_error_kind: Option<LocalSchedulerErrorKind> = None;
         let mut automatic_recovery_attempted: HashSet<u64> = HashSet::new();
         let mut automatic_recovery_allowed = true;
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -12132,6 +12138,7 @@ impl KiroProvider {
                     if last_error.is_none() {
                         last_selection_failure = Some(selection_failure);
                         last_call_failure_kind = call_failure_kind;
+                        last_scheduler_error_kind = local_scheduler_error_kind(&e);
                         last_error = Some(e);
                     } else {
                         tracing::warn!(
@@ -14241,12 +14248,15 @@ impl KiroProvider {
                 api_type, max_retries
             )
         });
-        Err(Self::traced_error_with_selection_failure(
-            message,
-            &attempts,
-            last_selection_failure,
-            last_call_failure_kind,
-        ))
+        Err(
+            Self::traced_error_with_selection_failure_and_scheduler_kind(
+                message,
+                &attempts,
+                last_selection_failure,
+                last_call_failure_kind,
+                last_scheduler_error_kind,
+            ),
+        )
     }
 
     /// 从请求体中提取模型信息

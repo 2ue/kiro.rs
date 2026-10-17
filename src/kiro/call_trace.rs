@@ -6,6 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::common::upstream_error::RawUpstreamError;
+use crate::kiro::token_manager::LocalSchedulerErrorKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -269,6 +270,7 @@ pub struct KiroCallError {
     selection_failure: Option<SelectionFailureSummary>,
     failure_kind: Option<KiroCallFailureKind>,
     error_metadata: Option<serde_json::Value>,
+    scheduler_error_kind: Option<LocalSchedulerErrorKind>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -292,6 +294,7 @@ impl KiroCallError {
             selection_failure: None,
             failure_kind: None,
             error_metadata: None,
+            scheduler_error_kind: None,
         }
     }
 
@@ -324,6 +327,15 @@ impl KiroCallError {
 
     pub fn error_metadata(&self) -> Option<&serde_json::Value> {
         self.error_metadata.as_ref()
+    }
+
+    pub fn with_scheduler_error_kind(mut self, kind: LocalSchedulerErrorKind) -> Self {
+        self.scheduler_error_kind = Some(kind);
+        self
+    }
+
+    pub fn scheduler_error_kind(&self) -> Option<LocalSchedulerErrorKind> {
+        self.scheduler_error_kind
     }
 }
 

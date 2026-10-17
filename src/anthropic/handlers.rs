@@ -108,7 +108,10 @@ use crate::kiro::call_trace::{
     SelectionFailureStage,
 };
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion, McpCallAttribution};
-use crate::kiro::token_manager::{AcquireMode, LocalPoolRouteState, LocalPoolRouteStateKind};
+use crate::kiro::token_manager::{
+    AcquireMode, LocalPoolRouteState, LocalPoolRouteStateKind, LocalSchedulerErrorKind,
+    local_scheduler_error_kind,
+};
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
@@ -128,6 +131,8 @@ const LOCAL_NON_STREAM_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const LOCAL_CAPACITY_PREFLIGHT_GRACE_MAX_MS: u64 = 250;
 const LOCAL_SCHEDULER_REDIS_DEGRADED_FALLBACK_GRACE_MS: u64 = 250;
 const EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT: Duration = Duration::from_millis(250);
+
+static SCHEDULER_ERROR_STRING_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 struct LocalStreamRetryConfig {
@@ -2147,7 +2152,13 @@ impl ExternalFallbackContext {
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<Response> {
         match self
-            .fallback_after_local_error_outcome(request_id, error_message, None, local_attempts)
+            .fallback_after_local_error_outcome(
+                request_id,
+                error_message,
+                None,
+                None,
+                local_attempts,
+            )
             .await?
         {
             ExternalPoolForwardOutcome::Response(response) => Some(response),
@@ -2160,6 +2171,7 @@ impl ExternalFallbackContext {
         request_id: &str,
         error_message: &str,
         call_failure_kind: Option<KiroCallFailureKind>,
+        scheduler_error_kind: Option<LocalSchedulerErrorKind>,
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<ExternalPoolForwardOutcome> {
         let classification_attempts = local_attempts.clone();
@@ -2167,6 +2179,7 @@ impl ExternalFallbackContext {
             request_id,
             error_message,
             call_failure_kind,
+            scheduler_error_kind,
             classification_attempts,
             local_attempts,
         )
@@ -2178,15 +2191,19 @@ impl ExternalFallbackContext {
         request_id: &str,
         error_message: &str,
         call_failure_kind: Option<KiroCallFailureKind>,
+        scheduler_error_kind: Option<LocalSchedulerErrorKind>,
         classification_attempts: Vec<KiroCredentialAttempt>,
         diagnostic_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<ExternalPoolForwardOutcome> {
-        let Some(classified_reason) = classify_local_error_for_external_fallback_with_kind(
-            error_message,
-            &classification_attempts,
-            &self.config,
-            call_failure_kind,
-        ) else {
+        let Some(classified_reason) =
+            classify_local_error_for_external_fallback_with_scheduler_kind(
+                error_message,
+                &classification_attempts,
+                &self.config,
+                call_failure_kind,
+                scheduler_error_kind,
+            )
+        else {
             tracing::debug!(
                 request_id,
                 classification_attempt_count = classification_attempts.len(),
@@ -2629,11 +2646,28 @@ fn classify_local_error_for_external_fallback(
     classify_local_error_for_external_fallback_with_kind(message, attempts, config, None)
 }
 
+#[cfg(test)]
 fn classify_local_error_for_external_fallback_with_kind(
     message: &str,
     attempts: &[KiroCredentialAttempt],
     config: &ExternalPoolsConfig,
     call_failure_kind: Option<KiroCallFailureKind>,
+) -> Option<String> {
+    classify_local_error_for_external_fallback_with_scheduler_kind(
+        message,
+        attempts,
+        config,
+        call_failure_kind,
+        None,
+    )
+}
+
+fn classify_local_error_for_external_fallback_with_scheduler_kind(
+    message: &str,
+    attempts: &[KiroCredentialAttempt],
+    config: &ExternalPoolsConfig,
+    call_failure_kind: Option<KiroCallFailureKind>,
+    scheduler_error_kind: Option<LocalSchedulerErrorKind>,
 ) -> Option<String> {
     match call_failure_kind {
         Some(
@@ -2667,6 +2701,10 @@ fn classify_local_error_for_external_fallback_with_kind(
         )
         | None => {}
     }
+    if let Some(kind) = scheduler_error_kind {
+        return classify_typed_local_scheduler_error(kind, message, config);
+    }
+    let _ = scheduler_error_kind_from_string_fallback(message);
     let lower = message.to_ascii_lowercase();
     if lower.contains("local inference attempt reserved for fallback") {
         return Some("local_attempt_reserved_for_fallback".to_string());
@@ -2745,6 +2783,106 @@ fn classify_local_error_for_external_fallback_with_kind(
         }
         _ => None,
     }
+}
+
+fn classify_typed_local_scheduler_error(
+    kind: LocalSchedulerErrorKind,
+    message: &str,
+    config: &ExternalPoolsConfig,
+) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    match kind {
+        LocalSchedulerErrorKind::NoModelCompatible if config.fallback_on_unsupported_model => {
+            Some("unsupported_model".to_string())
+        }
+        LocalSchedulerErrorKind::CapacityUnavailable
+        | LocalSchedulerErrorKind::QueueFull
+        | LocalSchedulerErrorKind::QueueTimeout
+            if lower.contains("redis 调度协调状态不可用") =>
+        {
+            config
+                .fallback_on_scheduler_redis_degraded
+                .then(|| "local_scheduler_redis_degraded".to_string())
+        }
+        LocalSchedulerErrorKind::CapacityUnavailable
+        | LocalSchedulerErrorKind::QueueFull
+        | LocalSchedulerErrorKind::QueueTimeout
+            if config.fallback_on_local_capacity_exhausted =>
+        {
+            Some("local_capacity_exhausted".to_string())
+        }
+        LocalSchedulerErrorKind::AllCoolingDown
+            if config.fallback_on_local_capacity_exhausted && lower.contains("临时可调度: 0") =>
+        {
+            Some("local_capacity_exhausted".to_string())
+        }
+        LocalSchedulerErrorKind::AllCoolingDown if config.fallback_on_local_transient_exhausted => {
+            Some("local_transient_exhausted".to_string())
+        }
+        LocalSchedulerErrorKind::AllDisabled
+        | LocalSchedulerErrorKind::ProxyBlocked
+        | LocalSchedulerErrorKind::RequestExcludedAll
+        | LocalSchedulerErrorKind::TokenUnavailable
+        | LocalSchedulerErrorKind::AllCoolingDown
+            if config.fallback_on_no_available_credentials =>
+        {
+            Some("no_available_credentials".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn scheduler_error_kind_from_string_fallback(message: &str) -> Option<LocalSchedulerErrorKind> {
+    let lower = message.to_ascii_lowercase();
+    let kind = if message.contains("本地账号池风险保护")
+        || lower.contains("local_pool_risk_circuit_open")
+    {
+        Some(LocalSchedulerErrorKind::RiskCircuitOpen)
+    } else if message.contains("没有支持当前模型的可用账号")
+        || message.contains("没有支持当前模型的可用凭据")
+    {
+        Some(LocalSchedulerErrorKind::NoModelCompatible)
+    } else if message.contains("所有可用账号均因代理资源不可用")
+        || message.contains("所有可用凭据均因代理资源不可用")
+    {
+        Some(LocalSchedulerErrorKind::ProxyBlocked)
+    } else if message.contains("所有可用账号均处于上游临时冷却")
+        || message.contains("所有可用凭据均处于上游临时冷却")
+    {
+        Some(LocalSchedulerErrorKind::AllCoolingDown)
+    } else if message.contains("本次请求临时排除了所有可用账号")
+        || message.contains("本次请求临时排除了所有可用凭据")
+    {
+        Some(LocalSchedulerErrorKind::RequestExcludedAll)
+    } else if message.contains("所有账号均已禁用") || message.contains("所有凭据均已禁用")
+    {
+        Some(LocalSchedulerErrorKind::AllDisabled)
+    } else if message.contains("所有账号均无法获取有效 Token")
+        || message.contains("所有凭据均无法获取有效 Token")
+    {
+        Some(LocalSchedulerErrorKind::TokenUnavailable)
+    } else if message.contains("账号调度等待队列已满") || message.contains("凭据调度等待队列已满")
+    {
+        Some(LocalSchedulerErrorKind::QueueFull)
+    } else if message.contains("账号调度排队等待超时") || message.contains("凭据调度排队等待超时")
+    {
+        Some(LocalSchedulerErrorKind::QueueTimeout)
+    } else if message.contains("本地账号调度容量暂不可用")
+        || message.contains("本地凭据调度容量暂不可用")
+        || message.contains("并发槽位已满")
+        || message.contains("Redis 调度协调状态不可用")
+        || lower.contains("local_scheduler_redis_degraded")
+        || lower.contains("schedulerredisdegraded")
+    {
+        Some(LocalSchedulerErrorKind::CapacityUnavailable)
+    } else {
+        None
+    };
+    if let Some(kind) = kind {
+        SCHEDULER_ERROR_STRING_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(?kind, "scheduler error string fallback matched");
+    }
+    kind
 }
 
 fn is_unsupported_model_error(lower_message: &str, attempts: &[KiroCredentialAttempt]) -> bool {
@@ -5455,6 +5593,7 @@ fn provider_public_error_for_message(
     provider: Option<&crate::kiro::provider::KiroProvider>,
     requested_model: Option<&str>,
 ) -> UsagePublicError {
+    let _ = scheduler_error_kind_from_string_fallback(err_str);
     if err_str.contains("reason=THINKING_SIGNATURE_INVALID") {
         return usage_public_error(
             StatusCode::BAD_REQUEST,
@@ -5589,7 +5728,8 @@ fn official_kiro_upstream_public_error(
     Some(usage_public_error(status, error_type, message, error_id))
 }
 
-fn is_local_temporary_scheduler_error(value: &str) -> bool {
+fn is_local_temporary_scheduler_error_string(value: &str) -> bool {
+    let _ = scheduler_error_kind_from_string_fallback(value);
     let lower = value.to_ascii_lowercase();
     value.contains("本地账号池风险保护")
         || value.contains("Redis 调度协调状态不可用")
@@ -5603,6 +5743,19 @@ fn is_local_temporary_scheduler_error(value: &str) -> bool {
         || lower.contains("local_pool_risk_circuit_open")
         || lower.contains("local_scheduler_redis_degraded")
         || lower.contains("schedulerredisdegraded")
+}
+
+fn is_local_temporary_scheduler_error(err: &Error) -> bool {
+    if let Some(kind) = local_scheduler_error_kind(err) {
+        return matches!(
+            kind,
+            LocalSchedulerErrorKind::CapacityUnavailable
+                | LocalSchedulerErrorKind::QueueFull
+                | LocalSchedulerErrorKind::QueueTimeout
+                | LocalSchedulerErrorKind::RiskCircuitOpen
+        );
+    }
+    is_local_temporary_scheduler_error_string(&err.to_string())
 }
 
 fn local_temporary_admission_backoff_secs(
@@ -5621,7 +5774,7 @@ fn local_temporary_admission_backoff_secs(
     }
 
     let err_str = err.to_string();
-    if !is_local_temporary_scheduler_error(&err_str) {
+    if !is_local_temporary_scheduler_error(err) {
         return None;
     }
     Some(
@@ -5754,6 +5907,66 @@ fn map_provider_error(
         );
     }
     let err_str = err.to_string();
+    if let Some(kind) = local_scheduler_error_kind(&err) {
+        match kind {
+            LocalSchedulerErrorKind::AllCoolingDown
+            | LocalSchedulerErrorKind::CapacityUnavailable
+            | LocalSchedulerErrorKind::QueueFull
+            | LocalSchedulerErrorKind::QueueTimeout => {
+                let retry_after_secs = retry_after_secs_from_error(&err_str)
+                    .map(|secs| secs.max(1))
+                    .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1));
+                log_provider_rate_limit_with_hint(&err_str, retry_after_secs, error_id);
+                return public_error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    envelope::public_rate_limit_message(Some(retry_after_secs)),
+                    request_id,
+                    error_id,
+                    [("retry-after", retry_after_secs.to_string())],
+                );
+            }
+            LocalSchedulerErrorKind::AllDisabled
+            | LocalSchedulerErrorKind::NoModelCompatible
+            | LocalSchedulerErrorKind::ProxyBlocked
+            | LocalSchedulerErrorKind::TokenUnavailable => {
+                log_provider_error_with_hint(&err_str, "没有可调度账号", error_id);
+                return public_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
+                    request_id,
+                    error_id,
+                    std::iter::empty::<(&'static str, String)>(),
+                );
+            }
+            LocalSchedulerErrorKind::RequestExcludedAll => {
+                log_provider_error_with_hint(&err_str, "Kiro API 调用失败", error_id);
+                return public_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                    request_id,
+                    error_id,
+                    std::iter::empty::<(&'static str, String)>(),
+                );
+            }
+            LocalSchedulerErrorKind::RiskCircuitOpen => {
+                // 保持旧的字符串路径：只有带有 KiroCallFailureKind::LocalPoolRiskCircuitOpen
+                // 的错误才在上方走 503；直接的本地调度文案原本会落到统一的 502。
+                log_provider_error_with_hint(&err_str, "Kiro API 调用失败", error_id);
+                return public_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+                    request_id,
+                    error_id,
+                    std::iter::empty::<(&'static str, String)>(),
+                );
+            }
+        }
+    }
+    let _ = scheduler_error_kind_from_string_fallback(&err_str);
 
     // Provider content length thresholds and model context windows are different limits.
     if is_upstream_payload_too_long_error(&err_str) {
@@ -7600,10 +7813,17 @@ async fn maybe_external_fallback_after_local_error_outcome(
     request_id: &str,
     message: &str,
     call_failure_kind: Option<KiroCallFailureKind>,
+    scheduler_error_kind: Option<LocalSchedulerErrorKind>,
     attempts: Vec<KiroCredentialAttempt>,
 ) -> Option<ExternalPoolForwardOutcome> {
     external_fallback?
-        .fallback_after_local_error_outcome(request_id, message, call_failure_kind, attempts)
+        .fallback_after_local_error_outcome(
+            request_id,
+            message,
+            call_failure_kind,
+            scheduler_error_kind,
+            attempts,
+        )
         .await
 }
 
@@ -7612,6 +7832,7 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
     request_id: &str,
     message: &str,
     call_failure_kind: Option<KiroCallFailureKind>,
+    scheduler_error_kind: Option<LocalSchedulerErrorKind>,
     classification_attempts: Vec<KiroCredentialAttempt>,
     diagnostic_attempts: Vec<KiroCredentialAttempt>,
 ) -> Option<ExternalPoolForwardOutcome> {
@@ -7620,6 +7841,7 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
             request_id,
             message,
             call_failure_kind,
+            scheduler_error_kind,
             classification_attempts,
             diagnostic_attempts,
         )
@@ -7742,6 +7964,7 @@ async fn maybe_external_fallback_after_websearch_mcp_failure(
         request_id,
         message,
         call_failure_kind,
+        None,
         attempts.clone(),
         attempts,
     )
@@ -8441,6 +8664,7 @@ async fn handle_stream_request(
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    local_scheduler_error_kind(&retry_error),
                                     classification_attempts,
                                     all_attempts.clone(),
                                 )
@@ -8556,6 +8780,7 @@ async fn handle_stream_request(
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    local_scheduler_error_kind(&retry_error),
                                     classification_attempts.clone(),
                                     all_attempts.clone(),
                                 )
@@ -8568,13 +8793,14 @@ async fn handle_stream_request(
                                     ExternalPoolForwardOutcome::FinalError(err) => {
                                         if let Some(external) = external_fallback.as_ref() {
                                             let local_fallback_reason =
-                                            classify_local_error_for_external_fallback_with_kind(
+                                            classify_local_error_for_external_fallback_with_scheduler_kind(
                                                 &retry_message,
                                                 &classification_attempts,
                                                 &external.config,
                                                 KiroProvider::call_failure_kind_from_error(
                                                     &retry_error,
                                                 ),
+                                                local_scheduler_error_kind(&retry_error),
                                             );
                                             if let Some(reason) =
                                                 budgeted_local_rescue_reason_after_external_route_error(
@@ -8702,6 +8928,7 @@ async fn handle_stream_request(
                         &request_id,
                         &message,
                         KiroProvider::call_failure_kind_from_error(&e),
+                        local_scheduler_error_kind(&e),
                         attempts.clone(),
                     )
                     .await
@@ -8711,11 +8938,12 @@ async fn handle_stream_request(
                             ExternalPoolForwardOutcome::FinalError(err) => {
                                 if let Some(external) = external_fallback.as_ref() {
                                     let local_fallback_reason =
-                                        classify_local_error_for_external_fallback_with_kind(
+                                        classify_local_error_for_external_fallback_with_scheduler_kind(
                                             &message,
                                             &attempts,
                                             &external.config,
                                             KiroProvider::call_failure_kind_from_error(&e),
+                                            local_scheduler_error_kind(&e),
                                         );
                                     if let Some(reason) =
                                         budgeted_local_rescue_reason_after_external_route_error(
@@ -11236,6 +11464,7 @@ async fn handle_non_stream_request(
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    local_scheduler_error_kind(&retry_error),
                                     classification_attempts,
                                     all_attempts.clone(),
                                 )
@@ -11348,6 +11577,7 @@ async fn handle_non_stream_request(
                                     &request_id,
                                     &retry_message,
                                     KiroProvider::call_failure_kind_from_error(&retry_error),
+                                    local_scheduler_error_kind(&retry_error),
                                     classification_attempts.clone(),
                                     all_attempts.clone(),
                                 )
@@ -11360,13 +11590,14 @@ async fn handle_non_stream_request(
                                     ExternalPoolForwardOutcome::FinalError(err) => {
                                         if let Some(external) = external_fallback.as_ref() {
                                             let local_fallback_reason =
-                                            classify_local_error_for_external_fallback_with_kind(
+                                            classify_local_error_for_external_fallback_with_scheduler_kind(
                                                 &retry_message,
                                                 &classification_attempts,
                                                 &external.config,
                                                 KiroProvider::call_failure_kind_from_error(
                                                     &retry_error,
                                                 ),
+                                                    local_scheduler_error_kind(&retry_error),
                                             );
                                             if let Some(reason) =
                                                 budgeted_local_rescue_reason_after_external_route_error(
@@ -11485,6 +11716,7 @@ async fn handle_non_stream_request(
                         &request_id,
                         &message,
                         KiroProvider::call_failure_kind_from_error(&e),
+                        local_scheduler_error_kind(&e),
                         attempts.clone(),
                     )
                     .await
@@ -11494,11 +11726,12 @@ async fn handle_non_stream_request(
                             ExternalPoolForwardOutcome::FinalError(err) => {
                                 if let Some(external) = external_fallback.as_ref() {
                                     let local_fallback_reason =
-                                        classify_local_error_for_external_fallback_with_kind(
+                                        classify_local_error_for_external_fallback_with_scheduler_kind(
                                             &message,
                                             &attempts,
                                             &external.config,
                                             KiroProvider::call_failure_kind_from_error(&e),
+                                            local_scheduler_error_kind(&e),
                                         );
                                     if let Some(reason) =
                                         budgeted_local_rescue_reason_after_external_route_error(
