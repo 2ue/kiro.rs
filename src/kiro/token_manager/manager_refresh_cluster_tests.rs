@@ -965,7 +965,9 @@ async fn token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_
                 stage: RedisRefreshFailureStage::ResponseStatus,
                 kind: RedisRefreshFailureKind::RateLimited,
                 status: Some(429),
-                retry_after: Some(StdDuration::from_secs(10)),
+                // 失败重放窗口要远长于 5 秒的 health claim 租期，保证 reclaim 时窗口仍在、
+                // 结果仍是 Replay；原来的 10 秒在机器负载高时余量不够。
+                retry_after: Some(StdDuration::from_secs(30)),
                 send_committed: true,
                 health_action_required: true,
             };
@@ -1002,7 +1004,8 @@ async fn token_refresh_two_manager_cancelled_health_claim_is_reclaimed_once_for_
                 managers[1].entries.lock()[0].cooldown_until.is_none(),
                 "{marker}"
             );
-            tokio::time::sleep(StdDuration::from_millis(5_200)).await;
+            // 等过 5 秒的 claim 租期，并留出 Redis 往返与调度的余量。
+            tokio::time::sleep(StdDuration::from_secs(6)).await;
             let reclaimed = managers[1]
                 .begin_distributed_refresh_until(
                     id,
