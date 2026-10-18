@@ -868,6 +868,7 @@ struct ExternalFallbackContext {
     request_api_key_id: Option<String>,
     requires_normalized_body: bool,
     raw_preflight_failure: Option<RawExternalPreflightFailure>,
+    stream_pre_output_hold: Option<Duration>,
 }
 
 struct LocalPoolPreflightExternalOutcome {
@@ -954,6 +955,12 @@ struct RequestRuntimeConfig {
 }
 
 impl RequestRuntimeConfig {
+    /// 外部池流式首输出前的静默保留窗口；0 表示一直保留到首个语义输出。
+    fn external_stream_pre_output_hold(&self) -> Option<Duration> {
+        (self.stream_pre_output_hold_secs > 0)
+            .then(|| Duration::from_secs(self.stream_pre_output_hold_secs))
+    }
+
     fn from_app_state(state: &AppState) -> Self {
         Self {
             extract_thinking: state.extract_thinking,
@@ -1811,6 +1818,7 @@ fn raw_external_route_request_with_hints(
         error_id: request_id.clone(),
         recorder: state.usage_recorder.clone(),
         started_at: inference_attempt_budget.started_at().into(),
+        stream_pre_output_hold: runtime_config.external_stream_pre_output_hold(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
         payload_breakdown: None,
@@ -1887,6 +1895,7 @@ fn build_external_fallback_context(
         request_api_key_id,
         requires_normalized_body,
         raw_preflight_failure,
+        stream_pre_output_hold: runtime_config.external_stream_pre_output_hold(),
     })
 }
 
@@ -2395,6 +2404,7 @@ impl ExternalFallbackContext {
             request_id,
             recorder: self.recorder.clone(),
             started_at: self.inference_attempt_budget.started_at().into(),
+            stream_pre_output_hold: self.stream_pre_output_hold,
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
             latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
             payload_breakdown: None,

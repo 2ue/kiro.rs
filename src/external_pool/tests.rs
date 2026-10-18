@@ -1821,6 +1821,125 @@ async fn external_pool_stream_keepalive_emits_ping_during_silent_gap_after_outpu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_pre_output_hold_commits_message_start_and_pings_before_first_output()
+{
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    // 上游先发 message_start，然后在首个语义输出前长时间静默（模拟长 thinking）。
+    let upstream = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_hold_a", 111)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(2_500)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("after-hold")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_messages_pool(&postgres, "stream-pre-output-hold", 1, &upstream.base_url).await;
+
+    let request_id = "req_stream_pre_output_hold";
+    let (mut route, recorder) = external_stream_route(request_id, "err_stream_pre_output_hold");
+    route.stream_pre_output_hold = Some(Duration::from_millis(500));
+    let mut config = external_stream_config_for_test();
+    // 空闲超时长于静默间隔，保留窗口到期后由 1 秒间隔的 ping 保活。
+    config.external_pool_stream_idle_timeout_secs = 3;
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("held stream should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("held stream should not fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    let message_start_pos = body
+        .find("msg_hold_a")
+        .expect("message_start should be present");
+    let ping_pos = body
+        .find("event: ping")
+        .expect("ping must be sent while the upstream is silent");
+    let text_start_pos = body
+        .find("content_block_start")
+        .expect("delayed content_block_start should be present");
+    assert!(
+        message_start_pos < ping_pos,
+        "message_start is committed before keepalive"
+    );
+    assert!(
+        ping_pos < text_start_pos,
+        "keepalive must cover the silent gap before the first semantic output"
+    );
+    assert!(body.contains("after-hold"));
+
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 1);
+    assert_eq!(upstream.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_stream_error_inside_pre_output_hold_still_fails_over_without_leaking_prefix()
+{
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_hold_failed", 111)),
+        ExternalStreamFakeStep::delay(Duration::from_millis(100)),
+        ExternalStreamFakeStep::chunk(external_sse_error("hold window upstream failure")),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_hold_ok", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+        ExternalStreamFakeStep::chunk(external_sse_text_delta("from-second-pool")),
+        ExternalStreamFakeStep::chunk(external_sse_text_stop()),
+        ExternalStreamFakeStep::chunk(external_sse_message_delta(111, 4)),
+        ExternalStreamFakeStep::chunk(external_sse_message_stop()),
+    ])
+    .await;
+    create_messages_pool(&postgres, "hold-failing", 1, &failing.base_url).await;
+    create_messages_pool(&postgres, "hold-healthy", 10, &healthy.base_url).await;
+
+    let request_id = "req_stream_hold_failover";
+    let (mut route, _recorder) = external_stream_route(request_id, "err_stream_hold_failover");
+    // 错误发生在保留窗口内：还没向客户端写任何字节，必须照常换池。
+    route.stream_pre_output_hold = Some(Duration::from_secs(5));
+    let response = match timeout(
+        Duration::from_secs(8),
+        manager.forward_with_failover_result(external_stream_config_for_test(), route),
+    )
+    .await
+    .expect("failover stream should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("an error inside the hold window must fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("from-second-pool"));
+    assert!(
+        !body.contains("msg_hold_failed"),
+        "the failed attempt's buffered message_start must not leak"
+    );
+    assert_eq!(failing.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_stream_protocol_only_then_error_event_fails_over_without_leaking_prefix() {
     let Some((manager, postgres)) = test_external_pool_manager().await else {
         return;
@@ -11289,6 +11408,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         error_id: "req_01capacity".to_string(),
         recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
         started_at: Instant::now(),
+        stream_pre_output_hold: None,
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         latency_trace: Arc::new(ExternalLatencyTraceState::default()),
         payload_breakdown: None,
@@ -12559,6 +12679,7 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         error_id: "req_error_external_billing".to_string(),
         recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
         started_at: Instant::now(),
+        stream_pre_output_hold: None,
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         latency_trace: Arc::new(ExternalLatencyTraceState::default()),
         payload_breakdown: None,

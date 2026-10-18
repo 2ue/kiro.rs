@@ -1079,6 +1079,9 @@ pub struct ExternalRouteRequest {
     pub error_id: String,
     pub recorder: Arc<crate::anthropic::usage::UsageRecorder>,
     pub started_at: Instant,
+    /// 流式首个语义输出前最多静默保留多久（与本地 `streamPreOutputHoldSecs` 一致，从请求开始计）。
+    /// 到期且已缓冲 message_start 时提前提交并开始保活，放弃之后的首输出前换池；None 表示一直保留。
+    pub stream_pre_output_hold: Option<Duration>,
     pub first_token_latency_ms: Arc<AtomicU64>,
     pub latency_trace: Arc<ExternalLatencyTraceState>,
     pub payload_breakdown: Option<PayloadByteBreakdown>,
@@ -11036,6 +11039,13 @@ async fn external_pool_stream_idle_deadline(
     }
 }
 
+async fn external_pool_stream_pre_output_hold_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn external_pool_stream_keepalive_deadline(
     last_keepalive_at: Instant,
     keepalive_interval: Duration,
@@ -11264,6 +11274,9 @@ where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
     let mut last_chunk_at = Instant::now();
+    let hold_deadline = route
+        .stream_pre_output_hold
+        .map(|hold| route.started_at + hold);
     loop {
         while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
             let end = idx + delimiter_len;
@@ -11383,6 +11396,18 @@ where
             }
             _ = lease.wait_until_lost() => {
                 return Err(external_pool_lease_lost_forward_error(outbound_model.clone()));
+            }
+            // 与本地路径一致：保留窗口到期后不再静默等待首个语义输出。已缓冲的
+            // message_start 先发给客户端，之后由提交后的流按间隔发送 ping，代价是放弃
+            // 之后的首输出前换池。还没收到任何事件时没有可提交的内容，继续等待。
+            _ = external_pool_stream_pre_output_hold_deadline(hold_deadline), if !prefix.is_empty() => {
+                tracing::info!(
+                    request_id = %route.request_id,
+                    pool_id = pool.id,
+                    pool_name = %pool.name,
+                    "external pool pre-output hold window elapsed; committing buffered events and starting keepalive"
+                );
+                return Ok(last_chunk_at);
             }
             _ = external_pool_stream_idle_deadline(last_chunk_at, stream_idle_timeout) => {
                 let seconds = stream_idle_timeout
