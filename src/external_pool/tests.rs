@@ -8266,10 +8266,26 @@ async fn external_pool_high_concurrency_random_mixed_status_turbulence_transfers
         }
     }
     let (primary_wave1_hits, primary_wave1_failures) = primary.snapshot();
+    // 主池拿到多少请求取决于调度速度：第一次失败写入 Redis 后，软惩罚（streak × penalty）
+    // 就把它排到备用池之后，所以快机器上第一波可打满 128 次，CI 上见过只有 13 次。这里只断言
+    // 与调度无关的部分：起初它优先级最高、确定性序列第 1 次必失败，所以至少有 1 次失败；
+    // 命中足够多时再检查"持续失败"（前 9 次全失败）和"夹着成功"（第 10 次成功）。
     assert!(
-        primary_wave1_failures > 20,
-        "the first wave must exercise sustained mixed failures, got {primary_wave1_failures}"
+        primary_wave1_failures >= 1,
+        "the turbulent primary must be exercised in the first wave, got {primary_wave1_hits} hits / {primary_wave1_failures} failures"
     );
+    if primary_wave1_hits >= 9 {
+        assert!(
+            primary_wave1_failures >= 9,
+            "the first nine deterministic hits all fail, got {primary_wave1_hits} hits / {primary_wave1_failures} failures"
+        );
+    }
+    if primary_wave1_hits >= 10 {
+        assert!(
+            primary_wave1_failures < primary_wave1_hits,
+            "the deterministic sequence succeeds on hit 10, got {primary_wave1_hits} hits / {primary_wave1_failures} failures"
+        );
+    }
     let runtime = manager
         .load_pool_runtime_snapshot(primary_pool.id, &[])
         .await
