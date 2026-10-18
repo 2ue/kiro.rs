@@ -178,4 +178,8 @@ test("manifest checks a successful same-SHA push and exposes the documented esca
   assert.match(workflow, /vars\.ALLOW_RELEASE_WITHOUT_FULL_QUALITY != 'true'/);
   assert.match(workflow, /vars\.ALLOW_RELEASE_WITHOUT_FULL_QUALITY == 'true'/);
   assert.match(workflow, /Please wait for the Quality Gate run on main for this commit to finish and pass, or manually dispatch the full profile/);
+  // octokit 的方法名是 listWorkflowRuns（GET /actions/workflows/{id}/runs）；写错方法名只会在发版时才报
+  // "is not a function"，所以在这里锁住。
+  assert.match(workflow, /github\.rest\.actions\.listWorkflowRuns\(/);
+  assert.doesNotMatch(workflow, /listWorkflowRunsForWorkflow/);
 });
