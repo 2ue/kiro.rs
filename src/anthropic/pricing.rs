@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use parking_lot::RwLock;
@@ -115,7 +115,9 @@ impl Default for PricingSnapshot {
 #[derive(Debug, Clone)]
 pub struct PricingCatalog {
     inner: Arc<RwLock<PricingSnapshot>>,
-    client: reqwest::Client,
+    /// 只在拉取远端价格时才需要。构建 reqwest Client 会加载系统根证书（rustls 下在 macOS
+    /// 要读钥匙串，单次约百毫秒且互斥），所以延迟到首次使用，克隆之间共享同一个实例。
+    client: Arc<OnceLock<reqwest::Client>>,
 }
 
 impl Default for PricingCatalog {
@@ -128,7 +130,7 @@ impl PricingCatalog {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(PricingSnapshot::default())),
-            client: reqwest::Client::new(),
+            client: Arc::new(OnceLock::new()),
         }
     }
 
@@ -317,6 +319,7 @@ impl PricingCatalog {
     ) -> anyhow::Result<HashMap<String, ModelPricing>> {
         let value: serde_json::Value = self
             .client
+            .get_or_init(reqwest::Client::new)
             .get(DEFAULT_PRICING_SOURCE_URL)
             .send()
             .await?
