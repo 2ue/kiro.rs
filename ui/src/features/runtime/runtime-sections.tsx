@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { Plus, Trash2 } from 'lucide-react'
+import { Check, Plus, Trash2 } from 'lucide-react'
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
 import { defaultCacheHitShaping, defaultPromptCacheCreationControl, inputSamplePolicy, pathPolicy, preserveFieldPolicy, writerSamplePolicy } from '@/lib/runtime-config-defaults'
 import type {
@@ -29,15 +29,15 @@ export function NumField({
   suffix?: string; disabled?: boolean; onChange: (v: number) => void
 }) {
   return (
-    <div className="space-y-1.5">
-      <div className="text-sm font-semibold text-foreground">{label}</div>
-      {desc && <div className="text-xs leading-relaxed text-muted-foreground">{desc}</div>}
-      <div className="flex items-center gap-2">
-        <Input type="number" className="w-full" value={value} min={min} max={max} step={step}
+    <div className="min-w-0 space-y-1.5">
+      <label className="block text-[13px] font-medium leading-5 text-foreground">{label}</label>
+      <div className="flex min-h-8 items-center gap-2">
+        <Input type="number" className="h-8 w-24 shrink-0 px-2 text-sm tabular-nums" value={value} min={min} max={max} step={step}
           inputMode={step && step < 1 ? 'decimal' : 'numeric'} disabled={disabled}
           onChange={(e) => onChange(numberValue(e.target.value, min ?? 0))} />
-        {suffix && <span className="min-w-[5rem] shrink-0 text-sm text-muted-foreground">{suffix}</span>}
+        {suffix && <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground">{suffix}</span>}
       </div>
+      {desc && <div className="max-w-[34rem] text-[11px] leading-4 text-muted-foreground">{desc}</div>}
     </div>
   )
 }
@@ -48,18 +48,75 @@ export function TogField({
   label: string; desc?: string; checked: boolean; disabled?: boolean; onChange: (v: boolean) => void
 }) {
   return (
-    <div className="flex items-start justify-between gap-4">
-      <div className="min-w-0">
-        <div className="text-sm font-semibold text-foreground">{label}</div>
-        {desc && <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{desc}</div>}
+    <div className="min-w-0 space-y-1.5">
+      <div className="flex min-h-8 items-center justify-between gap-4">
+        <div className="min-w-0 text-[13px] font-medium leading-5 text-foreground">{label}</div>
+        <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} className="shrink-0" />
       </div>
-      <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} className="mt-0.5 shrink-0" />
+      {desc && <div className="text-xs leading-5 text-muted-foreground">{desc}</div>}
     </div>
   )
 }
 
 function TwoCol({ children }: { children: React.ReactNode }) {
-  return <div className="grid gap-4 md:grid-cols-2">{children}</div>
+  return <div className="grid gap-x-6 gap-y-5 md:grid-cols-2">{children}</div>
+}
+
+function FieldGrid({ children }: { children: React.ReactNode }) {
+  return <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">{children}</div>
+}
+
+/**
+ * 文档式的参数分组：只用标题、细线和留白表达层级，不再给每个子组套一层卡片。
+ * 适合放在策略弹窗中，避免多个分组嵌套后所有内容看起来同级。
+ */
+function ParameterGroup({
+  title,
+  desc,
+  children,
+  className = '',
+}: {
+  title: string
+  desc?: string
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <section className={`space-y-5 border-t border-border/60 pt-5 first:border-t-0 first:pt-0 ${className}`}>
+      <header className="flex max-w-3xl items-start gap-2.5">
+        <span className="mt-2 size-1.5 shrink-0 rounded-full bg-foreground/35" aria-hidden="true" />
+        <div>
+          <h3 className="text-sm font-semibold leading-5 tracking-tight text-foreground">{title}</h3>
+          {desc && <p className="mt-1 text-xs leading-5 text-muted-foreground">{desc}</p>}
+        </div>
+      </header>
+      <div className="min-w-0 space-y-5">{children}</div>
+    </section>
+  )
+}
+
+function EditorSection({
+  id,
+  title,
+  desc,
+  className = '',
+  children,
+}: {
+  id?: string
+  title: string
+  desc?: string
+  className?: string
+  children: ReactNode
+}) {
+  return (
+    <section id={id} className={`min-w-0 scroll-mt-4 ${className}`}>
+      <header className="max-w-3xl">
+        <h3 className="text-base font-semibold leading-6 tracking-tight text-foreground">{title}</h3>
+        {desc && <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{desc}</p>}
+      </header>
+      <div className="mt-7 min-w-0">{children}</div>
+    </section>
+  )
 }
 
 // ─── 缓存策略与路径绑定(cachePolicy + legacy defaults) ───────────────────────
@@ -74,7 +131,7 @@ type SuppressedCreationTarget = NonNullable<KiroRsToolPlusPatch['suppressedCreat
 type StableSegmentPatch = NonNullable<CacheRoutePolicyPatch['stableSegment']>
 type CacheHitShapingPatch = NonNullable<CacheRoutePolicyPatch['hitShaping']>
 type ColdRequestGuardPatch = NonNullable<CacheRoutePolicyPatch['coldRequestGuard']>
-type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
+export type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
 
 const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
 const DFCACHE_ROUTE_PREFIX = '/dfcache/'
@@ -85,7 +142,7 @@ const CACHE_ENDPOINT_LABELS: Record<string, string> = {
   '/na': '/na/v1/messages',
 }
 
-function normalizeCachePolicyPath(prefix: string): string | null {
+export function normalizeCachePolicyPath(prefix: string): string | null {
   const trimmed = prefix.trim()
   if (!trimmed) return null
   const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
@@ -222,7 +279,7 @@ function builtinDefaultCacheType(prefix: string): CacheStrategyType {
   return prefix === '/na' ? 'no_cache' : 'current_high_cache'
 }
 
-function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
+export function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') {
     return { cacheType: 'no_cache' }
   }
@@ -254,27 +311,112 @@ function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): Ca
   }
 }
 
-function cacheTypeDesc(cacheType: CacheRoutePolicyPatch['cacheType']): string {
-  if (cacheType === 'no_cache') {
-    return '这个路径不进入缓存计算，直接使用原始用量返回和记录，CPU 和内存开销最低。'
+const SHARED_ROUTE_POLICY_FIELDS = ['cachePoint', 'bounds'] as const
+
+function pickDefinedRoutePolicyFields(
+  policy: CacheRoutePolicyPatch,
+  fields: readonly (keyof CacheRoutePolicyPatch)[],
+): Partial<CacheRoutePolicyPatch> {
+  const picked: Partial<CacheRoutePolicyPatch> = {}
+  for (const field of fields) {
+    if (policy[field] !== undefined) Object.assign(picked, { [field]: policy[field] })
+  }
+  return picked
+}
+
+/**
+ * 路径切换策略时只保留新策略支持的字段，避免旧策略参数继续跟着路径提交。
+ * cachePoint / bounds 是各缓存实现共用的缓存状态限制，其他字段按策略隔离。
+ */
+export function sanitizeCacheRoutePolicy(policy: CacheRoutePolicyPatch): CacheRoutePolicyPatch {
+  const cacheType = policy.cacheType ?? 'no_cache'
+  if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
+
+  const shared = pickDefinedRoutePolicyFields(policy, SHARED_ROUTE_POLICY_FIELDS)
+  if (cacheType === 'current_high_cache') {
+    return {
+      cacheType,
+      ...shared,
+      ...pickDefinedRoutePolicyFields(policy, ['routeNamespace', 'simulation', 'creationControl', 'reportedUsage', 'hitShaping', 'coldRequestGuard']),
+    }
   }
   if (cacheType === 'kiro_rs_tool') {
-    return '按 Kiro-RS Tool 的会话和路径规则计算缓存；第一次请求不会显示缓存读取，失败请求不会写入缓存。'
-  }
-  if (cacheType === 'kiro_rs_tool_plus') {
-    return '在 Kiro-RS Tool 前缀追踪基础上，单独控制输入、输出、缓存读取、缓存写入的放大倍数（可大于 1）和上下限，支持写入频次限制，流式 / 非流式 / 小请求可以用不同参数。不叠加命中率整形和最终用量显示配置。'
+    return {
+      cacheType,
+      ...shared,
+      ...pickDefinedRoutePolicyFields(policy, ['reportedUsage', 'kiroRsTool', 'hitShaping', 'coldRequestGuard']),
+    }
   }
   if (cacheType === 'stable_segment_cache') {
-    return '按请求里稳定不变的 tools、system 和历史消息计算缓存，只按会话和路径隔离；切换账号或外部池后缓存仍然保留，失败请求不会写入缓存。'
+    return {
+      cacheType,
+      ...shared,
+      ...pickDefinedRoutePolicyFields(policy, ['routeNamespace', 'reportedUsage', 'stableSegment', 'hitShaping', 'coldRequestGuard']),
+    }
   }
-  return '使用当前系统的本地模拟缓存逻辑，把原始用量换算成对外显示的缓存用量。'
+  return {
+    cacheType,
+    ...shared,
+    ...pickDefinedRoutePolicyFields(policy, ['kiroRsToolPlus']),
+  }
+}
+
+const CACHE_STRATEGY_OPTIONS: Array<{
+  value: CacheStrategyType
+  title: string
+  desc: string
+}> = [
+  { value: 'no_cache', title: '无缓存', desc: '直接使用原始用量，不进入缓存计算。' },
+  { value: 'current_high_cache', title: '本地模拟缓存', desc: '本地模拟命中和创建，适合保持现有展示逻辑。' },
+  { value: 'kiro_rs_tool', title: 'Kiro-RS Tool', desc: '按会话和路径追踪稳定前缀，逐步补建缓存。' },
+  { value: 'stable_segment_cache', title: '稳定片段缓存', desc: '从 tools、system 和历史消息提取稳定缓存片段。' },
+  { value: 'kiro_rs_tool_plus', title: 'Kiro-RS Tool Plus', desc: '分别控制四类 usage、写入频次、非流式和小请求。' },
+]
+
+function StrategyChoice({
+  value,
+  onChange,
+}: {
+  value: CacheStrategyType
+  onChange: (next: CacheStrategyType) => void
+}) {
+  return (
+    <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="缓存策略">
+      {CACHE_STRATEGY_OPTIONS.map((option) => {
+        const selected = option.value === value
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            onClick={() => onChange(option.value)}
+            className={`min-w-0 rounded-lg border px-3.5 py-3 text-left transition-colors ${selected
+              ? 'border-primary bg-primary/[0.04] shadow-[0_0_0_1px_hsl(var(--primary)/0.16)]'
+              : 'border-border/80 hover:border-foreground/30 hover:bg-muted/25'
+            }`}
+          >
+            <div className="flex items-start gap-2.5">
+              <span className={`mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/45 text-transparent'}`}>
+                {selected && <Check className="size-3" aria-hidden="true" />}
+              </span>
+              <span className="min-w-0">
+                <span className="block text-[13px] font-semibold leading-5 text-foreground">{option.title}</span>
+                <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">{option.desc}</span>
+              </span>
+            </div>
+          </button>
+        )
+      })}
+    </div>
+  )
 }
 
 function isBuiltInCachePrefix(prefix: string): boolean {
   return (BUILT_IN_CACHE_PREFIXES as readonly string[]).includes(prefix)
 }
 
-function canonicalCachePolicyPath(prefix: string): string {
+export function canonicalCachePolicyPath(prefix: string): string {
   const normalized = prefix.replace(/\/+$/, '') || '/'
   const lower = normalized.toLowerCase()
   if (lower === '/cc/v1' || lower === '/cc/v1/messages') return '/cc'
@@ -290,7 +432,7 @@ function cachePolicyPathAliases(prefix: string): string[] {
   return [prefix]
 }
 
-function routeOverrideForPrefix(
+export function routeOverrideForPrefix(
   pathOverrides: Record<string, CacheRoutePolicyPatch> | undefined,
   prefix: string
 ): CacheRoutePolicyPatch | undefined {
@@ -301,7 +443,7 @@ function routeOverrideForPrefix(
   return undefined
 }
 
-function reportedUsageForPrefix(
+export function reportedUsageForPrefix(
   pathOverrides: Record<string, ReportedUsagePathPolicy> | undefined,
   prefix: string
 ): ReportedUsagePathPolicy | undefined {
@@ -312,7 +454,7 @@ function reportedUsageForPrefix(
   return undefined
 }
 
-function deletePrefixAliases<T>(record: Record<string, T>, prefix: string) {
+export function deletePrefixAliases<T>(record: Record<string, T>, prefix: string) {
   for (const alias of cachePolicyPathAliases(prefix)) {
     delete record[alias]
   }
@@ -350,7 +492,7 @@ function moveDefinedRoute(routes: string[], oldPrefix: string, nextPrefix: strin
   return normalizedDefinedRoutesWith(withoutOld, nextPrefix, Boolean(normalizeDefinedCacheRoute(nextPrefix)))
 }
 
-function normalizeDefinedCacheRouteName(name: string): string | null {
+export function normalizeDefinedCacheRouteName(name: string): string | null {
   const trimmed = name.trim().toLowerCase()
   if (!trimmed) return null
   const suffix = trimmed.startsWith(DFCACHE_ROUTE_PREFIX)
@@ -362,7 +504,7 @@ function normalizeDefinedCacheRouteName(name: string): string | null {
   return suffix
 }
 
-function buildDefinedCacheRoute(name: string): string | null {
+export function buildDefinedCacheRoute(name: string): string | null {
   const normalizedName = normalizeDefinedCacheRouteName(name)
   return normalizedName ? `${DFCACHE_ROUTE_PREFIX}${normalizedName}` : null
 }
@@ -386,58 +528,60 @@ function SimulationOverrideForm({
         checked={merged.enabled ?? true}
         onChange={set('enabled')}
       />
-      <NumField
-        label="目标缓存读取比例"
-        desc="希望输入里大约多少比例显示成缓存读取。越高，看起来命中越多；最高 0.99。"
-        value={merged.targetReadRatio ?? 0.98}
-        min={0}
-        max={0.99}
-        step={0.01}
-        suffix="比例"
-        onChange={set('targetReadRatio')}
-      />
-      <NumField
-        label="输入放大倍数"
-        desc="计算展示用量前先把输入按这个倍数放大，用来模拟更长上下文；1 表示不放大。"
-        value={merged.tokenScale ?? 1.6}
-        min={1}
-        max={3}
-        step={0.1}
-        suffix="倍"
-        onChange={set('tokenScale')}
-      />
-      <NumField
-        label="模拟输入上限"
-        desc="放大后的展示输入最多到这个数；0 表示不设上限。"
-        value={merged.maxSimulatedInputTokens ?? 300000}
-        min={0}
-        suffix="Token"
-        onChange={set('maxSimulatedInputTokens')}
-      />
-      <NumField
-        label="放大生效门槛"
-        desc="原始输入低于这个值时不放大，避免小请求也显示成很大的用量。"
-        value={merged.scaleMinInputTokens ?? 20000}
-        min={0}
-        suffix="Token"
-        onChange={set('scaleMinInputTokens')}
-      />
-      <NumField
-        label="上限扣减下限"
-        desc="接近上限时至少少显示这么多，避免每次都卡在同一个上限数字。"
-        value={merged.capJitterMinTokens ?? 12000}
-        min={0}
-        suffix="Token"
-        onChange={set('capJitterMinTokens')}
-      />
-      <NumField
-        label="上限扣减上限"
-        desc="接近上限时最多少显示这么多；必须大于等于扣减下限。"
-        value={merged.capJitterMaxTokens ?? 24000}
-        min={0}
-        suffix="Token"
-        onChange={set('capJitterMaxTokens')}
-      />
+      <FieldGrid>
+        <NumField
+          label="目标缓存读取比例"
+          desc="希望输入里大约多少比例显示成缓存读取。越高，看起来命中越多；最高 0.99。"
+          value={merged.targetReadRatio ?? 0.98}
+          min={0}
+          max={0.99}
+          step={0.01}
+          suffix="比例"
+          onChange={set('targetReadRatio')}
+        />
+        <NumField
+          label="输入放大倍数"
+          desc="计算展示用量前先把输入按这个倍数放大，用来模拟更长上下文；1 表示不放大。"
+          value={merged.tokenScale ?? 1.6}
+          min={1}
+          max={3}
+          step={0.1}
+          suffix="倍"
+          onChange={set('tokenScale')}
+        />
+        <NumField
+          label="模拟输入上限"
+          desc="放大后的展示输入最多到这个数；0 表示不设上限。"
+          value={merged.maxSimulatedInputTokens ?? 300000}
+          min={0}
+          suffix="Token"
+          onChange={set('maxSimulatedInputTokens')}
+        />
+        <NumField
+          label="放大生效门槛"
+          desc="原始输入低于这个值时不放大，避免小请求也显示成很大的用量。"
+          value={merged.scaleMinInputTokens ?? 20000}
+          min={0}
+          suffix="Token"
+          onChange={set('scaleMinInputTokens')}
+        />
+        <NumField
+          label="上限扣减下限"
+          desc="接近上限时至少少显示这么多，避免每次都卡在同一个上限数字。"
+          value={merged.capJitterMinTokens ?? 12000}
+          min={0}
+          suffix="Token"
+          onChange={set('capJitterMinTokens')}
+        />
+        <NumField
+          label="上限扣减上限"
+          desc="接近上限时最多少显示这么多；必须大于等于扣减下限。"
+          value={merged.capJitterMaxTokens ?? 24000}
+          min={0}
+          suffix="Token"
+          onChange={set('capJitterMaxTokens')}
+        />
+      </FieldGrid>
     </div>
   )
 }
@@ -478,79 +622,81 @@ function CacheHitShapingForm({
         checked={merged.enabled}
         onChange={set('enabled')}
       />
-      <NumField
-        label="目标命中率"
-        desc="缓存读取 ÷（输入 + 读取 + 写入），口径与 sub2api 的 Token 使用趋势一致。会话首请求不受此约束；会受计费下限约束，放大倍数越高越容易达到。"
-        value={merged.targetHitRatio}
-        min={0}
-        max={0.99}
-        step={0.01}
-        suffix="比例"
-        disabled={!merged.enabled}
-        onChange={set('targetHitRatio')}
-      />
-      <NumField
-        label="命中率浮动"
-        desc="在目标值之上随机多出的幅度，避免每次都精确等于目标值；例如目标 0.9、浮动 0.04，实际落在 0.90~0.94。"
-        value={merged.ratioJitter}
-        min={0}
-        max={0.2}
-        step={0.01}
-        suffix="比例"
-        disabled={!merged.enabled}
-        onChange={set('ratioJitter')}
-      />
-      <NumField
-        label="缓存读取最小值"
-        desc="非零的缓存读取低于这个值时抬到这个值。0 表示不处理。"
-        value={merged.minCacheReadTokens}
-        min={0}
-        suffix="Token"
-        disabled={!merged.enabled}
-        onChange={set('minCacheReadTokens')}
-      />
-      <NumField
-        label="缓存写入最小值"
-        desc="非零的缓存写入低于这个值时抬到这个值。0 表示不处理。"
-        value={merged.minCacheCreationTokens}
-        min={0}
-        suffix="Token"
-        disabled={!merged.enabled}
-        onChange={set('minCacheCreationTokens')}
-      />
-      <NumField
-        label="计费下限倍数"
-        desc="整形后的计费不低于原始用量计费的这个倍数；与目标命中率冲突时以这里为准。1 表示不亏损，0 表示不限制。"
-        value={merged.minCostRatio}
-        min={0}
-        max={5}
-        step={0.05}
-        suffix="倍"
-        disabled={!merged.enabled}
-        onChange={set('minCostRatio')}
-      />
-      <NumField
-        label="缓存读取上限倍数"
-        desc="缓存读取最多为原始输入的多少倍，用来控制读取数值不过大；触及上限后命中率可以低于目标，计费下限仍然生效。0 表示不限制。"
-        value={merged.maxReadMultiplier}
-        min={0}
-        max={50}
-        step={0.5}
-        suffix="倍"
-        disabled={!merged.enabled}
-        onChange={set('maxReadMultiplier')}
-      />
-      <NumField
-        label="最小写入比例"
-        desc="本次允许写入时，缓存写入至少为原始输入的这个比例，用来把写入调大；不允许写入的请求不受影响。0 表示不限制。"
-        value={merged.minCreationRatio}
-        min={0}
-        max={5}
-        step={0.05}
-        suffix="倍"
-        disabled={!merged.enabled}
-        onChange={set('minCreationRatio')}
-      />
+      <FieldGrid>
+        <NumField
+          label="目标命中率"
+          desc="缓存读取 ÷（输入 + 读取 + 写入），口径与 sub2api 的 Token 使用趋势一致。会话首请求不受此约束；会受计费下限约束，放大倍数越高越容易达到。"
+          value={merged.targetHitRatio}
+          min={0}
+          max={0.99}
+          step={0.01}
+          suffix="比例"
+          disabled={!merged.enabled}
+          onChange={set('targetHitRatio')}
+        />
+        <NumField
+          label="命中率浮动"
+          desc="在目标值之上随机多出的幅度，避免每次都精确等于目标值；例如目标 0.9、浮动 0.04，实际落在 0.90~0.94。"
+          value={merged.ratioJitter}
+          min={0}
+          max={0.2}
+          step={0.01}
+          suffix="比例"
+          disabled={!merged.enabled}
+          onChange={set('ratioJitter')}
+        />
+        <NumField
+          label="缓存读取最小值"
+          desc="非零的缓存读取低于这个值时抬到这个值。0 表示不处理。"
+          value={merged.minCacheReadTokens}
+          min={0}
+          suffix="Token"
+          disabled={!merged.enabled}
+          onChange={set('minCacheReadTokens')}
+        />
+        <NumField
+          label="缓存写入最小值"
+          desc="非零的缓存写入低于这个值时抬到这个值。0 表示不处理。"
+          value={merged.minCacheCreationTokens}
+          min={0}
+          suffix="Token"
+          disabled={!merged.enabled}
+          onChange={set('minCacheCreationTokens')}
+        />
+        <NumField
+          label="计费下限倍数"
+          desc="整形后的计费不低于原始用量计费的这个倍数；与目标命中率冲突时以这里为准。1 表示不亏损，0 表示不限制。"
+          value={merged.minCostRatio}
+          min={0}
+          max={5}
+          step={0.05}
+          suffix="倍"
+          disabled={!merged.enabled}
+          onChange={set('minCostRatio')}
+        />
+        <NumField
+          label="缓存读取上限倍数"
+          desc="缓存读取最多为原始输入的多少倍，用来控制读取数值不过大；触及上限后命中率可以低于目标，计费下限仍然生效。0 表示不限制。"
+          value={merged.maxReadMultiplier}
+          min={0}
+          max={50}
+          step={0.5}
+          suffix="倍"
+          disabled={!merged.enabled}
+          onChange={set('maxReadMultiplier')}
+        />
+        <NumField
+          label="最小写入比例"
+          desc="本次允许写入时，缓存写入至少为原始输入的这个比例，用来把写入调大；不允许写入的请求不受影响。0 表示不限制。"
+          value={merged.minCreationRatio}
+          min={0}
+          max={5}
+          step={0.05}
+          suffix="倍"
+          disabled={!merged.enabled}
+          onChange={set('minCreationRatio')}
+        />
+      </FieldGrid>
     </div>
   )
 }
@@ -574,69 +720,71 @@ function CreationControlOverrideForm({
         checked={merged.enabled}
         onChange={set('enabled')}
       />
-      <NumField
-        label="最小成功请求间隔"
-        desc="两次显示缓存写入之间至少隔多少次成功请求；0 表示不按次数限制。"
-        value={merged.minSuccessfulRequestsBetweenCreation}
-        min={0}
-        suffix="次"
-        disabled={!merged.enabled}
-        onChange={set('minSuccessfulRequestsBetweenCreation')}
-      />
-      <NumField
-        label="最小时间间隔"
-        desc="两次显示缓存写入之间至少间隔多久；0 表示不按时间限制。"
-        value={merged.minCreationIntervalSecs}
-        min={0}
-        suffix="秒"
-        disabled={!merged.enabled}
-        onChange={set('minCreationIntervalSecs')}
-      />
-      <NumField
-        label="最小累计增量"
-        desc="累计新增输入达到多少 Token 后，才允许再次显示缓存写入；0 表示不限制。"
-        value={merged.minCreationDeltaTokens}
-        min={0}
-        suffix="Token"
-        disabled={!merged.enabled}
-        onChange={set('minCreationDeltaTokens')}
-      />
-      <NumField
-        label="单次展示上限"
-        desc="一次响应里最多显示多少缓存写入 Token；0 表示不限制。"
-        value={merged.maxCreationTokensPerEvent}
-        min={0}
-        suffix="Token"
-        disabled={!merged.enabled}
-        onChange={set('maxCreationTokensPerEvent')}
-      />
-      <NumField
-        label="额度窗口长度"
-        desc="按多长时间统计一次缓存写入展示额度；0 表示关闭窗口额度控制。"
-        value={merged.creationBudgetWindowSecs}
-        min={0}
-        suffix="秒"
-        disabled={!merged.enabled}
-        onChange={set('creationBudgetWindowSecs')}
-      />
-      <NumField
-        label="窗口展示额度"
-        desc="一个时间窗口内最多显示多少缓存写入 Token；0 表示不限制。"
-        value={merged.maxCreationTokensPerWindow}
-        min={0}
-        suffix="Token"
-        disabled={!merged.enabled}
-        onChange={set('maxCreationTokensPerWindow')}
-      />
-      <NumField
-        label="空闲后清理状态"
-        desc="这个路径多久没有新请求后清理临时计数，减少长期占用；0 表示不按空闲时间清理。"
-        value={merged.expireAfterIdleSecs}
-        min={0}
-        suffix="秒"
-        disabled={!merged.enabled}
-        onChange={set('expireAfterIdleSecs')}
-      />
+      <FieldGrid>
+        <NumField
+          label="最小成功请求间隔"
+          desc="两次显示缓存写入之间至少隔多少次成功请求；0 表示不按次数限制。"
+          value={merged.minSuccessfulRequestsBetweenCreation}
+          min={0}
+          suffix="次"
+          disabled={!merged.enabled}
+          onChange={set('minSuccessfulRequestsBetweenCreation')}
+        />
+        <NumField
+          label="最小时间间隔"
+          desc="两次显示缓存写入之间至少间隔多久；0 表示不按时间限制。"
+          value={merged.minCreationIntervalSecs}
+          min={0}
+          suffix="秒"
+          disabled={!merged.enabled}
+          onChange={set('minCreationIntervalSecs')}
+        />
+        <NumField
+          label="最小累计增量"
+          desc="累计新增输入达到多少 Token 后，才允许再次显示缓存写入；0 表示不限制。"
+          value={merged.minCreationDeltaTokens}
+          min={0}
+          suffix="Token"
+          disabled={!merged.enabled}
+          onChange={set('minCreationDeltaTokens')}
+        />
+        <NumField
+          label="单次展示上限"
+          desc="一次响应里最多显示多少缓存写入 Token；0 表示不限制。"
+          value={merged.maxCreationTokensPerEvent}
+          min={0}
+          suffix="Token"
+          disabled={!merged.enabled}
+          onChange={set('maxCreationTokensPerEvent')}
+        />
+        <NumField
+          label="额度窗口长度"
+          desc="按多长时间统计一次缓存写入展示额度；0 表示关闭窗口额度控制。"
+          value={merged.creationBudgetWindowSecs}
+          min={0}
+          suffix="秒"
+          disabled={!merged.enabled}
+          onChange={set('creationBudgetWindowSecs')}
+        />
+        <NumField
+          label="窗口展示额度"
+          desc="一个时间窗口内最多显示多少缓存写入 Token；0 表示不限制。"
+          value={merged.maxCreationTokensPerWindow}
+          min={0}
+          suffix="Token"
+          disabled={!merged.enabled}
+          onChange={set('maxCreationTokensPerWindow')}
+        />
+        <NumField
+          label="空闲后清理状态"
+          desc="这个路径多久没有新请求后清理临时计数，减少长期占用；0 表示不按空闲时间清理。"
+          value={merged.expireAfterIdleSecs}
+          min={0}
+          suffix="秒"
+          disabled={!merged.enabled}
+          onChange={set('expireAfterIdleSecs')}
+        />
+      </FieldGrid>
     </div>
   )
 }
@@ -654,41 +802,43 @@ function KiroRsToolPolicyForm({
 
   return (
     <div className="space-y-4">
-      <NumField
-        label="缓存覆盖比例"
-        desc="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。"
-        value={merged.coverageRatio ?? 1}
-        min={0}
-        max={1}
-        step={0.05}
-        suffix="比例"
-        onChange={set('coverageRatio')}
-      />
-      <NumField
-        label="覆盖上限"
-        desc="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。"
-        value={merged.maxCoverageTokens ?? 0}
-        min={0}
-        suffix="Token"
-        onChange={set('maxCoverageTokens')}
-      />
-      <NumField
-        label="单次新增创建上限"
-        desc="一次请求最多新增多少缓存。0 表示不限制；后续读取不会超过之前真正创建过的数量。"
-        value={merged.maxNewCreationTokensPerRequest ?? 0}
-        min={0}
-        suffix="Token"
-        onChange={set('maxNewCreationTokensPerRequest')}
-      />
-      <NumField
-        label="当前用户前缀上限"
-        desc="开启下方选项后，最多取当前用户文本前段多少 Token。0 表示不取。"
-        value={merged.currentUserStablePrefixMaxTokens ?? 0}
-        min={0}
-        suffix="Token"
-        disabled={!merged.cacheCurrentUserStablePrefix}
-        onChange={set('currentUserStablePrefixMaxTokens')}
-      />
+      <FieldGrid>
+        <NumField
+          label="缓存覆盖比例"
+          desc="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。"
+          value={merged.coverageRatio ?? 1}
+          min={0}
+          max={1}
+          step={0.05}
+          suffix="比例"
+          onChange={set('coverageRatio')}
+        />
+        <NumField
+          label="覆盖上限"
+          desc="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。"
+          value={merged.maxCoverageTokens ?? 0}
+          min={0}
+          suffix="Token"
+          onChange={set('maxCoverageTokens')}
+        />
+        <NumField
+          label="单次新增创建上限"
+          desc="一次请求最多新增多少缓存。0 表示不限制；后续读取不会超过之前真正创建过的数量。"
+          value={merged.maxNewCreationTokensPerRequest ?? 0}
+          min={0}
+          suffix="Token"
+          onChange={set('maxNewCreationTokensPerRequest')}
+        />
+        <NumField
+          label="当前用户前缀上限"
+          desc="开启下方选项后，最多取当前用户文本前段多少 Token。0 表示不取。"
+          value={merged.currentUserStablePrefixMaxTokens ?? 0}
+          min={0}
+          suffix="Token"
+          disabled={!merged.cacheCurrentUserStablePrefix}
+          onChange={set('currentUserStablePrefixMaxTokens')}
+        />
+      </FieldGrid>
       <TogField
         label="允许后续继续创建"
         desc="同一会话命中旧缓存后，如果又出现新的稳定内容，是否继续补创建。关闭后命中时只读不补建。"
@@ -718,20 +868,57 @@ function UsageFieldShapingForm({
 }) {
   const set = <K extends keyof UsageFieldShapingPatch>(key: K) => (nextValue: number) =>
     onChange({ ...value, [key]: nextValue })
-  return (
-    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
-      <div>
-        <div className="text-sm font-semibold">{title}</div>
-        <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{desc}</div>
+  const compactField = (
+    label: string,
+    description: string,
+    field: keyof UsageFieldShapingPatch,
+    fieldValue: number,
+    min: number,
+    max?: number,
+    step?: number,
+    suffix?: string,
+    disabled = false,
+  ) => (
+    <div className="min-w-0 space-y-1.5">
+      <label
+        className="block text-xs font-medium text-foreground"
+        title={description}
+      >
+        {label}
+      </label>
+      <div className="flex min-w-0 items-center gap-2">
+        <Input
+          type="number"
+          className="h-9 w-24 shrink-0 px-2 text-sm"
+          value={fieldValue}
+          min={min}
+          max={max}
+          step={step}
+          inputMode={step && step < 1 ? 'decimal' : 'numeric'}
+          disabled={disabled}
+          aria-label={`${title} · ${label}`}
+          onChange={(event) => set(field)(numberValue(event.target.value, min))}
+        />
+        {suffix && <span className="shrink-0 text-xs text-muted-foreground">{suffix}</span>}
       </div>
-      <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-5">
-        <NumField label="放大倍数" desc="可大于 1；0 表示上报为 0。" value={value.multiplier} min={0} max={1000} step={0.05} suffix="倍" onChange={set('multiplier')} />
-        <NumField label="浮动比例" desc="结果在 ×(1±比例) 内确定性浮动。" value={value.jitterRatio} min={0} max={1} step={0.01} suffix="比例" onChange={set('jitterRatio')} />
-        <NumField label="下限" desc="非零时不低于该值；0 不限。" value={value.minTokens} min={0} suffix="Token" onChange={set('minTokens')} />
-        <NumField label="上限" desc="不超过该值；0 不限。" value={value.maxTokens} min={0} suffix="Token" onChange={set('maxTokens')} />
-        <NumField label="上限浮动" desc="触及上限时随机少报 0~该值。" value={value.maxJitterTokens} min={0} suffix="Token" disabled={value.maxTokens <= 0} onChange={set('maxJitterTokens')} />
-      </div>
+      <div className="text-[11px] leading-4 text-muted-foreground">{description}</div>
     </div>
+  )
+
+  return (
+    <section className="grid gap-5 py-6 first:pt-0 xl:grid-cols-[minmax(12rem,0.85fr)_minmax(0,4fr)] xl:items-start">
+      <div className="max-w-xs xl:pt-1">
+        <div className="text-[13px] font-semibold">{title}</div>
+        <div className="mt-1.5 text-xs leading-5 text-muted-foreground">{desc}</div>
+      </div>
+      <div className="grid min-w-0 gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-3">
+        {compactField('放大倍数', '可大于 1；0 表示上报为 0。', 'multiplier', value.multiplier, 0, 1000, 0.05, '倍')}
+        {compactField('浮动比例', '结果在 ×(1±比例) 内确定性浮动。', 'jitterRatio', value.jitterRatio, 0, 1, 0.01, '比例')}
+        {compactField('下限', '非零时不低于该值；0 不限。', 'minTokens', value.minTokens, 0, undefined, undefined, 'Token')}
+        {compactField('上限', '不超过该值；0 不限。', 'maxTokens', value.maxTokens, 0, undefined, undefined, 'Token')}
+        {compactField('上限浮动', '触及上限时随机少报 0~该值。', 'maxJitterTokens', value.maxJitterTokens, 0, undefined, undefined, 'Token', value.maxTokens <= 0)}
+      </div>
+    </section>
   )
 }
 
@@ -745,12 +932,14 @@ function UsageShapingProfileForm({
   const setField = (key: 'input' | 'output' | 'cacheRead' | 'cacheCreation') =>
     (next: FullFieldShaping) => onChange({ ...value, [key]: next })
   return (
-    <div className="space-y-3">
-      <UsageFieldShapingForm title="缓存读取 cache_read" desc="前缀命中部分。放大后再执行上下限。" value={value.cacheRead} onChange={setField('cacheRead')} />
-      <UsageFieldShapingForm title="缓存写入 cache_creation" desc="新增前缀部分。放大后先经过写入频次控制，再执行上下限。" value={value.cacheCreation} onChange={setField('cacheCreation')} />
-      <UsageFieldShapingForm title="输入 input" desc="未缓存部分。上下限作用于最终 input（含转入部分），计费下限补足的部分不受上限约束。" value={value.input} onChange={setField('input')} />
-      <UsageFieldShapingForm title="输出 output" desc="上报的输出 Token。" value={value.output} onChange={setField('output')} />
-      <TwoCol>
+    <div className="space-y-5">
+      <div className="divide-y divide-border/60 border-y border-border/60">
+        <UsageFieldShapingForm title="缓存读取 cache_read" desc="前缀命中部分。放大后再执行上下限。" value={value.cacheRead} onChange={setField('cacheRead')} />
+        <UsageFieldShapingForm title="缓存写入 cache_creation" desc="新增前缀部分。放大后先经过写入频次控制，再执行上下限。" value={value.cacheCreation} onChange={setField('cacheCreation')} />
+        <UsageFieldShapingForm title="输入 input" desc="未缓存部分。上下限作用于最终 input（含转入部分），计费下限补足的部分不受上限约束。" value={value.input} onChange={setField('input')} />
+        <UsageFieldShapingForm title="输出 output" desc="上报的输出 Token。" value={value.output} onChange={setField('output')} />
+      </div>
+      <div className="grid gap-x-6 gap-y-5 border-t border-border/60 pt-4 md:grid-cols-2">
         <TogField
           label="读写超出上限转入 input"
           desc="关闭时被上限裁掉的缓存读取 / 写入直接丢弃；开启后计入 input。"
@@ -767,7 +956,7 @@ function UsageShapingProfileForm({
           suffix="倍"
           onChange={(minCostRatio) => onChange({ ...value, minCostRatio })}
         />
-      </TwoCol>
+      </div>
     </div>
   )
 }
@@ -781,13 +970,36 @@ function UsageShapingModeSelect({
 }) {
   return (
     <Select value={value} onValueChange={(next) => onChange(next as UsageShapingMode)}>
-      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+      <SelectTrigger size="sm" className="w-full max-w-xs"><SelectValue /></SelectTrigger>
       <SelectContent>
         <SelectItem value="inherit">沿用默认整形参数</SelectItem>
         <SelectItem value="custom">使用单独参数</SelectItem>
         <SelectItem value="raw">不整形（上报前缀拆分原值，不做频次控制）</SelectItem>
       </SelectContent>
     </Select>
+  )
+}
+
+function PlusPanel({
+  eyebrow,
+  title,
+  desc,
+  children,
+}: {
+  eyebrow: string
+  title: string
+  desc: string
+  children: ReactNode
+}) {
+  return (
+    <div className="space-y-7">
+      <header className="border-b border-border/70 pb-5">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-primary">{eyebrow}</div>
+        <h3 className="mt-1 text-base font-semibold tracking-tight text-foreground">{title}</h3>
+        <p className="mt-1.5 max-w-3xl text-xs leading-5 text-muted-foreground">{desc}</p>
+      </header>
+      {children}
+    </div>
   )
 }
 
@@ -803,142 +1015,143 @@ function KiroRsToolPlusPolicyForm({
     onChange({ ...merged, [key]: nextValue })
 
   return (
-    <div className="space-y-5">
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">前缀追踪</div>
-        <TwoCol>
-          <NumField
-            label="缓存覆盖比例"
-            desc="本轮最多把多少稳定前缀纳入缓存，范围 0 到 1。放大请用下方各字段的放大倍数。"
-            value={merged.coverageRatio ?? 1}
-            min={0}
-            max={1}
-            step={0.05}
-            suffix="比例"
-            onChange={set('coverageRatio')}
-          />
-          <NumField
-            label="覆盖上限"
-            desc="单次最多纳入多少 Token。0 表示不限制。"
-            value={merged.maxCoverageTokens ?? 0}
-            min={0}
-            suffix="Token"
-            onChange={set('maxCoverageTokens')}
-          />
-          <NumField
-            label="当前用户前缀上限"
-            desc="开启“缓存当前用户稳定前缀”后，最多取当前用户文本前段多少 Token。"
-            value={merged.currentUserStablePrefixMaxTokens ?? 0}
-            min={0}
-            suffix="Token"
-            disabled={!merged.cacheCurrentUserStablePrefix}
-            onChange={set('currentUserStablePrefixMaxTokens')}
-          />
-        </TwoCol>
-        <TogField
-          label="允许后续继续创建"
-          desc="命中旧缓存后出现新的稳定内容时是否继续补创建。"
-          checked={merged.incrementalCreateEnabled ?? true}
-          onChange={set('incrementalCreateEnabled')}
-        />
-        <TogField
-          label="缓存当前用户稳定前缀"
-          desc="开启后只取当前用户文本前段，适合有稳定长前缀的请求。"
-          checked={merged.cacheCurrentUserStablePrefix ?? false}
-          onChange={set('cacheCurrentUserStablePrefix')}
-        />
-      </div>
-
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">写入频次限制</div>
-        <div className="text-xs leading-5 text-muted-foreground">
-          在放大之后、上下限之前执行，额度按放大后的写入计算。小请求关闭缓存或选择“不整形”时不参与。
-        </div>
-        <CreationControlOverrideForm
-          value={merged.creationFrequency}
-          onChange={(creationFrequency) => onChange({ ...merged, creationFrequency })}
-        />
-        <div className="space-y-1.5">
-          <div className="text-sm font-semibold text-foreground">被拦下的写入记为</div>
-          <Select
-            value={merged.suppressedCreationTarget ?? 'input'}
-            onValueChange={(next) => onChange({ ...merged, suppressedCreationTarget: next as SuppressedCreationTarget })}
-          >
-            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="input">输入 input</SelectItem>
-              <SelectItem value="cache_read">缓存读取 cache_read</SelectItem>
-              <SelectItem value="drop">直接丢弃</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">默认整形（流式请求）</div>
-        <div className="text-xs leading-5 text-muted-foreground">
-          执行顺序：放大与浮动 → 写入频次限制 → 读写上下限 → 输入 / 输出上下限 → 计费下限。
-        </div>
-        <UsageShapingProfileForm value={merged.shaping} onChange={set('shaping')} />
-      </div>
-
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">非流式请求整形</div>
-        <UsageShapingModeSelect
-          value={merged.nonStream.mode}
-          onChange={(mode) => onChange({ ...merged, nonStream: { ...merged.nonStream, mode } })}
-        />
-        {merged.nonStream.mode === 'custom' && (
-          <UsageShapingProfileForm
-            value={merged.nonStream.profile}
-            onChange={(profile) => onChange({ ...merged, nonStream: { ...merged.nonStream, profile } })}
-          />
-        )}
-      </div>
-
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">小请求整形</div>
-        <div className="text-xs leading-5 text-muted-foreground">
-          真实输入不超过阈值的请求，优先级高于非流式整形。
-        </div>
-        <TogField
-          label="启用小请求整形"
-          checked={merged.smallRequest.enabled ?? false}
-          onChange={(enabled) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, enabled } })}
-        />
-        <TwoCol>
-          <NumField
-            label="小请求阈值"
-            desc="真实输入 Token 不超过该值视为小请求。"
-            value={merged.smallRequest.maxInputTokens ?? 1024}
-            min={0}
-            suffix="Token"
-            disabled={!merged.smallRequest.enabled}
-            onChange={(maxInputTokens) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, maxInputTokens } })}
-          />
-          <TogField
-            label="小请求不上报缓存"
-            desc="缓存读取和写入全部并回 input，也不消耗写入频次额度。"
-            checked={merged.smallRequest.disableCache ?? false}
-            disabled={!merged.smallRequest.enabled}
-            onChange={(disableCache) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, disableCache } })}
-          />
-        </TwoCol>
-        {merged.smallRequest.enabled && (
-          <>
-            <UsageShapingModeSelect
-              value={merged.smallRequest.mode ?? 'inherit'}
-              onChange={(mode) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, mode } })}
-            />
-            {merged.smallRequest.mode === 'custom' && (
-              <UsageShapingProfileForm
-                value={merged.smallRequest.profile}
-                onChange={(profile) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, profile } })}
+    <div className="min-w-0 space-y-10">
+          <PlusPanel eyebrow="01 / tracking" title="前缀追踪" desc="先定义本轮可以纳入缓存的稳定前缀范围，再决定命中后是否继续补建。">
+            <div className="grid gap-8 lg:grid-cols-[minmax(0,1.25fr)_minmax(15rem,0.75fr)]">
+            <ParameterGroup title="覆盖范围" desc="数值只描述本轮追踪边界，不改变下方 usage 整形。">
+              <FieldGrid>
+                <NumField
+                  label="缓存覆盖比例"
+                  desc="本轮最多把多少稳定前缀纳入缓存，范围 0 到 1。"
+                  value={merged.coverageRatio ?? 1}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  suffix="比例"
+                  onChange={set('coverageRatio')}
+                />
+                <NumField
+                  label="覆盖上限"
+                  desc="单次最多纳入多少 Token。0 表示不限制。"
+                  value={merged.maxCoverageTokens ?? 0}
+                  min={0}
+                  suffix="Token"
+                  onChange={set('maxCoverageTokens')}
+                />
+                <NumField
+                  label="当前用户前缀上限"
+                  desc="开启当前用户前缀后，最多取文本前段多少 Token。"
+                  value={merged.currentUserStablePrefixMaxTokens ?? 0}
+                  min={0}
+                  suffix="Token"
+                  disabled={!merged.cacheCurrentUserStablePrefix}
+                  onChange={set('currentUserStablePrefixMaxTokens')}
+                />
+              </FieldGrid>
+            </ParameterGroup>
+            <ParameterGroup title="补建开关" desc="控制已有缓存命中后的后续行为。">
+              <div className="space-y-5">
+                <TogField
+                  label="允许后续继续创建"
+                  desc="命中旧缓存后出现新的稳定内容时继续补创建。"
+                  checked={merged.incrementalCreateEnabled ?? true}
+                  onChange={set('incrementalCreateEnabled')}
+                />
+                <TogField
+                  label="缓存当前用户稳定前缀"
+                  desc="只取当前用户文本前段，适合有稳定长前缀的请求。"
+                  checked={merged.cacheCurrentUserStablePrefix ?? false}
+                  onChange={set('cacheCurrentUserStablePrefix')}
+                />
+              </div>
+              </ParameterGroup>
+            </div>
+          </PlusPanel>
+          <PlusPanel eyebrow="02 / frequency" title="写入频次限制" desc="在放大之后、上下限之前执行，额度按放大后的写入计算。小请求关闭缓存或选择不整形时不参与。">
+            <div className="grid gap-8 lg:grid-cols-[minmax(0,1.35fr)_minmax(15rem,0.65fr)]">
+            <ParameterGroup title="频次与额度" desc="控制什么时候把新增缓存写入展示给客户端。">
+              <CreationControlOverrideForm
+                value={merged.creationFrequency}
+                onChange={(creationFrequency) => onChange({ ...merged, creationFrequency })}
               />
+            </ParameterGroup>
+            <ParameterGroup title="被拦下的写入" desc="被频次规则拦下的写入如何计入本次 usage。">
+              <Select
+                value={merged.suppressedCreationTarget ?? 'input'}
+                onValueChange={(next) => onChange({ ...merged, suppressedCreationTarget: next as SuppressedCreationTarget })}
+              >
+                <SelectTrigger size="sm" className="w-full max-w-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="input">输入 input</SelectItem>
+                  <SelectItem value="cache_read">缓存读取 cache_read</SelectItem>
+                  <SelectItem value="drop">直接丢弃</SelectItem>
+                </SelectContent>
+              </Select>
+              </ParameterGroup>
+            </div>
+          </PlusPanel>
+          <PlusPanel eyebrow="03 / stream" title="默认整形（流式请求）" desc="执行顺序：放大与浮动 → 写入频次限制 → 读写上下限 → 输入 / 输出上下限 → 计费下限。">
+            <UsageShapingProfileForm value={merged.shaping} onChange={set('shaping')} />
+          </PlusPanel>
+          <PlusPanel eyebrow="04 / non-stream" title="非流式请求整形" desc="非流式请求可以沿用流式参数、单独整形，或直接返回拆分前的原值。">
+            <ParameterGroup title="请求模式" desc="先选模式，只有选择单独参数时才展开完整的整形表单。">
+              <UsageShapingModeSelect
+                value={merged.nonStream.mode}
+                onChange={(mode) => onChange({ ...merged, nonStream: { ...merged.nonStream, mode } })}
+              />
+            </ParameterGroup>
+            {merged.nonStream.mode === 'custom' && (
+              <ParameterGroup title="单独参数" desc="这组参数只对非流式请求生效。">
+                <UsageShapingProfileForm
+                  value={merged.nonStream.profile}
+                  onChange={(profile) => onChange({ ...merged, nonStream: { ...merged.nonStream, profile } })}
+                />
+              </ParameterGroup>
             )}
-          </>
-        )}
-      </div>
+          </PlusPanel>
+          <PlusPanel eyebrow="05 / small request" title="小请求整形" desc="真实输入不超过阈值的请求，优先级高于非流式整形。">
+            <ParameterGroup title="触发条件" desc="先开启规则，再设置哪些请求被视为小请求。">
+              <TogField
+                label="启用小请求整形"
+                checked={merged.smallRequest.enabled ?? false}
+                onChange={(enabled) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, enabled } })}
+              />
+              <div className="mt-5 grid gap-x-8 gap-y-5 lg:grid-cols-2">
+                <NumField
+                  label="小请求阈值"
+                  desc="真实输入 Token 不超过该值视为小请求。"
+                  value={merged.smallRequest.maxInputTokens ?? 1024}
+                  min={0}
+                  suffix="Token"
+                  disabled={!merged.smallRequest.enabled}
+                  onChange={(maxInputTokens) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, maxInputTokens } })}
+                />
+                <TogField
+                  label="小请求不上报缓存"
+                  desc="缓存读取和写入全部并回 input，也不消耗写入频次额度。"
+                  checked={merged.smallRequest.disableCache ?? false}
+                  disabled={!merged.smallRequest.enabled}
+                  onChange={(disableCache) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, disableCache } })}
+                />
+              </div>
+            </ParameterGroup>
+            {merged.smallRequest.enabled && (
+              <ParameterGroup title="小请求参数来源" desc="沿用默认整形或为小请求单独提供一份参数。">
+                <UsageShapingModeSelect
+                  value={merged.smallRequest.mode ?? 'inherit'}
+                  onChange={(mode) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, mode } })}
+                />
+                {merged.smallRequest.mode === 'custom' && (
+                  <div className="mt-6">
+                    <UsageShapingProfileForm
+                      value={merged.smallRequest.profile}
+                      onChange={(profile) => onChange({ ...merged, smallRequest: { ...merged.smallRequest, profile } })}
+                    />
+                  </div>
+                )}
+              </ParameterGroup>
+            )}
+          </PlusPanel>
     </div>
   )
 }
@@ -955,9 +1168,8 @@ function StableSegmentPolicyForm({
     onChange({ ...merged, [key]: nextValue })
 
   return (
-    <div className="space-y-5">
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">覆盖范围</div>
+    <div className="space-y-6">
+      <ParameterGroup title="覆盖范围">
         <TwoCol>
           <NumField
             label="缓存覆盖比例"
@@ -994,10 +1206,9 @@ function StableSegmentPolicyForm({
             onChange={set('minSegmentTokens')}
           />
         </TwoCol>
-      </div>
+      </ParameterGroup>
 
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">缓存创建</div>
+      <ParameterGroup title="缓存创建">
         <TwoCol>
           <NumField
             label="单次新增创建上限"
@@ -1017,77 +1228,81 @@ function StableSegmentPolicyForm({
             onChange={set('currentUserStablePrefixMaxTokens')}
           />
         </TwoCol>
-        <TogField
-          label="允许后续继续创建"
-          desc="命中已有缓存后，如果又出现新的稳定尾部，是否继续补创建。"
-          checked={merged.incrementalCreateEnabled ?? true}
-          onChange={set('incrementalCreateEnabled')}
-        />
-        <TogField
-          label="缓存当前用户稳定前缀"
-          desc="默认关闭。开启后把当前用户消息的稳定前段也纳入缓存，适合确实有固定长前缀的请求。"
-          checked={merged.cacheCurrentUserStablePrefix ?? false}
-          onChange={set('cacheCurrentUserStablePrefix')}
-        />
-      </div>
+        <TwoCol>
+          <TogField
+            label="允许后续继续创建"
+            desc="命中已有缓存后，如果又出现新的稳定尾部，是否继续补创建。"
+            checked={merged.incrementalCreateEnabled ?? true}
+            onChange={set('incrementalCreateEnabled')}
+          />
+          <TogField
+            label="缓存当前用户稳定前缀"
+            desc="默认关闭。开启后把当前用户消息的稳定前段也纳入缓存，适合确实有固定长前缀的请求。"
+            checked={merged.cacheCurrentUserStablePrefix ?? false}
+            onChange={set('cacheCurrentUserStablePrefix')}
+          />
+        </TwoCol>
+      </ParameterGroup>
 
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">稳定内容来源</div>
-        <TogField
-          label="包含 tools"
-          desc="工具定义是否参与稳定内容计算。"
-          checked={merged.includeTools ?? true}
-          onChange={set('includeTools')}
-        />
-        <TogField
-          label="包含 system"
-          desc="system 提示词是否参与稳定内容计算。"
-          checked={merged.includeSystem ?? true}
-          onChange={set('includeSystem')}
-        />
-        <TogField
-          label="包含历史消息"
-          desc="历史消息是否参与稳定内容计算。"
-          checked={merged.includeHistory ?? true}
-          onChange={set('includeHistory')}
-        />
-        <NumField
-          label="历史消息条数上限"
-          desc="最多纳入多少条历史消息。0 表示不限制。"
-          value={merged.historyMessageLimit ?? 0}
-          min={0}
-          suffix="条"
-          disabled={!merged.includeHistory}
-          onChange={set('historyMessageLimit')}
-        />
-      </div>
+      <ParameterGroup title="稳定内容来源">
+        <TwoCol>
+          <TogField
+            label="包含 tools"
+            desc="工具定义是否参与稳定内容计算。"
+            checked={merged.includeTools ?? true}
+            onChange={set('includeTools')}
+          />
+          <TogField
+            label="包含 system"
+            desc="system 提示词是否参与稳定内容计算。"
+            checked={merged.includeSystem ?? true}
+            onChange={set('includeSystem')}
+          />
+          <TogField
+            label="包含历史消息"
+            desc="历史消息是否参与稳定内容计算。"
+            checked={merged.includeHistory ?? true}
+            onChange={set('includeHistory')}
+          />
+          <NumField
+            label="历史消息条数上限"
+            desc="最多纳入多少条历史消息。0 表示不限制。"
+            value={merged.historyMessageLimit ?? 0}
+            min={0}
+            suffix="条"
+            disabled={!merged.includeHistory}
+            onChange={set('historyMessageLimit')}
+          />
+        </TwoCol>
+      </ParameterGroup>
 
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">缓存点规则</div>
-        <TogField
-          label="识别请求里的 cache_control"
-          desc="开启后按客户端显式标记的 cache_control 和 TTL 建立缓存点。"
-          checked={merged.honorExplicitCacheControl ?? true}
-          onChange={set('honorExplicitCacheControl')}
-        />
-        <TogField
-          label="自动缓存 system"
-          desc="请求没有显式 cache_control 时，自动在 system 结尾建立缓存点。"
-          checked={merged.autoCacheSystem ?? true}
-          onChange={set('autoCacheSystem')}
-        />
-        <TogField
-          label="自动缓存 tools"
-          desc="请求没有显式 cache_control 时，自动在 tools 结尾建立缓存点。"
-          checked={merged.autoCacheTools ?? true}
-          onChange={set('autoCacheTools')}
-        />
-        <TogField
-          label="自动缓存历史消息边界"
-          desc="在历史消息的边界自动建立缓存点。"
-          checked={merged.autoCacheHistoryMessageEnds ?? true}
-          onChange={set('autoCacheHistoryMessageEnds')}
-        />
+      <ParameterGroup title="缓存点规则">
+        <TwoCol>
+          <TogField
+            label="识别请求里的 cache_control"
+            desc="开启后按客户端显式标记的 cache_control 和 TTL 建立缓存点。"
+            checked={merged.honorExplicitCacheControl ?? true}
+            onChange={set('honorExplicitCacheControl')}
+          />
+          <TogField
+            label="自动缓存 system"
+            desc="请求没有显式 cache_control 时，自动在 system 结尾建立缓存点。"
+            checked={merged.autoCacheSystem ?? true}
+            onChange={set('autoCacheSystem')}
+          />
+          <TogField
+            label="自动缓存 tools"
+            desc="请求没有显式 cache_control 时，自动在 tools 结尾建立缓存点。"
+            checked={merged.autoCacheTools ?? true}
+            onChange={set('autoCacheTools')}
+          />
+          <TogField
+            label="自动缓存历史消息边界"
+            desc="在历史消息的边界自动建立缓存点。"
+            checked={merged.autoCacheHistoryMessageEnds ?? true}
+            onChange={set('autoCacheHistoryMessageEnds')}
+          />
+        </TwoCol>
         <TwoCol>
           <NumField
             label="默认 TTL"
@@ -1106,10 +1321,9 @@ function StableSegmentPolicyForm({
             onChange={set('extendedTtlSecs')}
           />
         </TwoCol>
-      </div>
+      </ParameterGroup>
 
-      <div className="space-y-3">
-        <div className="text-sm font-semibold">返回的 input_tokens</div>
+      <ParameterGroup title="返回的 input_tokens">
         <TwoCol>
           <NumField
             label="最小值"
@@ -1128,7 +1342,7 @@ function StableSegmentPolicyForm({
             onChange={set('reportedInputMaxTokens')}
           />
         </TwoCol>
-      </div>
+      </ParameterGroup>
     </div>
   )
 }
@@ -1144,20 +1358,18 @@ function NonStreamCacheToggle({
 }) {
   const policy = value ?? defaultUsagePatch(fallbackPrefix)
   return (
-    <div className="rounded-md border bg-muted/20 p-3">
-      <TogField
-        label="非流式 Usage 透传"
-        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
-        checked={Boolean(policy.skipNonStreamUsageProjection)}
-        onChange={(skipNonStreamUsageProjection) =>
-          onChange({ ...policy, skipNonStreamUsageProjection })
-        }
-      />
-    </div>
+    <TogField
+      label="非流式 Usage 透传"
+      desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
+      checked={Boolean(policy.skipNonStreamUsageProjection)}
+      onChange={(skipNonStreamUsageProjection) =>
+        onChange({ ...policy, skipNonStreamUsageProjection })
+      }
+    />
   )
 }
 
-function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
+export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
   // 只透传已配置的值，不补默认：未配置的模板保持关闭且不新增字段。
   const coldRequestGuard = policy.coldRequestGuard ? { coldRequestGuard: policy.coldRequestGuard } : {}
@@ -1206,15 +1418,17 @@ function currentHighCachePathDefaults(prefix: string, reportedUsage?: ReportedUs
   }
 }
 
-function StrategyTemplateEditor({
+export function StrategyTemplateEditor({
   title,
   desc,
+  showHeader = true,
   cacheType,
   policy,
   onChange,
 }: {
   title: string
   desc: string
+  showHeader?: boolean
   cacheType: CacheStrategyType
   policy: CacheRoutePolicyPatch
   onChange: (next: CacheRoutePolicyPatch) => void
@@ -1226,38 +1440,31 @@ function StrategyTemplateEditor({
   const setKiroRsTool = (kiroRsTool: KiroRsToolPatch) => onChange({ ...template, kiroRsTool })
   const setStableSegment = (stableSegment: StableSegmentPatch) => onChange({ ...template, stableSegment })
   const setHitShaping = (hitShaping: CacheHitShapingPatch) => onChange({ ...template, hitShaping })
-  const hitShapingSection = (
-    <div className="space-y-3">
-      <div className="text-sm font-semibold">命中率与小值整形</div>
-      <CacheHitShapingForm value={template.hitShaping ?? defaultCacheHitShaping()} onChange={setHitShaping} />
-      <ColdRequestGuardToggle
-        value={template.coldRequestGuard}
-        onChange={(coldRequestGuard) => onChange({ ...template, coldRequestGuard })}
-      />
-    </div>
-  )
 
   return (
-    <div className="space-y-4 rounded-lg bg-background p-4 shadow-sm">
-      <div>
-        <div className="text-sm font-semibold">{title}</div>
-        <div className="mt-1 text-xs leading-5 text-muted-foreground">{desc}</div>
-      </div>
+    <div className="space-y-8">
+      {showHeader && (
+        <div className="border-b border-border/70 pb-4">
+          <h2 className="text-base font-semibold text-foreground">{title}</h2>
+          <div className="mt-1 text-xs leading-5 text-muted-foreground">{desc}</div>
+        </div>
+      )}
       {cacheType === 'current_high_cache' ? (
         <>
-          <div className="space-y-3">
-            <div className="text-sm font-semibold">模拟读取参数</div>
+          <ParameterGroup title="模拟读取参数">
             <SimulationOverrideForm value={template.simulation ?? defaultSimulationPatch()} onChange={setSimulation} />
-          </div>
-          <div className="space-y-3">
-            <div className="text-sm font-semibold">缓存创建展示频次</div>
+          </ParameterGroup>
+          <ParameterGroup title="缓存创建展示频次">
             <CreationControlOverrideForm value={template.creationControl ?? defaultPromptCacheCreationControl()} onChange={setCreationControl} />
-          </div>
-          <div className="space-y-3">
-            <div className="text-sm font-semibold">最终用量显示</div>
-            <PathPolicyEditor policy={template.reportedUsage ?? defaultUsagePatch('/v1')} onChange={setReportedUsage} />
-          </div>
-          {hitShapingSection}
+          </ParameterGroup>
+          <PathPolicyEditor policy={template.reportedUsage ?? defaultUsagePatch('/v1')} onChange={setReportedUsage} />
+          <ParameterGroup title="命中率与小值整形">
+            <CacheHitShapingForm value={template.hitShaping ?? defaultCacheHitShaping()} onChange={setHitShaping} />
+            <ColdRequestGuardToggle
+              value={template.coldRequestGuard}
+              onChange={(coldRequestGuard) => onChange({ ...template, coldRequestGuard })}
+            />
+          </ParameterGroup>
         </>
       ) : cacheType === 'kiro_rs_tool_plus' ? (
         <KiroRsToolPlusPolicyForm
@@ -1266,36 +1473,52 @@ function StrategyTemplateEditor({
         />
       ) : cacheType === 'stable_segment_cache' ? (
         <>
-          <NonStreamCacheToggle
-            value={template.reportedUsage}
-            fallbackPrefix="/v1"
-            onChange={setReportedUsage}
-          />
+          <ParameterGroup title="非流式请求">
+            <NonStreamCacheToggle
+              value={template.reportedUsage}
+              fallbackPrefix="/v1"
+              onChange={setReportedUsage}
+            />
+          </ParameterGroup>
           <StableSegmentPolicyForm
             value={template.stableSegment ?? defaultStableSegmentPatch()}
             onChange={setStableSegment}
           />
-          {hitShapingSection}
+          <ParameterGroup title="命中率与小值整形">
+            <CacheHitShapingForm value={template.hitShaping ?? defaultCacheHitShaping()} onChange={setHitShaping} />
+            <ColdRequestGuardToggle
+              value={template.coldRequestGuard}
+              onChange={(coldRequestGuard) => onChange({ ...template, coldRequestGuard })}
+            />
+          </ParameterGroup>
         </>
       ) : (
         <>
-          <NonStreamCacheToggle
-            value={template.reportedUsage}
-            fallbackPrefix="/v1"
-            onChange={setReportedUsage}
-          />
+          <ParameterGroup title="非流式请求">
+            <NonStreamCacheToggle
+              value={template.reportedUsage}
+              fallbackPrefix="/v1"
+              onChange={setReportedUsage}
+            />
+          </ParameterGroup>
           <KiroRsToolPolicyForm
             value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
             onChange={setKiroRsTool}
           />
-          {hitShapingSection}
+          <ParameterGroup title="命中率与小值整形">
+            <CacheHitShapingForm value={template.hitShaping ?? defaultCacheHitShaping()} onChange={setHitShaping} />
+            <ColdRequestGuardToggle
+              value={template.coldRequestGuard}
+              onChange={(coldRequestGuard) => onChange({ ...template, coldRequestGuard })}
+            />
+          </ParameterGroup>
         </>
       )}
     </div>
   )
 }
 
-function pathPolicyWithStrategyDefaults(
+export function pathPolicyWithStrategyDefaults(
   cachePolicy: CachePolicyConfig,
   prefix: string,
   policy: CacheRoutePolicyPatch
@@ -1346,12 +1569,13 @@ function pathPolicyWithStrategyDefaults(
   }
 }
 
-function PathStrategyBindingCard({
+export function PathStrategyBindingCard({
   prefix,
   policy,
   cachePolicy,
   definedRoutes,
   builtIn,
+  showDelete = true,
   onPrefixChange,
   onDelete,
   onChange,
@@ -1362,6 +1586,7 @@ function PathStrategyBindingCard({
   cachePolicy: CachePolicyConfig
   definedRoutes: string[]
   builtIn?: boolean
+  showDelete?: boolean
   onPrefixChange: (nextPrefix: string) => void
   onDelete: () => void
   onChange: (next: CacheRoutePolicyPatch) => void
@@ -1397,7 +1622,7 @@ function PathStrategyBindingCard({
   }
 
   const setCacheType = (cacheType: CacheStrategyType) => {
-    onChange(defaultPathCachePatch(prefix, cacheType))
+    onChange(sanitizeCacheRoutePolicy(defaultPathCachePatch(prefix, cacheType)))
   }
 
   const patch = (next: Partial<CacheRoutePolicyPatch>) => {
@@ -1405,200 +1630,213 @@ function PathStrategyBindingCard({
   }
 
   return (
-    <div className="space-y-4 rounded-lg bg-background p-4 shadow-sm">
-      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-        <div className="min-w-0 flex-1 space-y-1.5">
-          <div className="text-sm font-semibold">{isDfcachePath ? '自定义路径后缀' : '路径前缀'}</div>
-          {builtIn ? (
-            <div className="rounded-md bg-muted/20 px-3 py-2 font-mono text-sm">{prefix}</div>
-          ) : isDfcachePath ? (
-            <div className="flex items-stretch overflow-hidden rounded-md border border-input bg-background">
-              <div className="flex items-center border-r border-input bg-muted/30 px-3 font-mono text-sm text-muted-foreground">
-                {DFCACHE_ROUTE_PREFIX}
+    <div className="min-w-0">
+        <div className="mb-7 flex items-start justify-between gap-4 border-b border-border/60 pb-4">
+          <div>
+            <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">编辑路径策略</div>
+            <div className="mt-1 font-mono text-sm font-semibold text-foreground">{prefix}</div>
+          </div>
+          <div className="shrink-0 text-right text-[11px] leading-5 text-muted-foreground">
+            <div>完整编辑</div>
+            <div className="hidden sm:block">修改后统一保存</div>
+          </div>
+        </div>
+        <div className="space-y-9">
+        <EditorSection
+          id="path-scope"
+          title="路径范围"
+          desc="先确定这条规则匹配哪些请求，再决定是否暴露为 /dfcache 入口。"
+        >
+          <div className="grid gap-7 xl:grid-cols-[minmax(0,1.25fr)_minmax(17rem,0.75fr)]">
+            <div className="min-w-0 space-y-2">
+              <div className="text-[13px] font-medium text-foreground">{isDfcachePath ? '自定义路径后缀' : '路径前缀'}</div>
+              {builtIn ? (
+                <div className="max-w-sm rounded-md border border-border/70 px-3 py-2 font-mono text-sm text-foreground">{prefix}</div>
+              ) : isDfcachePath ? (
+                <div className="flex max-w-sm items-stretch overflow-hidden rounded-md border border-input bg-card">
+                  <div className="flex items-center border-r border-input bg-muted/30 px-3 font-mono text-sm text-muted-foreground">
+                    {DFCACHE_ROUTE_PREFIX}
+                  </div>
+                  <Input
+                    className="min-w-0 border-0 shadow-none focus-visible:ring-0"
+                    value={draftDfcacheName}
+                    onChange={(event) => setDraftDfcacheName(event.target.value)}
+                    onBlur={commitPrefix}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') event.currentTarget.blur()
+                      if (event.key === 'Escape') {
+                        setDraftDfcacheName(normalizeDefinedCacheRouteName(prefix) ?? '')
+                        setPrefixError(null)
+                      }
+                    }}
+                  />
+                </div>
+              ) : (
+                <Input
+                  className="max-w-sm"
+                  value={draftPrefix}
+                  onChange={(event) => setDraftPrefix(event.target.value)}
+                  onBlur={commitPrefix}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') event.currentTarget.blur()
+                    if (event.key === 'Escape') {
+                      setDraftPrefix(prefix)
+                      setPrefixError(null)
+                    }
+                  }}
+                />
+              )}
+              <div className="max-w-sm text-xs leading-5 text-muted-foreground">
+                {isDfcachePath
+                  ? '固定前缀用于避开内置路由，只能修改后缀名。'
+                  : '请求路径以 ' + cacheEndpointLabel(prefix) + ' 开头时使用这条规则；多个规则都能匹配时，用最长的那个。'}
               </div>
-              <Input
-                className="border-0 shadow-none focus-visible:ring-0"
-                value={draftDfcacheName}
-                onChange={(event) => setDraftDfcacheName(event.target.value)}
-                onBlur={commitPrefix}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') event.currentTarget.blur()
-                  if (event.key === 'Escape') {
-                    setDraftDfcacheName(normalizeDefinedCacheRouteName(prefix) ?? '')
-                    setPrefixError(null)
-                  }
-                }}
+              {prefixError && <div className="text-xs text-destructive">{prefixError}</div>}
+            </div>
+            {isDfcachePath && (
+              <div className="border-t border-border/60 pt-5 xl:border-l xl:border-t-0 xl:pl-6 xl:pt-0">
+                <TogField
+                  label="注册为 /dfcache 路由"
+                  desc={normalizedDefinedRoute ? '开启后允许客户端访问这个 /dfcache/{name} 入口。' : '路径必须是 /dfcache/{name}，name 仅允许小写字母、数字、点、下划线或短横线。'}
+                  checked={isRouteRegistered}
+                  disabled={!normalizedDefinedRoute}
+                  onChange={onDefinedRouteChange}
+                />
+              </div>
+            )}
+          </div>
+          {!builtIn && showDelete && (
+            <div className="mt-6 flex justify-start border-t border-border/60 pt-4">
+              <Button type="button" variant="ghost" size="sm" className="px-0 text-destructive hover:bg-transparent hover:text-destructive" onClick={onDelete}>
+                <Trash2 className="mr-1 h-4 w-4" />
+                删除路径
+              </Button>
+            </div>
+          )}
+        </EditorSection>
+
+        <EditorSection
+          id="path-strategy"
+          className="border-t border-border/70 pt-8"
+          title="缓存策略"
+          desc="这里是唯一的决策区。切换策略会载入对应的默认参数，下面只展示当前策略的设置。"
+        >
+          <StrategyChoice value={effectiveCacheType} onChange={setCacheType} />
+        </EditorSection>
+
+        <EditorSection
+          id="path-parameters"
+          className="border-t border-border/70 pt-8"
+          title="策略参数"
+          desc="根据上面的策略选择显示当前实现真正需要的参数。"
+        >
+          {effectiveCacheType === 'no_cache' ? (
+            <div className="max-w-2xl border-l-2 border-muted-foreground/40 pl-4 text-sm leading-6 text-muted-foreground">
+              这个路径直接走无缓存逻辑，不进入缓存计算，也不展示缓存参数。
+            </div>
+          ) : effectiveCacheType === 'current_high_cache' ? (
+            <div className="space-y-7">
+              <ParameterGroup title="缓存空间" desc="决定本路径是否使用独立的本地模拟缓存状态。">
+                <TogField
+                  label="独立路径缓存空间"
+                  desc="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一凭据、会话、模型的默认缓存空间共享。"
+                  checked={Boolean(effectivePolicy.routeNamespace)}
+                  onChange={(routeNamespace) => patch({ routeNamespace })}
+                />
+              </ParameterGroup>
+              <ParameterGroup title="模拟读取参数" desc="控制本地如何模拟缓存命中和展示输入。">
+                <SimulationOverrideForm
+                  value={effectivePolicy.simulation ?? defaultSimulationPatch()}
+                  onChange={(simulation) => patch({ simulation })}
+                />
+              </ParameterGroup>
+              <ParameterGroup title="缓存创建展示频次" desc="限制对外展示缓存写入的频率，不改变真实缓存创建。">
+                <CreationControlOverrideForm
+                  value={effectivePolicy.creationControl ?? defaultPromptCacheCreationControl()}
+                  onChange={(creationControl) => patch({ creationControl })}
+                />
+              </ParameterGroup>
+              <PathPolicyEditor
+                policy={effectivePolicy.reportedUsage ?? defaultUsagePatch(prefix)}
+                onChange={(reportedUsage) => patch({ reportedUsage })}
               />
+              <ParameterGroup title="命中率与小值整形" desc="最后处理命中率、小值和冷请求边界。">
+                <CacheHitShapingForm
+                  value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
+                  onChange={(hitShaping) => patch({ hitShaping })}
+                />
+                <ColdRequestGuardToggle
+                  value={effectivePolicy.coldRequestGuard}
+                  onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
+                />
+              </ParameterGroup>
+            </div>
+          ) : effectiveCacheType === 'kiro_rs_tool_plus' ? (
+            <KiroRsToolPlusPolicyForm
+              value={effectivePolicy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch()}
+              onChange={(kiroRsToolPlus) => patch({ kiroRsToolPlus })}
+            />
+          ) : effectiveCacheType === 'stable_segment_cache' ? (
+            <div className="space-y-7">
+              <ParameterGroup title="缓存空间" desc="决定这条路径是否拥有独立的稳定片段缓存空间。">
+                <TogField
+                  label="独立路径缓存空间"
+                  desc="开启后这个路径的缓存只在本路径内读取和写入；关闭后与其他未开启的路径共享同一会话的缓存。"
+                  checked={Boolean(effectivePolicy.routeNamespace)}
+                  onChange={(routeNamespace) => patch({ routeNamespace })}
+                />
+              </ParameterGroup>
+              <ParameterGroup title="非流式请求" desc="决定非流式响应是否直接使用上游 usage。">
+                <NonStreamCacheToggle
+                  value={effectivePolicy.reportedUsage}
+                  fallbackPrefix={prefix}
+                  onChange={(reportedUsage) => patch({ reportedUsage })}
+                />
+              </ParameterGroup>
+              <StableSegmentPolicyForm
+                value={effectivePolicy.stableSegment ?? defaultStableSegmentPatch()}
+                onChange={(stableSegment) => patch({ stableSegment })}
+              />
+              <ParameterGroup title="命中率与小值整形" desc="最后处理命中率、小值和冷请求边界。">
+                <CacheHitShapingForm
+                  value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
+                  onChange={(hitShaping) => patch({ hitShaping })}
+                />
+                <ColdRequestGuardToggle
+                  value={effectivePolicy.coldRequestGuard}
+                  onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
+                />
+              </ParameterGroup>
             </div>
           ) : (
-            <Input
-              value={draftPrefix}
-              onChange={(event) => setDraftPrefix(event.target.value)}
-              onBlur={commitPrefix}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') event.currentTarget.blur()
-                if (event.key === 'Escape') {
-                  setDraftPrefix(prefix)
-                  setPrefixError(null)
-                }
-              }}
-            />
+            <div className="space-y-7">
+              <ParameterGroup title="非流式请求" desc="决定非流式响应是否直接使用上游 usage。">
+                <NonStreamCacheToggle
+                  value={effectivePolicy.reportedUsage}
+                  fallbackPrefix={prefix}
+                  onChange={(reportedUsage) => patch({ reportedUsage })}
+                />
+              </ParameterGroup>
+              <ParameterGroup title="稳定前缀规则" desc="控制 Kiro-RS Tool 本轮最多追踪和创建多少稳定内容。">
+                <KiroRsToolPolicyForm
+                  value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
+                  onChange={(kiroRsTool) => patch({ kiroRsTool })}
+                />
+              </ParameterGroup>
+              <ParameterGroup title="命中率与小值整形" desc="最后处理命中率、小值和冷请求边界。">
+                <CacheHitShapingForm
+                  value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
+                  onChange={(hitShaping) => patch({ hitShaping })}
+                />
+                <ColdRequestGuardToggle
+                  value={effectivePolicy.coldRequestGuard}
+                  onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
+                />
+              </ParameterGroup>
+            </div>
           )}
-          <div className="text-xs text-muted-foreground">
-            {isDfcachePath
-              ? '固定前缀用于避开内置路由，只能修改后缀名。'
-              : `请求路径以 ${cacheEndpointLabel(prefix)} 开头时使用这条规则；多个规则都能匹配时，用最长的那个。`}
-          </div>
-          {prefixError && <div className="text-xs text-destructive">{prefixError}</div>}
+        </EditorSection>
         </div>
-        {!builtIn && (
-          <Button type="button" variant="outline" size="sm" className="text-destructive" onClick={onDelete}>
-            <Trash2 className="mr-1 h-4 w-4" />
-            删除路径
-          </Button>
-        )}
-      </div>
-
-      {isDfcachePath && (
-        <TogField
-          label="注册为 /dfcache 路由"
-          desc={normalizedDefinedRoute ? '开启后允许客户端访问这个 /dfcache/{name} 入口。' : '路径必须是 /dfcache/{name}，name 仅允许小写字母、数字、点、下划线或短横线。'}
-          checked={isRouteRegistered}
-          disabled={!normalizedDefinedRoute}
-          onChange={onDefinedRouteChange}
-        />
-      )}
-
-      <div className="space-y-2">
-        <div className="text-sm font-semibold">缓存策略</div>
-        <Select value={effectiveCacheType} onValueChange={(value) => setCacheType(value as CacheStrategyType)}>
-          <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-          <SelectContent>
-            <SelectItem value="no_cache">无缓存</SelectItem>
-            <SelectItem value="current_high_cache">本地模拟缓存策略</SelectItem>
-            <SelectItem value="kiro_rs_tool">Kiro-RS Tool 缓存策略</SelectItem>
-            <SelectItem value="stable_segment_cache">稳定片段缓存策略</SelectItem>
-            <SelectItem value="kiro_rs_tool_plus">Kiro-RS Tool Plus 缓存策略</SelectItem>
-          </SelectContent>
-        </Select>
-        <div className="text-xs leading-5 text-muted-foreground">{cacheTypeDesc(effectiveCacheType)}</div>
-      </div>
-
-      {effectiveCacheType === 'no_cache' ? (
-        <div className="rounded-md bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          这个路径直接走无缓存逻辑，不进入缓存计算，也不展示缓存参数。
-        </div>
-      ) : effectiveCacheType === 'current_high_cache' ? (
-        <div className="space-y-4">
-          <div className="text-sm font-semibold">本路径策略参数</div>
-          <TogField
-            label="独立路径缓存空间"
-            desc="开启后，这个路径的本地模拟缓存读取和写入按路径独立统计；关闭后与同一凭据、会话、模型的默认缓存空间共享。"
-            checked={Boolean(effectivePolicy.routeNamespace)}
-            onChange={(routeNamespace) => patch({ routeNamespace })}
-          />
-          <SimulationOverrideForm
-            value={effectivePolicy.simulation ?? defaultSimulationPatch()}
-            onChange={(simulation) => patch({ simulation })}
-          />
-          <CreationControlOverrideForm
-            value={effectivePolicy.creationControl ?? defaultPromptCacheCreationControl()}
-            onChange={(creationControl) => patch({ creationControl })}
-          />
-          <PathPolicyEditor
-            policy={effectivePolicy.reportedUsage ?? defaultUsagePatch(prefix)}
-            onChange={(reportedUsage) => patch({ reportedUsage })}
-          />
-          <div className="space-y-3">
-            <div className="text-sm font-semibold">命中率与小值整形</div>
-            <CacheHitShapingForm
-              value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
-              onChange={(hitShaping) => patch({ hitShaping })}
-            />
-            <ColdRequestGuardToggle
-              value={effectivePolicy.coldRequestGuard}
-              onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
-            />
-          </div>
-        </div>
-      ) : effectiveCacheType === 'kiro_rs_tool_plus' ? (
-        <div className="space-y-4">
-          <div>
-            <div className="text-sm font-semibold">本路径策略参数</div>
-            <div className="mt-1 text-xs leading-5 text-muted-foreground">
-              路径参数整体替换 Plus 模板参数；缓存按路径独立。
-            </div>
-          </div>
-          <KiroRsToolPlusPolicyForm
-            value={effectivePolicy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch()}
-            onChange={(kiroRsToolPlus) => patch({ kiroRsToolPlus })}
-          />
-        </div>
-      ) : effectiveCacheType === 'stable_segment_cache' ? (
-        <div className="space-y-4">
-          <div>
-            <div className="text-sm font-semibold">本路径策略参数</div>
-            <div className="mt-1 text-xs leading-5 text-muted-foreground">
-              这里只展示稳定片段缓存策略自己需要的参数，不读取其他策略的参数。
-            </div>
-          </div>
-          <TogField
-            label="独立路径缓存空间"
-            desc="开启后这个路径的缓存只在本路径内读取和写入；关闭后与其他未开启的路径共享同一会话的缓存。"
-            checked={Boolean(effectivePolicy.routeNamespace)}
-            onChange={(routeNamespace) => patch({ routeNamespace })}
-          />
-          <NonStreamCacheToggle
-            value={effectivePolicy.reportedUsage}
-            fallbackPrefix={prefix}
-            onChange={(reportedUsage) => patch({ reportedUsage })}
-          />
-          <StableSegmentPolicyForm
-            value={effectivePolicy.stableSegment ?? defaultStableSegmentPatch()}
-            onChange={(stableSegment) => patch({ stableSegment })}
-          />
-          <div className="space-y-3">
-            <div className="text-sm font-semibold">命中率与小值整形</div>
-            <CacheHitShapingForm
-              value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
-              onChange={(hitShaping) => patch({ hitShaping })}
-            />
-            <ColdRequestGuardToggle
-              value={effectivePolicy.coldRequestGuard}
-              onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          <div>
-            <div className="text-sm font-semibold">本路径策略参数</div>
-            <div className="mt-1 text-xs leading-5 text-muted-foreground">
-              这里只展示 Kiro-RS Tool 自己需要的参数，不读取本地模拟缓存策略的参数。
-            </div>
-          </div>
-          <NonStreamCacheToggle
-            value={effectivePolicy.reportedUsage}
-            fallbackPrefix={prefix}
-            onChange={(reportedUsage) => patch({ reportedUsage })}
-          />
-          <KiroRsToolPolicyForm
-            value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
-            onChange={(kiroRsTool) => patch({ kiroRsTool })}
-          />
-          <div className="space-y-3">
-            <div className="text-sm font-semibold">命中率与小值整形</div>
-            <CacheHitShapingForm
-              value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
-              onChange={(hitShaping) => patch({ hitShaping })}
-            />
-            <ColdRequestGuardToggle
-              value={effectivePolicy.coldRequestGuard}
-              onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
-            />
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -1662,9 +1900,7 @@ export function CachePolicySettingsSection({
     const reportedPathOverrides = { ...config.reportedUsage.pathOverrides }
     deletePrefixAliases(pathOverrides, normalizedPrefix)
     deletePrefixAliases(reportedPathOverrides, normalizedPrefix)
-    pathOverrides[normalizedPrefix] = nextPolicy.cacheType === 'no_cache'
-      ? { cacheType: 'no_cache' }
-      : nextPolicy
+    pathOverrides[normalizedPrefix] = sanitizeCacheRoutePolicy(nextPolicy)
     updateCachePolicy(
       { ...cachePolicy, pathOverrides },
       { ...config.reportedUsage, pathOverrides: reportedPathOverrides }
@@ -2176,22 +2412,24 @@ function fieldNeedsTarget(policy: ReportedUsageFieldPolicy): boolean {
 }
 
 function FieldPolicyEditor({
-  title, policy, allowMoveDelta, extra, onChange,
+  title, policy, allowMoveDelta, onChange,
 }: {
   title: string
   policy: ReportedUsageFieldPolicy
   allowMoveDelta?: boolean
-  extra?: ReactNode
   onChange: (next: ReportedUsageFieldPolicy) => void
 }) {
   const set = <K extends keyof ReportedUsageFieldPolicy>(key: K) => (v: ReportedUsageFieldPolicy[K]) =>
     onChange({ ...policy, [key]: v })
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-sm font-semibold">{title}</span>
+    <div className="min-w-0 space-y-4 border-t border-border/60 pt-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold">{title}</div>
+          <div className="mt-1 text-xs leading-5 text-muted-foreground">{FIELD_MODE_DESCS[policy.mode]}</div>
+        </div>
         <Select value={policy.mode} onValueChange={(v) => set('mode')(v as ReportedUsageFieldPolicy['mode'])}>
-          <SelectTrigger size="sm" className="w-[9rem]"><SelectValue /></SelectTrigger>
+          <SelectTrigger size="sm" className="w-full max-w-36 shrink-0"><SelectValue /></SelectTrigger>
           <SelectContent>
             {Object.entries(FIELD_MODE_LABELS).map(([k, label]) => (
               <SelectItem key={k} value={k}>{label}</SelectItem>
@@ -2199,7 +2437,6 @@ function FieldPolicyEditor({
           </SelectContent>
         </Select>
       </div>
-      <div className="text-xs leading-5 text-muted-foreground">{FIELD_MODE_DESCS[policy.mode]}</div>
       {fieldNeedsMax(policy) && (
         <NumField
           label="封顶 Token"
@@ -2240,7 +2477,76 @@ function FieldPolicyEditor({
           onChange={set('moveDeltaToCacheRead')}
         />
       )}
-      {extra}
+    </div>
+  )
+}
+
+function FinalOutputGuardForm({
+  policy,
+  onChange,
+}: {
+  policy: ReportedUsagePathPolicy
+  onChange: (next: ReportedUsagePathPolicy) => void
+}) {
+  const set = <K extends keyof ReportedUsagePathPolicy>(key: K) => (v: ReportedUsagePathPolicy[K]) =>
+    onChange({ ...policy, [key]: v })
+  const enabled = policy.finalOutputGuardEnabled ?? true
+  return (
+    <div className="space-y-5 border-t border-border/60 pt-4">
+      <TogField
+        label="启用最终输出限制"
+        desc="先按阈值百分比放大 output_tokens，再用最终上限和扣减值限制结果。"
+        checked={enabled}
+        onChange={set('finalOutputGuardEnabled')}
+      />
+      <FieldGrid>
+        <NumField
+          label="输出放大阈值"
+          desc="展示输出大于这个值后才按百分比放大；0 表示大于 0 即生效。"
+          value={policy.outputUpliftMinTokens ?? 0}
+          min={0}
+          disabled={!enabled}
+          suffix="Token"
+          onChange={set('outputUpliftMinTokens')}
+        />
+        <NumField
+          label="输出放大百分比"
+          desc="输出超过阈值后增加的百分比；0 表示关闭。"
+          value={policy.outputUpliftPercent ?? 0}
+          min={0}
+          max={200}
+          disabled={!enabled}
+          suffix="%"
+          onChange={set('outputUpliftPercent')}
+        />
+        <NumField
+          label="输出最终上限"
+          desc="放大后最多显示多少 Token；0 表示不限制。"
+          value={policy.finalOutputMaxTokens ?? 0}
+          min={0}
+          disabled={!enabled}
+          suffix="Token"
+          onChange={set('finalOutputMaxTokens')}
+        />
+        <NumField
+          label="输出扣减下限"
+          desc="输出触顶时至少从最终上限里扣掉多少。"
+          value={policy.finalOutputJitterMinTokens ?? 0}
+          min={0}
+          disabled={!enabled}
+          suffix="Token"
+          onChange={set('finalOutputJitterMinTokens')}
+        />
+        <NumField
+          label="输出扣减上限"
+          desc="输出触顶时最多从最终上限里扣掉多少。"
+          value={policy.finalOutputJitterMaxTokens ?? 0}
+          min={0}
+          disabled={!enabled}
+          suffix="Token"
+          onChange={set('finalOutputJitterMaxTokens')}
+        />
+      </FieldGrid>
     </div>
   )
 }
@@ -2254,158 +2560,67 @@ function PathPolicyEditor({
   const set = <K extends keyof ReportedUsagePathPolicy>(key: K) => (v: ReportedUsagePathPolicy[K]) =>
     onChange({ ...policy, [key]: v })
   return (
-    <div className="space-y-3">
-      <TogField
-        label="启用本规则"
-        desc="控制最终返回给客户端和后台记录的用量数字；关闭后尽量保留原始数字。"
-        checked={policy.enabled}
-        onChange={set('enabled')}
-      />
-      <TogField
-        label="非流式 Usage 透传"
-        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
-        checked={Boolean(policy.skipNonStreamUsageProjection)}
-        onChange={set('skipNonStreamUsageProjection')}
-      />
-      {!policy.enabled && (
-        <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs leading-5 text-warning">
-          当前入口会尽量使用原始用量显示。重新开启后才会使用下面的展示规则。
+    <div className="space-y-8">
+      <ParameterGroup title="Usage 总开关" desc="先决定这条路径是否参与展示用量整理，以及非流式请求是否直接透传上游结果。">
+        <div className="grid gap-x-8 gap-y-5 lg:grid-cols-2">
+          <TogField
+            label="启用本规则"
+            desc="控制最终返回给客户端和后台记录的用量数字；关闭后尽量保留原始数字。"
+            checked={policy.enabled}
+            onChange={set('enabled')}
+          />
+          <TogField
+            label="非流式 Usage 透传"
+            desc="开启后，非流式响应使用上游原始 Usage，并且不推进本地缓存状态。"
+            checked={Boolean(policy.skipNonStreamUsageProjection)}
+            onChange={set('skipNonStreamUsageProjection')}
+          />
         </div>
-      )}
+        {!policy.enabled && (
+          <div className="rounded-md bg-warning/5 px-3 py-2 text-xs leading-5 text-warning">
+            当前入口会尽量使用原始用量显示。重新开启后才会使用下面的展示规则。
+          </div>
+        )}
+      </ParameterGroup>
       {policy.enabled && (
         <>
-          <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
-          <FieldPolicyEditor
-            title="展示输出"
-            policy={policy.output}
-            onChange={set('output')}
-            extra={(
-              <div className="space-y-3 rounded-md border border-dashed bg-muted/20 p-3">
+          <ParameterGroup title="字段展示规则" desc="分别决定 input、output、cache_read 和 cache_creation 的展示方式；字段之间互不挤在同一行。">
+            <div className="grid gap-x-8 gap-y-8 xl:grid-cols-2">
+              <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
+              <FieldPolicyEditor title="展示输出" policy={policy.output} onChange={set('output')} />
+              <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />
+              <FieldPolicyEditor title="展示缓存写入" policy={policy.cacheCreation} onChange={set('cacheCreation')} />
+            </div>
+          </ParameterGroup>
+          <ParameterGroup title="输出保护" desc="字段展示完成后，最后统一处理 output_tokens 的放大和上限，避免规则散落在输出字段里。">
+            <FinalOutputGuardForm policy={policy} onChange={onChange} />
+          </ParameterGroup>
+          <ParameterGroup title="缓存读写上限" desc="只压低已经算出的缓存读取 / 写入，不会把较小的值抬高。">
+            <div className="grid gap-x-8 gap-y-8 xl:grid-cols-2">
+              <div className="space-y-4 border-t border-border/60 pt-4">
                 <div>
-                  <div className="text-sm font-semibold">最终输出限制</div>
-                  <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                    这里会改最终返回给下游和后台记录的 usage.output_tokens。关闭开关后，只使用上面的输出字段改写结果。
-                  </div>
+                  <div className="text-sm font-semibold">缓存写入 cache_creation</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">触顶时按扣减范围随机下修，避免每次都显示同一个最大值。</div>
                 </div>
-                <TogField
-                  label="启用最终输出限制"
-                  desc="开启后，先按阈值百分比放大 output_tokens，再用“输出最终上限 - 扣减值”在最后限制住。"
-                  checked={policy.finalOutputGuardEnabled ?? true}
-                  onChange={set('finalOutputGuardEnabled')}
-                />
-                <TwoCol>
-                  <NumField
-                    label="输出放大阈值"
-                    desc="展示输出完成 raw / preserve / sample-max / sample-target 后，大于这个值才按百分比放大；0 表示只要输出大于 0 且配置了百分比就生效。"
-                    value={policy.outputUpliftMinTokens ?? 0}
-                    min={0}
-                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
-                    suffix="Token"
-                    onChange={set('outputUpliftMinTokens')}
-                  />
-                  <NumField
-                    label="输出放大百分比"
-                    desc="输出超过阈值后增加多少百分比；0 表示关闭放大，最大 200%。"
-                    value={policy.outputUpliftPercent ?? 0}
-                    min={0}
-                    max={200}
-                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
-                    suffix="%"
-                    onChange={set('outputUpliftPercent')}
-                  />
-                </TwoCol>
-                <TwoCol>
-                  <NumField
-                    label="输出最终上限"
-                    desc="展示输出放大后最多显示多少 Token；0 表示不限制。生效时会先扣减下面的随机扣减值，再作为最终有效上限。"
-                    value={policy.finalOutputMaxTokens ?? 0}
-                    min={0}
-                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
-                    suffix="Token"
-                    onChange={set('finalOutputMaxTokens')}
-                  />
-                  <NumField
-                    label="输出上限扣减下限"
-                    desc="输出触顶时至少从最终上限里扣掉多少 Token，避免每次都显示同一个最大值。"
-                    value={policy.finalOutputJitterMinTokens ?? 0}
-                    min={0}
-                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
-                    suffix="Token"
-                    onChange={set('finalOutputJitterMinTokens')}
-                  />
-                </TwoCol>
-                <TwoCol>
-                  <NumField
-                    label="输出上限扣减上限"
-                    desc="输出触顶时最多从最终上限里扣掉多少 Token；必须大于等于扣减下限，且不能超过输出最终上限。"
-                    value={policy.finalOutputJitterMaxTokens ?? 0}
-                    min={0}
-                    disabled={!(policy.finalOutputGuardEnabled ?? true)}
-                    suffix="Token"
-                    onChange={set('finalOutputJitterMaxTokens')}
-                  />
-                </TwoCol>
+                <div className="grid gap-x-5 gap-y-5 sm:grid-cols-2">
+                  <NumField label="最终上限" desc="0 表示不限制。" value={policy.finalCacheCreationMaxTokens} min={0} suffix="Token" onChange={set('finalCacheCreationMaxTokens')} />
+                  <NumField label="扣减下限" desc="触顶时至少扣掉多少。" value={policy.finalCacheCreationJitterMinTokens} min={0} suffix="Token" onChange={set('finalCacheCreationJitterMinTokens')} />
+                  <NumField label="扣减上限" desc="触顶时最多扣掉多少。" value={policy.finalCacheCreationJitterMaxTokens} min={0} suffix="Token" onChange={set('finalCacheCreationJitterMaxTokens')} />
+                </div>
               </div>
-            )}
-          />
-          <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />
-          <FieldPolicyEditor title="展示缓存写入" policy={policy.cacheCreation} onChange={set('cacheCreation')} />
-          <TwoCol>
-            <NumField
-              label="写入缓存最终上限"
-              desc="缓存写入最终最多显示多少 Token；0 表示不限制。只会压低过大的值，不会把小值抬高。"
-              value={policy.finalCacheCreationMaxTokens}
-              min={0}
-              suffix="Token"
-              onChange={set('finalCacheCreationMaxTokens')}
-            />
-            <NumField
-              label="写入上限扣减下限"
-              desc="触顶时至少从写入上限里扣掉多少 Token，避免每次都显示同一个最大值。"
-              value={policy.finalCacheCreationJitterMinTokens}
-              min={0}
-              suffix="Token"
-              onChange={set('finalCacheCreationJitterMinTokens')}
-            />
-          </TwoCol>
-          <TwoCol>
-            <NumField
-              label="写入上限扣减上限"
-              desc="触顶时最多从写入上限里扣掉多少 Token；必须大于等于扣减下限。"
-              value={policy.finalCacheCreationJitterMaxTokens}
-              min={0}
-              suffix="Token"
-              onChange={set('finalCacheCreationJitterMaxTokens')}
-            />
-          </TwoCol>
-          <TwoCol>
-            <NumField
-              label="读取缓存最终上限"
-              desc="缓存读取最终最多显示多少 Token；0 表示不限制。只会压低过大的值，不会把小值抬高。"
-              value={policy.finalCacheReadMaxTokens}
-              min={0}
-              suffix="Token"
-              onChange={set('finalCacheReadMaxTokens')}
-            />
-            <NumField
-              label="最终上限扣减下限"
-              desc="触顶时至少从上限里扣掉多少 Token，避免每次都显示同一个最大值。"
-              value={policy.finalCacheReadJitterMinTokens}
-              min={0}
-              suffix="Token"
-              onChange={set('finalCacheReadJitterMinTokens')}
-            />
-          </TwoCol>
-          <TwoCol>
-            <NumField
-              label="最终上限扣减上限"
-              desc="触顶时最多从上限里扣掉多少 Token；必须大于等于扣减下限。"
-              value={policy.finalCacheReadJitterMaxTokens}
-              min={0}
-              suffix="Token"
-              onChange={set('finalCacheReadJitterMaxTokens')}
-            />
-          </TwoCol>
+              <div className="space-y-4 border-t border-border/60 pt-4">
+                <div>
+                  <div className="text-sm font-semibold">缓存读取 cache_read</div>
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">触顶时按扣减范围随机下修，避免每次都显示同一个最大值。</div>
+                </div>
+                <div className="grid gap-x-5 gap-y-5 sm:grid-cols-2">
+                  <NumField label="最终上限" desc="0 表示不限制。" value={policy.finalCacheReadMaxTokens} min={0} suffix="Token" onChange={set('finalCacheReadMaxTokens')} />
+                  <NumField label="扣减下限" desc="触顶时至少扣掉多少。" value={policy.finalCacheReadJitterMinTokens} min={0} suffix="Token" onChange={set('finalCacheReadJitterMinTokens')} />
+                  <NumField label="扣减上限" desc="触顶时最多扣掉多少。" value={policy.finalCacheReadJitterMaxTokens} min={0} suffix="Token" onChange={set('finalCacheReadJitterMaxTokens')} />
+                </div>
+              </div>
+            </div>
+          </ParameterGroup>
         </>
       )}
     </div>

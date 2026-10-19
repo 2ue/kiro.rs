@@ -11148,6 +11148,79 @@ fn kiro_rs_tool_plus_route_amplifies_bounds_and_limits_creation_frequency() {
 }
 
 #[test]
+fn kiro_rs_tool_plus_does_not_stack_legacy_usage_guards() {
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/plus-isolated/v1/messages".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::KiroRsToolPlus),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(10)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::Disabled,
+        0.95,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let payload = MessagesRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        max_tokens: 16,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: json!("plus strategy isolation"),
+        }],
+        stream: false,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: Some(Metadata {
+            user_id: Some(
+                "user_test_account__session_2ea7b4d4-5a10-4ae9-8de8-5dbf2d1c6b77".to_string(),
+            ),
+        }),
+        stop_sequences: None,
+    };
+    let mut route = RequestRuntimeConfig::from_app_state(&state)
+        .cache_policy_for_path("/plus-isolated/v1/messages");
+    assert_eq!(
+        route.policy.cache_type,
+        PromptCacheStrategyType::KiroRsToolPlus
+    );
+    // Simulate a route assembled by an older caller with legacy knobs present.
+    route.policy.hit_shaping.enabled = true;
+    route.policy.cold_request_guard.enabled = true;
+    route.policy.reported_usage.enabled = true;
+    let context = prepare_usage_context(
+        &state,
+        route,
+        "/plus-isolated/v1/messages",
+        false,
+        &payload,
+        None,
+        Some("2ea7b4d4-5a10-4ae9-8de8-5dbf2d1c6b77".to_string()),
+        prompt_cache_scope_conversation_id(
+            PromptCacheStrategyType::KiroRsToolPlus,
+            PromptCacheSimulationMode::Disabled,
+            &payload,
+        ),
+        4096,
+    );
+    assert!(context.kiro_rs_tool_plus.is_some());
+    assert!(context.cache_hit_shaping.policy.is_none());
+    assert!(!context.cold_request_guard);
+    assert!(context.reported_cache_usage_policy.is_none());
+}
+
+#[test]
 fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
     let prompt_cache = Arc::new(PromptCacheTracker::default());
     let usage_recorder = Arc::new(UsageRecorder::new(10));

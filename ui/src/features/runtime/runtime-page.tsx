@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Gauge,
   Eye,
@@ -9,7 +10,6 @@ import {
   Shield,
   Sparkles,
   Wand2,
-  Zap,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -65,7 +65,6 @@ import {
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
 import {
-  CachePolicySettingsSection,
   normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
   ModelMappingSection,
@@ -81,7 +80,6 @@ type RuntimeSectionKey =
   | 'scheduler'
   | 'warmup'
   | 'payload'
-  | 'cachePolicy'
   | 'modelMapping'
   | 'startupProxy'
   | 'compat'
@@ -99,7 +97,6 @@ const runtimeSections: Array<{
   { key: 'scheduler', title: '账号选择权重', desc: '优先使用哪些账号的调度参数', icon: <Gauge className="h-4 w-4" /> },
   { key: 'warmup', title: '新账号预热', desc: '新账号逐步参与请求，稳定后恢复正常', icon: <Sparkles className="h-4 w-4" /> },
   { key: 'payload', title: '请求体处理', desc: '协议转换、大小保护、历史清理和当前请求兜底', icon: <Wand2 className="h-4 w-4" /> },
-  { key: 'cachePolicy', title: '缓存策略', desc: '策略模板默认参数和路径绑定', icon: <Zap className="h-4 w-4" /> },
   { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
   { key: 'startupProxy', title: '启动代理', desc: '启动期全局代理只读状态', icon: <Router className="h-4 w-4" /> },
   { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
@@ -689,6 +686,14 @@ export function RuntimePage() {
       <PageHeader
         title="运行配置"
         subtitle="调度、限流、冷却、缓存与兼容等运行时参数，保存后新请求立即生效"
+        actions={
+          <Button asChild variant="outline" size="sm">
+            <Link to="/cache-policies">
+              <Router className="size-4" />
+              管理缓存策略
+            </Link>
+          </Button>
+        }
       />
 
       <div className="grid gap-4 lg:grid-cols-[17rem_minmax(0,1fr)]">
@@ -1729,10 +1734,6 @@ export function RuntimePage() {
                   <PayloadFallbackSection shaping={draft.payloadShaping} payloadShapingBranchEnabled={payloadSizeLimitEnabled && draft.payloadShaping.enabled} onChange={set('payloadShaping')} />
                 </div>
               </div>
-            )}
-
-            {activeSection === 'cachePolicy' && (
-              <CachePolicySettingsSection config={draft} onChange={setDraft} />
             )}
 
             {activeSection === 'modelMapping' && (

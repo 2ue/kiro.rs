@@ -3610,7 +3610,6 @@ impl RequestUsageContext {
             self.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache
                 | PromptCacheStrategyType::KiroRsTool
-                | PromptCacheStrategyType::KiroRsToolPlus
                 | PromptCacheStrategyType::StableSegmentCache
         ) {
             return usage;
@@ -5383,7 +5382,8 @@ fn prepare_usage_context_with_inference_attempt_budget(
         stable_segment_cache_policy: policy.stable_segment,
         reported_cache_usage_policy,
         cache_hit_shaping: CacheHitShapingContext {
-            policy: (strategy_type != PromptCacheStrategyType::NoCache)
+            policy: (strategy_type != PromptCacheStrategyType::NoCache
+                && strategy_type != PromptCacheStrategyType::KiroRsToolPlus)
                 .then_some(policy.hit_shaping)
                 .filter(|policy| policy.enabled),
             reusable_prefix: payload
@@ -5393,6 +5393,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
             seed: reported_cache_creation_seed,
         },
         cold_request_guard: strategy_type != PromptCacheStrategyType::NoCache
+            && strategy_type != PromptCacheStrategyType::KiroRsToolPlus
             && policy.cold_request_guard.enabled,
         kiro_rs_tool_plus: (strategy_type == PromptCacheStrategyType::KiroRsToolPlus).then(|| {
             KiroRsToolPlusRequest {
