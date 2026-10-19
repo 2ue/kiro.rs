@@ -31,10 +31,10 @@ use super::types::{
     CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
     CredentialsStatusResponse, DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest,
     LoadBalancingModeResponse, ManualModelResponse, PromptSteeringDefaults,
-    ProxyResourceImportEntry, ProxyResourceResponse, ProxyResourceTestRequest,
-    ProxyResourceTestResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
-    RequestApiKeyItem, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
-    SetCredentialOverageRequest, SetCredentialProxyRequest,
+    ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse, ProxyResourceImportEntry,
+    ProxyResourceResponse, ProxyResourceTestRequest, ProxyResourceTestResponse,
+    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
+    SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
     SetLoadBalancingModeRequest, SetSupportedModelsRequest, SetWarmupRequest,
     SupportedModelsResponse, TestCredentialRequest, TestCredentialResponse,
@@ -1982,6 +1982,50 @@ impl AdminService {
     ) -> CredentialListResponse {
         let page = normalize_page(page);
         let limit = normalize_credentials_limit(limit);
+        if query
+            .status
+            .as_deref()
+            .is_some_and(status_requires_runtime_filter)
+        {
+            let detailed = self
+                .credential_status_items(CredentialStatusBuildOptions {
+                    include_account_info: true,
+                    include_cost_summary: false,
+                })
+                .7;
+            let matching_ids: HashSet<u64> = detailed
+                .iter()
+                .filter(|credential| credential_matches_query(credential, &query))
+                .map(|credential| credential.id)
+                .collect();
+            let snapshot = self.token_manager.base_snapshot();
+            let default_endpoint = self.token_manager.runtime_config().default_endpoint;
+            let mut filtered: Vec<_> = snapshot
+                .entries
+                .into_iter()
+                .filter(|entry| matching_ids.contains(&entry.id))
+                .map(|entry| credential_list_item_from_base(entry, &default_endpoint))
+                .collect();
+            sort_credential_list_items_for_admin_display_with_query(&mut filtered, &query);
+            let filtered_total = filtered.len();
+            let filtered_available = filtered
+                .iter()
+                .filter(|credential| !credential.disabled)
+                .count();
+            let total_pages = total_pages(filtered_total, limit);
+            let start = page.saturating_sub(1).saturating_mul(limit);
+            let items = filtered.into_iter().skip(start).take(limit).collect();
+            return CredentialListResponse {
+                page,
+                limit,
+                total: snapshot.total,
+                available: snapshot.available,
+                filtered_total,
+                filtered_available,
+                total_pages,
+                items,
+            };
+        }
         let snapshot = self.token_manager.base_snapshot();
         let default_endpoint = self.token_manager.runtime_config().default_endpoint;
         let mut filtered: Vec<_> = snapshot
@@ -2015,6 +2059,28 @@ impl AdminService {
     /// 获取凭据数量和全局调度容量概览。
     pub fn get_credentials_summary(&self) -> CredentialSummaryResponse {
         let snapshot = self.token_manager.summary_snapshot();
+        let detailed = self
+            .credential_status_items(CredentialStatusBuildOptions {
+                include_account_info: true,
+                include_cost_summary: false,
+            })
+            .7;
+        let quota_exhausted = detailed
+            .iter()
+            .filter(|credential| is_quota_exhausted(credential))
+            .count();
+        let account_error = detailed
+            .iter()
+            .filter(|credential| is_account_error(credential))
+            .count();
+        let cooling = detailed
+            .iter()
+            .filter(|credential| is_cooling_account(credential))
+            .count();
+        let normal = detailed
+            .iter()
+            .filter(|credential| is_normal_account(credential))
+            .count();
         CredentialSummaryResponse {
             total: snapshot.total,
             available: snapshot.available,
@@ -2030,6 +2096,10 @@ impl AdminService {
             cooling_down: snapshot.account_states.cooling_down,
             in_use: snapshot.account_states.in_use,
             failing: snapshot.account_states.failing,
+            normal,
+            cooling,
+            quota_exhausted,
+            account_error,
         }
     }
 
@@ -3569,13 +3639,89 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
 
-        self.run_proxy_resource_test(
-            resource.proxy_url,
-            resource.proxy_username,
-            resource.proxy_password,
-            req.test_url,
-        )
-        .await
+        let result = self
+            .run_proxy_resource_test(
+                resource.proxy_url,
+                resource.proxy_username,
+                resource.proxy_password,
+                req.test_url,
+            )
+            .await?;
+        self.persist_proxy_resource_test(id, &result).await?;
+        Ok(result)
+    }
+
+    pub async fn test_all_proxy_resources(
+        &self,
+        req: ProxyResourceTestRequest,
+    ) -> Result<ProxyResourceBatchTestResponse, AdminServiceError> {
+        let test_url = req.test_url.clone();
+        let resources = self
+            .postgres_store
+            .load_proxy_resources()
+            .await
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        let results = stream::iter(resources.into_iter().map(|resource| {
+            let test_url = test_url.clone();
+            async move {
+                let result = self
+                    .run_proxy_resource_test(
+                        resource.proxy_url.clone(),
+                        resource.proxy_username.clone(),
+                        resource.proxy_password.clone(),
+                        test_url,
+                    )
+                    .await;
+                (resource, result)
+            }
+        }))
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut items = Vec::with_capacity(results.len());
+        for (resource, result) in results {
+            let result = result?;
+            self.persist_proxy_resource_test(resource.id, &result)
+                .await?;
+            items.push(ProxyResourceBatchTestItem {
+                resource_id: resource.id,
+                name: resource.name,
+                success: result.success,
+                message: result.message,
+                proxy_url: result.proxy_url,
+                test_url: result.test_url,
+                status: result.status,
+                duration_ms: result.duration_ms,
+                response_preview: result.response_preview,
+            });
+        }
+        items.sort_by_key(|item| item.resource_id);
+        let success = items.iter().filter(|item| item.success).count();
+        Ok(ProxyResourceBatchTestResponse {
+            total: items.len(),
+            success,
+            failed: items.len().saturating_sub(success),
+            items,
+        })
+    }
+
+    async fn persist_proxy_resource_test(
+        &self,
+        id: u64,
+        result: &ProxyResourceTestResponse,
+    ) -> Result<(), AdminServiceError> {
+        self.postgres_store
+            .update_proxy_resource_test(
+                id,
+                result.success,
+                result.status,
+                result.duration_ms,
+                &result.message,
+                &result.test_url,
+            )
+            .await
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
     async fn run_proxy_resource_test(
@@ -5145,8 +5291,12 @@ impl AdminService {
         &self,
         format: &str,
         selected_ids: &[u64],
+        disabled_only: bool,
     ) -> Result<(String, String), AdminServiceError> {
         let mut credentials = self.token_manager.export_credentials();
+        if disabled_only {
+            credentials.retain(|credential| credential.disabled);
+        }
         let selected_id_set: HashSet<u64> = selected_ids.iter().copied().collect();
         let selected = !selected_id_set.is_empty();
         filter_export_credentials_by_ids(&mut credentials, &selected_id_set)?;
@@ -5195,6 +5345,7 @@ impl AdminService {
                 "count": credential_count,
                 "selected": selected,
                 "requestedIds": selected_ids.len(),
+                "disabledOnly": disabled_only,
             }),
         );
         result
@@ -7457,6 +7608,12 @@ fn proxy_resource_response(row: ProxyResourceRow) -> ProxyResourceResponse {
         created_at: row.created_at,
         updated_at: row.updated_at,
         credential_count: row.credential_count,
+        last_test_at: row.last_test_at,
+        last_test_success: row.last_test_success,
+        last_test_status: row.last_test_status,
+        last_test_duration_ms: row.last_test_duration_ms,
+        last_test_message: row.last_test_message,
+        last_test_url: row.last_test_url,
     }
 }
 
@@ -8224,8 +8381,11 @@ fn credential_matches_query(
             "enabled" => !credential.disabled,
             "disabled" => credential.disabled,
             "current" => credential.is_current,
-            "cooldown" => credential.cooled_down,
+            "cooldown" | "cooling" => is_cooling_account(credential),
             "rate_limited" | "rate-limited" => credential.rate_limited,
+            "quota_exhausted" | "quota-exhausted" => is_quota_exhausted(credential),
+            "account_error" | "account-error" => is_account_error(credential),
+            "normal" => is_normal_account(credential),
             "proxy_blocked" | "proxy-blocked" => matches!(
                 credential.effective_proxy_source.as_str(),
                 "resource_disabled" | "resource_missing"
@@ -8425,6 +8585,23 @@ fn credential_base_matches_query(
     }
 
     true
+}
+
+fn status_requires_runtime_filter(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "current"
+            | "cooldown"
+            | "cooling"
+            | "rate_limited"
+            | "rate-limited"
+            | "quota_exhausted"
+            | "quota-exhausted"
+            | "account_error"
+            | "account-error"
+            | "normal"
+            | "error"
+    )
 }
 
 fn credential_text_fields_match<'a>(
@@ -9829,6 +10006,61 @@ fn filter_export_credentials_by_ids(
         )));
     }
     Ok(())
+}
+
+/// 额度用尽：被 QuotaExceeded 自动禁用，或最近一次账号额度快照显示已用尽。
+fn is_quota_exhausted(credential: &CredentialStatusItem) -> bool {
+    if credential.disabled_reason.as_deref() == Some("QuotaExceeded") {
+        return true;
+    }
+
+    credential.account_info.as_ref().is_some_and(|info| {
+        (info.usage_limit > 0.0 && info.current_usage >= info.usage_limit)
+            || (info.credit_limit > 0.0 && info.credit_remaining <= 0.0)
+    })
+}
+
+/// 账号异常：账号本身出错（失效、配置无效、暂停/锁定，或认证失败仍未恢复），
+/// 不包含额度用尽，也不包含限流、网络、流式等普通失败。
+///
+/// 只使用结构化信号：`last_error_reason` 是自由文本（可能包含上游响应体），
+/// 子串匹配会把 `token_refresh_rate_limited`、`max tokens` 之类误判为账号异常。
+fn is_account_error(credential: &CredentialStatusItem) -> bool {
+    if is_quota_exhausted(credential) {
+        return false;
+    }
+    if matches!(
+        credential.disabled_reason.as_deref(),
+        Some(
+            "InvalidRefreshToken"
+                | "InvalidConfig"
+                | "TemporarilySuspended"
+                | "AccountSuspended"
+                | "AccountLocked"
+        )
+    ) {
+        return true;
+    }
+
+    // last_error_* 在调用成功后不会清空，失败连击需仍未归零才视为当前异常。
+    !credential.disabled
+        && credential.last_error_kind.as_deref() == Some("auth")
+        && credential.transient_failure_streak > 0
+}
+
+fn is_cooling_account(credential: &CredentialStatusItem) -> bool {
+    !credential.disabled
+        && credential.cooled_down
+        && !is_quota_exhausted(credential)
+        && !is_account_error(credential)
+}
+
+fn is_normal_account(credential: &CredentialStatusItem) -> bool {
+    !credential.disabled
+        && !credential.cooled_down
+        && !credential.rate_limited
+        && !is_quota_exhausted(credential)
+        && !is_account_error(credential)
 }
 
 fn merge_redis_delete_stats(

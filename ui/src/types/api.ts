@@ -43,6 +43,10 @@ export interface CredentialSummaryResponse {
   coolingDown: number
   inUse: number
   failing: number
+  normal: number
+  cooling: number
+  quotaExhausted: number
+  accountError: number
 }
 
 export interface SystemVersionResponse {
@@ -683,6 +687,12 @@ export interface ProxyResource {
   createdAt: string
   updatedAt: string
   credentialCount: number
+  lastTestAt?: string | null
+  lastTestSuccess?: boolean | null
+  lastTestStatus?: number | null
+  lastTestDurationMs?: number | null
+  lastTestMessage?: string | null
+  lastTestUrl?: string | null
 }
 
 export interface ProxyResourcesResponse {
@@ -704,6 +714,13 @@ export interface ProxyResourceTestResponse {
   status?: number | null
   durationMs: number
   responsePreview?: string
+}
+
+export interface ProxyResourceBatchTestResponse {
+  total: number
+  success: number
+  failed: number
+  items: Array<ProxyResourceTestResponse & { resourceId: number; name: string }>
 }
 
 export interface CreateProxyResourceRequest {

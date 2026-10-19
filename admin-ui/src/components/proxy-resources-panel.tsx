@@ -22,6 +22,7 @@ import {
   useImportProxyResources,
   useProxyResources,
   useSetCredentialProxy,
+  useTestAllProxyResources,
   useTestProxyResource,
   useUpdateProxyResource,
 } from '@/hooks/use-credentials'
@@ -505,6 +506,9 @@ function ProxyResourceCard({
         <div className="flex flex-wrap gap-2">
           <Badge variant="outline">#{resource.id}</Badge>
           <Badge variant={resource.enabled ? 'success' : 'destructive'}>{resource.enabled ? '启用' : '已禁用'}</Badge>
+          {resource.lastTestSuccess === true && <Badge variant="success">测活成功</Badge>}
+          {resource.lastTestSuccess === false && <Badge variant="destructive">测活失败</Badge>}
+          {typeof resource.lastTestSuccess !== 'boolean' && <Badge variant="outline">未测活</Badge>}
           {resource.hasPassword && <Badge variant="outline">密码</Badge>}
         </div>
         <div className="grid gap-2 text-sm md:grid-cols-2">
@@ -538,6 +542,14 @@ function ProxyResourceCard({
               <span className="whitespace-pre-wrap break-words font-medium">{resource.notes}</span>
             </div>
           )}
+          {resource.lastTestAt && (
+            <div className="md:col-span-2">
+              <span className="text-muted-foreground">最近测活：</span>
+              <span className="font-medium">{formatDateTime(resource.lastTestAt)}</span>
+              {resource.lastTestDurationMs != null && <span className="ml-2 text-xs text-muted-foreground">耗时 {resource.lastTestDurationMs}ms</span>}
+              {resource.lastTestMessage && <div className="mt-1 truncate text-xs text-muted-foreground" title={resource.lastTestMessage}>{resource.lastTestMessage}</div>}
+            </div>
+          )}
         </div>
         <ProxyTestResult result={testResult} />
         <div className="flex flex-wrap gap-2 border-t pt-3">
@@ -568,9 +580,32 @@ export function ProxyResourcesPanel() {
   const [editorOpen, setEditorOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
   const [editing, setEditing] = useState<ProxyResource | null>(null)
+  const [statusTab, setStatusTab] = useState<'all' | 'success' | 'failed' | 'untested'>('all')
+  const testAll = useTestAllProxyResources()
   const list = resources.data?.resources || []
   const enabledCount = useMemo(() => list.filter((resource) => resource.enabled).length, [list])
   const boundCount = useMemo(() => list.reduce((sum, resource) => sum + resource.credentialCount, 0), [list])
+  const statusCounts = useMemo(() => ({
+    all: list.length,
+    success: list.filter((resource) => resource.lastTestSuccess === true).length,
+    failed: list.filter((resource) => resource.lastTestSuccess === false).length,
+    untested: list.filter((resource) => typeof resource.lastTestSuccess !== 'boolean').length,
+  }), [list])
+  const visibleList = useMemo(() => {
+    if (statusTab === 'success') return list.filter((resource) => resource.lastTestSuccess === true)
+    if (statusTab === 'failed') return list.filter((resource) => resource.lastTestSuccess === false)
+    if (statusTab === 'untested') return list.filter((resource) => typeof resource.lastTestSuccess !== 'boolean')
+    return list
+  }, [list, statusTab])
+
+  const testAllResources = async () => {
+    try {
+      const result = await testAll.mutateAsync({})
+      toast[result.failed > 0 ? 'warning' : 'success'](`批量测活完成：成功 ${result.success}，失败 ${result.failed}`)
+    } catch (error) {
+      toast.error(`批量测活失败: ${extractErrorMessage(error)}`)
+    }
+  }
 
   const openCreate = () => {
     setEditing(null)
@@ -648,6 +683,10 @@ export function ProxyResourcesPanel() {
             <Upload className="h-4 w-4" />
             批量导入
           </Button>
+          <Button size="sm" variant="outline" onClick={testAllResources} disabled={testAll.isPending || list.length === 0}>
+            <Activity className={testAll.isPending ? 'h-4 w-4 animate-pulse' : 'h-4 w-4'} />
+            {testAll.isPending ? '全部测活中...' : '批量测活（全部）'}
+          </Button>
           <Button size="sm" variant="outline" onClick={() => resources.refetch()}>
             <RefreshCw className="h-4 w-4" />
             刷新列表
@@ -655,13 +694,27 @@ export function ProxyResourcesPanel() {
         </div>
       </div>
 
-      {list.length === 0 ? (
+      <div className="flex flex-wrap gap-2 border-b pb-3" role="tablist" aria-label="代理测活状态">
+        {([
+          ['all', '全部'],
+          ['success', '测活成功'],
+          ['failed', '测活失败'],
+          ['untested', '未测活'],
+        ] as const).map(([key, label]) => (
+          <Button key={key} role="tab" aria-selected={statusTab === key} size="sm" variant={statusTab === key ? 'default' : 'ghost'} onClick={() => setStatusTab(key)}>
+            {label}
+            <Badge variant={statusTab === key ? 'secondary' : 'outline'} className="ml-1">{statusCounts[key]}</Badge>
+          </Button>
+        ))}
+      </div>
+
+      {visibleList.length === 0 ? (
         <Card>
-          <CardContent className="py-8 text-center text-muted-foreground">暂无代理资源</CardContent>
+          <CardContent className="py-8 text-center text-muted-foreground">{list.length === 0 ? '暂无代理资源' : '当前分类暂无代理'}</CardContent>
         </Card>
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {list.map((resource) => (
+          {visibleList.map((resource) => (
             <ProxyResourceCard key={resource.id} resource={resource} onEdit={openEdit} />
           ))}
         </div>

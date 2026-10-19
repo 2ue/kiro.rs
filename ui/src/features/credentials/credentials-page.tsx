@@ -664,6 +664,11 @@ export function CredentialsPage() {
     setProxyFilter('__all__')
   }
 
+  const applyStatusFilter = (value: string) => {
+    setStatusFilter(value)
+    setPage(1)
+  }
+
   const setLbMode = (mode: LoadBalancingMode) => {
     const label = mode === 'priority'
       ? '优先级'
@@ -1002,6 +1007,27 @@ export function CredentialsPage() {
             : `共 ${credentialSummary.data?.total ?? grandTotal} 个账号`
         }
       >
+        <div className="mb-3 flex flex-wrap gap-2" role="tablist" aria-label="账号快捷状态筛选">
+          {[
+            ['normal', '正常', credentialSummary.data?.normal ?? 0, 'success'],
+            ['cooling', '冷却', credentialSummary.data?.cooling ?? credentialSummary.data?.coolingDown ?? 0, 'warning'],
+            ['quota_exhausted', '额度用尽', credentialSummary.data?.quotaExhausted ?? 0, 'error'],
+            ['account_error', '账号异常', credentialSummary.data?.accountError ?? 0, 'error'],
+          ].map(([value, label, count, tone]) => (
+            <Button
+              key={value}
+              type="button"
+              size="sm"
+              variant={statusFilter === value ? 'default' : 'outline'}
+              onClick={() => applyStatusFilter(value as string)}
+              role="tab"
+              aria-selected={statusFilter === value}
+            >
+              <span>{label}</span>
+              <Badge tone={statusFilter === value ? 'neutral' : tone as 'success' | 'warning' | 'error'} className="ml-1">{count as number}</Badge>
+            </Button>
+          ))}
+        </div>
         {/* Toolbar */}
         <Toolbar className="mb-3">
           <div className="grid w-full min-w-0 items-end gap-2 sm:grid-cols-2 xl:grid-cols-[minmax(220px,1.5fr)_140px_minmax(180px,1fr)_130px_140px] 2xl:grid-cols-[minmax(230px,1.25fr)_130px_minmax(170px,0.95fr)_120px_130px_minmax(130px,0.85fr)_140px_90px_auto]">
@@ -1022,7 +1048,11 @@ export function CredentialsPage() {
                   <SelectItem value="disabled">已禁用</SelectItem>
                   <SelectItem value="current">当前活跃</SelectItem>
                   <SelectItem value="cooldown">冷却中</SelectItem>
+                  <SelectItem value="cooling">冷却账号</SelectItem>
                   <SelectItem value="rate_limited">限流中</SelectItem>
+                  <SelectItem value="quota_exhausted">额度用尽</SelectItem>
+                  <SelectItem value="account_error">账号异常</SelectItem>
+                  <SelectItem value="normal">正常</SelectItem>
                   <SelectItem value="proxy_blocked">代理不可用</SelectItem>
                   <SelectItem value="error">有错误</SelectItem>
                   <SelectItem value="custom_scheduling">有调度覆盖</SelectItem>

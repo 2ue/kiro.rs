@@ -1664,7 +1664,7 @@ export function CredentialExportModal({ open, onClose, selectedIds = [] }: {
   selectedIds?: number[]
 }) {
   const [format, setFormat] = useState<CredentialExportFormat>('json')
-  const [scope, setScope] = useState<'selected' | 'all'>('all')
+  const [scope, setScope] = useState<'selected' | 'all' | 'disabled'>('all')
   const [loading, setLoading] = useState(false)
   const selectedCount = selectedIds.length
 
@@ -1676,9 +1676,9 @@ export function CredentialExportModal({ open, onClose, selectedIds = [] }: {
     setLoading(true)
     try {
       const exportIds = scope === 'selected' ? selectedIds : undefined
-      const blob = await exportCredentials(format, exportIds)
+      const blob = await exportCredentials(format, exportIds, scope === 'disabled')
       downloadBlob(blob, exportFilename(format))
-      toast.success(scope === 'selected' ? `已导出选中账号 ${selectedCount} 个` : '导出成功')
+      toast.success(scope === 'selected' ? `已导出选中账号 ${selectedCount} 个` : scope === 'disabled' ? '已导出全部已禁用账号' : '导出成功')
       onClose()
     } catch (e) {
       toast.error(`导出失败: ${extractErrorMessage(e)}`)
@@ -1700,17 +1700,16 @@ export function CredentialExportModal({ open, onClose, selectedIds = [] }: {
             </SelectContent>
           </Select>
         </Field>
-        {selectedCount > 0 && (
-          <Field label="导出范围">
-            <Select value={scope} onValueChange={(v) => setScope(v as 'selected' | 'all')} disabled={loading}>
-              <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="selected">导出选中账号（{selectedCount} 个）</SelectItem>
-                <SelectItem value="all">导出全部账号</SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
-        )}
+        <Field label="导出范围">
+          <Select value={scope} onValueChange={(v) => setScope(v as 'selected' | 'all' | 'disabled')} disabled={loading}>
+            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {selectedCount > 0 && <SelectItem value="selected">导出选中账号（{selectedCount} 个）</SelectItem>}
+              <SelectItem value="all">导出全部账号</SelectItem>
+              <SelectItem value="disabled">导出全部已禁用账号</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
         <div className="flex justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={onClose} disabled={loading}>取消</Button>
           <Button size="sm" onClick={handleExport} disabled={loading}>

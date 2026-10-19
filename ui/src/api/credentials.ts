@@ -48,6 +48,7 @@ import type {
   ProxyResource,
   ProxyResourceTestRequest,
   ProxyResourceTestResponse,
+  ProxyResourceBatchTestResponse,
   ProxyResourcesResponse,
   UpdateAdminApiKeyRequest,
   CreateRequestApiKeyRequest,
@@ -323,6 +324,11 @@ export async function testProxyResource(id: number, req: ProxyResourceTestReques
   return data
 }
 
+export async function testAllProxyResources(req: ProxyResourceTestRequest = {}): Promise<ProxyResourceBatchTestResponse> {
+  const { data } = await api.post<ProxyResourceBatchTestResponse>('/proxy-resources/test-all', req)
+  return data
+}
+
 export async function createProxyResource(req: CreateProxyResourceRequest): Promise<ProxyResource> {
   const { data } = await api.post<ProxyResource>('/proxy-resources', req)
   return data
@@ -468,9 +474,9 @@ export async function testExternalPool(id: number, req?: ExternalPoolTestRequest
   return data
 }
 
-export async function exportCredentials(format: CredentialExportFormat, ids?: number[]): Promise<Blob> {
+export async function exportCredentials(format: CredentialExportFormat, ids?: number[], disabledOnly = false): Promise<Blob> {
   const { data } = await api.get<Blob>('/credentials/export', {
-    params: { format, ids: ids && ids.length ? ids.join(',') : undefined },
+    params: { format, ids: ids && ids.length ? ids.join(',') : undefined, disabled: disabledOnly ? true : undefined },
     responseType: 'blob',
   })
   return data
