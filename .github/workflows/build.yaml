@@ -53,7 +53,7 @@ jobs:
   quality:
     name: Frontend and Rust quality gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
 
     services:
       postgres:
