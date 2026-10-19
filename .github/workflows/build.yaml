@@ -53,7 +53,7 @@ jobs:
   quality:
     name: Frontend and Rust quality gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -179,14 +179,6 @@ jobs:
       - name: Check Clippy warning baseline
         run: node scripts/ci/check-clippy-baseline.mjs
 
-      - name: Test without default features
-        if: ${{ env.QUALITY_PROFILE == 'full' }}
-        run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --all-targets --no-default-features -- --test-threads=1
-
-      - name: Test with default features
-        if: ${{ env.QUALITY_PROFILE == 'full' }}
-        run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --all-targets -- --test-threads=1
-
       - name: Check no-default Rust compilation
         if: ${{ env.QUALITY_PROFILE == 'release' }}
         run: cargo check --locked --all-targets --no-default-features
@@ -198,3 +190,73 @@ jobs:
       - name: Build release with default features
         if: ${{ env.QUALITY_PROFILE == 'full' }}
         run: cargo build --release --locked
+
+  # The two full test runs only differ in the TLS feature, so they run as parallel jobs instead
+  # of back to back. Integration tests isolate themselves (a random PostgreSQL schema and a
+  # random Redis key prefix per test), so they no longer need --test-threads=1.
+  tests:
+    name: Rust tests (${{ matrix.name }})
+    if: ${{ (inputs.profile || 'full') == 'full' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            cargo_args: ''
+          - name: no default features
+            cargo_args: --no-default-features
+
+    services:
+      postgres:
+        image: postgres:16.9-alpine3.21
+        env:
+          POSTGRES_USER: kiro_rs
+          POSTGRES_PASSWORD: kiro_rs_test
+          POSTGRES_DB: kiro_rs_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kiro_rs -d kiro_rs_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7.4.5-alpine3.21
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tests-${{ matrix.cargo_args || 'default' }}
+          cache-on-failure: true
+
+      - name: Verify integration-test services
+        run: |
+          docker exec "${{ job.services.postgres.id }}" pg_isready -U kiro_rs -d kiro_rs_test
+          test "$(docker exec "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
+
+      - name: Run tests
+        run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --all-targets ${{ matrix.cargo_args }}
