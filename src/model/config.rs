@@ -3,6 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub use super::kiro_rs_tool_plus::{
+    KiroRsToolPlusCachePolicy, SelectedUsageShaping, SuppressedCreationTarget, UsageFieldShaping,
+    UsageShapingProfile,
+};
+
 use crate::anthropic::{
     inference_attempt_budget::DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
     payload_guard::KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT,
@@ -2798,6 +2803,9 @@ pub struct CacheRoutePolicyPatch {
     pub bounds: Option<CacheBoundsPolicyPatch>,
     #[serde(default)]
     pub kiro_rs_tool: Option<KiroRsToolCachePolicyPatch>,
+    /// Kiro-RS Tool Plus 策略参数；整体替换，缺失字段取默认值。
+    #[serde(default)]
+    pub kiro_rs_tool_plus: Option<KiroRsToolPlusCachePolicy>,
     /// Boxed: the patch has ~25 optional fields and `CachePolicyConfig` embeds this struct
     /// several times, which otherwise bloats every `Config` copy on debug-build stacks.
     #[serde(default)]
@@ -2869,6 +2877,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = &self.kiro_rs_tool {
             patch.validate_raw(&format!("{label}.kiroRsTool"))?;
         }
+        if let Some(policy) = &self.kiro_rs_tool_plus {
+            policy.validate(&format!("{label}.kiroRsToolPlus"))?;
+        }
         if let Some(patch) = &self.stable_segment {
             patch.validate_raw(&format!("{label}.stableSegment"))?;
         }
@@ -2884,6 +2895,9 @@ impl CacheRoutePolicyPatch {
             PromptCacheStrategyType::NoCache => self.apply_no_cache_fields_to(policy),
             PromptCacheStrategyType::CurrentHighCache => self.apply_fields_to(policy),
             PromptCacheStrategyType::KiroRsTool => self.apply_kiro_rs_tool_fields_to(policy),
+            PromptCacheStrategyType::KiroRsToolPlus => {
+                self.apply_kiro_rs_tool_plus_fields_to(policy)
+            }
             PromptCacheStrategyType::StableSegmentCache => {
                 self.apply_stable_segment_fields_to(policy)
             }
@@ -2916,6 +2930,23 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.cold_request_guard {
             policy.cold_request_guard = patch.apply_to(policy.cold_request_guard);
+        }
+        policy.normalized()
+    }
+
+    /// Plus 策略自带整形与写入频次控制，不叠加 hitShaping / coldRequestGuard / reportedUsage。
+    fn apply_kiro_rs_tool_plus_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        if let Some(cache_type) = self.cache_type {
+            policy.cache_type = cache_type;
+        }
+        if let Some(patch) = self.cache_point {
+            policy.cache_point = patch.apply_to(policy.cache_point);
+        }
+        if let Some(patch) = self.bounds {
+            policy.bounds = patch.apply_to(policy.bounds);
+        }
+        if let Some(plus) = self.kiro_rs_tool_plus {
+            policy.kiro_rs_tool_plus = plus.normalized();
         }
         policy.normalized()
     }
@@ -2954,6 +2985,7 @@ impl CacheRoutePolicyPatch {
             || self.cache_point.is_some()
             || self.bounds.is_some()
             || self.kiro_rs_tool.is_some()
+            || self.kiro_rs_tool_plus.is_some()
             || self.stable_segment.is_some()
     }
 
@@ -2978,6 +3010,7 @@ impl CacheRoutePolicyPatch {
                 .kiro_rs_tool
                 .as_ref()
                 .is_none_or(KiroRsToolCachePolicyPatch::is_empty)
+            && self.kiro_rs_tool_plus.is_none()
             && self
                 .stable_segment
                 .as_deref()
@@ -3001,6 +3034,7 @@ pub enum PromptCacheStrategyType {
     CurrentHighCache,
     KiroRsTool,
     StableSegmentCache,
+    KiroRsToolPlus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -3014,6 +3048,8 @@ pub struct CachePolicyConfig {
     pub kiro_rs_tool: CacheRoutePolicyPatch,
     #[serde(default)]
     pub stable_segment_cache: CacheRoutePolicyPatch,
+    #[serde(default)]
+    pub kiro_rs_tool_plus: CacheRoutePolicyPatch,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
 }
@@ -3070,6 +3106,7 @@ impl CachePolicyConfig {
             current_high_cache: self.current_high_cache.clone(),
             kiro_rs_tool: self.kiro_rs_tool.clone(),
             stable_segment_cache: self.stable_segment_cache.clone(),
+            kiro_rs_tool_plus: self.kiro_rs_tool_plus.clone(),
             path_overrides,
         }
     }
@@ -3083,6 +3120,8 @@ impl CachePolicyConfig {
             .validate("Kiro-RS-Tool 缓存策略模板", base.clone())?;
         self.stable_segment_cache
             .validate("Stable Segment 缓存策略模板", base.clone())?;
+        self.kiro_rs_tool_plus
+            .validate("Kiro-RS-Tool Plus 缓存策略模板", base.clone())?;
         for (prefix, policy) in &self.path_overrides {
             let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
                 return Err("缓存策略路径前缀不能为空".to_string());
@@ -3122,6 +3161,7 @@ impl CachePolicyConfig {
             stable_segment: base.stable_segment,
             hit_shaping: base.hit_shaping,
             cold_request_guard: base.cold_request_guard,
+            kiro_rs_tool_plus: base.kiro_rs_tool_plus,
         };
         self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
     }
@@ -3151,9 +3191,41 @@ impl CachePolicyConfig {
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: base.hit_shaping,
             cold_request_guard: base.cold_request_guard,
+            kiro_rs_tool_plus: base.kiro_rs_tool_plus,
         };
         self.stable_segment_cache
             .apply_stable_segment_fields_to(neutral)
+    }
+
+    fn kiro_rs_tool_plus_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+        let neutral = CacheRoutePolicy {
+            cache_type: PromptCacheStrategyType::KiroRsToolPlus,
+            simulation: CacheSimulationPolicy {
+                enabled: false,
+                target_read_ratio: default_prompt_cache_target_read_ratio(),
+                token_scale: 1.0,
+                max_simulated_input_tokens: 0,
+                cap_jitter_min_tokens: 0,
+                cap_jitter_max_tokens: 0,
+                scale_min_input_tokens: 0,
+            }
+            .normalized(),
+            creation_control: PromptCacheCreationControlConfig {
+                enabled: false,
+                ..base.creation_control
+            }
+            .normalized(),
+            reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
+            cache_point: CachePointPolicy::default(),
+            bounds: base.bounds,
+            kiro_rs_tool: base.kiro_rs_tool,
+            stable_segment: base.stable_segment,
+            hit_shaping: CacheHitShapingPolicy::disabled(),
+            cold_request_guard: ColdRequestGuardPolicy::disabled(),
+            kiro_rs_tool_plus: KiroRsToolPlusCachePolicy::default(),
+        };
+        self.kiro_rs_tool_plus
+            .apply_kiro_rs_tool_plus_fields_to(neutral)
     }
 
     fn no_cache_policy(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
@@ -3179,6 +3251,7 @@ impl CachePolicyConfig {
             stable_segment: base.stable_segment,
             hit_shaping: CacheHitShapingPolicy::disabled(),
             cold_request_guard: ColdRequestGuardPolicy::disabled(),
+            kiro_rs_tool_plus: base.kiro_rs_tool_plus,
         }
         .normalized()
     }
@@ -3205,6 +3278,11 @@ impl CachePolicyConfig {
                 policy.cache_type = PromptCacheStrategyType::StableSegmentCache;
                 policy.normalized()
             }
+            PromptCacheStrategyType::KiroRsToolPlus => {
+                let mut policy = self.kiro_rs_tool_plus_template(base);
+                policy.cache_type = PromptCacheStrategyType::KiroRsToolPlus;
+                policy.normalized()
+            }
         }
     }
 }
@@ -3221,6 +3299,7 @@ pub struct CacheRoutePolicy {
     pub stable_segment: StableSegmentCachePolicy,
     pub hit_shaping: CacheHitShapingPolicy,
     pub cold_request_guard: ColdRequestGuardPolicy,
+    pub kiro_rs_tool_plus: KiroRsToolPlusCachePolicy,
 }
 
 impl CacheRoutePolicy {
@@ -3231,6 +3310,7 @@ impl CacheRoutePolicy {
         self.kiro_rs_tool = self.kiro_rs_tool.normalized();
         self.stable_segment = self.stable_segment.normalized();
         self.hit_shaping = self.hit_shaping.normalized();
+        self.kiro_rs_tool_plus = self.kiro_rs_tool_plus.normalized();
         self
     }
 
@@ -3246,6 +3326,8 @@ impl CacheRoutePolicy {
         self.kiro_rs_tool.validate(&format!("{label}.kiroRsTool"))?;
         self.stable_segment
             .validate(&format!("{label}.stableSegment"))?;
+        self.kiro_rs_tool_plus
+            .validate(&format!("{label}.kiroRsToolPlus"))?;
         Ok(())
     }
 }
@@ -3291,7 +3373,9 @@ pub fn resolve_cache_policy_for_path(
     let policy = override_policy.apply_fields_for_strategy(policy);
     let namespace = match cache_type {
         PromptCacheStrategyType::NoCache => None,
-        PromptCacheStrategyType::KiroRsTool => Some(prefix.clone()),
+        PromptCacheStrategyType::KiroRsTool | PromptCacheStrategyType::KiroRsToolPlus => {
+            Some(prefix.clone())
+        }
         PromptCacheStrategyType::StableSegmentCache => override_policy
             .route_namespace
             .unwrap_or_else(|| override_policy.affects_cache_state())
@@ -6306,6 +6390,7 @@ impl Config {
             stable_segment: StableSegmentCachePolicy::default(),
             hit_shaping: CacheHitShapingPolicy::default(),
             cold_request_guard: ColdRequestGuardPolicy::default(),
+            kiro_rs_tool_plus: KiroRsToolPlusCachePolicy::default(),
         }
         .normalized()
     }
@@ -8791,6 +8876,105 @@ mod tests {
             resolved.policy.stable_segment.reported_input_max_tokens,
             192
         );
+    }
+
+    #[test]
+    fn kiro_rs_tool_plus_policy_resolves_template_and_path_override() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "cachePolicy": {
+                "kiroRsToolPlus": {
+                    "hitShaping": { "enabled": true },
+                    "kiroRsToolPlus": {
+                        "coverageRatio": 0.8,
+                        "shaping": { "cacheRead": { "multiplier": 2.5 } }
+                    }
+                },
+                "pathOverrides": {
+                    "/plus": { "cacheType": "kiro_rs_tool_plus" },
+                    "/plus-custom": {
+                        "cacheType": "kiro_rs_tool_plus",
+                        "kiroRsToolPlus": {
+                            "creationFrequency": { "enabled": true, "minSuccessfulRequestsBetweenCreation": 5 },
+                            "suppressedCreationTarget": "cache_read",
+                            "shaping": { "cacheCreation": { "multiplier": 3, "maxTokens": 50000 } },
+                            "nonStream": { "mode": "raw" },
+                            "smallRequest": { "enabled": true, "maxInputTokens": 2048, "disableCache": true }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize config");
+        config.cache_policy = config.cache_policy.normalized();
+        config
+            .cache_policy
+            .validate(config.legacy_cache_route_policy_default())
+            .expect("valid plus policy");
+
+        let template = config.cache_policy_for_path("/plus/v1/messages");
+        assert_eq!(template.namespace.as_deref(), Some("/plus"));
+        assert_eq!(
+            template.policy.cache_type,
+            PromptCacheStrategyType::KiroRsToolPlus
+        );
+        assert_eq!(template.policy.kiro_rs_tool_plus.coverage_ratio, 0.8);
+        assert_eq!(
+            template
+                .policy
+                .kiro_rs_tool_plus
+                .shaping
+                .cache_read
+                .multiplier,
+            2.5
+        );
+        // Plus 策略自带整形，不叠加 hitShaping / reportedUsage。
+        assert!(!template.policy.hit_shaping.enabled);
+        assert!(!template.policy.reported_usage.enabled);
+
+        let custom = config.cache_policy_for_path("/plus-custom/v1/messages");
+        let plus = custom.policy.kiro_rs_tool_plus;
+        assert!(plus.creation_frequency.enabled);
+        assert_eq!(
+            plus.creation_frequency
+                .min_successful_requests_between_creation,
+            5
+        );
+        assert_eq!(
+            plus.suppressed_creation_target,
+            SuppressedCreationTarget::CacheRead
+        );
+        assert_eq!(plus.shaping.cache_creation.multiplier, 3.0);
+        assert_eq!(plus.shaping.cache_creation.max_tokens, 50_000);
+        // 路径级参数整体替换模板。
+        assert_eq!(plus.shaping.cache_read.multiplier, 1.0);
+        assert_eq!(
+            plus.non_stream.mode,
+            crate::model::kiro_rs_tool_plus::UsageShapingProfileMode::Raw
+        );
+        assert!(plus.small_request.enabled && plus.small_request.disable_cache);
+        assert_eq!(plus.small_request.max_input_tokens, 2_048);
+    }
+
+    #[test]
+    fn kiro_rs_tool_plus_policy_rejects_invalid_path_override() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "cachePolicy": {
+                "pathOverrides": {
+                    "/plus": {
+                        "cacheType": "kiro_rs_tool_plus",
+                        "kiroRsToolPlus": {
+                            "shaping": { "output": { "minTokens": 10, "maxTokens": 5 } }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize config");
+        let err = config
+            .cache_policy
+            .validate(config.legacy_cache_route_policy_default())
+            .expect_err("min > max should fail");
+        assert!(err.contains("kiroRsToolPlus.shaping.output"), "{err}");
     }
 
     #[test]

@@ -8548,6 +8548,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -8663,6 +8664,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: Some(UsageSource::LocalPromptCache),
@@ -8756,6 +8758,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
             PromptCacheSimulationMode::HighCache,
@@ -8854,6 +8857,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -8987,6 +8991,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -9070,6 +9075,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::KiroRsTool,
             PromptCacheSimulationMode::Disabled,
@@ -9217,6 +9223,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -9556,6 +9563,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/v1/messages",
             PromptCacheSimulationMode::HighCache,
@@ -9733,6 +9741,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
             PromptCacheSimulationMode::HighCache,
@@ -9839,6 +9848,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -9928,6 +9938,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: None,
@@ -10741,6 +10752,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
         simulated_source: Some(UsageSource::LocalPromptCache),
@@ -10842,6 +10854,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: Some(cache::CacheSimulation {
             cache_creation_input_tokens: 3968,
@@ -11171,6 +11184,227 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         second_usage.total_input_tokens
     );
     assert_eq!(second_usage.total_input_tokens, 8192);
+}
+
+#[test]
+fn kiro_rs_tool_plus_route_amplifies_bounds_and_limits_creation_frequency() {
+    let prompt_cache = Arc::new(PromptCacheTracker::default());
+    let usage_recorder = Arc::new(UsageRecorder::new(10));
+    let mut plus = crate::model::config::KiroRsToolPlusCachePolicy::default();
+    plus.creation_frequency.enabled = true;
+    plus.creation_frequency
+        .min_successful_requests_between_creation = 100;
+    plus.creation_frequency.min_creation_interval_secs = 0;
+    plus.creation_frequency.min_creation_delta_tokens = 0;
+    plus.creation_frequency.max_creation_tokens_per_event = 0;
+    plus.creation_frequency.creation_budget_window_secs = 0;
+    plus.suppressed_creation_target = crate::model::config::SuppressedCreationTarget::CacheRead;
+    plus.shaping.cache_read.multiplier = 3.0;
+    plus.shaping.output.multiplier = 2.0;
+    plus.shaping.output.max_tokens = 150;
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/plus/v1/messages".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::KiroRsToolPlus),
+            kiro_rs_tool_plus: Some(plus),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        usage_recorder,
+        prompt_cache,
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::Disabled,
+        0.95,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let session_id = "5f0c7a52-3a51-4f0e-9a43-2f0b1b6a9d10";
+    let mut payload = MessagesRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        max_tokens: 16,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: json!("start plus strategy session"),
+        }],
+        stream: false,
+        system: Some(vec![SystemMessage {
+            text: "stable plus strategy system prompt ".repeat(700),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: Some(Metadata {
+            user_id: Some(format!("user_test_account__session_{session_id}")),
+        }),
+        stop_sequences: None,
+    };
+    let context_for = |payload: &MessagesRequest, input_tokens: i32| {
+        let cache_route =
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/plus/v1/messages");
+        assert_eq!(
+            cache_route.policy.cache_type,
+            PromptCacheStrategyType::KiroRsToolPlus
+        );
+        prepare_usage_context(
+            &state,
+            cache_route,
+            "/plus/v1/messages",
+            false,
+            payload,
+            None,
+            Some(session_id.to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::KiroRsToolPlus,
+                PromptCacheSimulationMode::Disabled,
+                payload,
+            ),
+            input_tokens,
+        )
+        .attach_credential(Some(1), None, false, false, Vec::new())
+    };
+
+    // 首轮：没有可读前缀，首次写入放行。
+    let first = context_for(&payload, 4096);
+    assert!(first.request.kiro_rs_tool_plus.is_some());
+    let first_body = cache::build_usage_with_simulation_policy(
+        None,
+        4096,
+        100,
+        first.request.simulated_usage,
+        true,
+    );
+    assert!(first_body.cache_creation_input_tokens > 0);
+    let first_source = first.usage_source(&first_body, None, false);
+    assert_eq!(first_source, UsageSource::LocalPromptCache);
+    let first_raw = cache::RawUsage::uncached(4096, 100).to_cache_usage();
+    let first_final =
+        first.canonical_reported_usage_for_success_with_raw(first_body, first_source, first_raw);
+    assert_eq!(
+        first_final.cache_creation_input_tokens,
+        first_body.cache_creation_input_tokens
+    );
+    assert_eq!(first_final.cache_read_input_tokens, 0);
+    assert_eq!(first_final.output_tokens, 150);
+    first.record_success_reported(first_final, first_source, Some(first_raw));
+
+    // 次轮：读取 ×3；频次控制拦下写入并改记为读取。
+    payload.messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: json!("continue the same plus strategy session"),
+        },
+    ]);
+    let second = context_for(&payload, 8192);
+    let second_body = cache::build_usage_with_simulation_policy(
+        None,
+        8192,
+        60,
+        second.request.simulated_usage,
+        true,
+    );
+    assert!(second_body.cache_read_input_tokens > 0);
+    let second_source = second.usage_source(&second_body, None, false);
+    let second_raw = cache::RawUsage::uncached(8192, 60).to_cache_usage();
+    let second_final = second.canonical_reported_usage_for_success_with_raw(
+        second_body,
+        second_source,
+        second_raw,
+    );
+    assert_eq!(second_final.cache_creation_input_tokens, 0);
+    assert_eq!(
+        second_final.cache_read_input_tokens,
+        second_body.cache_read_input_tokens * 3 + second_body.cache_creation_input_tokens
+    );
+    assert_eq!(second_final.input_tokens, second_body.input_tokens);
+    assert_eq!(second_final.output_tokens, 120);
+    assert_eq!(
+        second_final.total_input_tokens,
+        second_final.input_tokens + second_final.cache_read_input_tokens
+    );
+}
+
+#[test]
+fn kiro_rs_tool_plus_does_not_stack_legacy_usage_guards() {
+    let mut cache_policy = CachePolicyConfig::default();
+    cache_policy.path_overrides.insert(
+        "/plus-isolated/v1/messages".to_string(),
+        CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::KiroRsToolPlus),
+            ..CacheRoutePolicyPatch::default()
+        },
+    );
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(10)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::Disabled,
+        0.95,
+        CompatProfile::ClaudeCode,
+        false,
+    )
+    .with_cache_policy(cache_policy);
+    let payload = MessagesRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        max_tokens: 16,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: json!("plus strategy isolation"),
+        }],
+        stream: false,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: Some(Metadata {
+            user_id: Some(
+                "user_test_account__session_2ea7b4d4-5a10-4ae9-8de8-5dbf2d1c6b77".to_string(),
+            ),
+        }),
+        stop_sequences: None,
+    };
+    let mut route = RequestRuntimeConfig::from_app_state(&state)
+        .cache_policy_for_path("/plus-isolated/v1/messages");
+    assert_eq!(
+        route.policy.cache_type,
+        PromptCacheStrategyType::KiroRsToolPlus
+    );
+    // Simulate a route assembled by an older caller with legacy knobs present.
+    route.policy.hit_shaping.enabled = true;
+    route.policy.cold_request_guard.enabled = true;
+    route.policy.reported_usage.enabled = true;
+    let context = prepare_usage_context(
+        &state,
+        route,
+        "/plus-isolated/v1/messages",
+        false,
+        &payload,
+        None,
+        Some("2ea7b4d4-5a10-4ae9-8de8-5dbf2d1c6b77".to_string()),
+        prompt_cache_scope_conversation_id(
+            PromptCacheStrategyType::KiroRsToolPlus,
+            PromptCacheSimulationMode::Disabled,
+            &payload,
+        ),
+        4096,
+    );
+    assert!(context.kiro_rs_tool_plus.is_some());
+    assert!(context.cache_hit_shaping.policy.is_none());
+    assert!(!context.cold_request_guard);
+    assert!(context.reported_cache_usage_policy.is_none());
 }
 
 #[test]

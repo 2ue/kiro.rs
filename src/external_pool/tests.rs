@@ -11417,6 +11417,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
+        kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -12688,6 +12689,7 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
         prompt_cache_bounds: PromptCacheBounds::default(),
         kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
+        kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -16099,6 +16101,72 @@ fn kiro_rs_tool_usage_projection_commits_external_pool_cache_only_after_success(
         "Kiro-RS Tool reported input range must remain authoritative, got {}",
         reported.input_tokens
     );
+    assert_eq!(
+        reported.input_tokens
+            + reported.cache_creation_input_tokens
+            + reported.cache_read_input_tokens,
+        reported.total_input_tokens
+    );
+}
+
+#[test]
+fn kiro_rs_tool_plus_usage_projection_shapes_external_pool_usage() {
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.endpoint = "/plus/v1/messages".to_string();
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::KiroRsToolPlus;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+    route.reported_usage = ReportedUsageConfig {
+        default: ReportedUsagePathPolicy::disabled(),
+        path_overrides: Default::default(),
+    };
+    let mut plus = crate::model::config::KiroRsToolPlusCachePolicy::default();
+    plus.shaping.cache_read.multiplier = 50.0;
+    plus.shaping.cache_read.max_tokens = 1_000;
+    plus.shaping.input.min_tokens = 5_000;
+    plus.shaping.output.multiplier = 3.0;
+    route.kiro_rs_tool_plus_cache_policy = plus;
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_0c6b1c55-1b1e-4c4b-9d6b-3b8f2b8d9e11".to_string(),
+        ),
+    });
+    payload_mut(&mut route).system = Some(vec![SystemMessage {
+        text: "stable external plus strategy prompt ".repeat(700),
+        cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+    }]);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+    let first_projection = projection_context(&route, &pool, 0).expect("first projection");
+    let first = maybe_project_non_stream_usage(body.clone(), Some(&first_projection));
+    let first_reported = first.usage_capture.reported.expect("first reported usage");
+    assert_eq!(first_reported.cache_read_input_tokens, 0);
+    assert!(first_reported.cache_creation_input_tokens > 0);
+    assert_eq!(first_reported.output_tokens, 30);
+    first_projection.record_success();
+
+    payload_mut(&mut route).messages.extend([
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("ready"),
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::json!("continue external plus strategy session"),
+        },
+    ]);
+    refresh_test_route_derived_state(&mut route);
+    let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+    let second = maybe_project_non_stream_usage(body, Some(&second_projection));
+    let reported = second
+        .usage_capture
+        .reported
+        .expect("second reported usage");
+    assert_eq!(reported.cache_read_input_tokens, 1_000);
+    assert!(reported.input_tokens >= 5_000);
     assert_eq!(
         reported.input_tokens
             + reported.cache_creation_input_tokens

@@ -91,6 +91,7 @@ export function defaultCachePolicy(): CachePolicyConfig {
     currentHighCache: {},
     kiroRsTool: {},
     stableSegmentCache: {},
+    kiroRsToolPlus: {},
     pathOverrides: {},
   }
 }
@@ -699,7 +700,7 @@ function canonicalCachePolicyPath(prefix: string): string {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.kiroRsToolPlus && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard
 }
 
 export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -718,6 +719,7 @@ export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyCon
     currentHighCache: source.currentHighCache ?? {},
     kiroRsTool: source.kiroRsTool ?? {},
     stableSegmentCache: source.stableSegmentCache ?? {},
+    kiroRsToolPlus: source.kiroRsToolPlus ?? {},
     pathOverrides,
   }
 }
