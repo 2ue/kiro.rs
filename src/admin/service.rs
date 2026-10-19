@@ -5356,6 +5356,11 @@ impl AdminService {
         let mut credentials = self.token_manager.export_credentials();
         if disabled_only {
             credentials.retain(|credential| credential.disabled);
+            if credentials.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "没有可导出的已禁用凭据".to_string(),
+                ));
+            }
         }
         let selected_id_set: HashSet<u64> = selected_ids.iter().copied().collect();
         let selected = !selected_id_set.is_empty();

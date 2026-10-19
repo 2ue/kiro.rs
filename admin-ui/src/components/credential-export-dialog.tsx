@@ -18,7 +18,11 @@ interface CredentialExportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   selectedIds?: number[]
+  totalCount: number
+  disabledCount: number
 }
+
+type ExportScope = 'selected' | 'all' | 'disabled'
 
 const formats: Array<{ value: CredentialExportFormat; label: string; description: string }> = [
   {
@@ -54,11 +58,22 @@ function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url)
 }
 
-export function CredentialExportDialog({ open, onOpenChange, selectedIds = [] }: CredentialExportDialogProps) {
+export function CredentialExportDialog({
+  open,
+  onOpenChange,
+  selectedIds = [],
+  totalCount,
+  disabledCount,
+}: CredentialExportDialogProps) {
   const [format, setFormat] = useState<CredentialExportFormat>('json')
-  const [scope, setScope] = useState<'selected' | 'all' | 'disabled'>('all')
+  const [scope, setScope] = useState<ExportScope>('all')
   const [exporting, setExporting] = useState(false)
   const selectedCount = selectedIds.length
+  const scopes: Array<{ value: ExportScope; label: string; count: number; disabled: boolean }> = [
+    { value: 'selected', label: '选中凭据', count: selectedCount, disabled: selectedCount === 0 },
+    { value: 'all', label: '全部凭据', count: totalCount, disabled: false },
+    { value: 'disabled', label: '全部已禁用', count: disabledCount, disabled: disabledCount === 0 },
+  ]
 
   useEffect(() => {
     if (open) setScope(selectedCount > 0 ? 'selected' : 'all')
@@ -101,37 +116,24 @@ export function CredentialExportDialog({ open, onOpenChange, selectedIds = [] }:
               <div className="text-sm text-muted-foreground">{item.description}</div>
             </button>
           ))}
-          <div className="space-y-2">
+          <div className="space-y-2 pt-2">
             <div className="text-sm font-medium">导出范围</div>
-            {selectedCount > 0 && (
-              <button
-                type="button"
-                className={`w-full rounded-md border p-3 text-left transition-colors ${
-                  scope === 'selected' ? 'border-primary bg-primary/5' : 'hover:bg-muted'
-                }`}
-                onClick={() => setScope('selected')}
-              >
-                <div className="font-medium">选中凭据（{selectedCount} 个）</div>
-              </button>
-            )}
-            <button
-                type="button"
-                className={`w-full rounded-md border p-3 text-left transition-colors ${
-                  scope === 'all' ? 'border-primary bg-primary/5' : 'hover:bg-muted'
-                }`}
-                onClick={() => setScope('all')}
-              >
-                <div className="font-medium">全部凭据</div>
-              </button>
-              <button
-                type="button"
-                className={`w-full rounded-md border p-3 text-left transition-colors ${
-                  scope === 'disabled' ? 'border-primary bg-primary/5' : 'hover:bg-muted'
-                }`}
-                onClick={() => setScope('disabled')}
-              >
-                <div className="font-medium">全部已禁用凭据</div>
-            </button>
+            <div className="grid gap-2 sm:grid-cols-3">
+              {scopes.map((item) => (
+                <button
+                  key={item.value}
+                  type="button"
+                  disabled={item.disabled}
+                  className={`rounded-md border p-3 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                    scope === item.value ? 'border-primary bg-primary/5' : 'hover:bg-muted'
+                  }`}
+                  onClick={() => setScope(item.value)}
+                >
+                  <div className="font-medium">{item.label}</div>
+                  <div className="text-muted-foreground">{item.count} 个</div>
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         <DialogFooter>

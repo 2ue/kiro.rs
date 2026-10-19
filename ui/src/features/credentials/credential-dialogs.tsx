@@ -1658,10 +1658,12 @@ export function BatchVerifyModal({ open, verifying, progress, results, testModel
 // CredentialExportModal
 // ============================================================================
 
-export function CredentialExportModal({ open, onClose, selectedIds = [] }: {
+export function CredentialExportModal({ open, onClose, selectedIds = [], totalCount, disabledCount }: {
   open: boolean
   onClose: () => void
   selectedIds?: number[]
+  totalCount: number
+  disabledCount: number
 }) {
   const [format, setFormat] = useState<CredentialExportFormat>('json')
   const [scope, setScope] = useState<'selected' | 'all' | 'disabled'>('all')
@@ -1705,8 +1707,8 @@ export function CredentialExportModal({ open, onClose, selectedIds = [] }: {
             <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
               {selectedCount > 0 && <SelectItem value="selected">导出选中账号（{selectedCount} 个）</SelectItem>}
-              <SelectItem value="all">导出全部账号</SelectItem>
-              <SelectItem value="disabled">导出全部已禁用账号</SelectItem>
+              <SelectItem value="all">导出全部账号（{totalCount} 个）</SelectItem>
+              <SelectItem value="disabled" disabled={disabledCount === 0}>导出全部已禁用账号（{disabledCount} 个）</SelectItem>
             </SelectContent>
           </Select>
         </Field>

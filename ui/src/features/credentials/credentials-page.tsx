@@ -1401,7 +1401,13 @@ export function CredentialsPage() {
       <BatchEditCredentialsModal open={batchEditOpen} ids={Array.from(selectedIds)} onClose={() => setBatchEditOpen(false)} onDone={() => { invalidate(); setSelectedIds(new Set()) }} />
       <BatchImportModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
       <KamImportModal open={kamOpen} onClose={() => setKamOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
-      <CredentialExportModal open={exportOpen} onClose={() => setExportOpen(false)} selectedIds={Array.from(selectedIds)} />
+      <CredentialExportModal
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        selectedIds={Array.from(selectedIds)}
+        totalCount={credentialSummary.data?.total ?? credentials.data?.total ?? 0}
+        disabledCount={disabledCount}
+      />
       <BatchVerifyModal
         open={verifyOpen}
         verifying={verifying}

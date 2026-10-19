@@ -1876,6 +1876,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
         open={exportDialogOpen}
         onOpenChange={setExportDialogOpen}
         selectedIds={Array.from(selectedIds)}
+        totalCount={summaryData?.total ?? data?.total ?? 0}
+        disabledCount={disabledCredentialCount}
       />
 
       {/* 批量验活对话框 */}
