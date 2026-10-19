@@ -19940,6 +19940,27 @@ async fn l2_failing_pool_is_probationed_then_recovers_and_regains_traffic() {
     config.external_pool_degrade_error_rate_threshold = 0.5;
 
     // 阶段一：制造持续失败，触发降级
+    //
+    // 降级只在选池时按已落盘的质量样本判定，样本写入是 detached task。
+    // 直接打 256 并发时，所有请求可能在任何失败样本落盘前就完成选池，
+    // 这一轮就判定不到降级（测试因此偶发失败）。先用一小波预热，
+    // 等两个池都有足够样本，主波次开始选池时失败率落差就已可见。
+    let mut warmed_up = false;
+    for round in 0..5 {
+        let _ =
+            run_quality_wave(&manager, &config, &format!("l2_recover_warmup_{round}"), 16).await;
+        if wait_for_quality_samples(
+            &manager,
+            &[flaky_pool.id, healthy_pool.id],
+            config.external_pool_quality_min_samples,
+        )
+        .await
+        {
+            warmed_up = true;
+            break;
+        }
+    }
+    assert!(warmed_up, "预热后两个池都必须有足够的质量样本");
     let _ = run_quality_wave(&manager, &config, "l2_recover_fail", L2_WAVE_SIZE).await;
     assert!(
         wait_for_quality_samples(

@@ -1012,8 +1012,9 @@ impl PostgresStore {
 
     pub async fn migrate_with_options(&self, compress_usage_rollups: bool) -> anyhow::Result<()> {
         let mut conn = self.pool.acquire().await?;
+        let migration_lock_id = postgres_migration_lock_id(&mut conn).await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .bind(migration_lock_id)
             .execute(&mut *conn)
             .await?;
 
@@ -1139,7 +1140,7 @@ impl PostgresStore {
         .await;
 
         let unlock_result = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .bind(migration_lock_id)
             .execute(&mut *conn)
             .await;
         migration_result?;
@@ -1153,8 +1154,9 @@ impl PostgresStore {
 
     pub async fn create_usage_indexes_concurrently(&self) -> anyhow::Result<()> {
         let mut conn = self.pool.acquire().await?;
+        let migration_lock_id = postgres_migration_lock_id(&mut conn).await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .bind(migration_lock_id)
             .execute(&mut *conn)
             .await?;
 
@@ -1172,7 +1174,7 @@ impl PostgresStore {
         .await;
 
         let unlock_result = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .bind(migration_lock_id)
             .execute(&mut *conn)
             .await;
         result?;
@@ -1182,8 +1184,9 @@ impl PostgresStore {
 
     pub async fn backfill_usage_legacy_cost_fields(&self) -> anyhow::Result<()> {
         let mut conn = self.pool.acquire().await?;
+        let migration_lock_id = postgres_migration_lock_id(&mut conn).await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .bind(migration_lock_id)
             .execute(&mut *conn)
             .await?;
 
@@ -1211,7 +1214,7 @@ impl PostgresStore {
         .await;
 
         let unlock_result = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(POSTGRES_MIGRATION_LOCK_ID)
+            .bind(migration_lock_id)
             .execute(&mut *conn)
             .await;
         result?;
@@ -9295,6 +9298,25 @@ async fn acquire_usage_writer_commit_guard(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Advisory locks are database-wide, but every test runs in its own schema. Scope the migration
+/// lock by schema in tests so parallel tests do not queue behind each other's migrations;
+/// production keeps the single global lock id.
+#[cfg(test)]
+async fn postgres_migration_lock_id(conn: &mut PgConnection) -> anyhow::Result<i64> {
+    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let digest = Sha256::digest(schema.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    Ok(POSTGRES_MIGRATION_LOCK_ID ^ i64::from_be_bytes(bytes))
+}
+
+#[cfg(not(test))]
+async fn postgres_migration_lock_id(_conn: &mut PgConnection) -> anyhow::Result<i64> {
+    Ok(POSTGRES_MIGRATION_LOCK_ID)
 }
 
 #[cfg(test)]
