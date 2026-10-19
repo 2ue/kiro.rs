@@ -153,17 +153,29 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const { data } = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: "build.yaml",
-              head_sha: context.sha,
-              status: "success",
-              per_page: 100,
-            });
-            const runs = data.workflow_runs.filter(
-              (run) => run.head_sha === context.sha && run.conclusion === "success",
-            );
+            // The full Quality Gate on main takes much longer than the image builds, so wait for
+            // the push run of this commit to finish instead of failing while it is still running.
+            const listRuns = async () => {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: "build.yaml",
+                head_sha: context.sha,
+                per_page: 100,
+              });
+              return data.workflow_runs.filter((run) => run.head_sha === context.sha);
+            };
+            const deadline = Date.now() + 80 * 60 * 1000;
+            let runs = await listRuns();
+            while (Date.now() < deadline) {
+              const pushRuns = runs.filter((run) => run.event === "push");
+              if (pushRuns.some((run) => run.conclusion === "success")) break;
+              if (!pushRuns.some((run) => run.status !== "completed")) break;
+              core.info("Full Quality Gate push run is still running; checking again in 60s.");
+              await new Promise((resolve) => setTimeout(resolve, 60 * 1000));
+              runs = await listRuns();
+            }
+            runs = runs.filter((run) => run.conclusion === "success");
             const fullPushRun = runs.find((run) => run.event === "push");
             if (fullPushRun) {
               core.info(`Found successful full Quality Gate push run #${fullPushRun.run_number}.`);
