@@ -71,6 +71,13 @@ const PAGE_SIZE_OPTIONS = [12, 24, 48, 96]
 
 type PageItem = number | 'ellipsis-left' | 'ellipsis-right'
 
+const credentialQuickStatusFilters = [
+  { value: 'normal', label: '正常', tone: 'success' as const },
+  { value: 'cooling', label: '冷却', tone: 'warning' as const },
+  { value: 'quota_exhausted', label: '额度用尽', tone: 'warning' as const },
+  { value: 'account_error', label: '账号异常', tone: 'destructive' as const },
+]
+
 function isUsageQuotaExhausted(info?: { currentUsage: number; usageLimit: number } | null): boolean {
   if (!info) return false
   return Number.isFinite(info.currentUsage) &&
@@ -426,6 +433,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       coolingDown: summaryData?.coolingDown ?? 0,
       inUse: summaryData?.inUse ?? 0,
       failing: summaryData?.failing ?? 0,
+      normal: summaryData?.normal ?? 0,
+      cooling: summaryData?.cooling ?? 0,
+      quotaExhausted: summaryData?.quotaExhausted ?? 0,
+      accountError: summaryData?.accountError ?? 0,
       page: listData?.page ?? currentPage,
       limit: listData?.limit ?? itemsPerPage,
       totalPages: listData?.totalPages ?? 0,
@@ -496,6 +507,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setProxyFilter('all')
     setSortBy('default')
     setSortOrder('desc')
+  }
+
+  const applyStatusFilter = (value: string) => {
+    setStatusFilter(value)
+    setCurrentPage(1)
   }
 
   // 后台分页总数变化时，避免停留在不存在的页码。
@@ -1542,6 +1558,34 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
+          <div className="flex flex-wrap gap-2" role="tablist" aria-label="账号快捷状态筛选">
+            {credentialQuickStatusFilters.map((item) => {
+              const count = item.value === 'normal'
+                ? data?.normal ?? 0
+                : item.value === 'cooling'
+                  ? data?.cooling ?? 0
+                  : item.value === 'quota_exhausted'
+                    ? data?.quotaExhausted ?? 0
+                    : data?.accountError ?? 0
+              const active = statusFilter === item.value
+              return (
+                <Button
+                  key={item.value}
+                  type="button"
+                  size="sm"
+                  variant={active ? 'default' : 'outline'}
+                  onClick={() => applyStatusFilter(item.value)}
+                  role="tab"
+                  aria-selected={active}
+                >
+                  {item.label}
+                  <Badge variant={active ? 'secondary' : item.tone} className="ml-1 tabular-nums">
+                    {count}
+                  </Badge>
+                </Button>
+              )
+            })}
+          </div>
           <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-8">
             <div className="relative md:col-span-2">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -1619,14 +1663,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <select
               className="h-10 rounded-md border bg-background px-3 text-sm"
               value={statusFilter}
-              onChange={event => setStatusFilter(event.target.value)}
+              onChange={event => applyStatusFilter(event.target.value)}
             >
               <option value="all">全部状态</option>
               <option value="enabled">启用</option>
               <option value="disabled">已禁用</option>
               <option value="current">当前活跃</option>
               <option value="cooldown">冷却中</option>
+              <option value="cooling">冷却账号</option>
               <option value="rate_limited">限流中</option>
+              <option value="quota_exhausted">额度用尽</option>
+              <option value="account_error">账号异常</option>
+              <option value="normal">正常</option>
               <option value="proxy_blocked">代理不可用</option>
               <option value="custom_scheduling">有调度覆盖</option>
               <option value="custom_priority">自定义优先级</option>

@@ -39,6 +39,7 @@ import {
   getRuntimeConfig,
   updateRuntimeConfig,
   testProxyResource,
+  testAllProxyResources,
   testProxyResourceConfig,
 } from '@/api/credentials'
 import type {
@@ -187,6 +188,14 @@ export function useTestProxyResource() {
       typeof id === 'number'
         ? testProxyResource(id, request)
         : testProxyResourceConfig(request),
+  })
+}
+
+export function useTestAllProxyResources() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (request: ProxyResourceTestRequest = {}) => testAllProxyResources(request),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['proxy-resources'] }),
   })
 }
 

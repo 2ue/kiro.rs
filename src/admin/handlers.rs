@@ -968,6 +968,18 @@ pub async fn test_proxy_resource(
     }
 }
 
+/// POST /api/admin/proxy-resources/test-all
+/// 测试数据库中的全部代理资源，并保存每个代理的最新测活状态
+pub async fn test_all_proxy_resources(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyResourceTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_all_proxy_resources(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// PUT /api/admin/proxy-resources/:id
 /// 更新代理/家宽资源
 pub async fn update_proxy_resource(
@@ -1390,7 +1402,10 @@ pub async fn export_credentials(
                 .into_response();
         }
     };
-    match state.service.export_credentials(format, &selected_ids) {
+    match state
+        .service
+        .export_credentials(format, &selected_ids, query.disabled.unwrap_or(false))
+    {
         Ok((body, filename)) => {
             let content_type = if filename.ends_with(".jsonl") {
                 "application/x-ndjson; charset=utf-8"

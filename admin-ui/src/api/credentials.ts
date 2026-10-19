@@ -44,6 +44,7 @@ import type {
   ProxyResource,
   ProxyResourceTestRequest,
   ProxyResourceTestResponse,
+  ProxyResourceBatchTestResponse,
   ProxyResourcesResponse,
   CreateProxyResourceRequest,
   BatchProxyResourceImportRequest,
@@ -439,6 +440,13 @@ export async function testProxyResource(
   return data
 }
 
+export async function testAllProxyResources(
+  req: ProxyResourceTestRequest = {}
+): Promise<ProxyResourceBatchTestResponse> {
+  const { data } = await api.post<ProxyResourceBatchTestResponse>('/proxy-resources/test-all', req)
+  return data
+}
+
 export async function createProxyResource(
   req: CreateProxyResourceRequest
 ): Promise<ProxyResource> {
@@ -612,9 +620,9 @@ export async function testExternalPool(
   return data
 }
 
-export async function exportCredentials(format: CredentialExportFormat, ids?: number[]): Promise<Blob> {
+export async function exportCredentials(format: CredentialExportFormat, ids?: number[], disabledOnly = false): Promise<Blob> {
   const { data } = await api.get<Blob>('/credentials/export', {
-    params: { format, ids: ids && ids.length ? ids.join(',') : undefined },
+    params: { format, ids: ids && ids.length ? ids.join(',') : undefined, disabled: disabledOnly ? true : undefined },
     responseType: 'blob',
   })
   return data

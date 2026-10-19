@@ -429,6 +429,10 @@ pub struct CredentialSummaryResponse {
     pub in_use: usize,
     /// Enabled accounts with recent call or token-refresh failures.
     pub failing: usize,
+    pub normal: usize,
+    pub cooling: usize,
+    pub quota_exhausted: usize,
+    pub account_error: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -614,6 +618,8 @@ pub struct ExportCredentialsQuery {
     pub format: Option<String>,
     /// Comma-separated credential ids to export. Empty or absent means export all credentials.
     pub ids: Option<String>,
+    /// Export only disabled credentials when true.
+    pub disabled: Option<bool>,
 }
 
 // ============ 操作请求 ============
@@ -1161,6 +1167,12 @@ pub struct ProxyResourceResponse {
     pub created_at: String,
     pub updated_at: String,
     pub credential_count: u64,
+    pub last_test_at: Option<String>,
+    pub last_test_success: Option<bool>,
+    pub last_test_status: Option<u16>,
+    pub last_test_duration_ms: Option<u64>,
+    pub last_test_message: Option<String>,
+    pub last_test_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1189,6 +1201,30 @@ pub struct ProxyResourceTestResponse {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourceBatchTestItem {
+    pub resource_id: u64,
+    pub name: String,
+    pub success: bool,
+    pub message: String,
+    pub proxy_url: String,
+    pub test_url: String,
+    pub status: Option<u16>,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourceBatchTestResponse {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub items: Vec<ProxyResourceBatchTestItem>,
 }
 
 #[derive(Debug, Deserialize)]

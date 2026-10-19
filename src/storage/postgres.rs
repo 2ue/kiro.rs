@@ -481,6 +481,12 @@ pub struct ProxyResourceRow {
     pub created_at: String,
     pub updated_at: String,
     pub credential_count: u64,
+    pub last_test_at: Option<String>,
+    pub last_test_success: Option<bool>,
+    pub last_test_status: Option<u16>,
+    pub last_test_duration_ms: Option<u64>,
+    pub last_test_message: Option<String>,
+    pub last_test_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -514,6 +520,9 @@ fn proxy_resource_from_row(row: PgRow) -> anyhow::Result<ProxyResourceRow> {
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
     let credential_count: i64 = row.try_get("credential_count").unwrap_or(0);
+    let last_test_at: Option<DateTime<Utc>> = row.try_get("last_test_at")?;
+    let last_test_status: Option<i32> = row.try_get("last_test_status")?;
+    let last_test_duration_ms: Option<i64> = row.try_get("last_test_duration_ms")?;
     Ok(ProxyResourceRow {
         id: id as u64,
         name: row.try_get("name")?,
@@ -525,6 +534,12 @@ fn proxy_resource_from_row(row: PgRow) -> anyhow::Result<ProxyResourceRow> {
         created_at: created_at.to_rfc3339(),
         updated_at: updated_at.to_rfc3339(),
         credential_count: credential_count.max(0) as u64,
+        last_test_at: last_test_at.map(|value| value.to_rfc3339()),
+        last_test_success: row.try_get("last_test_success")?,
+        last_test_status: last_test_status.map(|value| value.max(0) as u16),
+        last_test_duration_ms: last_test_duration_ms.map(|value| value.max(0) as u64),
+        last_test_message: row.try_get("last_test_message")?,
+        last_test_url: row.try_get("last_test_url")?,
     })
 }
 
@@ -2803,6 +2818,8 @@ impl PostgresStore {
             r#"
             SELECT pr.id, pr.name, pr.proxy_url, pr.proxy_username, pr.proxy_password,
                    pr.enabled, pr.notes, pr.created_at, pr.updated_at,
+                   pr.last_test_at, pr.last_test_success, pr.last_test_status,
+                   pr.last_test_duration_ms, pr.last_test_message, pr.last_test_url,
                    COUNT(c.id) FILTER (WHERE c.deleted_at IS NULL) AS credential_count
             FROM proxy_resources pr
             LEFT JOIN credentials c
@@ -2825,6 +2842,8 @@ impl PostgresStore {
             r#"
             SELECT pr.id, pr.name, pr.proxy_url, pr.proxy_username, pr.proxy_password,
                    pr.enabled, pr.notes, pr.created_at, pr.updated_at,
+                   pr.last_test_at, pr.last_test_success, pr.last_test_status,
+                   pr.last_test_duration_ms, pr.last_test_message, pr.last_test_url,
                    COUNT(c.id) FILTER (WHERE c.deleted_at IS NULL) AS credential_count
             FROM proxy_resources pr
             LEFT JOIN credentials c
@@ -2931,6 +2950,8 @@ impl PostgresStore {
             VALUES ($1, $2, $3, $4, $5, $6, now(), NULL)
             RETURNING id, name, proxy_url, proxy_username, proxy_password,
                       enabled, notes, created_at, updated_at,
+                      last_test_at, last_test_success, last_test_status,
+                      last_test_duration_ms, last_test_message, last_test_url,
                       0::BIGINT AS credential_count
             "#,
         )
@@ -2943,6 +2964,39 @@ impl PostgresStore {
         .fetch_one(&self.pool)
         .await?;
         proxy_resource_from_row(row)
+    }
+
+    pub async fn update_proxy_resource_test(
+        &self,
+        id: u64,
+        success: bool,
+        status: Option<u16>,
+        duration_ms: u64,
+        message: &str,
+        test_url: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE proxy_resources
+            SET last_test_at = now(),
+                last_test_success = $2,
+                last_test_status = $3,
+                last_test_duration_ms = $4,
+                last_test_message = $5,
+                last_test_url = $6,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(id as i64)
+        .bind(success)
+        .bind(status.map(i32::from))
+        .bind(duration_ms as i64)
+        .bind(message)
+        .bind(test_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn update_proxy_resource(
@@ -12471,6 +12525,12 @@ CREATE TABLE IF NOT EXISTS proxy_resources (
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_test_at TIMESTAMPTZ,
+    last_test_success BOOLEAN,
+    last_test_status INTEGER,
+    last_test_duration_ms BIGINT,
+    last_test_message TEXT,
+    last_test_url TEXT,
     deleted_at TIMESTAMPTZ
 );
 
@@ -12494,6 +12554,24 @@ ALTER TABLE proxy_resources
 
 ALTER TABLE proxy_resources
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS last_test_at TIMESTAMPTZ;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS last_test_success BOOLEAN;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS last_test_status INTEGER;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS last_test_duration_ms BIGINT;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS last_test_message TEXT;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS last_test_url TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_proxy_resources_active
     ON proxy_resources (id)

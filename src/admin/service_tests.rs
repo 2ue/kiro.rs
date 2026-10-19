@@ -1002,6 +1002,48 @@ fn credential_default_sort_keeps_enabled_then_newest_created() {
 }
 
 #[test]
+fn credential_status_filters_keep_quota_and_account_errors_separate() {
+    let quota = credential_item(1, true, None, 0, 0.0, Some(100.0));
+    assert!(is_quota_exhausted(&quota));
+    assert!(!is_account_error(&quota));
+
+    let mut account_error = credential_item(2, true, None, 0, 0.0, None);
+    account_error.disabled_reason = Some("InvalidRefreshToken".to_string());
+    assert!(is_account_error(&account_error));
+    assert!(!is_quota_exhausted(&account_error));
+
+    let mut cooling = credential_item(3, false, None, 0, 0.0, None);
+    cooling.cooled_down = true;
+    assert!(is_cooling_account(&cooling));
+    assert!(!is_normal_account(&cooling));
+
+    let normal = credential_item(4, false, None, 0, 0.0, None);
+    assert!(is_normal_account(&normal));
+
+    // 限流、普通失败的原因文本里出现 token/auth 等字样也不能算账号异常
+    let mut rate_limited = credential_item(5, false, None, 0, 0.0, None);
+    rate_limited.last_error_kind = Some("rate_limit".to_string());
+    rate_limited.last_error_reason = Some("token_refresh_rate_limited".to_string());
+    rate_limited.transient_failure_streak = 2;
+    assert!(!is_account_error(&rate_limited));
+
+    let mut auth_failing = credential_item(6, false, None, 0, 0.0, None);
+    auth_failing.last_error_kind = Some("auth".to_string());
+    auth_failing.transient_failure_streak = 1;
+    assert!(is_account_error(&auth_failing));
+    assert!(!is_normal_account(&auth_failing));
+
+    // 认证失败已经被后续成功调用抵消，不再算账号异常
+    auth_failing.transient_failure_streak = 0;
+    assert!(!is_account_error(&auth_failing));
+
+    let mut manual = credential_item(7, true, None, 0, 0.0, None);
+    manual.disabled_reason = Some("Manual".to_string());
+    assert!(!is_account_error(&manual));
+    assert!(!is_quota_exhausted(&manual));
+}
+
+#[test]
 fn credential_custom_sort_runs_before_pagination_order() {
     let mut credentials = vec![
         credential_item(1, false, Some("2026-01-01T00:00:00Z"), 10, 0.2, Some(20.0)),
