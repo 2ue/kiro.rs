@@ -72,7 +72,7 @@ const TEMPLATE_META: Array<{
   title: string
   shortTitle: string
   description: string
-  tone: 'primary' | 'success' | 'warning' | 'info'
+  tone: 'primary' | 'success' | 'warning' | 'info' | 'secondary'
 }> = [
   {
     type: 'current_high_cache',
@@ -101,6 +101,13 @@ const TEMPLATE_META: Array<{
     shortTitle: 'Kiro-RS Tool Plus',
     description: '独立控制四类 usage 的 shaping、非流式策略、小请求和写入频次。',
     tone: 'info',
+  },
+  {
+    type: 'bounded_high_cache',
+    title: '上下限优先缓存策略',
+    shortTitle: '上下限优先缓存',
+    description: '参数同本地模拟缓存；各字段上下限是最终约束，计费只在范围内补，差额跨请求记账。',
+    tone: 'secondary',
   },
 ]
 
@@ -132,6 +139,8 @@ function strategyLabel(type?: CacheStrategyType): string {
       return '稳定片段缓存'
     case 'kiro_rs_tool_plus':
       return 'Kiro-RS Tool Plus'
+    case 'bounded_high_cache':
+      return '上下限优先缓存'
     default:
       return '无缓存'
   }
@@ -147,6 +156,7 @@ function templatePolicy(config: RuntimeConfig, type: TemplateKey): CacheRoutePol
   }
   if (type === 'kiro_rs_tool') return cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, type)
   if (type === 'stable_segment_cache') return cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, type)
+  if (type === 'bounded_high_cache') return cachePolicyForStrategyTemplate(cachePolicy.boundedHighCache ?? {}, type)
   return cachePolicyForStrategyTemplate(cachePolicy.kiroRsToolPlus ?? {}, type)
 }
 
@@ -177,7 +187,8 @@ function defaultPathPolicy(prefix: string, cachePolicy: CachePolicyConfig, repor
       existing.cacheType === 'no_cache' ||
       existing.cacheType === 'kiro_rs_tool' ||
       existing.cacheType === 'kiro_rs_tool_plus' ||
-      existing.cacheType === 'stable_segment_cache'
+      existing.cacheType === 'stable_segment_cache' ||
+      existing.cacheType === 'bounded_high_cache'
     ) {
       return existing
     }
@@ -203,6 +214,13 @@ function formatTokens(value?: number): string {
 }
 
 function templateHighlights(type: TemplateKey, policy: CacheRoutePolicyPatch): string[] {
+  if (type === 'bounded_high_cache') {
+    return [
+      `命中读取 ${formatRatio(policy.simulation?.targetReadRatio)}`,
+      `输入上限 ${formatTokens(policy.reportedUsage?.input?.maxTokens)}`,
+      `计费下限 ${policy.hitShaping?.enabled ? `${policy.hitShaping.minCostRatio ?? 1}×` : '关闭'}`,
+    ]
+  }
   if (type === 'current_high_cache') {
     return [
       `命中读取 ${formatRatio(policy.simulation?.targetReadRatio)}`,
@@ -238,6 +256,12 @@ function templateHighlights(type: TemplateKey, policy: CacheRoutePolicyPatch): s
 
 function pathSummary(policy: CacheRoutePolicyPatch): string[] {
   if (!policy.cacheType || policy.cacheType === 'no_cache') return ['请求不进入缓存计算']
+  if (policy.cacheType === 'bounded_high_cache') {
+    return [
+      `输入上限 ${formatTokens(policy.reportedUsage?.input?.maxTokens)}`,
+      `路径空间 ${policy.routeNamespace ? '独立' : '共享'}`,
+    ]
+  }
   if (policy.cacheType === 'current_high_cache') {
     return [
       `命中读取 ${formatRatio(policy.simulation?.targetReadRatio)}`,
@@ -277,6 +301,7 @@ function TemplateCard({
     success: 'bg-success/10 text-success',
     warning: 'bg-warning/10 text-warning',
     info: 'bg-info/10 text-info',
+    secondary: 'bg-secondary/10 text-secondary',
   }[meta.tone]
   return (
     <Card className="flex h-full flex-col border border-border/70 transition hover:-translate-y-0.5 hover:shadow-md">
@@ -405,6 +430,8 @@ export function CachePoliciesPage() {
       nextCachePolicy.kiroRsTool = templateEditor.policy
     } else if (templateEditor.type === 'stable_segment_cache') {
       nextCachePolicy.stableSegmentCache = templateEditor.policy
+    } else if (templateEditor.type === 'bounded_high_cache') {
+      nextCachePolicy.boundedHighCache = templateEditor.policy
     } else {
       nextCachePolicy.kiroRsToolPlus = templateEditor.policy
     }
@@ -530,7 +557,7 @@ export function CachePoliciesPage() {
       />
 
       <StatGrid min="12rem">
-        <StatCard title="默认策略模板" value="4" desc="四种策略分别维护自己的参数" icon={<WandSparkles />} tone="primary" />
+        <StatCard title="默认策略模板" value={TEMPLATE_META.length} desc="每种策略分别维护自己的参数" icon={<WandSparkles />} tone="primary" />
         <StatCard title="路径策略" value={paths.length} desc="包含内置路径和自定义覆盖" icon={<Route />} tone="info" />
         <StatCard title="/dfcache 路由" value={definedRoutes.length} desc="已注册的自定义入口" icon={<Database />} tone="success" />
         <StatCard title="命中判定阈值" value={formatTokens(workingConfig.highCacheThreshold)} desc="后台统计高缓存命中的 Token 阈值" icon={<Info />} tone="warning" />

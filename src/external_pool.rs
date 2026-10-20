@@ -1074,6 +1074,8 @@ pub struct ExternalRouteRequest {
     pub kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
     pub kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy,
     pub stable_segment_cache_policy: StableSegmentCachePolicy,
+    /// 路由的 hitShaping 参数；`bounded_high_cache` 外部池投影收口时使用（读取倍数上限、读写最小值）。
+    pub cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub request_id: String,
@@ -15483,6 +15485,7 @@ fn project_usage_value(
         response_output_estimate,
     );
     let projected = apply_external_pool_usage_cost_floor(projected, raw_for_floor, projection);
+    let projected = apply_external_pool_bounded_final_caps(projected, controlled, projection);
     let projected_json = projected.to_anthropic_usage_json();
     let obj = usage.as_object_mut()?;
     let projected_obj = projected_json.as_object()?;
@@ -15550,6 +15553,61 @@ fn apply_external_pool_usage_final_path_guards(
     let usage = policy.apply_final_input_guard(usage);
     let usage = policy.apply_final_standard_cache_guards(usage);
     policy.apply_final_output_guard_to_usage(usage)
+}
+
+/// `bounded_high_cache`：计费补偿之后按上下限收口（input 上限、最终读写上限、
+/// 读取倍数上限、creation control 单次上限、读写最小值），收口之后不再改写。
+/// creation control 未放行本次写入时最终写入为 0（计费补偿补上的写入也会被清掉）。
+/// 其他策略原样返回。
+///
+/// 读取倍数上限的基准与本地链路一致，用本次请求的真实输入（`raw_input_tokens`），
+/// 不用上游 usage（上游可能把放大后的缓存写入计入总量）。
+fn apply_external_pool_bounded_final_caps(
+    usage: CacheUsage,
+    controlled: CacheUsage,
+    projection: &ExternalUsageProjectionContext,
+) -> CacheUsage {
+    if !projection.bounded_final_caps {
+        return usage;
+    }
+    let raw = CacheUsage {
+        total_input_tokens: projection.raw_input_tokens.max(0),
+        input_tokens: projection.raw_input_tokens.max(0),
+        output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    };
+    let reported_policy = projection.reported_policy.as_ref();
+    let (max_cache_read_tokens, max_cache_creation_tokens) = reported_policy
+        .map(|policy| policy.final_cache_caps(usage))
+        .unwrap_or((0, 0));
+    let creation_control = projection.prompt_cache_creation_control.normalized();
+    // 与投影里 creation control 的调用条件一致：只有实际经过频次控制时才可能拦下写入。
+    let controls_creation = creation_control.enabled
+        && projection.cache_state_enabled
+        && projection.reported_policy.is_some();
+    let input = crate::anthropic::bounded_shaping::BoundedShapingInput {
+        policy: projection.cache_hit_shaping_policy,
+        has_reusable_prefix: usage.cache_read_input_tokens > 0,
+        creation_allowed: !controls_creation || controlled.cache_creation_input_tokens > 0,
+        raw,
+        pricing: None,
+        input_max_tokens: reported_policy
+            .map(|policy| policy.reported_input_max_tokens())
+            .unwrap_or(0),
+        max_cache_read_tokens,
+        max_cache_creation_tokens,
+        max_creation_event_tokens: if controls_creation {
+            creation_control.max_creation_tokens_per_event.max(0)
+        } else {
+            0
+        },
+        carried_cost_deficit_usd: 0.0,
+        seed: projection.bounded_seed,
+    };
+    crate::anthropic::bounded_shaping::enforce_bounded_usage(usage, &input)
 }
 
 fn apply_external_pool_usage_cost_floor(

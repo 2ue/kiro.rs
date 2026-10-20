@@ -1484,7 +1484,7 @@ export interface StableSegmentCachePolicyPatch {
   reportedInputMaxTokens?: number
 }
 
-export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool' | 'stable_segment_cache' | 'kiro_rs_tool_plus'
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool' | 'stable_segment_cache' | 'kiro_rs_tool_plus' | 'bounded_high_cache'
 
 export interface CacheRoutePolicyPatch {
   cacheType?: PromptCacheStrategyType
@@ -1523,6 +1523,8 @@ export interface CachePolicyConfig {
   kiroRsTool: CacheRoutePolicyPatch
   stableSegmentCache: CacheRoutePolicyPatch
   kiroRsToolPlus?: CacheRoutePolicyPatch
+  /** 上下限优先缓存策略模板，不继承 default。 */
+  boundedHighCache?: CacheRoutePolicyPatch
   pathOverrides: Record<string, CacheRoutePolicyPatch>
 }
 

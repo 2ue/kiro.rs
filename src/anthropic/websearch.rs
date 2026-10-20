@@ -108,6 +108,8 @@ pub enum WebSearchOutcome {
     Success {
         response: Response,
         output_tokens: i32,
+        /// 下发给客户端的最终 usage（经过 `usage_mapper`）。
+        reported_usage: super::cache::CacheUsage,
         attribution: McpCallAttribution,
     },
     Failure {
@@ -122,14 +124,23 @@ pub enum WebSearchOutcome {
 pub struct WebSearchToolErrorOutcome {
     pub response: Response,
     pub output_tokens: i32,
+    /// 下发给客户端的最终 usage（经过 `usage_mapper`）。
+    pub reported_usage: super::cache::CacheUsage,
     pub error_code: &'static str,
     pub internal_reason: &'static str,
 }
+
+/// 下游 usage 改写：输入原始 usage（input 为请求估算、output 为摘要估算、无缓存），
+/// 返回最终下发的 usage。message_start、message_delta 和非流式响应体使用同一个结果。
+pub type WebSearchUsageMapper<'a> =
+    &'a (dyn Fn(super::cache::CacheUsage) -> super::cache::CacheUsage + Send + Sync);
 
 pub struct WebSearchRequestContext<'a> {
     pub provider: Arc<crate::kiro::provider::KiroProvider>,
     pub payload: &'a MessagesRequest,
     pub input_tokens: i32,
+    /// 路由需要整形 websearch usage 时提供；None 时按原始估算下发（原有行为）。
+    pub usage_mapper: Option<WebSearchUsageMapper<'a>>,
     pub inference_attempt_budget: Arc<InferenceAttemptBudget>,
     pub attribution_sink: Arc<McpCallAttributionSink>,
     pub request_id: &'a str,
@@ -141,7 +152,41 @@ struct WebSearchResponseContext<'a> {
     query: &'a str,
     tool_use_id: &'a str,
     summary: &'a str,
+    /// 最终下发的 usage；message_start 只取其中的 input / 缓存字段，output 为 0。
+    usage: super::cache::CacheUsage,
+}
+
+impl WebSearchResponseContext<'_> {
+    fn usage_json(&self, output_tokens: i32) -> Value {
+        json!({
+            "input_tokens": self.usage.input_tokens.max(0),
+            "output_tokens": output_tokens.max(0),
+            "cache_creation_input_tokens": self.usage.cache_creation_input_tokens.max(0),
+            "cache_read_input_tokens": self.usage.cache_read_input_tokens.max(0)
+        })
+    }
+}
+
+/// websearch 的原始 usage：input 为请求估算，output 为摘要估算，没有缓存字段。
+fn raw_websearch_usage(input_tokens: i32, output_tokens: i32) -> super::cache::CacheUsage {
+    super::cache::CacheUsage {
+        total_input_tokens: input_tokens.max(0),
+        input_tokens: input_tokens.max(0),
+        output_tokens: output_tokens.max(0),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+    }
+}
+
+fn map_websearch_usage(
+    mapper: Option<WebSearchUsageMapper<'_>>,
     input_tokens: i32,
+    output_tokens: i32,
+) -> super::cache::CacheUsage {
+    let raw = raw_websearch_usage(input_tokens, output_tokens);
+    mapper.map(|mapper| mapper(raw)).unwrap_or(raw)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,7 +833,7 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     summary: String,
-    input_tokens: i32,
+    usage: super::cache::CacheUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let events = generate_websearch_events(
         &model,
@@ -796,7 +841,7 @@ pub fn create_websearch_sse_stream(
         &tool_use_id,
         search_results,
         &summary,
-        input_tokens,
+        usage,
     );
 
     stream::iter(
@@ -868,7 +913,6 @@ fn generate_websearch_message_with_content(
     context: &WebSearchResponseContext<'_>,
     search_content: Value,
 ) -> Value {
-    let output_tokens = estimated_output_tokens(context.summary);
     json!({
         "id": envelope::message_id(),
         "type": "message",
@@ -897,12 +941,7 @@ fn generate_websearch_message_with_content(
         ],
         "stop_reason": "end_turn",
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": context.input_tokens.max(0),
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
-        }
+        "usage": context.usage_json(context.usage.output_tokens)
     })
 }
 
@@ -912,14 +951,14 @@ fn generate_websearch_message(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     summary: &str,
-    input_tokens: i32,
+    usage: super::cache::CacheUsage,
 ) -> Value {
     let context = WebSearchResponseContext {
         model,
         query,
         tool_use_id,
         summary,
-        input_tokens,
+        usage,
     };
     generate_websearch_message_with_content(&context, websearch_result_content(&search_results))
 }
@@ -944,12 +983,7 @@ fn generate_websearch_events_with_content(
                 "model": context.model,
                 "content": [],
                 "stop_reason": null,
-                "usage": {
-                    "input_tokens": context.input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
-                }
+                "usage": context.usage_json(0)
             }
         }),
     ));
@@ -1081,7 +1115,6 @@ fn generate_websearch_events_with_content(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = estimated_output_tokens(context.summary);
     events.push(SseEvent::new(
         "message_delta",
         json!({
@@ -1089,12 +1122,7 @@ fn generate_websearch_events_with_content(
             "delta": {
                 "stop_reason": "end_turn"
             },
-            "usage": {
-                "input_tokens": context.input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0
-            }
+            "usage": context.usage_json(context.usage.output_tokens)
         }),
     ));
 
@@ -1116,14 +1144,14 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     summary: &str,
-    input_tokens: i32,
+    usage: super::cache::CacheUsage,
 ) -> Vec<SseEvent> {
     let context = WebSearchResponseContext {
         model,
         query,
         tool_use_id,
         summary,
-        input_tokens,
+        usage,
     };
     generate_websearch_events_with_content(&context, websearch_result_content(&search_results))
 }
@@ -1136,6 +1164,7 @@ fn create_websearch_tool_error_outcome(
     request_id: &str,
 ) -> WebSearchToolErrorOutcome {
     let output_tokens = estimated_output_tokens(context.summary);
+    let reported_usage = context.usage;
     let search_content = websearch_error_content(error_code);
     let response = if stream_response {
         let events = generate_websearch_events_with_content(context, search_content);
@@ -1155,6 +1184,7 @@ fn create_websearch_tool_error_outcome(
     WebSearchToolErrorOutcome {
         response,
         output_tokens,
+        reported_usage,
         error_code: error_code.as_str(),
         internal_reason,
     }
@@ -1251,12 +1281,17 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
             let tool_error = should_continue_after_websearch_failure(&failure).then(|| {
                 let error_code = websearch_tool_error_code_for_failure(&failure);
                 let summary = generate_websearch_tool_error_summary(&query, error_code);
+                let usage = map_websearch_usage(
+                    context.usage_mapper,
+                    input_tokens,
+                    estimated_output_tokens(&summary),
+                );
                 let response_context = WebSearchResponseContext {
                     model: &payload.model,
                     query: &query,
                     tool_use_id: &tool_use_id,
                     summary: &summary,
-                    input_tokens,
+                    usage,
                 };
                 create_websearch_tool_error_outcome(
                     &response_context,
@@ -1288,6 +1323,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
     let search_results = Some(search_results);
     let summary = generate_search_summary(&query, &search_results);
     let output_tokens = estimated_output_tokens(&summary);
+    let reported_usage = map_websearch_usage(context.usage_mapper, input_tokens, output_tokens);
     let response = if payload.stream {
         let stream = create_websearch_sse_stream(
             model,
@@ -1295,7 +1331,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
             tool_use_id,
             search_results,
             summary,
-            input_tokens,
+            reported_usage,
         );
         envelope::sse_builder_with_id(request_id)
             .body(Body::from_stream(stream))
@@ -1309,7 +1345,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
                 &tool_use_id,
                 search_results,
                 &summary,
-                input_tokens,
+                reported_usage,
             ),
             request_id,
             None,
@@ -1318,6 +1354,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
     WebSearchOutcome::Success {
         response,
         output_tokens,
+        reported_usage,
         attribution,
     }
 }
@@ -2273,13 +2310,14 @@ mod tests {
                 error: None,
             });
             let summary = generate_search_summary("query", &results);
+            let usage = raw_websearch_usage(123, estimated_output_tokens(&summary));
             let non_stream = generate_websearch_message(
                 "test-model",
                 "query",
                 "tool-1",
                 results.clone(),
                 &summary,
-                123,
+                usage,
             );
             assert_eq!(non_stream["type"], "message");
             assert_eq!(non_stream["role"], "assistant");
@@ -2296,8 +2334,14 @@ mod tests {
                     > 0
             );
 
-            let events =
-                generate_websearch_events("test-model", "query", "tool-1", results, &summary, 123);
+            let events = generate_websearch_events(
+                "test-model",
+                "query",
+                "tool-1",
+                results,
+                &summary,
+                usage,
+            );
             assert_eq!(
                 events.first().map(|event| event.event.as_str()),
                 Some("message_start")
@@ -2357,7 +2401,7 @@ mod tests {
                 query: "query",
                 tool_use_id: "tool-1",
                 summary: &summary,
-                input_tokens: 123,
+                usage: raw_websearch_usage(123, estimated_output_tokens(&summary)),
             };
             let non_stream =
                 generate_websearch_message_with_content(&context, search_content.clone());
@@ -2493,10 +2537,55 @@ mod tests {
     }
 
     #[test]
+    fn websearch_usage_mapper_result_is_used_for_start_delta_and_non_stream() {
+        // 路由整形后的 usage（input 压到上限、output 放大）必须同时出现在 message_start、
+        // message_delta 和非流式响应体里；不传 mapper 时保持原始估算。
+        let summary = generate_search_summary("query", &None);
+        let raw_output = estimated_output_tokens(&summary);
+        let mapper = |raw: super::super::cache::CacheUsage| super::super::cache::CacheUsage {
+            input_tokens: 321,
+            total_input_tokens: 321,
+            output_tokens: raw.output_tokens * 2,
+            ..raw
+        };
+        let mapped = map_websearch_usage(Some(&mapper), 40_000, raw_output);
+        assert_eq!(mapped.input_tokens, 321);
+        assert_eq!(mapped.output_tokens, raw_output * 2);
+        assert_eq!(
+            map_websearch_usage(None, 40_000, raw_output),
+            raw_websearch_usage(40_000, raw_output)
+        );
+
+        let events = generate_websearch_events("m", "query", "tool-1", None, &summary, mapped);
+        let start = &events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start")
+            .data["message"]["usage"];
+        assert_eq!(start["input_tokens"], 321);
+        assert_eq!(start["output_tokens"], 0);
+        let delta = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta")
+            .data["usage"];
+        assert_eq!(delta["input_tokens"], 321);
+        assert_eq!(delta["output_tokens"], raw_output * 2);
+        let non_stream = generate_websearch_message("m", "query", "tool-1", None, &summary, mapped);
+        assert_eq!(&non_stream["usage"], delta);
+    }
+
+    #[test]
     fn test_websearch_usage_is_sub2api_compatible() {
         let summary = generate_search_summary("test query", &None);
-        let events =
-            generate_websearch_events("test-model", "test query", "tool-1", None, &summary, 1234);
+        let events = generate_websearch_events(
+            "test-model",
+            "test query",
+            "tool-1",
+            None,
+            &summary,
+            raw_websearch_usage(1234, estimated_output_tokens(&summary)),
+        );
 
         let message_start = events
             .iter()

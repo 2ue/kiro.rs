@@ -384,6 +384,15 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 
 每个路径策略还会在所有字段改写完成后应用 `finalCacheReadMaxTokens` 和 `finalCacheCreationMaxTokens`。默认把最终 `cache_read_input_tokens` 限制在 `700000` 以内，并把最终 `cache_creation_input_tokens` 限制在 `400000 - deterministic_jitter(20000..45000)` 以内。`finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` 与 `finalCacheCreationJitterMinTokens` / `finalCacheCreationJitterMaxTokens` 可让触顶值在上限以下确定性波动；守护只会向下裁剪，不会抬高原本较小的读取或写入缓存值。
 
+#### 上下限优先缓存策略（`bounded_high_cache`）
+
+参数和 `current_high_cache` 完全相同（`simulation`、`creationControl`、`reportedUsage`、`hitShaping`、`coldRequestGuard`），模板写在 `cachePolicy.boundedHighCache`，不读取 `default` / `currentHighCache`。区别只在最终 usage：各字段上下限是最终约束，整形之后不再改写。
+
+- 范围：`input` ≤ `reportedUsage.input` 上限；`cache_read` ≤ min(最终读取上限, 原始输入 × `hitShaping.maxReadMultiplier`)；`cache_creation` ≤ min(最终写入上限, `creationControl.maxCreationTokensPerEvent`)，未放行写入时为 0。上限在配置值以下确定性浮动（input 15%，读写 5%），不会集中在同一个整数上。
+- 优先级：上下限 > 写入频次控制 > 命中率 > 不亏损。超出范围的部分直接丢弃，不挪到其他字段；非零读写低于最小值时抬到最小值，上限低于最小值时清零。
+- 计费：`hitShaping.minCostRatio` 只在范围内补（依次抬高写入、读取、input）。本次补不上的差额按 creation control 的维度累计（上限为当次下限的 20 倍，状态在进程内存中，随会话空闲过期），之后放行写入的请求在写入上限内补回。
+- 外部池路径同样在计费补偿之后按上下限收口。
+
 #### Kiro-RS Tool Plus 缓存策略（`kiro_rs_tool_plus`）
 
 在 Kiro-RS Tool 前缀追踪的基础上，对下游 usage 的 `input`、`output`、`cache_read`、`cache_creation` 分别整形，不叠加 `hitShaping`、`coldRequestGuard` 和 `reportedUsage`。模板写在 `cachePolicy.kiroRsToolPlus.kiroRsToolPlus`，路径级 `pathOverrides[...].kiroRsToolPlus` 会整体替换模板参数（缺省字段取默认值）。默认参数下的行为与 Kiro-RS Tool 的前缀拆分一致。
