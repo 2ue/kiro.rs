@@ -203,7 +203,7 @@ impl IdentityGuard {
                         .char_indices()
                         .filter(|(_, ch)| ch.is_whitespace())
                         .map(|(idx, ch)| idx + ch.len_utf8())
-                        .last()
+                        .next_back()
                         .unwrap_or(buffer.len())
                 }
                 None => break,
