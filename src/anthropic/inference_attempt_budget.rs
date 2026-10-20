@@ -252,6 +252,11 @@ impl InferenceAttemptBudget {
     ///
     /// 只升不降：并发的 fallback 路径不会因为本次抬高而丢失既有额度。
     pub(crate) fn raise_max_attempts_for_berserk(&self, required: u32) {
+        self.raise_max_attempts(required);
+    }
+
+    /// 抬高请求级发送上限（只升不降），用于一个请求内需要多次上游调用的流程。
+    pub(crate) fn raise_max_attempts(&self, required: u32) {
         // 消耗计数与「下游已提交」共用一个 u32，计数只占低 31 位，
         // 上限必须留在 CONSUMED_MASK 之内，否则计数会溢出踩到标志位。
         self.max_attempts

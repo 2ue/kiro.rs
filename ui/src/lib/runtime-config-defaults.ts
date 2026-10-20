@@ -145,6 +145,7 @@ export function defaultBodyConversion(): BodyConversionConfig {
     nativeReasoningFields: true,
     toolPairingRepair: true,
     historyPlaceholderTools: true,
+    modelDrivenWebSearch: { enabled: false, pathOverrides: {} },
   }
 }
 
@@ -152,6 +153,10 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
   return {
     ...defaultBodyConversion(),
     ...(input ?? {}),
+    modelDrivenWebSearch: {
+      enabled: input?.modelDrivenWebSearch?.enabled ?? false,
+      pathOverrides: { ...(input?.modelDrivenWebSearch?.pathOverrides ?? {}) },
+    },
   }
 }
 

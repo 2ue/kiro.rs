@@ -115,6 +115,8 @@ use crate::kiro::token_manager::{
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
+#[path = "handlers/model_driven_websearch.rs"]
+mod model_driven_websearch;
 #[path = "handlers/parsed_body_pipeline.rs"]
 mod parsed_body_pipeline;
 #[path = "handlers/request_entry.rs"]
@@ -7753,23 +7755,52 @@ async fn post_messages_inner(
         });
         let mut usage_guard =
             WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
-        let outcome = websearch::handle_websearch_request(websearch::WebSearchRequestContext {
-            provider,
-            payload: &payload,
-            input_tokens,
-            usage_mapper: websearch_usage_mapper
-                .as_ref()
-                .map(|mapper| mapper as websearch::WebSearchUsageMapper<'_>),
-            inference_attempt_budget,
-            attribution_sink,
-            request_id: &request_id,
-            error_id: &error_id,
-        })
-        .await;
+        let usage_mapper = websearch_usage_mapper
+            .as_ref()
+            .map(|mapper| mapper as websearch::WebSearchUsageMapper<'_>);
+        let outcome = if runtime_config
+            .body_conversion
+            .model_driven_web_search
+            .enabled_for_route(&endpoint)
+        {
+            model_driven_websearch::run(model_driven_websearch::ModelDrivenWebSearchContext {
+                state: &state,
+                provider,
+                payload: &payload,
+                endpoint: &endpoint,
+                runtime_config: &runtime_config,
+                cache_route: cache_route.clone(),
+                model_resolution: &model_resolution,
+                usage_mapper,
+                inference_attempt_budget,
+                attribution_sink,
+                identity_output_guard: identity_output_guard_applies(
+                    &state,
+                    &endpoint,
+                    payload.stream,
+                ),
+                request_id: &request_id,
+                error_id: &error_id,
+            })
+            .await
+        } else {
+            websearch::handle_websearch_request(websearch::WebSearchRequestContext {
+                provider,
+                payload: &payload,
+                input_tokens,
+                usage_mapper,
+                inference_attempt_budget,
+                attribution_sink,
+                request_id: &request_id,
+                error_id: &error_id,
+            })
+            .await
+        };
         let usage_context = usage_guard.take();
         return match outcome {
             websearch::WebSearchOutcome::Success {
                 response,
+                raw_input_tokens,
                 output_tokens,
                 reported_usage,
                 attribution,
@@ -7782,8 +7813,8 @@ async fn post_messages_inner(
                     attribution.attempts,
                 );
                 let raw_usage = super::cache::CacheUsage {
-                    total_input_tokens: input_tokens.max(0),
-                    input_tokens: input_tokens.max(0),
+                    total_input_tokens: raw_input_tokens.max(0),
+                    input_tokens: raw_input_tokens.max(0),
                     output_tokens: output_tokens.max(0),
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,

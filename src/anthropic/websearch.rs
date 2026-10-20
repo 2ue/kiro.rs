@@ -106,6 +106,8 @@ pub struct WebSearchResult {
 pub enum WebSearchOutcome {
     Success {
         response: Response,
+        /// 原始（整形前）input tokens；模型驱动模式下是所有模型调用的累加值。
+        raw_input_tokens: i32,
         output_tokens: i32,
         /// 下发给客户端的最终 usage（经过 `usage_mapper`）。
         reported_usage: super::cache::CacheUsage,
@@ -153,21 +155,51 @@ struct WebSearchResponseContext<'a> {
     summary: &'a str,
     /// 最终下发的 usage；message_start 只取其中的 input / 缓存字段，output 为 0。
     usage: super::cache::CacheUsage,
+    /// 成功执行的搜索次数，写入最终 usage 的 `server_tool_use.web_search_requests`。
+    web_search_requests: u32,
 }
 
 impl WebSearchResponseContext<'_> {
-    fn usage_json(&self, output_tokens: i32) -> Value {
-        json!({
-            "input_tokens": self.usage.input_tokens.max(0),
-            "output_tokens": output_tokens.max(0),
-            "cache_creation_input_tokens": self.usage.cache_creation_input_tokens.max(0),
-            "cache_read_input_tokens": self.usage.cache_read_input_tokens.max(0)
-        })
+    fn start_usage_json(&self) -> Value {
+        usage_json(self.usage, 0, None)
+    }
+
+    fn final_usage_json(&self) -> Value {
+        usage_json(
+            self.usage,
+            self.usage.output_tokens,
+            Some(self.web_search_requests),
+        )
     }
 }
 
+/// Anthropic usage object for WebSearch responses.
+///
+/// `server_tool_use` is appended after usage shaping and only on the final usage
+/// (`message_delta` / non-streaming body): it is a protocol counter, not a token field, and
+/// downstream billing parses only the four standard token fields.
+pub(crate) fn usage_json(
+    usage: super::cache::CacheUsage,
+    output_tokens: i32,
+    web_search_requests: Option<u32>,
+) -> Value {
+    let mut value = json!({
+        "input_tokens": usage.input_tokens.max(0),
+        "output_tokens": output_tokens.max(0),
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens.max(0),
+        "cache_read_input_tokens": usage.cache_read_input_tokens.max(0)
+    });
+    if let Some(requests) = web_search_requests {
+        value["server_tool_use"] = json!({"web_search_requests": requests});
+    }
+    value
+}
+
 /// websearch 的原始 usage：input 为请求估算，output 为摘要估算，没有缓存字段。
-fn raw_websearch_usage(input_tokens: i32, output_tokens: i32) -> super::cache::CacheUsage {
+pub(crate) fn raw_websearch_usage(
+    input_tokens: i32,
+    output_tokens: i32,
+) -> super::cache::CacheUsage {
     super::cache::CacheUsage {
         total_input_tokens: input_tokens.max(0),
         input_tokens: input_tokens.max(0),
@@ -858,23 +890,36 @@ fn websearch_result_content(search_results: &Option<WebSearchResults>) -> Value 
                 results
                     .results
                     .iter()
-                    .map(|result| {
-                        let page_age = result.published_date.and_then(|milliseconds| {
-                            chrono::DateTime::from_timestamp_millis(milliseconds)
-                                .map(|date| date.format("%B %-d, %Y").to_string())
-                        });
-                        json!({
-                            "type": "web_search_result",
-                            "title": result.title,
-                            "url": result.url,
-                            "encrypted_content": result.snippet.clone().unwrap_or_default(),
-                            "page_age": page_age
-                        })
-                    })
+                    .map(web_search_result_block)
                     .collect()
             })
             .unwrap_or_default(),
     )
+}
+
+/// Formatted `published_date`, the `page_age` of a result.
+pub(crate) fn result_page_age(result: &WebSearchResult) -> Option<String> {
+    result.published_date.and_then(|milliseconds| {
+        chrono::DateTime::from_timestamp_millis(milliseconds)
+            .map(|date| date.format("%B %-d, %Y").to_string())
+    })
+}
+
+pub(crate) fn web_search_result_block(result: &WebSearchResult) -> Value {
+    json!({
+        "type": "web_search_result",
+        "title": result.title,
+        "url": result.url,
+        "encrypted_content": result.snippet.clone().unwrap_or_default(),
+        "page_age": result_page_age(result)
+    })
+}
+
+pub(crate) fn web_search_error_block(error_code: &str) -> Value {
+    json!({
+        "type": "web_search_tool_result_error",
+        "error_code": error_code
+    })
 }
 
 fn websearch_error_content(error_code: WebSearchToolErrorCode) -> Value {
@@ -940,7 +985,7 @@ fn generate_websearch_message_with_content(
         ],
         "stop_reason": "end_turn",
         "stop_sequence": null,
-        "usage": context.usage_json(context.usage.output_tokens)
+        "usage": context.final_usage_json()
     })
 }
 
@@ -958,6 +1003,7 @@ fn generate_websearch_message(
         tool_use_id,
         summary,
         usage,
+        web_search_requests: 1,
     };
     generate_websearch_message_with_content(&context, websearch_result_content(&search_results))
 }
@@ -982,7 +1028,7 @@ fn generate_websearch_events_with_content(
                 "model": context.model,
                 "content": [],
                 "stop_reason": null,
-                "usage": context.usage_json(0)
+                "usage": context.start_usage_json()
             }
         }),
     ));
@@ -1121,7 +1167,7 @@ fn generate_websearch_events_with_content(
             "delta": {
                 "stop_reason": "end_turn"
             },
-            "usage": context.usage_json(context.usage.output_tokens)
+            "usage": context.final_usage_json()
         }),
     ));
 
@@ -1151,6 +1197,7 @@ fn generate_websearch_events(
         tool_use_id,
         summary,
         usage,
+        web_search_requests: 1,
     };
     generate_websearch_events_with_content(&context, websearch_result_content(&search_results))
 }
@@ -1291,6 +1338,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
                     tool_use_id: &tool_use_id,
                     summary: &summary,
                     usage,
+                    web_search_requests: 0,
                 };
                 create_websearch_tool_error_outcome(
                     &response_context,
@@ -1352,9 +1400,76 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
     };
     WebSearchOutcome::Success {
         response,
+        raw_input_tokens: input_tokens,
         output_tokens,
         reported_usage,
         attribution,
+    }
+}
+
+/// Whether the current user turn is a Claude Code WebSearch sub-request
+/// (`Perform a web search for the query: ...`), which always expects a search.
+pub(crate) fn is_claude_code_search_request(req: &MessagesRequest) -> bool {
+    let Some(message) = req.messages.iter().rev().find(|m| m.role == "user") else {
+        return false;
+    };
+    let starts = |text: &str| text.trim_start().starts_with(WEB_SEARCH_QUERY_PREFIX);
+    match &message.content {
+        Value::String(text) => starts(text),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(starts)
+        }),
+        _ => false,
+    }
+}
+
+/// `max_uses` of the request's native web_search tool, if set.
+pub(crate) fn native_web_search_max_uses(req: &MessagesRequest) -> Option<i32> {
+    req.tools
+        .iter()
+        .flatten()
+        .find(|tool| is_native_web_search_tool(tool))
+        .and_then(|tool| tool.max_uses)
+}
+
+/// Runs one search for the model-driven mode: query truncation and domain filters as in the
+/// template mode. Errors are returned as the Anthropic `web_search_tool_result_error` code.
+pub(crate) async fn execute_search(
+    provider: &crate::kiro::provider::KiroProvider,
+    payload: &MessagesRequest,
+    query: &str,
+    inference_attempt_budget: Arc<InferenceAttemptBudget>,
+    attribution_sink: Arc<McpCallAttributionSink>,
+    request_id: &str,
+) -> Result<Vec<WebSearchResult>, &'static str> {
+    let query = truncate_search_query(query, MAX_WEB_SEARCH_QUERY_CHARS);
+    let domain_filter = WebSearchDomainFilter::from_request(payload);
+    let (_, mcp_request) = create_mcp_request(&domain_filter.mcp_query(&query));
+    match call_mcp_api(
+        provider,
+        &mcp_request,
+        inference_attempt_budget,
+        attribution_sink,
+        request_id,
+    )
+    .await
+    {
+        Ok((mut results, _)) => {
+            domain_filter.apply(&mut results);
+            Ok(results.results)
+        }
+        Err(failure) => {
+            tracing::warn!(
+                request_id,
+                failure = failure.internal_reason,
+                "model-driven WebSearch search failed"
+            );
+            Err(websearch_tool_error_code_for_failure(&failure).as_str())
+        }
     }
 }
 
@@ -2401,6 +2516,7 @@ mod tests {
                 tool_use_id: "tool-1",
                 summary: &summary,
                 usage: raw_websearch_usage(123, estimated_output_tokens(&summary)),
+                web_search_requests: 0,
             };
             let non_stream =
                 generate_websearch_message_with_content(&context, search_content.clone());
@@ -2608,7 +2724,8 @@ mod tests {
         assert!(final_usage["output_tokens"].as_i64().unwrap_or_default() > 0);
         assert_eq!(final_usage["cache_creation_input_tokens"], 0);
         assert_eq!(final_usage["cache_read_input_tokens"], 0);
-        assert!(final_usage.get("server_tool_use").is_none());
+        // The search counter is appended after shaping, on the final usage only.
+        assert_eq!(final_usage["server_tool_use"]["web_search_requests"], 1);
         assert!(final_usage.get("cache_creation_5m_input_tokens").is_none());
         assert!(final_usage.get("cache_creation_1h_input_tokens").is_none());
     }

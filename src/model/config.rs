@@ -206,6 +206,39 @@ pub struct BodyConversionConfig {
     /// 为历史中出现但当前 tools 缺失的工具补占位定义。
     #[serde(default = "default_true")]
     pub history_placeholder_tools: bool,
+
+    /// 原生 WebSearch 的模型驱动模式：模型生成搜索词、代理执行搜索、模型根据结果写带引用的回答。
+    /// 默认关闭，关闭时沿用模板回答。
+    #[serde(default)]
+    pub model_driven_web_search: ModelDrivenWebSearchConfig,
+}
+
+/// 原生 WebSearch 模型驱动模式的开关。
+///
+/// 每次搜索会额外调用 1 次模型，最后再调用 1 次写回答；这些调用的 token 累加进本次请求的 usage。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDrivenWebSearchConfig {
+    /// 全局默认值。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 按路由前缀覆盖（`/v1`、`/cc`、`/dfcache/x` ...），按最长前缀匹配。
+    #[serde(default)]
+    pub path_overrides: BTreeMap<String, bool>,
+}
+
+impl ModelDrivenWebSearchConfig {
+    /// `endpoint`（请求路径）是否启用模型驱动模式。
+    pub fn enabled_for_route(&self, endpoint: &str) -> bool {
+        self.path_overrides
+            .iter()
+            .filter_map(|(prefix, enabled)| {
+                normalize_reported_usage_path_prefix(prefix).map(|prefix| (prefix, *enabled))
+            })
+            .filter(|(prefix, _)| reported_usage_path_matches(prefix, endpoint))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map_or(self.enabled, |(_, enabled)| enabled)
+    }
 }
 
 impl Default for BodyConversionConfig {
@@ -222,6 +255,7 @@ impl Default for BodyConversionConfig {
             native_reasoning_fields: true,
             tool_pairing_repair: true,
             history_placeholder_tools: true,
+            model_driven_web_search: ModelDrivenWebSearchConfig::default(),
         }
     }
 }
@@ -7031,6 +7065,24 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_driven_web_search_is_off_by_default_and_follows_the_longest_route_override() {
+        let mut config = super::ModelDrivenWebSearchConfig::default();
+        assert!(!config.enabled_for_route("/v1/messages"));
+        config.path_overrides.insert("/cc".to_string(), true);
+        config.path_overrides.insert("/cc/off".to_string(), false);
+        assert!(config.enabled_for_route("/cc/v1/messages"));
+        assert!(!config.enabled_for_route("/cc/off/v1/messages"));
+        assert!(!config.enabled_for_route("/ccx/v1/messages"));
+        config.enabled = true;
+        assert!(config.enabled_for_route("/v1/messages"));
+        assert!(!config.enabled_for_route("/cc/off/v1/messages"));
+
+        let parsed: super::BodyConversionConfig =
+            serde_json::from_value(serde_json::json!({})).expect("body conversion");
+        assert!(!parsed.model_driven_web_search.enabled);
+    }
 
     #[test]
     fn prompt_steering_language_turn_reminder_defaults_and_normalizes() {

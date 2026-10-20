@@ -1893,6 +1893,12 @@ export function RuntimePage() {
                     <TogField label="分块工具策略" desc="定义 Write/Edit 分块协议能力；额外 system/工具描述提示受上方总开关控制。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
                     <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
+                    <TogField
+                      label="WebSearch 模型驱动（默认值）"
+                      desc="开启后由模型生成搜索词、根据结果写带引用的回答；每次搜索多调用 1 次模型，token 计入本次 usage。关闭时沿用模板回答。路由策略里可以按路由单独设置。"
+                      checked={draft.bodyConversion.modelDrivenWebSearch.enabled}
+                      onChange={(enabled) => setBodyConversion('modelDrivenWebSearch')({ ...draft.bodyConversion.modelDrivenWebSearch, enabled })}
+                    />
                   </TwoCol>
                 </div>
                 <div className="space-y-3">

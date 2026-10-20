@@ -14,10 +14,12 @@ export type RoutePolicyFile = {
   sourceRoute: string
   cachePolicy: CacheRoutePolicyPatch
   identity: IdentityRouteOverride
+  /** Model-driven WebSearch for the route; absent means "follow the default". */
+  webSearch?: boolean
 }
 
 export type RoutePolicyImport =
-  | { ok: true; sourceRoute: string | null; cachePolicy: CacheRoutePolicyPatch; identity: IdentityRouteOverride }
+  | { ok: true; sourceRoute: string | null; cachePolicy: CacheRoutePolicyPatch; identity: IdentityRouteOverride; webSearch?: boolean }
   | { ok: false; error: string }
 
 const CACHE_TYPES: PromptCacheStrategyType[] = [
@@ -60,6 +62,7 @@ export function buildRoutePolicyFile(
   sourceRoute: string,
   cachePolicy: CacheRoutePolicyPatch,
   identity: IdentityRouteOverride,
+  webSearch?: boolean,
   now: Date = new Date(),
 ): RoutePolicyFile {
   return {
@@ -69,6 +72,7 @@ export function buildRoutePolicyFile(
     sourceRoute,
     cachePolicy: structuredClone(cachePolicy),
     identity: structuredClone(identity),
+    ...(webSearch === undefined ? {} : { webSearch }),
   }
 }
 
@@ -122,6 +126,11 @@ export function parseRoutePolicyImport(text: string): RoutePolicyImport {
     identity[key as keyof IdentityRouteOverride] = value
   }
 
+  if (data.webSearch !== undefined && data.webSearch !== null && typeof data.webSearch !== 'boolean') {
+    return { ok: false, error: 'webSearch 必须是 true 或 false' }
+  }
+  const webSearch = typeof data.webSearch === 'boolean' ? data.webSearch : undefined
+
   // Wrong-typed nested values would break the editor, so check each known field's shape here.
   const policy: Record<string, unknown> = { cacheType }
   if (cachePolicy.routeNamespace !== undefined && cachePolicy.routeNamespace !== null) {
@@ -142,6 +151,7 @@ export function parseRoutePolicyImport(text: string): RoutePolicyImport {
     sourceRoute: typeof data.sourceRoute === 'string' && data.sourceRoute.trim() ? data.sourceRoute.trim() : null,
     cachePolicy: structuredClone(policy) as CacheRoutePolicyPatch,
     identity,
+    ...(webSearch === undefined ? {} : { webSearch }),
   }
 }
 
