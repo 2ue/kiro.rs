@@ -2769,6 +2769,48 @@ pub struct StableSegmentCachePolicy {
     pub reported_input_min_tokens: i32,
     #[serde(default = "default_stable_segment_reported_input_max_tokens")]
     pub reported_input_max_tokens: i32,
+    /// 读写放大倍数（1~3，默认 1 不放大）：真实总输入先乘这个倍数，再按片段覆盖比例归入读写。
+    /// 未覆盖部分（input）仍按真实值计算；冷请求不产生读取。
+    #[serde(default = "default_stable_segment_token_scale")]
+    pub token_scale: f64,
+    /// 放大后总输入的软上限，0 表示不限。触到上限时按 capJitter 区间扣减（不超过上限的 8%）。
+    #[serde(default)]
+    pub max_simulated_input_tokens: i32,
+    #[serde(default)]
+    pub cap_jitter_min_tokens: i32,
+    #[serde(default)]
+    pub cap_jitter_max_tokens: i32,
+    /// 真实总输入低于这个值时不放大，0 表示总是放大。
+    #[serde(default)]
+    pub scale_min_input_tokens: i32,
+    /// output 放大比例（0~200，默认 0 不放大）。output 超过 outputUpliftMinTokens 时才放大。
+    #[serde(default)]
+    pub output_uplift_percent: u32,
+    /// output 放大门槛，0 表示所有非零 output 都放大。
+    #[serde(default)]
+    pub output_uplift_min_tokens: i32,
+    /// 最终下游读取上限，在命中率整形和冷请求约束之后向下裁剪。0 表示沿用默认上限（70 万）。
+    #[serde(default)]
+    pub final_cache_read_max_tokens: i32,
+    /// 读取上限的确定性扣减区间，避免每次都精确等于上限。
+    #[serde(default)]
+    pub final_cache_read_jitter_min_tokens: i32,
+    #[serde(default)]
+    pub final_cache_read_jitter_max_tokens: i32,
+    /// 最终下游写入上限。0 表示沿用默认上限（40 万，扣减 2 万~4.5 万）。
+    #[serde(default)]
+    pub final_cache_creation_max_tokens: i32,
+    #[serde(default)]
+    pub final_cache_creation_jitter_min_tokens: i32,
+    #[serde(default)]
+    pub final_cache_creation_jitter_max_tokens: i32,
+    /// 最终下游 output 上限（放大之后裁剪）。0 表示不限。
+    #[serde(default)]
+    pub final_output_max_tokens: i32,
+    #[serde(default)]
+    pub final_output_jitter_min_tokens: i32,
+    #[serde(default)]
+    pub final_output_jitter_max_tokens: i32,
 }
 
 impl Default for StableSegmentCachePolicy {
@@ -2795,11 +2837,40 @@ impl Default for StableSegmentCachePolicy {
             extended_ttl_secs: default_stable_segment_extended_ttl_secs(),
             reported_input_min_tokens: default_stable_segment_reported_input_min_tokens(),
             reported_input_max_tokens: default_stable_segment_reported_input_max_tokens(),
+            token_scale: default_stable_segment_token_scale(),
+            max_simulated_input_tokens: 0,
+            cap_jitter_min_tokens: 0,
+            cap_jitter_max_tokens: 0,
+            scale_min_input_tokens: 0,
+            output_uplift_percent: 0,
+            output_uplift_min_tokens: 0,
+            final_cache_read_max_tokens: 0,
+            final_cache_read_jitter_min_tokens: 0,
+            final_cache_read_jitter_max_tokens: 0,
+            final_cache_creation_max_tokens: 0,
+            final_cache_creation_jitter_min_tokens: 0,
+            final_cache_creation_jitter_max_tokens: 0,
+            final_output_max_tokens: 0,
+            final_output_jitter_min_tokens: 0,
+            final_output_jitter_max_tokens: 0,
         }
     }
 }
 
 impl StableSegmentCachePolicy {
+    pub const MAX_TOKEN_SCALE: f64 = 3.0;
+    pub const MAX_OUTPUT_UPLIFT_PERCENT: u32 = 200;
+
+    /// 是否配置了读写放大。
+    pub fn amplifies_cache(self) -> bool {
+        self.token_scale.is_finite() && self.token_scale > 1.0
+    }
+
+    /// 是否配置了 output 放大。
+    pub fn uplifts_output(self) -> bool {
+        self.output_uplift_percent > 0
+    }
+
     pub fn normalized(mut self) -> Self {
         if !self.coverage_ratio.is_finite() {
             self.coverage_ratio = default_stable_segment_coverage_ratio();
@@ -2823,12 +2894,126 @@ impl StableSegmentCachePolicy {
         if !self.cache_current_user_stable_prefix {
             self.current_user_stable_prefix_max_tokens = 0;
         }
+        self.token_scale = if self.token_scale.is_finite() {
+            self.token_scale.clamp(1.0, Self::MAX_TOKEN_SCALE)
+        } else {
+            default_stable_segment_token_scale()
+        };
+        self.max_simulated_input_tokens = self.max_simulated_input_tokens.max(0);
+        self.cap_jitter_min_tokens = self.cap_jitter_min_tokens.max(0);
+        self.cap_jitter_max_tokens = self.cap_jitter_max_tokens.max(0);
+        if self.cap_jitter_min_tokens > self.cap_jitter_max_tokens {
+            std::mem::swap(
+                &mut self.cap_jitter_min_tokens,
+                &mut self.cap_jitter_max_tokens,
+            );
+        }
+        self.scale_min_input_tokens = self.scale_min_input_tokens.max(0);
+        self.output_uplift_percent = self
+            .output_uplift_percent
+            .min(Self::MAX_OUTPUT_UPLIFT_PERCENT);
+        self.output_uplift_min_tokens = self.output_uplift_min_tokens.max(0);
+        for (max, min_jitter, max_jitter) in [
+            (
+                &mut self.final_cache_read_max_tokens,
+                &mut self.final_cache_read_jitter_min_tokens,
+                &mut self.final_cache_read_jitter_max_tokens,
+            ),
+            (
+                &mut self.final_cache_creation_max_tokens,
+                &mut self.final_cache_creation_jitter_min_tokens,
+                &mut self.final_cache_creation_jitter_max_tokens,
+            ),
+            (
+                &mut self.final_output_max_tokens,
+                &mut self.final_output_jitter_min_tokens,
+                &mut self.final_output_jitter_max_tokens,
+            ),
+        ] {
+            *max = (*max).max(0);
+            *min_jitter = (*min_jitter).max(0);
+            *max_jitter = (*max_jitter).max(0);
+            if *min_jitter > *max_jitter {
+                std::mem::swap(min_jitter, max_jitter);
+            }
+        }
         self
     }
 
     pub fn validate(self, label: &str) -> Result<(), String> {
         if !(0.0..=1.0).contains(&self.coverage_ratio) || !self.coverage_ratio.is_finite() {
             return Err(format!("{label}.coverageRatio 必须在 0 到 1 之间"));
+        }
+        if !(1.0..=Self::MAX_TOKEN_SCALE).contains(&self.token_scale)
+            || !self.token_scale.is_finite()
+        {
+            return Err(format!("{label}.tokenScale 必须在 1 到 3 之间"));
+        }
+        for (name, value) in [
+            ("maxSimulatedInputTokens", self.max_simulated_input_tokens),
+            ("capJitterMinTokens", self.cap_jitter_min_tokens),
+            ("capJitterMaxTokens", self.cap_jitter_max_tokens),
+            ("scaleMinInputTokens", self.scale_min_input_tokens),
+            ("outputUpliftMinTokens", self.output_uplift_min_tokens),
+        ] {
+            if value < 0 {
+                return Err(format!("{label}.{name} 不能小于 0"));
+            }
+        }
+        if self.cap_jitter_min_tokens > self.cap_jitter_max_tokens {
+            return Err(format!(
+                "{label}.capJitterMinTokens 不能大于 capJitterMaxTokens"
+            ));
+        }
+        if self.output_uplift_percent > Self::MAX_OUTPUT_UPLIFT_PERCENT {
+            return Err(format!("{label}.outputUpliftPercent 不能大于 200"));
+        }
+        if self.final_cache_read_max_tokens < 0 {
+            return Err(format!("{label}.finalCacheReadMaxTokens 不能小于 0"));
+        }
+        if self.final_cache_read_jitter_min_tokens < 0 {
+            return Err(format!("{label}.finalCacheReadJitterMinTokens 不能小于 0"));
+        }
+        if self.final_cache_read_jitter_max_tokens < 0 {
+            return Err(format!("{label}.finalCacheReadJitterMaxTokens 不能小于 0"));
+        }
+        if self.final_cache_creation_max_tokens < 0 {
+            return Err(format!("{label}.finalCacheCreationMaxTokens 不能小于 0"));
+        }
+        if self.final_cache_creation_jitter_min_tokens < 0 {
+            return Err(format!(
+                "{label}.finalCacheCreationJitterMinTokens 不能小于 0"
+            ));
+        }
+        if self.final_cache_creation_jitter_max_tokens < 0 {
+            return Err(format!(
+                "{label}.finalCacheCreationJitterMaxTokens 不能小于 0"
+            ));
+        }
+        if self.final_output_max_tokens < 0 {
+            return Err(format!("{label}.finalOutputMaxTokens 不能小于 0"));
+        }
+        if self.final_output_jitter_min_tokens < 0 {
+            return Err(format!("{label}.finalOutputJitterMinTokens 不能小于 0"));
+        }
+        if self.final_output_jitter_max_tokens < 0 {
+            return Err(format!("{label}.finalOutputJitterMaxTokens 不能小于 0"));
+        }
+        if self.final_cache_read_jitter_min_tokens > self.final_cache_read_jitter_max_tokens {
+            return Err(format!(
+                "{label}.finalCacheReadJitterMinTokens 不能大于 finalCacheReadJitterMaxTokens"
+            ));
+        }
+        if self.final_cache_creation_jitter_min_tokens > self.final_cache_creation_jitter_max_tokens
+        {
+            return Err(format!(
+                "{label}.finalCacheCreationJitterMinTokens 不能大于 finalCacheCreationJitterMaxTokens"
+            ));
+        }
+        if self.final_output_jitter_min_tokens > self.final_output_jitter_max_tokens {
+            return Err(format!(
+                "{label}.finalOutputJitterMinTokens 不能大于 finalOutputJitterMaxTokens"
+            ));
         }
         if self.max_coverage_tokens < 0 {
             return Err(format!("{label}.maxCoverageTokens 不能小于 0"));
@@ -2913,6 +3098,38 @@ pub struct StableSegmentCachePolicyPatch {
     pub reported_input_min_tokens: Option<i32>,
     #[serde(default)]
     pub reported_input_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub token_scale: Option<f64>,
+    #[serde(default)]
+    pub max_simulated_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub cap_jitter_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub cap_jitter_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub scale_min_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub output_uplift_percent: Option<u32>,
+    #[serde(default)]
+    pub output_uplift_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_cache_read_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_cache_read_jitter_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_cache_read_jitter_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_cache_creation_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_cache_creation_jitter_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_cache_creation_jitter_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_output_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_output_jitter_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub final_output_jitter_max_tokens: Option<i32>,
 }
 
 impl StableSegmentCachePolicyPatch {
@@ -2977,6 +3194,54 @@ impl StableSegmentCachePolicyPatch {
         if let Some(value) = self.reported_input_max_tokens {
             policy.reported_input_max_tokens = value;
         }
+        if let Some(value) = self.token_scale {
+            policy.token_scale = value;
+        }
+        if let Some(value) = self.max_simulated_input_tokens {
+            policy.max_simulated_input_tokens = value;
+        }
+        if let Some(value) = self.cap_jitter_min_tokens {
+            policy.cap_jitter_min_tokens = value;
+        }
+        if let Some(value) = self.cap_jitter_max_tokens {
+            policy.cap_jitter_max_tokens = value;
+        }
+        if let Some(value) = self.scale_min_input_tokens {
+            policy.scale_min_input_tokens = value;
+        }
+        if let Some(value) = self.output_uplift_percent {
+            policy.output_uplift_percent = value;
+        }
+        if let Some(value) = self.output_uplift_min_tokens {
+            policy.output_uplift_min_tokens = value;
+        }
+        if let Some(value) = self.final_cache_read_max_tokens {
+            policy.final_cache_read_max_tokens = value;
+        }
+        if let Some(value) = self.final_cache_read_jitter_min_tokens {
+            policy.final_cache_read_jitter_min_tokens = value;
+        }
+        if let Some(value) = self.final_cache_read_jitter_max_tokens {
+            policy.final_cache_read_jitter_max_tokens = value;
+        }
+        if let Some(value) = self.final_cache_creation_max_tokens {
+            policy.final_cache_creation_max_tokens = value;
+        }
+        if let Some(value) = self.final_cache_creation_jitter_min_tokens {
+            policy.final_cache_creation_jitter_min_tokens = value;
+        }
+        if let Some(value) = self.final_cache_creation_jitter_max_tokens {
+            policy.final_cache_creation_jitter_max_tokens = value;
+        }
+        if let Some(value) = self.final_output_max_tokens {
+            policy.final_output_max_tokens = value;
+        }
+        if let Some(value) = self.final_output_jitter_min_tokens {
+            policy.final_output_jitter_min_tokens = value;
+        }
+        if let Some(value) = self.final_output_jitter_max_tokens {
+            policy.final_output_jitter_max_tokens = value;
+        }
         policy.normalized()
     }
 
@@ -3001,6 +3266,22 @@ impl StableSegmentCachePolicyPatch {
             && self.extended_ttl_secs.is_none()
             && self.reported_input_min_tokens.is_none()
             && self.reported_input_max_tokens.is_none()
+            && self.token_scale.is_none()
+            && self.max_simulated_input_tokens.is_none()
+            && self.cap_jitter_min_tokens.is_none()
+            && self.cap_jitter_max_tokens.is_none()
+            && self.scale_min_input_tokens.is_none()
+            && self.output_uplift_percent.is_none()
+            && self.output_uplift_min_tokens.is_none()
+            && self.final_cache_read_max_tokens.is_none()
+            && self.final_cache_read_jitter_min_tokens.is_none()
+            && self.final_cache_read_jitter_max_tokens.is_none()
+            && self.final_cache_creation_max_tokens.is_none()
+            && self.final_cache_creation_jitter_min_tokens.is_none()
+            && self.final_cache_creation_jitter_max_tokens.is_none()
+            && self.final_output_max_tokens.is_none()
+            && self.final_output_jitter_min_tokens.is_none()
+            && self.final_output_jitter_max_tokens.is_none()
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {
@@ -3059,6 +3340,110 @@ impl StableSegmentCachePolicyPatch {
         ) {
             return Err(format!(
                 "{label}.reportedInputMinTokens 不能大于 reportedInputMaxTokens"
+            ));
+        }
+        if let Some(value) = self.token_scale
+            && (!(1.0..=StableSegmentCachePolicy::MAX_TOKEN_SCALE).contains(&value)
+                || !value.is_finite())
+        {
+            return Err(format!("{label}.tokenScale 必须在 1 到 3 之间"));
+        }
+        for (name, value) in [
+            ("maxSimulatedInputTokens", self.max_simulated_input_tokens),
+            ("capJitterMinTokens", self.cap_jitter_min_tokens),
+            ("capJitterMaxTokens", self.cap_jitter_max_tokens),
+            ("scaleMinInputTokens", self.scale_min_input_tokens),
+            ("outputUpliftMinTokens", self.output_uplift_min_tokens),
+        ] {
+            if value.is_some_and(|value| value < 0) {
+                return Err(format!("{label}.{name} 不能小于 0"));
+            }
+        }
+        if matches!(
+            (self.cap_jitter_min_tokens, self.cap_jitter_max_tokens),
+            (Some(min), Some(max)) if min > max
+        ) {
+            return Err(format!(
+                "{label}.capJitterMinTokens 不能大于 capJitterMaxTokens"
+            ));
+        }
+        if self
+            .output_uplift_percent
+            .is_some_and(|value| value > StableSegmentCachePolicy::MAX_OUTPUT_UPLIFT_PERCENT)
+        {
+            return Err(format!("{label}.outputUpliftPercent 不能大于 200"));
+        }
+        if self
+            .final_cache_read_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.finalCacheReadMaxTokens 不能小于 0"));
+        }
+        if self
+            .final_cache_read_jitter_min_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.finalCacheReadJitterMinTokens 不能小于 0"));
+        }
+        if self
+            .final_cache_read_jitter_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.finalCacheReadJitterMaxTokens 不能小于 0"));
+        }
+        if self
+            .final_cache_creation_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.finalCacheCreationMaxTokens 不能小于 0"));
+        }
+        if self
+            .final_cache_creation_jitter_min_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!(
+                "{label}.finalCacheCreationJitterMinTokens 不能小于 0"
+            ));
+        }
+        if self
+            .final_cache_creation_jitter_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!(
+                "{label}.finalCacheCreationJitterMaxTokens 不能小于 0"
+            ));
+        }
+        if self.final_output_max_tokens.is_some_and(|value| value < 0) {
+            return Err(format!("{label}.finalOutputMaxTokens 不能小于 0"));
+        }
+        if self
+            .final_output_jitter_min_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.finalOutputJitterMinTokens 不能小于 0"));
+        }
+        if self
+            .final_output_jitter_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.finalOutputJitterMaxTokens 不能小于 0"));
+        }
+        if matches!((self.final_cache_read_jitter_min_tokens, self.final_cache_read_jitter_max_tokens), (Some(min), Some(max)) if min > max)
+        {
+            return Err(format!(
+                "{label}.finalCacheReadJitterMinTokens 不能大于 finalCacheReadJitterMaxTokens"
+            ));
+        }
+        if matches!((self.final_cache_creation_jitter_min_tokens, self.final_cache_creation_jitter_max_tokens), (Some(min), Some(max)) if min > max)
+        {
+            return Err(format!(
+                "{label}.finalCacheCreationJitterMinTokens 不能大于 finalCacheCreationJitterMaxTokens"
+            ));
+        }
+        if matches!((self.final_output_jitter_min_tokens, self.final_output_jitter_max_tokens), (Some(min), Some(max)) if min > max)
+        {
+            return Err(format!(
+                "{label}.finalOutputJitterMinTokens 不能大于 finalOutputJitterMaxTokens"
             ));
         }
         Ok(())
@@ -5952,6 +6337,10 @@ fn default_stable_segment_reported_input_max_tokens() -> i32 {
     256
 }
 
+fn default_stable_segment_token_scale() -> f64 {
+    1.0
+}
+
 fn default_prompt_cache_token_scale() -> f64 {
     1.6
 }
@@ -6339,7 +6728,7 @@ fn default_reported_usage_normal_max_multiplier() -> f64 {
     1.1
 }
 
-fn default_final_cache_read_max_tokens() -> i32 {
+pub(crate) fn default_final_cache_read_max_tokens() -> i32 {
     700_000
 }
 
@@ -9126,6 +9515,82 @@ mod tests {
         assert_eq!(policy.extended_ttl_secs, 3_600);
         assert_eq!(policy.reported_input_min_tokens, 32);
         assert_eq!(policy.reported_input_max_tokens, 256);
+    }
+
+    #[test]
+    fn stable_segment_cache_amplification_defaults_are_disabled() {
+        let policy = StableSegmentCachePolicy::default();
+        assert_eq!(policy.token_scale, 1.0);
+        assert!(!policy.amplifies_cache());
+        assert!(!policy.uplifts_output());
+        assert_eq!(policy.final_cache_read_max_tokens, 0);
+        assert_eq!(policy.final_cache_creation_max_tokens, 0);
+        assert_eq!(policy.final_output_max_tokens, 0);
+    }
+
+    #[test]
+    fn stable_segment_cache_amplification_fields_patch_and_normalize() {
+        let patch: StableSegmentCachePolicyPatch = serde_json::from_value(serde_json::json!({
+            "tokenScale": 2.5,
+            "maxSimulatedInputTokens": 300000,
+            "capJitterMinTokens": 20000,
+            "capJitterMaxTokens": 10000,
+            "scaleMinInputTokens": 8000,
+            "outputUpliftPercent": 150,
+            "outputUpliftMinTokens": 600,
+            "finalCacheReadMaxTokens": 400000,
+            "finalCacheReadJitterMinTokens": 1000,
+            "finalCacheReadJitterMaxTokens": 5000,
+            "finalCacheCreationMaxTokens": 60000,
+            "finalOutputMaxTokens": 32000
+        }))
+        .expect("deserialize patch");
+        assert!(
+            patch.validate_raw("stableSegment").is_err(),
+            "capJitter 最小值大于最大值应拒绝"
+        );
+
+        let policy = patch.apply_to(StableSegmentCachePolicy::default());
+        assert_eq!(policy.token_scale, 2.5);
+        assert!(policy.amplifies_cache());
+        assert_eq!(policy.max_simulated_input_tokens, 300_000);
+        assert_eq!(
+            (policy.cap_jitter_min_tokens, policy.cap_jitter_max_tokens),
+            (10_000, 20_000)
+        );
+        assert_eq!(policy.scale_min_input_tokens, 8_000);
+        assert_eq!(policy.output_uplift_percent, 150);
+        assert_eq!(policy.output_uplift_min_tokens, 600);
+        assert_eq!(policy.final_cache_read_max_tokens, 400_000);
+        assert_eq!(policy.final_cache_creation_max_tokens, 60_000);
+        assert_eq!(policy.final_output_max_tokens, 32_000);
+        assert!(policy.validate("stableSegment").is_ok());
+    }
+
+    #[test]
+    fn stable_segment_cache_amplification_rejects_out_of_range_values() {
+        for (field, value) in [
+            ("tokenScale", serde_json::json!(3.5)),
+            ("tokenScale", serde_json::json!(0.5)),
+            ("outputUpliftPercent", serde_json::json!(250)),
+            ("finalCacheReadMaxTokens", serde_json::json!(-1)),
+            ("scaleMinInputTokens", serde_json::json!(-5)),
+        ] {
+            let patch: StableSegmentCachePolicyPatch =
+                serde_json::from_value(serde_json::json!({ field: value })).expect("deserialize");
+            assert!(
+                patch.validate_raw("stableSegment").is_err(),
+                "{field} 越界应拒绝"
+            );
+        }
+        let normalized = StableSegmentCachePolicy {
+            token_scale: 9.0,
+            output_uplift_percent: 900,
+            ..StableSegmentCachePolicy::default()
+        }
+        .normalized();
+        assert_eq!(normalized.token_scale, 3.0);
+        assert_eq!(normalized.output_uplift_percent, 200);
     }
 
     #[test]

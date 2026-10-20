@@ -924,6 +924,15 @@ fn sample_zero_based_range(random: u64, low: i32, high: i32) -> i32 {
     low + (random % span) as i32
 }
 
+/// output 超过 `min_tokens` 时按 `percent`（上限 200）放大；`min_tokens` 为 0 时所有非零 output 都放大。
+pub fn uplift_output_tokens(tokens: i32, min_tokens: i32, percent: u32) -> i32 {
+    let tokens = tokens.max(0);
+    if percent == 0 || tokens <= min_tokens.max(0) {
+        return tokens;
+    }
+    uplift_tokens_by_percent(tokens, percent)
+}
+
 fn uplift_tokens_by_percent(tokens: i32, percent: u32) -> i32 {
     let tokens = tokens.max(0);
     let percent = percent.min(200);
@@ -1603,8 +1612,12 @@ impl CacheSimulation {
             .unwrap_or(raw_input_tokens);
         if self.split_cached_input {
             if let Some(covered_ratio) = self.target_cache_ratio {
-                let usage =
-                    self.to_split_ratio_usage(raw_input_tokens, output_tokens, covered_ratio);
+                let usage = self.to_split_ratio_usage(
+                    raw_input_tokens,
+                    cache_basis_tokens,
+                    output_tokens,
+                    covered_ratio,
+                );
                 return self.apply_split_input_range(usage);
             }
         }
@@ -1667,9 +1680,14 @@ impl CacheSimulation {
         }
     }
 
+    /// 按覆盖比例把输入拆成读写和 input。
+    ///
+    /// `cache_basis_tokens` 是放大后的总输入（未配置放大时等于真实总输入）：读写按放大后的
+    /// 总量 × 覆盖比例计算，input 仍是真实的未覆盖部分，因此放大只增加读写，不改 input。
     fn to_split_ratio_usage(
         self,
         raw_input_tokens: i32,
+        cache_basis_tokens: i32,
         output_tokens: i32,
         covered_ratio: f64,
     ) -> CacheUsage {
@@ -1686,9 +1704,15 @@ impl CacheSimulation {
             };
         }
 
-        let cache_total =
-            ((total_input_tokens as f64) * covered_ratio.clamp(0.0, 1.0)).round() as i32;
-        let cache_total = cache_total.clamp(0, total_input_tokens);
+        let covered_ratio = covered_ratio.clamp(0.0, 1.0);
+        let raw_cache_total = ((total_input_tokens as f64) * covered_ratio).round() as i32;
+        let raw_cache_total = raw_cache_total.clamp(0, total_input_tokens);
+        let cache_basis_tokens = cache_basis_tokens.max(total_input_tokens);
+        let cache_total = if cache_basis_tokens > total_input_tokens {
+            (((cache_basis_tokens as f64) * covered_ratio).round() as i32).max(raw_cache_total)
+        } else {
+            raw_cache_total
+        };
         let raw_read = self.cache_read_input_tokens.max(0);
         let raw_creation = self.cache_creation_input_tokens.max(0);
         let raw_cached_total = raw_read.saturating_add(raw_creation);
@@ -1708,16 +1732,31 @@ impl CacheSimulation {
             (((cache_total as f64) * (raw_read as f64 / raw_cached_total as f64)).round() as i32)
                 .clamp(0, cache_total);
         let cache_creation_input_tokens = cache_total.saturating_sub(cache_read_input_tokens);
-        let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+        let (mut cache_creation_5m_input_tokens, mut cache_creation_1h_input_tokens) =
             cap_cache_creation_breakdown(
                 self.cache_creation_5m_input_tokens,
                 self.cache_creation_1h_input_tokens,
                 cache_creation_input_tokens,
             );
+        // 放大后写入可能超过原 TTL 明细：多出的部分按已有归属补齐（只有 1h 时归入 1h，否则归入 5m），
+        // 保证 5m + 1h == creation。
+        let assigned =
+            cache_creation_5m_input_tokens.saturating_add(cache_creation_1h_input_tokens);
+        let remainder = cache_creation_input_tokens.saturating_sub(assigned).max(0);
+        if remainder > 0 {
+            if cache_creation_1h_input_tokens > 0 && cache_creation_5m_input_tokens == 0 {
+                cache_creation_1h_input_tokens += remainder;
+            } else {
+                cache_creation_5m_input_tokens += remainder;
+            }
+        }
 
+        let input_tokens = total_input_tokens.saturating_sub(raw_cache_total);
         CacheUsage {
-            total_input_tokens,
-            input_tokens: total_input_tokens.saturating_sub(cache_total),
+            total_input_tokens: input_tokens
+                .saturating_add(cache_read_input_tokens)
+                .saturating_add(cache_creation_input_tokens),
+            input_tokens,
             output_tokens: output_tokens.max(0),
             cache_creation_input_tokens,
             cache_read_input_tokens,
@@ -2340,6 +2379,115 @@ mod tests {
         assert!(!inputs.contains(&0));
         assert!(!inputs.contains(&32));
         assert!(!inputs.contains(&4_096));
+    }
+
+    fn stable_segment_split(read: i32, creation: i32, ratio: f64) -> CacheSimulation {
+        CacheSimulation::from_prompt_cache_split_input(PromptCacheUsage {
+            cache_creation_input_tokens: creation,
+            cache_read_input_tokens: read,
+            cache_creation_5m_input_tokens: creation,
+            cache_creation_1h_input_tokens: 0,
+            effective_cache_ratio: Some(ratio),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn split_ratio_without_amplification_is_unchanged() {
+        let usage = stable_segment_split(40, 60, 0.5).to_usage(100, 1);
+        assert_eq!(usage.total_input_tokens, 100);
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.cache_read_input_tokens, 20);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+    }
+
+    #[test]
+    fn split_ratio_amplification_scales_cache_fields_and_keeps_real_input() {
+        let mut simulation = stable_segment_split(80_000, 10_000, 0.9);
+        simulation.amplification = Some(CacheAmplification::new(2.0, 0, 0, 0, 0, 0));
+        let usage = simulation.to_usage(100_000, 10);
+
+        // 读写按放大后的 20 万 × 0.9 = 18 万拆分，input 仍是真实未覆盖的 1 万。
+        assert_eq!(usage.input_tokens, 10_000);
+        assert_eq!(
+            usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
+            180_000
+        );
+        assert_eq!(usage.cache_read_input_tokens, 160_000);
+        assert_eq!(usage.cache_creation_input_tokens, 20_000);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 20_000);
+        assert_eq!(
+            usage.total_input_tokens,
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn split_ratio_amplification_respects_threshold_and_soft_cap() {
+        let mut below = stable_segment_split(8_000, 1_000, 0.9);
+        below.amplification = Some(CacheAmplification::new(2.0, 0, 0, 0, 20_000, 0));
+        let usage = below.to_usage(10_000, 1);
+        assert_eq!(usage.total_input_tokens, 10_000, "低于放大门槛时不放大");
+
+        let mut capped = stable_segment_split(90_000, 0, 1.0);
+        capped.amplification = Some(CacheAmplification::new(3.0, 150_000, 0, 0, 0, 0));
+        let usage = capped.to_usage(100_000, 1);
+        assert_eq!(
+            usage.cache_read_input_tokens, 150_000,
+            "放大后总输入不超过软上限"
+        );
+        assert_eq!(usage.input_tokens, 0);
+    }
+
+    #[test]
+    fn split_ratio_amplification_does_not_create_cache_without_coverage() {
+        let mut simulation = stable_segment_split(0, 10_000, 0.0);
+        simulation.amplification = Some(CacheAmplification::new(3.0, 0, 0, 0, 0, 0));
+        let usage = simulation.to_usage(50_000, 1);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.input_tokens, 50_000);
+    }
+
+    #[test]
+    fn split_ratio_amplification_keeps_reported_input_range() {
+        let mut simulation =
+            CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
+                PromptCacheUsage {
+                    cache_creation_input_tokens: 10_000,
+                    cache_read_input_tokens: 80_000,
+                    cache_creation_5m_input_tokens: 10_000,
+                    cache_creation_1h_input_tokens: 0,
+                    effective_cache_ratio: Some(0.9),
+                },
+                32,
+                256,
+                7,
+            )
+            .unwrap();
+        simulation.amplification = Some(CacheAmplification::new(2.0, 0, 0, 0, 0, 0));
+        let usage = simulation.to_usage(100_000, 1);
+        assert!((32..=256).contains(&usage.input_tokens));
+        assert!(usage.cache_read_input_tokens >= 160_000);
+        assert_eq!(
+            usage.total_input_tokens,
+            usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn uplift_output_tokens_applies_threshold_and_cap() {
+        assert_eq!(uplift_output_tokens(500, 600, 200), 500);
+        assert_eq!(uplift_output_tokens(600, 600, 200), 600);
+        assert_eq!(uplift_output_tokens(1_000, 600, 200), 3_000);
+        assert_eq!(uplift_output_tokens(1_000, 0, 50), 1_500);
+        assert_eq!(uplift_output_tokens(1_000, 0, 0), 1_000);
+        assert_eq!(uplift_output_tokens(0, 0, 100), 0);
+        assert_eq!(
+            uplift_output_tokens(1_000, 0, 500),
+            3_000,
+            "放大比例上限 200%"
+        );
     }
 
     #[test]

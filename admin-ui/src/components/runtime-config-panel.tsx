@@ -2209,6 +2209,22 @@ function defaultStableSegmentPatch(): StableSegmentPatch {
     extendedTtlSecs: 3600,
     reportedInputMinTokens: 32,
     reportedInputMaxTokens: 256,
+    tokenScale: 1,
+    maxSimulatedInputTokens: 0,
+    capJitterMinTokens: 0,
+    capJitterMaxTokens: 0,
+    scaleMinInputTokens: 0,
+    outputUpliftPercent: 0,
+    outputUpliftMinTokens: 0,
+    finalCacheReadMaxTokens: 0,
+    finalCacheReadJitterMinTokens: 0,
+    finalCacheReadJitterMaxTokens: 0,
+    finalCacheCreationMaxTokens: 0,
+    finalCacheCreationJitterMinTokens: 0,
+    finalCacheCreationJitterMaxTokens: 0,
+    finalOutputMaxTokens: 0,
+    finalOutputJitterMinTokens: 0,
+    finalOutputJitterMaxTokens: 0,
   }
 }
 
@@ -2786,6 +2802,22 @@ function StableSegmentPolicyForm({
       <NumberField title="长 TTL" description="客户端标记 1 小时缓存时使用，不能小于默认 TTL。" value={merged.extendedTtlSecs ?? 3600} min={1} suffix="秒" onChange={set('extendedTtlSecs')} />
       <NumberField title="返回 input_tokens 最小值" description="扣除缓存部分后，返回给客户端的 input_tokens 不低于这个值。" value={merged.reportedInputMinTokens ?? 0} min={0} suffix="Token" onChange={set('reportedInputMinTokens')} />
       <NumberField title="返回 input_tokens 最大值" description="返回给客户端的 input_tokens 不高于这个值。0 表示不限制；大于 0 时不能小于最小值。" value={merged.reportedInputMaxTokens ?? 0} min={0} suffix="Token" onChange={set('reportedInputMaxTokens')} />
+      <NumberField title="读写放大倍数" description="真实总输入先乘这个倍数，再按片段覆盖比例归入读写；input 仍是真实的未覆盖部分。1 表示不放大，最大 3。" value={merged.tokenScale ?? 1} min={1} max={3} step={0.05} suffix="倍" onChange={set('tokenScale')} />
+      <NumberField title="读写放大门槛" description="真实总输入低于这个值时不放大。0 表示总是放大。" value={merged.scaleMinInputTokens ?? 0} min={0} suffix="Token" onChange={set('scaleMinInputTokens')} />
+      <NumberField title="放大后总输入上限" description="放大后的总输入超过这个值时按上限截断。0 表示不限制。" value={merged.maxSimulatedInputTokens ?? 0} min={0} suffix="Token" onChange={set('maxSimulatedInputTokens')} />
+      <NumberField title="放大上限扣减最小值" description="触到上限时额外扣减的最小量。" value={merged.capJitterMinTokens ?? 0} min={0} suffix="Token" onChange={set('capJitterMinTokens')} />
+      <NumberField title="放大上限扣减最大值" description="触到上限时额外扣减的最大量，实际不超过上限的 8%。" value={merged.capJitterMaxTokens ?? 0} min={0} suffix="Token" onChange={set('capJitterMaxTokens')} />
+      <NumberField title="output 放大比例" description="output 超过门槛时按这个比例放大，0 表示关闭，最大 200%。" value={merged.outputUpliftPercent ?? 0} min={0} max={200} suffix="%" onChange={set('outputUpliftPercent')} />
+      <NumberField title="output 放大门槛" description="output 超过这个值才放大。0 表示所有非零 output 都放大。" value={merged.outputUpliftMinTokens ?? 0} min={0} suffix="Token" onChange={set('outputUpliftMinTokens')} />
+      <NumberField title="读取最终上限" description="最终返回的读取不超过这个值。0 表示沿用默认 70 万。" value={merged.finalCacheReadMaxTokens ?? 0} min={0} suffix="Token" onChange={set('finalCacheReadMaxTokens')} />
+      <NumberField title="读取上限扣减最小值" description="读取触到上限时的扣减区间下限。" value={merged.finalCacheReadJitterMinTokens ?? 0} min={0} suffix="Token" onChange={set('finalCacheReadJitterMinTokens')} />
+      <NumberField title="读取上限扣减最大值" description="读取触到上限时的扣减区间上限。" value={merged.finalCacheReadJitterMaxTokens ?? 0} min={0} suffix="Token" onChange={set('finalCacheReadJitterMaxTokens')} />
+      <NumberField title="写入最终上限" description="最终返回的写入不超过这个值。0 表示沿用默认 40 万。" value={merged.finalCacheCreationMaxTokens ?? 0} min={0} suffix="Token" onChange={set('finalCacheCreationMaxTokens')} />
+      <NumberField title="写入上限扣减最小值" description="写入触到上限时的扣减区间下限。" value={merged.finalCacheCreationJitterMinTokens ?? 0} min={0} suffix="Token" onChange={set('finalCacheCreationJitterMinTokens')} />
+      <NumberField title="写入上限扣减最大值" description="写入触到上限时的扣减区间上限。" value={merged.finalCacheCreationJitterMaxTokens ?? 0} min={0} suffix="Token" onChange={set('finalCacheCreationJitterMaxTokens')} />
+      <NumberField title="output 最终上限" description="放大后的 output 不超过这个值。0 表示不限制。" value={merged.finalOutputMaxTokens ?? 0} min={0} suffix="Token" onChange={set('finalOutputMaxTokens')} />
+      <NumberField title="output 上限扣减最小值" description="output 触到上限时的扣减区间下限。" value={merged.finalOutputJitterMinTokens ?? 0} min={0} suffix="Token" onChange={set('finalOutputJitterMinTokens')} />
+      <NumberField title="output 上限扣减最大值" description="output 触到上限时的扣减区间上限。" value={merged.finalOutputJitterMaxTokens ?? 0} min={0} suffix="Token" onChange={set('finalOutputJitterMaxTokens')} />
       <ToggleField title="允许后续继续创建" description="命中已有缓存后，如果又出现新的稳定尾部，是否继续补创建。" checked={merged.incrementalCreateEnabled ?? true} onCheckedChange={set('incrementalCreateEnabled')} />
       <ToggleField title="缓存当前用户稳定前缀" description="默认关闭。开启后把当前用户消息的稳定前段也纳入缓存。" checked={merged.cacheCurrentUserStablePrefix ?? false} onCheckedChange={set('cacheCurrentUserStablePrefix')} />
       <ToggleField title="包含 tools" description="工具定义是否参与稳定内容计算。" checked={merged.includeTools ?? true} onCheckedChange={set('includeTools')} />

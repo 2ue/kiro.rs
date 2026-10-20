@@ -3746,6 +3746,56 @@ impl RequestUsageContext {
             .is_some_and(|simulation| simulation.cache_read_input_tokens > 0)
     }
 
+    /// 稳定片段缓存的最终上限守护。
+    ///
+    /// 读写上限未配置（0）时沿用默认上限（读取 70 万；写入 40 万、扣减 2 万~4.5 万），
+    /// output 上限未配置时不限。命中率整形按这组上限取值，整形和冷请求约束之后再按它收口，
+    /// 读写放大、命中率补读取都不会超过上限。
+    fn stable_segment_final_guard(&self) -> Option<super::cache::ReportedCacheUsagePolicy> {
+        if self.prompt_cache_strategy_type != PromptCacheStrategyType::StableSegmentCache {
+            return None;
+        }
+        let policy = self.stable_segment_cache_policy.normalized();
+        let mut guard = ReportedUsagePathPolicy::default();
+        if policy.final_cache_read_max_tokens > 0 {
+            guard.final_cache_read_max_tokens = policy.final_cache_read_max_tokens;
+            guard.final_cache_read_jitter_min_tokens = policy.final_cache_read_jitter_min_tokens;
+            guard.final_cache_read_jitter_max_tokens = policy.final_cache_read_jitter_max_tokens;
+        }
+        if policy.final_cache_creation_max_tokens > 0 {
+            guard.final_cache_creation_max_tokens = policy.final_cache_creation_max_tokens;
+            guard.final_cache_creation_jitter_min_tokens =
+                policy.final_cache_creation_jitter_min_tokens;
+            guard.final_cache_creation_jitter_max_tokens =
+                policy.final_cache_creation_jitter_max_tokens;
+        }
+        guard.output_uplift_percent = 0;
+        guard.final_output_guard_enabled = policy.final_output_max_tokens > 0;
+        guard.final_output_max_tokens = policy.final_output_max_tokens;
+        guard.final_output_jitter_min_tokens = policy.final_output_jitter_min_tokens;
+        guard.final_output_jitter_max_tokens = policy.final_output_jitter_max_tokens;
+        super::cache::ReportedCacheUsagePolicy::from_path_policy(guard, self.cache_hit_shaping.seed)
+    }
+
+    /// 命中率整形使用的上下限来源：路由有 reportedUsage 投影时用它，稳定片段缓存用自己的上限。
+    fn hit_shaping_reported_policy(&self) -> Option<super::cache::ReportedCacheUsagePolicy> {
+        self.reported_cache_usage_policy
+            .clone()
+            .or_else(|| self.stable_segment_final_guard())
+    }
+
+    /// 稳定片段缓存的最终收口：读写、output 按上限向下裁剪，收口之后不再改写。
+    fn apply_stable_segment_final_caps(
+        &self,
+        usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        let Some(guard) = self.stable_segment_final_guard() else {
+            return usage;
+        };
+        let usage = guard.apply_final_standard_cache_guards_for_standard_fields(usage);
+        guard.apply_final_output_guard_to_usage(usage)
+    }
+
     fn uses_local_prompt_cache_strategy(&self) -> bool {
         matches!(
             self.prompt_cache_strategy_type,
@@ -3777,7 +3827,8 @@ impl RequestUsageContext {
             return usage;
         }
 
-        default_standard_cache_field_guard()
+        self.stable_segment_final_guard()
+            .or_else(default_standard_cache_field_guard)
             .map(|guard| guard.apply_final_standard_cache_guards_for_standard_fields(usage))
             .unwrap_or(usage)
     }
@@ -4190,6 +4241,7 @@ impl CredentialUsageContext {
         let reported_usage = self
             .request
             .ensure_reported_usage_for_record(reported_usage, usage_source);
+        let reported_usage = self.apply_stable_segment_output_uplift(reported_usage);
         self.shape_final_cache_hit(reported_usage, controlled, raw)
     }
 
@@ -4213,7 +4265,28 @@ impl CredentialUsageContext {
             usage_source,
             raw_usage_to_reported_raw(raw_usage),
         );
+        let reported_usage = self.apply_stable_segment_output_uplift(reported_usage);
         self.shape_final_cache_hit(reported_usage, controlled, raw_usage)
+    }
+
+    /// 稳定片段缓存的 output 放大：在命中率 / 计费下限整形之前执行，计费下限按放大后的 output 计算。
+    fn apply_stable_segment_output_uplift(
+        &self,
+        mut usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        if self.request.prompt_cache_strategy_type != PromptCacheStrategyType::StableSegmentCache {
+            return usage;
+        }
+        let policy = self.request.stable_segment_cache_policy.normalized();
+        if !policy.uplifts_output() {
+            return usage;
+        }
+        usage.output_tokens = super::cache::uplift_output_tokens(
+            usage.output_tokens,
+            policy.output_uplift_min_tokens,
+            policy.output_uplift_percent,
+        );
+        usage
     }
 
     /// Kiro-RS Tool Plus：放大 → 写入频次控制 → 上下限 / 计费下限。
@@ -4296,6 +4369,7 @@ impl CredentialUsageContext {
         }
         let shaped = self.shape_final_cache_hit_ratio(reported_usage, controlled, raw_usage);
         let constrained = self.constrain_cold_reported_usage(shaped, raw_usage);
+        let constrained = self.request.apply_stable_segment_final_caps(constrained);
         self.record_final_creation_adjustment(controlled, constrained);
         constrained
     }
@@ -4481,7 +4555,7 @@ impl CredentialUsageContext {
             return reported_usage;
         }
         let creation_allowed = self.creation_allowed_after_control(controlled);
-        let reported_policy = self.request.reported_cache_usage_policy.clone();
+        let reported_policy = self.request.hit_shaping_reported_policy();
         self.request.cache_hit_shaping.apply(
             reported_usage,
             CacheHitShapingRequest {
@@ -5723,6 +5797,25 @@ fn prompt_cache_scope_conversation_id(
     }
 }
 
+/// 稳定片段缓存的读写放大：只在 `tokenScale > 1` 时生效。放大只作用于下游上报的读写，
+/// 片段追踪提交的仍是真实片段。
+fn stable_segment_cache_amplification(
+    policy: StableSegmentCachePolicy,
+    seed: u64,
+) -> Option<super::cache::CacheAmplification> {
+    let policy = policy.normalized();
+    policy.amplifies_cache().then(|| {
+        super::cache::CacheAmplification::new(
+            policy.token_scale,
+            policy.max_simulated_input_tokens,
+            policy.cap_jitter_min_tokens,
+            policy.cap_jitter_max_tokens,
+            policy.scale_min_input_tokens,
+            seed,
+        )
+    })
+}
+
 fn build_simulated_usage(
     simulation_mode: PromptCacheSimulationMode,
     conversation_id: Option<&str>,
@@ -5819,7 +5912,12 @@ fn prepare_credential_usage_context(
                 policy.reported_input_min_tokens,
                 policy.reported_input_max_tokens,
                 plan.cache_jitter_seed(),
-            );
+            )
+            .map(|mut simulation| {
+                simulation.amplification =
+                    stable_segment_cache_amplification(policy, plan.cache_jitter_seed());
+                simulation
+            });
         usage_context.simulated_usage = simulated_usage;
         usage_context.simulated_source = simulated_usage.map(|_| UsageSource::LocalPromptCache);
         usage_context.stable_segment_prompt_cache_plan = Some(plan);
@@ -8705,7 +8803,7 @@ impl StreamContextTemplate {
                     return credential_usage
                         .shape_bounded_final_usage(preview, preview, raw, false);
                 }
-                let reported_policy = credential_usage.request.reported_cache_usage_policy.clone();
+                let reported_policy = credential_usage.request.hit_shaping_reported_policy();
                 let shaped = credential_usage.request.cache_hit_shaping.apply(
                     preview,
                     CacheHitShapingRequest {
@@ -8718,7 +8816,10 @@ impl StreamContextTemplate {
                         reported_policy: reported_policy.as_ref(),
                     },
                 );
-                credential_usage.constrain_cold_reported_usage(shaped, raw)
+                let constrained = credential_usage.constrain_cold_reported_usage(shaped, raw);
+                credential_usage
+                    .request
+                    .apply_stable_segment_final_caps(constrained)
             });
         (ctx, initial_events)
     }

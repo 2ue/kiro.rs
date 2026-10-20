@@ -265,6 +265,22 @@ function defaultStableSegmentPatch(): StableSegmentPatch {
     extendedTtlSecs: 3600,
     reportedInputMinTokens: 32,
     reportedInputMaxTokens: 256,
+    tokenScale: 1,
+    maxSimulatedInputTokens: 0,
+    capJitterMinTokens: 0,
+    capJitterMaxTokens: 0,
+    scaleMinInputTokens: 0,
+    outputUpliftPercent: 0,
+    outputUpliftMinTokens: 0,
+    finalCacheReadMaxTokens: 0,
+    finalCacheReadJitterMinTokens: 0,
+    finalCacheReadJitterMaxTokens: 0,
+    finalCacheCreationMaxTokens: 0,
+    finalCacheCreationJitterMinTokens: 0,
+    finalCacheCreationJitterMaxTokens: 0,
+    finalOutputMaxTokens: 0,
+    finalOutputJitterMinTokens: 0,
+    finalOutputJitterMaxTokens: 0,
   }
 }
 
@@ -1355,6 +1371,152 @@ function StableSegmentPolicyForm({
             min={0}
             suffix="Token"
             onChange={set('reportedInputMaxTokens')}
+          />
+        </TwoCol>
+      </ParameterGroup>
+
+      <ParameterGroup title="读写放大">
+        <TwoCol>
+          <NumField
+            label="放大倍数"
+            desc="真实总输入先乘这个倍数，再按片段覆盖比例归入读写；input 仍是真实的未覆盖部分。1 表示不放大，最大 3。"
+            value={merged.tokenScale ?? 1}
+            min={1}
+            max={3}
+            step={0.05}
+            suffix="倍"
+            onChange={set('tokenScale')}
+          />
+          <NumField
+            label="放大门槛"
+            desc="真实总输入低于这个值时不放大。0 表示总是放大。"
+            value={merged.scaleMinInputTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('scaleMinInputTokens')}
+          />
+          <NumField
+            label="放大后总输入上限"
+            desc="放大后的总输入超过这个值时按上限截断。0 表示不限制。"
+            value={merged.maxSimulatedInputTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('maxSimulatedInputTokens')}
+          />
+          <NumField
+            label="上限扣减最小值"
+            desc="触到上限时额外扣减的最小量，避免每次都等于上限。"
+            value={merged.capJitterMinTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('capJitterMinTokens')}
+          />
+          <NumField
+            label="上限扣减最大值"
+            desc="触到上限时额外扣减的最大量，实际不超过上限的 8%。"
+            value={merged.capJitterMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('capJitterMaxTokens')}
+          />
+        </TwoCol>
+      </ParameterGroup>
+
+      <ParameterGroup title="output 放大">
+        <TwoCol>
+          <NumField
+            label="放大比例"
+            desc="output 超过门槛时按这个比例放大，0 表示关闭，最大 200%。"
+            value={merged.outputUpliftPercent ?? 0}
+            min={0}
+            max={200}
+            suffix="%"
+            onChange={set('outputUpliftPercent')}
+          />
+          <NumField
+            label="放大门槛"
+            desc="output 超过这个值才放大。0 表示所有非零 output 都放大。"
+            value={merged.outputUpliftMinTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('outputUpliftMinTokens')}
+          />
+        </TwoCol>
+      </ParameterGroup>
+
+      <ParameterGroup title="最终上限">
+        <TwoCol>
+          <NumField
+            label="读取上限"
+            desc="最终返回的 cache_read_input_tokens 不超过这个值。0 表示沿用默认 70 万。"
+            value={merged.finalCacheReadMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalCacheReadMaxTokens')}
+          />
+          <NumField
+            label="读取上限扣减最小值"
+            desc="读取触到上限时的扣减区间下限。"
+            value={merged.finalCacheReadJitterMinTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalCacheReadJitterMinTokens')}
+          />
+          <NumField
+            label="读取上限扣减最大值"
+            desc="读取触到上限时的扣减区间上限。"
+            value={merged.finalCacheReadJitterMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalCacheReadJitterMaxTokens')}
+          />
+          <NumField
+            label="写入上限"
+            desc="最终返回的 cache_creation_input_tokens 不超过这个值。0 表示沿用默认 40 万。"
+            value={merged.finalCacheCreationMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalCacheCreationMaxTokens')}
+          />
+          <NumField
+            label="写入上限扣减最小值"
+            desc="写入触到上限时的扣减区间下限。"
+            value={merged.finalCacheCreationJitterMinTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalCacheCreationJitterMinTokens')}
+          />
+          <NumField
+            label="写入上限扣减最大值"
+            desc="写入触到上限时的扣减区间上限。"
+            value={merged.finalCacheCreationJitterMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalCacheCreationJitterMaxTokens')}
+          />
+          <NumField
+            label="output 上限"
+            desc="放大后的 output 不超过这个值。0 表示不限制。"
+            value={merged.finalOutputMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalOutputMaxTokens')}
+          />
+          <NumField
+            label="output 上限扣减最小值"
+            desc="output 触到上限时的扣减区间下限。"
+            value={merged.finalOutputJitterMinTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalOutputJitterMinTokens')}
+          />
+          <NumField
+            label="output 上限扣减最大值"
+            desc="output 触到上限时的扣减区间上限。"
+            value={merged.finalOutputJitterMaxTokens ?? 0}
+            min={0}
+            suffix="Token"
+            onChange={set('finalOutputJitterMaxTokens')}
           />
         </TwoCol>
       </ParameterGroup>
