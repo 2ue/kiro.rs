@@ -1584,6 +1584,40 @@ export interface ChunkedWritePromptSteeringConfig {
 export interface PromptSteeringDefaults {
   languageConstraintPrompt: string
   taskQualityPrompt: string
+  identityPrompt: string
+  identityTurnReminderPrompt: string
+}
+
+export interface IdentityTurnReminderConfig {
+  enabled: boolean
+  prompt: string
+}
+
+export interface IdentityOutputGuardConfig {
+  enabled: boolean
+  streamEnabled: boolean
+}
+
+export interface IdentityRouteOverride {
+  enabled?: boolean
+  promptEnabled?: boolean
+  turnReminderEnabled?: boolean
+  outputGuardEnabled?: boolean
+  outputGuardStreamEnabled?: boolean
+  applyToExternalPool?: boolean
+}
+
+export interface IdentityPromptConfig {
+  enabled: boolean
+  routeMode: PromptSteeringRouteMode
+  routeRules: string[]
+  promptEnabled: boolean
+  prompt: string
+  turnReminder: IdentityTurnReminderConfig
+  outputGuard: IdentityOutputGuardConfig
+  applyToExternalPool: boolean
+  claudeModelsOnly: boolean
+  pathOverrides: Record<string, IdentityRouteOverride>
 }
 
 export interface PromptSteeringConfig {
@@ -1599,6 +1633,7 @@ export interface PromptSteeringConfig {
   chunkedWrite: ChunkedWritePromptSteeringConfig
   thinking: PromptSteeringToggle
   custom: PromptSteeringTextBlock
+  identity: IdentityPromptConfig
 }
 
 export interface PayloadShapingConfig {

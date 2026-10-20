@@ -171,6 +171,19 @@ export function defaultPromptSteering(): PromptSteeringConfig {
     chunkedWrite: { enabled: true, systemPromptEnabled: true, toolDescriptionEnabled: true },
     thinking: { enabled: true },
     custom: { enabled: false, prompt: '' },
+    // Identity masking is off by default; empty prompts are filled with the backend defaults.
+    identity: {
+      enabled: false,
+      routeMode: 'allow_all',
+      routeRules: [],
+      promptEnabled: true,
+      prompt: '',
+      turnReminder: { enabled: true, prompt: '' },
+      outputGuard: { enabled: true, streamEnabled: true },
+      applyToExternalPool: false,
+      claudeModelsOnly: false,
+      pathOverrides: {},
+    },
   }
 }
 
@@ -192,10 +205,20 @@ export function normalizePromptSteering(input?: Partial<PromptSteeringConfig> | 
     chunkedWrite: { ...defaults.chunkedWrite, ...(input?.chunkedWrite ?? {}) },
     thinking: { ...defaults.thinking, ...(input?.thinking ?? {}) },
     custom: { ...defaults.custom, ...(input?.custom ?? {}) },
+    identity: {
+      ...defaults.identity,
+      ...(input?.identity ?? {}),
+      turnReminder: { ...defaults.identity.turnReminder, ...(input?.identity?.turnReminder ?? {}) },
+      outputGuard: { ...defaults.identity.outputGuard, ...(input?.identity?.outputGuard ?? {}) },
+      routeRules: Array.from(new Set((input?.identity?.routeRules ?? []).map((rule) => rule.trim()).filter(Boolean))),
+      pathOverrides: { ...(input?.identity?.pathOverrides ?? {}) },
+    },
   }
   next.languageConstraint.prompt = next.languageConstraint.prompt.trim()
   next.taskQuality.prompt = next.taskQuality.prompt.trim()
   next.custom.prompt = next.custom.prompt.trim()
+  next.identity.prompt = next.identity.prompt.trim()
+  next.identity.turnReminder.prompt = next.identity.turnReminder.prompt.trim()
   return next
 }
 

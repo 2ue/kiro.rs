@@ -12395,20 +12395,18 @@ fn extract_session_id_from_metadata_user_id(user_id: &str) -> Option<String> {
     Some(uuid.to_string())
 }
 
+/// Response headers relayed from an external pool upstream.
+///
+/// This is an allowlist: provider-specific headers (`server`, `cf-ray`, `x-amzn-*`, upstream
+/// request ids, organization ids, ...) would fingerprint the serving channel, so only the content
+/// headers needed to read the body and the standard Anthropic retry / rate-limit headers pass.
+/// Request ids are always replaced with this proxy's own ids afterwards.
 fn should_forward_response_header(name: &HeaderName) -> bool {
     let lower = name.as_str().to_ascii_lowercase();
-    !matches!(
+    matches!(
         lower.as_str(),
-        "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "upgrade"
-    )
+        "content-type" | "content-encoding" | "cache-control" | "retry-after" | "x-should-retry"
+    ) || lower.starts_with("anthropic-ratelimit-")
 }
 
 fn success_response_headers_look_like_html(headers: &HeaderMap) -> bool {

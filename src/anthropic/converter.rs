@@ -627,6 +627,10 @@ fn convert_request_with_model_id(
         content.push_str("\n\n");
         content.push_str(&reminder);
     }
+    if let Some(reminder) = options.prompt_steering.identity.turn_reminder_text() {
+        content.push_str("\n\n");
+        content.push_str(reminder);
+    }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -1687,7 +1691,7 @@ mod tests {
         let before = reverse_map.clone();
         let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
             .expect_err("raw-vs-mapped collision must be rejected");
-        assert!(error.to_string().contains("same Kiro tool name"));
+        assert!(error.to_string().contains("same normalized tool name"));
         assert_eq!(reverse_map, before, "reverse map commit must be atomic");
     }
 
@@ -1708,7 +1712,7 @@ mod tests {
             let error = convert_tools(&tools, &None, &mut reverse_map, ConverterOptions::default())
                 .expect_err("hash collision must be rejected instead of silently skipping a tool");
 
-            assert!(error.to_string().contains("same Kiro tool name"));
+            assert!(error.to_string().contains("same normalized tool name"));
             assert!(reverse_map.is_empty());
         }
     }
@@ -4481,6 +4485,46 @@ mod tests {
         assert!(
             current_message_content(&repeated_prompt_result)
                 .ends_with("<language_reminder>简体中文/简体中文</language_reminder>")
+        );
+    }
+
+    #[test]
+    fn identity_turn_reminder_is_appended_last_even_when_steering_is_off() {
+        let req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
+        let baseline = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+
+        let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
+        options.prompt_steering.identity.enabled = true;
+        let result = convert_request_with_options(&req, options.clone()).unwrap();
+        let content = current_message_content(&result);
+        assert!(
+            content.ends_with(crate::model::config::DEFAULT_IDENTITY_TURN_REMINDER),
+            "identity reminder must be the last instruction in the turn: {content}"
+        );
+        assert!(content.contains("<language_reminder>"));
+        assert!(content.find("<language_reminder>") < content.find("<identity_reminder>"));
+
+        // The steering master switch only gates operator steering, not identity masking.
+        let mut steering_off = ConverterOptions::default();
+        steering_off.prompt_steering.enabled = false;
+        steering_off.prompt_steering.identity.enabled = true;
+        let result = convert_request_with_options(&req, steering_off).unwrap();
+        assert_eq!(
+            current_message_content(&result),
+            format!(
+                "{}\n\n{}",
+                current_message_content(&baseline),
+                crate::model::config::DEFAULT_IDENTITY_TURN_REMINDER
+            )
+        );
+
+        let mut reminder_off = ConverterOptions::default();
+        reminder_off.prompt_steering.identity.enabled = true;
+        reminder_off.prompt_steering.identity.turn_reminder.enabled = false;
+        let result = convert_request_with_options(&req, reminder_off).unwrap();
+        assert_eq!(
+            current_message_content(&result),
+            current_message_content(&baseline)
         );
     }
 

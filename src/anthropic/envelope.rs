@@ -39,6 +39,11 @@ pub(crate) fn public_rate_limit_message(retry_after_secs: Option<u64>) -> String
     }
 }
 
+/// Public text for an upstream error body.
+///
+/// Only the human-readable `message` is relayed, with known provider prefixes removed. Upstream
+/// `reason` / `code` values are channel-specific identifiers (for example
+/// `CONTENT_LENGTH_EXCEEDS_THRESHOLD`), so they stay in the logs and are never appended.
 pub(crate) fn kiro_official_upstream_message(raw: &str) -> Option<String> {
     let value = extract_json_value(raw)?;
     let message = json_string_at(
@@ -51,28 +56,23 @@ pub(crate) fn kiro_official_upstream_message(raw: &str) -> Option<String> {
             "/error",
         ],
     )?;
-    let mut message = normalize_public_upstream_text(message)?;
-    if let Some(reason) = json_string_at(
-        &value,
-        &[
-            "/reason",
-            "/Reason",
-            "/error/reason",
-            "/error/Reason",
-            "/code",
-            "/Code",
-            "/error/code",
-            "/error/Code",
-        ],
-    )
-    .and_then(normalize_public_upstream_text)
-    .filter(|reason| !message.contains(reason))
-    {
-        message.push_str(" (reason: ");
-        message.push_str(&reason);
-        message.push(')');
-    }
+    let message = normalize_public_upstream_text(strip_provider_message_prefix(message))?;
     Some(truncate_public_upstream_message(&message))
+}
+
+/// Provider wrappers that prefix the real message, e.g. `Bedrock error message: ...`.
+fn strip_provider_message_prefix(message: &str) -> &str {
+    const PREFIXES: &[&str] = &["bedrock error message:", "bedrock error:"];
+    let trimmed = message.trim_start();
+    PREFIXES
+        .iter()
+        .find_map(|prefix| {
+            trimmed
+                .get(..prefix.len())
+                .filter(|head| head.eq_ignore_ascii_case(prefix))
+                .map(|_| trimmed[prefix.len()..].trim_start())
+        })
+        .unwrap_or(trimmed)
 }
 
 fn extract_json_value(raw: &str) -> Option<Value> {
@@ -116,9 +116,15 @@ fn normalize_public_upstream_text(raw: &str) -> Option<String> {
     Some(text)
 }
 
+/// Whether proxy-generated text can be shown to clients verbatim; it must not name the serving
+/// channel or internal machinery. Callers fall back to a generic public message otherwise.
+pub(crate) fn public_text_is_safe(message: &str) -> bool {
+    !public_upstream_message_has_forbidden_content(message)
+}
+
 fn public_upstream_message_has_forbidden_content(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    [
+    let substring_hit = [
         "kiro",
         "credential",
         "external pool",
@@ -130,6 +136,15 @@ fn public_upstream_message_has_forbidden_content(message: &str) -> bool {
         "client secret",
         "refresh token",
         "access token",
+        // Channel identity: the serving platform must not be inferable from relayed text.
+        "amazon",
+        "amazonaws",
+        "bedrock",
+        "codewhisperer",
+        "q developer",
+        "arn:",
+        "profilearn",
+        "profile_arn",
         "账号 #",
         "凭据",
         "凭证",
@@ -137,7 +152,29 @@ fn public_upstream_message_has_forbidden_content(message: &str) -> bool {
         "调度",
     ]
     .iter()
-    .any(|needle| lower.contains(needle))
+    .any(|needle| lower.contains(needle));
+    // Short or ambiguous terms are matched as whole words so ordinary text ("laws", "draws",
+    // "q") is not rejected.
+    substring_hit
+        || lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .any(|word| matches!(word, "aws" | "sigv4" | "q_developer"))
+        || message_contains_upstream_reason_code(message)
+}
+
+/// Upstream reason codes are SCREAMING_SNAKE_CASE identifiers such as
+/// `MONTHLY_REQUEST_COUNT`; a message that embeds one is channel-identifying.
+fn message_contains_upstream_reason_code(message: &str) -> bool {
+    message
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|word| {
+            word.len() >= 8
+                && word.contains('_')
+                && word
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+                && word.chars().any(|ch| ch.is_ascii_uppercase())
+        })
 }
 
 fn truncate_public_upstream_message(message: &str) -> String {
@@ -447,12 +484,54 @@ mod tests {
         )
         .expect("official message");
 
-        assert_eq!(
-            message,
-            "Bedrock error message: Could not process image (reason: IMAGE_FORMAT_UNSUPPORTED)"
-        );
+        assert_eq!(message, "Could not process image");
         assert!(!message.contains("账号"));
         assert!(!message.contains("test"));
+        assert!(!message.to_ascii_lowercase().contains("bedrock"));
+        assert!(!message.contains("IMAGE_FORMAT_UNSUPPORTED"));
+    }
+
+    #[test]
+    fn kiro_official_upstream_message_hides_channel_identifying_text() {
+        for raw in [
+            r#"{"message":"Amazon Q could not complete the request"}"#,
+            r#"{"message":"Request failed for arn:aws:codewhisperer:us-east-1:123:profile/X"}"#,
+            r#"{"message":"Error calling https://q.us-east-1.amazonaws.com"}"#,
+            r#"{"message":"CodeWhisperer streaming failed"}"#,
+            r#"{"message":"Bedrock rejected this request"}"#,
+            r#"{"message":"AWS service error"}"#,
+            r#"{"message":"Input exceeds CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+            r#"{"message":"Monthly limit reached: MONTHLY_REQUEST_COUNT"}"#,
+        ] {
+            assert!(
+                kiro_official_upstream_message(raw).is_none(),
+                "channel-identifying upstream text must not be relayed: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_official_upstream_message_keeps_ordinary_wording() {
+        for (raw, expected) in [
+            (
+                r#"{"message":"Improperly formed request.","reason":"INVALID_INPUT_FORMAT"}"#,
+                "Improperly formed request.",
+            ),
+            (
+                r#"{"message":"The draws and laws in this image could not be read"}"#,
+                "The draws and laws in this image could not be read",
+            ),
+            (
+                r#"{"message":"Bedrock error: Input is too long for requested model."}"#,
+                "Input is too long for requested model.",
+            ),
+        ] {
+            assert_eq!(
+                kiro_official_upstream_message(raw).as_deref(),
+                Some(expected),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

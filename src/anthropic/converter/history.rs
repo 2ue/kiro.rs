@@ -484,7 +484,7 @@ fn set_native_reasoning_content(
 ) -> Result<(), ConversionError> {
     if current.is_some() {
         return Err(ConversionError::UnsupportedContent(
-            "assistant history contains multiple or mixed native reasoning blocks; Kiro accepts one reasoningContent union value per assistant message"
+            "assistant history contains multiple or mixed native reasoning blocks; only one reasoning block per assistant message is supported"
                 .to_string(),
         ));
     }

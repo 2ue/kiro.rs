@@ -6380,7 +6380,14 @@ impl AdminService {
             .map_err(AdminServiceError::InvalidCredential)?;
         let prompt_steering_chars = prompt_steering.language_constraint.prompt.chars().count()
             + prompt_steering.task_quality.prompt.chars().count()
-            + prompt_steering.custom.prompt.chars().count();
+            + prompt_steering.custom.prompt.chars().count()
+            + prompt_steering.identity.prompt.chars().count()
+            + prompt_steering
+                .identity
+                .turn_reminder
+                .prompt
+                .chars()
+                .count();
         if prompt_steering_chars > 20_000 {
             return Err(AdminServiceError::InvalidCredential(
                 "promptSteering 提示词总长度不能大于 20000 字符".to_string(),

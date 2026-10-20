@@ -1233,10 +1233,12 @@ async fn upstream_too_long_errors_map_to_prompt_is_too_long_for_five_rounds() {
                 StatusCode::BAD_REQUEST,
                 "round {round}: {raw}"
             );
-            assert_eq!(
-                response.headers()["x-kiro-too-long-kind"],
-                kind,
-                "round {round}"
+            assert!(
+                response
+                    .headers()
+                    .keys()
+                    .all(|name| !name.as_str().contains("kiro")),
+                "round {round} ({kind}): response headers must not name the channel"
             );
             assert_eq!(
                 response.headers()["x-error-id"],
@@ -8622,6 +8624,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-limit".to_string()),
         request_api_key_id: None,
@@ -8738,6 +8741,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-dfcache-tool".to_string()),
         request_api_key_id: None,
@@ -8832,6 +8836,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-upstream-raw-limit".to_string()),
         request_api_key_id: None,
@@ -8931,6 +8936,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-prod-like".to_string()),
         request_api_key_id: None,
@@ -9065,6 +9071,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("context-estimate-session".to_string()),
         request_api_key_id: None,
@@ -9149,6 +9156,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("conversation-kiro-strategy".to_string()),
         request_api_key_id: None,
@@ -9297,6 +9305,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-latency".to_string()),
         request_api_key_id: None,
@@ -9637,6 +9646,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-policy".to_string()),
         request_api_key_id: None,
@@ -9812,6 +9822,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-creation-policy".to_string()),
         request_api_key_id: None,
@@ -9922,6 +9933,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-error".to_string()),
         request_api_key_id: None,
@@ -10012,6 +10024,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-large-failure".to_string()),
         request_api_key_id: None,
@@ -10416,7 +10429,8 @@ async fn official_kiro_upstream_400_message_is_exposed_without_internal_prefix()
         .expect("error message");
 
     assert!(message.contains("Invalid tool use format."));
-    assert!(message.contains("REQUEST_BODY_INVALID"));
+    // Upstream reason codes are channel-specific and stay in the logs.
+    assert!(!message.contains("REQUEST_BODY_INVALID"));
     assert!(message.contains("error ID: req_01official"));
     assert!(!message.contains("账号"));
     assert!(!message.contains("secret-user"));
@@ -10479,8 +10493,9 @@ async fn official_kiro_bad_request_message_is_exposed_when_safe() {
         .and_then(|v| v.as_str())
         .expect("error message");
 
-    assert!(message.contains("Bedrock error message: Could not process image"));
-    assert!(message.contains("IMAGE_FORMAT_UNSUPPORTED"));
+    assert!(message.starts_with("Could not process image"));
+    assert!(!message.to_ascii_lowercase().contains("bedrock"));
+    assert!(!message.contains("IMAGE_FORMAT_UNSUPPORTED"));
     assert!(message.contains("error ID: req_01official_bad_request"));
     assert!(!message.contains("hidden@example.com"));
     assert!(!message.contains("凭据"));
@@ -10514,7 +10529,7 @@ async fn official_kiro_high_load_message_is_exposed_when_safe() {
         .expect("error message");
 
     assert!(message.contains("Encountered unexpectedly high load"));
-    assert!(message.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
+    assert!(!message.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
     assert!(message.contains("error ID: req_01official_high_load"));
     assert!(!message.contains("账号 #157"));
     assert!(!message.contains("hidden"));
@@ -10826,6 +10841,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-a".to_string()),
         request_api_key_id: None,
@@ -10928,6 +10944,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         stop_sequences: Vec::new(),
         omit_thinking_display: false,
         strip_injected_control_blocks: false,
+        identity_output_guard: false,
         downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id: Some("session-high-cache".to_string()),
         request_api_key_id: None,
@@ -14623,4 +14640,54 @@ fn hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round() {
         saw_suppressed,
         "scenario should exercise creation control suppression"
     );
+}
+
+#[test]
+fn claude_only_listing_keeps_claude_ids_and_aliases() {
+    for id in [
+        "claude-opus-4-6",
+        "claude-sonnet-4-5",
+        "Claude-Haiku-4-5",
+        "opus",
+        "sonnet",
+        "haiku",
+    ] {
+        assert!(is_listed_claude_model(id), "{id} should stay listed");
+    }
+    for id in [
+        "deepseek-3.2",
+        "glm-5",
+        "minimax-m2.5",
+        "qwen3-coder-next",
+        "auto",
+    ] {
+        assert!(!is_listed_claude_model(id), "{id} should be hidden");
+    }
+}
+
+#[test]
+fn conversion_errors_never_name_the_channel() {
+    for message in [
+        "multiple tool definitions resolve to the same Kiro tool name",
+        "profileArn is missing for this request",
+        "CodeWhisperer rejected the tool schema",
+    ] {
+        let response =
+            conversion_error_response(&ConversionError::UnsupportedContent(message.to_string()));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), 64 * 1024))
+                .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let text = value["error"]["message"].as_str().unwrap();
+        assert_eq!(text, envelope::PUBLIC_INVALID_REQUEST_MESSAGE, "{message}");
+    }
+
+    let safe = "messages: at least one message is required";
+    let response =
+        conversion_error_response(&ConversionError::UnsupportedContent(safe.to_string()));
+    let body =
+        futures::executor::block_on(axum::body::to_bytes(response.into_body(), 64 * 1024)).unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["error"]["message"], safe);
 }

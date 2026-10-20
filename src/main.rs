@@ -1284,11 +1284,9 @@ fn create_health_router(state: Arc<AppHealthState>) -> Router {
         .with_state(state)
 }
 
+/// Unauthenticated liveness probe; it deliberately does not name the service.
 async fn healthz() -> Json<Value> {
-    Json(json!({
-        "status": "ok",
-        "service": "kiro-rs"
-    }))
+    Json(json!({ "status": "ok" }))
 }
 
 async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {

@@ -30,10 +30,12 @@ import {
   defaultReportedUsage,
   emptyRuntimeConfig,
   normalizeCachePolicy,
+  normalizePromptSteering,
   normalizeReportedUsage,
 } from '@/lib/runtime-config-defaults'
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
-import type { CachePolicyConfig, CacheRoutePolicyPatch, RuntimeConfig } from '@/types/api'
+import type { CachePolicyConfig, CacheRoutePolicyPatch, IdentityPromptConfig, IdentityRouteOverride, RuntimeConfig } from '@/types/api'
+import { identitySummary, RouteIdentityEditor } from './route-identity-editor'
 import {
   buildDefinedCacheRoute,
   cachePolicyForStrategyTemplate,
@@ -60,6 +62,7 @@ type PathEditorState = {
   prefix: string
   policy: CacheRoutePolicyPatch
   definedRoutes: string[]
+  identity: IdentityRouteOverride
 }
 
 type TemplateEditorState = {
@@ -118,7 +121,32 @@ function hydrateRuntimeConfig(config: RuntimeConfig): RuntimeConfig {
     reportedUsage: normalizeReportedUsage(config.reportedUsage ?? defaultReportedUsage()),
     cachePolicy: normalizeCachePolicy(config.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(config.definedCacheRoutes ?? []),
+    promptSteering: normalizePromptSteering(config.promptSteering),
   }
+}
+
+/** Identity override stored for a route prefix, accepting both "/x" and "/x/" keys. */
+function identityOverrideForPrefix(identity: IdentityPromptConfig, prefix: string): IdentityRouteOverride {
+  const canonical = canonicalCachePolicyPath(prefix)
+  const entry = Object.entries(identity.pathOverrides ?? {}).find(([key]) => canonicalCachePolicyPath(key) === canonical)
+  return entry ? { ...entry[1] } : {}
+}
+
+function withIdentityOverride(
+  config: RuntimeConfig,
+  oldPrefix: string | null,
+  nextPrefix: string | null,
+  override: IdentityRouteOverride | null,
+): RuntimeConfig['promptSteering'] {
+  const identity = config.promptSteering.identity
+  const pathOverrides: Record<string, IdentityRouteOverride> = {}
+  for (const [key, value] of Object.entries(identity.pathOverrides ?? {})) {
+    const canonical = canonicalCachePolicyPath(key)
+    if (canonical === oldPrefix || canonical === nextPrefix) continue
+    pathOverrides[key] = value
+  }
+  if (nextPrefix && override && Object.keys(override).length > 0) pathOverrides[nextPrefix] = override
+  return { ...config.promptSteering, identity: { ...identity, pathOverrides } }
 }
 
 function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
@@ -334,6 +362,7 @@ function TemplateCard({
 function PathCard({
   prefix,
   policy,
+  identityBadges,
   builtIn,
   registered,
   onEdit,
@@ -341,6 +370,7 @@ function PathCard({
 }: {
   prefix: string
   policy: CacheRoutePolicyPatch
+  identityBadges: string[]
   builtIn: boolean
   registered: boolean
   onEdit: () => void
@@ -365,6 +395,9 @@ function PathCard({
       <CardContent className="mt-auto pt-1">
         <div className="flex flex-wrap gap-2">
           {pathSummary(policy).map((item) => <Badge key={item} size="xs" tone="neutral">{item}</Badge>)}
+          {identityBadges.map((item) => (
+            <Badge key={item} size="xs" tone={item === '身份隐藏关' ? 'neutral' : 'info'}>{item}</Badge>
+          ))}
         </div>
       </CardContent>
     </Card>
@@ -396,10 +429,11 @@ export function CachePoliciesPage() {
       ...Object.keys(cachePolicy.pathOverrides ?? {}).map(canonicalCachePolicyPath),
       ...Object.keys(workingConfig.reportedUsage.pathOverrides ?? {}).map(canonicalCachePolicyPath),
       ...definedRoutes.map(canonicalCachePolicyPath),
+      ...Object.keys(workingConfig.promptSteering.identity.pathOverrides ?? {}).map(canonicalCachePolicyPath),
     ])).sort(routeOrder)
   }, [cachePolicy.pathOverrides, definedRoutes, workingConfig])
 
-  const persist = async (nextConfig: RuntimeConfig, successMessage = '缓存策略已保存，新请求立即生效') => {
+  const persist = async (nextConfig: RuntimeConfig, successMessage = '路由策略已保存，新请求立即生效') => {
     const normalized = hydrateRuntimeConfig({
       ...nextConfig,
       highCacheThreshold: Math.max(0, Math.floor(nextConfig.highCacheThreshold || 0)),
@@ -452,6 +486,7 @@ export function CachePoliciesPage() {
       prefix,
       policy: mergedPathPolicy(prefix),
       definedRoutes: [...workingConfig.definedCacheRoutes],
+      identity: identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
     })
   }
 
@@ -462,6 +497,7 @@ export function CachePoliciesPage() {
       prefix: '/dfcache/',
       policy: { cacheType: 'no_cache' },
       definedRoutes: [...definedRoutes],
+      identity: {},
     })
   }
 
@@ -503,6 +539,7 @@ export function CachePoliciesPage() {
       cachePolicy: normalizeCachePolicy(nextCachePolicy),
       reportedUsage: normalizeReportedUsage(nextReportedUsage),
       definedCacheRoutes: nextDefinedRoutes,
+      promptSteering: withIdentityOverride(workingConfig, oldPrefix, nextPrefix, pathEditor.identity),
     })
     if (saved) setPathEditor(null)
   }
@@ -510,8 +547,8 @@ export function CachePoliciesPage() {
   const deletePath = async (prefix: string) => {
     if (!workingConfig) return
     const confirmed = await confirm({
-      title: '删除缓存策略？',
-      message: `确认删除路径 ${prefix} 的缓存策略吗？对应的路径覆盖、Usage 覆盖和 /dfcache 注册都会被清理。`,
+      title: '删除路由策略？',
+      message: `确认删除路径 ${prefix} 的路由策略吗？对应的缓存覆盖、Usage 覆盖、身份隐藏覆盖和 /dfcache 注册都会被清理。`,
       confirmText: '确认删除',
       cancelText: '取消',
       tone: 'danger',
@@ -531,7 +568,8 @@ export function CachePoliciesPage() {
       cachePolicy: normalizeCachePolicy(nextCachePolicy),
       reportedUsage: normalizeReportedUsage(nextReportedUsage),
       definedCacheRoutes: normalizeDefinedCacheRoutes(nextDefinedRoutes),
-    }, '路径策略已删除')
+      promptSteering: withIdentityOverride(workingConfig, normalizedPrefix, null, null),
+    }, '路由策略已删除')
     if (saved && pathEditor?.originalPrefix === prefix) setPathEditor(null)
   }
 
@@ -540,32 +578,32 @@ export function CachePoliciesPage() {
     await persist({ ...workingConfig, highCacheThreshold: threshold }, '缓存命中阈值已保存')
   }
 
-  if (runtimeConfig.isLoading || !workingConfig) return <LoadingState text="加载缓存策略..." />
+  if (runtimeConfig.isLoading || !workingConfig) return <LoadingState text="加载路由策略..." />
   if (runtimeConfig.error) return <ErrorState message={extractErrorMessage(runtimeConfig.error)} />
 
   return (
     <PageContainer className="pb-24">
       <PageHeader
-        title="缓存策略"
-        subtitle="把默认模板、路径覆盖和 /dfcache 路由集中在一处管理"
+        title="路由策略"
+        subtitle="按路由分别管理缓存策略和身份隐藏，默认模板、路径覆盖和 /dfcache 路由集中在一处"
         actions={
           <Button onClick={openNewPathEditor}>
             <Plus />
-            新增路径策略
+            新增路由
           </Button>
         }
       />
 
       <StatGrid min="12rem">
         <StatCard title="默认策略模板" value={TEMPLATE_META.length} desc="每种策略分别维护自己的参数" icon={<WandSparkles />} tone="primary" />
-        <StatCard title="路径策略" value={paths.length} desc="包含内置路径和自定义覆盖" icon={<Route />} tone="info" />
+        <StatCard title="路由" value={paths.length} desc="包含内置路由和自定义覆盖" icon={<Route />} tone="info" />
         <StatCard title="/dfcache 路由" value={definedRoutes.length} desc="已注册的自定义入口" icon={<Database />} tone="success" />
         <StatCard title="命中判定阈值" value={formatTokens(workingConfig.highCacheThreshold)} desc="后台统计高缓存命中的 Token 阈值" icon={<Info />} tone="warning" />
       </StatGrid>
 
       <SectionCard
         title="默认策略模板"
-        description="路径选择策略后，会先读取对应模板；路径弹窗里可以再配置独立覆盖。"
+        description="路由选择缓存策略后，会先读取对应模板；路由弹窗里可以再配置独立覆盖。"
         icon={<WandSparkles />}
       >
         <div className="grid gap-4 xl:grid-cols-2">
@@ -576,8 +614,8 @@ export function CachePoliciesPage() {
       </SectionCard>
 
       <SectionCard
-        title="路径策略"
-        description="内置路径不能删除；自定义路径通过 /dfcache/{name} 管理。编辑和新增都在弹窗中完成。"
+        title="路由"
+        description="每个路由独立配置缓存策略和身份隐藏。内置路由不能删除；自定义路由通过 /dfcache/{name} 管理。"
         icon={<Route />}
         actions={<Button variant="outline" size="sm" onClick={openNewPathEditor}><Plus />新增路径</Button>}
       >
@@ -589,6 +627,11 @@ export function CachePoliciesPage() {
                 key={prefix}
                 prefix={prefix}
                 policy={mergedPathPolicy(prefix)}
+                identityBadges={identitySummary(
+                  workingConfig.promptSteering.identity,
+                  prefix,
+                  identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
+                )}
                 builtIn={isBuiltInPrefix(prefix)}
                 registered={Boolean(normalizedRoute && definedRoutes.includes(normalizedRoute))}
                 onEdit={() => openPathEditor(prefix)}
@@ -651,15 +694,15 @@ export function CachePoliciesPage() {
       {pathEditor && (
         <ModalShell
           open
-          title={pathEditor.mode === 'new' ? '新增路径策略' : `编辑路径策略 · ${pathEditor.originalPrefix}`}
-          description="路径、策略类型和策略参数会一起保存；关闭弹窗不会提交草稿。"
+          title={pathEditor.mode === 'new' ? '新增路由策略' : `编辑路由策略 · ${pathEditor.originalPrefix}`}
+          description="路径、缓存策略和身份隐藏会一起保存；关闭弹窗不会提交草稿。"
           width="max-w-5xl"
           noBodyPadding
           onClose={() => { if (!updateConfig.isPending) setPathEditor(null) }}
           footer={
             <>
               <Button variant="outline" onClick={() => setPathEditor(null)} disabled={updateConfig.isPending}><X />取消</Button>
-              <Button onClick={() => void savePath()} disabled={updateConfig.isPending}><Check />保存路径策略</Button>
+              <Button onClick={() => void savePath()} disabled={updateConfig.isPending}><Check />保存路由策略</Button>
             </>
           }
         >
@@ -694,6 +737,14 @@ export function CachePoliciesPage() {
                 return { ...current, definedRoutes: routes }
               })}
             />
+            <div className="mt-8 border-t pt-6">
+              <RouteIdentityEditor
+                prefix={canonicalCachePolicyPath(normalizeCachePolicyPath(pathEditor.prefix) ?? pathEditor.prefix)}
+                identity={workingConfig.promptSteering.identity}
+                value={pathEditor.identity}
+                onChange={(identity) => setPathEditor((current) => current ? { ...current, identity } : current)}
+              />
+            </div>
           </div>
         </ModalShell>
       )}

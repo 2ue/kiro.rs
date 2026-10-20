@@ -85,7 +85,7 @@ fn should_retry_local_conversion_after_reasoning_shaping(error: &ConversionError
     matches!(
         message.as_str(),
         "consecutive assistant messages contain multiple native reasoning blocks and cannot be merged losslessly"
-            | "assistant history contains multiple or mixed native reasoning blocks; Kiro accepts one reasoningContent union value per assistant message"
+            | "assistant history contains multiple or mixed native reasoning blocks; only one reasoning block per assistant message is supported"
             | "assistant history mixes native signed/redacted reasoning with unsigned thinking and cannot be represented losslessly"
     )
 }
@@ -171,6 +171,17 @@ pub(super) fn payload_has_documents(payload: &MessagesRequest) -> bool {
         })
 }
 
+/// Prompt steering for one local request with the identity settings resolved for its route, so
+/// the converter's identity turn reminder only applies on routes identity masking is bound to.
+fn prompt_steering_for_route(
+    config: &crate::model::config::PromptSteeringConfig,
+    endpoint: &str,
+) -> crate::model::config::PromptSteeringConfig {
+    let mut config = config.clone().normalized();
+    config.identity = config.identity.for_route(endpoint);
+    config
+}
+
 fn language_turn_reminder_for_payload(
     endpoint: &str,
     compat_profile: CompatProfile,
@@ -246,7 +257,7 @@ pub(super) fn prepare_with_plan(
         force_visible_thinking: should_force_visible_thinking(payload, runtime_config),
         explicit_reasoning_request: false,
         native_reasoning_capability,
-        prompt_steering: runtime_config.prompt_steering.clone().normalized(),
+        prompt_steering: prompt_steering_for_route(&runtime_config.prompt_steering, endpoint),
         language_turn_reminder: language_turn_reminder.clone(),
     };
     // Historical thinking is discarded before conversion for every request when the configured
