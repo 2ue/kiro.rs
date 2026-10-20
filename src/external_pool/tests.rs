@@ -2573,6 +2573,53 @@ fn stream_response_headers_disable_proxy_buffering() {
 }
 
 #[test]
+fn forwarded_response_headers_drop_provider_fingerprints() {
+    let mut upstream_headers = HeaderMap::new();
+    for (name, value) in [
+        ("content-type", "application/json"),
+        ("retry-after", "3"),
+        ("anthropic-ratelimit-requests-remaining", "10"),
+        ("server", "cloudflare"),
+        ("cf-ray", "abc123-SJC"),
+        ("x-amzn-requestid", "1f2e3d"),
+        ("x-amzn-errortype", "ThrottlingException"),
+        ("anthropic-organization-id", "org-upstream"),
+        ("x-request-id", "upstream-request-id"),
+        ("request-id", "req_upstream"),
+        ("via", "1.1 upstream-gateway"),
+    ] {
+        upstream_headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+
+    let mut builder = Response::builder().status(StatusCode::OK);
+    apply_forwarded_response_headers(&mut builder, &upstream_headers, "req_01local");
+    let response = builder.body(()).expect("response should build");
+    let headers = response.headers();
+
+    assert_eq!(headers["content-type"], "application/json");
+    assert_eq!(headers["retry-after"], "3");
+    assert_eq!(headers["anthropic-ratelimit-requests-remaining"], "10");
+    assert_eq!(headers["request-id"], "req_01local");
+    for dropped in [
+        "server",
+        "cf-ray",
+        "x-amzn-requestid",
+        "x-amzn-errortype",
+        "anthropic-organization-id",
+        "x-request-id",
+        "via",
+    ] {
+        assert!(
+            !headers.contains_key(dropped),
+            "{dropped} must not be relayed"
+        );
+    }
+}
+
+#[test]
 fn external_pool_coordinator_breaker_uses_bounded_exponential_backoff() {
     let breaker = ExternalPoolCoordinatorBreaker::default();
     let expected = [1, 2, 4, 8, 16, 30, 30, 30];

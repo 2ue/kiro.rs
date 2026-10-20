@@ -20,6 +20,7 @@ const CONTROL_TAG_NAMES: &[&str] = &[
     "<max_thinking_length>",
     "<thinking_output_policy>",
     "<language_reminder>",
+    "<identity_reminder>",
 ];
 const MAX_LENGTH_OPEN: &str = "<max_thinking_length>";
 const MAX_LENGTH_CLOSE: &str = "</max_thinking_length>";
@@ -28,6 +29,8 @@ const MAX_LENGTH_DIGITS: usize = 10;
 const LANGUAGE_REMINDER_OPEN: &str = "<language_reminder>";
 const LANGUAGE_REMINDER_CLOSE: &str = "</language_reminder>";
 const LANGUAGE_REMINDER_MAX_BYTES: usize = 1024;
+const IDENTITY_REMINDER_OPEN: &str = "<identity_reminder>";
+const IDENTITY_REMINDER_CLOSE: &str = "</identity_reminder>";
 
 /// 代理可能注入的全部固定控制块（逐字）。
 fn literal_blocks() -> &'static [String] {
@@ -96,17 +99,26 @@ fn find_max_length_block(text: &str) -> Option<(usize, usize)> {
 
 /// 在 `text[from..]` 中查找长度不超过 1024 字节的完整语言提醒块。
 fn find_language_reminder_block(text: &str) -> Option<(usize, usize)> {
+    find_bounded_tag_block(text, LANGUAGE_REMINDER_OPEN, LANGUAGE_REMINDER_CLOSE)
+}
+
+/// 身份提醒块与语言提醒同样按标签和长度识别。
+fn find_identity_reminder_block(text: &str) -> Option<(usize, usize)> {
+    find_bounded_tag_block(text, IDENTITY_REMINDER_OPEN, IDENTITY_REMINDER_CLOSE)
+}
+
+fn find_bounded_tag_block(text: &str, open: &str, close: &str) -> Option<(usize, usize)> {
     let mut search = 0;
-    while let Some(rel) = text[search..].find(LANGUAGE_REMINDER_OPEN) {
+    while let Some(rel) = text[search..].find(open) {
         let start = search + rel;
-        let content_start = start + LANGUAGE_REMINDER_OPEN.len();
-        if let Some(close_rel) = text[content_start..].find(LANGUAGE_REMINDER_CLOSE) {
-            let end = content_start + close_rel + LANGUAGE_REMINDER_CLOSE.len();
+        let content_start = start + open.len();
+        if let Some(close_rel) = text[content_start..].find(close) {
+            let end = content_start + close_rel + close.len();
             if end - start <= LANGUAGE_REMINDER_MAX_BYTES {
                 return Some((start, end));
             }
         }
-        search = start + LANGUAGE_REMINDER_OPEN.len();
+        search = start + open.len();
     }
     None
 }
@@ -121,6 +133,7 @@ fn find_control_block(text: &str) -> Option<(usize, usize)> {
         })
         .chain(find_max_length_block(text))
         .chain(find_language_reminder_block(text))
+        .chain(find_identity_reminder_block(text))
         .min_by_key(|(start, _)| *start)
 }
 
@@ -162,12 +175,16 @@ fn is_partial_control_block(candidate: &str) -> bool {
     {
         return true;
     }
-    if LANGUAGE_REMINDER_OPEN.starts_with(candidate) {
-        return true;
-    }
-    if let Some(after_open) = candidate.strip_prefix(LANGUAGE_REMINDER_OPEN) {
-        return candidate.len() <= LANGUAGE_REMINDER_MAX_BYTES
-            && !after_open.contains(LANGUAGE_REMINDER_CLOSE);
+    for (open, close) in [
+        (LANGUAGE_REMINDER_OPEN, LANGUAGE_REMINDER_CLOSE),
+        (IDENTITY_REMINDER_OPEN, IDENTITY_REMINDER_CLOSE),
+    ] {
+        if open.starts_with(candidate) {
+            return true;
+        }
+        if let Some(after_open) = candidate.strip_prefix(open) {
+            return candidate.len() <= LANGUAGE_REMINDER_MAX_BYTES && !after_open.contains(close);
+        }
     }
     if MAX_LENGTH_OPEN.starts_with(candidate) {
         return true;
@@ -488,6 +505,29 @@ mod tests {
     #[test]
     fn streaming_removes_language_reminder_split_byte_by_byte() {
         let text = "before<language_reminder>Respond in Chinese</language_reminder>after";
+        let mut cleaner = ControlBlockCleaner::new();
+        let mut out = cleaner.apply(vec![SseEvent::new(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        )]);
+        for byte in text.bytes() {
+            out.extend(cleaner.apply(vec![delta(&String::from_utf8(vec![byte]).unwrap())]));
+        }
+        out.extend(cleaner.apply(vec![SseEvent::new(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        )]));
+        assert_eq!(collect_text(&out), "beforeafter");
+    }
+
+    #[test]
+    fn echoed_identity_reminder_is_removed_in_both_paths() {
+        let text = format!(
+            "before{}after",
+            crate::model::config::DEFAULT_IDENTITY_TURN_REMINDER
+        );
+        assert_eq!(strip_control_blocks(&text), "beforeafter");
+
         let mut cleaner = ControlBlockCleaner::new();
         let mut out = cleaner.apply(vec![SseEvent::new(
             "content_block_start",

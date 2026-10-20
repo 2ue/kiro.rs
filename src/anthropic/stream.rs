@@ -1745,6 +1745,7 @@ pub struct StreamContext {
     tool_name_text_restorer: Option<super::tool_name_restore::ToolNameTextRestorer>,
     /// 清洗正文中复述的代理注入控制块（`<thinking_mode>` 等）。
     control_block_cleaner: Option<super::control_block_cleaner::ControlBlockCleaner>,
+    identity_guard: Option<super::identity_guard::IdentityGuard>,
 }
 
 impl StreamContext {
@@ -1928,6 +1929,7 @@ impl StreamContext {
             omit_thinking_display: false,
             tool_name_text_restorer,
             control_block_cleaner: None,
+            identity_guard: None,
         }
     }
 
@@ -1961,9 +1963,20 @@ impl StreamContext {
             enabled.then(super::control_block_cleaner::ControlBlockCleaner::new);
     }
 
+    /// Enables the identity output guard; `fallback` is sent when every sentence is removed.
+    pub fn set_identity_guard(&mut self, fallback: Option<&str>) {
+        self.identity_guard = fallback.map(super::identity_guard::IdentityGuard::new);
+    }
+
     fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
         let events = match self.control_block_cleaner.as_mut() {
             Some(cleaner) => cleaner.apply(events),
+            None => events,
+        };
+        // After control-block cleanup so echoed reminder tags are gone, before tool-name
+        // restoration and stop sequences so those see the final text.
+        let events = match self.identity_guard.as_mut() {
+            Some(guard) => guard.apply(events),
             None => events,
         };
         let events = match self.tool_name_text_restorer.as_mut() {
@@ -2741,7 +2754,15 @@ impl StreamContext {
             };
         }
         let Some(error_id) = self.stream_error_id.as_deref() else {
-            return raw_message;
+            if envelope::public_text_is_safe(&raw_message) {
+                return raw_message;
+            }
+            return match error_type {
+                "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
+                "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+                _ => envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            }
+            .to_string();
         };
         let public_message = match error_type {
             "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
@@ -4327,6 +4348,42 @@ mod tests {
 
         assert_eq!(run(true), "Template:\nDone.");
         assert!(run(false).contains("<thinking_output_policy>"));
+    }
+
+    #[test]
+    fn identity_guard_removes_leaks_from_the_real_stream_path() {
+        let leaked = "你说得对，我是 Kiro，一个 AI 驱动的开发环境。我可以帮你写代码。";
+        let run = |guard: bool| {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            ctx.set_strip_injected_control_blocks(true);
+            ctx.set_identity_guard(guard.then_some("I'm Claude."));
+            let mut events = ctx.generate_initial_events();
+            for chunk in leaked.chars().collect::<Vec<_>>().chunks(3) {
+                let chunk: String = chunk.iter().collect();
+                events.extend(ctx.process_kiro_event(&Event::AssistantResponse(
+                    assistant_response_event(&chunk, None),
+                )));
+            }
+            events.extend(ctx.generate_final_events());
+            let serialized = events
+                .iter()
+                .map(SseEvent::to_sse_string)
+                .collect::<String>();
+            let text = events
+                .iter()
+                .filter(|event| event.data["delta"]["type"] == "text_delta")
+                .filter_map(|event| event.data["delta"]["text"].as_str())
+                .collect::<String>();
+            (text, serialized)
+        };
+
+        let (text, serialized) = run(true);
+        assert_eq!(text, "我可以帮你写代码。");
+        assert!(!serialized.to_lowercase().contains("kiro"));
+        assert!(serialized.contains("message_stop"));
+
+        let (unguarded, _) = run(false);
+        assert_eq!(unguarded, leaked);
     }
 
     #[test]

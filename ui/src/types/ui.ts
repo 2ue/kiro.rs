@@ -76,7 +76,7 @@ export const navPages: NavPage[] = [
 
   // 设置域
   { key: 'runtime', path: 'runtime', label: '运行', description: '调度、限流、冷却、缓存、兼容', icon: SlidersHorizontal, domain: 'settings' },
-  { key: 'cachePolicies', path: 'cache-policies', label: '缓存策略', description: '管理默认策略和路径覆盖', icon: Zap, domain: 'settings' },
+  { key: 'cachePolicies', path: 'cache-policies', label: '路由策略', description: '按路由管理缓存策略和身份隐藏', icon: Zap, domain: 'settings' },
   { key: 'models', path: 'models', label: '模型', description: '模型能力与价格目录', icon: ModelsIcon, domain: 'settings' },
   { key: 'security', path: 'security', label: '安全', description: 'Admin Key、客户端接入 Key', icon: ShieldCheck, domain: 'settings' },
 ]
@@ -95,7 +95,7 @@ export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   externalPoolRisk: { title: '外部池风控', subtitle: '检查外部池缓存分布与成本风险' },
   audit: { title: '审计', subtitle: '关键操作与变更记录' },
   runtime: { title: '运行配置', subtitle: '调度、限流、冷却、缓存与兼容策略' },
-  cachePolicies: { title: '缓存策略', subtitle: '按默认模板和请求路径管理缓存行为' },
+  cachePolicies: { title: '路由策略', subtitle: '按路由管理缓存策略和身份隐藏' },
   models: { title: '模型', subtitle: '模型能力与价格目录,支持同步与手动维护' },
   security: { title: '安全', subtitle: 'Admin Key 与客户端接入 Key 管理' },
 }

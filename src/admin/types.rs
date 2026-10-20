@@ -7,11 +7,12 @@ use crate::anthropic::usage::UsageRecord;
 use crate::kiro::token_manager::CredentialIdentitySnapshot;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
-    DEFAULT_LANGUAGE_CONSTRAINT_PROMPT, DEFAULT_TASK_QUALITY_PROMPT, ExternalPoolsConfig,
-    ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
-    PromptCacheCreationControlConfig, PromptSteeringConfig, ReportedUsageConfig,
-    RequestAdmissionConfig, ThinkingTriggerMode, WeightedCapacityConfig,
+    DEFAULT_IDENTITY_PROMPT, DEFAULT_IDENTITY_TURN_REMINDER, DEFAULT_LANGUAGE_CONSTRAINT_PROMPT,
+    DEFAULT_TASK_QUALITY_PROMPT, ExternalPoolsConfig, ImageProcessingConfig, KiroAgentModeStrategy,
+    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PayloadShapingConfigPatch, PromptCacheCreationControlConfig,
+    PromptSteeringConfig, ReportedUsageConfig, RequestAdmissionConfig, ThinkingTriggerMode,
+    WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -1755,6 +1756,8 @@ pub struct TokenRefreshAdmissionRuntimeResponse {
 pub struct PromptSteeringDefaults {
     pub language_constraint_prompt: &'static str,
     pub task_quality_prompt: &'static str,
+    pub identity_prompt: &'static str,
+    pub identity_turn_reminder_prompt: &'static str,
 }
 
 impl Default for PromptSteeringDefaults {
@@ -1762,6 +1765,8 @@ impl Default for PromptSteeringDefaults {
         Self {
             language_constraint_prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim(),
             task_quality_prompt: DEFAULT_TASK_QUALITY_PROMPT.trim(),
+            identity_prompt: DEFAULT_IDENTITY_PROMPT.trim(),
+            identity_turn_reminder_prompt: DEFAULT_IDENTITY_TURN_REMINDER.trim(),
         }
     }
 }

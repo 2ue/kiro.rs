@@ -425,7 +425,8 @@ fn allocate_selected_tool_names(
                     "拒绝歧义工具名映射"
                 );
                 return Err(ConversionError::UnsupportedContent(
-                    "multiple tool definitions resolve to the same Kiro tool name".to_string(),
+                    "multiple tool definitions resolve to the same normalized tool name"
+                        .to_string(),
                 ));
             }
         }
