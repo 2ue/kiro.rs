@@ -605,6 +605,10 @@ pub struct MessagesRequest {
     pub thinking: Option<Thinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+    /// Deprecated top-level structured output format (`structured-outputs-2025-11-13` beta);
+    /// served like `output_config.format`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<serde_json::Value>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,

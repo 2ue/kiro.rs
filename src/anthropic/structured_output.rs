@@ -4,10 +4,12 @@
 //! whose input is the final answer. The response side turns that tool call back into one plain
 //! `text` block holding the JSON, with `stop_reason: end_turn`, the shape the official API returns.
 //!
-//! - Without client tools the internal tool is forced (`tool_choice: tool`), and text the model
-//!   writes before the call is dropped so the text content parses as JSON.
-//! - With client tools the model chooses between them and the internal tool (`tool_choice` is
-//!   left as the client sent it), matching the official behavior where a tool call may come first.
+//! - Without callable client tools the internal tool is forced (`tool_choice: tool`).
+//! - With client tools the model must either call one of them or give the structured answer
+//!   (`auto` / `any` become `any`), matching the official behavior where a tool call may come
+//!   first and any final answer conforms to the schema. A client `tool_choice: tool` is kept.
+//! - When the answer is the structured call, text written before it is dropped so the text
+//!   content parses as JSON; when a client tool is called, that text is kept.
 
 use std::collections::HashMap;
 
@@ -24,14 +26,19 @@ const TOOL_DESCRIPTION: &str = "Return the final answer to the user. The input o
 pub(crate) struct StructuredOutputTarget {
     /// Client-facing name of the internal tool.
     pub(crate) tool_name: String,
-    /// The tool was forced because the client offered no tools: preamble text is dropped.
+    /// The internal tool was forced because no client tool can be called this turn.
     pub(crate) forced: bool,
 }
 
 /// Returns the request to convert and the response target when the request asks for structured
 /// output. `None` keeps the request unchanged (no `format`, or a format this path cannot serve).
 pub(crate) fn plan(payload: &MessagesRequest) -> Option<(MessagesRequest, StructuredOutputTarget)> {
-    let format = payload.output_config.as_ref()?.format.as_ref()?;
+    // `output_config.format` wins; the deprecated top-level `output_format` is the fallback.
+    let format = payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.format.as_ref())
+        .or(payload.output_format.as_ref())?;
     if format.get("type").and_then(Value::as_str) != Some("json_schema") {
         tracing::debug!("output_config.format without json_schema type is ignored");
         return None;
@@ -47,7 +54,12 @@ pub(crate) fn plan(payload: &MessagesRequest) -> Option<(MessagesRequest, Struct
         .flatten()
         .filter(|tool| tool.tool_type.is_none() || tool.input_schema.contains_key("type"))
         .collect();
-    let forced = client_tools.is_empty();
+    let client_choice = payload
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str);
+    let forced = client_tools.is_empty() || client_choice == Some("none");
     let tool_name = unused_tool_name(payload);
 
     let mut request = payload.clone();
@@ -66,6 +78,16 @@ pub(crate) fn plan(payload: &MessagesRequest) -> Option<(MessagesRequest, Struct
     });
     if forced {
         request.tool_choice = Some(json!({"type": "tool", "name": tool_name}));
+    } else if client_choice != Some("tool") {
+        // A final answer must be the structured call; keep disable_parallel_tool_use.
+        let mut choice = payload
+            .tool_choice
+            .as_ref()
+            .filter(|choice| choice.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        choice["type"] = json!("any");
+        request.tool_choice = Some(choice);
     }
     Some((request, StructuredOutputTarget { tool_name, forced }))
 }
@@ -103,27 +125,28 @@ pub(crate) fn rewrite_content(
         .position(|block| is_target_tool_block(block, target))?;
     let input = content[position].get("input").cloned().unwrap_or(json!({}));
     let text = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+    let has_client_tool_use = content.iter().any(|block| {
+        block.get("type").and_then(Value::as_str) == Some("tool_use")
+            && !is_target_tool_block(block, target)
+    });
     content[position] = json!({"type": "text", "text": text});
 
     let mut index = 0;
     content.retain(|block| {
+        let is_text = block.get("type").and_then(Value::as_str) == Some("text");
         let keep = index == position
-            || !(is_target_tool_block(block, target)
-                || (target.forced && block.get("type").and_then(Value::as_str) == Some("text")));
+            || !(is_target_tool_block(block, target) || (!has_client_tool_use && is_text));
         index += 1;
         keep
     });
-    let has_client_tool_use = content
-        .iter()
-        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
     (!has_client_tool_use).then_some("end_turn")
 }
 
 /// Streaming counterpart of [`rewrite_content`].
 ///
-/// The internal tool block becomes a text block whose deltas are the tool input JSON. In forced
-/// mode, text blocks are held back until the stream shows whether the structured call arrives:
-/// they are dropped when it does and released otherwise. Block indexes are renumbered so the
+/// The internal tool block becomes a text block whose deltas are the tool input JSON. Text blocks
+/// are held back until the stream shows what follows them: they are dropped when the structured
+/// call arrives and released when a client tool call or the end of the message does. Block indexes are renumbered so the
 /// client always sees contiguous indexes.
 #[derive(Debug)]
 pub(crate) struct StructuredOutputStreamRewriter {
@@ -135,7 +158,7 @@ pub(crate) struct StructuredOutputStreamRewriter {
     structured_index: Option<i64>,
     structured_seen: bool,
     client_tool_seen: bool,
-    /// Held text blocks (forced mode): upstream index and their events, in order.
+    /// Held text blocks: upstream index and their events, in order.
     held: Vec<(i64, Vec<SseEvent>)>,
     held_indexes: Vec<i64>,
 }
@@ -194,8 +217,8 @@ impl StructuredOutputStreamRewriter {
                     }
                     self.client_tool_seen = true;
                 }
-                if self.target.forced
-                    && !self.structured_seen
+                if !self.structured_seen
+                    && !self.client_tool_seen
                     && block.get("type").and_then(Value::as_str) == Some("text")
                 {
                     self.held_indexes.push(index);
@@ -329,7 +352,35 @@ mod tests {
         assert!(!target.forced);
         assert_eq!(target.tool_name, "structured_output_1");
         assert_eq!(converted.tools.expect("tools").len(), 2);
-        assert_eq!(converted.tool_choice, original.tool_choice);
+        assert_eq!(converted.tool_choice, Some(json!({"type": "any"})));
+
+        let mut named = original.clone();
+        named.tool_choice = Some(json!({"type": "tool", "name": "structured_output"}));
+        assert_eq!(plan(&named).unwrap().0.tool_choice, named.tool_choice);
+        let mut none = original.clone();
+        none.tool_choice = Some(json!({"type": "none"}));
+        let (converted, target) = plan(&none).unwrap();
+        assert!(target.forced);
+        assert_eq!(
+            converted.tool_choice,
+            Some(json!({"type": "tool", "name": "structured_output_1"}))
+        );
+        let mut parallel = original.clone();
+        parallel.tool_choice = Some(json!({"type": "auto", "disable_parallel_tool_use": true}));
+        assert_eq!(
+            plan(&parallel).unwrap().0.tool_choice,
+            Some(json!({"type": "any", "disable_parallel_tool_use": true}))
+        );
+    }
+
+    #[test]
+    fn plan_accepts_the_deprecated_top_level_output_format() {
+        let mut req = schema_request(None);
+        let format = req.output_config.take().unwrap().format;
+        req.output_format = format;
+        let (converted, target) = plan(&req).expect("structured plan");
+        assert!(target.forced);
+        assert_eq!(converted.tools.expect("tools")[0].name, "structured_output");
     }
 
     #[test]
@@ -359,6 +410,24 @@ mod tests {
         assert_eq!(content[1]["type"], "text");
         let parsed: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed, json!({"name": "Ada", "age": 36}));
+    }
+
+    #[test]
+    fn non_stream_choice_mode_drops_preamble_when_the_answer_is_structured() {
+        let target = StructuredOutputTarget {
+            tool_name: "structured_output".to_string(),
+            forced: false,
+        };
+        let mut content = vec![
+            json!({"type": "text", "text": "Here you go:"}),
+            json!({"type": "tool_use", "id": "toolu_01d", "name": "structured_output",
+                   "input": {"name": "Ada"}}),
+        ];
+        assert_eq!(rewrite_content(&mut content, &target), Some("end_turn"));
+        assert_eq!(
+            content,
+            vec![json!({"type": "text", "text": "{\"name\":\"Ada\"}"})]
+        );
     }
 
     #[test]

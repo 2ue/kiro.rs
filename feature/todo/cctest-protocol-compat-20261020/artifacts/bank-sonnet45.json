@@ -1,0 +1,806 @@
+{
+ "tool_forced_text": [
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_h1bbC3KF2KuOFbdG5EAQLC",
+     "name": "get_weather",
+     "input": {
+      "location": "Exampleville-44c2db3c",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 3.0,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_OpVN1F4YbO74BG70uFmV5r",
+     "name": "get_weather",
+     "input": {
+      "location": "Exampleville-44c2db3c",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.2,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_lQE6znWvWau3MgpJT5KmpT",
+     "name": "get_weather",
+     "input": {
+      "location": "Exampleville-44c2db3c",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.3,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_mylLrmfIPEKiMckFZGexkp",
+     "name": "get_weather",
+     "input": {
+      "location": "Exampleville-44c2db3c",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.5,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_NEGtgf89X536D98cCthXn4",
+     "name": "get_weather",
+     "input": {
+      "location": "Exampleville-44c2db3c",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.3,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_O1MCx66VZZLrNBkhcstZ6k",
+     "name": "get_weather",
+     "input": {
+      "location": "Exampleville-44c2db3c",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.4,
+   "stream": true
+  }
+ ],
+ "tool_choice_tool": [
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_AusTe2zeBxSnhOslcKtjej",
+     "name": "get_weather",
+     "input": {
+      "location": "Paris"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.3,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_G5ACpeAzDJRtV1lKPjkqga",
+     "name": "get_weather",
+     "input": {
+      "location": "Paris"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.1,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_TMJwRIJwSiCtkdI3YFiskc",
+     "name": "get_weather",
+     "input": {
+      "location": "Paris"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.0,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_sRKfyoddsp4OsmNHZOseYe",
+     "name": "get_weather",
+     "input": {
+      "location": "Paris"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.0,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_5yw8JIkgQycKRDv06ln2MW",
+     "name": "get_weather",
+     "input": {
+      "location": "Paris"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.0,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_LZDGZJHG0hOg15wdOnyDj0",
+     "name": "get_weather",
+     "input": {
+      "location": "Paris"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 1.8,
+   "stream": true
+  }
+ ],
+ "tool_choice_any": [
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_3UpcDk1vziDwtkRGfXIY1V",
+     "name": "get_weather",
+     "input": {
+      "location": "Tokyo",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.1,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_AKcmLfbHtPlTXu2LuI6Ln4",
+     "name": "get_weather",
+     "input": {
+      "location": "Tokyo",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.2,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_ag35t53GsM98SiqMI1Q1IJ",
+     "name": "get_weather",
+     "input": {
+      "location": "Tokyo",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.2,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_HMsBDGgQ4si1xeoRskQhNL",
+     "name": "get_weather",
+     "input": {
+      "location": "Tokyo",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 3.4,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_hkoJjnTpRfs2GwOhmfeDTb",
+     "name": "get_weather",
+     "input": {
+      "location": "Tokyo",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.3,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_A9Y5nwjMMLDbTL3jnItLZB",
+     "name": "get_weather",
+     "input": {
+      "location": "Tokyo",
+      "unit": "celsius"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.3,
+   "stream": true
+  }
+ ],
+ "cutoff_ym": [
+  {
+   "status": 200,
+   "text": "2024-10",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.8,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "2024-10",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.7,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "2024-10",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "2024-10",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.7,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "2024-10",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.6,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "2024-10",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.8,
+   "stream": true
+  }
+ ],
+ "cutoff_month": [
+  {
+   "status": 200,
+   "text": "October 2023",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.1,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "October 2023",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.8,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "October 2023",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "October 2023",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "October 2023",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "October 2023",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": true
+  }
+ ],
+ "context_window": [
+  {
+   "status": 200,
+   "text": "200000",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "200000",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "200000",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "200000",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.8,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "200000",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "200000",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.1,
+   "stream": true
+  }
+ ],
+ "recent_events": [
+  {
+   "status": 200,
+   "text": "1|I don't know\n2|I don't know\n3|I don't know\n4|I don't know",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.2,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "1|I don't know\n2|I don't know\n3|I don't know\n4|I don't know",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "1|I don't know\n2|I don't know\n3|I don't know\n4|I don't know",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "1|I don't know\n2|I don't know\n3|I don't know\n4|I don't know",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.1,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "1|I don't know\n2|I don't know\n3|I don't know\n4|I don't know",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.4,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "1|I don't know\n2|I don't know\n3|I don't know\n4|I don't know",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": true
+  }
+ ],
+ "provider": [
+  {
+   "status": 200,
+   "text": "Anthropic Claude",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "Anthropic Claude",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.6,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "Anthropic Claude",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 3.3,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "Anthropic Claude",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.8,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "Anthropic Claude",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.7,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "Anthropic Claude",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.7,
+   "stream": true
+  }
+ ],
+ "echo_token": [
+  {
+   "status": 200,
+   "text": "f4cc28bc301ba0c0",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.6,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "f4cc28bc301ba0c0",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.6,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "f4cc28bc301ba0c0",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.9,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "f4cc28bc301ba0c0",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.8,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "f4cc28bc301ba0c0",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.7,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "f4cc28bc301ba0c0",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 1.8,
+   "stream": true
+  }
+ ],
+ "echo_tag": [
+  {
+   "status": 200,
+   "text": "我在你的消息中看到的tag是：`<dc85d48fe73185ec>`",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.3,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "我没有在之前的对话中看到 `<dc85d48fe73185ec>` 这个标签。你刚才是第一次输入这个标签。\n\n在此之前的对话中，我只看到了系统提示词中的各种 XML 标签，比如 `<identity>`、`<capabilities>`、`<response_style>` 等，但没有看到你提到的这个特定标签。",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 3.7,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "我看到的tag是：`<dc85d48fe73185ec>`",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.1,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "我在你的消息中看到的tag是：`<dc85d48fe73185ec>`\n\n这是你刚才输入的标签文本。",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.4,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "我看到的 tag 是：`<dc85d48fe73185ec>`",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.6,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "我没有在前面的对话中看到你提到的那个tag `<dc85d48fe73185ec>`。\n\n这是我们对话的开始，你刚才第一次输入了这个tag。在此之前的内容都是系统提示信息，不是用户输入的内容。",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 3.4,
+   "stream": true
+  }
+ ],
+ "json_minified": [
+  {
+   "status": 200,
+   "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-A31C5CC2\"}",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-A31C5CC2\"}",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.3,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-A31C5CC2\"}",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.1,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-A31C5CC2\"}",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.1,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "{\"a\":\"ztset\",\"b\":37,\"c\":\"ZT-A31C5CC2\"}",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 3.5,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "{\"a\":\"ztest\",\"b\":37,\"c\":\"ZT-A31C5CC2\"}",
+   "tools": [],
+   "stop": "end_turn",
+   "secs": 2.0,
+   "stream": true
+  }
+ ],
+ "code_exec": [
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_okiU13aS4a9GboWlQQkuiY",
+     "name": "code_execution",
+     "input": {
+      "code": "print('HELLO_CHECK')",
+      "language": "python"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.5,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_kyoItwDEdXzQGHMVjrJReN",
+     "name": "code_execution",
+     "input": {
+      "code": "print('HELLO_CHECK')"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.3,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_UGDP2nqLP4YIlx3svjJxyI",
+     "name": "code_execution",
+     "input": {
+      "code": "\nprint('HELLO_CHECK')\n"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.3,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_rDwPVuYoWruSUJLKML57CY",
+     "name": "code_execution",
+     "input": {}
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 1.9,
+   "stream": true
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_45HAOhi44nDrESO8gYyA5u",
+     "name": "code_execution",
+     "input": {
+      "code": "print('HELLO_CHECK')",
+      "language": "python"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.4,
+   "stream": false
+  },
+  {
+   "status": 200,
+   "text": "",
+   "tools": [
+    {
+     "id": "tooluse_I7XKBWntUvwPB6o23YLXIZ",
+     "name": "code_execution",
+     "input": {
+      "code": "print('HELLO_CHECK')"
+     }
+    }
+   ],
+   "stop": "tool_use",
+   "secs": 2.5,
+   "stream": true
+  }
+ ]
+}

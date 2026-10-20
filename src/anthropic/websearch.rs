@@ -1611,6 +1611,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         }
@@ -1640,6 +1641,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -1929,6 +1931,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -1975,6 +1978,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2004,6 +2008,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2030,6 +2035,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };

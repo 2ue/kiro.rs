@@ -1151,6 +1151,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -1826,6 +1827,7 @@ mod tests {
                 tool_choice: None,
                 thinking,
                 output_config,
+                output_format: None,
                 metadata: None,
                 stop_sequences: None,
             };
@@ -1919,6 +1921,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -1998,6 +2001,7 @@ mod tests {
             thinking: None,
             tool_choice: Some(serde_json::json!({"type": "tool", "name": original_name})),
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2072,6 +2076,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         }
@@ -2262,6 +2267,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2312,6 +2318,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2375,6 +2382,7 @@ mod tests {
             thinking: None,
             tool_choice: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2433,6 +2441,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2496,6 +2505,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2604,6 +2614,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2637,6 +2648,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2689,6 +2701,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2786,6 +2799,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -2821,6 +2835,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2851,6 +2866,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2885,6 +2901,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2940,6 +2957,7 @@ mod tests {
                 display: None,
             }),
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3020,6 +3038,7 @@ mod tests {
                         display: None,
                     }),
                     output_config: None,
+                    output_format: None,
                     metadata: None,
                     stop_sequences: None,
                 };
@@ -3092,6 +3111,7 @@ mod tests {
                 display: None,
             }),
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3166,6 +3186,7 @@ mod tests {
                 effort: Some("high".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3225,6 +3246,7 @@ mod tests {
                 effort: Some("xhigh".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3278,6 +3300,7 @@ mod tests {
                 effort: Some("xhigh".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3319,6 +3342,7 @@ mod tests {
                 effort: Some("high".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3411,6 +3435,7 @@ mod tests {
                         display: None,
                     }),
                     output_config: None,
+                    output_format: None,
                     metadata: None,
                     stop_sequences: None,
                 };
@@ -3442,6 +3467,7 @@ mod tests {
                     display: None,
                 }),
                 output_config: None,
+                output_format: None,
                 metadata: None,
                 stop_sequences: None,
             };
@@ -3493,6 +3519,7 @@ mod tests {
                 display: None,
             }),
             output_config: Some(OutputConfig::default()),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3550,6 +3577,7 @@ mod tests {
                 effort: Some("high".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3607,6 +3635,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3664,6 +3693,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3719,6 +3749,7 @@ mod tests {
                 display: None,
             }),
             output_config: Some(OutputConfig::default()),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3762,6 +3793,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: Some(OutputConfig::default()),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3812,6 +3844,7 @@ mod tests {
                 display: None,
             }),
             output_config: Some(OutputConfig::default()),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3875,6 +3908,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3928,6 +3962,7 @@ mod tests {
                 display: None,
             }),
             output_config: Some(OutputConfig::default()),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -3985,6 +4020,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4042,6 +4078,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4087,6 +4124,7 @@ mod tests {
                 display: None,
             }),
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4129,6 +4167,7 @@ mod tests {
                 effort: Some("xhigh".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4172,6 +4211,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4222,6 +4262,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4265,6 +4306,7 @@ mod tests {
                 effort: Some("high".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4322,6 +4364,7 @@ mod tests {
                 effort: Some("high".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4373,6 +4416,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4429,6 +4473,7 @@ mod tests {
             tool_choice: Some(tool_choice),
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         }
@@ -4593,6 +4638,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -4726,6 +4772,7 @@ mod tests {
             tool_choice,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         }
@@ -6927,6 +6974,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -6996,6 +7044,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };

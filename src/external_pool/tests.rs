@@ -11433,6 +11433,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         }),
@@ -12802,6 +12803,7 @@ fn test_payload(model: &str) -> MessagesRequest {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some("user_test_account__session_external-projection-session".to_string()),
         }),

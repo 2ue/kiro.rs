@@ -602,7 +602,8 @@ fn citation(source: &Source, number: usize) -> Value {
         "title": source.title,
         // Proxy-issued opaque index (the official value is Anthropic-encrypted).
         "encrypted_index": BASE64_STANDARD.encode(format!("{number}:{}", source.url)),
-        "cited_text": truncate_chars(source.snippet.trim(), CITED_TEXT_MAX_CHARS)
+        // At most 150 characters, like the official field.
+        "cited_text": source.snippet.trim().chars().take(CITED_TEXT_MAX_CHARS).collect::<String>()
     })
 }
 
@@ -824,6 +825,21 @@ mod tests {
         assert_eq!(blocks[1]["citations"].as_array().unwrap().len(), 2);
         assert!(blocks[2].get("citations").is_none());
         assert!(!texts.concat().contains('['));
+    }
+
+    #[test]
+    fn cited_text_is_at_most_150_characters() {
+        let source = Source {
+            title: "t".to_string(),
+            url: "https://example.com".to_string(),
+            snippet: "字".repeat(400),
+        };
+        let cited = citation(&source, 1)["cited_text"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count();
+        assert_eq!(cited, CITED_TEXT_MAX_CHARS);
     }
 
     #[test]

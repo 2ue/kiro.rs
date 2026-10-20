@@ -3199,6 +3199,7 @@ mod tests {
                 effort: Some("max".to_string()),
                 format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
