@@ -28,6 +28,8 @@ pub(crate) struct ResponseToolPolicy {
     max_tool_uses: Option<usize>,
     /// Kiro cannot force a tool call; this is only diagnosed after the response completes.
     required: Option<RequiredToolUse>,
+    /// `output_config.format` served through an internal tool; restored to JSON text downstream.
+    structured_output: Option<super::structured_output::StructuredOutputTarget>,
 }
 
 impl ResponseToolPolicy {
@@ -46,6 +48,19 @@ impl ResponseToolPolicy {
     #[cfg(test)]
     pub(crate) fn required(&self) -> Option<&RequiredToolUse> {
         self.required.as_ref()
+    }
+
+    pub(crate) fn set_structured_output(
+        &mut self,
+        target: super::structured_output::StructuredOutputTarget,
+    ) {
+        self.structured_output = Some(target);
+    }
+
+    pub(crate) fn structured_output(
+        &self,
+    ) -> Option<&super::structured_output::StructuredOutputTarget> {
+        self.structured_output.as_ref()
     }
 
     pub(crate) fn limit_tool_uses(&mut self, max: usize) {

@@ -3599,6 +3599,7 @@ fn messages_request_for_model(model: &str) -> MessagesRequest {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     }
@@ -8249,6 +8250,7 @@ fn synthetic_thinking_activation_never_forges_client_effort_five_rounds() {
         let mut explicit = messages_request_for_model("claude-opus-4-8-thinking");
         explicit.output_config = Some(OutputConfig {
             effort: Some("max".to_string()),
+            format: None,
         });
         override_thinking_from_model_name(&mut explicit).expect("explicit effort override");
         assert_eq!(
@@ -8297,6 +8299,7 @@ fn thinking_trigger_always_preserves_enabled_and_output_config() {
     });
     payload.output_config = Some(OutputConfig {
         effort: Some("low".to_string()),
+        format: None,
     });
     let mut runtime_config =
         runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
@@ -10819,6 +10822,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -10922,6 +10926,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -11063,6 +11068,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -11126,6 +11132,7 @@ fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -11201,6 +11208,7 @@ fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
@@ -11354,6 +11362,7 @@ fn kiro_rs_tool_plus_route_amplifies_bounds_and_limits_creation_frequency() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
@@ -11483,6 +11492,7 @@ fn kiro_rs_tool_plus_does_not_stack_legacy_usage_guards() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some(
                 "user_test_account__session_2ea7b4d4-5a10-4ae9-8de8-5dbf2d1c6b77".to_string(),
@@ -11562,6 +11572,7 @@ fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
@@ -11663,6 +11674,7 @@ fn disabled_prompt_cache_does_not_simulate_without_stable_conversation_id() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -11729,6 +11741,7 @@ fn builtin_na_path_does_not_build_local_profile_or_reporting_policy() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -11816,6 +11829,7 @@ fn no_cache_route_does_not_build_cache_profile_plan_or_shape_reporting() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -11930,6 +11944,7 @@ fn no_cache_disabled_reported_usage_preserves_upstream_metadata_usage() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -12018,6 +12033,7 @@ fn no_cache_canonical_record_keeps_upstream_raw_when_default_reporting_exists() 
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: None,
         stop_sequences: None,
     };
@@ -13813,6 +13829,7 @@ fn cold_request_guard_is_off_by_default_and_only_changes_cold_requests_when_on()
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some(
                 "user_test_account__session_4d5e6f70-8192-4a3b-8c4d-5e6f708192a3".to_string(),
@@ -14015,6 +14032,7 @@ fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untou
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some(
                 "user_test_account__session_5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d".to_string(),
@@ -14199,6 +14217,7 @@ fn minea_prod_params_cold_requests_report_no_read_and_stay_within_raw() {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some(format!("user_test_account__session_{session_id}")),
         }),
@@ -14384,6 +14403,7 @@ fn minea_like_route_keeps_target_hit_ratio_and_no_small_cache_values() {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: Some(Metadata {
                 user_id: Some(format!("user_test_account__session_{session_id}")),
             }),
@@ -14553,6 +14573,7 @@ fn hit_shaping_disabled_matches_legacy_usage_pipeline_round_by_round() {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: Some(Metadata {
                 user_id: Some(format!("user_test_account__session_{session_id}")),
             }),

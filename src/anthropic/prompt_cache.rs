@@ -2072,6 +2072,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_test_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string(),
@@ -2671,6 +2672,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2721,6 +2723,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };
@@ -2999,6 +3002,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };

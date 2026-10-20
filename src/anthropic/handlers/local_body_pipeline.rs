@@ -235,6 +235,13 @@ pub(super) fn prepare_with_plan(
 ) -> Result<PreparedLocalKiroBody, LocalBodyPrepareError> {
     debug_assert_eq!(plan.profile.as_str(), "local_credential");
     debug_assert_eq!(plan.conversion, BodyStageState::Enabled);
+    // Structured output is served through an internal tool, so every later stage (conversion,
+    // retries, token counting) sees the request that is actually sent to Kiro.
+    let structured_output = crate::anthropic::structured_output::plan(payload);
+    let payload = structured_output
+        .as_ref()
+        .map(|(request, _)| request)
+        .unwrap_or(payload);
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
     let discovered_reasoning_capability = matches!(
         &native_reasoning_capability,
@@ -467,7 +474,13 @@ pub(super) fn prepare_with_plan(
         tool_name_map: conversion_result.tool_name_map,
         tool_schema_key_map: conversion_result.tool_schema_key_map,
         known_tool_names: conversion_result.known_tool_names,
-        response_tool_policy: conversion_result.response_tool_policy,
+        response_tool_policy: {
+            let mut policy = conversion_result.response_tool_policy;
+            if let Some((_, target)) = structured_output {
+                policy.set_structured_output(target);
+            }
+            policy
+        },
         warnings_header,
         extract_xml_thinking,
         too_long_retry,
@@ -533,7 +546,9 @@ mod tests {
             }),
             output_config: output_effort.map(|effort| OutputConfig {
                 effort: Some(effort.to_string()),
+                format: None,
             }),
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         }
@@ -597,6 +612,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         };

@@ -11433,6 +11433,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
             tool_choice: None,
             thinking: None,
             output_config: None,
+            output_format: None,
             metadata: None,
             stop_sequences: None,
         }),
@@ -12802,6 +12803,7 @@ fn test_payload(model: &str) -> MessagesRequest {
         tool_choice: None,
         thinking: None,
         output_config: None,
+        output_format: None,
         metadata: Some(Metadata {
             user_id: Some("user_test_account__session_external-projection-session".to_string()),
         }),
@@ -12967,6 +12969,7 @@ fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
     });
     payload_mut(&mut route).output_config = Some(OutputConfig {
         effort: Some("xhigh".to_string()),
+        format: None,
     });
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
@@ -13085,6 +13088,7 @@ fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization(
     });
     payload_mut(&mut route).output_config = Some(OutputConfig {
         effort: Some("xhigh".to_string()),
+        format: None,
     });
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,

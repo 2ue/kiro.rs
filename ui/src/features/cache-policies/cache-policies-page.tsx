@@ -39,6 +39,7 @@ import {
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
 import type { CachePolicyConfig, CacheRoutePolicyPatch, IdentityPromptConfig, IdentityRouteOverride, RuntimeConfig } from '@/types/api'
 import { identitySummary, RouteIdentityEditor } from './route-identity-editor'
+import { RouteWebSearchEditor } from './route-websearch-editor'
 import { RoutePolicyImportDialog } from './route-policy-import-dialog'
 import { buildRoutePolicyFile, downloadRoutePolicyFile } from './route-policy-transfer'
 import {
@@ -68,6 +69,8 @@ type PathEditorState = {
   policy: CacheRoutePolicyPatch
   definedRoutes: string[]
   identity: IdentityRouteOverride
+  /** Model-driven WebSearch override; undefined follows the runtime default. */
+  webSearch?: boolean
   /** Set when the editor was prefilled by copying or importing a route policy. */
   origin?: { kind: 'copy' | 'import'; route: string | null }
   /** Register the new /dfcache route as soon as a valid name is typed (copy of a reachable route). */
@@ -156,6 +159,36 @@ function withIdentityOverride(
   }
   if (nextPrefix && override && Object.keys(override).length > 0) pathOverrides[nextPrefix] = override
   return { ...config.promptSteering, identity: { ...identity, pathOverrides } }
+}
+
+/** Model-driven WebSearch override stored for a route prefix. */
+function webSearchOverrideForPrefix(config: RuntimeConfig, prefix: string): boolean | undefined {
+  const canonical = canonicalCachePolicyPath(prefix)
+  const entry = Object.entries(config.bodyConversion.modelDrivenWebSearch?.pathOverrides ?? {})
+    .find(([key]) => canonicalCachePolicyPath(key) === canonical)
+  return entry?.[1]
+}
+
+function withWebSearchOverride(
+  config: RuntimeConfig,
+  oldPrefix: string | null,
+  nextPrefix: string | null,
+  value: boolean | undefined,
+): RuntimeConfig['bodyConversion'] {
+  const current = config.bodyConversion.modelDrivenWebSearch ?? { enabled: false, pathOverrides: {} }
+  const pathOverrides: Record<string, boolean> = {}
+  for (const [key, enabled] of Object.entries(current.pathOverrides ?? {})) {
+    const canonical = canonicalCachePolicyPath(key)
+    if (canonical === oldPrefix || canonical === nextPrefix) continue
+    pathOverrides[key] = enabled
+  }
+  if (nextPrefix && value !== undefined) pathOverrides[nextPrefix] = value
+  return { ...config.bodyConversion, modelDrivenWebSearch: { ...current, pathOverrides } }
+}
+
+function webSearchBadge(config: RuntimeConfig, prefix: string): string {
+  const value = webSearchOverrideForPrefix(config, prefix) ?? config.bodyConversion.modelDrivenWebSearch?.enabled ?? false
+  return value ? 'WebSearch 模型驱动' : 'WebSearch 模板'
 }
 
 function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
@@ -411,7 +444,7 @@ function PathCard({
         <div className="flex flex-wrap gap-2">
           {pathSummary(policy).map((item) => <Badge key={item} size="xs" tone="neutral">{item}</Badge>)}
           {identityBadges.map((item) => (
-            <Badge key={item} size="xs" tone={item === '身份隐藏关' ? 'neutral' : 'info'}>{item}</Badge>
+            <Badge key={item} size="xs" tone={item === '身份隐藏关' || item === 'WebSearch 模板' ? 'neutral' : 'info'}>{item}</Badge>
           ))}
         </div>
       </CardContent>
@@ -503,6 +536,7 @@ export function CachePoliciesPage() {
       policy: mergedPathPolicy(prefix),
       definedRoutes: [...workingConfig.definedCacheRoutes],
       identity: identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
+      webSearch: webSearchOverrideForPrefix(workingConfig, prefix),
     })
   }
 
@@ -529,6 +563,7 @@ export function CachePoliciesPage() {
       policy: structuredClone(mergedPathPolicy(prefix)),
       definedRoutes: [...definedRoutes],
       identity: structuredClone(identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix)),
+      webSearch: webSearchOverrideForPrefix(workingConfig, prefix),
       origin: { kind: 'copy', route: prefix },
       // Built-in routes and registered /dfcache routes are reachable, so the copy is too.
       autoRegister: isBuiltInPrefix(prefix) || Boolean(sourceRoute && definedRoutes.includes(sourceRoute)),
@@ -541,12 +576,13 @@ export function CachePoliciesPage() {
       prefix,
       sanitizeCacheRoutePolicy(mergedPathPolicy(prefix)),
       identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
+      webSearchOverrideForPrefix(workingConfig, prefix),
     ))
     toast.success(`已导出 ${prefix} 的路由策略`)
   }
 
   /** Imported policies open the normal new-route editor, prefilled; the route is never imported. */
-  const openImportedPathEditor = (imported: { sourceRoute: string | null; cachePolicy: CacheRoutePolicyPatch; identity: IdentityRouteOverride }) => {
+  const openImportedPathEditor = (imported: { sourceRoute: string | null; cachePolicy: CacheRoutePolicyPatch; identity: IdentityRouteOverride; webSearch?: boolean }) => {
     setImportOpen(false)
     setPathEditor({
       mode: 'new',
@@ -555,6 +591,7 @@ export function CachePoliciesPage() {
       policy: imported.cachePolicy,
       definedRoutes: [...definedRoutes],
       identity: imported.identity,
+      webSearch: imported.webSearch,
       origin: { kind: 'import', route: imported.sourceRoute },
     })
   }
@@ -598,6 +635,7 @@ export function CachePoliciesPage() {
       reportedUsage: normalizeReportedUsage(nextReportedUsage),
       definedCacheRoutes: nextDefinedRoutes,
       promptSteering: withIdentityOverride(workingConfig, oldPrefix, nextPrefix, pathEditor.identity),
+      bodyConversion: withWebSearchOverride(workingConfig, oldPrefix, nextPrefix, pathEditor.webSearch),
     })
     if (saved) setPathEditor(null)
   }
@@ -606,7 +644,7 @@ export function CachePoliciesPage() {
     if (!workingConfig) return
     const confirmed = await confirm({
       title: '删除路由策略？',
-      message: `确认删除路径 ${prefix} 的路由策略吗？对应的缓存覆盖、Usage 覆盖、身份隐藏覆盖和 /dfcache 注册都会被清理。`,
+      message: `确认删除路径 ${prefix} 的路由策略吗？对应的缓存覆盖、Usage 覆盖、身份隐藏覆盖、WebSearch 设置和 /dfcache 注册都会被清理。`,
       confirmText: '确认删除',
       cancelText: '取消',
       tone: 'danger',
@@ -627,6 +665,7 @@ export function CachePoliciesPage() {
       reportedUsage: normalizeReportedUsage(nextReportedUsage),
       definedCacheRoutes: normalizeDefinedCacheRoutes(nextDefinedRoutes),
       promptSteering: withIdentityOverride(workingConfig, normalizedPrefix, null, null),
+      bodyConversion: withWebSearchOverride(workingConfig, normalizedPrefix, null, undefined),
     }, '路由策略已删除')
     if (saved && pathEditor?.originalPrefix === prefix) setPathEditor(null)
   }
@@ -696,11 +735,14 @@ export function CachePoliciesPage() {
                 key={prefix}
                 prefix={prefix}
                 policy={mergedPathPolicy(prefix)}
-                identityBadges={identitySummary(
-                  workingConfig.promptSteering.identity,
-                  prefix,
-                  identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
-                )}
+                identityBadges={[
+                  ...identitySummary(
+                    workingConfig.promptSteering.identity,
+                    prefix,
+                    identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
+                  ),
+                  webSearchBadge(workingConfig, prefix),
+                ]}
                 builtIn={isBuiltInPrefix(prefix)}
                 registered={Boolean(normalizedRoute && definedRoutes.includes(normalizedRoute))}
                 onEdit={() => openPathEditor(prefix)}
@@ -828,6 +870,13 @@ export function CachePoliciesPage() {
                 identity={workingConfig.promptSteering.identity}
                 value={pathEditor.identity}
                 onChange={(identity) => setPathEditor((current) => current ? { ...current, identity } : current)}
+              />
+            </div>
+            <div className="mt-8 border-t pt-6">
+              <RouteWebSearchEditor
+                defaultEnabled={workingConfig.bodyConversion.modelDrivenWebSearch?.enabled ?? false}
+                value={pathEditor.webSearch}
+                onChange={(webSearch) => setPathEditor((current) => current ? { ...current, webSearch } : current)}
               />
             </div>
           </div>

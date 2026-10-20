@@ -61,6 +61,7 @@ pub(crate) mod request_facts;
 mod router;
 mod stop_sequence;
 mod stream;
+mod structured_output;
 mod thinking_display;
 pub(crate) mod tool_format_debug;
 mod tool_name_restore;

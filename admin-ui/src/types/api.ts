@@ -1561,6 +1561,13 @@ export interface BodyConversionConfig {
   nativeReasoningFields: boolean
   toolPairingRepair: boolean
   historyPlaceholderTools: boolean
+  modelDrivenWebSearch: ModelDrivenWebSearchConfig
+}
+
+/** Model-driven native WebSearch: off by default, overridable per route prefix. */
+export interface ModelDrivenWebSearchConfig {
+  enabled: boolean
+  pathOverrides: Record<string, boolean>
 }
 
 export type PromptSteeringScope = 'route_rules' | 'cc_only' | 'claude_code_profile' | 'all_routes'

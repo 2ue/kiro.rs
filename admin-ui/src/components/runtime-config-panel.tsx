@@ -193,6 +193,7 @@ const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
   nativeReasoningFields: true,
   toolPairingRepair: true,
   historyPlaceholderTools: true,
+  modelDrivenWebSearch: { enabled: false, pathOverrides: {} },
 })
 
 const normalizeBodyConversion = (
@@ -200,6 +201,11 @@ const normalizeBodyConversion = (
 ): RuntimeConfig['bodyConversion'] => ({
   ...defaultBodyConversion(),
   ...(input ?? {}),
+  // Edited in the new console; kept as loaded so saving here never drops route overrides.
+  modelDrivenWebSearch: {
+    enabled: input?.modelDrivenWebSearch?.enabled ?? false,
+    pathOverrides: { ...(input?.modelDrivenWebSearch?.pathOverrides ?? {}) },
+  },
 })
 
 const defaultPromptSteering = (): RuntimeConfig['promptSteering'] => ({
