@@ -16542,9 +16542,24 @@ fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
 
     assert_eq!(billing.raw_usage.input_tokens, 1);
     assert_eq!(billing.raw_usage.output_tokens, 0);
-    assert!(billing.reported_usage.input_tokens > 1);
+    // 可疑的 1 token 上游 usage 按请求估算修复：修复后的总输入（input + 缓存）与计费都
+    // 远大于原始值。下发的 input 字段本身仍按 reportedUsage.input 采样，可能恰好为 1，
+    // 所以这里断言总量而不是单个 input 字段。
+    assert!(
+        billing.reported_usage.total_input_tokens > 1,
+        "{:?}",
+        billing.reported_usage
+    );
     assert!(billing.reported_usage.output_tokens > 0);
-    assert!(usage["input_tokens"].as_i64().expect("input") > 1);
+    let downstream_total = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .map(|key| usage[*key].as_i64().unwrap_or_default())
+    .sum::<i64>();
+    assert!(downstream_total > 1, "{usage}");
     assert!(usage["output_tokens"].as_i64().expect("output") > 0);
     assert!(billing.reported_cost_usd > billing.raw_cost_usd);
 }
