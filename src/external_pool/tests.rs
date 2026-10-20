@@ -11419,6 +11419,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
         kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy::disabled(),
         model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
         request_id: "req_external_capacity".to_string(),
@@ -12691,6 +12692,7 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
         kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy::default(),
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
+        cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy::disabled(),
         model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
         request_id: "req_external_billing".to_string(),
@@ -16176,6 +16178,143 @@ fn kiro_rs_tool_plus_usage_projection_shapes_external_pool_usage() {
 }
 
 #[test]
+fn bounded_high_cache_external_projection_never_leaves_bounds() {
+    // 上游返回真实 cache_creation、开启计费下限：外部池投影最终 usage 仍在上下限内，
+    // 读取不超过原始输入 × maxReadMultiplier，非零读写不低于最小值。
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":2000,"output_tokens":40,"cache_creation_input_tokens":60000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::BoundedHighCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::HighCache;
+    // 放大到原始输入的 3 倍、目标读取 99%：读取会超过 maxReadMultiplier=1 的上限。
+    route.prompt_cache_token_scale = 3.0;
+    route.prompt_cache_scale_min_input_tokens = 0;
+    route.prompt_cache_target_read_ratio = 0.99;
+    route.cache_hit_shaping_policy = crate::model::config::CacheHitShapingPolicy {
+        enabled: true,
+        target_hit_ratio: 0.95,
+        ratio_jitter: 0.04,
+        min_cache_read_tokens: 1_024,
+        min_cache_creation_tokens: 1_024,
+        min_cost_ratio: 1.0,
+        max_read_multiplier: 1.0,
+        min_creation_ratio: 0.0,
+    };
+    route.prompt_cache_creation_control = PromptCacheCreationControlConfig {
+        enabled: true,
+        max_creation_tokens_per_event: 30_000,
+        ..PromptCacheCreationControlConfig::default()
+    };
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy {
+                move_delta_to_cache_read: true,
+                ..ReportedUsageFieldPolicy::sample_input_max(500)
+            },
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_7b2c1d0e-4f5a-4b6c-8d7e-9f0a1b2c3d4e".to_string(),
+        ),
+    });
+    payload_mut(&mut route).system = Some(vec![SystemMessage {
+        text: "stable bounded external prompt ".repeat(700),
+        cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+    }]);
+    refresh_test_route_derived_state(&mut route);
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let mut saw_read = false;
+    for round in 0..6 {
+        let projection =
+            projection_context_with_cost_floor(&route, &pool, 30).expect("bounded projection");
+        let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+        let reported = projected.usage_capture.reported.expect("reported usage");
+        let raw_input = projection.raw_input_tokens.max(1);
+        assert!(
+            (1..=500).contains(&reported.input_tokens),
+            "round {round}: {reported:?}"
+        );
+        assert!(
+            reported.cache_creation_input_tokens <= 30_000,
+            "round {round}: {reported:?}"
+        );
+        assert!(
+            reported.cache_read_input_tokens <= raw_input,
+            "round {round}: read {} raw {raw_input}",
+            reported.cache_read_input_tokens
+        );
+        for value in [
+            reported.cache_read_input_tokens,
+            reported.cache_creation_input_tokens,
+        ] {
+            assert!(value == 0 || value >= 1_024, "round {round}: {reported:?}");
+        }
+        if round > 0 {
+            saw_read |= reported.cache_read_input_tokens > 0;
+        }
+        projection.record_success();
+        payload_mut(&mut route).messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!(format!("continue bounded round {round}")),
+            },
+        ]);
+        refresh_test_route_derived_state(&mut route);
+    }
+    assert!(saw_read, "later rounds should hit the local prefix");
+}
+
+#[test]
+fn bounded_high_cache_external_projection_drops_creation_when_suppressed() {
+    // 第一次写入放行后，紧接着的请求被 creation control 拦下：即使计费补偿想补写入，
+    // 最终写入也必须为 0。
+    let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":2000,"output_tokens":40,"cache_creation_input_tokens":60000,"cache_read_input_tokens":0}}"#,
+        );
+    let mut route = test_route("claude-sonnet-4-5");
+    route.prompt_cache_strategy_type = PromptCacheStrategyType::BoundedHighCache;
+    route.prompt_cache_simulation_mode = PromptCacheSimulationMode::HighCache;
+    route.prompt_cache_creation_control = PromptCacheCreationControlConfig {
+        enabled: true,
+        min_creation_interval_secs: 3_600,
+        max_creation_tokens_per_event: 30_000,
+        ..PromptCacheCreationControlConfig::default()
+    };
+    configure_usage_projection_test_path(
+        &mut route,
+        ReportedUsagePathPolicy {
+            input: ReportedUsageFieldPolicy::sample_input_max(500),
+            ..ReportedUsagePathPolicy::default()
+        },
+    );
+    payload_mut(&mut route).metadata = Some(Metadata {
+        user_id: Some(
+            "user_test_account__session_8c3d2e1f-5a6b-4c7d-9e8f-0a1b2c3d4e5f".to_string(),
+        ),
+    });
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+    let first = projection_context_with_cost_floor(&route, &pool, 0).expect("first projection");
+    let _ = maybe_project_non_stream_usage(body.clone(), Some(&first));
+    first.record_success();
+    let second = projection_context_with_cost_floor(&route, &pool, 0).expect("second projection");
+    let projected = maybe_project_non_stream_usage(body, Some(&second));
+    let reported = projected.usage_capture.reported.expect("reported usage");
+    // 6s 内第二次写入被 min_creation_interval 拦下：计费补偿不能把写入加回来。
+    assert_eq!(reported.cache_creation_input_tokens, 0, "{reported:?}");
+    assert!(reported.input_tokens <= 500, "{reported:?}");
+}
+
+#[test]
 fn kiro_rs_tool_usage_projection_applies_path_cache_creation_policy() {
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}"#,
@@ -16403,9 +16542,24 @@ fn usage_projection_cost_floor_repairs_suspicious_tiny_raw_usage() {
 
     assert_eq!(billing.raw_usage.input_tokens, 1);
     assert_eq!(billing.raw_usage.output_tokens, 0);
-    assert!(billing.reported_usage.input_tokens > 1);
+    // 可疑的 1 token 上游 usage 按请求估算修复：修复后的总输入（input + 缓存）与计费都
+    // 远大于原始值。下发的 input 字段本身仍按 reportedUsage.input 采样，可能恰好为 1，
+    // 所以这里断言总量而不是单个 input 字段。
+    assert!(
+        billing.reported_usage.total_input_tokens > 1,
+        "{:?}",
+        billing.reported_usage
+    );
     assert!(billing.reported_usage.output_tokens > 0);
-    assert!(usage["input_tokens"].as_i64().expect("input") > 1);
+    let downstream_total = [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .map(|key| usage[*key].as_i64().unwrap_or_default())
+    .sum::<i64>();
+    assert!(downstream_total > 1, "{usage}");
     assert!(usage["output_tokens"].as_i64().expect("output") > 0);
     assert!(billing.reported_cost_usd > billing.raw_cost_usd);
 }

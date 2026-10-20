@@ -2893,7 +2893,8 @@ impl CacheRoutePolicyPatch {
     fn apply_fields_for_strategy(&self, policy: CacheRoutePolicy) -> CacheRoutePolicy {
         match policy.cache_type {
             PromptCacheStrategyType::NoCache => self.apply_no_cache_fields_to(policy),
-            PromptCacheStrategyType::CurrentHighCache => self.apply_fields_to(policy),
+            PromptCacheStrategyType::CurrentHighCache
+            | PromptCacheStrategyType::BoundedHighCache => self.apply_fields_to(policy),
             PromptCacheStrategyType::KiroRsTool => self.apply_kiro_rs_tool_fields_to(policy),
             PromptCacheStrategyType::KiroRsToolPlus => {
                 self.apply_kiro_rs_tool_plus_fields_to(policy)
@@ -3035,6 +3036,17 @@ pub enum PromptCacheStrategyType {
     KiroRsTool,
     StableSegmentCache,
     KiroRsToolPlus,
+    /// 上下限优先的本地模拟缓存：模拟、前缀追踪、reportedUsage、creationControl、hitShaping
+    /// 与 `current_high_cache` 相同，但各字段上下限是最终约束，计费只在范围内补，
+    /// 补不上的差额跨请求记账。
+    BoundedHighCache,
+}
+
+impl PromptCacheStrategyType {
+    /// 走本地模拟缓存（high cache 模拟、前缀追踪）链路的策略。
+    pub fn uses_high_cache_simulation(self) -> bool {
+        matches!(self, Self::CurrentHighCache | Self::BoundedHighCache)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -3050,6 +3062,9 @@ pub struct CachePolicyConfig {
     pub stable_segment_cache: CacheRoutePolicyPatch,
     #[serde(default)]
     pub kiro_rs_tool_plus: CacheRoutePolicyPatch,
+    /// 上下限优先的本地模拟缓存策略模板（`bounded_high_cache`），不继承 `default`。
+    #[serde(default)]
+    pub bounded_high_cache: CacheRoutePolicyPatch,
     #[serde(default)]
     pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
 }
@@ -3107,6 +3122,7 @@ impl CachePolicyConfig {
             kiro_rs_tool: self.kiro_rs_tool.clone(),
             stable_segment_cache: self.stable_segment_cache.clone(),
             kiro_rs_tool_plus: self.kiro_rs_tool_plus.clone(),
+            bounded_high_cache: self.bounded_high_cache.clone(),
             path_overrides,
         }
     }
@@ -3122,6 +3138,8 @@ impl CachePolicyConfig {
             .validate("Stable Segment 缓存策略模板", base.clone())?;
         self.kiro_rs_tool_plus
             .validate("Kiro-RS-Tool Plus 缓存策略模板", base.clone())?;
+        self.bounded_high_cache
+            .validate("上下限优先缓存策略模板", base.clone())?;
         for (prefix, policy) in &self.path_overrides {
             let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
                 return Err("缓存策略路径前缀不能为空".to_string());
@@ -3134,6 +3152,12 @@ impl CachePolicyConfig {
     fn current_high_cache_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
         let policy = self.default.apply_fields_to(base);
         self.current_high_cache.apply_fields_to(policy)
+    }
+
+    fn bounded_high_cache_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+        let mut policy = self.bounded_high_cache.apply_fields_to(base);
+        policy.cache_type = PromptCacheStrategyType::BoundedHighCache;
+        policy.normalized()
     }
 
     fn kiro_rs_tool_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
@@ -3283,6 +3307,7 @@ impl CachePolicyConfig {
                 policy.cache_type = PromptCacheStrategyType::KiroRsToolPlus;
                 policy.normalized()
             }
+            PromptCacheStrategyType::BoundedHighCache => self.bounded_high_cache_template(base),
         }
     }
 }
@@ -3380,10 +3405,12 @@ pub fn resolve_cache_policy_for_path(
             .route_namespace
             .unwrap_or_else(|| override_policy.affects_cache_state())
             .then(|| prefix.clone()),
-        PromptCacheStrategyType::CurrentHighCache => override_policy
-            .route_namespace
-            .unwrap_or_else(|| override_policy.affects_cache_state())
-            .then(|| prefix.clone()),
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache => {
+            override_policy
+                .route_namespace
+                .unwrap_or_else(|| override_policy.affects_cache_state())
+                .then(|| prefix.clone())
+        }
     };
 
     ResolvedCacheRoutePolicy {
@@ -8953,6 +8980,67 @@ mod tests {
         );
         assert!(plus.small_request.enabled && plus.small_request.disable_cache);
         assert_eq!(plus.small_request.max_input_tokens, 2_048);
+    }
+
+    #[test]
+    fn bounded_high_cache_policy_resolves_own_template_and_path_override() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "cachePolicy": {
+                "default": { "hitShaping": { "enabled": true, "minCostRatio": 0.9 } },
+                "currentHighCache": { "hitShaping": { "targetHitRatio": 0.6 } },
+                "boundedHighCache": {
+                    "simulation": { "enabled": true, "tokenScale": 2.0 },
+                    "hitShaping": { "enabled": true, "targetHitRatio": 0.95, "minCostRatio": 0.3 }
+                },
+                "pathOverrides": {
+                    "/bounded": { "cacheType": "bounded_high_cache" },
+                    "/bounded-custom": {
+                        "cacheType": "bounded_high_cache",
+                        "hitShaping": { "maxReadMultiplier": 5.0 },
+                        "reportedUsage": {
+                            "input": { "mode": "sample-max", "maxTokens": 500 }
+                        }
+                    },
+                    "/current": { "cacheType": "current_high_cache" }
+                }
+            }
+        }))
+        .expect("deserialize config");
+        config.cache_policy = config.cache_policy.normalized();
+        config
+            .cache_policy
+            .validate(config.legacy_cache_route_policy_default())
+            .expect("valid bounded policy");
+
+        let template = config.cache_policy_for_path("/bounded/v1/messages");
+        assert_eq!(
+            template.policy.cache_type,
+            PromptCacheStrategyType::BoundedHighCache
+        );
+        assert!(template.policy.cache_type.uses_high_cache_simulation());
+        // 只取自己的模板，不继承 default / currentHighCache。
+        assert_eq!(template.policy.hit_shaping.target_hit_ratio, 0.95);
+        assert_eq!(template.policy.hit_shaping.min_cost_ratio, 0.3);
+        assert_eq!(template.policy.simulation.token_scale, 2.0);
+
+        let custom = config.cache_policy_for_path("/bounded-custom/v1/messages");
+        assert_eq!(custom.namespace.as_deref(), Some("/bounded-custom"));
+        assert_eq!(custom.policy.hit_shaping.max_read_multiplier, 5.0);
+        assert_eq!(custom.policy.hit_shaping.target_hit_ratio, 0.95);
+        assert_eq!(custom.policy.reported_usage.input.max_tokens, 500);
+
+        // current_high_cache 不受新模板影响。
+        let current = config.cache_policy_for_path("/current/v1/messages");
+        assert_eq!(
+            current.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(current.policy.hit_shaping.target_hit_ratio, 0.6);
+        assert_eq!(current.policy.hit_shaping.min_cost_ratio, 0.9);
+
+        let serialized = serde_json::to_value(PromptCacheStrategyType::BoundedHighCache)
+            .expect("serialize strategy");
+        assert_eq!(serialized, serde_json::json!("bounded_high_cache"));
     }
 
     #[test]

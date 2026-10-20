@@ -1391,7 +1391,15 @@ fn local_reasoning_fallback_ignores_payload_shaping_disabled_for_five_rounds() {
 }
 
 fn websearch_handler_test_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
+    websearch_handler_test_router_with_config(base_url, |_| {})
+}
+
+fn websearch_handler_test_router_with_config(
+    base_url: &str,
+    customize: impl FnOnce(&mut Config),
+) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
+    customize(&mut config);
     config.kiro_upstream_base_url = Some(base_url.to_string());
     config.kiro_upstream_response_timeout_secs = 1;
     config.credential_retry_max_attempts = 1;
@@ -1954,6 +1962,95 @@ async fn run_native_websearch_current_official_and_future_version_formats_route_
             "official-version-web_search_20270101".to_string(),
         ]
     );
+}
+
+async fn run_bounded_high_cache_websearch_usage_goes_through_route_shaping() {
+    let upstream = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) =
+        websearch_handler_test_router_with_config(&upstream.base_url, |config| {
+            config.defined_cache_routes = vec!["/dfcache/bounded".to_string()];
+            config.cache_policy.path_overrides.insert(
+                "/dfcache/bounded".to_string(),
+                CacheRoutePolicyPatch {
+                    cache_type: Some(PromptCacheStrategyType::BoundedHighCache),
+                    simulation: Some(CacheSimulationPolicyPatch {
+                        enabled: Some(true),
+                        ..Default::default()
+                    }),
+                    reported_usage: Some(ReportedUsagePathPolicy {
+                        input: ReportedUsageFieldPolicy::sample_input_max(500),
+                        output_uplift_percent: 100,
+                        output_uplift_min_tokens: 1,
+                        ..ReportedUsagePathPolicy::default()
+                    }),
+                    ..CacheRoutePolicyPatch::default()
+                },
+            );
+        });
+    let long_query = format!("bounded websearch {}", "context ".repeat(4_000));
+    for stream in [false, true] {
+        let response = router
+            .clone()
+            .oneshot(multimodal_handler_request(
+                "/dfcache/bounded/v1/messages",
+                single_query_websearch_body(&long_query, stream),
+            ))
+            .await
+            .expect("bounded WebSearch response");
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let request_id = response_request_id(&response);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("bounded WebSearch body");
+        let text = String::from_utf8_lossy(&body).to_string();
+        let downstream_usage: Vec<serde_json::Value> = if stream {
+            text.split("\n\n")
+                .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+                .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                .filter_map(|event| match event["type"].as_str() {
+                    Some("message_start") => Some(event["message"]["usage"].clone()),
+                    Some("message_delta") => Some(event["usage"].clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            vec![serde_json::from_str::<serde_json::Value>(&text).expect("json")["usage"].clone()]
+        };
+        assert!(!downstream_usage.is_empty(), "stream={stream}: {text}");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        for usage in &downstream_usage {
+            let input = usage["input_tokens"].as_i64().unwrap_or_default();
+            assert!((1..=500).contains(&input), "stream={stream}: {usage}");
+            assert_eq!(
+                input,
+                i64::from(record.compat_input_tokens),
+                "stream={stream}"
+            );
+        }
+        let final_usage = downstream_usage.last().expect("final usage");
+        let raw_usage = record.raw_usage.expect("raw usage kept");
+        let raw_output = raw_usage.output_tokens;
+        assert!(
+            raw_usage.input_tokens > 500,
+            "raw input stays for original cost: {raw_usage:?}"
+        );
+        assert_eq!(
+            final_usage["output_tokens"].as_i64().unwrap_or_default(),
+            i64::from(record.output_tokens)
+        );
+        assert!(
+            record.output_tokens >= raw_output * 2,
+            "output uplift applied: {} vs raw {raw_output}",
+            record.output_tokens
+        );
+    }
+}
+
+#[test]
+fn bounded_high_cache_websearch_usage_goes_through_route_shaping() {
+    run_handler_fixture_on_large_stack_thread("websearch-bounded-usage", || async {
+        run_bounded_high_cache_websearch_usage_goes_through_route_shaping().await;
+    });
 }
 
 #[test]
@@ -13802,6 +13899,199 @@ fn cold_request_guard_is_off_by_default_and_only_changes_cold_requests_when_on()
     assert!(
         total(second_on) > raw_input,
         "hit rounds keep configured shaping: {second_on:?}"
+    );
+}
+
+/// 现网 minerst 参数回放：同一套参数分别配给 `current_high_cache` 和 `bounded_high_cache`。
+/// 后者最终下游 usage 每个字段都不超出上下限；前者保持原有行为（计费下限会把 input 补到上限之外）。
+#[test]
+fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untouched() {
+    fn minerst_state(cache_type: PromptCacheStrategyType) -> AppState {
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/dfcache/minerst".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(cache_type),
+                route_namespace: Some(true),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    target_read_ratio: Some(0.98),
+                    token_scale: Some(2.05),
+                    max_simulated_input_tokens: Some(300_000),
+                    cap_jitter_min_tokens: Some(12_000),
+                    cap_jitter_max_tokens: Some(24_000),
+                    scale_min_input_tokens: Some(20_000),
+                }),
+                creation_control: Some(PromptCacheCreationControlConfig {
+                    enabled: true,
+                    scope_mode:
+                        crate::model::config::PromptCacheCreationControlScopeMode::ConversationModel,
+                    min_successful_requests_between_creation: 0,
+                    min_creation_interval_secs: 6,
+                    min_creation_delta_tokens: 12_000,
+                    max_creation_tokens_per_event: 30_000,
+                    creation_budget_window_secs: 300,
+                    max_creation_tokens_per_window: 120_000,
+                    expire_after_idle_secs: 3_600,
+                }),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy {
+                        move_delta_to_cache_read: true,
+                        ..ReportedUsageFieldPolicy::sample_input_max(500)
+                    },
+                    final_cache_read_max_tokens: 650_000,
+                    final_cache_read_jitter_min_tokens: 12_345,
+                    final_cache_read_jitter_max_tokens: 56_789,
+                    final_cache_creation_max_tokens: 450_000,
+                    final_cache_creation_jitter_min_tokens: 23_456,
+                    final_cache_creation_jitter_max_tokens: 45_789,
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                hit_shaping: Some(crate::model::config::CacheHitShapingPolicyPatch {
+                    enabled: Some(true),
+                    target_hit_ratio: Some(0.95),
+                    ratio_jitter: Some(0.04),
+                    min_cost_ratio: Some(0.3),
+                    max_read_multiplier: Some(5.0),
+                    min_creation_ratio: Some(2.0),
+                    min_cache_read_tokens: Some(1_024),
+                    min_cache_creation_tokens: Some(1_024),
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        let pricing = Arc::new(PricingCatalog::new());
+        pricing.upsert_manual_price(
+            "claude-sonnet-4-5",
+            crate::anthropic::pricing::ModelPricing {
+                input_cost_per_token: 0.000004,
+                output_cost_per_token: 0.00002,
+                cache_creation_input_token_cost: 0.000005,
+                cache_read_input_token_cost: 0.0000002,
+            },
+        );
+        AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(256)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.99,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy)
+        .with_pricing_catalog(pricing)
+    }
+    let endpoint = "/dfcache/minerst/v1/messages";
+    let payload_for = |messages: Vec<Message>| MessagesRequest {
+        model: "claude-sonnet-4-5".to_string(),
+        max_tokens: 64_000,
+        messages,
+        stream: true,
+        system: Some(vec![SystemMessage {
+            text: "stable claude code system prompt ".repeat(1_200),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: Some(Metadata {
+            user_id: Some(
+                "user_test_account__session_5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d".to_string(),
+            ),
+        }),
+        stop_sequences: None,
+    };
+    let replay = |state: &AppState| {
+        let cache_route =
+            RequestRuntimeConfig::from_app_state(state).cache_policy_for_path(endpoint);
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": "hi" }]),
+        }];
+        let mut results = Vec::new();
+        for round in 0..40 {
+            if round > 0 {
+                messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: json!([{ "type": "text", "text": format!("answer {round} ").repeat(80) }]),
+                });
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: json!([{ "type": "text", "text": format!("next {round} ").repeat(80) }]),
+                });
+            }
+            let raw_input = 31_000 + round * 300;
+            let output = 60 + (round * 97) % 3_000;
+            let payload = payload_for(messages.clone());
+            let conversation_id = extract_stable_conversation_id(&payload).expect("session id");
+            let context = prepare_usage_context(
+                state,
+                cache_route.clone(),
+                endpoint,
+                true,
+                &payload,
+                None,
+                Some(conversation_id.clone()),
+                Some(conversation_id),
+                raw_input,
+            );
+            let credential_usage = attach_test_credential_usage(context, 1);
+            let body = cache::build_usage_with_simulation_policy(
+                None,
+                raw_input,
+                output,
+                credential_usage.request.simulated_usage,
+                true,
+            );
+            let source = credential_usage.usage_source(&body, None, false);
+            results.push((
+                raw_input,
+                credential_usage.canonical_reported_usage_for_success(body, source),
+            ));
+        }
+        results
+    };
+
+    let bounded = replay(&minerst_state(PromptCacheStrategyType::BoundedHighCache));
+    let mut writes = 0;
+    for (round, (raw_input, reported)) in bounded.iter().enumerate() {
+        assert!(
+            (1..=500).contains(&reported.input_tokens),
+            "round {round}: input {reported:?}"
+        );
+        assert!(
+            reported.cache_creation_input_tokens <= 30_000,
+            "round {round}: creation {reported:?}"
+        );
+        assert!(
+            reported.cache_read_input_tokens <= raw_input * 5,
+            "round {round}: read {reported:?}"
+        );
+        for value in [
+            reported.cache_read_input_tokens,
+            reported.cache_creation_input_tokens,
+        ] {
+            assert!(value == 0 || value >= 1_024, "round {round}: {reported:?}");
+        }
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.input_tokens
+                + reported.cache_read_input_tokens
+                + reported.cache_creation_input_tokens
+        );
+        writes += (reported.cache_creation_input_tokens > 0) as i32;
+    }
+    assert!(writes >= 1, "bounded replay should still write");
+
+    // current_high_cache 保持原有行为：同样参数下 input 会被计费下限补到上限之外。
+    let current = replay(&minerst_state(PromptCacheStrategyType::CurrentHighCache));
+    assert!(
+        current.iter().any(|(_, usage)| usage.input_tokens > 500),
+        "current_high_cache behavior must stay unchanged"
     );
 }
 

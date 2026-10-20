@@ -145,6 +145,7 @@ const defaultCachePolicy = (): CachePolicyConfig => ({
   kiroRsTool: {},
   stableSegmentCache: {},
   kiroRsToolPlus: {},
+  boundedHighCache: {},
   pathOverrides: {},
 })
 
@@ -2028,6 +2029,7 @@ function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
     kiroRsTool: source.kiroRsTool ?? {},
     stableSegmentCache: source.stableSegmentCache ?? {},
     kiroRsToolPlus: source.kiroRsToolPlus ?? {},
+    boundedHighCache: source.boundedHighCache ?? {},
     pathOverrides,
   }
 }
@@ -2063,6 +2065,11 @@ const defaultCacheHitShaping = (): Required<CacheHitShapingPatch> => ({
   minCreationRatio: 0,
 })
 type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
+
+/** 走本地模拟缓存参数（模拟、写入频次、reportedUsage、hitShaping）的策略。 */
+function isHighCacheStrategy(cacheType: CacheStrategyType): cacheType is 'current_high_cache' | 'bounded_high_cache' {
+  return cacheType === 'current_high_cache' || cacheType === 'bounded_high_cache'
+}
 
 const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
 const CACHE_ENDPOINT_LABELS: Record<string, string> = {
@@ -2205,7 +2212,7 @@ function defaultPathCachePatch(
     }
   }
   return {
-    cacheType: 'current_high_cache',
+    cacheType: cacheType === 'bounded_high_cache' ? 'bounded_high_cache' : 'current_high_cache',
     routeNamespace: Boolean(normalizeDefinedCacheRoute(prefix)),
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
@@ -2222,6 +2229,9 @@ function cacheTypeDesc(cacheType: CacheRoutePolicyPatch['cacheType']): string {
   }
   if (cacheType === 'kiro_rs_tool_plus') {
     return '在 Kiro-RS Tool 前缀追踪基础上，单独控制输入、输出、缓存读取、缓存写入的放大倍数（可大于 1）和上下限，支持写入频次限制，流式 / 非流式 / 小请求可以用不同参数。不叠加命中率整形和最终用量显示配置。'
+  }
+  if (cacheType === 'bounded_high_cache') {
+    return '参数与本地模拟缓存相同，但各字段上下限（输入上限、读写上限、读取倍数上限、单次写入上限）是最终约束，整形之后不再改写；计费只在范围内补，补不上的差额在之后放行写入的请求上补。'
   }
   if (cacheType === 'stable_segment_cache') {
     return '按请求里稳定不变的 tools、system 和历史消息计算缓存，只按会话和路径隔离；切换账号或外部池后缓存仍然保留，失败请求不会写入缓存。'
@@ -2309,6 +2319,7 @@ function CacheTypeSegment({
     { value: 'kiro_rs_tool', label: 'Kiro-RS Tool' },
     { value: 'stable_segment_cache', label: '稳定片段缓存' },
     { value: 'kiro_rs_tool_plus', label: 'Kiro-RS Tool Plus' },
+    { value: 'bounded_high_cache', label: '上下限优先缓存' },
   ]
   return (
     <div className="flex flex-wrap gap-2">
@@ -2409,9 +2420,12 @@ function ColdRequestGuardToggle({
 
 function CacheHitShapingForm({
   value,
+  bounded = false,
   onChange,
 }: {
   value: CacheHitShapingPatch
+  /** 上下限优先策略：计费下限只在上下限内补，说明文字随之调整。 */
+  bounded?: boolean
   onChange: (next: CacheHitShapingPatch) => void
 }) {
   const merged = { ...defaultCacheHitShaping(), ...value }
@@ -2424,7 +2438,9 @@ function CacheHitShapingForm({
       <div className="grid gap-4">
         <ToggleField
           title="启用命中率与小值整形"
-          description="在最终显示给下游的用量上执行：在输入、读取、写入的总量内按目标命中率重新分配，写入保持较大量级，并保证计费不低于原始用量。"
+          description={bounded
+            ? '在最终显示给下游的用量上执行：在各字段上下限内按目标命中率分配，写入保持较大量级，计费尽量不低于下限。'
+            : '在最终显示给下游的用量上执行：在输入、读取、写入的总量内按目标命中率重新分配，写入保持较大量级，并保证计费不低于原始用量。'}
           checked={merged.enabled}
           onCheckedChange={set('enabled')}
         />
@@ -2432,8 +2448,8 @@ function CacheHitShapingForm({
         <NumberField title="命中率浮动" description="在目标值之上随机多出的幅度；例如目标 0.9、浮动 0.04，实际落在 0.90~0.94。" value={merged.ratioJitter} min={0} max={0.2} step={0.01} suffix="比例" disabled={!merged.enabled} onChange={set('ratioJitter')} />
         <NumberField title="缓存读取最小值" description="非零缓存读取低于这个值时抬到这个值；0 表示不处理。" value={merged.minCacheReadTokens} min={0} suffix="Token" disabled={!merged.enabled} onChange={set('minCacheReadTokens')} />
         <NumberField title="缓存写入最小值" description="非零缓存写入低于这个值时抬到这个值；0 表示不处理。" value={merged.minCacheCreationTokens} min={0} suffix="Token" disabled={!merged.enabled} onChange={set('minCacheCreationTokens')} />
-        <NumberField title="计费下限倍数" description="整形后的计费不低于原始用量计费的这个倍数；与目标命中率冲突时以这里为准。1 表示不亏损，0 表示不限制。" value={merged.minCostRatio} min={0} max={5} step={0.05} suffix="倍" disabled={!merged.enabled} onChange={set('minCostRatio')} />
-        <NumberField title="缓存读取上限倍数" description="缓存读取最多为原始输入的多少倍；触及上限后命中率可以低于目标，计费下限仍然生效。0 表示不限制。" value={merged.maxReadMultiplier} min={0} max={50} step={0.5} suffix="倍" disabled={!merged.enabled} onChange={set('maxReadMultiplier')} />
+        <NumberField title="计费下限倍数" description={bounded ? '整形后的计费尽量不低于原始用量计费的这个倍数，只在各字段上下限内补；补不上的差额累计，在之后放行写入的请求上补。0 表示不限制。' : '整形后的计费不低于原始用量计费的这个倍数；与目标命中率冲突时以这里为准。1 表示不亏损，0 表示不限制。'} value={merged.minCostRatio} min={0} max={5} step={0.05} suffix="倍" disabled={!merged.enabled} onChange={set('minCostRatio')} />
+        <NumberField title="缓存读取上限倍数" description={bounded ? '缓存读取最多为原始输入的多少倍，是最终上限；触及上限后命中率和计费都可以低于目标。0 表示不限制。' : '缓存读取最多为原始输入的多少倍；触及上限后命中率可以低于目标，计费下限仍然生效。0 表示不限制。'} value={merged.maxReadMultiplier} min={0} max={50} step={0.5} suffix="倍" disabled={!merged.enabled} onChange={set('maxReadMultiplier')} />
         <NumberField title="最小写入比例" description="本次允许写入时，缓存写入至少为原始输入的这个比例；不允许写入的请求不受影响。0 表示不限制。" value={merged.minCreationRatio} min={0} max={5} step={0.05} suffix="倍" disabled={!merged.enabled} onChange={set('minCreationRatio')} />
       </div>
     </div>
@@ -2776,6 +2792,7 @@ function StrategyTemplateCard({
     <>
       <CacheHitShapingForm
         value={template.hitShaping ?? defaultCacheHitShaping()}
+        bounded={cacheType === 'bounded_high_cache'}
         onChange={(hitShaping) => onChange({ ...template, hitShaping })}
       />
       <ColdRequestGuardToggle
@@ -2791,7 +2808,7 @@ function StrategyTemplateCard({
         <h4 className="text-sm font-semibold">{title}</h4>
         <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>
       </div>
-      {cacheType === 'current_high_cache' ? (
+      {isHighCacheStrategy(cacheType) ? (
         <>
           <div className="space-y-3">
             <h5 className="text-sm font-semibold">模拟读取参数</h5>
@@ -2853,7 +2870,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
     return { cacheType: 'kiro_rs_tool_plus', kiroRsToolPlus: policy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch() }
   }
   return {
-    cacheType: 'current_high_cache',
+    cacheType: cacheType === 'bounded_high_cache' ? 'bounded_high_cache' : 'current_high_cache',
     simulation: policy.simulation ?? defaultSimulationPatch(),
     creationControl: policy.creationControl ?? defaultPromptCacheCreationControl(),
     reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
@@ -2890,6 +2907,8 @@ function pathPolicyWithStrategyDefaults(
   }
   const template = cacheType === 'kiro_rs_tool'
     ? cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
+    : cacheType === 'bounded_high_cache'
+      ? cachePolicyForStrategyTemplate(cachePolicy.boundedHighCache ?? {}, 'bounded_high_cache')
     : cacheType === 'stable_segment_cache'
       ? cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, 'stable_segment_cache')
       : cachePolicyForStrategyTemplate(
@@ -2904,7 +2923,7 @@ function pathPolicyWithStrategyDefaults(
     ...policy,
     cacheType,
     hitShaping: policy.hitShaping ?? template.hitShaping ?? defaultCacheHitShaping(),
-    ...(cacheType === 'current_high_cache'
+    ...(isHighCacheStrategy(cacheType)
       ? {
           routeNamespace: policy.routeNamespace ?? template.routeNamespace ?? Boolean(normalizeDefinedCacheRoute(prefix)),
           simulation: policy.simulation ?? template.simulation ?? defaultSimulationPatch(),
@@ -3067,7 +3086,7 @@ function PathCachePolicyCard({
             这个路径直接走无缓存逻辑，不进入缓存计算，也不展示缓存参数。
           </p>
         </div>
-      ) : effectiveCacheType === 'current_high_cache' ? (
+      ) : isHighCacheStrategy(effectiveCacheType) ? (
         <div className="space-y-4">
           <h4 className="text-sm font-semibold">本路径策略参数</h4>
           <ToggleField
@@ -3092,6 +3111,7 @@ function PathCachePolicyCard({
           />
           <CacheHitShapingForm
             value={effectivePolicy.hitShaping ?? defaultCacheHitShaping()}
+            bounded={effectiveCacheType === 'bounded_high_cache'}
             onChange={(hitShaping) => patch({ hitShaping })}
           />
           <ColdRequestGuardToggle
@@ -3194,7 +3214,7 @@ function CachePolicyEditor({
     const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
     const legacyReportedUsage = reportedUsageForPrefix(value.reportedUsage.pathOverrides, normalizedPrefix)
     if (existing) {
-      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool' || existing.cacheType === 'kiro_rs_tool_plus' || existing.cacheType === 'stable_segment_cache') {
+      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool' || existing.cacheType === 'kiro_rs_tool_plus' || existing.cacheType === 'stable_segment_cache' || existing.cacheType === 'bounded_high_cache') {
         return existing
       }
       return legacyReportedUsage ? { ...existing, reportedUsage: existing.reportedUsage ?? legacyReportedUsage } : existing
@@ -3318,6 +3338,10 @@ function CachePolicyEditor({
     updateCachePolicy({ ...cachePolicy, kiroRsToolPlus: next })
   }
   const stableSegmentTemplate = cachePolicyForStrategyTemplate(cachePolicy.stableSegmentCache ?? {}, 'stable_segment_cache')
+  const boundedTemplate = cachePolicyForStrategyTemplate(cachePolicy.boundedHighCache ?? {}, 'bounded_high_cache')
+  const setBoundedTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({ ...cachePolicy, boundedHighCache: next })
+  }
 
   return (
     <div className="md:col-span-2 space-y-5">
@@ -3350,13 +3374,20 @@ function CachePolicyEditor({
           policy={kiroPlusTemplate}
           onChange={setKiroPlusTemplate}
         />
+        <StrategyTemplateCard
+          title="上下限优先缓存策略默认参数"
+          description="参数与本地模拟缓存相同，但不读取本地模拟策略的模板。各字段上下限是最终约束，计费只在范围内补，补不上的差额在之后放行写入的请求上补。"
+          cacheType="bounded_high_cache"
+          policy={boundedTemplate}
+          onChange={setBoundedTemplate}
+        />
       </div>
 
       <div className="space-y-4 rounded-lg border bg-background p-4">
         <div>
           <h4 className="text-sm font-semibold">路径绑定</h4>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            每个路径都显式选择无缓存、本地模拟缓存策略、Kiro-RS Tool 缓存策略、Kiro-RS Tool Plus 缓存策略或稳定片段缓存策略。
+            每个路径都显式选择无缓存、本地模拟缓存策略、上下限优先缓存策略、Kiro-RS Tool 缓存策略、Kiro-RS Tool Plus 缓存策略或稳定片段缓存策略。
           </p>
         </div>
         <div className="flex flex-col gap-3 lg:flex-row lg:items-end">

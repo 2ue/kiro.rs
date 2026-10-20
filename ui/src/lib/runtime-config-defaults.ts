@@ -92,6 +92,7 @@ export function defaultCachePolicy(): CachePolicyConfig {
     kiroRsTool: {},
     stableSegmentCache: {},
     kiroRsToolPlus: {},
+    boundedHighCache: {},
     pathOverrides: {},
   }
 }
@@ -720,6 +721,7 @@ export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyCon
     kiroRsTool: source.kiroRsTool ?? {},
     stableSegmentCache: source.stableSegmentCache ?? {},
     kiroRsToolPlus: source.kiroRsToolPlus ?? {},
+    boundedHighCache: source.boundedHighCache ?? {},
     pathOverrides,
   }
 }

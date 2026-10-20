@@ -869,6 +869,7 @@ struct ExternalFallbackContext {
     kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
     kiro_rs_tool_plus_cache_policy: crate::model::config::KiroRsToolPlusCachePolicy,
     stable_segment_cache_policy: StableSegmentCachePolicy,
+    cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy,
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
@@ -1242,11 +1243,14 @@ fn cache_route_for_request_stream(
 
 fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
     match policy.cache_type {
-        PromptCacheStrategyType::CurrentHighCache if policy.simulation.enabled => {
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache
+            if policy.simulation.enabled =>
+        {
             PromptCacheSimulationMode::HighCache
         }
         PromptCacheStrategyType::NoCache
         | PromptCacheStrategyType::CurrentHighCache
+        | PromptCacheStrategyType::BoundedHighCache
         | PromptCacheStrategyType::KiroRsTool
         | PromptCacheStrategyType::KiroRsToolPlus
         | PromptCacheStrategyType::StableSegmentCache => PromptCacheSimulationMode::Disabled,
@@ -1256,7 +1260,7 @@ fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptC
 fn prompt_cache_converter_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
     match policy.cache_type {
         PromptCacheStrategyType::NoCache => PromptCacheSimulationMode::Disabled,
-        PromptCacheStrategyType::CurrentHighCache => {
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache => {
             prompt_cache_simulation_mode_for_policy(policy)
         }
         PromptCacheStrategyType::KiroRsTool
@@ -1825,6 +1829,7 @@ fn raw_external_route_request_with_hints(
         kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
         kiro_rs_tool_plus_cache_policy: policy.kiro_rs_tool_plus,
         stable_segment_cache_policy: policy.stable_segment,
+        cache_hit_shaping_policy: policy.hit_shaping,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         request_id: request_id.clone(),
@@ -1898,6 +1903,7 @@ fn build_external_fallback_context(
         kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
         kiro_rs_tool_plus_cache_policy: policy.kiro_rs_tool_plus,
         stable_segment_cache_policy: policy.stable_segment,
+        cache_hit_shaping_policy: policy.hit_shaping,
         model_capabilities: state.model_capabilities.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         recorder: state.usage_recorder.clone(),
@@ -2414,6 +2420,7 @@ impl ExternalFallbackContext {
             kiro_rs_tool_cache_policy: self.kiro_rs_tool_cache_policy,
             kiro_rs_tool_plus_cache_policy: self.kiro_rs_tool_plus_cache_policy,
             stable_segment_cache_policy: self.stable_segment_cache_policy,
+            cache_hit_shaping_policy: self.cache_hit_shaping_policy,
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
             error_id: request_id.clone(),
@@ -3516,7 +3523,7 @@ impl RequestUsageContext {
     }
 
     fn cache_amplification(&self) -> Option<super::cache::CacheAmplification> {
-        if self.prompt_cache_strategy_type != PromptCacheStrategyType::CurrentHighCache
+        if !self.prompt_cache_strategy_type.uses_high_cache_simulation()
             || self.simulation_mode != PromptCacheSimulationMode::HighCache
         {
             return None;
@@ -3738,6 +3745,7 @@ impl RequestUsageContext {
         matches!(
             self.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache
+                | PromptCacheStrategyType::BoundedHighCache
                 | PromptCacheStrategyType::KiroRsTool
                 | PromptCacheStrategyType::KiroRsToolPlus
                 | PromptCacheStrategyType::StableSegmentCache
@@ -3757,6 +3765,7 @@ impl RequestUsageContext {
         if !matches!(
             self.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache
+                | PromptCacheStrategyType::BoundedHighCache
                 | PromptCacheStrategyType::KiroRsTool
                 | PromptCacheStrategyType::StableSegmentCache
         ) {
@@ -3911,7 +3920,7 @@ fn should_apply_reported_usage(
     }
     match strategy_type {
         PromptCacheStrategyType::NoCache => false,
-        PromptCacheStrategyType::CurrentHighCache => {
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
         PromptCacheStrategyType::KiroRsTool
@@ -3926,7 +3935,7 @@ fn should_build_local_prompt_cache_usage(
 ) -> bool {
     match strategy_type {
         PromptCacheStrategyType::NoCache => false,
-        PromptCacheStrategyType::CurrentHighCache => {
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
         PromptCacheStrategyType::KiroRsTool
@@ -4277,10 +4286,121 @@ impl CredentialUsageContext {
         controlled: super::cache::CacheUsage,
         raw_usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
+        if self.uses_bounded_high_cache() {
+            return self.shape_bounded_final_usage(reported_usage, controlled, raw_usage, true);
+        }
         let shaped = self.shape_final_cache_hit_ratio(reported_usage, controlled, raw_usage);
         let constrained = self.constrain_cold_reported_usage(shaped, raw_usage);
         self.record_final_creation_adjustment(controlled, constrained);
         constrained
+    }
+
+    fn uses_bounded_high_cache(&self) -> bool {
+        self.request.prompt_cache_strategy_type == PromptCacheStrategyType::BoundedHighCache
+    }
+
+    /// `bounded_high_cache` 的最终下游 usage：在上下限内做命中率 / 小值 / 计费整形，
+    /// 冷请求约束之后再按上下限收口，收口之后不再改写。
+    ///
+    /// `commit` 为 true 时（最终 usage）把写入增量记回频次窗口、把计费差额记账；
+    /// 为 false 时（message_start 预览）只计算，不更新状态。
+    fn shape_bounded_final_usage(
+        &self,
+        reported_usage: super::cache::CacheUsage,
+        controlled: super::cache::CacheUsage,
+        raw_usage: super::cache::CacheUsage,
+        commit: bool,
+    ) -> super::cache::CacheUsage {
+        let input = self.bounded_shaping_input(reported_usage, controlled, raw_usage);
+        let shaped = super::bounded_shaping::shape_bounded_usage(reported_usage, input);
+        let constrained = self.constrain_cold_reported_usage(shaped, raw_usage);
+        let final_usage = super::bounded_shaping::enforce_bounded_usage(constrained, &input);
+        if commit {
+            self.record_final_creation_adjustment(controlled, final_usage);
+            self.record_bounded_cost_outcome(&input, final_usage);
+        }
+        final_usage
+    }
+
+    fn bounded_shaping_input(
+        &self,
+        reported_usage: super::cache::CacheUsage,
+        controlled: super::cache::CacheUsage,
+        raw_usage: super::cache::CacheUsage,
+    ) -> super::bounded_shaping::BoundedShapingInput {
+        let reported_policy = self.request.reported_cache_usage_policy.as_ref();
+        let (max_cache_read_tokens, max_cache_creation_tokens) = reported_policy
+            .map(|policy| policy.final_cache_caps(reported_usage))
+            .unwrap_or((0, 0));
+        let config = self.request.prompt_cache_creation_control.normalized();
+        let controls_creation =
+            config.enabled && self.request.simulation_mode == PromptCacheSimulationMode::HighCache;
+        let scope = self.scope();
+        let credential_key = self.creation_control_credential_key();
+        super::bounded_shaping::BoundedShapingInput {
+            policy: self
+                .request
+                .cache_hit_shaping
+                .policy
+                .unwrap_or_else(crate::model::config::CacheHitShapingPolicy::disabled),
+            has_reusable_prefix: self.request.cache_hit_shaping.reusable_prefix,
+            creation_allowed: self.creation_allowed_after_control(controlled),
+            raw: raw_usage,
+            pricing: self
+                .request
+                .pricing_catalog
+                .model_pricing(self.creation_control_model()),
+            input_max_tokens: reported_policy
+                .map(|policy| policy.reported_input_max_tokens())
+                .unwrap_or(0),
+            max_cache_read_tokens,
+            max_cache_creation_tokens,
+            // 写入频次控制优先于命中率和计费：放行写入时最终写入不超过本次放行量
+            // （已含单次上限和窗口余量），避免整形把写入抬高后透支窗口额度。
+            max_creation_event_tokens: if controls_creation {
+                controlled.cache_creation_input_tokens.max(0)
+            } else {
+                0
+            },
+            carried_cost_deficit_usd: self
+                .request
+                .prompt_cache_creation_controller
+                .cost_deficit_usd(
+                    scope.as_ref(),
+                    config,
+                    credential_key.as_deref(),
+                    Some(self.creation_control_model()),
+                ),
+            seed: self.request.cache_hit_shaping.seed,
+        }
+    }
+
+    /// 把本次最终计费相对计费下限的差额记入同一控制维度：不足累加，超出抵扣。
+    fn record_bounded_cost_outcome(
+        &self,
+        input: &super::bounded_shaping::BoundedShapingInput,
+        final_usage: super::cache::CacheUsage,
+    ) {
+        let (Some(floor_usd), Some(pricing)) = (input.cost_floor_usd(), input.pricing) else {
+            return;
+        };
+        let scope = self.scope();
+        let credential_key = self.creation_control_credential_key();
+        self.request
+            .prompt_cache_creation_controller
+            .record_cost_outcome(
+                scope.as_ref(),
+                self.request.prompt_cache_creation_control,
+                credential_key.as_deref(),
+                Some(self.creation_control_model()),
+                floor_usd,
+                pricing.estimate(final_usage),
+            );
+    }
+
+    fn creation_control_credential_key(&self) -> Option<String> {
+        self.credential_id
+            .map(|credential_id| format!("credential:{credential_id}"))
     }
 
     /// 把最终下游写入相对 creation control 放行量的增量记回窗口。
@@ -4450,6 +4570,7 @@ impl CredentialUsageContext {
         matches!(
             self.request.prompt_cache_strategy_type,
             PromptCacheStrategyType::CurrentHighCache
+                | PromptCacheStrategyType::BoundedHighCache
                 | PromptCacheStrategyType::KiroRsTool
                 | PromptCacheStrategyType::KiroRsToolPlus
                 | PromptCacheStrategyType::StableSegmentCache
@@ -4653,7 +4774,8 @@ impl CredentialUsageContext {
         if let Some(scope) = self.scope() {
             match self.request.prompt_cache_strategy_type {
                 PromptCacheStrategyType::NoCache => {}
-                PromptCacheStrategyType::CurrentHighCache => {
+                PromptCacheStrategyType::CurrentHighCache
+                | PromptCacheStrategyType::BoundedHighCache => {
                     self.request.prompt_cache.update_with_bounds(
                         Some(scope),
                         self.request.prompt_cache_profile.as_ref(),
@@ -4788,15 +4910,15 @@ impl CredentialUsageContext {
 
     fn record_websearch_tool_error_success(
         &self,
-        usage: super::cache::CacheUsage,
+        usage: WebSearchRecordedUsage,
         error_code: &'static str,
         internal_reason: &'static str,
     ) {
         self.record(
             UsageRecordStatus::Success,
-            usage,
+            usage.reported,
             UsageSource::RequestEstimate,
-            Some(usage),
+            Some(usage.raw),
             Some("websearch_tool_error".to_string()),
             Some(internal_reason.to_string()),
             Some(format!(
@@ -5211,10 +5333,18 @@ impl Drop for StreamUsageGuard {
     }
 }
 
+/// websearch 记录用的 usage：`reported` 是下发给客户端的最终 usage，`raw` 是原始估算
+/// （用于原始计费）。未整形的策略两者相同。
+#[derive(Debug, Clone, Copy)]
+struct WebSearchRecordedUsage {
+    reported: super::cache::CacheUsage,
+    raw: super::cache::CacheUsage,
+}
+
 fn wrap_websearch_stream_usage_record(
     response: Response,
     usage_context: CredentialUsageContext,
-    usage: super::cache::CacheUsage,
+    usage: WebSearchRecordedUsage,
     tool_error: Option<(&'static str, &'static str)>,
 ) -> Response {
     let (parts, body) = response.into_parts();
@@ -5279,9 +5409,9 @@ fn wrap_websearch_stream_usage_record(
                             );
                         } else {
                             guard.context().record_success_reported_with_metering(
-                                usage,
+                                usage.reported,
                                 UsageSource::RequestEstimate,
-                                Some(usage),
+                                Some(usage.raw),
                                 None,
                             );
                         }
@@ -5363,7 +5493,8 @@ fn prepare_usage_context_with_inference_attempt_budget(
     let (prompt_cache_profile, kiro_rs_tool_prompt_cache_plan, stable_segment_prompt_cache_plan) =
         match strategy_type {
             PromptCacheStrategyType::NoCache => (None, None, None),
-            PromptCacheStrategyType::CurrentHighCache => match simulation_mode {
+            PromptCacheStrategyType::CurrentHighCache
+            | PromptCacheStrategyType::BoundedHighCache => match simulation_mode {
                 PromptCacheSimulationMode::Disabled => (None, None, None),
                 PromptCacheSimulationMode::HighCache if prompt_cache_supported => (
                     state.prompt_cache.build_high_cache_profile_for_model(
@@ -5416,11 +5547,13 @@ fn prepare_usage_context_with_inference_attempt_budget(
         };
     let (simulated_usage, simulated_source) = match strategy_type {
         PromptCacheStrategyType::NoCache => (None, None),
-        PromptCacheStrategyType::CurrentHighCache => build_simulated_usage(
-            simulation_mode,
-            stable_conversation_id.as_deref(),
-            prompt_cache_profile.as_ref(),
-        ),
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache => {
+            build_simulated_usage(
+                simulation_mode,
+                stable_conversation_id.as_deref(),
+                prompt_cache_profile.as_ref(),
+            )
+        }
         PromptCacheStrategyType::KiroRsTool => {
             let simulated_usage = kiro_rs_tool_prompt_cache_plan.as_ref().and_then(|plan| {
                 let policy = policy.kiro_rs_tool.normalized();
@@ -5575,10 +5708,12 @@ fn prompt_cache_scope_conversation_id(
         PromptCacheStrategyType::KiroRsTool
         | PromptCacheStrategyType::KiroRsToolPlus
         | PromptCacheStrategyType::StableSegmentCache => extract_stable_conversation_id(payload),
-        PromptCacheStrategyType::CurrentHighCache => match mode {
-            PromptCacheSimulationMode::Disabled => None,
-            PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
-        },
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache => {
+            match mode {
+                PromptCacheSimulationMode::Disabled => None,
+                PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
+            }
+        }
     }
 }
 
@@ -7526,12 +7661,29 @@ async fn post_messages_inner(
         let request_id = usage_context.request_id.clone();
         let error_id = usage_context.error_id.clone();
         let attribution_sink = Arc::new(McpCallAttributionSink::default());
+        // bounded_high_cache：websearch 与普通请求走同一条最终 usage 链路（reportedUsage 的
+        // input / output 上下限与 output 放大、最终读写上限、上下限收口），下发与记录一致。
+        // 其他策略保持原样下发估算值。
+        let websearch_usage_shaper = (usage_context.prompt_cache_strategy_type
+            == PromptCacheStrategyType::BoundedHighCache)
+            .then(|| usage_context.clone());
+        let websearch_usage_mapper = websearch_usage_shaper.as_ref().map(|context| {
+            move |raw: super::cache::CacheUsage| {
+                context
+                    .clone()
+                    .attach_credential(None, None, false, false, Vec::new())
+                    .canonical_reported_usage_for_success(raw, UsageSource::RequestEstimate)
+            }
+        });
         let mut usage_guard =
             WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
         let outcome = websearch::handle_websearch_request(websearch::WebSearchRequestContext {
             provider,
             payload: &payload,
             input_tokens,
+            usage_mapper: websearch_usage_mapper
+                .as_ref()
+                .map(|mapper| mapper as websearch::WebSearchUsageMapper<'_>),
             inference_attempt_budget,
             attribution_sink,
             request_id: &request_id,
@@ -7543,6 +7695,7 @@ async fn post_messages_inner(
             websearch::WebSearchOutcome::Success {
                 response,
                 output_tokens,
+                reported_usage,
                 attribution,
             } => {
                 let usage_context = usage_context.attach_credential(
@@ -7552,7 +7705,7 @@ async fn post_messages_inner(
                     false,
                     attribution.attempts,
                 );
-                let usage = super::cache::CacheUsage {
+                let raw_usage = super::cache::CacheUsage {
                     total_input_tokens: input_tokens.max(0),
                     input_tokens: input_tokens.max(0),
                     output_tokens: output_tokens.max(0),
@@ -7560,6 +7713,10 @@ async fn post_messages_inner(
                     cache_read_input_tokens: 0,
                     cache_creation_5m_input_tokens: 0,
                     cache_creation_1h_input_tokens: 0,
+                };
+                let usage = WebSearchRecordedUsage {
+                    reported: reported_usage,
+                    raw: raw_usage,
                 };
                 if payload.stream {
                     wrap_websearch_stream_usage_record(response, usage_context, usage, None)
@@ -7571,9 +7728,9 @@ async fn post_messages_inner(
                         .inference_attempt_budget
                         .mark_downstream_committed();
                     usage_context.record_success_reported_with_metering(
-                        usage,
+                        usage.reported,
                         UsageSource::RequestEstimate,
-                        Some(usage),
+                        Some(usage.raw),
                         None,
                     );
                     response
@@ -7612,14 +7769,17 @@ async fn post_messages_inner(
                         false,
                         attribution.attempts,
                     );
-                    let usage = super::cache::CacheUsage {
-                        total_input_tokens: input_tokens.max(0),
-                        input_tokens: input_tokens.max(0),
-                        output_tokens: tool_error.output_tokens.max(0),
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                        cache_creation_5m_input_tokens: 0,
-                        cache_creation_1h_input_tokens: 0,
+                    let usage = WebSearchRecordedUsage {
+                        reported: tool_error.reported_usage,
+                        raw: super::cache::CacheUsage {
+                            total_input_tokens: input_tokens.max(0),
+                            input_tokens: input_tokens.max(0),
+                            output_tokens: tool_error.output_tokens.max(0),
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0,
+                            cache_creation_5m_input_tokens: 0,
+                            cache_creation_1h_input_tokens: 0,
+                        },
                     };
                     if payload.stream {
                         return wrap_websearch_stream_usage_record(
@@ -8428,6 +8588,10 @@ impl StreamContextTemplate {
                 let raw =
                     super::cache::RawUsage::uncached(credential_usage.request.input_tokens, 0)
                         .to_cache_usage();
+                if credential_usage.uses_bounded_high_cache() {
+                    return credential_usage
+                        .shape_bounded_final_usage(preview, preview, raw, false);
+                }
                 let reported_policy = credential_usage.request.reported_cache_usage_policy.clone();
                 let shaped = credential_usage.request.cache_hit_shaping.apply(
                     preview,

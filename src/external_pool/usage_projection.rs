@@ -52,6 +52,11 @@ pub(super) struct ExternalUsageProjectionContext {
     pub(super) output_uplift_min_tokens: i32,
     pub(super) output_uplift_percent: u32,
     pub(super) kiro_rs_tool_plus: Option<ExternalKiroRsToolPlusProjection>,
+    /// `bounded_high_cache`：最终下游 usage 按上下限收口，收口之后不再改写。
+    pub(super) bounded_final_caps: bool,
+    pub(super) bounded_seed: u64,
+    /// 路由 hitShaping 参数：收口时提供读取倍数上限和读写最小值。
+    pub(super) cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy,
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
@@ -79,6 +84,8 @@ pub(super) struct ExternalUsageProjectionTemplate {
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pricing_catalog: Arc<PricingCatalog>,
     kiro_rs_tool_plus: Option<ExternalKiroRsToolPlusProjection>,
+    bounded_final_caps: bool,
+    cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy,
 }
 
 impl ExternalUsageProjectionTemplate {
@@ -151,6 +158,9 @@ impl ExternalUsageProjectionTemplate {
             output_uplift_min_tokens: self.output_uplift_min_tokens,
             output_uplift_percent: self.output_uplift_percent,
             kiro_rs_tool_plus: self.kiro_rs_tool_plus,
+            bounded_final_caps: self.bounded_final_caps,
+            bounded_seed: fastrand::u64(..),
+            cache_hit_shaping_policy: self.cache_hit_shaping_policy,
             state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
         }
     }
@@ -222,7 +232,9 @@ fn build_template(
         return None;
     }
     if !reported_usage.enabled
-        && route.prompt_cache_strategy_type == PromptCacheStrategyType::CurrentHighCache
+        && route
+            .prompt_cache_strategy_type
+            .uses_high_cache_simulation()
     {
         return None;
     }
@@ -273,6 +285,7 @@ fn build_template(
     let (profile, kiro_rs_tool_prompt_cache_plan, stable_segment_cache_policy, simulated_usage) =
         match route.prompt_cache_strategy_type {
             PromptCacheStrategyType::CurrentHighCache
+            | PromptCacheStrategyType::BoundedHighCache
                 if prompt_cache_supported
                     && route.prompt_cache_simulation_mode
                         == PromptCacheSimulationMode::HighCache =>
@@ -344,7 +357,7 @@ fn build_template(
             crate::model::config::ReportedUsagePathPolicy::disabled(),
             fastrand::u64(..),
         ),
-        PromptCacheStrategyType::CurrentHighCache
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache
             if prompt_cache_supported
                 && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
         {
@@ -362,6 +375,7 @@ fn build_template(
             .then(|| ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..)))
             .flatten(),
         PromptCacheStrategyType::CurrentHighCache
+        | PromptCacheStrategyType::BoundedHighCache
         | PromptCacheStrategyType::KiroRsTool
         | PromptCacheStrategyType::KiroRsToolPlus
         | PromptCacheStrategyType::StableSegmentCache => None,
@@ -401,6 +415,9 @@ fn build_template(
         prompt_cache_creation_control: route.prompt_cache_creation_control,
         pricing_catalog: route.pricing_catalog.clone(),
         kiro_rs_tool_plus,
+        bounded_final_caps: route.prompt_cache_strategy_type
+            == PromptCacheStrategyType::BoundedHighCache,
+        cache_hit_shaping_policy: route.cache_hit_shaping_policy,
     })
 }
 
