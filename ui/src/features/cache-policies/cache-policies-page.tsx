@@ -3,12 +3,14 @@ import {
   Check,
   Copy,
   Database,
+  Download,
   Edit3,
   Info,
   Plus,
   Route,
   Save,
   Trash2,
+  Upload,
   WandSparkles,
   X,
   Zap,
@@ -37,6 +39,8 @@ import {
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
 import type { CachePolicyConfig, CacheRoutePolicyPatch, IdentityPromptConfig, IdentityRouteOverride, RuntimeConfig } from '@/types/api'
 import { identitySummary, RouteIdentityEditor } from './route-identity-editor'
+import { RoutePolicyImportDialog } from './route-policy-import-dialog'
+import { buildRoutePolicyFile, downloadRoutePolicyFile } from './route-policy-transfer'
 import {
   buildDefinedCacheRoute,
   cachePolicyForStrategyTemplate,
@@ -64,8 +68,8 @@ type PathEditorState = {
   policy: CacheRoutePolicyPatch
   definedRoutes: string[]
   identity: IdentityRouteOverride
-  /** Source route when the editor was opened by copying a route. */
-  copiedFrom?: string
+  /** Set when the editor was prefilled by copying or importing a route policy. */
+  origin?: { kind: 'copy' | 'import'; route: string | null }
   /** Register the new /dfcache route as soon as a valid name is typed (copy of a reachable route). */
   autoRegister?: boolean
 }
@@ -372,6 +376,7 @@ function PathCard({
   registered,
   onEdit,
   onCopy,
+  onExport,
   onDelete,
 }: {
   prefix: string
@@ -381,6 +386,7 @@ function PathCard({
   registered: boolean
   onEdit: () => void
   onCopy: () => void
+  onExport: () => void
   onDelete: () => void
 }) {
   return (
@@ -397,6 +403,7 @@ function PathCard({
         <div className="flex shrink-0 gap-1">
           <Button variant="ghost" size="icon-xs" title="编辑" aria-label={`编辑 ${prefix}`} onClick={onEdit}><Edit3 /></Button>
           <Button variant="ghost" size="icon-xs" title="复制" aria-label={`复制 ${prefix} 的策略`} onClick={onCopy}><Copy /></Button>
+          <Button variant="ghost" size="icon-xs" title="导出 JSON" aria-label={`导出 ${prefix} 的策略`} onClick={onExport}><Download /></Button>
           {!builtIn && <Button variant="ghost" size="icon-xs" className="text-destructive hover:text-destructive" title="删除" onClick={onDelete}><Trash2 /></Button>}
         </div>
       </CardHeader>
@@ -419,6 +426,7 @@ export function CachePoliciesPage() {
   const [workingConfig, setWorkingConfig] = useState<RuntimeConfig | null>(null)
   const [templateEditor, setTemplateEditor] = useState<TemplateEditorState | null>(null)
   const [pathEditor, setPathEditor] = useState<PathEditorState | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
   const [threshold, setThreshold] = useState(10000)
 
   useEffect(() => {
@@ -521,9 +529,33 @@ export function CachePoliciesPage() {
       policy: structuredClone(mergedPathPolicy(prefix)),
       definedRoutes: [...definedRoutes],
       identity: structuredClone(identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix)),
-      copiedFrom: prefix,
+      origin: { kind: 'copy', route: prefix },
       // Built-in routes and registered /dfcache routes are reachable, so the copy is too.
       autoRegister: isBuiltInPrefix(prefix) || Boolean(sourceRoute && definedRoutes.includes(sourceRoute)),
+    })
+  }
+
+  const exportPath = (prefix: string) => {
+    if (!workingConfig) return
+    downloadRoutePolicyFile(buildRoutePolicyFile(
+      prefix,
+      sanitizeCacheRoutePolicy(mergedPathPolicy(prefix)),
+      identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
+    ))
+    toast.success(`已导出 ${prefix} 的路由策略`)
+  }
+
+  /** Imported policies open the normal new-route editor, prefilled; the route is never imported. */
+  const openImportedPathEditor = (imported: { sourceRoute: string | null; cachePolicy: CacheRoutePolicyPatch; identity: IdentityRouteOverride }) => {
+    setImportOpen(false)
+    setPathEditor({
+      mode: 'new',
+      originalPrefix: null,
+      prefix: '/dfcache/',
+      policy: imported.cachePolicy,
+      definedRoutes: [...definedRoutes],
+      identity: imported.identity,
+      origin: { kind: 'import', route: imported.sourceRoute },
     })
   }
 
@@ -613,10 +645,16 @@ export function CachePoliciesPage() {
         title="路由策略"
         subtitle="按路由分别管理缓存策略和身份隐藏，默认模板、路径覆盖和 /dfcache 路由集中在一处"
         actions={
-          <Button onClick={openNewPathEditor}>
-            <Plus />
-            新增路由
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setImportOpen(true)}>
+              <Upload />
+              导入
+            </Button>
+            <Button onClick={openNewPathEditor}>
+              <Plus />
+              新增路由
+            </Button>
+          </div>
         }
       />
 
@@ -643,7 +681,12 @@ export function CachePoliciesPage() {
         title="路由"
         description="每个路由独立配置缓存策略和身份隐藏。内置路由不能删除；自定义路由通过 /dfcache/{name} 管理。"
         icon={<Route />}
-        actions={<Button variant="outline" size="sm" onClick={openNewPathEditor}><Plus />新增路径</Button>}
+        actions={
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}><Upload />导入</Button>
+            <Button variant="outline" size="sm" onClick={openNewPathEditor}><Plus />新增路径</Button>
+          </div>
+        }
       >
         <div className="grid gap-4 xl:grid-cols-2">
           {paths.map((prefix) => {
@@ -662,6 +705,7 @@ export function CachePoliciesPage() {
                 registered={Boolean(normalizedRoute && definedRoutes.includes(normalizedRoute))}
                 onEdit={() => openPathEditor(prefix)}
                 onCopy={() => openCopyPathEditor(prefix)}
+                onExport={() => exportPath(prefix)}
                 onDelete={() => void deletePath(prefix)}
               />
             )
@@ -689,6 +733,10 @@ export function CachePoliciesPage() {
           </Button>
         </div>
       </SectionCard>
+
+      {importOpen && (
+        <RoutePolicyImportDialog onClose={() => setImportOpen(false)} onImport={openImportedPathEditor} />
+      )}
 
       {templateEditor && (
         <ModalShell
@@ -721,11 +769,13 @@ export function CachePoliciesPage() {
       {pathEditor && (
         <ModalShell
           open
-          title={pathEditor.copiedFrom
-            ? `复制路由策略 · 来自 ${pathEditor.copiedFrom}`
-            : pathEditor.mode === 'new' ? '新增路由策略' : `编辑路由策略 · ${pathEditor.originalPrefix}`}
-          description={pathEditor.copiedFrom
-            ? '已填入来源路由的缓存策略和身份隐藏设置；路由不会复制，请填写新的 /dfcache 路由名后保存。'
+          title={pathEditor.origin?.kind === 'copy'
+            ? `复制路由策略 · 来自 ${pathEditor.origin.route}`
+            : pathEditor.origin?.kind === 'import'
+              ? `导入路由策略${pathEditor.origin.route ? ` · 来自 ${pathEditor.origin.route}` : ''}`
+              : pathEditor.mode === 'new' ? '新增路由策略' : `编辑路由策略 · ${pathEditor.originalPrefix}`}
+          description={pathEditor.origin
+            ? `已填入${pathEditor.origin.kind === 'copy' ? '来源路由' : '导入'}的缓存策略和身份隐藏设置；路由不会${pathEditor.origin.kind === 'copy' ? '复制' : '导入'}，请填写新的 /dfcache 路由名后保存。`
             : '路径、缓存策略和身份隐藏会一起保存；关闭弹窗不会提交草稿。'}
           width="max-w-5xl"
           noBodyPadding
