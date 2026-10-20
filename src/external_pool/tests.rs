@@ -12967,6 +12967,7 @@ fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
     });
     payload_mut(&mut route).output_config = Some(OutputConfig {
         effort: Some("xhigh".to_string()),
+        format: None,
     });
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
@@ -13085,6 +13086,7 @@ fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization(
     });
     payload_mut(&mut route).output_config = Some(OutputConfig {
         effort: Some("xhigh".to_string()),
+        format: None,
     });
     route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,

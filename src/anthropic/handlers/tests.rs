@@ -8249,6 +8249,7 @@ fn synthetic_thinking_activation_never_forges_client_effort_five_rounds() {
         let mut explicit = messages_request_for_model("claude-opus-4-8-thinking");
         explicit.output_config = Some(OutputConfig {
             effort: Some("max".to_string()),
+            format: None,
         });
         override_thinking_from_model_name(&mut explicit).expect("explicit effort override");
         assert_eq!(
@@ -8297,6 +8298,7 @@ fn thinking_trigger_always_preserves_enabled_and_output_config() {
     });
     payload.output_config = Some(OutputConfig {
         effort: Some("low".to_string()),
+        format: None,
     });
     let mut runtime_config =
         runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);

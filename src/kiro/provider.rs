@@ -3197,6 +3197,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,

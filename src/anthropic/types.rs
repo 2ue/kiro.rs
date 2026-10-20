@@ -555,6 +555,11 @@ pub struct OutputConfig {
     /// model capability default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Structured output format (`{"type": "json_schema", "schema": {...}}`). Kiro has no
+    /// native equivalent; the local path serves it through an internal tool
+    /// (see `structured_output`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
 }
 
 /// Compatibility default used only by the legacy synthetic thinking prompt transport.

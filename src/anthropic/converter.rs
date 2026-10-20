@@ -1805,6 +1805,7 @@ mod tests {
                 None,
                 Some(OutputConfig {
                     effort: Some("low".to_string()),
+                    format: None,
                 }),
                 "<thinking_mode>adaptive</thinking_mode>",
                 "<thinking_effort>low</thinking_effort>",
@@ -3163,6 +3164,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3221,6 +3223,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("xhigh".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3273,6 +3276,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("xhigh".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3313,6 +3317,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3543,6 +3548,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3599,6 +3605,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3655,6 +3662,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3865,6 +3873,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -3974,6 +3983,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -4030,6 +4040,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -4116,6 +4127,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("xhigh".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -4158,6 +4170,7 @@ mod tests {
             thinking: None,
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -4207,6 +4220,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("max".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -4249,6 +4263,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,
@@ -4305,6 +4320,7 @@ mod tests {
             }),
             output_config: Some(OutputConfig {
                 effort: Some("high".to_string()),
+                format: None,
             }),
             metadata: None,
             stop_sequences: None,

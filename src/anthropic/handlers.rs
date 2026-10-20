@@ -13072,6 +13072,11 @@ async fn handle_non_stream_request(
     credential_usage
         .request
         .mark_response_tool_gate(&response_tool_gate);
+    if let Some(target) = response_tool_policy.structured_output() {
+        if let Some(reason) = super::structured_output::rewrite_content(&mut content, target) {
+            stop_reason = reason.to_string();
+        }
+    }
 
     if credential_usage.request.strip_injected_control_blocks {
         super::control_block_cleaner::strip_control_blocks_in_content(&mut content);

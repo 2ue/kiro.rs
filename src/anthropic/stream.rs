@@ -1743,6 +1743,8 @@ pub struct StreamContext {
     /// 清洗正文中复述的代理注入控制块（`<thinking_mode>` 等）。
     control_block_cleaner: Option<super::control_block_cleaner::ControlBlockCleaner>,
     identity_guard: Option<super::identity_guard::IdentityGuard>,
+    /// Turns the internal structured-output tool call back into JSON text.
+    structured_output: Option<super::structured_output::StructuredOutputStreamRewriter>,
 }
 
 impl StreamContext {
@@ -1927,11 +1929,16 @@ impl StreamContext {
             tool_name_text_restorer,
             control_block_cleaner: None,
             identity_guard: None,
+            structured_output: None,
         }
     }
 
     pub fn set_response_tool_policy(&mut self, policy: &ResponseToolPolicy) {
         self.response_tool_gate = policy.gate();
+        self.structured_output = policy
+            .structured_output()
+            .cloned()
+            .map(super::structured_output::StructuredOutputStreamRewriter::new);
     }
 
     pub fn response_tool_gate(&self) -> &ResponseToolGate {
@@ -1966,6 +1973,11 @@ impl StreamContext {
     }
 
     fn apply_output_filters(&mut self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        // First, so later text filters see the structured answer as ordinary text.
+        let events = match self.structured_output.as_mut() {
+            Some(rewriter) => rewriter.apply(events),
+            None => events,
+        };
         let events = match self.control_block_cleaner.as_mut() {
             Some(cleaner) => cleaner.apply(events),
             None => events,
@@ -1994,6 +2006,13 @@ impl StreamContext {
     pub fn downstream_stop_reason(&self) -> String {
         if self.stop_sequence_matched() {
             return super::stop_sequence::STOP_SEQUENCE_STOP_REASON.to_string();
+        }
+        if self
+            .structured_output
+            .as_ref()
+            .is_some_and(|rewriter| rewriter.replaced_stop_reason())
+        {
+            return "end_turn".to_string();
         }
         self.state_manager.get_stop_reason()
     }
