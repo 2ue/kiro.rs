@@ -354,6 +354,7 @@ fn internal_request(payload: &MessagesRequest) -> MessagesRequest {
     request
 }
 
+#[allow(clippy::result_large_err)]
 async fn call_model(
     ctx: &ModelDrivenWebSearchContext<'_>,
     request: &MessagesRequest,
