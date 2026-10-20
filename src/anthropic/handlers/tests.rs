@@ -14712,3 +14712,171 @@ fn conversion_errors_never_name_the_channel() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["error"]["message"], safe);
 }
+
+fn stable_segment_usage_context(policy: StableSegmentCachePolicy) -> RequestUsageContext {
+    RequestUsageContext {
+        recorder: Arc::new(UsageRecorder::new(10)),
+        tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        prompt_cache: Arc::new(PromptCacheTracker::default()),
+        prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+        pricing_catalog: Arc::new(PricingCatalog::new()),
+        request_id: "req_stable_segment_uplift".to_string(),
+        error_id: "req_01stable_segment_uplift".to_string(),
+        endpoint: "/dfcache/ssc/v1/messages".to_string(),
+        stream: true,
+        model: "claude-sonnet-4-6".to_string(),
+        upstream_model: None,
+        model_resolution_source: None,
+        model_resolution_note: None,
+        requested_max_tokens: 0,
+        stop_sequences: Vec::new(),
+        omit_thinking_display: false,
+        strip_injected_control_blocks: false,
+        identity_output_guard: false,
+        downstream_stop_reason: Arc::new(Mutex::new(None)),
+        conversation_id: Some("session-ssc".to_string()),
+        request_api_key_id: None,
+        prompt_cache_scope_conversation_id: Some("session-ssc".to_string()),
+        input_tokens: 100_000,
+        context_window_tokens: 200_000,
+        prompt_cache_profile: None,
+        kiro_rs_tool_prompt_cache_plan: None,
+        stable_segment_prompt_cache_plan: None,
+        prompt_cache_route_namespace: None,
+        prompt_cache_strategy_type: PromptCacheStrategyType::StableSegmentCache,
+        simulation_mode: PromptCacheSimulationMode::Disabled,
+        prompt_cache_target_read_ratio: 0.95,
+        prompt_cache_token_scale: 1.0,
+        prompt_cache_max_simulated_input_tokens: 0,
+        prompt_cache_cap_jitter_min_tokens: 0,
+        prompt_cache_cap_jitter_max_tokens: 0,
+        prompt_cache_scale_min_input_tokens: 0,
+        prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+        prompt_cache_bounds: PromptCacheBounds::default(),
+        stable_segment_cache_policy: policy,
+        cache_hit_shaping: CacheHitShapingContext::default(),
+        cold_request_guard: false,
+        kiro_rs_tool_plus: None,
+        reported_cache_usage_policy: None,
+        simulated_usage: None,
+        simulated_source: Some(UsageSource::LocalPromptCache),
+        payload_breakdown: None,
+        payload_guard_report: None,
+        error_metadata: Arc::new(Mutex::new(None)),
+        route_subtype_override: None,
+        fallback_reason: None,
+        local_preflight: None,
+        external_attempts: Vec::new(),
+        started_at: Instant::now(),
+        first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        capacity_weight_units: Arc::new(AtomicU32::new(1)),
+        latency: RequestLatencyTraceState::new(),
+    }
+}
+
+fn stable_segment_amplified_usage() -> CacheUsage {
+    CacheUsage {
+        total_input_tokens: 200_000,
+        input_tokens: 200,
+        output_tokens: 1_000,
+        cache_creation_input_tokens: 20_000,
+        cache_read_input_tokens: 179_800,
+        cache_creation_5m_input_tokens: 20_000,
+        cache_creation_1h_input_tokens: 0,
+    }
+}
+
+#[test]
+fn stable_segment_default_policy_keeps_usage_unchanged() {
+    let credential_usage = stable_segment_usage_context(StableSegmentCachePolicy::default())
+        .attach_credential(Some(1), None, false, false, Vec::new());
+    let usage = stable_segment_amplified_usage();
+    let reported =
+        credential_usage.canonical_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
+    assert_eq!(reported.output_tokens, usage.output_tokens);
+    assert_eq!(
+        reported.cache_read_input_tokens,
+        usage.cache_read_input_tokens
+    );
+    assert_eq!(
+        reported.cache_creation_input_tokens,
+        usage.cache_creation_input_tokens
+    );
+    assert_eq!(reported.input_tokens, usage.input_tokens);
+}
+
+#[test]
+fn stable_segment_output_uplift_applies_above_threshold() {
+    let policy = StableSegmentCachePolicy {
+        output_uplift_percent: 200,
+        output_uplift_min_tokens: 600,
+        ..StableSegmentCachePolicy::default()
+    };
+    let credential_usage = stable_segment_usage_context(policy).attach_credential(
+        Some(1),
+        None,
+        false,
+        false,
+        Vec::new(),
+    );
+    let large = stable_segment_amplified_usage();
+    let reported =
+        credential_usage.canonical_reported_usage_for_success(large, UsageSource::LocalPromptCache);
+    assert_eq!(reported.output_tokens, 3_000);
+
+    let small = CacheUsage {
+        output_tokens: 500,
+        ..stable_segment_amplified_usage()
+    };
+    let reported =
+        credential_usage.canonical_reported_usage_for_success(small, UsageSource::LocalPromptCache);
+    assert_eq!(reported.output_tokens, 500, "低于门槛不放大");
+}
+
+#[test]
+fn stable_segment_final_caps_bound_amplified_usage() {
+    let policy = StableSegmentCachePolicy {
+        output_uplift_percent: 200,
+        final_cache_read_max_tokens: 100_000,
+        final_cache_creation_max_tokens: 5_000,
+        final_output_max_tokens: 2_000,
+        ..StableSegmentCachePolicy::default()
+    };
+    let credential_usage = stable_segment_usage_context(policy).attach_credential(
+        Some(1),
+        None,
+        false,
+        false,
+        Vec::new(),
+    );
+    let reported = credential_usage.canonical_reported_usage_for_success(
+        stable_segment_amplified_usage(),
+        UsageSource::LocalPromptCache,
+    );
+    assert_eq!(reported.cache_read_input_tokens, 100_000);
+    assert_eq!(reported.cache_creation_input_tokens, 5_000);
+    assert_eq!(reported.output_tokens, 2_000);
+    assert_eq!(
+        reported.cache_creation_5m_input_tokens + reported.cache_creation_1h_input_tokens,
+        reported.cache_creation_input_tokens
+    );
+}
+
+#[test]
+fn stable_segment_default_caps_still_bound_large_cache_fields() {
+    let credential_usage = stable_segment_usage_context(StableSegmentCachePolicy::default())
+        .attach_credential(Some(1), None, false, false, Vec::new());
+    let usage = CacheUsage {
+        total_input_tokens: 1_500_000,
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_creation_input_tokens: 600_000,
+        cache_read_input_tokens: 900_000,
+        cache_creation_5m_input_tokens: 600_000,
+        cache_creation_1h_input_tokens: 0,
+    };
+    let reported =
+        credential_usage.canonical_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
+    assert!(reported.cache_read_input_tokens <= 700_000);
+    assert!(reported.cache_creation_input_tokens <= 400_000);
+}

@@ -1798,6 +1798,22 @@ export interface StableSegmentCachePolicyPatch {
   extendedTtlSecs?: number
   reportedInputMinTokens?: number
   reportedInputMaxTokens?: number
+  tokenScale?: number
+  maxSimulatedInputTokens?: number
+  capJitterMinTokens?: number
+  capJitterMaxTokens?: number
+  scaleMinInputTokens?: number
+  outputUpliftPercent?: number
+  outputUpliftMinTokens?: number
+  finalCacheReadMaxTokens?: number
+  finalCacheReadJitterMinTokens?: number
+  finalCacheReadJitterMaxTokens?: number
+  finalCacheCreationMaxTokens?: number
+  finalCacheCreationJitterMinTokens?: number
+  finalCacheCreationJitterMaxTokens?: number
+  finalOutputMaxTokens?: number
+  finalOutputJitterMinTokens?: number
+  finalOutputJitterMaxTokens?: number
 }
 
 export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool' | 'stable_segment_cache' | 'kiro_rs_tool_plus' | 'bounded_high_cache'
