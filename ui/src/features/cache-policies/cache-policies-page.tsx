@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   Check,
+  Copy,
   Database,
   Edit3,
   Info,
@@ -63,6 +64,10 @@ type PathEditorState = {
   policy: CacheRoutePolicyPatch
   definedRoutes: string[]
   identity: IdentityRouteOverride
+  /** Source route when the editor was opened by copying a route. */
+  copiedFrom?: string
+  /** Register the new /dfcache route as soon as a valid name is typed (copy of a reachable route). */
+  autoRegister?: boolean
 }
 
 type TemplateEditorState = {
@@ -366,6 +371,7 @@ function PathCard({
   builtIn,
   registered,
   onEdit,
+  onCopy,
   onDelete,
 }: {
   prefix: string
@@ -374,6 +380,7 @@ function PathCard({
   builtIn: boolean
   registered: boolean
   onEdit: () => void
+  onCopy: () => void
   onDelete: () => void
 }) {
   return (
@@ -388,7 +395,8 @@ function PathCard({
           <CardDescription>{strategyLabel(policy.cacheType)}</CardDescription>
         </div>
         <div className="flex shrink-0 gap-1">
-          <Button variant="ghost" size="icon-xs" title="编辑" onClick={onEdit}><Edit3 /></Button>
+          <Button variant="ghost" size="icon-xs" title="编辑" aria-label={`编辑 ${prefix}`} onClick={onEdit}><Edit3 /></Button>
+          <Button variant="ghost" size="icon-xs" title="复制" aria-label={`复制 ${prefix} 的策略`} onClick={onCopy}><Copy /></Button>
           {!builtIn && <Button variant="ghost" size="icon-xs" className="text-destructive hover:text-destructive" title="删除" onClick={onDelete}><Trash2 /></Button>}
         </div>
       </CardHeader>
@@ -498,6 +506,24 @@ export function CachePoliciesPage() {
       policy: { cacheType: 'no_cache' },
       definedRoutes: [...definedRoutes],
       identity: {},
+    })
+  }
+
+  /** Opens the new-route editor prefilled with another route's settings; the route itself is not copied. */
+  const openCopyPathEditor = (prefix: string) => {
+    if (!workingConfig) return
+    const sourceRoute = normalizeDefinedCacheRoute(prefix)
+    setPathEditor({
+      mode: 'new',
+      originalPrefix: null,
+      prefix: '/dfcache/',
+      // Deep copies so editing the copy never touches the source route's draft.
+      policy: structuredClone(mergedPathPolicy(prefix)),
+      definedRoutes: [...definedRoutes],
+      identity: structuredClone(identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix)),
+      copiedFrom: prefix,
+      // Built-in routes and registered /dfcache routes are reachable, so the copy is too.
+      autoRegister: isBuiltInPrefix(prefix) || Boolean(sourceRoute && definedRoutes.includes(sourceRoute)),
     })
   }
 
@@ -635,6 +661,7 @@ export function CachePoliciesPage() {
                 builtIn={isBuiltInPrefix(prefix)}
                 registered={Boolean(normalizedRoute && definedRoutes.includes(normalizedRoute))}
                 onEdit={() => openPathEditor(prefix)}
+                onCopy={() => openCopyPathEditor(prefix)}
                 onDelete={() => void deletePath(prefix)}
               />
             )
@@ -694,8 +721,12 @@ export function CachePoliciesPage() {
       {pathEditor && (
         <ModalShell
           open
-          title={pathEditor.mode === 'new' ? '新增路由策略' : `编辑路由策略 · ${pathEditor.originalPrefix}`}
-          description="路径、缓存策略和身份隐藏会一起保存；关闭弹窗不会提交草稿。"
+          title={pathEditor.copiedFrom
+            ? `复制路由策略 · 来自 ${pathEditor.copiedFrom}`
+            : pathEditor.mode === 'new' ? '新增路由策略' : `编辑路由策略 · ${pathEditor.originalPrefix}`}
+          description={pathEditor.copiedFrom
+            ? '已填入来源路由的缓存策略和身份隐藏设置；路由不会复制，请填写新的 /dfcache 路由名后保存。'
+            : '路径、缓存策略和身份隐藏会一起保存；关闭弹窗不会提交草稿。'}
           width="max-w-5xl"
           noBodyPadding
           onClose={() => { if (!updateConfig.isPending) setPathEditor(null) }}
@@ -722,6 +753,9 @@ export function CachePoliciesPage() {
                 if (oldRoute && nextRoute && definedRoutes.includes(oldRoute)) {
                   definedRoutes = definedRoutes.filter((route) => route !== oldRoute)
                   definedRoutes = normalizeDefinedCacheRoutes([...definedRoutes, nextRoute])
+                } else if (current.autoRegister && nextRoute) {
+                  // A copied reachable route stays reachable once it has a valid name.
+                  definedRoutes = normalizeDefinedCacheRoutes([...definedRoutes, nextRoute])
                 }
                 return { ...current, prefix: nextPrefix, definedRoutes }
               })}
@@ -734,7 +768,8 @@ export function CachePoliciesPage() {
                 const routes = enabled
                   ? normalizeDefinedCacheRoutes([...current.definedRoutes, route])
                   : current.definedRoutes.filter((item) => item !== route)
-                return { ...current, definedRoutes: routes }
+                // An explicit choice replaces the copy's automatic registration.
+                return { ...current, definedRoutes: routes, autoRegister: enabled }
               })}
             />
             <div className="mt-8 border-t pt-6">
