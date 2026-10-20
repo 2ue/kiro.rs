@@ -9,7 +9,6 @@ use bytes::Bytes;
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use super::envelope;
 use super::inference_attempt_budget::InferenceAttemptBudget;
@@ -731,7 +730,7 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
     );
 
     // tool_use_id 使用相同格式
-    let tool_use_id = format!("srvtoolu_{}", Uuid::new_v4().simple());
+    let tool_use_id = envelope::server_tool_use_id();
 
     let request = McpRequest {
         id: request_id,

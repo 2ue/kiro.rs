@@ -207,6 +207,34 @@ pub(crate) fn message_id() -> String {
     random_anthropic_id("msg")
 }
 
+pub(crate) fn tool_use_id() -> String {
+    random_anthropic_id("toolu")
+}
+
+pub(crate) fn server_tool_use_id() -> String {
+    random_anthropic_id("srvtoolu")
+}
+
+/// Client-facing id for an upstream tool call. Kiro ids (`tooluse_...`) are mapped to the
+/// Anthropic shape (`toolu_01...`); the mapping is a hash so every chunk of one upstream call,
+/// and a replayed or duplicated event, resolves to the same id. Ids already in the Anthropic
+/// shape pass through. The client echoes the id back in `tool_result`, and Kiro accepts any
+/// matching id pair in history, so no reverse mapping is kept.
+pub(crate) fn public_tool_use_id(upstream_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    if upstream_id.starts_with("toolu_") {
+        return upstream_id.to_string();
+    }
+    let digest = Sha256::digest(upstream_id.as_bytes());
+    let mut id = String::with_capacity("toolu_01".len() + ID_RANDOM_LEN);
+    id.push_str("toolu_01");
+    for byte in digest.iter().take(ID_RANDOM_LEN) {
+        id.push(ID_ALPHABET[usize::from(*byte) % ID_ALPHABET.len()] as char);
+    }
+    id
+}
+
 pub(crate) fn request_id() -> String {
     random_anthropic_id("req")
 }
@@ -351,6 +379,30 @@ mod tests {
         assert_eq!(req.len(), "req_01".len() + ID_RANDOM_LEN);
         assert!(!msg.contains('-'));
         assert!(!req.contains('-'));
+    }
+
+    #[test]
+    fn tool_ids_use_anthropic_prefixes() {
+        let tool = tool_use_id();
+        let server = server_tool_use_id();
+        assert!(tool.starts_with("toolu_01"));
+        assert!(server.starts_with("srvtoolu_01"));
+        assert_eq!(tool.len(), "toolu_01".len() + ID_RANDOM_LEN);
+        assert_eq!(server.len(), "srvtoolu_01".len() + ID_RANDOM_LEN);
+        assert!(
+            tool.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        );
+    }
+
+    #[test]
+    fn upstream_tool_ids_map_to_stable_anthropic_ids() {
+        let mapped = public_tool_use_id("tooluse_h1bbC3KF2KuOFbdG5EAQLC");
+        assert!(mapped.starts_with("toolu_01"));
+        assert_eq!(mapped.len(), "toolu_01".len() + ID_RANDOM_LEN);
+        assert_eq!(mapped, public_tool_use_id("tooluse_h1bbC3KF2KuOFbdG5EAQLC"));
+        assert_ne!(mapped, public_tool_use_id("tooluse_OpVN1F4YbO74BG70uFmV5r"));
+        assert_eq!(public_tool_use_id("toolu_01abc"), "toolu_01abc");
     }
 
     #[test]

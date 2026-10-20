@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MetadataTokenUsage};
 use crate::model::config::{PromptCacheSimulationMode, ReportedUsagePathPolicy};
@@ -1102,8 +1101,7 @@ pub(crate) fn extract_invoke_content_blocks(
                             serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
                         let input = tool_schema_key_map.reverse_tool_input(&upstream_name, input);
                         let input = repair_tool_use_input_for_cli(&name, input);
-                        let tool_use_id =
-                            format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                        let tool_use_id = envelope::tool_use_id();
                         blocks.push(json!({
                             "type": "tool_use",
                             "id": tool_use_id,
@@ -1148,8 +1146,7 @@ pub(crate) fn extract_invoke_content_blocks(
                         pending_text.push_str(visible_before);
                     }
                     push_text(&mut blocks, &mut pending_text);
-                    let tool_use_id =
-                        format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+                    let tool_use_id = envelope::tool_use_id();
                     blocks.push(json!({
                         "type": "tool_use",
                         "id": tool_use_id,
@@ -3272,7 +3269,7 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         self.seen_tool_sigs.insert(sig);
 
-        let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+        let tool_use_id = envelope::tool_use_id();
         if !self.response_tool_gate.admit(&tool_use_id, &output_name) {
             return Vec::new();
         }
@@ -3629,6 +3626,11 @@ impl StreamContext {
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
+        // 对外 id 统一为 Anthropic 形态（toolu_01…）；映射幂等，内部状态只用这一套 id。
+        let tool_use = &crate::kiro::model::events::ToolUseEvent {
+            tool_use_id: envelope::public_tool_use_id(&tool_use.tool_use_id),
+            ..tool_use.clone()
+        };
         // 不允许的调用（例如 tool_choice=none 时对历史占位工具的调用）整段丢弃：
         // 不开块、不计入 has_tool_use，下游不会收到需要回 tool_result 的 tool_use。
         let gate_name = self
@@ -4697,6 +4699,49 @@ mod tests {
             vec!["legacy_tool_results".to_string()]
         );
         assert_protocol_contamination_error(&events, &ctx);
+    }
+
+    #[test]
+    fn stream_maps_chunked_kiro_tool_use_id_to_one_anthropic_id() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            8,
+            false,
+            HashMap::new(),
+            HashSet::from(["Bash".to_string()]),
+        );
+        let mut events = ctx.generate_initial_events();
+        for (input, stop) in [(r#"{"command":"#, false), (r#""pwd"}"#, true)] {
+            events.extend(ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+                name: "Bash".to_string(),
+                tool_use_id: "tooluse_h1bbC3KF2KuOFbdG5EAQLC".to_string(),
+                input: input.to_string(),
+                stop,
+            })));
+        }
+        events.extend(ctx.generate_final_events());
+
+        let starts: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .map(|event| &event.data["content_block"])
+            .collect();
+        assert_eq!(starts.len(), 1, "one upstream call must open one block");
+        let id = starts[0]["id"].as_str().expect("tool id");
+        assert!(id.starts_with("toolu_01"), "unexpected id {id}");
+        assert_eq!(
+            id,
+            envelope::public_tool_use_id("tooluse_h1bbC3KF2KuOFbdG5EAQLC")
+        );
+        assert_eq!(
+            collect_delta_text(&events, "input_json_delta", "partial_json"),
+            r#"{"command":"pwd"}"#
+        );
     }
 
     #[test]

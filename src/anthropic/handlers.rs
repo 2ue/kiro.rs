@@ -12641,6 +12641,10 @@ async fn handle_non_stream_request(
                 }
             }
             Event::ToolUse(tool_use) => {
+                let tool_use = &crate::kiro::model::events::ToolUseEvent {
+                    tool_use_id: envelope::public_tool_use_id(&tool_use.tool_use_id),
+                    ..tool_use.clone()
+                };
                 saw_meaningful_upstream_response = true;
                 text_content.push_str(&transcript_sanitizer.structured_tool_boundary());
                 has_tool_use = true;
