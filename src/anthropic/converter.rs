@@ -5942,6 +5942,48 @@ mod tests {
         assert_eq!(tool_uses[0].tool_use_id, "toolu_ok");
     }
 
+    fn format_only_request() -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Generate a person."}],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn format_only_output_config_is_not_a_reasoning_request() {
+        let req = format_only_request();
+        assert!(!model::requested_native_reasoning(&req));
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+        let content = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(!content.contains("<thinking_mode>"), "{content}");
+        assert!(result.additional_model_request_fields.is_none());
+
+        // An explicit effort next to the format still requests reasoning.
+        let mut with_effort = req.clone();
+        with_effort.output_config.as_mut().unwrap().effort = Some("high".to_string());
+        assert!(model::requested_native_reasoning(&with_effort));
+        // An empty output_config keeps its old meaning (default-effort reasoning).
+        let mut empty = req;
+        empty.output_config = Some(super::super::types::OutputConfig::default());
+        assert!(model::requested_native_reasoning(&empty));
+    }
+
+    #[test]
+    fn format_only_request_converts_with_thinking_controls_disabled() {
+        let mut options = ConverterOptions::default();
+        options.conversion.thinking_prompt_controls =
+            crate::anthropic::body_capabilities::BodyStageState::Disabled;
+        convert_request_with_options(&format_only_request(), options)
+            .expect("structured output alone must not require reasoning controls");
+    }
+
     #[test]
     fn test_tool_use_ids_are_sanitized_consistently() {
         let raw_id = "toolu:01/ABC";

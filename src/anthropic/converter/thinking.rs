@@ -90,7 +90,11 @@ fn generate_thinking_prefix(
             )));
         }
     }
-    if req.output_config.is_some() {
+    if req
+        .output_config
+        .as_ref()
+        .is_some_and(|config| config.requests_reasoning())
+    {
         let effort = legacy_prompt_effort(req)?;
         let output_policy = if policy_allowed
             && (options.force_visible_thinking

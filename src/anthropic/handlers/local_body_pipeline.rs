@@ -505,7 +505,10 @@ fn should_expose_downstream_thinking(
         .as_ref()
         .map(|t| t.is_enabled())
         .unwrap_or(false)
-        || payload.output_config.is_some()
+        || payload
+            .output_config
+            .as_ref()
+            .is_some_and(|config| config.requests_reasoning())
         || kiro_request
             .additional_model_request_fields
             .as_ref()
