@@ -568,6 +568,15 @@ pub struct OutputConfig {
 /// `output_config.effort` or used in place of an authoritative Kiro schema default.
 pub const LEGACY_PROMPT_COMPAT_THINKING_EFFORT: &str = "high";
 
+impl OutputConfig {
+    /// Whether this output config asks for reasoning. `format` alone is a structured output
+    /// request, not a reasoning request; an empty object keeps meaning "reasoning at the model's
+    /// default effort", as before `format` existed.
+    pub fn requests_reasoning(&self) -> bool {
+        self.effort.is_some() || self.format.is_none()
+    }
+}
+
 pub fn parse_thinking_effort(effort: &str) -> Option<&'static str> {
     THINKING_EFFORT_VALUES
         .iter()

@@ -99,7 +99,11 @@ pub(super) fn requested_native_reasoning(req: &MessagesRequest) -> bool {
     if thinking_is_disabled(req) {
         return has_explicit_output_effort(req);
     }
-    req.thinking.as_ref().is_some_and(|t| t.is_enabled()) || req.output_config.is_some()
+    req.thinking.as_ref().is_some_and(|t| t.is_enabled())
+        || req
+            .output_config
+            .as_ref()
+            .is_some_and(|config| config.requests_reasoning())
 }
 
 fn effort_from_budget_tokens(tokens: i32) -> &'static str {
