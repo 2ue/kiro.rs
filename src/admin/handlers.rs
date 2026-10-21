@@ -18,15 +18,16 @@ use super::{
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
         CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
         ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
-        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialOverageRequest,
-        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
-        SetCredentialRegionsRequest, SetCredentialRpmRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
-        SetWarmupRequest, SuccessResponse, SyncModelCapabilitiesRequest, SystemVersionResponse,
-        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
-        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialFastRequest,
+        SetCredentialOverageRequest, SetCredentialProxyRequest,
+        SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
+        SetCredentialRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
+        SyncModelCapabilitiesRequest, SystemVersionResponse, TestCredentialRequest,
+        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+        UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
+        ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -606,6 +607,26 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/fast
+/// 设置凭据 Fast 值（0 表示关闭）
+pub async fn set_credential_fast(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialFastRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_fast(id, payload.fast) {
+        Ok(_) => {
+            let message = if payload.fast == 0 {
+                format!("凭据 #{} 已关闭 Fast", id)
+            } else {
+                format!("凭据 #{} Fast 值已设置为 {}", id, payload.fast)
+            };
+            Json(SuccessResponse::new(message)).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

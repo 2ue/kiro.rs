@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle, Router, Gauge, Globe, Eye, EyeOff } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle, Router, Gauge, Globe, Eye, EyeOff, Zap } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -22,6 +22,7 @@ import { formatUsd } from '@/lib/format'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetCredentialFast,
   useSetWarmup,
   useClearInFlight,
   useResetFailure,
@@ -214,12 +215,14 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
+  const [editingFast, setEditingFast] = useState(false)
   const [editingRegions, setEditingRegions] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [editingRpm, setEditingRpm] = useState(false)
   const [editingSupportedModels, setEditingSupportedModels] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [fastValue, setFastValue] = useState(String(credential.fast ?? 0))
   const [regionValue, setRegionValue] = useState(credential.region || '')
   const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
   const [apiRegionValue, setApiRegionValue] = useState(credential.apiRegion || '')
@@ -244,6 +247,7 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setFast = useSetCredentialFast()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -364,6 +368,10 @@ export function CredentialCard({
   }, [credential.priority])
 
   useEffect(() => {
+    setFastValue(String(credential.fast ?? 0))
+  }, [credential.fast])
+
+  useEffect(() => {
     setRegionValue(credential.region || '')
     setAuthRegionValue(credential.authRegion || '')
     setApiRegionValue(credential.apiRegion || '')
@@ -399,6 +407,27 @@ export function CredentialCard({
       {
         onSuccess: (res) => {
           toast.success(res.message)
+        },
+        onError: (err) => {
+          toast.error('操作失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleFastChange = (value: string) => {
+    const v = value.trim()
+    const newFast = v ? Number(v) : 0
+    if (!Number.isInteger(newFast) || newFast < 0) {
+      toast.error('Fast 值必须是非负整数')
+      return
+    }
+    setFast.mutate(
+      { id: credential.id, fast: newFast },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingFast(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + extractErrorMessage(err))
@@ -655,9 +684,18 @@ export function CredentialCard({
     })
   }
 
+  const fast = credential.fast ?? 0
+  const fastTier = fast > 0 ? String(Math.min(fast, 3)) : undefined
+
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
+      <Card
+        data-fast-tier={fastTier}
+        className={[
+          credential.isCurrent ? 'ring-2 ring-primary' : '',
+          fast > 0 ? 'fast-card' : '',
+        ].join(' ')}
+      >
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -670,6 +708,18 @@ export function CredentialCard({
                 <Badge variant="outline">#{credential.id}</Badge>
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
+                )}
+                {fast > 0 && (
+                  <button
+                    type="button"
+                    className="fast-badge"
+                    onClick={() => setEditingFast(true)}
+                    title={`Fast ${fast}：优先打满这个账号；点击修改`}
+                    aria-label={`Fast ${fast}，点击修改`}
+                  >
+                    <Zap className="h-3 w-3" aria-hidden="true" fill="currentColor" />
+                    FAST {fast}
+                  </button>
                 )}
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
@@ -795,6 +845,52 @@ export function CredentialCard({
                   onClick={() => setEditingPriority(true)}
                 >
                   {credential.priority}
+                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+                </span>
+              )}
+            </div>
+            <div>
+              <span className="text-muted-foreground">Fast：</span>
+              {editingFast ? (
+                <div className="inline-flex items-center gap-1 ml-1">
+                  <Input
+                    type="number"
+                    value={fastValue}
+                    onChange={(e) => setFastValue(e.target.value)}
+                    className="w-16 h-7 text-sm"
+                    min="0"
+                    aria-label="Fast 值"
+                  />
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => handleFastChange(fastValue)}
+                    disabled={setFast.isPending}
+                    aria-label="保存 Fast"
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 w-7 p-0"
+                    onClick={() => {
+                      setEditingFast(false)
+                      setFastValue(String(fast))
+                    }}
+                    aria-label="取消"
+                  >
+                    ✕
+                  </Button>
+                </div>
+              ) : (
+                <span
+                  className="font-medium cursor-pointer hover:underline ml-1"
+                  onClick={() => setEditingFast(true)}
+                  title="数字越大越先打满（和优先级相反），0 表示关闭；已有会话会逐步切过来"
+                >
+                  {fast > 0 ? fast : '未开启'}
                   <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
                 </span>
               )}

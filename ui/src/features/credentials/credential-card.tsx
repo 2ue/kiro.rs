@@ -7,6 +7,7 @@ import {
   Trash2,
   Wallet,
   Wand2,
+  Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
@@ -55,6 +56,7 @@ import {
   useSetDisabled,
   useDiscoverCredentialSupportedModels,
   useSetPriority,
+  useSetCredentialFast,
   useSetWarmup,
 } from '@/hooks/use-credentials'
 import type { BalanceResponse, CredentialStatusItem, UsageRecord } from '@/types/api'
@@ -178,6 +180,7 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
+  const [editingFast, setEditingFast] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [editingRpm, setEditingRpm] = useState(false)
@@ -189,6 +192,7 @@ export function CredentialCard({
   const [diagnosticRecords, setDiagnosticRecords] = useState<UsageRecord[]>([])
 
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [fastValue, setFastValue] = useState(String(credential.fast ?? 0))
   const [concurrencyValue, setConcurrencyValue] = useState(
     typeof credential.maxConcurrentRequestsOverride === 'number' ? String(credential.maxConcurrentRequestsOverride) : ''
   )
@@ -208,6 +212,7 @@ export function CredentialCard({
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setFast = useSetCredentialFast()
   const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
@@ -280,6 +285,7 @@ export function CredentialCard({
   }
 
   useEffect(() => { setPriorityValue(String(credential.priority)) }, [credential.priority])
+  useEffect(() => { setFastValue(String(credential.fast ?? 0)) }, [credential.fast])
   useEffect(() => {
     setConcurrencyValue(typeof credential.maxConcurrentRequestsOverride === 'number' ? String(credential.maxConcurrentRequestsOverride) : '')
   }, [credential.id, credential.maxConcurrentRequestsOverride])
@@ -313,6 +319,16 @@ export function CredentialCard({
     if (!Number.isInteger(p) || p < 0) { toast.error('优先级必须是非负整数'); return }
     setPriority.mutate({ id: credential.id, priority: p }, {
       onSuccess: (res) => { toast.success(res.message); setEditingPriority(false) },
+      onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  const saveFast = (value: string) => {
+    const v = value.trim()
+    const n = v ? Number(v) : 0
+    if (!Number.isInteger(n) || n < 0) { toast.error('Fast 值必须是非负整数'); return }
+    setFast.mutate({ id: credential.id, fast: n }, {
+      onSuccess: (res) => { toast.success(res.message); setEditingFast(false) },
       onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
     })
   }
@@ -418,11 +434,17 @@ export function CredentialCard({
   const statusTone = credential.disabled ? 'error' : credential.cooledDown ? 'warning' : credential.rateLimited ? 'info' : 'success'
   const statusLabel = credential.disabled ? (credential.disabledReason || '禁用') : credential.cooledDown ? `冷却` : credential.rateLimited ? '限流' : '正常'
 
+  const fast = credential.fast ?? 0
+  const fastTier = fast > 0 ? String(Math.min(fast, 3)) : undefined
+
   return (
-    <div className={[
-      'relative overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
-      credential.disabled ? 'opacity-75' : '',
-    ].join(' ')}>
+    <div
+      data-fast-tier={fastTier}
+      className={[
+        'relative overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
+        fast > 0 ? 'fast-card' : '',
+        credential.disabled ? 'opacity-75' : '',
+      ].join(' ')}>
       {credential.isCurrent && <span className="absolute inset-y-3 left-0 w-1 rounded-r-full bg-primary" />}
 
       {/* ── Header ── */}
@@ -435,6 +457,17 @@ export function CredentialCard({
             </span>
             <span className="tabular text-xs text-muted-foreground font-mono">#{credential.id}</span>
             {credential.isCurrent && <Badge tone="primary">当前</Badge>}
+            {fast > 0 && (
+              <button
+                type="button"
+                className="fast-badge"
+                onClick={() => setEditingFast(true)}
+                title={`Fast ${fast}：优先打满这个账号；点击修改`}
+                aria-label={`Fast ${fast}，点击修改`}>
+                <Zap className="size-3" aria-hidden="true" fill="currentColor" />
+                FAST {fast}
+              </button>
+            )}
           </div>
           <div className="mt-1.5 flex flex-wrap items-center gap-1">
             <Badge tone={statusTone}>{statusLabel}</Badge>
@@ -558,6 +591,9 @@ export function CredentialCard({
           <DropdownMenuContent align="end">
             <DropdownMenuLabel>更多操作</DropdownMenuLabel>
             <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => setEditingFast(true)}>
+              <Zap className="h-3.5 w-3.5" aria-hidden="true" /> {fast > 0 ? `修改 Fast（当前 ${fast}）` : '开启 Fast'}
+            </DropdownMenuItem>
             <DropdownMenuItem
               disabled={setWarmup.isPending}
               onSelect={() => setWarmup.mutate(
@@ -740,6 +776,35 @@ export function CredentialCard({
           )}
         </div>
       )}
+
+      {/* ── Fast Modal ── */}
+      <ModalShell open={editingFast} title={`Fast：${displayCredentialLabel}`} width="max-w-md"
+        onClose={() => { setEditingFast(false); setFastValue(String(fast)) }}>
+        <div className="space-y-3">
+          <div className="rounded-lg bg-muted/30 px-3 py-2 text-sm">
+            <div className="flex justify-between gap-2">
+              <span className="text-muted-foreground">当前 Fast</span>
+              <span className="font-semibold">{fast > 0 ? fast : '未开启'}</span>
+            </div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              开启后，请求会先集中到这个账号，并发用满后再分给其他账号。数值越大越先打满（和优先级相反），0 表示关闭。
+              已有会话会逐步切过来，不会强行中断；冷却、限流、并发上限等安全规则照常生效。
+            </div>
+          </div>
+          <Field label="Fast 值" description="0 或留空表示关闭">
+            <Input type="number" min={0} value={fastValue} disabled={setFast.isPending}
+              onChange={(e) => setFastValue(e.target.value)} />
+          </Field>
+          <div className="flex justify-end gap-2">
+            {fast > 0 && (
+              <Button variant="ghost" size="sm" onClick={() => saveFast('0')} disabled={setFast.isPending}>关闭 Fast</Button>
+            )}
+            <Button size="sm" onClick={() => saveFast(fastValue)} disabled={setFast.isPending}>
+              {setFast.isPending && <Spinner size="sm" />}保存
+            </Button>
+          </div>
+        </div>
+      </ModalShell>
 
       {/* ── Priority Modal ── */}
         <ModalShell open={editingPriority} title={`优先级：${displayCredentialLabel}`} width="max-w-md"

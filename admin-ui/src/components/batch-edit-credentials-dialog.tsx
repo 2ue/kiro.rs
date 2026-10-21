@@ -124,6 +124,8 @@ export function BatchEditCredentialsDialog({
   const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [updatePriority, setUpdatePriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState('')
+  const [updateFast, setUpdateFast] = useState(false)
+  const [fastValue, setFastValue] = useState('')
 
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
@@ -182,6 +184,8 @@ export function BatchEditCredentialsDialog({
     setShowProxyPassword(false)
     setUpdatePriority(false)
     setPriorityValue('')
+    setUpdateFast(false)
+    setFastValue('')
   }, [open])
 
   const submit = () => {
@@ -189,7 +193,7 @@ export function BatchEditCredentialsDialog({
       toast.error('请先选择要修改的账号')
       return
     }
-    if (!updatePriority && !updateRegions && !updateConcurrency && !updateRpm && !updateRateLimitAutoDisable && !updateProxy) {
+    if (!updatePriority && !updateFast && !updateRegions && !updateConcurrency && !updateRpm && !updateRateLimitAutoDisable && !updateProxy) {
       toast.error('请选择至少一组要修改的参数')
       return
     }
@@ -200,6 +204,19 @@ export function BatchEditCredentialsDialog({
         request.priority = {
           priority: priorityValue.trim()
             ? (parseOptionalNonNegativeInteger(priorityValue, '账号优先级') ?? 0)
+            : 0,
+        }
+      } catch (error) {
+        toast.error(extractErrorMessage(error))
+        return
+      }
+    }
+
+    if (updateFast) {
+      try {
+        request.fast = {
+          fast: fastValue.trim()
+            ? (parseOptionalNonNegativeInteger(fastValue, 'Fast 值') ?? 0)
             : 0,
         }
       } catch (error) {
@@ -308,7 +325,30 @@ export function BatchEditCredentialsDialog({
                 onChange={(event) => setPriorityValue(event.target.value)}
               />
               <span className="block text-xs leading-5 text-muted-foreground">
-                数值越大优先级越高；保存为 0 表示回到默认优先级。
+                数值越小优先级越高；保存为 0 表示回到默认优先级。
+              </span>
+            </label>
+          </div>
+
+          <div className={`rounded-md border p-3 ${updateFast ? 'border-primary bg-primary/5' : 'bg-muted/20'}`}>
+            <ToggleRow
+              checked={updateFast}
+              disabled={batchUpdate.isPending}
+              label="修改 Fast"
+              onCheckedChange={setUpdateFast}
+            />
+            <label className="mt-3 block space-y-2">
+              <span className="text-sm font-medium">Fast 值</span>
+              <Input
+                type="number"
+                min="0"
+                value={fastValue}
+                placeholder="留空保存为 0（关闭）"
+                disabled={!updateFast || batchUpdate.isPending}
+                onChange={(event) => setFastValue(event.target.value)}
+              />
+              <span className="block text-xs leading-5 text-muted-foreground">
+                开启后请求先集中到这些账号，并发用满再分给其他账号；数值越大越先打满（和优先级相反），0 表示关闭。
               </span>
             </label>
           </div>

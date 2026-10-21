@@ -30,6 +30,7 @@ import {
   setCredentialConcurrency,
   setCredentialOverage,
   setCredentialPriority,
+  setCredentialFast,
   setCredentialProxy,
   setCredentialRegions,
   setCredentialRateLimitAutoDisable,
@@ -282,6 +283,14 @@ export function useSetPriority() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) => setCredentialPriority(id, priority),
+    onSuccess: (_data, variables) => invalidateCredentialCaches(queryClient, variables.id),
+  })
+}
+
+export function useSetCredentialFast() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, fast }: { id: number; fast: number }) => setCredentialFast(id, fast),
     onSuccess: (_data, variables) => invalidateCredentialCaches(queryClient, variables.id),
   })
 }

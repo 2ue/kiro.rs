@@ -15,6 +15,7 @@ import {
   deleteProxyResource,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialFast,
   setCredentialConcurrency,
   setCredentialRpm,
   setCredentialRateLimitAutoDisable,
@@ -296,6 +297,18 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+// 设置 Fast 值
+export function useSetCredentialFast() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, fast }: { id: number; fast: number }) =>
+      setCredentialFast(id, fast),
     onSuccess: (_data, variables) => {
       invalidateCredentialCaches(queryClient, variables.id)
     },

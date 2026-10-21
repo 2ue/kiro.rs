@@ -1801,6 +1801,7 @@ impl AdminService {
             issuer_url: req.issuer_url,
             scopes: req.scopes,
             priority: req.priority,
+            fast: req.fast,
             max_concurrent_requests: req.max_concurrent_requests,
             rpm: req.rpm,
             rate_limit_auto_disable_enabled: req.rate_limit_auto_disable_enabled,
@@ -2467,6 +2468,22 @@ impl AdminService {
             true,
             None,
             json!({ "priority": priority }),
+        );
+        Ok(())
+    }
+
+    /// 设置凭据 Fast 值（0 表示关闭）
+    pub fn set_credential_fast(&self, id: u64, fast: u32) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_fast(id, fast)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.audit(
+            "set_credential_fast",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "fast": fast }),
         );
         Ok(())
     }
@@ -4255,6 +4272,7 @@ impl AdminService {
             )));
         }
         if req.priority.is_none()
+            && req.fast.is_none()
             && req.regions.is_none()
             && req.concurrency.is_none()
             && req.rpm.is_none()
@@ -4269,6 +4287,7 @@ impl AdminService {
         let mut seen = HashSet::new();
         let ids: Vec<u64> = req.ids.into_iter().filter(|id| seen.insert(*id)).collect();
         let priority = req.priority.map(|value| value.priority);
+        let fast = req.fast.map(|value| value.fast);
         let regions = req.regions.map(|regions| {
             (
                 normalize_optional_update(regions.region),
@@ -4301,6 +4320,18 @@ impl AdminService {
                     .map_err(|e| self.classify_error(e, id))
                 {
                     error = Some(err.to_string());
+                }
+            }
+
+            if error.is_none() {
+                if let Some(fast) = fast {
+                    if let Err(err) = self
+                        .token_manager
+                        .set_credential_fast(id, fast)
+                        .map_err(|e| self.classify_error(e, id))
+                    {
+                        error = Some(err.to_string());
+                    }
                 }
             }
 
@@ -7924,6 +7955,7 @@ fn credential_status_item_from_snapshot(
         created_at: entry.created_at,
         updated_at: entry.updated_at,
         priority: entry.priority,
+        fast: entry.fast,
         disabled: entry.disabled,
         failure_count: entry.failure_count,
         is_current: entry.id == current_id,
@@ -8005,6 +8037,7 @@ fn credential_list_item_from_base(
         created_at: credential.created_at,
         updated_at: credential.updated_at,
         priority: credential.priority,
+        fast: credential.fast,
         disabled: credential.disabled,
         disabled_reason: credential.disabled_reason,
         auth_method: credential.auth_method,

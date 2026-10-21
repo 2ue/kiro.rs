@@ -1014,6 +1014,8 @@ pub struct MultiTokenManager {
     /// Serializes only candidate selection plus the local provisional reservation.
     /// Redis and upstream awaits always run after this guard is dropped.
     selection_reservation_gate: Mutex<()>,
+    /// Last time this instance moved a sticky session up to a higher Fast tier.
+    fast_sticky_migration_last: Mutex<Option<Instant>>,
     /// 异步自愈 single-flight：账号池全灭时大量并发请求会同时走到自愈分支，
     /// 只让一个请求写 PgSQL，其余请求等它完成后按最新状态重新选择。
     auto_heal_gate: TokioMutex<()>,
@@ -1053,6 +1055,11 @@ const SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX: StdDuration = StdDuration::from_secs
 /// migrate to another credential solely because the previous cross-instance Redis release has
 /// not become visible yet. Keep this window short so a real holder still falls back quickly.
 const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_millis(250);
+/// Existing sticky sessions move to a higher Fast tier one at a time per instance. Moving a
+/// session drops its upstream prompt cache, so a burst of migrations would turn into a burst of
+/// cold requests on the Fast account; pacing keeps the shift gradual while new sessions go to
+/// the Fast tier immediately.
+const FAST_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 const CREDENTIAL_RUNTIME_MUTATION_RETENTION: StdDuration =
@@ -2413,6 +2420,7 @@ impl MultiTokenManager {
             next_in_flight_lease_id: AtomicU64::new(initial_lease_id),
             queued_requests: Arc::new(AtomicU32::new(0)),
             selection_reservation_gate: Mutex::new(()),
+            fast_sticky_migration_last: Mutex::new(None),
             auto_heal_gate: TokioMutex::new(()),
             #[cfg(test)]
             auto_heal_pgsql_attempts: AtomicU64::new(0),
@@ -5482,6 +5490,7 @@ impl MultiTokenManager {
         excluded_ids: &HashSet<u64>,
         current_id: u64,
         current_priority: u32,
+        current_fast: u32,
         request_weight_units: u32,
     ) -> bool {
         let priority_mode = self.load_balancing_mode.lock().as_str() == "priority";
@@ -5497,7 +5506,11 @@ impl MultiTokenManager {
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
-                && (!priority_mode || entry.credentials.priority == current_priority)
+                // priority mode waits for its own priority level, but a full Fast tier must
+                // overflow to the next tier instead of queueing behind it.
+                && (!priority_mode
+                    || entry.credentials.priority == current_priority
+                    || entry.credentials.fast != current_fast)
                 && credential_is_dispatchable(
                     &proxy_resources,
                     entry,
@@ -5508,6 +5521,65 @@ impl MultiTokenManager {
                     request_weight_units,
                 )
         })
+    }
+
+    /// Decides whether a sticky session bound to a lower Fast tier should move up on this request.
+    ///
+    /// Moving is only allowed when a higher-tier credential can take the request right now
+    /// (all dispatch safety rules, including its concurrency limit), and at most one session per
+    /// `FAST_STICKY_MIGRATION_INTERVAL` moves on this instance. Otherwise the session stays on
+    /// its bound credential as before.
+    fn should_migrate_sticky_to_fast_tier(
+        &self,
+        bound_fast: u32,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        request_weight_units: u32,
+    ) -> bool {
+        let has_higher_tier = {
+            let entries = self.entries.lock();
+            if !entries
+                .iter()
+                .any(|entry| entry.credentials.fast > bound_fast)
+            {
+                return false;
+            }
+            let proxy_resources = self.proxy_resources.lock();
+            let now = Instant::now();
+            let config = self.config.lock();
+            let global_in_flight = entries
+                .iter()
+                .map(|entry| entry.in_flight_requests)
+                .sum::<u32>();
+            global_has_concurrency_capacity(
+                global_in_flight,
+                config.dispatch_global_max_concurrent_requests,
+                request_weight_units,
+            ) && entries.iter().any(|entry| {
+                entry.credentials.fast > bound_fast
+                    && !excluded_ids.contains(&entry.id)
+                    && credential_is_dispatchable(
+                        &proxy_resources,
+                        entry,
+                        model,
+                        now,
+                        config.credential_max_concurrent_requests,
+                        config.credential_rpm.unwrap_or(0),
+                        request_weight_units,
+                    )
+            })
+        };
+        if !has_higher_tier {
+            return false;
+        }
+        let now = Instant::now();
+        let mut last = self.fast_sticky_migration_last.lock();
+        if last.is_some_and(|at| now.saturating_duration_since(at) < FAST_STICKY_MIGRATION_INTERVAL)
+        {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     fn exclude_credentials_requiring_refresh(&self, excluded_ids: &mut HashSet<u64>) -> usize {
@@ -5607,6 +5679,27 @@ impl MultiTokenManager {
 
         if available.is_empty() {
             return None;
+        }
+
+        // Fast tiers sit above every load-balancing mode: only the highest Fast tier among the
+        // dispatchable candidates competes, so a tier is filled up to its safety limits
+        // (concurrency, RPM, cooldown, model, proxy) before traffic overflows to the next one.
+        let top_fast = available
+            .iter()
+            .map(|entry| entry.credentials.fast)
+            .max()
+            .unwrap_or(0);
+        if top_fast > 0 {
+            ready.retain(|entry| entry.credentials.fast == top_fast);
+            warming.retain(|entry| entry.credentials.fast == top_fast);
+            let tier_recent = |entries: &[&CredentialEntry]| {
+                entries
+                    .iter()
+                    .map(|entry| entry.health.recent_selection_count_60s as u64)
+                    .sum::<u64>()
+            };
+            warming_recent = tier_recent(&warming);
+            total_recent = warming_recent.saturating_add(tier_recent(&ready));
         }
 
         let select_warming = should_select_warming_from_totals(
@@ -6127,6 +6220,9 @@ impl MultiTokenManager {
         let mut local_excluded_ids = excluded_ids.clone();
         let mut slot_race_excluded_count = 0usize;
         let mut sticky_bound_release_grace_waited = false;
+        // Set once this request decides to move its sticky session up to a higher Fast tier:
+        // (bound credential id, its Fast value).
+        let mut fast_migration_from: Option<(u64, u32)> = None;
         // 上一轮已经尝试过自愈：本轮按自愈后的状态正常判定，不再立即重复自愈。
         // 自愈只会把 TooManyFailures 禁用的凭据恢复为可用，所以"自愈轮"与"普通判定轮"交替出现，
         // 普通判定轮的终止条件（选中、排队超时、bail）与原逻辑一致，不会无限循环。
@@ -6247,9 +6343,31 @@ impl MultiTokenManager {
 
             let selection_reservation_guard = self.selection_reservation_gate.lock();
             let decision = {
-                let bound_hit = request_bound_id.and_then(|bound_id| {
-                    self.get_bound_credential(bound_id, model, &local_excluded_ids)
-                });
+                let bound_hit = request_bound_id
+                    .and_then(|bound_id| {
+                        self.get_bound_credential(bound_id, model, &local_excluded_ids)
+                    })
+                    .filter(|(bound_id, bound_credentials)| {
+                        if fast_migration_from.is_some() {
+                            // Already decided to move this request; keep that decision on retry.
+                            return false;
+                        }
+                        let migrate = self.should_migrate_sticky_to_fast_tier(
+                            bound_credentials.fast,
+                            model,
+                            &local_excluded_ids,
+                            request_weight_units,
+                        );
+                        if migrate {
+                            fast_migration_from = Some((*bound_id, bound_credentials.fast));
+                            tracing::debug!(
+                                credential_id = *bound_id,
+                                fast = bound_credentials.fast,
+                                "sticky 会话绑定在较低 Fast 档，本次迁移到更高 Fast 档账号"
+                            );
+                        }
+                        !migrate
+                    });
 
                 if let Some(hit) = bound_hit {
                     AcquireDecision::Selected(hit.0, hit.1, true, false)
@@ -6805,6 +6923,7 @@ impl MultiTokenManager {
                     &local_excluded_ids,
                     id,
                     credentials.priority,
+                    credentials.fast,
                     request_weight_units,
                 ) {
                     local_excluded_ids.insert(id);
@@ -7046,6 +7165,15 @@ impl MultiTokenManager {
                         let should_bind = match request_bound_id {
                             None => true,
                             Some(bound_id) if bound_id == ctx.id => true,
+                            // Only a move that actually landed on a higher Fast tier rebinds;
+                            // a temporary fallback keeps the original binding as before.
+                            Some(bound_id)
+                                if fast_migration_from.is_some_and(|(from_id, from_fast)| {
+                                    from_id == bound_id && ctx.credentials.fast > from_fast
+                                }) =>
+                            {
+                                true
+                            }
                             Some(bound_id) => {
                                 self.bound_credential_is_permanently_unavailable(bound_id)
                             }
@@ -8845,6 +8973,12 @@ impl MultiTokenManager {
                 credential.normalize_supported_models();
                 credential.normalize_api_key_defaults();
                 credential.normalize_external_idp_defaults();
+                // A notification-triggered reload may read a snapshot taken before a newer local
+                // write committed (e.g. two Admin edits in quick succession). Never let that older
+                // revision overwrite the newer credential this instance already holds.
+                if credential.storage_revision < entry.credentials.storage_revision {
+                    credential = entry.credentials.clone();
+                }
                 if entry.credentials.disabled != credential.disabled
                     || !entry.credentials.same_dispatch_config(&credential)
                 {
@@ -12498,6 +12632,20 @@ impl MultiTokenManager {
         self.select_highest_priority();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_priority_updated");
+        Ok(())
+    }
+
+    /// 设置凭据 Fast 值（Admin API）。
+    ///
+    /// 0 表示关闭。新会话立即按新的 Fast 档调度；已有 sticky 会话按
+    /// `FAST_STICKY_MIGRATION_INTERVAL` 逐个迁移，不会一次性切走。
+    pub fn set_credential_fast(&self, id: u64, fast: u32) -> anyhow::Result<()> {
+        self.persist_credential_mutation(id, |credential| {
+            credential.fast = fast;
+            Ok(())
+        })?;
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("credential_fast_updated");
         Ok(())
     }
 

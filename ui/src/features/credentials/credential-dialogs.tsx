@@ -1247,6 +1247,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
 }) {
   const [fields, setFields] = useState({
     priority: '',
+    fast: '',
     concurrency: '',
     rpm: '',
     proxyResourceId: '',
@@ -1260,7 +1261,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   const [rateLimitAutoDisableEnabled, setRateLimitAutoDisableEnabled] = useState(true)
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
-  const [enableFields, setEnableFields] = useState({ priority: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+  const [enableFields, setEnableFields] = useState({ priority: false, fast: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
@@ -1277,9 +1278,9 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
 
   useEffect(() => {
     if (!open) {
-      setFields({ priority: '', concurrency: '', rpm: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
+      setFields({ priority: '', fast: '', concurrency: '', rpm: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
       setRateLimitAutoDisableEnabled(true)
-      setEnableFields({ priority: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+      setEnableFields({ priority: false, fast: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
       setShowProxyUsername(false)
       setShowProxyPassword(false)
     }
@@ -1302,6 +1303,12 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
         priority = n
       }
       req.priority = { priority }
+    }
+    if (enableFields.fast) {
+      const v = fields.fast.trim()
+      const fast = v ? Number(v) : 0
+      if (!Number.isInteger(fast) || fast < 0) { toast.error('Fast 值必须是非负整数'); return }
+      req.fast = { fast }
     }
     if (enableFields.proxy) {
       const resourceId = fields.proxyResourceId ? Number(fields.proxyResourceId) : null
@@ -1373,6 +1380,19 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
                     disabled={!enableFields.priority || batchUpdate.isPending}
                     onChange={(e) => setFields((p) => ({ ...p, priority: e.target.value }))}
                     placeholder="留空重置"
+                  />
+                </div>
+              </Field>
+              <Field label="Fast" description="数字越大越先打满；0 或留空表示关闭">
+                <div className="flex items-center gap-2">
+                  <Checkbox checked={enableFields.fast} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, fast: Boolean(v) }))} id="batch-fast" aria-label="批量修改 Fast" />
+                  <Input
+                    type="number"
+                    min={0}
+                    value={fields.fast}
+                    disabled={!enableFields.fast || batchUpdate.isPending}
+                    onChange={(e) => setFields((p) => ({ ...p, fast: e.target.value }))}
+                    placeholder="留空关闭"
                   />
                 </div>
               </Field>

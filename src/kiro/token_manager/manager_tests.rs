@@ -13887,3 +13887,264 @@ async fn postgres_auth_reset_updates_credential_and_runtime_atomically() {
 
     store.drop_test_schema().await.unwrap();
 }
+
+fn fast_test_credential(token: &str, fast: u32) -> KiroCredentials {
+    let mut credential = test_access_token_credential(token, "Pro");
+    credential.fast = fast;
+    credential
+}
+
+#[tokio::test]
+async fn fast_tiers_fill_highest_tier_before_overflowing_in_every_mode() {
+    for mode in [
+        "priority",
+        "balanced",
+        "health_balanced",
+        "weighted_least_inflight",
+    ] {
+        let mut config = Config::default();
+        config.load_balancing_mode = mode.to_string();
+        config.credential_max_concurrent_requests = 2;
+        config.credential_warmup_requests = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                fast_test_credential("plain", 0),
+                fast_test_credential("fast-1", 1),
+                fast_test_credential("fast-2", 2),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..6 {
+            held.push(manager.acquire_context(None).await.unwrap());
+        }
+        let order: Vec<u64> = held.iter().map(|ctx| ctx.id).collect();
+        assert_eq!(
+            order,
+            vec![3, 3, 2, 2, 1, 1],
+            "{mode}: the highest Fast tier fills first, then the next tier, then plain credentials"
+        );
+        for ctx in &mut held {
+            ctx.release_in_flight();
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_tier_wins_over_priority_and_zero_fast_keeps_priority_order() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    let mut preferred = fast_test_credential("preferred", 0);
+    preferred.priority = 0;
+    let mut fast = fast_test_credential("fast", 1);
+    fast.priority = 100;
+    let manager = MultiTokenManager::new(config, vec![preferred, fast], None, None, false).unwrap();
+
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 2, "Fast is a higher dimension than priority");
+    ctx.release_in_flight();
+
+    manager.set_credential_fast(2, 0).unwrap();
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(
+        ctx.id, 1,
+        "Fast 0 turns the feature off and priority applies again"
+    );
+    ctx.release_in_flight();
+}
+
+#[tokio::test]
+async fn fast_tier_never_bypasses_dispatch_safety_rules() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            fast_test_credential("plain", 0),
+            fast_test_credential("fast", 5),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    manager.set_disabled(2, true).unwrap();
+    let mut ctx = manager.acquire_context(None).await.unwrap();
+    assert_eq!(ctx.id, 1, "a disabled Fast credential is never selected");
+    ctx.release_in_flight();
+
+    manager.set_disabled(2, false).unwrap();
+    manager
+        .set_credential_max_concurrent_requests(2, Some(1))
+        .unwrap();
+    let mut first = manager.acquire_context(None).await.unwrap();
+    let mut second = manager.acquire_context(None).await.unwrap();
+    assert_eq!(first.id, 2);
+    assert_eq!(
+        second.id, 1,
+        "the Fast credential's own concurrency limit still applies; overflow goes down a tier"
+    );
+    second.release_in_flight();
+    first.release_in_flight();
+}
+
+#[test]
+fn fast_slot_race_overflows_to_lower_tier_in_priority_mode() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    let mut fast = fast_test_credential("fast", 1);
+    fast.priority = 0;
+    let mut plain_low = fast_test_credential("plain-low", 0);
+    plain_low.priority = 9;
+    let mut plain_other = fast_test_credential("plain-other", 0);
+    plain_other.priority = 3;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![fast, plain_low, plain_other],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let mut excluded = HashSet::new();
+
+    // The Fast credential lost its slot: overflowing to a plain credential is allowed even
+    // though its priority differs.
+    assert!(
+        manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 1, 0, 1, 1)
+    );
+
+    // Between plain credentials priority mode still waits on its own priority level.
+    excluded.insert(1);
+    assert!(
+        !manager.has_alternate_dispatchable_credential_for_slot_race(None, &excluded, 2, 9, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn fast_sticky_sessions_migrate_gradually_and_rebind() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    // The second credential starts as a lower-priority spare so both sessions bind to the first.
+    let first = fast_test_credential("first", 0);
+    let mut second = fast_test_credential("second", 0);
+    second.priority = 5;
+    let manager = MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+    let empty = HashSet::new();
+
+    for session in ["fast-sticky-a", "fast-sticky-b"] {
+        let mut ctx = manager
+            .acquire_context_for_session(None, Some(session), &empty)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+        ctx.release_in_flight();
+    }
+
+    manager.set_credential_fast(2, 1).unwrap();
+
+    let mut moved = manager
+        .acquire_context_for_session(None, Some("fast-sticky-a"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(moved.id, 2, "an existing session moves up to the Fast tier");
+    assert!(!moved.sticky_bound);
+    moved.release_in_flight();
+
+    let mut paced = manager
+        .acquire_context_for_session(None, Some("fast-sticky-b"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        paced.id, 1,
+        "migrations are paced; a second session stays on its binding within the interval"
+    );
+    assert!(paced.sticky_bound);
+    paced.release_in_flight();
+
+    let mut rebound = manager
+        .acquire_context_for_session(None, Some("fast-sticky-a"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        rebound.id, 2,
+        "a migrated session is rebound to the Fast credential"
+    );
+    assert!(rebound.sticky_bound);
+    rebound.release_in_flight();
+
+    let mut new_session = manager
+        .acquire_context_for_session(None, Some("fast-sticky-new"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        new_session.id, 2,
+        "new sessions go to the Fast tier immediately"
+    );
+    new_session.release_in_flight();
+
+    *manager.fast_sticky_migration_last.lock() =
+        Some(Instant::now() - FAST_STICKY_MIGRATION_INTERVAL);
+    let mut later = manager
+        .acquire_context_for_session(None, Some("fast-sticky-b"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        later.id, 2,
+        "after the interval the next session migrates too"
+    );
+    later.release_in_flight();
+}
+
+#[tokio::test]
+async fn fast_sticky_session_stays_when_fast_tier_is_full() {
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            fast_test_credential("first", 0),
+            fast_test_credential("second", 0),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let empty = HashSet::new();
+    let mut bound = manager
+        .acquire_context_for_session(None, Some("fast-sticky-full"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(bound.id, 1);
+    bound.release_in_flight();
+
+    manager.set_credential_fast(2, 1).unwrap();
+    manager
+        .set_credential_max_concurrent_requests(2, Some(1))
+        .unwrap();
+    let mut occupying = manager.acquire_context(None).await.unwrap();
+    assert_eq!(occupying.id, 2);
+
+    let mut stay = manager
+        .acquire_context_for_session(None, Some("fast-sticky-full"), &empty)
+        .await
+        .unwrap();
+    assert_eq!(
+        stay.id, 1,
+        "a session only migrates when the Fast tier can take it right now"
+    );
+    assert!(stay.sticky_bound);
+    assert!(
+        manager.fast_sticky_migration_last.lock().is_none(),
+        "a skipped migration does not consume the pacing slot"
+    );
+    stay.release_in_flight();
+    occupying.release_in_flight();
+}
