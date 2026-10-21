@@ -74,6 +74,31 @@ pub(super) async fn handle_messages_endpoint(
         return error.to_response(&request_id);
     }
     let mut requires_normalized_body = false;
+    match normalize_raw_output_effort_with_probe(&raw_body, &raw_probe) {
+        Ok(Some(body)) => {
+            tracing::info!(
+                endpoint,
+                model = ?raw_probe.model,
+                "dropped output_config.effort \"none\" before routing"
+            );
+            raw_body = body;
+            raw_probe = probe_raw_messages_body(&raw_body);
+            requires_normalized_body = true;
+        }
+        Ok(None) => {}
+        Err(message) => {
+            let request_id = envelope::request_id();
+            let error = EntryRequestError::invalid(message, "output_effort_normalization_failed");
+            record_entry_request_error(
+                attribution.as_ref(),
+                &endpoint,
+                &request_id,
+                &error,
+                Some(&raw_probe),
+            );
+            return error.to_response(&request_id);
+        }
+    }
     let model_max_output_tokens = raw_probe.model.as_deref().and_then(|model| {
         let resolution = state.model_capabilities.resolve_model_with_mapping(
             model,

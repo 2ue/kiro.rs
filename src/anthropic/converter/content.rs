@@ -64,10 +64,17 @@ pub(super) fn process_message_content(
                             if let Some(tool_use_id) =
                                 block.tool_use_id.as_deref().and_then(sanitize_tool_use_id)
                             {
-                                images.extend(extract_tool_result_images(&block.content)?);
-                                let result_content = normalize_tool_result_content(
-                                    extract_tool_result_content(&block.content),
-                                );
+                                let (result_images, omitted_images) =
+                                    extract_tool_result_images(&block.content);
+                                images.extend(result_images);
+                                let mut result_text = extract_tool_result_content(&block.content);
+                                for note in omitted_images {
+                                    if !result_text.is_empty() {
+                                        result_text.push('\n');
+                                    }
+                                    result_text.push_str(&note);
+                                }
+                                let result_content = normalize_tool_result_content(result_text);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -892,31 +899,44 @@ fn render_search_result_block(item: &serde_json::Value) -> String {
     )
 }
 
+/// Converts the images inside a tool_result.
+///
+/// An image a tool returned (a screenshot, a rendered file) stays in the conversation history, so
+/// one unusable image would make every later turn of that session fail. Unusable images are
+/// replaced by a short text note in the tool result instead; images in the user's own message
+/// still fail the request explicitly.
 fn extract_tool_result_images(
     content: &Option<serde_json::Value>,
-) -> Result<Vec<KiroImage>, ConversionError> {
+) -> (Vec<KiroImage>, Vec<String>) {
     let Some(serde_json::Value::Array(items)) = content else {
-        return Ok(Vec::new());
+        return (Vec::new(), Vec::new());
     };
 
     let mut images = Vec::new();
+    let mut omitted = Vec::new();
     for item in items {
         if item.get("type").and_then(|value| value.as_str()) != Some("image") {
             continue;
         }
-        let block = serde_json::from_value::<ContentBlock>(item.clone()).map_err(|error| {
-            ConversionError::UnsupportedContent(format!(
-                "invalid image block in tool_result: {error}"
-            ))
-        })?;
-        let source = block.source.ok_or_else(|| {
-            ConversionError::UnsupportedContent(
-                "image block in tool_result missing source".to_string(),
-            )
-        })?;
-        images.push(convert_image_source(source)?);
+        let converted = serde_json::from_value::<ContentBlock>(item.clone())
+            .map_err(|error| {
+                ConversionError::UnsupportedContent(format!("invalid image block: {error}"))
+            })
+            .and_then(|block| {
+                block.source.ok_or_else(|| {
+                    ConversionError::UnsupportedContent("image block missing source".to_string())
+                })
+            })
+            .and_then(convert_image_source);
+        match converted {
+            Ok(image) => images.push(image),
+            Err(error) => {
+                tracing::warn!(error = %error, "tool_result image could not be converted; replaced with a text note");
+                omitted.push(format!("[image omitted: {error}]"));
+            }
+        }
     }
-    Ok(images)
+    (images, omitted)
 }
 
 fn normalize_tool_result_content(content: String) -> String {
@@ -1118,27 +1138,43 @@ mod tests {
     }
 
     #[test]
-    fn empty_tool_result_image_is_rejected_with_clear_error() {
+    fn unusable_tool_result_image_becomes_a_text_note_instead_of_failing() {
+        // A bad image a tool returned stays in history; failing on it would break every later
+        // turn of the session. It is replaced by a note and the remaining content is kept.
         let content = json!([
             {
                 "type": "tool_result",
                 "tool_use_id": "toolu_123",
                 "content": [
+                    {"type": "text", "text": "screenshot taken"},
                     {
                         "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": ""
-                        }
-                    }
+                        "source": {"type": "base64", "media_type": "image/png", "data": ""}
+                    },
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/bmp", "data": "Qk0="}
+                    },
+                    {"type": "image"}
                 ]
             }
         ]);
 
-        let err = process_message_content(&content)
-            .expect_err("empty tool_result image should be rejected");
+        let (_, images, tool_results) = process_message_content(&content)
+            .expect("tool_result images must not fail the request");
+        assert!(images.is_empty());
+        assert_eq!(tool_results.len(), 1);
+        let text = serde_json::to_string(&tool_results[0]).expect("tool result json");
+        assert!(text.contains("screenshot taken"), "{text}");
+        assert_eq!(text.matches("[image omitted:").count(), 3, "{text}");
+    }
 
+    #[test]
+    fn empty_user_image_is_still_rejected_with_clear_error() {
+        let content = json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}}
+        ]);
+        let err = process_message_content(&content).expect_err("user image stays strict");
         assert_empty_image_error(err);
     }
 }

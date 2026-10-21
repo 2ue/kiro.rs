@@ -77,8 +77,8 @@ use super::request_facts::{
 };
 use super::request_facts::{
     RawMessagesBodyProbe, deserialize_messages_request_with_probe,
-    normalize_raw_reasoning_protocol_with_probe_and_limit, probe_raw_messages_body,
-    rewrite_raw_missing_top_level_max_tokens_with_probe,
+    normalize_raw_output_effort_with_probe, normalize_raw_reasoning_protocol_with_probe_and_limit,
+    probe_raw_messages_body, rewrite_raw_missing_top_level_max_tokens_with_probe,
     validate_raw_reasoning_protocol_with_probe,
 };
 use super::stream::{SseEvent, StreamContext};

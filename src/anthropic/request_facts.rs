@@ -536,6 +536,47 @@ pub(crate) fn normalize_raw_reasoning_protocol_with_probe_and_limit(
     }))
 }
 
+/// Newer Claude Code clients send `output_config.effort: "none"` to mean "no explicit effort".
+/// It is not one of the effort levels, so drop the field and let the request continue as if it
+/// was omitted instead of rejecting it at the entry validator.
+pub(crate) fn normalize_raw_output_effort_with_probe(
+    raw_body: &Bytes,
+    probe: &RawMessagesBodyProbe,
+) -> Result<Option<Bytes>, String> {
+    if !probe.matches_body(raw_body) {
+        return Err("raw request probe does not match the request body snapshot".to_string());
+    }
+    if probe.duplicate_output_config_field {
+        return Ok(None);
+    }
+    let Some(span) = probe.output_config_value_span.as_ref() else {
+        return Ok(None);
+    };
+    if json_object_has_duplicate_keys(&raw_body[span.clone()])? {
+        return Ok(None);
+    }
+    let Some(serde_json::Value::Object(mut output_config)) =
+        parse_bounded_protocol_value(raw_body, Some(span))?
+    else {
+        return Ok(None);
+    };
+    let is_none_effort = output_config
+        .get("effort")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|effort| effort.trim().eq_ignore_ascii_case("none"));
+    if !is_none_effort {
+        return Ok(None);
+    }
+    output_config.remove("effort");
+    let encoded = serde_json::to_vec(&serde_json::Value::Object(output_config))
+        .map_err(|error| format!("failed to serialize normalized output_config: {error}"))?;
+    let mut out = Vec::with_capacity(raw_body.len());
+    out.extend_from_slice(&raw_body[..span.start]);
+    out.extend_from_slice(&encoded);
+    out.extend_from_slice(&raw_body[span.end..]);
+    Ok(Some(Bytes::from(out)))
+}
+
 fn parse_bounded_protocol_value(
     raw_body: &Bytes,
     span: Option<&std::ops::Range<usize>>,
@@ -1335,6 +1376,62 @@ mod tests {
 
         assert_eq!(value["max_tokens"], 4096);
         assert_eq!(value["model"], "m");
+    }
+
+    #[test]
+    fn output_effort_none_is_dropped_so_the_request_validates() {
+        // Captured from production: claude-cli 2.1.288 sends effort "none" with enabled thinking.
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-opus-4-8","max_tokens":128,"thinking":{"type":"enabled","budget_tokens":10240},"output_config":{"effort":"none"},"messages":[]}"#,
+        );
+        let probe = probe_raw_messages_body(&raw);
+        let rewritten = normalize_raw_output_effort_with_probe(&raw, &probe)
+            .expect("normalize")
+            .expect("effort none rewritten");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+        assert_eq!(value["output_config"], serde_json::json!({}));
+        assert_eq!(value["thinking"]["budget_tokens"], 10240);
+        assert_eq!(value["messages"], serde_json::json!([]));
+
+        let probe = probe_raw_messages_body(&rewritten);
+        let normalized =
+            normalize_raw_reasoning_protocol_with_probe_and_limit(&rewritten, &probe, None)
+                .expect("reasoning normalization")
+                .map(|normalization| normalization.body)
+                .unwrap_or(rewritten);
+        validate_raw_reasoning_protocol(&normalized).expect("normalized request validates");
+
+        let raw = Bytes::from_static(
+            br#"{"model":"m","output_config":{"effort":" None ","format":{"type":"json_schema"}},"messages":[]}"#,
+        );
+        let probe = probe_raw_messages_body(&raw);
+        let rewritten = normalize_raw_output_effort_with_probe(&raw, &probe)
+            .expect("normalize")
+            .expect("rewritten");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+        assert!(value["output_config"].get("effort").is_none());
+        assert_eq!(value["output_config"]["format"]["type"], "json_schema");
+
+        for untouched in [
+            br#"{"model":"m","output_config":{"effort":"high"},"messages":[]}"#.as_slice(),
+            br#"{"model":"m","output_config":{"effort":"bogus"},"messages":[]}"#.as_slice(),
+            br#"{"model":"m","messages":[]}"#.as_slice(),
+        ] {
+            let raw = Bytes::copy_from_slice(untouched);
+            let probe = probe_raw_messages_body(&raw);
+            assert!(
+                normalize_raw_output_effort_with_probe(&raw, &probe)
+                    .expect("normalize")
+                    .is_none()
+            );
+        }
+        let bogus = Bytes::from_static(
+            br#"{"model":"m","output_config":{"effort":"bogus"},"messages":[]}"#,
+        );
+        assert!(
+            validate_raw_reasoning_protocol(&bogus).is_err(),
+            "unknown efforts still fail"
+        );
     }
 
     #[test]
