@@ -35,6 +35,7 @@ import type {
   SetDisabledRequest,
   SetCredentialProxyRequest,
   SetPriorityRequest,
+  SetCredentialFastRequest,
   SetWarmupRequest,
   SuccessResponse,
   SupportedModelsResponse,
@@ -181,6 +182,11 @@ export async function setCredentialDisabled(id: number, disabled: boolean): Prom
 
 export async function setCredentialPriority(id: number, priority: number): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/priority`, { priority } as SetPriorityRequest)
+  return data
+}
+
+export async function setCredentialFast(id: number, fast: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/fast`, { fast } as SetCredentialFastRequest)
   return data
 }
 

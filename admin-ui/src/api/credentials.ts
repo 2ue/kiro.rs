@@ -21,6 +21,7 @@ import type {
   SetCredentialRateLimitAutoDisableRequest,
   SetCredentialRpmRequest,
   SetPriorityRequest,
+  SetCredentialFastRequest,
   SetWarmupRequest,
   AddCredentialRequest,
   AddCredentialResponse,
@@ -242,6 +243,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据 Fast 值（0 表示关闭）
+export async function setCredentialFast(
+  id: number,
+  fast: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/fast`,
+    { fast } as SetCredentialFastRequest
   )
   return data
 }

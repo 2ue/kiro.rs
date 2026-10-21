@@ -890,6 +890,7 @@ fn credential_item(
         created_at: created_at.map(str::to_string),
         updated_at: None,
         priority: id as u32,
+        fast: 0,
         disabled,
         failure_count: 0,
         is_current: false,

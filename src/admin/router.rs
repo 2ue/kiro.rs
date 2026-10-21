@@ -32,16 +32,16 @@ use super::{
         get_usage_records, get_usage_records_page, get_usage_summary, get_usage_writer_stats,
         import_proxy_resources, preview_usage_cleanup, refresh_credentials_info,
         reset_failure_count, resume_usage_cleanup, set_credential_concurrency,
-        set_credential_disabled, set_credential_overage, set_credential_priority,
-        set_credential_proxy, set_credential_rate_limit_auto_disable, set_credential_regions,
-        set_credential_rpm, set_credential_supported_models, set_credential_warmup,
-        set_external_pool_enabled, set_external_pool_supported_models, set_load_balancing_mode,
-        start_usage_cleanup, sync_credential_supported_models, sync_external_pool_supported_models,
-        sync_model_capabilities, sync_model_pricing, test_all_proxy_resources, test_credential,
-        test_external_pool, test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
-        update_credential_auth, update_external_pool, update_proxy_resource,
-        update_request_api_key, update_runtime_config, upsert_manual_model,
-        validate_existing_credentials, validate_external_credentials,
+        set_credential_disabled, set_credential_fast, set_credential_overage,
+        set_credential_priority, set_credential_proxy, set_credential_rate_limit_auto_disable,
+        set_credential_regions, set_credential_rpm, set_credential_supported_models,
+        set_credential_warmup, set_external_pool_enabled, set_external_pool_supported_models,
+        set_load_balancing_mode, start_usage_cleanup, sync_credential_supported_models,
+        sync_external_pool_supported_models, sync_model_capabilities, sync_model_pricing,
+        test_all_proxy_resources, test_credential, test_external_pool, test_proxy_resource,
+        test_proxy_resource_config, update_admin_api_key, update_credential_auth,
+        update_external_pool, update_proxy_resource, update_request_api_key, update_runtime_config,
+        upsert_manual_model, validate_existing_credentials, validate_external_credentials,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -104,6 +104,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/auth", patch(update_credential_auth))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/fast", post(set_credential_fast))
         .route(
             "/credentials/{id}/concurrency",
             post(set_credential_concurrency),

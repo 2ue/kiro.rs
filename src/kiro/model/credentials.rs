@@ -100,6 +100,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// Fast 值（0 表示未开启，数字越大越优先，与 `priority` 方向相反）。
+    ///
+    /// 开启后，满足调度安全规则的请求先集中到 Fast 值最高的账号，并发打满后才溢出到
+    /// 下一档，最后才是未开启的账号；同一档内仍按负载均衡模式和 `priority` 选择。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fast: u32,
+
     /// 凭据级最大并发请求数覆盖。
     ///
     /// `None` 表示继承全局 `credentialMaxConcurrentRequests`；
@@ -225,6 +233,7 @@ impl fmt::Debug for KiroCredentials {
             .field("issuer_url_present", &self.issuer_url.is_some())
             .field("scopes_present", &self.scopes.is_some())
             .field("priority", &self.priority)
+            .field("fast", &self.fast)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("rpm", &self.rpm)
             .field(
@@ -575,6 +584,7 @@ impl KiroCredentials {
             && self.issuer_url == other.issuer_url
             && self.scopes == other.scopes
             && self.priority == other.priority
+            && self.fast == other.fast
             && self.max_concurrent_requests == other.max_concurrent_requests
             && self.rpm == other.rpm
             && self.rate_limit_auto_disable_enabled == other.rate_limit_auto_disable_enabled
@@ -982,6 +992,7 @@ mod tests {
             issuer_url: Some("issuer-url-sensitive-value".to_string()),
             scopes: Some("scopes-sensitive-value".to_string()),
             priority: 3,
+            fast: 0,
             max_concurrent_requests: Some(4),
             rpm: Some(5),
             rate_limit_auto_disable_enabled: Some(false),
@@ -1182,6 +1193,17 @@ mod tests {
         let json = r#"{"refreshToken": "test"}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 0);
+    }
+
+    #[test]
+    fn fast_defaults_to_off_and_round_trips() {
+        let creds = KiroCredentials::from_json(r#"{"refreshToken": "test"}"#).unwrap();
+        assert_eq!(creds.fast, 0);
+        assert!(serde_json::to_value(&creds).unwrap().get("fast").is_none());
+
+        let creds = KiroCredentials::from_json(r#"{"refreshToken": "test", "fast": 2}"#).unwrap();
+        assert_eq!(creds.fast, 2);
+        assert_eq!(serde_json::to_value(&creds).unwrap()["fast"], 2);
     }
 
     #[test]

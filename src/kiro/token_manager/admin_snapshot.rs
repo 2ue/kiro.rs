@@ -55,6 +55,7 @@ pub struct CredentialEntrySnapshot {
     pub updated_at: Option<String>,
     /// 优先级
     pub priority: u32,
+    pub fast: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -210,6 +211,7 @@ pub struct CredentialBaseSnapshot {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub priority: u32,
+    pub fast: u32,
     pub disabled: bool,
     pub disabled_reason: Option<String>,
     pub auth_method: Option<String>,
@@ -404,6 +406,7 @@ pub(super) fn base_snapshot_from_entry(
         created_at: entry.credentials.created_at.clone(),
         updated_at: entry.credentials.updated_at.clone(),
         priority: entry.credentials.priority,
+        fast: entry.credentials.fast,
         disabled: entry.disabled,
         disabled_reason: entry.disabled_reason.map(|r| r.as_str().to_string()),
         auth_method: normalized_auth_method(&entry.credentials),
@@ -496,6 +499,7 @@ pub(super) fn runtime_snapshot_from_entry(
         created_at: entry.credentials.created_at.clone(),
         updated_at: entry.credentials.updated_at.clone(),
         priority: entry.credentials.priority,
+        fast: entry.credentials.fast,
         disabled: entry.disabled,
         failure_count: entry.failure_count,
         auth_method: normalized_auth_method(&entry.credentials),

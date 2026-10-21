@@ -142,3 +142,96 @@
     border-color: hsl(var(--info) / 0.3);
   }
 }
+
+/* Fast credential card: a rotating gradient rim plus a soft glow. Higher Fast tiers get a
+   hotter palette; the tier number is always shown as text, so color is never the only cue. */
+@property --fast-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
+.fast-card {
+  --fast-a: 199 95% 55%;
+  --fast-b: 262 90% 66%;
+  --fast-c: 320 85% 62%;
+  position: relative;
+  isolation: isolate;
+  box-shadow:
+    0 0 0 1px hsl(var(--fast-b) / 0.35),
+    0 8px 28px -10px hsl(var(--fast-b) / 0.55);
+}
+.fast-card[data-fast-tier='2'] {
+  --fast-a: 262 90% 66%;
+  --fast-b: 320 85% 62%;
+  --fast-c: 28 95% 58%;
+}
+.fast-card[data-fast-tier='3'] {
+  --fast-a: 320 85% 62%;
+  --fast-b: 28 95% 58%;
+  --fast-c: 48 100% 55%;
+}
+.fast-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  padding: 1.5px;
+  border-radius: inherit;
+  background: conic-gradient(
+    from var(--fast-angle),
+    hsl(var(--fast-a)),
+    hsl(var(--fast-b)),
+    hsl(var(--fast-c)),
+    hsl(var(--fast-a))
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  animation: fast-rim-spin 4s linear infinite;
+  pointer-events: none;
+}
+.fast-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  border-radius: inherit;
+  background:
+    radial-gradient(120% 60% at 0% 0%, hsl(var(--fast-a) / 0.12), transparent 60%),
+    radial-gradient(120% 60% at 100% 0%, hsl(var(--fast-c) / 0.1), transparent 60%);
+  pointer-events: none;
+}
+
+.fast-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  border-radius: 9999px;
+  padding: 0.05rem 0.5rem 0.05rem 0.35rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #fff;
+  background: linear-gradient(110deg, hsl(var(--fast-a)), hsl(var(--fast-b)) 55%, hsl(var(--fast-c)));
+  background-size: 200% 100%;
+  box-shadow: 0 0 12px -2px hsl(var(--fast-b) / 0.7);
+  animation: fast-badge-shine 2.8s ease-in-out infinite;
+}
+.fast-badge svg {
+  filter: drop-shadow(0 0 3px rgb(255 255 255 / 0.8));
+}
+
+@keyframes fast-rim-spin {
+  to {
+    --fast-angle: 360deg;
+  }
+}
+@keyframes fast-badge-shine {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fast-card::before, .fast-badge { animation: none; }
+}

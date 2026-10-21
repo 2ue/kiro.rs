@@ -354,6 +354,8 @@ pub struct CredentialListItem {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub priority: u32,
+    /// Fast 值（0 表示未开启，数字越大越优先打满）
+    pub fast: u32,
     pub disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
@@ -458,6 +460,8 @@ pub struct CredentialStatusItem {
     pub updated_at: Option<String>,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
+    /// Fast 值（0 表示未开启，数字越大越优先打满）
+    pub fast: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -639,6 +643,13 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改 Fast 值请求（0 表示关闭）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialFastRequest {
+    pub fast: u32,
 }
 
 /// 修改凭据预热状态请求
@@ -948,6 +959,10 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// Fast 值（可选，默认 0 表示未开启）
+    #[serde(default)]
+    pub fast: u32,
 
     /// 凭据级最大并发覆盖。None 表示继承全局，0 表示该账号不限并发。
     #[serde(default, alias = "max_concurrent_requests")]
@@ -1343,6 +1358,8 @@ pub struct BatchUpdateCredentialsRequest {
     pub ids: Vec<u64>,
     #[serde(default)]
     pub priority: Option<SetPriorityRequest>,
+    #[serde(default)]
+    pub fast: Option<SetCredentialFastRequest>,
     #[serde(default)]
     pub regions: Option<SetCredentialRegionsRequest>,
     #[serde(default)]

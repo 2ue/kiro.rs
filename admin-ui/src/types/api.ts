@@ -98,6 +98,7 @@ export type CredentialListItem = Pick<
   | 'createdAt'
   | 'updatedAt'
   | 'priority'
+  | 'fast'
   | 'disabled'
   | 'disabledReason'
   | 'authMethod'
@@ -236,6 +237,8 @@ export interface CredentialStatusItem {
   createdAt: string | null
   updatedAt: string | null
   priority: number
+  /** Fast 值：0 表示未开启，数字越大越先打满。 */
+  fast: number
   disabled: boolean
   failureCount: number
   isCurrent: boolean
@@ -539,6 +542,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetCredentialFastRequest {
+  fast: number
+}
+
 export interface SetWarmupRequest {
   warmupRemaining: number
 }
@@ -564,6 +571,7 @@ export interface SetCredentialRegionsRequest {
 export interface BatchUpdateCredentialsRequest {
   ids: number[]
   priority?: SetPriorityRequest
+  fast?: SetCredentialFastRequest
   regions?: SetCredentialRegionsRequest
   concurrency?: SetCredentialConcurrencyRequest
   rpm?: SetCredentialRpmRequest
