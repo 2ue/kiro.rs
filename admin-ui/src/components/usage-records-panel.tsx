@@ -709,6 +709,8 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="最后Assistant字符" value={typeof trace.lastAssistantContentChars === 'number' ? formatNumber(trace.lastAssistantContentChars) : '-'} />
         <UsageMetric label="过滤trivial文本块" value={typeof trace.filteredTrivialTextBlocks === 'number' ? formatNumber(trace.filteredTrivialTextBlocks) : '-'} tone="warning" />
         <UsageMetric label="过滤trivial字符" value={typeof trace.filteredTrivialTextChars === 'number' ? formatNumber(trace.filteredTrivialTextChars) : '-'} tone="warning" />
+        <UsageMetric label="WebSearch 模式" value={trace.websearchMode === 'model_driven' ? '模型驱动' : trace.websearchMode === 'template' ? '模板回答' : trace.websearchMode || '-'} />
+        <UsageMetric label="搜索次数" value={typeof trace.webSearchRequests === 'number' ? formatNumber(trace.webSearchRequests) : '-'} />
       </div>
     </div>
   )

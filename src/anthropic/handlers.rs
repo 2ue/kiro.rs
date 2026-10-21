@@ -438,6 +438,8 @@ struct RequestLatencyTraceState {
     filtered_trivial_text_chars: Arc<Mutex<Option<u32>>>,
     tool_choice_violation: Arc<Mutex<Option<String>>>,
     dropped_tool_uses: Arc<Mutex<Option<Vec<String>>>>,
+    websearch_mode: Arc<Mutex<Option<String>>>,
+    web_search_requests: Arc<Mutex<Option<u32>>>,
 }
 
 impl RequestLatencyTraceState {
@@ -501,6 +503,8 @@ impl RequestLatencyTraceState {
             filtered_trivial_text_chars: Arc::new(Mutex::new(None)),
             tool_choice_violation: Arc::new(Mutex::new(None)),
             dropped_tool_uses: Arc::new(Mutex::new(None)),
+            websearch_mode: Arc::new(Mutex::new(None)),
+            web_search_requests: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -3318,6 +3322,16 @@ impl RequestUsageContext {
         *self.downstream_stop_reason.lock() = Some(reason.into());
     }
 
+    /// 原生 WebSearch 请求走的模式（`template` / `model_driven`），写入用量记录诊断。
+    fn set_websearch_mode(&self, mode: &'static str) {
+        *self.latency.websearch_mode.lock() = Some(mode.to_string());
+    }
+
+    /// 本次请求成功执行的搜索次数，写入用量记录诊断。
+    fn set_web_search_requests(&self, requests: u32) {
+        *self.latency.web_search_requests.lock() = Some(requests);
+    }
+
     fn mark_client_dropped(&self) {
         let elapsed = self.elapsed_ms();
         let _ = self.latency.client_dropped_latency_ms.compare_exchange(
@@ -3523,6 +3537,8 @@ impl RequestUsageContext {
             filtered_trivial_text_chars: *self.latency.filtered_trivial_text_chars.lock(),
             tool_choice_violation: self.latency.tool_choice_violation.lock().clone(),
             dropped_tool_uses: self.latency.dropped_tool_uses.lock().clone(),
+            websearch_mode: self.latency.websearch_mode.lock().clone(),
+            web_search_requests: *self.latency.web_search_requests.lock(),
         };
         (!trace.is_empty()).then_some(trace)
     }
@@ -4180,6 +4196,18 @@ fn public_error_response(
 }
 
 impl CredentialUsageContext {
+    /// 用整个请求结束时的归因替换凭据信息（模型驱动 WebSearch 可能跨多次调用换号）。
+    fn with_credential_attribution(mut self, attribution: McpCallAttribution) -> Self {
+        if attribution.credential_id.is_some() {
+            self.credential_id = attribution.credential_id;
+            self.credential_label = attribution.credential_label;
+        }
+        if !attribution.attempts.is_empty() {
+            self.credential_attempts = attribution.attempts;
+        }
+        self
+    }
+
     fn with_error_metadata(mut self, error_metadata: Option<serde_json::Value>) -> Self {
         if error_metadata.is_some() {
             self.error_metadata = error_metadata;
@@ -5507,6 +5535,123 @@ fn wrap_websearch_stream_usage_record(
         return Response::from_parts(parts, Body::from_stream(stream));
     }
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+/// 模型驱动 WebSearch 的流式响应：后台任务边执行边写入，结束前把结果写进 `completion`。
+///
+/// 与模板模式不同，首个字节下发后仍要继续调用上游（搜索与后续轮次的模型调用），所以只在
+/// 流结束时才标记下游已提交；每次模型调用都是完整读取的非流式请求，调用内的换号重试不会
+/// 重复下发内容。
+fn wrap_model_driven_websearch_stream(
+    response: Response,
+    usage_context: CredentialUsageContext,
+    completion: websearch::WebSearchStreamCompletionSlot,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let data_stream = body.into_data_stream();
+    let capture_request_id = usage_context.request.request_id.clone();
+    let guard = StreamUsageGuard::new(usage_context);
+    let stream = stream::unfold(
+        (data_stream, Some(guard), completion),
+        move |(mut data_stream, mut guard, completion)| async move {
+            match data_stream.next().await {
+                Some(Ok(chunk)) => Some((Ok(chunk), (data_stream, guard, completion))),
+                Some(Err(error)) => {
+                    if let Some(guard) = guard.take() {
+                        tracing::warn!(
+                            request_id = %guard.context().request.request_id,
+                            error = %error,
+                            "model-driven WebSearch response body stream failed"
+                        );
+                        guard
+                            .context()
+                            .request
+                            .mark_stream_terminal(StreamTerminalReason::InternalError);
+                        guard.context().record_failure(
+                            UsageRecordStatus::StreamError,
+                            "api_error",
+                            "websearch_response_body_stream_error",
+                        );
+                        guard.complete();
+                    }
+                    Some((
+                        Err(std::io::Error::other(
+                            "model-driven WebSearch response body stream failed",
+                        )),
+                        (data_stream, guard, completion),
+                    ))
+                }
+                None => {
+                    if let Some(guard) = guard.take() {
+                        let result = completion.lock().take();
+                        finish_model_driven_websearch_stream(&guard, result);
+                        guard.complete();
+                    }
+                    None
+                }
+            }
+        },
+    );
+    if crate::diagnostics::capture::is_active() {
+        let stream =
+            crate::diagnostics::capture::tap_client_stream(capture_request_id, "websearch", stream);
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn finish_model_driven_websearch_stream(
+    guard: &StreamUsageGuard,
+    result: Option<websearch::WebSearchStreamCompletion>,
+) {
+    let request = &guard.context().request;
+    request
+        .latency
+        .inference_attempt_budget
+        .mark_downstream_committed();
+    let Some(result) = result else {
+        request.mark_stream_terminal(StreamTerminalReason::InternalError);
+        guard.context().record_failure(
+            UsageRecordStatus::StreamError,
+            "api_error",
+            "websearch_stream_ended_without_result",
+        );
+        return;
+    };
+    let raw_usage = websearch::raw_websearch_usage(result.raw_input_tokens, result.output_tokens);
+    let context = guard
+        .context()
+        .clone()
+        .with_credential_attribution(result.attribution);
+    if let Some((error_type, internal_reason)) = result.failure {
+        context
+            .request
+            .mark_stream_terminal(StreamTerminalReason::UpstreamStatusError);
+        context.record_stream_failure_from_context(
+            UsageRecordStatus::StreamError,
+            Some(raw_usage),
+            Some((error_type.to_string(), internal_reason.to_string())),
+            None,
+            None,
+            None,
+        );
+        return;
+    }
+    context
+        .request
+        .set_web_search_requests(result.web_search_requests);
+    context
+        .request
+        .set_downstream_stop_reason(result.stop_reason);
+    context
+        .request
+        .mark_stream_terminal(StreamTerminalReason::Completed);
+    context.record_success_reported_with_metering(
+        result.reported_usage,
+        UsageSource::RequestEstimate,
+        Some(raw_usage),
+        None,
+    );
 }
 
 fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> Option<String> {
@@ -7843,50 +7988,58 @@ async fn post_messages_inner(
         let websearch_usage_shaper = (usage_context.prompt_cache_strategy_type
             == PromptCacheStrategyType::BoundedHighCache)
             .then(|| usage_context.clone());
-        let websearch_usage_mapper = websearch_usage_shaper.as_ref().map(|context| {
-            move |raw: super::cache::CacheUsage| {
-                context
-                    .clone()
-                    .attach_credential(None, None, false, false, Vec::new())
-                    .canonical_reported_usage_for_success(raw, UsageSource::RequestEstimate)
-            }
+        let websearch_usage_mapper: Option<websearch::SharedWebSearchUsageMapper> =
+            websearch_usage_shaper.map(|context| {
+                Arc::new(move |raw: super::cache::CacheUsage| {
+                    context
+                        .clone()
+                        .attach_credential(None, None, false, false, Vec::new())
+                        .canonical_reported_usage_for_success(raw, UsageSource::RequestEstimate)
+                }) as websearch::SharedWebSearchUsageMapper
+            });
+        let model_driven = runtime_config
+            .body_conversion
+            .model_driven_web_search
+            .enabled_for_route(&endpoint);
+        usage_context.set_websearch_mode(if model_driven {
+            "model_driven"
+        } else {
+            "template"
         });
         let mut usage_guard =
             WebSearchPreResponseUsageGuard::new(usage_context, attribution_sink.clone());
-        let usage_mapper = websearch_usage_mapper
-            .as_ref()
-            .map(|mapper| mapper as websearch::WebSearchUsageMapper<'_>);
-        let outcome = if runtime_config
-            .body_conversion
-            .model_driven_web_search
-            .enabled_for_route(&endpoint)
-        {
-            model_driven_websearch::run(model_driven_websearch::ModelDrivenWebSearchContext {
-                state: &state,
-                provider,
-                payload: &payload,
-                endpoint: &endpoint,
-                runtime_config: &runtime_config,
-                cache_route: cache_route.clone(),
-                model_resolution: &model_resolution,
-                usage_mapper,
-                inference_attempt_budget,
-                attribution_sink,
-                identity_output_guard: identity_output_guard_applies(
-                    &state,
-                    &endpoint,
-                    payload.stream,
-                ),
-                request_id: &request_id,
-                error_id: &error_id,
-            })
+        let outcome = if model_driven {
+            // Boxed: the loop owns its context and nests several model calls, and inlining that
+            // future into this handler would grow every request's future (and overflow small
+            // debug-build stacks).
+            Box::pin(model_driven_websearch::run(
+                model_driven_websearch::ModelDrivenWebSearchContext {
+                    state: state.clone(),
+                    provider,
+                    payload: payload.clone(),
+                    endpoint: endpoint.clone(),
+                    runtime_config: runtime_config.clone(),
+                    cache_route: cache_route.clone(),
+                    model_resolution: model_resolution.clone(),
+                    usage_mapper: websearch_usage_mapper,
+                    inference_attempt_budget,
+                    attribution_sink,
+                    identity_output_guard: identity_output_guard_applies(
+                        &state,
+                        &endpoint,
+                        payload.stream,
+                    ),
+                    request_id: request_id.clone(),
+                    error_id: error_id.clone(),
+                },
+            ))
             .await
         } else {
             websearch::handle_websearch_request(websearch::WebSearchRequestContext {
                 provider,
                 payload: &payload,
                 input_tokens,
-                usage_mapper,
+                usage_mapper: websearch_usage_mapper.as_deref(),
                 inference_attempt_budget,
                 attribution_sink,
                 request_id: &request_id,
@@ -7896,13 +8049,29 @@ async fn post_messages_inner(
         };
         let usage_context = usage_guard.take();
         return match outcome {
+            websearch::WebSearchOutcome::StreamingSuccess {
+                response,
+                completion,
+                attribution,
+            } => {
+                let usage_context = usage_context.attach_credential(
+                    attribution.credential_id,
+                    attribution.credential_label,
+                    false,
+                    false,
+                    attribution.attempts,
+                );
+                wrap_model_driven_websearch_stream(response, usage_context, completion)
+            }
             websearch::WebSearchOutcome::Success {
                 response,
                 raw_input_tokens,
                 output_tokens,
                 reported_usage,
                 attribution,
+                web_search_requests,
             } => {
+                usage_context.set_web_search_requests(web_search_requests);
                 let usage_context = usage_context.attach_credential(
                     attribution.credential_id,
                     attribution.credential_label,

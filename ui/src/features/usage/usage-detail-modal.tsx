@@ -579,6 +579,12 @@ export function UsageDetailModal({
                 {typeof record.latencyTrace.filteredTrivialTextChars === 'number' && (
                   <MetricTile label="过滤trivial字符" value={formatNumber(record.latencyTrace.filteredTrivialTextChars)} tone="warning" />
                 )}
+                {record.latencyTrace.websearchMode && (
+                  <MetricTile label="WebSearch 模式" value={websearchModeLabel(record.latencyTrace.websearchMode)} />
+                )}
+                {typeof record.latencyTrace.webSearchRequests === 'number' && (
+                  <MetricTile label="搜索次数" value={formatNumber(record.latencyTrace.webSearchRequests)} />
+                )}
               </>
             )}
           </div>
@@ -715,4 +721,10 @@ export function UsageDetailModal({
       </div>
     </ModalShell>
   )
+}
+
+function websearchModeLabel(mode: string): string {
+  if (mode === 'model_driven') return '模型驱动'
+  if (mode === 'template') return '模板回答'
+  return mode
 }

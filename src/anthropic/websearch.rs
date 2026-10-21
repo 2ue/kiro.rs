@@ -112,6 +112,16 @@ pub enum WebSearchOutcome {
         /// 下发给客户端的最终 usage（经过 `usage_mapper`）。
         reported_usage: super::cache::CacheUsage,
         attribution: McpCallAttribution,
+        /// 成功执行的搜索次数（用量记录诊断用）。
+        web_search_requests: u32,
+    },
+    /// 模型驱动模式的流式响应：首轮模型调用成功后立即开始下发，后续轮次边执行边写入。
+    /// 结果在流结束前写入 `completion`，由 handler 在流结束时记录用量。
+    StreamingSuccess {
+        response: Response,
+        completion: WebSearchStreamCompletionSlot,
+        /// 首轮模型调用的归因；客户端在流结束前断开时用于记录。
+        attribution: McpCallAttribution,
     },
     Failure {
         response: Response,
@@ -135,6 +145,25 @@ pub struct WebSearchToolErrorOutcome {
 /// 返回最终下发的 usage。message_start、message_delta 和非流式响应体使用同一个结果。
 pub type WebSearchUsageMapper<'a> =
     &'a (dyn Fn(super::cache::CacheUsage) -> super::cache::CacheUsage + Send + Sync);
+
+/// 可跨任务持有的 usage 改写（模型驱动流式模式在后台任务里计算最终 usage）。
+pub type SharedWebSearchUsageMapper =
+    Arc<dyn Fn(super::cache::CacheUsage) -> super::cache::CacheUsage + Send + Sync>;
+
+/// 模型驱动流式响应的最终结果，后台任务在发送最后的事件之前写入。
+#[derive(Debug, Clone)]
+pub struct WebSearchStreamCompletion {
+    pub raw_input_tokens: i32,
+    pub output_tokens: i32,
+    pub reported_usage: super::cache::CacheUsage,
+    pub attribution: McpCallAttribution,
+    pub web_search_requests: u32,
+    pub stop_reason: &'static str,
+    /// 响应已开始后某一轮模型调用失败：(error_type, internal_reason)。
+    pub failure: Option<(&'static str, &'static str)>,
+}
+
+pub type WebSearchStreamCompletionSlot = Arc<parking_lot::Mutex<Option<WebSearchStreamCompletion>>>;
 
 pub struct WebSearchRequestContext<'a> {
     pub provider: Arc<crate::kiro::provider::KiroProvider>,
@@ -1404,6 +1433,7 @@ pub async fn handle_websearch_request(context: WebSearchRequestContext<'_>) -> W
         output_tokens,
         reported_usage,
         attribution,
+        web_search_requests: 1,
     }
 }
 

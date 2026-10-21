@@ -324,6 +324,12 @@ pub struct UsageLatencyTrace {
     /// 因违反本轮工具约束被丢弃的 tool_use，格式 `reason:tool`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped_tool_uses: Option<Vec<String>>,
+    /// 原生 WebSearch 请求的处理模式：`template`（模板回答）或 `model_driven`（模型驱动）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websearch_mode: Option<String>,
+    /// 原生 WebSearch 请求成功执行的搜索次数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_requests: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -401,6 +407,8 @@ impl UsageLatencyTrace {
             && self.filtered_trivial_text_chars.is_none()
             && self.tool_choice_violation.is_none()
             && self.dropped_tool_uses.is_none()
+            && self.websearch_mode.is_none()
+            && self.web_search_requests.is_none()
     }
 }
 

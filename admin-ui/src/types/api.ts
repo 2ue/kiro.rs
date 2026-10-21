@@ -834,6 +834,8 @@ export interface UsageLatencyTrace {
   lastAssistantContentChars?: number
   filteredTrivialTextBlocks?: number
   filteredTrivialTextChars?: number
+  websearchMode?: 'template' | 'model_driven' | string
+  webSearchRequests?: number
 }
 
 export interface KiroCredentialAttempt {
