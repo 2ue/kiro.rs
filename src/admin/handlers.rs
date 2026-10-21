@@ -21,13 +21,13 @@ use super::{
         RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialFastRequest,
         SetCredentialOverageRequest, SetCredentialProxyRequest,
         SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
-        SetCredentialRpmRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
-        SyncModelCapabilitiesRequest, SystemVersionResponse, TestCredentialRequest,
-        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-        UsageCleanupRequest, UsageCleanupResumeRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
+        SetWarmupRequest, SuccessResponse, SyncModelCapabilitiesRequest, SystemVersionResponse,
+        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupResumeRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{
@@ -627,6 +627,19 @@ pub async fn set_credential_fast(
             };
             Json(SuccessResponse::new(message)).into_response()
         }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/route-policy
+/// 设置账号路由调度规则（allow_all / allow_list / deny_list）
+pub async fn set_credential_route_policy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialRoutePolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_route_policy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 路由规则已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

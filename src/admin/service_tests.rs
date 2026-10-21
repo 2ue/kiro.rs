@@ -891,6 +891,8 @@ fn credential_item(
         updated_at: None,
         priority: id as u32,
         fast: 0,
+        route_mode: crate::model::config::ExternalPoolRouteMode::AllowAll,
+        route_rules: Vec::new(),
         disabled,
         failure_count: 0,
         is_current: false,
@@ -1644,4 +1646,46 @@ fn external_pool_quality_probe_share_and_top_k_are_bounded() {
     };
     let err = validate_external_pools_config(&config).unwrap_err();
     assert!(err.contains("externalPoolQualityTopK"), "{err}");
+}
+
+#[test]
+fn credential_route_policy_validation_normalizes_and_rejects_empty_allow_list() {
+    use crate::model::config::ExternalPoolRouteMode;
+    let (mode, rules) = validated_credential_route_policy(SetCredentialRoutePolicyRequest {
+        route_mode: ExternalPoolRouteMode::DenyList,
+        route_rules: vec![" ha/ ".to_string(), "/HA".to_string()],
+    })
+    .unwrap();
+    assert_eq!(mode, ExternalPoolRouteMode::DenyList);
+    assert_eq!(rules, vec!["/ha".to_string()]);
+
+    assert!(
+        validated_credential_route_policy(SetCredentialRoutePolicyRequest {
+            route_mode: ExternalPoolRouteMode::AllowList,
+            route_rules: vec!["  ".to_string()],
+        })
+        .is_err()
+    );
+    assert!(
+        validated_credential_route_policy(SetCredentialRoutePolicyRequest {
+            route_mode: ExternalPoolRouteMode::AllowAll,
+            route_rules: vec!["/x".to_string(); 201],
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn batch_update_accepts_route_policy_alone() {
+    let req: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+        "ids": [1, 2],
+        "routePolicy": {"routeMode": "allow_list", "routeRules": ["/cc"]}
+    }))
+    .unwrap();
+    let policy = req.route_policy.expect("route policy");
+    assert_eq!(
+        policy.route_mode,
+        crate::model::config::ExternalPoolRouteMode::AllowList
+    );
+    assert_eq!(policy.route_rules, vec!["/cc".to_string()]);
 }

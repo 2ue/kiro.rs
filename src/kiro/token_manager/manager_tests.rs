@@ -14209,3 +14209,121 @@ fn dispatch_neutral_admin_patch_does_not_quarantine_enabled_account_for_five_rou
         assert!(entry.disabled, "round {round}");
     }
 }
+
+fn route_test_credential(
+    token: &str,
+    mode: crate::model::config::ExternalPoolRouteMode,
+    rules: &[&str],
+) -> KiroCredentials {
+    let mut credential = test_access_token_credential(token, "Pro");
+    credential.route_mode = mode;
+    credential.route_rules = rules.iter().map(|rule| rule.to_string()).collect();
+    credential
+}
+
+#[test]
+fn credential_route_rules_scope_exclusions_and_route_state() {
+    use crate::model::config::ExternalPoolRouteMode::{AllowAll, AllowList, DenyList};
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    let manager = MultiTokenManager::new(
+        config,
+        vec![
+            route_test_credential("any", AllowAll, &[]),
+            route_test_credential("cc-only", AllowList, &["/cc"]),
+            route_test_credential("not-ha", DenyList, &["/ha"]),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        manager.credential_ids_rejecting_route("/ha/v1/messages"),
+        vec![2, 3]
+    );
+    assert_eq!(
+        manager.credential_ids_rejecting_route("/cc/v1/messages"),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        manager.credential_ids_rejecting_route("/v1/messages"),
+        vec![2]
+    );
+    assert!(!manager.route_rejected_by_all_credentials("/ha/v1/messages"));
+
+    let ha = manager.local_pool_route_state_fresh_for_route(None, Some("/ha/v1/messages"));
+    assert_eq!(ha.kind, LocalPoolRouteStateKind::Ready);
+    assert_eq!(ha.total, 1, "only the allow-all credential can take /ha");
+    assert_eq!(ha.dispatchable, 1);
+    let all = manager.local_pool_route_state_fresh(None);
+    assert_eq!(all.total, 3);
+
+    // Once the only /ha-capable credential is disabled, /ha sees an empty local pool even though
+    // other credentials are still dispatchable for other routes.
+    manager.set_disabled(1, true).unwrap();
+    let ha = manager.local_pool_route_state_fresh_for_route(None, Some("/ha/v1/messages"));
+    assert_eq!(ha.kind, LocalPoolRouteStateKind::AllDisabled);
+    let cc = manager.local_pool_route_state_fresh_for_route(None, Some("/cc/v1/messages"));
+    assert_eq!(cc.kind, LocalPoolRouteStateKind::Ready);
+    assert_eq!(cc.dispatchable, 2);
+}
+
+#[test]
+fn route_rejected_by_all_credentials_drives_route_policy_and_ignores_empty_pool() {
+    use crate::model::config::ExternalPoolRouteMode::{AllowList, DenyList};
+    let mut config = Config::default();
+    config.credential_warmup_requests = 0;
+    let manager = MultiTokenManager::new(
+        config.clone(),
+        vec![
+            route_test_credential("cc", AllowList, &["/cc"]),
+            route_test_credential("not-ha", DenyList, &["/ha"]),
+        ],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(manager.route_rejected_by_all_credentials("/ha/v1/messages"));
+    assert!(!manager.route_rejected_by_all_credentials("/cc/v1/messages"));
+    // With every credential rejecting the route the filter is ignored, so the route state
+    // still describes the whole pool and the request goes through the route policy instead.
+    let ha = manager.local_pool_route_state_fresh_for_route(None, Some("/ha/v1/messages"));
+    assert_eq!(ha.total, 2);
+
+    manager
+        .set_credential_route_policy(
+            2,
+            crate::model::config::ExternalPoolRouteMode::AllowAll,
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(!manager.route_rejected_by_all_credentials("/ha/v1/messages"));
+
+    let empty = MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap();
+    assert!(!empty.route_rejected_by_all_credentials("/ha/v1/messages"));
+}
+
+#[test]
+fn credential_route_policy_setter_normalizes_rules() {
+    let manager = MultiTokenManager::new(
+        Config::default(),
+        vec![test_access_token_credential("a", "Pro")],
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    manager
+        .set_credential_route_policy(
+            1,
+            crate::model::config::ExternalPoolRouteMode::AllowList,
+            vec![" cc/ ".to_string(), "/CC".to_string(), "".to_string()],
+        )
+        .unwrap();
+    let entries = manager.entries.lock();
+    assert_eq!(entries[0].credentials.route_rules, vec!["/cc".to_string()]);
+    assert!(entries[0].credentials.allows_route("/cc/v1/messages"));
+}

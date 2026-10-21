@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle, Router, Gauge, Globe, Eye, EyeOff, Zap } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle, Router, Gauge, Globe, Eye, EyeOff, Zap, Route } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -16,13 +16,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import type { CredentialStatusItem, BalanceResponse, ExternalPoolRouteMode } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatUsd } from '@/lib/format'
 import {
   useSetDisabled,
   useSetPriority,
   useSetCredentialFast,
+  useSetCredentialRoutePolicy,
   useSetWarmup,
   useClearInFlight,
   useResetFailure,
@@ -204,6 +205,14 @@ function SecretInput({
   )
 }
 
+/** Short label for a credential's route policy; undefined when it accepts every route. */
+function credentialRouteSummary(mode?: ExternalPoolRouteMode, rules: string[] = []): string | undefined {
+  if (!mode || mode === 'allow_all') return undefined
+  const list = rules.length <= 2 ? rules.join(', ') : `${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
+  if (mode === 'allow_list') return rules.length ? `仅 ${list}` : '不承接任何入口'
+  return rules.length ? `排除 ${list}` : undefined
+}
+
 export function CredentialCard({
   credential,
   onQueryBalance,
@@ -216,6 +225,9 @@ export function CredentialCard({
   const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
   const [editingFast, setEditingFast] = useState(false)
+  const [editingRoutePolicy, setEditingRoutePolicy] = useState(false)
+  const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>(credential.routeMode ?? 'allow_all')
+  const [routeRulesDraft, setRouteRulesDraft] = useState((credential.routeRules ?? []).join('\n'))
   const [editingRegions, setEditingRegions] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
@@ -248,6 +260,7 @@ export function CredentialCard({
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setFast = useSetCredentialFast()
+  const setRoutePolicy = useSetCredentialRoutePolicy()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -411,6 +424,32 @@ export function CredentialCard({
         onError: (err) => {
           toast.error('操作失败: ' + extractErrorMessage(err))
         },
+      }
+    )
+  }
+
+  const openRoutePolicyEditor = () => {
+    setRouteModeDraft(credential.routeMode ?? 'allow_all')
+    setRouteRulesDraft((credential.routeRules ?? []).join('\n'))
+    setEditingRoutePolicy(true)
+  }
+
+  const handleRoutePolicySave = () => {
+    const routeRules = routeModeDraft === 'allow_all'
+      ? []
+      : routeRulesDraft.split('\n').map((rule) => rule.trim()).filter(Boolean)
+    if (routeModeDraft === 'allow_list' && routeRules.length === 0) {
+      toast.error('只允许模式至少需要一条路由规则，否则这个账号不会承接任何请求')
+      return
+    }
+    setRoutePolicy.mutate(
+      { id: credential.id, request: { routeMode: routeModeDraft, routeRules } },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRoutePolicy(false)
+        },
+        onError: (err) => toast.error('路由限制设置失败: ' + extractErrorMessage(err)),
       }
     )
   }
@@ -685,6 +724,7 @@ export function CredentialCard({
   }
 
   const fast = credential.fast ?? 0
+  const routeSummary = credentialRouteSummary(credential.routeMode, credential.routeRules)
   const fastTier = fast > 0 ? String(Math.min(fast, 3)) : undefined
 
   return (
@@ -782,6 +822,12 @@ export function CredentialCard({
                 )}
                 {credential.hasProxy && (
                   <Badge variant="outline">代理</Badge>
+                )}
+                {routeSummary && (
+                  <Badge variant="secondary" className="cursor-pointer" onClick={openRoutePolicyEditor} title={`${routeSummary}；点击修改`}>
+                    <Route className="mr-1 h-3 w-3" aria-hidden="true" />
+                    {routeSummary}
+                  </Badge>
                 )}
                 {typeof credential.maxConcurrentRequestsOverride === 'number' && (
                   <Badge variant="outline">并发覆盖</Badge>
@@ -894,6 +940,17 @@ export function CredentialCard({
                   <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
                 </span>
               )}
+            </div>
+            <div>
+              <span className="text-muted-foreground">路由限制：</span>
+              <span
+                className="font-medium cursor-pointer hover:underline ml-1"
+                onClick={openRoutePolicyEditor}
+                title="控制哪些入口路由可以调度到这个账号，规则与外部账号相同"
+              >
+                {routeSummary ?? '不限制'}
+                <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
+              </span>
             </div>
             <div>
               <span className="text-muted-foreground">失败次数：</span>
@@ -1575,6 +1632,51 @@ export function CredentialCard({
             </Button>
             <Button onClick={handleConcurrencySave} disabled={setCredentialConcurrency.isPending}>
               {setCredentialConcurrency.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editingRoutePolicy} onOpenChange={setEditingRoutePolicy}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>路由限制：{displayName}</DialogTitle>
+            <DialogDescription>
+              控制哪些入口路由可以调度到这个账号，写法和外部账号相同。被排除的路由不会使用这个账号，先于 Fast 和优先级生效；某个路由所有本地账号都被排除时，按外部池的路由规则决定是否转外部池。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <label className="block text-sm">
+              <span className="font-medium">路由模式</span>
+              <select
+                className="mt-2 h-10 w-full rounded-md border bg-background px-3 text-sm"
+                value={routeModeDraft}
+                disabled={setRoutePolicy.isPending}
+                onChange={(event) => setRouteModeDraft(event.target.value as ExternalPoolRouteMode)}
+              >
+                <option value="allow_all">全部入口允许</option>
+                <option value="allow_list">只允许下列入口</option>
+                <option value="deny_list">禁止下列入口</option>
+              </select>
+            </label>
+            <label className="block text-sm">
+              <span className="font-medium">路由规则</span>
+              <span className="mt-1 block text-xs text-muted-foreground">每行一条，可填 /v1、/cc、/ha，或完整 /cc/v1/messages；* 表示全部入口。</span>
+              <textarea
+                className="mt-2 min-h-24 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
+                value={routeRulesDraft}
+                disabled={setRoutePolicy.isPending || routeModeDraft === 'allow_all'}
+                onChange={(event) => setRouteRulesDraft(event.target.value)}
+              />
+            </label>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingRoutePolicy(false)} disabled={setRoutePolicy.isPending}>
+              取消
+            </Button>
+            <Button onClick={handleRoutePolicySave} disabled={setRoutePolicy.isPending}>
+              {setRoutePolicy.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               保存
             </Button>
           </DialogFooter>

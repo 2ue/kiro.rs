@@ -1593,6 +1593,7 @@ async fn maybe_raw_external_preflight_response(
         provider.as_ref(),
         &config,
         raw_probe.model.as_deref(),
+        Some(endpoint),
         bounded_preflight_capacity_wait(&config, inference_attempt_budget.as_ref()),
         "raw_before_parse",
         None,
@@ -1653,7 +1654,7 @@ async fn maybe_raw_external_preflight_response(
         }
         ExternalPoolForwardOutcome::FinalError(err) => {
             let current_local_dispatchable = provider
-                .local_pool_route_state_fresh(raw_probe.model.as_deref())
+                .local_pool_route_state_fresh_for_route(raw_probe.model.as_deref(), Some(endpoint))
                 .dispatchable;
             if let Some(rescue_reason) = budgeted_local_rescue_reason_after_external_route_error(
                 UsageRouteSubtype::ExternalFallbackPreflight,
@@ -1928,7 +1929,9 @@ fn build_external_fallback_context(
 impl ExternalFallbackContext {
     fn current_local_dispatchable(&self, model: Option<&str>) -> Option<usize> {
         let model = model.or(Some(self.payload.model.as_str()));
-        let state = self.provider.local_pool_route_state_fresh(model);
+        let state = self
+            .provider
+            .local_pool_route_state_fresh_for_route(model, Some(&self.endpoint));
         Some(if matches!(state.kind, LocalPoolRouteStateKind::Ready) {
             state.dispatchable
         } else {
@@ -2126,6 +2129,7 @@ impl ExternalFallbackContext {
             self.provider.as_ref(),
             &self.config,
             model,
+            Some(&self.endpoint),
             bounded_preflight_capacity_wait(&self.config, self.inference_attempt_budget.as_ref()),
             "parsed_preflight",
             Some(request_id),
@@ -2246,9 +2250,10 @@ impl ExternalFallbackContext {
             );
             return None;
         };
-        let local_state = self
-            .provider
-            .local_pool_route_state_fresh(Some(&self.payload.model));
+        let local_state = self.provider.local_pool_route_state_fresh_for_route(
+            Some(&self.payload.model),
+            Some(&self.endpoint),
+        );
         let typed_auxiliary_route_reason = match call_failure_kind {
             Some(KiroCallFailureKind::AuxiliaryAttemptsExhausted) => {
                 Some("local_auxiliary_attempts_exhausted")
@@ -2584,11 +2589,12 @@ async fn local_pool_preflight_reason_after_capacity_grace(
     provider: &KiroProvider,
     config: &ExternalPoolsConfig,
     model: Option<&str>,
+    route: Option<&str>,
     max_wait: Duration,
     stage: &'static str,
     request_id: Option<&str>,
 ) -> Option<(String, LocalPoolRouteState)> {
-    let mut state = provider.local_pool_route_state_fresh(model);
+    let mut state = provider.local_pool_route_state_fresh_for_route(model, route);
     let mut reason =
         local_pool_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)?;
     if !local_preflight_capacity_reason(reason) || max_wait.is_zero() {
@@ -2618,7 +2624,7 @@ async fn local_pool_preflight_reason_after_capacity_grace(
         }
 
         sleep((deadline - now).min(Duration::from_millis(50))).await;
-        state = provider.local_pool_route_state_fresh(model);
+        state = provider.local_pool_route_state_fresh_for_route(model, route);
         let Some(next_reason) =
             local_pool_fallback_reason_for_fresh_state(state.kind, state.dispatchable, config)
         else {
@@ -7591,9 +7597,12 @@ async fn post_messages_inner(
         return response;
     }
     websearch::normalize_web_search_max_uses(&mut payload);
+    // Per-credential route rules behave like the pool-wide rule once no local credential
+    // accepts this route: the external pool's own route rules decide whether it takes over.
     let local_route_allowed = runtime_config
         .external_pools
-        .local_pool_route_allowed(&endpoint);
+        .local_pool_route_allowed(&endpoint)
+        && !provider.route_rejected_by_all_credentials(&endpoint);
     if !local_route_allowed {
         if prompt_steering_for_external {
             super::prompt_steering::apply_to_messages_request(

@@ -36,6 +36,7 @@ import type {
   SetCredentialProxyRequest,
   SetPriorityRequest,
   SetCredentialFastRequest,
+  SetCredentialRoutePolicyRequest,
   SetWarmupRequest,
   SuccessResponse,
   SupportedModelsResponse,
@@ -187,6 +188,11 @@ export async function setCredentialPriority(id: number, priority: number): Promi
 
 export async function setCredentialFast(id: number, fast: number): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/fast`, { fast } as SetCredentialFastRequest)
+  return data
+}
+
+export async function setCredentialRoutePolicy(id: number, req: SetCredentialRoutePolicyRequest): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/route-policy`, req)
   return data
 }
 

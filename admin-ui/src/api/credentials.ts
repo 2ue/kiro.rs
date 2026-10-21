@@ -22,6 +22,7 @@ import type {
   SetCredentialRpmRequest,
   SetPriorityRequest,
   SetCredentialFastRequest,
+  SetCredentialRoutePolicyRequest,
   SetWarmupRequest,
   AddCredentialRequest,
   AddCredentialResponse,
@@ -255,6 +256,18 @@ export async function setCredentialFast(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/fast`,
     { fast } as SetCredentialFastRequest
+  )
+  return data
+}
+
+// 设置账号路由调度规则
+export async function setCredentialRoutePolicy(
+  id: number,
+  req: SetCredentialRoutePolicyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/route-policy`,
+    req
   )
   return data
 }

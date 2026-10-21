@@ -189,6 +189,9 @@ pub(crate) struct InferenceAttemptBudget {
     auxiliary: Arc<AuxiliaryAttemptBudget>,
     started_at: Instant,
     dispatch_deadline: OnceLock<Instant>,
+    /// Request entry route (e.g. `/cc/v1/messages`) used to apply per-credential route
+    /// rules on every local dispatch of this request, including stream retries and MCP calls.
+    dispatch_route: OnceLock<String>,
     credential_dispatch_elapsed_ms: AtomicU64,
     upstream_header_wait_ms: AtomicU64,
 }
@@ -219,6 +222,7 @@ impl InferenceAttemptBudget {
             auxiliary: Arc::new(AuxiliaryAttemptBudget::new(auxiliary_max_attempts)),
             started_at: Instant::now(),
             dispatch_deadline: OnceLock::new(),
+            dispatch_route: OnceLock::new(),
             credential_dispatch_elapsed_ms: AtomicU64::new(0),
             upstream_header_wait_ms: AtomicU64::new(0),
         }
@@ -277,6 +281,15 @@ impl InferenceAttemptBudget {
         let _ = self
             .dispatch_deadline
             .set(self.started_at + duration.max(Duration::from_millis(1)));
+    }
+
+    /// Installs the request route once; later calls keep the first value.
+    pub(crate) fn set_dispatch_route(&self, route: &str) {
+        let _ = self.dispatch_route.set(route.to_string());
+    }
+
+    pub(crate) fn dispatch_route(&self) -> Option<&str> {
+        self.dispatch_route.get().map(String::as_str)
     }
 
     pub(crate) fn dispatch_deadline(&self) -> Option<Instant> {

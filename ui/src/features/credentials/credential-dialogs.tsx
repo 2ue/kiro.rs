@@ -49,9 +49,11 @@ import type {
   BatchUpdateCredentialsRequest,
   CredentialExportFormat,
   CredentialStatusItem,
+  ExternalPoolRouteMode,
   ProxyResource,
   TestCredentialResponse,
 } from '@/types/api'
+import { splitRules } from '@/features/external-pools/external-pool-utils'
 import { SecretInput } from './credential-inputs'
 import { CredentialTagsField } from '@/components/credential-tags-field'
 import { credentialSubscriptionLabel } from './credential-utils'
@@ -1261,7 +1263,9 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   const [rateLimitAutoDisableEnabled, setRateLimitAutoDisableEnabled] = useState(true)
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
-  const [enableFields, setEnableFields] = useState({ priority: false, fast: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+  const [enableFields, setEnableFields] = useState({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+  const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>('allow_all')
+  const [routeRulesDraft, setRouteRulesDraft] = useState('')
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
@@ -1280,7 +1284,9 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
     if (!open) {
       setFields({ priority: '', fast: '', concurrency: '', rpm: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
       setRateLimitAutoDisableEnabled(true)
-      setEnableFields({ priority: false, fast: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+      setEnableFields({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
+      setRouteModeDraft('allow_all')
+      setRouteRulesDraft('')
       setShowProxyUsername(false)
       setShowProxyPassword(false)
     }
@@ -1309,6 +1315,14 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       const fast = v ? Number(v) : 0
       if (!Number.isInteger(fast) || fast < 0) { toast.error('Fast 值必须是非负整数'); return }
       req.fast = { fast }
+    }
+    if (enableFields.routePolicy) {
+      const routeRules = routeModeDraft === 'allow_all' ? [] : splitRules(routeRulesDraft)
+      if (routeModeDraft === 'allow_list' && routeRules.length === 0) {
+        toast.error('只允许模式至少需要一条路由规则，否则这些账号不会承接任何请求')
+        return
+      }
+      req.routePolicy = { routeMode: routeModeDraft, routeRules }
     }
     if (enableFields.proxy) {
       const resourceId = fields.proxyResourceId ? Number(fields.proxyResourceId) : null
@@ -1393,6 +1407,29 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
                     disabled={!enableFields.fast || batchUpdate.isPending}
                     onChange={(e) => setFields((p) => ({ ...p, fast: e.target.value }))}
                     placeholder="留空关闭"
+                  />
+                </div>
+              </Field>
+              <Field label="路由限制" description="和外部账号相同的入口规则；每行一条，* 表示全部入口">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <Checkbox checked={enableFields.routePolicy} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, routePolicy: Boolean(v) }))} id="batch-route-policy" aria-label="批量修改路由限制" />
+                    <Select value={routeModeDraft} onValueChange={(v) => setRouteModeDraft(v as ExternalPoolRouteMode)} disabled={!enableFields.routePolicy || batchUpdate.isPending}>
+                      <SelectTrigger size="sm" className="w-full" aria-label="路由模式"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="allow_all">全部入口允许</SelectItem>
+                        <SelectItem value="allow_list">只允许下列入口</SelectItem>
+                        <SelectItem value="deny_list">禁止下列入口</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <Textarea
+                    className="min-h-16 font-mono text-xs"
+                    aria-label="路由规则"
+                    value={routeRulesDraft}
+                    placeholder={'/cc\n/ha'}
+                    disabled={!enableFields.routePolicy || routeModeDraft === 'allow_all' || batchUpdate.isPending}
+                    onChange={(e) => setRouteRulesDraft(e.target.value)}
                   />
                 </div>
               </Field>

@@ -31,6 +31,7 @@ import {
   setCredentialOverage,
   setCredentialPriority,
   setCredentialFast,
+  setCredentialRoutePolicy,
   setCredentialProxy,
   setCredentialRegions,
   setCredentialRateLimitAutoDisable,
@@ -47,6 +48,7 @@ import {
   updateRuntimeConfig,
 } from '@/api/credentials'
 import type {
+  SetCredentialRoutePolicyRequest,
   AddCredentialRequest,
   BatchDeleteCredentialsRequest,
   BatchUpdateCredentialsRequest,
@@ -291,6 +293,14 @@ export function useSetCredentialFast() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ id, fast }: { id: number; fast: number }) => setCredentialFast(id, fast),
+    onSuccess: (_data, variables) => invalidateCredentialCaches(queryClient, variables.id),
+  })
+}
+
+export function useSetCredentialRoutePolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: SetCredentialRoutePolicyRequest }) => setCredentialRoutePolicy(id, request),
     onSuccess: (_data, variables) => invalidateCredentialCaches(queryClient, variables.id),
   })
 }

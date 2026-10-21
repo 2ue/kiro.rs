@@ -14,7 +14,7 @@ use base64::{
 };
 
 use crate::http_client::ProxyConfig;
-use crate::model::config::Config;
+use crate::model::config::{Config, ExternalPoolRouteMode, route_policy_allows};
 use crate::model::model_support::{model_is_supported_by_list, normalize_supported_models};
 
 /// Kiro API Key/headless 凭据默认应走 CLI runtime 协议。
@@ -107,6 +107,16 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_zero")]
     pub fast: u32,
+
+    /// 路由调度规则，语义与外部池 `routeMode` 相同：`allow_all`（默认）、`allow_list`
+    /// 只承接命中 `routeRules` 的入口、`deny_list` 不承接命中的入口。路由不允许的账号在本次
+    /// 请求的候选集里直接排除，先于 Fast 和优先级生效。
+    #[serde(default, skip_serializing_if = "is_allow_all_route_mode")]
+    pub route_mode: ExternalPoolRouteMode,
+
+    /// 路由规则（路径前缀，`*` 表示全部），由 `normalize_route_rules` 规范化。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_rules: Vec<String>,
 
     /// 凭据级最大并发请求数覆盖。
     ///
@@ -234,6 +244,8 @@ impl fmt::Debug for KiroCredentials {
             .field("scopes_present", &self.scopes.is_some())
             .field("priority", &self.priority)
             .field("fast", &self.fast)
+            .field("route_mode", &self.route_mode)
+            .field("route_rules", &self.route_rules)
             .field("max_concurrent_requests", &self.max_concurrent_requests)
             .field("rpm", &self.rpm)
             .field(
@@ -267,6 +279,10 @@ impl fmt::Debug for KiroCredentials {
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn is_allow_all_route_mode(mode: &ExternalPoolRouteMode) -> bool {
+    *mode == ExternalPoolRouteMode::AllowAll
 }
 
 fn compact_protocol_value(value: &str) -> String {
@@ -569,6 +585,11 @@ impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
 
+    /// 账号的路由规则是否允许 `endpoint` 调度到这个账号。
+    pub fn allows_route(&self, endpoint: &str) -> bool {
+        route_policy_allows(self.route_mode, &self.route_rules, endpoint)
+    }
+
     /// 比较会影响认证、调度、代理解析和后台展示的持久化字段。
     pub fn same_dispatch_config(&self, other: &Self) -> bool {
         self.id == other.id
@@ -585,6 +606,8 @@ impl KiroCredentials {
             && self.scopes == other.scopes
             && self.priority == other.priority
             && self.fast == other.fast
+            && self.route_mode == other.route_mode
+            && self.route_rules == other.route_rules
             && self.max_concurrent_requests == other.max_concurrent_requests
             && self.rpm == other.rpm
             && self.rate_limit_auto_disable_enabled == other.rate_limit_auto_disable_enabled
@@ -993,6 +1016,8 @@ mod tests {
             scopes: Some("scopes-sensitive-value".to_string()),
             priority: 3,
             fast: 0,
+            route_mode: ExternalPoolRouteMode::AllowAll,
+            route_rules: Vec::new(),
             max_concurrent_requests: Some(4),
             rpm: Some(5),
             rate_limit_auto_disable_enabled: Some(false),
@@ -1193,6 +1218,35 @@ mod tests {
         let json = r#"{"refreshToken": "test"}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 0);
+    }
+
+    #[test]
+    fn route_policy_defaults_to_allow_all_and_matches_like_external_pools() {
+        let creds = KiroCredentials::from_json(r#"{"refreshToken": "test"}"#).unwrap();
+        assert_eq!(creds.route_mode, ExternalPoolRouteMode::AllowAll);
+        let value = serde_json::to_value(&creds).unwrap();
+        assert!(value.get("routeMode").is_none());
+        assert!(value.get("routeRules").is_none());
+        assert!(creds.allows_route("/cc/v1/messages"));
+
+        let allow = KiroCredentials::from_json(
+            r#"{"refreshToken": "t", "routeMode": "allow_list", "routeRules": ["/cc"]}"#,
+        )
+        .unwrap();
+        assert!(allow.allows_route("/cc/v1/messages"));
+        assert!(!allow.allows_route("/ccx/v1/messages"));
+        assert!(!allow.allows_route("/v1/messages"));
+        assert_eq!(
+            serde_json::to_value(&allow).unwrap()["routeMode"],
+            "allow_list"
+        );
+
+        let deny = KiroCredentials::from_json(
+            r#"{"refreshToken": "t", "routeMode": "deny_list", "routeRules": ["/ha"]}"#,
+        )
+        .unwrap();
+        assert!(!deny.allows_route("/ha/v1/messages"));
+        assert!(deny.allows_route("/cc/v1/messages"));
     }
 
     #[test]
