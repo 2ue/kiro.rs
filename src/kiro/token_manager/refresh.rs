@@ -15,7 +15,9 @@ use crate::http_client::{
 };
 use crate::kiro::endpoint::configured_upstream_url;
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{
+    KiroCredentials, profile_arn_region, validate_kiro_region_host_label,
+};
 use crate::kiro::model::token_refresh::{
     ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
     RefreshResponse,
@@ -200,6 +202,7 @@ fn refresh_failure_from_token_refresh_admission(
     )
 }
 
+#[derive(Clone)]
 pub(crate) struct RefreshSendAdmission {
     auxiliary_budget: Option<Arc<AuxiliaryAttemptBudget>>,
     concurrency: Arc<AuxiliaryConcurrencyController>,
@@ -686,6 +689,169 @@ pub(crate) async fn refresh_token_with_client(
     }
 }
 
+/// Auth region tried last when a credential does not pin one.
+pub(crate) const FALLBACK_AUTH_REGION: &str = "us-east-1";
+
+/// A refresh that may have tried several auth regions.
+#[derive(Debug)]
+pub(crate) struct RegionRotatedRefresh {
+    pub(crate) credentials: KiroCredentials,
+    /// Region to store as `authRegion`: the refresh succeeded in a region other than the one the
+    /// credential resolves to by default, so later refreshes can use it directly.
+    pub(crate) learned_auth_region: Option<String>,
+}
+
+/// Auth regions to try, in order, for a credential that does not pin `authRegion`: `region`,
+/// `apiRegion`, the profile ARN region, the configured default, then `us-east-1`, without
+/// duplicates. An explicit `authRegion` is the only candidate. API key and external IdP
+/// credentials (own token endpoint) get none, so they refresh exactly as before.
+pub(crate) fn auth_region_candidates(
+    credentials: &KiroCredentials,
+    config: &Config,
+) -> Vec<String> {
+    if credentials.is_api_key_credential() || credentials.is_external_idp_refresh_credential() {
+        return Vec::new();
+    }
+    if let Some(region) = credentials
+        .auth_region
+        .as_deref()
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
+    {
+        return vec![region.to_string()];
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    for region in [
+        credentials.region.as_deref(),
+        credentials.api_region.as_deref(),
+        credentials
+            .profile_arn
+            .as_deref()
+            .and_then(profile_arn_region),
+        Some(config.effective_auth_region()),
+        Some(FALLBACK_AUTH_REGION),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let region = region.trim();
+        if region.is_empty()
+            || validate_kiro_region_host_label(region).is_err()
+            || candidates.iter().any(|candidate| candidate == region)
+        {
+            continue;
+        }
+        candidates.push(region.to_string());
+    }
+    candidates
+}
+
+/// Whether a failed refresh may be retried in the next auth region. Only definite rejections
+/// (400/401/403) and connection failures before the request was sent qualify: neither spends
+/// the refresh token. Timeouts, 5xx, rate limits and admission rejections stop the rotation
+/// because the token may already have been rotated upstream or the next try would be throttled.
+fn refresh_failure_allows_next_region(error: &anyhow::Error) -> bool {
+    let Some(failure) = error.downcast_ref::<RefreshFailure>() else {
+        return false;
+    };
+    match failure.stage {
+        RefreshFailureStage::ResponseStatus => matches!(
+            failure.kind,
+            RefreshFailureKind::InvalidGrant
+                | RefreshFailureKind::CredentialAuth
+                | RefreshFailureKind::Protocol
+        ),
+        RefreshFailureStage::RequestSend => {
+            !failure.send_committed && failure.kind == RefreshFailureKind::Network
+        }
+        _ => false,
+    }
+}
+
+async fn rotate_auth_regions<F, Fut>(
+    candidates: &[String],
+    mut attempt: F,
+) -> anyhow::Result<(KiroCredentials, String)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<KiroCredentials>>,
+{
+    let mut first_status_failure = None;
+    let mut first_failure = None;
+    for (index, region) in candidates.iter().enumerate() {
+        match attempt(region.clone()).await {
+            Ok(credentials) => {
+                if index > 0 {
+                    tracing::info!(
+                        auth_region = %region,
+                        attempts = index + 1,
+                        "token refresh succeeded after trying other auth regions"
+                    );
+                }
+                return Ok((credentials, region.clone()));
+            }
+            Err(error) => {
+                let failure = error.downcast_ref::<RefreshFailure>();
+                tracing::warn!(
+                    auth_region = %region,
+                    attempt = index + 1,
+                    candidates = candidates.len(),
+                    kind = ?failure.map(|failure| failure.kind.as_str()),
+                    status = ?failure.and_then(|failure| failure.status),
+                    "token refresh failed in auth region"
+                );
+                if !refresh_failure_allows_next_region(&error) {
+                    return Err(error);
+                }
+                let is_status_failure = failure
+                    .is_some_and(|failure| failure.stage == RefreshFailureStage::ResponseStatus);
+                if is_status_failure && first_status_failure.is_none() {
+                    first_status_failure = Some(error);
+                } else if first_failure.is_none() {
+                    first_failure = Some(error);
+                }
+            }
+        }
+    }
+    // Every region rejected the token. An upstream answer explains more than a connect failure.
+    Err(first_status_failure
+        .or(first_failure)
+        .unwrap_or_else(|| anyhow::anyhow!("no auth region to refresh in")))
+}
+
+/// Refreshes a credential being imported or validated, trying each auth region from
+/// [`auth_region_candidates`] until one accepts the token. Day-to-day refreshes keep using
+/// [`refresh_token_with_client`] with the stored region.
+pub(crate) async fn refresh_token_with_region_rotation(
+    credentials: &KiroCredentials,
+    config: &Config,
+    client: Arc<reqwest::Client>,
+    admission: Option<RefreshSendAdmission>,
+) -> anyhow::Result<RegionRotatedRefresh> {
+    let candidates = auth_region_candidates(credentials, config);
+    if candidates.len() <= 1 {
+        let credentials = refresh_token_with_client(credentials, config, client, admission).await?;
+        return Ok(RegionRotatedRefresh {
+            credentials,
+            learned_auth_region: None,
+        });
+    }
+    let default_region = credentials.effective_auth_region(config).to_string();
+    let (mut refreshed, region) = rotate_auth_regions(&candidates, |region| {
+        let mut attempt = credentials.clone();
+        attempt.auth_region = Some(region);
+        let client = client.clone();
+        let admission = admission.clone();
+        async move { refresh_token_with_client(&attempt, config, client, admission).await }
+    })
+    .await?;
+    refreshed.auth_region = credentials.auth_region.clone();
+    Ok(RegionRotatedRefresh {
+        credentials: refreshed,
+        learned_auth_region: (region != default_region).then_some(region),
+    })
+}
+
 /// 刷新 Social Token
 async fn refresh_social_token(
     credentials: &KiroCredentials,
@@ -1086,6 +1252,216 @@ pub(super) fn usage_limits_user_agent(
 
 pub(super) fn usage_limits_amz_user_agent(kiro_version: &str, machine_id: &str) -> String {
     format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id)
+}
+
+#[cfg(test)]
+mod region_rotation_tests {
+    use super::*;
+
+    fn idc(
+        region: Option<&str>,
+        auth: Option<&str>,
+        api: Option<&str>,
+        arn: Option<&str>,
+    ) -> KiroCredentials {
+        KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            region: region.map(str::to_string),
+            auth_region: auth.map(str::to_string),
+            api_region: api.map(str::to_string),
+            profile_arn: arn.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn failure(
+        stage: RefreshFailureStage,
+        kind: RefreshFailureKind,
+        status: Option<u16>,
+        committed: bool,
+    ) -> anyhow::Error {
+        RefreshFailure::new(stage, kind, status, None, committed).into()
+    }
+
+    #[test]
+    fn candidates_follow_region_api_region_arn_then_defaults_without_duplicates() {
+        let config = Config::default();
+        let creds = idc(
+            Some("eu-central-1"),
+            None,
+            Some("eu-west-1"),
+            Some("arn:aws:codewhisperer:ap-south-1:1:profile/X"),
+        );
+        assert_eq!(
+            auth_region_candidates(&creds, &config),
+            ["eu-central-1", "eu-west-1", "ap-south-1", "us-east-1"]
+        );
+        let api_only = idc(None, None, Some("eu-central-1"), None);
+        assert_eq!(
+            auth_region_candidates(&api_only, &config),
+            ["eu-central-1", "us-east-1"]
+        );
+    }
+
+    #[test]
+    fn explicit_auth_region_is_the_only_candidate() {
+        let creds = idc(Some("eu-central-1"), Some("eu-west-1"), None, None);
+        assert_eq!(
+            auth_region_candidates(&creds, &Config::default()),
+            ["eu-west-1"]
+        );
+    }
+
+    #[test]
+    fn api_key_and_external_idp_credentials_do_not_rotate() {
+        let config = Config::default();
+        let api_key = KiroCredentials {
+            kiro_api_key: Some("ksk_x".to_string()),
+            region: Some("eu-central-1".to_string()),
+            ..Default::default()
+        };
+        assert!(auth_region_candidates(&api_key, &config).is_empty());
+        let external = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            client_id: Some("client".to_string()),
+            region: Some("eu-central-1".to_string()),
+            ..Default::default()
+        };
+        assert!(auth_region_candidates(&external, &config).is_empty());
+    }
+
+    #[test]
+    fn invalid_region_values_are_skipped() {
+        let creds = idc(Some("eu central 1"), None, None, None);
+        assert_eq!(
+            auth_region_candidates(&creds, &Config::default()),
+            ["us-east-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_moves_on_after_a_rejection_and_returns_the_winning_region() {
+        let candidates = vec!["eu-central-1".to_string(), "us-east-1".to_string()];
+        let tried = std::sync::Mutex::new(Vec::new());
+        let (_, region) = rotate_auth_regions(&candidates, |region| {
+            tried.lock().unwrap().push(region.clone());
+            async move {
+                if region == "eu-central-1" {
+                    Err(failure(
+                        RefreshFailureStage::ResponseStatus,
+                        RefreshFailureKind::InvalidGrant,
+                        Some(400),
+                        true,
+                    ))
+                } else {
+                    Ok(KiroCredentials::default())
+                }
+            }
+        })
+        .await
+        .expect("second region succeeds");
+        assert_eq!(region, "us-east-1");
+        assert_eq!(*tried.lock().unwrap(), ["eu-central-1", "us-east-1"]);
+    }
+
+    #[tokio::test]
+    async fn rotation_stops_on_failures_that_may_have_spent_the_token() {
+        let candidates = vec!["eu-central-1".to_string(), "us-east-1".to_string()];
+        for error in [
+            failure(
+                RefreshFailureStage::ResponseHeaders,
+                RefreshFailureKind::Timeout,
+                None,
+                true,
+            ),
+            failure(
+                RefreshFailureStage::ResponseStatus,
+                RefreshFailureKind::UpstreamUnavailable,
+                Some(503),
+                true,
+            ),
+            failure(
+                RefreshFailureStage::ResponseStatus,
+                RefreshFailureKind::RateLimited,
+                Some(429),
+                true,
+            ),
+            failure(
+                RefreshFailureStage::RequestSend,
+                RefreshFailureKind::Network,
+                None,
+                true,
+            ),
+        ] {
+            let kind = error.downcast_ref::<RefreshFailure>().unwrap().kind;
+            let error = std::sync::Mutex::new(Some(error));
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let result = rotate_auth_regions(&candidates, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let error = error.lock().unwrap().take();
+                async move { Err::<KiroCredentials, _>(error.unwrap()) }
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "{kind:?} must not try another region"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rotation_retries_after_a_connect_failure_before_send() {
+        let candidates = vec!["eu-central-1".to_string(), "us-east-1".to_string()];
+        let (_, region) = rotate_auth_regions(&candidates, |region| async move {
+            if region == "eu-central-1" {
+                Err(failure(
+                    RefreshFailureStage::RequestSend,
+                    RefreshFailureKind::Network,
+                    None,
+                    false,
+                ))
+            } else {
+                Ok(KiroCredentials::default())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(region, "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn exhausted_rotation_reports_the_first_upstream_rejection() {
+        let candidates = vec!["eu-central-1".to_string(), "us-east-1".to_string()];
+        let error = rotate_auth_regions(&candidates, |region| async move {
+            Err::<KiroCredentials, _>(if region == "eu-central-1" {
+                failure(
+                    RefreshFailureStage::RequestSend,
+                    RefreshFailureKind::Network,
+                    None,
+                    false,
+                )
+            } else {
+                failure(
+                    RefreshFailureStage::ResponseStatus,
+                    RefreshFailureKind::InvalidGrant,
+                    Some(400),
+                    true,
+                )
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<RefreshFailure>().unwrap().kind,
+            RefreshFailureKind::InvalidGrant
+        );
+    }
 }
 
 #[cfg(test)]

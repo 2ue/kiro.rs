@@ -157,10 +157,9 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   const scopes = stringField(normalized.scopes) ?? stringField(normalized.scope) ?? stringField(nested?.scopes) ?? stringField(nested?.scope)
   const profileArn = stringField(normalized.profileArn) ?? stringField(nested?.profileArn)
   const region = stringField(normalized.region) ?? stringField(nested?.region) ?? parsedKiroApiKey?.region
-  const authRegion =
-    stringField(normalized.authRegion) ??
-    stringField(nested?.authRegion) ??
-    region
+  // Only an explicit authRegion pins the refresh region; otherwise the backend tries region,
+  // apiRegion and the profile ARN region in turn and stores the one that works.
+  const authRegion = stringField(normalized.authRegion) ?? stringField(nested?.authRegion)
   const apiRegion =
     stringField(normalized.apiRegion) ??
     stringField(nested?.apiRegion) ??

@@ -101,7 +101,7 @@ use super::redis_runtime::{
 use super::refresh::{
     RefreshFailure, RefreshFailureKind, RefreshFailureStage, RefreshSendAdmission,
     get_usage_limits, is_token_expired, is_token_expiring_within_secs, refresh_token_with_client,
-    set_overage_status, validate_refresh_token,
+    refresh_token_with_region_rotation, set_overage_status, validate_refresh_token,
 };
 use super::route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 use super::rpm::{
@@ -13247,7 +13247,9 @@ impl MultiTokenManager {
             .refresh_http_client(config.tls_backend, effective_proxy.as_ref())
             .await?;
         let refreshed =
-            refresh_token_with_client(&credentials, &config, client, Some(admission)).await?;
+            refresh_token_with_region_rotation(&credentials, &config, client, Some(admission))
+                .await?
+                .credentials;
         let refreshed = Self::preserve_proxy_fields(refreshed, &source_credentials);
         self.token_context_from_credentials_until(
             EXTERNAL_CREDENTIAL_CONTEXT_ID,
@@ -13366,8 +13368,8 @@ impl MultiTokenManager {
         self.ensure_machine_id_available(&new_cred, None)?;
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
-            new_cred.clone()
+        let (mut validated_cred, learned_auth_region) = if new_cred.is_api_key_credential() {
+            (new_cred.clone(), None)
         } else {
             let new_cred_for_proxy = self.resolve_proxy_for_credential(new_cred.clone())?;
             let effective_proxy = new_cred_for_proxy.effective_proxy(self.proxy.as_ref());
@@ -13380,7 +13382,14 @@ impl MultiTokenManager {
             let client = self
                 .refresh_http_client(config.tls_backend, effective_proxy.as_ref())
                 .await?;
-            refresh_token_with_client(&new_cred_for_proxy, &config, client, Some(admission)).await?
+            let refreshed = refresh_token_with_region_rotation(
+                &new_cred_for_proxy,
+                &config,
+                client,
+                Some(admission),
+            )
+            .await?;
+            (refreshed.credentials, refreshed.learned_auth_region)
         };
 
         // 4. 保留用户输入的元数据
@@ -13402,6 +13411,10 @@ impl MultiTokenManager {
         validated_cred.scopes = new_cred.scopes;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
+        if let Some(region) = learned_auth_region {
+            tracing::info!(auth_region = %region, "导入时在非默认 Auth Region 刷新成功，已记录为账号 authRegion");
+            validated_cred.auth_region = Some(region);
+        }
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;

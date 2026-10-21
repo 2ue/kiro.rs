@@ -375,7 +375,6 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
       onChange({ ...defaults, proxyMode: 'single', [key]: text, proxyResourceId: '', proxyResourceIds: [] })
       return
     }
-    if (key === 'region' && text.trim() && !defaults.authRegion.trim()) { onChange({ ...defaults, region: text, authRegion: text }); return }
     onChange({ ...defaults, [key]: value })
   }
   const setProxyMode = (proxyMode: ProxyAssignmentMode) => {
@@ -567,7 +566,6 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           }
         }
       }
-      if (key === 'region' && value.trim() && !prev.authRegion.trim()) return { ...prev, region: value, authRegion: value }
       if (key === 'proxyResourceId' && value && value !== '__none__') return { ...prev, proxyResourceId: value, proxyUrl: '', proxyUsername: '', proxyPassword: '' }
       if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && value.trim()) return { ...prev, [key]: value, proxyResourceId: '' }
       return { ...prev, [key]: value }
