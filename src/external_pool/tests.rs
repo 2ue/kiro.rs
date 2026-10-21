@@ -1845,6 +1845,8 @@ async fn external_pool_stream_pre_output_hold_commits_message_start_and_pings_be
     let mut config = external_stream_config_for_test();
     // 空闲超时长于静默间隔，保留窗口到期后由 1 秒间隔的 ping 保活。
     config.external_pool_stream_idle_timeout_secs = 3;
+    // The hold-window commit only applies when the first-output timeout is disabled.
+    config.external_pool_stream_first_output_timeout_secs = 0;
     let response = match timeout(
         Duration::from_secs(8),
         manager.forward_with_failover_result(config, route),
@@ -1882,6 +1884,120 @@ async fn external_pool_stream_pre_output_hold_commits_message_start_and_pings_be
     assert_eq!(record.status, UsageRecordStatus::Success);
     assert_eq!(record.external_attempts.len(), 1);
     assert_eq!(upstream.snapshot(), 1);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_first_output_timeout_fails_over_a_pool_that_stalls_after_message_start() {
+    // Production 2026-10-21: an external pool sent message_start and then nothing for minutes;
+    // the hold window committed it and the request could no longer fail over.
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let stalling = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::chunk(external_sse_message_start("msg_stall", 111)),
+        ExternalStreamFakeStep::chunk(external_sse_ping()),
+        ExternalStreamFakeStep::delay(Duration::from_secs(6)),
+        ExternalStreamFakeStep::chunk(external_sse_text_start()),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_stall",
+        "from-healthy-pool",
+        222,
+        6,
+    ))
+    .await;
+    create_messages_pool(&postgres, "first-output-stalling", 1, &stalling.base_url).await;
+    create_messages_pool(&postgres, "first-output-healthy", 10, &healthy.base_url).await;
+
+    let request_id = "req_first_output_timeout";
+    let (mut route, recorder) = external_stream_route(request_id, "err_first_output_timeout");
+    route.stream_pre_output_hold = Some(Duration::from_millis(300));
+    let mut config = external_stream_config_for_test();
+    config.external_pool_stream_idle_timeout_secs = 30;
+    config.external_pool_stream_first_output_timeout_secs = 2;
+    let response = match timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("first-output timeout must end the stalled attempt")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!("a pool with no first output must fail over: {error:?}")
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("from-healthy-pool"), "{body}");
+    assert!(
+        !body.contains("msg_stall"),
+        "the stalled pool's message_start must not be committed or leak"
+    );
+    assert_eq!(stalling.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+    let record = usage_record_for_request(&recorder, request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    assert_eq!(record.external_attempts.len(), 2);
+
+    postgres.drop_test_schema().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_pool_pre_output_failure_fails_over_past_the_shared_dispatch_deadline() {
+    // The shared dispatch deadline (~15s) bounds queueing; a pool that errors after a long
+    // silent wait must still fail over instead of ending the request with that error.
+    let Some((manager, postgres)) = test_external_pool_manager().await else {
+        return;
+    };
+    let slow_failing = ExternalStreamFakeServer::start(vec![
+        ExternalStreamFakeStep::delay(Duration::from_millis(1_500)),
+        ExternalStreamFakeStep::chunk(external_sse_error("late upstream failure")),
+    ])
+    .await;
+    let healthy = ExternalStreamFakeServer::start(external_stream_success_steps(
+        "msg_after_deadline",
+        "after-deadline",
+        222,
+        6,
+    ))
+    .await;
+    create_messages_pool(&postgres, "deadline-failing", 1, &slow_failing.base_url).await;
+    create_messages_pool(&postgres, "deadline-healthy", 10, &healthy.base_url).await;
+
+    let request_id = "req_pre_output_past_deadline";
+    let (route, recorder) = external_stream_route(request_id, "err_pre_output_past_deadline");
+    route
+        .inference_attempt_budget
+        .set_dispatch_deadline_after(Duration::from_millis(500));
+    let mut config = external_stream_config_for_test();
+    config.external_pool_stream_idle_timeout_secs = 30;
+    let response = match timeout(
+        Duration::from_secs(10),
+        manager.forward_with_failover_result(config, route),
+    )
+    .await
+    .expect("failover should finish")
+    {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(error) => {
+            panic!(
+                "a pre-output failure after the dispatch deadline must still fail over: {error:?}"
+            )
+        }
+    };
+    let (body, stream_error) = read_response_body_text_allow_error(response).await;
+    assert_eq!(stream_error, None);
+    assert!(body.contains("after-deadline"), "{body}");
+    assert_eq!(slow_failing.snapshot(), 1);
+    assert_eq!(healthy.snapshot(), 1);
+    assert_eq!(
+        usage_record_for_request(&recorder, request_id).status,
+        UsageRecordStatus::Success
+    );
 
     postgres.drop_test_schema().await.unwrap();
 }

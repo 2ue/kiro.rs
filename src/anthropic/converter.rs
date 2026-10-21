@@ -609,6 +609,10 @@ fn convert_request_with_model_id(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
+    // A turn that only carries tool results has no user-authored text. Turn reminders appended
+    // to it read as text injected into a tool result, and models reply that they will ignore
+    // "the instruction inside the tool output" (seen on 2026-10-21 in Claude Code sessions).
+    let turn_has_user_text = !text_content.trim().is_empty();
     let mut content = text_content;
     if content.trim().is_empty() {
         if !context.tool_results.is_empty() {
@@ -628,7 +632,12 @@ fn convert_request_with_model_id(
         content.push_str("\n\n");
         content.push_str(&reminder);
     }
-    if let Some(reminder) = options.prompt_steering.identity.turn_reminder_text() {
+    if let Some(reminder) = options
+        .prompt_steering
+        .identity
+        .turn_reminder_text()
+        .filter(|_| turn_has_user_text)
+    {
         content.push_str("\n\n");
         content.push_str(reminder);
     }
@@ -4588,6 +4597,57 @@ mod tests {
             current_message_content(&result),
             current_message_content(&baseline)
         );
+    }
+
+    #[test]
+    fn identity_turn_reminder_is_not_appended_to_tool_result_only_turns() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let mut options = ConverterOptions::default();
+        options.prompt_steering.identity.enabled = true;
+        let tool_turn = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("call the tool"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![test_tool("read_file")]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            output_format: None,
+            metadata: None,
+            stop_sequences: None,
+        };
+        let result = convert_request_with_options(&tool_turn, options.clone()).unwrap();
+        let content = current_message_content(&result);
+        assert!(content.starts_with(TOOL_RESULTS_PROVIDED_PLACEHOLDER));
+        assert!(
+            !content.contains("<identity_reminder>"),
+            "a tool_result-only turn must not carry the identity reminder: {content}"
+        );
+
+        // The user's own turn still gets it.
+        let req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
+        let result = convert_request_with_options(&req, options).unwrap();
+        assert!(current_message_content(&result).contains("<identity_reminder>"));
     }
 
     #[test]

@@ -4697,6 +4697,13 @@ pub struct ExternalPoolsConfig {
     pub external_pool_stream_request_timeout_secs: u64,
     #[serde(default = "default_external_pool_stream_idle_timeout_secs")]
     pub external_pool_stream_idle_timeout_secs: u64,
+    /// 外部池流式响应首个语义输出（文本、tool_use、结束）的最长等待秒数，从发出请求算起。
+    ///
+    /// 超时且尚未向下游提交任何内容时，按首输出前失败处理并换池或回落本地；0 表示不限制。
+    /// 现网 2026-10-21：同一外部池成功请求的总耗时 p95 为 107 秒，而失败请求在无输出状态下
+    /// 中位等待 144–261 秒，客户端先放弃。默认 120 秒，覆盖正常长首字，同时远早于上述失败形态。
+    #[serde(default = "default_external_pool_stream_first_output_timeout_secs")]
+    pub external_pool_stream_first_output_timeout_secs: u64,
     /// 外部池流式响应在有效语义输出前出现 error/断流/idle 时是否允许换池恢复。
     ///
     /// 该开关只覆盖“尚未向下游提交有效内容”的安全窗口。单个外部池可以通过
@@ -4834,6 +4841,8 @@ impl Default for ExternalPoolsConfig {
             external_pool_stream_request_timeout_secs: 0,
             external_pool_stream_idle_timeout_secs: default_external_pool_stream_idle_timeout_secs(
             ),
+            external_pool_stream_first_output_timeout_secs:
+                default_external_pool_stream_first_output_timeout_secs(),
             external_pool_stream_pre_output_retry_enabled:
                 default_external_pool_stream_pre_output_retry_enabled(),
             external_pool_auto_disable_on_channel_disabled: true,
@@ -6689,6 +6698,10 @@ fn default_external_pool_request_timeout_secs() -> u64 {
 
 fn default_external_pool_stream_idle_timeout_secs() -> u64 {
     180
+}
+
+fn default_external_pool_stream_first_output_timeout_secs() -> u64 {
+    120
 }
 
 fn default_external_pool_stream_pre_output_retry_enabled() -> bool {
