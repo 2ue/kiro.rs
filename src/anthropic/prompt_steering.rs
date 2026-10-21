@@ -641,7 +641,7 @@ mod tests {
         let system = on.system.as_ref().expect("system kept");
         assert_eq!(system.len(), 2);
         assert!(system[0].text.contains("<language_constraint>"));
-        assert!(system[0].text.contains("client settings"));
+        assert!(system[0].text.contains("the client sets"));
         assert_eq!(system[1].text, "client system");
         // The current user turn is never touched.
         assert_eq!(

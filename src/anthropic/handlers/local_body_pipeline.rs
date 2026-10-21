@@ -196,6 +196,7 @@ fn language_turn_reminder_for_payload(
 fn language_reminder_log_value(preference: Option<&ClientLanguagePreference>) -> &'static str {
     match preference {
         Some(ClientLanguagePreference::Explicit(_)) => "explicit",
+        Some(ClientLanguagePreference::Detected(_)) => "detected",
         Some(ClientLanguagePreference::FollowUser) => "follow_user",
         None => "off",
     }
@@ -642,7 +643,7 @@ mod tests {
                 .current_message
                 .user_input_message
                 .content
-                .contains("Respond in Korean for all user-facing text")
+                .contains("Visible reply language: Korean")
         );
 
         let unmatched_preference = language_turn_reminder_for_payload(
@@ -678,6 +679,12 @@ mod tests {
                 "Korean".to_string()
             ))),
             "explicit"
+        );
+        assert_eq!(
+            language_reminder_log_value(Some(&ClientLanguagePreference::Detected(
+                "Chinese".to_string()
+            ))),
+            "detected"
         );
         assert_eq!(
             language_reminder_log_value(Some(&ClientLanguagePreference::FollowUser)),

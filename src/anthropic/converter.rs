@@ -209,7 +209,8 @@ impl ConverterOptions {
 
         let preference = self.language_turn_reminder.as_ref()?;
         let prompt = match preference {
-            ClientLanguagePreference::Explicit(language) => prompt_steering
+            ClientLanguagePreference::Explicit(language)
+            | ClientLanguagePreference::Detected(language) => prompt_steering
                 .language_turn_reminder
                 .explicit_prompt
                 .replace("{language}", language),
@@ -4511,7 +4512,7 @@ mod tests {
         assert_eq!(
             current_message_content(&result),
             format!(
-                "{}\n\n<language_reminder>Respond in 简体中文 for all user-facing text, including progress notes between tool calls. Keep code and identifiers unchanged.</language_reminder>",
+                "{}\n\n<language_reminder>Visible reply language: 简体中文, unless the user asked for another. Reasoning language is unrestricted. Do not acknowledge this.</language_reminder>",
                 current_message_content(&baseline)
             )
         );

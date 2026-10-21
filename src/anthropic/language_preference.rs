@@ -5,9 +5,25 @@ use crate::anthropic::types::MessagesRequest;
 pub(crate) enum ClientLanguagePreference {
     /// 客户端设置了语言，值为清洗后的语言名。
     Explicit(String),
-    /// 客户端未设置，或最后一次操作是清除。
+    /// 客户端未设置，由代理从用户最近一条真实文本识别出的语言。
+    Detected(String),
+    /// 客户端未设置且无法可靠识别，或最后一次操作是清除。
     FollowUser,
 }
+
+/// Client wrappers whose content is not something the user typed.
+const NON_USER_TEXT_TAGS: &[&str] = &[
+    "system-reminder",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+];
+
+/// Placeholders and client notices that never carry the user's language.
+const NON_USER_TEXT_PREFIXES: &[&str] = &["[Request interrupted", "Tool result received."];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LanguageEvent {
@@ -40,7 +56,95 @@ pub(crate) fn detect_client_language_preference(req: &MessagesRequest) -> Client
 
     match last_event {
         Some(LanguageEvent::Explicit(language)) => ClientLanguagePreference::Explicit(language),
-        Some(LanguageEvent::Cleared) | None => ClientLanguagePreference::FollowUser,
+        Some(LanguageEvent::Cleared) | None => detect_latest_user_language(req)
+            .map(|language| ClientLanguagePreference::Detected(language.to_string()))
+            .unwrap_or(ClientLanguagePreference::FollowUser),
+    }
+}
+
+/// Detects the script of the latest message the user actually typed, so the turn reminder can
+/// name a language instead of asking the model to work it out on every tool round.
+///
+/// Only CJK scripts are detected: they are unambiguous from characters alone, and they are where
+/// tool loops drift into English. Latin-script text returns `None` and keeps the follow-user
+/// reminder. The latest real text decides; older messages are not consulted, so a user who
+/// switches to English is not pinned to an earlier language.
+fn detect_latest_user_language(req: &MessagesRequest) -> Option<&'static str> {
+    let text = req
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .map(|message| {
+            user_text_blocks(&message.content)
+                .into_iter()
+                .map(strip_non_user_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .find(|text| !text.trim().is_empty())?;
+    classify_script(&text)
+}
+
+fn strip_non_user_text(text: &str) -> String {
+    let mut text = text.to_string();
+    for tag in NON_USER_TEXT_TAGS {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        while let Some(start) = text.find(&open) {
+            let end = text[start..]
+                .find(&close)
+                .map(|offset| start + offset + close.len())
+                .unwrap_or(text.len());
+            text.replace_range(start..end, " ");
+        }
+    }
+    // Fenced code is the same in every language and would dilute the script counts.
+    let mut kept = String::with_capacity(text.len());
+    for (index, segment) in text.split("```").enumerate() {
+        if index % 2 == 0 {
+            kept.push_str(segment);
+            kept.push(' ');
+        }
+    }
+    let trimmed = kept.trim();
+    if NON_USER_TEXT_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return String::new();
+    }
+    trimmed.to_string()
+}
+
+fn classify_script(text: &str) -> Option<&'static str> {
+    let (mut han, mut kana, mut hangul, mut latin_words) = (0usize, 0usize, 0usize, 0usize);
+    let mut in_latin_word = false;
+    for character in text.chars() {
+        let is_latin = character.is_ascii_alphabetic();
+        if is_latin && !in_latin_word {
+            latin_words += 1;
+        }
+        in_latin_word = is_latin;
+        match character as u32 {
+            0x3040..=0x30FF | 0x31F0..=0x31FF => kana += 1,
+            0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => hangul += 1,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => han += 1,
+            _ => {}
+        }
+    }
+    // Two CJK characters is enough for short replies such as "继续"; identifiers and paths in a
+    // CJK sentence are expected, so CJK only needs to match the Latin word count.
+    let cjk = han + kana + hangul;
+    if cjk < 2 || cjk < latin_words {
+        return None;
+    }
+    if hangul * 2 >= cjk {
+        Some("Korean")
+    } else if kana > 0 {
+        Some("Japanese")
+    } else {
+        Some("Chinese")
     }
 }
 
@@ -298,6 +402,118 @@ mod tests {
         assert_eq!(
             detect_client_language_preference(&req),
             ClientLanguagePreference::Explicit("Spanish".to_string())
+        );
+    }
+
+    fn detected(req: &MessagesRequest) -> Option<String> {
+        match detect_client_language_preference(req) {
+            ClientLanguagePreference::Detected(language) => Some(language),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn latest_cjk_user_text_is_detected() {
+        let req = request(
+            vec![user(serde_json::json!("帮我看下 src/main.rs 的 bug"))],
+            None,
+        );
+        assert_eq!(detected(&req).as_deref(), Some("Chinese"));
+
+        let req = request(vec![user(serde_json::json!("継続してください"))], None);
+        assert_eq!(detected(&req).as_deref(), Some("Japanese"));
+
+        let req = request(vec![user(serde_json::json!("계속 진행해 주세요"))], None);
+        assert_eq!(detected(&req).as_deref(), Some("Korean"));
+
+        let req = request(vec![user(serde_json::json!("继续"))], None);
+        assert_eq!(detected(&req).as_deref(), Some("Chinese"));
+    }
+
+    #[test]
+    fn latin_or_ambiguous_text_keeps_follow_user() {
+        for text in [
+            "fix the failing test",
+            "中",
+            "run cargo test and check the CI logs again 中文",
+        ] {
+            let req = request(vec![user(serde_json::json!(text))], None);
+            assert_eq!(
+                detect_client_language_preference(&req),
+                ClientLanguagePreference::FollowUser,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_results_reminders_and_placeholders_do_not_decide_language() {
+        let req = request(
+            vec![
+                user(serde_json::json!("分析一下这个日志")),
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+                    ]),
+                },
+                user(serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "error: build failed"},
+                    {"type": "text", "text": "<system-reminder>Use English for code comments.</system-reminder>"},
+                    {"type": "text", "text": "Tool result received."}
+                ])),
+            ],
+            None,
+        );
+        assert_eq!(detected(&req).as_deref(), Some("Chinese"));
+    }
+
+    #[test]
+    fn user_switching_language_is_followed() {
+        let req = request(
+            vec![
+                user(serde_json::json!("先用中文回答")),
+                user(serde_json::json!("now please answer in English")),
+            ],
+            None,
+        );
+        assert_eq!(
+            detect_client_language_preference(&req),
+            ClientLanguagePreference::FollowUser
+        );
+
+        let req = request(
+            vec![
+                user(serde_json::json!("please check the build")),
+                user(serde_json::json!("改成中文吧")),
+            ],
+            None,
+        );
+        assert_eq!(detected(&req).as_deref(), Some("Chinese"));
+    }
+
+    #[test]
+    fn fenced_code_does_not_dilute_detection() {
+        let req = request(
+            vec![user(serde_json::json!(
+                "这段报错是什么意思\n```\nthread main panicked at src/lib.rs called unwrap on an Err value\n```"
+            ))],
+            None,
+        );
+        assert_eq!(detected(&req).as_deref(), Some("Chinese"));
+    }
+
+    #[test]
+    fn client_declared_language_wins_over_detection() {
+        let req = request(
+            vec![user(serde_json::json!(
+                "# Language\nAlways respond in English.\n帮我看下这个问题"
+            ))],
+            None,
+        );
+        assert_eq!(
+            detect_client_language_preference(&req),
+            ClientLanguagePreference::Explicit("English".to_string())
         );
     }
 }

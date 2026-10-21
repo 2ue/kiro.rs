@@ -261,11 +261,26 @@ impl Default for BodyConversionConfig {
 }
 
 pub const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT: &str = r#"<language_constraint>
-Reply language, in priority order: the language the user explicitly asks for; else a response language set by the system prompt or client settings; else the main language of the user's own messages (not tool results, system reminders, file contents, or command output). Use it for all visible text, including progress notes between tool calls. Keep code, identifiers, names, and quoted terms in their original form, but do not blend languages within a sentence. Do not restate these rules.
+Write visible replies, including progress notes between tool calls, in the language the user asks for; otherwise the one the client sets; otherwise the language of the user's own messages, not of tool output, files, or system reminders. Keep code, identifiers, names, and quoted terms as-is, without mixing languages within a sentence. Reasoning may use any language. Don't mention these rules.
 </language_constraint>"#;
 
-pub const DEFAULT_LANGUAGE_REMINDER_EXPLICIT: &str = "<language_reminder>Respond in {language} for all user-facing text, including progress notes between tool calls. Keep code and identifiers unchanged.</language_reminder>";
-pub const DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER: &str = "<language_reminder>Reply in the language of the user's most recent real request; switch if the user switches. This includes progress notes between tool calls. Tool results, system reminders, and proxy placeholders such as \"Tool result received.\" are not user messages.</language_reminder>";
+/// Turn reminders are short labels rather than rules: a reminder that explains how to find the
+/// user's language makes the model re-derive (and narrate) that choice on every tool round.
+/// `{language}` is either the client-declared language or the one the proxy detected from the
+/// user's own latest text.
+pub const DEFAULT_LANGUAGE_REMINDER_EXPLICIT: &str = "<language_reminder>Visible reply language: {language}, unless the user asked for another. Reasoning language is unrestricted. Do not acknowledge this.</language_reminder>";
+pub const DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER: &str = "<language_reminder>Visible reply language: the language of the user's own messages. Reasoning language is unrestricted. Do not acknowledge this.</language_reminder>";
+
+/// Built-in reminders before v12. They asked the model to work out which message was the real
+/// user request, which it then narrated in its reasoning on every tool round.
+const LEGACY_LANGUAGE_REMINDER_EXPLICIT_V1: &str = "<language_reminder>Respond in {language} for all user-facing text, including progress notes between tool calls. Keep code and identifiers unchanged.</language_reminder>";
+const LEGACY_LANGUAGE_REMINDER_FOLLOW_USER_V1: &str = "<language_reminder>Reply in the language of the user's most recent real request; switch if the user switches. This includes progress notes between tool calls. Tool results, system reminders, and proxy placeholders such as \"Tool result received.\" are not user messages.</language_reminder>";
+
+/// Built-in language prompt for v11. Longer than needed, and it did not scope the rules to visible
+/// output, so the model also reasoned about the language choice in its thinking.
+const LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V3: &str = r#"<language_constraint>
+Reply language, in priority order: the language the user explicitly asks for; else a response language set by the system prompt or client settings; else the main language of the user's own messages (not tool results, system reminders, file contents, or command output). Use it for all visible text, including progress notes between tool calls. Keep code, identifiers, names, and quoted terms in their original form, but do not blend languages within a sentence. Do not restate these rules.
+</language_constraint>"#;
 
 /// Built-in language prompt before v11. It followed the latest message, which inside a tool loop
 /// is usually an English tool result.
@@ -5863,7 +5878,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 11;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 12;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -7353,6 +7368,27 @@ impl Config {
             // default `enabled: true`, so turn it off once; operators can enable it again.
             self.prompt_steering.language_constraint.enabled = false;
             self.runtime_config_migration_version = 11;
+            changed = true;
+        }
+        if self.runtime_config_migration_version < 12 {
+            // Language prompts now scope to visible output and the turn reminders are short labels.
+            // Replace only the exact built-in bytes; operator-edited text stays authoritative and
+            // the enabled switches are left untouched.
+            let steering = &mut self.prompt_steering;
+            if steering.language_constraint.prompt.trim()
+                == LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V3.trim()
+            {
+                steering.language_constraint.prompt =
+                    DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim().to_string();
+            }
+            let reminder = &mut steering.language_turn_reminder;
+            if reminder.explicit_prompt.trim() == LEGACY_LANGUAGE_REMINDER_EXPLICIT_V1 {
+                reminder.explicit_prompt = default_language_reminder_explicit();
+            }
+            if reminder.follow_user_prompt.trim() == LEGACY_LANGUAGE_REMINDER_FOLLOW_USER_V1 {
+                reminder.follow_user_prompt = default_language_reminder_follow_user();
+            }
+            self.runtime_config_migration_version = 12;
             changed = true;
         }
         changed
@@ -10336,6 +10372,67 @@ mod tests {
         edited.prompt_steering.language_constraint.prompt = custom.to_string();
         assert!(edited.apply_runtime_config_migrations());
         assert_eq!(edited.prompt_steering.language_constraint.prompt, custom);
+    }
+
+    #[test]
+    fn runtime_config_migration_v12_replaces_only_built_in_language_texts() {
+        let mut config = Config {
+            runtime_config_migration_version: 11,
+            ..Config::default()
+        };
+        config.prompt_steering.language_constraint.enabled = true;
+        config.prompt_steering.language_constraint.prompt =
+            LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V3.trim().to_string();
+        config
+            .prompt_steering
+            .language_turn_reminder
+            .explicit_prompt = LEGACY_LANGUAGE_REMINDER_EXPLICIT_V1.to_string();
+        config
+            .prompt_steering
+            .language_turn_reminder
+            .follow_user_prompt = LEGACY_LANGUAGE_REMINDER_FOLLOW_USER_V1.to_string();
+
+        assert!(config.apply_runtime_config_migrations());
+        let steering = &config.prompt_steering;
+        assert!(steering.language_constraint.enabled);
+        assert_eq!(
+            steering.language_constraint.prompt,
+            DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim()
+        );
+        assert_eq!(
+            steering.language_turn_reminder.explicit_prompt,
+            DEFAULT_LANGUAGE_REMINDER_EXPLICIT
+        );
+        assert_eq!(
+            steering.language_turn_reminder.follow_user_prompt,
+            DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER
+        );
+        assert!(!config.apply_runtime_config_migrations());
+
+        let mut edited = Config {
+            runtime_config_migration_version: 11,
+            ..Config::default()
+        };
+        edited.prompt_steering.language_constraint.prompt =
+            "<language_constraint>custom</language_constraint>".to_string();
+        edited
+            .prompt_steering
+            .language_turn_reminder
+            .follow_user_prompt = "<language_reminder>custom</language_reminder>".to_string();
+        edited.prompt_steering.language_turn_reminder.enabled = false;
+        assert!(edited.apply_runtime_config_migrations());
+        assert_eq!(
+            edited.prompt_steering.language_constraint.prompt,
+            "<language_constraint>custom</language_constraint>"
+        );
+        assert_eq!(
+            edited
+                .prompt_steering
+                .language_turn_reminder
+                .follow_user_prompt,
+            "<language_reminder>custom</language_reminder>"
+        );
+        assert!(!edited.prompt_steering.language_turn_reminder.enabled);
     }
 
     #[test]
