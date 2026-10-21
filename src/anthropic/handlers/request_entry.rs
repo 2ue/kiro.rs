@@ -20,6 +20,7 @@ pub(super) async fn handle_messages_endpoint(
         runtime_config.inference_upstream_max_attempts,
         runtime_config.auxiliary_upstream_max_attempts,
     ));
+    inference_attempt_budget.set_dispatch_route(&endpoint);
     let local_dispatch_max_wait_secs = state
         .kiro_provider
         .as_ref()
@@ -354,7 +355,7 @@ fn maybe_local_pool_unavailable_fast_fail_response(
         return None;
     }
 
-    let local_state = provider.local_pool_route_state_cached(Some(model));
+    let local_state = provider.local_pool_route_state_cached_for_route(Some(model), Some(endpoint));
     let (status, error_type, message, reason, retry_after_secs) =
         local_pool_fast_fail_response_parts(local_state.kind, local_state.retry_after_secs)?;
 

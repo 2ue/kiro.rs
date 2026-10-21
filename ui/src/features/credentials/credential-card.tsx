@@ -6,6 +6,7 @@ import {
   Router,
   Trash2,
   Wallet,
+  Route,
   Wand2,
   Zap,
 } from 'lucide-react'
@@ -15,6 +16,7 @@ import {
   Badge,
   Button,
   Checkbox,
+  SelectItem,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -57,9 +59,10 @@ import {
   useDiscoverCredentialSupportedModels,
   useSetPriority,
   useSetCredentialFast,
+  useSetCredentialRoutePolicy,
   useSetWarmup,
 } from '@/hooks/use-credentials'
-import type { BalanceResponse, CredentialStatusItem, UsageRecord } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem, ExternalPoolRouteMode, UsageRecord } from '@/types/api'
 import {
   accountInfoValue,
   authLabel,
@@ -70,11 +73,21 @@ import {
   subscriptionBadgeMeta,
 } from './credential-utils'
 import { SecretInput } from './credential-inputs'
+import { SelectBox, TextAreaBox } from '@/features/external-pools/external-pool-components'
+import { joinRules, splitRules } from '@/features/external-pools/external-pool-utils'
 import { SupportedModelTagsEditor, mergeSupportedModels } from '@/features/shared/supported-model-tags'
 
 // ============================================================================
 // Sub-components
 // ============================================================================
+
+/** Short label for a credential's route policy; undefined when it accepts every route. */
+function credentialRouteSummary(mode?: ExternalPoolRouteMode, rules: string[] = []): string | undefined {
+  if (!mode || mode === 'allow_all') return undefined
+  const list = rules.length <= 2 ? rules.join(', ') : `${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
+  if (mode === 'allow_list') return rules.length ? `仅 ${list}` : '不承接任何入口'
+  return rules.length ? `排除 ${list}` : undefined
+}
 
 function SummaryCell({ label, value, error, onClick }: { label: string; value: React.ReactNode; error?: boolean; onClick?: () => void }) {
   const content = (
@@ -181,6 +194,9 @@ export function CredentialCard({
   const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
   const [editingFast, setEditingFast] = useState(false)
+  const [editingRoutePolicy, setEditingRoutePolicy] = useState(false)
+  const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>(credential.routeMode ?? 'allow_all')
+  const [routeRulesDraft, setRouteRulesDraft] = useState(joinRules(credential.routeRules ?? []))
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [editingRpm, setEditingRpm] = useState(false)
@@ -213,6 +229,7 @@ export function CredentialCard({
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setFast = useSetCredentialFast()
+  const setRoutePolicy = useSetCredentialRoutePolicy()
   const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
@@ -319,6 +336,23 @@ export function CredentialCard({
     if (!Number.isInteger(p) || p < 0) { toast.error('优先级必须是非负整数'); return }
     setPriority.mutate({ id: credential.id, priority: p }, {
       onSuccess: (res) => { toast.success(res.message); setEditingPriority(false) },
+      onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  const resetRoutePolicyDraft = () => {
+    setRouteModeDraft(credential.routeMode ?? 'allow_all')
+    setRouteRulesDraft(joinRules(credential.routeRules ?? []))
+  }
+
+  const saveRoutePolicy = () => {
+    const routeRules = routeModeDraft === 'allow_all' ? [] : splitRules(routeRulesDraft)
+    if (routeModeDraft === 'allow_list' && routeRules.length === 0) {
+      toast.error('只允许模式至少需要一条路由规则，否则这个账号不会承接任何请求')
+      return
+    }
+    setRoutePolicy.mutate({ id: credential.id, request: { routeMode: routeModeDraft, routeRules } }, {
+      onSuccess: (res) => { toast.success(res.message); setEditingRoutePolicy(false) },
       onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
     })
   }
@@ -435,6 +469,7 @@ export function CredentialCard({
   const statusLabel = credential.disabled ? (credential.disabledReason || '禁用') : credential.cooledDown ? `冷却` : credential.rateLimited ? '限流' : '正常'
 
   const fast = credential.fast ?? 0
+  const routeSummary = credentialRouteSummary(credential.routeMode, credential.routeRules)
   const fastTier = fast > 0 ? String(Math.min(fast, 3)) : undefined
 
   return (
@@ -477,6 +512,14 @@ export function CredentialCard({
             </Badge>
             {epLabel && <Badge title={credential.endpoint}>{epLabel}</Badge>}
             {credential.hasProxy && <Badge tone="info">代理</Badge>}
+            {routeSummary && (
+              <button type="button" onClick={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }}
+                title={`${routeSummary}；点击修改`} aria-label={`${routeSummary}，点击修改`}>
+                <Badge tone="secondary" className="cursor-pointer">
+                  <Route className="mr-0.5 size-3" aria-hidden="true" />{routeSummary}
+                </Badge>
+              </button>
+            )}
             {credential.rateLimitAutoDisableEnabled === false && <Badge tone="warning">429仅冷却</Badge>}
             {supportedModels.length > 0 && <Badge tone="secondary" title={supportedModels.join('\n')}>模型 {supportedModels.length}</Badge>}
             {credential.hasProfileArn && <Badge tone="secondary">Profile ARN</Badge>}
@@ -591,6 +634,9 @@ export function CredentialCard({
           <DropdownMenuContent align="end">
             <DropdownMenuLabel>更多操作</DropdownMenuLabel>
             <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }}>
+              <Route className="h-3.5 w-3.5" aria-hidden="true" /> 路由限制{routeSummary ? `（${routeSummary}）` : ''}
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => setEditingFast(true)}>
               <Zap className="h-3.5 w-3.5" aria-hidden="true" /> {fast > 0 ? `修改 Fast（当前 ${fast}）` : '开启 Fast'}
             </DropdownMenuItem>
@@ -776,6 +822,42 @@ export function CredentialCard({
           )}
         </div>
       )}
+
+      {/* ── Route Policy Modal ── */}
+      <ModalShell open={editingRoutePolicy} title={`路由限制：${displayCredentialLabel}`} width="max-w-lg"
+        onClose={() => { setEditingRoutePolicy(false); resetRoutePolicyDraft() }}>
+        <div className="space-y-3">
+          <div className="rounded-lg bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            控制哪些入口路由可以调度到这个账号，规则写法和外部账号相同。被排除的路由不会用这个账号，先于 Fast 和优先级生效。
+            如果某个路由所有本地账号都被排除，按外部池的路由规则决定是否转外部池。
+          </div>
+          <div className="grid gap-3 md:grid-cols-[200px_1fr]">
+            <SelectBox
+              label="路由模式"
+              value={routeModeDraft}
+              disabled={setRoutePolicy.isPending}
+              onChange={(v) => setRouteModeDraft(v as ExternalPoolRouteMode)}
+            >
+              <SelectItem value="allow_all">全部入口允许</SelectItem>
+              <SelectItem value="allow_list">只允许下列入口</SelectItem>
+              <SelectItem value="deny_list">禁止下列入口</SelectItem>
+            </SelectBox>
+            <TextAreaBox
+              label="路由规则"
+              description="每行一条，可填 /v1、/cc、/ha，或完整 /cc/v1/messages；* 表示全部入口。"
+              value={routeRulesDraft}
+              disabled={setRoutePolicy.isPending || routeModeDraft === 'allow_all'}
+              onChange={setRouteRulesDraft}
+            />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" size="sm" onClick={() => { setEditingRoutePolicy(false); resetRoutePolicyDraft() }} disabled={setRoutePolicy.isPending}>取消</Button>
+            <Button size="sm" onClick={saveRoutePolicy} disabled={setRoutePolicy.isPending}>
+              {setRoutePolicy.isPending && <Spinner size="sm" />}保存
+            </Button>
+          </div>
+        </div>
+      </ModalShell>
 
       {/* ── Fast Modal ── */}
       <ModalShell open={editingFast} title={`Fast：${displayCredentialLabel}`} width="max-w-md"

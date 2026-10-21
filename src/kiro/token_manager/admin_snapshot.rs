@@ -56,6 +56,8 @@ pub struct CredentialEntrySnapshot {
     /// 优先级
     pub priority: u32,
     pub fast: u32,
+    pub route_mode: crate::model::config::ExternalPoolRouteMode,
+    pub route_rules: Vec<String>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -212,6 +214,8 @@ pub struct CredentialBaseSnapshot {
     pub updated_at: Option<String>,
     pub priority: u32,
     pub fast: u32,
+    pub route_mode: crate::model::config::ExternalPoolRouteMode,
+    pub route_rules: Vec<String>,
     pub disabled: bool,
     pub disabled_reason: Option<String>,
     pub auth_method: Option<String>,
@@ -407,6 +411,8 @@ pub(super) fn base_snapshot_from_entry(
         updated_at: entry.credentials.updated_at.clone(),
         priority: entry.credentials.priority,
         fast: entry.credentials.fast,
+        route_mode: entry.credentials.route_mode,
+        route_rules: entry.credentials.route_rules.clone(),
         disabled: entry.disabled,
         disabled_reason: entry.disabled_reason.map(|r| r.as_str().to_string()),
         auth_method: normalized_auth_method(&entry.credentials),
@@ -500,6 +506,8 @@ pub(super) fn runtime_snapshot_from_entry(
         updated_at: entry.credentials.updated_at.clone(),
         priority: entry.credentials.priority,
         fast: entry.credentials.fast,
+        route_mode: entry.credentials.route_mode,
+        route_rules: entry.credentials.route_rules.clone(),
         disabled: entry.disabled,
         failure_count: entry.failure_count,
         auth_method: normalized_auth_method(&entry.credentials),

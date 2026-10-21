@@ -4904,7 +4904,11 @@ impl ExternalPoolsConfig {
     }
 }
 
-fn route_policy_allows(mode: ExternalPoolRouteMode, rules: &[String], endpoint: &str) -> bool {
+pub(crate) fn route_policy_allows(
+    mode: ExternalPoolRouteMode,
+    rules: &[String],
+    endpoint: &str,
+) -> bool {
     match mode {
         ExternalPoolRouteMode::AllowAll => true,
         ExternalPoolRouteMode::AllowList => {

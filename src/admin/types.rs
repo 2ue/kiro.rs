@@ -356,6 +356,10 @@ pub struct CredentialListItem {
     pub priority: u32,
     /// Fast 值（0 表示未开启，数字越大越优先打满）
     pub fast: u32,
+    /// 路由调度规则：allow_all / allow_list / deny_list
+    pub route_mode: crate::model::config::ExternalPoolRouteMode,
+    /// 路由规则（路径前缀）
+    pub route_rules: Vec<String>,
     pub disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
@@ -462,6 +466,10 @@ pub struct CredentialStatusItem {
     pub priority: u32,
     /// Fast 值（0 表示未开启，数字越大越优先打满）
     pub fast: u32,
+    /// 路由调度规则：allow_all / allow_list / deny_list
+    pub route_mode: crate::model::config::ExternalPoolRouteMode,
+    /// 路由规则（路径前缀）
+    pub route_rules: Vec<String>,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -650,6 +658,16 @@ pub struct SetPriorityRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SetCredentialFastRequest {
     pub fast: u32,
+}
+
+/// 修改账号路由调度规则请求，语义与外部池 routeMode/routeRules 相同
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialRoutePolicyRequest {
+    #[serde(default, alias = "route_mode")]
+    pub route_mode: crate::model::config::ExternalPoolRouteMode,
+    #[serde(default, alias = "route_rules")]
+    pub route_rules: Vec<String>,
 }
 
 /// 修改凭据预热状态请求
@@ -963,6 +981,14 @@ pub struct AddCredentialRequest {
     /// Fast 值（可选，默认 0 表示未开启）
     #[serde(default)]
     pub fast: u32,
+
+    /// 路由调度规则（可选，默认 allow_all）
+    #[serde(default, alias = "route_mode")]
+    pub route_mode: crate::model::config::ExternalPoolRouteMode,
+
+    /// 路由规则（可选）
+    #[serde(default, alias = "route_rules")]
+    pub route_rules: Vec<String>,
 
     /// 凭据级最大并发覆盖。None 表示继承全局，0 表示该账号不限并发。
     #[serde(default, alias = "max_concurrent_requests")]
@@ -1360,6 +1386,8 @@ pub struct BatchUpdateCredentialsRequest {
     pub priority: Option<SetPriorityRequest>,
     #[serde(default)]
     pub fast: Option<SetCredentialFastRequest>,
+    #[serde(default)]
+    pub route_policy: Option<SetCredentialRoutePolicyRequest>,
     #[serde(default)]
     pub regions: Option<SetCredentialRegionsRequest>,
     #[serde(default)]

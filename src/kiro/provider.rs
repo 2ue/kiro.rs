@@ -8515,17 +8515,48 @@ impl KiroProvider {
             .cooldown_retry_after_hint_secs(fallback_secs)
     }
 
-    pub fn local_pool_route_state_fresh(&self, model: Option<&str>) -> LocalPoolRouteState {
-        self.token_manager.local_pool_route_state_fresh(model)
-    }
-
     /// See [`MultiTokenManager::usable_explicit_model_catalog`].
     pub fn usable_explicit_model_catalog(&self) -> Option<Vec<String>> {
         self.token_manager.usable_explicit_model_catalog()
     }
 
-    pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
-        self.token_manager.local_pool_route_state_cached(model)
+    pub fn local_pool_route_state_fresh_for_route(
+        &self,
+        model: Option<&str>,
+        route: Option<&str>,
+    ) -> LocalPoolRouteState {
+        self.token_manager
+            .local_pool_route_state_fresh_for_route(model, route)
+    }
+
+    pub fn local_pool_route_state_cached_for_route(
+        &self,
+        model: Option<&str>,
+        route: Option<&str>,
+    ) -> LocalPoolRouteState {
+        self.token_manager
+            .local_pool_route_state_cached_for_route(model, route)
+    }
+
+    /// Whether every local credential's route rules reject `route`.
+    pub fn route_rejected_by_all_credentials(&self, route: &str) -> bool {
+        self.token_manager.route_rejected_by_all_credentials(route)
+    }
+
+    /// Initial per-request exclusions: credentials whose route rules reject the request route.
+    fn route_excluded_credential_ids(
+        &self,
+        inference_attempt_budget: Option<&InferenceAttemptBudget>,
+    ) -> HashSet<u64> {
+        inference_attempt_budget
+            .and_then(InferenceAttemptBudget::dispatch_route)
+            .map(|route| {
+                self.token_manager
+                    .credential_ids_rejecting_route(route)
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn credential_log_label(&self, id: u64) -> String {
@@ -11053,7 +11084,8 @@ impl KiroProvider {
         let mut attempts = Vec::new();
         let mut automatic_recovery_attempted: HashSet<u64> = HashSet::new();
         let mut automatic_recovery_allowed = true;
-        let mut excluded_ids: HashSet<u64> = HashSet::new();
+        let mut excluded_ids: HashSet<u64> =
+            self.route_excluded_credential_ids(Some(inference_attempt_budget));
         let auxiliary_attempt_budget = inference_attempt_budget.auxiliary_budget();
 
         for attempt in 0..max_retries {
@@ -12088,7 +12120,10 @@ impl KiroProvider {
             .map(str::to_string)
             .or_else(|| Self::extract_model_from_request(request_body));
         let conversation_id = Self::extract_conversation_id_from_request(request_body);
-        let mut excluded_ids: HashSet<u64> = HashSet::new();
+        // Credentials whose route rules reject this request route never take it; excluding them
+        // up front keeps every later retry, sticky and alternate check route-aware.
+        let mut excluded_ids: HashSet<u64> =
+            self.route_excluded_credential_ids(inference_attempt_budget);
         // Replaced after an attempt the upstream had already started processing, so the retry
         // carries a fresh request identity (see `refresh_kiro_request_identity`).
         let mut refreshed_request_body: Option<String> = None;

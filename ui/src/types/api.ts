@@ -98,6 +98,9 @@ export interface CredentialStatusItem {
   priority: number
   /** Fast 值：0 表示未开启，数字越大越先打满。 */
   fast: number
+  /** 路由调度规则，语义与外部池相同；allow_all 表示不限制。 */
+  routeMode: ExternalPoolRouteMode
+  routeRules: string[]
   disabled: boolean
   failureCount: number
   isCurrent: boolean
@@ -175,6 +178,8 @@ export type CredentialListItem = Pick<
   | 'updatedAt'
   | 'priority'
   | 'fast'
+  | 'routeMode'
+  | 'routeRules'
   | 'disabled'
   | 'authMethod'
   | 'provider'
@@ -580,6 +585,11 @@ export interface SetCredentialFastRequest {
   fast: number
 }
 
+export interface SetCredentialRoutePolicyRequest {
+  routeMode: ExternalPoolRouteMode
+  routeRules: string[]
+}
+
 export interface SetWarmupRequest {
   warmupRemaining: number
 }
@@ -606,6 +616,7 @@ export interface BatchUpdateCredentialsRequest {
   ids: number[]
   priority?: SetPriorityRequest
   fast?: SetCredentialFastRequest
+  routePolicy?: SetCredentialRoutePolicyRequest
   regions?: SetCredentialRegionsRequest
   concurrency?: SetCredentialConcurrencyRequest
   rpm?: SetCredentialRpmRequest

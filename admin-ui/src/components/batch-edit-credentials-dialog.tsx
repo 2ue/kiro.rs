@@ -18,7 +18,7 @@ import {
   parseOptionalNonNegativeInteger,
 } from '@/components/credential-parameter-defaults'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BatchUpdateCredentialsRequest } from '@/types/api'
+import type { BatchUpdateCredentialsRequest, ExternalPoolRouteMode } from '@/types/api'
 
 interface BatchEditCredentialsDialogProps {
   open: boolean
@@ -125,6 +125,9 @@ export function BatchEditCredentialsDialog({
   const [updatePriority, setUpdatePriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState('')
   const [updateFast, setUpdateFast] = useState(false)
+  const [updateRoutePolicy, setUpdateRoutePolicy] = useState(false)
+  const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>('allow_all')
+  const [routeRulesDraft, setRouteRulesDraft] = useState('')
   const [fastValue, setFastValue] = useState('')
 
   const batchUpdate = useBatchUpdateCredentials()
@@ -186,6 +189,9 @@ export function BatchEditCredentialsDialog({
     setPriorityValue('')
     setUpdateFast(false)
     setFastValue('')
+    setUpdateRoutePolicy(false)
+    setRouteModeDraft('allow_all')
+    setRouteRulesDraft('')
   }, [open])
 
   const submit = () => {
@@ -193,7 +199,7 @@ export function BatchEditCredentialsDialog({
       toast.error('请先选择要修改的账号')
       return
     }
-    if (!updatePriority && !updateFast && !updateRegions && !updateConcurrency && !updateRpm && !updateRateLimitAutoDisable && !updateProxy) {
+    if (!updatePriority && !updateFast && !updateRoutePolicy && !updateRegions && !updateConcurrency && !updateRpm && !updateRateLimitAutoDisable && !updateProxy) {
       toast.error('请选择至少一组要修改的参数')
       return
     }
@@ -223,6 +229,17 @@ export function BatchEditCredentialsDialog({
         toast.error(extractErrorMessage(error))
         return
       }
+    }
+
+    if (updateRoutePolicy) {
+      const routeRules = routeModeDraft === 'allow_all'
+        ? []
+        : routeRulesDraft.split('\n').map((rule) => rule.trim()).filter(Boolean)
+      if (routeModeDraft === 'allow_list' && routeRules.length === 0) {
+        toast.error('只允许模式至少需要一条路由规则，否则这些账号不会承接任何请求')
+        return
+      }
+      request.routePolicy = { routeMode: routeModeDraft, routeRules }
     }
 
     if (updateRegions) {
@@ -349,6 +366,41 @@ export function BatchEditCredentialsDialog({
               />
               <span className="block text-xs leading-5 text-muted-foreground">
                 开启后请求先集中到这些账号，并发用满再分给其他账号；数值越大越先打满（和优先级相反），0 表示关闭。
+              </span>
+            </label>
+          </div>
+
+          <div className={`rounded-md border p-3 ${updateRoutePolicy ? 'border-primary bg-primary/5' : 'bg-muted/20'}`}>
+            <ToggleRow
+              checked={updateRoutePolicy}
+              disabled={batchUpdate.isPending}
+              label="修改路由限制"
+              onCheckedChange={setUpdateRoutePolicy}
+            />
+            <label className="mt-3 block space-y-2">
+              <span className="text-sm font-medium">路由模式</span>
+              <select
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                value={routeModeDraft}
+                disabled={!updateRoutePolicy || batchUpdate.isPending}
+                onChange={(event) => setRouteModeDraft(event.target.value as ExternalPoolRouteMode)}
+              >
+                <option value="allow_all">全部入口允许</option>
+                <option value="allow_list">只允许下列入口</option>
+                <option value="deny_list">禁止下列入口</option>
+              </select>
+            </label>
+            <label className="mt-3 block space-y-2">
+              <span className="text-sm font-medium">路由规则</span>
+              <textarea
+                className="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
+                value={routeRulesDraft}
+                placeholder={'/cc\n/ha'}
+                disabled={!updateRoutePolicy || routeModeDraft === 'allow_all' || batchUpdate.isPending}
+                onChange={(event) => setRouteRulesDraft(event.target.value)}
+              />
+              <span className="block text-xs leading-5 text-muted-foreground">
+                和外部账号相同的入口规则，每行一条，* 表示全部入口；被排除的路由不会调度到这些账号。
               </span>
             </label>
           </div>

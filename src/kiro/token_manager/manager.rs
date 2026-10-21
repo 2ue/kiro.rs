@@ -2844,12 +2844,45 @@ impl MultiTokenManager {
         self.local_pool_route_state_fresh(model)
     }
 
+    #[cfg(test)]
     pub fn local_pool_route_state_fresh(&self, model: Option<&str>) -> LocalPoolRouteState {
-        let mut state = self.compute_local_pool_route_state(model, true);
+        self.local_pool_route_state_fresh_for_route(model, None)
+    }
+
+    /// Like [`Self::local_pool_route_state_fresh`], counting only credentials whose route rules
+    /// allow `route`. When no credential allows it the filter is ignored: that case is handled
+    /// by the request route policy (see [`Self::route_rejected_by_all_credentials`]).
+    pub fn local_pool_route_state_fresh_for_route(
+        &self,
+        model: Option<&str>,
+        route: Option<&str>,
+    ) -> LocalPoolRouteState {
+        let mut state = self.compute_local_pool_route_state(model, route, true);
         if state.kind.should_route_external() && self.auto_heal_for_route_state() {
-            state = self.compute_local_pool_route_state(model, true);
+            state = self.compute_local_pool_route_state(model, route, true);
         }
         state
+    }
+
+    /// Whether every local credential's route rules reject `route`. An empty pool is not
+    /// route-blocked; it keeps the existing "no credentials" handling.
+    pub fn route_rejected_by_all_credentials(&self, route: &str) -> bool {
+        let entries = self.entries.lock();
+        !entries.is_empty()
+            && entries
+                .iter()
+                .all(|entry| !entry.credentials.allows_route(route))
+    }
+
+    /// Credential ids whose route rules reject `route`; a request on that route must not be
+    /// dispatched to them.
+    pub fn credential_ids_rejecting_route(&self, route: &str) -> Vec<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| !entry.credentials.allows_route(route))
+            .map(|entry| entry.id)
+            .collect()
     }
 
     /// Returns a local-memory routing snapshot without performing scheduler Redis reads/probes.
@@ -2859,10 +2892,19 @@ impl MultiTokenManager {
     /// path. It still preserves the existing TooManyFailures auto-heal behavior so entry-level
     /// fast-fail does not strand a self-healable local pool. The authoritative scheduler state is
     /// still refreshed by normal dispatch/preflight paths before a local upstream call is made.
+    #[cfg(test)]
     pub fn local_pool_route_state_cached(&self, model: Option<&str>) -> LocalPoolRouteState {
-        let mut state = self.compute_local_pool_route_state(model, false);
+        self.local_pool_route_state_cached_for_route(model, None)
+    }
+
+    pub fn local_pool_route_state_cached_for_route(
+        &self,
+        model: Option<&str>,
+        route: Option<&str>,
+    ) -> LocalPoolRouteState {
+        let mut state = self.compute_local_pool_route_state(model, route, false);
         if state.kind.should_route_external() && self.auto_heal_for_route_state() {
-            state = self.compute_local_pool_route_state(model, false);
+            state = self.compute_local_pool_route_state(model, route, false);
         }
         state
     }
@@ -2874,7 +2916,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         error_message: &str,
     ) -> SelectionFailureSummary {
-        let state = self.compute_local_pool_route_state(model, true);
+        let state = self.compute_local_pool_route_state(model, None, true);
         let (stage, primary_reason) =
             Self::selection_failure_stage_and_reason(&state, error_message);
         let config = self.config.lock().clone();
@@ -3210,6 +3252,7 @@ impl MultiTokenManager {
     fn compute_local_pool_route_state(
         &self,
         model: Option<&str>,
+        route: Option<&str>,
         refresh_scheduler_state: bool,
     ) -> LocalPoolRouteState {
         let config = self.config.lock().clone();
@@ -3236,8 +3279,19 @@ impl MultiTokenManager {
         }
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
-        let total = entries.len();
-        let available = entries.iter().filter(|entry| !entry.disabled).count();
+        // Only credentials that accept this request route can serve it. The global in-flight
+        // count below still covers every credential because the global limit is shared.
+        let route = route.filter(|route| {
+            entries
+                .iter()
+                .any(|entry| entry.credentials.allows_route(route))
+        });
+        let scoped: Vec<&CredentialEntry> = entries
+            .iter()
+            .filter(|entry| route.is_none_or(|route| entry.credentials.allows_route(route)))
+            .collect();
+        let total = scoped.len();
+        let available = scoped.iter().filter(|entry| !entry.disabled).count();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
         let global_rpm = config.credential_rpm.unwrap_or(0);
         let global_in_flight_requests = entries
@@ -3260,7 +3314,7 @@ impl MultiTokenManager {
         let mut wait_for: Option<StdDuration> = None;
         let mut effective_concurrency_range: Option<(u32, u32)> = None;
 
-        for entry in entries.iter() {
+        for entry in scoped.iter().copied() {
             if !credential_is_usable_for_model(entry, model) {
                 continue;
             }
@@ -12696,6 +12750,27 @@ impl MultiTokenManager {
         })?;
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_fast_updated");
+        Ok(())
+    }
+
+    /// 设置凭据路由调度规则（Admin API）。
+    ///
+    /// 规则只决定后续请求能否调度到这个账号；已有 sticky 绑定在路由不允许时不再复用，
+    /// 但绑定本身保留，同一会话换到允许的路由时仍可回到原账号。
+    pub fn set_credential_route_policy(
+        &self,
+        id: u64,
+        route_mode: crate::model::config::ExternalPoolRouteMode,
+        route_rules: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let route_rules = crate::model::config::normalize_route_rules(&route_rules);
+        self.persist_credential_mutation(id, |credential| {
+            credential.route_mode = route_mode;
+            credential.route_rules = route_rules;
+            Ok(())
+        })?;
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("credential_route_policy_updated");
         Ok(())
     }
 
