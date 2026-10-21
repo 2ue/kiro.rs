@@ -1401,7 +1401,6 @@ fn websearch_handler_test_router_with_config(
     customize: impl FnOnce(&mut Config),
 ) -> (Router, Arc<UsageRecorder>) {
     let mut config = Config::default();
-    customize(&mut config);
     config.kiro_upstream_base_url = Some(base_url.to_string());
     config.kiro_upstream_response_timeout_secs = 1;
     config.credential_retry_max_attempts = 1;
@@ -1415,6 +1414,7 @@ fn websearch_handler_test_router_with_config(
     config.credential_cooldown_backoff_multiplier = 1.0;
     config.credential_cooldown_jitter_percent = 0;
     config.credential_max_cooldown_secs = 0;
+    customize(&mut config);
     let credentials = (1..=80)
         .map(|id| KiroCredentials {
             id: Some(id),
@@ -14879,4 +14879,351 @@ fn stable_segment_default_caps_still_bound_large_cache_fields() {
         credential_usage.canonical_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
     assert!(reported.cache_read_input_tokens <= 700_000);
     assert!(reported.cache_creation_input_tokens <= 400_000);
+}
+
+#[derive(Clone, Default)]
+struct ModelDrivenUpstreamState {
+    model_hits: Arc<AtomicUsize>,
+    mcp_hits: Arc<AtomicUsize>,
+    fail_answer_round: Arc<std::sync::atomic::AtomicBool>,
+    mcp_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+fn model_driven_eventstream(frames: Vec<Vec<u8>>) -> Response {
+    let mut body = Vec::new();
+    for frame in frames {
+        body.extend(frame);
+    }
+    body.extend(eventstream_test_frame(
+        "metadataEvent",
+        json!({"tokenUsage": {"uncachedInputTokens": 1500, "outputTokens": 40, "totalTokens": 1540,
+            "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0}}),
+    ));
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")],
+        body,
+    )
+        .into_response()
+}
+
+/// First model call asks for a search; once the request carries tool results it answers with a
+/// citation marker (or fails when `fail_answer_round` is set).
+async fn model_driven_model_upstream(
+    State(state): State<ModelDrivenUpstreamState>,
+    body: Bytes,
+) -> Response {
+    state.model_hits.fetch_add(1, Ordering::AcqRel);
+    let body = String::from_utf8_lossy(&body);
+    if !body.contains("toolResults") {
+        return model_driven_eventstream(vec![eventstream_test_frame(
+            "toolUseEvent",
+            json!({"name": "web_search", "toolUseId": "tooluse_md_1",
+                "input": "{\"query\":\"rust release\"}", "stop": true}),
+        )]);
+    }
+    if state.fail_answer_round.load(Ordering::Acquire) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": "private-answer-round-marker"})),
+        )
+            .into_response();
+    }
+    model_driven_eventstream(vec![eventstream_test_frame(
+        "assistantResponseEvent",
+        json!({"content": "Rust shipped a new release [1]. More details later."}),
+    )])
+}
+
+async fn model_driven_mcp_upstream(
+    State(state): State<ModelDrivenUpstreamState>,
+    body: Bytes,
+) -> Response {
+    state.mcp_hits.fetch_add(1, Ordering::AcqRel);
+    let delay = state.mcp_delay_ms.load(Ordering::Acquire);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    let request = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+    let request_id = request["id"].as_str().unwrap_or("missing-id").to_string();
+    let query = request
+        .pointer("/params/arguments/query")
+        .and_then(Value::as_str)
+        .unwrap_or("missing-query")
+        .to_string();
+    Json(valid_mcp_search_response(&request_id, &query)).into_response()
+}
+
+struct ModelDrivenUpstream {
+    base_url: String,
+    state: ModelDrivenUpstreamState,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ModelDrivenUpstream {
+    async fn start() -> Self {
+        let state = ModelDrivenUpstreamState::default();
+        let app = Router::new()
+            .route("/mcp", post(model_driven_mcp_upstream))
+            .route(
+                "/generateAssistantResponse",
+                post(model_driven_model_upstream),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake model-driven upstream");
+        let address = listener.local_addr().expect("fake model-driven address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake model-driven upstream");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            state,
+            task,
+        }
+    }
+}
+
+impl Drop for ModelDrivenUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn model_driven_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
+    websearch_handler_test_router_with_config(base_url, |config| {
+        config.body_conversion.model_driven_web_search.enabled = true;
+        config.kiro_upstream_response_timeout_secs = 10;
+        config.stream_keepalive_interval_secs = 1;
+    })
+}
+
+fn parse_test_sse(body: &[u8]) -> Vec<(String, Value)> {
+    String::from_utf8_lossy(body)
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut name = None;
+            let mut data = None;
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event:") {
+                    name = Some(value.trim().to_string());
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data = serde_json::from_str::<Value>(value.trim()).ok();
+                }
+            }
+            Some((name?, data?))
+        })
+        .collect()
+}
+
+async fn run_model_driven_websearch_streams_blocks_with_keepalive_and_citations() {
+    let upstream = ModelDrivenUpstream::start().await;
+    upstream.state.mcp_delay_ms.store(2_500, Ordering::Release);
+    let (router, usage_recorder) = model_driven_router(&upstream.base_url);
+
+    let response = router
+        .clone()
+        .oneshot(multimodal_handler_request(
+            "/v1/messages",
+            single_query_websearch_body("What is new in Rust?", true),
+        ))
+        .await
+        .expect("model-driven stream response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response_request_id(&response);
+    let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+        .await
+        .expect("model-driven stream body");
+    let events = parse_test_sse(&body);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+    assert_eq!(names.first(), Some(&"message_start"), "{names:?}");
+    assert_eq!(names.last(), Some(&"message_stop"), "{names:?}");
+    // The search runs between server_tool_use and its result; keepalive pings fill the gap.
+    let tool_stop = events
+        .iter()
+        .position(|(name, data)| name == "content_block_stop" && data["index"] == 0)
+        .expect("server_tool_use stop");
+    let result_start = events
+        .iter()
+        .position(|(name, data)| {
+            name == "content_block_start"
+                && data["content_block"]["type"] == "web_search_tool_result"
+        })
+        .expect("web_search_tool_result start");
+    assert!(
+        names[tool_stop..result_start].contains(&"ping"),
+        "pings expected while the search runs: {names:?}"
+    );
+    // server_tool_use: empty input at start, query in input_json_delta.
+    let (_, start) = &events[1];
+    assert_eq!(start["content_block"]["type"], "server_tool_use");
+    assert_eq!(start["content_block"]["input"], json!({}));
+    assert_eq!(events[2].1["delta"]["type"], "input_json_delta");
+    assert!(
+        events[2].1["delta"]["partial_json"]
+            .as_str()
+            .is_some_and(|json| json.contains("rust release"))
+    );
+    // Contiguous block indexes from 0.
+    let mut indexes: Vec<i64> = events
+        .iter()
+        .filter(|(name, _)| name == "content_block_start")
+        .map(|(_, data)| data["index"].as_i64().unwrap())
+        .collect();
+    indexes.dedup();
+    assert_eq!(indexes, (0..indexes.len() as i64).collect::<Vec<_>>());
+    assert!(
+        events
+            .iter()
+            .any(|(_, data)| data["delta"]["type"] == "citations_delta"
+                && data["delta"]["citation"]["type"] == "web_search_result_location"),
+        "answer must carry citations: {names:?}"
+    );
+    let text: String = events
+        .iter()
+        .filter(|(_, data)| data["delta"]["type"] == "text_delta")
+        .map(|(_, data)| data["delta"]["text"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        text.contains("Rust shipped a new release") && !text.contains("[1]"),
+        "{text}"
+    );
+    let delta = events
+        .iter()
+        .find(|(name, _)| name == "message_delta")
+        .expect("message_delta");
+    assert_eq!(delta.1["delta"]["stop_reason"], "end_turn");
+    assert_eq!(
+        delta.1["usage"]["server_tool_use"]["web_search_requests"],
+        1
+    );
+    assert_eq!(upstream.state.model_hits.load(Ordering::Acquire), 2);
+    assert_eq!(upstream.state.mcp_hits.load(Ordering::Acquire), 1);
+
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    let trace = record.latency_trace.expect("latency trace");
+    assert_eq!(trace.websearch_mode.as_deref(), Some("model_driven"));
+    assert_eq!(trace.web_search_requests, Some(1));
+    assert_eq!(record.output_tokens, 80, "usage sums both model calls");
+}
+
+#[test]
+fn model_driven_websearch_streams_blocks_with_keepalive_and_citations() {
+    run_handler_fixture_on_large_stack_thread("model-driven-stream", || async {
+        run_model_driven_websearch_streams_blocks_with_keepalive_and_citations().await;
+    });
+}
+
+async fn run_model_driven_websearch_non_stream_and_template_mode_record_their_mode() {
+    let upstream = ModelDrivenUpstream::start().await;
+    let (router, usage_recorder) = model_driven_router(&upstream.base_url);
+    let response = router
+        .clone()
+        .oneshot(multimodal_handler_request(
+            "/v1/messages",
+            single_query_websearch_body("What is new in Rust?", false),
+        ))
+        .await
+        .expect("model-driven non-stream response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response_request_id(&response);
+    let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+        .await
+        .expect("model-driven non-stream body");
+    let value: Value = serde_json::from_slice(&body).expect("message JSON");
+    let kinds: Vec<&str> = value["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds[..2],
+        ["server_tool_use", "web_search_tool_result"],
+        "{kinds:?}"
+    );
+    assert!(
+        value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "text"
+                || !block["text"].as_str().unwrap().trim().is_empty())
+    );
+    assert!(value["content"][2]["citations"].is_array(), "{value}");
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    assert_eq!(record.status, UsageRecordStatus::Success);
+    let trace = record.latency_trace.expect("latency trace");
+    assert_eq!(trace.websearch_mode.as_deref(), Some("model_driven"));
+    assert_eq!(trace.web_search_requests, Some(1));
+
+    // The template mode records its mode too.
+    let template = WebSearchHandlerUpstream::start().await;
+    let (router, usage_recorder) = websearch_handler_test_router(&template.base_url);
+    let response = router
+        .oneshot(multimodal_handler_request(
+            "/v1/messages",
+            single_query_websearch_body("template-mode", false),
+        ))
+        .await
+        .expect("template response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response_request_id(&response);
+    let _ = axum::body::to_bytes(response.into_body(), 512 * 1024).await;
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    let trace = record.latency_trace.expect("latency trace");
+    assert_eq!(trace.websearch_mode.as_deref(), Some("template"));
+    assert_eq!(trace.web_search_requests, Some(1));
+}
+
+#[test]
+fn model_driven_websearch_non_stream_and_template_mode_record_their_mode() {
+    run_handler_fixture_on_large_stack_thread("model-driven-non-stream", || async {
+        run_model_driven_websearch_non_stream_and_template_mode_record_their_mode().await;
+    });
+}
+
+async fn run_model_driven_websearch_failure_after_start_ends_stream_with_error_event() {
+    let upstream = ModelDrivenUpstream::start().await;
+    upstream
+        .state
+        .fail_answer_round
+        .store(true, Ordering::Release);
+    let (router, usage_recorder) = model_driven_router(&upstream.base_url);
+    let response = router
+        .oneshot(multimodal_handler_request(
+            "/v1/messages",
+            single_query_websearch_body("What is new in Rust?", true),
+        ))
+        .await
+        .expect("model-driven failing stream response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "headers are sent after the first round"
+    );
+    let request_id = response_request_id(&response);
+    let body = axum::body::to_bytes(response.into_body(), 512 * 1024)
+        .await
+        .expect("failing stream body");
+    let events = parse_test_sse(&body);
+    let (name, last) = events.last().expect("events");
+    assert_eq!(name, "error", "{events:?}");
+    assert_eq!(last["type"], "error");
+    assert!(!String::from_utf8_lossy(&body).contains("private-answer-round-marker"));
+    assert!(!events.iter().any(|(name, _)| name == "message_stop"));
+    let record = usage_record_for_request(&usage_recorder, &request_id);
+    assert_eq!(record.status, UsageRecordStatus::StreamError);
+}
+
+#[test]
+fn model_driven_websearch_failure_after_start_ends_stream_with_error_event() {
+    run_handler_fixture_on_large_stack_thread("model-driven-failure", || async {
+        run_model_driven_websearch_failure_after_start_ends_stream_with_error_event().await;
+    });
 }

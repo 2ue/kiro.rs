@@ -21,22 +21,28 @@ const SNIPPET_MAX_CHARS: usize = 2000;
 const CITED_TEXT_MAX_CHARS: usize = 150;
 const SEARCH_TOOL_NAME: &str = "web_search";
 const SEARCH_TOOL_DESCRIPTION: &str = "Search the web for current or external information. Use a concise query. Results are numbered so they can be cited.";
-const GUIDANCE: &str = "<web_search_guidance>You can search the web with the `web_search` tool. Call it with a concise query when the answer needs current or external information; you may search again with a refined query. After the results arrive, answer the user from them. When a sentence uses information from a search result, put that result's number in square brackets right after the sentence, for example [1] or [1][3]. Only cite numbers that appear in the results.</web_search_guidance>";
+const GUIDANCE: &str = "<web_search_guidance>You can search the web with the `web_search` tool. Call it with a concise query when the answer needs current or external information; you may search again with a refined query. Before a search call, write one short sentence saying what you are going to search for. After the results arrive, answer the user from them; if the user only asked for a search, summarize the most relevant results instead of just confirming that the search ran. When a sentence uses information from a search result, put that result's number in square brackets right after the sentence, for example [1] or [1][3]. Only cite numbers that appear in the results.</web_search_guidance>";
+/// Part of every result list header: a reminder next to where the answer is generated is
+/// followed more reliably than the system prompt alone. Phrased as a description of the data,
+/// not an instruction, so the model does not open its answer by acknowledging it.
+const CITATION_HINT: &str = "cite a result with its number in square brackets, e.g. [1]";
 
-pub(super) struct ModelDrivenWebSearchContext<'a> {
-    pub(super) state: &'a AppState,
+/// Everything the loop needs, owned: in streaming mode the loop continues in a background task
+/// after the response headers and the first events have been sent.
+pub(super) struct ModelDrivenWebSearchContext {
+    pub(super) state: AppState,
     pub(super) provider: Arc<KiroProvider>,
-    pub(super) payload: &'a MessagesRequest,
-    pub(super) endpoint: &'a str,
-    pub(super) runtime_config: &'a RequestRuntimeConfig,
+    pub(super) payload: MessagesRequest,
+    pub(super) endpoint: String,
+    pub(super) runtime_config: RequestRuntimeConfig,
     pub(super) cache_route: ResolvedCacheRoutePolicy,
-    pub(super) model_resolution: &'a ModelResolution,
-    pub(super) usage_mapper: Option<websearch::WebSearchUsageMapper<'a>>,
+    pub(super) model_resolution: ModelResolution,
+    pub(super) usage_mapper: Option<websearch::SharedWebSearchUsageMapper>,
     pub(super) inference_attempt_budget: Arc<InferenceAttemptBudget>,
     pub(super) attribution_sink: Arc<McpCallAttributionSink>,
     pub(super) identity_output_guard: bool,
-    pub(super) request_id: &'a str,
-    pub(super) error_id: &'a str,
+    pub(super) request_id: String,
+    pub(super) error_id: String,
 }
 
 /// One numbered search result, as cited by the model.
@@ -59,10 +65,29 @@ struct RoundOutput {
 struct CallFailure {
     response: Response,
     error_type: &'static str,
+    internal_reason: &'static str,
     attribution: McpCallAttribution,
 }
 
-#[derive(Default)]
+fn processing_failure_for(
+    ctx: &ModelDrivenWebSearchContext,
+    attribution: McpCallAttribution,
+    internal_reason: &'static str,
+) -> CallFailure {
+    CallFailure {
+        response: envelope::error_response_with_id(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            &ctx.request_id,
+        ),
+        error_type: "api_error",
+        internal_reason,
+        attribution,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct Accounting {
     input_tokens: i32,
     output_tokens: i32,
@@ -83,43 +108,335 @@ impl Accounting {
     }
 }
 
-pub(super) async fn run(ctx: ModelDrivenWebSearchContext<'_>) -> websearch::WebSearchOutcome {
-    let max_searches = websearch::native_web_search_max_uses(ctx.payload)
+/// Where the loop writes its content blocks: collected for a JSON response, or sent to the client
+/// as soon as each block is complete when streaming.
+struct BlockOutput {
+    blocks: Vec<Value>,
+    writer: Option<StreamWriter>,
+}
+
+impl BlockOutput {
+    /// Returns false once the streaming client has gone away.
+    async fn push(&mut self, block: Value) -> bool {
+        match self.writer.as_mut() {
+            Some(writer) => writer.push_block(&block).await,
+            None => {
+                self.blocks.push(block);
+                true
+            }
+        }
+    }
+}
+
+struct StreamWriter {
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+    next_index: usize,
+    keepalive: Duration,
+}
+
+impl StreamWriter {
+    async fn send(&mut self, event: SseEvent) -> bool {
+        self.tx
+            .send(Bytes::from(event.to_sse_string()))
+            .await
+            .is_ok()
+    }
+
+    async fn ping(&mut self) -> bool {
+        self.tx.send(create_ping_sse()).await.is_ok()
+    }
+
+    async fn push_block(&mut self, block: &Value) -> bool {
+        let index = self.next_index;
+        self.next_index += 1;
+        for event in block_events(index, block) {
+            if !self.send(event).await {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Awaits `future`, sending `ping` events at the keepalive interval while streaming. `None`
+/// means the client disconnected; the future is dropped so no further upstream work runs.
+async fn with_keepalive<F: std::future::Future>(
+    output: &mut BlockOutput,
+    future: F,
+) -> Option<F::Output> {
+    let Some(writer) = output.writer.as_mut() else {
+        return Some(future.await);
+    };
+    let period = writer.keepalive;
+    let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return Some(output),
+            _ = ticker.tick() => {
+                if !writer.ping().await {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+enum DriveError {
+    /// Boxed: `CallFailure` holds a whole error response.
+    Model(Box<CallFailure>),
+    ClientGone,
+}
+
+struct DriveResult {
+    searches: u32,
+    stop_reason: &'static str,
+}
+
+pub(super) async fn run(ctx: ModelDrivenWebSearchContext) -> websearch::WebSearchOutcome {
+    let max_searches = websearch::native_web_search_max_uses(&ctx.payload)
         .map_or(DEFAULT_MAX_SEARCHES, |uses| uses.max(1) as u32)
         .min(MAX_SEARCHES_CEILING);
-    // Each search costs one MCP send and one more model call.
+    // Each search costs one MCP send and one more model call, plus one answer-only retry.
     ctx.inference_attempt_budget.raise_max_attempts(
         ctx.inference_attempt_budget
             .max_attempts()
-            .saturating_add(max_searches.saturating_mul(2)),
+            .saturating_add(max_searches.saturating_mul(2))
+            .saturating_add(1),
     );
 
-    let mut request = internal_request(ctx.payload);
-    if websearch::is_claude_code_search_request(ctx.payload) {
+    let mut request = internal_request(&ctx.payload);
+    if websearch::is_claude_code_search_request(&ctx.payload) {
         // The Claude Code WebSearch sub-request always expects a search.
         request.tool_choice = Some(json!({"type": "tool", "name": SEARCH_TOOL_NAME}));
     }
 
+    // The first model call runs before anything is sent, so account selection retries and an
+    // HTTP error status stay available when it fails.
     let mut accounting = Accounting::default();
-    let mut blocks: Vec<Value> = Vec::new();
+    let first = match call_model(&ctx, &request, &mut accounting).await {
+        Ok(round) => round,
+        Err(failure) => return failure_outcome(failure),
+    };
+
+    if !ctx.payload.stream {
+        let mut output = BlockOutput {
+            blocks: Vec::new(),
+            writer: None,
+        };
+        let result = match drive(
+            &ctx,
+            request,
+            first,
+            &mut accounting,
+            &mut output,
+            max_searches,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(DriveError::Model(failure)) => return failure_outcome(*failure),
+            Err(DriveError::ClientGone) => unreachable!("non-streaming output has no client"),
+        };
+        let raw = websearch::raw_websearch_usage(accounting.input_tokens, accounting.output_tokens);
+        let reported = ctx.usage_mapper.as_ref().map_or(raw, |mapper| mapper(raw));
+        let response = envelope::json_response_with_id(
+            StatusCode::OK,
+            json!({
+                "id": envelope::message_id(),
+                "type": "message",
+                "role": "assistant",
+                "model": ctx.payload.model,
+                "content": output.blocks,
+                "stop_reason": result.stop_reason,
+                "stop_sequence": null,
+                "usage": websearch::usage_json(reported, reported.output_tokens, Some(result.searches))
+            }),
+            &ctx.request_id,
+            None,
+        );
+        log_completion(&ctx, &accounting, result.searches);
+        return websearch::WebSearchOutcome::Success {
+            response,
+            raw_input_tokens: accounting.input_tokens,
+            output_tokens: accounting.output_tokens,
+            reported_usage: reported,
+            attribution: accounting.attribution(&ctx.provider),
+            web_search_requests: result.searches,
+        };
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+    let completion: websearch::WebSearchStreamCompletionSlot = Arc::new(Mutex::new(None));
+    let attribution = accounting.attribution(&ctx.provider);
+    let request_id = ctx.request_id.clone();
+    let keepalive = Duration::from_secs(normalize_stream_keepalive_interval_secs(
+        ctx.runtime_config.stream_keepalive_interval_secs,
+    ));
+    tokio::spawn(stream_loop(
+        ctx,
+        request,
+        first,
+        accounting,
+        StreamWriter {
+            tx,
+            next_index: 0,
+            keepalive,
+        },
+        completion.clone(),
+        max_searches,
+    ));
+    let body = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), rx))
+    });
+    websearch::WebSearchOutcome::StreamingSuccess {
+        response: envelope::sse_builder_with_id(&request_id)
+            .body(Body::from_stream(body))
+            .unwrap(),
+        completion,
+        attribution,
+    }
+}
+
+fn failure_outcome(failure: CallFailure) -> websearch::WebSearchOutcome {
+    websearch::WebSearchOutcome::Failure {
+        response: failure.response,
+        error_type: failure.error_type,
+        internal_reason: failure.internal_reason,
+        attribution: failure.attribution,
+        tool_error: None,
+    }
+}
+
+fn log_completion(ctx: &ModelDrivenWebSearchContext, accounting: &Accounting, searches: u32) {
+    tracing::info!(
+        request_id = %ctx.request_id,
+        searches,
+        stream = ctx.payload.stream,
+        input_tokens = accounting.input_tokens,
+        output_tokens = accounting.output_tokens,
+        "model-driven WebSearch completed"
+    );
+}
+
+/// The streaming half: `message_start` goes out at once, then every block as soon as it is
+/// complete, with `ping` keepalives while searches and model calls run.
+async fn stream_loop(
+    ctx: ModelDrivenWebSearchContext,
+    request: MessagesRequest,
+    first: RoundOutput,
+    mut accounting: Accounting,
+    writer: StreamWriter,
+    completion: websearch::WebSearchStreamCompletionSlot,
+    max_searches: u32,
+) {
+    let mut output = BlockOutput {
+        blocks: Vec::new(),
+        writer: Some(writer),
+    };
+    // The final usage is only known when the loop ends; message_start carries the first call's
+    // input and no cache fields, and the final usage in message_delta replaces it.
+    let start_usage = websearch::raw_websearch_usage(accounting.input_tokens, 0);
+    let start = message_start_event(&ctx.payload.model, start_usage);
+    if !output
+        .writer
+        .as_mut()
+        .expect("streaming writer")
+        .send(start)
+        .await
+    {
+        return;
+    }
+    let result = drive(
+        &ctx,
+        request,
+        first,
+        &mut accounting,
+        &mut output,
+        max_searches,
+    )
+    .await;
+    let raw = websearch::raw_websearch_usage(accounting.input_tokens, accounting.output_tokens);
+    let writer = output.writer.as_mut().expect("streaming writer");
+    match result {
+        Ok(result) => {
+            let reported = ctx.usage_mapper.as_ref().map_or(raw, |mapper| mapper(raw));
+            *completion.lock() = Some(websearch::WebSearchStreamCompletion {
+                raw_input_tokens: accounting.input_tokens,
+                output_tokens: accounting.output_tokens,
+                reported_usage: reported,
+                attribution: accounting.attribution(&ctx.provider),
+                web_search_requests: result.searches,
+                stop_reason: result.stop_reason,
+                failure: None,
+            });
+            log_completion(&ctx, &accounting, result.searches);
+            for event in final_events(result.stop_reason, reported, result.searches) {
+                if !writer.send(event).await {
+                    return;
+                }
+            }
+        }
+        Err(DriveError::ClientGone) => {}
+        Err(DriveError::Model(failure)) => {
+            // Headers are already sent, so the failure ends the stream with an error event,
+            // the shape the official API uses for mid-stream errors.
+            *completion.lock() = Some(websearch::WebSearchStreamCompletion {
+                raw_input_tokens: accounting.input_tokens,
+                output_tokens: accounting.output_tokens,
+                reported_usage: raw,
+                attribution: failure.attribution,
+                web_search_requests: 0,
+                stop_reason: "error",
+                failure: Some((failure.error_type, failure.internal_reason)),
+            });
+            let message = match failure.error_type {
+                "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+                "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
+                _ => envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            };
+            let event = SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": failure.error_type,
+                        "message": envelope::public_message_with_error_id(message, &ctx.error_id)
+                    }
+                }),
+            );
+            let _ = writer.send(event).await;
+        }
+    }
+}
+
+/// The search loop shared by both response modes. The first round is already done.
+async fn drive(
+    ctx: &ModelDrivenWebSearchContext,
+    mut request: MessagesRequest,
+    first: RoundOutput,
+    accounting: &mut Accounting,
+    output: &mut BlockOutput,
+    max_searches: u32,
+) -> Result<DriveResult, DriveError> {
     let mut sources: Vec<Source> = Vec::new();
     let mut searches = 0_u32;
     let mut final_text = String::new();
     let mut client_tool_calls: Vec<(String, Value)> = Vec::new();
+    let mut pending = Some(first);
+    let mut rounds = 0_u32;
 
-    for _ in 0..=max_searches {
-        let round = match call_model(&ctx, &request, &mut accounting).await {
-            Ok(round) => round,
-            Err(failure) => {
-                return websearch::WebSearchOutcome::Failure {
-                    response: failure.response,
-                    error_type: failure.error_type,
-                    internal_reason: "websearch_model_call_failed",
-                    attribution: failure.attribution,
-                    tool_error: None,
-                };
-            }
+    loop {
+        let round = match pending.take() {
+            Some(round) => round,
+            None => with_keepalive(output, call_model(ctx, &request, accounting))
+                .await
+                .ok_or(DriveError::ClientGone)?
+                .map_err(|failure| DriveError::Model(Box::new(failure)))?,
         };
+        rounds += 1;
         let searches_allowed = request
             .tool_choice
             .as_ref()
@@ -152,24 +469,28 @@ pub(super) async fn run(ctx: ModelDrivenWebSearchContext<'_>) -> websearch::WebS
             break;
         }
 
-        let preamble = round.text.trim();
-        if !preamble.is_empty() {
-            blocks.push(json!({"type": "text", "text": preamble}));
-        }
         let mut assistant_content = Vec::new();
+        let preamble = clean_preamble(ctx, &round.text);
         if !preamble.is_empty() {
-            assistant_content.push(json!({"type": "text", "text": preamble}));
+            let block = json!({"type": "text", "text": preamble});
+            assistant_content.push(block.clone());
+            if !output.push(block).await {
+                return Err(DriveError::ClientGone);
+            }
         }
         let mut tool_results = Vec::new();
         for query in search_calls {
             let server_id = envelope::server_tool_use_id();
             let internal_id = envelope::tool_use_id();
-            blocks.push(json!({
+            let server_tool_use = json!({
                 "type": "server_tool_use",
                 "id": server_id,
                 "name": SEARCH_TOOL_NAME,
                 "input": {"query": query}
-            }));
+            });
+            if !output.push(server_tool_use).await {
+                return Err(DriveError::ClientGone);
+            }
             assistant_content.push(json!({
                 "type": "tool_use",
                 "id": internal_id,
@@ -183,15 +504,17 @@ pub(super) async fn run(ctx: ModelDrivenWebSearchContext<'_>) -> websearch::WebS
                 )
             } else {
                 searches += 1;
-                match websearch::execute_search(
+                let search = websearch::execute_search(
                     &ctx.provider,
-                    ctx.payload,
+                    &ctx.payload,
                     &query,
                     ctx.inference_attempt_budget.clone(),
                     ctx.attribution_sink.clone(),
-                    ctx.request_id,
-                )
-                .await
+                    &ctx.request_id,
+                );
+                match with_keepalive(output, search)
+                    .await
+                    .ok_or(DriveError::ClientGone)?
                 {
                     Ok(results) => {
                         let first = sources.len() + 1;
@@ -219,11 +542,14 @@ pub(super) async fn run(ctx: ModelDrivenWebSearchContext<'_>) -> websearch::WebS
                     ),
                 }
             };
-            blocks.push(json!({
+            let result_block = json!({
                 "type": "web_search_tool_result",
                 "tool_use_id": server_id,
                 "content": result_content
-            }));
+            });
+            if !output.push(result_block).await {
+                return Err(DriveError::ClientGone);
+            }
             tool_results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": internal_id,
@@ -238,6 +564,9 @@ pub(super) async fn run(ctx: ModelDrivenWebSearchContext<'_>) -> websearch::WebS
             role: "user".to_string(),
             content: Value::Array(tool_results),
         });
+        if rounds > max_searches {
+            break;
+        }
         // Later rounds may search again unless the budget is spent; then the model must answer.
         request.tool_choice = Some(if searches >= max_searches {
             json!({"type": "none"})
@@ -246,71 +575,75 @@ pub(super) async fn run(ctx: ModelDrivenWebSearchContext<'_>) -> websearch::WebS
         });
     }
 
+    // An answer with no text (the model kept calling tools after the limit, or returned
+    // nothing) gets one answer-only retry; an empty text block is never sent, since the
+    // official API rejects it when the history is sent back.
+    if final_text.trim().is_empty() && client_tool_calls.is_empty() {
+        request.tool_choice = Some(json!({"type": "none"}));
+        let retry = with_keepalive(output, call_model(ctx, &request, accounting))
+            .await
+            .ok_or(DriveError::ClientGone)?
+            .map_err(|failure| DriveError::Model(Box::new(failure)))?;
+        final_text = retry.text;
+    }
+
     let mut answer = cited_text_blocks(&final_text, &sources);
-    if !super::super::control_block_cleaner::request_mentions_control_tags(ctx.payload) {
-        super::super::control_block_cleaner::strip_control_blocks_in_content(&mut answer);
+    clean_text_blocks(ctx, &mut answer);
+    for block in answer {
+        if !output.push(block).await {
+            return Err(DriveError::ClientGone);
+        }
     }
-    if ctx.identity_output_guard {
-        super::super::identity_guard::scrub_content(&mut answer, IDENTITY_GUARD_FALLBACK);
-    }
-    blocks.extend(answer);
     let stop_reason = if client_tool_calls.is_empty() {
         "end_turn"
     } else {
         for (name, input) in client_tool_calls {
-            blocks.push(json!({
+            let block = json!({
                 "type": "tool_use",
                 "id": envelope::tool_use_id(),
                 "name": name,
                 "input": input
-            }));
+            });
+            if !output.push(block).await {
+                return Err(DriveError::ClientGone);
+            }
         }
         "tool_use"
     };
-
-    let raw = websearch::raw_websearch_usage(accounting.input_tokens, accounting.output_tokens);
-    let reported = ctx.usage_mapper.map_or(raw, |mapper| mapper(raw));
-    let response = if ctx.payload.stream {
-        let events = stream_events(&ctx.payload.model, &blocks, stop_reason, reported, searches);
-        envelope::sse_builder_with_id(ctx.request_id)
-            .body(Body::from_stream(futures::stream::iter(
-                events.into_iter().map(|event| {
-                    Ok::<_, std::convert::Infallible>(Bytes::from(event.to_sse_string()))
-                }),
-            )))
-            .unwrap()
-    } else {
-        envelope::json_response_with_id(
-            StatusCode::OK,
-            json!({
-                "id": envelope::message_id(),
-                "type": "message",
-                "role": "assistant",
-                "model": ctx.payload.model,
-                "content": blocks,
-                "stop_reason": stop_reason,
-                "stop_sequence": null,
-                "usage": websearch::usage_json(reported, reported.output_tokens, Some(searches))
-            }),
-            ctx.request_id,
-            None,
-        )
-    };
-    tracing::info!(
-        request_id = ctx.request_id,
+    Ok(DriveResult {
         searches,
-        sources = sources.len(),
-        input_tokens = accounting.input_tokens,
-        output_tokens = accounting.output_tokens,
-        "model-driven WebSearch completed"
-    );
-    websearch::WebSearchOutcome::Success {
-        response,
-        raw_input_tokens: accounting.input_tokens,
-        output_tokens: accounting.output_tokens,
-        reported_usage: reported,
-        attribution: accounting.attribution(&ctx.provider),
+        stop_reason,
+    })
+}
+
+/// Text written before a search call, without echoed control prompts or identity leaks.
+fn clean_preamble(ctx: &ModelDrivenWebSearchContext, text: &str) -> String {
+    let mut text = text.to_string();
+    if !super::super::control_block_cleaner::request_mentions_control_tags(&ctx.payload) {
+        text = super::super::control_block_cleaner::strip_control_blocks(&text).into_owned();
     }
+    if ctx.identity_output_guard
+        && let Some(cleaned) = super::super::identity_guard::scrub_text(&text)
+    {
+        text = cleaned;
+    }
+    text.trim().to_string()
+}
+
+/// Removes echoed control prompts and identity leaks, then drops text blocks left empty.
+fn clean_text_blocks(ctx: &ModelDrivenWebSearchContext, blocks: &mut Vec<Value>) {
+    if !super::super::control_block_cleaner::request_mentions_control_tags(&ctx.payload) {
+        super::super::control_block_cleaner::strip_control_blocks_in_content(blocks);
+    }
+    if ctx.identity_output_guard {
+        super::super::identity_guard::scrub_content(blocks, IDENTITY_GUARD_FALLBACK);
+    }
+    blocks.retain(|block| {
+        block["type"] != "text"
+            || block["text"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty())
+    });
 }
 
 /// The request sent to the model: the native tool becomes an ordinary `web_search` tool, the
@@ -356,7 +689,7 @@ fn internal_request(payload: &MessagesRequest) -> MessagesRequest {
 
 #[allow(clippy::result_large_err)]
 async fn call_model(
-    ctx: &ModelDrivenWebSearchContext<'_>,
+    ctx: &ModelDrivenWebSearchContext,
     request: &MessagesRequest,
     accounting: &mut Accounting,
 ) -> Result<RoundOutput, CallFailure> {
@@ -371,16 +704,17 @@ async fn call_model(
         })
         .unwrap_or(KiroReasoningCapabilityState::Unknown);
     let prepared = local_body_pipeline::prepare(
-        ctx.endpoint,
+        &ctx.endpoint,
         request,
-        ctx.runtime_config,
+        &ctx.runtime_config,
         &ctx.cache_route,
-        ctx.model_resolution,
+        &ctx.model_resolution,
         native_reasoning_capability,
     )
     .map_err(|error| CallFailure {
         response: error.response,
         error_type: "invalid_request_error",
+        internal_reason: "websearch_model_request_invalid",
         attribution: accounting.attribution(&ctx.provider),
     })?;
     let upstream_model = ctx
@@ -392,7 +726,7 @@ async fn call_model(
         &ctx.provider,
         &prepared.request_body,
         Some(&prepared.kiro_request),
-        Some(ctx.request_id),
+        Some(ctx.request_id.as_str()),
         None,
         capacity_weight_units_for_local_request(ctx.provider.as_ref(), prepared.input_tokens),
         Some(upstream_model),
@@ -405,14 +739,15 @@ async fn call_model(
             merge_credential_attempts(std::mem::take(&mut accounting.attempts), attempts);
         let status_response = map_provider_error(
             error,
-            Some(ctx.request_id),
-            Some(ctx.error_id),
+            Some(ctx.request_id.as_str()),
+            Some(ctx.error_id.as_str()),
             Some(ctx.provider.as_ref()),
             None,
         );
         CallFailure {
             error_type: error_type_for_status(status_response.status()),
             response: status_response,
+            internal_reason: "websearch_model_call_failed",
             attribution: accounting.attribution(&ctx.provider),
         }
     })?;
@@ -430,20 +765,15 @@ async fn call_model(
     let runtime = ctx.provider.runtime_config();
     let processing_failure = |detail: String| {
         tracing::warn!(
-            request_id = ctx.request_id,
+            request_id = %ctx.request_id,
             detail,
             "model-driven WebSearch model call failed"
         );
-        CallFailure {
-            response: envelope::error_response_with_id(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-                ctx.request_id,
-            ),
-            error_type: "api_error",
-            attribution: accounting.attribution(&ctx.provider),
-        }
+        processing_failure_for(
+            ctx,
+            accounting.attribution(&ctx.provider),
+            "websearch_model_call_failed",
+        )
     };
     let body = match read_non_stream_body_with_first_output_deadline(
         response,
@@ -569,7 +899,7 @@ fn format_results(query: &str, results: &[websearch::WebSearchResult], first: us
     if results.is_empty() {
         return format!("No results found for \"{query}\".");
     }
-    let mut text = format!("Search results for \"{query}\":\n");
+    let mut text = format!("Search results for \"{query}\" ({CITATION_HINT}):\n");
     for (offset, result) in results.iter().enumerate() {
         text.push_str(&format!(
             "\n[{}] {}\nURL: {}\n",
@@ -595,7 +925,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
 }
 
-fn citation(source: &Source, number: usize) -> Value {
+fn citation(source: &Source, number: usize, cited_span: &str) -> Value {
     json!({
         "type": "web_search_result_location",
         "url": source.url,
@@ -603,17 +933,120 @@ fn citation(source: &Source, number: usize) -> Value {
         // Proxy-issued opaque index (the official value is Anthropic-encrypted).
         "encrypted_index": BASE64_STANDARD.encode(format!("{number}:{}", source.url)),
         // At most 150 characters, like the official field.
-        "cited_text": source.snippet.trim().chars().take(CITED_TEXT_MAX_CHARS).collect::<String>()
+        "cited_text": cited_text(&source.snippet, cited_span)
     })
 }
 
-/// Splits the answer at `[n]` markers into text blocks: a span that ends with markers carries
-/// the cited sources; markers are removed from the text. Unknown numbers are dropped.
+/// The snippet sentence that overlaps most with the cited span (at most 150 characters);
+/// the start of the snippet when nothing overlaps.
+fn cited_text(snippet: &str, cited_span: &str) -> String {
+    let snippet = snippet.trim();
+    let span_tokens = overlap_tokens(cited_span);
+    let best = split_sentences(snippet)
+        .into_iter()
+        .map(|sentence| {
+            let tokens = overlap_tokens(sentence);
+            (span_tokens.intersection(&tokens).count(), sentence)
+        })
+        .filter(|(shared, _)| *shared > 0)
+        .max_by_key(|(shared, _)| *shared)
+        .map_or(snippet, |(_, sentence)| sentence);
+    best.trim().chars().take(CITED_TEXT_MAX_CHARS).collect()
+}
+
+fn split_sentences(text: &str) -> Vec<&str> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        // ASCII punctuation ends a sentence only before whitespace or the end, so "1.90" and
+        // "e.g." inside a sentence do not split it; CJK punctuation always ends one.
+        let ascii_end = matches!(ch, '.' | '!' | '?')
+            && chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        if ascii_end || matches!(ch, '。' | '！' | '？' | '\n') {
+            let end = index + ch.len_utf8();
+            if !text[start..end].trim().is_empty() {
+                sentences.push(&text[start..end]);
+            }
+            start = end;
+        }
+    }
+    if !text[start..].trim().is_empty() {
+        sentences.push(&text[start..]);
+    }
+    sentences
+}
+
+/// Tokens for overlap matching: lowercase words of 3+ characters, and character bigrams for
+/// CJK text (which has no spaces).
+fn overlap_tokens(text: &str) -> std::collections::HashSet<String> {
+    let mut tokens = std::collections::HashSet::new();
+    let mut word = String::new();
+    let mut previous_cjk: Option<char> = None;
+    let flush = |word: &mut String, tokens: &mut std::collections::HashSet<String>| {
+        if word.chars().count() >= 3 {
+            tokens.insert(std::mem::take(word));
+        } else {
+            word.clear();
+        }
+    };
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            flush(&mut word, &mut tokens);
+            if let Some(previous) = previous_cjk {
+                tokens.insert(format!("{previous}{ch}"));
+            }
+            previous_cjk = Some(ch);
+        } else if ch.is_alphanumeric() {
+            previous_cjk = None;
+            word.extend(ch.to_lowercase());
+        } else {
+            previous_cjk = None;
+            flush(&mut word, &mut tokens);
+        }
+    }
+    flush(&mut word, &mut tokens);
+    tokens
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32, 0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7af)
+}
+
+/// Citation markers the model writes: `[1]`, `[1][2]`, `[1, 2]`, `[1-3]`, `[^1]`, `【1】`, `［1］`.
+static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?:\s*(?:\[\^?|【|［)\d{1,3}(?:\s*[,，、\-–~]\s*\^?\d{1,3})*(?:\]|】|］))+")
+        .unwrap()
+});
+
+/// Numbers in one marker run, ranges expanded, unknown numbers dropped, in first-seen order.
+fn marker_numbers(marker: &str, sources: usize) -> Vec<usize> {
+    static ITEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(\d{1,3})(?:\s*[\-–~]\s*\^?(\d{1,3}))?").unwrap()
+    });
+    let mut numbers = Vec::new();
+    for item in ITEM.captures_iter(marker) {
+        let Some(start) = item[1].parse::<usize>().ok() else {
+            continue;
+        };
+        let end = item
+            .get(2)
+            .and_then(|end| end.as_str().parse::<usize>().ok())
+            .filter(|end| *end >= start && *end - start < 20)
+            .unwrap_or(start);
+        for number in start..=end {
+            if (1..=sources).contains(&number) && !numbers.contains(&number) {
+                numbers.push(number);
+            }
+        }
+    }
+    numbers
+}
+
+/// Splits the answer at citation markers into text blocks: a span that ends with markers carries
+/// the cited sources; markers are removed from the text. Unknown numbers are dropped. When the
+/// model wrote no usable marker, paragraphs that clearly reuse a result's wording are cited.
 fn cited_text_blocks(text: &str, sources: &[Source]) -> Vec<Value> {
-    static MARKER: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?:\s*\[\d{1,3}\])+").unwrap());
-    static NUMBER: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"\d{1,3}").unwrap());
     const TRAILING_PUNCTUATION: &[char] = &[
         '.', ',', ';', ':', '!', '?', '。', '，', '；', '：', '！', '？', '、',
     ];
@@ -622,16 +1055,7 @@ fn cited_text_blocks(text: &str, sources: &[Source]) -> Vec<Value> {
     let mut blocks = Vec::new();
     let mut cursor = 0;
     for found in MARKER.find_iter(text) {
-        let numbers: Vec<usize> = NUMBER
-            .find_iter(found.as_str())
-            .filter_map(|n| n.as_str().parse::<usize>().ok())
-            .filter(|n| (1..=sources.len()).contains(n))
-            .fold(Vec::new(), |mut acc, n| {
-                if !acc.contains(&n) {
-                    acc.push(n);
-                }
-                acc
-            });
+        let numbers = marker_numbers(found.as_str(), sources.len());
         let mut span_end = found.start();
         let mut next = found.end();
         // "sentence [1]." keeps the period with the cited sentence.
@@ -655,14 +1079,7 @@ fn cited_text_blocks(text: &str, sources: &[Source]) -> Vec<Value> {
         if numbers.is_empty() {
             push_plain(&mut blocks, &span);
         } else {
-            blocks.push(json!({
-                "type": "text",
-                "text": span,
-                "citations": numbers
-                    .iter()
-                    .map(|n| citation(&sources[n - 1], *n))
-                    .collect::<Vec<_>>()
-            }));
+            blocks.push(cited_block(&span, &numbers, sources));
         }
     }
     if cursor < text.len() {
@@ -671,7 +1088,53 @@ fn cited_text_blocks(text: &str, sources: &[Source]) -> Vec<Value> {
     if blocks.is_empty() {
         blocks.push(json!({"type": "text", "text": text}));
     }
+    if !sources.is_empty() && !blocks.iter().any(|block| block.get("citations").is_some()) {
+        return overlap_cited_blocks(text, sources).unwrap_or(blocks);
+    }
     blocks
+}
+
+fn cited_block(span: &str, numbers: &[usize], sources: &[Source]) -> Value {
+    json!({
+        "type": "text",
+        "text": span,
+        "citations": numbers
+            .iter()
+            .map(|n| citation(&sources[n - 1], *n, span))
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Fallback for an answer without markers: each paragraph is cited with the result whose
+/// title and snippet share the most wording with it, when the overlap is clear. `None` when
+/// no paragraph qualifies.
+fn overlap_cited_blocks(text: &str, sources: &[Source]) -> Option<Vec<Value>> {
+    const MIN_SHARED: usize = 3;
+    const MIN_RATIO: f64 = 0.25;
+    let source_tokens: Vec<_> = sources
+        .iter()
+        .map(|source| overlap_tokens(&format!("{} {}", source.title, source.snippet)))
+        .collect();
+    let mut blocks = Vec::new();
+    let mut cited_any = false;
+    for paragraph in text.split_inclusive("\n\n") {
+        let tokens = overlap_tokens(paragraph);
+        let best = source_tokens
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (tokens.intersection(candidate).count(), index))
+            .max_by_key(|(shared, index)| (*shared, std::cmp::Reverse(*index)));
+        match best {
+            Some((shared, index))
+                if shared >= MIN_SHARED && shared as f64 >= tokens.len() as f64 * MIN_RATIO =>
+            {
+                cited_any = true;
+                blocks.push(cited_block(paragraph, &[index + 1], sources));
+            }
+            _ => push_plain(&mut blocks, paragraph),
+        }
+    }
+    cited_any.then_some(blocks)
 }
 
 fn push_plain(blocks: &mut Vec<Value>, text: &str) {
@@ -689,14 +1152,8 @@ fn push_plain(blocks: &mut Vec<Value>, text: &str) {
     blocks.push(json!({"type": "text", "text": text}));
 }
 
-fn stream_events(
-    model: &str,
-    blocks: &[Value],
-    stop_reason: &str,
-    usage: crate::anthropic::cache::CacheUsage,
-    searches: u32,
-) -> Vec<SseEvent> {
-    let mut events = vec![SseEvent::new(
+fn message_start_event(model: &str, usage: crate::anthropic::cache::CacheUsage) -> SseEvent {
+    SseEvent::new(
         "message_start",
         json!({
             "type": "message_start",
@@ -711,72 +1168,94 @@ fn stream_events(
                 "usage": websearch::usage_json(usage, 0, None)
             }
         }),
-    )];
-    let delta = |index: usize, delta: Value| {
+    )
+}
+
+/// `content_block_start` / deltas / `content_block_stop` for one complete block.
+fn block_events(index: usize, block: &Value) -> Vec<SseEvent> {
+    let delta = |delta: Value| {
         SseEvent::new(
             "content_block_delta",
             json!({"type": "content_block_delta", "index": index, "delta": delta}),
         )
     };
-    for (index, block) in blocks.iter().enumerate() {
-        let kind = block["type"].as_str().unwrap_or_default();
-        let start_block = match kind {
-            "text" => json!({"type": "text", "text": ""}),
-            "server_tool_use" | "tool_use" => json!({
-                "type": kind,
-                "id": block["id"],
-                "name": block["name"],
-                "input": {}
-            }),
-            _ => block.clone(),
-        };
-        events.push(SseEvent::new(
-            "content_block_start",
-            json!({"type": "content_block_start", "index": index, "content_block": start_block}),
-        ));
-        match kind {
-            "text" => {
-                for citation in block["citations"].as_array().into_iter().flatten() {
-                    events.push(delta(
-                        index,
-                        json!({"type": "citations_delta", "citation": citation}),
-                    ));
-                }
-                let text = block["text"].as_str().unwrap_or_default();
-                let mut chars = text.chars();
-                loop {
-                    let chunk: String = chars.by_ref().take(100).collect();
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    events.push(delta(index, json!({"type": "text_delta", "text": chunk})));
-                }
-            }
-            "server_tool_use" | "tool_use" => {
+    let kind = block["type"].as_str().unwrap_or_default();
+    let start_block = match kind {
+        "text" => json!({"type": "text", "text": ""}),
+        "server_tool_use" | "tool_use" => json!({
+            "type": kind,
+            "id": block["id"],
+            "name": block["name"],
+            "input": {}
+        }),
+        _ => block.clone(),
+    };
+    let mut events = vec![SseEvent::new(
+        "content_block_start",
+        json!({"type": "content_block_start", "index": index, "content_block": start_block}),
+    )];
+    match kind {
+        "text" => {
+            for citation in block["citations"].as_array().into_iter().flatten() {
                 events.push(delta(
-                    index,
-                    json!({"type": "input_json_delta", "partial_json": block["input"].to_string()}),
+                    json!({"type": "citations_delta", "citation": citation}),
                 ));
             }
-            _ => {}
+            let text = block["text"].as_str().unwrap_or_default();
+            let mut chars = text.chars();
+            loop {
+                let chunk: String = chars.by_ref().take(100).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                events.push(delta(json!({"type": "text_delta", "text": chunk})));
+            }
         }
-        events.push(SseEvent::new(
-            "content_block_stop",
-            json!({"type": "content_block_stop", "index": index}),
-        ));
+        "server_tool_use" | "tool_use" => {
+            events.push(delta(
+                json!({"type": "input_json_delta", "partial_json": block["input"].to_string()}),
+            ));
+        }
+        _ => {}
     }
     events.push(SseEvent::new(
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-            "usage": websearch::usage_json(usage, usage.output_tokens, Some(searches))
-        }),
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": index}),
     ));
-    events.push(SseEvent::new(
-        "message_stop",
-        json!({"type": "message_stop"}),
-    ));
+    events
+}
+
+fn final_events(
+    stop_reason: &str,
+    usage: crate::anthropic::cache::CacheUsage,
+    searches: u32,
+) -> Vec<SseEvent> {
+    vec![
+        SseEvent::new(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": websearch::usage_json(usage, usage.output_tokens, Some(searches))
+            }),
+        ),
+        SseEvent::new("message_stop", json!({"type": "message_stop"})),
+    ]
+}
+
+#[cfg(test)]
+fn stream_events(
+    model: &str,
+    blocks: &[Value],
+    stop_reason: &str,
+    usage: crate::anthropic::cache::CacheUsage,
+    searches: u32,
+) -> Vec<SseEvent> {
+    let mut events = vec![message_start_event(model, usage)];
+    for (index, block) in blocks.iter().enumerate() {
+        events.extend(block_events(index, block));
+    }
+    events.extend(final_events(stop_reason, usage, searches));
     events
 }
 
@@ -834,7 +1313,7 @@ mod tests {
             url: "https://example.com".to_string(),
             snippet: "字".repeat(400),
         };
-        let cited = citation(&source, 1)["cited_text"]
+        let cited = citation(&source, 1, "")["cited_text"]
             .as_str()
             .unwrap()
             .chars()
@@ -894,7 +1373,7 @@ mod tests {
         let blocks = vec![
             json!({"type": "server_tool_use", "id": "srvtoolu_01a", "name": "web_search", "input": {"query": "rust"}}),
             json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_01a", "content": []}),
-            json!({"type": "text", "text": "Rust 1.90.", "citations": [citation(&sources()[0], 1)]}),
+            json!({"type": "text", "text": "Rust 1.90.", "citations": [citation(&sources()[0], 1, "Rust 1.90.")]}),
         ];
         let events = stream_events("claude-sonnet-4-5", &blocks, "end_turn", usage, 1);
         let kinds: Vec<String> = events
@@ -930,5 +1409,63 @@ mod tests {
         let final_usage = &events[10].data["usage"];
         assert_eq!(final_usage["input_tokens"], 1200);
         assert_eq!(final_usage["server_tool_use"]["web_search_requests"], 1);
+    }
+
+    #[test]
+    fn marker_variants_are_parsed_and_removed() {
+        let cases = [
+            ("Rust 1.90 shipped【1】。", vec![1]),
+            ("Rust 1.90 shipped [1, 2].", vec![1, 2]),
+            ("Rust 1.90 shipped [1-2].", vec![1, 2]),
+            ("Rust 1.90 shipped[^1].", vec![1]),
+            ("Rust 1.90 shipped［2］.", vec![2]),
+        ];
+        for (text, expected) in cases {
+            let blocks = cited_text_blocks(text, &sources());
+            let urls: Vec<String> = blocks[0]["citations"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{text}: no citations"))
+                .iter()
+                .map(|c| c["url"].as_str().unwrap().to_string())
+                .collect();
+            let all = sources();
+            let want: Vec<String> = expected.iter().map(|n| all[n - 1].url.clone()).collect();
+            assert_eq!(urls, want, "{text}");
+            let joined: String = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
+            assert!(!joined.contains(['[', '【', '［']), "{text}: {joined}");
+        }
+    }
+
+    #[test]
+    fn answer_without_markers_is_cited_by_wording_overlap() {
+        let blocks = cited_text_blocks(
+            "Rust 1.90 was released on September 18 with new lints.\n\nThanks for asking.",
+            &sources(),
+        );
+        assert_eq!(
+            blocks[0]["citations"][0]["url"],
+            "https://blog.rust-lang.org/1.90"
+        );
+        assert!(blocks.last().unwrap().get("citations").is_none());
+    }
+
+    #[test]
+    fn unrelated_answer_without_markers_gets_no_citations() {
+        let blocks = cited_text_blocks("The weather is nice today.", &sources());
+        assert!(blocks.iter().all(|b| b.get("citations").is_none()));
+    }
+
+    #[test]
+    fn cited_text_picks_the_most_relevant_snippet_sentence() {
+        let source = Source {
+            title: "t".to_string(),
+            url: "https://example.com".to_string(),
+            snippet: "Intro about the site. Rust 1.90 was released on September 18. Other news."
+                .to_string(),
+        };
+        assert_eq!(
+            cited_text(&source.snippet, "Rust 1.90 was released in September"),
+            "Rust 1.90 was released on September 18."
+        );
     }
 }

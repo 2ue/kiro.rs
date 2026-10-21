@@ -1321,6 +1321,8 @@ impl ExternalLatencyTraceState {
             filtered_trivial_text_chars: None,
             tool_choice_violation: None,
             dropped_tool_uses: None,
+            websearch_mode: None,
+            web_search_requests: None,
         };
         (!trace.is_empty()).then_some(trace)
     }
