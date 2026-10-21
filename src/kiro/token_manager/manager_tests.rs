@@ -5198,6 +5198,7 @@ fn runtime_patch_quarantine_is_field_semantic_for_five_rounds() {
             assert!(
                 !PendingCredentialRuntimeMutation::Patch {
                     operation_id: uuid::Uuid::new_v4(),
+                    dispatch_neutral: false,
                     patch,
                 }
                 .requires_dispatch_quarantine(),
@@ -5234,6 +5235,7 @@ fn runtime_patch_quarantine_is_field_semantic_for_five_rounds() {
             assert!(
                 PendingCredentialRuntimeMutation::Patch {
                     operation_id: uuid::Uuid::new_v4(),
+                    dispatch_neutral: false,
                     patch,
                 }
                 .requires_dispatch_quarantine(),
@@ -5271,6 +5273,7 @@ fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five
                 },
                 _ => PendingCredentialRuntimeMutation::Patch {
                     operation_id: uuid::Uuid::new_v4(),
+                    dispatch_neutral: false,
                     patch: CredentialRuntimeStatePatch {
                         refresh_failure_count: Some(0),
                         expected_generation: Some(0),
@@ -5318,6 +5321,7 @@ fn non_terminal_runtime_persistence_backlog_does_not_false_disable_pool_for_five
             2,
             PendingCredentialRuntimeMutation::Patch {
                 operation_id: uuid::Uuid::new_v4(),
+                dispatch_neutral: false,
                 patch: CredentialRuntimeStatePatch {
                     disabled_reason: CredentialRuntimeDisabledReasonPatch::Set(
                         DisabledReason::Manual.as_str().to_string(),
@@ -14147,4 +14151,60 @@ async fn fast_sticky_session_stays_when_fast_tier_is_full() {
     );
     stay.release_in_flight();
     occupying.release_in_flight();
+
+#[test]
+fn dispatch_neutral_admin_patch_does_not_quarantine_enabled_account_for_five_rounds() {
+    for round in 1..=5_u64 {
+        let credentials = (0..2)
+            .map(|idx| api_key_credential(&format!("ksk_neutral_patch_{round}_{idx}")))
+            .collect::<Vec<_>>();
+        let manager =
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+        let enable = CredentialRuntimeStatePatch {
+            failure_count: Some(0),
+            refresh_failure_count: Some(0),
+            disabled_reason: CredentialRuntimeDisabledReasonPatch::Clear,
+            credential_disabled: Some(false),
+            advance_generation: true,
+            ..Default::default()
+        };
+
+        // Account 1 is already enabled while its earlier results are still queued: an "enable"
+        // patch changes nothing it dispatches on and must keep it schedulable.
+        assert!(manager.enqueue_pending_runtime_mutation(
+            1,
+            PendingCredentialRuntimeMutation::Success {
+                operation_id: uuid::Uuid::new_v4(),
+                expected_generation: 0,
+                success_count: 1,
+            },
+        ));
+        manager
+            .enqueue_admin_runtime_patch_for_recovery(1, uuid::Uuid::new_v4(), enable.clone())
+            .unwrap();
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|entry| entry.id == 1).unwrap();
+            assert!(entry.runtime_persistence_degraded, "round {round}");
+            assert!(!entry.runtime_persistence_quarantined, "round {round}");
+            assert!(!entry.disabled, "round {round}");
+        }
+
+        // Account 2 is really disabled: re-enabling it changes dispatch state, so it stays out
+        // of scheduling until PgSQL confirms the change.
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|entry| entry.id == 2).unwrap();
+            entry.credentials.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::Manual);
+            MultiTokenManager::recompute_entry_disabled(entry);
+        }
+        manager
+            .enqueue_admin_runtime_patch_for_recovery(2, uuid::Uuid::new_v4(), enable)
+            .unwrap();
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 2).unwrap();
+        assert!(entry.runtime_persistence_quarantined, "round {round}");
+        assert!(entry.disabled, "round {round}");
+    }
 }

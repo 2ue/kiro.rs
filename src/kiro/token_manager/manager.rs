@@ -1649,6 +1649,10 @@ enum PendingCredentialRuntimeMutation {
     Patch {
         operation_id: uuid::Uuid,
         patch: CredentialRuntimeStatePatch,
+        /// The patch leaves every dispatch-relevant field equal to the account's local state
+        /// when it was queued (e.g. "enable" on an account that is already enabled). It still
+        /// has to reach PgSQL, but it must not pull the account out of scheduling meanwhile.
+        dispatch_neutral: bool,
     },
 }
 
@@ -1908,6 +1912,10 @@ impl PendingCredentialRuntimeMutation {
     fn requires_dispatch_quarantine(&self) -> bool {
         match self {
             Self::Disable { .. } => true,
+            Self::Patch {
+                dispatch_neutral: true,
+                ..
+            } => false,
             Self::Patch { patch, .. } => {
                 // A patch that only advances the generation (per-account concurrency or RPM
                 // edits) changes no dispatch-relevant state, so it must not pull the account
@@ -9409,6 +9417,33 @@ impl MultiTokenManager {
                 .is_some_and(|entry| entry.runtime_persistence_degraded)
     }
 
+    /// Whether applying `patch` would leave the account's dispatch state unchanged.
+    fn runtime_patch_is_dispatch_neutral(
+        entry: &CredentialEntry,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> bool {
+        let reason_unchanged = match &patch.disabled_reason {
+            CredentialRuntimeDisabledReasonPatch::Preserve => true,
+            CredentialRuntimeDisabledReasonPatch::Clear => entry.disabled_reason.is_none(),
+            CredentialRuntimeDisabledReasonPatch::Set(reason) => {
+                entry.disabled_reason == DisabledReason::from_str(reason)
+            }
+        };
+        reason_unchanged
+            && patch
+                .credential_disabled
+                .is_none_or(|disabled| disabled == entry.credentials.disabled)
+            && patch
+                .failure_count
+                .is_none_or(|count| count == entry.failure_count)
+            && patch
+                .refresh_failure_count
+                .is_none_or(|count| count == entry.refresh_failure_count)
+            && patch
+                .warmup_remaining
+                .is_none_or(|remaining| remaining == entry.warmup_remaining)
+    }
+
     fn apply_runtime_patch_to_entry(
         entry: &mut CredentialEntry,
         patch: &CredentialRuntimeStatePatch,
@@ -9453,6 +9488,18 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    fn runtime_patch_is_dispatch_neutral_for(
+        &self,
+        id: u64,
+        patch: &CredentialRuntimeStatePatch,
+    ) -> bool {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| Self::runtime_patch_is_dispatch_neutral(entry, patch))
+    }
+
     fn enqueue_admin_runtime_patch_for_recovery(
         &self,
         id: u64,
@@ -9462,6 +9509,7 @@ impl MultiTokenManager {
         let mutation = PendingCredentialRuntimeMutation::Patch {
             operation_id,
             patch: patch.clone(),
+            dispatch_neutral: self.runtime_patch_is_dispatch_neutral_for(id, &patch),
         };
         if !self.enqueue_pending_runtime_mutation(id, mutation) {
             anyhow::bail!("凭据不存在: {}", id);
@@ -9622,6 +9670,7 @@ impl MultiTokenManager {
             PendingCredentialRuntimeMutation::Patch {
                 operation_id,
                 patch,
+                ..
             } => store
                 .patch_credential_runtime_state(id, operation_id, &patch)
                 .await
@@ -10409,6 +10458,7 @@ impl MultiTokenManager {
         let mutation = PendingCredentialRuntimeMutation::Patch {
             operation_id,
             patch: patch.clone(),
+            dispatch_neutral: self.runtime_patch_is_dispatch_neutral_for(id, &patch),
         };
         if self.has_pending_runtime_mutations(id)
             || self
