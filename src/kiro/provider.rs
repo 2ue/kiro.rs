@@ -7427,7 +7427,9 @@ mod tests {
         }
     }
 
-    /// S9：只开端点轮换（普通模式）—— 换端点生效，但不做多轮笛卡尔积。
+    /// S9：只开端点轮换（普通模式）—— 不做多轮笛卡尔积；
+    /// 换到另一个账号时，必须用该账号自己的主端点（否则 profileArn 与端点 region 不一致，
+    /// Kiro 会返回 "Improperly formed request"，现网 2026-10-21 的 429 换号全部失败）。
     #[tokio::test]
     async fn s9_region_rotation_alone_switches_endpoints_without_berserk_amplification() {
         for pool_size in [2usize, 5] {
@@ -7438,16 +7440,23 @@ mod tests {
 
             assert!(result.is_err());
             let attempts = server.state.attempts();
-            let regions: HashSet<String> = attempts.iter().map(|a| a.region.clone()).collect();
+            let mut first_region_by_account: HashMap<u64, String> = HashMap::new();
+            for attempt in &attempts {
+                first_region_by_account
+                    .entry(attempt.account)
+                    .or_insert_with(|| attempt.region.clone());
+            }
             assert!(
-                regions.len() > 1,
-                "pool={pool_size}：普通模式下开启端点轮换后应当换过端点，实际 {regions:?}"
+                first_region_by_account
+                    .values()
+                    .all(|region| region == "us-east-1"),
+                "pool={pool_size}：换号后每个账号的首次尝试必须用自己的主端点，实际 {first_region_by_account:?}"
             );
             assert!(
-                regions
+                attempts
                     .iter()
-                    .all(|region| KIRO_ROTATION_REGIONS.contains(&region.as_str())),
-                "只能落在内置的两个官方端点上，实际 {regions:?}"
+                    .all(|a| KIRO_ROTATION_REGIONS.contains(&a.region.as_str())),
+                "只能落在内置的两个官方端点上"
             );
             // 普通模式不豁免尝试预算，总量必须远小于狂暴模式的 账号×端点×轮数。
             assert!(
@@ -12246,8 +12255,8 @@ impl KiroProvider {
             // 为主端点（对齐 kiro-rs-main）。关闭轮换时为 None，退回凭据自身的
             // 解析链，行为与引入轮换之前一致。
             let credential_region = ctx.credentials.effective_api_region(&config).to_string();
-            let attempt_region_override =
-                berserk_plan.region_at(&credential_region, rotation_cursor.region_index());
+            let attempt_region_override = berserk_plan
+                .region_at(&credential_region, rotation_cursor.region_index_for(ctx.id));
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
@@ -14179,7 +14188,7 @@ impl KiroProvider {
                 {
                     // 普通模式下的 region 轮换：不改变账号故障转移语义，
                     // 只让下一次重试打到另一个上游地址。
-                    let region_index = rotation_cursor.advance_region_for_normal_retry();
+                    let region_index = rotation_cursor.advance_region_for_normal_retry(ctx.id);
                     tracing::debug!(
                         credential_id = ctx.id,
                         region_index,

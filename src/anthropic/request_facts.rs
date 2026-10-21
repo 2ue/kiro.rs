@@ -536,44 +536,79 @@ pub(crate) fn normalize_raw_reasoning_protocol_with_probe_and_limit(
     }))
 }
 
-/// Newer Claude Code clients send `output_config.effort: "none"` to mean "no explicit effort".
-/// It is not one of the effort levels, so drop the field and let the request continue as if it
-/// was omitted instead of rejecting it at the entry validator.
-pub(crate) fn normalize_raw_output_effort_with_probe(
+/// Thinking types newer Claude Code clients send that are not part of the Messages API contract
+/// this proxy enforces. Each maps to the closest supported type; unknown values still fail.
+const COMPATIBLE_THINKING_TYPE_ALIASES: &[(&str, &str)] = &[
+    // claude-cli 2.1.296: reasoning between tool calls, i.e. model-chosen thinking.
+    ("between_tools", "adaptive"),
+];
+
+/// Rewrites client reasoning controls that newer Claude Code versions send but the entry
+/// validator does not accept, so the request continues instead of failing with
+/// `invalid_reasoning_protocol`:
+/// - `output_config.effort: "none"` means "no explicit effort" and is dropped.
+/// - `thinking.type` aliases in [`COMPATIBLE_THINKING_TYPE_ALIASES`] map to a supported type.
+///
+/// Duplicate fields and duplicate keys are left untouched for the strict validator.
+pub(crate) fn normalize_raw_client_reasoning_aliases_with_probe(
     raw_body: &Bytes,
     probe: &RawMessagesBodyProbe,
 ) -> Result<Option<Bytes>, String> {
     if !probe.matches_body(raw_body) {
         return Err("raw request probe does not match the request body snapshot".to_string());
     }
-    if probe.duplicate_output_config_field {
+    let mut replacements = Vec::with_capacity(2);
+
+    if !probe.duplicate_output_config_field
+        && let Some(span) = probe.output_config_value_span.as_ref()
+        && !json_object_has_duplicate_keys(&raw_body[span.clone()])?
+        && let Some(serde_json::Value::Object(mut output_config)) =
+            parse_bounded_protocol_value(raw_body, Some(span))?
+        && output_config
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|effort| effort.trim().eq_ignore_ascii_case("none"))
+    {
+        output_config.remove("effort");
+        let encoded = serde_json::to_vec(&serde_json::Value::Object(output_config))
+            .map_err(|error| format!("failed to serialize normalized output_config: {error}"))?;
+        replacements.push((span.clone(), encoded));
+    }
+
+    if !probe.duplicate_thinking_field
+        && let Some(span) = probe.thinking_value_span.as_ref()
+        && !json_object_has_duplicate_keys(&raw_body[span.clone()])?
+        && let Some(serde_json::Value::Object(mut thinking)) =
+            parse_bounded_protocol_value(raw_body, Some(span))?
+        && let Some(target) = thinking
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|thinking_type| {
+                let thinking_type = thinking_type.trim().to_ascii_lowercase();
+                COMPATIBLE_THINKING_TYPE_ALIASES
+                    .iter()
+                    .find(|(alias, _)| *alias == thinking_type)
+                    .map(|(_, target)| *target)
+            })
+    {
+        thinking.insert("type".to_string(), serde_json::Value::from(target));
+        let encoded = serde_json::to_vec(&serde_json::Value::Object(thinking))
+            .map_err(|error| format!("failed to serialize normalized thinking: {error}"))?;
+        replacements.push((span.clone(), encoded));
+    }
+
+    if replacements.is_empty() {
         return Ok(None);
     }
-    let Some(span) = probe.output_config_value_span.as_ref() else {
-        return Ok(None);
-    };
-    if json_object_has_duplicate_keys(&raw_body[span.clone()])? {
-        return Ok(None);
-    }
-    let Some(serde_json::Value::Object(mut output_config)) =
-        parse_bounded_protocol_value(raw_body, Some(span))?
-    else {
-        return Ok(None);
-    };
-    let is_none_effort = output_config
-        .get("effort")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|effort| effort.trim().eq_ignore_ascii_case("none"));
-    if !is_none_effort {
-        return Ok(None);
-    }
-    output_config.remove("effort");
-    let encoded = serde_json::to_vec(&serde_json::Value::Object(output_config))
-        .map_err(|error| format!("failed to serialize normalized output_config: {error}"))?;
+    replacements.sort_unstable_by_key(|(span, _)| span.start);
     let mut out = Vec::with_capacity(raw_body.len());
-    out.extend_from_slice(&raw_body[..span.start]);
-    out.extend_from_slice(&encoded);
-    out.extend_from_slice(&raw_body[span.end..]);
+    let mut cursor = 0;
+    for (span, bytes) in replacements {
+        out.extend_from_slice(&raw_body[cursor..span.start]);
+        out.extend_from_slice(&bytes);
+        cursor = span.end;
+    }
+    out.extend_from_slice(&raw_body[cursor..]);
     Ok(Some(Bytes::from(out)))
 }
 
@@ -1385,7 +1420,7 @@ mod tests {
             br#"{"model":"claude-opus-4-8","max_tokens":128,"thinking":{"type":"enabled","budget_tokens":10240},"output_config":{"effort":"none"},"messages":[]}"#,
         );
         let probe = probe_raw_messages_body(&raw);
-        let rewritten = normalize_raw_output_effort_with_probe(&raw, &probe)
+        let rewritten = normalize_raw_client_reasoning_aliases_with_probe(&raw, &probe)
             .expect("normalize")
             .expect("effort none rewritten");
         let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
@@ -1405,7 +1440,7 @@ mod tests {
             br#"{"model":"m","output_config":{"effort":" None ","format":{"type":"json_schema"}},"messages":[]}"#,
         );
         let probe = probe_raw_messages_body(&raw);
-        let rewritten = normalize_raw_output_effort_with_probe(&raw, &probe)
+        let rewritten = normalize_raw_client_reasoning_aliases_with_probe(&raw, &probe)
             .expect("normalize")
             .expect("rewritten");
         let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
@@ -1420,7 +1455,7 @@ mod tests {
             let raw = Bytes::copy_from_slice(untouched);
             let probe = probe_raw_messages_body(&raw);
             assert!(
-                normalize_raw_output_effort_with_probe(&raw, &probe)
+                normalize_raw_client_reasoning_aliases_with_probe(&raw, &probe)
                     .expect("normalize")
                     .is_none()
             );
@@ -1431,6 +1466,51 @@ mod tests {
         assert!(
             validate_raw_reasoning_protocol(&bogus).is_err(),
             "unknown efforts still fail"
+        );
+    }
+
+    #[test]
+    fn thinking_type_between_tools_maps_to_adaptive() {
+        // Captured from production: claude-cli 2.1.296 (external, sdk-ts).
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5-5","max_tokens":4096,"thinking":{"type":"between_tools"},"messages":[]}"#,
+        );
+        assert!(
+            validate_raw_reasoning_protocol(&raw).is_err(),
+            "rejected before normalization"
+        );
+        let probe = probe_raw_messages_body(&raw);
+        let rewritten = normalize_raw_client_reasoning_aliases_with_probe(&raw, &probe)
+            .expect("normalize")
+            .expect("rewritten");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+        assert_eq!(value["thinking"], serde_json::json!({"type": "adaptive"}));
+        validate_raw_reasoning_protocol(&rewritten).expect("normalized request validates");
+
+        // Both aliases in one request are rewritten together.
+        let both = Bytes::from_static(
+            br#"{"model":"m","max_tokens":4096,"output_config":{"effort":"none"},"thinking":{"type":"Between_Tools"},"messages":[]}"#,
+        );
+        let probe = probe_raw_messages_body(&both);
+        let rewritten = normalize_raw_client_reasoning_aliases_with_probe(&both, &probe)
+            .expect("normalize")
+            .expect("rewritten");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+        assert_eq!(value["thinking"]["type"], "adaptive");
+        assert_eq!(value["output_config"], serde_json::json!({}));
+        validate_raw_reasoning_protocol(&rewritten).expect("normalized request validates");
+
+        let unknown =
+            Bytes::from_static(br#"{"model":"m","thinking":{"type":"auto"},"messages":[]}"#);
+        let probe = probe_raw_messages_body(&unknown);
+        assert!(
+            normalize_raw_client_reasoning_aliases_with_probe(&unknown, &probe)
+                .expect("normalize")
+                .is_none()
+        );
+        assert!(
+            validate_raw_reasoning_protocol(&unknown).is_err(),
+            "unknown types still fail"
         );
     }
 

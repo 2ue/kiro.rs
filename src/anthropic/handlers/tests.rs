@@ -15227,3 +15227,21 @@ fn model_driven_websearch_failure_after_start_ends_stream_with_error_event() {
         run_model_driven_websearch_failure_after_start_ends_stream_with_error_event().await;
     });
 }
+
+#[test]
+fn upstream_tool_use_format_rejection_is_a_non_retryable_400() {
+    // Production message shape: no "400 bad request" / "request_body_invalid" text.
+    let message = "upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=70 retry_after_secs=unknown content_type=json reason=invalid tool use format";
+    let public = provider_public_error_for_message(message, Some("req_test"), None, None);
+    assert_eq!(public.status_code, 400);
+    assert_eq!(public.error_type, "invalid_request_error");
+
+    let response = map_provider_error(
+        anyhow::anyhow!(message),
+        Some("req_test"),
+        Some("req_test"),
+        None,
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

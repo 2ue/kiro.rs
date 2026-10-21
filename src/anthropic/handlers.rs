@@ -77,8 +77,9 @@ use super::request_facts::{
 };
 use super::request_facts::{
     RawMessagesBodyProbe, deserialize_messages_request_with_probe,
-    normalize_raw_output_effort_with_probe, normalize_raw_reasoning_protocol_with_probe_and_limit,
-    probe_raw_messages_body, rewrite_raw_missing_top_level_max_tokens_with_probe,
+    normalize_raw_client_reasoning_aliases_with_probe,
+    normalize_raw_reasoning_protocol_with_probe_and_limit, probe_raw_messages_body,
+    rewrite_raw_missing_top_level_max_tokens_with_probe,
     validate_raw_reasoning_protocol_with_probe,
 };
 use super::stream::{SseEvent, StreamContext};
@@ -6165,7 +6166,12 @@ fn provider_public_error_for_message(
         return public_error;
     }
 
-    if is_upstream_improperly_formed_error(err_str) || is_upstream_bad_request_error(err_str) {
+    // A tool-use shape the upstream rejects fails the same way on every resend, so it is a
+    // non-retryable 400 for the client, not a temporary 502 that invites endless retries.
+    if is_upstream_improperly_formed_error(err_str)
+        || is_upstream_tool_use_format_error(err_str)
+        || is_upstream_bad_request_error(err_str)
+    {
         return usage_public_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -6585,7 +6591,7 @@ fn map_provider_error(
         );
     }
 
-    if is_upstream_bad_request_error(&err_str) {
+    if is_upstream_tool_use_format_error(&err_str) || is_upstream_bad_request_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
             "请求被上游以 400 拒绝（不应切换账号重试）",

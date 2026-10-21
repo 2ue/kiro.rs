@@ -955,41 +955,42 @@ pub(super) fn normalize_tool_use_input(input: serde_json::Value) -> serde_json::
     }
 }
 
+/// Longest toolUseId sent upstream. Production 2026-10-21: one 100-character
+/// `call_<hex>_fc_<hex>` id from an OpenAI-style client sat in a history where every other id
+/// was at most 64 characters, and Kiro rejected every resend with "Invalid tool use format".
+/// Longer ids are shortened deterministically, so a tool_use and its tool_result still match.
+const MAX_TOOL_USE_ID_CHARS: usize = 64;
+
 pub(super) fn sanitize_tool_use_id(id: &str) -> Option<String> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
+    let allowed = |ch: char| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+    if trimmed.len() <= MAX_TOOL_USE_ID_CHARS && trimmed.chars().all(allowed) {
         return Some(trimmed.to_string());
     }
 
     let sanitized = trimmed
         .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
+        .map(|ch| if allowed(ch) { ch } else { '_' })
         .collect::<String>();
     let sanitized = sanitized.trim_matches('_');
-    let prefix = if sanitized.is_empty() {
-        "toolu".to_string()
-    } else {
-        sanitized.to_string()
-    };
     let mut hasher = Sha256::new();
     hasher.update(trimmed.as_bytes());
     let digest = hasher.finalize();
-    Some(format!(
-        "{}_{:02x}{:02x}{:02x}{:02x}",
-        prefix, digest[0], digest[1], digest[2], digest[3]
-    ))
+    let suffix = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    );
+    // Keep a readable prefix and leave room for "_" + 8 hex chars.
+    let max_prefix = MAX_TOOL_USE_ID_CHARS - suffix.len() - 1;
+    let prefix: String = if sanitized.is_empty() {
+        "toolu".to_string()
+    } else {
+        sanitized.chars().take(max_prefix).collect()
+    };
+    Some(format!("{}_{}", prefix.trim_end_matches('_'), suffix))
 }
 
 #[cfg(test)]
@@ -1135,6 +1136,57 @@ mod tests {
         .expect_err("empty data URL image should be rejected");
 
         assert_empty_image_error(err);
+    }
+
+    #[test]
+    fn long_tool_use_ids_are_shortened_deterministically() {
+        // Captured from production: 100-character id from an OpenAI-style client.
+        let long = "call_ce6ce2f9833f4533ad4473dea889819a_fc_04b64eaef0ee9346016ad87fd852248191a6166ad01de2a30d_2349e5e8";
+        assert_eq!(long.len(), 100);
+        let short = sanitize_tool_use_id(long).expect("id");
+        assert!(short.len() <= MAX_TOOL_USE_ID_CHARS, "{short}");
+        assert!(
+            short.starts_with("call_ce6ce2f9833f4533ad4473de"),
+            "{short}"
+        );
+        assert!(
+            short
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        );
+        assert_eq!(
+            sanitize_tool_use_id(long),
+            Some(short.clone()),
+            "deterministic"
+        );
+        let other = format!("{long}x");
+        assert_ne!(
+            sanitize_tool_use_id(&other),
+            Some(short),
+            "distinct ids stay distinct"
+        );
+
+        let at_limit = "a".repeat(MAX_TOOL_USE_ID_CHARS);
+        assert_eq!(
+            sanitize_tool_use_id(&at_limit).as_deref(),
+            Some(at_limit.as_str())
+        );
+        assert_eq!(
+            sanitize_tool_use_id("toolu_01ABC").as_deref(),
+            Some("toolu_01ABC")
+        );
+    }
+
+    #[test]
+    fn long_tool_use_id_stays_paired_across_tool_use_and_tool_result() {
+        let long = "call_".to_string() + &"f".repeat(120);
+        let content = json!([{"type": "tool_result", "tool_use_id": long, "content": "ok"}]);
+        let (_, _, results) = process_message_content(&content).expect("converted");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            Some(results[0].tool_use_id.clone()),
+            sanitize_tool_use_id(&long)
+        );
     }
 
     #[test]

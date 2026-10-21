@@ -74,12 +74,12 @@ pub(super) async fn handle_messages_endpoint(
         return error.to_response(&request_id);
     }
     let mut requires_normalized_body = false;
-    match normalize_raw_output_effort_with_probe(&raw_body, &raw_probe) {
+    match normalize_raw_client_reasoning_aliases_with_probe(&raw_body, &raw_probe) {
         Ok(Some(body)) => {
             tracing::info!(
                 endpoint,
                 model = ?raw_probe.model,
-                "dropped output_config.effort \"none\" before routing"
+                "normalized client reasoning aliases (effort none / thinking type) before routing"
             );
             raw_body = body;
             raw_probe = probe_raw_messages_body(&raw_body);
@@ -88,7 +88,7 @@ pub(super) async fn handle_messages_endpoint(
         Ok(None) => {}
         Err(message) => {
             let request_id = envelope::request_id();
-            let error = EntryRequestError::invalid(message, "output_effort_normalization_failed");
+            let error = EntryRequestError::invalid(message, "reasoning_alias_normalization_failed");
             record_entry_request_error(
                 attribution.as_ref(),
                 &endpoint,

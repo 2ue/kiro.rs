@@ -167,6 +167,10 @@ pub(crate) struct RotationCursor {
     region_slots: usize,
     round: u32,
     max_rounds: u32,
+    /// Credential the normal-mode region advance was made for. A normal-mode region switch only
+    /// retries the *same* account on its other endpoint; a different account starts again from
+    /// its own primary region (see [`Self::region_index_for`]).
+    normal_region_owner: Option<u64>,
 }
 
 /// 一轮账号耗尽后的下一步动作。
@@ -187,11 +191,27 @@ impl RotationCursor {
             region_slots: plan.region_slots(),
             round: 1,
             max_rounds: plan.rounds(),
+            normal_region_owner: None,
         }
     }
 
     pub(crate) fn region_index(&self) -> usize {
         self.region_index
+    }
+
+    /// Region index to use for `credential_id` on this attempt.
+    ///
+    /// Berserk rotation advances the region for every account at once, so its index applies to
+    /// all of them. A normal-mode region advance belongs to the account that just failed: a
+    /// failover to another account must use that account's own primary region. Applying the
+    /// advanced index to it sent a us-east-1 account's profileArn to the eu-central-1 endpoint,
+    /// which Kiro rejects with "Improperly formed request" (production 2026-10-21: every 429
+    /// failover from an eu-central-1 Fast account failed this way).
+    pub(crate) fn region_index_for(&self, credential_id: u64) -> usize {
+        match self.normal_region_owner {
+            Some(owner) if owner != credential_id => 0,
+            _ => self.region_index,
+        }
     }
 
     pub(crate) fn round(&self) -> u32 {
@@ -204,9 +224,11 @@ impl RotationCursor {
     /// 与 [`Self::advance_after_accounts_exhausted`] 的区别是这里没有"轮次"概念，
     /// 也不清空账号排除集合——普通模式的账号故障转移语义保持原样，
     /// 仅仅是让连续重试打到不同的上游地址。
-    pub(crate) fn advance_region_for_normal_retry(&mut self) -> usize {
+    pub(crate) fn advance_region_for_normal_retry(&mut self, credential_id: u64) -> usize {
         if self.region_slots > 1 {
-            self.region_index = (self.region_index + 1) % self.region_slots;
+            let current = self.region_index_for(credential_id);
+            self.region_index = (current + 1) % self.region_slots;
+            self.normal_region_owner = Some(credential_id);
         }
         self.region_index
     }
@@ -216,6 +238,8 @@ impl RotationCursor {
     /// 调用方拿到 [`RotationStep::NextRegion`] / [`RotationStep::NextRound`] 后
     /// 必须清空本请求的账号排除集合，让所有账号在新 region / 新轮次重新可选。
     pub(crate) fn advance_after_accounts_exhausted(&mut self, plan: &BerserkPlan) -> RotationStep {
+        // Berserk rotation is pool-wide: the new region applies to every account.
+        self.normal_region_owner = None;
         if self.region_index + 1 < self.region_slots {
             self.region_index += 1;
             return RotationStep::NextRegion {
@@ -310,7 +334,7 @@ mod tests {
 
         let mut cursor = RotationCursor::new(&plan);
         assert_eq!(
-            cursor.advance_region_for_normal_retry(),
+            cursor.advance_region_for_normal_retry(7),
             0,
             "关闭时普通模式重试不得切换端点"
         );
@@ -366,12 +390,54 @@ mod tests {
         let plan = BerserkPlan::from_config(&config_with(false, true, 1, 0));
         let mut cursor = RotationCursor::new(&plan);
         assert_eq!(cursor.region_index(), 0, "首次请求必须使用主力端点");
-        assert_eq!(cursor.advance_region_for_normal_retry(), 1);
+        assert_eq!(cursor.advance_region_for_normal_retry(7), 1);
         assert_eq!(
-            cursor.advance_region_for_normal_retry(),
+            cursor.advance_region_for_normal_retry(7),
             0,
             "用完一圈后必须回到第一个端点继续循环"
         );
+    }
+
+    #[test]
+    fn normal_mode_region_advance_does_not_leak_to_a_failover_account() {
+        let plan = BerserkPlan::from_config(&config_with(false, true, 1, 0));
+        let mut cursor = RotationCursor::new(&plan);
+        // Account 1 fails and its retry moves to its other endpoint.
+        assert_eq!(cursor.advance_region_for_normal_retry(1), 1);
+        assert_eq!(
+            cursor.region_index_for(1),
+            1,
+            "same account retries the other endpoint"
+        );
+        assert_eq!(
+            cursor.region_index_for(2),
+            0,
+            "a failover account uses its own primary region"
+        );
+        assert_eq!(
+            plan.region_at("us-east-1", cursor.region_index_for(2)),
+            Some("us-east-1"),
+            "a us-east-1 account must not be sent to eu-central-1 with its us-east-1 profileArn"
+        );
+        // Account 2 then fails too: it advances from its own position.
+        assert_eq!(cursor.advance_region_for_normal_retry(2), 1);
+        assert_eq!(cursor.region_index_for(2), 1);
+        assert_eq!(cursor.region_index_for(1), 0);
+    }
+
+    #[test]
+    fn berserk_region_advance_applies_to_every_account() {
+        let plan = BerserkPlan::from_config(&config_with(true, true, 1, 0));
+        let mut cursor = RotationCursor::new(&plan);
+        cursor.advance_region_for_normal_retry(1);
+        assert!(matches!(
+            cursor.advance_after_accounts_exhausted(&plan),
+            RotationStep::NextRegion { region_index: 1 }
+                | RotationStep::NextRound { .. }
+                | RotationStep::Exhausted
+        ));
+        assert_eq!(cursor.region_index_for(1), cursor.region_index());
+        assert_eq!(cursor.region_index_for(2), cursor.region_index());
     }
 
     #[test]
