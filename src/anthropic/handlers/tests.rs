@@ -15245,3 +15245,33 @@ fn upstream_tool_use_format_rejection_is_a_non_retryable_400() {
     );
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[test]
+fn non_stream_error_after_partial_output_is_still_retryable() {
+    use crate::kiro::model::events::{AssistantResponseEvent, Event};
+    let events = vec![
+        Event::AssistantResponse(AssistantResponseEvent {
+            content: "partial".to_string(),
+            ..Default::default()
+        }),
+        Event::Exception {
+            exception_type: "error".to_string(),
+            message: r#"{"message":"Encountered an unexpected error when processing the request, please try again."}"#.to_string(),
+        },
+    ];
+    assert!(
+        non_stream_status_error_before_first_output(&events).is_none(),
+        "the streaming-safe check ignores errors after output"
+    );
+    let detail = non_stream_status_error_event(&events).expect("non-stream must retry it");
+    assert!(detail.contains("unexpected error"));
+
+    let length = vec![Event::Exception {
+        exception_type: "ContentLengthExceededException".to_string(),
+        message: "max".to_string(),
+    }];
+    assert!(
+        non_stream_status_error_event(&length).is_none(),
+        "max_tokens is not a failure"
+    );
+}

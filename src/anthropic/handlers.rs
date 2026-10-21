@@ -10581,6 +10581,34 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
     saw_side_channel
 }
 
+/// Error or exception event in a buffered non-stream response.
+///
+/// A non-stream response is assembled in full before anything is sent to the client, so a
+/// failure event is retryable on another credential even after the upstream produced partial
+/// output: the client has received nothing. Production 2026-10-21: four non-stream requests on
+/// Fast account #1948 got partial text followed by "Encountered an unexpected error" and were
+/// returned as 502 without trying another account.
+fn non_stream_status_error_event(events: &[Event]) -> Option<String> {
+    events.iter().find_map(|event| match event {
+        Event::Error {
+            error_code,
+            error_message,
+        } => Some(format!(
+            "upstream error event {}: {}",
+            error_code, error_message
+        )),
+        Event::Exception {
+            exception_type,
+            message,
+        } if exception_type != "ContentLengthExceededException" => Some(format!(
+            "upstream exception event {}: {}",
+            exception_type, message
+        )),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
 fn non_stream_status_error_before_first_output(events: &[Event]) -> Option<String> {
     let mut saw_output = false;
     for event in events {
@@ -12691,7 +12719,7 @@ async fn handle_non_stream_request(
 
         let pre_output_failure = match first_output_timeout {
             Some(detail) => Some((StreamRetryReason::FirstOutputTimeout, detail)),
-            None => non_stream_status_error_before_first_output(&upstream_events)
+            None => non_stream_status_error_event(&upstream_events)
                 .map(|detail| (StreamRetryReason::StatusError, detail)),
         };
         if let Some((retry_reason, detail)) = pre_output_failure {

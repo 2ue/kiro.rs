@@ -171,6 +171,9 @@ pub(crate) struct RotationCursor {
     /// retries the *same* account on its other endpoint; a different account starts again from
     /// its own primary region (see [`Self::region_index_for`]).
     normal_region_owner: Option<u64>,
+    /// Berserk mode rotates regions for the whole pool, so region advances are never scoped to
+    /// a single account there.
+    pool_wide_regions: bool,
 }
 
 /// 一轮账号耗尽后的下一步动作。
@@ -192,9 +195,11 @@ impl RotationCursor {
             round: 1,
             max_rounds: plan.rounds(),
             normal_region_owner: None,
+            pool_wide_regions: plan.active(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn region_index(&self) -> usize {
         self.region_index
     }
@@ -228,7 +233,7 @@ impl RotationCursor {
         if self.region_slots > 1 {
             let current = self.region_index_for(credential_id);
             self.region_index = (current + 1) % self.region_slots;
-            self.normal_region_owner = Some(credential_id);
+            self.normal_region_owner = (!self.pool_wide_regions).then_some(credential_id);
         }
         self.region_index
     }
