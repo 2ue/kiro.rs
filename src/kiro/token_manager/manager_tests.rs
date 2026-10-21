@@ -14151,6 +14151,7 @@ async fn fast_sticky_session_stays_when_fast_tier_is_full() {
     );
     stay.release_in_flight();
     occupying.release_in_flight();
+}
 
 #[test]
 fn dispatch_neutral_admin_patch_does_not_quarantine_enabled_account_for_five_rounds() {
