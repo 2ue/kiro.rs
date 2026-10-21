@@ -235,9 +235,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   const handleRegionChange = (value: string) => {
     setRegion(value)
-    if (value.trim() && !authRegion.trim()) {
-      setAuthRegion(value)
-    }
   }
 
   const handleKiroApiKeyChange = (value: string) => {

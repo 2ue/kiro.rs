@@ -231,10 +231,6 @@ export function CredentialParameterDefaultsPanel({
       })
       return
     }
-    if (key === 'region' && value.trim() && !defaults.authRegion.trim()) {
-      onChange({ ...defaults, region: value, authRegion: value })
-      return
-    }
     onChange({ ...defaults, [key]: value })
   }
 
