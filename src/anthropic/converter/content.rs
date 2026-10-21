@@ -64,10 +64,17 @@ pub(super) fn process_message_content(
                             if let Some(tool_use_id) =
                                 block.tool_use_id.as_deref().and_then(sanitize_tool_use_id)
                             {
-                                images.extend(extract_tool_result_images(&block.content)?);
-                                let result_content = normalize_tool_result_content(
-                                    extract_tool_result_content(&block.content),
-                                );
+                                let (result_images, omitted_images) =
+                                    extract_tool_result_images(&block.content);
+                                images.extend(result_images);
+                                let mut result_text = extract_tool_result_content(&block.content);
+                                for note in omitted_images {
+                                    if !result_text.is_empty() {
+                                        result_text.push('\n');
+                                    }
+                                    result_text.push_str(&note);
+                                }
+                                let result_content = normalize_tool_result_content(result_text);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -892,31 +899,44 @@ fn render_search_result_block(item: &serde_json::Value) -> String {
     )
 }
 
+/// Converts the images inside a tool_result.
+///
+/// An image a tool returned (a screenshot, a rendered file) stays in the conversation history, so
+/// one unusable image would make every later turn of that session fail. Unusable images are
+/// replaced by a short text note in the tool result instead; images in the user's own message
+/// still fail the request explicitly.
 fn extract_tool_result_images(
     content: &Option<serde_json::Value>,
-) -> Result<Vec<KiroImage>, ConversionError> {
+) -> (Vec<KiroImage>, Vec<String>) {
     let Some(serde_json::Value::Array(items)) = content else {
-        return Ok(Vec::new());
+        return (Vec::new(), Vec::new());
     };
 
     let mut images = Vec::new();
+    let mut omitted = Vec::new();
     for item in items {
         if item.get("type").and_then(|value| value.as_str()) != Some("image") {
             continue;
         }
-        let block = serde_json::from_value::<ContentBlock>(item.clone()).map_err(|error| {
-            ConversionError::UnsupportedContent(format!(
-                "invalid image block in tool_result: {error}"
-            ))
-        })?;
-        let source = block.source.ok_or_else(|| {
-            ConversionError::UnsupportedContent(
-                "image block in tool_result missing source".to_string(),
-            )
-        })?;
-        images.push(convert_image_source(source)?);
+        let converted = serde_json::from_value::<ContentBlock>(item.clone())
+            .map_err(|error| {
+                ConversionError::UnsupportedContent(format!("invalid image block: {error}"))
+            })
+            .and_then(|block| {
+                block.source.ok_or_else(|| {
+                    ConversionError::UnsupportedContent("image block missing source".to_string())
+                })
+            })
+            .and_then(convert_image_source);
+        match converted {
+            Ok(image) => images.push(image),
+            Err(error) => {
+                tracing::warn!(error = %error, "tool_result image could not be converted; replaced with a text note");
+                omitted.push(format!("[image omitted: {error}]"));
+            }
+        }
     }
-    Ok(images)
+    (images, omitted)
 }
 
 fn normalize_tool_result_content(content: String) -> String {
@@ -935,41 +955,42 @@ pub(super) fn normalize_tool_use_input(input: serde_json::Value) -> serde_json::
     }
 }
 
+/// Longest toolUseId sent upstream. Production 2026-10-21: one 100-character
+/// `call_<hex>_fc_<hex>` id from an OpenAI-style client sat in a history where every other id
+/// was at most 64 characters, and Kiro rejected every resend with "Invalid tool use format".
+/// Longer ids are shortened deterministically, so a tool_use and its tool_result still match.
+const MAX_TOOL_USE_ID_CHARS: usize = 64;
+
 pub(super) fn sanitize_tool_use_id(id: &str) -> Option<String> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
+    let allowed = |ch: char| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+    if trimmed.len() <= MAX_TOOL_USE_ID_CHARS && trimmed.chars().all(allowed) {
         return Some(trimmed.to_string());
     }
 
     let sanitized = trimmed
         .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
+        .map(|ch| if allowed(ch) { ch } else { '_' })
         .collect::<String>();
     let sanitized = sanitized.trim_matches('_');
-    let prefix = if sanitized.is_empty() {
-        "toolu".to_string()
-    } else {
-        sanitized.to_string()
-    };
     let mut hasher = Sha256::new();
     hasher.update(trimmed.as_bytes());
     let digest = hasher.finalize();
-    Some(format!(
-        "{}_{:02x}{:02x}{:02x}{:02x}",
-        prefix, digest[0], digest[1], digest[2], digest[3]
-    ))
+    let suffix = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    );
+    // Keep a readable prefix and leave room for "_" + 8 hex chars.
+    let max_prefix = MAX_TOOL_USE_ID_CHARS - suffix.len() - 1;
+    let prefix: String = if sanitized.is_empty() {
+        "toolu".to_string()
+    } else {
+        sanitized.chars().take(max_prefix).collect()
+    };
+    Some(format!("{}_{}", prefix.trim_end_matches('_'), suffix))
 }
 
 #[cfg(test)]
@@ -1118,27 +1139,94 @@ mod tests {
     }
 
     #[test]
-    fn empty_tool_result_image_is_rejected_with_clear_error() {
+    fn long_tool_use_ids_are_shortened_deterministically() {
+        // Captured from production: 100-character id from an OpenAI-style client.
+        let long = "call_ce6ce2f9833f4533ad4473dea889819a_fc_04b64eaef0ee9346016ad87fd852248191a6166ad01de2a30d_2349e5e8";
+        assert_eq!(long.len(), 100);
+        let short = sanitize_tool_use_id(long).expect("id");
+        assert!(short.len() <= MAX_TOOL_USE_ID_CHARS, "{short}");
+        assert!(
+            short.starts_with("call_ce6ce2f9833f4533ad4473de"),
+            "{short}"
+        );
+        assert!(
+            short
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        );
+        assert_eq!(
+            sanitize_tool_use_id(long),
+            Some(short.clone()),
+            "deterministic"
+        );
+        let other = format!("{long}x");
+        assert_ne!(
+            sanitize_tool_use_id(&other),
+            Some(short),
+            "distinct ids stay distinct"
+        );
+
+        let at_limit = "a".repeat(MAX_TOOL_USE_ID_CHARS);
+        assert_eq!(
+            sanitize_tool_use_id(&at_limit).as_deref(),
+            Some(at_limit.as_str())
+        );
+        assert_eq!(
+            sanitize_tool_use_id("toolu_01ABC").as_deref(),
+            Some("toolu_01ABC")
+        );
+    }
+
+    #[test]
+    fn long_tool_use_id_stays_paired_across_tool_use_and_tool_result() {
+        let long = "call_".to_string() + &"f".repeat(120);
+        let content = json!([{"type": "tool_result", "tool_use_id": long, "content": "ok"}]);
+        let (_, _, results) = process_message_content(&content).expect("converted");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            Some(results[0].tool_use_id.clone()),
+            sanitize_tool_use_id(&long)
+        );
+    }
+
+    #[test]
+    fn unusable_tool_result_image_becomes_a_text_note_instead_of_failing() {
+        // A bad image a tool returned stays in history; failing on it would break every later
+        // turn of the session. It is replaced by a note and the remaining content is kept.
         let content = json!([
             {
                 "type": "tool_result",
                 "tool_use_id": "toolu_123",
                 "content": [
+                    {"type": "text", "text": "screenshot taken"},
                     {
                         "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": ""
-                        }
-                    }
+                        "source": {"type": "base64", "media_type": "image/png", "data": ""}
+                    },
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/bmp", "data": "Qk0="}
+                    },
+                    {"type": "image"}
                 ]
             }
         ]);
 
-        let err = process_message_content(&content)
-            .expect_err("empty tool_result image should be rejected");
+        let (_, images, tool_results) = process_message_content(&content)
+            .expect("tool_result images must not fail the request");
+        assert!(images.is_empty());
+        assert_eq!(tool_results.len(), 1);
+        let text = serde_json::to_string(&tool_results[0]).expect("tool result json");
+        assert!(text.contains("screenshot taken"), "{text}");
+        assert_eq!(text.matches("[image omitted:").count(), 3, "{text}");
+    }
 
+    #[test]
+    fn empty_user_image_is_still_rejected_with_clear_error() {
+        let content = json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}}
+        ]);
+        let err = process_message_content(&content).expect_err("user image stays strict");
         assert_empty_image_error(err);
     }
 }

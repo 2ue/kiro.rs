@@ -117,6 +117,8 @@ use crate::anthropic::request_facts::{
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
+/// Extra pre-output failovers allowed after the shared dispatch deadline has passed.
+const EXTERNAL_POOL_PRE_OUTPUT_FAILOVERS_PAST_DEADLINE: u32 = 2;
 const EXTERNAL_POOL_LEASE_MAX_AGE_SECS: u64 = DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS * 2;
 const EXTERNAL_POOL_LEASE_HEARTBEAT_RETRY_MILLIS: u64 = 250;
 const EXTERNAL_POOL_QUEUE_LEASE_SAFETY_MARGIN_SECS: u64 = 60;
@@ -6302,8 +6304,23 @@ impl ExternalPoolManager {
             }
         };
 
+        // The shared dispatch deadline bounds queueing and capacity waits (it is ~15 seconds from
+        // request start). A pool that already failed *before any downstream output* has used that
+        // time on the upstream, not in a queue; a bounded number of such pre-output failovers may
+        // continue past the deadline so the request still lands on a working pool.
+        let mut pre_output_failovers_left = EXTERNAL_POOL_PRE_OUTPUT_FAILOVERS_PAST_DEADLINE;
+        let mut last_failure_was_pre_output = false;
         loop {
-            if dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let past_dispatch_deadline =
+                dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            let pre_output_failover_allowed = past_dispatch_deadline
+                && last_failure_was_pre_output
+                && pre_output_failovers_left > 0
+                && !route
+                    .inference_attempt_budget
+                    .snapshot()
+                    .downstream_committed;
+            if past_dispatch_deadline && !pre_output_failover_allowed {
                 // 已经有具体池的失败时，用它作为最终错误；合成的 deadline 错误会丢掉
                 // attempts 和上游错误详情（与 synthetic capacity error 的处理一致）。
                 if last_error.is_some() {
@@ -6311,6 +6328,15 @@ impl ExternalPoolManager {
                 }
                 return self.external_dispatch_deadline_outcome(&route, attempts, &config);
             }
+            if pre_output_failover_allowed {
+                pre_output_failovers_left -= 1;
+                tracing::info!(
+                    request_id = %route.request_id,
+                    remaining = pre_output_failovers_left,
+                    "external pool failed before output; failing over past the dispatch deadline"
+                );
+            }
+            last_failure_was_pre_output = false;
             let mut capacity_waiter = self.capacity_signal.register();
             if max_pool_attempts.is_some_and(|max_attempts| pool_attempt_index >= max_attempts) {
                 break;
@@ -6529,7 +6555,9 @@ impl ExternalPoolManager {
             };
             capacity_waiter.finish_acquired();
             drop(queue_guard.take());
-            if dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if dispatch_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                && !pre_output_failover_allowed
+            {
                 drop(lease);
                 if last_error.is_some() {
                     break;
@@ -6789,6 +6817,8 @@ impl ExternalPoolManager {
                             .await;
                     }
                     if cross_pool_retry {
+                        last_failure_was_pre_output =
+                            external_error_is_pre_output_stream_failure(&err);
                         excluded.insert(pool_id);
                         last_error = Some((pool, err));
                         pool_attempt_index = pool_attempt_index.saturating_add(1);
@@ -11105,6 +11135,16 @@ fn external_pre_output_stream_protocol_error(
     )
 }
 
+/// Whether a pool failure happened on a stream before any downstream output: a stream error
+/// event, read error, EOF, idle or first-output timeout before semantic output.
+fn external_error_is_pre_output_stream_failure(err: &ExternalPoolError) -> bool {
+    err.protocol_error
+        .is_some_and(|reason| reason.starts_with("stream_pre_output_"))
+        || err.message.contains("before semantic output")
+        || err.message.contains("produced no semantic output")
+        || err.message.contains("stream pre-output read failed")
+}
+
 fn external_pre_output_stream_network_error(
     message: impl Into<String>,
     config: &ExternalPoolsConfig,
@@ -11282,6 +11322,19 @@ where
     let hold_deadline = route
         .stream_pre_output_hold
         .map(|hold| route.started_at + hold);
+    // With a first-output timeout the stream stays uncommitted until semantic output, so a pool
+    // that only sends message_start/ping and then stalls is still replaced by another pool or
+    // the local rescue path. Without it the hold window commits the buffered prefix and the
+    // request can no longer fail over (production 2026-10-21: 451 external requests ended with
+    // no output after 144–261 seconds).
+    // Measured per attempt: a failover pool gets its own full window.
+    let attempt_started_at = Instant::now();
+    let first_output_deadline =
+        (config.external_pool_stream_first_output_timeout_secs > 0).then(|| {
+            attempt_started_at
+                + Duration::from_secs(config.external_pool_stream_first_output_timeout_secs)
+        });
+    let hold_deadline = hold_deadline.filter(|_| first_output_deadline.is_none());
     loop {
         while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
             let end = idx + delimiter_len;
@@ -11413,6 +11466,26 @@ where
                     "external pool pre-output hold window elapsed; committing buffered events and starting keepalive"
                 );
                 return Ok(last_chunk_at);
+            }
+            _ = external_pool_stream_pre_output_hold_deadline(first_output_deadline) => {
+                let seconds = config.external_pool_stream_first_output_timeout_secs;
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    error_id = %route.error_id,
+                    pool_id = pool.id,
+                    pool_name = %pool.name,
+                    first_output_timeout_secs = seconds,
+                    buffered_prefix_bytes = prefix.len(),
+                    "external pool stream produced no semantic output before the first-output timeout; failing over"
+                );
+                return Err(external_pre_output_stream_network_error(
+                    format!(
+                        "model endpoint produced no semantic output within {} seconds",
+                        seconds
+                    ),
+                    config,
+                    outbound_model.clone(),
+                ));
             }
             _ = external_pool_stream_idle_deadline(last_chunk_at, stream_idle_timeout) => {
                 let seconds = stream_idle_timeout

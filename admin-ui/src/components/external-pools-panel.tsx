@@ -408,6 +408,7 @@ export function ExternalPoolsPanel() {
           externalPoolRequestTimeoutSecs: whole(configDraft.externalPoolRequestTimeoutSecs),
           externalPoolStreamRequestTimeoutSecs: whole(configDraft.externalPoolStreamRequestTimeoutSecs),
           externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
+          externalPoolStreamFirstOutputTimeoutSecs: whole(configDraft.externalPoolStreamFirstOutputTimeoutSecs),
           externalPoolStreamPreOutputRetryEnabled: Boolean(configDraft.externalPoolStreamPreOutputRetryEnabled),
           externalPoolUsageProjectionCostFloorEnabled: Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled),
           externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
@@ -737,6 +738,7 @@ export function ExternalPoolsPanel() {
                   <NumberBox disabled={!externalEnabled} label="非流式总超时" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(externalPoolRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRequestTimeoutSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="流式总超时" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(externalPoolStreamRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamRequestTimeoutSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="流式空闲超时" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(externalPoolStreamIdleTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamIdleTimeoutSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="首个输出超时" value={configDraft.externalPoolStreamFirstOutputTimeoutSecs} onChange={(v) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamFirstOutputTimeoutSecs: v }))} />
                   <Toggle disabled={!externalEnabled} label="流式首输出前错误换池" description="stream 已返回 200 但还没提交 content、thinking 或 tool_use 前遇到 error、断流、EOF 或空闲超时时，允许在外部池内换池。" checked={configDraft.externalPoolStreamPreOutputRetryEnabled} onChange={(externalPoolStreamPreOutputRetryEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamPreOutputRetryEnabled }))} />
                 </div>
               </FormSection>

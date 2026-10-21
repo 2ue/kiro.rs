@@ -425,6 +425,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
       externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
       externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
       externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
+      externalPoolStreamFirstOutputTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamFirstOutputTimeoutSecs),
       externalPoolRouteMode: normalizeExternalPoolRouteMode(draft.externalPools.externalPoolRouteMode),
       externalPoolRouteRules: normalizeRuleList(draft.externalPools.externalPoolRouteRules),
       localPoolRouteMode: normalizeExternalPoolRouteMode(draft.externalPools.localPoolRouteMode),

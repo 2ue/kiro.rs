@@ -213,6 +213,7 @@ export function ExternalPoolsPage() {
           externalPoolRequestTimeoutSecs: whole(configDraft.externalPoolRequestTimeoutSecs),
           externalPoolStreamRequestTimeoutSecs: whole(configDraft.externalPoolStreamRequestTimeoutSecs),
           externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
+          externalPoolStreamFirstOutputTimeoutSecs: whole(configDraft.externalPoolStreamFirstOutputTimeoutSecs),
           externalPoolStreamPreOutputRetryEnabled: Boolean(configDraft.externalPoolStreamPreOutputRetryEnabled),
           externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
           externalPoolUsageProjectionCostFloorEnabled: Boolean(configDraft.externalPoolUsageProjectionCostFloorEnabled),
@@ -531,6 +532,7 @@ export function ExternalPoolsPage() {
                   <NumberBox disabled={!externalEnabled} label="非流式总超时" suffix="秒" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolRequestTimeoutSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="流式总超时" suffix="秒" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamRequestTimeoutSecs: v }))} />
                   <NumberBox disabled={!externalEnabled} label="流式空闲超时" suffix="秒" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamIdleTimeoutSecs: v }))} />
+                  <NumberBox disabled={!externalEnabled} label="首个输出超时" suffix="秒" value={configDraft.externalPoolStreamFirstOutputTimeoutSecs} onChange={(v) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamFirstOutputTimeoutSecs: v }))} />
                   <ToggleRow disabled={!externalEnabled} label="流式首输出前错误换池" description="stream 已返回 200 但还没提交 content、thinking 或 tool_use 前遇到 error、断流、EOF 或空闲超时时，允许在外部账号内换池。" checked={configDraft.externalPoolStreamPreOutputRetryEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolStreamPreOutputRetryEnabled: v }))} />
                 </div>
               </FormSection>
