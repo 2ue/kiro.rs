@@ -4323,16 +4323,14 @@ impl AdminService {
                 }
             }
 
-            if error.is_none() {
-                if let Some(fast) = fast {
-                    if let Err(err) = self
-                        .token_manager
-                        .set_credential_fast(id, fast)
-                        .map_err(|e| self.classify_error(e, id))
-                    {
-                        error = Some(err.to_string());
-                    }
-                }
+            if error.is_none()
+                && let Some(fast) = fast
+                && let Err(err) = self
+                    .token_manager
+                    .set_credential_fast(id, fast)
+                    .map_err(|e| self.classify_error(e, id))
+            {
+                error = Some(err.to_string());
             }
 
             if error.is_none() {
