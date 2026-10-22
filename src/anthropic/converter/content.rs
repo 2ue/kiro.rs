@@ -14,9 +14,35 @@ use super::{ConversionError, EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER};
 
 const TOOL_RESULT_IMAGE_PLACEHOLDER: &str = "[image attached]";
 
+/// The upstream only accepts inline base64 image bytes (verified 2026-10-22 with a real account:
+/// `source.url` and `source.s3Location` both return 400). Remote URLs therefore only work when
+/// `imageProcessing.safeDownloadRemoteSources` materializes them before conversion.
+pub(crate) const REMOTE_IMAGE_URL_UNSUPPORTED_MESSAGE: &str =
+    "remote image URL sources are not supported; send the image as base64 data";
+
+/// Text that replaces a remote URL image in history, so one old link does not fail every later
+/// turn of the session.
+const HISTORY_REMOTE_IMAGE_PLACEHOLDER: &str = "[image omitted: remote image URLs are not supported; ask the user to send the image as base64 data]";
+
+/// How images in a user message that cannot be sent upstream are handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UserImageMode {
+    /// The current turn: the user is asking about this image, so fail explicitly.
+    Strict,
+    /// History: replace an unsendable remote URL image with a text note.
+    History,
+}
+
 /// 处理消息内容，提取文本、图片和工具结果
 pub(super) fn process_message_content(
     content: &serde_json::Value,
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    process_message_content_with_mode(content, UserImageMode::Strict)
+}
+
+pub(super) fn process_message_content_with_mode(
+    content: &serde_json::Value,
+    image_mode: UserImageMode,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -58,6 +84,15 @@ pub(super) fn process_message_content(
                                     "image block missing source".to_string(),
                                 )
                             })?;
+                            if image_mode == UserImageMode::History
+                                && is_remote_image_url_source(&source)
+                            {
+                                tracing::warn!(
+                                    "历史消息中的远程 URL 图片无法发送，已替换为占位文本"
+                                );
+                                text_parts.push(HISTORY_REMOTE_IMAGE_PLACEHOLDER.to_string());
+                                continue;
+                            }
                             images.push(convert_image_source(source)?);
                         }
                         "tool_result" => {
@@ -107,6 +142,15 @@ pub(super) fn process_message_content(
     Ok((text_parts.join("\n"), images, tool_results))
 }
 
+/// A `url` image source that is not an inline data URL (i.e. it was not downloaded).
+fn is_remote_image_url_source(source: &ImageSource) -> bool {
+    source.source_type == "url"
+        && source
+            .url
+            .as_deref()
+            .is_some_and(|url| parse_data_url(url).is_none())
+}
+
 fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionError> {
     match source.source_type.as_str() {
         "base64" => {
@@ -154,7 +198,7 @@ fn convert_image_source(source: ImageSource) -> Result<KiroImage, ConversionErro
                 Ok(KiroImage::from_base64(format, data))
             } else {
                 Err(ConversionError::UnsupportedContent(
-                    "remote image URL source was not materialized before conversion".to_string(),
+                    REMOTE_IMAGE_URL_UNSUPPORTED_MESSAGE.to_string(),
                 ))
             }
         }
@@ -1219,6 +1263,42 @@ mod tests {
         let text = serde_json::to_string(&tool_results[0]).expect("tool result json");
         assert!(text.contains("screenshot taken"), "{text}");
         assert_eq!(text.matches("[image omitted:").count(), 3, "{text}");
+    }
+
+    #[test]
+    fn remote_url_image_in_history_becomes_placeholder_but_current_turn_stays_strict() {
+        let content = json!([
+            {"type": "text", "text": "look at this"},
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+            {"type": "image", "source": {"type": "url", "url": "data:image/png;base64,iVBORw0KGgo="}}
+        ]);
+        for round in 0..5 {
+            let (text, images, _) =
+                process_message_content_with_mode(&content, UserImageMode::History)
+                    .expect("history URL image must not fail the request");
+            assert!(text.starts_with("look at this"), "round {round}: {text}");
+            assert!(
+                text.contains(HISTORY_REMOTE_IMAGE_PLACEHOLDER),
+                "round {round}"
+            );
+            assert!(
+                !text.contains("example.com"),
+                "round {round}: URL is not echoed"
+            );
+            assert_eq!(
+                images.len(),
+                1,
+                "round {round}: inline data URL is still sent"
+            );
+
+            let err = process_message_content(&content).expect_err("current turn stays strict");
+            match err {
+                ConversionError::UnsupportedContent(message) => {
+                    assert_eq!(message, REMOTE_IMAGE_URL_UNSUPPORTED_MESSAGE)
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
     }
 
     #[test]

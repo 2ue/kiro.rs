@@ -7078,6 +7078,47 @@ mod tests {
         }
     }
 
+    /// A remote URL image in history used to fail every later turn of the session (production
+    /// /dfcache/minea, 2026-10-21). It is replaced by a note; the current turn stays strict.
+    #[test]
+    fn history_remote_url_image_does_not_fail_later_turns() {
+        let messages = |current: serde_json::Value| {
+            serde_json::json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "what is this"},
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+                    ]},
+                    {"role": "assistant", "content": "I cannot see it."},
+                    {"role": "user", "content": current}
+                ]
+            })
+        };
+        let req: MessagesRequest =
+            serde_json::from_value(messages(serde_json::json!("try again"))).unwrap();
+        let result = convert_request(&req).expect("history URL image is replaced");
+        let Some(Message::User(user)) = result.conversation_state.history.first() else {
+            panic!("expected a history user turn");
+        };
+        assert!(user.user_input_message.images.is_empty());
+        assert!(
+            user.user_input_message
+                .content
+                .contains("remote image URLs are not supported")
+        );
+
+        let req: MessagesRequest = serde_json::from_value(messages(serde_json::json!([
+            {"type": "image", "source": {"type": "url", "url": "https://example.com/b.png"}}
+        ])))
+        .unwrap();
+        assert!(
+            convert_request(&req).is_err(),
+            "current-turn URL image stays a 400"
+        );
+    }
+
     /// F5: Codex / OpenAI Responses split parallel `function_call_output`s into one user message
     /// each. Every result must stay paired with its tool_use instead of being dropped.
     #[test]
