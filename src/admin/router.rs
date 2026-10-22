@@ -45,6 +45,7 @@ use super::{
         validate_existing_credentials, validate_external_credentials,
     },
     middleware::{AdminState, admin_auth_middleware},
+    route_scenarios::http as route_scenario_http,
 };
 
 /// 创建 Admin API 路由
@@ -76,6 +77,30 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/import", post(batch_import_credentials))
+        .route(
+            "/route-scenarios",
+            get(route_scenario_http::list).post(route_scenario_http::create),
+        )
+        .route(
+            "/route-scenarios/options",
+            get(route_scenario_http::options),
+        )
+        .route(
+            "/route-scenarios/current",
+            get(route_scenario_http::current),
+        )
+        .route(
+            "/route-scenarios/{id}",
+            put(route_scenario_http::update).delete(route_scenario_http::delete),
+        )
+        .route(
+            "/route-scenarios/{id}/preview",
+            get(route_scenario_http::preview),
+        )
+        .route(
+            "/route-scenarios/{id}/apply",
+            post(route_scenario_http::apply),
+        )
         .route("/credentials/batch-update", post(batch_update_credentials))
         .route("/credentials/batch-delete", post(batch_delete_credentials))
         .route("/credentials/export", get(export_credentials))

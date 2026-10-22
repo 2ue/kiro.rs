@@ -12,6 +12,7 @@ import {
   FileCheck2,
   Gauge,
   Zap,
+  Route,
 } from 'lucide-react'
 
 export const CONSOLE_BASE_PATH = '/ui'
@@ -31,6 +32,7 @@ export type PageKey =
   | 'audit'
   | 'runtime'
   | 'cachePolicies'
+  | 'routeScenarios'
   | 'models'
   | 'security'
 
@@ -77,6 +79,7 @@ export const navPages: NavPage[] = [
   // 设置域
   { key: 'runtime', path: 'runtime', label: '运行', description: '调度、限流、冷却、缓存、兼容', icon: SlidersHorizontal, domain: 'settings' },
   { key: 'cachePolicies', path: 'cache-policies', label: '路由策略', description: '按路由管理缓存策略和身份隐藏', icon: Zap, domain: 'settings' },
+  { key: 'routeScenarios', path: 'route-scenarios', label: '路由场景', description: '保存多套路由规则并一键切换', icon: Route, domain: 'settings' },
   { key: 'models', path: 'models', label: '模型', description: '模型能力与价格目录', icon: ModelsIcon, domain: 'settings' },
   { key: 'security', path: 'security', label: '安全', description: 'Admin Key、客户端接入 Key', icon: ShieldCheck, domain: 'settings' },
 ]
@@ -96,6 +99,7 @@ export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   audit: { title: '审计', subtitle: '关键操作与变更记录' },
   runtime: { title: '运行配置', subtitle: '调度、限流、冷却、缓存与兼容策略' },
   cachePolicies: { title: '路由策略', subtitle: '按路由管理缓存策略和身份隐藏' },
+  routeScenarios: { title: '路由场景', subtitle: '把本地、外部和各账号的路由规则存成多套场景，一键切换' },
   models: { title: '模型', subtitle: '模型能力与价格目录,支持同步与手动维护' },
   security: { title: '安全', subtitle: 'Admin Key 与客户端接入 Key 管理' },
 }

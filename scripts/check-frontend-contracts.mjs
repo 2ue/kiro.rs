@@ -37,6 +37,21 @@ const intentionallyUiOnly = new Set([
   'UsageExternalPoolRiskThresholds',
   'UsageExternalPoolRiskTotals',
   'UsageExternalPoolRiskWindow',
+  // Route scenarios are managed only in the new console.
+  'AccountRoutePolicy',
+  'RoutePolicy',
+  'RouteScenario',
+  'RouteScenarioAccountOption',
+  'RouteScenarioApplyItem',
+  'RouteScenarioApplyResponse',
+  'RouteScenarioChange',
+  'RouteScenarioContent',
+  'RouteScenarioItemKey',
+  'RouteScenarioItemKind',
+  'RouteScenarioListResponse',
+  'RouteScenarioOptions',
+  'RouteScenarioPreview',
+  'SaveRouteScenarioRequest',
 ])
 const intentionallyAdminOnly = new Set(['AdminErrorResponse', 'BulkCredentialActionError'])
 

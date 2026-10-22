@@ -20,6 +20,7 @@ mod capture_handlers;
 mod error;
 mod handlers;
 mod middleware;
+mod route_scenarios;
 mod router;
 mod service;
 pub mod types;

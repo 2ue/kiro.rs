@@ -109,6 +109,12 @@ function numberValue(value: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback
 }
 
+function routePolicySummary(mode: string, rules: string[] = []): string {
+  if (mode === 'allow_list') return `仅允许 ${rules.join('、') || '（未设置）'}`
+  if (mode === 'deny_list') return `禁止 ${rules.join('、') || '（未设置）'}`
+  return '不限制'
+}
+
 function normalizeExternalPoolRouteMode(value?: string): RuntimeConfig['externalPools']['externalPoolRouteMode'] {
   if (value === 'allow_list' || value === 'deny_list') return value
   return 'allow_all'
@@ -467,8 +473,6 @@ export function RuntimePage() {
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
   const [savedDraft, setSavedDraft] = useState<RuntimeConfig | null>(null)
   const [activeSection, setActiveSection] = useState<RuntimeSectionKey>('loadBalancing')
-  const [externalRouteRulesText, setExternalRouteRulesText] = useState('')
-  const [localRouteRulesText, setLocalRouteRulesText] = useState('')
   const [promptSteeringRouteRulesText, setPromptSteeringRouteRulesText] = useState('')
   const [identityRouteRulesText, setIdentityRouteRulesText] = useState('')
 
@@ -522,8 +526,6 @@ export function RuntimePage() {
       }
       setDraft(hydratedDraft)
       setSavedDraft(hydratedDraft)
-      setExternalRouteRulesText(ruleText(config.data.externalPools?.externalPoolRouteRules))
-      setLocalRouteRulesText(ruleText(config.data.externalPools?.localPoolRouteRules))
       setPromptSteeringRouteRulesText(ruleText(promptSteering.routeRules))
       setIdentityRouteRulesText(ruleText(promptSteering.identity.routeRules))
     }
@@ -1026,88 +1028,21 @@ export function RuntimePage() {
                   </div>
                 </div>
 
-                <div className="space-y-4">
-                  <div className="grid gap-4 md:grid-cols-[minmax(16rem,22rem)_1fr]">
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">本地池路由模式</div>
-                      <Select
-                        value={draft.externalPools.localPoolRouteMode}
-                        onValueChange={(v) =>
-                          setExternalPools('localPoolRouteMode')(
-                            normalizeExternalPoolRouteMode(v),
-                          )
-                        }
-                      >
-                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="allow_all">全部入口允许进入本地账号</SelectItem>
-                          <SelectItem value="allow_list">只允许下列入口进入本地账号</SelectItem>
-                          <SelectItem value="deny_list">禁止下列入口进入本地账号</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <p className="text-xs leading-5 text-muted-foreground">
-                        默认允许全部入口，保持当前行为；切换为允许列表或禁止列表后，右侧规则才会参与判断。
-                      </p>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">本地池路由规则</div>
-                      <Textarea
-                        className="min-h-40 font-mono text-xs"
-                        value={localRouteRulesText}
-                        disabled={draft.externalPools.localPoolRouteMode === 'allow_all'}
-                        placeholder={'/v1\n/cc\n/ha\n/na\n/dfcache/team'}
-                        onChange={(e) => {
-                          setLocalRouteRulesText(e.target.value)
-                          setExternalPools('localPoolRouteRules')(parseRuleText(e.target.value))
-                        }}
-                      />
-                      <p className="text-xs leading-5 text-muted-foreground">
-                        每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages。规则按大小写不敏感的精确或路径前缀匹配；* 表示全部入口。
-                      </p>
+                <div className="space-y-3 rounded-md border bg-muted/30 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-sm font-semibold">路由限制</div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button asChild variant="outline" size="sm"><Link to="/external-pools">在外部池页修改</Link></Button>
+                      <Button asChild variant="outline" size="sm"><Link to="/route-scenarios">路由场景</Link></Button>
                     </div>
                   </div>
-
-                  <div className="grid gap-4 md:grid-cols-[minmax(16rem,22rem)_1fr]">
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">外部池路由模式</div>
-                      <Select
-                        value={draft.externalPools.externalPoolRouteMode}
-                        onValueChange={(v) =>
-                          setExternalPools('externalPoolRouteMode')(
-                            normalizeExternalPoolRouteMode(v),
-                          )
-                        }
-                      >
-                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="allow_all">全部入口允许进入外部池</SelectItem>
-                          <SelectItem value="allow_list">只允许下列入口进入外部池</SelectItem>
-                          <SelectItem value="deny_list">禁止下列入口进入外部池</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <p className="text-xs leading-5 text-muted-foreground">
-                        默认允许全部入口，保持升级前行为；切换为允许列表或禁止列表后，右侧规则才会参与判断。
-                      </p>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">外部池路由规则</div>
-                      <Textarea
-                        className="min-h-40 font-mono text-xs"
-                        value={externalRouteRulesText}
-                        disabled={draft.externalPools.externalPoolRouteMode === 'allow_all'}
-                        placeholder={'/v1\n/cc\n/ha\n/na\n/dfcache/team'}
-                        onChange={(e) => {
-                          setExternalRouteRulesText(e.target.value)
-                          setExternalPools('externalPoolRouteRules')(parseRuleText(e.target.value))
-                        }}
-                      />
-                      <p className="text-xs leading-5 text-muted-foreground">
-                        每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages。规则按大小写不敏感的精确或路径前缀匹配；* 表示全部入口。
-                      </p>
-                    </div>
+                  <div className="grid gap-2 text-sm md:grid-cols-2">
+                    <div><span className="text-muted-foreground">本地账号：</span>{routePolicySummary(draft.externalPools.localPoolRouteMode, draft.externalPools.localPoolRouteRules)}</div>
+                    <div><span className="text-muted-foreground">外部账号：</span>{routePolicySummary(draft.externalPools.externalPoolRouteMode, draft.externalPools.externalPoolRouteRules)}</div>
                   </div>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    本地和外部的整体路由限制统一在外部池页的“路由策略”里修改；要整套切换本地、外部和各账号的路由规则，用路由场景。
+                  </p>
                 </div>
 
                 <TwoCol>

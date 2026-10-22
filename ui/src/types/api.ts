@@ -2547,3 +2547,92 @@ export interface ManualModelResponse {
 }
 
 export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'
+
+// ============ 路由场景 ============
+
+/** A route rule set, as used by every route policy. */
+export interface RoutePolicy {
+  routeMode: ExternalPoolRouteMode
+  routeRules: string[]
+}
+
+export interface AccountRoutePolicy extends RoutePolicy {
+  id: number
+}
+
+/** Scenario body. Accounts not listed are reset to "unrestricted" when applied. */
+export interface RouteScenarioContent {
+  local: RoutePolicy
+  external: RoutePolicy
+  localAccounts: AccountRoutePolicy[]
+  externalAccounts: AccountRoutePolicy[]
+}
+
+export interface RouteScenario {
+  id: number
+  name: string
+  description?: string | null
+  content: RouteScenarioContent
+  revision: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface RouteScenarioListResponse {
+  scenarios: RouteScenario[]
+  activeScenarioId?: number | null
+  activeInSync: boolean
+}
+
+export interface RouteScenarioOptions {
+  routes: string[]
+  localAccounts: RouteScenarioAccountOption[]
+  externalAccounts: RouteScenarioAccountOption[]
+}
+
+export interface SaveRouteScenarioRequest {
+  name: string
+  description?: string
+  content: RouteScenarioContent
+}
+
+export type RouteScenarioItemKind = 'local_pool' | 'external_pool' | 'local_account' | 'external_account'
+
+export interface RouteScenarioItemKey {
+  kind: RouteScenarioItemKind
+  id: number
+}
+
+export interface RouteScenarioChange extends RouteScenarioItemKey {
+  label: string
+  before: string
+  after: string
+}
+
+export interface RouteScenarioPreview {
+  changes: RouteScenarioChange[]
+  unchanged: number
+  missingAccounts: RouteScenarioItemKey[]
+  unknownRoutes: string[]
+  uncoveredLocalRoutes: string[]
+  uncoveredExternalRoutes: string[]
+}
+
+export interface RouteScenarioApplyItem extends RouteScenarioItemKey {
+  label: string
+  success: boolean
+  error?: string
+}
+
+export interface RouteScenarioApplyResponse {
+  total: number
+  success: number
+  failed: number
+  skipped: number
+  items: RouteScenarioApplyItem[]
+}
+
+export interface RouteScenarioAccountOption extends RoutePolicy {
+  id: number
+  label: string
+}

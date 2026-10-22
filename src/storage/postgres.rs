@@ -2816,6 +2816,74 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn list_route_scenarios(&self) -> anyhow::Result<Vec<RouteScenarioRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, description, content, revision, created_at, updated_at \
+             FROM route_scenarios ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(route_scenario_from_row).collect()
+    }
+
+    pub async fn get_route_scenario(&self, id: u64) -> anyhow::Result<Option<RouteScenarioRow>> {
+        let row = sqlx::query(
+            "SELECT id, name, description, content, revision, created_at, updated_at \
+             FROM route_scenarios WHERE id = $1",
+        )
+        .bind(id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(route_scenario_from_row).transpose()
+    }
+
+    pub async fn insert_route_scenario(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        content: &serde_json::Value,
+    ) -> anyhow::Result<RouteScenarioRow> {
+        let row = sqlx::query(
+            "INSERT INTO route_scenarios (name, description, content) VALUES ($1, $2, $3) \
+             RETURNING id, name, description, content, revision, created_at, updated_at",
+        )
+        .bind(name)
+        .bind(description)
+        .bind(content)
+        .fetch_one(&self.pool)
+        .await?;
+        route_scenario_from_row(row)
+    }
+
+    pub async fn update_route_scenario(
+        &self,
+        id: u64,
+        name: &str,
+        description: Option<&str>,
+        content: &serde_json::Value,
+    ) -> anyhow::Result<Option<RouteScenarioRow>> {
+        let row = sqlx::query(
+            "UPDATE route_scenarios SET name = $2, description = $3, content = $4, \
+             revision = revision + 1, updated_at = now() WHERE id = $1 \
+             RETURNING id, name, description, content, revision, created_at, updated_at",
+        )
+        .bind(id as i64)
+        .bind(name)
+        .bind(description)
+        .bind(content)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(route_scenario_from_row).transpose()
+    }
+
+    pub async fn delete_route_scenario(&self, id: u64) -> anyhow::Result<bool> {
+        let result = sqlx::query("DELETE FROM route_scenarios WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn load_proxy_resources(&self) -> anyhow::Result<Vec<ProxyResourceRow>> {
         let rows = sqlx::query(
             r#"
@@ -12471,6 +12539,30 @@ fn usage_local_route_label(value: &str) -> String {
     }
 }
 
+/// One stored route scenario: a named snapshot of route rules (see admin route scenarios).
+#[derive(Debug, Clone)]
+pub struct RouteScenarioRow {
+    pub id: u64,
+    pub name: String,
+    pub description: Option<String>,
+    pub content: serde_json::Value,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+fn route_scenario_from_row(row: sqlx::postgres::PgRow) -> anyhow::Result<RouteScenarioRow> {
+    Ok(RouteScenarioRow {
+        id: row.try_get::<i64, _>("id")? as u64,
+        name: row.try_get("name")?,
+        description: row.try_get("description")?,
+        content: row.try_get("content")?,
+        revision: row.try_get::<i64, _>("revision")?.max(0) as u64,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS runtime_config (
     id TEXT PRIMARY KEY,
@@ -13274,6 +13366,16 @@ CREATE INDEX IF NOT EXISTS idx_credential_events_credential_created
     ON credential_events (credential_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_credential_events_type_created
     ON credential_events (event_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS route_scenarios (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    content JSONB NOT NULL DEFAULT '{}'::jsonb,
+    revision BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 "#;
 
 // Explicit maintenance-only backfill. Do not call this from the default startup

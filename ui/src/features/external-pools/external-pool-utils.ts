@@ -147,7 +147,7 @@ export type ExternalPoolFormDraft = {
   normalizeModelVersionDots: boolean
   supportedModelsText: string
   routeMode: NonNullable<CreateExternalPoolRequest['routeMode']>
-  routeRulesText: string
+  routeRules: string[]
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
   modelMappingRequireMatch: boolean
   modelMappingRulesText: string
@@ -177,7 +177,7 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   normalizeModelVersionDots: false,
   supportedModelsText: '',
   routeMode: 'allow_all',
-  routeRulesText: '',
+  routeRules: [],
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: false,
   modelMappingRulesText: '',
@@ -207,7 +207,7 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
   supportedModelsText: joinRules(pool.supportedModels || []),
   routeMode: pool.routeMode || 'allow_all',
-  routeRulesText: joinRules(pool.routeRules || []),
+  routeRules: [...(pool.routeRules || [])],
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),
   modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
