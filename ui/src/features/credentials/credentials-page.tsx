@@ -1314,8 +1314,11 @@ export function CredentialsPage() {
                 <div className="text-[0.68rem] text-muted-foreground">所有账号历史记录</div>
               </div>
               <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-                <div className="text-xs text-muted-foreground">估算计费</div>
-                <div className="mt-1 text-lg font-semibold tabular-nums">{formatUsdFixed2(creditDetailStats.totalEstimatedCostUsd)}</div>
+                <div className="text-xs text-muted-foreground">估算计费/原始计费</div>
+                <div className="mt-1 text-lg font-semibold tabular-nums">
+                  {formatUsdFixed2(creditDetailStats.totalEstimatedCostUsd)}
+                  <span className="text-sm font-normal text-muted-foreground"> / {formatUsdFixed2(creditDetailStats.totalOriginalCostUsd)}</span>
+                </div>
                 <div className="text-[0.68rem] text-muted-foreground">所有账号历史记录</div>
               </div>
               <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
@@ -1332,7 +1335,6 @@ export function CredentialsPage() {
             </div>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
               <span>总购买额度：{formatCredits(creditDetailStats.totalCreditLimit)}</span>
-              <span>原始计费：{formatUsdFixed2(creditDetailStats.totalOriginalCostUsd)}</span>
               <span>估算公式：估算计费 / 已消耗积分 × 剩余积分</span>
             </div>
             <div className="overflow-hidden rounded-lg bg-card shadow-sm">
@@ -1347,8 +1349,7 @@ export function CredentialsPage() {
                       <th className="w-28 px-3 py-2 text-right font-semibold text-muted-foreground">剩余积分</th>
                       <th className="w-28 px-3 py-2 text-right font-semibold text-muted-foreground">总额</th>
                       <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">已消耗积分</th>
-                      <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">估算计费</th>
-                      <th className="w-32 px-3 py-2 text-right font-semibold text-muted-foreground">原始计费</th>
+                      <th className="w-44 px-3 py-2 text-right font-semibold text-muted-foreground">估算计费/原始计费</th>
                       <th className="w-36 px-3 py-2 text-right font-semibold text-muted-foreground">预估剩余费用</th>
                       <th className="w-24 px-3 py-2 text-left font-semibold text-muted-foreground">状态</th>
                       <th className="w-44 px-3 py-2 text-left font-semibold text-muted-foreground">最近查询</th>
@@ -1370,8 +1371,7 @@ export function CredentialsPage() {
                         </td>
                         <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatCredits(row.creditLimit)}</td>
                         <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatCredits(row.consumedCredits)}</td>
-                        <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatUsdFixed2(row.estimatedCostUsd)}</td>
-                        <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatUsdFixed2(row.originalCostUsd)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatUsdFixed2(row.estimatedCostUsd)} / {formatUsdFixed2(row.originalCostUsd)}</td>
                         <td className="px-3 py-2 text-right tabular-nums text-success">
                           {row.creditEstimateBlocked
                             ? <span className="text-destructive" title={row.creditEstimateBlockedReason}>不可估算</span>
