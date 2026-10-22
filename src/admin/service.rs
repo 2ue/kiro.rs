@@ -10317,6 +10317,147 @@ fn collect_model_id_item(value: &Value, out: &mut Vec<String>) {
 #[path = "service_tests.rs"]
 mod tests;
 
+// ============ 路由场景辅助 ============
+
+/// Runs an admin store future on the current runtime (route scenarios).
+pub(super) fn block_on_admin_store_public<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    block_on_admin_store(future)
+}
+
+impl AdminService {
+    pub(super) fn route_scenario_store(&self) -> Arc<PostgresStore> {
+        self.postgres_store.clone()
+    }
+
+    pub(super) fn route_scenario_runtime_config(
+        &self,
+    ) -> crate::model::config::ExternalPoolsConfig {
+        self.token_manager.runtime_config().external_pools
+    }
+
+    /// Local accounts as (id, label, route policy). Accounts disabled because their quota ran out
+    /// or their credential is no longer usable are left out: a scenario only covers accounts that
+    /// can serve again. Manually disabled and failure-disabled accounts are kept.
+    pub(super) fn route_scenario_local_accounts(
+        &self,
+    ) -> Vec<(u64, String, super::route_scenarios::RoutePolicy)> {
+        const UNUSABLE: &[&str] = &[
+            "QuotaExceeded",
+            "InvalidRefreshToken",
+            "InvalidConfig",
+            "AccountSuspended",
+            "AccountLocked",
+        ];
+        self.token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                !(entry.disabled
+                    && entry
+                        .disabled_reason
+                        .as_deref()
+                        .is_some_and(|reason| UNUSABLE.contains(&reason)))
+            })
+            .map(|entry| {
+                let label = entry
+                    .email
+                    .clone()
+                    .filter(|email| !email.trim().is_empty())
+                    .unwrap_or_else(|| format!("账号 #{}", entry.id));
+                (
+                    entry.id,
+                    label,
+                    super::route_scenarios::RoutePolicy {
+                        route_mode: entry.route_mode,
+                        route_rules: entry.route_rules,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Routes listed on the route policy page: built-in routes, configured path overrides and
+    /// registered /dfcache routes.
+    pub(super) fn route_scenario_routes(&self) -> Vec<String> {
+        let config = self.token_manager.runtime_config();
+        let mut routes: std::collections::BTreeSet<String> = ["/v1", "/cc", "/ha", "/na"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let normalize =
+            |path: &str| crate::model::config::normalize_route_rules(&[path.to_string()]);
+        for path in config
+            .cache_policy
+            .path_overrides
+            .keys()
+            .chain(config.reported_usage.path_overrides.keys())
+            .chain(config.prompt_steering.identity.path_overrides.keys())
+            .chain(config.defined_cache_routes.iter())
+        {
+            routes.extend(
+                normalize(path)
+                    .into_iter()
+                    .filter(|route| route != "*" && route != "/"),
+            );
+        }
+        routes.into_iter().collect()
+    }
+
+    pub(super) fn route_scenario_active_id(&self) -> Option<u64> {
+        self.token_manager.runtime_config().active_route_scenario_id
+    }
+
+    pub(super) fn set_route_scenario_active_id(&self, id: Option<u64>) {
+        if let Err(err) = self
+            .token_manager
+            .update_runtime_config(|config| config.active_route_scenario_id = id)
+        {
+            tracing::warn!(error = %err, "记录当前路由场景失败");
+        }
+    }
+
+    /// Writes the local and external pool-wide route policies in one runtime config update.
+    pub(super) fn set_pool_route_policies(
+        &self,
+        local: &super::route_scenarios::RoutePolicy,
+        external: &super::route_scenarios::RoutePolicy,
+    ) -> Result<(), AdminServiceError> {
+        let mut external_pools = self.token_manager.runtime_config().external_pools;
+        external_pools.local_pool_route_mode = local.route_mode;
+        external_pools.local_pool_route_rules = local.route_rules.clone();
+        external_pools.external_pool_route_mode = external.route_mode;
+        external_pools.external_pool_route_rules = external.route_rules.clone();
+        validate_external_pools_config(&external_pools)
+            .map_err(AdminServiceError::InvalidCredential)?;
+        self.token_manager
+            .update_runtime_config(|config| config.external_pools = external_pools.clone())
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.external_pool_manager
+            .invalidate_external_pool_policy_state();
+        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+        Ok(())
+    }
+
+    pub(super) fn route_scenario_audit(
+        &self,
+        action: &'static str,
+        id: u64,
+        detail: serde_json::Value,
+    ) {
+        self.audit(
+            action,
+            "route_scenario",
+            Some(id.to_string()),
+            true,
+            None,
+            detail,
+        );
+    }
+}
+
 fn block_on_admin_store<T>(
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {

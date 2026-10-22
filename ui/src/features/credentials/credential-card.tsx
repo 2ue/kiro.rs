@@ -11,6 +11,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   Badge,
@@ -73,9 +74,10 @@ import {
   subscriptionBadgeMeta,
 } from './credential-utils'
 import { SecretInput } from './credential-inputs'
-import { SelectBox, TextAreaBox } from '@/features/external-pools/external-pool-components'
-import { joinRules, splitRules } from '@/features/external-pools/external-pool-utils'
+import { SelectBox } from '@/features/external-pools/external-pool-components'
 import { SupportedModelTagsEditor, mergeSupportedModels } from '@/features/shared/supported-model-tags'
+import { RouteSelector } from '@/features/route-scenarios/route-selector'
+import { getRouteScenarioOptions } from '@/api/credentials'
 
 // ============================================================================
 // Sub-components
@@ -195,8 +197,10 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [editingFast, setEditingFast] = useState(false)
   const [editingRoutePolicy, setEditingRoutePolicy] = useState(false)
+  const scenarioOptions = useQuery({ queryKey: ['route-scenario-options'], queryFn: getRouteScenarioOptions, enabled: editingRoutePolicy })
+  const routeOptions = scenarioOptions.data?.routes ?? []
   const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>(credential.routeMode ?? 'allow_all')
-  const [routeRulesDraft, setRouteRulesDraft] = useState(joinRules(credential.routeRules ?? []))
+  const [routeRulesDraft, setRouteRulesDraft] = useState<string[]>(credential.routeRules ?? [])
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [editingRpm, setEditingRpm] = useState(false)
@@ -342,11 +346,11 @@ export function CredentialCard({
 
   const resetRoutePolicyDraft = () => {
     setRouteModeDraft(credential.routeMode ?? 'allow_all')
-    setRouteRulesDraft(joinRules(credential.routeRules ?? []))
+    setRouteRulesDraft(credential.routeRules ?? [])
   }
 
   const saveRoutePolicy = () => {
-    const routeRules = routeModeDraft === 'allow_all' ? [] : splitRules(routeRulesDraft)
+    const routeRules = routeModeDraft === 'allow_all' ? [] : routeRulesDraft
     if (routeModeDraft === 'allow_list' && routeRules.length === 0) {
       toast.error('只允许模式至少需要一条路由规则，否则这个账号不会承接任何请求')
       return
@@ -828,8 +832,8 @@ export function CredentialCard({
         onClose={() => { setEditingRoutePolicy(false); resetRoutePolicyDraft() }}>
         <div className="space-y-3">
           <div className="rounded-lg bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-            控制哪些入口路由可以调度到这个账号，规则写法和外部账号相同。被排除的路由不会用这个账号，先于 Fast 和优先级生效。
-            如果某个路由所有本地账号都被排除，按外部池的路由规则决定是否转外部池。
+            控制哪些入口路由可以调度到这个账号。被排除的路由不会用这个账号，先于 Fast 和优先级生效。
+            如果某个路由所有本地账号都被排除，按外部池的路由规则决定是否转外部池。要整套切换多个账号的规则，用路由场景。
           </div>
           <div className="grid gap-3 md:grid-cols-[200px_1fr]">
             <SelectBox
@@ -842,13 +846,15 @@ export function CredentialCard({
               <SelectItem value="allow_list">只允许下列入口</SelectItem>
               <SelectItem value="deny_list">禁止下列入口</SelectItem>
             </SelectBox>
-            <TextAreaBox
-              label="路由规则"
-              description="每行一条，可填 /v1、/cc、/ha，或完整 /cc/v1/messages；* 表示全部入口。"
-              value={routeRulesDraft}
-              disabled={setRoutePolicy.isPending || routeModeDraft === 'allow_all'}
-              onChange={setRouteRulesDraft}
-            />
+            <div className="min-w-0 space-y-1.5">
+              <div className="text-sm font-medium">路由</div>
+              <RouteSelector
+                routes={routeOptions}
+                value={routeRulesDraft}
+                disabled={setRoutePolicy.isPending || routeModeDraft === 'allow_all'}
+                onChange={setRouteRulesDraft}
+              />
+            </div>
           </div>
           <div className="flex justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={() => { setEditingRoutePolicy(false); resetRoutePolicyDraft() }} disabled={setRoutePolicy.isPending}>取消</Button>

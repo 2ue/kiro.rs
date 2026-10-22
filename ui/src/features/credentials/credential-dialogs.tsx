@@ -9,6 +9,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
   addCredential,
@@ -17,7 +18,9 @@ import {
   getCredentialBalance,
   setCredentialDisabled,
   testCredential,
+  getRouteScenarioOptions,
 } from '@/api/credentials'
+import { RouteSelector } from '@/features/route-scenarios/route-selector'
 import {
   Button,
   Checkbox,
@@ -53,7 +56,6 @@ import type {
   ProxyResource,
   TestCredentialResponse,
 } from '@/types/api'
-import { splitRules } from '@/features/external-pools/external-pool-utils'
 import { SecretInput } from './credential-inputs'
 import { CredentialTagsField } from '@/components/credential-tags-field'
 import { credentialSubscriptionLabel } from './credential-utils'
@@ -1263,7 +1265,9 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [enableFields, setEnableFields] = useState({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
   const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>('allow_all')
-  const [routeRulesDraft, setRouteRulesDraft] = useState('')
+  const [routeRulesDraft, setRouteRulesDraft] = useState<string[]>([])
+  const scenarioOptions = useQuery({ queryKey: ['route-scenario-options'], queryFn: getRouteScenarioOptions, enabled: open })
+  const routeOptions = scenarioOptions.data?.routes ?? []
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
@@ -1284,7 +1288,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       setRateLimitAutoDisableEnabled(true)
       setEnableFields({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
       setRouteModeDraft('allow_all')
-      setRouteRulesDraft('')
+      setRouteRulesDraft([])
       setShowProxyUsername(false)
       setShowProxyPassword(false)
     }
@@ -1315,7 +1319,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       req.fast = { fast }
     }
     if (enableFields.routePolicy) {
-      const routeRules = routeModeDraft === 'allow_all' ? [] : splitRules(routeRulesDraft)
+      const routeRules = routeModeDraft === 'allow_all' ? [] : routeRulesDraft
       if (routeModeDraft === 'allow_list' && routeRules.length === 0) {
         toast.error('只允许模式至少需要一条路由规则，否则这些账号不会承接任何请求')
         return
@@ -1408,7 +1412,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
                   />
                 </div>
               </Field>
-              <Field label="路由限制" description="和外部账号相同的入口规则；每行一条，* 表示全部入口">
+              <Field label="路由限制" description="从路由策略里已有的路由中选择">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
                     <Checkbox checked={enableFields.routePolicy} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, routePolicy: Boolean(v) }))} id="batch-route-policy" aria-label="批量修改路由限制" />
@@ -1421,13 +1425,11 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
                       </SelectContent>
                     </Select>
                   </div>
-                  <Textarea
-                    className="min-h-16 font-mono text-xs"
-                    aria-label="路由规则"
+                  <RouteSelector
+                    routes={routeOptions}
                     value={routeRulesDraft}
-                    placeholder={'/cc\n/ha'}
                     disabled={!enableFields.routePolicy || routeModeDraft === 'allow_all' || batchUpdate.isPending}
-                    onChange={(e) => setRouteRulesDraft(e.target.value)}
+                    onChange={setRouteRulesDraft}
                   />
                 </div>
               </Field>

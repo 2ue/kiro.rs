@@ -7,6 +7,9 @@ import { Button } from '@/components/ui'
 import { SelectItem } from '@/components/ui'
 import { cn } from '@/lib/utils'
 import { SupportedModelTagsEditor, parseSupportedModelItems } from '@/features/shared/supported-model-tags'
+import { RouteSelector } from '@/features/route-scenarios/route-selector'
+import { getRouteScenarioOptions } from '@/api/credentials'
+import { useQuery } from '@tanstack/react-query'
 import {
   type ExternalPoolFormDraft,
   type ExternalPoolModelMappingPreset,
@@ -81,6 +84,8 @@ export function ExternalPoolFormModal({
   const [quickImportText, setQuickImportText] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
+  const scenarioOptions = useQuery({ queryKey: ['route-scenario-options'], queryFn: getRouteScenarioOptions, enabled: open })
+  const routeOptions = scenarioOptions.data?.routes ?? []
 
   useEffect(() => {
     if (!open) {
@@ -294,13 +299,15 @@ export function ExternalPoolFormModal({
               <SelectItem value="allow_list">只允许下列入口</SelectItem>
               <SelectItem value="deny_list">禁止下列入口</SelectItem>
             </SelectBox>
-            <TextAreaBox
-              label="单池路由规则"
-              description="每行一条，可填 /v1、/cc、/ha、/na、/dfcache/team，或完整 /cc/v1/messages；* 表示全部入口。"
-              value={draft.routeRulesText}
-              disabled={saving || draft.routeMode === 'allow_all'}
-              onChange={(v) => set('routeRulesText', v)}
-            />
+            <div className="min-w-0 space-y-1.5">
+              <div className="text-sm font-medium">单池路由</div>
+              <RouteSelector
+                routes={routeOptions}
+                value={draft.routeRules}
+                disabled={saving || draft.routeMode === 'allow_all'}
+                onChange={(routeRules) => set('routeRules', routeRules)}
+              />
+            </div>
           </div>
         </FormSection>
 

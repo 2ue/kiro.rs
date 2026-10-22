@@ -33,6 +33,9 @@ const RuntimePage = React.lazy(() =>
 const CachePoliciesPage = React.lazy(() =>
   import('@/features/cache-policies/cache-policies-page').then((m) => ({ default: m.CachePoliciesPage }))
 )
+const RouteScenariosPage = React.lazy(() =>
+  import('@/features/route-scenarios/route-scenarios-page').then((m) => ({ default: m.RouteScenariosPage }))
+)
 const ModelsPage = React.lazy(() =>
   import('@/features/models/models-page').then((m) => ({ default: m.ModelsPage }))
 )
@@ -80,6 +83,7 @@ const router = createBrowserRouter(
         // 设置域
         { path: 'runtime', element: <Lazy><RuntimePage /></Lazy> },
         { path: 'cache-policies', element: <Lazy><CachePoliciesPage /></Lazy> },
+        { path: 'route-scenarios', element: <Lazy><RouteScenariosPage /></Lazy> },
         { path: 'models', element: <Lazy><ModelsPage /></Lazy> },
         { path: 'security', element: <Lazy><SecurityPage /></Lazy> },
 

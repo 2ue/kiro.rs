@@ -5837,6 +5837,11 @@ pub struct Config {
     #[serde(default)]
     pub defined_cache_routes: Vec<String>,
 
+    /// Route scenario most recently applied in full from the admin route scenario page; only
+    /// used to show which scenario is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_route_scenario_id: Option<u64>,
+
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
@@ -7047,6 +7052,7 @@ impl Default for Config {
             reported_usage: ReportedUsageConfig::default(),
             cache_policy: CachePolicyConfig::default(),
             defined_cache_routes: Vec::new(),
+            active_route_scenario_id: None,
             usage_record_limit: default_usage_record_limit(),
             tool_format_debug: ToolFormatDebugConfig::default(),
             high_cache_threshold: default_high_cache_threshold(),

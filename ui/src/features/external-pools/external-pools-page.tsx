@@ -23,6 +23,7 @@ import {
   setExternalPoolEnabled,
   updateExternalPool,
   updateRuntimeConfig,
+  getRouteScenarioOptions,
 } from '@/api/credentials'
 import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
 import { useRuntimeConfig } from '@/hooks/use-credentials'
@@ -69,6 +70,7 @@ import {
   whole,
 } from './external-pool-utils'
 import { ExternalPoolFormModal } from './external-pool-form-modal'
+import { RouteSelector } from '@/features/route-scenarios/route-selector'
 import { ExternalPoolTestModal } from './external-pool-test-modal'
 import {
   FormSection,
@@ -134,14 +136,14 @@ export function ExternalPoolsPage() {
   const confirmDialog = useConfirm()
   const runtimeConfig = useRuntimeConfig()
   const pools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools })
+  const scenarioOptions = useQuery({ queryKey: ['route-scenario-options'], queryFn: getRouteScenarioOptions })
+  const routeOptions = scenarioOptions.data?.routes ?? []
   const status = useQuery({ queryKey: ['external-pools-status'], queryFn: getExternalPoolsStatus, refetchInterval: 5000 })
 
   const [savingConfig, setSavingConfig] = useState(false)
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
   const [modelRulesText, setModelRulesText] = useState('')
   const [pathRulesText, setPathRulesText] = useState('')
-  const [externalRouteRulesText, setExternalRouteRulesText] = useState('')
-  const [localRouteRulesText, setLocalRouteRulesText] = useState('')
   const [retryStatusCodesText, setRetryStatusCodesText] = useState('')
   const [samePoolRetryStatusCodesText, setSamePoolRetryStatusCodesText] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
@@ -156,8 +158,6 @@ export function ExternalPoolsPage() {
     setConfigDraft(externalPools)
     setModelRulesText(joinRules(externalPools.directExternalModelRules))
     setPathRulesText(joinRules(externalPools.directExternalPathRules))
-    setExternalRouteRulesText(joinRules(externalPools.externalPoolRouteRules))
-    setLocalRouteRulesText(joinRules(externalPools.localPoolRouteRules))
     setRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolRetryStatusCodes))
     setSamePoolRetryStatusCodesText(joinStatusCodeList(externalPools.externalPoolSamePoolRetryStatusCodes))
   }, [runtimeConfig.data?.externalPools])
@@ -239,7 +239,7 @@ export function ExternalPoolsPage() {
     if (!createForm.name?.trim() || !createForm.baseUrl?.trim() || !createForm.apiKey?.trim()) return toast.error('名称、Base URL 和 Key 必填')
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, routeRulesText, headerOverridesText, ...form } = createForm
+      const { modelMappingRulesText, supportedModelsText, headerOverridesText, ...form } = createForm
       await createExternalPool({
         ...form,
         name: createForm.name.trim(),
@@ -249,7 +249,7 @@ export function ExternalPoolsPage() {
         streamResponseMode: createForm.streamResponseMode === 'inherit' ? null : createForm.streamResponseMode,
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
-        routeRules: splitRules(routeRulesText),
+        routeRules: form.routeMode === 'allow_all' ? [] : form.routeRules,
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
       })
@@ -274,7 +274,7 @@ export function ExternalPoolsPage() {
     if (!editForm.name?.trim() || !editForm.baseUrl?.trim()) return toast.error('名称和 Base URL 必填')
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, supportedModelsText, routeRulesText, headerOverridesText, ...form } = editForm
+      const { modelMappingRulesText, supportedModelsText, headerOverridesText, ...form } = editForm
       const payload: UpdateExternalPoolRequest = {
         ...form,
         name: editForm.name.trim(),
@@ -284,7 +284,7 @@ export function ExternalPoolsPage() {
         streamResponseMode: editForm.streamResponseMode === 'inherit' ? null : editForm.streamResponseMode,
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
-        routeRules: splitRules(routeRulesText),
+        routeRules: form.routeMode === 'allow_all' ? [] : form.routeRules,
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
         supportedModels: parseSupportedModelsText(supportedModelsText),
       }
@@ -392,7 +392,7 @@ export function ExternalPoolsPage() {
             title="路由策略"
             titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
             active={externalEnabled}
-            description="控制哪些入口进入本地账号或外部账号。"
+            description="控制哪些入口进入本地账号或外部账号。单个账号的规则和整套切换在路由场景页管理。"
           >
             <div className="grid gap-4 lg:grid-cols-2">
               <FormSection title="本地账号路由" description="决定哪些入口允许进入本地账号；其余入口会按外部池策略处理。">
@@ -410,15 +410,15 @@ export function ExternalPoolsPage() {
                     <SelectItem value="allow_list">只允许下列入口进入本地账号</SelectItem>
                     <SelectItem value="deny_list">禁止下列入口进入本地账号</SelectItem>
                   </SelectBox>
-                  <TextAreaBox
-                    disabled={!externalEnabled || configDraft.localPoolRouteMode === 'allow_all'}
-                    label="路由规则"
-                    value={localRouteRulesText}
-                    onChange={(value) => {
-                      setLocalRouteRulesText(value)
-                      setConfigDraft((prev) => ({ ...prev, localPoolRouteRules: splitRules(value) }))
-                    }}
-                  />
+                  <div className="min-w-0 space-y-1.5">
+                    <div className="text-sm font-medium">路由</div>
+                    <RouteSelector
+                      routes={routeOptions}
+                      value={configDraft.localPoolRouteRules}
+                      disabled={!externalEnabled || configDraft.localPoolRouteMode === 'allow_all'}
+                      onChange={(localPoolRouteRules) => setConfigDraft((prev) => ({ ...prev, localPoolRouteRules }))}
+                    />
+                  </div>
                 </div>
               </FormSection>
 
@@ -437,15 +437,15 @@ export function ExternalPoolsPage() {
                     <SelectItem value="allow_list">只允许下列入口进入外部账号</SelectItem>
                     <SelectItem value="deny_list">禁止下列入口进入外部账号</SelectItem>
                   </SelectBox>
-                  <TextAreaBox
-                    disabled={!externalEnabled || configDraft.externalPoolRouteMode === 'allow_all'}
-                    label="路由规则"
-                    value={externalRouteRulesText}
-                    onChange={(value) => {
-                      setExternalRouteRulesText(value)
-                      setConfigDraft((prev) => ({ ...prev, externalPoolRouteRules: splitRules(value) }))
-                    }}
-                  />
+                  <div className="min-w-0 space-y-1.5">
+                    <div className="text-sm font-medium">路由</div>
+                    <RouteSelector
+                      routes={routeOptions}
+                      value={configDraft.externalPoolRouteRules}
+                      disabled={!externalEnabled || configDraft.externalPoolRouteMode === 'allow_all'}
+                      onChange={(externalPoolRouteRules) => setConfigDraft((prev) => ({ ...prev, externalPoolRouteRules }))}
+                    />
+                  </div>
                 </div>
               </FormSection>
             </div>
