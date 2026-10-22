@@ -2000,6 +2000,7 @@ export interface RuntimeConfig {
   requestAdmission: RequestAdmissionConfig
   credentialMaxConcurrentRequests: number
   credentialInfoRefreshConcurrency: number
+  kiroCreditUnitPriceUsd?: number | null
   credentialTransientCooldownSecs: number
   credentialRateLimitCooldownSecs: number
   credentialServerErrorCooldownSecs: number

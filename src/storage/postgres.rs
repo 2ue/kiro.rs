@@ -29,11 +29,13 @@ use crate::anthropic::usage::{
     UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals, UsageExternalPoolRiskWindow,
     UsageOverviewAccountRow, UsageOverviewExternal, UsageOverviewLocal, UsageOverviewMetrics,
     UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewRouteRow,
+    UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup, UsageOverviewSeriesGroups,
     UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals,
     UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
     UsageRecordsResult, UsageRouteKind, UsageRouteSubtype, UsageSeriesPoint, UsageSource,
     UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
     usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
+    usage_external_reason_category, usage_external_reason_label,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -5917,6 +5919,8 @@ impl PostgresUsageStore {
         let dimensions = vec![
             "global".to_string(),
             "external_pool".to_string(),
+            "external_reason".to_string(),
+            "local_route".to_string(),
             "credential".to_string(),
             "model".to_string(),
             "endpoint".to_string(),
@@ -6023,6 +6027,7 @@ impl PostgresUsageStore {
         let mut all = OverviewAccumulator::default();
         let mut external = OverviewAccumulator::default();
         let mut series = HashMap::<String, OverviewSeriesAccumulator>::new();
+        let mut series_groups = OverviewSeriesGroupsAccumulator::default();
         let mut pools = HashMap::<String, OverviewPoolAccumulator>::new();
         let mut accounts = HashMap::<String, OverviewAccumulator>::new();
         let mut account_labels = HashMap::<String, String>::new();
@@ -6042,15 +6047,28 @@ impl PostgresUsageStore {
             match dimension.as_str() {
                 "global" if dimension_key == "all" => {
                     all.add(metrics);
-                    series.entry(series_key).or_default().all.add(metrics);
+                    series
+                        .entry(series_key)
+                        .or_default()
+                        .all
+                        .add(metrics, OverviewExternalCosts::from_row(&row)?);
                 }
                 "external_pool" => {
                     external.add(metrics);
-                    series
-                        .entry(series_key.clone())
+                    let costs = OverviewExternalCosts::from_row(&row)?;
+                    let bucket = series.entry(series_key.clone()).or_default();
+                    bucket.external.add(metrics, costs);
+                    bucket
+                        .external_pools
+                        .entry(dimension_key.clone())
                         .or_default()
-                        .external
-                        .add(metrics);
+                        .add(metrics, costs);
+                    series_groups.external_pools.add(
+                        &dimension_key,
+                        dimension_label.as_deref(),
+                        costs.raw_cost_usd,
+                        metrics.requests,
+                    );
                     let pool = pools.entry(dimension_key.clone()).or_default();
                     pool.metrics.add(metrics);
                     pool.raw_cost_usd += row.try_get::<f64, _>("external_pool_raw_cost_usd")?;
@@ -6073,6 +6091,37 @@ impl PostgresUsageStore {
                     if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
                         pool.label = Some(label.to_string());
                     }
+                }
+                "local_route" => {
+                    series
+                        .entry(series_key)
+                        .or_default()
+                        .local_routes
+                        .entry(dimension_key.clone())
+                        .or_default()
+                        .add(metrics, OverviewExternalCosts::default());
+                    series_groups.local_routes.add(
+                        &dimension_key,
+                        dimension_label.as_deref(),
+                        metrics.kiro_metering_usage,
+                        metrics.requests,
+                    );
+                }
+                "external_reason" => {
+                    let costs = OverviewExternalCosts::from_row(&row)?;
+                    series
+                        .entry(series_key)
+                        .or_default()
+                        .external_reasons
+                        .entry(dimension_key.clone())
+                        .or_default()
+                        .add(metrics, costs);
+                    series_groups.external_reasons.add(
+                        &dimension_key,
+                        Some(usage_external_reason_label(&dimension_key)),
+                        metrics.requests as f64,
+                        metrics.requests,
+                    );
                 }
                 "credential" => {
                     let account = accounts.entry(dimension_key.clone()).or_default();
@@ -6113,7 +6162,8 @@ impl PostgresUsageStore {
             }
         }
 
-        let series_points = overview_series_points(spec, series);
+        let series_groups = series_groups.finish();
+        let series_points = overview_series_points(spec, series, &series_groups);
         let external_metrics = external.to_metrics();
         let local_metrics = all.subtract(&external);
 
@@ -6280,6 +6330,7 @@ impl PostgresUsageStore {
                 routes: route_rows,
             },
             series: series_points,
+            series_groups,
             top_models,
             top_accounts,
             top_keys,
@@ -6745,6 +6796,59 @@ impl PostgresUsageStore {
     /// rollup tables would erase fresh rollups and make the live service look empty
     /// until enough new writes accumulate. Rebuilding from active details in the
     /// same reset transaction preserves those post-cutoff records.
+    /// Rebuilds the route dimensions (`local_route`, `external_reason`) from the
+    /// active usage records. Offline maintenance only: the caller holds the
+    /// exclusive maintenance fence and the commit guard blocks writers.
+    pub async fn rebuild_usage_route_dimensions(&self) -> anyhow::Result<u64> {
+        let dimensions = USAGE_ROUTE_ROLLUP_DIMENSIONS
+            .iter()
+            .map(|dimension| dimension.to_string())
+            .collect::<Vec<_>>();
+        let mut tx = self.store.pool().begin().await?;
+        acquire_usage_cleanup_commit_guard(&mut tx).await?;
+        for table in ["usage_rollup_time_buckets", "usage_rollup_totals"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE dimension = ANY($1::text[])"
+            ))
+            .bind(&dimensions)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let mut scanned = 0_u64;
+        let mut last_id: Option<String> = None;
+        loop {
+            let rows = sqlx::query(
+                r#"
+                SELECT id, data
+                FROM usage_records
+                WHERE deleted_at IS NULL
+                  AND rollup_active
+                  AND ($1::text IS NULL OR id > $1)
+                ORDER BY id ASC
+                LIMIT 1000
+                "#,
+            )
+            .bind(last_id.as_deref())
+            .fetch_all(&mut *tx)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut rollups = UsageRollupBatchDelta::default();
+            for row in rows {
+                last_id = Some(row.try_get("id")?);
+                let value: serde_json::Value = row.try_get("data")?;
+                let mut record: UsageRecord = serde_json::from_value(value)?;
+                apply_usage_record_legacy_cost_compatibility(&mut record);
+                rollups.add_record_dimensions(&record, &USAGE_ROUTE_ROLLUP_DIMENSIONS);
+                scanned += 1;
+            }
+            rollups.apply(&mut tx).await?;
+        }
+        tx.commit().await?;
+        Ok(scanned)
+    }
+
     pub async fn reset_usage_rollups_from_active_records(&self) -> anyhow::Result<()> {
         let mut tx = self.store.pool().begin().await?;
         configure_usage_cleanup_transaction(&mut tx).await?;
@@ -9660,7 +9764,33 @@ struct UsageRollupBatchDelta {
     has_negative: bool,
 }
 
+/// Rollup dimensions describing how a request was routed. They were added
+/// after launch, so history needs an explicit rebuild to fill them.
+const USAGE_ROUTE_ROLLUP_DIMENSIONS: [&str; 2] = ["local_route", "external_reason"];
+
 impl UsageRollupBatchDelta {
+    /// Adds only the named dimensions (totals and hour buckets). Used by the
+    /// targeted backfill so the other rollup tables are left untouched.
+    fn add_record_dimensions(&mut self, record: &UsageRecord, only: &[&str]) {
+        let metrics = UsageRollupMetrics::from_record(record, 1);
+        let bucket_start = usage_rollup_bucket_start(parse_usage_created_at(record));
+        for dimension in usage_rollup_dimensions(record)
+            .into_iter()
+            .filter(|dimension| only.contains(&dimension.dimension))
+        {
+            self.totals
+                .entry((dimension.dimension, dimension.key.clone()))
+                .or_default()
+                .add(dimension.label.clone(), metrics);
+            if dimension.include_time_bucket {
+                self.time_buckets
+                    .entry((bucket_start, dimension.dimension, dimension.key))
+                    .or_default()
+                    .add(dimension.label, metrics);
+            }
+        }
+    }
+
     fn add_record(&mut self, record: &UsageRecord, direction: i64) {
         let direction = if direction < 0 { -1 } else { 1 };
         self.has_negative |= direction < 0;
@@ -9881,6 +10011,17 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
             dimension: "local_route",
             label: Some(usage_local_route_label(&route_key)),
             key: route_key,
+            include_time_bucket: true,
+        });
+    }
+
+    if record.route_kind == Some(UsageRouteKind::ExternalPool) {
+        let reason_key =
+            usage_external_reason_category(record.route_subtype, record.fallback_reason.as_deref());
+        dimensions.push(UsageRollupDimension {
+            dimension: "external_reason",
+            key: reason_key.to_string(),
+            label: Some(usage_external_reason_label(reason_key).to_string()),
             include_time_bucket: true,
         });
     }
@@ -11295,14 +11436,133 @@ impl OverviewAccumulator {
             estimated_cost_usd: metrics.estimated_cost_usd,
             original_cost_usd: metrics.original_cost_usd,
             kiro_metering_usage: metrics.kiro_metering_usage,
+            raw_cost_usd: 0.0,
+            billable_cost_usd: 0.0,
+            profit_usd: 0.0,
         }
     }
 }
 
+/// External-pool cost columns carried by every rollup row. Only external-pool
+/// records contribute non-zero values, so local-route cells stay at zero.
 #[derive(Debug, Clone, Copy, Default)]
+struct OverviewExternalCosts {
+    raw_cost_usd: f64,
+    billable_cost_usd: f64,
+    profit_usd: f64,
+}
+
+impl OverviewExternalCosts {
+    fn from_row(row: &PgRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
+            billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
+            profit_usd: row.try_get("external_pool_profit_usd")?,
+        })
+    }
+
+    fn add(&mut self, other: Self) {
+        self.raw_cost_usd += other.raw_cost_usd;
+        self.billable_cost_usd += other.billable_cost_usd;
+        self.profit_usd += other.profit_usd;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OverviewSeriesCell {
+    metrics: OverviewAccumulator,
+    costs: OverviewExternalCosts,
+}
+
+impl OverviewSeriesCell {
+    fn add(&mut self, metrics: OverviewAccumulator, costs: OverviewExternalCosts) {
+        self.metrics.add(metrics);
+        self.costs.add(costs);
+    }
+
+    fn to_series_metrics(self) -> UsageOverviewSeriesMetrics {
+        UsageOverviewSeriesMetrics {
+            raw_cost_usd: self.costs.raw_cost_usd.max(0.0),
+            billable_cost_usd: self.costs.billable_cost_usd.max(0.0),
+            profit_usd: self.costs.profit_usd,
+            ..self.metrics.to_series_metrics()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct OverviewSeriesAccumulator {
-    all: OverviewAccumulator,
-    external: OverviewAccumulator,
+    all: OverviewSeriesCell,
+    external: OverviewSeriesCell,
+    local_routes: HashMap<String, OverviewSeriesCell>,
+    external_pools: HashMap<String, OverviewSeriesCell>,
+    external_reasons: HashMap<String, OverviewSeriesCell>,
+}
+
+#[derive(Debug, Default)]
+struct OverviewSeriesGroupMember {
+    label: Option<String>,
+    weight: f64,
+    requests: i64,
+}
+
+/// Collects the members of one breakdown across the whole range so every
+/// bucket can be emitted in the same order and labels are sent once.
+#[derive(Debug, Default)]
+struct OverviewSeriesGroupAccumulator {
+    members: HashMap<String, OverviewSeriesGroupMember>,
+}
+
+impl OverviewSeriesGroupAccumulator {
+    fn add(&mut self, key: &str, label: Option<&str>, weight: f64, requests: i64) {
+        let member = self.members.entry(key.to_string()).or_default();
+        if let Some(label) = label.map(str::trim).filter(|value| !value.is_empty()) {
+            member.label = Some(label.to_string());
+        }
+        member.weight += weight;
+        member.requests += requests;
+    }
+
+    fn finish(self, default_label: impl Fn(&str) -> String) -> Vec<UsageOverviewSeriesGroup> {
+        let mut members = self
+            .members
+            .into_iter()
+            .filter(|(_, member)| member.requests > 0)
+            .collect::<Vec<_>>();
+        members.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .weight
+                .total_cmp(&left.weight)
+                .then_with(|| right.requests.cmp(&left.requests))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        members
+            .into_iter()
+            .map(|(key, member)| UsageOverviewSeriesGroup {
+                label: member.label.unwrap_or_else(|| default_label(&key)),
+                key,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct OverviewSeriesGroupsAccumulator {
+    local_routes: OverviewSeriesGroupAccumulator,
+    external_pools: OverviewSeriesGroupAccumulator,
+    external_reasons: OverviewSeriesGroupAccumulator,
+}
+
+impl OverviewSeriesGroupsAccumulator {
+    fn finish(self) -> UsageOverviewSeriesGroups {
+        UsageOverviewSeriesGroups {
+            local_routes: self.local_routes.finish(usage_local_route_label),
+            external_pools: self.external_pools.finish(|key| format!("#{key}")),
+            external_reasons: self
+                .external_reasons
+                .finish(|key| usage_external_reason_label(key).to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -11419,20 +11679,52 @@ fn overview_series_slots(spec: &UsageOverviewSpec) -> Vec<(String, DateTime<Utc>
     slots
 }
 
+fn overview_series_breakdown(
+    order: &[UsageOverviewSeriesGroup],
+    cells: &HashMap<String, OverviewSeriesCell>,
+) -> Vec<UsageOverviewSeriesBreakdown> {
+    // Absent members are omitted; the client treats a missing key as zero.
+    order
+        .iter()
+        .filter_map(|group| {
+            cells
+                .get(&group.key)
+                .map(|cell| UsageOverviewSeriesBreakdown {
+                    key: group.key.clone(),
+                    metrics: cell.to_series_metrics(),
+                })
+        })
+        .collect()
+}
+
 fn overview_series_points(
     spec: &UsageOverviewSpec,
-    series: HashMap<String, OverviewSeriesAccumulator>,
+    mut series: HashMap<String, OverviewSeriesAccumulator>,
+    groups: &UsageOverviewSeriesGroups,
 ) -> Vec<UsageOverviewSeriesPoint> {
     overview_series_slots(spec)
         .into_iter()
         .map(|(key, bucket_start, label)| {
-            let values = series.get(&key).copied().unwrap_or_default();
+            let values = series.remove(&key).unwrap_or_default();
+            let local = OverviewSeriesCell {
+                metrics: values.all.metrics.subtract(&values.external.metrics),
+                costs: OverviewExternalCosts::default(),
+            };
             UsageOverviewSeriesPoint {
                 bucket_start: bucket_start.to_rfc3339(),
                 label,
                 all: values.all.to_series_metrics(),
-                local: values.all.subtract(&values.external).to_series_metrics(),
+                local: local.to_series_metrics(),
                 external: values.external.to_series_metrics(),
+                local_routes: overview_series_breakdown(&groups.local_routes, &values.local_routes),
+                external_pools: overview_series_breakdown(
+                    &groups.external_pools,
+                    &values.external_pools,
+                ),
+                external_reasons: overview_series_breakdown(
+                    &groups.external_reasons,
+                    &values.external_reasons,
+                ),
             }
         })
         .collect()
@@ -13927,6 +14219,91 @@ mod tests {
     }
 
     #[test]
+    fn usage_rollup_dimensions_tag_external_records_with_reason_category() {
+        let mut external = usage_record("external-reason", 0);
+        external.route_kind = Some(UsageRouteKind::ExternalPool);
+        external.route_subtype = Some(UsageRouteSubtype::ExternalFallbackPreflight);
+        external.fallback_reason = Some("local_capacity_full".to_string());
+        let reason = usage_rollup_dimensions(&external)
+            .into_iter()
+            .find(|dimension| dimension.dimension == "external_reason")
+            .expect("external reason rollup dimension");
+        assert_eq!(reason.key, "local_capacity");
+        assert_eq!(reason.label.as_deref(), Some("本地容量不足"));
+        assert!(reason.include_time_bucket);
+
+        external.route_kind = Some(UsageRouteKind::LocalCredential);
+        assert!(
+            usage_rollup_dimensions(&external)
+                .into_iter()
+                .all(|dimension| dimension.dimension != "external_reason"),
+            "local records must not be tagged with an external reason"
+        );
+    }
+
+    #[test]
+    fn usage_external_reason_category_groups_by_owner() {
+        use UsageRouteSubtype::*;
+        let cases = [
+            (
+                Some(ExternalDirectPolicy),
+                Some("model_rule:x"),
+                "policy_direct",
+            ),
+            (
+                Some(ExternalRoutePolicy),
+                Some("local_route_blocked"),
+                "policy_direct",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("local_capacity_full"),
+                "local_capacity",
+            ),
+            (
+                Some(ExternalFallbackAfterLocalAttempts),
+                Some("local_attempt_reserved_for_fallback"),
+                "local_capacity",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("local_all_cooling_down"),
+                "local_unavailable",
+            ),
+            (
+                Some(ExternalFallbackAfterLocalAttempts),
+                Some("no_available_credentials"),
+                "local_unavailable",
+            ),
+            (
+                Some(ExternalFallbackAfterLocalAttempts),
+                Some("unsupported_model"),
+                "model_unsupported",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("local_scheduler_redis_degraded"),
+                "system_degraded",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("something_new"),
+                "other",
+            ),
+            (Some(ExternalFallbackPreflight), None, "other"),
+            (Some(ExternalError), Some("local_capacity_full"), "other"),
+            (None, Some("local_capacity_full"), "other"),
+        ];
+        for (subtype, reason, expected) in cases {
+            assert_eq!(
+                usage_external_reason_category(subtype, reason),
+                expected,
+                "{subtype:?} / {reason:?}"
+            );
+        }
+    }
+
+    #[test]
     fn usage_rollup_dimensions_include_local_route_subtype_only_for_local_routes() {
         let mut local = usage_record("local-route", 0);
         local.route_kind = Some(UsageRouteKind::LocalCredential);
@@ -16266,6 +16643,169 @@ mod tests {
         assert_eq!(read_only, "on");
 
         tx.commit().await.unwrap();
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_overview_series_breaks_down_routes_pools_and_reasons_and_backfills() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let base = fixed_utc("2026-07-15T10:00:00Z");
+
+        let mut local_ok = usage_record("series-local-ok", 0);
+        local_ok.created_at = (base + chrono::Duration::minutes(5)).to_rfc3339();
+        local_ok.route_kind = Some(UsageRouteKind::LocalCredential);
+        local_ok.route_subtype = Some(UsageRouteSubtype::LocalSuccess);
+        local_ok.kiro_metering_usage = 3.0;
+        local_ok.estimated_cost_usd = 0.30;
+
+        let mut local_rescue = usage_record("series-local-rescue", 0);
+        local_rescue.created_at = (base + chrono::Duration::minutes(40)).to_rfc3339();
+        local_rescue.route_kind = Some(UsageRouteKind::LocalCredential);
+        local_rescue.route_subtype = Some(UsageRouteSubtype::LocalRescueAfterExternal);
+        local_rescue.kiro_metering_usage = 1.5;
+
+        let mut external_capacity = external_usage_record("series-ext-capacity", 0.40, 0.30, 0.50);
+        external_capacity.created_at = (base + chrono::Duration::minutes(10)).to_rfc3339();
+        external_capacity.route_subtype = Some(UsageRouteSubtype::ExternalFallbackPreflight);
+        external_capacity.fallback_reason = Some("local_capacity_full".to_string());
+
+        let mut external_direct = external_usage_record("series-ext-direct", 0.20, 0.10, 0.25);
+        external_direct.created_at =
+            (base + chrono::Duration::hours(1) + chrono::Duration::minutes(10)).to_rfc3339();
+        external_direct.route_subtype = Some(UsageRouteSubtype::ExternalDirectPolicy);
+        external_direct.fallback_reason = None;
+        external_direct.external_pool_id = Some(7);
+        external_direct.external_pool_name = Some("direct-b".to_string());
+
+        usage_store
+            .record_batch(vec![
+                local_ok,
+                local_rescue,
+                external_capacity,
+                external_direct,
+            ])
+            .await
+            .unwrap();
+
+        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
+            base + chrono::Duration::hours(3),
+            Some("UTC"),
+            None,
+            Some(&base.to_rfc3339()),
+            Some(&(base + chrono::Duration::hours(2)).to_rfc3339()),
+            Some("hour"),
+            None,
+        )
+        .unwrap();
+
+        let assert_overview = |overview: &UsageOverviewResponse| {
+            assert_eq!(overview.series.len(), 2);
+            let groups = &overview.series_groups;
+            assert_eq!(
+                groups
+                    .local_routes
+                    .iter()
+                    .map(|g| g.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["local_success", "local_rescue_after_external"],
+                "local routes are ordered by consumed credits"
+            );
+            assert_eq!(
+                groups
+                    .external_pools
+                    .iter()
+                    .map(|g| (g.key.as_str(), g.label.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("42", "backup-a"), ("7", "direct-b")],
+                "external pools are ordered by upstream raw cost"
+            );
+            let mut reasons = groups
+                .external_reasons
+                .iter()
+                .map(|g| (g.key.as_str(), g.label.as_str()))
+                .collect::<Vec<_>>();
+            reasons.sort();
+            assert_eq!(
+                reasons,
+                vec![
+                    ("local_capacity", "本地容量不足"),
+                    ("policy_direct", "策略直连")
+                ]
+            );
+
+            let first = &overview.series[0];
+            assert_eq!(first.local_routes.len(), 2);
+            assert!((first.local.kiro_metering_usage - 4.5).abs() < 1e-9);
+            assert!((first.external.raw_cost_usd - 0.40).abs() < 1e-9);
+            assert!((first.external.billable_cost_usd - 0.50).abs() < 1e-9);
+            assert!((first.external.profit_usd - 0.10).abs() < 1e-9);
+            assert_eq!(
+                first.local.raw_cost_usd, 0.0,
+                "local split never carries external cost"
+            );
+            assert_eq!(first.external_pools.len(), 1);
+            assert_eq!(first.external_pools[0].key, "42");
+            assert_eq!(first.external_reasons.len(), 1);
+            assert_eq!(first.external_reasons[0].key, "local_capacity");
+
+            let second = &overview.series[1];
+            assert!(second.local_routes.is_empty());
+            assert_eq!(second.external_pools[0].key, "7");
+            assert!((second.external_pools[0].metrics.raw_cost_usd - 0.20).abs() < 1e-9);
+            assert_eq!(second.external_reasons[0].key, "policy_direct");
+            assert_eq!(second.external_reasons[0].metrics.requests, 1);
+        };
+
+        let overview = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert_overview(&overview);
+
+        // Simulate history recorded before the route dimensions existed.
+        sqlx::query(
+            "DELETE FROM usage_rollup_time_buckets WHERE dimension IN ('local_route', 'external_reason')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM usage_rollup_totals WHERE dimension IN ('local_route', 'external_reason')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let wiped = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert!(wiped.series_groups.local_routes.is_empty());
+        assert!(wiped.series_groups.external_reasons.is_empty());
+
+        let global_before: i64 = sqlx::query_scalar(
+            "SELECT requests FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let scanned = usage_store.rebuild_usage_route_dimensions().await.unwrap();
+        assert_eq!(scanned, 4);
+        // Running twice must not double count.
+        usage_store.rebuild_usage_route_dimensions().await.unwrap();
+        let global_after: i64 = sqlx::query_scalar(
+            "SELECT requests FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            global_before, global_after,
+            "backfill leaves other dimensions untouched"
+        );
+
+        let rebuilt = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert_overview(&rebuilt);
+
         store.drop_test_schema().await.unwrap();
     }
 

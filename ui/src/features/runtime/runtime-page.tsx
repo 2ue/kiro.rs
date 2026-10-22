@@ -293,6 +293,10 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     },
     credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
     credentialInfoRefreshConcurrency: toWhole(draft.credentialInfoRefreshConcurrency, 1, 16),
+    // 0 或空值表示未配置；后端同样把 0 视为清空。
+    kiroCreditUnitPriceUsd: draft.kiroCreditUnitPriceUsd && draft.kiroCreditUnitPriceUsd > 0
+      ? Math.min(draft.kiroCreditUnitPriceUsd, 100)
+      : null,
     credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
     credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
     credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
@@ -831,6 +835,7 @@ export function RuntimePage() {
                 <NumField label="单账号每分钟请求上限" desc="每个账号一分钟最多接多少个请求；0 表示不做本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={set('credentialRpm')} />
                 <NumField label="单账号最大并发" desc="每个账号同一时间最多处理多少个请求；0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={set('credentialMaxConcurrentRequests')} />
                 <NumField label="积分查询上游并发" desc="管理端强制查询积分时，同时向 Kiro 请求账号额度的数量；与推理并发独立。建议保持 1 到 3，避免批量查询触发上游限流。" value={draft.credentialInfoRefreshConcurrency} min={1} max={16} suffix="并发" onChange={set('credentialInfoRefreshConcurrency')} />
+                <NumField label="Kiro 积分单价" desc="每个积分的真实成本，按套餐价折算填写。只用于总览把本地积分换算成成本、计算全局毛利，不影响调度和计费。0 表示未配置。" value={draft.kiroCreditUnitPriceUsd ?? 0} min={0} max={100} step={0.0001} suffix="美元/积分" onChange={set('kiroCreditUnitPriceUsd')} />
                 <NumField label="全局最大并发" desc="整个服务同一时间最多处理多少个请求；0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={set('dispatchGlobalMaxConcurrentRequests')} />
                 <NumField label="最大排队请求数" desc="账号忙不过来时最多让多少个请求排队；0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={set('dispatchMaxQueuedRequests')} />
                 <TogField

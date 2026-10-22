@@ -728,6 +728,13 @@ pub struct SetCredentialRegionsRequest {
     pub api_region: Option<Option<String>>,
 }
 
+fn deserialize_optional_f64_update<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer).map(Some)
+}
+
 fn deserialize_optional_string_update<'de, D>(
     deserializer: D,
 ) -> Result<Option<Option<String>>, D::Error>
@@ -1802,6 +1809,8 @@ pub struct RuntimeConfigResponse {
     pub request_admission: RequestAdmissionConfig,
     pub credential_max_concurrent_requests: u32,
     pub credential_info_refresh_concurrency: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_credit_unit_price_usd: Option<f64>,
     pub credential_transient_cooldown_secs: u64,
     pub credential_rate_limit_cooldown_secs: u64,
     pub credential_server_error_cooldown_secs: u64,
@@ -1913,6 +1922,9 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_max_concurrent_requests: u32,
     #[serde(default)]
     pub credential_info_refresh_concurrency: Option<u32>,
+    /// 缺省表示保持不变；`null` 表示清空；数值表示设置。
+    #[serde(default, deserialize_with = "deserialize_optional_f64_update")]
+    pub kiro_credit_unit_price_usd: Option<Option<f64>>,
     pub credential_transient_cooldown_secs: u64,
     #[serde(default)]
     pub credential_rate_limit_cooldown_secs: Option<u64>,

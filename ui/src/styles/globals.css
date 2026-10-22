@@ -123,6 +123,30 @@
 }
 /* PLACEHOLDER_THEME */
 
+/* 总览分时趋势专用分类色：顺序即色盲安全机制，按位分配、不循环。
+ * 亮/暗两套已用 dataviz 校验脚本验证（相邻 CVD ΔE ≥ 8.4，正常视觉 ΔE ≥ 19.3）。
+ * 亮色第 3/4/5 位对白底不足 3:1，图表必须保留图例和数据表兜底。 */
+:root {
+  --trend-1: #2a78d6;
+  --trend-2: #eb6834;
+  --trend-3: #1baf7a;
+  --trend-4: #eda100;
+  --trend-5: #e87ba4;
+  --trend-6: #008300;
+  --trend-other: #a3a29b;
+  --trend-line: #0b0b0b;
+}
+.dark {
+  --trend-1: #3987e5;
+  --trend-2: #d95926;
+  --trend-3: #199e70;
+  --trend-4: #c98500;
+  --trend-5: #d55181;
+  --trend-6: #008300;
+  --trend-other: #6b6a65;
+  --trend-line: #ffffff;
+}
+
 @theme inline {
   --color-background: hsl(var(--background));
   --color-surface-subtle: hsl(var(--surface-subtle));

@@ -1147,6 +1147,17 @@ export interface UsageOverviewSeriesMetrics {
   estimatedCostUsd: number
   originalCostUsd: number
   kiroMeteringUsage: number
+  /** 外部池上游原始成本（只有外部池记录有值） */
+  rawCostUsd: number
+  /** 外部池最终可计费金额 */
+  billableCostUsd: number
+  /** 外部池补偿后成本 - 上游原始成本 */
+  profitUsd: number
+}
+
+export interface UsageOverviewSeriesBreakdown {
+  key: string
+  metrics: UsageOverviewSeriesMetrics
 }
 
 export interface UsageOverviewSeriesPoint {
@@ -1155,6 +1166,23 @@ export interface UsageOverviewSeriesPoint {
   all: UsageOverviewSeriesMetrics
   local: UsageOverviewSeriesMetrics
   external: UsageOverviewSeriesMetrics
+  localRoutes: UsageOverviewSeriesBreakdown[]
+  externalPools: UsageOverviewSeriesBreakdown[]
+  externalReasons: UsageOverviewSeriesBreakdown[]
+}
+
+export interface UsageOverviewSeriesGroup {
+  key: string
+  label: string
+}
+
+export interface UsageOverviewSeriesGroups {
+  /** 按消耗积分降序 */
+  localRoutes: UsageOverviewSeriesGroup[]
+  /** 按上游原始成本降序 */
+  externalPools: UsageOverviewSeriesGroup[]
+  /** 按请求数降序 */
+  externalReasons: UsageOverviewSeriesGroup[]
 }
 
 export interface UsageOverviewPoolRow {
@@ -1226,6 +1254,7 @@ export interface UsageOverviewResponse {
     routes: UsageOverviewRouteRow[]
   }
   series: UsageOverviewSeriesPoint[]
+  seriesGroups: UsageOverviewSeriesGroups
   topModels: UsageOverviewRankRow[]
   topAccounts: UsageOverviewRankRow[]
   topKeys: UsageOverviewRankRow[]
@@ -1259,6 +1288,7 @@ export interface UsageOverviewSeriesResponse {
   timezone: string
   range: UsageOverviewResponse['range']
   series: UsageOverviewSeriesPoint[]
+  seriesGroups: UsageOverviewSeriesGroups
 }
 
 export interface UsageOverviewLocalResponse {
@@ -2314,6 +2344,8 @@ export interface RuntimeConfig {
   requestAdmission: RequestAdmissionConfig
   credentialMaxConcurrentRequests: number
   credentialInfoRefreshConcurrency: number
+  /** 每个 Kiro 积分的真实成本（美元），只用于总览把积分换算成成本；null 表示未配置 */
+  kiroCreditUnitPriceUsd?: number | null
   credentialTransientCooldownSecs: number
   credentialRateLimitCooldownSecs: number
   credentialServerErrorCooldownSecs: number

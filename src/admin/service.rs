@@ -226,6 +226,20 @@ const PROXY_TEST_PREVIEW_CHARS: usize = 300;
 const ADMIN_EXTERNAL_POOL_TEST_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 const ADMIN_MODEL_TEST_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// 积分单价只用于总览换算。0 视为未配置；负数、非有限值或明显离谱的值拒绝写入。
+fn normalize_kiro_credit_unit_price_usd(
+    value: Option<f64>,
+) -> Result<Option<f64>, AdminServiceError> {
+    match value {
+        None => Ok(None),
+        Some(0.0) => Ok(None),
+        Some(price) if price.is_finite() && price > 0.0 && price <= 100.0 => Ok(Some(price)),
+        Some(_) => Err(AdminServiceError::InvalidCredential(
+            "kiroCreditUnitPriceUsd 必须是 0 到 100 之间的美元数值".to_string(),
+        )),
+    }
+}
+
 fn effective_credential_info_refresh_concurrency(config: &Config) -> usize {
     config.credential_info_refresh_concurrency.clamp(
         MIN_CREDENTIAL_INFO_REFRESH_CONCURRENCY,
@@ -4759,6 +4773,7 @@ impl AdminService {
             timezone: overview.timezone,
             range: overview.range,
             series: overview.series,
+            series_groups: overview.series_groups,
         })
     }
 
@@ -5781,6 +5796,7 @@ impl AdminService {
             request_admission: config.request_admission.normalized(),
             credential_max_concurrent_requests: config.credential_max_concurrent_requests,
             credential_info_refresh_concurrency: config.credential_info_refresh_concurrency,
+            kiro_credit_unit_price_usd: config.kiro_credit_unit_price_usd,
             credential_transient_cooldown_secs: config.credential_transient_cooldown_secs,
             credential_rate_limit_cooldown_secs: config.credential_rate_limit_cooldown_secs,
             credential_server_error_cooldown_secs: config.credential_server_error_cooldown_secs,
@@ -5928,6 +5944,10 @@ impl AdminService {
         let credential_info_refresh_concurrency = req
             .credential_info_refresh_concurrency
             .unwrap_or(current_config.credential_info_refresh_concurrency);
+        let kiro_credit_unit_price_usd = normalize_kiro_credit_unit_price_usd(
+            req.kiro_credit_unit_price_usd
+                .unwrap_or(current_config.kiro_credit_unit_price_usd),
+        )?;
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
@@ -6542,6 +6562,7 @@ impl AdminService {
                 config.request_admission = request_admission;
                 config.credential_max_concurrent_requests = req.credential_max_concurrent_requests;
                 config.credential_info_refresh_concurrency = credential_info_refresh_concurrency;
+                config.kiro_credit_unit_price_usd = kiro_credit_unit_price_usd;
                 config.credential_transient_cooldown_secs = req.credential_transient_cooldown_secs;
                 config.credential_rate_limit_cooldown_secs = credential_rate_limit_cooldown_secs;
                 config.credential_server_error_cooldown_secs =

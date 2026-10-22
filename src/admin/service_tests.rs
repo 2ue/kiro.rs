@@ -18,6 +18,45 @@ fn cleanup_request() -> UsageCleanupRequest {
 }
 
 #[test]
+fn kiro_credit_unit_price_accepts_positive_values_and_treats_zero_as_unset() {
+    assert_eq!(normalize_kiro_credit_unit_price_usd(None).unwrap(), None);
+    assert_eq!(
+        normalize_kiro_credit_unit_price_usd(Some(0.0)).unwrap(),
+        None
+    );
+    assert_eq!(
+        normalize_kiro_credit_unit_price_usd(Some(0.04)).unwrap(),
+        Some(0.04)
+    );
+    for invalid in [-0.01, f64::NAN, f64::INFINITY, 100.5] {
+        assert!(normalize_kiro_credit_unit_price_usd(Some(invalid)).is_err());
+    }
+}
+
+#[test]
+fn update_runtime_config_request_distinguishes_missing_and_null_credit_price() {
+    let base = serde_json::json!({
+        "credentialRpm": 0,
+        "credentialTransientCooldownSecs": 10,
+        "credentialMaxCooldownSecs": 300,
+        "credentialWarmupRequests": 0,
+        "compressionEnabled": false,
+    });
+    let missing: UpdateRuntimeConfigRequest = serde_json::from_value(base.clone()).unwrap();
+    assert_eq!(missing.kiro_credit_unit_price_usd, None);
+
+    let mut cleared = base.clone();
+    cleared["kiroCreditUnitPriceUsd"] = serde_json::Value::Null;
+    let cleared: UpdateRuntimeConfigRequest = serde_json::from_value(cleared).unwrap();
+    assert_eq!(cleared.kiro_credit_unit_price_usd, Some(None));
+
+    let mut set = base;
+    set["kiroCreditUnitPriceUsd"] = serde_json::json!(0.035);
+    let set: UpdateRuntimeConfigRequest = serde_json::from_value(set).unwrap();
+    assert_eq!(set.kiro_credit_unit_price_usd, Some(Some(0.035)));
+}
+
+#[test]
 fn credential_info_refresh_concurrency_defaults_and_clamps() {
     let mut config = crate::model::config::Config::default();
     assert_eq!(effective_credential_info_refresh_concurrency(&config), 3);

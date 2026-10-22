@@ -47,6 +47,52 @@ pub struct UsageDemoSeedReport {
     pub pools: usize,
 }
 
+/// Spreads demo external traffic over the real fallback reasons so the overview
+/// "why external" trend has every category; a capacity crunch skews to capacity.
+fn demo_external_route(
+    rng: &mut fastrand::Rng,
+    capacity_crunch: bool,
+) -> (Option<UsageRouteSubtype>, Option<String>, Option<String>) {
+    let roll = rng.usize(0..100);
+    let fallback = |subtype, reason: &str| (Some(subtype), Some(reason.to_string()), None);
+    if capacity_crunch {
+        return if roll < 80 {
+            fallback(
+                UsageRouteSubtype::ExternalFallbackPreflight,
+                "local_capacity_full",
+            )
+        } else {
+            fallback(
+                UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+                "local_capacity_exhausted",
+            )
+        };
+    }
+    match roll {
+        0..=44 => (
+            Some(UsageRouteSubtype::ExternalDirectPolicy),
+            None,
+            Some("demo_seed".to_string()),
+        ),
+        45..=69 => fallback(
+            UsageRouteSubtype::ExternalFallbackPreflight,
+            "local_capacity_full",
+        ),
+        70..=84 => fallback(
+            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+            "local_transient_exhausted",
+        ),
+        85..=93 => fallback(
+            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+            "unsupported_model",
+        ),
+        _ => fallback(
+            UsageRouteSubtype::ExternalFallbackPreflight,
+            "local_scheduler_redis_degraded",
+        ),
+    }
+}
+
 pub async fn seed_usage_demo(
     store: &PostgresStore,
     days: u32,
@@ -136,6 +182,12 @@ pub async fn seed_usage_demo(
                 cache_creation,
             ) * weekend_factor;
             let error_spike = day == 4 && (14..=15).contains(&hour) && !is_external;
+            let capacity_crunch = day == 2 && (11..=15).contains(&hour);
+            let (route_subtype, fallback_reason, direct_policy_reason) = if is_external {
+                demo_external_route(&mut rng, capacity_crunch)
+            } else {
+                (None, None, None)
+            };
             let status = choose_status(&mut rng, error_spike);
             let pricing_available = rng.usize(0..100) >= 3;
             let (
@@ -290,15 +342,17 @@ pub async fn seed_usage_demo(
                 } else {
                     UsageRouteKind::LocalCredential
                 }),
-                route_subtype: Some(if is_external {
-                    UsageRouteSubtype::ExternalDirectPolicy
-                } else if status == UsageRecordStatus::Success {
-                    UsageRouteSubtype::LocalSuccess
-                } else {
-                    UsageRouteSubtype::LocalErrorNoFallback
-                }),
-                fallback_reason: None,
-                direct_policy_reason: Some("demo_seed".to_string()),
+                route_subtype: Some(route_subtype.unwrap_or_else(|| {
+                    if status != UsageRecordStatus::Success {
+                        UsageRouteSubtype::LocalErrorNoFallback
+                    } else if rng.usize(0..100) < 3 {
+                        UsageRouteSubtype::LocalRescueAfterExternal
+                    } else {
+                        UsageRouteSubtype::LocalSuccess
+                    }
+                })),
+                fallback_reason,
+                direct_policy_reason,
                 local_attempted: Some(!is_external),
                 local_preflight: None,
                 external_pool_id,
