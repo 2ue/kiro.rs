@@ -39,6 +39,7 @@ import {
   formatMeteringUsage,
   formatNumber,
   formatQuotaFixed,
+  formatUsd,
   formatUsdFixed2,
 } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
@@ -51,6 +52,7 @@ import {
   useResetFailure,
   useRuntimeConfig,
   useSetCredentialConcurrency,
+  useSetCredentialOverage,
   useSetCredentialProxy,
   useSetCredentialRegions,
   useSetCredentialRpm,
@@ -238,6 +240,7 @@ export function CredentialCard({
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
+  const setCredentialOverage = useSetCredentialOverage()
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
   const discoverCredentialSupportedModels = useDiscoverCredentialSupportedModels()
@@ -270,6 +273,26 @@ export function CredentialCard({
     ? Math.min(100, Math.max(0, (accountInfo.currentUsage / accountInfo.usageLimit) * 100))
     : 0
   const quotaProgressTone = quotaUsagePercent >= 95 ? 'error' : quotaUsagePercent >= 80 ? 'warning' : 'success'
+  const overageStatus = (accountInfo?.overageStatus || '').toUpperCase()
+  const overageCapability = (accountInfo?.overageCapability || '').toUpperCase()
+  const overageEnabled = overageStatus === 'ENABLED'
+  const overageCapable = overageCapability === '' || overageCapability === 'OVERAGE_CAPABLE'
+  const overageLabel = accountInfo
+    ? !overageCapable
+      ? '不支持'
+      : overageStatus === 'ENABLED'
+        ? '已开启'
+        : overageStatus === 'DISABLED'
+          ? '已关闭'
+          : '未知'
+    : '未查询'
+  const overageDetail = accountInfo
+    ? [
+        accountInfo.overageCap > 0 ? `上限 ${formatUsd(accountInfo.overageCap)}` : null,
+        accountInfo.overageRate > 0 ? `单价 ${formatUsd(accountInfo.overageRate)}` : null,
+        accountInfo.currentOverages > 0 ? `已用 ${formatUsd(accountInfo.currentOverages)}` : null,
+      ].filter(Boolean).join(' · ') || undefined
+    : '查询额度后同步状态'
   const displayCredentialLabel = credentialLabel(credential, showEmailSuffix)
 
   const concurrencyPct =
@@ -283,11 +306,7 @@ export function CredentialCard({
   const concurrencySummaryDetail =
     credential.inFlightRequests > 0
       ? `最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`
-      : typeof credential.maxConcurrentRequestsOverride === 'number'
-        ? `账号覆盖：${credential.maxConcurrentRequestsOverride}`
-        : credential.maxConcurrentRequests > 0
-          ? `继承全局：${credential.maxConcurrentRequests}`
-          : '不限制'
+      : undefined
   const concurrencyError = credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests
   const ringColor =
     concurrencyPct >= 90
@@ -423,6 +442,13 @@ export function CredentialCard({
     setCredentialRateLimitAutoDisable.mutate({ id: credential.id, request: { enabled } }, {
       onSuccess: (res) => toast.success(res.message),
       onError: (e) => toast.error(`429 自动禁用设置失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  const toggleOverage = (enabled: boolean) => {
+    setCredentialOverage.mutate({ id: credential.id, enabled }, {
+      onSuccess: () => toast.success(`超额调用已${enabled ? '开启' : '关闭'}`),
+      onError: (e) => toast.error(`超额开关设置失败: ${extractErrorMessage(e)}`),
     })
   }
 
@@ -715,26 +741,24 @@ export function CredentialCard({
                 }
               />
               <MetaItem label="近期错误率" value={`${(recentErrorRate * 100).toFixed(1)}%`} error={recentErrorRate > 0} />
-              <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />
-              <MetaItem label="总调度" value={<span title={formatNumber(schedulerSelectionCount)}>{formatCompact(schedulerSelectionCount)}</span>} />
               <MetaItem
-                label="调度压力"
-                value={schedulerSelectionPressure.toFixed(2)}
+                label="调度评分(压力)"
+                value={`${schedulerScore.toFixed(2)} (${schedulerSelectionPressure.toFixed(2)})`}
                 error={schedulerSelectionPressure > 1}
               />
+              <MetaItem label="总调度" value={<span title={formatNumber(schedulerSelectionCount)}>{formatCompact(schedulerSelectionCount)}</span>} />
               <MetaItem
                 label="支持模型"
                 value={
                   <button
                     type="button"
                     className="max-w-full truncate text-left text-sm text-primary hover:underline"
-                    title={supportedModels.length > 0 ? supportedModels.join('\n') : '不限制'}
+                    title={supportedModels.length > 0 ? supportedModels.join('\n') : undefined}
                     onClick={() => setEditingSupportedModels(true)}
                   >
                     {supportedModelsSummary(supportedModels)}
                   </button>
                 }
-                detail={supportedModels.length > 0 ? '账号调度白名单' : '未设置，不限制模型'}
               />
               <MetaItem label="失败/刷新失败" value={`${credential.failureCount} / ${credential.refreshFailureCount}`} error={hasFailures} />
               {credential.warmupRemaining > 0 && (
@@ -772,9 +796,30 @@ export function CredentialCard({
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">计费与积分</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              <MetaItem label="估算计费" value={formatUsdFixed2(credential.estimatedCostUsd)} />
-              <MetaItem label="原始计费" value={formatUsdFixed2(credential.originalCostUsd)} />
+              <MetaItem
+                label="估算计费/原始计费"
+                value={`${formatUsdFixed2(credential.estimatedCostUsd)} / ${formatUsdFixed2(credential.originalCostUsd)}`}
+              />
               <MetaItem label="使用积分" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
+              <MetaItem
+                label="超额调用"
+                value={
+                  <span className="inline-flex items-center gap-2">
+                    {setCredentialOverage.isPending ? (
+                      <Spinner size="sm" />
+                    ) : (
+                      <Switch
+                        checked={overageEnabled}
+                        disabled={!accountInfo || !overageCapable}
+                        onCheckedChange={toggleOverage}
+                        aria-label="切换超额调用"
+                      />
+                    )}
+                    <span className={overageEnabled ? 'text-warning' : !overageCapable ? 'text-muted-foreground' : ''}>{overageLabel}</span>
+                  </span>
+                }
+                detail={overageDetail}
+              />
             </div>
           </div>
 
@@ -790,7 +835,6 @@ export function CredentialCard({
                     {credential.effectiveAuthRegion || '-'}
                   </button>
                 }
-                detail={credential.authRegion || credential.region ? '账号覆盖' : '继承全局'}
               />
               <MetaItem
                 label="API Region"
@@ -800,7 +844,6 @@ export function CredentialCard({
                     {credential.effectiveApiRegion || '-'}
                   </button>
                 }
-                detail={credential.apiRegion ? '账号覆盖' : '继承全局'}
               />
               <MetaItem
                 label="代理"
@@ -927,9 +970,6 @@ export function CredentialCard({
               <span className="text-muted-foreground">当前生效</span>
               <span className="font-semibold">{credential.maxConcurrentRequests > 0 ? `${credential.maxConcurrentRequests} 并发` : '不限'}</span>
             </div>
-            <div className="mt-1 text-xs text-muted-foreground">
-              {typeof credential.maxConcurrentRequestsOverride === 'number' ? '当前已覆盖全局。' : '当前继承全局。'}
-            </div>
           </div>
           <Field label="账号级最大并发" description="留空继承全局；0 表示该账号不限；正整数设置上限。">
             <Input type="number" min={0} value={concurrencyValue} placeholder="留空继承全局，0 表示不限"
@@ -965,9 +1005,6 @@ export function CredentialCard({
                   ? credential.rpm === 0 ? '不限制' : `${credential.rpm} 次/分钟`
                   : '-'}
               </span>
-            </div>
-            <div className="mt-1 text-xs text-muted-foreground">
-              {typeof credential.rpmOverride === 'number' ? '当前已覆盖全局。' : '当前继承全局。'}
             </div>
           </div>
           <Field label="账号级 RPM 限制" description="留空继承全局；0 表示该账号不限；正整数设置每分钟最大请求数。">

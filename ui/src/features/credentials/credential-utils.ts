@@ -143,16 +143,6 @@ export function proxySummary(c: Pick<CredentialStatusItem, 'effectiveProxySource
   return label
 }
 
-export function concurrencyLimitLabel(c: Pick<CredentialStatusItem, 'maxConcurrentRequests' | 'maxConcurrentRequestsOverride'>): string {
-  if (typeof c.maxConcurrentRequestsOverride === 'number') {
-    return c.maxConcurrentRequestsOverride > 0
-      ? `账号覆盖：${c.maxConcurrentRequestsOverride}`
-      : '账号覆盖：不限'
-  }
-  const effective = c.maxConcurrentRequests > 0 ? `${c.maxConcurrentRequests}` : '不限'
-  return `继承全局：${effective}`
-}
-
 export function dispatchStatusLabel(
   c: Pick<
     CredentialStatusItem,
