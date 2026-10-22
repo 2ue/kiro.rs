@@ -7712,6 +7712,9 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_stream_idle_timeout_secs > 86_400 {
         return Err("externalPoolStreamIdleTimeoutSecs 不能大于 86400".to_string());
     }
+    if config.external_pool_stream_first_output_timeout_secs > 86_400 {
+        return Err("externalPoolStreamFirstOutputTimeoutSecs 不能大于 86400".to_string());
+    }
     if config.external_pool_usage_projection_uplift_percent > 200 {
         return Err("externalPoolUsageProjectionUpliftPercent 不能大于 200".to_string());
     }

@@ -2094,6 +2094,8 @@ export interface ExternalPoolsConfig {
   externalPoolRequestTimeoutSecs: number
   externalPoolStreamRequestTimeoutSecs: number
   externalPoolStreamIdleTimeoutSecs: number
+  /** 首个语义输出的最长等待秒数（每个外部池尝试单独计时）；超时且未输出时换池，0 表示不限制。 */
+  externalPoolStreamFirstOutputTimeoutSecs: number
   externalPoolStreamPreOutputRetryEnabled: boolean
   externalPoolAutoDisableOnChannelDisabled: boolean
   externalPoolUsageProjectionUpliftPercent: number

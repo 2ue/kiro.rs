@@ -77,6 +77,7 @@ use super::request_facts::{
 };
 use super::request_facts::{
     RawMessagesBodyProbe, deserialize_messages_request_with_probe,
+    normalize_raw_client_reasoning_aliases_with_probe,
     normalize_raw_reasoning_protocol_with_probe_and_limit, probe_raw_messages_body,
     rewrite_raw_missing_top_level_max_tokens_with_probe,
     validate_raw_reasoning_protocol_with_probe,
@@ -6165,7 +6166,12 @@ fn provider_public_error_for_message(
         return public_error;
     }
 
-    if is_upstream_improperly_formed_error(err_str) || is_upstream_bad_request_error(err_str) {
+    // A tool-use shape the upstream rejects fails the same way on every resend, so it is a
+    // non-retryable 400 for the client, not a temporary 502 that invites endless retries.
+    if is_upstream_improperly_formed_error(err_str)
+        || is_upstream_tool_use_format_error(err_str)
+        || is_upstream_bad_request_error(err_str)
+    {
         return usage_public_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -6585,7 +6591,7 @@ fn map_provider_error(
         );
     }
 
-    if is_upstream_bad_request_error(&err_str) {
+    if is_upstream_tool_use_format_error(&err_str) || is_upstream_bad_request_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
             "请求被上游以 400 拒绝（不应切换账号重试）",
@@ -10575,6 +10581,34 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
     saw_side_channel
 }
 
+/// Error or exception event in a buffered non-stream response.
+///
+/// A non-stream response is assembled in full before anything is sent to the client, so a
+/// failure event is retryable on another credential even after the upstream produced partial
+/// output: the client has received nothing. Production 2026-10-21: four non-stream requests on
+/// Fast account #1948 got partial text followed by "Encountered an unexpected error" and were
+/// returned as 502 without trying another account.
+fn non_stream_status_error_event(events: &[Event]) -> Option<String> {
+    events.iter().find_map(|event| match event {
+        Event::Error {
+            error_code,
+            error_message,
+        } => Some(format!(
+            "upstream error event {}: {}",
+            error_code, error_message
+        )),
+        Event::Exception {
+            exception_type,
+            message,
+        } if exception_type != "ContentLengthExceededException" => Some(format!(
+            "upstream exception event {}: {}",
+            exception_type, message
+        )),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
 fn non_stream_status_error_before_first_output(events: &[Event]) -> Option<String> {
     let mut saw_output = false;
     for event in events {
@@ -12685,7 +12719,7 @@ async fn handle_non_stream_request(
 
         let pre_output_failure = match first_output_timeout {
             Some(detail) => Some((StreamRetryReason::FirstOutputTimeout, detail)),
-            None => non_stream_status_error_before_first_output(&upstream_events)
+            None => non_stream_status_error_event(&upstream_events)
                 .map(|detail| (StreamRetryReason::StatusError, detail)),
         };
         if let Some((retry_reason, detail)) = pre_output_failure {
