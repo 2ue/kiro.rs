@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   Check,
   Copy,
+  CopyPlus,
   Database,
   Download,
   Edit3,
   Info,
+  Link2,
   Plus,
   Route,
   Save,
@@ -27,7 +29,22 @@ import {
   StatGrid,
   useConfirm,
 } from '@/components/patterns'
-import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input } from '@/components/ui'
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  Input,
+} from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   defaultReportedUsage,
@@ -42,6 +59,7 @@ import { identitySummary, RouteIdentityEditor } from './route-identity-editor'
 import { RouteWebSearchEditor } from './route-websearch-editor'
 import { RoutePolicyImportDialog } from './route-policy-import-dialog'
 import { buildRoutePolicyFile, downloadRoutePolicyFile } from './route-policy-transfer'
+import { routeBaseUrl, routeClaudeCodeEnv } from './route-copy'
 import {
   buildDefinedCacheRoute,
   cachePolicyForStrategyTemplate,
@@ -401,6 +419,19 @@ function TemplateCard({
   )
 }
 
+async function copyRouteText(label: string, value: string, reachable: boolean) {
+  try {
+    await navigator.clipboard.writeText(value)
+    if (reachable) {
+      toast.success(`${label}已复制`)
+    } else {
+      toast.warning(`${label}已复制，但该路由还没注册 /dfcache，请求会返回 404`)
+    }
+  } catch (error) {
+    toast.error(`复制失败: ${extractErrorMessage(error)}`)
+  }
+}
+
 function PathCard({
   prefix,
   policy,
@@ -422,6 +453,8 @@ function PathCard({
   onExport: () => void
   onDelete: () => void
 }) {
+  const reachable = builtIn || registered
+  const baseUrl = routeBaseUrl(prefix)
   return (
     <Card className="flex h-full flex-col border border-border/70 transition hover:shadow-md">
       <CardHeader className="items-start gap-3 pb-3">
@@ -430,17 +463,51 @@ function PathCard({
             <CardTitle className="font-mono text-sm">{prefix}</CardTitle>
             {builtIn && <Badge size="xs" tone="secondary">内置</Badge>}
             {!builtIn && registered && <Badge size="xs" tone="success" dot>/dfcache 已注册</Badge>}
+            {!reachable && <Badge size="xs" tone="warning">未注册，暂不可访问</Badge>}
           </div>
           <CardDescription>{strategyLabel(policy.cacheType)}</CardDescription>
         </div>
         <div className="flex shrink-0 gap-1">
           <Button variant="ghost" size="icon-xs" title="编辑" aria-label={`编辑 ${prefix}`} onClick={onEdit}><Edit3 /></Button>
-          <Button variant="ghost" size="icon-xs" title="复制" aria-label={`复制 ${prefix} 的策略`} onClick={onCopy}><Copy /></Button>
+          <Button variant="ghost" size="icon-xs" title="复制为新路由" aria-label={`以 ${prefix} 的策略新建路由`} onClick={onCopy}><CopyPlus /></Button>
           <Button variant="ghost" size="icon-xs" title="导出 JSON" aria-label={`导出 ${prefix} 的策略`} onClick={onExport}><Download /></Button>
           {!builtIn && <Button variant="ghost" size="icon-xs" className="text-destructive hover:text-destructive" title="删除" onClick={onDelete}><Trash2 /></Button>}
         </div>
       </CardHeader>
-      <CardContent className="mt-auto pt-1">
+      <CardContent className="mt-auto space-y-3 pt-1">
+        <div className="flex min-w-0 items-center gap-1 rounded-md border border-border/70 bg-muted/40 py-1 pl-2.5 pr-1">
+          <Link2 className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate font-mono text-xs" title={baseUrl}>{baseUrl}</span>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            title="复制完整路由地址"
+            aria-label={`复制 ${prefix} 的完整路由地址`}
+            onClick={() => void copyRouteText('路由地址', baseUrl, reachable)}
+          >
+            <Copy />
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="xs" title="更多复制方式" aria-label={`${prefix} 的更多复制方式`}>
+                更多
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuLabel>复制接入信息</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => void copyRouteText('路由地址', baseUrl, reachable)}>
+                Base URL
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void copyRouteText('Messages 接口地址', `${baseUrl}/v1/messages`, reachable)}>
+                Messages 接口地址
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void copyRouteText('Claude Code 环境变量', routeClaudeCodeEnv(prefix), reachable)}>
+                Claude Code 环境变量
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
         <div className="flex flex-wrap gap-2">
           {pathSummary(policy).map((item) => <Badge key={item} size="xs" tone="neutral">{item}</Badge>)}
           {identityBadges.map((item) => (
