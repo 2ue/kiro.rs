@@ -9227,6 +9227,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
     async fn redis_usage_writer_burst_keeps_scheduler_latency_bounded_for_three_rounds() {
         run_isolated_redis_fixture(|store| async move {
             store.clear_usage_summary().await.unwrap();

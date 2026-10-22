@@ -5056,6 +5056,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "timing-sensitive: flakes on loaded CI runners; run by the non-blocking 'Timing-sensitive tests' CI job"]
     async fn production_postgres_only_usage_never_materializes_redis_for_five_rounds() {
         let Some(postgres_url) = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")
         else {

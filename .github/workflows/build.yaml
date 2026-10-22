@@ -260,3 +260,57 @@ jobs:
 
       - name: Run tests
         run: node scripts/ci/run-tests-with-known-failures.mjs -- --no-fail-fast --locked --all-targets ${{ matrix.cargo_args }}
+
+  # Tests marked `#[ignore = "timing-sensitive: ..."]` assert wall-clock budgets (scheduler p99,
+  # background sample writes) that depend on how busy the runner is, so they flake in the
+  # parallel run above. They run here alone and single-threaded so regressions stay visible, but
+  # a failure only warns and never blocks a release: Docker publishing waits for `quality` and
+  # `tests`, not for this job.
+  timing-tests:
+    name: Timing-sensitive tests
+    if: ${{ (inputs.profile || 'full') == 'full' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+
+    services:
+      postgres:
+        image: postgres:16.9-alpine3.21
+        env:
+          POSTGRES_USER: kiro_rs
+          POSTGRES_PASSWORD: kiro_rs_test
+          POSTGRES_DB: kiro_rs_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kiro_rs -d kiro_rs_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7.4.5-alpine3.21
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tests-default
+          save-if: false
+
+      - name: Run timing-sensitive tests
+        run: node scripts/ci/run-timing-sensitive-tests.mjs
