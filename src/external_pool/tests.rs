@@ -5027,7 +5027,9 @@ async fn external_pool_authoritative_refresh_survives_leader_cancellation_for_fi
         let caller_manager = manager.clone();
         let caller =
             tokio::spawn(async move { caller_manager.load_authoritative_pool_snapshot().await });
-        timeout(Duration::from_millis(500), async {
+        // Generous deadlines: this test checks that the refresh survives cancellation and is not
+        // replaced (the PG load count below), not how fast a loaded CI runner schedules it.
+        timeout(Duration::from_secs(5), async {
             loop {
                 if manager.authoritative_pool_snapshot_pg_loads_for_test() > loads_before {
                     break;
@@ -5042,7 +5044,7 @@ async fn external_pool_authoritative_refresh_survives_leader_cancellation_for_fi
         unlock_external_pool_table(blocker).await;
 
         let snapshot = timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(5),
             manager.load_authoritative_pool_snapshot(),
         )
         .await
