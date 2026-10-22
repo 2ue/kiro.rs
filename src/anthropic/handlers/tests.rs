@@ -9577,11 +9577,9 @@ fn stream_zero_context_and_metadata_record_request_estimate_consistently() {
             context_usage_percentage: 0.0,
         })),
     );
-    events.extend(
-        stream_context.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage::default()),
-        })),
-    );
+    events.extend(stream_context.process_kiro_event(&Event::Metadata(
+        MetadataEvent::with_token_usage(Some(MetadataTokenUsage::default())),
+    )));
     events.extend(stream_context.generate_final_events());
 
     let downstream_usage = &events
@@ -13346,6 +13344,24 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
             Some("claude-sonnet-5")
         );
     }
+}
+
+/// F1: a non-stream content-filter refusal is an answer, not an empty usage-only turn, so it
+/// must not be retried with a continue nudge.
+#[test]
+fn non_stream_content_filter_refusal_is_not_usage_only() {
+    let refusal: crate::kiro::model::events::MetadataEvent =
+        serde_json::from_value(serde_json::json!({"stopReason": "CONTENT_FILTERED"}))
+            .expect("metadata");
+    assert!(!non_stream_events_are_usage_only(&[
+        Event::Metadata(refusal),
+        Event::ContextUsage(crate::kiro::model::events::ContextUsageEvent {
+            context_usage_percentage: 100.0,
+        }),
+    ]));
+    assert!(non_stream_events_are_usage_only(&[Event::Metadata(
+        crate::kiro::model::events::MetadataEvent::default()
+    )]));
 }
 
 #[tokio::test]

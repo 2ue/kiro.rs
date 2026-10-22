@@ -479,6 +479,13 @@ fn convert_request_with_model_id(
     } else {
         &req.messages
     };
+    // 2.6. Consecutive user turns at the end belong to the current turn. OpenAI Responses/Codex
+    // clients split parallel `function_call_output`s into one user message each; without this
+    // merge the earlier results become a history turn followed by a synthetic "OK" assistant,
+    // the current results no longer sit after their assistant tool_use, and both the results and
+    // their tool_use get dropped. The Anthropic API itself combines consecutive same-role turns.
+    let merged_tail_messages = merge_trailing_user_messages(messages);
+    let messages: &[_] = merged_tail_messages.as_deref().unwrap_or(messages);
 
     // 3. 生成会话 ID 和代理 ID
     // High-cache 模式下缺失 metadata 时从稳定请求锚点派生确定性 UUID；
@@ -714,6 +721,41 @@ fn convert_request_with_model_id(
         response_tool_policy,
         additional_model_request_fields,
     })
+}
+
+/// Merges a run of trailing user messages into one current user message, preserving block order.
+/// Returns `None` when the last message is the only trailing user turn.
+fn merge_trailing_user_messages(
+    messages: &[super::types::Message],
+) -> Option<Vec<super::types::Message>> {
+    let run_start = messages
+        .iter()
+        .rposition(|message| message.role != "user")
+        .map_or(0, |index| index + 1);
+    if messages.len().saturating_sub(run_start) < 2 {
+        return None;
+    }
+    let mut blocks = Vec::new();
+    for message in &messages[run_start..] {
+        match &message.content {
+            serde_json::Value::Array(items) => blocks.extend(items.iter().cloned()),
+            serde_json::Value::String(text) if !text.is_empty() => {
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            serde_json::Value::String(_) | serde_json::Value::Null => {}
+            other => blocks.push(other.clone()),
+        }
+    }
+    tracing::debug!(
+        merged_user_messages = messages.len() - run_start,
+        "末尾连续 user 消息已合并为当前轮"
+    );
+    let mut merged = messages[..run_start].to_vec();
+    merged.push(super::types::Message {
+        role: "user".to_string(),
+        content: serde_json::Value::Array(blocks),
+    });
+    Some(merged)
 }
 
 /// 确定聊天触发类型
@@ -7032,6 +7074,65 @@ mod tests {
             assert_eq!(
                 converted.assistant_response_message.reasoning_content,
                 Some(ReasoningContent::redacted_content(data))
+            );
+        }
+    }
+
+    /// F5: Codex / OpenAI Responses split parallel `function_call_output`s into one user message
+    /// each. Every result must stay paired with its tool_use instead of being dropped.
+    #[test]
+    fn split_parallel_tool_results_stay_paired_for_five_rounds() {
+        for round in 0..5 {
+            let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 1024,
+                "tools": [{
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+                }],
+                "messages": [
+                    {"role": "user", "content": "Read both files"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": format!("call_a_{round}"), "name": "read_file", "input": {"path": "a"}},
+                        {"type": "tool_use", "id": format!("call_b_{round}"), "name": "read_file", "input": {"path": "b"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": format!("call_a_{round}"), "content": "A"}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": format!("call_b_{round}"), "content": "B"}
+                    ]}
+                ]
+            }))
+            .expect("messages request");
+
+            let result = convert_request(&req).expect("conversion");
+            assert_eq!(result.warnings.orphan_tool_results, 0, "round {round}");
+            assert_eq!(result.warnings.orphan_tool_uses, 0, "round {round}");
+            let current = &result.conversation_state.current_message.user_input_message;
+            let ids: Vec<_> = current
+                .user_input_message_context
+                .tool_results
+                .iter()
+                .map(|result| result.tool_use_id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![format!("call_a_{round}"), format!("call_b_{round}")]
+            );
+            let Some(Message::Assistant(assistant)) = result.conversation_state.history.last()
+            else {
+                panic!("history must end with the tool_use assistant");
+            };
+            assert_eq!(
+                assistant
+                    .assistant_response_message
+                    .tool_uses
+                    .as_ref()
+                    .map(Vec::len),
+                Some(2),
+                "round {round}: both tool_use blocks are kept"
             );
         }
     }

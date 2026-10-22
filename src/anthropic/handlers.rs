@@ -10592,6 +10592,11 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
             | Event::InvalidState(_)
             | Event::Error { .. }
             | Event::Exception { .. } => return false,
+            // A content-filter refusal is an authoritative answer; retrying the same history
+            // would only be filtered again.
+            Event::Metadata(metadata) if metadata.content_filter_refusal().is_some() => {
+                return false;
+            }
             Event::Metadata(_)
             | Event::MessageMetadata(_)
             | Event::Metering(_)
@@ -12949,6 +12954,7 @@ async fn handle_non_stream_request(
         super::transcript_sanitizer::ToolTranscriptSanitizer::new(known_tool_names.iter().cloned());
     let mut upstream_message_status: Option<String> = None;
     let mut saw_meaningful_upstream_response = false;
+    let mut content_filter_refusal: Option<String> = None;
     let mut saw_upstream_metadata = false;
     let mut saw_upstream_context_usage = false;
     let mut saw_upstream_metering = false;
@@ -13106,7 +13112,8 @@ async fn handle_non_stream_request(
                     context_input_tokens = Some(actual_input_tokens);
                 }
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if percentage.is_finite() && percentage >= 100.0 {
+                if percentage.is_finite() && percentage >= 100.0 && content_filter_refusal.is_none()
+                {
                     stop_reason = "model_context_window_exceeded".to_string();
                 }
                 tracing::debug!(
@@ -13117,6 +13124,12 @@ async fn handle_non_stream_request(
             }
             Event::Metadata(metadata) => {
                 saw_upstream_metadata = true;
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!(refusal = %refusal, "非流式响应上游内容过滤拒答，按 stop_reason=refusal 结束");
+                    stop_reason = super::stream::REFUSAL_STOP_REASON.to_string();
+                    saw_meaningful_upstream_response = true;
+                    content_filter_refusal.get_or_insert(refusal);
+                }
                 if let Some(token_usage) = metadata.token_usage {
                     tracing::debug!(
                         input_tokens = token_usage.input_tokens(),
@@ -13216,7 +13229,9 @@ async fn handle_non_stream_request(
                 message,
             } => {
                 if exception_type == "ContentLengthExceededException" {
-                    stop_reason = "max_tokens".to_string();
+                    if content_filter_refusal.is_none() {
+                        stop_reason = "max_tokens".to_string();
+                    }
                 } else {
                     let detail =
                         format!("upstream exception event {}: {}", exception_type, message);
@@ -13256,6 +13271,10 @@ async fn handle_non_stream_request(
             envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
             &credential_usage.request.request_id,
         );
+    }
+    if content_filter_refusal.is_some() {
+        // A refusal can cut a tool call off mid-input. Never complete or report those calls.
+        tool_json_buffers.clear();
     }
     if !tool_json_buffers.is_empty() {
         for (tool_use_id, buffer) in std::mem::take(&mut tool_json_buffers) {
