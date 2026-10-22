@@ -1837,51 +1837,19 @@ fn kiro_image_source_bytes(image: &crate::kiro::model::requests::conversation::K
         .source
         .bytes
         .as_ref()
-        .map(|bytes| decoded_base64_source_bytes(bytes).unwrap_or(bytes.len()))
+        .map(|bytes| encoded_base64_source_bytes(bytes))
         .unwrap_or_else(|| json_len(image))
 }
 
-fn decoded_base64_source_bytes(value: &str) -> Option<usize> {
-    let value = inline_base64_payload(value);
-    let mut symbols = 0usize;
-    let mut padding = 0usize;
-    let mut saw_padding = false;
-
-    for byte in value.bytes() {
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        if byte == b'=' {
-            saw_padding = true;
-            padding = padding.checked_add(1)?;
-            if padding > 2 {
-                return None;
-            }
-        } else {
-            if saw_padding || !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')) {
-                return None;
-            }
-        }
-        symbols = symbols.checked_add(1)?;
-    }
-
-    if symbols == 0 {
-        return Some(0);
-    }
-    let complete = (symbols / 4).checked_mul(3)?;
-    let remainder = symbols % 4;
-    if padding > 0 {
-        if remainder != 0 || symbols < 4 {
-            return None;
-        }
-        return complete.checked_sub(padding);
-    }
-    match remainder {
-        0 => Some(complete),
-        2 => complete.checked_add(1),
-        3 => complete.checked_add(2),
-        _ => None,
-    }
+/// Upstream measures the 5 MB image limit on the base64 string it receives, not on the decoded
+/// image (production: a ~3.97 MB image with a 5298668-byte base64 payload was rejected with
+/// `image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes`). Count the encoded symbols that
+/// are actually forwarded: data-URL prefixes and whitespace are stripped before conversion.
+fn encoded_base64_source_bytes(value: &str) -> usize {
+    inline_base64_payload(value)
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count()
 }
 
 fn inline_base64_payload(value: &str) -> &str {
@@ -2398,7 +2366,7 @@ fn anthropic_image_source_bytes(block: &Value) -> usize {
     };
     for key in ["data", "base64", "bytes"] {
         if let Some(value) = source.get(key).and_then(Value::as_str) {
-            return decoded_base64_source_bytes(value).unwrap_or(value.len());
+            return encoded_base64_source_bytes(value);
         }
     }
     json_len(block)
@@ -2491,7 +2459,7 @@ fn find_oversized_image_in_blocks(
                     .get("source")
                     .and_then(|source| source.get("data"))
                     .and_then(Value::as_str)?;
-                let bytes = decoded_base64_source_bytes(data).unwrap_or(data.len());
+                let bytes = encoded_base64_source_bytes(data);
                 (bytes > max_bytes).then(|| CurrentImageTooLarge {
                     path: format!("{path}.image.source.base64"),
                     bytes,
@@ -5251,6 +5219,19 @@ mod tests {
             metadata: None,
             stop_sequences: None,
         }
+    }
+
+    /// Images over the limit by one base64 quantum: the smallest valid oversized payload.
+    const OVERSIZED_IMAGE_ENCODED_BYTES: usize = UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 4;
+
+    /// Valid base64 whose encoded length is exactly `encoded_bytes` (the upstream size measure).
+    fn base64_with_encoded_len(encoded_bytes: usize) -> String {
+        assert_eq!(
+            encoded_bytes % 4,
+            0,
+            "base64 length must be a multiple of 4"
+        );
+        "A".repeat(encoded_bytes)
     }
 
     fn base64_zeros_for_decoded_bytes(decoded_bytes: usize) -> String {
@@ -8619,7 +8600,7 @@ mod tests {
 
     #[test]
     fn anthropic_guard_drops_oversized_historical_images_even_when_body_fits() {
-        let oversized = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let oversized = base64_with_encoded_len(OVERSIZED_IMAGE_ENCODED_BYTES);
         let mut request = anthropic_request(vec![
             anthropic_message(
                 "user",
@@ -8657,14 +8638,14 @@ mod tests {
         assert_eq!(report.dropped_historical_images, 1);
         assert_eq!(
             report.dropped_historical_image_bytes,
-            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+            OVERSIZED_IMAGE_ENCODED_BYTES
         );
         assert!(!body.contains(r#""type":"image""#));
         assert!(body.contains("Historical image was omitted"));
     }
 
     #[test]
-    fn image_source_size_uses_decoded_base64_bytes_for_five_rounds() {
+    fn image_source_size_uses_encoded_base64_length_for_five_rounds() {
         for round in 0..5 {
             for decoded_bytes in [
                 UPSTREAM_IMAGE_SOURCE_MAX_BYTES - 1,
@@ -8672,16 +8653,19 @@ mod tests {
                 UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1,
             ] {
                 let encoded = base64_zeros_for_decoded_bytes(decoded_bytes);
+                let encoded_bytes = encoded.len();
                 let plain = serde_json::json!({
                     "type": "image",
                     "source": {"type": "base64", "data": encoded}
                 });
                 assert_eq!(
                     anthropic_image_source_bytes(&plain),
-                    decoded_bytes,
+                    encoded_bytes,
                     "round {round}"
                 );
 
+                // Data-URL prefixes and whitespace are stripped before forwarding, so they do
+                // not count towards the upstream limit.
                 let wrapped = serde_json::json!({
                     "type": "image",
                     "source": {
@@ -8691,24 +8675,70 @@ mod tests {
                 });
                 assert_eq!(
                     anthropic_image_source_bytes(&wrapped),
-                    decoded_bytes,
+                    encoded_bytes,
                     "round {round}"
                 );
 
                 let kiro = KiroImage::from_base64("png", encoded);
                 assert_eq!(
                     kiro_image_source_bytes(&kiro),
-                    decoded_bytes,
+                    encoded_bytes,
                     "round {round}"
                 );
             }
         }
     }
 
+    /// Production 2026-10-21: a ~3.97 MB image (5298668 base64 bytes) was forwarded because the
+    /// local check used decoded bytes, and upstream rejected the whole session three times.
     #[test]
-    fn exact_five_mib_decoded_images_are_not_dropped_for_five_rounds() {
+    fn image_under_limit_decoded_but_over_limit_encoded_is_oversized_for_five_rounds() {
+        const PRODUCTION_ENCODED_BYTES: usize = 5_298_668;
+        const { assert!(PRODUCTION_ENCODED_BYTES / 4 * 3 < UPSTREAM_IMAGE_SOURCE_MAX_BYTES) };
+        for round in 0..5 {
+            let encoded = base64_with_encoded_len(PRODUCTION_ENCODED_BYTES);
+
+            let current = anthropic_request_with_messages(serde_json::json!([
+                {"role": "user", "content": [{"type": "text", "text": "look"}, image_block(PRODUCTION_ENCODED_BYTES)]}
+            ]));
+            let violation = find_oversized_current_image(&current).expect("current violation");
+            assert_eq!(
+                violation.message(),
+                "messages.0.content.1.image.source.base64: image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes",
+                "round {round}"
+            );
+
+            let mut history = anthropic_request(vec![
+                anthropic_message(
+                    "user",
+                    serde_json::json!([{
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": encoded}
+                    }]),
+                ),
+                anthropic_message("assistant", serde_json::json!("seen")),
+                anthropic_message("user", serde_json::json!("continue")),
+            ]);
+            let (body, report) = guard_anthropic_messages_request(
+                &mut history,
+                guard_config(usize::MAX),
+                UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+            )
+            .expect("guard");
+            assert_eq!(report.dropped_historical_images, 1, "round {round}");
+            assert_eq!(
+                report.dropped_historical_image_bytes,
+                PRODUCTION_ENCODED_BYTES
+            );
+            assert!(body.contains("Historical image was omitted"));
+            assert!(!body.contains(r#""type":"image""#));
+        }
+    }
+
+    #[test]
+    fn exact_five_mib_encoded_images_are_not_dropped_for_five_rounds() {
         for _round in 0..5 {
-            let encoded = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES);
+            let encoded = base64_with_encoded_len(UPSTREAM_IMAGE_SOURCE_MAX_BYTES);
             let mut anthropic = anthropic_request(vec![anthropic_message(
                 "user",
                 serde_json::json!([{
@@ -8739,7 +8769,7 @@ mod tests {
                 .user_input_message
                 .images = vec![KiroImage::from_base64(
                 "png",
-                base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
+                base64_with_encoded_len(UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
             )];
             let (_body, report) = guard_kiro_request(&mut kiro, guard_config(usize::MAX))
                 .expect("exact-limit Kiro image");
@@ -8757,7 +8787,7 @@ mod tests {
 
     #[test]
     fn multiple_oversized_current_images_emit_one_summary_placeholder() {
-        let encoded = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let encoded = base64_with_encoded_len(OVERSIZED_IMAGE_ENCODED_BYTES);
         let image = || {
             serde_json::json!({
                 "type": "image",
@@ -8785,7 +8815,7 @@ mod tests {
         assert_eq!(report.dropped_current_images, 2);
         assert_eq!(
             report.dropped_current_image_bytes,
-            2 * (UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1)
+            2 * OVERSIZED_IMAGE_ENCODED_BYTES
         );
         assert_eq!(body.matches("Current images were omitted").count(), 1);
         assert!(!body.contains(r#""type":"image""#));
@@ -8795,7 +8825,7 @@ mod tests {
 
     #[test]
     fn anthropic_guard_drops_oversized_current_images_even_when_body_fits() {
-        let oversized = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let oversized = base64_with_encoded_len(OVERSIZED_IMAGE_ENCODED_BYTES);
         let mut request = anthropic_request(vec![anthropic_message(
             "user",
             serde_json::json!([
@@ -8830,7 +8860,7 @@ mod tests {
         assert_eq!(report.dropped_current_images, 1);
         assert_eq!(
             report.dropped_current_image_bytes,
-            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+            OVERSIZED_IMAGE_ENCODED_BYTES
         );
         assert_eq!(report.dropped_historical_images, 0);
         assert!(!body.contains(r#""type":"image""#));
@@ -8839,7 +8869,7 @@ mod tests {
 
     #[test]
     fn anthropic_guard_rejects_oversized_images_when_configured() {
-        let oversized = base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let oversized = base64_with_encoded_len(OVERSIZED_IMAGE_ENCODED_BYTES);
         let mut request = anthropic_request(vec![anthropic_message(
             "user",
             serde_json::json!([
@@ -9264,7 +9294,7 @@ mod tests {
         let mut user = HistoryUserMessage::new("image", TEST_MODEL);
         user.user_input_message.images = vec![KiroImage::from_base64(
             "png",
-            base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+            base64_with_encoded_len(OVERSIZED_IMAGE_ENCODED_BYTES),
         )];
         let mut request = request_with_history(vec![Message::User(user)]);
 
@@ -9274,7 +9304,7 @@ mod tests {
         assert_eq!(report.dropped_historical_images, 1);
         assert_eq!(
             report.dropped_historical_image_bytes,
-            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+            OVERSIZED_IMAGE_ENCODED_BYTES
         );
         let Message::User(user) = &request.conversation_state.history[0] else {
             panic!("expected user");
@@ -9295,7 +9325,7 @@ mod tests {
             .user_input_message
             .images = vec![KiroImage::from_base64(
             "png",
-            base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+            base64_with_encoded_len(OVERSIZED_IMAGE_ENCODED_BYTES),
         )];
 
         let (body, report) =
@@ -9304,7 +9334,7 @@ mod tests {
         assert_eq!(report.dropped_current_images, 1);
         assert_eq!(
             report.dropped_current_image_bytes,
-            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+            OVERSIZED_IMAGE_ENCODED_BYTES
         );
         assert!(
             request
@@ -9325,13 +9355,13 @@ mod tests {
         assert!(!body.contains(&"A".repeat(128)));
     }
 
-    fn image_block(decoded_bytes: usize) -> Value {
+    fn image_block(encoded_bytes: usize) -> Value {
         serde_json::json!({
             "type": "image",
             "source": {
                 "type": "base64",
                 "media_type": "image/png",
-                "data": base64_zeros_for_decoded_bytes(decoded_bytes)
+                "data": base64_with_encoded_len(encoded_bytes)
             }
         })
     }
@@ -9347,7 +9377,7 @@ mod tests {
 
     #[test]
     fn oversized_current_image_is_reported_with_official_path_and_message() {
-        let bytes = UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 520_143;
+        let bytes = UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 55_788;
         let request = anthropic_request_with_messages(serde_json::json!([
             {"role": "user", "content": [{"type": "text", "text": "look"}, image_block(bytes)]}
         ]));
@@ -9372,7 +9402,7 @@ mod tests {
             {"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": "t1",
-                "content": [{"type": "text", "text": "img"}, image_block(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1)]
+                "content": [{"type": "text", "text": "img"}, image_block(OVERSIZED_IMAGE_ENCODED_BYTES)]
             }]}
         ]));
 
@@ -9386,7 +9416,7 @@ mod tests {
     #[test]
     fn oversized_historical_image_does_not_reject_current_turn() {
         let request = anthropic_request_with_messages(serde_json::json!([
-            {"role": "user", "content": [image_block(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1)]},
+            {"role": "user", "content": [image_block(OVERSIZED_IMAGE_ENCODED_BYTES)]},
             {"role": "assistant", "content": "seen"},
             {"role": "user", "content": [{"type": "text", "text": "next"}, image_block(1024)]}
         ]));
@@ -9415,7 +9445,7 @@ mod tests {
             .user_input_message
             .images = vec![KiroImage::from_base64(
             "png",
-            base64_zeros_for_decoded_bytes(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+            base64_with_encoded_len(OVERSIZED_IMAGE_ENCODED_BYTES),
         )];
 
         let err = guard_kiro_request(

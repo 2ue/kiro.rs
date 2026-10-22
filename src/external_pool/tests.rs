@@ -10825,6 +10825,40 @@ fn external_public_error_reports_payload_limit_without_context_window_message() 
     assert!(!public_error.message.contains("Prompt is too long"));
 }
 
+#[test]
+fn external_image_size_rejection_maps_to_fixed_image_message_for_five_rounds() {
+    for round in 0..5 {
+        let body = Bytes::from(format!(
+            r#"{{"error":{{"type":"invalid_request_error","message":"messages.{round}.content.1.image.source.base64: image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes","reason":"IMAGE_SIZE_EXCEEDED"}},"type":"error"}}"#
+        ));
+        let err = classify_external_error(
+            StatusCode::BAD_REQUEST,
+            body,
+            HeaderMap::new(),
+            &ExternalPoolsConfig::default(),
+        );
+        assert!(!err.retryable, "round {round}");
+        let public_error = external_public_error_from_parts(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            false,
+            &err.message,
+            "req_01image",
+        );
+        assert_eq!(public_error.status_code, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(public_error.error_type, "invalid_request_error");
+        assert_eq!(
+            public_error.message,
+            envelope::public_message_with_error_id(
+                envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+                "req_01image"
+            )
+        );
+        assert!(!public_error.message.contains("5298668"));
+        assert!(!public_error.message.contains("messages."));
+    }
+}
+
 #[tokio::test]
 async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
     let mut headers = HeaderMap::new();

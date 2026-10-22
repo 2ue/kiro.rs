@@ -4975,6 +4975,10 @@ mod tests {
                 "image_invalid_bad_request",
             ),
             (
+                r#"{"message":"messages.6.content.1.image.source.base64: image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes","reason":"IMAGE_SIZE_EXCEEDED"}"#,
+                "image_too_large_bad_request",
+            ),
+            (
                 r#"{"message":"Bedrock could not process image","reason":"IMAGE_FORMAT_UNSUPPORTED"}"#,
                 "image_invalid_bad_request",
             ),
@@ -14595,6 +14599,9 @@ impl KiroProvider {
         if Self::bad_request_body_indicates_invalid_model(&lower) {
             return "model_invalid_bad_request";
         }
+        if Self::bad_request_body_indicates_image_too_large(&lower) {
+            return "image_too_large_bad_request";
+        }
         // Image failures can mention tool-result images, so classify them before tool protocol
         // failures. Neither image failures nor a generic REQUEST_BODY_INVALID is account-specific.
         if Self::bad_request_body_indicates_invalid_image(&lower) {
@@ -14694,6 +14701,12 @@ impl KiroProvider {
         ]
         .iter()
         .any(|needle| lower_body.contains(needle))
+    }
+
+    /// Upstream `IMAGE_SIZE_EXCEEDED`, e.g.
+    /// `messages.6.content.1.image.source.base64: image exceeds 5 MB maximum: ...`.
+    fn bad_request_body_indicates_image_too_large(lower_body: &str) -> bool {
+        lower_body.contains("image_size_exceeded") || lower_body.contains("image exceeds")
     }
 
     fn bad_request_body_indicates_invalid_image(lower_body: &str) -> bool {
@@ -14805,6 +14818,7 @@ impl KiroProvider {
             | "profile_arn_bad_request"
             | "tool_use_format_bad_request"
             | "image_invalid_bad_request"
+            | "image_too_large_bad_request"
             | "request_body_invalid_bad_request"
             | "content_length_exceeds_threshold"
             | "context_window_full_bad_request"

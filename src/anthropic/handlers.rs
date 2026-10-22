@@ -6531,6 +6531,18 @@ fn map_provider_error(
         );
     }
 
+    if is_upstream_image_too_large_error(&err_str) {
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：图片超过上游 5 MB 限制", error_id);
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+            request_id,
+            error_id,
+            [("x-should-retry", "false".to_string())],
+        );
+    }
+
     if is_upstream_invalid_model_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
@@ -6687,6 +6699,15 @@ fn is_upstream_payload_too_long_error(value: &str) -> bool {
 fn is_upstream_context_window_full_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("context window is full") && lower.contains("reduce conversation history")
+}
+
+/// Upstream `IMAGE_SIZE_EXCEEDED`. The provider error carries the classified reason; the raw
+/// upstream text (which names internal message indexes) is never forwarded to the client.
+fn is_upstream_image_too_large_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("image_too_large_bad_request")
+        || lower.contains("image_size_exceeded")
+        || lower.contains("image exceeds 5 mb")
 }
 
 fn is_upstream_improperly_formed_error(value: &str) -> bool {
@@ -7151,7 +7172,7 @@ fn payload_guard_error_response(err: PayloadGuardError) -> Response {
         PayloadGuardError::OversizedImage { .. } => envelope::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.",
+            envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
         ),
         PayloadGuardError::ToolPairingInvariant { .. } => envelope::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

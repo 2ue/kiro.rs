@@ -1682,6 +1682,8 @@ impl ExternalPoolFinalError {
     fn public_message(&self, external_error_id: &str) -> String {
         let message = if self.is_rate_limit() {
             envelope::PUBLIC_RATE_LIMIT_MESSAGE
+        } else if self.is_external_image_too_large() {
+            envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE
         } else if self.is_external_payload_too_large() {
             "prompt is too long: Request input content length exceeded the external upstream threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history and retry."
         } else if self.is_external_context_window_full() {
@@ -1723,6 +1725,10 @@ impl ExternalPoolFinalError {
             || lower.contains("timeout")
             || lower.contains("timed out")
             || lower.contains("deadline")
+    }
+
+    pub fn is_external_image_too_large(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST && self.message == EXTERNAL_IMAGE_TOO_LARGE_MESSAGE
     }
 
     pub fn is_external_payload_too_large(&self) -> bool {
@@ -12934,6 +12940,13 @@ fn external_error_message_indicates_invalid_model(lower_message: &str) -> bool {
         || lower_message.contains("not available for this endpoint")
 }
 
+const EXTERNAL_IMAGE_TOO_LARGE_MESSAGE: &str =
+    "external upstream rejected the request because an image exceeds the size limit";
+
+fn external_error_message_indicates_image_too_large(lower_message: &str) -> bool {
+    lower_message.contains("image_size_exceeded") || lower_message.contains("image exceeds")
+}
+
 fn external_error_message_indicates_payload_too_large(lower_message: &str) -> bool {
     lower_message.contains("content_length_exceeds_threshold")
         || lower_message.contains("request payload is too large")
@@ -13153,7 +13166,9 @@ fn classify_external_error(
         .with_raw_upstream_error(Some(raw_upstream_error));
     }
     if status == StatusCode::BAD_REQUEST {
-        let message = if external_error_message_indicates_payload_too_large(&lower) {
+        let message = if external_error_message_indicates_image_too_large(&lower) {
+            EXTERNAL_IMAGE_TOO_LARGE_MESSAGE
+        } else if external_error_message_indicates_payload_too_large(&lower) {
             "external upstream rejected the request because the request payload is too large"
         } else if external_error_message_indicates_context_window_full(&lower) {
             "external upstream rejected the request because the prompt is too long"

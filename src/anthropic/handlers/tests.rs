@@ -13349,6 +13349,45 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
 }
 
 #[tokio::test]
+async fn upstream_image_size_rejection_maps_to_fixed_400_without_raw_text_for_five_rounds() {
+    for round in 0..5 {
+        let raw = format!(
+            "流式 API 请求失败（账号 #1948 test，请求无效）: upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=144 retry_after_secs=unknown content_type=json reason=image_too_large_bad_request 400 Bad Request {{\"message\":\"messages.{round}.content.1.image.source.base64: image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes\",\"reason\":\"IMAGE_SIZE_EXCEEDED\"}}"
+        );
+        let response = map_provider_error(
+            anyhow::anyhow!(raw),
+            Some("req_image"),
+            Some("err_image"),
+            None,
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "round {round}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            Some("false")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            value["error"]["message"],
+            envelope::public_message_with_error_id(
+                envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+                "err_image"
+            )
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("5298668"));
+        assert!(!text.contains("IMAGE_SIZE_EXCEEDED"));
+    }
+}
+
+#[tokio::test]
 async fn oversized_current_image_response_is_official_400_without_retry() {
     let violation = crate::anthropic::payload_guard::CurrentImageTooLarge {
         path: "messages.0.content.1.image.source.base64".to_string(),
