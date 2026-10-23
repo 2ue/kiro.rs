@@ -885,6 +885,7 @@ function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[
       ...item,
       name: item.name ?? `请求 Key ${index + 1}`,
       enabled: item.enabled ?? true,
+      usageLimits: item.usageLimits ?? [],
     }))
   }
   if (!response.requestApiKey) return []
@@ -896,6 +897,7 @@ function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[
       primary: true,
       name: '兼容旧主 Key',
       enabled: true,
+      usageLimits: [],
     },
   ]
 }

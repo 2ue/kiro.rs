@@ -1729,6 +1729,33 @@ pub struct RequestApiKeyItem {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_admission: Option<RequestAdmissionConfig>,
+    pub usage_limits: Vec<crate::anthropic::request_key_limits::KeyUsageLimit>,
+}
+
+/// Usage against every limit of one request key.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestKeyUsageLimitItem {
+    pub key_id: String,
+    pub enabled: bool,
+    pub statuses: Vec<crate::anthropic::request_key_limits::KeyLimitStatus>,
+    /// Set when the counters could not be read (requests for this key are then rejected).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestKeyUsageLimitsResponse {
+    /// Day and month windows reset at midnight in this timezone.
+    pub timezone: String,
+    pub items: Vec<RequestKeyUsageLimitItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetRequestKeyUsageRequest {
+    pub period: crate::anthropic::request_key_limits::KeyLimitPeriod,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1742,6 +1769,9 @@ pub struct CreateRequestApiKeyRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub request_admission: Option<RequestAdmissionConfig>,
+    /// Replaces the key's usage limits; an empty list removes them.
+    #[serde(default)]
+    pub usage_limits: Option<Vec<crate::anthropic::request_key_limits::KeyUsageLimit>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1755,6 +1785,9 @@ pub struct UpdateRequestApiKeyRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub request_admission: Option<RequestAdmissionConfig>,
+    /// Replaces the key's usage limits; an empty list removes them.
+    #[serde(default)]
+    pub usage_limits: Option<Vec<crate::anthropic::request_key_limits::KeyUsageLimit>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

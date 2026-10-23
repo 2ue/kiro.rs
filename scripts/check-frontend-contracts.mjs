@@ -41,6 +41,10 @@ const intentionallyUiOnly = new Set([
   'AccountEventKind',
   'AccountEventSummaryResponse',
   'AccountEventSummaryRow',
+  // Per-key usage limit status is shown only in the new console's security page.
+  'KeyLimitStatus',
+  'RequestKeyUsageLimitItem',
+  'RequestKeyUsageLimitsResponse',
   // Route scenarios are managed only in the new console.
   'AccountRoutePolicy',
   'RoutePolicy',

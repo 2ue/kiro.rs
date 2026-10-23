@@ -1435,6 +1435,7 @@ fn access_key_response_keeps_legacy_primary_field_and_lists_managed_policies() {
         "sk-managed-client".to_string(),
     ];
     let policies = vec![RequestApiKeyPolicy {
+        usage_limits: Vec::new(),
         api_key: "sk-managed-client".to_string(),
         name: "client-a".to_string(),
         enabled: true,
@@ -1475,6 +1476,7 @@ fn request_key_policy_validation_preserves_legacy_keys_and_fails_closed() {
     assert!(validate_request_api_key_policies(&keys, &[]).is_ok());
 
     let policy = RequestApiKeyPolicy {
+        usage_limits: Vec::new(),
         api_key: "sk-managed".to_string(),
         name: "client-a".to_string(),
         enabled: true,

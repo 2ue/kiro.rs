@@ -4,6 +4,8 @@
 //! multi-instance deployment therefore has an aggregate limit equal to the sum
 //! of each instance's configured limit.
 
+use crate::anthropic::request_key_limits::{KeyLimitDecision, RequestKeyLimiter};
+use crate::storage::redis_cache::RedisStore;
 use std::{
     collections::{BTreeSet, HashMap},
     pin::Pin,
@@ -143,10 +145,14 @@ pub(crate) enum RequestRejectionReason {
     LocalPoolUnavailable,
     LocalPoolTemporaryUnavailable,
     AdmissionLocalTemporaryBackoff,
+    /// A per-key usage limit (billed amount, credits or tokens) is reached.
+    KeyUsageLimitExceeded,
+    /// Usage-limit counters could not be read, so a limited key is rejected.
+    KeyUsageLimitUnavailable,
 }
 
 impl RequestRejectionReason {
-    const COUNT: usize = Self::AdmissionLocalTemporaryBackoff as usize + 1;
+    const COUNT: usize = Self::KeyUsageLimitUnavailable as usize + 1;
 
     const fn index(self) -> usize {
         self as usize
@@ -173,6 +179,8 @@ impl RequestRejectionReason {
             Self::LocalPoolUnavailable => "local_pool_unavailable",
             Self::LocalPoolTemporaryUnavailable => "local_pool_temporary_unavailable",
             Self::AdmissionLocalTemporaryBackoff => "admission_local_temporary_backoff",
+            Self::KeyUsageLimitExceeded => "key_usage_limit_exceeded",
+            Self::KeyUsageLimitUnavailable => "key_usage_limit_unavailable",
         }
     }
 }
@@ -270,6 +278,8 @@ impl RejectionLogTokenBucket {
 /// Admission controller shared by all `/messages` route variants.
 pub struct RequestAdmissionController {
     policies: RwLock<RequestAdmissionPolicySnapshot>,
+    /// Usage caps per key (billed amount, credits, tokens), counted in Redis.
+    usage_limits: Arc<RequestKeyLimiter>,
     shards: Box<[Mutex<HashMap<[u8; 32], Arc<KeyState>>>]>,
     tracked_keys: AtomicUsize,
     operations: AtomicUsize,
@@ -489,6 +499,7 @@ impl RequestAdmissionController {
                 default: config.normalized(),
                 per_key: HashMap::new(),
             }),
+            usage_limits: Arc::new(RequestKeyLimiter::new(None)),
             shards,
             tracked_keys: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -508,6 +519,16 @@ impl RequestAdmissionController {
             rejection_log_summaries_emitted: AtomicU64::new(0),
             rejection_log_budget_lock_acquisitions: AtomicU64::new(0),
         }
+    }
+
+    /// Uses `redis` for usage-limit counters. Call once at startup, before serving.
+    pub(crate) fn with_usage_limit_store(mut self, redis: Option<Arc<RedisStore>>) -> Self {
+        self.usage_limits = Arc::new(RequestKeyLimiter::new(redis));
+        self
+    }
+
+    pub(crate) fn usage_limits(&self) -> &Arc<RequestKeyLimiter> {
+        &self.usage_limits
     }
 
     pub(crate) fn update_config(&self, config: RequestAdmissionConfig) {
@@ -1138,6 +1159,73 @@ fn response_holding_permit(response: Response, permit: RequestAdmissionPermit) -
     )
 }
 
+/// 429 for a key over a usage limit, or 503 when its counters cannot be read. `None` lets the
+/// request continue; keys without limits return here without touching Redis.
+async fn usage_limit_rejection(
+    state: &RequestAdmissionMiddlewareState,
+    identity: RequestApiKeyIdentity,
+    endpoint: &str,
+) -> Option<Response> {
+    let decision = state
+        .controller
+        .usage_limits()
+        .check(&identity.stable_id())
+        .await;
+    let (status, reason, error_type, message, retry_after) = match decision {
+        KeyLimitDecision::Allowed => return None,
+        KeyLimitDecision::Exceeded {
+            status,
+            retry_after_secs,
+        } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            RequestRejectionReason::KeyUsageLimitExceeded,
+            "rate_limit_error",
+            format!(
+                "API key usage limit reached: {} {} {} of {}.",
+                status.period.as_str(),
+                status.metric.as_str(),
+                format_limit_value(status.used),
+                format_limit_value(status.limit),
+            ),
+            retry_after_secs,
+        ),
+        KeyLimitDecision::Unavailable(error) => {
+            tracing::warn!(error = %error, "读取 Key 用量限额失败，按限额拒绝请求");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                RequestRejectionReason::KeyUsageLimitUnavailable,
+                "overloaded_error",
+                "API key usage limit could not be checked. Please retry shortly.".to_string(),
+                Some(5),
+            )
+        }
+    };
+    let request_id = envelope::request_id();
+    RequestRejectionAttribution::new(
+        state.controller.clone(),
+        state.recorder.clone(),
+        identity,
+        None,
+    )
+    .record(reason, "admission", status, &request_id, endpoint);
+    Some(match retry_after {
+        Some(secs) => envelope::error_response_with_id_and_headers(
+            status,
+            error_type,
+            &message,
+            &request_id,
+            [("retry-after", secs.to_string())],
+        ),
+        None => envelope::error_response_with_id(status, error_type, &message, &request_id),
+    })
+}
+
+fn format_limit_value(value: f64) -> String {
+    let rounded = (value * 1_000_000.0).round() / 1_000_000.0;
+    let text = format!("{rounded:.6}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 /// Admission middleware for inference routes only. Authentication must be the
 /// outer layer so the request carries a digest-only identity extension.
 pub(crate) async fn request_admission_middleware(
@@ -1159,6 +1247,11 @@ pub(crate) async fn request_admission_middleware(
             &request_id,
         );
     };
+
+    // Usage caps first: a key over its limit should not take a concurrency slot or queue.
+    if let Some(response) = usage_limit_rejection(&state, identity, request.uri().path()).await {
+        return response;
+    }
 
     match state.controller.acquire(identity).await {
         Ok(permit) => {
@@ -1687,6 +1780,48 @@ mod tests {
             .unwrap();
         request.extensions_mut().insert(identity);
         request
+    }
+
+    #[tokio::test]
+    async fn usage_limited_keys_fail_closed_without_redis_and_never_reach_the_handler() {
+        use crate::anthropic::request_key_limits::{KeyLimitMetric, KeyLimitPeriod, KeyUsageLimit};
+
+        let controller = Arc::new(RequestAdmissionController::new(config(100, 4, 0, 0)));
+        let limited = identity("usage-limited-key");
+        let free = identity("usage-free-key");
+        controller.usage_limits().update_limits([(
+            limited.stable_id(),
+            vec![KeyUsageLimit {
+                metric: KeyLimitMetric::CostUsd,
+                period: KeyLimitPeriod::Daily,
+                limit: 1.0,
+            }],
+        )]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = middleware_router(controller.clone(), hits.clone(), BodyMode::Complete);
+
+        let rejected = app
+            .clone()
+            .oneshot(request("/messages", limited))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // The rejected key did not take a concurrency slot.
+        assert_eq!(gate_snapshot(&controller, limited), idle_gate_snapshot());
+
+        let allowed = app
+            .clone()
+            .oneshot(request("/messages", free))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Routes outside the admission layer are not limited.
+        let models = app.oneshot(request("/models", limited)).await.unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2241,6 +2376,8 @@ mod tests {
             RequestRejectionReason::LocalPoolUnavailable,
             RequestRejectionReason::LocalPoolTemporaryUnavailable,
             RequestRejectionReason::AdmissionLocalTemporaryBackoff,
+            RequestRejectionReason::KeyUsageLimitExceeded,
+            RequestRejectionReason::KeyUsageLimitUnavailable,
         ];
 
         for (expected_index, reason) in ALL_REASONS.iter().copied().enumerate() {

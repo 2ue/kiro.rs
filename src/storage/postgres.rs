@@ -5182,6 +5182,48 @@ impl PostgresStore {
         Ok(removed)
     }
 
+    /// Usage of one request API key from the usage rollups, in the units key limits use.
+    /// `since = None` reads the lifetime totals. Rollups are written shortly after each request,
+    /// so the most recent seconds may be missing.
+    pub async fn request_key_usage_since(
+        &self,
+        key_id: &str,
+        since: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<RequestKeyUsageTotals> {
+        let row = match since {
+            Some(since) => sqlx::query(
+                r#"
+                SELECT COALESCE(SUM(total_estimated_cost_usd), 0)::float8 AS cost_usd,
+                       COALESCE(SUM(total_kiro_metering_usage), 0)::float8 AS credits,
+                       COALESCE(SUM(billable_input_tokens + total_cache_read_input_tokens + total_output_tokens), 0)::float8 AS tokens
+                FROM usage_rollup_time_buckets
+                WHERE dimension = 'request_api_key' AND dimension_key = $1 AND bucket_start >= $2
+                "#,
+            )
+            .bind(key_id)
+            .bind(since)
+            .fetch_one(&self.pool)
+            .await?,
+            None => sqlx::query(
+                r#"
+                SELECT COALESCE(SUM(total_estimated_cost_usd), 0)::float8 AS cost_usd,
+                       COALESCE(SUM(total_kiro_metering_usage), 0)::float8 AS credits,
+                       COALESCE(SUM(billable_input_tokens + total_cache_read_input_tokens + total_output_tokens), 0)::float8 AS tokens
+                FROM usage_rollup_totals
+                WHERE dimension = 'request_api_key' AND dimension_key = $1
+                "#,
+            )
+            .bind(key_id)
+            .fetch_one(&self.pool)
+            .await?,
+        };
+        Ok(RequestKeyUsageTotals {
+            cost_usd: row.try_get("cost_usd")?,
+            credits: row.try_get("credits")?,
+            tokens: row.try_get("tokens")?,
+        })
+    }
+
     pub async fn record_credential_event(
         &self,
         credential_id: Option<u64>,
@@ -5626,6 +5668,14 @@ pub struct AccountQuotaFigures {
     pub current_usage: f64,
     pub usage_limit: f64,
     pub current_overages: f64,
+}
+
+/// A request API key's usage in limit units, read from the usage rollups.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RequestKeyUsageTotals {
+    pub cost_usd: f64,
+    pub credits: f64,
+    pub tokens: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

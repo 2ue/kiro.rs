@@ -2480,6 +2480,15 @@ export interface AccessKeysResponse {
   maskedAdminApiKey: string
 }
 
+export type KeyLimitMetric = 'cost_usd' | 'credits' | 'tokens'
+export type KeyLimitPeriod = 'daily' | 'monthly' | 'total'
+
+export interface KeyUsageLimit {
+  metric: KeyLimitMetric
+  period: KeyLimitPeriod
+  limit: number
+}
+
 export interface RequestApiKeyItem {
   id: string
   apiKey: string
@@ -2488,6 +2497,30 @@ export interface RequestApiKeyItem {
   name: string
   enabled: boolean
   requestAdmission?: RequestAdmissionConfig
+  usageLimits: KeyUsageLimit[]
+}
+
+export interface KeyLimitStatus {
+  metric: KeyLimitMetric
+  period: KeyLimitPeriod
+  limit: number
+  used: number
+  exceeded: boolean
+  /** RFC3339; absent for `total`. */
+  resetsAt?: string | null
+}
+
+export interface RequestKeyUsageLimitItem {
+  keyId: string
+  enabled: boolean
+  statuses: KeyLimitStatus[]
+  /** Counters could not be read; requests with this key are rejected. */
+  error?: string
+}
+
+export interface RequestKeyUsageLimitsResponse {
+  timezone: string
+  items: RequestKeyUsageLimitItem[]
 }
 
 export interface CreateRequestApiKeyRequest {
@@ -2495,6 +2528,7 @@ export interface CreateRequestApiKeyRequest {
   name?: string
   enabled?: boolean
   requestAdmission?: RequestAdmissionConfig
+  usageLimits?: KeyUsageLimit[]
 }
 
 export interface UpdateRequestApiKeyRequest {
@@ -2502,6 +2536,7 @@ export interface UpdateRequestApiKeyRequest {
   name?: string
   enabled?: boolean
   requestAdmission?: RequestAdmissionConfig
+  usageLimits?: KeyUsageLimit[]
 }
 
 export interface UpdateAdminApiKeyRequest {

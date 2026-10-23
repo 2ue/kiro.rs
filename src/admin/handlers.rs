@@ -18,8 +18,8 @@ use super::{
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
         CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
         ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
-        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialFastRequest,
-        SetCredentialOverageRequest, SetCredentialProxyRequest,
+        RefreshCredentialInfoRequest, ResetRequestKeyUsageRequest, SetCredentialConcurrencyRequest,
+        SetCredentialFastRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
         SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
         SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
@@ -1202,6 +1202,32 @@ pub async fn update_request_api_key(
         .update_request_api_key(&id, payload, &state.current_admin_api_key())
     {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/security/request-keys/usage-limits
+/// 每个设置了用量限额的 Key 当前已用量。
+pub async fn get_request_key_usage_limits(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_request_key_usage_limits().await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/security/request-keys/:id/usage-limits/reset
+/// 把某个 Key 当前周期的用量计数清零。
+pub async fn reset_request_key_usage(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ResetRequestKeyUsageRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .reset_request_key_usage(&id, payload.period)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

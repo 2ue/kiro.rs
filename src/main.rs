@@ -414,7 +414,8 @@ async fn async_main() {
     }
     let request_api_key_store = Arc::new(RequestApiKeyStore::new(request_api_keys.clone()));
     let request_admission = Arc::new(
-        anthropic::request_admission::RequestAdmissionController::new(config.request_admission),
+        anthropic::request_admission::RequestAdmissionController::new(config.request_admission)
+            .with_usage_limit_store(Some(redis_store.clone())),
     );
     apply_request_api_key_runtime(&config, &request_api_key_store, &request_admission);
     if request_api_key_store.len() == 0 {
@@ -471,6 +472,13 @@ async fn async_main() {
             Arc::new(PostgresUsageStore::new(usage_postgres_store.clone())),
             observability_redis_store.clone(),
         ),
+    );
+    usage_recorder.set_key_limits(request_admission.usage_limits().clone());
+    // Windows without history yet (new deploy, Redis flushed) start from the usage rollups.
+    anthropic::request_key_limits::spawn_seed_from_history(
+        request_admission.usage_limits().clone(),
+        postgres_store.clone(),
+        anthropic::request_key_limits::limited_periods(&config.request_api_key_policies()),
     );
     tracing::info!(
         usage_redis_cache_enabled = observability_redis_store.is_some(),
@@ -1365,6 +1373,17 @@ fn apply_request_api_key_runtime(
         })
         .collect::<Vec<_>>();
     request_admission.update_policies(config.request_admission, overrides);
+    request_admission.usage_limits().update_limits(
+        policies
+            .iter()
+            .filter(|policy| policy.enabled)
+            .map(|policy| {
+                (
+                    common::auth::request_api_key_id(&policy.api_key),
+                    policy.usage_limits.clone(),
+                )
+            }),
+    );
 }
 
 fn spawn_redis_runtime_event_listener(
