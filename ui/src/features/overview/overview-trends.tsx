@@ -466,7 +466,7 @@ function TrendTooltip({
       <div className="grid gap-1.5">
         {[...bars].reverse().map((series) => (
           <div key={series.key} className="flex items-center gap-2 leading-none">
-            <span className="size-2.5 shrink-0 rounded-[2px]" style={{ background: chartVar(series.key) }} />
+            <span className="size-2.5 shrink-0 rounded-[2px]" style={{ background: series.color }} />
             <span className="truncate text-muted-foreground">{series.name}</span>
             <span className="ml-auto pl-3 font-mono font-medium tabular-nums text-foreground">{formatValue(series.value(point), view.format)}</span>
           </div>
@@ -475,7 +475,7 @@ function TrendTooltip({
           const lineValue = line.value(point)
           return (
             <div key={line.key} className="flex items-center gap-2 leading-none">
-              <span className="h-2.5 w-1 shrink-0 rounded-[2px]" style={{ background: chartVar(line.key) }} />
+              <span className="h-2.5 w-1 shrink-0 rounded-[2px]" style={{ background: line.color }} />
               <span className="truncate text-muted-foreground">{line.name}</span>
               <span className="ml-auto pl-3 font-mono font-medium tabular-nums text-foreground">
                 {lineValue == null ? '-' : formatValue(lineValue, view.format)}
@@ -635,13 +635,17 @@ function SegmentedViews({
   )
 }
 
-/** ChartConfig 的 key 会变成 CSS 变量名，这里统一转成合法标识符。 */
-function chartKey(key: string): string {
-  return `s-${key.replace(/[^a-zA-Z0-9_-]/g, '_')}`
-}
+/**
+ * 图表里的数据键按“第几个柱子 / 第几条线”固定，而不是按系列名。
+ * 切换视图时 recharts 看到的是同一组柱子和折线，只是数值变了，
+ * 于是会从旧高度平滑过渡到新高度，而不是整张图卸载重画。
+ */
+const barSlot = (index: number) => `b${index}`
+const partialSlot = (index: number) => `b${index}p`
+const lineSlot = (index: number) => `l${index}`
 
-function chartVar(key: string): string {
-  return `var(--color-${chartKey(key)})`
+function chartVar(slot: string): string {
+  return `var(--color-${slot})`
 }
 
 /** 柱子/折线下方的渐变，从实色淡到透明。 */
@@ -682,9 +686,8 @@ export function OverviewTrendCard({
 }) {
   const gradientId = useId().replace(/:/g, '')
   const reducedMotion = usePrefersReducedMotion()
-  const animate = !reducedMotion
-  // 切换视图时整张图重新挂载，柱子从基线长出、折线从左往右画出。
-  const animation = { isAnimationActive: animate, animationDuration: 600, animationEasing: 'ease-out' as const }
+  // 数据变化（切换视图、隐藏系列、自动刷新）时柱高和折线位置做补间。
+  const animation = { isAnimationActive: !reducedMotion, animationDuration: 500, animationEasing: 'ease-in-out' as const }
   const [viewKey, setViewKey] = useState(views[0]?.key ?? '')
   const [hidden, setHidden] = useState<Set<string>>(() => new Set())
   const [showTable, setShowTable] = useState(false)
@@ -702,14 +705,16 @@ export function OverviewTrendCard({
     if (!view) return []
     return points.map((point, index) => {
       const row: ChartRow = { label: point.label, index }
-      for (const series of view.bars) {
+      view.bars.forEach((series, slot) => {
         const value = series.value(point)
         // 未结束的时段单独成一组淡色柱子，避免看起来像流量暴跌。
-        row[series.key] = index >= partialFrom ? 0 : value
-        row[`${series.key}__partial`] = index >= partialFrom ? value : 0
-      }
+        row[barSlot(slot)] = index >= partialFrom ? 0 : value
+        row[partialSlot(slot)] = index >= partialFrom ? value : 0
+      })
       // 未结束的时段数值天然偏低，折线在这里断开；提示框和数据表照常显示。
-      for (const line of view.lines ?? []) row[line.key] = index >= partialFrom ? null : line.value(point)
+      ;(view.lines ?? []).forEach((line, slot) => {
+        row[lineSlot(slot)] = index >= partialFrom ? null : line.value(point)
+      })
       return row
     })
   }, [partialFrom, points, view])
@@ -749,7 +754,13 @@ export function OverviewTrendCard({
     ? view.headline.value(points)
     : visibleBars.reduce((sum, series) => sum + sumOver(points, series.value), 0)
   const headlineLabel = view.headline?.label ?? `${view.label}合计`
-  const topBarKey = visibleBars[visibleBars.length - 1]?.key
+  const barSlots = view.bars
+    .map((series, slot) => ({ series, slot }))
+    .filter(({ series }) => !hidden.has(series.key))
+  const lineSlots = (view.lines ?? [])
+    .map((line, slot) => ({ line, slot }))
+    .filter(({ line }) => !hidden.has(line.key))
+  const topBarSlot = barSlots[barSlots.length - 1]?.slot
   const hasData = points.length > 0 && !view.emptyHint
   const xAxis = xAxisTicks(points, hourly)
   // 命中率可能整体很低或很高；固定 0~100% 会把折线压成一条线，这里按数据留白，并封顶在 0~1。
@@ -758,14 +769,14 @@ export function OverviewTrendCard({
     (max) => Math.min(1, Math.ceil((max + 0.05) * 20) / 20),
   ]
   // 柱子用实色 + 卡片色描边分段，避免堆叠时渐变在接缝处断层；渐变只给折线下的面积用。
-  const gradientItems = visibleLines.map((line) => ({ key: line.key, area: true }))
+  const gradientItems = lineSlots.map(({ slot }) => ({ key: lineSlot(slot), area: true }))
   const chartConfig: ChartConfig = Object.fromEntries([
-    ...view.bars.map((series) => [chartKey(series.key), { label: series.name, color: series.color }]),
-    ...(view.lines ?? []).map((line) => [chartKey(line.key), { label: line.name, color: line.color }]),
+    ...view.bars.map((series, slot) => [barSlot(slot), { label: series.name, color: series.color }]),
+    ...(view.lines ?? []).map((line, slot) => [lineSlot(slot), { label: line.name, color: line.color }]),
   ])
-  const gradientRef = (key: string) => `url(#${gradientId}-${gradientItems.findIndex((item) => item.key === key)})`
+  const gradientRef = (slot: string) => `url(#${gradientId}-${gradientItems.findIndex((item) => item.key === slot)})`
   // 只有单条折线时铺渐变面积；多条叠在一起会发灰、看不清。
-  const areaLineKey = lineOnly && visibleLines.length === 1 ? visibleLines[0]?.key : undefined
+  const areaLineSlot = lineOnly && lineSlots.length === 1 ? lineSlots[0]?.slot : undefined
 
   return (
     <SectionCard
@@ -810,9 +821,8 @@ export function OverviewTrendCard({
           <TrendTable points={points} view={view} bars={visibleBars} lines={visibleLines} partialFrom={partialFrom} />
         ) : (
           <ChartContainer
-            key={view.key}
             config={chartConfig}
-            className="aspect-auto h-[280px] w-full animate-in fade-in-0 duration-300 motion-reduce:animate-none"
+            className="aspect-auto h-[280px] w-full [&_.recharts-curve]:transition-colors [&_.recharts-curve]:duration-500 [&_.recharts-rectangle]:transition-colors [&_.recharts-rectangle]:duration-500 motion-reduce:[&_.recharts-curve]:transition-none motion-reduce:[&_.recharts-rectangle]:transition-none"
             role="img"
             aria-label={`${title}：${view.label}，共 ${points.length} 个时段，可切换为数据表查看具体数值`}
           >
@@ -850,7 +860,7 @@ export function OverviewTrendCard({
                 />
                 <ChartTooltip
                   cursor={lineOnly ? { strokeDasharray: '3 3' } : { radius: 6, fillOpacity: 0.6 }}
-                  animationDuration={150}
+                  isAnimationActive={false}
                   content={(props) => (
                     <TrendTooltip
                       active={props.active}
@@ -879,65 +889,65 @@ export function OverviewTrendCard({
                     }}
                   />
                 )}
-                {visibleBars.map((series) => (
+                {barSlots.map(({ series, slot }) => (
                   <Bar
-                    key={series.key}
-                    dataKey={series.key}
+                    key={barSlot(slot)}
+                    dataKey={barSlot(slot)}
                     name={series.name}
                     stackId="trend"
-                    fill={chartVar(series.key)}
+                    fill={chartVar(barSlot(slot))}
                     fillOpacity={0.9}
                     stroke={SURFACE}
-                    strokeWidth={visibleBars.length > 1 ? 1 : 0}
+                    strokeWidth={barSlots.length > 1 ? 1 : 0}
                     maxBarSize={points.length > 48 ? 10 : 28}
-                    radius={series.key === topBarKey ? [5, 5, 0, 0] : 0}
+                    radius={slot === topBarSlot ? [5, 5, 0, 0] : 0}
                     activeBar={{ fillOpacity: 1 }}
                     {...animation}
                   />
                 ))}
-                {visibleBars.map((series) => (
+                {barSlots.map(({ series, slot }) => (
                   <Bar
-                    key={`${series.key}__partial`}
-                    dataKey={`${series.key}__partial`}
+                    key={partialSlot(slot)}
+                    dataKey={partialSlot(slot)}
                     name={`${series.name}（进行中）`}
                     stackId="trend"
-                    fill={chartVar(series.key)}
+                    fill={chartVar(barSlot(slot))}
                     fillOpacity={0.25}
                     stroke={SURFACE}
-                    strokeWidth={visibleBars.length > 1 ? 1 : 0}
+                    strokeWidth={barSlots.length > 1 ? 1 : 0}
                     maxBarSize={points.length > 48 ? 10 : 28}
-                    radius={series.key === topBarKey ? [6, 6, 0, 0] : 0}
-                    {...animation}
+                    radius={slot === topBarSlot ? [5, 5, 0, 0] : 0}
                     legendType="none"
+                    {...animation}
                   />
                 ))}
-                {areaLineKey && visibleLines.filter((line) => line.key === areaLineKey).map((line) => (
+                {areaLineSlot != null && (
                   <Area
-                    key={`${line.key}__area`}
-                    dataKey={line.key}
+                    key={`${lineSlot(areaLineSlot)}a`}
+                    dataKey={lineSlot(areaLineSlot)}
                     type="monotone"
                     stroke="none"
-                    fill={gradientRef(line.key)}
+                    fill={gradientRef(lineSlot(areaLineSlot))}
                     connectNulls={false}
-                    {...animation}
                     activeDot={false}
                     legendType="none"
                     tooltipType="none"
+                    {...animation}
                   />
-                ))}
-                {visibleLines.map((line) => (
+                )}
+                {lineSlots.map(({ line, slot }) => (
                   <Line
-                    key={line.key}
-                    dataKey={line.key}
+                    key={lineSlot(slot)}
+                    dataKey={lineSlot(slot)}
                     name={line.name}
                     type={points.length > 72 ? 'linear' : 'monotone'}
-                    stroke={chartVar(line.key)}
+                    stroke={chartVar(lineSlot(slot))}
                     strokeWidth={line.reference ? 1.75 : points.length > 72 ? 1.5 : 2}
                     strokeDasharray={line.reference ? '5 4' : undefined}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     dot={false}
-                    activeDot={{ r: 4, fill: chartVar(line.key), stroke: SURFACE, strokeWidth: 2 }}
+                    activeDot={{ r: 4, fill: chartVar(lineSlot(slot)), stroke: SURFACE, strokeWidth: 2 }}
                     connectNulls={false}
                     {...animation}
                   />
