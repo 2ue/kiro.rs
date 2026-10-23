@@ -267,3 +267,66 @@ export function mergeCredentialPlanes(
     unpricedRequests: usage?.unpricedRequests ?? 0,
   }
 }
+
+// ============================================================================
+// Quota bar
+// ============================================================================
+
+export type QuotaTone = 'success' | 'warning' | 'error'
+
+export interface QuotaBarModel {
+  /** Base usage as a share of the plan limit, 0-100. */
+  basePercent: number
+  baseTone: QuotaTone
+  /** Usage went past the plan limit. */
+  inOverage: boolean
+  /** Credits used beyond the plan limit; 0 while within the limit. */
+  overage: number
+  /** Total usage (plan + overage) as a share of the plan limit; above 100 in overage. */
+  usagePercent: number
+  /** Widths in % of the whole track. Within the limit the base fills `basePercent`. */
+  baseWidth: number
+  overageWidth: number
+}
+
+/** Track share the full base segment keeps however large the overage grows. */
+const MIN_BASE_WIDTH_WHEN_OVERAGE = 40
+/** Track share the overage segment keeps however small the overage is, so it stays visible. */
+const MIN_OVERAGE_WIDTH = 4
+
+/**
+ * Splits account usage into the plan part and the overage part, all in credits. Within the limit
+ * this is the usual single bar. Past the limit the base segment is full and the overage follows
+ * it on the same track, sized by `limit / (limit + overage)` so it grows with the actual
+ * overage; both segments keep a minimum width so neither disappears.
+ *
+ * Overage is the larger of `currentUsage - usageLimit` and `currentOverages`: some responses
+ * cap usage at the limit and report the excess only in `currentOverages`.
+ */
+export function quotaBarModel(
+  info: Pick<CredentialAccountInfo, 'currentUsage' | 'usageLimit' | 'currentOverages'> | undefined,
+): QuotaBarModel {
+  const used = finiteNonNegative(info?.currentUsage)
+  const limit = finiteNonNegative(info?.usageLimit)
+  const overage = limit > 0 ? Math.max(used - limit, finiteNonNegative(info?.currentOverages), 0) : 0
+  const basePercent = limit > 0 ? Math.min(100, (Math.min(used, limit) / limit) * 100) : 0
+  const baseTone: QuotaTone = basePercent >= 95 ? 'error' : basePercent >= 80 ? 'warning' : 'success'
+  if (overage <= 0) {
+    return { basePercent, baseTone, inOverage: false, overage: 0, usagePercent: basePercent, baseWidth: basePercent, overageWidth: 0 }
+  }
+  const proportional = (limit / (limit + overage)) * 100
+  const baseWidth = Math.min(100 - MIN_OVERAGE_WIDTH, Math.max(MIN_BASE_WIDTH_WHEN_OVERAGE, proportional))
+  return {
+    basePercent: 100,
+    baseTone: 'error',
+    inOverage: true,
+    overage,
+    usagePercent: ((limit + overage) / limit) * 100,
+    baseWidth,
+    overageWidth: 100 - baseWidth,
+  }
+}
+
+function finiteNonNegative(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
