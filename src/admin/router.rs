@@ -16,14 +16,14 @@ use super::{
         delete_proxy_resource, delete_request_api_key, discover_credential_supported_models,
         discover_external_pool_supported_models,
         discover_external_pool_supported_models_from_request, export_credentials,
-        force_refresh_token, get_access_keys, get_all_credentials, get_audit_logs,
-        get_credential_balance, get_credential_credit_summary, get_credential_diagnostics,
-        get_credential_info, get_credentials_account_info, get_credentials_list,
-        get_credentials_page, get_credentials_runtime, get_credentials_summary,
-        get_credentials_usage_summary, get_external_pool_status, get_external_pools,
-        get_load_balancing_mode, get_model_capabilities, get_model_pricing, get_proxy_resources,
-        get_runtime_config, get_system_version, get_usage_cleanup_status, get_usage_dashboard,
-        get_usage_dashboard_accounts, get_usage_dashboard_breakdown,
+        force_refresh_token, get_access_keys, get_account_event_summary, get_all_credentials,
+        get_audit_logs, get_credential_balance, get_credential_credit_summary,
+        get_credential_diagnostics, get_credential_info, get_credentials_account_info,
+        get_credentials_list, get_credentials_page, get_credentials_runtime,
+        get_credentials_summary, get_credentials_usage_summary, get_external_pool_status,
+        get_external_pools, get_load_balancing_mode, get_model_capabilities, get_model_pricing,
+        get_proxy_resources, get_runtime_config, get_system_version, get_usage_cleanup_status,
+        get_usage_dashboard, get_usage_dashboard_accounts, get_usage_dashboard_breakdown,
         get_usage_dashboard_external_pool_billing, get_usage_dashboard_external_pool_risk,
         get_usage_dashboard_overview, get_usage_dashboard_overview_external,
         get_usage_dashboard_overview_local, get_usage_dashboard_overview_rankings,
@@ -289,6 +289,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/usage-writer-stats", get(get_usage_writer_stats))
         .route("/audit-logs", get(get_audit_logs))
+        .route(
+            "/audit-logs/account-summary",
+            get(get_account_event_summary),
+        )
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

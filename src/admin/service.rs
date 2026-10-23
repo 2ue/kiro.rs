@@ -98,10 +98,11 @@ use crate::model::config::{
     RequestAdmissionConfig, RequestApiKeyPolicy, normalize_defined_cache_routes,
 };
 use crate::model::model_support::normalize_supported_models;
+use crate::storage::account_events::{AccountEvent, AccountEventKind, AccountSource};
 use crate::storage::postgres::{
-    AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, NewUsageCleanupJob,
-    PostgresStore, PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
-    UsageCleanupJobProgress, UsageCleanupJobRow,
+    AccountEventSummaryResponse, AdminAuditLogFilter, AdminAuditLogPage, CreateProxyResourceRow,
+    CredentialAccountInfoRow, NewUsageCleanupJob, PostgresStore, PostgresUsageStore,
+    ProxyResourceRow, UpdateProxyResourceRow, UsageCleanupJobProgress, UsageCleanupJobRow,
 };
 use crate::storage::redis_cache::{RedisPatternDeleteStats, RedisStore};
 
@@ -1484,12 +1485,13 @@ impl AdminService {
         if !deleted {
             return Err(AdminServiceError::NotFound { id });
         }
-        self.audit(
+        self.audit_account_change(
             "delete_external_pool",
-            "external_pool",
-            Some(id.to_string()),
-            true,
-            None,
+            AccountEventKind::Deleted,
+            AccountSource::External,
+            id,
+            format!("#{id}"),
+            "删除外部池",
             json!({}),
         );
         self.invalidate_external_pool_admin_cache_for_delete("delete", id);
@@ -1509,12 +1511,18 @@ impl AdminService {
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
         .ok_or(AdminServiceError::NotFound { id })?;
-        self.audit(
+        let (kind, reason_label) = if request.enabled {
+            (AccountEventKind::ManualEnabled, "手动启用")
+        } else {
+            (AccountEventKind::ManualDisabled, "手动禁用")
+        };
+        self.audit_account_change(
             "set_external_pool_enabled",
-            "external_pool",
-            Some(id.to_string()),
-            true,
-            None,
+            kind,
+            AccountSource::External,
+            id,
+            pool.name.clone(),
+            reason_label,
             json!({ "enabled": request.enabled }),
         );
         self.invalidate_external_pool_admin_cache_with_pool("enabled", &pool);
@@ -1531,12 +1539,13 @@ impl AdminService {
         })
         .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
         .ok_or(AdminServiceError::NotFound { id })?;
-        self.audit(
+        self.audit_account_change(
             "clear_external_pool_auto_disabled",
-            "external_pool",
-            Some(id.to_string()),
-            true,
-            None,
+            AccountEventKind::ManualEnabled,
+            AccountSource::External,
+            id,
+            pool.name.clone(),
+            "清除自动禁用",
             json!({}),
         );
         self.invalidate_external_pool_admin_cache_with_pool("clear_auto_disabled", &pool);
@@ -1928,6 +1937,30 @@ impl AdminService {
         self.token_manager
             .publish_admin_credentials_changed("proxy_resources_changed");
         self.token_manager.notify_dispatch_state_changed();
+    }
+
+    /// Admin audit row that also shows up in the account change view.
+    fn audit_account_change(
+        &self,
+        action: &'static str,
+        kind: AccountEventKind,
+        source: AccountSource,
+        account_id: u64,
+        account_label: String,
+        reason_label: &'static str,
+        detail: serde_json::Value,
+    ) {
+        let (_, object_type, object_id, detail) = AccountEvent {
+            kind,
+            source,
+            account_id,
+            account_label,
+            reason: action.to_string(),
+            reason_label: reason_label.to_string(),
+            detail,
+        }
+        .into_audit_parts();
+        self.audit(action, object_type, Some(object_id), true, None, detail);
     }
 
     fn audit(
@@ -2451,12 +2484,18 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
-        self.audit(
+        let (kind, reason_label) = if disabled {
+            (AccountEventKind::ManualDisabled, "手动禁用")
+        } else {
+            (AccountEventKind::ManualEnabled, "手动启用")
+        };
+        self.audit_account_change(
             "set_credential_disabled",
-            "credential",
-            Some(id.to_string()),
-            true,
-            None,
+            kind,
+            AccountSource::Local,
+            id,
+            self.token_manager.credential_label_for_audit(id),
+            reason_label,
             json!({ "disabled": disabled }),
         );
         Ok(())
@@ -2730,12 +2769,13 @@ impl AdminService {
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))?;
         self.invalidate_balance_cache(id);
-        self.audit(
+        self.audit_account_change(
             "reset_credential",
-            "credential",
-            Some(id.to_string()),
-            true,
-            None,
+            AccountEventKind::ManualEnabled,
+            AccountSource::Local,
+            id,
+            self.token_manager.credential_label_for_audit(id),
+            "重置并启用",
             json!({}),
         );
         Ok(())
@@ -3350,15 +3390,24 @@ impl AdminService {
             next_reset_at: balance.next_reset_at,
             checked_at: balance.checked_at.clone(),
         };
-        if let Err(err) = self
+        let previous = match self
             .postgres_store
-            .save_credential_account_info(balance.id, &info)
+            .save_credential_account_info_returning_previous(balance.id, &info)
             .await
         {
-            let message = format!("保存凭据账号信息快照失败: {}", err);
-            tracing::warn!(credential_id = balance.id, "{}", message);
-            return Err(AdminServiceError::InternalError(message));
-        }
+            Ok(previous) => previous,
+            Err(err) => {
+                let message = format!("保存凭据账号信息快照失败: {}", err);
+                tracing::warn!(credential_id = balance.id, "{}", message);
+                return Err(AdminServiceError::InternalError(message));
+            }
+        };
+        self.token_manager.record_account_quota_transition(
+            balance.id,
+            previous,
+            &info,
+            "account_info_query",
+        );
         let _ = self
             .token_manager
             .apply_account_info_snapshot_for_credential(balance.id, &info);
@@ -4488,6 +4537,8 @@ impl AdminService {
 
     /// 删除凭据
     pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
+        // Taken before the delete so the log still names the account afterwards.
+        let label = self.token_manager.credential_label_for_audit(id);
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
@@ -4496,12 +4547,13 @@ impl AdminService {
 
         // 清理已删除凭据的账号信息缓存
         self.invalidate_balance_cache(id);
-        self.audit(
+        self.audit_account_change(
             "delete_credential",
-            "credential",
-            Some(id.to_string()),
-            true,
-            None,
+            AccountEventKind::Deleted,
+            AccountSource::Local,
+            id,
+            label,
+            "删除账号",
             json!({}),
         );
 
@@ -5796,18 +5848,55 @@ impl AdminService {
         });
     }
 
-    pub fn get_audit_logs(&self, page: usize, limit: usize) -> AdminAuditLogPage {
+    pub fn get_audit_logs_filtered(
+        &self,
+        page: usize,
+        limit: usize,
+        filter: AdminAuditLogFilter,
+    ) -> AdminAuditLogPage {
         let store = self.postgres_store.clone();
-        block_on_admin_store(async move { store.query_admin_audit_logs(page, limit).await })
-            .unwrap_or_else(|err| {
-                tracing::warn!("查询 Admin 审计日志失败: {}", err);
-                AdminAuditLogPage {
-                    page: page.max(1),
-                    limit: if limit == 0 { 20 } else { limit.min(200) },
-                    has_next: false,
-                    records: Vec::new(),
-                }
-            })
+        block_on_admin_store(async move {
+            store
+                .query_admin_audit_logs_filtered(page, limit, &filter)
+                .await
+        })
+        .unwrap_or_else(|err| {
+            tracing::warn!("查询 Admin 审计日志失败: {}", err);
+            AdminAuditLogPage {
+                page: page.max(1),
+                limit: if limit == 0 { 20 } else { limit.min(200) },
+                has_next: false,
+                records: Vec::new(),
+            }
+        })
+    }
+
+    pub fn get_account_event_summary(
+        &self,
+        hours: u32,
+        account_source: Option<String>,
+    ) -> AccountEventSummaryResponse {
+        let since = chrono::Utc::now() - chrono::Duration::hours(i64::from(hours));
+        let source = account_source
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let store = self.postgres_store.clone();
+        let query_source = source.clone();
+        let items = block_on_admin_store(async move {
+            store
+                .summarize_account_events(since, query_source.as_deref())
+                .await
+        })
+        .unwrap_or_else(|err| {
+            tracing::warn!("统计账号异动失败: {}", err);
+            Vec::new()
+        });
+        AccountEventSummaryResponse {
+            hours,
+            since: since.to_rfc3339(),
+            account_source: source,
+            items,
+        }
     }
 
     /// 获取运行时全局配置。
@@ -5955,6 +6044,8 @@ impl AdminService {
             extract_thinking: config.extract_thinking,
             thinking_trigger_mode: config.thinking_trigger_mode,
             expose_proxy_warnings: config.expose_proxy_warnings,
+            audit_log_retention_enabled: config.audit_log_retention_enabled,
+            audit_log_retention_days: config.audit_log_retention_days,
         }
     }
 
@@ -6277,6 +6368,22 @@ impl AdminService {
         let expose_proxy_warnings = req
             .expose_proxy_warnings
             .unwrap_or(current_config.expose_proxy_warnings);
+        let audit_log_retention_enabled = req
+            .audit_log_retention_enabled
+            .unwrap_or(current_config.audit_log_retention_enabled);
+        let audit_log_retention_days = req
+            .audit_log_retention_days
+            .unwrap_or(current_config.audit_log_retention_days);
+        if !(crate::model::config::MIN_AUDIT_LOG_RETENTION_DAYS
+            ..=crate::model::config::MAX_AUDIT_LOG_RETENTION_DAYS)
+            .contains(&audit_log_retention_days)
+        {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "auditLogRetentionDays 必须在 {} 到 {} 天之间",
+                crate::model::config::MIN_AUDIT_LOG_RETENTION_DAYS,
+                crate::model::config::MAX_AUDIT_LOG_RETENTION_DAYS
+            )));
+        }
 
         validate_runtime_cooldown_settings(
             req.credential_transient_cooldown_secs,
@@ -6696,6 +6803,8 @@ impl AdminService {
                 config.extract_thinking = extract_thinking;
                 config.thinking_trigger_mode = thinking_trigger_mode;
                 config.expose_proxy_warnings = expose_proxy_warnings;
+                config.audit_log_retention_enabled = audit_log_retention_enabled;
+                config.audit_log_retention_days = audit_log_retention_days;
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         self.request_admission.update_config(request_admission);

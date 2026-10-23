@@ -5875,6 +5875,15 @@ pub struct Config {
     #[serde(default = "default_expose_proxy_warnings")]
     pub expose_proxy_warnings: bool,
 
+    /// 是否自动清理过期审计日志（含账号异动）。默认关闭：升级后不删除任何已有记录，
+    /// 由管理员在审计页确认后手动开启。
+    #[serde(default)]
+    pub audit_log_retention_enabled: bool,
+
+    /// 审计日志保留天数；开启自动清理后，后台按批删除更早的记录。
+    #[serde(default = "default_audit_log_retention_days")]
+    pub audit_log_retention_days: u32,
+
     /// 外部备用号池和直连/预检 fallback 策略。
     #[serde(default)]
     pub external_pools: ExternalPoolsConfig,
@@ -6530,6 +6539,13 @@ fn default_expose_proxy_warnings() -> bool {
     false
 }
 
+pub const MIN_AUDIT_LOG_RETENTION_DAYS: u32 = 1;
+pub const MAX_AUDIT_LOG_RETENTION_DAYS: u32 = 3650;
+
+fn default_audit_log_retention_days() -> u32 {
+    15
+}
+
 fn default_local_pool_circuit_window_secs() -> u64 {
     60
 }
@@ -7071,6 +7087,8 @@ impl Default for Config {
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
             expose_proxy_warnings: default_expose_proxy_warnings(),
+            audit_log_retention_enabled: false,
+            audit_log_retention_days: default_audit_log_retention_days(),
             external_pools: ExternalPoolsConfig::default(),
             config_path: None,
         }
@@ -7909,6 +7927,9 @@ mod tests {
         assert_eq!(config.dispatch_max_queued_requests, 30);
         assert!(!config.weighted_capacity.enabled);
         assert_eq!(config.credential_warmup_requests, 3);
+        // Audit cleanup stays off until an operator turns it on, so upgrades delete nothing.
+        assert!(!config.audit_log_retention_enabled);
+        assert_eq!(config.audit_log_retention_days, 15);
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
         assert!(config.payload_guard_enabled);

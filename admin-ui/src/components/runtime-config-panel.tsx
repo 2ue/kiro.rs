@@ -665,6 +665,8 @@ const emptyConfig: RuntimeConfig = {
   extractThinking: true,
   thinkingTriggerMode: 'real_request',
   exposeProxyWarnings: false,
+  auditLogRetentionEnabled: false,
+  auditLogRetentionDays: 15,
 }
 
 function toNumber(value: string, fallback: number): number {

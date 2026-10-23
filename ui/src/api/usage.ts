@@ -1,6 +1,7 @@
 import { api } from '@/api/http'
 import type {
   AdminAuditLogPage,
+  AccountEventSummaryResponse,
   AdminAuditLogPageQuery,
   ModelCapabilitiesStatus,
   SyncModelCapabilitiesRequest,
@@ -236,6 +237,13 @@ export async function resumeUsageCleanup(jobId: string): Promise<UsageCleanupSta
 
 export async function getAuditLogsPage(query: AdminAuditLogPageQuery): Promise<AdminAuditLogPage> {
   const { data } = await api.get<AdminAuditLogPage>('/audit-logs', { params: query })
+  return data
+}
+
+export async function getAccountEventSummary(hours: number, accountSource?: string): Promise<AccountEventSummaryResponse> {
+  const { data } = await api.get<AccountEventSummaryResponse>('/audit-logs/account-summary', {
+    params: { hours, accountSource: accountSource || undefined },
+  })
   return data
 }
 

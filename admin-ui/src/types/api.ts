@@ -1330,6 +1330,21 @@ export interface AdminAuditLogPage {
 export interface AdminAuditLogPageQuery {
   page: number
   limit: number
+  /** Only account change events. */
+  accountEvents?: boolean
+  accountEvent?: string
+  accountSource?: string
+  objectType?: string
+  objectId?: string
+  /** Account label substring or id. */
+  account?: string
+  action?: string
+  actor?: string
+  success?: boolean
+  /** RFC3339, inclusive. */
+  since?: string
+  /** RFC3339, exclusive. */
+  until?: string
 }
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
@@ -2112,6 +2127,8 @@ export interface RuntimeConfig {
   extractThinking: boolean
   thinkingTriggerMode: ThinkingTriggerMode
   exposeProxyWarnings: boolean
+  auditLogRetentionEnabled: boolean
+  auditLogRetentionDays: number
 }
 
 export type UpdateRuntimeConfigRequest = RuntimeConfig

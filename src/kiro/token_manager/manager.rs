@@ -40,12 +40,16 @@ use crate::model::config::{
     MAX_TOKEN_REFRESH_BURST, MAX_TOKEN_REFRESH_MAX_RPM, MIN_TOKEN_REFRESH_BACKGROUND_INTERVAL_SECS,
     MIN_TOKEN_REFRESH_BACKGROUND_LEAD_SECS, MIN_TOKEN_REFRESH_BURST, MIN_TOKEN_REFRESH_MAX_RPM,
 };
+use crate::storage::account_events::{
+    AccountEvent, AccountEventKind, AccountSource, quota_transition, record_account_event,
+};
 use crate::storage::postgres::{
-    CredentialAccountInfoRow, CredentialRefreshExpectedContext, CredentialRefreshFieldsCasOutcome,
-    CredentialRefreshFieldsPatch, CredentialRuntimeDisabledReasonPatch,
-    CredentialRuntimeFailureCounts, CredentialRuntimeStateMutationResult,
-    CredentialRuntimeStatePatch, CredentialRuntimeStateRow, CredentialStatsDeltaRow,
-    CredentialUpsertCasOutcome, CredentialWithRuntimePatchCasOutcome, PostgresStore,
+    AccountQuotaFigures, CredentialAccountInfoRow, CredentialRefreshExpectedContext,
+    CredentialRefreshFieldsCasOutcome, CredentialRefreshFieldsPatch,
+    CredentialRuntimeDisabledReasonPatch, CredentialRuntimeFailureCounts,
+    CredentialRuntimeStateMutationResult, CredentialRuntimeStatePatch, CredentialRuntimeStateRow,
+    CredentialStatsDeltaRow, CredentialUpsertCasOutcome, CredentialWithRuntimePatchCasOutcome,
+    PostgresStore,
 };
 use crate::storage::redis_cache::{
     RedisRefreshBegin, RedisRefreshFailure, RedisRefreshFailureKind, RedisRefreshFailureStage,
@@ -2026,6 +2030,25 @@ struct RuntimeMutationCleanupReport {
     saturated: bool,
 }
 
+/// Account event kind for a scheduler audit row: enabling is a recovery, disabling is split into
+/// quota, risk control and other automatic disables.
+fn scheduler_account_event_kind(action: &str, reason: DisabledReason) -> AccountEventKind {
+    if action == "auto_enable_credential" {
+        return AccountEventKind::AutoEnabled;
+    }
+    match reason {
+        DisabledReason::QuotaExceeded => AccountEventKind::QuotaExhausted,
+        DisabledReason::TemporarilySuspended
+        | DisabledReason::AccountSuspended
+        | DisabledReason::AccountLocked => AccountEventKind::RiskControlled,
+        DisabledReason::Manual => AccountEventKind::ManualDisabled,
+        DisabledReason::TooManyFailures
+        | DisabledReason::TooManyRefreshFailures
+        | DisabledReason::InvalidRefreshToken
+        | DisabledReason::InvalidConfig => AccountEventKind::AutoDisabled,
+    }
+}
+
 async fn cleanup_runtime_mutation_history_batches(
     store: Arc<PostgresStore>,
     retention: StdDuration,
@@ -2652,6 +2675,26 @@ impl MultiTokenManager {
             .max(1)
     }
 
+    /// Account name for account-change rows: email, masked key or endpoint, without the `#id`
+    /// prefix (the id is shown next to it). Falls back to `#id`.
+    pub(crate) fn credential_label_for_audit(&self, id: u64) -> String {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(Self::credential_account_name)
+            .unwrap_or_else(|| format!("#{id}"))
+    }
+
+    fn credential_account_name(entry: &CredentialEntry) -> String {
+        let label = Self::credential_audit_label(entry);
+        let prefix = format!("#{} ", entry.id);
+        label
+            .strip_prefix(&prefix)
+            .map(str::to_string)
+            .unwrap_or(label)
+    }
+
     fn credential_audit_label(entry: &CredentialEntry) -> String {
         let prefix = format!("#{}", entry.id);
         let label = entry
@@ -2732,6 +2775,20 @@ impl MultiTokenManager {
             detail["endpoint"] = serde_json::Value::String(endpoint);
         }
         merge_json_object(&mut detail, extra_detail);
+        // Tag it as an account change so the audit page's account view lists it.
+        let event_kind = scheduler_account_event_kind(action, reason);
+        let account_name = label
+            .strip_prefix(&format!("#{id} "))
+            .map(str::to_string)
+            .unwrap_or_else(|| label.clone());
+        merge_json_object(
+            &mut detail,
+            serde_json::json!({
+                "accountEvent": event_kind.as_str(),
+                "accountSource": AccountSource::Local.as_str(),
+                "accountLabel": account_name,
+            }),
+        );
 
         let object_id = id.to_string();
         spawn_best_effort_storage_task("记录调度审计日志", async move {
@@ -8484,7 +8541,10 @@ impl MultiTokenManager {
         let usage_limits = self.get_usage_limits_for(id).await?;
         let info = Self::account_info_row_from_usage_limits(&usage_limits);
         if let Some(store) = &self.postgres_store {
-            store.save_credential_account_info(id, &info).await?;
+            let previous = store
+                .save_credential_account_info_returning_previous(id, &info)
+                .await?;
+            self.record_account_quota_transition(id, previous, &info, "quota_exhausted_refresh");
         }
         self.apply_account_info_snapshot_for_credential(id, &info);
         self.publish_credentials_changed("credential_quota_account_info_refreshed");
@@ -8536,6 +8596,57 @@ impl MultiTokenManager {
             changed |= Self::apply_account_info_quota_guard(entry, account_info.get(&entry.id));
         }
         changed
+    }
+
+    /// Logs a quota state change between two account-info snapshots. Called after the snapshot
+    /// is saved, off the request path; the write is queued and never awaited.
+    pub(crate) fn record_account_quota_transition(
+        &self,
+        id: u64,
+        previous: Option<AccountQuotaFigures>,
+        info: &CredentialAccountInfoRow,
+        trigger: &'static str,
+    ) {
+        let Some(store) = self.postgres_store.clone() else {
+            return;
+        };
+        let next = AccountQuotaFigures {
+            current_usage: info.current_usage,
+            usage_limit: info.usage_limit,
+            current_overages: info.current_overages,
+        };
+        let Some(kind) = quota_transition(previous, next) else {
+            return;
+        };
+        let (reason, reason_label) = match kind {
+            AccountEventKind::OverageStarted => ("account_info_overage_started", "开始超额"),
+            AccountEventKind::QuotaExhausted => ("account_info_quota_exhausted", "额度用完"),
+            _ => ("account_info_quota_recovered", "额度恢复"),
+        };
+        let label = self.credential_label_for_audit(id);
+        let overage = (next.current_usage - next.usage_limit)
+            .max(next.current_overages)
+            .max(0.0);
+        record_account_event(
+            store,
+            "system-account-info",
+            AccountEvent {
+                kind,
+                source: AccountSource::Local,
+                account_id: id,
+                account_label: label,
+                reason: reason.to_string(),
+                reason_label: reason_label.to_string(),
+                detail: serde_json::json!({
+                    "trigger": trigger,
+                    "currentUsage": next.current_usage,
+                    "usageLimit": next.usage_limit,
+                    "overage": overage,
+                    "previousUsage": previous.map(|figures| figures.current_usage),
+                    "subscriptionTitle": info.subscription_title,
+                }),
+            },
+        );
     }
 
     pub(crate) fn apply_account_info_snapshot_for_credential(

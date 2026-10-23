@@ -37,6 +37,10 @@ const intentionallyUiOnly = new Set([
   'UsageExternalPoolRiskThresholds',
   'UsageExternalPoolRiskTotals',
   'UsageExternalPoolRiskWindow',
+  // The account change view and its summary exist only in the new console's audit page.
+  'AccountEventKind',
+  'AccountEventSummaryResponse',
+  'AccountEventSummaryRow',
   // Route scenarios are managed only in the new console.
   'AccountRoutePolicy',
   'RoutePolicy',

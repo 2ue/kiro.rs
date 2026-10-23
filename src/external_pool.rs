@@ -86,6 +86,9 @@ use crate::{
         expand_claude_supported_model_variants, normalize_model_id, normalize_supported_models,
     },
     storage::{
+        account_events::{
+            AccountEvent, AccountSource, external_pool_disable_event, record_account_event,
+        },
         postgres::PostgresStore,
         redis_cache::{
             ExternalPoolCoordinatorGuardError, ExternalPoolCoordinatorGuardState,
@@ -9317,6 +9320,26 @@ impl ExternalPoolManager {
         .await;
         match changed {
             Ok(Ok(true)) => {
+                let (kind, reason_label) = external_pool_disable_event(reason);
+                record_account_event(
+                    self.postgres.clone(),
+                    "system-external-pool",
+                    AccountEvent {
+                        kind,
+                        source: AccountSource::External,
+                        account_id: pool.id,
+                        account_label: pool.name.clone(),
+                        reason: reason.to_string(),
+                        reason_label: reason_label.to_string(),
+                        detail: json!({
+                            "baseUrl": pool.base_url,
+                            "lastError": last_error.chars().take(500).collect::<String>(),
+                            "failureCount": count,
+                            "threshold": threshold,
+                            "disabledForSecs": config.external_pool_auto_disable_duration_secs,
+                        }),
+                    },
+                );
                 if let Err(err) = self
                     .publish_external_pool_data_changed("auto_disable", Some(pool.id))
                     .await

@@ -103,6 +103,29 @@ impl CredentialsIdsQueryParams {
 pub struct AuditLogsQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
+    /// `true` lists only account change events.
+    pub account_events: Option<bool>,
+    pub account_event: Option<String>,
+    pub account_source: Option<String>,
+    pub object_type: Option<String>,
+    pub object_id: Option<String>,
+    /// Account label substring or id.
+    pub account: Option<String>,
+    pub action: Option<String>,
+    pub actor: Option<String>,
+    pub success: Option<bool>,
+    /// RFC3339 lower bound (inclusive).
+    pub since: Option<String>,
+    /// RFC3339 upper bound (exclusive).
+    pub until: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountEventSummaryQueryParams {
+    /// Window in hours back from now, 1 to 720. Defaults to 24.
+    pub hours: Option<u32>,
+    pub account_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1807,11 +1830,69 @@ pub async fn get_audit_logs(
     State(state): State<AdminState>,
     Query(params): Query<AuditLogsQueryParams>,
 ) -> impl IntoResponse {
+    let parse_time = |value: &Option<String>,
+                      name: &str|
+     -> Result<
+        Option<chrono::DateTime<chrono::Utc>>,
+        crate::admin::error::AdminServiceError,
+    > {
+        match value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => Ok(None),
+            Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+                .map(|time| Some(time.with_timezone(&chrono::Utc)))
+                .map_err(|_| {
+                    crate::admin::error::AdminServiceError::InvalidCredential(format!(
+                        "{name} 必须是 RFC3339 时间"
+                    ))
+                }),
+        }
+    };
+    let filter = match (
+        parse_time(&params.since, "since"),
+        parse_time(&params.until, "until"),
+    ) {
+        (Ok(since), Ok(until)) => crate::storage::postgres::AdminAuditLogFilter {
+            account_events_only: params.account_events.unwrap_or(false),
+            account_event: params.account_event,
+            account_source: params.account_source,
+            object_type: params.object_type,
+            object_id: params.object_id,
+            account_query: params.account,
+            action: params.action,
+            actor: params.actor,
+            success: params.success,
+            since,
+            until,
+        },
+        (Err(err), _) | (_, Err(err)) => {
+            return (err.status_code(), Json(err.into_response())).into_response();
+        }
+    };
+    Json(state.service.get_audit_logs_filtered(
+        params.page.unwrap_or(1),
+        params.limit.unwrap_or(20),
+        filter,
+    ))
+    .into_response()
+}
+
+/// GET /api/admin/audit-logs/account-summary
+/// 账号异动按类型统计（默认最近 24 小时）。
+pub async fn get_account_event_summary(
+    State(state): State<AdminState>,
+    Query(params): Query<AccountEventSummaryQueryParams>,
+) -> impl IntoResponse {
+    let hours = params.hours.unwrap_or(24).clamp(1, 720);
     Json(
         state
             .service
-            .get_audit_logs(params.page.unwrap_or(1), params.limit.unwrap_or(20)),
+            .get_account_event_summary(hours, params.account_source),
     )
+    .into_response()
 }
 
 #[cfg(test)]
