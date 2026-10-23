@@ -13,6 +13,7 @@ import {
 } from 'recharts'
 import { Table2, BarChart3 } from 'lucide-react'
 import { formatCompact, formatCredits, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
+import { CACHE_HIT_RATE_CRITICAL, CACHE_HIT_RATE_WARNING, cacheHitRate } from './cache-hit-rate'
 import { cn } from '@/lib/utils'
 import { EmptyState, LoadingState, SectionCard } from '@/components/patterns'
 import {
@@ -53,7 +54,7 @@ const EXTERNAL_REASON_COLORS: Record<string, string> = {
   system_degraded: SLOT_COLORS[4],
 }
 
-type ValueFormat = 'count' | 'usd' | 'credits' | 'usdPerCredit'
+type ValueFormat = 'count' | 'usd' | 'credits' | 'usdPerCredit' | 'percent'
 
 type TrendSeries = {
   key: string
@@ -80,8 +81,11 @@ export type TrendView = {
   label: string
   format: ValueFormat
   bars: TrendSeries[]
-  line?: TrendLine
+  /** 叠加的折线；比例类视图（命中率）只有折线、没有柱子 */
+  lines?: TrendLine[]
   reference?: { value: number; label: string }
+  /** 比例类视图：y 轴按数据自适应，但不超出 0~1 */
+  ratioAxis?: boolean
   extraRows?: TrendExtraRow[]
   emptyHint?: string
   footnote?: ReactNode
@@ -92,12 +96,14 @@ function formatValue(value: number, format: ValueFormat): string {
   if (format === 'usd') return formatUsdFixed2(value)
   if (format === 'credits') return formatCredits(value)
   if (format === 'usdPerCredit') return `$${value.toFixed(3)}`
+  if (format === 'percent') return formatPercent(value)
   return formatNumber(value)
 }
 
 function formatAxisValue(value: number, format: ValueFormat): string {
   if (format === 'usd') return `$${formatCompact(value)}`
   if (format === 'usdPerCredit') return `$${value.toFixed(2)}`
+  if (format === 'percent') return `${Math.round(value * 100)}%`
   return formatCompact(value)
 }
 
@@ -153,6 +159,26 @@ function stackSeries(
   return series
 }
 
+const HIT_RATE_FOOTNOTE = `缓存读 ÷（未缓存输入 + 缓存读 + 缓存写），与 sub2api 口径一致，按 token 加权。参考线：低于 ${Math.round(CACHE_HIT_RATE_WARNING * 100)}% 需关注，低于 ${Math.round(CACHE_HIT_RATE_CRITICAL * 100)}% 偏低。`
+const HIT_RATE_REFERENCE = { value: CACHE_HIT_RATE_WARNING, label: '关注线' }
+
+/** 每个成员一条命中率折线；比例不能堆叠，超过 5 个成员时只画前 5 个。 */
+function hitRateLines(
+  groups: UsageOverviewSeriesGroup[],
+  rows: (point: UsageOverviewSeriesPoint) => UsageOverviewSeriesBreakdown[] | undefined,
+  fixedColors?: Record<string, string>,
+): TrendLine[] {
+  return stackSeries(groups.slice(0, MAX_STACK_MEMBERS), rows, () => 0, fixedColors).map((series) => ({
+    key: `hit:${series.key}`,
+    name: series.name,
+    color: series.color,
+    value: (point) => {
+      const row = rows(point)?.find((item) => item.key === series.key)
+      return row ? cacheHitRate(row.metrics) : null
+    },
+  }))
+}
+
 // ─── 三个分区的视图定义 ─────────────────────────────────────────────────────────
 
 export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[] {
@@ -171,6 +197,20 @@ export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[
       footnote: '本地为估算计费，外部池为最终可计费金额，两者都是对下游收的钱，可以直接相加。',
     },
     { key: 'tokens', label: 'Token', format: 'count', bars: splitBars(totalTokens) },
+    {
+      key: 'cacheHitRate',
+      label: '缓存命中率',
+      format: 'percent',
+      bars: [],
+      ratioAxis: true,
+      reference: HIT_RATE_REFERENCE,
+      lines: [
+        { key: 'hit:all', name: '整体', color: INK_COLOR, value: (point) => cacheHitRate(point.all) },
+        { key: 'hit:local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => cacheHitRate(point.local) },
+        { key: 'hit:external', name: '外部池', color: SLOT_COLORS[1], value: (point) => cacheHitRate(point.external) },
+      ],
+      footnote: HIT_RATE_FOOTNOTE,
+    },
   ]
   if (creditUnitPriceUsd != null) {
     const localCost = (point: UsageOverviewSeriesPoint) => point.local.kiroMeteringUsage * creditUnitPriceUsd
@@ -183,7 +223,7 @@ export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[
         { key: 'localCost', name: '本地积分成本', color: SLOT_COLORS[0], value: localCost },
         { key: 'externalCost', name: '外部上游成本', color: SLOT_COLORS[1], value: (point) => point.external.rawCostUsd },
       ],
-      line: { key: 'revenue', name: '对外计费', color: INK_COLOR, value: (point) => point.all.estimatedCostUsd },
+      lines: [{ key: 'revenue', name: '对外计费', color: INK_COLOR, value: (point) => point.all.estimatedCostUsd }],
       extraRows: [
         { label: '毛利', value: (point) => formatUsdFixed2(point.all.estimatedCostUsd - cost(point)) },
       ],
@@ -212,18 +252,30 @@ export function localTrendViews(groups: UsageOverviewSeriesGroups, creditUnitPri
       footnote: routeHint,
     },
     {
+      key: 'cacheHitRate',
+      label: '缓存命中率',
+      format: 'percent',
+      bars: [],
+      ratioAxis: true,
+      reference: HIT_RATE_REFERENCE,
+      lines: hasRoutes
+        ? hitRateLines(groups.localRoutes, (point) => point.localRoutes, LOCAL_ROUTE_COLORS)
+        : [{ key: 'hit:local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => cacheHitRate(point.local) }],
+      footnote: routeHint ?? HIT_RATE_FOOTNOTE,
+    },
+    {
       key: 'revenuePerCredit',
       label: '每积分收入',
       format: 'usdPerCredit',
       bars: [],
-      line: {
+      lines: [{
         key: 'revenuePerCredit',
         name: '每积分收入',
         color: SLOT_COLORS[0],
         value: (point) => (point.local.kiroMeteringUsage > 0
           ? point.local.estimatedCostUsd / point.local.kiroMeteringUsage
           : null),
-      },
+      }],
       reference: creditUnitPriceUsd != null ? { value: creditUnitPriceUsd, label: '积分单价' } : undefined,
       footnote: creditUnitPriceUsd != null
         ? '估算计费 ÷ 消耗积分。折线低于积分单价参考线的时段，本地账号在亏钱。'
@@ -244,7 +296,7 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
       label: '上游成本',
       format: 'usd',
       bars: byPool((m) => m.rawCostUsd),
-      line: { key: 'billable', name: '可计费', color: INK_COLOR, value: (point) => point.external.billableCostUsd },
+      lines: [{ key: 'billable', name: '可计费', color: INK_COLOR, value: (point) => point.external.billableCostUsd }],
       extraRows: [{ label: '毛利', value: (point) => formatUsdFixed2(point.external.profitUsd) }],
       footnote: '柱子是外部池实际花出去的上游成本，折线是对下游的可计费金额。',
     },
@@ -254,6 +306,29 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
       format: 'usd',
       bars: [{ key: 'profit', name: '毛利', color: SLOT_COLORS[0], value: (point) => point.external.profitUsd }],
       footnote: '补偿后计费 - 上游原始成本；低于 0 的时段在亏钱。',
+    },
+    {
+      key: 'cacheHitRate',
+      label: '缓存命中率',
+      format: 'percent',
+      bars: [],
+      ratioAxis: true,
+      reference: HIT_RATE_REFERENCE,
+      lines: hitRateLines(groups.externalPools, (point) => point.externalPools),
+      footnote: HIT_RATE_FOOTNOTE,
+    },
+    {
+      key: 'reasonHitRate',
+      label: '原因命中率',
+      format: 'percent',
+      bars: [],
+      ratioAxis: true,
+      reference: HIT_RATE_REFERENCE,
+      lines: hitRateLines(groups.externalReasons, (point) => point.externalReasons, EXTERNAL_REASON_COLORS),
+      emptyHint: groups.externalReasons.length === 0
+        ? '当前范围没有原因数据。历史记录需要离线运行 maintenance usage-route-dimension-backfill 回灌。'
+        : undefined,
+      footnote: '按走外部的原因拆开命中率：从本地溢出到外部的请求会丢失会话粘性，命中率明显低于策略直连时说明溢出在损失缓存。',
     },
     {
       key: 'reasons',
@@ -299,6 +374,7 @@ function TrendTooltip({
   points,
   view,
   bars,
+  lines,
   partialFrom,
 }: {
   active?: boolean
@@ -307,13 +383,13 @@ function TrendTooltip({
   points: UsageOverviewSeriesPoint[]
   view: TrendView
   bars: TrendSeries[]
+  lines: TrendLine[]
   partialFrom: number
 }) {
   if (!active || payloadIndex == null) return null
   const point = points[payloadIndex]
   if (!point) return null
   const total = bars.reduce((sum, series) => sum + series.value(point), 0)
-  const lineValue = view.line?.value(point)
   return (
     <div className="min-w-48 rounded-lg bg-popover/95 px-3 py-2 text-xs shadow-md ring-1 ring-border/60 backdrop-blur">
       <div className="mb-1.5 font-medium text-popover-foreground">
@@ -334,15 +410,18 @@ function TrendTooltip({
             <span className="ml-auto font-semibold tabular-nums text-popover-foreground">{formatValue(total, view.format)}</span>
           </div>
         )}
-        {view.line && (
-          <div className="flex items-center gap-2">
-            <span className="h-0.5 w-3 shrink-0 rounded-full" style={{ background: view.line.color }} />
-            <span className="text-muted-foreground">{view.line.name}</span>
-            <span className="ml-auto font-semibold tabular-nums text-popover-foreground">
-              {lineValue == null ? '-' : formatValue(lineValue, view.format)}
-            </span>
-          </div>
-        )}
+        {lines.map((line) => {
+          const lineValue = line.value(point)
+          return (
+            <div key={line.key} className="flex items-center gap-2">
+              <span className="h-0.5 w-3 shrink-0 rounded-full" style={{ background: line.color }} />
+              <span className="text-muted-foreground">{line.name}</span>
+              <span className="ml-auto font-semibold tabular-nums text-popover-foreground">
+                {lineValue == null ? '-' : formatValue(lineValue, view.format)}
+              </span>
+            </div>
+          )
+        })}
         {view.extraRows?.map((row) => (
           <div key={row.label} className="flex items-center gap-2">
             <span className="pl-5 text-muted-foreground">{row.label}</span>
@@ -358,11 +437,13 @@ function TrendTable({
   points,
   view,
   bars,
+  lines,
   partialFrom,
 }: {
   points: UsageOverviewSeriesPoint[]
   view: TrendView
   bars: TrendSeries[]
+  lines: TrendLine[]
   partialFrom: number
 }) {
   return (
@@ -373,13 +454,12 @@ function TrendTable({
             <TableHead>时段</TableHead>
             {bars.map((series) => <TableHead key={series.key} className="text-right">{series.name}</TableHead>)}
             {bars.length > 1 && <TableHead className="text-right">合计</TableHead>}
-            {view.line && <TableHead className="text-right">{view.line.name}</TableHead>}
+            {lines.map((line) => <TableHead key={line.key} className="text-right">{line.name}</TableHead>)}
             {view.extraRows?.map((row) => <TableHead key={row.label} className="text-right">{row.label}</TableHead>)}
           </TableRow>
         </TableHeader>
         <TableBody>
           {points.map((point, index) => {
-            const lineValue = view.line?.value(point)
             return (
               <TableRow key={point.bucketStart}>
                 <TableCell className="whitespace-nowrap">
@@ -394,9 +474,14 @@ function TrendTable({
                     {formatValue(bars.reduce((sum, series) => sum + series.value(point), 0), view.format)}
                   </TableCell>
                 )}
-                {view.line && (
-                  <TableCell className="text-right font-mono tabular-nums">{lineValue == null ? '-' : formatValue(lineValue, view.format)}</TableCell>
-                )}
+                {lines.map((line) => {
+                  const lineValue = line.value(point)
+                  return (
+                    <TableCell key={line.key} className="text-right font-mono tabular-nums">
+                      {lineValue == null ? '-' : formatValue(lineValue, view.format)}
+                    </TableCell>
+                  )
+                })}
                 {view.extraRows?.map((row) => (
                   <TableCell key={row.label} className="text-right font-mono tabular-nums">{row.value(point)}</TableCell>
                 ))}
@@ -440,14 +525,17 @@ export function OverviewTrendCard({
     () => (view?.bars ?? []).filter((series) => !hidden.has(series.key)),
     [hidden, view],
   )
-  const showLine = Boolean(view?.line && !hidden.has(view.line.key))
+  const visibleLines = useMemo(
+    () => (view?.lines ?? []).filter((line) => !hidden.has(line.key)),
+    [hidden, view],
+  )
   const rows = useMemo<ChartRow[]>(() => {
     if (!view) return []
     return points.map((point, index) => {
       const row: ChartRow = { label: point.label, index }
       for (const series of view.bars) row[series.key] = series.value(point)
       // 未结束的时段数值天然偏低，折线在这里断开，避免画出一条“暴跌”；提示框和数据表照常显示。
-      if (view.line) row[view.line.key] = index >= partialFrom ? null : view.line.value(point)
+      for (const line of view.lines ?? []) row[line.key] = index >= partialFrom ? null : line.value(point)
       return row
     })
   }, [partialFrom, points, view])
@@ -466,11 +554,16 @@ export function OverviewTrendCard({
   })
   const legendItems = [
     ...view.bars.map((series) => ({ key: series.key, name: series.name, color: series.color, shape: 'rect' as const })),
-    ...(view.line ? [{ key: view.line.key, name: view.line.name, color: view.line.color, shape: 'line' as const }] : []),
+    ...(view.lines ?? []).map((line) => ({ key: line.key, name: line.name, color: line.color, shape: 'line' as const })),
   ]
   const topBarKey = visibleBars[visibleBars.length - 1]?.key
   const hasData = points.length > 0 && !view.emptyHint
   const xAxis = xAxisTicks(points, hourly)
+  // 命中率可能整体很低或很高；固定 0~100% 会把折线压成一条线，这里按数据留白，并封顶在 0~1。
+  const ratioDomain: [(min: number) => number, (max: number) => number] = [
+    (min) => Math.max(0, Math.floor((min - 0.05) * 20) / 20),
+    (max) => Math.min(1, Math.ceil((max + 0.05) * 20) / 20),
+  ]
 
   return (
     <SectionCard
@@ -509,7 +602,7 @@ export function OverviewTrendCard({
         ) : !hasData ? (
           <EmptyState title={view.emptyHint ?? '暂无趋势数据'} className="py-10" />
         ) : showTable ? (
-          <TrendTable points={points} view={view} bars={visibleBars} partialFrom={partialFrom} />
+          <TrendTable points={points} view={view} bars={visibleBars} lines={visibleLines} partialFrom={partialFrom} />
         ) : (
           <div
             className="h-[260px] w-full"
@@ -541,6 +634,7 @@ export function OverviewTrendCard({
                   minTickGap={16}
                 />
                 <YAxis
+                  domain={view.ratioAxis ? ratioDomain : [0, 'auto']}
                   tickFormatter={(value: number) => formatAxisValue(value, view.format)}
                   stroke="hsl(var(--muted-foreground))"
                   fontSize={11}
@@ -558,6 +652,7 @@ export function OverviewTrendCard({
                       points={points}
                       view={view}
                       bars={visibleBars}
+                      lines={visibleLines}
                       partialFrom={partialFrom}
                     />
                   )}
@@ -593,11 +688,12 @@ export function OverviewTrendCard({
                     ))}
                   </Bar>
                 ))}
-                {view.line && showLine && (
+                {visibleLines.map((line) => (
                   <Line
-                    dataKey={view.line.key}
-                    name={view.line.name}
-                    stroke={view.line.color}
+                    key={line.key}
+                    dataKey={line.key}
+                    name={line.name}
+                    stroke={line.color}
                     strokeWidth={2}
                     strokeLinecap="round"
                     strokeLinejoin="round"
@@ -606,7 +702,7 @@ export function OverviewTrendCard({
                     connectNulls={false}
                     isAnimationActive={false}
                   />
-                )}
+                ))}
               </ComposedChart>
             </ResponsiveContainer>
           </div>

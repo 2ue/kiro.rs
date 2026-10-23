@@ -5,7 +5,6 @@ import {
   Activity,
   AlertTriangle,
   ArrowLeft,
-  Clock3,
   DollarSign,
   ExternalLink,
   Layers3,
@@ -14,7 +13,7 @@ import {
   Wallet,
   Zap,
 } from 'lucide-react'
-import { getExternalPools } from '@/api/credentials'
+import { getExternalPools, getExternalPoolsStatus } from '@/api/credentials'
 import {
   useUsageOverviewExternal,
   useUsageOverviewLocal,
@@ -28,6 +27,8 @@ import {
   useCredentialRuntime,
   useRuntimeConfig,
 } from '@/hooks/use-credentials'
+import { cacheHitRate, cacheHitRateLevel, type CacheHitRateLevel } from './cache-hit-rate'
+import { compareUsageTier, credentialUsageTier, externalPoolUsageTier, type UsageTier } from './usage-order'
 import {
   OverviewTrendCard,
   externalTrendViews,
@@ -43,6 +44,7 @@ import type {
   CredentialAccountInfo,
   CredentialStatusItem,
   ExternalPool,
+  ExternalPoolStatus,
   UsageOverviewMetrics,
   UsageOverviewRankRow,
   UsageOverviewRouteRow,
@@ -91,6 +93,7 @@ type LocalAccountOverviewRow = {
   creditEstimateBlocked: boolean
   creditEstimateBlockedReason?: string
   estimatedRemainingCostUsd?: number
+  tier: UsageTier
 }
 
 type ExternalUsagePool = {
@@ -113,6 +116,7 @@ const EMPTY_OVERVIEW_METRICS: UsageOverviewMetrics = {
   errorRequests: 0,
   errorRate: 0,
   inputTokens: 0,
+  uncachedInputTokens: 0,
   outputTokens: 0,
   cacheReadInputTokens: 0,
   cacheCreationInputTokens: 0,
@@ -223,17 +227,87 @@ function usageLink(
   navigate(`/usage?${search.toString()}`)
 }
 
-function OverallSummarySection({ metrics }: { metrics: UsageOverviewMetrics }) {
+const HIT_RATE_TONE: Record<CacheHitRateLevel, 'success' | 'warning' | 'error' | 'default'> = {
+  ok: 'success',
+  warning: 'warning',
+  critical: 'error',
+  none: 'default',
+}
+
+const HIT_RATE_TEXT: Record<CacheHitRateLevel, string> = {
+  ok: 'text-foreground',
+  warning: 'text-warning',
+  critical: 'text-destructive',
+  none: 'text-muted-foreground',
+}
+
+const HIT_RATE_HINT: Record<CacheHitRateLevel, string> = {
+  ok: '',
+  warning: '命中率偏低，需关注',
+  critical: '命中率过低',
+  none: '没有输入 token',
+}
+
+function formatHitRate(rate: number | null): string {
+  return rate == null ? '-' : formatPercent(rate)
+}
+
+/** 表格里的命中率单元格：数值 + 低于阈值时的图标和文字说明，不只靠颜色。 */
+function HitRateCell({ metrics }: { metrics: UsageOverviewMetrics }) {
+  const rate = cacheHitRate(metrics)
+  const level = cacheHitRateLevel(rate)
+  return (
+    <span
+      className={cn('inline-flex items-center justify-end gap-1', HIT_RATE_TEXT[level])}
+      title={HIT_RATE_HINT[level] || '缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）'}
+    >
+      {(level === 'warning' || level === 'critical') && <AlertTriangle className="size-3" aria-hidden />}
+      {formatHitRate(rate)}
+      {(level === 'warning' || level === 'critical') && <span className="sr-only">{HIT_RATE_HINT[level]}</span>}
+    </span>
+  )
+}
+
+const TIER_BADGE: Record<UsageTier, { label: string; tone: 'success' | 'info' | 'warning' | 'neutral' } | null> = {
+  active: { label: '使用中', tone: 'success' },
+  ready: null,
+  cooling: { label: '冷却中', tone: 'warning' },
+  unavailable: null,
+}
+
+function UsageTierBadge({ tier, inFlight }: { tier: UsageTier; inFlight?: number }) {
+  const badge = TIER_BADGE[tier]
+  if (!badge) return null
+  const label = tier === 'active' && inFlight ? `${badge.label} ${inFlight}` : badge.label
+  return <Badge tone={badge.tone} size="xs" title={tier === 'active' ? `当前在途请求 ${inFlight ?? 0} 个` : undefined}>{label}</Badge>
+}
+
+function CacheHitRateCard({ all, local, external }: { all: UsageOverviewMetrics; local: UsageOverviewMetrics; external: UsageOverviewMetrics }) {
+  const rate = cacheHitRate(all)
+  const level = cacheHitRateLevel(rate)
+  return (
+    <StatCard
+      title="缓存命中率"
+      value={formatHitRate(rate)}
+      desc={`本地 ${formatHitRate(cacheHitRate(local))} · 外部 ${formatHitRate(cacheHitRate(external))}${HIT_RATE_HINT[level] ? ` · ${HIT_RATE_HINT[level]}` : ''}`}
+      icon={<Layers3 />}
+      tone={HIT_RATE_TONE[level]}
+    />
+  )
+}
+
+function OverallSummarySection({ totals }: { totals: { all: UsageOverviewMetrics; local: UsageOverviewMetrics; external: UsageOverviewMetrics } }) {
+  const metrics = totals.all
   return (
     <SectionCard>
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard title="请求数" value={formatCompact(metrics.requests)} valueTitle={formatNumber(metrics.requests)} desc={`${formatCompact(metrics.successRequests)} 成功 · ${formatCompact(metrics.errorRequests)} 错误`} icon={<Activity />} tone="primary" />
-        <StatCard title="成功率" value={formatPercent(metricsShare(metrics.successRequests, metrics.requests))} desc={`错误率 ${formatPercent(metrics.errorRate)}`} icon={<TrendingUp />} tone={metrics.errorRate > 0.05 ? 'warning' : 'success'} />
+        <StatCard title="成功率" value={formatPercent(metricsShare(metrics.successRequests, metrics.requests))} desc={`错误率 ${formatPercent(metrics.errorRate)} · 平均耗时 ${Math.round(metrics.averageDurationMs)} ms`} icon={<TrendingUp />} tone={metrics.errorRate > 0.05 ? 'warning' : 'success'} />
         <TokenSummaryCard metrics={metrics} className="sm:col-span-2" />
         <StatCard title="估算计费" value={formatUsdFixed2(metrics.estimatedCostUsd)} icon={<DollarSign />} tone="primary" />
         <StatCard title="原始计费" value={formatUsdFixed2(metrics.originalCostUsd)} icon={<DollarSign />} tone="warning" />
         <StatCard title="Kiro 积分" value={formatCompact(metrics.kiroMeteringUsage)} valueTitle={formatNumber(metrics.kiroMeteringUsage)} icon={<Zap />} tone="info" />
-        <StatCard title="平均耗时" value={`${Math.round(metrics.averageDurationMs)} ms`} desc={`${formatCompact(metrics.pricedRequests)} 个请求已计价`} icon={<Clock3 />} tone="default" />
+        <CacheHitRateCard all={totals.all} local={totals.local} external={totals.external} />
       </div>
     </SectionCard>
   )
@@ -389,7 +463,7 @@ function LocalPoolSection({
           <EmptyState title="暂无本地路径数据" className="py-6" />
         ) : (
           <div className="overflow-x-auto">
-            <Table className="min-w-[860px]">
+            <Table className="min-w-[960px]">
               <TableHeader>
                 <TableRow>
                   <TableHead>路径</TableHead>
@@ -398,6 +472,7 @@ function LocalPoolSection({
                   <TableHead className="text-right">估算费用</TableHead>
                   <TableHead className="text-right">原始费用</TableHead>
                   <TableHead className="text-right">积分比</TableHead>
+                  <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
                   <TableHead className="text-right">错误率</TableHead>
                 </TableRow>
               </TableHeader>
@@ -437,6 +512,7 @@ function LocalPoolSection({
                         <div>{formatCreditCostRate(estimatedRate)}</div>
                         <div className="text-[0.62rem] text-muted-foreground">原始 {formatCreditCostRate(originalRate)}</div>
                       </TableCell>
+                      <TableCell className="text-right font-mono text-xs"><HitRateCell metrics={route.metrics} /></TableCell>
                       <TableCell className="text-right font-mono text-xs">{formatPercent(route.metrics.errorRate)}</TableCell>
                     </TableRow>
                   )
@@ -452,7 +528,7 @@ function LocalPoolSection({
         <EmptyState title="暂无本地账号" className="mt-3 py-8" />
       ) : (
         <div className="mt-2 overflow-x-auto">
-          <Table className="min-w-[1040px]">
+          <Table className="min-w-[1140px]">
             <TableHeader>
               <TableRow>
                 <TableHead>账号</TableHead>
@@ -462,6 +538,7 @@ function LocalPoolSection({
                 <TableHead className="text-right">积分转换率</TableHead>
                 <TableHead className="text-right">剩余积分</TableHead>
                 <TableHead className="text-right">预估估算费用</TableHead>
+                <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
                 <TableHead className="text-right">错误率</TableHead>
               </TableRow>
             </TableHeader>
@@ -473,6 +550,7 @@ function LocalPoolSection({
                 return (
                   <TableRow key={account.credentialId} className={account.credential.disabled ? 'opacity-65' : undefined}>
                     <TableCell>
+                      <div className="flex min-w-0 items-center gap-1.5">
                       <Button
                         variant="link"
                         size="xs"
@@ -487,6 +565,8 @@ function LocalPoolSection({
                       >
                         #{account.credentialId} {account.label}
                       </Button>
+                      <UsageTierBadge tier={account.tier} inFlight={account.credential.inFlightRequests} />
+                      </div>
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.requests)}</TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.kiroMeteringUsage)}</TableCell>
@@ -519,6 +599,7 @@ function LocalPoolSection({
                         <span className="text-muted-foreground">无法估算</span>
                       )}
                     </TableCell>
+                    <TableCell className="text-right font-mono text-xs"><HitRateCell metrics={account.metrics} /></TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatPercent(account.metrics.errorRate)}</TableCell>
                   </TableRow>
                 )
@@ -534,6 +615,7 @@ function LocalPoolSection({
 function ExternalPoolSection({
   external,
   pools,
+  poolStatuses,
   range,
   navigate,
 }: {
@@ -549,10 +631,12 @@ function ExternalPoolSection({
     pools: ExternalUsagePool[]
   }
   pools: ExternalPool[]
+  poolStatuses: ExternalPoolStatus[]
   range: { from: string; to: string }
   navigate: ReturnType<typeof useNavigate>
 }) {
   const usageById = new Map(external.pools.map((item) => [item.poolId, item]))
+  const statusById = new Map(poolStatuses.map((item) => [item.pool.id, item]))
   const configuredIds = new Set(pools.map((pool) => pool.id))
   const rows = [
     ...pools.map((pool) => ({
@@ -561,6 +645,8 @@ function ExternalPoolSection({
       poolName: pool.name,
       priority: pool.priority,
       usage: usageById.get(pool.id),
+      status: statusById.get(pool.id),
+      tier: externalPoolUsageTier(pool, statusById.get(pool.id)),
     })),
     ...external.pools
       .filter((usage) => !configuredIds.has(usage.poolId))
@@ -570,9 +656,13 @@ function ExternalPoolSection({
         poolName: usage.poolName || `#${usage.poolId}`,
         priority: Number.MAX_SAFE_INTEGER,
         usage,
+        status: undefined,
+        tier: externalPoolUsageTier(undefined, undefined),
       })),
   ]
+    // 正在使用的池排最前；同一层内沿用可计费金额排序。
     .sort((left, right) => (
+      compareUsageTier(left.tier, right.tier) ||
       (right.usage?.billableCostUsd ?? 0) - (left.usage?.billableCostUsd ?? 0) ||
       (right.usage?.metrics.requests ?? 0) - (left.usage?.metrics.requests ?? 0) ||
       left.priority - right.priority ||
@@ -629,7 +719,7 @@ function ExternalPoolSection({
         <EmptyState title="暂无外部池配置" className="mt-3 py-8" />
       ) : (
         <div className="mt-4 scrollbar-thin overflow-x-auto">
-          <Table className="min-w-[980px] text-xs">
+          <Table className="min-w-[1080px] text-xs">
             <TableHeader>
               <TableRow>
                 <TableHead>外部池</TableHead>
@@ -639,12 +729,13 @@ function ExternalPoolSection({
                 <TableHead className="text-right" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</TableHead>
                 <TableHead className="text-right">差额占原始</TableHead>
                 <TableHead className="text-right">原始/整形倍率</TableHead>
+                <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
                 <TableHead className="text-right">未计价</TableHead>
                 <TableHead className="text-right">兜底</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.map(({ pool, poolId, poolName, usage }) => {
+              {rows.map(({ pool, poolId, poolName, usage, status, tier }) => {
                 const metrics = usage?.metrics ?? EMPTY_OVERVIEW_METRICS
                 const rawCostUsd = usage?.rawCostUsd ?? 0
                 const shapedCostUsd = usage?.shapedCostUsd ?? usage?.reportedCostUsd ?? 0
@@ -669,6 +760,7 @@ function ExternalPoolSection({
                         >
                           #{poolId} {poolName}
                         </Button>
+                        <UsageTierBadge tier={tier} inFlight={status?.inFlight} />
                         {pool && <Badge tone={pool.enabled ? 'success' : 'neutral'} size="xs">{pool.enabled ? '启用' : '停用'}</Badge>}
                         {pool?.autoDisabled && <Badge tone="error" size="xs">自动禁用</Badge>}
                         {metrics.requests === 0 && <Badge tone="secondary" size="xs">无流量</Badge>}
@@ -695,6 +787,7 @@ function ExternalPoolSection({
                     <TableCell className="text-right font-mono" title="上游原始成本 ÷ 整形后展示成本">
                       {costMultiplier(rawCostUsd, shapedCostUsd)}
                     </TableCell>
+                    <TableCell className="text-right font-mono"><HitRateCell metrics={metrics} /></TableCell>
                     <TableCell className="text-right font-mono" title={formatNumber(metrics.unpricedRequests)}>{formatNumber(metrics.unpricedRequests)}</TableCell>
                     <TableCell className="text-right font-mono" title={formatNumber(usage?.costFloorAppliedRequests ?? 0)}>{formatNumber(usage?.costFloorAppliedRequests ?? 0)}</TableCell>
                   </TableRow>
@@ -818,6 +911,12 @@ export function OverviewPage() {
     enabled: activeTab === 'external',
     refetchInterval: autoRefresh.refetchInterval || 30000,
   })
+  const externalPoolStatuses = useQuery({
+    queryKey: ['external-pools-status'],
+    queryFn: getExternalPoolsStatus,
+    enabled: activeTab === 'external',
+    refetchInterval: 5000,
+  })
   const rangeParam = searchParams.get('range')
   const isPreset = PRESETS.some((item) => item.key === rangeParam)
   const rangeKey = (isPreset ? rangeParam : undefined) as PresetRange | undefined
@@ -889,9 +988,12 @@ export function OverviewPage() {
           creditEstimateBlocked: !creditStatus.available,
           creditEstimateBlockedReason: creditStatus.reason,
           estimatedRemainingCostUsd,
+          tier: credentialUsageTier(credential, creditStatus.available),
         }
       })
+      // 正在使用的账号排最前；同一层内沿用消耗排序，避免刷新时乱跳。
       .sort((left, right) =>
+        compareUsageTier(left.tier, right.tier) ||
         right.metrics.estimatedCostUsd - left.metrics.estimatedCostUsd ||
         right.metrics.requests - left.metrics.requests ||
         left.credentialId - right.credentialId
@@ -1005,6 +1107,7 @@ export function OverviewPage() {
     localCredentialAccountInfo.error ? `本地账号余额：${extractErrorMessage(localCredentialAccountInfo.error)}` : '',
     external.error ? `外部池：${extractErrorMessage(external.error)}` : '',
     externalPools.error ? `外部池配置：${extractErrorMessage(externalPools.error)}` : '',
+    externalPoolStatuses.error ? `外部池状态：${extractErrorMessage(externalPoolStatuses.error)}` : '',
     rankings.error ? `排行：${extractErrorMessage(rankings.error)}` : '',
   ].filter(Boolean)
 
@@ -1044,6 +1147,7 @@ export function OverviewPage() {
           if (localCredentialIds.length > 0) void localCredentialAccountInfo.refetch()
           void external.refetch()
           void externalPools.refetch()
+          void externalPoolStatuses.refetch()
           void rankings.refetch()
         }}>
           <RefreshCw className={cn('size-4', summary.isFetching && 'animate-spin')} />
@@ -1102,7 +1206,7 @@ export function OverviewPage() {
 
         <TabsContent value="summary">
           <div className="space-y-3">
-            <OverallSummarySection metrics={summaryData.totals.all} />
+            <OverallSummarySection totals={summaryData.totals} />
             <OverviewTrendCard
               key={`summary-${creditUnitPriceUsd != null}`}
               title="分时趋势"
@@ -1173,6 +1277,7 @@ export function OverviewPage() {
                 pools: [],
               }}
               pools={externalPools.data?.pools ?? []}
+              poolStatuses={externalPoolStatuses.data?.pools ?? []}
               range={summaryData.range}
               navigate={navigate}
             />

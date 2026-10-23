@@ -1385,6 +1385,10 @@ pub struct UsageOverviewMetrics {
     pub error_requests: usize,
     pub error_rate: f64,
     pub input_tokens: i64,
+    /// Uncached input reported downstream. Cache hit rate (sub2api 口径) is
+    /// `cache_read / (uncached_input + cache_read + cache_creation)`.
+    #[serde(default)]
+    pub uncached_input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
@@ -1404,6 +1408,7 @@ impl Default for UsageOverviewMetrics {
             error_requests: 0,
             error_rate: 0.0,
             input_tokens: 0,
+            uncached_input_tokens: 0,
             output_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1423,6 +1428,8 @@ pub struct UsageOverviewSeriesMetrics {
     pub requests: usize,
     pub error_requests: usize,
     pub input_tokens: i64,
+    #[serde(default)]
+    pub uncached_input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,

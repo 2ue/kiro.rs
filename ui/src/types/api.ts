@@ -1126,6 +1126,8 @@ export interface UsageOverviewMetrics {
   errorRequests: number
   errorRate: number
   inputTokens: number
+  /** 未缓存输入；缓存命中率 = 缓存读 / (未缓存输入 + 缓存读 + 缓存写)，与 sub2api 口径一致 */
+  uncachedInputTokens: number
   outputTokens: number
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
@@ -1141,6 +1143,7 @@ export interface UsageOverviewSeriesMetrics {
   requests: number
   errorRequests: number
   inputTokens: number
+  uncachedInputTokens: number
   outputTokens: number
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
