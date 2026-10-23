@@ -25,13 +25,16 @@ export function RouteSelector({
   const keyword = search.trim().toLowerCase()
   const visible = routes.filter((route) => !keyword || route.toLowerCase().includes(keyword))
 
-  const toggle = (route: string, checked: boolean) => {
+  const setMany = (items: string[], checked: boolean) => {
     const next = new Set(selected)
-    if (checked) next.add(route)
-    else next.delete(route)
+    for (const route of items) {
+      if (checked) next.add(route)
+      else next.delete(route)
+    }
     // Keep the configured order, unknown routes last.
     onChange([...routes.filter((item) => next.has(item)), ...value.filter((item) => !known.has(item) && next.has(item))])
   }
+  const toggle = (route: string, checked: boolean) => setMany([route], checked)
 
   return (
     <div className={cn('flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border bg-background px-2 py-1.5', disabled && 'opacity-60')}>
@@ -55,6 +58,14 @@ export function RouteSelector({
         </PopoverTrigger>
         <PopoverContent align="end" className="w-72 p-2">
           <Input className="mb-2" placeholder="搜索路由" value={search} onChange={(event) => setSearch(event.target.value)} aria-label="搜索路由" />
+          <div className="mb-1 flex items-center gap-1 border-b pb-1">
+            <Button type="button" size="xs" variant="ghost" onClick={() => setMany(visible, true)} disabled={visible.length === 0}>
+              全选{keyword ? '匹配项' : ''}（{visible.length}）
+            </Button>
+            <Button type="button" size="xs" variant="ghost" onClick={() => setMany(keyword ? visible : value, false)} disabled={value.length === 0}>
+              {keyword ? '取消匹配项' : '清空'}
+            </Button>
+          </div>
           <div className="max-h-64 space-y-0.5 overflow-y-auto">
             {visible.length === 0 ? (
               <p className="py-4 text-center text-xs text-muted-foreground">没有匹配的路由</p>
