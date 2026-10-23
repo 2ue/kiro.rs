@@ -3675,6 +3675,8 @@ enum HandlerEventStreamFault {
     TextWithMeteringNoStatus,
     UsageOnlyMeteringNoStatus,
     UsageOnlyEveryAttempt,
+    /// 200 with an empty EventStream body on every attempt ("ended without any frames").
+    EmptyStreamEveryAttempt,
     CompleteToolWithoutStatus,
     TwoIdenticalToolsWithoutStatus,
     IncompleteToolWithoutStatus,
@@ -3885,6 +3887,9 @@ async fn handler_eventstream_fault_upstream(
             HandlerEventStreamFault::UsageOnlyEveryAttempt => {
                 handler_eventstream_bytes_response(handler_eventstream_usage_only_body())
             }
+            HandlerEventStreamFault::EmptyStreamEveryAttempt => {
+                handler_eventstream_bytes_response(Vec::new())
+            }
             _ => handler_eventstream_bytes_response(handler_eventstream_normal_body()),
         };
     }
@@ -3982,6 +3987,9 @@ async fn handler_eventstream_fault_upstream(
                     "content":"user Continue\n\nbashHashd1e9567d: private fault output"
                 }),
             ))
+        }
+        HandlerEventStreamFault::EmptyStreamEveryAttempt => {
+            handler_eventstream_bytes_response(Vec::new())
         }
         HandlerEventStreamFault::UnknownEventOnly => {
             handler_eventstream_bytes_response(eventstream_test_frame(
@@ -4238,6 +4246,22 @@ fn handler_eventstream_fault_router_with_config(
     credential_retry_max_attempts: u32,
     configure: impl FnOnce(&mut Config),
 ) -> (Router, Arc<UsageRecorder>) {
+    handler_eventstream_fault_router_with_external(
+        base_url,
+        credential_count,
+        credential_retry_max_attempts,
+        configure,
+        None,
+    )
+}
+
+fn handler_eventstream_fault_router_with_external(
+    base_url: &str,
+    credential_count: u64,
+    credential_retry_max_attempts: u32,
+    configure: impl FnOnce(&mut Config),
+    external_pool_manager: Option<Arc<ExternalPoolManager>>,
+) -> (Router, Arc<UsageRecorder>) {
     assert!(credential_count > 0);
     let mut config = Config::default();
     config.kiro_upstream_base_url = Some(base_url.to_string());
@@ -4295,7 +4319,7 @@ fn handler_eventstream_fault_router_with_config(
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
-            external_pool_manager: None,
+            external_pool_manager,
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );
@@ -5882,6 +5906,141 @@ async fn run_handler_usage_only_eof_matrix() {
         );
         assert_eq!(upstream.hits(), 2, "usage-only twice round={round}");
     }
+}
+
+/// Every local account returns 200 with an empty stream, so the pre-output retry runs out of
+/// local accounts. The request must continue on the external pool inside the same SSE stream
+/// instead of ending with an `api_error` event.
+async fn run_stream_precommit_retry_falls_back_to_external_when_local_exhausted() {
+    let external_upstream = ExternalMessagesUpstream::start().await;
+    let Some(external_pool_manager) = test_external_pool_manager_for_handlers(
+        &external_upstream.base_url,
+        ExternalPoolRequestBodyMode::Normalized,
+    )
+    .await
+    else {
+        return;
+    };
+    for round in 1..=5 {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::EmptyStreamEveryAttempt)
+                .await;
+        let (app, usage_recorder) = handler_eventstream_fault_router_with_external(
+            &upstream.base_url,
+            2,
+            1,
+            |config| {
+                config.kiro_upstream_stream_retry_max_attempts = 10;
+                config.inference_upstream_max_attempts = 10;
+                config.external_pools.external_pools_enabled = true;
+                config.external_pools.local_pool_preflight_enabled = true;
+                config.external_pools.fallback_on_no_available_credentials = true;
+                config.external_pools.fallback_on_local_capacity_exhausted = true;
+                config.external_pools.fallback_on_local_transient_exhausted = true;
+                config.external_pools.external_pool_retry_max_attempts = 0;
+                config.external_pools.external_pool_max_queued_requests = 0;
+                config.external_pools.external_pool_request_timeout_secs = 10;
+                config
+                    .external_pools
+                    .external_pool_stream_request_timeout_secs = 10;
+                config.external_pools.external_pool_stream_idle_timeout_secs = 10;
+            },
+            Some(external_pool_manager.clone()),
+        );
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert!(
+            body.contains("fake-normalized-external-ok"),
+            "round={round}: external pool must finish the turn: {body}"
+        );
+        assert!(
+            !body.contains("event: error"),
+            "round={round}: no error event once the external pool answers: {body}"
+        );
+        assert_eq!(
+            body.matches("event: message_start").count(),
+            1,
+            "round={round}: the failed local attempts must not leak a message_start: {body}"
+        );
+        assert_eq!(
+            upstream.hits(),
+            2,
+            "round={round}: each local account is tried once before falling back"
+        );
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success, "round={round}");
+        assert_eq!(
+            record.route_kind,
+            Some(UsageRouteKind::ExternalPool),
+            "round={round}"
+        );
+        assert_eq!(
+            record.route_subtype,
+            Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts),
+            "round={round}"
+        );
+        assert!(record.fallback_reason.is_some(), "round={round}");
+        assert_eq!(record.local_attempted, Some(true), "round={round}");
+        assert_eq!(
+            record
+                .local_preflight
+                .as_ref()
+                .and_then(|preflight| preflight.get("stage"))
+                .and_then(Value::as_str),
+            Some("stream_precommit_retry"),
+            "round={round}: the record shows where the fallback was taken"
+        );
+        assert_eq!(
+            record.credential_attempts.len(),
+            2,
+            "round={round}: both failed local attempts stay on the record: {:?}",
+            record.credential_attempts
+        );
+    }
+    assert_eq!(external_upstream.state.hits(), 5);
+}
+
+#[test]
+fn stream_precommit_retry_falls_back_to_external_when_local_exhausted_for_five_rounds() {
+    run_handler_fixture_on_large_stack_thread(
+        "stream-precommit-external-fallback",
+        run_stream_precommit_retry_falls_back_to_external_when_local_exhausted,
+    );
+}
+
+/// Without an external pool the pre-output retry still ends with one SSE error event once
+/// every local account has failed.
+async fn run_stream_precommit_retry_without_external_pool_reports_error() {
+    for round in 1..=5 {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::EmptyStreamEveryAttempt)
+                .await;
+        let (app, usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 2, 1, |config| {
+                config.kiro_upstream_stream_retry_max_attempts = 10;
+                config.inference_upstream_max_attempts = 10;
+            });
+        let (status, request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert_eq!(
+            body.matches("event: error").count(),
+            1,
+            "round={round} body={body}"
+        );
+        assert_eq!(upstream.hits(), 2, "round={round}");
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::StreamError, "round={round}");
+    }
+}
+
+#[test]
+fn stream_precommit_retry_without_external_pool_reports_error_for_five_rounds() {
+    run_handler_fixture_on_large_stack_thread(
+        "stream-precommit-no-external",
+        run_stream_precommit_retry_without_external_pool_reports_error,
+    );
 }
 
 #[test]

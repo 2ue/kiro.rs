@@ -2299,6 +2299,31 @@ impl ExternalFallbackContext {
         classification_attempts: Vec<KiroCredentialAttempt>,
         diagnostic_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<ExternalPoolForwardOutcome> {
+        self.fallback_after_local_error_outcome_at_stage(
+            request_id,
+            error_message,
+            call_failure_kind,
+            scheduler_error_kind,
+            classification_attempts,
+            diagnostic_attempts,
+            None,
+        )
+        .await
+    }
+
+    /// `stage` is written to `localPreflight.stage` so fallbacks taken from a specific point of
+    /// the request (for example the pre-output stream retry) can be told apart in usage records.
+    #[allow(clippy::too_many_arguments)]
+    async fn fallback_after_local_error_outcome_at_stage(
+        &self,
+        request_id: &str,
+        error_message: &str,
+        call_failure_kind: Option<KiroCallFailureKind>,
+        scheduler_error_kind: Option<LocalSchedulerErrorKind>,
+        classification_attempts: Vec<KiroCredentialAttempt>,
+        diagnostic_attempts: Vec<KiroCredentialAttempt>,
+        stage: Option<&'static str>,
+    ) -> Option<ExternalPoolForwardOutcome> {
         let Some(classified_reason) =
             classify_local_error_for_external_fallback_with_scheduler_kind(
                 error_message,
@@ -2402,14 +2427,18 @@ impl ExternalFallbackContext {
             local_dispatchable = local_state.dispatchable,
             "fresh local state permits external fallback after local error"
         );
-        let local_preflight = Some(json!({
+        let mut local_preflight = json!({
             "reason": route_reason.clone(),
             "classifiedLocalErrorReason": classified_reason,
             "error": error_message,
             "attemptCount": diagnostic_attempts.len(),
             "classificationAttemptCount": classification_attempts.len(),
             "state": local_state,
-        }));
+        });
+        if let Some(stage) = stage {
+            local_preflight["stage"] = json!(stage);
+        }
+        let local_preflight = Some(local_preflight);
         let route_subtype = if diagnostic_attempts.is_empty() {
             UsageRouteSubtype::ExternalFallbackPreflight
         } else {
@@ -9085,6 +9114,9 @@ struct SseStreamState {
     retry_plan: Option<StreamRetryPlan>,
     attempt_number: u32,
     prior_attempts: Vec<KiroCredentialAttempt>,
+    /// Set once a pre-output retry hands the request to the external pool. From then on the
+    /// external SSE body is forwarded as-is and the external manager owns the usage record.
+    external_passthrough: Option<BoxStream<'static, Result<Bytes, axum::Error>>>,
 }
 
 impl SseStreamState {
@@ -9129,6 +9161,7 @@ impl SseStreamState {
             retry_plan,
             attempt_number: 1,
             prior_attempts: Vec::new(),
+            external_passthrough: None,
         }
     }
 
@@ -11001,6 +11034,39 @@ async fn retry_stream_before_downstream_commit(
         }
         Err(err) => {
             let retry_detail = format!("stream retry dispatch failed: {}", err);
+            if let Some(external) = plan.external_fallback.as_ref() {
+                let message = err.to_string();
+                let classification_attempts = KiroProvider::diagnostic_attempts_from_error(&err);
+                let diagnostic_attempts = merge_credential_attempts(
+                    state.prior_attempts.clone(),
+                    classification_attempts.clone(),
+                );
+                if let Some(outcome) = external
+                    .fallback_after_local_error_outcome_at_stage(
+                        &plan.request_id,
+                        &message,
+                        KiroProvider::call_failure_kind_from_error(&err),
+                        local_scheduler_error_kind(&err),
+                        classification_attempts,
+                        diagnostic_attempts,
+                        Some(STREAM_PRECOMMIT_RETRY_FALLBACK_STAGE),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        request_id = %plan.request_id,
+                        reason = reason.as_str(),
+                        error = %retry_detail,
+                        "本地 Kiro 流式首输出前重试没有可用账号，转外部池继续"
+                    );
+                    // The external manager records usage for this request from here on, so the
+                    // local attempt must not write a second, failed record.
+                    state.retry_plan = None;
+                    state.external_passthrough =
+                        Some(external_passthrough_stream(outcome, &plan.request_id).await);
+                    return StreamRetryOutcome::Retried(state);
+                }
+            }
             tracing::error!(
                 request_id = %plan.request_id,
                 reason = reason.as_str(),
@@ -11013,6 +11079,81 @@ async fn retry_stream_before_downstream_commit(
             StreamRetryOutcome::NotRetried(state)
         }
     }
+}
+
+/// `localPreflight.stage` for external fallbacks taken by the pre-output stream retry.
+const STREAM_PRECOMMIT_RETRY_FALLBACK_STAGE: &str = "stream_precommit_retry";
+/// Largest external error body read when turning it into an SSE error event.
+const EXTERNAL_PASSTHROUGH_ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Turns the external fallback result into the bytes forwarded on the already-open SSE stream.
+///
+/// The response headers (200, `text/event-stream`) were sent with the local attempt, so the
+/// external status code cannot reach the client any more. A successful external stream is
+/// forwarded unchanged; any error becomes one SSE `error` event, the same shape Claude Code
+/// receives for other errors after the stream has started.
+async fn external_passthrough_stream(
+    outcome: ExternalPoolForwardOutcome,
+    request_id: &str,
+) -> BoxStream<'static, Result<Bytes, axum::Error>> {
+    let (error_type, message) = match outcome {
+        ExternalPoolForwardOutcome::Response(response) if response.status().is_success() => {
+            return response.into_body().into_data_stream().boxed();
+        }
+        ExternalPoolForwardOutcome::Response(response) => {
+            let status = response.status();
+            let body = axum::body::to_bytes(
+                response.into_body(),
+                EXTERNAL_PASSTHROUGH_ERROR_BODY_MAX_BYTES,
+            )
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+            let error = body.as_ref().and_then(|value| value.get("error"));
+            let error_type = error
+                .and_then(|error| error.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("api_error")
+                .to_string();
+            let message = error
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    envelope::public_message_with_error_id(
+                        envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+                        request_id,
+                    )
+                });
+            tracing::warn!(
+                request_id,
+                status = status.as_u16(),
+                error_type = %error_type,
+                "外部池回退返回错误响应，按 SSE error 事件下发"
+            );
+            (error_type, message)
+        }
+        ExternalPoolForwardOutcome::FinalError(err) => {
+            let public = err.public_error();
+            tracing::warn!(
+                request_id,
+                error_id = %err.error_id,
+                status = err.status.as_u16(),
+                route_error_type = %err.route_error_type,
+                pool_name = ?err.pool_name,
+                "外部池回退失败，按 SSE error 事件下发"
+            );
+            (public.error_type, public.message)
+        }
+    };
+    let event = SseEvent::new(
+        "error",
+        json!({
+            "type": "error",
+            "error": {"type": error_type, "message": message}
+        }),
+    );
+    stream::once(async move { Ok(Bytes::from(event.to_sse_string())) }).boxed()
 }
 
 /// Downstream keepalive and upstream timing for one stream.
@@ -11077,6 +11218,37 @@ fn create_sse_stream(
         move |mut state| async move {
             if state.finished {
                 return None;
+            }
+
+            if let Some(external) = state.external_passthrough.as_mut() {
+                let bytes: Vec<Result<Bytes, Infallible>> = match external.next().await {
+                    Some(Ok(chunk)) => vec![Ok(chunk)],
+                    Some(Err(err)) => {
+                        // The external usage guard already recorded this failure; close the
+                        // stream with an error event instead of cutting the connection.
+                        tracing::warn!(error = %err, "外部池回退流读取失败，结束下游流");
+                        state.finished = true;
+                        let event = SseEvent::new(
+                            "error",
+                            json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": envelope::public_message_with_error_id(
+                                        envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+                                        &state.usage_guard.context().request.error_id,
+                                    ),
+                                }
+                            }),
+                        );
+                        vec![Ok(Bytes::from(event.to_sse_string()))]
+                    }
+                    None => return None,
+                };
+                if !bytes.is_empty() {
+                    mark_stream_downstream_committed(&mut state);
+                }
+                return Some((stream::iter(bytes), state));
             }
 
             if !state.downstream_committed && state.retry_plan.is_none() {
