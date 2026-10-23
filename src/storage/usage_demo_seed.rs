@@ -47,6 +47,81 @@ pub struct UsageDemoSeedReport {
     pub pools: usize,
 }
 
+/// Spreads demo external traffic over the real fallback reasons so the overview
+/// "why external" trend has every category; a capacity crunch skews to capacity.
+fn demo_external_route(
+    rng: &mut fastrand::Rng,
+    capacity_crunch: bool,
+) -> (Option<UsageRouteSubtype>, Option<String>, Option<String>) {
+    let roll = rng.usize(0..100);
+    let fallback = |subtype, reason: &str| (Some(subtype), Some(reason.to_string()), None);
+    if capacity_crunch {
+        return if roll < 80 {
+            fallback(
+                UsageRouteSubtype::ExternalFallbackPreflight,
+                "local_capacity_full",
+            )
+        } else {
+            fallback(
+                UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+                "local_capacity_exhausted",
+            )
+        };
+    }
+    match roll {
+        0..=44 => (
+            Some(UsageRouteSubtype::ExternalDirectPolicy),
+            None,
+            Some("demo_seed".to_string()),
+        ),
+        45..=69 => fallback(
+            UsageRouteSubtype::ExternalFallbackPreflight,
+            "local_capacity_full",
+        ),
+        70..=84 => fallback(
+            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+            "local_transient_exhausted",
+        ),
+        85..=93 => fallback(
+            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+            "unsupported_model",
+        ),
+        _ => fallback(
+            UsageRouteSubtype::ExternalFallbackPreflight,
+            "local_scheduler_redis_degraded",
+        ),
+    }
+}
+
+/// Cache behaviour that makes the hit-rate views tell a story: sticky local
+/// traffic and direct-policy pools reuse the prompt cache well, while requests
+/// that overflowed from the local pool lose stickiness and mostly miss. A
+/// nightly redeploy window (03:00-04:59) resets local caches.
+fn demo_cache_split(
+    rng: &mut fastrand::Rng,
+    input_tokens: i32,
+    is_external: bool,
+    fallback_reason: Option<&str>,
+    hour: u32,
+) -> (i32, i32) {
+    let (hit_probability, read_share) = match (is_external, fallback_reason) {
+        (false, _) if (3..=4).contains(&hour) => (35, 0.70),
+        (false, _) => (92, 0.90),
+        (true, None) => (88, 0.86),
+        (true, Some("local_capacity_full" | "local_capacity_exhausted")) => (45, 0.75),
+        (true, Some(_)) => (30, 0.70),
+    };
+    if rng.usize(0..100) < hit_probability {
+        let jitter = 0.9 + rng.f64() * 0.1;
+        let read = (f64::from(input_tokens) * read_share * jitter) as i32;
+        let creation = (f64::from(input_tokens - read) * 0.25) as i32;
+        (read, creation)
+    } else {
+        // Cold request: the prompt is written to the cache instead.
+        (0, (f64::from(input_tokens) * 0.8) as i32)
+    }
+}
+
 pub async fn seed_usage_demo(
     store: &PostgresStore,
     days: u32,
@@ -114,18 +189,21 @@ pub async fn seed_usage_demo(
             };
             let is_external = rng.f64() < external_ratio;
             let model = choose_model(&mut rng);
+            let capacity_crunch = day == 2 && (11..=15).contains(&hour);
+            let (route_subtype, fallback_reason, direct_policy_reason) = if is_external {
+                demo_external_route(&mut rng, capacity_crunch)
+            } else {
+                (None, None, None)
+            };
             let input_tokens = 24_000 + rng.i32(0..96_000);
             let output_tokens = 600 + rng.i32(0..3_000);
-            let cache_read = if rng.usize(0..100) < 18 {
-                input_tokens / 3
-            } else {
-                0
-            };
-            let cache_creation = if cache_read == 0 && rng.usize(0..100) < 9 {
-                input_tokens / 10
-            } else {
-                0
-            };
+            let (cache_read, cache_creation) = demo_cache_split(
+                &mut rng,
+                input_tokens,
+                is_external,
+                fallback_reason.as_deref(),
+                hour,
+            );
             let total_input_tokens = input_tokens;
             let billable_input_tokens = (input_tokens - cache_read - cache_creation).max(0);
             let base_cost = estimate_cost(
@@ -290,15 +368,17 @@ pub async fn seed_usage_demo(
                 } else {
                     UsageRouteKind::LocalCredential
                 }),
-                route_subtype: Some(if is_external {
-                    UsageRouteSubtype::ExternalDirectPolicy
-                } else if status == UsageRecordStatus::Success {
-                    UsageRouteSubtype::LocalSuccess
-                } else {
-                    UsageRouteSubtype::LocalErrorNoFallback
-                }),
-                fallback_reason: None,
-                direct_policy_reason: Some("demo_seed".to_string()),
+                route_subtype: Some(route_subtype.unwrap_or_else(|| {
+                    if status != UsageRecordStatus::Success {
+                        UsageRouteSubtype::LocalErrorNoFallback
+                    } else if rng.usize(0..100) < 3 {
+                        UsageRouteSubtype::LocalRescueAfterExternal
+                    } else {
+                        UsageRouteSubtype::LocalSuccess
+                    }
+                })),
+                fallback_reason,
+                direct_policy_reason,
                 local_attempted: Some(!is_external),
                 local_preflight: None,
                 external_pool_id,

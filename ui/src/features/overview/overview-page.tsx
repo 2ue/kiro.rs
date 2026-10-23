@@ -5,7 +5,6 @@ import {
   Activity,
   AlertTriangle,
   ArrowLeft,
-  Clock3,
   DollarSign,
   ExternalLink,
   Layers3,
@@ -14,7 +13,7 @@ import {
   Wallet,
   Zap,
 } from 'lucide-react'
-import { getExternalPools } from '@/api/credentials'
+import { getExternalPools, getExternalPoolsStatus } from '@/api/credentials'
 import {
   useUsageOverviewExternal,
   useUsageOverviewLocal,
@@ -26,7 +25,16 @@ import {
   useCredentials,
   useCredentialAccountInfo,
   useCredentialRuntime,
+  useRuntimeConfig,
 } from '@/hooks/use-credentials'
+import { cacheHitRate, cacheHitRateLevel, type CacheHitRateLevel } from './cache-hit-rate'
+import { compareUsageTier, credentialUsageTier, externalPoolUsageTier, type UsageTier } from './usage-order'
+import {
+  OverviewTrendCard,
+  externalTrendViews,
+  localTrendViews,
+  summaryTrendViews,
+} from './overview-trends'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { formatCompact, formatCredits, formatDate, formatNumber, formatPercent, formatUsdFixed2 } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
@@ -36,6 +44,7 @@ import type {
   CredentialAccountInfo,
   CredentialStatusItem,
   ExternalPool,
+  ExternalPoolStatus,
   UsageOverviewMetrics,
   UsageOverviewRankRow,
   UsageOverviewRouteRow,
@@ -65,14 +74,12 @@ import {
   TabsContent,
   TabsList,
   TabsTrigger,
-  Tooltip,
 } from '@/components/ui'
 
 const TIMEZONE = 'Asia/Shanghai'
 const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:overview'
 
 type PresetRange = 'today' | 'yesterday' | 'last24h' | 'last7d' | 'last30d' | 'thisMonth'
-type TrendMetric = 'requests' | 'estimatedCostUsd' | 'originalCostUsd' | 'kiroMeteringUsage' | 'tokens'
 type OverviewTab = 'summary' | 'local' | 'external' | 'rankings'
 type RankingDimension = 'models' | 'accounts' | 'keys' | 'paths' | 'errors'
 type TokenUsageMetrics = Pick<UsageOverviewMetrics, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens'>
@@ -86,6 +93,7 @@ type LocalAccountOverviewRow = {
   creditEstimateBlocked: boolean
   creditEstimateBlockedReason?: string
   estimatedRemainingCostUsd?: number
+  tier: UsageTier
 }
 
 type ExternalUsagePool = {
@@ -108,6 +116,7 @@ const EMPTY_OVERVIEW_METRICS: UsageOverviewMetrics = {
   errorRequests: 0,
   errorRate: 0,
   inputTokens: 0,
+  uncachedInputTokens: 0,
   outputTokens: 0,
   cacheReadInputTokens: 0,
   cacheCreationInputTokens: 0,
@@ -126,14 +135,6 @@ const PRESETS: Array<{ key: PresetRange; label: string }> = [
   { key: 'last7d', label: '7 天' },
   { key: 'last30d', label: '30 天' },
   { key: 'thisMonth', label: '本月' },
-]
-
-const TREND_METRICS: Array<{ key: TrendMetric; label: string }> = [
-  { key: 'requests', label: '请求' },
-  { key: 'estimatedCostUsd', label: '估算计费' },
-  { key: 'originalCostUsd', label: '原始计费' },
-  { key: 'kiroMeteringUsage', label: 'Kiro 积分' },
-  { key: 'tokens', label: 'Token' },
 ]
 
 function localDateTimeValue(value?: string | null): string {
@@ -212,80 +213,6 @@ function totalTokenUsage(metrics: TokenUsageMetrics): number {
   return metrics.inputTokens + metrics.outputTokens + metrics.cacheReadInputTokens + metrics.cacheCreationInputTokens
 }
 
-function seriesMetricValue(point: UsageOverviewSeriesPoint, scope: 'all' | 'local' | 'external', key: TrendMetric): number {
-  const metrics = point[scope]
-  if (key === 'tokens') return totalTokenUsage(metrics)
-  return metrics[key]
-}
-
-function trendDisplayValue(point: UsageOverviewSeriesPoint, key: TrendMetric, showLocal: boolean, showExternal: boolean): number {
-  const local = seriesMetricValue(point, 'local', key)
-  const external = seriesMetricValue(point, 'external', key)
-  return (showLocal ? local : 0) + (showExternal ? external : 0)
-}
-
-function trendTooltip(point: UsageOverviewSeriesPoint, key: TrendMetric, showLocal: boolean, showExternal: boolean): string {
-  const displayed = trendDisplayValue(point, key, showLocal, showExternal)
-  const local = seriesMetricValue(point, 'local', key)
-  const external = seriesMetricValue(point, 'external', key)
-  return `${point.label} · 当前显示 ${formatTrendValue(displayed, key)} · 本地 ${formatTrendValue(local, key)} · 外部 ${formatTrendValue(external, key)}`
-}
-
-function formatTrendValue(value: number, key: TrendMetric): string {
-  if (key === 'estimatedCostUsd' || key === 'originalCostUsd') return formatUsdFixed2(value)
-  return formatCompact(value)
-}
-
-function trendAxisTicks(max: number): number[] {
-  return [1, 0.75, 0.5, 0.25, 0].map((ratio) => max * ratio)
-}
-
-function TrendTooltipContent({
-  point,
-  metric,
-  showLocal,
-  showExternal,
-}: {
-  point: UsageOverviewSeriesPoint
-  metric: TrendMetric
-  showLocal: boolean
-  showExternal: boolean
-}) {
-  const displayed = trendDisplayValue(point, metric, showLocal, showExternal)
-  const local = seriesMetricValue(point, 'local', metric)
-  const external = seriesMetricValue(point, 'external', metric)
-
-  return (
-    <div className="w-44 space-y-2 font-normal">
-      <div className="font-semibold text-secondary-foreground">{point.label}</div>
-      <div className="space-y-1 font-mono tabular-nums">
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-secondary-foreground/70">当前显示</span>
-          <span>{formatTrendValue(displayed, metric)}</span>
-        </div>
-        <div className={cn('flex items-center justify-between gap-3', !showLocal && 'opacity-45')}>
-          <span className="inline-flex items-center gap-1.5 text-secondary-foreground/70">
-            <span className="size-2 rounded-full bg-primary" />
-            本地
-          </span>
-          <span>{formatTrendValue(local, metric)}</span>
-        </div>
-        <div className={cn('flex items-center justify-between gap-3', !showExternal && 'opacity-45')}>
-          <span className="inline-flex items-center gap-1.5 text-secondary-foreground/70">
-            <span className="size-2 rounded-full bg-info" />
-            外部
-          </span>
-          <span>{formatTrendValue(external, metric)}</span>
-        </div>
-        <div className="flex items-center justify-between gap-3 border-t border-secondary-foreground/15 pt-1">
-          <span className="text-secondary-foreground/70">本地占比</span>
-          <span>{formatPercent(metricsShare(local, local + external))}</span>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function usageLink(
   navigate: ReturnType<typeof useNavigate>,
   params: { routeKind: 'local_credential' | 'external_pool'; credentialId?: number; externalPoolId?: number; endpoint?: string; since: string; until: string },
@@ -300,17 +227,87 @@ function usageLink(
   navigate(`/usage?${search.toString()}`)
 }
 
-function OverallSummarySection({ metrics }: { metrics: UsageOverviewMetrics }) {
+const HIT_RATE_TONE: Record<CacheHitRateLevel, 'success' | 'warning' | 'error' | 'default'> = {
+  ok: 'success',
+  warning: 'warning',
+  critical: 'error',
+  none: 'default',
+}
+
+const HIT_RATE_TEXT: Record<CacheHitRateLevel, string> = {
+  ok: 'text-foreground',
+  warning: 'text-warning',
+  critical: 'text-destructive',
+  none: 'text-muted-foreground',
+}
+
+const HIT_RATE_HINT: Record<CacheHitRateLevel, string> = {
+  ok: '',
+  warning: '命中率偏低，需关注',
+  critical: '命中率过低',
+  none: '没有输入 token',
+}
+
+function formatHitRate(rate: number | null): string {
+  return rate == null ? '-' : formatPercent(rate)
+}
+
+/** 表格里的命中率单元格：数值 + 低于阈值时的图标和文字说明，不只靠颜色。 */
+function HitRateCell({ metrics }: { metrics: UsageOverviewMetrics }) {
+  const rate = cacheHitRate(metrics)
+  const level = cacheHitRateLevel(rate)
+  return (
+    <span
+      className={cn('inline-flex items-center justify-end gap-1', HIT_RATE_TEXT[level])}
+      title={HIT_RATE_HINT[level] || '缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）'}
+    >
+      {(level === 'warning' || level === 'critical') && <AlertTriangle className="size-3" aria-hidden />}
+      {formatHitRate(rate)}
+      {(level === 'warning' || level === 'critical') && <span className="sr-only">{HIT_RATE_HINT[level]}</span>}
+    </span>
+  )
+}
+
+const TIER_BADGE: Record<UsageTier, { label: string; tone: 'success' | 'info' | 'warning' | 'neutral' } | null> = {
+  active: { label: '使用中', tone: 'success' },
+  ready: null,
+  cooling: { label: '冷却中', tone: 'warning' },
+  unavailable: null,
+}
+
+function UsageTierBadge({ tier, inFlight }: { tier: UsageTier; inFlight?: number }) {
+  const badge = TIER_BADGE[tier]
+  if (!badge) return null
+  const label = tier === 'active' && inFlight ? `${badge.label} ${inFlight}` : badge.label
+  return <Badge tone={badge.tone} size="xs" title={tier === 'active' ? `当前在途请求 ${inFlight ?? 0} 个` : undefined}>{label}</Badge>
+}
+
+function CacheHitRateCard({ all, local, external }: { all: UsageOverviewMetrics; local: UsageOverviewMetrics; external: UsageOverviewMetrics }) {
+  const rate = cacheHitRate(all)
+  const level = cacheHitRateLevel(rate)
+  return (
+    <StatCard
+      title="缓存命中率"
+      value={formatHitRate(rate)}
+      desc={`本地 ${formatHitRate(cacheHitRate(local))} · 外部 ${formatHitRate(cacheHitRate(external))}${HIT_RATE_HINT[level] ? ` · ${HIT_RATE_HINT[level]}` : ''}`}
+      icon={<Layers3 />}
+      tone={HIT_RATE_TONE[level]}
+    />
+  )
+}
+
+function OverallSummarySection({ totals }: { totals: { all: UsageOverviewMetrics; local: UsageOverviewMetrics; external: UsageOverviewMetrics } }) {
+  const metrics = totals.all
   return (
     <SectionCard>
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard title="请求数" value={formatCompact(metrics.requests)} valueTitle={formatNumber(metrics.requests)} desc={`${formatCompact(metrics.successRequests)} 成功 · ${formatCompact(metrics.errorRequests)} 错误`} icon={<Activity />} tone="primary" />
-        <StatCard title="成功率" value={formatPercent(metricsShare(metrics.successRequests, metrics.requests))} desc={`错误率 ${formatPercent(metrics.errorRate)}`} icon={<TrendingUp />} tone={metrics.errorRate > 0.05 ? 'warning' : 'success'} />
+        <StatCard title="成功率" value={formatPercent(metricsShare(metrics.successRequests, metrics.requests))} desc={`错误率 ${formatPercent(metrics.errorRate)} · 平均耗时 ${Math.round(metrics.averageDurationMs)} ms`} icon={<TrendingUp />} tone={metrics.errorRate > 0.05 ? 'warning' : 'success'} />
         <TokenSummaryCard metrics={metrics} className="sm:col-span-2" />
         <StatCard title="估算计费" value={formatUsdFixed2(metrics.estimatedCostUsd)} icon={<DollarSign />} tone="primary" />
         <StatCard title="原始计费" value={formatUsdFixed2(metrics.originalCostUsd)} icon={<DollarSign />} tone="warning" />
         <StatCard title="Kiro 积分" value={formatCompact(metrics.kiroMeteringUsage)} valueTitle={formatNumber(metrics.kiroMeteringUsage)} icon={<Zap />} tone="info" />
-        <StatCard title="平均耗时" value={`${Math.round(metrics.averageDurationMs)} ms`} desc={`${formatCompact(metrics.pricedRequests)} 个请求已计价`} icon={<Clock3 />} tone="default" />
+        <CacheHitRateCard all={totals.all} local={totals.local} external={totals.external} />
       </div>
     </SectionCard>
   )
@@ -367,160 +364,6 @@ function TokenBreakdownItem({
         {formatCompact(value)}
       </div>
     </div>
-  )
-}
-
-function TrendPanel({
-  points,
-  metric,
-  onMetricChange,
-  onDrillDown,
-}: {
-  points: UsageOverviewSeriesPoint[]
-  metric: TrendMetric
-  onMetricChange: (metric: TrendMetric) => void
-  onDrillDown: (point: UsageOverviewSeriesPoint) => void
-}) {
-  const [showLocal, setShowLocal] = useState(true)
-  const [showExternal, setShowExternal] = useState(true)
-  const maxValue = Math.max(
-    0,
-    ...points.map((point) => trendDisplayValue(point, metric, showLocal, showExternal)),
-  )
-  const axisMax = Math.max(1, maxValue)
-  const plotHeight = 190
-  const plotTopPadding = 28
-  const chartHeight = plotHeight + plotTopPadding
-  const ticks = trendAxisTicks(axisMax)
-  const bucketWidth = points.length > 24 ? 64 : points.length > 12 ? 70 : 76
-  const plotMinWidth = Math.max(680, points.length * bucketWidth)
-
-  return (
-    <SectionCard
-      title="趋势"
-      icon={<TrendingUp />}
-      actions={
-        <div className="flex flex-wrap gap-1">
-          {TREND_METRICS.map((item) => (
-            <Button
-              key={item.key}
-              size="xs"
-              variant={metric === item.key ? 'secondary' : 'ghost'}
-              onClick={() => onMetricChange(item.key)}
-            >
-              {item.label}
-            </Button>
-          ))}
-        </div>
-      }
-    >
-      {points.length === 0 ? (
-        <EmptyState title="暂无趋势数据" className="py-8" />
-      ) : (
-        <div className="flex pt-1">
-          <div className="relative w-16 shrink-0 pr-2" style={{ height: chartHeight }}>
-            {ticks.map((tick) => {
-              const top = plotTopPadding + ((axisMax - tick) / axisMax) * plotHeight
-              return (
-                <span
-                  key={tick}
-                  className="absolute right-2 -translate-y-1/2 whitespace-nowrap font-mono text-[0.62rem] tabular-nums text-muted-foreground"
-                  style={{ top }}
-                >
-                  {formatTrendValue(tick, metric)}
-                </span>
-              )
-            })}
-          </div>
-          <div className="min-w-0 flex-1 overflow-x-auto pb-2">
-            <div style={{ minWidth: plotMinWidth }}>
-              <div
-                className="relative flex-1 border-b border-l border-border/70"
-                style={{ height: chartHeight, minWidth: plotMinWidth }}
-              >
-                {ticks.map((tick) => {
-                  const top = plotTopPadding + ((axisMax - tick) / axisMax) * plotHeight
-                  return (
-                    <span
-                      key={tick}
-                      className="absolute left-0 right-0 border-t border-dashed border-border/60"
-                      style={{ top }}
-                    />
-                  )
-                })}
-                <div className="absolute inset-x-3 bottom-0 z-10 flex items-end gap-3" style={{ height: plotHeight }}>
-                  {points.map((point) => {
-                    const local = seriesMetricValue(point, 'local', metric)
-                    const external = seriesMetricValue(point, 'external', metric)
-                    const displayed = trendDisplayValue(point, metric, showLocal, showExternal)
-                    const localHeight = showLocal && local > 0 ? Math.max(2, (local / axisMax) * plotHeight) : 0
-                    const externalHeight = showExternal && external > 0 ? Math.max(2, (external / axisMax) * plotHeight) : 0
-                    const totalHeight = Math.min(plotHeight, localHeight + externalHeight)
-
-                    return (
-                      <Tooltip
-                        key={point.bucketStart}
-                        label={<TrendTooltipContent point={point} metric={metric} showLocal={showLocal} showExternal={showExternal} />}
-                      >
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          className="group relative flex h-full flex-1 items-end justify-center overflow-visible rounded-sm px-1 pb-0 pt-0 hover:bg-muted/40"
-                          title={`${trendTooltip(point, metric, showLocal, showExternal)}，点击查看`}
-                          onClick={() => onDrillDown(point)}
-                        >
-                          <span
-                            className="relative flex w-full max-w-12 flex-col items-stretch justify-end"
-                            style={{ height: `${totalHeight}px` }}
-                          >
-                            {displayed > 0 && (
-                              <span className="absolute bottom-full left-1/2 mb-1 max-w-16 -translate-x-1/2 truncate rounded-sm bg-background/95 px-1 font-mono text-[0.58rem] font-semibold tabular-nums text-foreground shadow-sm ring-1 ring-border/80">
-                                {formatTrendValue(displayed, metric)}
-                              </span>
-                            )}
-                            <span className="w-full rounded-t-sm bg-info/75 transition group-hover:bg-info" style={{ height: `${externalHeight}px` }} />
-                            <span className="w-full rounded-b-sm bg-primary/80 transition group-hover:bg-primary" style={{ height: `${localHeight}px` }} />
-                          </span>
-                        </Button>
-                      </Tooltip>
-                    )
-                  })}
-                </div>
-              </div>
-              <div className="mt-1 flex flex-1 gap-3 px-3" style={{ minWidth: plotMinWidth }}>
-                {points.map((point) => (
-                  <span key={`${point.bucketStart}-label`} className="flex-1 whitespace-nowrap text-center text-[0.62rem] text-muted-foreground">
-                    {point.label}
-                  </span>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-      <div className="mt-3 flex flex-wrap items-center gap-4 text-[0.68rem] text-muted-foreground">
-        <Button
-          size="xs"
-          variant={showLocal ? 'secondary' : 'ghost'}
-          className="h-6 gap-1.5 px-2 text-[0.68rem]"
-          aria-pressed={showLocal}
-          onClick={() => setShowLocal((value) => !value)}
-        >
-          <span className={cn('size-2 rounded-full', showLocal ? 'bg-primary/80' : 'bg-muted-foreground/30')} />
-          本地账号池
-        </Button>
-        <Button
-          size="xs"
-          variant={showExternal ? 'secondary' : 'ghost'}
-          className="h-6 gap-1.5 px-2 text-[0.68rem]"
-          aria-pressed={showExternal}
-          onClick={() => setShowExternal((value) => !value)}
-        >
-          <span className={cn('size-2 rounded-full', showExternal ? 'bg-info/75' : 'bg-muted-foreground/30')} />
-          外部池
-        </Button>
-      </div>
-    </SectionCard>
   )
 }
 
@@ -620,7 +463,7 @@ function LocalPoolSection({
           <EmptyState title="暂无本地路径数据" className="py-6" />
         ) : (
           <div className="overflow-x-auto">
-            <Table className="min-w-[860px]">
+            <Table className="min-w-[960px]">
               <TableHeader>
                 <TableRow>
                   <TableHead>路径</TableHead>
@@ -629,6 +472,7 @@ function LocalPoolSection({
                   <TableHead className="text-right">估算费用</TableHead>
                   <TableHead className="text-right">原始费用</TableHead>
                   <TableHead className="text-right">积分比</TableHead>
+                  <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
                   <TableHead className="text-right">错误率</TableHead>
                 </TableRow>
               </TableHeader>
@@ -668,6 +512,7 @@ function LocalPoolSection({
                         <div>{formatCreditCostRate(estimatedRate)}</div>
                         <div className="text-[0.62rem] text-muted-foreground">原始 {formatCreditCostRate(originalRate)}</div>
                       </TableCell>
+                      <TableCell className="text-right font-mono text-xs"><HitRateCell metrics={route.metrics} /></TableCell>
                       <TableCell className="text-right font-mono text-xs">{formatPercent(route.metrics.errorRate)}</TableCell>
                     </TableRow>
                   )
@@ -683,7 +528,7 @@ function LocalPoolSection({
         <EmptyState title="暂无本地账号" className="mt-3 py-8" />
       ) : (
         <div className="mt-2 overflow-x-auto">
-          <Table className="min-w-[1040px]">
+          <Table className="min-w-[1140px]">
             <TableHeader>
               <TableRow>
                 <TableHead>账号</TableHead>
@@ -693,6 +538,7 @@ function LocalPoolSection({
                 <TableHead className="text-right">积分转换率</TableHead>
                 <TableHead className="text-right">剩余积分</TableHead>
                 <TableHead className="text-right">预估估算费用</TableHead>
+                <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
                 <TableHead className="text-right">错误率</TableHead>
               </TableRow>
             </TableHeader>
@@ -704,6 +550,7 @@ function LocalPoolSection({
                 return (
                   <TableRow key={account.credentialId} className={account.credential.disabled ? 'opacity-65' : undefined}>
                     <TableCell>
+                      <div className="flex min-w-0 items-center gap-1.5">
                       <Button
                         variant="link"
                         size="xs"
@@ -718,6 +565,8 @@ function LocalPoolSection({
                       >
                         #{account.credentialId} {account.label}
                       </Button>
+                      <UsageTierBadge tier={account.tier} inFlight={account.credential.inFlightRequests} />
+                      </div>
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.requests)}</TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatNumber(account.metrics.kiroMeteringUsage)}</TableCell>
@@ -750,6 +599,7 @@ function LocalPoolSection({
                         <span className="text-muted-foreground">无法估算</span>
                       )}
                     </TableCell>
+                    <TableCell className="text-right font-mono text-xs"><HitRateCell metrics={account.metrics} /></TableCell>
                     <TableCell className="text-right font-mono text-xs">{formatPercent(account.metrics.errorRate)}</TableCell>
                   </TableRow>
                 )
@@ -765,6 +615,7 @@ function LocalPoolSection({
 function ExternalPoolSection({
   external,
   pools,
+  poolStatuses,
   range,
   navigate,
 }: {
@@ -780,10 +631,12 @@ function ExternalPoolSection({
     pools: ExternalUsagePool[]
   }
   pools: ExternalPool[]
+  poolStatuses: ExternalPoolStatus[]
   range: { from: string; to: string }
   navigate: ReturnType<typeof useNavigate>
 }) {
   const usageById = new Map(external.pools.map((item) => [item.poolId, item]))
+  const statusById = new Map(poolStatuses.map((item) => [item.pool.id, item]))
   const configuredIds = new Set(pools.map((pool) => pool.id))
   const rows = [
     ...pools.map((pool) => ({
@@ -792,6 +645,8 @@ function ExternalPoolSection({
       poolName: pool.name,
       priority: pool.priority,
       usage: usageById.get(pool.id),
+      status: statusById.get(pool.id),
+      tier: externalPoolUsageTier(pool, statusById.get(pool.id)),
     })),
     ...external.pools
       .filter((usage) => !configuredIds.has(usage.poolId))
@@ -801,9 +656,13 @@ function ExternalPoolSection({
         poolName: usage.poolName || `#${usage.poolId}`,
         priority: Number.MAX_SAFE_INTEGER,
         usage,
+        status: undefined,
+        tier: externalPoolUsageTier(undefined, undefined),
       })),
   ]
+    // 正在使用的池排最前；同一层内沿用可计费金额排序。
     .sort((left, right) => (
+      compareUsageTier(left.tier, right.tier) ||
       (right.usage?.billableCostUsd ?? 0) - (left.usage?.billableCostUsd ?? 0) ||
       (right.usage?.metrics.requests ?? 0) - (left.usage?.metrics.requests ?? 0) ||
       left.priority - right.priority ||
@@ -860,7 +719,7 @@ function ExternalPoolSection({
         <EmptyState title="暂无外部池配置" className="mt-3 py-8" />
       ) : (
         <div className="mt-4 scrollbar-thin overflow-x-auto">
-          <Table className="min-w-[980px] text-xs">
+          <Table className="min-w-[1080px] text-xs">
             <TableHeader>
               <TableRow>
                 <TableHead>外部池</TableHead>
@@ -870,12 +729,13 @@ function ExternalPoolSection({
                 <TableHead className="text-right" title="按最终上报 usage 计算，包含输出补偿和成本底线修复">补偿后计费</TableHead>
                 <TableHead className="text-right">差额占原始</TableHead>
                 <TableHead className="text-right">原始/整形倍率</TableHead>
+                <TableHead className="text-right" title="缓存读 ÷（未缓存输入 + 缓存读 + 缓存写）">缓存命中率</TableHead>
                 <TableHead className="text-right">未计价</TableHead>
                 <TableHead className="text-right">兜底</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.map(({ pool, poolId, poolName, usage }) => {
+              {rows.map(({ pool, poolId, poolName, usage, status, tier }) => {
                 const metrics = usage?.metrics ?? EMPTY_OVERVIEW_METRICS
                 const rawCostUsd = usage?.rawCostUsd ?? 0
                 const shapedCostUsd = usage?.shapedCostUsd ?? usage?.reportedCostUsd ?? 0
@@ -900,6 +760,7 @@ function ExternalPoolSection({
                         >
                           #{poolId} {poolName}
                         </Button>
+                        <UsageTierBadge tier={tier} inFlight={status?.inFlight} />
                         {pool && <Badge tone={pool.enabled ? 'success' : 'neutral'} size="xs">{pool.enabled ? '启用' : '停用'}</Badge>}
                         {pool?.autoDisabled && <Badge tone="error" size="xs">自动禁用</Badge>}
                         {metrics.requests === 0 && <Badge tone="secondary" size="xs">无流量</Badge>}
@@ -926,6 +787,7 @@ function ExternalPoolSection({
                     <TableCell className="text-right font-mono" title="上游原始成本 ÷ 整形后展示成本">
                       {costMultiplier(rawCostUsd, shapedCostUsd)}
                     </TableCell>
+                    <TableCell className="text-right font-mono"><HitRateCell metrics={metrics} /></TableCell>
                     <TableCell className="text-right font-mono" title={formatNumber(metrics.unpricedRequests)}>{formatNumber(metrics.unpricedRequests)}</TableCell>
                     <TableCell className="text-right font-mono" title={formatNumber(usage?.costFloorAppliedRequests ?? 0)}>{formatNumber(usage?.costFloorAppliedRequests ?? 0)}</TableCell>
                   </TableRow>
@@ -1049,6 +911,12 @@ export function OverviewPage() {
     enabled: activeTab === 'external',
     refetchInterval: autoRefresh.refetchInterval || 30000,
   })
+  const externalPoolStatuses = useQuery({
+    queryKey: ['external-pools-status'],
+    queryFn: getExternalPoolsStatus,
+    enabled: activeTab === 'external',
+    refetchInterval: 5000,
+  })
   const rangeParam = searchParams.get('range')
   const isPreset = PRESETS.some((item) => item.key === rangeParam)
   const rangeKey = (isPreset ? rangeParam : undefined) as PresetRange | undefined
@@ -1057,20 +925,31 @@ export function OverviewPage() {
   const [customFrom, setCustomFrom] = useState(() => localDateTimeValue(fromParam))
   const [customTo, setCustomTo] = useState(() => localDateTimeValue(toParam))
   const [customError, setCustomError] = useState('')
-  const [trendMetric, setTrendMetric] = useState<TrendMetric>('requests')
 
+  const hourlyParam = searchParams.get('granularity') === 'hour'
   const queryParams = useMemo(() => {
-    if (rangeKey) return { timezone: TIMEZONE, range: rangeKey }
+    if (rangeKey) {
+      // 7 天范围允许显式切到按小时；其余预设沿用后端默认粒度。
+      return rangeKey === 'last7d' && hourlyParam
+        ? { timezone: TIMEZONE, range: rangeKey, granularity: 'hour' as const }
+        : { timezone: TIMEZONE, range: rangeKey }
+    }
     if (fromParam && toParam) return { timezone: TIMEZONE, from: fromParam, to: toParam, granularity: searchParams.get('granularity') === 'hour' ? 'hour' as const : 'day' as const }
     return { timezone: TIMEZONE, range: 'today' }
-  }, [fromParam, rangeKey, searchParams, toParam])
+  }, [fromParam, hourlyParam, rangeKey, searchParams, toParam])
   const rankingQueryParams = useMemo(() => ({ ...queryParams, topN: 50 as number }), [queryParams])
 
   const refreshInterval = rangeKey && ['today', 'last24h', 'thisMonth'].includes(rangeKey)
     ? autoRefresh.refetchInterval
     : false
   const summary = useUsageOverviewSummary(queryParams, refreshInterval, activeTab === 'summary' || activeTab === 'local' || activeTab === 'external' || activeTab === 'rankings')
-  const series = useUsageOverviewSeries(queryParams, refreshInterval, activeTab === 'summary' && !summary.isError)
+  const series = useUsageOverviewSeries(
+    queryParams,
+    refreshInterval,
+    (activeTab === 'summary' || activeTab === 'local' || activeTab === 'external') && !summary.isError,
+  )
+  const runtimeConfig = useRuntimeConfig()
+  const creditUnitPriceUsd = runtimeConfig.data?.kiroCreditUnitPriceUsd ?? null
   const local = useUsageOverviewLocal(queryParams, refreshInterval, activeTab === 'local' && !summary.isError)
   const external = useUsageOverviewExternal(queryParams, refreshInterval, activeTab === 'external' && !summary.isError)
   const rankings = useUsageOverviewRankings(rankingQueryParams, refreshInterval, activeTab === 'rankings' && !summary.isError)
@@ -1109,9 +988,12 @@ export function OverviewPage() {
           creditEstimateBlocked: !creditStatus.available,
           creditEstimateBlockedReason: creditStatus.reason,
           estimatedRemainingCostUsd,
+          tier: credentialUsageTier(credential, creditStatus.available),
         }
       })
+      // 正在使用的账号排最前；同一层内沿用消耗排序，避免刷新时乱跳。
       .sort((left, right) =>
+        compareUsageTier(left.tier, right.tier) ||
         right.metrics.estimatedCostUsd - left.metrics.estimatedCostUsd ||
         right.metrics.requests - left.metrics.requests ||
         left.credentialId - right.credentialId
@@ -1162,20 +1044,28 @@ export function OverviewPage() {
     setCustomError('')
   }
 
+  // 只有按天的柱子能下钻到当天的小时；小时已经是最细粒度。
+  const seriesGranularity = series.data?.range.granularity ?? summary.data?.range.granularity
   const drillDown = (point: UsageOverviewSeriesPoint) => {
     const current = new URLSearchParams(searchParams)
     const start = new Date(point.bucketStart)
     const end = new Date(start)
-    if (summary.data?.range.granularity === 'day') end.setUTCDate(end.getUTCDate() + 1)
-    else end.setUTCHours(end.getUTCHours() + 1)
+    end.setUTCDate(end.getUTCDate() + 1)
     const next = new URLSearchParams(searchParams)
-    next.delete('tab')
     next.set('from', start.toISOString())
     next.set('to', end.toISOString())
     next.set('granularity', 'hour')
     if (current.get('range')) next.set('backRange', current.get('range') as string)
     if (current.get('from')) next.set('backFrom', current.get('from') as string)
     if (current.get('to')) next.set('backTo', current.get('to') as string)
+    next.delete('range')
+    setSearchParams(next)
+  }
+
+  const setHourly = (hourly: boolean) => {
+    const next = new URLSearchParams(searchParams)
+    if (hourly) next.set('granularity', 'hour')
+    else next.delete('granularity')
     setSearchParams(next)
   }
 
@@ -1187,8 +1077,12 @@ export function OverviewPage() {
     const backRange = searchParams.get('backRange')
     const backFrom = searchParams.get('backFrom')
     const backTo = searchParams.get('backTo')
-    if (backRange) next.set('range', backRange)
-    else if (backFrom && backTo) {
+    if (backRange) {
+      next.set('range', backRange)
+      next.delete('from')
+      next.delete('to')
+      next.delete('granularity')
+    } else if (backFrom && backTo) {
       next.set('from', backFrom)
       next.set('to', backTo)
       next.set('granularity', 'day')
@@ -1197,6 +1091,13 @@ export function OverviewPage() {
   }
 
   const summaryData = summary.data
+  const seriesPoints = series.data?.series ?? []
+  const seriesGroups = series.data?.seriesGroups ?? { localRoutes: [], externalPools: [], externalReasons: [] }
+  // 还没结束的时段（当前小时或当天）：柱子半透明并在提示里标“进行中”。
+  const dataThroughMs = Date.parse(series.data?.range.dataThrough ?? '')
+  const bucketMs = seriesGranularity === 'day' ? 86_400_000 : 3_600_000
+  const firstPartial = seriesPoints.findIndex((point) => Date.parse(point.bucketStart) + bucketMs > dataThroughMs)
+  const partialFrom = firstPartial < 0 ? seriesPoints.length : firstPartial
   const isDrilled = Boolean(searchParams.get('backRange') || searchParams.get('backFrom'))
   const partialErrors = [
     series.error ? `趋势：${extractErrorMessage(series.error)}` : '',
@@ -1206,6 +1107,7 @@ export function OverviewPage() {
     localCredentialAccountInfo.error ? `本地账号余额：${extractErrorMessage(localCredentialAccountInfo.error)}` : '',
     external.error ? `外部池：${extractErrorMessage(external.error)}` : '',
     externalPools.error ? `外部池配置：${extractErrorMessage(externalPools.error)}` : '',
+    externalPoolStatuses.error ? `外部池状态：${extractErrorMessage(externalPoolStatuses.error)}` : '',
     rankings.error ? `排行：${extractErrorMessage(rankings.error)}` : '',
   ].filter(Boolean)
 
@@ -1245,6 +1147,7 @@ export function OverviewPage() {
           if (localCredentialIds.length > 0) void localCredentialAccountInfo.refetch()
           void external.refetch()
           void externalPools.refetch()
+          void externalPoolStatuses.refetch()
           void rankings.refetch()
         }}>
           <RefreshCw className={cn('size-4', summary.isFetching && 'animate-spin')} />
@@ -1282,6 +1185,11 @@ export function OverviewPage() {
         <span>·</span>
         <span>范围已按整点对齐：{formatDate(summaryData.range.from)} - {formatDate(summaryData.range.to)}</span>
         {summaryData.range.granularity === 'day' && <Badge tone="neutral">按天聚合</Badge>}
+        {rangeKey === 'last7d' && (
+          <Button size="xs" variant="outline" className="h-6 px-2 text-[0.68rem]" onClick={() => setHourly(!hourlyParam)}>
+            {hourlyParam ? '改为按天' : '改为按小时'}
+          </Button>
+        )}
         {refreshInterval && <Badge tone="success">每 {autoRefresh.intervalSeconds} 秒刷新</Badge>}
       </div>
 
@@ -1298,17 +1206,34 @@ export function OverviewPage() {
 
         <TabsContent value="summary">
           <div className="space-y-3">
-            <OverallSummarySection metrics={summaryData.totals.all} />
-            <TrendPanel
-              points={series.data?.series ?? []}
-              metric={trendMetric}
-              onMetricChange={setTrendMetric}
-              onDrillDown={drillDown}
+            <OverallSummarySection totals={summaryData.totals} />
+            <OverviewTrendCard
+              key={`summary-${creditUnitPriceUsd != null}`}
+              title="分时趋势"
+              icon={<TrendingUp />}
+              views={summaryTrendViews(creditUnitPriceUsd)}
+              points={seriesPoints}
+              hourly={seriesGranularity === 'hour'}
+              partialFrom={partialFrom}
+              loading={series.isFetching}
+              onDrillDown={seriesGranularity === 'day' ? drillDown : undefined}
             />
           </div>
         </TabsContent>
 
         <TabsContent value="local">
+          <div className="space-y-3">
+          <OverviewTrendCard
+            key={`local-${creditUnitPriceUsd != null}`}
+            title="本地分时趋势"
+            icon={<Zap />}
+            views={localTrendViews(seriesGroups, creditUnitPriceUsd)}
+            points={seriesPoints}
+            hourly={seriesGranularity === 'hour'}
+            partialFrom={partialFrom}
+            loading={series.isFetching}
+            onDrillDown={seriesGranularity === 'day' ? drillDown : undefined}
+          />
           {local.isLoading && !local.data ? (
             <LoadingState text="加载本地账号池..." />
           ) : (
@@ -1321,9 +1246,21 @@ export function OverviewPage() {
               navigate={navigate}
             />
           )}
+          </div>
         </TabsContent>
 
         <TabsContent value="external">
+          <div className="space-y-3">
+          <OverviewTrendCard
+            title="外部池分时趋势"
+            icon={<DollarSign />}
+            views={externalTrendViews(seriesGroups)}
+            points={seriesPoints}
+            hourly={seriesGranularity === 'hour'}
+            partialFrom={partialFrom}
+            loading={series.isFetching}
+            onDrillDown={seriesGranularity === 'day' ? drillDown : undefined}
+          />
           {external.isLoading && !external.data ? (
             <LoadingState text="加载外部池..." />
           ) : (
@@ -1340,10 +1277,12 @@ export function OverviewPage() {
                 pools: [],
               }}
               pools={externalPools.data?.pools ?? []}
+              poolStatuses={externalPoolStatuses.data?.pools ?? []}
               range={summaryData.range}
               navigate={navigate}
             />
           )}
+          </div>
         </TabsContent>
 
         <TabsContent value="rankings">

@@ -66,3 +66,12 @@ export {
   TableHead,
   TableCell,
 } from './table'
+export {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  ChartLegend,
+  ChartLegendContent,
+  ChartStyle,
+  type ChartConfig,
+} from './chart'

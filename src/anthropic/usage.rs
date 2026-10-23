@@ -77,6 +77,52 @@ pub enum UsageRouteSubtype {
     ExternalError,
 }
 
+/// Why an external-pool request left the local credential pool, grouped by
+/// who has to act on it. The raw `fallbackReason` strings stay on the record
+/// for drill-down; this coarse key is what the overview trend stacks on.
+pub fn usage_external_reason_category(
+    route_subtype: Option<UsageRouteSubtype>,
+    fallback_reason: Option<&str>,
+) -> &'static str {
+    match route_subtype {
+        Some(UsageRouteSubtype::ExternalDirectPolicy | UsageRouteSubtype::ExternalRoutePolicy) => {
+            return "policy_direct";
+        }
+        Some(
+            UsageRouteSubtype::ExternalFallbackPreflight
+            | UsageRouteSubtype::ExternalFallbackAfterLocalAttempts,
+        ) => {}
+        _ => return "other",
+    }
+    match fallback_reason.map(str::trim).unwrap_or_default() {
+        "local_capacity_full"
+        | "local_capacity_exhausted"
+        | "local_auxiliary_concurrency_saturated"
+        | "local_auxiliary_attempts_exhausted"
+        | "local_attempt_reserved_for_fallback" => "local_capacity",
+        "local_no_credentials"
+        | "local_all_disabled"
+        | "local_proxy_blocked"
+        | "local_all_cooling_down"
+        | "local_transient_exhausted"
+        | "no_available_credentials" => "local_unavailable",
+        "unsupported_model" | "local_no_model_compatible" => "model_unsupported",
+        "local_scheduler_redis_degraded" | "local_pool_risk_circuit_open" => "system_degraded",
+        _ => "other",
+    }
+}
+
+pub fn usage_external_reason_label(key: &str) -> &'static str {
+    match key {
+        "policy_direct" => "策略直连",
+        "local_capacity" => "本地容量不足",
+        "local_unavailable" => "本地账号不可用",
+        "model_unsupported" => "模型不支持",
+        "system_degraded" => "系统降级",
+        _ => "其他",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolAttempt {
@@ -1340,6 +1386,10 @@ pub struct UsageOverviewMetrics {
     pub error_requests: usize,
     pub error_rate: f64,
     pub input_tokens: i64,
+    /// Uncached input reported downstream. Cache hit rate (sub2api 口径) is
+    /// `cache_read / (uncached_input + cache_read + cache_creation)`.
+    #[serde(default)]
+    pub uncached_input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
@@ -1359,6 +1409,7 @@ impl Default for UsageOverviewMetrics {
             error_requests: 0,
             error_rate: 0.0,
             input_tokens: 0,
+            uncached_input_tokens: 0,
             output_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1378,12 +1429,33 @@ pub struct UsageOverviewSeriesMetrics {
     pub requests: usize,
     pub error_requests: usize,
     pub input_tokens: i64,
+    #[serde(default)]
+    pub uncached_input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
     pub estimated_cost_usd: f64,
     pub original_cost_usd: f64,
     pub kiro_metering_usage: f64,
+    /// External-pool upstream cost. Only external-pool rows contribute, so the
+    /// value is zero for local-route breakdowns.
+    #[serde(default)]
+    pub raw_cost_usd: f64,
+    /// External-pool final billable amount (downstream revenue).
+    #[serde(default)]
+    pub billable_cost_usd: f64,
+    /// External-pool uplifted cost minus upstream raw cost.
+    #[serde(default)]
+    pub profit_usd: f64,
+}
+
+/// One breakdown member (local route, external pool or external reason) in a
+/// single series bucket. Labels live once in `UsageOverviewSeriesGroups`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewSeriesBreakdown {
+    pub key: String,
+    pub metrics: UsageOverviewSeriesMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1394,6 +1466,32 @@ pub struct UsageOverviewSeriesPoint {
     pub all: UsageOverviewSeriesMetrics,
     pub local: UsageOverviewSeriesMetrics,
     pub external: UsageOverviewSeriesMetrics,
+    #[serde(default)]
+    pub local_routes: Vec<UsageOverviewSeriesBreakdown>,
+    #[serde(default)]
+    pub external_pools: Vec<UsageOverviewSeriesBreakdown>,
+    #[serde(default)]
+    pub external_reasons: Vec<UsageOverviewSeriesBreakdown>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewSeriesGroup {
+    pub key: String,
+    pub label: String,
+}
+
+/// Breakdown members present in the range, ordered by business weight:
+/// local routes by credits, external pools by upstream cost, reasons by requests.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageOverviewSeriesGroups {
+    #[serde(default)]
+    pub local_routes: Vec<UsageOverviewSeriesGroup>,
+    #[serde(default)]
+    pub external_pools: Vec<UsageOverviewSeriesGroup>,
+    #[serde(default)]
+    pub external_reasons: Vec<UsageOverviewSeriesGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1460,6 +1558,8 @@ pub struct UsageOverviewResponse {
     pub external: UsageOverviewExternal,
     pub local: UsageOverviewLocal,
     pub series: Vec<UsageOverviewSeriesPoint>,
+    #[serde(default)]
+    pub series_groups: UsageOverviewSeriesGroups,
     pub top_models: Vec<UsageOverviewRankRow>,
     pub top_accounts: Vec<UsageOverviewRankRow>,
     pub top_keys: Vec<UsageOverviewRankRow>,
@@ -1485,6 +1585,7 @@ pub struct UsageOverviewSeriesResponse {
     pub timezone: String,
     pub range: UsageOverviewRange,
     pub series: Vec<UsageOverviewSeriesPoint>,
+    pub series_groups: UsageOverviewSeriesGroups,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1587,6 +1688,10 @@ pub struct UsageOverviewSpec {
     pub top_n: usize,
 }
 
+/// Hourly overview series stay readable (and cheap) up to one week plus the
+/// partial hours a rolling `last7d` window adds after hour alignment.
+pub const USAGE_OVERVIEW_HOURLY_MAX_DAYS: i64 = 8;
+
 pub fn resolve_usage_overview_spec(
     now: DateTime<Utc>,
     timezone: Option<&str>,
@@ -1643,6 +1748,12 @@ pub fn resolve_usage_overview_spec(
         None => "day",
     }
     .to_string();
+    if granularity == "hour" && span > ChronoDuration::days(USAGE_OVERVIEW_HOURLY_MAX_DAYS) {
+        anyhow::bail!(
+            "按小时聚合最多支持 {} 天，请缩小范围或改用按天",
+            USAGE_OVERVIEW_HOURLY_MAX_DAYS
+        )
+    }
 
     Ok(UsageOverviewSpec {
         timezone: timezone_name,
@@ -4480,6 +4591,76 @@ mod tests {
         assert_eq!(custom.to.to_rfc3339(), "2026-10-01T19:00:00+00:00");
         assert_eq!(custom.granularity, "hour");
         assert_eq!(custom.top_n, 50);
+    }
+
+    #[test]
+    fn usage_overview_hourly_granularity_is_capped_to_about_a_week() {
+        let now = DateTime::parse_from_rfc3339("2026-10-02T07:20:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let week = resolve_usage_overview_spec(
+            now,
+            Some("Asia/Shanghai"),
+            Some("last7d"),
+            None,
+            None,
+            Some("hour"),
+            None,
+        )
+        .expect("rolling last7d must allow hourly buckets");
+        assert_eq!(week.granularity, "hour");
+
+        let month = resolve_usage_overview_spec(
+            now,
+            Some("Asia/Shanghai"),
+            Some("last30d"),
+            None,
+            None,
+            Some("hour"),
+            None,
+        )
+        .expect_err("30 days of hourly buckets must be rejected");
+        assert!(month.to_string().contains("按小时聚合最多支持"));
+
+        let month_default = resolve_usage_overview_spec(
+            now,
+            Some("Asia/Shanghai"),
+            Some("last30d"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("default granularity for long ranges stays daily");
+        assert_eq!(month_default.granularity, "day");
+    }
+
+    #[test]
+    fn usage_overview_series_point_deserializes_without_breakdowns() {
+        let point: UsageOverviewSeriesPoint = serde_json::from_value(serde_json::json!({
+            "bucketStart": "2026-10-02T00:00:00Z",
+            "label": "10-02 08:00",
+            "all": series_metrics_json(),
+            "local": series_metrics_json(),
+            "external": series_metrics_json(),
+        }))
+        .expect("cached overview without breakdown fields stays readable");
+        assert!(point.local_routes.is_empty());
+        assert_eq!(point.external.raw_cost_usd, 0.0);
+    }
+
+    fn series_metrics_json() -> serde_json::Value {
+        serde_json::json!({
+            "requests": 1,
+            "errorRequests": 0,
+            "inputTokens": 1,
+            "outputTokens": 1,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "estimatedCostUsd": 0.1,
+            "originalCostUsd": 0.1,
+            "kiroMeteringUsage": 0.5,
+        })
     }
 
     fn record_with_time(

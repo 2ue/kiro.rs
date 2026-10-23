@@ -5343,6 +5343,13 @@ pub struct Config {
     #[serde(default = "default_credential_info_refresh_concurrency")]
     pub credential_info_refresh_concurrency: u32,
 
+    /// 每个 Kiro 积分的真实成本（美元），由运营按套餐价折算填写。
+    ///
+    /// 只用于管理端总览把本地积分换算成成本、与外部池成本放到同一口径；
+    /// 不参与调度和计费。未配置时总览不展示全局毛利。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kiro_credit_unit_price_usd: Option<f64>,
+
     /// 上游瞬态错误没有 Retry-After 时，对单个凭据设置的临时冷却秒数。
     #[serde(default = "default_credential_transient_cooldown_secs")]
     pub credential_transient_cooldown_secs: u64,
@@ -6980,6 +6987,7 @@ impl Default for Config {
             credential_rpm: default_credential_rpm(),
             credential_max_concurrent_requests: default_credential_max_concurrent_requests(),
             credential_info_refresh_concurrency: default_credential_info_refresh_concurrency(),
+            kiro_credit_unit_price_usd: None,
             credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
             credential_rate_limit_cooldown_secs: default_credential_rate_limit_cooldown_secs(),
             credential_server_error_cooldown_secs: default_credential_server_error_cooldown_secs(),

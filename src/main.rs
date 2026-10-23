@@ -1548,6 +1548,13 @@ async fn handle_maintenance_command(
             store.compress_usage_rollups_to_hour_buckets().await?;
             println!("usage rollup compression completed");
         }
+        MaintenanceCommand::UsageRouteDimensionBackfill => {
+            store.migrate_with_options(false).await?;
+            let scanned = PostgresUsageStore::new(std::sync::Arc::new(store))
+                .rebuild_usage_route_dimensions()
+                .await?;
+            println!("usage route dimension backfill completed: records={scanned}");
+        }
         MaintenanceCommand::UsageDemoSeed { days, seed, reset } => {
             let report = seed_usage_demo(&store, days, seed, reset).await?;
             println!(
