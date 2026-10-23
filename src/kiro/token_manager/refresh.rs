@@ -1661,6 +1661,10 @@ mod tests {
         active: Arc<AtomicUsize>,
         peak_active: Arc<AtomicUsize>,
         request_bodies: Arc<Mutex<HashSet<Vec<u8>>>>,
+        /// Requests are counted on arrival but answered only once this is `true`, so a test can
+        /// hold the in-flight refresh until it has observed what it needs instead of racing a
+        /// wall-clock timeout.
+        response_gate: Arc<tokio::sync::watch::Sender<bool>>,
     }
 
     impl FakeOAuthState {
@@ -1671,7 +1675,12 @@ mod tests {
                 active: Arc::new(AtomicUsize::new(0)),
                 peak_active: Arc::new(AtomicUsize::new(0)),
                 request_bodies: Arc::new(Mutex::new(HashSet::new())),
+                response_gate: Arc::new(tokio::sync::watch::channel(true).0),
             }
+        }
+
+        fn open_response_gate(&self) {
+            self.response_gate.send_replace(true);
         }
 
         fn set_scenario(&self, scenario: FakeOAuthScenario) {
@@ -1728,11 +1737,21 @@ mod tests {
 
     impl FakeOAuthServer {
         async fn start(scenario: FakeOAuthScenario) -> Self {
+            Self::start_with_gate(scenario, true).await
+        }
+
+        /// Like `start`, but every response waits for `state.open_response_gate()`.
+        async fn start_gated(scenario: FakeOAuthScenario) -> Self {
+            Self::start_with_gate(scenario, false).await
+        }
+
+        async fn start_with_gate(scenario: FakeOAuthScenario, gate_open: bool) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind fake OAuth server");
             let address = listener.local_addr().expect("fake OAuth address");
             let state = FakeOAuthState::new(scenario);
+            state.response_gate.send_replace(gate_open);
             let server_state = state.clone();
             let task = tokio::spawn(async move {
                 loop {
@@ -1753,6 +1772,10 @@ mod tests {
                         let active = state.active.fetch_add(1, Ordering::AcqRel) + 1;
                         state.peak_active.fetch_max(active, Ordering::AcqRel);
                         let _active_guard = FakeOAuthActiveGuard(state.active.clone());
+                        let mut gate = state.response_gate.subscribe();
+                        if gate.wait_for(|open| *open).await.is_err() {
+                            return;
+                        }
 
                         match state.scenario() {
                             FakeOAuthScenario::Timeout => {
@@ -2422,7 +2445,10 @@ mod tests {
      {
         const CONCURRENCY: usize = 8;
         for round in 1..=5 {
-            let server = FakeOAuthServer::start(FakeOAuthScenario::Timeout).await;
+            // The first refresh holds the single auxiliary permit until every other task has been
+            // rejected. A wall-clock timeout here let a task delayed on a busy runner reach the
+            // permit after it was released and break the counts.
+            let server = FakeOAuthServer::start_gated(FakeOAuthScenario::ServerError).await;
             let credentials = fake_expired_external_idp_credentials(
                 20,
                 40_000_000 + round,
@@ -2439,12 +2465,25 @@ mod tests {
                     acquire_with_auxiliary_budget(&manager, 2).await.0.map(drop)
                 }));
             }
+            let all_others_rejected = tokio::time::timeout(StdDuration::from_secs(30), async {
+                while manager.auxiliary_concurrency_snapshot().rejected < (CONCURRENCY - 1) as u64 {
+                    tokio::time::sleep(StdDuration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(
+                all_others_rejected.is_ok(),
+                "round {round}: only {} of {} concurrent refreshes were rejected",
+                manager.auxiliary_concurrency_snapshot().rejected,
+                CONCURRENCY - 1
+            );
+            server.state.open_response_gate();
 
             let mut saturated = 0;
             let mut exhausted = 0;
             for task in tasks {
                 let error = match task.await.expect("concurrency task joins") {
-                    Ok(()) => panic!("controlled timeout burst must fail"),
+                    Ok(()) => panic!("gated refresh burst must fail"),
                     Err(error) => error,
                 };
                 if error
