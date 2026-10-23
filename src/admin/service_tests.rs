@@ -1005,6 +1005,36 @@ fn credential_default_sort_keeps_enabled_then_newest_created() {
 }
 
 #[test]
+fn credential_default_sort_puts_fast_accounts_first() {
+    let mut credentials = vec![
+        credential_item(1, false, Some("2026-01-03T00:00:00Z"), 0, 0.0, None),
+        credential_item(2, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None),
+        credential_item(3, true, Some("2026-01-02T00:00:00Z"), 0, 0.0, None),
+        credential_item(4, false, Some("2026-01-02T00:00:00Z"), 0, 0.0, None),
+        credential_item(5, false, Some("2026-01-04T00:00:00Z"), 0, 0.0, None),
+    ];
+    credentials[1].fast = 2; // #2
+    credentials[2].fast = 5; // #3, disabled but still Fast
+    credentials[3].fast = 2; // #4
+
+    sort_credentials_for_admin_display(&mut credentials);
+
+    let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
+    // Highest Fast first; equal Fast keeps enabled-then-newest; non-Fast accounts follow.
+    assert_eq!(ids, vec![3, 4, 2, 5, 1]);
+
+    // An explicit sort is untouched by Fast.
+    let query = CredentialListQuery {
+        sort_by: Some("id".to_string()),
+        sort_order: Some("asc".to_string()),
+        ..Default::default()
+    };
+    sort_credentials_for_admin_display_with_query(&mut credentials, &query);
+    let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
 fn credential_status_filters_keep_quota_and_account_errors_separate() {
     let quota = credential_item(1, true, None, 0, 0.0, Some(100.0));
     assert!(is_quota_exhausted(&quota));

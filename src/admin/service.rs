@@ -8451,8 +8451,8 @@ fn compare_credential_list_default(
     a: &CredentialListItem,
     b: &CredentialListItem,
 ) -> std::cmp::Ordering {
-    a.disabled
-        .cmp(&b.disabled)
+    compare_fast_first(a.fast, b.fast)
+        .then_with(|| a.disabled.cmp(&b.disabled))
         .then_with(|| {
             compare_option_ord_desc_some_first(a.created_at.as_ref(), b.created_at.as_ref())
         })
@@ -8479,12 +8479,17 @@ fn compare_credential_list_by(
     }
 }
 
+/// Fast accounts lead the default list, higher Fast values first; the rest keep their order.
+fn compare_fast_first(a: u32, b: u32) -> std::cmp::Ordering {
+    b.cmp(&a)
+}
+
 fn compare_credentials_default(
     a: &CredentialStatusItem,
     b: &CredentialStatusItem,
 ) -> std::cmp::Ordering {
-    a.disabled
-        .cmp(&b.disabled)
+    compare_fast_first(a.fast, b.fast)
+        .then_with(|| a.disabled.cmp(&b.disabled))
         .then_with(|| {
             compare_option_ord_desc_some_first(a.created_at.as_ref(), b.created_at.as_ref())
         })
