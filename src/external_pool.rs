@@ -3428,6 +3428,11 @@ pub struct ExternalPoolManager {
     static_pool_snapshot_stale_ttl: Duration,
     static_pool_snapshot_failure_retry: Duration,
     static_pool_snapshot_refresh_timeout: Duration,
+    /// PG query bound and caller wait bound for the authoritative snapshot. Production uses
+    /// the constants; tests that hold a table lock raise them so the refresh cannot time out
+    /// while the test is still releasing the lock.
+    authoritative_pool_snapshot_query_timeout: Duration,
+    authoritative_pool_snapshot_wait_timeout: Duration,
     #[cfg(test)]
     static_pool_snapshot_pg_loads: Arc<AtomicU64>,
     #[cfg(test)]
@@ -4757,6 +4762,9 @@ impl ExternalPoolManager {
             static_pool_snapshot_stale_ttl: EXTERNAL_POOL_STATIC_SNAPSHOT_STALE_TTL,
             static_pool_snapshot_failure_retry: EXTERNAL_POOL_STATIC_SNAPSHOT_FAILURE_RETRY,
             static_pool_snapshot_refresh_timeout: EXTERNAL_POOL_STATIC_SNAPSHOT_REFRESH_TIMEOUT,
+            authoritative_pool_snapshot_query_timeout: EXTERNAL_POOL_SELECTION_POSTGRES_TIMEOUT,
+            authoritative_pool_snapshot_wait_timeout:
+                EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_WAIT_TIMEOUT,
             #[cfg(test)]
             static_pool_snapshot_pg_loads: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -4835,6 +4843,18 @@ impl ExternalPoolManager {
             .max(Duration::from_millis(1));
         self.static_pool_snapshot_failure_retry = failure_retry.max(Duration::from_millis(1));
         self.static_pool_snapshot_refresh_timeout = refresh_timeout.max(Duration::from_millis(1));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_authoritative_pool_snapshot_timeouts(
+        mut self,
+        query_timeout: Duration,
+        wait_timeout: Duration,
+    ) -> Self {
+        self.authoritative_pool_snapshot_query_timeout =
+            query_timeout.max(Duration::from_millis(1));
+        self.authoritative_pool_snapshot_wait_timeout = wait_timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -5503,7 +5523,7 @@ impl ExternalPoolManager {
                 self.authoritative_pool_snapshot_pg_loads
                     .fetch_add(1, Ordering::Relaxed);
                 match timeout(
-                    EXTERNAL_POOL_SELECTION_POSTGRES_TIMEOUT,
+                    self.authoritative_pool_snapshot_query_timeout,
                     self.postgres.list_dispatchable_external_pools(),
                 )
                 .await
@@ -5542,7 +5562,7 @@ impl ExternalPoolManager {
     async fn load_authoritative_pool_snapshot(
         &self,
     ) -> Result<Arc<Vec<ExternalPool>>, ExternalPoolSelectionUnavailable> {
-        let deadline = Instant::now() + EXTERNAL_POOL_AUTHORITATIVE_SNAPSHOT_WAIT_TIMEOUT;
+        let deadline = Instant::now() + self.authoritative_pool_snapshot_wait_timeout;
         loop {
             let changed = self.authoritative_pool_snapshot_changed.notified();
             tokio::pin!(changed);

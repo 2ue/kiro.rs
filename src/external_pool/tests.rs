@@ -303,6 +303,24 @@ fn test_redis_config() -> Option<Config> {
     Some(config)
 }
 
+/// For tests that hold `external_upstream_pools` locked and then expect the refresh to succeed.
+/// The authoritative PG query and caller wait get a long bound, so how long the test takes to
+/// release the lock on a busy runner cannot turn the refresh into a timeout. Tests that assert
+/// the timeout itself keep the production bounds via `test_external_pool_manager`.
+const LOCK_HOLDING_TEST_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn test_external_pool_manager_without_snapshot_timeouts()
+-> Option<(ExternalPoolManager, Arc<PostgresStore>)> {
+    let (manager, postgres) = test_external_pool_manager().await?;
+    Some((
+        manager.with_authoritative_pool_snapshot_timeouts(
+            LOCK_HOLDING_TEST_SNAPSHOT_TIMEOUT,
+            LOCK_HOLDING_TEST_SNAPSHOT_TIMEOUT,
+        ),
+        postgres,
+    ))
+}
+
 async fn test_external_pool_manager() -> Option<(ExternalPoolManager, Arc<PostgresStore>)> {
     let Some(postgres_config) = test_postgres_config() else {
         eprintln!("跳过外部备用池集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -4950,7 +4968,8 @@ async fn external_pool_authoritative_selection_pg_lock_is_typed_bounded_and_reco
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_pool_authoritative_snapshot_singleflights_c32_c128_for_five_rounds() {
-    let Some((manager, postgres)) = test_external_pool_manager().await else {
+    let Some((manager, postgres)) = test_external_pool_manager_without_snapshot_timeouts().await
+    else {
         return;
     };
     let pool = postgres
@@ -4970,7 +4989,7 @@ async fn external_pool_authoritative_snapshot_singleflights_c32_c128_for_five_ro
                 )
                 .await
             });
-            timeout(Duration::from_millis(500), async {
+            timeout(Duration::from_secs(10), async {
                 loop {
                     if manager.authoritative_pool_snapshot_pg_loads_for_test() > loads_before {
                         break;
@@ -4989,7 +5008,7 @@ async fn external_pool_authoritative_snapshot_singleflights_c32_c128_for_five_ro
                 "round {round}, c{concurrency}: one cold generation must issue one PG query"
             );
             unlock_external_pool_table(blocker).await;
-            let results = timeout(Duration::from_secs(2), wave)
+            let results = timeout(Duration::from_secs(10), wave)
                 .await
                 .unwrap_or_else(|_| panic!("round {round}, c{concurrency}: wave timed out"))
                 .unwrap();
@@ -5012,7 +5031,8 @@ async fn external_pool_authoritative_snapshot_singleflights_c32_c128_for_five_ro
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_pool_authoritative_refresh_survives_leader_cancellation_for_five_rounds() {
-    let Some((manager, postgres)) = test_external_pool_manager().await else {
+    let Some((manager, postgres)) = test_external_pool_manager_without_snapshot_timeouts().await
+    else {
         return;
     };
     let pool = postgres
@@ -5027,8 +5047,8 @@ async fn external_pool_authoritative_refresh_survives_leader_cancellation_for_fi
         let caller_manager = manager.clone();
         let caller =
             tokio::spawn(async move { caller_manager.load_authoritative_pool_snapshot().await });
-        // Generous deadlines: this test checks that the refresh survives cancellation and is not
-        // replaced (the PG load count below), not how fast a loaded CI runner schedules it.
+        // The manager's own query and wait bounds are raised (see the helper), so the time this
+        // test needs to cancel the caller and release the lock cannot time the refresh out.
         timeout(Duration::from_secs(5), async {
             loop {
                 if manager.authoritative_pool_snapshot_pg_loads_for_test() > loads_before {
