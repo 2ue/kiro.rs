@@ -25,7 +25,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   Input,
-  Progress,
   Spinner,
   Switch,
 } from '@/components/ui'
@@ -73,6 +72,7 @@ import {
   endpointLabel,
   numberOrZero,
   proxySummary,
+  quotaBarModel,
   subscriptionBadgeMeta,
 } from './credential-utils'
 import { SecretInput } from './credential-inputs'
@@ -91,6 +91,35 @@ function credentialRouteSummary(mode?: ExternalPoolRouteMode, rules: string[] = 
   const list = rules.length <= 2 ? rules.join(', ') : `${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
   if (mode === 'allow_list') return rules.length ? `仅 ${list}` : '不承接任何入口'
   return rules.length ? `排除 ${list}` : undefined
+}
+
+const QUOTA_TONE_CLASS = { success: 'bg-success', warning: 'bg-warning', error: 'bg-destructive' } as const
+
+/** Plan usage, followed on the same track by overage in a separate colour once past the limit. */
+function QuotaBar({ model }: { model: ReturnType<typeof quotaBarModel> }) {
+  return (
+    <div
+      role="progressbar"
+      aria-label="额度使用进度"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(model.basePercent)}
+      aria-valuetext={model.inOverage ? '基础额度已用完，正在使用超额' : `已用 ${Math.round(model.basePercent)}%`}
+      className="mt-2 flex h-1.5 w-full overflow-hidden rounded-full bg-muted"
+    >
+      <div
+        className={`h-full transition-[width] duration-300 ${QUOTA_TONE_CLASS[model.baseTone]} ${model.inOverage ? 'rounded-l-full' : 'rounded-full'}`}
+        style={{ width: `${model.baseWidth}%` }}
+      />
+      {model.inOverage && (
+        <div
+          className="h-full rounded-r-full border-l border-card bg-violet-500 transition-[width] duration-300"
+          style={{ width: `${model.overageWidth}%` }}
+          title="超额部分"
+        />
+      )}
+    </div>
+  )
 }
 
 function SummaryCell({ label, value, error, onClick }: { label: string; value: React.ReactNode; error?: boolean; onClick?: () => void }) {
@@ -269,10 +298,7 @@ export function CredentialCard({
   const epLabel = endpointLabel(credential.endpoint)
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const canClearInFlight = credential.inFlightRequests > 0
-  const quotaUsagePercent = accountInfo && accountInfo.usageLimit > 0
-    ? Math.min(100, Math.max(0, (accountInfo.currentUsage / accountInfo.usageLimit) * 100))
-    : 0
-  const quotaProgressTone = quotaUsagePercent >= 95 ? 'error' : quotaUsagePercent >= 80 ? 'warning' : 'success'
+  const quotaBar = quotaBarModel(accountInfo)
   const overageStatus = (accountInfo?.overageStatus || '').toUpperCase()
   const overageCapability = (accountInfo?.overageCapability || '').toUpperCase()
   const overageEnabled = overageStatus === 'ENABLED'
@@ -607,16 +633,20 @@ export function CredentialCard({
             {loadingBalance
               ? '…'
               : accountInfo
-                ? `${formatQuotaFixed(accountInfo.currentUsage)} / ${formatQuotaFixed(accountInfo.usageLimit)}`
+                ? (
+                    <>
+                      {`${formatQuotaFixed(Math.min(accountInfo.currentUsage, accountInfo.usageLimit))} / ${formatQuotaFixed(accountInfo.usageLimit)}`}
+                      {quotaBar.inOverage && (
+                        <span className="ml-1.5 text-violet-600 dark:text-violet-400">
+                          超额 {quotaBar.overageUsage > 0 ? `+${formatQuotaFixed(quotaBar.overageUsage)}` : formatUsd(accountInfo.currentOverages)}
+                        </span>
+                      )}
+                    </>
+                  )
                 : '- / -'}
           </span>
         </div>
-        <Progress
-          value={quotaUsagePercent}
-          tone={quotaProgressTone}
-          className="mt-2 h-1.5"
-          aria-label="额度使用进度"
-        />
+        <QuotaBar model={quotaBar} />
       </div>
 
       {/* ── Action Strip ── */}
