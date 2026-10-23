@@ -52,7 +52,7 @@
 | B4 | 费用小数展示 6/8 位 | 待补代码级核对 | 用户需求 + UI 代码搜索 | 尚未形成完整专题验证记录 |
 | C1 | stream idle/read/status 首输出前重试 | 已实现，待生产观察 | 7/14 Todo | 正常流回归通过；故障注入待补 |
 | C2 | `end_turn` vs silent truncation | 观测盲区已修，截断未证实 | feature/10 + CLI JSONL | 真实 CLI/`/cc` 验证字段已落库 |
-| C3 | 日文/葡语/中英混用与 prompt steering | 已实现提示词增强，待统计观察 | prompt injection 审计 + feature/10 | 真实 CLI 小样本未复现外语混入 |
+| C3 | 日文/葡语/中英混用与提示词注入 | 已实现提示词增强，待统计观察 | prompt injection 审计 + feature/10 | 真实 CLI 小样本未复现外语混入 |
 | C4 | 错误返回策略 | 已修复并验证 | 7/13 follow-up + 7/14 Todo | 单测 + direct API 验证 |
 | D1 | 外部池不支持模型导致队列/冷却异常 | 已修复并验证 | 7/13 evidence P001/P002 + 7/14 Todo | fake external upstream 真实验证 |
 | D2 | 本地容量存在仍可能外部池 | 已确认待修复 | 7/15 production follow-up P1 | 待构造本地池 transient exhaustion 复现 |
@@ -80,7 +80,7 @@
 - B3 `output_tokens` 放大与最终上限：已实现并验证，会影响下游 usage 与落库 usage。
 - C1 stream idle/read/status 首输出前重试：已实现安全边界和正常流回归；故障注入仍待补。
 - C2 `end_turn` vs silent truncation：已补 `sawUpstreamCompleted`、`stopReasonSource` 等观测；静默截断本身未证实。
-- C3 语言混用 / prompt steering：已加可配置提示词增强；长期效果待统计观察。
+- C3 语言混用 / 提示词注入：已加可配置提示词增强；长期效果待统计观察。
 - C4 错误返回策略：已改为官方上游安全 message 可透出，外部池/内部错误继续脱敏。
 - D1 外部池不支持模型导致队列/冷却异常：已改为按外部池 + 模型短冷却，并完成 fake upstream 验证。
 - E1 旧版本升级/启动迁移卡死：启动迁移设计口径已调整为轻量 schema 补齐，不自动扫描历史 usage；仍需旧版本数据集回归。
@@ -94,7 +94,7 @@
 - B4 费用小数展示 6/8 位：待复核两套 UI 的 usage detail formatter 和页面展示；当前不能标记完成。
 - C1 stream 首输出前重试：故障注入验证未补齐；当前只证明正常流未破坏。
 - C2 silent truncation：只能说观测盲区已修，不能说静默截断已被证实或已根治。
-- C3 语言混用 / prompt steering：小样本真实验证通过，但长期减少幻觉效果待统计。
+- C3 语言混用 / 提示词注入：小样本真实验证通过，但长期减少幻觉效果待统计。
 - C4 模型不可用类官方 400 换号重试：仍需补 retry classifier 与实现验证。
 - D2 本地容量存在时仍可能外部池：已确认待修复，需要 local route-state 复查和严格 local-first fallback 逻辑。
 - D3 Redis scheduler degraded：已确认待修复，需要调度 Redis 与 usage/dashboard 隔离、分操作超时/退避等改造。
@@ -377,7 +377,7 @@
 - 继续采集长会话样本，记录 EOF 前最后若干上游事件类型；仅有 `sawUpstreamCompleted=false` 仍不足以判定截断。
 - 如果要把“无 completed 的 EOF”改成异常或触发重试，必须先证明 H2 确实存在并定义安全边界。
 
-### C3. 日文/葡语/中英混用与 prompt steering
+### C3. 日文/葡语/中英混用与提示词注入
 
 状态：已实现提示词增强，待统计观察。
 
@@ -385,14 +385,14 @@
 
 - 用户样本：`続けて本体を追記する。`、`让me等一会儿`、葡语/日语/中英混用片段。
 - 本地 JSONL 复核：[`feature/issues/10-stream-end-turn-vs-silent-truncation.md`](../issues/10-stream-end-turn-vs-silent-truncation.md) 第 1.2、6.5、7 节。
-- 注入点审计：[`docs/archive/runtime-correctness-feature-workspace-history/plans/prompt-injection-inventory-and-centralization-plan-20260715.md`](../../docs/archive/runtime-correctness-feature-workspace-history/plans/prompt-injection-inventory-and-centralization-plan-20260715.md)。
-- 源码：[`src/anthropic/prompt_steering.rs`](../../src/anthropic/prompt_steering.rs)、[`src/model/config.rs`](../../src/model/config.rs)。
+- 注入点清单：[`feature/todo/prompt-injection-routes-20261023/01-inventory.md`](../todo/prompt-injection-routes-20261023/01-inventory.md)。
+- 源码：[`src/anthropic/prompt_injection.rs`](../../src/anthropic/prompt_injection.rs)、[`src/model/prompt_injection/catalog.rs`](../../src/model/prompt_injection/catalog.rs)。
 
 说明：
 
 - 用户目标不是禁止正常中文夹杂英文术语，而是减少错误的语言混用，例如“让me看一下”。
 - 真实复核中，日文例子不是 silent truncation：有 `requestId`，`stop_reason=tool_use`，下一条就是 `Edit` 工具调用。
-- 当前方案走可配置 prompt steering：语言约束、任务质量提示、工具调用行为提示集中处理，避免无差别污染所有请求。
+- 当前方案走 `promptInjection`：语言约束（A2/A3）、任务质量（A1）、工具调用行为提示（B3/B4）等都是独立注入项，各有全局默认开关，由路由显式设置开关，避免无差别污染所有请求。
 
 复现/验证：
 

@@ -18,10 +18,10 @@ use crate::model::config::{
     CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
     KiroRsToolCachePolicy, MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig,
     ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptCacheStrategyType, PromptSteeringConfig, ReportedUsageConfig,
-    ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, StableSegmentCachePolicy,
-    ThinkingTriggerMode, normalize_defined_cache_route, normalize_defined_cache_routes,
-    resolve_cache_policy_for_path,
+    PromptCacheSimulationMode, PromptCacheStrategyType, PromptInjectionConfig, ReportedUsageConfig,
+    ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, RouteFeatureSet, RouteFeaturesConfig,
+    StableSegmentCachePolicy, ThinkingTriggerMode, normalize_defined_cache_route,
+    normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
 use crate::token;
 use anyhow::Error;
@@ -114,6 +114,8 @@ use crate::kiro::token_manager::{
     local_scheduler_error_kind,
 };
 
+#[path = "handlers/injection_preview.rs"]
+mod injection_preview;
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
 #[path = "handlers/model_driven_websearch.rs"]
@@ -122,6 +124,10 @@ mod model_driven_websearch;
 mod parsed_body_pipeline;
 #[path = "handlers/request_entry.rs"]
 mod request_entry;
+
+pub(crate) use injection_preview::{
+    PromptInjectionPreviewRequest, PromptInjectionPreviewResponse, preview_prompt_injection,
+};
 
 const UPSTREAM_INVALID_REQUEST_MESSAGE: &str = envelope::PUBLIC_INVALID_REQUEST_MESSAGE;
 const LATENCY_COUNTER_UNSET: u32 = u32::MAX;
@@ -137,31 +143,43 @@ const EXTERNAL_POOL_FALLBACK_READINESS_TIMEOUT: Duration = Duration::from_millis
 
 static SCHEDULER_ERROR_STRING_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LocalStreamRetryConfig {
     enabled: bool,
     max_attempts: u32,
     on_idle_timeout: bool,
     on_read_error: bool,
     on_status_error: bool,
+    /// 空轮重试时追加到当前轮的续写提示；注入项 `emptyTurnNudge` 关闭时为 `None`。
+    empty_turn_nudge: Option<Arc<str>>,
 }
 
 impl LocalStreamRetryConfig {
-    fn from_runtime_config(config: &RequestRuntimeConfig) -> Self {
+    fn from_runtime_config(
+        config: &RequestRuntimeConfig,
+        injections: &crate::model::config::ResolvedInjections,
+    ) -> Self {
         Self {
             enabled: config.kiro_upstream_stream_retry_enabled,
             max_attempts: config.kiro_upstream_stream_retry_max_attempts.clamp(1, 100),
             on_idle_timeout: config.kiro_upstream_stream_retry_on_idle_timeout,
             on_read_error: config.kiro_upstream_stream_retry_on_read_error,
             on_status_error: config.kiro_upstream_stream_retry_on_status_error,
+            empty_turn_nudge: injections
+                .allows(crate::model::config::InjectionId::EmptyTurnNudge)
+                .then(|| {
+                    Arc::<str>::from(
+                        injections.text(crate::model::prompt_injection::TextKey::EmptyTurnNudge),
+                    )
+                }),
         }
     }
 
-    fn active(self) -> bool {
+    fn active(&self) -> bool {
         self.enabled && self.max_attempts > 1
     }
 
-    fn allows(self, reason: StreamRetryReason) -> bool {
+    fn allows(&self, reason: StreamRetryReason) -> bool {
         match reason {
             StreamRetryReason::IdleTimeout | StreamRetryReason::FirstOutputTimeout => {
                 self.on_idle_timeout
@@ -720,14 +738,15 @@ fn log_thinking_request_trace(
     let latest_user_has_visible_thinking_signal =
         request_has_claude_code_visible_thinking_signal(payload);
 
+    let trigger_mode = runtime_config.route_features_for(endpoint).thinking_trigger;
     tracing::debug!(
         endpoint,
         model = %payload.model,
-        trigger_mode = ?runtime_config.thinking_trigger_mode,
+        trigger_mode = ?trigger_mode,
         thinking_requested,
         thinking_type = ?thinking_type,
         output_effort = ?output_effort,
-        force_visible_thinking = should_force_visible_thinking(payload, runtime_config),
+        force_visible_thinking = should_force_visible_thinking(payload, trigger_mode),
         latest_user_has_visible_thinking_signal,
         "Anthropic thinking request trace"
     );
@@ -929,7 +948,6 @@ struct CredentialErrorHint {
 #[derive(Debug, Clone)]
 struct RequestRuntimeConfig {
     extract_thinking: bool,
-    thinking_trigger_mode: ThinkingTriggerMode,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
@@ -970,13 +988,34 @@ struct RequestRuntimeConfig {
     kiro_upstream_stream_retry_on_status_error: bool,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
-    prompt_steering: PromptSteeringConfig,
+    prompt_injection: PromptInjectionConfig,
+    route_features: RouteFeaturesConfig,
+    claude_models_only: bool,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
 }
 
 impl RequestRuntimeConfig {
+    /// `endpoint` 上生效的路由功能。
+    fn route_features_for(&self, endpoint: &str) -> RouteFeatureSet {
+        self.route_features.resolve(endpoint)
+    }
+
+    /// `endpoint` 上允许注入的项。
+    fn injections_for(
+        &self,
+        endpoint: &str,
+        upstream: crate::model::config::UpstreamKind,
+    ) -> crate::model::config::ResolvedInjections {
+        crate::model::config::ResolvedInjections::resolve(
+            endpoint,
+            upstream,
+            self.compat_profile,
+            &self.prompt_injection,
+        )
+    }
+
     /// 外部池流式首输出前的静默保留窗口；0 表示一直保留到首个语义输出。
     fn external_stream_pre_output_hold(&self) -> Option<Duration> {
         (self.stream_pre_output_hold_secs > 0)
@@ -986,7 +1025,6 @@ impl RequestRuntimeConfig {
     fn from_app_state(state: &AppState) -> Self {
         Self {
             extract_thinking: state.extract_thinking,
-            thinking_trigger_mode: state.thinking_trigger_mode,
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: state.prompt_cache_token_scale,
@@ -1027,7 +1065,9 @@ impl RequestRuntimeConfig {
             kiro_upstream_stream_retry_on_status_error: true,
             image_processing: state.image_processing.normalized(),
             body_conversion: state.body_conversion.clone(),
-            prompt_steering: state.prompt_steering.clone().normalized(),
+            prompt_injection: state.prompt_injection.clone().normalized(),
+            route_features: state.route_features.clone().normalized(),
+            claude_models_only: state.claude_models_only,
             missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
             external_pools: state.external_pools.clone(),
@@ -1035,19 +1075,37 @@ impl RequestRuntimeConfig {
     }
 
     fn from_config_with_fallback(config: &Config, fallback: Self) -> Self {
+        Self::from_config_with_defaults(
+            config,
+            fallback.prompt_cache_simulation_mode,
+            fallback.prompt_cache_target_read_ratio,
+            fallback.prompt_cache_token_scale,
+        )
+    }
+
+    /// 只依赖运行配置本身（管理端预览用），非有限的比例回落到内置默认。
+    fn from_config(config: &Config) -> Self {
+        Self::from_config_with_defaults(config, PromptCacheSimulationMode::HighCache, 0.0, 1.0)
+    }
+
+    fn from_config_with_defaults(
+        config: &Config,
+        prompt_cache_simulation_mode: PromptCacheSimulationMode,
+        fallback_target_read_ratio: f64,
+        fallback_token_scale: f64,
+    ) -> Self {
         Self {
             extract_thinking: config.extract_thinking,
-            thinking_trigger_mode: config.thinking_trigger_mode,
-            prompt_cache_simulation_mode: fallback.prompt_cache_simulation_mode,
+            prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: if config.prompt_cache_target_read_ratio.is_finite() {
                 config.prompt_cache_target_read_ratio.clamp(0.0, 0.99)
             } else {
-                fallback.prompt_cache_target_read_ratio
+                fallback_target_read_ratio
             },
             prompt_cache_token_scale: if config.prompt_cache_token_scale.is_finite() {
                 config.prompt_cache_token_scale.clamp(1.0, 3.0)
             } else {
-                fallback.prompt_cache_token_scale
+                fallback_token_scale
             },
             prompt_cache_max_simulated_input_tokens: config
                 .prompt_cache_max_simulated_input_tokens
@@ -1109,7 +1167,9 @@ impl RequestRuntimeConfig {
                 .kiro_upstream_stream_retry_on_status_error,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
-            prompt_steering: config.prompt_steering.clone().normalized(),
+            prompt_injection: config.prompt_injection.clone().normalized(),
+            route_features: config.route_features.clone().normalized(),
+            claude_models_only: config.claude_models_only,
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
@@ -6560,6 +6620,18 @@ fn map_provider_error(
         );
     }
 
+    if is_upstream_image_too_large_error(&err_str) {
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：图片超过上游 5 MB 限制", error_id);
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+            request_id,
+            error_id,
+            [("x-should-retry", "false".to_string())],
+        );
+    }
+
     if is_upstream_invalid_model_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
@@ -6716,6 +6788,15 @@ fn is_upstream_payload_too_long_error(value: &str) -> bool {
 fn is_upstream_context_window_full_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("context window is full") && lower.contains("reduce conversation history")
+}
+
+/// Upstream `IMAGE_SIZE_EXCEEDED`. The provider error carries the classified reason; the raw
+/// upstream text (which names internal message indexes) is never forwarded to the client.
+fn is_upstream_image_too_large_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("image_too_large_bad_request")
+        || lower.contains("image_size_exceeded")
+        || lower.contains("image exceeds 5 mb")
 }
 
 fn is_upstream_improperly_formed_error(value: &str) -> bool {
@@ -7180,7 +7261,7 @@ fn payload_guard_error_response(err: PayloadGuardError) -> Response {
         PayloadGuardError::OversizedImage { .. } => envelope::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.",
+            envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
         ),
         PayloadGuardError::ToolPairingInvariant { .. } => envelope::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -7380,31 +7461,26 @@ fn models_list_response(state: &AppState, query: &ModelsQuery) -> Response {
     Json(ModelsResponse::paginate(models, query)).into_response()
 }
 
-/// Live identity config so admin changes apply without a restart.
-fn live_identity_config(state: &AppState) -> crate::model::config::IdentityPromptConfig {
-    let config = match state.kiro_provider.as_ref() {
+/// Live runtime config so admin changes apply without a restart.
+fn live_runtime_config(state: &AppState) -> RequestRuntimeConfig {
+    match state.kiro_provider.as_ref() {
         Some(provider) => request_runtime_config(state, provider),
         None => RequestRuntimeConfig::from_app_state(state),
-    };
-    config.prompt_steering.identity
+    }
 }
 
+/// 路由功能"渠道信息输出过滤"是否作用于这个请求。
 fn identity_output_guard_applies(state: &AppState, endpoint: &str, stream: bool) -> bool {
-    live_identity_config(state)
-        .for_route(endpoint)
-        .output_guard_applies(stream)
+    live_runtime_config(state)
+        .route_features_for(endpoint)
+        .channel_leak_guard_applies(stream)
 }
 
 /// Reply used when the guard removed every sentence of an answer.
 const IDENTITY_GUARD_FALLBACK: &str = "I'm Claude, an AI assistant made by Anthropic.";
 
 fn claude_models_only(state: &AppState) -> bool {
-    // Prefer the provider's live runtime config so the admin toggle applies without a restart.
-    let config = match state.kiro_provider.as_ref() {
-        Some(provider) => request_runtime_config(state, provider),
-        None => RequestRuntimeConfig::from_app_state(state),
-    };
-    config.prompt_steering.identity.claude_models_only
+    live_runtime_config(state).claude_models_only
 }
 
 /// Claude ids plus the Claude Code aliases (`opus`, `sonnet`, `haiku`, ...) that the listing keeps.
@@ -7761,15 +7837,11 @@ async fn post_messages_inner(
         requires_normalized_body,
         raw_preflight_failure,
     );
-    let prompt_steering_for_external = super::prompt_steering::should_apply_to_external_pool(
-        &endpoint,
-        runtime_config.compat_profile,
-        &runtime_config.prompt_steering,
-    );
-    let identity_for_external = super::prompt_steering::identity_applies_to_external_pool(
-        &endpoint,
-        &runtime_config.prompt_steering,
-    );
+    // 外部池和本地 Kiro 各自解析注入项：外部池快照只带开了"外部池"的项，本地请求另外注入。
+    let external_injections =
+        runtime_config.injections_for(&endpoint, crate::model::config::UpstreamKind::ExternalPool);
+    let local_injections =
+        runtime_config.injections_for(&endpoint, crate::model::config::UpstreamKind::Local);
     // 当前轮超大图片对所有路由一致地返回 400（历史超大图片仍由 payload guard 占位处理）。
     if let Some(response) =
         reject_oversized_current_image(&payload, attribution.as_ref(), &endpoint)
@@ -7784,23 +7856,13 @@ async fn post_messages_inner(
         .local_pool_route_allowed(&endpoint)
         && !provider.route_rejected_by_all_credentials(&endpoint);
     if !local_route_allowed {
-        if prompt_steering_for_external {
-            super::prompt_steering::apply_to_messages_request(
-                &endpoint,
-                runtime_config.compat_profile,
-                &runtime_config.prompt_steering,
-                &mut payload,
-            );
-        }
-        if identity_for_external {
-            super::prompt_steering::apply_identity_to_messages_request(
-                &endpoint,
-                &runtime_config.prompt_steering,
-                &mut payload,
-            );
-        }
         if let Some(external) = external_fallback.as_mut() {
-            external.refresh_payload(&payload);
+            let mut external_payload = payload.clone();
+            super::prompt_injection::apply_to_messages_request(
+                &external_injections,
+                &mut external_payload,
+            );
+            external.refresh_payload(&external_payload);
             let request_id = envelope::request_id();
             let direct_model_resolution = Some(external_request_model_resolution(&payload.model));
             if let Some(response) = external
@@ -7858,41 +7920,15 @@ async fn post_messages_inner(
         return response;
     }
 
-    if prompt_steering_for_external {
-        super::prompt_steering::apply_to_messages_request(
-            &endpoint,
-            runtime_config.compat_profile,
-            &runtime_config.prompt_steering,
-            &mut payload,
-        );
-    }
-    if identity_for_external {
-        super::prompt_steering::apply_identity_to_messages_request(
-            &endpoint,
-            &runtime_config.prompt_steering,
-            &mut payload,
-        );
-    }
     if let Some(external) = external_fallback.as_mut() {
-        external.refresh_payload(&payload);
-    }
-    if !prompt_steering_for_external {
-        super::prompt_steering::apply_to_messages_request(
-            &endpoint,
-            runtime_config.compat_profile,
-            &runtime_config.prompt_steering,
-            &mut payload,
+        let mut external_payload = payload.clone();
+        super::prompt_injection::apply_to_messages_request(
+            &external_injections,
+            &mut external_payload,
         );
+        external.refresh_payload(&external_payload);
     }
-    // The external fallback snapshot above is already taken, so this only affects the local
-    // Kiro request when identity masking is not opted in for external pools.
-    if !identity_for_external {
-        super::prompt_steering::apply_identity_to_messages_request(
-            &endpoint,
-            &runtime_config.prompt_steering,
-            &mut payload,
-        );
-    }
+    super::prompt_injection::apply_to_messages_request(&local_injections, &mut payload);
     if let Some(external) = external_fallback.as_ref() {
         let request_id = envelope::request_id();
         let direct_model_resolution = Some(external_request_model_resolution(&payload.model));
@@ -8042,9 +8078,8 @@ async fn post_messages_inner(
                 }) as websearch::SharedWebSearchUsageMapper
             });
         let model_driven = runtime_config
-            .body_conversion
-            .model_driven_web_search
-            .enabled_for_route(&endpoint);
+            .route_features_for(&endpoint)
+            .model_driven_web_search;
         usage_context.set_websearch_mode(if model_driven {
             "model_driven"
         } else {
@@ -8299,6 +8334,7 @@ async fn post_messages_inner(
         extract_xml_thinking,
         too_long_retry,
         cache_point_retry,
+        applied_injections: _,
     } = prepared_local;
 
     let mut usage_context = prepare_usage_context_with_inference_attempt_budget(
@@ -8372,7 +8408,7 @@ async fn post_messages_inner(
             cache_point_retry,
             external_fallback,
             runtime_config.kiro_upstream_stream_idle_timeout_secs,
-            LocalStreamRetryConfig::from_runtime_config(&runtime_config),
+            LocalStreamRetryConfig::from_runtime_config(&runtime_config, &local_injections),
             capacity_weight_units,
             claude_code_noop_delta_keepalive,
             runtime_config.stream_keepalive_interval_secs,
@@ -8405,7 +8441,7 @@ async fn post_messages_inner(
             too_long_retry,
             cache_point_retry,
             external_fallback,
-            LocalStreamRetryConfig::from_runtime_config(&runtime_config),
+            LocalStreamRetryConfig::from_runtime_config(&runtime_config, &local_injections),
             capacity_weight_units,
         )
         .await
@@ -9843,7 +9879,7 @@ async fn handle_stream_request(
                     Ok(body) => {
                         effective_body = body;
                         Some(StreamRetryPlan {
-                            config: stream_retry_config,
+                            config: stream_retry_config.clone(),
                             provider: provider.clone(),
                             request_body: Arc::<str>::from(effective_body),
                             kiro_request: None,
@@ -10604,6 +10640,11 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
             | Event::InvalidState(_)
             | Event::Error { .. }
             | Event::Exception { .. } => return false,
+            // A content-filter refusal is an authoritative answer; retrying the same history
+            // would only be filtered again.
+            Event::Metadata(metadata) if metadata.content_filter_refusal().is_some() => {
+                return false;
+            }
             Event::Metadata(_)
             | Event::MessageMetadata(_)
             | Event::Metering(_)
@@ -10825,11 +10866,13 @@ enum StreamRetryOutcome {
 }
 
 /// 上游只回 usage/metadata 就 EOF（空轮次）时，首输出前那一次重试使用的请求：去掉原生
-/// reasoning 字段、历史 reasoning 和可见 thinking 输出策略，并在当前轮末尾追加续写提示。
-/// 现网同一请求原样重发（含换号）几乎总是再次为空，重试必须改变请求。无法解析时返回 None。
+/// reasoning 字段、历史 reasoning 和可见 thinking 输出策略，注入项开启时再在当前轮末尾追加
+/// 续写提示。现网同一请求原样重发（含换号）几乎总是再次为空，重试必须改变请求。无法解析时
+/// 返回 None。
 fn usage_only_retry_request(
     request_body: &str,
     kiro_request: Option<&KiroRequest>,
+    empty_turn_nudge: Option<&str>,
 ) -> Option<(String, KiroRequest)> {
     let mut request = match kiro_request {
         Some(request) => request.clone(),
@@ -10849,16 +10892,20 @@ fn usage_only_retry_request(
             .user_input_message
             .content,
     );
-    super::empty_turn_nudge::append_empty_turn_nudge(&mut request);
+    if let Some(nudge) = empty_turn_nudge {
+        super::empty_turn_nudge::append_empty_turn_nudge(&mut request, nudge);
+    }
     let body = serialize_kiro_request(&request).ok()?;
     Some((body, request))
 }
 
 /// 流式空轮次：把重试计划替换为 [`usage_only_retry_request`]。返回是否替换成功。
 fn prepare_usage_only_stream_retry_plan(plan: &mut StreamRetryPlan) -> bool {
-    let Some((body, request)) =
-        usage_only_retry_request(&plan.request_body, plan.kiro_request.as_deref())
-    else {
+    let Some((body, request)) = usage_only_retry_request(
+        &plan.request_body,
+        plan.kiro_request.as_deref(),
+        plan.config.empty_turn_nudge.as_deref(),
+    ) else {
         return false;
     };
     plan.request_body = Arc::<str>::from(body);
@@ -13024,9 +13071,11 @@ async fn handle_non_stream_request(
             && non_stream_events_are_usage_only(&upstream_events)
         {
             usage_only_retried = true;
-            if let Some((retry_body, retry_request)) =
-                usage_only_retry_request(request_body, Some(kiro_request))
-            {
+            if let Some((retry_body, retry_request)) = usage_only_retry_request(
+                request_body,
+                Some(kiro_request),
+                stream_retry_config.empty_turn_nudge.as_deref(),
+            ) {
                 let next_attempt = non_stream_status_retry_attempt.saturating_add(1);
                 tracing::warn!(
                     request_id = %request_id,
@@ -13106,6 +13155,7 @@ async fn handle_non_stream_request(
         super::transcript_sanitizer::ToolTranscriptSanitizer::new(known_tool_names.iter().cloned());
     let mut upstream_message_status: Option<String> = None;
     let mut saw_meaningful_upstream_response = false;
+    let mut content_filter_refusal: Option<String> = None;
     let mut saw_upstream_metadata = false;
     let mut saw_upstream_context_usage = false;
     let mut saw_upstream_metering = false;
@@ -13263,7 +13313,8 @@ async fn handle_non_stream_request(
                     context_input_tokens = Some(actual_input_tokens);
                 }
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if percentage.is_finite() && percentage >= 100.0 {
+                if percentage.is_finite() && percentage >= 100.0 && content_filter_refusal.is_none()
+                {
                     stop_reason = "model_context_window_exceeded".to_string();
                 }
                 tracing::debug!(
@@ -13274,6 +13325,12 @@ async fn handle_non_stream_request(
             }
             Event::Metadata(metadata) => {
                 saw_upstream_metadata = true;
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!(refusal = %refusal, "非流式响应上游内容过滤拒答，按 stop_reason=refusal 结束");
+                    stop_reason = super::stream::REFUSAL_STOP_REASON.to_string();
+                    saw_meaningful_upstream_response = true;
+                    content_filter_refusal.get_or_insert(refusal);
+                }
                 if let Some(token_usage) = metadata.token_usage {
                     tracing::debug!(
                         input_tokens = token_usage.input_tokens(),
@@ -13373,7 +13430,9 @@ async fn handle_non_stream_request(
                 message,
             } => {
                 if exception_type == "ContentLengthExceededException" {
-                    stop_reason = "max_tokens".to_string();
+                    if content_filter_refusal.is_none() {
+                        stop_reason = "max_tokens".to_string();
+                    }
                 } else {
                     let detail =
                         format!("upstream exception event {}: {}", exception_type, message);
@@ -13413,6 +13472,10 @@ async fn handle_non_stream_request(
             envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
             &credential_usage.request.request_id,
         );
+    }
+    if content_filter_refusal.is_some() {
+        // A refusal can cut a tool call off mid-input. Never complete or report those calls.
+        tool_json_buffers.clear();
     }
     if !tool_json_buffers.is_empty() {
         for (tool_use_id, buffer) in std::mem::take(&mut tool_json_buffers) {
@@ -13824,19 +13887,13 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) -> Result<()
     Ok(())
 }
 
-fn apply_thinking_trigger_mode(
-    payload: &mut MessagesRequest,
-    runtime_config: &RequestRuntimeConfig,
-) {
-    if !runtime_config.prompt_steering.enabled {
-        return;
-    }
-
-    let should_trigger = match runtime_config.thinking_trigger_mode {
+fn apply_thinking_trigger_mode(payload: &mut MessagesRequest, trigger_mode: ThinkingTriggerMode) {
+    let should_trigger = match trigger_mode {
         ThinkingTriggerMode::Always => true,
         ThinkingTriggerMode::RealRequest => {
             request_has_claude_code_visible_thinking_signal(payload)
         }
+        ThinkingTriggerMode::Off => false,
     };
     if !should_trigger {
         return;
@@ -13856,7 +13913,7 @@ fn apply_thinking_trigger_mode(
             tracing::debug!(
                 model = %payload.model,
                 thinking_type = %thinking.thinking_type,
-                trigger_mode = ?runtime_config.thinking_trigger_mode,
+                trigger_mode = ?trigger_mode,
                 "thinking 触发信号已匹配，但未知 thinking 类型保持原值并拒绝隐式触发"
             );
             return;
@@ -13945,12 +14002,8 @@ fn is_ascii_word_char(ch: char) -> bool {
 
 fn should_force_visible_thinking(
     payload: &MessagesRequest,
-    runtime_config: &RequestRuntimeConfig,
+    trigger_mode: ThinkingTriggerMode,
 ) -> bool {
-    if !runtime_config.prompt_steering.enabled {
-        return false;
-    }
-
     if !payload
         .thinking
         .as_ref()
@@ -13959,11 +14012,12 @@ fn should_force_visible_thinking(
         return false;
     }
 
-    match runtime_config.thinking_trigger_mode {
+    match trigger_mode {
         ThinkingTriggerMode::Always => true,
         ThinkingTriggerMode::RealRequest => {
             request_has_claude_code_visible_thinking_signal(payload)
         }
+        ThinkingTriggerMode::Off => false,
     }
 }
 
@@ -14035,20 +14089,15 @@ async fn count_tokens_for_endpoint(
     );
 
     // Use the provider's live runtime config, like the messages path, so admin changes to prompt
-    // steering and identity masking are reflected in token counts without a restart.
+    // injection are reflected in token counts without a restart.
     let runtime_config = match state.kiro_provider.as_ref() {
         Some(provider) => request_runtime_config(&state, provider),
         None => RequestRuntimeConfig::from_app_state(&state),
     };
-    super::prompt_steering::apply_to_count_tokens_request(
-        endpoint,
-        runtime_config.compat_profile,
-        &runtime_config.prompt_steering,
-        &mut payload,
-    );
-    super::prompt_steering::apply_identity_to_count_tokens_request(
-        endpoint,
-        &runtime_config.prompt_steering,
+    // count_tokens 按本地 Kiro 链路估算，与 messages 请求注入的 system 一致。
+    super::prompt_injection::apply_to_count_tokens_request(
+        &runtime_config.prompt_injection,
+        &runtime_config.injections_for(endpoint, crate::model::config::UpstreamKind::Local),
         &mut payload,
     );
 

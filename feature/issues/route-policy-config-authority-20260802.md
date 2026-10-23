@@ -21,7 +21,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 ## 用户可见风险（修复前）
 
 - 页面把某路径配置为无缓存或高缓存后，请求链路可能仍受代码里的内置路径名单影响。
-- `/cc` 可能被提示词引导特殊处理，不能自然配置成普通 `/v1`、`/ha` 或 `/na` 策略。
+- `/cc` 可能被提示词注入特殊处理，不能自然配置成普通 `/v1`、`/ha` 或 `/na` 策略。
 - `/na` 可能被迁移逻辑强制恢复为无缓存，导致页面调整后重启或 reload 不符合预期。
 - `count_tokens` 对 `/cc` 的处理和 messages 请求不完全同构，容易出现估算与真实请求不一致。
 - 前端显示的默认值、别名归一化和“仅 /cc 路径”文案会继续暗示内置路由策略不可变。
@@ -34,25 +34,26 @@ Last reviewed: 2026-08-03 Asia/Shanghai
    `current_high_cache`，重启或执行运行配置迁移。
 2. 观察旧实现的路径策略解析：`/cc` 仍会被内置默认分支当成高缓存，
    `/na` 会被迁移逻辑恢复成无缓存，导致页面配置与实际行为不一致。
-3. 将提示词引导范围设置为非 `/cc` 的入口，调用对应
+3. 在非 `/cc` 的入口上打开提示词注入项，调用对应
    `messages` 和 `count_tokens`；旧实现只识别 `/cc`，新入口不会按配置生效。
 4. 在 `/v1`、`/cc`、`/ha`、`/na` 间切换相同缓存类型，旧实现的路径缓存
    命名空间仍由内置路径名单决定；自定义路径却可能使用独立命名空间。
 
 本轮新增的配置解析测试使用同一组场景验证修复后的预期：显式路径覆盖优先，
-迁移不覆盖显式 `/na`，命名空间由字段控制，提示词和 `count_tokens` 共享路径规则。
+迁移不覆盖显式 `/na`，命名空间由字段控制，提示词注入在 `messages` 和 `count_tokens` 上按同一份路由设置解析。
 
 ## 当前源码链
 
-### P0: `/cc` 提示词引导路径特判（已修复）
+### P0: `/cc` 提示词路径特判（已修复）
 
-- `src/anthropic/prompt_steering.rs`
-  - 已移除按 `/cc` 字符串判断的 `is_cc_endpoint()`。
-  - `routeMode` / `routeRules` 通过共享路径规则匹配器决定提示词是否生效。
-- `src/model/config.rs`
-  - 旧 `cc_only` 只作为兼容输入，归一化为 `route_rules + allow_list + [/cc]` 默认配置。
+- `src/anthropic/prompt_injection.rs`
+  - 不存在按 `/cc` 字符串判断的 `is_cc_endpoint()`。
+  - 写进 system 的注入项（A1/A2/A4/A5）是否生效由 `ResolvedInjections` 决定。
+- `src/model/prompt_injection/mod.rs`
+  - 注入项本身不带路由规则。每项有全局默认开关 `promptInjection.defaults`，路由在 `promptInjection.pathOverrides` 上按前缀显式设置"跟随默认 / 开 / 关"，按最长前缀匹配，路由上没写的项跟随默认。
+  - 新装默认：任务质量（A1）全局关、`/cc` 上显式开；旧配置在加载时迁移成等价的路由设置（迁移版本 13）。
 - `src/anthropic/handlers.rs`
-  - `messages` 和 `count_tokens` 均传入实际入口，使用同一套配置规则，不再由 `count_tokens_cc` 单独决定策略。
+  - `messages` 和 `count_tokens` 均传入实际入口，按同一份路由设置解析注入项，不再由 `count_tokens_cc` 单独决定策略。
 
 ### P0: `/na` 缓存策略被强制（已修复）
 
@@ -71,8 +72,8 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 ### P1: 前端配置解释和文案路径特判（已修复）
 
 - 两套 UI 仍列出内置入口作为可配置项和默认建议，这是入口清单，不是不可变策略。
-- 提示词页面显示 `按路径规则`、`提示词路径模式`、`提示词路径规则`，并支持自定义内置或 `/dfcache/*` 入口。
-- “应用到外部池”和 “count_tokens 同步计入”均说明使用同一套路径规则，不再写死 `/cc`。
+- 新版控制台的"提示词注入"页（`/ui/prompt-injection`）编辑各注入项的全局默认和文本；路由策略编辑弹窗分"缓存 / 提示词注入 / 功能"三个分区，提示词注入分区按路由显式设置各项，支持内置入口和自定义 `/dfcache/*` 入口。旧版 admin-ui 不再编辑提示词注入。
+- 外部池开关（A1、A2、A4、A5）和 `promptInjection.applyToCountTokens` 都按同一份路由设置生效，不写死 `/cc`。
 
 ## 不属于本问题的固定路径
 
@@ -100,7 +101,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 - 把内置路由默认策略变成配置初始化值，而不是运行时强制逻辑。
 - 所有运行时决策先解析出路径配置，再按配置执行。
 - `/cc`、`/ha`、`/na` 可以配置成任意缓存策略；配置后重启和 reload 不应被迁移覆盖。
-- 提示词引导从“仅 `/cc` 路径”改成“按配置的路径规则”或“按兼容 profile”。
+- 提示词注入从“仅 `/cc` 路径”改成“注入项不带路由规则，由路由显式设置”。
 
 ### 后端修复
 
@@ -115,18 +116,15 @@ Last reviewed: 2026-08-03 Asia/Shanghai
    - 如果用户已经显式配置某路径，不覆盖。
 3. 移除运行时迁移中强制 `/na` 为 no-cache 的逻辑。
 4. 移除 `resolve_cache_policy_for_path()` 中基于 `/v1|/cc|/ha|/na` 的缓存 namespace 特判，改为配置字段控制是否使用路径 namespace。
-5. 扩展 `PromptSteeringConfig`，增加路径规则配置，例如：
-   - `routeMode`: `allow_all` / `allow_list` / `deny_list`
-   - `routeRules`: 路径前缀规则
-   - 默认保持历史行为：只允许 `/cc`
-6. 保留 `PromptSteeringScope::ClaudeCodeProfile` 与 `AllRoutes` 兼容旧配置，但不再通过 `is_cc_endpoint()` 写死判断；`cc_only` 迁移为默认路径规则 `/cc`。
-7. `count_tokens` 使用同一通用提示词规则，不再需要通过专用 `/cc` 函数表达策略。
+5. 提示词注入使用 `promptInjection`：14 个注入项各自的全局默认开关 `defaults`、可编辑文本 `texts`、按路由前缀的显式设置 `pathOverrides`。注入项本身不带路由规则。
+6. 新装默认：任务质量（A1）全局关、`/cc` 上显式开；旧配置在加载时迁移成等价的路由设置，不通过 `is_cc_endpoint()` 写死判断。
+7. `count_tokens` 按 `promptInjection.applyToCountTokens` 和同一份路由设置计入写进 system 的注入项，不再需要通过专用 `/cc` 函数表达策略。
 
 ### 前端修复
 
 1. “缓存策略与路径绑定”允许 `/na` 切换到高缓存或 Kiro-RS Tool。
 2. 默认策略仍可展示内置建议，但不把建议作为不可变行为。
-3. “提示词引导”文案从“仅 /cc 路径”改为“按路径规则”，并暴露路径规则配置。
+3. 提示词注入在新版控制台的"提示词注入"页编辑全局默认，在路由策略弹窗的"提示词注入"分区按路由显式设置。
 4. 路径归一化和别名处理集中到通用规则，避免每个内置路径散落判断。
 
 ## 验收矩阵
@@ -137,25 +135,25 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 - `/na` 配置为 `current_high_cache` 后，重启/迁移/归一化不会改回 no-cache。
 - `/cc` 配置为 `current_high_cache` 且需要独立 namespace 时，namespace 行为由配置决定，而不是路径名决定。
 - `/v1`、`/cc`、`/ha`、`/na` 的默认策略仍保持历史默认值。
-- 提示词引导默认仍只作用于 `/cc`，但这是默认路径规则，不是硬编码路径判断。
-- 修改提示词路径规则后，`/v1`、`/ha`、`/na`、`/dfcache/team` 都能按配置启用或禁用。
-- `count_tokens` 与 messages 使用相同提示词路径规则。
+- 任务质量注入项默认只在 `/cc` 上开，这是 `/cc` 路由上的显式设置，不是硬编码路径判断。
+- 在路由上设置注入项后，`/v1`、`/ha`、`/na`、`/dfcache/team` 都能按配置启用或禁用。
+- `count_tokens` 与 messages 按同一份路由设置解析注入项。
 - 外部池路径规则继续按配置匹配，不被本修复破坏。
 
 ### 前端
 
 - 页面能把 `/na` 从无缓存改成高缓存并保存。
 - 页面能把 `/cc` 改成无缓存策略并保存。
-- 提示词引导不再显示“仅 /cc 路径”这种不可变语义。
-- 路径规则 UI 支持 `/v1`、`/cc`、`/ha`、`/na`、`/dfcache/team`。
+- 提示词注入不显示“仅 /cc 路径”这种不可变语义。
+- 路由策略弹窗的提示词注入分区支持 `/v1`、`/cc`、`/ha`、`/na`、`/dfcache/team`。
 
 ### 真实/动态验证
 
 - 在隔离或本地服务上验证：
   - `/cc/v1/messages` 使用 no-cache 配置时，usage/cache 行为符合 no-cache。
   - `/na/v1/messages` 使用 high-cache 配置时，usage/cache 行为符合 high-cache。
-  - `/v1/messages/count_tokens` 被路径规则开启提示词引导后，估算包含新增 system prompt。
-  - `/cc/v1/messages/count_tokens` 被路径规则排除后，估算不包含新增 system prompt。
+  - `/v1` 路由上打开写进 system 的注入项后，`/v1/messages/count_tokens` 估算包含新增 system prompt。
+  - `/cc` 路由上关闭这些注入项后，`/cc/v1/messages/count_tokens` 估算不包含新增 system prompt。
 
 ## 残余风险
 
@@ -168,7 +166,7 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 
 ### 已修改范围
 
-- 后端：`src/model/config.rs`、`src/anthropic/prompt_steering.rs`、`src/anthropic/router.rs`、`src/anthropic/handlers.rs`、`src/anthropic/middleware.rs`、`src/anthropic/mod.rs`、`src/main.rs`。
+- 后端：`src/model/config.rs`、`src/anthropic/prompt_injection.rs`、`src/anthropic/router.rs`、`src/anthropic/handlers.rs`、`src/anthropic/middleware.rs`、`src/anthropic/mod.rs`、`src/main.rs`。
 - 新版 UI：`ui/src/types/api.ts`、`ui/src/lib/runtime-config-defaults.ts`、`ui/src/features/runtime/runtime-page.tsx`、`ui/src/features/runtime/runtime-sections.tsx`。
 - 旧版管理界面：`admin-ui/src/types/api.ts`、`admin-ui/src/components/runtime-config-panel.tsx`。
 
@@ -181,8 +179,6 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 - `pnpm --dir ui check && pnpm --dir ui build`：通过；仅保留既有 chunk size warning。
 - `pnpm --dir admin-ui build`：通过。
 - `node feature/tests/check-feature-docs.mjs`：`70` 份问题文档、`280` 条相对链接通过。
-- `node feature/tests/prompt-control-independence.mjs`：两套 UI 的提示词总开关与 body conversion 独立性通过。
-- `node feature/tests/prompt-default-parity.mjs`：Rust、UI、Admin UI 的任务质量默认值一致。
 - `git diff --check`：通过。
 - 冻结候选二进制 SHA-256：`fba89eb1e57947b481f38051341481662ca1c7f927a25c4ec167351cef0fcf77`。
 - Claude Code CLI `2.1.220` 假上游套件通过：`bare-invoke`、`long-session`（`5 sessions / 110 turns / 100 tool pairs / leakMatches=[]`）和 `thinking-wire`（`60/60`）；thinking 子套件使用 Claude Code 包内真实二进制复跑，排除了 Volta shim 环境噪声。
@@ -192,10 +188,10 @@ Last reviewed: 2026-08-03 Asia/Shanghai
 
 - `/cc -> no_cache`、`/na -> current_high_cache` 的显式路径配置不会被默认值或迁移覆盖。
 - `routeNamespace` 显式开关决定缓存空间是否按入口独立，不由 `/v1`、`/cc`、`/ha`、`/na` 名称决定。
-- 提示词路径规则可命中 `/v1`、`/cc`、`/ha`、`/na` 和自定义 `/dfcache/team`，`messages` 与 `count_tokens` 使用同一规则。
+- 注入项的路由设置可作用于 `/v1`、`/cc`、`/ha`、`/na` 和自定义 `/dfcache/team`，`messages` 与 `count_tokens` 使用同一份设置。
 - 内置入口仍由 Axum 固定注册，但 handler wrapper 只传递真实入口，缓存、usage、提示词和外部池策略在运行时按配置解析。
-- `builtin_routes_follow_runtime_cache_and_prompt_config_matrix` 通过同一个 Axum handler + 假 Kiro 上游验证了配置矩阵：`/cc -> no_cache`、`/na -> current_high_cache` 且共享缓存空间、`/ha -> current_high_cache` 且独立缓存空间；只有 `/ha` 命中提示词引导；四个内置入口的 `count_tokens` 均保持本地处理。
+- `builtin_routes_follow_runtime_cache_and_prompt_config_matrix` 通过同一个 Axum handler + 假 Kiro 上游验证了配置矩阵：`/cc -> no_cache`、`/na -> current_high_cache` 且共享缓存空间、`/ha -> current_high_cache` 且独立缓存空间；只有 `/ha` 注入了提示词；四个内置入口的 `count_tokens` 均保持本地处理。
 
 ## 回滚
 
-- 如果动态验证发现配置迁移兼容风险，可以保留新增提示词路径规则，同时临时恢复默认内置策略补齐；但不能恢复运行时 `is_cc_endpoint()` 或强制 `/na` no-cache 作为长期方案。
+- 如果动态验证发现配置迁移兼容风险，可以保留提示词注入的路由设置，同时临时恢复默认内置策略补齐；但不能恢复运行时 `is_cc_endpoint()` 或强制 `/na` no-cache 作为长期方案。

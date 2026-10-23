@@ -28,9 +28,8 @@ use crate::kiro::model::events::MetadataTokenUsage;
 use crate::kiro::token_manager::{LocalSchedulerError, LocalSchedulerErrorKind, MultiTokenManager};
 use crate::model::config::{
     CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch, CacheSimulationPolicyPatch,
-    PromptCacheCreationControlConfig, PromptSteeringRouteMode, PromptSteeringScope,
-    ReportedUsageFieldPolicy, ReportedUsagePathPolicy, RequestAdmissionConfig,
-    StableSegmentCachePolicy,
+    PromptCacheCreationControlConfig, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
+    RequestAdmissionConfig, StableSegmentCachePolicy,
 };
 use crate::storage::{postgres::PostgresStore, redis_cache::RedisStore};
 use axum::{
@@ -3194,19 +3193,40 @@ fn route_policy_matrix_config(base_url: &str) -> Config {
         },
     );
 
-    config.prompt_steering.scope = PromptSteeringScope::RouteRules;
-    config.prompt_steering.route_mode = PromptSteeringRouteMode::AllowList;
-    config.prompt_steering.route_rules = vec!["/ha".to_string()];
-    config.prompt_steering.language_constraint.enabled = false;
-    config.prompt_steering.task_quality.enabled = false;
-    config.prompt_steering.tool_choice.enabled = false;
-    config.prompt_steering.chunked_write.enabled = false;
-    config.prompt_steering.thinking.enabled = false;
-    config.prompt_steering.custom.enabled = true;
-    config.prompt_steering.custom.prompt = format!(
-        "{ROUTE_POLICY_MATRIX_PROMPT_MARKER} {}",
-        "extra route policy prompt tokens ".repeat(50)
-    );
+    // 只有 /ha 显式开启自定义注入项；其他注入项全部关闭。
+    {
+        use crate::model::config::InjectionId;
+        use crate::model::prompt_injection::{ItemOverride, ItemSetting, TextKey};
+        let injection = &mut config.prompt_injection;
+        injection.path_overrides.clear();
+        for id in InjectionId::ALL {
+            injection.defaults.insert(
+                id,
+                ItemSetting {
+                    enabled: false,
+                    external_pool: id.supports_external_pool().then_some(false),
+                },
+            );
+        }
+        injection.path_overrides.insert(
+            "/ha".to_string(),
+            [(
+                InjectionId::Custom,
+                ItemOverride {
+                    enabled: Some(true),
+                    external_pool: None,
+                },
+            )]
+            .into(),
+        );
+        injection.texts.insert(
+            TextKey::Custom,
+            format!(
+                "{ROUTE_POLICY_MATRIX_PROMPT_MARKER} {}",
+                "extra route policy prompt tokens ".repeat(50)
+            ),
+        );
+    }
 
     config
 }
@@ -3613,6 +3633,7 @@ fn local_stream_protocol_contamination_retry_uses_status_policy_and_explicit_ter
         on_idle_timeout: false,
         on_read_error: false,
         on_status_error: true,
+        empty_turn_nudge: None,
     };
     assert!(enabled.allows(StreamRetryReason::ProtocolContamination));
     assert_eq!(
@@ -3622,7 +3643,7 @@ fn local_stream_protocol_contamination_retry_uses_status_policy_and_explicit_ter
 
     let disabled = LocalStreamRetryConfig {
         on_status_error: false,
-        ..enabled
+        ..enabled.clone()
     };
     assert!(!disabled.allows(StreamRetryReason::ProtocolContamination));
     assert_eq!(
@@ -5839,8 +5860,10 @@ async fn run_handler_usage_only_eof_matrix() {
             !bodies[1].contains("additionalModelRequestFields"),
             "usage-only round={round}"
         );
-        let nudge = serde_json::to_string(crate::anthropic::empty_turn_nudge::EMPTY_TURN_NUDGE)
-            .expect("nudge json");
+        let nudge = serde_json::to_string(
+            crate::model::prompt_injection::catalog::DEFAULT_EMPTY_TURN_NUDGE,
+        )
+        .expect("nudge json");
         let nudge = nudge.trim_matches('"');
         assert!(
             !bodies[0].contains(nudge),
@@ -6032,8 +6055,9 @@ fn handler_usage_only_eof_retries_before_empty_success_for_five_rounds() {
 /// nudge; if the retry is still empty it fails with a retryable 502 instead of an empty success.
 /// An EOF without any trusted completion signal also fails with a retryable 502.
 async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
-    let nudge = serde_json::to_string(crate::anthropic::empty_turn_nudge::EMPTY_TURN_NUDGE)
-        .expect("nudge json");
+    let nudge =
+        serde_json::to_string(crate::model::prompt_injection::catalog::DEFAULT_EMPTY_TURN_NUDGE)
+            .expect("nudge json");
     let nudge = nudge.trim_matches('"').to_string();
     for round in 1..=5 {
         let upstream = HandlerEventStreamFaultUpstream::start(
@@ -7232,7 +7256,6 @@ fn runtime_config_for_payload_guard(
 ) -> RequestRuntimeConfig {
     RequestRuntimeConfig {
         extract_thinking: true,
-        thinking_trigger_mode: ThinkingTriggerMode::RealRequest,
         prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
         prompt_cache_target_read_ratio: 0.98,
         prompt_cache_token_scale: 1.0,
@@ -7274,7 +7297,9 @@ fn runtime_config_for_payload_guard(
         kiro_upstream_stream_retry_on_status_error: true,
         image_processing: ImageProcessingConfig::default(),
         body_conversion: BodyConversionConfig::default(),
-        prompt_steering: PromptSteeringConfig::default(),
+        prompt_injection: PromptInjectionConfig::default(),
+        route_features: RouteFeaturesConfig::default(),
+        claude_models_only: false,
         missing_max_tokens: MissingMaxTokensConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
         external_pools: ExternalPoolsConfig::default(),
@@ -8161,42 +8186,37 @@ fn thinking_suffix_preserves_omitted_effort_for_explicit_adaptive() {
 #[test]
 fn thinking_trigger_real_request_preserves_empty_payload() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6");
-    let runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    let trigger_mode = ThinkingTriggerMode::RealRequest;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     assert!(payload.thinking.is_none());
     assert!(payload.output_config.is_none());
-    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    assert!(!should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
-fn disabled_prompt_master_suppresses_automatic_thinking_additions() {
+fn thinking_trigger_off_never_synthesizes_or_forces_thinking() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
     payload.messages[0].content = json!("ultrathink analyze this issue");
-    let mut runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
-    runtime_config.prompt_steering.enabled = false;
-    runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+    let trigger_mode = ThinkingTriggerMode::Off;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     assert!(
         payload.thinking.is_none(),
-        "master-off must not synthesize thinking from model suffix or prompt signal"
+        "trigger off must not synthesize thinking from the prompt signal"
     );
-    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    assert!(!should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
 fn thinking_trigger_real_request_uses_claude_code_ultrathink_signal() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6");
     payload.messages[0].content = json!("ultrathink analyze this issue");
-    let runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    let trigger_mode = ThinkingTriggerMode::RealRequest;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     let thinking = payload
         .thinking
@@ -8205,7 +8225,7 @@ fn thinking_trigger_real_request_uses_claude_code_ultrathink_signal() {
     assert_eq!(thinking.thinking_type, "adaptive");
     assert_eq!(thinking.budget_tokens, 0);
     assert!(payload.output_config.is_none());
-    assert!(should_force_visible_thinking(&payload, &runtime_config));
+    assert!(should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -8218,10 +8238,9 @@ The user included the keyword "ultrathink", requesting deeper reasoning on this 
 
 Return a fix plan."#
     );
-    let runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    let trigger_mode = ThinkingTriggerMode::RealRequest;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     assert_eq!(
         payload
@@ -8231,21 +8250,20 @@ Return a fix plan."#
             .thinking_type,
         "adaptive"
     );
-    assert!(should_force_visible_thinking(&payload, &runtime_config));
+    assert!(should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
 fn thinking_trigger_real_request_does_not_treat_think_hard_as_cli_keyword() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6");
     payload.messages[0].content = json!("think hard about this issue");
-    let runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    let trigger_mode = ThinkingTriggerMode::RealRequest;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     assert!(payload.thinking.is_none());
     assert!(payload.output_config.is_none());
-    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    assert!(!should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -8257,10 +8275,9 @@ fn thinking_trigger_real_request_respects_explicit_disabled_over_cli_signal() {
         budget_tokens: 4096,
         display: None,
     });
-    let runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    let trigger_mode = ThinkingTriggerMode::RealRequest;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     let thinking = payload
         .thinking
@@ -8269,7 +8286,7 @@ fn thinking_trigger_real_request_respects_explicit_disabled_over_cli_signal() {
     assert_eq!(thinking.thinking_type, "disabled");
     assert_eq!(thinking.budget_tokens, 4096);
     assert!(payload.output_config.is_none());
-    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    assert!(!should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -8289,14 +8306,13 @@ fn thinking_trigger_real_request_ignores_old_user_signal_after_new_turn() {
             content: json!("new plain turn"),
         },
     ];
-    let runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    let trigger_mode = ThinkingTriggerMode::RealRequest;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     assert!(payload.thinking.is_none());
     assert!(payload.output_config.is_none());
-    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    assert!(!should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -8325,10 +8341,9 @@ fn thinking_trigger_real_request_keeps_signal_across_tool_result_continuation() 
             }]),
         },
     ];
-    let runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+    let trigger_mode = ThinkingTriggerMode::RealRequest;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     assert_eq!(
         payload
@@ -8338,17 +8353,15 @@ fn thinking_trigger_real_request_keeps_signal_across_tool_result_continuation() 
             .thinking_type,
         "adaptive"
     );
-    assert!(should_force_visible_thinking(&payload, &runtime_config));
+    assert!(should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
 fn thinking_trigger_always_adds_adaptive_without_forging_explicit_effort() {
     let mut payload = messages_request_for_model("claude-sonnet-4-6");
-    let mut runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
-    runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+    let trigger_mode = ThinkingTriggerMode::Always;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     let thinking = payload
         .thinking
@@ -8357,7 +8370,7 @@ fn thinking_trigger_always_adds_adaptive_without_forging_explicit_effort() {
     assert_eq!(thinking.thinking_type, "adaptive");
     assert_eq!(thinking.budget_tokens, 0);
     assert!(payload.output_config.is_none());
-    assert!(should_force_visible_thinking(&payload, &runtime_config));
+    assert!(should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -8393,9 +8406,8 @@ fn synthetic_thinking_activation_never_forges_client_effort_five_rounds() {
 
         let mut triggered = messages_request_for_model("claude-sonnet-4-6");
         triggered.messages[0].content = json!("ultrathink inspect this");
-        let runtime_config =
-            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
-        apply_thinking_trigger_mode(&mut triggered, &runtime_config);
+        let trigger_mode = ThinkingTriggerMode::RealRequest;
+        apply_thinking_trigger_mode(&mut triggered, trigger_mode);
         assert_eq!(
             triggered
                 .thinking
@@ -8431,11 +8443,9 @@ fn thinking_trigger_always_preserves_disabled() {
         budget_tokens: 4096,
         display: None,
     });
-    let mut runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
-    runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+    let trigger_mode = ThinkingTriggerMode::Always;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     let thinking = payload
         .thinking
@@ -8444,7 +8454,7 @@ fn thinking_trigger_always_preserves_disabled() {
     assert_eq!(thinking.thinking_type, "disabled");
     assert_eq!(thinking.budget_tokens, 4096);
     assert!(payload.output_config.is_none());
-    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    assert!(!should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -8459,11 +8469,9 @@ fn thinking_trigger_always_preserves_enabled_and_output_config() {
         effort: Some("low".to_string()),
         format: None,
     });
-    let mut runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
-    runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+    let trigger_mode = ThinkingTriggerMode::Always;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     let thinking = payload
         .thinking
@@ -8480,7 +8488,7 @@ fn thinking_trigger_always_preserves_enabled_and_output_config() {
             .as_deref(),
         Some("low")
     );
-    assert!(should_force_visible_thinking(&payload, &runtime_config));
+    assert!(should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -8491,11 +8499,9 @@ fn thinking_trigger_always_preserves_unknown_type_without_implicit_activation() 
         budget_tokens: 4096,
         display: None,
     });
-    let mut runtime_config =
-        runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
-    runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+    let trigger_mode = ThinkingTriggerMode::Always;
 
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    apply_thinking_trigger_mode(&mut payload, trigger_mode);
 
     let thinking = payload
         .thinking
@@ -8504,7 +8510,7 @@ fn thinking_trigger_always_preserves_unknown_type_without_implicit_activation() 
     assert_eq!(thinking.thinking_type, "mystery");
     assert_eq!(thinking.budget_tokens, 4096);
     assert!(payload.output_config.is_none());
-    assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    assert!(!should_force_visible_thinking(&payload, trigger_mode));
 }
 
 #[test]
@@ -9735,11 +9741,9 @@ fn stream_zero_context_and_metadata_record_request_estimate_consistently() {
             context_usage_percentage: 0.0,
         })),
     );
-    events.extend(
-        stream_context.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage::default()),
-        })),
-    );
+    events.extend(stream_context.process_kiro_event(&Event::Metadata(
+        MetadataEvent::with_token_usage(Some(MetadataTokenUsage::default())),
+    )));
     events.extend(stream_context.generate_final_events());
 
     let downstream_usage = &events
@@ -13506,6 +13510,63 @@ fn known_models_move_to_usable_same_family_catalog_and_unknown_models_stay_for_f
     }
 }
 
+/// F1: a non-stream content-filter refusal is an answer, not an empty usage-only turn, so it
+/// must not be retried with a continue nudge.
+#[test]
+fn non_stream_content_filter_refusal_is_not_usage_only() {
+    let refusal: crate::kiro::model::events::MetadataEvent =
+        serde_json::from_value(serde_json::json!({"stopReason": "CONTENT_FILTERED"}))
+            .expect("metadata");
+    assert!(!non_stream_events_are_usage_only(&[
+        Event::Metadata(refusal),
+        Event::ContextUsage(crate::kiro::model::events::ContextUsageEvent {
+            context_usage_percentage: 100.0,
+        }),
+    ]));
+    assert!(non_stream_events_are_usage_only(&[Event::Metadata(
+        crate::kiro::model::events::MetadataEvent::default()
+    )]));
+}
+
+#[tokio::test]
+async fn upstream_image_size_rejection_maps_to_fixed_400_without_raw_text_for_five_rounds() {
+    for round in 0..5 {
+        let raw = format!(
+            "流式 API 请求失败（账号 #1948 test，请求无效）: upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=144 retry_after_secs=unknown content_type=json reason=image_too_large_bad_request 400 Bad Request {{\"message\":\"messages.{round}.content.1.image.source.base64: image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes\",\"reason\":\"IMAGE_SIZE_EXCEEDED\"}}"
+        );
+        let response = map_provider_error(
+            anyhow::anyhow!(raw),
+            Some("req_image"),
+            Some("err_image"),
+            None,
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "round {round}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            Some("false")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            value["error"]["message"],
+            envelope::public_message_with_error_id(
+                envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+                "err_image"
+            )
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("5298668"));
+        assert!(!text.contains("IMAGE_SIZE_EXCEEDED"));
+    }
+}
+
 #[tokio::test]
 async fn oversized_current_image_response_is_official_400_without_retry() {
     let violation = crate::anthropic::payload_guard::CurrentImageTooLarge {
@@ -15153,7 +15214,7 @@ impl Drop for ModelDrivenUpstream {
 
 fn model_driven_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
     websearch_handler_test_router_with_config(base_url, |config| {
-        config.body_conversion.model_driven_web_search.enabled = true;
+        config.route_features.defaults.model_driven_web_search = true;
         config.kiro_upstream_response_timeout_secs = 10;
         config.stream_keepalive_interval_secs = 1;
     })
@@ -15432,4 +15493,205 @@ fn non_stream_error_after_partial_output_is_still_retryable() {
         non_stream_status_error_event(&length).is_none(),
         "max_tokens is not a failure"
     );
+}
+
+/// 预览和真实请求走同一套注入与转换代码：同一组条件下，预览返回的 system 合成消息、当前轮和
+/// 工具描述，与假上游实际收到的 Kiro 请求逐字节一致。
+#[test]
+fn prompt_injection_preview_matches_the_real_upstream_request() {
+    run_handler_fixture_on_large_stack_thread("prompt-injection-preview-parity", || async {
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let mut config = route_policy_matrix_config(&upstream.base_url);
+        config.prompt_injection = crate::model::config::PromptInjectionConfig::default();
+        let (app, _usage) = multimodal_handler_test_router_from_config(config.clone());
+
+        for (route, tool_choice, with_write_edit, with_system) in [
+            ("/cc", "any", true, true),
+            ("/v1", "tool", true, true),
+            ("/cc", "none", false, true),
+            ("/v1", "auto", true, false),
+        ] {
+            let request: super::injection_preview::PromptInjectionPreviewRequest =
+                serde_json::from_value(json!({
+                    "route": route,
+                    "model": "claude-sonnet-4-20250514",
+                    "toolChoice": tool_choice,
+                    "withWriteEdit": with_write_edit,
+                    "withSystem": with_system,
+                }))
+                .unwrap();
+            let preview = preview_prompt_injection(&config, request.clone())
+                .unwrap_or_else(|error| panic!("{route}/{tool_choice}: {error}"));
+            assert!(
+                preview.error.is_none(),
+                "{route}/{tool_choice}: {:?}",
+                preview.error
+            );
+            assert_eq!(
+                preview.endpoint,
+                super::injection_preview::messages_endpoint(route)
+            );
+
+            let payload = super::injection_preview::preview_payload(&request);
+            let body_index = upstream.hits();
+            let response = app
+                .clone()
+                .oneshot(multimodal_handler_request(
+                    &super::injection_preview::messages_endpoint(route),
+                    serde_json::to_string(&payload).unwrap(),
+                ))
+                .await
+                .expect("message response");
+            let status = response.status();
+            if status != StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                panic!(
+                    "{route}/{tool_choice}: {status} {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            let captured: Value =
+                serde_json::from_str(&upstream.bodies_snapshot()[body_index]).unwrap();
+            let state = &captured["conversationState"];
+            let current = state["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                preview.current_turn.as_deref(),
+                Some(current),
+                "{route}/{tool_choice}: current turn"
+            );
+            let history = state["history"].as_array().cloned().unwrap_or_default();
+            let system_turn = (history.len() >= 2
+                && history[1]["assistantResponseMessage"]["content"]
+                    == "I will follow these instructions.")
+                .then(|| {
+                    history[0]["userInputMessage"]["content"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                });
+            assert_eq!(
+                preview.system_turn, system_turn,
+                "{route}/{tool_choice}: system turn"
+            );
+            let tools: Vec<(String, String)> =
+                state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|tool| {
+                        let spec = &tool["toolSpecification"];
+                        (
+                            spec["name"].as_str().unwrap().to_string(),
+                            spec["description"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect();
+            assert_eq!(preview.tools, tools, "{route}/{tool_choice}: tools");
+        }
+    });
+}
+
+/// 逐项关闭：每次只关一个注入项，真实请求里只有这一项消失，其余文本逐字节不变。
+#[test]
+fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
+    use crate::model::config::InjectionId;
+    use crate::model::prompt_injection::{ItemSetting, TextKey};
+    run_handler_fixture_on_large_stack_thread("prompt-injection-independence", || async {
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let base = {
+            let mut config = route_policy_matrix_config(&upstream.base_url);
+            let injection = &mut config.prompt_injection;
+            *injection = crate::model::config::PromptInjectionConfig::default();
+            injection.path_overrides.clear();
+            for id in InjectionId::ALL {
+                injection.defaults.insert(
+                    id,
+                    ItemSetting {
+                        enabled: true,
+                        external_pool: id.supports_external_pool().then_some(false),
+                    },
+                );
+            }
+            injection
+                .texts
+                .insert(TextKey::Custom, "independence custom text".to_string());
+            config
+        };
+        let request: super::injection_preview::PromptInjectionPreviewRequest =
+            serde_json::from_value(json!({
+                "route": "/v1",
+                "model": "claude-sonnet-4-20250514",
+                "toolChoice": "any",
+            }))
+            .unwrap();
+        let payload =
+            serde_json::to_string(&super::injection_preview::preview_payload(&request)).unwrap();
+        let send = |config: Config| {
+            let upstream = &upstream;
+            let payload = payload.clone();
+            async move {
+                let (app, _usage) = multimodal_handler_test_router_from_config(config);
+                let index = upstream.hits();
+                let response = app
+                    .oneshot(multimodal_handler_request("/v1/messages", payload))
+                    .await
+                    .expect("message response");
+                assert_eq!(response.status(), StatusCode::OK);
+                upstream.bodies_snapshot()[index].clone()
+            }
+        };
+        let all_on = send(base.clone()).await;
+        // 这些项在这个请求里会出现，关掉后它们的文本必须从请求里消失。
+        let markers = [
+            (InjectionId::TaskQuality, "<task_quality_policy>"),
+            (InjectionId::LanguageConstraint, "<language_constraint>"),
+            (InjectionId::Custom, "independence custom text"),
+            (InjectionId::IdentityPrompt, "<assistant_identity"),
+            (InjectionId::IdentityTurnReminder, "<identity_reminder>"),
+            (InjectionId::ChunkedWritePolicy, "always comply silently"),
+            (
+                InjectionId::ChunkedWriteToolSuffix,
+                "IMPORTANT: If the content to write",
+            ),
+            (
+                InjectionId::ToolChoicePrefix,
+                "<tool_choice>any</tool_choice>",
+            ),
+            (
+                InjectionId::ToolChoiceTurnReminder,
+                "<tool_choice_reminder>",
+            ),
+        ];
+        for (_, marker) in markers {
+            assert!(
+                all_on.contains(marker),
+                "all-on request must contain {marker}"
+            );
+        }
+        for (off, off_marker) in markers {
+            let mut config = base.clone();
+            config.prompt_injection.defaults.insert(
+                off,
+                ItemSetting {
+                    enabled: false,
+                    external_pool: off.supports_external_pool().then_some(false),
+                },
+            );
+            let body = send(config).await;
+            assert!(
+                !body.contains(off_marker),
+                "{off:?} off: {off_marker} still injected"
+            );
+            for (other, marker) in markers {
+                if other != off {
+                    assert!(body.contains(marker), "{off:?} off removed {other:?}");
+                }
+            }
+        }
+    });
 }

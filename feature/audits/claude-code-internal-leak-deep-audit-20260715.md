@@ -223,10 +223,7 @@ fake server 未实现合法 `/ListAvailableModels` 响应时，每次 temp proxy
 - master ON：none/named/any 对应工具数 0/1/N。
 - master OFF：none/named/any 全部退化为 N。
 
-总开关不应控制结构化 `tool_choice` 过滤。建议拆为：
-
-- Operator prompt：language/task/custom 及 scope/external/count_tokens policy。
-- Protocol conversion：tool_choice、thinking conversion、chunk policy、schema/name mapping。
+当前结构没有提示词总开关：结构化 `tool_choice` 过滤和响应侧拦截只受 `bodyConversion.toolChoiceSteering` 控制；tool_choice 提示词是独立注入项 `toolChoicePrefix`（B3）和 `toolChoiceTurnReminder`（B4），关闭它们不改变 none/named/any 的工具数。
 
 ### 5.2 Scope 只约束一部分注入
 
@@ -235,7 +232,7 @@ fake server 未实现合法 `/ListAvailableModels` 响应时，每次 temp proxy
 - `/cc`：language/task prompt、tool_choice、synthetic thinking、chunk policy 均存在。
 - `/v1`、`/na`、`/ha`：language/task prompt 消失，但 tool_choice、thinking、chunk 仍存在。
 
-如果这是预期，UI 必须明确 scope 只管 operator prompt；如果 UI 宣称是总 scope，则 converter 必须收到 endpoint/scope 并统一执行。
+当前结构中注入项本身不带路由规则：14 个注入项（含 tool_choice、thinking、分块写入）各自有全局默认开关，由路由在 `promptInjection.pathOverrides` 上显式设置，converter 按请求入口解析同一份设置，路由策略弹窗的"提示词注入"分区逐项显示。
 
 ### 5.3 Count tokens 与 Messages 转换不一致
 
@@ -244,11 +241,7 @@ fake server 未实现合法 `/ListAvailableModels` 响应时，每次 temp proxy
 - master ON：auto/none/named/any 全部固定为 889。
 - master OFF：auto/none/named/any 全部固定为 80。
 
-它只反映 prompt block 是否注入，不反映 tool_choice、synthetic thinking 或 chunk policy 的 Messages 实际变换。不能继续声称 count_tokens 与 Messages 使用完整同一口径。
-
-### 5.4 UI 存在双配置权威
-
-`bodyConversion.*` 与 `promptSteering.*` 是两套独立后端字段，但两个 UI 保存时会用 prompt 子开关覆盖前三个 bodyConversion 字段。经 API 设置的独立值可能被下一次 UI 保存静默改写。
+它只反映 prompt block 是否注入，不反映 tool_choice、synthetic thinking 或 chunk policy 的 Messages 实际变换。当前 count_tokens 按 `promptInjection.applyToCountTokens` 和该路由上的设置只计入写进 system 的注入项（A1/A2/A4/A5），转换层注入项不计入，两者不是完整同一口径。
 
 ## 6. 通过项与正向证据
 
@@ -305,9 +298,9 @@ Claude CLI 2.1.197 在隔离 `--bare` 配置中未暴露内建 WebSearch；显�
 
 ### P1：配置模型
 
-1. master switch 只控制 operator prompt。
-2. tool_choice/thinking/chunk 由 bodyConversion 或新的 compatibility policy 独立控制。
-3. 两个 UI 不再镜像覆盖两套配置。
+1. 不设提示词总开关；14 个注入项各自独立开关，注入项不带路由规则，由路由显式设置。
+2. 结构化 tool_choice 过滤和响应侧拦截由 `bodyConversion.toolChoiceSteering` 控制；`-thinking` 模型名解析、thinking 触发方式等由 `routeFeatures` 按路由控制，不受提示词开关影响。
+3. 提示词注入只在新版控制台的"提示词注入"页和路由策略弹窗编辑，旧版 admin-ui 不编辑这些设置。
 4. count_tokens 要么扩展到同一转换口径，要么删除“完全一致”的 UI 承诺。
 
 ## 8. 修复后发布门禁

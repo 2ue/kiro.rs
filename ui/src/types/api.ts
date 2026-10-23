@@ -1137,6 +1137,8 @@ export interface UsageOverviewMetrics {
   errorRequests: number
   errorRate: number
   inputTokens: number
+  /** 未缓存输入；缓存命中率 = 缓存读 / (未缓存输入 + 缓存读 + 缓存写)，与 sub2api 口径一致 */
+  uncachedInputTokens: number
   outputTokens: number
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
@@ -1152,12 +1154,24 @@ export interface UsageOverviewSeriesMetrics {
   requests: number
   errorRequests: number
   inputTokens: number
+  uncachedInputTokens: number
   outputTokens: number
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
   estimatedCostUsd: number
   originalCostUsd: number
   kiroMeteringUsage: number
+  /** 外部池上游原始成本（只有外部池记录有值） */
+  rawCostUsd: number
+  /** 外部池最终可计费金额 */
+  billableCostUsd: number
+  /** 外部池补偿后成本 - 上游原始成本 */
+  profitUsd: number
+}
+
+export interface UsageOverviewSeriesBreakdown {
+  key: string
+  metrics: UsageOverviewSeriesMetrics
 }
 
 export interface UsageOverviewSeriesPoint {
@@ -1166,6 +1180,23 @@ export interface UsageOverviewSeriesPoint {
   all: UsageOverviewSeriesMetrics
   local: UsageOverviewSeriesMetrics
   external: UsageOverviewSeriesMetrics
+  localRoutes: UsageOverviewSeriesBreakdown[]
+  externalPools: UsageOverviewSeriesBreakdown[]
+  externalReasons: UsageOverviewSeriesBreakdown[]
+}
+
+export interface UsageOverviewSeriesGroup {
+  key: string
+  label: string
+}
+
+export interface UsageOverviewSeriesGroups {
+  /** 按消耗积分降序 */
+  localRoutes: UsageOverviewSeriesGroup[]
+  /** 按上游原始成本降序 */
+  externalPools: UsageOverviewSeriesGroup[]
+  /** 按请求数降序 */
+  externalReasons: UsageOverviewSeriesGroup[]
 }
 
 export interface UsageOverviewPoolRow {
@@ -1237,6 +1268,7 @@ export interface UsageOverviewResponse {
     routes: UsageOverviewRouteRow[]
   }
   series: UsageOverviewSeriesPoint[]
+  seriesGroups: UsageOverviewSeriesGroups
   topModels: UsageOverviewRankRow[]
   topAccounts: UsageOverviewRankRow[]
   topKeys: UsageOverviewRankRow[]
@@ -1270,6 +1302,7 @@ export interface UsageOverviewSeriesResponse {
   timezone: string
   range: UsageOverviewResponse['range']
   series: UsageOverviewSeriesPoint[]
+  seriesGroups: UsageOverviewSeriesGroups
 }
 
 export interface UsageOverviewLocalResponse {
@@ -1689,7 +1722,7 @@ export interface AccountEventSummaryResponse {
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
 export type KiroAgentModeStrategy = 'vibe' | 'spec' | 'auto'
 export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
-export type ThinkingTriggerMode = 'real_request' | 'always'
+export type ThinkingTriggerMode = 'real_request' | 'always' | 'off'
 export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
@@ -1947,92 +1980,163 @@ export interface BodyConversionConfig {
   toolNameMapping: boolean
   toolSchemaKeyMapping: 'sanitize' | 'reject' | 'disabled'
   toolSchemaKeyValidationRegex: string
+  /** Structured tool_choice handling: tool filtering and response-side enforcement only. */
   toolChoiceSteering: boolean
-  chunkedToolPolicy: boolean
-  thinkingPromptControls: boolean
   nativeReasoningFields: boolean
   toolPairingRepair: boolean
   historyPlaceholderTools: boolean
-  modelDrivenWebSearch: ModelDrivenWebSearchConfig
 }
 
-/** Model-driven native WebSearch: off by default, overridable per route prefix. */
-export interface ModelDrivenWebSearchConfig {
+export type InjectionId =
+  | 'taskQuality'
+  | 'languageConstraint'
+  | 'languageTurnReminder'
+  | 'custom'
+  | 'identityPrompt'
+  | 'identityTurnReminder'
+  | 'chunkedWritePolicy'
+  | 'chunkedWriteToolSuffix'
+  | 'thinkingControls'
+  | 'thinkingOutputPolicy'
+  | 'toolChoicePrefix'
+  | 'toolChoiceTurnReminder'
+  | 'webSearchGuidance'
+  | 'emptyTurnNudge'
+
+export type InjectionTextKey =
+  | 'taskQuality'
+  | 'languageConstraint'
+  | 'languageTurnReminder.explicit'
+  | 'languageTurnReminder.followUser'
+  | 'custom'
+  | 'identityPrompt'
+  | 'identityTurnReminder'
+  | 'chunkedWritePolicy'
+  | 'chunkedWriteToolSuffix.write'
+  | 'chunkedWriteToolSuffix.edit'
+  | 'webSearchGuidance'
+  | 'emptyTurnNudge'
+
+export interface InjectionItemSetting {
   enabled: boolean
-  pathOverrides: Record<string, boolean>
+  /** Only present on items that can be injected into external-pool requests. */
+  externalPool?: boolean
 }
 
-export type PromptSteeringScope = 'route_rules' | 'cc_only' | 'claude_code_profile' | 'all_routes'
-export type PromptSteeringRouteMode = 'allow_all' | 'allow_list' | 'deny_list'
-
-export interface PromptSteeringTextBlock {
-  enabled: boolean
-  prompt: string
-}
-
-export interface PromptSteeringToggle {
-  enabled: boolean
-}
-
-export interface ChunkedWritePromptSteeringConfig {
-  enabled: boolean
-  systemPromptEnabled: boolean
-  toolDescriptionEnabled: boolean
-}
-
-export interface PromptSteeringDefaults {
-  languageConstraintPrompt: string
-  taskQualityPrompt: string
-  identityPrompt: string
-  identityTurnReminderPrompt: string
-}
-
-export interface IdentityTurnReminderConfig {
-  enabled: boolean
-  prompt: string
-}
-
-export interface IdentityOutputGuardConfig {
-  enabled: boolean
-  streamEnabled: boolean
-}
-
-export interface IdentityRouteOverride {
+export interface InjectionItemOverride {
   enabled?: boolean
-  promptEnabled?: boolean
-  turnReminderEnabled?: boolean
-  outputGuardEnabled?: boolean
-  outputGuardStreamEnabled?: boolean
-  applyToExternalPool?: boolean
+  externalPool?: boolean
 }
 
-export interface IdentityPromptConfig {
-  enabled: boolean
-  routeMode: PromptSteeringRouteMode
-  routeRules: string[]
-  promptEnabled: boolean
-  prompt: string
-  turnReminder: IdentityTurnReminderConfig
-  outputGuard: IdentityOutputGuardConfig
-  applyToExternalPool: boolean
-  claudeModelsOnly: boolean
-  pathOverrides: Record<string, IdentityRouteOverride>
-}
-
-export interface PromptSteeringConfig {
-  enabled: boolean
-  scope: PromptSteeringScope
-  routeMode: PromptSteeringRouteMode
-  routeRules: string[]
-  applyToExternalPool: boolean
+export interface PromptInjectionConfig {
   applyToCountTokens: boolean
-  languageConstraint: PromptSteeringTextBlock
-  taskQuality: PromptSteeringTextBlock
-  toolChoice: PromptSteeringToggle
-  chunkedWrite: ChunkedWritePromptSteeringConfig
-  thinking: PromptSteeringToggle
-  custom: PromptSteeringTextBlock
-  identity: IdentityPromptConfig
+  defaults: Record<InjectionId, InjectionItemSetting>
+  /** Edited texts only; a missing key uses the built-in text from the catalog. */
+  texts: Partial<Record<InjectionTextKey, string>>
+  pathOverrides: Record<string, Partial<Record<InjectionId, InjectionItemOverride>>>
+}
+
+export interface RouteFeatureSet {
+  thinkingModelName: boolean
+  thinkingTrigger: ThinkingTriggerMode
+  channelLeakGuard: boolean
+  channelLeakGuardStream: boolean
+  modelDrivenWebSearch: boolean
+}
+
+export type RouteFeatureOverride = Partial<RouteFeatureSet>
+
+export interface RouteFeaturesConfig {
+  defaults: RouteFeatureSet
+  pathOverrides: Record<string, RouteFeatureOverride>
+}
+
+export type InjectionCategory = 'operator' | 'protocol' | 'feature' | 'recovery'
+export type InjectionRecommendation = 'keep_on' | 'user_choice'
+
+export interface InjectionTextVariant {
+  key: InjectionTextKey
+  label: string
+  defaultText: string
+}
+
+export interface InjectionCatalogEntry {
+  id: InjectionId
+  code: string
+  name: string
+  category: InjectionCategory
+  position: string
+  trigger: string
+  dependsOn: string | null
+  impactWhenOff: string
+  recommendation: InjectionRecommendation
+  recommendationNote: string
+  defaultEnabled: boolean
+  externalPool: boolean
+  strictBlocks: boolean
+  editable: boolean
+  texts: InjectionTextVariant[]
+  readOnlyVariants: InjectionTextVariant[]
+}
+
+export interface FixedInjection {
+  code: string
+  name: string
+  text: string
+  reason: string
+}
+
+export interface PromptInjectionCatalog {
+  items: InjectionCatalogEntry[]
+  fixed: FixedInjection[]
+  maxTextChars: number
+  maxTotalTextChars: number
+}
+
+export type PreviewToolChoice = 'auto' | 'any' | 'tool' | 'none'
+export type PreviewThinking = 'off' | 'enabled' | 'adaptive'
+
+export interface PromptInjectionPreviewRequest {
+  route: string
+  upstream?: 'local' | 'external_pool'
+  model?: string
+  nativeReasoning?: boolean
+  withSystem?: boolean
+  withWriteEdit?: boolean
+  disableParallelToolUse?: boolean
+  toolChoice?: PreviewToolChoice
+  thinking?: PreviewThinking
+  language?: 'none' | 'declared'
+  emptyTurnRetry?: boolean
+  stream?: boolean
+  /** Unsaved settings used only for this preview. */
+  draft?: { promptInjection?: PromptInjectionConfig; routeFeatures?: RouteFeaturesConfig }
+}
+
+export type PreviewBlockReason = 'off' | 'external_pool_unsupported' | 'external_pool_off' | 'strict'
+
+export interface PromptInjectionPreviewItem {
+  id: InjectionId
+  status: 'applied' | 'not_triggered' | 'blocked'
+  blocked?: PreviewBlockReason
+  source?: string
+}
+
+export interface PromptInjectionPreviewResponse {
+  endpoint: string
+  items: PromptInjectionPreviewItem[]
+  features: {
+    thinkingModelName: boolean
+    thinkingTrigger: ThinkingTriggerMode
+    channelLeakGuard: boolean
+    modelDrivenWebSearch: boolean
+  }
+  externalSystem?: string[]
+  systemTurn?: string
+  currentTurn?: string
+  tools: Array<[string, string]>
+  emptyTurnRetryTurn?: string
+  error?: string
 }
 
 export interface PayloadShapingConfig {
@@ -2366,6 +2470,8 @@ export interface RuntimeConfig {
   requestAdmission: RequestAdmissionConfig
   credentialMaxConcurrentRequests: number
   credentialInfoRefreshConcurrency: number
+  /** 每个 Kiro 积分的真实成本（美元），只用于总览把积分换算成成本；null 表示未配置 */
+  kiroCreditUnitPriceUsd?: number | null
   credentialTransientCooldownSecs: number
   credentialRateLimitCooldownSecs: number
   credentialServerErrorCooldownSecs: number
@@ -2427,9 +2533,9 @@ export interface RuntimeConfig {
   whitespaceCompression: boolean
   imageProcessing: ImageProcessingConfig
   bodyConversion: BodyConversionConfig
-  promptSteering: PromptSteeringConfig
-  /** Built-in prompt texts from the backend, used by "restore default". */
-  promptSteeringDefaults?: PromptSteeringDefaults
+  promptInjection: PromptInjectionConfig
+  routeFeatures: RouteFeaturesConfig
+  claudeModelsOnly: boolean
   missingMaxTokens: MissingMaxTokensConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
@@ -2462,7 +2568,6 @@ export interface RuntimeConfig {
   modelResolutionMode: ModelResolutionMode
   modelMapping: ModelMappingConfig
   extractThinking: boolean
-  thinkingTriggerMode: ThinkingTriggerMode
   exposeProxyWarnings: boolean
   auditLogRetentionEnabled: boolean
   auditLogRetentionDays: number

@@ -29,11 +29,13 @@ use crate::anthropic::usage::{
     UsageExternalPoolRiskThresholds, UsageExternalPoolRiskTotals, UsageExternalPoolRiskWindow,
     UsageOverviewAccountRow, UsageOverviewExternal, UsageOverviewLocal, UsageOverviewMetrics,
     UsageOverviewPoolRow, UsageOverviewRankRow, UsageOverviewResponse, UsageOverviewRouteRow,
+    UsageOverviewSeriesBreakdown, UsageOverviewSeriesGroup, UsageOverviewSeriesGroups,
     UsageOverviewSeriesMetrics, UsageOverviewSeriesPoint, UsageOverviewSpec, UsageOverviewTotals,
     UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
     UsageRecordsResult, UsageRouteKind, UsageRouteSubtype, UsageSeriesPoint, UsageSource,
     UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
     usage_dashboard_timezone, usage_dashboard_window_spec_for_key, usage_dashboard_windows,
+    usage_external_reason_category, usage_external_reason_label,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -103,6 +105,14 @@ struct RequiredPostgresColumn {
 }
 
 const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_totals",
+        column_name: "total_compat_input_tokens",
+    },
+    RequiredPostgresColumn {
+        table_name: "usage_rollup_time_buckets",
+        column_name: "total_compat_input_tokens",
+    },
     RequiredPostgresColumn {
         table_name: "credentials",
         column_name: "revision",
@@ -1142,11 +1152,13 @@ impl PostgresStore {
 
             // Compression is an explicit, potentially large maintenance operation. Keep it out
             // of the bounded default startup transaction while retaining the session lock.
-            if compress_usage_rollups {
+            if compress_usage_rollups
+                && !usage_rollup_hour_compression_v1_applied(&mut conn).await?
+            {
                 run_usage_exclusive_versioned_migration(
                     &mut conn,
-                    "usage-rollup-hour-bucket-compression-v1",
-                    USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL,
+                    "usage-rollup-hour-bucket-compression-v2",
+                    USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V2_SQL,
                 )
                 .await?;
             }
@@ -1247,6 +1259,8 @@ impl PostgresStore {
         let value: serde_json::Value = row.try_get("config")?;
         let mut config: Config = serde_json::from_value(value)?;
         config.set_config_path_for_runtime(None);
+        // 升级过程中旧版本实例可能写回旧的提示词字段；每次加载都转换，热加载也能拿到新结构。
+        config.migrate_legacy_prompt_fields();
         Ok(Some(config))
     }
 
@@ -5334,6 +5348,17 @@ async fn ensure_usage_indexes_if_startup_safe(
     Ok(())
 }
 
+async fn usage_rollup_hour_compression_v1_applied(
+    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+) -> anyhow::Result<bool> {
+    let applied: Option<String> =
+        sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = $1")
+            .bind("usage-rollup-hour-bucket-compression-v1")
+            .fetch_optional(&mut **conn)
+            .await?;
+    Ok(applied.is_some())
+}
+
 async fn run_usage_exclusive_versioned_migration(
     conn: &mut sqlx::pool::PoolConnection<Postgres>,
     version: &str,
@@ -6274,6 +6299,8 @@ impl PostgresUsageStore {
         let dimensions = vec![
             "global".to_string(),
             "external_pool".to_string(),
+            "external_reason".to_string(),
+            "local_route".to_string(),
             "credential".to_string(),
             "model".to_string(),
             "endpoint".to_string(),
@@ -6293,6 +6320,7 @@ impl PostgresUsageStore {
                 success_requests,
                 error_requests,
                 total_input_tokens,
+                total_compat_input_tokens,
                 total_output_tokens,
                 total_cache_read_input_tokens,
                 total_cache_creation_input_tokens,
@@ -6336,6 +6364,7 @@ impl PostgresUsageStore {
                 COUNT(*) FILTER (WHERE status = 'success')::bigint AS success_requests,
                 COUNT(*) FILTER (WHERE status <> 'success')::bigint AS error_requests,
                 COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(compat_input_tokens), 0)::bigint AS total_compat_input_tokens,
                 COALESCE(SUM(output_tokens), 0)::bigint AS total_output_tokens,
                 COALESCE(SUM(cache_read_input_tokens), 0)::bigint
                     AS total_cache_read_input_tokens,
@@ -6380,6 +6409,7 @@ impl PostgresUsageStore {
         let mut all = OverviewAccumulator::default();
         let mut external = OverviewAccumulator::default();
         let mut series = HashMap::<String, OverviewSeriesAccumulator>::new();
+        let mut series_groups = OverviewSeriesGroupsAccumulator::default();
         let mut pools = HashMap::<String, OverviewPoolAccumulator>::new();
         let mut accounts = HashMap::<String, OverviewAccumulator>::new();
         let mut account_labels = HashMap::<String, String>::new();
@@ -6399,15 +6429,28 @@ impl PostgresUsageStore {
             match dimension.as_str() {
                 "global" if dimension_key == "all" => {
                     all.add(metrics);
-                    series.entry(series_key).or_default().all.add(metrics);
+                    series
+                        .entry(series_key)
+                        .or_default()
+                        .all
+                        .add(metrics, OverviewExternalCosts::from_row(&row)?);
                 }
                 "external_pool" => {
                     external.add(metrics);
-                    series
-                        .entry(series_key.clone())
+                    let costs = OverviewExternalCosts::from_row(&row)?;
+                    let bucket = series.entry(series_key.clone()).or_default();
+                    bucket.external.add(metrics, costs);
+                    bucket
+                        .external_pools
+                        .entry(dimension_key.clone())
                         .or_default()
-                        .external
-                        .add(metrics);
+                        .add(metrics, costs);
+                    series_groups.external_pools.add(
+                        &dimension_key,
+                        dimension_label.as_deref(),
+                        costs.raw_cost_usd,
+                        metrics.requests,
+                    );
                     let pool = pools.entry(dimension_key.clone()).or_default();
                     pool.metrics.add(metrics);
                     pool.raw_cost_usd += row.try_get::<f64, _>("external_pool_raw_cost_usd")?;
@@ -6430,6 +6473,37 @@ impl PostgresUsageStore {
                     if let Some(label) = dimension_label.as_deref().filter(|v| !v.is_empty()) {
                         pool.label = Some(label.to_string());
                     }
+                }
+                "local_route" => {
+                    series
+                        .entry(series_key)
+                        .or_default()
+                        .local_routes
+                        .entry(dimension_key.clone())
+                        .or_default()
+                        .add(metrics, OverviewExternalCosts::default());
+                    series_groups.local_routes.add(
+                        &dimension_key,
+                        dimension_label.as_deref(),
+                        metrics.kiro_metering_usage,
+                        metrics.requests,
+                    );
+                }
+                "external_reason" => {
+                    let costs = OverviewExternalCosts::from_row(&row)?;
+                    series
+                        .entry(series_key)
+                        .or_default()
+                        .external_reasons
+                        .entry(dimension_key.clone())
+                        .or_default()
+                        .add(metrics, costs);
+                    series_groups.external_reasons.add(
+                        &dimension_key,
+                        Some(usage_external_reason_label(&dimension_key)),
+                        metrics.requests as f64,
+                        metrics.requests,
+                    );
                 }
                 "credential" => {
                     let account = accounts.entry(dimension_key.clone()).or_default();
@@ -6470,7 +6544,8 @@ impl PostgresUsageStore {
             }
         }
 
-        let series_points = overview_series_points(spec, series);
+        let series_groups = series_groups.finish();
+        let series_points = overview_series_points(spec, series, &series_groups);
         let external_metrics = external.to_metrics();
         let local_metrics = all.subtract(&external);
 
@@ -6637,6 +6712,7 @@ impl PostgresUsageStore {
                 routes: route_rows,
             },
             series: series_points,
+            series_groups,
             top_models,
             top_accounts,
             top_keys,
@@ -7102,6 +7178,72 @@ impl PostgresUsageStore {
     /// rollup tables would erase fresh rollups and make the live service look empty
     /// until enough new writes accumulate. Rebuilding from active details in the
     /// same reset transaction preserves those post-cutoff records.
+    /// Rebuilds the route dimensions (`local_route`, `external_reason`) from the
+    /// active usage records. Offline maintenance only: the caller holds the
+    /// exclusive maintenance fence and the commit guard blocks writers.
+    pub async fn rebuild_usage_route_dimensions(&self) -> anyhow::Result<u64> {
+        let dimensions = USAGE_ROUTE_ROLLUP_DIMENSIONS
+            .iter()
+            .map(|dimension| dimension.to_string())
+            .collect::<Vec<_>>();
+        let mut tx = self.store.pool().begin().await?;
+        acquire_usage_cleanup_commit_guard(&mut tx).await?;
+        for table in ["usage_rollup_time_buckets", "usage_rollup_totals"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE dimension = ANY($1::text[])"
+            ))
+            .bind(&dimensions)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // The uncached-input column was added after launch; recompute it for every
+        // dimension from the same expansion the writer uses, leaving the other
+        // columns untouched. Zeroing first keeps the command idempotent.
+        for table in ["usage_rollup_time_buckets", "usage_rollup_totals"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET total_compat_input_tokens = 0 WHERE total_compat_input_tokens <> 0"
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
+        let mut compat_input = UsageCompatInputBackfill::default();
+        let mut scanned = 0_u64;
+        let mut last_id: Option<String> = None;
+        loop {
+            let rows = sqlx::query(
+                r#"
+                SELECT id, data
+                FROM usage_records
+                WHERE deleted_at IS NULL
+                  AND rollup_active
+                  AND ($1::text IS NULL OR id > $1)
+                ORDER BY id ASC
+                LIMIT 1000
+                "#,
+            )
+            .bind(last_id.as_deref())
+            .fetch_all(&mut *tx)
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut rollups = UsageRollupBatchDelta::default();
+            for row in rows {
+                last_id = Some(row.try_get("id")?);
+                let value: serde_json::Value = row.try_get("data")?;
+                let mut record: UsageRecord = serde_json::from_value(value)?;
+                apply_usage_record_legacy_cost_compatibility(&mut record);
+                rollups.add_record_dimensions(&record, &USAGE_ROUTE_ROLLUP_DIMENSIONS);
+                compat_input.add_record(&record);
+                scanned += 1;
+            }
+            rollups.apply(&mut tx).await?;
+        }
+        compat_input.apply(&mut tx).await?;
+        tx.commit().await?;
+        Ok(scanned)
+    }
+
     pub async fn reset_usage_rollups_from_active_records(&self) -> anyhow::Result<()> {
         let mut tx = self.store.pool().begin().await?;
         configure_usage_cleanup_transaction(&mut tx).await?;
@@ -9822,6 +9964,9 @@ struct UsageRollupMetrics {
     fallback_from_sticky_requests: i64,
     total_input_tokens: i64,
     billable_input_tokens: i64,
+    /// Uncached input as reported downstream (Anthropic `input_tokens`); the
+    /// cache hit-rate denominator is this + cache read + cache creation.
+    total_compat_input_tokens: i64,
     total_output_tokens: i64,
     total_cache_read_input_tokens: i64,
     total_cache_creation_input_tokens: i64,
@@ -9872,6 +10017,7 @@ impl UsageRollupMetrics {
             fallback_from_sticky_requests: signed_bool(record.fallback_from_sticky, sign),
             total_input_tokens: signed_i32(record.total_input_tokens, sign),
             billable_input_tokens: signed_i32(record.billable_input_tokens, sign),
+            total_compat_input_tokens: signed_i32(record.compat_input_tokens, sign),
             total_output_tokens: signed_i32(record.output_tokens, sign),
             total_cache_read_input_tokens: signed_i32(record.cache_read_input_tokens, sign),
             total_cache_creation_input_tokens: signed_i32(record.cache_creation_input_tokens, sign),
@@ -9946,6 +10092,7 @@ impl UsageRollupMetrics {
         self.fallback_from_sticky_requests += other.fallback_from_sticky_requests;
         self.total_input_tokens += other.total_input_tokens;
         self.billable_input_tokens += other.billable_input_tokens;
+        self.total_compat_input_tokens += other.total_compat_input_tokens;
         self.total_output_tokens += other.total_output_tokens;
         self.total_cache_read_input_tokens += other.total_cache_read_input_tokens;
         self.total_cache_creation_input_tokens += other.total_cache_creation_input_tokens;
@@ -10017,7 +10164,124 @@ struct UsageRollupBatchDelta {
     has_negative: bool,
 }
 
+/// Accumulates `compat_input_tokens` per rollup row for the targeted backfill.
+#[derive(Default)]
+struct UsageCompatInputBackfill {
+    totals: HashMap<(&'static str, String), i64>,
+    time_buckets: HashMap<(DateTime<Utc>, &'static str, String), i64>,
+}
+
+impl UsageCompatInputBackfill {
+    fn add_record(&mut self, record: &UsageRecord) {
+        let value = i64::from(record.compat_input_tokens);
+        if value == 0 {
+            return;
+        }
+        let bucket_start = usage_rollup_bucket_start(parse_usage_created_at(record));
+        for dimension in usage_rollup_dimensions(record) {
+            *self
+                .totals
+                .entry((dimension.dimension, dimension.key.clone()))
+                .or_default() += value;
+            if dimension.include_time_bucket {
+                *self
+                    .time_buckets
+                    .entry((bucket_start, dimension.dimension, dimension.key))
+                    .or_default() += value;
+            }
+        }
+    }
+
+    async fn apply(self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
+        const CHUNK: usize = 5_000;
+        let totals = self.totals.into_iter().collect::<Vec<_>>();
+        for chunk in totals.chunks(CHUNK) {
+            let dimensions = chunk
+                .iter()
+                .map(|((d, _), _)| d.to_string())
+                .collect::<Vec<_>>();
+            let keys = chunk
+                .iter()
+                .map(|((_, k), _)| k.clone())
+                .collect::<Vec<_>>();
+            let values = chunk.iter().map(|(_, v)| *v).collect::<Vec<_>>();
+            sqlx::query(
+                r#"
+                UPDATE usage_rollup_totals AS rollup
+                SET total_compat_input_tokens = source.value
+                FROM unnest($1::text[], $2::text[], $3::bigint[])
+                    AS source(dimension, dimension_key, value)
+                WHERE rollup.dimension = source.dimension
+                  AND rollup.dimension_key = source.dimension_key
+                "#,
+            )
+            .bind(&dimensions)
+            .bind(&keys)
+            .bind(&values)
+            .execute(&mut **tx)
+            .await?;
+        }
+        let buckets = self.time_buckets.into_iter().collect::<Vec<_>>();
+        for chunk in buckets.chunks(CHUNK) {
+            let starts = chunk.iter().map(|((b, _, _), _)| *b).collect::<Vec<_>>();
+            let dimensions = chunk
+                .iter()
+                .map(|((_, d, _), _)| d.to_string())
+                .collect::<Vec<_>>();
+            let keys = chunk
+                .iter()
+                .map(|((_, _, k), _)| k.clone())
+                .collect::<Vec<_>>();
+            let values = chunk.iter().map(|(_, v)| *v).collect::<Vec<_>>();
+            sqlx::query(
+                r#"
+                UPDATE usage_rollup_time_buckets AS rollup
+                SET total_compat_input_tokens = source.value
+                FROM unnest($1::timestamptz[], $2::text[], $3::text[], $4::bigint[])
+                    AS source(bucket_start, dimension, dimension_key, value)
+                WHERE rollup.bucket_start = source.bucket_start
+                  AND rollup.dimension = source.dimension
+                  AND rollup.dimension_key = source.dimension_key
+                "#,
+            )
+            .bind(&starts)
+            .bind(&dimensions)
+            .bind(&keys)
+            .bind(&values)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Rollup dimensions describing how a request was routed. They were added
+/// after launch, so history needs an explicit rebuild to fill them.
+const USAGE_ROUTE_ROLLUP_DIMENSIONS: [&str; 2] = ["local_route", "external_reason"];
+
 impl UsageRollupBatchDelta {
+    /// Adds only the named dimensions (totals and hour buckets). Used by the
+    /// targeted backfill so the other rollup tables are left untouched.
+    fn add_record_dimensions(&mut self, record: &UsageRecord, only: &[&str]) {
+        let metrics = UsageRollupMetrics::from_record(record, 1);
+        let bucket_start = usage_rollup_bucket_start(parse_usage_created_at(record));
+        for dimension in usage_rollup_dimensions(record)
+            .into_iter()
+            .filter(|dimension| only.contains(&dimension.dimension))
+        {
+            self.totals
+                .entry((dimension.dimension, dimension.key.clone()))
+                .or_default()
+                .add(dimension.label.clone(), metrics);
+            if dimension.include_time_bucket {
+                self.time_buckets
+                    .entry((bucket_start, dimension.dimension, dimension.key))
+                    .or_default()
+                    .add(dimension.label, metrics);
+            }
+        }
+    }
+
     fn add_record(&mut self, record: &UsageRecord, direction: i64) {
         let direction = if direction < 0 { -1 } else { 1 };
         self.has_negative |= direction < 0;
@@ -10242,6 +10506,17 @@ fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
         });
     }
 
+    if record.route_kind == Some(UsageRouteKind::ExternalPool) {
+        let reason_key =
+            usage_external_reason_category(record.route_subtype, record.fallback_reason.as_deref());
+        dimensions.push(UsageRollupDimension {
+            dimension: "external_reason",
+            key: reason_key.to_string(),
+            label: Some(usage_external_reason_label(reason_key).to_string()),
+            include_time_bucket: true,
+        });
+    }
+
     if let Some(external_pool_id) = record.external_pool_id {
         dimensions.push(UsageRollupDimension {
             dimension: "external_pool",
@@ -10315,14 +10590,15 @@ async fn upsert_usage_rollup_total(
             external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
             external_pool_profit_usd, external_pool_reported_cost_usd,
             external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
-            duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+            duration_ms_sum, duration_ms_count, duration_ms_max, total_compat_input_tokens,
+            updated_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, $39, $40, now()
+            $35, $36, $37, $38, $39, $40, $41, now()
         )
         ON CONFLICT (dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_totals.dimension_label),
@@ -10340,6 +10616,7 @@ async fn upsert_usage_rollup_total(
             fallback_from_sticky_requests = usage_rollup_totals.fallback_from_sticky_requests + EXCLUDED.fallback_from_sticky_requests,
             total_input_tokens = usage_rollup_totals.total_input_tokens + EXCLUDED.total_input_tokens,
             billable_input_tokens = usage_rollup_totals.billable_input_tokens + EXCLUDED.billable_input_tokens,
+            total_compat_input_tokens = usage_rollup_totals.total_compat_input_tokens + EXCLUDED.total_compat_input_tokens,
             total_output_tokens = usage_rollup_totals.total_output_tokens + EXCLUDED.total_output_tokens,
             total_cache_read_input_tokens = usage_rollup_totals.total_cache_read_input_tokens + EXCLUDED.total_cache_read_input_tokens,
             total_cache_creation_input_tokens = usage_rollup_totals.total_cache_creation_input_tokens + EXCLUDED.total_cache_creation_input_tokens,
@@ -10409,6 +10686,7 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.duration_ms_sum)
     .bind(metrics.duration_ms_count)
     .bind(metrics.duration_ms_max)
+    .bind(metrics.total_compat_input_tokens)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -10438,14 +10716,14 @@ async fn upsert_usage_rollup_time_bucket(
             external_pool_uplifted_cost_usd, external_pool_profit_usd, external_pool_reported_cost_usd,
             external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count,
-            duration_ms_max, updated_at
+            duration_ms_max, total_compat_input_tokens, updated_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, $37, $38, $39, $40, $41, now()
+            $35, $36, $37, $38, $39, $40, $41, $42, now()
         )
         ON CONFLICT (bucket_start, dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_time_buckets.dimension_label),
@@ -10463,6 +10741,7 @@ async fn upsert_usage_rollup_time_bucket(
             fallback_from_sticky_requests = usage_rollup_time_buckets.fallback_from_sticky_requests + EXCLUDED.fallback_from_sticky_requests,
             total_input_tokens = usage_rollup_time_buckets.total_input_tokens + EXCLUDED.total_input_tokens,
             billable_input_tokens = usage_rollup_time_buckets.billable_input_tokens + EXCLUDED.billable_input_tokens,
+            total_compat_input_tokens = usage_rollup_time_buckets.total_compat_input_tokens + EXCLUDED.total_compat_input_tokens,
             total_output_tokens = usage_rollup_time_buckets.total_output_tokens + EXCLUDED.total_output_tokens,
             total_cache_read_input_tokens = usage_rollup_time_buckets.total_cache_read_input_tokens + EXCLUDED.total_cache_read_input_tokens,
             total_cache_creation_input_tokens = usage_rollup_time_buckets.total_cache_creation_input_tokens + EXCLUDED.total_cache_creation_input_tokens,
@@ -10533,6 +10812,7 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.duration_ms_sum)
     .bind(metrics.duration_ms_count)
     .bind(metrics.duration_ms_max)
+    .bind(metrics.total_compat_input_tokens)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -11489,6 +11769,7 @@ struct OverviewAccumulator {
     success_requests: i64,
     error_requests: i64,
     input_tokens: i64,
+    uncached_input_tokens: i64,
     output_tokens: i64,
     cache_read_input_tokens: i64,
     cache_creation_input_tokens: i64,
@@ -11509,6 +11790,7 @@ impl OverviewAccumulator {
             success_requests: row.try_get("success_requests")?,
             error_requests: row.try_get("error_requests")?,
             input_tokens: row.try_get("total_input_tokens")?,
+            uncached_input_tokens: row.try_get("total_compat_input_tokens")?,
             output_tokens: row.try_get("total_output_tokens")?,
             cache_read_input_tokens: row.try_get("total_cache_read_input_tokens")?,
             cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
@@ -11529,6 +11811,7 @@ impl OverviewAccumulator {
         self.success_requests += other.success_requests;
         self.error_requests += other.error_requests;
         self.input_tokens += other.input_tokens;
+        self.uncached_input_tokens += other.uncached_input_tokens;
         self.output_tokens += other.output_tokens;
         self.cache_read_input_tokens += other.cache_read_input_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
@@ -11560,6 +11843,11 @@ impl OverviewAccumulator {
                 self.input_tokens,
                 other.input_tokens,
                 "input_tokens",
+            ),
+            uncached_input_tokens: overview_subtract_i64(
+                self.uncached_input_tokens,
+                other.uncached_input_tokens,
+                "uncached_input_tokens",
             ),
             output_tokens: overview_subtract_i64(
                 self.output_tokens,
@@ -11624,6 +11912,7 @@ impl OverviewAccumulator {
             error_requests,
             error_rate: usage_ratio(error_requests, requests),
             input_tokens: self.input_tokens.max(0),
+            uncached_input_tokens: self.uncached_input_tokens.max(0),
             output_tokens: self.output_tokens.max(0),
             cache_read_input_tokens: self.cache_read_input_tokens.max(0),
             cache_creation_input_tokens: self.cache_creation_input_tokens.max(0),
@@ -11646,20 +11935,140 @@ impl OverviewAccumulator {
             requests: metrics.requests,
             error_requests: metrics.error_requests,
             input_tokens: metrics.input_tokens,
+            uncached_input_tokens: metrics.uncached_input_tokens,
             output_tokens: metrics.output_tokens,
             cache_read_input_tokens: metrics.cache_read_input_tokens,
             cache_creation_input_tokens: metrics.cache_creation_input_tokens,
             estimated_cost_usd: metrics.estimated_cost_usd,
             original_cost_usd: metrics.original_cost_usd,
             kiro_metering_usage: metrics.kiro_metering_usage,
+            raw_cost_usd: 0.0,
+            billable_cost_usd: 0.0,
+            profit_usd: 0.0,
         }
     }
 }
 
+/// External-pool cost columns carried by every rollup row. Only external-pool
+/// records contribute non-zero values, so local-route cells stay at zero.
 #[derive(Debug, Clone, Copy, Default)]
+struct OverviewExternalCosts {
+    raw_cost_usd: f64,
+    billable_cost_usd: f64,
+    profit_usd: f64,
+}
+
+impl OverviewExternalCosts {
+    fn from_row(row: &PgRow) -> anyhow::Result<Self> {
+        Ok(Self {
+            raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
+            billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
+            profit_usd: row.try_get("external_pool_profit_usd")?,
+        })
+    }
+
+    fn add(&mut self, other: Self) {
+        self.raw_cost_usd += other.raw_cost_usd;
+        self.billable_cost_usd += other.billable_cost_usd;
+        self.profit_usd += other.profit_usd;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct OverviewSeriesCell {
+    metrics: OverviewAccumulator,
+    costs: OverviewExternalCosts,
+}
+
+impl OverviewSeriesCell {
+    fn add(&mut self, metrics: OverviewAccumulator, costs: OverviewExternalCosts) {
+        self.metrics.add(metrics);
+        self.costs.add(costs);
+    }
+
+    fn to_series_metrics(self) -> UsageOverviewSeriesMetrics {
+        UsageOverviewSeriesMetrics {
+            raw_cost_usd: self.costs.raw_cost_usd.max(0.0),
+            billable_cost_usd: self.costs.billable_cost_usd.max(0.0),
+            profit_usd: self.costs.profit_usd,
+            ..self.metrics.to_series_metrics()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct OverviewSeriesAccumulator {
-    all: OverviewAccumulator,
-    external: OverviewAccumulator,
+    all: OverviewSeriesCell,
+    external: OverviewSeriesCell,
+    local_routes: HashMap<String, OverviewSeriesCell>,
+    external_pools: HashMap<String, OverviewSeriesCell>,
+    external_reasons: HashMap<String, OverviewSeriesCell>,
+}
+
+#[derive(Debug, Default)]
+struct OverviewSeriesGroupMember {
+    label: Option<String>,
+    weight: f64,
+    requests: i64,
+}
+
+/// Collects the members of one breakdown across the whole range so every
+/// bucket can be emitted in the same order and labels are sent once.
+#[derive(Debug, Default)]
+struct OverviewSeriesGroupAccumulator {
+    members: HashMap<String, OverviewSeriesGroupMember>,
+}
+
+impl OverviewSeriesGroupAccumulator {
+    fn add(&mut self, key: &str, label: Option<&str>, weight: f64, requests: i64) {
+        let member = self.members.entry(key.to_string()).or_default();
+        if let Some(label) = label.map(str::trim).filter(|value| !value.is_empty()) {
+            member.label = Some(label.to_string());
+        }
+        member.weight += weight;
+        member.requests += requests;
+    }
+
+    fn finish(self, default_label: impl Fn(&str) -> String) -> Vec<UsageOverviewSeriesGroup> {
+        let mut members = self
+            .members
+            .into_iter()
+            .filter(|(_, member)| member.requests > 0)
+            .collect::<Vec<_>>();
+        members.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .weight
+                .total_cmp(&left.weight)
+                .then_with(|| right.requests.cmp(&left.requests))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        members
+            .into_iter()
+            .map(|(key, member)| UsageOverviewSeriesGroup {
+                label: member.label.unwrap_or_else(|| default_label(&key)),
+                key,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct OverviewSeriesGroupsAccumulator {
+    local_routes: OverviewSeriesGroupAccumulator,
+    external_pools: OverviewSeriesGroupAccumulator,
+    external_reasons: OverviewSeriesGroupAccumulator,
+}
+
+impl OverviewSeriesGroupsAccumulator {
+    fn finish(self) -> UsageOverviewSeriesGroups {
+        UsageOverviewSeriesGroups {
+            local_routes: self.local_routes.finish(usage_local_route_label),
+            external_pools: self.external_pools.finish(|key| format!("#{key}")),
+            external_reasons: self
+                .external_reasons
+                .finish(|key| usage_external_reason_label(key).to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -11776,20 +12185,52 @@ fn overview_series_slots(spec: &UsageOverviewSpec) -> Vec<(String, DateTime<Utc>
     slots
 }
 
+fn overview_series_breakdown(
+    order: &[UsageOverviewSeriesGroup],
+    cells: &HashMap<String, OverviewSeriesCell>,
+) -> Vec<UsageOverviewSeriesBreakdown> {
+    // Absent members are omitted; the client treats a missing key as zero.
+    order
+        .iter()
+        .filter_map(|group| {
+            cells
+                .get(&group.key)
+                .map(|cell| UsageOverviewSeriesBreakdown {
+                    key: group.key.clone(),
+                    metrics: cell.to_series_metrics(),
+                })
+        })
+        .collect()
+}
+
 fn overview_series_points(
     spec: &UsageOverviewSpec,
-    series: HashMap<String, OverviewSeriesAccumulator>,
+    mut series: HashMap<String, OverviewSeriesAccumulator>,
+    groups: &UsageOverviewSeriesGroups,
 ) -> Vec<UsageOverviewSeriesPoint> {
     overview_series_slots(spec)
         .into_iter()
         .map(|(key, bucket_start, label)| {
-            let values = series.get(&key).copied().unwrap_or_default();
+            let values = series.remove(&key).unwrap_or_default();
+            let local = OverviewSeriesCell {
+                metrics: values.all.metrics.subtract(&values.external.metrics),
+                costs: OverviewExternalCosts::default(),
+            };
             UsageOverviewSeriesPoint {
                 bucket_start: bucket_start.to_rfc3339(),
                 label,
                 all: values.all.to_series_metrics(),
-                local: values.all.subtract(&values.external).to_series_metrics(),
+                local: local.to_series_metrics(),
                 external: values.external.to_series_metrics(),
+                local_routes: overview_series_breakdown(&groups.local_routes, &values.local_routes),
+                external_pools: overview_series_breakdown(
+                    &groups.external_pools,
+                    &values.external_pools,
+                ),
+                external_reasons: overview_series_breakdown(
+                    &groups.external_reasons,
+                    &values.external_reasons,
+                ),
             }
         })
         .collect()
@@ -13366,6 +13807,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
     total_input_tokens BIGINT NOT NULL DEFAULT 0,
     billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_output_tokens BIGINT NOT NULL DEFAULT 0,
     total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -13409,6 +13851,7 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_output_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -13453,6 +13896,7 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
     total_input_tokens BIGINT NOT NULL DEFAULT 0,
     billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_output_tokens BIGINT NOT NULL DEFAULT 0,
     total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
     total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -13496,6 +13940,7 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_compat_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_output_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -13826,6 +14271,9 @@ ALTER TABLE usage_cleanup_jobs
     CHECK (max_rows IS NULL OR max_rows >= 0);
 "#;
 
+/// Frozen: databases that already ran v1 hold this checksum. Kept only so the
+/// v2 test can prove the two differ solely by `total_compat_input_tokens`.
+#[cfg(test)]
 const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL: &str = r#"
 CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
 SELECT
@@ -13899,6 +14347,132 @@ SELECT
     priced_requests, unpriced_requests, local_prompt_cache_requests,
     simulated_requests, upstream_metadata_requests, sticky_bound_requests,
     fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
+    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
+    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
+    external_pool_profit_usd, external_pool_reported_cost_usd,
+    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+FROM usage_rollup_time_buckets_hourly;
+
+CREATE TEMP TABLE usage_cache_read_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    cache_read_input_tokens,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_cache_read_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), cache_read_input_tokens;
+
+TRUNCATE TABLE usage_cache_read_rollup_time_buckets;
+
+INSERT INTO usage_cache_read_rollup_time_buckets (
+    bucket_start, cache_read_input_tokens, requests, updated_at
+)
+SELECT bucket_start, cache_read_input_tokens, requests, updated_at
+FROM usage_cache_read_rollup_time_buckets_hourly;
+
+CREATE TEMP TABLE usage_duration_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    duration_ms,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_duration_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), duration_ms;
+
+TRUNCATE TABLE usage_duration_rollup_time_buckets;
+
+INSERT INTO usage_duration_rollup_time_buckets (
+    bucket_start, duration_ms, requests, updated_at
+)
+SELECT bucket_start, duration_ms, requests, updated_at
+FROM usage_duration_rollup_time_buckets_hourly;
+"#;
+
+/// v1 (above) predates `total_compat_input_tokens`; its checksum is frozen in
+/// databases that already ran it, so the column-aware copy lives in v2. A
+/// database runs at most one of them: v2 is skipped once v1 has compressed.
+const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V2_SQL: &str = r#"
+CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    dimension,
+    dimension_key,
+    NULLIF(MAX(NULLIF(dimension_label, '')), '') AS dimension_label,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(SUM(success_requests), 0)::bigint AS success_requests,
+    COALESCE(SUM(error_requests), 0)::bigint AS error_requests,
+    COALESCE(SUM(stream_requests), 0)::bigint AS stream_requests,
+    COALESCE(SUM(non_stream_requests), 0)::bigint AS non_stream_requests,
+    COALESCE(SUM(priced_requests), 0)::bigint AS priced_requests,
+    COALESCE(SUM(unpriced_requests), 0)::bigint AS unpriced_requests,
+    COALESCE(SUM(local_prompt_cache_requests), 0)::bigint AS local_prompt_cache_requests,
+    COALESCE(SUM(simulated_requests), 0)::bigint AS simulated_requests,
+    COALESCE(SUM(upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
+    COALESCE(SUM(sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
+    COALESCE(SUM(fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
+    COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
+    COALESCE(SUM(billable_input_tokens), 0)::bigint AS billable_input_tokens,
+    COALESCE(SUM(total_compat_input_tokens), 0)::bigint AS total_compat_input_tokens,
+    COALESCE(SUM(total_output_tokens), 0)::bigint AS total_output_tokens,
+    COALESCE(SUM(total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+    COALESCE(SUM(total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+    COALESCE(SUM(local_prompt_cache_input_tokens), 0)::bigint AS local_prompt_cache_input_tokens,
+    COALESCE(SUM(local_prompt_cache_read_input_tokens), 0)::bigint AS local_prompt_cache_read_input_tokens,
+    COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
+    COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+    COALESCE(SUM(total_original_cost_usd), 0)::double precision AS total_original_cost_usd,
+    COALESCE(SUM(total_kiro_metering_usage), 0)::double precision AS total_kiro_metering_usage,
+    COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
+    COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
+    COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
+    COALESCE(SUM(external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
+    COALESCE(SUM(external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
+    COALESCE(SUM(external_pool_shaped_cost_usd), 0)::double precision AS external_pool_shaped_cost_usd,
+    COALESCE(SUM(external_pool_uplifted_cost_usd), 0)::double precision AS external_pool_uplifted_cost_usd,
+    COALESCE(SUM(external_pool_profit_usd), 0)::double precision AS external_pool_profit_usd,
+    COALESCE(SUM(external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
+    COALESCE(SUM(external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
+    COALESCE(SUM(external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd,
+    COALESCE(SUM(duration_ms_sum), 0)::bigint AS duration_ms_sum,
+    COALESCE(SUM(duration_ms_count), 0)::bigint AS duration_ms_count,
+    COALESCE(MAX(duration_ms_max), 0)::bigint AS duration_ms_max,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), dimension, dimension_key;
+
+TRUNCATE TABLE usage_rollup_time_buckets;
+
+INSERT INTO usage_rollup_time_buckets (
+    bucket_start, dimension, dimension_key, dimension_label, requests,
+    success_requests, error_requests, stream_requests, non_stream_requests,
+    priced_requests, unpriced_requests, local_prompt_cache_requests,
+    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
+    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    total_compat_input_tokens,
+    total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, total_original_cost_usd, total_kiro_metering_usage,
+    external_pool_requests, external_pool_priced_requests, external_pool_unpriced_requests,
+    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
+    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
+    external_pool_profit_usd, external_pool_reported_cost_usd,
+    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+)
+SELECT
+    bucket_start, dimension, dimension_key, dimension_label, requests,
+    success_requests, error_requests, stream_requests, non_stream_requests,
+    priced_requests, unpriced_requests, local_prompt_cache_requests,
+    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
+    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    total_compat_input_tokens,
     total_output_tokens, total_cache_read_input_tokens,
     total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
@@ -14560,6 +15134,127 @@ mod tests {
             public_error_message: None,
             payload_breakdown: None,
             payload_guard_report: None,
+        }
+    }
+
+    #[test]
+    fn usage_rollup_metrics_track_uncached_input_in_both_directions() {
+        let mut record = usage_record("compat-input", 300);
+        record.compat_input_tokens = 120;
+        let added = UsageRollupMetrics::from_record(&record, 1);
+        let removed = UsageRollupMetrics::from_record(&record, -1);
+        assert_eq!(added.total_compat_input_tokens, 120);
+        assert_eq!(removed.total_compat_input_tokens, -120);
+        let mut net = added;
+        net.add(removed);
+        assert_eq!(net.total_compat_input_tokens, 0);
+        assert_eq!(net.total_cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn usage_rollup_hour_compression_v2_only_adds_the_compat_input_column() {
+        let v1 = USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL;
+        let v2 = USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_V2_SQL;
+        assert!(!v1.contains("total_compat_input_tokens"));
+        assert_eq!(
+            v2.matches("total_compat_input_tokens").count(),
+            4,
+            "v2 must sum the column and carry it through the temp-table insert"
+        );
+        let stripped = v2
+            .replace(
+                "    COALESCE(SUM(total_compat_input_tokens), 0)::bigint AS total_compat_input_tokens,\n",
+                "",
+            )
+            .replace("    total_compat_input_tokens,\n", "");
+        assert_eq!(
+            stripped, v1,
+            "v2 must not drift from v1 beyond the new column"
+        );
+    }
+
+    #[test]
+    fn usage_rollup_dimensions_tag_external_records_with_reason_category() {
+        let mut external = usage_record("external-reason", 0);
+        external.route_kind = Some(UsageRouteKind::ExternalPool);
+        external.route_subtype = Some(UsageRouteSubtype::ExternalFallbackPreflight);
+        external.fallback_reason = Some("local_capacity_full".to_string());
+        let reason = usage_rollup_dimensions(&external)
+            .into_iter()
+            .find(|dimension| dimension.dimension == "external_reason")
+            .expect("external reason rollup dimension");
+        assert_eq!(reason.key, "local_capacity");
+        assert_eq!(reason.label.as_deref(), Some("本地容量不足"));
+        assert!(reason.include_time_bucket);
+
+        external.route_kind = Some(UsageRouteKind::LocalCredential);
+        assert!(
+            usage_rollup_dimensions(&external)
+                .into_iter()
+                .all(|dimension| dimension.dimension != "external_reason"),
+            "local records must not be tagged with an external reason"
+        );
+    }
+
+    #[test]
+    fn usage_external_reason_category_groups_by_owner() {
+        use UsageRouteSubtype::*;
+        let cases = [
+            (
+                Some(ExternalDirectPolicy),
+                Some("model_rule:x"),
+                "policy_direct",
+            ),
+            (
+                Some(ExternalRoutePolicy),
+                Some("local_route_blocked"),
+                "policy_direct",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("local_capacity_full"),
+                "local_capacity",
+            ),
+            (
+                Some(ExternalFallbackAfterLocalAttempts),
+                Some("local_attempt_reserved_for_fallback"),
+                "local_capacity",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("local_all_cooling_down"),
+                "local_unavailable",
+            ),
+            (
+                Some(ExternalFallbackAfterLocalAttempts),
+                Some("no_available_credentials"),
+                "local_unavailable",
+            ),
+            (
+                Some(ExternalFallbackAfterLocalAttempts),
+                Some("unsupported_model"),
+                "model_unsupported",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("local_scheduler_redis_degraded"),
+                "system_degraded",
+            ),
+            (
+                Some(ExternalFallbackPreflight),
+                Some("something_new"),
+                "other",
+            ),
+            (Some(ExternalFallbackPreflight), None, "other"),
+            (Some(ExternalError), Some("local_capacity_full"), "other"),
+            (None, Some("local_capacity_full"), "other"),
+        ];
+        for (subtype, reason, expected) in cases {
+            assert_eq!(
+                usage_external_reason_category(subtype, reason),
+                expected,
+                "{subtype:?} / {reason:?}"
+            );
         }
     }
 
@@ -16907,6 +17602,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_overview_series_breaks_down_routes_pools_and_reasons_and_backfills() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(store.clone());
+        let base = fixed_utc("2026-07-15T10:00:00Z");
+
+        let mut local_ok = usage_record("series-local-ok", 0);
+        local_ok.created_at = (base + chrono::Duration::minutes(5)).to_rfc3339();
+        local_ok.route_kind = Some(UsageRouteKind::LocalCredential);
+        local_ok.route_subtype = Some(UsageRouteSubtype::LocalSuccess);
+        local_ok.kiro_metering_usage = 3.0;
+        local_ok.estimated_cost_usd = 0.30;
+        local_ok.compat_input_tokens = 200;
+        local_ok.cache_read_input_tokens = 600;
+        local_ok.cache_creation_input_tokens = 200;
+
+        let mut local_rescue = usage_record("series-local-rescue", 0);
+        local_rescue.created_at = (base + chrono::Duration::minutes(40)).to_rfc3339();
+        local_rescue.route_kind = Some(UsageRouteKind::LocalCredential);
+        local_rescue.route_subtype = Some(UsageRouteSubtype::LocalRescueAfterExternal);
+        local_rescue.kiro_metering_usage = 1.5;
+        local_rescue.compat_input_tokens = 900;
+        local_rescue.cache_read_input_tokens = 0;
+        local_rescue.cache_creation_input_tokens = 100;
+
+        let mut external_capacity = external_usage_record("series-ext-capacity", 0.40, 0.30, 0.50);
+        external_capacity.created_at = (base + chrono::Duration::minutes(10)).to_rfc3339();
+        external_capacity.route_subtype = Some(UsageRouteSubtype::ExternalFallbackPreflight);
+        external_capacity.fallback_reason = Some("local_capacity_full".to_string());
+
+        let mut external_direct = external_usage_record("series-ext-direct", 0.20, 0.10, 0.25);
+        external_direct.created_at =
+            (base + chrono::Duration::hours(1) + chrono::Duration::minutes(10)).to_rfc3339();
+        external_direct.route_subtype = Some(UsageRouteSubtype::ExternalDirectPolicy);
+        external_direct.fallback_reason = None;
+        external_direct.external_pool_id = Some(7);
+        external_direct.external_pool_name = Some("direct-b".to_string());
+
+        usage_store
+            .record_batch(vec![
+                local_ok,
+                local_rescue,
+                external_capacity,
+                external_direct,
+            ])
+            .await
+            .unwrap();
+
+        let spec = crate::anthropic::usage::resolve_usage_overview_spec(
+            base + chrono::Duration::hours(3),
+            Some("UTC"),
+            None,
+            Some(&base.to_rfc3339()),
+            Some(&(base + chrono::Duration::hours(2)).to_rfc3339()),
+            Some("hour"),
+            None,
+        )
+        .unwrap();
+
+        let assert_overview = |overview: &UsageOverviewResponse| {
+            assert_eq!(overview.series.len(), 2);
+            let groups = &overview.series_groups;
+            assert_eq!(
+                groups
+                    .local_routes
+                    .iter()
+                    .map(|g| g.key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["local_success", "local_rescue_after_external"],
+                "local routes are ordered by consumed credits"
+            );
+            assert_eq!(
+                groups
+                    .external_pools
+                    .iter()
+                    .map(|g| (g.key.as_str(), g.label.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("42", "backup-a"), ("7", "direct-b")],
+                "external pools are ordered by upstream raw cost"
+            );
+            let mut reasons = groups
+                .external_reasons
+                .iter()
+                .map(|g| (g.key.as_str(), g.label.as_str()))
+                .collect::<Vec<_>>();
+            reasons.sort();
+            assert_eq!(
+                reasons,
+                vec![
+                    ("local_capacity", "本地容量不足"),
+                    ("policy_direct", "策略直连")
+                ]
+            );
+
+            let first = &overview.series[0];
+            assert_eq!(first.local_routes.len(), 2);
+            assert!((first.local.kiro_metering_usage - 4.5).abs() < 1e-9);
+            assert!((first.external.raw_cost_usd - 0.40).abs() < 1e-9);
+            assert!((first.external.billable_cost_usd - 0.50).abs() < 1e-9);
+            assert!((first.external.profit_usd - 0.10).abs() < 1e-9);
+            assert_eq!(
+                first.local.raw_cost_usd, 0.0,
+                "local split never carries external cost"
+            );
+            assert_eq!(first.external_pools.len(), 1);
+            assert_eq!(first.external_pools[0].key, "42");
+            assert_eq!(first.external_reasons.len(), 1);
+            assert_eq!(first.external_reasons[0].key, "local_capacity");
+
+            let second = &overview.series[1];
+            assert!(second.local_routes.is_empty());
+            assert_eq!(second.external_pools[0].key, "7");
+            assert!((second.external_pools[0].metrics.raw_cost_usd - 0.20).abs() < 1e-9);
+            assert_eq!(second.external_reasons[0].key, "policy_direct");
+            assert_eq!(second.external_reasons[0].metrics.requests, 1);
+
+            // sub2api 口径的分母：未缓存输入 + 缓存读 + 缓存写，各维度独立求和。
+            let route = |key: &str| {
+                first
+                    .local_routes
+                    .iter()
+                    .find(|row| row.key == key)
+                    .map(|row| row.metrics.clone())
+                    .expect("local route bucket")
+            };
+            let ok = route("local_success");
+            assert_eq!(
+                (
+                    ok.uncached_input_tokens,
+                    ok.cache_read_input_tokens,
+                    ok.cache_creation_input_tokens
+                ),
+                (200, 600, 200)
+            );
+            let rescue = route("local_rescue_after_external");
+            assert_eq!(rescue.uncached_input_tokens, 900);
+            assert_eq!(first.local.uncached_input_tokens, 1_100);
+            assert_eq!(overview.totals.local.uncached_input_tokens, 1_100);
+            assert_eq!(
+                overview.totals.external.uncached_input_tokens,
+                250 * 2,
+                "both external fixtures report 250 uncached input tokens"
+            );
+            assert_eq!(
+                overview.totals.all.uncached_input_tokens,
+                overview.totals.local.uncached_input_tokens
+                    + overview.totals.external.uncached_input_tokens
+            );
+        };
+
+        let overview = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert_overview(&overview);
+
+        // Simulate history recorded before the route dimensions existed.
+        sqlx::query(
+            "DELETE FROM usage_rollup_time_buckets WHERE dimension IN ('local_route', 'external_reason')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "DELETE FROM usage_rollup_totals WHERE dimension IN ('local_route', 'external_reason')",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let wiped = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert!(wiped.series_groups.local_routes.is_empty());
+        assert!(wiped.series_groups.external_reasons.is_empty());
+
+        let global_before: i64 = sqlx::query_scalar(
+            "SELECT requests FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let scanned = usage_store.rebuild_usage_route_dimensions().await.unwrap();
+        assert_eq!(scanned, 4);
+        // Running twice must not double count.
+        usage_store.rebuild_usage_route_dimensions().await.unwrap();
+        let global_after: i64 = sqlx::query_scalar(
+            "SELECT requests FROM usage_rollup_totals WHERE dimension = 'global' AND dimension_key = 'all'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            global_before, global_after,
+            "backfill leaves other dimensions untouched"
+        );
+
+        let rebuilt = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert_overview(&rebuilt);
+
+        // History written before `total_compat_input_tokens` existed reads as 0;
+        // the backfill must restore it for every dimension, idempotently.
+        for table in ["usage_rollup_time_buckets", "usage_rollup_totals"] {
+            sqlx::query(&format!("UPDATE {table} SET total_compat_input_tokens = 0"))
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        let zeroed = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert_eq!(zeroed.totals.all.uncached_input_tokens, 0);
+        usage_store.rebuild_usage_route_dimensions().await.unwrap();
+        usage_store.rebuild_usage_route_dimensions().await.unwrap();
+        let restored = usage_store.dashboard_overview(&spec).await.unwrap();
+        assert_overview(&restored);
+        let credential_compat: i64 = sqlx::query_scalar(
+            "SELECT SUM(total_compat_input_tokens)::bigint FROM usage_rollup_totals WHERE dimension = 'credential'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            credential_compat, 1_100,
+            "non-route dimensions are rebuilt too"
+        );
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_dashboard_uses_exact_utc_boundary_population_for_every_window_metric() {
         let Some(config) = test_config() else {
             eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
@@ -17280,7 +18202,7 @@ mod tests {
         let store = Arc::new(PostgresStore::connect_test(&config).await.unwrap());
         clean(&store).await;
         sqlx::query(
-            "DELETE FROM schema_migrations WHERE version = 'usage-rollup-hour-bucket-compression-v1'",
+            "DELETE FROM schema_migrations WHERE version LIKE 'usage-rollup-hour-bucket-compression-%'",
         )
         .execute(store.pool())
         .await
@@ -17296,15 +18218,17 @@ mod tests {
                 r#"
                 INSERT INTO usage_rollup_time_buckets (
                     bucket_start, dimension, dimension_key, requests,
-                    duration_ms_sum, duration_ms_count, duration_ms_max
+                    duration_ms_sum, duration_ms_count, duration_ms_max,
+                    total_compat_input_tokens
                 )
-                VALUES ($1, 'global', 'all', $2, $3, $2, $4)
+                VALUES ($1, 'global', 'all', $2, $3, $2, $4, $5)
                 "#,
             )
             .bind(bucket_start)
             .bind(requests)
             .bind(requests * 100)
             .bind(requests * 100)
+            .bind(requests * 10)
             .execute(store.pool())
             .await
             .unwrap();
@@ -17350,7 +18274,7 @@ mod tests {
         assert_eq!(default_rows, 2);
         let default_applied: Option<String> =
             sqlx::query_scalar("SELECT checksum FROM schema_migrations WHERE version = $1")
-                .bind("usage-rollup-hour-bucket-compression-v1")
+                .bind("usage-rollup-hour-bucket-compression-v2")
                 .fetch_optional(store.pool())
                 .await
                 .unwrap();
@@ -17407,6 +18331,16 @@ mod tests {
         assert_eq!(requests, 3);
         assert_eq!(duration_ms_sum, 300);
         assert_eq!(duration_ms_max, 200);
+        let compat_input: i64 = sqlx::query_scalar(
+            "SELECT SUM(total_compat_input_tokens)::bigint FROM usage_rollup_time_buckets",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            compat_input, 30,
+            "v2 compression keeps the uncached-input column"
+        );
 
         let cache_requests: i64 = sqlx::query_scalar(
             "SELECT SUM(requests)::bigint FROM usage_cache_read_rollup_time_buckets",
@@ -17435,6 +18369,32 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(duration_rows, 1);
+
+        // A database that already compressed under v1 must not run v2 again.
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 'usage-rollup-hour-bucket-compression-v2'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES ('usage-rollup-hour-bucket-compression-v1', 'frozen', now())",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        store
+            .compress_usage_rollups_to_hour_buckets()
+            .await
+            .unwrap();
+        let v2_after_v1: Option<String> =
+            sqlx::query_scalar("SELECT version FROM schema_migrations WHERE version = $1")
+                .bind("usage-rollup-hour-bucket-compression-v2")
+                .fetch_optional(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            v2_after_v1.is_none(),
+            "v2 is skipped once v1 has compressed"
+        );
 
         store.drop_test_schema().await.unwrap();
     }

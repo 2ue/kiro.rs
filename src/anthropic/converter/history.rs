@@ -8,14 +8,16 @@ use crate::kiro::model::requests::conversation::{
     UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::ToolUseEntry;
-use crate::model::config::CompatProfile;
+use crate::model::config::{CompatProfile, InjectionId};
+use crate::model::prompt_injection::TextKey;
+use crate::model::prompt_injection::catalog::THINKING_OUTPUT_POLICY;
 
 use super::content::{
-    normalize_tool_use_input, process_message_content, render_server_tool_block,
-    sanitize_tool_use_id,
+    UserImageMode, normalize_tool_use_input, process_message_content_with_mode,
+    render_server_tool_block, sanitize_tool_use_id,
 };
 use super::thinking::{generate_thinking_prefix_for_model, has_thinking_tags};
-use super::tools::{SYSTEM_CHUNKED_POLICY, generate_tool_choice_prefix, map_tool_name};
+use super::tools::{generate_tool_choice_prefix, map_tool_name, request_declares_write_or_edit};
 use super::{
     ConversionError, ConverterOptions, EMPTY_USER_CONTENT_PLACEHOLDER, ProxyWarnings,
     TOOL_RESULTS_PROVIDED_PLACEHOLDER,
@@ -36,6 +38,7 @@ pub(super) fn build_history(
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
     warnings: &mut ProxyWarnings,
+    applied_injections: &mut Vec<InjectionId>,
     options: ConverterOptions,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
@@ -66,6 +69,17 @@ pub(super) fn build_history(
         None
     };
     let tool_choice_prefix = generate_tool_choice_prefix(req, tool_name_map, options.clone());
+    let record_prefixes = |applied: &mut Vec<InjectionId>| {
+        if let Some(prefix) = &thinking_prefix {
+            applied.push(InjectionId::ThinkingControls);
+            if prefix.contains(THINKING_OUTPUT_POLICY) {
+                applied.push(InjectionId::ThinkingOutputPolicy);
+            }
+        }
+        if tool_choice_prefix.is_some() {
+            applied.push(InjectionId::ToolChoicePrefix);
+        }
+    };
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -76,9 +90,14 @@ pub(super) fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = if options.inject_chunked_policy() {
-                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            // 分块写入策略只在请求声明了 Write 或 Edit 工具时追加；没有这两个工具时它没有作用对象。
+            let chunked_policy = (options.allows(InjectionId::ChunkedWritePolicy)
+                && request_declares_write_or_edit(req))
+            .then(|| options.injections.text(TextKey::ChunkedWritePolicy).trim())
+            .filter(|policy| !policy.is_empty());
+            let system_content = if let Some(policy) = chunked_policy {
+                applied_injections.push(InjectionId::ChunkedWritePolicy);
+                format!("{}\n{}", system_content, policy)
             } else {
                 system_content
             };
@@ -90,8 +109,10 @@ pub(super) fn build_history(
             };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
+            let mut thinking_injected = false;
             let final_content = if let Some(ref prefix) = thinking_prefix {
                 if !has_thinking_tags(&system_content) {
+                    thinking_injected = true;
                     format!("{}\n{}", prefix, system_content)
                 } else {
                     system_content
@@ -99,6 +120,11 @@ pub(super) fn build_history(
             } else {
                 system_content
             };
+            if thinking_injected {
+                record_prefixes(applied_injections);
+            } else if tool_choice_prefix.is_some() {
+                applied_injections.push(InjectionId::ToolChoicePrefix);
+            }
 
             // 系统消息作为 user + assistant 配对
             let user_msg = HistoryUserMessage::new(final_content, model_id);
@@ -109,14 +135,15 @@ pub(super) fn build_history(
         }
     } else {
         let mut synthetic_prefixes = Vec::new();
-        if let Some(prefix) = thinking_prefix {
+        if let Some(prefix) = thinking_prefix.clone() {
             synthetic_prefixes.push(prefix);
         }
-        if let Some(prefix) = tool_choice_prefix {
+        if let Some(prefix) = tool_choice_prefix.clone() {
             synthetic_prefixes.push(prefix);
         }
 
         if !synthetic_prefixes.is_empty() {
+            record_prefixes(applied_injections);
             // 没有系统消息但有控制配置，插入新的系统消息
             let user_msg = HistoryUserMessage::new(synthetic_prefixes.join("\n"), model_id);
             history.push(Message::User(user_msg));
@@ -209,7 +236,8 @@ pub(super) fn merge_user_messages(
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) =
+            process_message_content_with_mode(&msg.content, UserImageMode::History)?;
         if !text.is_empty() {
             content_parts.push(text);
         }

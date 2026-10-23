@@ -74,12 +74,71 @@ impl MetadataTokenUsage {
     }
 }
 
+/// `metadataEvent.stopReason` when the upstream content filter refused the turn.
+pub const CONTENT_FILTERED_STOP_REASON: &str = "CONTENT_FILTERED";
+
+/// `metadataEvent.stopDetails.refusal`: refusal category and explanation.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataRefusal {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataStopDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<MetadataRefusal>,
+}
+
 /// Metadata event containing authoritative token usage.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataEvent {
     #[serde(default)]
     pub token_usage: Option<MetadataTokenUsage>,
+    /// Upstream stop reason, e.g. `CONTENT_FILTERED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<MetadataStopDetails>,
+}
+
+impl MetadataEvent {
+    #[cfg(test)]
+    pub fn with_token_usage(token_usage: Option<MetadataTokenUsage>) -> Self {
+        Self {
+            token_usage,
+            ..Self::default()
+        }
+    }
+
+    /// Readable refusal detail (`category: explanation`) when the upstream content filter
+    /// stopped the turn. A filtered turn carries at most a little reasoning and no answer text,
+    /// so without this signal it looks like an empty success and gets retried.
+    pub fn content_filter_refusal(&self) -> Option<String> {
+        if !self
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.eq_ignore_ascii_case(CONTENT_FILTERED_STOP_REASON))
+        {
+            return None;
+        }
+        let refusal = self
+            .stop_details
+            .as_ref()
+            .and_then(|details| details.refusal.as_ref());
+        let category = refusal.and_then(|refusal| refusal.category.as_deref());
+        let explanation = refusal.and_then(|refusal| refusal.explanation.as_deref());
+        Some(match (category, explanation) {
+            (Some(category), Some(explanation)) => format!("{category}: {explanation}"),
+            (Some(value), None) | (None, Some(value)) => value.to_string(),
+            (None, None) => CONTENT_FILTERED_STOP_REASON.to_string(),
+        })
+    }
 }
 
 impl EventPayload for MetadataEvent {

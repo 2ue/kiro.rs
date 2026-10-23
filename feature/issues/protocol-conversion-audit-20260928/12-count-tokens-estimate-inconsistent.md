@@ -55,7 +55,7 @@ Verified-against: a4227c1 (2026-09-29)
 `count_tokens` handler（`src/anthropic/handlers.rs`）：
 
 - `src/anthropic/handlers.rs:28` 把 `axum::Json` 导入为 `JsonExtractor`；`src/anthropic/handlers.rs:11404-11434` 和 `11505-11516` 的五个 handler 都用 `JsonExtractor<CountTokensRequest>`，没有自定义 rejection。
-- `src/anthropic/handlers.rs:11455-11503` `count_tokens_for_endpoint`：先注入 prompt steering（第 11466-11471 行，默认对 `/cc` 生效，见 [P14](14-prompt-steering-alters-tool-behavior.md)），再处理多模态 source，然后调用 `token::count_all_tokens`（第 11491-11496 行），最后 `max(1)`。它不解析模型，也不校验模型是否存在。
+- `src/anthropic/handlers.rs:11455-11503` `count_tokens_for_endpoint`：先按 `promptInjection.applyToCountTokens` 和各注入项在该路由上的设置，把写进 system 的项（身份声明 A5，任务质量、语言约束、自定义 A1/A2/A4）加到请求上（`src/anthropic/prompt_injection.rs` 的 `apply_to_count_tokens_request`，见 [提示词注入改造方案](../../todo/prompt-injection-routes-20261023/README.md)），再处理多模态 source，然后调用 `token::count_all_tokens`（第 11491-11496 行），最后 `max(1)`。它不解析模型，也不校验模型是否存在。
 - `src/anthropic/types.rs:459-470` `CountTokensRequest` 只有 `model` / `messages` / `system` / `tools`，`thinking` / `tool_choice` 会被 serde 静默忽略。
 
 messages 路径同样调用 `count_all_tokens`（远程外发和阻塞在这里同样生效）：
@@ -173,7 +173,7 @@ C. 实现真实 tokenizer：Claude 的 tokenizer 没有公开，没法做到精�
 
 采用 B：
 
-1. **统一估算器**：新建 `token::estimate_request(&EstimateInput)`，count_tokens 和 messages（本地、WebSearch、外部池投影、fallback refresh）都调用它，输入是同一份经过 prompt steering 之后的 payload。
+1. **统一估算器**：新建 `token::estimate_request(&EstimateInput)`，count_tokens 和 messages（本地、WebSearch、外部池投影、fallback refresh）都调用它，输入是同一份经过提示词注入之后的 payload。
    - 片段只累加原始的 char units，最后对请求整体做一次 `/4` 并乘一次系数。系数要么去掉分段（统一 1.0 到 1.1），要么改成单调的连续函数。
    - 继续保留图片和文档的专门估算（`src/token.rs:329-388`）。
    - 修正注释中 4.5 / 4.0 的不一致。
@@ -195,7 +195,7 @@ C. 实现真实 tokenizer：Claude 的 tokenizer 没有公开，没法做到精�
 - 一致性：同一 payload 下，`count_tokens` 与 messages 本地回退估算（`input_tokens` 字段来源为 RequestEstimate 时）完全相等。有校准时，用 fake upstream 回放 `contextUsageEvent`，5 轮后 count_tokens 与 messages 的 raw input 差异不超过 15%。
 - 远程：用 mock 延迟 10 秒的远程服务，count_tokens 在 5 秒内回退本地估算；并发 64 个 `/v1/messages` 时 mock 命中数为 0（热路径不调用）；在 `current_thread` runtime 下不 panic。
 - 信封：语法错误、缺少字段、字段类型错误、缺少 `Content-Type` 四类请求，都返回 `400 invalid_request_error` JSON 并带 `request-id`。
-- 五个入口前缀都覆盖；prompt steering 开和关两种情况下都符合"count_tokens 与 messages 用同一份 payload"。
+- 五个入口前缀都覆盖；写进 system 的注入项在该路由上开和关两种情况下都符合"count_tokens 与 messages 用同一份 payload"。
 
 ## 兼容性与风险
 

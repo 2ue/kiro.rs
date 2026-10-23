@@ -18,7 +18,7 @@ use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, Config, ExternalPoolsConfig,
     ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode,
+    PromptCacheSimulationMode, PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
     ToolFormatDebugConfig,
 };
 
@@ -72,7 +72,9 @@ pub struct AnthropicRouterConfig {
     cache_policy: CachePolicyConfig,
     defined_cache_routes: Vec<String>,
     compat_profile: CompatProfile,
-    thinking_trigger_mode: ThinkingTriggerMode,
+    prompt_injection: PromptInjectionConfig,
+    route_features: RouteFeaturesConfig,
+    claude_models_only: bool,
     model_resolution_mode: ModelResolutionMode,
     model_mapping: ModelMappingConfig,
     expose_proxy_warnings: bool,
@@ -89,7 +91,6 @@ pub struct AnthropicRouterConfig {
     kiro_upstream_stream_idle_timeout_secs: u64,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
-    prompt_steering: PromptSteeringConfig,
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
@@ -117,7 +118,9 @@ impl AnthropicRouterConfig {
             cache_policy: config.cache_policy.clone(),
             defined_cache_routes: config.defined_cache_routes.clone(),
             compat_profile: config.compat_profile,
-            thinking_trigger_mode: config.thinking_trigger_mode,
+            prompt_injection: config.prompt_injection.clone().normalized(),
+            route_features: config.route_features.clone().normalized(),
+            claude_models_only: config.claude_models_only,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
             expose_proxy_warnings: config.expose_proxy_warnings,
@@ -134,7 +137,6 @@ impl AnthropicRouterConfig {
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
-            prompt_steering: config.prompt_steering.clone().normalized(),
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
@@ -191,7 +193,9 @@ pub fn create_router_with_provider(
         cache_policy,
         defined_cache_routes,
         compat_profile,
-        thinking_trigger_mode,
+        prompt_injection,
+        route_features,
+        claude_models_only,
         model_resolution_mode,
         model_mapping,
         expose_proxy_warnings,
@@ -208,7 +212,6 @@ pub fn create_router_with_provider(
         kiro_upstream_stream_idle_timeout_secs,
         image_processing,
         body_conversion,
-        prompt_steering,
         missing_max_tokens,
         payload_shaping,
         external_pools,
@@ -240,7 +243,7 @@ pub fn create_router_with_provider(
     .with_reported_usage(reported_usage)
     .with_cache_policy(cache_policy)
     .with_defined_cache_routes(defined_cache_routes)
-    .with_thinking_trigger_mode(thinking_trigger_mode)
+    .with_prompt_injection(prompt_injection, route_features, claude_models_only)
     .with_model_resolution_mode(model_resolution_mode)
     .with_model_mapping(model_mapping)
     .with_payload_guard(
@@ -257,7 +260,6 @@ pub fn create_router_with_provider(
         kiro_upstream_stream_idle_timeout_secs,
         image_processing,
         body_conversion,
-        prompt_steering,
         payload_shaping,
     )
     .with_missing_max_tokens(missing_max_tokens)

@@ -429,6 +429,18 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 - `creationFrequency`：参数同 `promptCacheCreationControl`，默认关闭；额度按放大后的写入计算。`suppressedCreationTarget` 决定被拦下的写入记为 `input`（默认）、`cache_read` 或 `drop`。
 - `nonStream.mode` / `smallRequest.mode`：`inherit` 沿用 `shaping`，`custom` 使用本节 `profile`，`raw` 不整形也不做频次控制。小请求（真实输入 ≤ `maxInputTokens`）优先于非流式；`disableCache` 让小请求的读写全部并回 input。
 
+#### 提示词注入
+
+代理注入的提示词按注入项逐项开关，由路由显式关联，配置写在 `config.json` 顶层（完整示例见 `config.example.json`）：
+
+- `promptInjection`：`defaults` 是 14 个注入项的全局默认（`enabled`，任务质量、语言约束、自定义、身份声明 4 项另有 `externalPool`）；`pathOverrides` 按路由前缀覆盖，逐项取设置了该项的最长前缀；`texts` 保存改过的文本；`applyToCountTokens` 控制 count_tokens 是否计入写进 system 的注入项。
+- `routeFeatures`：不注入提示词的路由功能，`defaults` 与 `pathOverrides` 规则同上，含 `thinkingModelName`、`thinkingTrigger`（`real_request` / `always` / `off`）、`channelLeakGuard`、`channelLeakGuardStream`、`modelDrivenWebSearch`。
+- `claudeModelsOnly`：`/v1/models` 是否只列出 Claude 模型，默认 `false`。
+
+新装默认：任务质量全局关、`/cc` 显式开；语言、身份、自定义相关项关；分块写入、thinking、tool_choice、WebSearch 引导、空轮续写等其余项开。`anthropic-strict` 下部分项不注入，thinking 兼容标签只由 `thinkingControls` 控制，它关闭且模型没有原生 reasoning 字段时，带 reasoning 的请求返回 400。`bodyConversion.toolChoiceSteering` 只控制结构化 `tool_choice` 过滤和响应侧拦截。
+
+全局默认和文本在新版控制台「提示词注入」页面（`/ui/prompt-injection`）编辑，可按路由和请求条件预览实际注入内容；单个路由在路由策略编辑弹窗的「提示词注入」「功能」分区设置。旧版 `promptSteering` 等配置加载时自动迁移为等价设置。注入项说明和默认值依据见 [提示词注入改造方案](feature/todo/prompt-injection-routes-20261023/README.md)。
+
 ### credentials.json
 
 支持单对象格式（向后兼容）或数组格式（多凭据）。

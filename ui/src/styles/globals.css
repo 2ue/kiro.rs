@@ -123,6 +123,29 @@
 }
 /* PLACEHOLDER_THEME */
 
+/* 总览分时趋势专用分类色：在 OKLCH 里取同亮度、同饱和度的五个色相，视觉权重一致。
+ * 语义：1 蓝=主体/正常，2 琥珀=需关注，3 青=恢复，4 玫红=失败，5 紫=其他。
+ * 图表里实际出现的每组组合都用 dataviz 校验脚本验证过（亮/暗、色盲与正常视觉）。
+ * 亮色琥珀、青对白底不足 3:1，图例同时显示数值，并可切换为数据表。 */
+:root {
+  --trend-1: #487cde;
+  --trend-2: #e49e38;
+  --trend-3: #20a89b;
+  --trend-4: #e05864;
+  --trend-5: #9763cc;
+  --trend-other: #a1a1aa;
+  --trend-line: #64748b;
+}
+.dark {
+  --trend-1: #5889e6;
+  --trend-2: #dc7705;
+  --trend-3: #12a195;
+  --trend-4: #dc5c66;
+  --trend-5: #9f6ed1;
+  --trend-other: #71717a;
+  --trend-line: #94a3b8;
+}
+
 @theme inline {
   --color-background: hsl(var(--background));
   --color-surface-subtle: hsl(var(--surface-subtle));

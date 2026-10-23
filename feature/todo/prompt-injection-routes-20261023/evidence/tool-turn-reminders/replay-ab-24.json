@@ -1,0 +1,29 @@
+{
+  "old": {
+    "ok": 15,
+    "errors": 9,
+    "replies_text": 7,
+    "replies_thinking": 9,
+    "hits": [
+      {
+        "case": "b252e4a8#882",
+        "kind": "text",
+        "match": "占位",
+        "context": "alid_reasoning_protocol` 是否相关需要采集样本确认。 3. **工具 input 空字符串 key 清洗**：只有 AIClient2API 一行注释提及，没有错误样本，先等采集数据。  **2ue 已经做得更好的**： - 工具 ID 字符清洗、工具定义占位、input 类型规整 - 图片格式验证和字节级完整性检查、5 MB 上限 - 流结束完整性检查（4 种情况区分）  详细对比已写入 `/Users/yuanfeijie/Desktop/procode/kiro-rs-reference/analysis/protocol-co"
+      },
+      {
+        "case": "b252e4a8#2",
+        "kind": "thinking",
+        "match": "提示词注入",
+        "context": "用户想让我分析 Claude Code CLI 在 kiro.rs 项目中的会话日志，看看为什么总是出现\"用户用中文提问，我也用中文回答\"这种侵入感很强的回答。用户怀疑是语言提示词注入过猛。  从刚才的命令输出看，最近的会话文件是： - 6938a407-6214-40e7-8f6e-5a16a4ba4210.jsonl (10月21日 10:16) - e34f4df3-9adc-45d3-bf0e-60dcb5fcafad.jsonl (10月21日 09"
+      }
+    ]
+  },
+  "new": {
+    "ok": 24,
+    "errors": 0,
+    "replies_text": 7,
+    "replies_thinking": 7,
+    "hits": []
+  }
+}

@@ -1,0 +1,930 @@
+{
+  "old": [
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": false,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": false,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 5,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 5,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 5,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 5,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 5,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 5,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 5,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 5,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    }
+  ],
+  "new": [
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read",
+        "Read",
+        "Read"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 2,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 2,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 3,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 3,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 4,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read",
+        "Read",
+        "Read"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 4,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 5,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 5,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 5,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 5,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 5,
+      "choice": "any",
+      "status": 502,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 5,
+      "choice": "tool",
+      "status": 502,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 5,
+      "choice": "any",
+      "status": 502,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 5,
+      "choice": "tool",
+      "status": 502,
+      "complied": false,
+      "tools": []
+    }
+  ]
+}

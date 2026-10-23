@@ -22,15 +22,16 @@ use super::{
         get_credentials_list, get_credentials_page, get_credentials_runtime,
         get_credentials_summary, get_credentials_usage_summary, get_external_pool_status,
         get_external_pools, get_load_balancing_mode, get_model_capabilities, get_model_pricing,
-        get_proxy_resources, get_request_key_usage_limits, get_runtime_config, get_system_version,
-        get_usage_cleanup_status, get_usage_dashboard, get_usage_dashboard_accounts,
-        get_usage_dashboard_breakdown, get_usage_dashboard_external_pool_billing,
-        get_usage_dashboard_external_pool_risk, get_usage_dashboard_overview,
-        get_usage_dashboard_overview_external, get_usage_dashboard_overview_local,
-        get_usage_dashboard_overview_rankings, get_usage_dashboard_overview_series,
-        get_usage_dashboard_overview_summary, get_usage_dashboard_series, get_usage_dashboard_top,
-        get_usage_dashboard_windows, get_usage_records, get_usage_records_page, get_usage_summary,
-        get_usage_writer_stats, import_proxy_resources, preview_usage_cleanup,
+        get_prompt_injection_catalog, get_proxy_resources, get_request_key_usage_limits,
+        get_runtime_config, get_system_version, get_usage_cleanup_status, get_usage_dashboard,
+        get_usage_dashboard_accounts, get_usage_dashboard_breakdown,
+        get_usage_dashboard_external_pool_billing, get_usage_dashboard_external_pool_risk,
+        get_usage_dashboard_overview, get_usage_dashboard_overview_external,
+        get_usage_dashboard_overview_local, get_usage_dashboard_overview_rankings,
+        get_usage_dashboard_overview_series, get_usage_dashboard_overview_summary,
+        get_usage_dashboard_series, get_usage_dashboard_top, get_usage_dashboard_windows,
+        get_usage_records, get_usage_records_page, get_usage_summary, get_usage_writer_stats,
+        import_proxy_resources, preview_prompt_injection, preview_usage_cleanup,
         refresh_credentials_info, reset_failure_count, reset_request_key_usage,
         resume_usage_cleanup, set_credential_concurrency, set_credential_disabled,
         set_credential_fast, set_credential_overage, set_credential_priority, set_credential_proxy,
@@ -301,6 +302,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/runtime",
             get(get_runtime_config).put(update_runtime_config),
         )
+        .route(
+            "/prompt-injection/catalog",
+            get(get_prompt_injection_catalog),
+        )
+        .route("/prompt-injection/preview", post(preview_prompt_injection))
         .route("/system/version", get(get_system_version))
         .route("/diagnostics/capture", get(get_capture_overview))
         .route("/diagnostics/capture/start", post(start_capture))

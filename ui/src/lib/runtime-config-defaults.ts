@@ -8,7 +8,8 @@ import type {
   ModelMappingConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
-  PromptSteeringConfig,
+  PromptInjectionConfig,
+  RouteFeaturesConfig,
   ReportedUsageConfig,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -140,95 +141,81 @@ export function defaultBodyConversion(): BodyConversionConfig {
     toolSchemaKeyMapping: 'sanitize',
     toolSchemaKeyValidationRegex: '^[a-zA-Z0-9_.-]{1,64}$',
     toolChoiceSteering: true,
-    chunkedToolPolicy: true,
-    thinkingPromptControls: true,
     nativeReasoningFields: true,
     toolPairingRepair: true,
     historyPlaceholderTools: true,
-    modelDrivenWebSearch: { enabled: false, pathOverrides: {} },
   }
 }
 
 export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | null): BodyConversionConfig {
+  const base = defaultBodyConversion()
   return {
-    ...defaultBodyConversion(),
-    ...(input ?? {}),
-    modelDrivenWebSearch: {
-      enabled: input?.modelDrivenWebSearch?.enabled ?? false,
-      pathOverrides: { ...(input?.modelDrivenWebSearch?.pathOverrides ?? {}) },
-    },
+    toolSchemaNormalization: input?.toolSchemaNormalization ?? base.toolSchemaNormalization,
+    toolNameMapping: input?.toolNameMapping ?? base.toolNameMapping,
+    toolSchemaKeyMapping: input?.toolSchemaKeyMapping ?? base.toolSchemaKeyMapping,
+    toolSchemaKeyValidationRegex: input?.toolSchemaKeyValidationRegex ?? base.toolSchemaKeyValidationRegex,
+    toolChoiceSteering: input?.toolChoiceSteering ?? base.toolChoiceSteering,
+    nativeReasoningFields: input?.nativeReasoningFields ?? base.nativeReasoningFields,
+    toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
+    historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
   }
 }
 
-export function defaultPromptSteering(): PromptSteeringConfig {
+/**
+ * Placeholder until the runtime config loads; the backend always returns the full structure.
+ * Item defaults come from the catalog endpoint, so nothing here duplicates backend text.
+ */
+export function emptyPromptInjection(): PromptInjectionConfig {
   return {
-    enabled: true,
-    scope: 'route_rules',
-    routeMode: 'allow_list',
-    routeRules: ['/cc'],
-    applyToExternalPool: true,
     applyToCountTokens: true,
-    // Prompt texts come from the backend (promptSteeringDefaults); an empty prompt is filled
-    // with the built-in default on save.
-    languageConstraint: { enabled: false, prompt: '' },
-    taskQuality: { enabled: true, prompt: '' },
-    toolChoice: { enabled: true },
-    chunkedWrite: { enabled: true, systemPromptEnabled: true, toolDescriptionEnabled: true },
-    thinking: { enabled: true },
-    custom: { enabled: false, prompt: '' },
-    // Identity masking is off by default; empty prompts are filled with the backend defaults.
-    identity: {
-      enabled: false,
-      routeMode: 'allow_all',
-      routeRules: [],
-      promptEnabled: true,
-      prompt: '',
-      turnReminder: { enabled: true, prompt: '' },
-      outputGuard: { enabled: true, streamEnabled: true },
-      applyToExternalPool: false,
-      claudeModelsOnly: false,
-      pathOverrides: {},
-    },
+    defaults: {} as PromptInjectionConfig['defaults'],
+    texts: {},
+    pathOverrides: {},
   }
 }
 
-export function normalizePromptSteering(input?: Partial<PromptSteeringConfig> | null): PromptSteeringConfig {
-  const defaults = defaultPromptSteering()
-  const routeMode = input?.routeMode === 'allow_all' || input?.routeMode === 'deny_list'
-    ? input.routeMode
-    : defaults.routeMode
-  const routeRules = normalizeRuleList(input?.routeRules ?? defaults.routeRules)
-  const next = {
-    ...defaults,
-    ...(input ?? {}),
-    scope: input?.scope === 'cc_only' ? 'route_rules' : (input?.scope ?? defaults.scope),
-    routeMode,
-    routeRules: routeMode === 'allow_list' && routeRules.length === 0 ? defaults.routeRules : routeRules,
-    languageConstraint: { ...defaults.languageConstraint, ...(input?.languageConstraint ?? {}) },
-    taskQuality: { ...defaults.taskQuality, ...(input?.taskQuality ?? {}) },
-    toolChoice: { ...defaults.toolChoice, ...(input?.toolChoice ?? {}) },
-    chunkedWrite: { ...defaults.chunkedWrite, ...(input?.chunkedWrite ?? {}) },
-    thinking: { ...defaults.thinking, ...(input?.thinking ?? {}) },
-    custom: { ...defaults.custom, ...(input?.custom ?? {}) },
-    identity: {
-      ...defaults.identity,
-      ...(input?.identity ?? {}),
-      turnReminder: { ...defaults.identity.turnReminder, ...(input?.identity?.turnReminder ?? {}) },
-      outputGuard: { ...defaults.identity.outputGuard, ...(input?.identity?.outputGuard ?? {}) },
-      routeRules: Array.from(new Set((input?.identity?.routeRules ?? []).map((rule) => rule.trim()).filter(Boolean))),
-      pathOverrides: { ...(input?.identity?.pathOverrides ?? {}) },
-    },
+export function normalizePromptInjection(input?: Partial<PromptInjectionConfig> | null): PromptInjectionConfig {
+  const base = emptyPromptInjection()
+  const texts: PromptInjectionConfig['texts'] = {}
+  for (const [key, value] of Object.entries(input?.texts ?? {})) {
+    if (typeof value === 'string' && value.trim()) texts[key as keyof typeof texts] = value
   }
-  next.languageConstraint.prompt = next.languageConstraint.prompt.trim()
-  next.taskQuality.prompt = next.taskQuality.prompt.trim()
-  next.custom.prompt = next.custom.prompt.trim()
-  next.identity.prompt = next.identity.prompt.trim()
-  next.identity.turnReminder.prompt = next.identity.turnReminder.prompt.trim()
-  return next
+  const pathOverrides: PromptInjectionConfig['pathOverrides'] = {}
+  for (const [prefix, items] of Object.entries(input?.pathOverrides ?? {})) {
+    const kept = Object.fromEntries(
+      Object.entries(items ?? {}).filter(([, item]) => item && (item.enabled !== undefined || item.externalPool !== undefined)),
+    )
+    if (Object.keys(kept).length > 0) pathOverrides[prefix] = kept
+  }
+  return {
+    applyToCountTokens: input?.applyToCountTokens ?? base.applyToCountTokens,
+    defaults: { ...base.defaults, ...(input?.defaults ?? {}) },
+    texts,
+    pathOverrides,
+  }
 }
 
-function normalizeRuleList(value?: string[] | null): string[] {
-  return Array.from(new Set((value ?? []).map((rule) => rule.trim()).filter(Boolean)))
+export function defaultRouteFeatures(): RouteFeaturesConfig {
+  return {
+    defaults: {
+      thinkingModelName: true,
+      thinkingTrigger: 'real_request',
+      channelLeakGuard: false,
+      channelLeakGuardStream: true,
+      modelDrivenWebSearch: false,
+    },
+    pathOverrides: {},
+  }
+}
+
+export function normalizeRouteFeatures(input?: Partial<RouteFeaturesConfig> | null): RouteFeaturesConfig {
+  const base = defaultRouteFeatures()
+  const pathOverrides: RouteFeaturesConfig['pathOverrides'] = {}
+  for (const [prefix, route] of Object.entries(input?.pathOverrides ?? {})) {
+    const kept = Object.fromEntries(Object.entries(route ?? {}).filter(([, value]) => value !== undefined && value !== null))
+    if (Object.keys(kept).length > 0) pathOverrides[prefix] = kept
+  }
+  return { defaults: { ...base.defaults, ...(input?.defaults ?? {}) }, pathOverrides }
 }
 
 export function defaultMissingMaxTokens(): MissingMaxTokensConfig {
@@ -455,6 +442,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   },
   credentialMaxConcurrentRequests: 0,
   credentialInfoRefreshConcurrency: 3,
+  kiroCreditUnitPriceUsd: null,
   credentialTransientCooldownSecs: 10,
   credentialRateLimitCooldownSecs: 30,
   credentialServerErrorCooldownSecs: 5,
@@ -537,7 +525,9 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
   bodyConversion: defaultBodyConversion(),
-  promptSteering: defaultPromptSteering(),
+  promptInjection: emptyPromptInjection(),
+  routeFeatures: defaultRouteFeatures(),
+  claudeModelsOnly: false,
   missingMaxTokens: defaultMissingMaxTokens(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
@@ -570,7 +560,6 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   modelResolutionMode: 'compatible',
   modelMapping: defaultModelMappingConfig(),
   extractThinking: true,
-  thinkingTriggerMode: 'real_request',
   exposeProxyWarnings: false,
   auditLogRetentionEnabled: false,
   auditLogRetentionDays: 15,

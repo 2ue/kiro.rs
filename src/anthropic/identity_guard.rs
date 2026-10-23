@@ -1,6 +1,6 @@
 //! Output-side identity guard.
 //!
-//! The Kiro upstream injects its own product identity server-side. Prompt steering keeps larger
+//! The Kiro upstream injects its own product identity server-side. The identity prompt keeps larger
 //! models in line, but smaller models still occasionally answer "I'm Kiro", deny it by name
 //! ("I'm not Kiro"), or comment on "conflicting instructions". This guard removes those sentences
 //! from assistant text before it reaches the client.

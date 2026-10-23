@@ -1,0 +1,69 @@
+{
+  "label": "old",
+  "placeholder": "Tool result received.",
+  "reminders_on_tool_turns": true,
+  "model": "claude-sonnet-4-5",
+  "session": "f189800b-bc13-4c51-bffc-0b5821cd44c5",
+  "turns": [
+    {
+      "index": 0,
+      "error": false,
+      "num_turns": 6,
+      "elapsed_s": 33.3,
+      "raw": null
+    },
+    {
+      "index": 1,
+      "error": false,
+      "num_turns": 3,
+      "elapsed_s": 11.9,
+      "raw": null
+    },
+    {
+      "index": 2,
+      "error": false,
+      "num_turns": 6,
+      "elapsed_s": 19.9,
+      "raw": null
+    },
+    {
+      "index": 3,
+      "error": false,
+      "num_turns": 9,
+      "elapsed_s": 71.1,
+      "raw": null
+    },
+    {
+      "index": 4,
+      "error": false,
+      "num_turns": 9,
+      "elapsed_s": 61.5,
+      "raw": null
+    },
+    {
+      "index": 5,
+      "error": false,
+      "num_turns": 3,
+      "elapsed_s": 17.1,
+      "raw": null
+    },
+    {
+      "index": 6,
+      "error": false,
+      "num_turns": 3,
+      "elapsed_s": 26.0,
+      "raw": null
+    },
+    {
+      "index": 7,
+      "error": false,
+      "num_turns": 2,
+      "elapsed_s": 10.4,
+      "raw": null
+    }
+  ],
+  "tool_uses": 33,
+  "tool_only_replies": 48,
+  "hits_text": [],
+  "hits_thinking": []
+}

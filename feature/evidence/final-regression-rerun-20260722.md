@@ -6,7 +6,7 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 
 ## 范围与安全边界
 
-本轮复测针对用户补充的 P0/P1 风险重新验证：Claude Code transcript 泄漏、tool hash 形态、thinking/output_config 转发、body 清理/压缩字节语义、prompt 总开关独立性、高并发低 RPM / Redis scheduler degraded / runtime quarantine、business Redis 与 usage/observability Redis 故障域隔离，以及错误突发下内部重试/Redis 写放大。
+本轮复测针对用户补充的 P0/P1 风险重新验证：Claude Code transcript 泄漏、tool hash 形态、thinking/output_config 转发、body 清理/压缩字节语义、高并发低 RPM / Redis scheduler degraded / runtime quarantine、business Redis 与 usage/observability Redis 故障域隔离，以及错误突发下内部重试/Redis 写放大。
 
 执行边界：
 
@@ -33,7 +33,6 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 | Business/observability Redis fault domain | PASS: source contract 37 pass / 9 live-signal skips / 0 fail；product 3/3 exact | usage/Admin 只用 observability Redis；scheduler/external/runtime-event/health 只用 business Redis；observability 慢/断开不影响 scheduler；business fault fail-closed 且不伪装 `AllDisabled` |
 | SchedulerRedisDegraded external takeover | PASS: enabled 3 clean rounds × (5 degraded + 5 recovery)；disabled 1 clean round × (5 degraded + 5 recovery) | enabled 时 500ms Redis degraded 请求进入 external 并恢复 local；disabled 时不打 local/external upstream、公开 429 脱敏且恢复 local；runner 不用 Docker/Cargo、不探测 `9022` |
 | Protocol contamination source contracts | PASS: 30/30 | `user Continue`、`Tool results provided`、`function_results`、`*Hash<8hex>` 等泄漏形态；Hash-shaped text 不作为任意内部工具名；marker-free raw body byte-identical |
-| Prompt/UI control contracts | PASS | Rust/UI/Admin UI 默认 task-quality prompt byte-equal 且无内部 marker；两套 UI 的 prompt master 与 bodyConversion 控制面独立 |
 | Real Claude CLI thinking capture | PASS: 30 message requests = 6 efforts × 5 rounds | Claude CLI 原始请求体包含 `thinking: {type:"adaptive"}`；`output_config.effort` absent→`high`，`low/medium/high/xhigh/max` 均按原值出现 |
 | Real kiro.rs thinking wire | PASS: 60/60 = 2 endpoints × 6 efforts × 5 rounds | `additionalModelRequestFields.output_config.effort` 在 CLI/IDE 两入口均保持 `low/medium/high/xhigh/max`，`max` 未被截断为 `high`；当前 OutputConfig schema 下 final Kiro wire 不注入未广告的 `thinking` 字段 |
 | Real Claude CLI long session | PASS: 5 sessions × 20 tool cycles | 110 CLI turns、105 `--continue` turns、100 tool turns、50 Bash / 50 Read、210 inference hits、100 tool_use/tool_result pairs、leakMatches=0、unknown upstream requests=0 |
@@ -114,16 +113,7 @@ Status: `focused-regression-pass / release-gates-still-require-final-inventory-a
 - provider compression enabled/disabled 的 final bytes 和 SHA 与期望完全一致；
 - reasoning 控制字段校验先做 bounded scan；非法/歧义控制 fail closed，合法控制不改写原始字节。
 
-### 5. Prompt 总开关与 bodyConversion 已分离，但总开关仍是“提示词注入总门”
-
-本轮 `prompt-control-independence.mjs` 通过，说明两套 UI 不再把 prompt master 操作误写到 `bodyConversion`。但当前产品语义仍是：
-
-- `promptSteering.enabled=false` 时，不注入 language/task/custom/tool_choice/thinking/chunked-write prompt。
-- body conversion / native reasoning / raw protocol validation 不依赖这个开关。
-
-这是当前实现的显式合同，不是 body 处理总开关。若产品希望“语言增强”和“tool_choice/thinking/chunked-write prompt”拆成多个总开关，应作为 UX/配置设计变更另立 issue，而不能在本轮回归里静默改变语义。
-
-### 6. Redis scheduler / usage / runtime fault 组合本轮未再复现假全禁用或内部 spin
+### 5. Redis scheduler / usage / runtime fault 组合本轮未再复现假全禁用或内部 spin
 
 关键结果：
 
@@ -264,8 +254,6 @@ node --test \
   feature/tests/thinking-effort-kiro-wire-contract.test.mjs \
   feature/tests/runtime-validation-paths.test.mjs \
   feature/tests/thinking-effort-claude-cli-capture-signal.test.mjs
-node feature/tests/prompt-default-parity.mjs
-node feature/tests/prompt-control-independence.mjs
 node feature/tests/cost-format-contract.mjs
 node feature/tests/request-api-key-id-contract.mjs
 node feature/tests/mcp-attempt-channel-contract.mjs
@@ -281,7 +269,7 @@ Results:
 - feature docs: 47 issue documents and 114 relative links pass;
 - `git diff --check`: pass;
 - protocol/thinking/runtime path contracts: 30/30 pass;
-- prompt/UI/cost/request-key/MCP contracts: pass;
+- UI/cost/request-key/MCP contracts: pass;
 - Redis/scheduler/storage runner contracts: 94 tests = 72 pass / 22 explicit live-fixture skips / 0 fail.
 
 Final artifact inventory was rerun:

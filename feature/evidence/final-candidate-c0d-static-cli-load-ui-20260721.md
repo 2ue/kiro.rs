@@ -52,8 +52,6 @@ node feature/tests/check-feature-docs.mjs
 node feature/tests/cost-format-contract.mjs
 node feature/tests/mcp-attempt-channel-contract.mjs
 node feature/tests/request-api-key-id-contract.mjs
-node feature/tests/prompt-control-independence.mjs
-node feature/tests/prompt-default-parity.mjs
 node --test feature/tests/*.test.mjs
 ```
 
@@ -64,16 +62,12 @@ Result:
 - cost format contract: pass for `ui` and `admin-ui`.
 - MCP attempt channel contract: pass for both UI contracts.
 - request API key ID contract: pass for `ui` and `admin-ui`.
-- prompt control independence: pass; both UI surfaces keep prompt master state separate from body conversion state and document the total prompt gate.
-- prompt default parity: pass; Rust, UI, and Admin UI task-quality defaults match and contain no internal transcript fingerprints.
 - full Node source/runner contract batch: `280 tests`, `258 pass`, `22 explicit skips`, `0 fail`, duration `75617.155833ms`.
 
 Selected log hashes:
 
 - `check-feature-docs.log`: `d7f0da8c1fb64962b4b805a98244173cfdd22eae401ac0dec7594e50bd16ae77`
 - `node-all.log`: `b1dd7f1b08de16d2a72fc3d25658437761150d3644fdf6d659e77ac63c5c6c67`
-- `prompt-control-independence.log`: `24c1b217320028296c4f3a8aa3cf25dcca5548250683dc0aa2317dfdaaee50da`
-- `prompt-default-parity.log`: `ce829b647ff7406a8cbe594b7673093849fbf0b6659e2b165ad163bf7c82c5c1`
 
 The `22` Node skips are explicit live-fixture skips and are not counted as dynamic product passes.
 
@@ -112,7 +106,7 @@ The external documentation used for this check is current as of the crawl/search
 - AWS Bedrock Claude adaptive thinking docs state that `effort` belongs in a separate `output_config` object and not inside `thinking`: <https://docs.aws.amazon.com/bedrock/latest/userguide/claude-messages-adaptive-thinking.html>.
 - Claude Platform effort/adaptive thinking docs describe `output_config.effort` and `thinking: { "type": "adaptive" }` as related but separate controls: <https://platform.claude.com/docs/en/build-with-claude/effort> and <https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking>.
 
-This cross-check supports the local contract: do not silently clamp `max` to `high`, do not invent unsupported upstream `thinking` fields, and keep structured client capability fields independent from prompt-steering text switches.
+This cross-check supports the local contract: do not silently clamp `max` to `high`, do not invent unsupported upstream `thinking` fields, and keep structured client capability fields independent from prompt injection item switches.
 
 ### UI builds
 

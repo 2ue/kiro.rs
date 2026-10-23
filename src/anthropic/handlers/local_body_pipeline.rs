@@ -4,7 +4,6 @@ use crate::anthropic::language_preference::{
     ClientLanguagePreference, detect_client_language_preference,
 };
 use crate::anthropic::payload_guard::sanitize_anthropic_messages_for_external_forwarding;
-use crate::anthropic::prompt_steering::language_turn_reminder_applies;
 use crate::anthropic::tool_schema_keys::ToolSchemaKeyMap;
 use crate::anthropic::tool_use_policy::ResponseToolPolicy;
 use crate::model::config::PayloadShapingConfig;
@@ -26,6 +25,8 @@ pub(super) struct PreparedLocalKiroBody {
     pub(super) extract_xml_thinking: bool,
     pub(super) too_long_retry: Option<PayloadTooLongRetryRequest>,
     pub(super) cache_point_retry: Option<CachePointRetryRequest>,
+    /// 本次请求实际注入的项，按注入顺序。
+    pub(super) applied_injections: Vec<crate::model::config::InjectionId>,
 }
 
 pub(super) struct LocalBodyPrepareError {
@@ -69,6 +70,8 @@ fn conversion_error_category(error: &ConversionError) -> &'static str {
                 "invalid_image_data"
             } else if message.starts_with("Image data cannot be empty.") {
                 "empty_image_data"
+            } else if message.starts_with("remote image URL sources are not supported") {
+                "remote_image_url"
             } else if message.contains("image") {
                 "image_content"
             } else {
@@ -171,26 +174,57 @@ pub(super) fn payload_has_documents(payload: &MessagesRequest) -> bool {
         })
 }
 
-/// Prompt steering for one local request with the identity settings resolved for its route, so
-/// the converter's identity turn reminder only applies on routes identity masking is bound to.
-fn prompt_steering_for_route(
-    config: &crate::model::config::PromptSteeringConfig,
-    endpoint: &str,
-) -> crate::model::config::PromptSteeringConfig {
-    let mut config = config.clone().normalized();
-    config.identity = config.identity.for_route(endpoint);
-    config
-}
-
+/// 每轮语言提醒开启时才识别语言偏好（识别要扫描整段对话）。
 fn language_turn_reminder_for_payload(
-    endpoint: &str,
-    compat_profile: CompatProfile,
-    config: &PromptSteeringConfig,
+    injections: &crate::model::config::ResolvedInjections,
     payload: &MessagesRequest,
 ) -> Option<ClientLanguagePreference> {
-    // count_tokens 使用本地 token 计数，不经过 converter 注入。
-    language_turn_reminder_applies(endpoint, compat_profile, config)
+    injections
+        .allows(crate::model::config::InjectionId::LanguageTurnReminder)
         .then(|| detect_client_language_preference(payload))
+}
+
+/// 本次请求实际注入的项：写进 system 的项由 handler 在转换前加好，这里按 marker 识别；
+/// 其余由转换器记录。
+pub(super) fn applied_prompt_injections(
+    payload: &MessagesRequest,
+    injections: &crate::model::config::ResolvedInjections,
+    converted: &[crate::model::config::InjectionId],
+) -> Vec<crate::model::config::InjectionId> {
+    use crate::model::config::InjectionId;
+    use crate::model::prompt_injection::TextKey;
+    use crate::model::prompt_injection::catalog::{IDENTITY_PROMPT_MARKER, PROMPT_STEERING_MARKER};
+    let system = payload.system.as_deref().unwrap_or_default();
+    let block = |marker: &str| system.iter().find(|block| block.text.contains(marker));
+    let mut applied = Vec::new();
+    if block(IDENTITY_PROMPT_MARKER).is_some() && injections.allows(InjectionId::IdentityPrompt) {
+        applied.push(InjectionId::IdentityPrompt);
+    }
+    if let Some(steering) = block(PROMPT_STEERING_MARKER) {
+        for (id, key) in [
+            (InjectionId::LanguageConstraint, TextKey::LanguageConstraint),
+            (InjectionId::TaskQuality, TextKey::TaskQuality),
+            (InjectionId::Custom, TextKey::Custom),
+        ] {
+            let text = injections.text(key).trim();
+            if injections.allows(id) && !text.is_empty() && steering.text.contains(text) {
+                applied.push(id);
+            }
+        }
+    }
+    applied.extend_from_slice(converted);
+    applied
+}
+
+fn prompt_injections_log_value(applied: &[crate::model::config::InjectionId]) -> String {
+    if applied.is_empty() {
+        return "none".to_string();
+    }
+    applied
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn language_reminder_log_value(preference: Option<&ClientLanguagePreference>) -> &'static str {
@@ -248,13 +282,14 @@ pub(super) fn prepare_with_plan(
         &native_reasoning_capability,
         KiroReasoningCapabilityState::Supported(_)
     );
-    // 语言识别必须基于进入转换前的完整 payload，不能使用后续裁剪后的副本。
-    let language_turn_reminder = language_turn_reminder_for_payload(
-        endpoint,
-        runtime_config.compat_profile,
-        &runtime_config.prompt_steering,
+    let injections =
+        runtime_config.injections_for(endpoint, crate::model::config::UpstreamKind::Local);
+    let force_visible_thinking = should_force_visible_thinking(
         payload,
+        runtime_config.route_features_for(endpoint).thinking_trigger,
     );
+    // 语言识别必须基于进入转换前的完整 payload，不能使用后续裁剪后的副本。
+    let language_turn_reminder = language_turn_reminder_for_payload(&injections, payload);
     let converter_options = ConverterOptions {
         compat_profile: runtime_config.compat_profile,
         conversion: plan.converter,
@@ -262,10 +297,9 @@ pub(super) fn prepare_with_plan(
         kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
         kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
         kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
-        force_visible_thinking: should_force_visible_thinking(payload, runtime_config),
-        explicit_reasoning_request: false,
+        force_visible_thinking,
         native_reasoning_capability,
-        prompt_steering: prompt_steering_for_route(&runtime_config.prompt_steering, endpoint),
+        injections,
         language_turn_reminder: language_turn_reminder.clone(),
     };
     // Historical thinking is discarded before conversion for every request when the configured
@@ -320,7 +354,7 @@ pub(super) fn prepare_with_plan(
                 );
                 match convert_request_with_resolved_model(
                     &shaped_payload,
-                    converter_options,
+                    converter_options.clone(),
                     model_resolution,
                 ) {
                     Ok(result) => result,
@@ -335,6 +369,11 @@ pub(super) fn prepare_with_plan(
         }
     };
 
+    let applied_injections = applied_prompt_injections(
+        payload,
+        &converter_options.injections,
+        &conversion_result.applied_injections,
+    );
     let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -431,6 +470,11 @@ pub(super) fn prepare_with_plan(
         language_reminder = language_reminder_log_value(language_turn_reminder.as_ref()),
         "Kiro request prepared"
     );
+    tracing::info!(
+        endpoint = endpoint,
+        prompt_injections = %prompt_injections_log_value(&applied_injections),
+        "prompt injections applied"
+    );
     let input_tokens = if plan.token_counting.is_enabled() {
         token::count_all_tokens(
             &payload.model,
@@ -486,6 +530,7 @@ pub(super) fn prepare_with_plan(
         extract_xml_thinking,
         too_long_retry,
         cache_point_retry,
+        applied_injections,
     })
 }
 
@@ -593,10 +638,31 @@ mod tests {
     }
 
     #[test]
-    fn language_turn_reminder_uses_route_and_original_payload() {
-        let mut config = PromptSteeringConfig::default();
-        config.language_constraint.enabled = true;
-        config.route_rules = vec!["/cc".to_string()];
+    fn language_turn_reminder_uses_route_setting_and_original_payload() {
+        use crate::model::config::{
+            InjectionId, PromptInjectionConfig, ResolvedInjections, UpstreamKind,
+        };
+        use crate::model::prompt_injection::ItemOverride;
+        let mut config = PromptInjectionConfig::default();
+        config.path_overrides.insert(
+            "/cc".to_string(),
+            [(
+                InjectionId::LanguageTurnReminder,
+                ItemOverride {
+                    enabled: Some(true),
+                    external_pool: None,
+                },
+            )]
+            .into(),
+        );
+        let resolve = |endpoint: &str| {
+            ResolvedInjections::resolve(
+                endpoint,
+                UpstreamKind::Local,
+                CompatProfile::ClaudeCode,
+                &config,
+            )
+        };
         let payload = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
@@ -621,12 +687,8 @@ mod tests {
             stop_sequences: None,
         };
 
-        let matched_preference = language_turn_reminder_for_payload(
-            "/cc/v1/messages",
-            CompatProfile::ClaudeCode,
-            &config,
-            &payload,
-        );
+        let cc = resolve("/cc/v1/messages");
+        let matched_preference = language_turn_reminder_for_payload(&cc, &payload);
         assert_eq!(
             matched_preference,
             Some(ClientLanguagePreference::Explicit("Korean".to_string()))
@@ -634,7 +696,7 @@ mod tests {
         let matched_result = crate::anthropic::converter::convert_request_with_options(
             &payload,
             ConverterOptions {
-                prompt_steering: config.clone(),
+                injections: cc,
                 language_turn_reminder: matched_preference,
                 ..ConverterOptions::default()
             },
@@ -649,17 +711,13 @@ mod tests {
                 .contains("Visible reply language: Korean")
         );
 
-        let unmatched_preference = language_turn_reminder_for_payload(
-            "/v1/messages",
-            CompatProfile::ClaudeCode,
-            &config,
-            &payload,
-        );
+        let v1 = resolve("/v1/messages");
+        let unmatched_preference = language_turn_reminder_for_payload(&v1, &payload);
         assert!(unmatched_preference.is_none());
         let unmatched_result = crate::anthropic::converter::convert_request_with_options(
             &payload,
             ConverterOptions {
-                prompt_steering: config,
+                injections: v1,
                 language_turn_reminder: unmatched_preference,
                 ..ConverterOptions::default()
             },

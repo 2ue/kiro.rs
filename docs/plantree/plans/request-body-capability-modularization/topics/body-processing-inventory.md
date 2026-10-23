@@ -2,8 +2,8 @@
 
 ## Parsed Anthropic Stages
 
-- Thinking override from model name: enables/modifies `thinking` when model aliases include thinking intent.
-- Thinking trigger mode: may apply configured thinking based on request/model settings.
+- Thinking override from model name: enables/modifies `thinking` when model aliases include thinking intent (`routeFeatures.thinkingModelName`, resolved per route).
+- Thinking trigger mode: may apply configured thinking based on request/model settings (`routeFeatures.thinkingTrigger`: `real_request` / `always` / `off`, resolved per route).
 - Multimodal preprocessing:
   - Safe mode can materialize file sources from local file store.
   - Safe mode can download remote image/document URL sources up to 20 MB.
@@ -19,20 +19,19 @@
   - tool definition conversion
   - tool name sanitization and mapping
   - schema normalization and unsupported field cleanup
-  - tool_choice prompt injection
-  - Write/Edit tool description suffixes
+  - tool_choice prompt injection (prompt injection items `toolChoicePrefix` / `toolChoiceTurnReminder`)
+  - Write/Edit tool description suffixes (prompt injection item `chunkedWriteToolSuffix`)
   - thinking/native reasoning/synthetic thinking handling
   - tool_use/tool_result pairing repair
   - placeholder tools for historical tool uses
 - `BodyConversionConfig` can independently disable selected compatibility capabilities while defaulting to current behavior:
   - `toolSchemaNormalization`
   - `toolNameMapping`
-  - `toolChoiceSteering`
-  - `chunkedToolPolicy`
-  - `thinkingPromptControls`
+  - `toolChoiceSteering` (structured `tool_choice` tool filtering and response-side interception only; tool_choice prompt text is controlled by the prompt injection items)
   - `nativeReasoningFields`
   - `toolPairingRepair`
   - `historyPlaceholderTools`
+- Prompt injection: `promptInjection` resolves each of the 14 injection items per route (longest-prefix `pathOverrides`, falling back to `defaults`); thinking compatibility tags are controlled only by `thinkingControls`.
 - Payload guard:
   - serialize request body
   - apply repair/shaping/trimming

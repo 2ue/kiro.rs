@@ -26,7 +26,6 @@ import { useModelCapabilities } from '@/hooks/use-usage'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
-  IdentityRouteOverride,
   AccessKeysResponse,
   CachePolicyConfig,
   CacheRoutePolicyPatch,
@@ -188,95 +187,27 @@ const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
   toolSchemaKeyMapping: 'sanitize',
   toolSchemaKeyValidationRegex: '^[a-zA-Z0-9_.-]{1,64}$',
   toolChoiceSteering: true,
-  chunkedToolPolicy: true,
-  thinkingPromptControls: true,
   nativeReasoningFields: true,
   toolPairingRepair: true,
   historyPlaceholderTools: true,
-  modelDrivenWebSearch: { enabled: false, pathOverrides: {} },
 })
 
 const normalizeBodyConversion = (
   input?: Partial<RuntimeConfig['bodyConversion']> | null,
-): RuntimeConfig['bodyConversion'] => ({
-  ...defaultBodyConversion(),
-  ...(input ?? {}),
-  // Edited in the new console; kept as loaded so saving here never drops route overrides.
-  modelDrivenWebSearch: {
-    enabled: input?.modelDrivenWebSearch?.enabled ?? false,
-    pathOverrides: { ...(input?.modelDrivenWebSearch?.pathOverrides ?? {}) },
-  },
-})
-
-const defaultPromptSteering = (): RuntimeConfig['promptSteering'] => ({
-  enabled: true,
-  scope: 'route_rules',
-  routeMode: 'allow_list',
-  routeRules: ['/cc'],
-  applyToExternalPool: true,
-  applyToCountTokens: true,
-  // Prompt texts come from the backend (promptSteeringDefaults); an empty prompt is filled
-  // with the built-in default on save.
-  languageConstraint: { enabled: false, prompt: '' },
-  taskQuality: { enabled: true, prompt: '' },
-  toolChoice: { enabled: true },
-  chunkedWrite: { enabled: true, systemPromptEnabled: true, toolDescriptionEnabled: true },
-  thinking: { enabled: true },
-  custom: { enabled: false, prompt: '' },
-  // Identity masking is off by default; empty prompts are filled with the backend defaults.
-  identity: {
-    enabled: false,
-    routeMode: 'allow_all',
-    routeRules: [],
-    promptEnabled: true,
-    prompt: '',
-    turnReminder: { enabled: true, prompt: '' },
-    outputGuard: { enabled: true, streamEnabled: true },
-    applyToExternalPool: false,
-    claudeModelsOnly: false,
-    pathOverrides: {},
-  },
-})
-
-const normalizePromptSteeringRouteRules = (value?: string[] | null): string[] =>
-  Array.from(new Set((value ?? []).map((rule) => rule.trim()).filter(Boolean)))
-
-const normalizePromptSteering = (
-  input?: Partial<RuntimeConfig['promptSteering']> | null,
-): RuntimeConfig['promptSteering'] => {
-  const defaults = defaultPromptSteering()
-  const routeMode = input?.routeMode === 'allow_all' || input?.routeMode === 'deny_list'
-    ? input.routeMode
-    : defaults.routeMode
-  const routeRules = normalizePromptSteeringRouteRules(input?.routeRules ?? defaults.routeRules)
-  const next = {
-    ...defaults,
-    ...(input ?? {}),
-    scope: input?.scope === 'cc_only' ? 'route_rules' : (input?.scope ?? defaults.scope),
-    routeMode,
-    routeRules: routeMode === 'allow_list' && routeRules.length === 0 ? defaults.routeRules : routeRules,
-    languageConstraint: { ...defaults.languageConstraint, ...(input?.languageConstraint ?? {}) },
-    taskQuality: { ...defaults.taskQuality, ...(input?.taskQuality ?? {}) },
-    toolChoice: { ...defaults.toolChoice, ...(input?.toolChoice ?? {}) },
-    chunkedWrite: { ...defaults.chunkedWrite, ...(input?.chunkedWrite ?? {}) },
-    thinking: { ...defaults.thinking, ...(input?.thinking ?? {}) },
-    custom: { ...defaults.custom, ...(input?.custom ?? {}) },
-    identity: {
-      ...defaults.identity,
-      ...(input?.identity ?? {}),
-      turnReminder: { ...defaults.identity.turnReminder, ...(input?.identity?.turnReminder ?? {}) },
-      outputGuard: { ...defaults.identity.outputGuard, ...(input?.identity?.outputGuard ?? {}) },
-      routeRules: Array.from(new Set((input?.identity?.routeRules ?? []).map((rule) => rule.trim()).filter(Boolean))),
-      pathOverrides: { ...(input?.identity?.pathOverrides ?? {}) },
-    },
+): RuntimeConfig['bodyConversion'] => {
+  const base = defaultBodyConversion()
+  return {
+    toolSchemaNormalization: input?.toolSchemaNormalization ?? base.toolSchemaNormalization,
+    toolNameMapping: input?.toolNameMapping ?? base.toolNameMapping,
+    toolSchemaKeyMapping: input?.toolSchemaKeyMapping ?? base.toolSchemaKeyMapping,
+    toolSchemaKeyValidationRegex: input?.toolSchemaKeyValidationRegex ?? base.toolSchemaKeyValidationRegex,
+    toolChoiceSteering: input?.toolChoiceSteering ?? base.toolChoiceSteering,
+    nativeReasoningFields: input?.nativeReasoningFields ?? base.nativeReasoningFields,
+    toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
+    historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
   }
-  next.languageConstraint.prompt = next.languageConstraint.prompt.trim()
-  next.taskQuality.prompt = next.taskQuality.prompt.trim()
-  next.custom.prompt = next.custom.prompt.trim()
-  next.identity.prompt = next.identity.prompt.trim()
-  next.identity.turnReminder.prompt = next.identity.turnReminder.prompt.trim()
-  return next
 }
+
 
 const defaultMissingMaxTokens = (): RuntimeConfig['missingMaxTokens'] => ({
   policy: 'default_value',
@@ -629,7 +560,20 @@ const emptyConfig: RuntimeConfig = {
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
   bodyConversion: defaultBodyConversion(),
-  promptSteering: defaultPromptSteering(),
+  // Prompt injection and route features are edited in the new console; this page keeps the
+  // loaded values and sends them back unchanged.
+  promptInjection: { applyToCountTokens: true, defaults: {} as RuntimeConfig['promptInjection']['defaults'], texts: {}, pathOverrides: {} },
+  routeFeatures: {
+    defaults: {
+      thinkingModelName: true,
+      thinkingTrigger: 'real_request',
+      channelLeakGuard: false,
+      channelLeakGuardStream: true,
+      modelDrivenWebSearch: false,
+    },
+    pathOverrides: {},
+  },
+  claudeModelsOnly: false,
   missingMaxTokens: defaultMissingMaxTokens(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
@@ -663,7 +607,6 @@ const emptyConfig: RuntimeConfig = {
   modelResolutionMode: 'compatible',
   modelMapping: defaultModelMappingConfig(),
   extractThinking: true,
-  thinkingTriggerMode: 'real_request',
   exposeProxyWarnings: false,
   auditLogRetentionEnabled: false,
   auditLogRetentionDays: 15,
@@ -3008,76 +2951,10 @@ function pathPolicyWithStrategyDefaults(
   }
 }
 
-const IDENTITY_ROUTE_FIELDS: Array<{ key: keyof IdentityRouteOverride; label: string }> = [
-  { key: 'enabled', label: '身份隐藏' },
-  { key: 'promptEnabled', label: '注入身份声明' },
-  { key: 'turnReminderEnabled', label: '每轮身份提醒' },
-  { key: 'outputGuardEnabled', label: '输出过滤' },
-  { key: 'outputGuardStreamEnabled', label: '流式也过滤' },
-  { key: 'applyToExternalPool', label: '应用到外部池' },
-]
-
-function identityDefaultValue(identity: RuntimeConfig['promptSteering']['identity'], key: keyof IdentityRouteOverride): boolean {
-  switch (key) {
-    case 'enabled':
-      return identity.enabled
-    case 'promptEnabled':
-      return identity.promptEnabled
-    case 'turnReminderEnabled':
-      return identity.turnReminder.enabled
-    case 'outputGuardEnabled':
-      return identity.outputGuard.enabled
-    case 'outputGuardStreamEnabled':
-      return identity.outputGuard.streamEnabled
-    case 'applyToExternalPool':
-      return identity.applyToExternalPool
-  }
-}
-
-function RouteIdentityFields({
-  identity,
-  value,
-  onChange,
-}: {
-  identity: RuntimeConfig['promptSteering']['identity']
-  value: IdentityRouteOverride
-  onChange: (next: IdentityRouteOverride) => void
-}) {
-  const routeOff = value.enabled === false || (value.enabled === undefined && !identity.enabled)
+function RouteSettingsNotice() {
   return (
-    <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
-      <div>
-        <h4 className="text-sm font-semibold">身份与渠道隐藏</h4>
-        <p className="mt-1 text-xs leading-5 text-muted-foreground">
-          每项都可以单独设置；“跟随默认”使用上方身份隐藏的默认值和路由规则。提示词内容统一在上方维护。
-        </p>
-      </div>
-      <div className="grid gap-3 md:grid-cols-3">
-        {IDENTITY_ROUTE_FIELDS.map((field) => {
-          const current = value[field.key]
-          const selectValue = current === undefined ? 'inherit' : current ? 'on' : 'off'
-          return (
-            <label key={field.key} className="block text-sm">
-              <span className="mb-1 block font-medium">{field.label}</span>
-              <select
-                className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
-                value={selectValue}
-                disabled={field.key !== 'enabled' && routeOff}
-                onChange={(event) => {
-                  const next = { ...value }
-                  if (event.target.value === 'inherit') delete next[field.key]
-                  else next[field.key] = event.target.value === 'on'
-                  onChange(next)
-                }}
-              >
-                <option value="inherit">跟随默认（{identityDefaultValue(identity, field.key) ? '开' : '关'}）</option>
-                <option value="on">开启</option>
-                <option value="off">关闭</option>
-              </select>
-            </label>
-          )
-        })}
-      </div>
+    <div className="rounded-lg border bg-muted/20 p-4 text-xs leading-5 text-muted-foreground">
+      这个路由的提示词注入和功能（身份声明、WebSearch 模型驱动、thinking 触发等）请在新版管理后台的“路由策略”中设置。
     </div>
   )
 }
@@ -3088,26 +2965,20 @@ function PathCachePolicyCard({
   cachePolicy,
   definedRoutes,
   builtIn,
-  identity,
-  identityOverride,
   onPrefixChange,
   onDelete,
   onChange,
   onDefinedRouteChange,
-  onIdentityChange,
 }: {
   prefix: string
   policy: CacheRoutePolicyPatch
   cachePolicy: CachePolicyConfig
   definedRoutes: string[]
   builtIn?: boolean
-  identity: RuntimeConfig['promptSteering']['identity']
-  identityOverride: IdentityRouteOverride
   onPrefixChange: (nextPrefix: string) => void
   onDelete: () => void
   onChange: (next: CacheRoutePolicyPatch) => void
   onDefinedRouteChange: (enabled: boolean) => void
-  onIdentityChange: (next: IdentityRouteOverride) => void
 }) {
   const [draftPrefix, setDraftPrefix] = useState(prefix)
   const [draftDfcacheName, setDraftDfcacheName] = useState(normalizeDefinedCacheRouteName(prefix) ?? '')
@@ -3322,7 +3193,7 @@ function PathCachePolicyCard({
           />
         </div>
       )}
-      <RouteIdentityFields identity={identity} value={identityOverride} onChange={onIdentityChange} />
+      <RouteSettingsNotice />
     </div>
   )
 }
@@ -3342,47 +3213,51 @@ function CachePolicyEditor({
     ...Object.keys(cachePolicy.pathOverrides ?? {}).map(canonicalCachePolicyPath),
     ...Object.keys(value.reportedUsage.pathOverrides ?? {}).map(canonicalCachePolicyPath),
     ...value.definedCacheRoutes.map(canonicalCachePolicyPath),
-    ...Object.keys(value.promptSteering.identity.pathOverrides ?? {}).map(canonicalCachePolicyPath),
+    ...Object.keys(value.promptInjection.pathOverrides ?? {}).map(canonicalCachePolicyPath),
+    ...Object.keys(value.routeFeatures.pathOverrides ?? {}).map(canonicalCachePolicyPath),
   ])).sort(compareCachePrefix)
-  const identity = value.promptSteering.identity
 
-  const identityOverrideFor = (prefix: string): IdentityRouteOverride => {
-    const normalizedPrefix = canonicalCachePolicyPath(prefix)
-    const entry = Object.entries(identity.pathOverrides ?? {}).find(
-      ([key]) => canonicalCachePolicyPath(key) === normalizedPrefix,
-    )
-    return entry ? { ...entry[1] } : {}
-  }
-
-  /** Moves, replaces, or drops the identity override for a route in one update. */
-  const identityOverridesWith = (oldPrefix: string | null, nextPrefix: string | null, next: IdentityRouteOverride | null) => {
-    const pathOverrides: Record<string, IdentityRouteOverride> = {}
-    for (const [key, override] of Object.entries(identity.pathOverrides ?? {})) {
+  /** Moves (rename) or drops (`nextPrefix = null`) one route key in a path-override map. */
+  const movedRouteMap = <T,>(map: Record<string, T>, oldPrefix: string, nextPrefix: string | null): Record<string, T> => {
+    const result: Record<string, T> = {}
+    let moved: T | undefined
+    for (const [key, entry] of Object.entries(map ?? {})) {
       const canonical = canonicalCachePolicyPath(key)
-      if (canonical === oldPrefix || canonical === nextPrefix) continue
-      pathOverrides[key] = override
+      if (canonical === oldPrefix) {
+        moved = entry
+        continue
+      }
+      if (nextPrefix && canonical === nextPrefix) continue
+      result[key] = entry
     }
-    if (nextPrefix && next && Object.keys(next).length > 0) pathOverrides[nextPrefix] = next
-    return { ...value.promptSteering, identity: { ...identity, pathOverrides } }
+    if (nextPrefix && moved !== undefined) result[nextPrefix] = moved
+    return result
   }
 
-  const setIdentityOverride = (prefix: string, next: IdentityRouteOverride) => {
-    const normalizedPrefix = canonicalCachePolicyPath(prefix)
-    onChange({ ...value, promptSteering: identityOverridesWith(normalizedPrefix, normalizedPrefix, next) })
-  }
+  const routeSettingsMoved = (oldPrefix: string, nextPrefix: string | null) => ({
+    promptInjection: {
+      ...value.promptInjection,
+      pathOverrides: movedRouteMap(value.promptInjection.pathOverrides, oldPrefix, nextPrefix),
+    },
+    routeFeatures: {
+      ...value.routeFeatures,
+      pathOverrides: movedRouteMap(value.routeFeatures.pathOverrides, oldPrefix, nextPrefix),
+    },
+  })
 
   const updateCachePolicy = (
     nextCachePolicy: CachePolicyConfig,
     nextReportedUsage = value.reportedUsage,
     nextDefinedRoutes = value.definedCacheRoutes,
-    nextPromptSteering = value.promptSteering
+    nextRouteSettings: Pick<RuntimeConfig, 'promptInjection' | 'routeFeatures'> = value,
   ) => {
     onChange({
       ...value,
       cachePolicy: nextCachePolicy,
       reportedUsage: nextReportedUsage,
       definedCacheRoutes: nextDefinedRoutes,
-      promptSteering: nextPromptSteering,
+      promptInjection: nextRouteSettings.promptInjection,
+      routeFeatures: nextRouteSettings.routeFeatures,
     })
   }
 
@@ -3468,7 +3343,7 @@ function CachePolicyEditor({
       { ...cachePolicy, pathOverrides },
       { ...value.reportedUsage, pathOverrides: reportedPathOverrides },
       moveDefinedRoute(value.definedCacheRoutes, normalizedOld, normalizedNext),
-      identityOverridesWith(normalizedOld, normalizedNext, identityOverrideFor(normalizedOld))
+      routeSettingsMoved(normalizedOld, normalizedNext)
     )
   }
 
@@ -3482,7 +3357,7 @@ function CachePolicyEditor({
       { ...cachePolicy, pathOverrides },
       { ...value.reportedUsage, pathOverrides: reportedPathOverrides },
       normalizedDefinedRoutesWith(value.definedCacheRoutes, normalizedPrefix, false),
-      identityOverridesWith(normalizedPrefix, null, null)
+      routeSettingsMoved(normalizedPrefix, null)
     )
   }
 
@@ -3608,13 +3483,10 @@ function CachePolicyEditor({
               cachePolicy={cachePolicy}
               definedRoutes={value.definedCacheRoutes}
               builtIn={isBuiltInCachePrefix(prefix)}
-              identity={identity}
-              identityOverride={identityOverrideFor(prefix)}
               onPrefixChange={(nextPrefix) => renamePath(prefix, nextPrefix)}
               onDelete={() => deletePath(prefix)}
               onChange={(nextPolicy) => setPathPolicy(prefix, nextPolicy)}
               onDefinedRouteChange={(enabled) => setDefinedRoute(prefix, enabled)}
-              onIdentityChange={(next) => setIdentityOverride(prefix, next)}
             />
           ))}
         </div>
@@ -3722,22 +3594,10 @@ export function RuntimeConfigPanel() {
   const updateConfig = useUpdateRuntimeConfig()
   const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyConfig)
-  const [promptSteeringRouteRulesText, setPromptSteeringRouteRulesText] = useState('')
-  const [identityRouteRulesText, setIdentityRouteRulesText] = useState('')
 
   useEffect(() => {
     if (config.data) {
       const bodyConversion = normalizeBodyConversion(config.data.bodyConversion)
-      const rawPromptSteering = (config.data as Partial<RuntimeConfig>).promptSteering
-      const promptSteering = normalizePromptSteering(rawPromptSteering ?? {
-        ...defaultPromptSteering(),
-        toolChoice: { enabled: bodyConversion.toolChoiceSteering },
-        chunkedWrite: {
-          ...defaultPromptSteering().chunkedWrite,
-          enabled: bodyConversion.chunkedToolPolicy,
-        },
-        thinking: { enabled: bodyConversion.thinkingPromptControls },
-      })
       setDraft({
         ...emptyConfig,
         ...config.data,
@@ -3759,7 +3619,6 @@ export function RuntimeConfigPanel() {
         },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
         bodyConversion,
-        promptSteering,
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity),
         externalPools: {
@@ -3775,8 +3634,6 @@ export function RuntimeConfigPanel() {
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
-      setPromptSteeringRouteRulesText(promptSteering.routeRules.join('\n'))
-      setIdentityRouteRulesText(promptSteering.identity.routeRules.join('\n'))
     }
   }, [config.data])
 
@@ -3857,7 +3714,9 @@ export function RuntimeConfigPanel() {
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       imageProcessing: normalizeImageProcessing(draft.imageProcessing),
       bodyConversion: normalizeBodyConversion(draft.bodyConversion),
-      promptSteering: normalizePromptSteering(draft.promptSteering),
+      promptInjection: draft.promptInjection,
+      routeFeatures: draft.routeFeatures,
+      claudeModelsOnly: draft.claudeModelsOnly,
       missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -3981,106 +3840,6 @@ export function RuntimeConfigPanel() {
   const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
   const payloadGuardRetryMode = payloadGuardMode === 'on_too_long'
   const defaultModelMappingRules = generateDefaultModelMappingRules(modelCapabilities.data)
-  const updatePromptSteering = <K extends keyof RuntimeConfig['promptSteering']>(key: K, value: RuntimeConfig['promptSteering'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        [key]: value,
-      },
-    }))
-  const updatePromptTextBlock = (block: 'languageConstraint' | 'taskQuality' | 'custom', key: 'enabled' | 'prompt', value: boolean | string) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        [block]: {
-          ...defaultPromptSteering()[block],
-          ...prev.promptSteering?.[block],
-          [key]: value,
-        },
-      },
-    }))
-  const updateIdentity = <K extends keyof RuntimeConfig['promptSteering']['identity']>(
-    key: K,
-    value: RuntimeConfig['promptSteering']['identity'][K],
-  ) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        identity: {
-          ...defaultPromptSteering().identity,
-          ...prev.promptSteering?.identity,
-          [key]: value,
-        },
-      },
-    }))
-  const updateIdentityOutputGuard = <K extends keyof RuntimeConfig['promptSteering']['identity']['outputGuard']>(
-    key: K,
-    value: RuntimeConfig['promptSteering']['identity']['outputGuard'][K],
-  ) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        identity: {
-          ...defaultPromptSteering().identity,
-          ...prev.promptSteering?.identity,
-          outputGuard: {
-            ...defaultPromptSteering().identity.outputGuard,
-            ...prev.promptSteering?.identity?.outputGuard,
-            [key]: value,
-          },
-        },
-      },
-    }))
-  const updateIdentityTurnReminder = <K extends keyof RuntimeConfig['promptSteering']['identity']['turnReminder']>(
-    key: K,
-    value: RuntimeConfig['promptSteering']['identity']['turnReminder'][K],
-  ) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        identity: {
-          ...defaultPromptSteering().identity,
-          ...prev.promptSteering?.identity,
-          turnReminder: {
-            ...defaultPromptSteering().identity.turnReminder,
-            ...prev.promptSteering?.identity?.turnReminder,
-            [key]: value,
-          },
-        },
-      },
-    }))
-  const updatePromptToggle = (key: 'toolChoice' | 'thinking', enabled: boolean) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        [key]: { enabled },
-      },
-    }))
-  const updateChunkedWrite = (key: keyof RuntimeConfig['promptSteering']['chunkedWrite'], value: boolean) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        chunkedWrite: {
-          ...defaultPromptSteering().chunkedWrite,
-          ...prev.promptSteering?.chunkedWrite,
-          [key]: value,
-        },
-      },
-    }))
   const payloadConditionTitle = payloadGuardRetryMode
     ? '仅在上游返回输入过长后重试时执行'
     : '仅当发送前请求体超过上方阈值时执行'
@@ -4731,293 +4490,10 @@ export function RuntimeConfigPanel() {
               }
             />
             <ImpactGroupHeader
-              label="提示词引导"
-              title="Claude Code system prompt 引导"
-              description="管理代理新增的语言、任务质量、tool_choice、thinking 与分块兼容提示；关闭总开关后不新增任何这类提示，客户端原始结构化字段仍保留。"
+              label="提示词注入"
+              title="提示词注入与路由功能"
+              description="代理写进上游请求的提示词、身份声明、WebSearch 模型驱动和 thinking 触发等设置已移到新版管理后台的“提示词注入”和“路由策略”页面，这里不再编辑。保存本页不会改动这些设置。"
             />
-            <ToggleField
-              title="启用提示词引导"
-              description="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示；客户端已提供的结构化字段仍按原语义处理。"
-              checked={draft.promptSteering.enabled}
-              onCheckedChange={(enabled) => updatePromptSteering('enabled', enabled)}
-            />
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3">
-                <div className="text-sm font-medium">生效范围</div>
-                <div className="mt-1 text-xs leading-5 text-muted-foreground">anthropic-strict profile 始终不注入 synthetic prompt。</div>
-              </div>
-              <select
-                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                value={draft.promptSteering.scope}
-                onChange={(event) => updatePromptSteering('scope', event.target.value as RuntimeConfig['promptSteering']['scope'])}
-              >
-                <option value="route_rules">按路径规则</option>
-                <option value="claude_code_profile">Claude Code / Debug profile</option>
-                <option value="all_routes">全部 messages 路由</option>
-              </select>
-            </label>
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3">
-                <div className="text-sm font-medium">提示词路径模式</div>
-                <div className="mt-1 text-xs leading-5 text-muted-foreground">只在“按路径规则”范围下参与判断。</div>
-              </div>
-              <select
-                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                value={draft.promptSteering.routeMode}
-                disabled={draft.promptSteering.scope !== 'route_rules'}
-                onChange={(event) =>
-                  updatePromptSteering(
-                    'routeMode',
-                    event.target.value as RuntimeConfig['promptSteering']['routeMode'],
-                  )
-                }
-              >
-                <option value="allow_list">只对规则命中的入口生效</option>
-                <option value="deny_list">对规则外的入口生效</option>
-                <option value="allow_all">全部入口生效</option>
-              </select>
-            </label>
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3">
-                <div className="text-sm font-medium">提示词路径规则</div>
-                <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                  每行一条，可填入口前缀或完整 messages / count_tokens 路径；规则按大小写不敏感的精确或路径前缀匹配。
-                </div>
-              </div>
-              <textarea
-                className="min-h-28 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                value={promptSteeringRouteRulesText}
-                disabled={draft.promptSteering.scope !== 'route_rules' || draft.promptSteering.routeMode === 'allow_all'}
-                placeholder={'/cc\n/v1\n/ha\n/na\n/dfcache/team'}
-                onChange={(event) => {
-                  const routeRules = normalizePromptSteeringRouteRules(
-                    event.target.value.split(/[\r\n,]+/),
-                  )
-                  setPromptSteeringRouteRulesText(event.target.value)
-                  updatePromptSteering('routeRules', routeRules)
-                }}
-              />
-            </label>
-            <ToggleField
-              title="应用到外部池"
-              description="开启后，请求进入外部池 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
-              checked={draft.promptSteering.applyToExternalPool}
-              onCheckedChange={(applyToExternalPool) => updatePromptSteering('applyToExternalPool', applyToExternalPool)}
-            />
-            <ToggleField
-              title="count_tokens 同步计入"
-              description="count_tokens 使用同一提示词路径规则，避免估算低于真实请求。"
-              checked={draft.promptSteering.applyToCountTokens}
-              onCheckedChange={(applyToCountTokens) => updatePromptSteering('applyToCountTokens', applyToCountTokens)}
-            />
-            <ToggleField
-              title="语言约束"
-              description="默认关闭。开启后在 system 顶部注入一次：优先用户明确要求的语言，其次客户端声明的语言（如 Claude Code 的 language 设置），否则跟随用户自己的消息。关闭时不注入任何语言提示词。"
-              checked={draft.promptSteering.languageConstraint.enabled}
-              onCheckedChange={(enabled) => updatePromptTextBlock('languageConstraint', 'enabled', enabled)}
-            />
-            <ToggleField
-              title="任务质量"
-              description="强调最新用户消息、仅分析/真实执行/发布等任务边界，以及已验证必须有证据。"
-              checked={draft.promptSteering.taskQuality.enabled}
-              onCheckedChange={(enabled) => updatePromptTextBlock('taskQuality', 'enabled', enabled)}
-            />
-            <ToggleField
-              title="tool_choice 引导"
-              description="控制本地 Kiro 的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
-              checked={draft.promptSteering.toolChoice.enabled}
-              onCheckedChange={(enabled) => updatePromptToggle('toolChoice', enabled)}
-            />
-            <ToggleField
-              title="thinking 提示控制"
-              description="控制 synthetic thinking 兼容提示；总开关关闭时不注入提示，客户端显式 thinking 仍保留。"
-              checked={draft.promptSteering.thinking.enabled}
-              onCheckedChange={(enabled) => updatePromptToggle('thinking', enabled)}
-            />
-            <ToggleField
-              title="分块写入提示"
-              description="控制 Write/Edit 分块兼容提示及其两个提示位置；总开关关闭时不注入这些提示。"
-              checked={draft.promptSteering.chunkedWrite.enabled}
-              onCheckedChange={(enabled) => updateChunkedWrite('enabled', enabled)}
-            />
-            <ToggleField
-              title="分块 system 提示"
-              description="在 system 中要求模型遵守 Write/Edit 分块限制。"
-              checked={draft.promptSteering.chunkedWrite.systemPromptEnabled}
-              disabled={!draft.promptSteering.chunkedWrite.enabled}
-              onCheckedChange={(enabled) => updateChunkedWrite('systemPromptEnabled', enabled)}
-            />
-            <ToggleField
-              title="分块工具描述"
-              description="给 Write/Edit 工具 description 追加分块限制说明。"
-              checked={draft.promptSteering.chunkedWrite.toolDescriptionEnabled}
-              disabled={!draft.promptSteering.chunkedWrite.enabled}
-              onCheckedChange={(enabled) => updateChunkedWrite('toolDescriptionEnabled', enabled)}
-            />
-            <ToggleField
-              title="自定义追加提示词"
-              description="追加 operator 自定义 system prompt；默认关闭。"
-              checked={draft.promptSteering.custom.enabled}
-              onCheckedChange={(enabled) => updatePromptTextBlock('custom', 'enabled', enabled)}
-            />
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-medium">语言约束提示词</div>
-                  <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在“语言约束”开启时注入；留空保存时使用内置默认。</div>
-                </div>
-                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('languageConstraint', 'prompt', config.data?.promptSteeringDefaults?.languageConstraintPrompt ?? '')}>
-                  恢复默认
-                </Button>
-              </div>
-              <textarea
-                className="min-h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
-                value={draft.promptSteering.languageConstraint.prompt}
-                onChange={(event) => updatePromptTextBlock('languageConstraint', 'prompt', event.target.value)}
-              />
-            </label>
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-medium">任务质量提示词</div>
-                  <div className="mt-1 text-xs leading-5 text-muted-foreground">用于减少追问被忽视、任务边界错误、没有真实证据却声称完成等问题。</div>
-                </div>
-                <Button type="button" variant="outline" size="sm" onClick={() => updatePromptTextBlock('taskQuality', 'prompt', config.data?.promptSteeringDefaults?.taskQualityPrompt ?? '')}>
-                  恢复默认
-                </Button>
-              </div>
-              <textarea
-                className="min-h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
-                value={draft.promptSteering.taskQuality.prompt}
-                onChange={(event) => updatePromptTextBlock('taskQuality', 'prompt', event.target.value)}
-              />
-            </label>
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3">
-                <div className="text-sm font-medium">自定义追加提示词</div>
-                <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在“自定义追加提示词”开启时注入；不要写动态 request id、时间或账号信息。</div>
-              </div>
-              <textarea
-                className="min-h-32 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
-                value={draft.promptSteering.custom.prompt}
-                onChange={(event) => updatePromptTextBlock('custom', 'prompt', event.target.value)}
-              />
-            </label>
-            <ImpactGroupHeader
-              label="身份隐藏"
-              title="统一以 Claude 身份回答，不暴露上游渠道"
-              description="这里是默认值：没有单独设置的路由按这里的开关和路由规则生效；单个路由可以在缓存路径卡片里独立开关。不受上方提示词引导的总开关和 strict 模式影响。"
-            />
-            <ToggleField
-              title="启用身份隐藏"
-              description="总开关，默认关闭。关闭后下方提示词、每轮提醒和输出过滤都不生效。"
-              checked={draft.promptSteering.identity.enabled}
-              onCheckedChange={(enabled) => updateIdentity('enabled', enabled)}
-            />
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3 text-sm font-medium">生效路由</div>
-              <select
-                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-60"
-                value={draft.promptSteering.identity.routeMode}
-                disabled={!draft.promptSteering.identity.enabled}
-                onChange={(event) =>
-                  updateIdentity('routeMode', event.target.value as RuntimeConfig['promptSteering']['identity']['routeMode'])
-                }
-              >
-                <option value="allow_all">全部路由</option>
-                <option value="allow_list">只在以下路由生效</option>
-                <option value="deny_list">以下路由不生效</option>
-              </select>
-              <textarea
-                className="mt-3 min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs disabled:opacity-60"
-                value={identityRouteRulesText}
-                disabled={!draft.promptSteering.identity.enabled || draft.promptSteering.identity.routeMode === 'allow_all'}
-                placeholder={'/cc\n/v1'}
-                onChange={(event) => {
-                  setIdentityRouteRulesText(event.target.value)
-                  updateIdentity(
-                    'routeRules',
-                    Array.from(new Set(event.target.value.split('\n').map((rule) => rule.trim()).filter(Boolean))),
-                  )
-                }}
-              />
-              <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                每行一条，填入口前缀（如 /cc）或完整 messages / count_tokens 路径。
-              </div>
-            </label>
-            <ToggleField
-              title="注入身份声明"
-              description="在 system 最前面加一段简短的身份声明。"
-              checked={draft.promptSteering.identity.promptEnabled}
-              disabled={!draft.promptSteering.identity.enabled}
-              onCheckedChange={(enabled) => updateIdentity('promptEnabled', enabled)}
-            />
-            <ToggleField
-              title="每轮身份提醒"
-              description="在当前用户消息末尾追加一句提醒，对抗上游自带的身份设定；只作用于本地 Kiro 链路。"
-              checked={draft.promptSteering.identity.turnReminder.enabled}
-              disabled={!draft.promptSteering.identity.enabled}
-              onCheckedChange={(enabled) => updateIdentityTurnReminder('enabled', enabled)}
-            />
-            <ToggleField
-              title="输出过滤"
-              description="返回前删除“我是 Kiro / 我不是 Kiro / 指令冲突”这类暴露渠道的句子，只看自我描述，不拦普通提到的词。"
-              checked={draft.promptSteering.identity.outputGuard.enabled}
-              disabled={!draft.promptSteering.identity.enabled}
-              onCheckedChange={(enabled) => updateIdentityOutputGuard('enabled', enabled)}
-            />
-            <ToggleField
-              title="流式也过滤"
-              description="流式回复按整句检查后再下发，每句要等说完才发出，首字会稍晚；关闭后流式只靠提示词。"
-              checked={draft.promptSteering.identity.outputGuard.streamEnabled}
-              disabled={!draft.promptSteering.identity.enabled || !draft.promptSteering.identity.outputGuard.enabled}
-              onCheckedChange={(enabled) => updateIdentityOutputGuard('streamEnabled', enabled)}
-            />
-            <ToggleField
-              title="应用到外部池"
-              description="外部池通常直连真实 Claude 上游，默认不注入提示词；某个外部池也需要时再开启。"
-              checked={draft.promptSteering.identity.applyToExternalPool}
-              disabled={!draft.promptSteering.identity.enabled}
-              onCheckedChange={(enabled) => updateIdentity('applyToExternalPool', enabled)}
-            />
-            <ToggleField
-              title="模型列表只显示 Claude"
-              description="/v1/models 隐藏 DeepSeek、GLM、MiniMax、Qwen 等非 Claude 模型；直接用模型名调用不受影响。独立开关，不跟随上面的总开关和路由。"
-              checked={draft.promptSteering.identity.claudeModelsOnly}
-              onCheckedChange={(enabled) => updateIdentity('claudeModelsOnly', enabled)}
-            />
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div className="text-sm font-medium">身份声明提示词</div>
-                <Button type="button" variant="outline" size="sm" onClick={() => updateIdentity('prompt', config.data?.promptSteeringDefaults?.identityPrompt ?? '')}>
-                  恢复默认
-                </Button>
-              </div>
-              <textarea
-                className="min-h-48 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
-                value={draft.promptSteering.identity.prompt}
-                onChange={(event) => updateIdentity('prompt', event.target.value)}
-              />
-              <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                留空保存时使用内置默认。只约束模型如何介绍自己，不要禁止讨论 Kiro / AWS 这些词，否则用户代码里出现这些词时模型会回避。
-              </div>
-            </label>
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <div className="text-sm font-medium">每轮身份提醒</div>
-                <Button type="button" variant="outline" size="sm" onClick={() => updateIdentityTurnReminder('prompt', config.data?.promptSteeringDefaults?.identityTurnReminderPrompt ?? '')}>
-                  恢复默认
-                </Button>
-              </div>
-              <textarea
-                className="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
-                value={draft.promptSteering.identity.turnReminder.prompt}
-                onChange={(event) => updateIdentityTurnReminder('prompt', event.target.value)}
-              />
-              <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                保持简短，并用 &lt;identity_reminder&gt; 标签包裹：模型若原样复述该标签块，代理会在输出中删掉它。
-              </div>
-            </label>
             <ImpactGroupHeader
               label="本地转换"
               title="本地凭据路径的 Anthropic -> Kiro 转换能力"
@@ -5026,9 +4502,7 @@ export function RuntimeConfigPanel() {
             {[
               ['toolSchemaNormalization', '工具 schema 规范化', '清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。'],
               ['toolNameMapping', '工具名映射', '清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。'],
-              ['toolChoiceSteering', '结构化 tool_choice', '按请求语义执行 none=0、any=N、named=1 工具过滤；提示词总开关只控制额外提示，不删除结构化语义。'],
-              ['thinkingPromptControls', 'thinking 转换能力', '允许本地 Kiro 生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。'],
-              ['chunkedToolPolicy', '分块工具策略', '定义 Write/Edit 分块协议能力；额外 system/工具描述提示受上方总开关控制。'],
+              ['toolChoiceSteering', '结构化 tool_choice', '按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用。对应的提示词在新版管理后台的提示词注入页单独控制。'],
               ['nativeReasoningFields', '原生 reasoning 字段', '对支持的 Kiro 模型上报 additionalModelRequestFields。'],
               ['toolPairingRepair', '工具配对修复', '清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
@@ -5525,27 +4999,6 @@ export function RuntimeConfigPanel() {
                 }))
               }
             />
-            <label className="block rounded-md border bg-background p-4">
-              <div className="mb-3">
-                <div className="text-sm font-medium">思考触发策略</div>
-                <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                  按请求触发会遵循 Claude Code CLI 的 thinking 语义；总是触发会在请求没有明确关闭时启用思考输出。
-                </div>
-              </div>
-              <select
-                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                value={draft.thinkingTriggerMode}
-                onChange={(event) =>
-                  setDraft((prev) => ({
-                    ...prev,
-                    thinkingTriggerMode: event.target.value as RuntimeConfig['thinkingTriggerMode'],
-                  }))
-                }
-              >
-                <option value="real_request">按请求触发</option>
-                <option value="always">总是触发</option>
-              </select>
-            </label>
             <ToggleField
               title="提取 Thinking 内容块"
               description="控制非流式响应里是否把 <thinking> 标签解析成独立 thinking 内容块。严格模式下不会暴露未签名 thinking。"

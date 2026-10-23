@@ -9,7 +9,7 @@
 执行前先理解当前实现，否则会把正常行为误判成问题：
 
 - Claude Code 默认每个请求都带 `thinking: {type: adaptive}` 和 `output_config.effort`（2.1.156 实测默认 `effort=high`；2.1.283 需在 CC-T-01 重新确认）。关键词 `think` / `think hard` / `ultrathink` 历史实测不改变请求体，只是 prompt 文本。CLI 没有"不思考"参数；只有 `--effort` 改 `output_config.effort`，只有显式 thinking 模型名（如 `--model sonnet-thinking`）改请求模型名。
-- kiro-rs 服务端在 `thinkingTriggerMode=real_request`（默认）下：
+- kiro-rs 服务端在 `routeFeatures.thinkingTrigger=real_request`（默认）下：
   - 普通 `adaptive`（含各档 effort、含 prompt 关键词）：不强制输出可见 thinking。原因：若所有 adaptive 请求都强制可见 thinking，普通请求会多出 thinking 块和输出 token 成本，adaptive 只作为兼容控制；
   - `thinking.type=enabled`（如 `MAX_THINKING_TOKENS`、`alwaysThinkingEnabled` 可能产生）或模型名带 `-thinking`：按可见 thinking 处理；
   - `thinking.type=disabled`：即使模型名带 `-thinking` 也不输出 thinking。
@@ -36,7 +36,7 @@
 | CC-T-06 | P1 | 新增（用户要求） | 交互式 | 会话内用快捷键或 `/config` 切换 thinking 开/关（以当前版本 UI 为准），每次切换后问一题 | 会话内切换 | 开时有 thinking，关时无 | 请求体随切换变化；切换后历史不报错 |
 | CC-T-07 | P1 | 既有场景 | 基线；开启发往上游的请求体采样 | `ccp --effort low` / `medium` / `high` / `xhigh` / `max` 各跑推理题；CLI 与直连（IDE 形态）两个入口 × 6 档（含不带 effort）× 5 轮，检查服务端发往上游的请求体 | effort | 均成功，usage 非 0；普通模型名下无 `thinking_delta`、无额外 thinking tokens | `--effort high` 时请求保留 adaptive 配置并被转换进上游 history（普通模型名下 thinking 控制只来自 adaptive 与 effort）。effort 写入上游原生推理字段（或兼容字段），`max` 不被截成 `high`，上游请求保留 `output_config.effort=max`；原生 adaptive 路径不发 `budget_tokens`；不凭空添加客户端没声明、上游也没声明的 thinking 字段；不支持的 effort 被映射而不是 400；违规数为 0。已知问题：max 被悄悄截成 high，或 adaptive/预算/别名/开关没进入最终上游请求体 |
 | CC-T-08 | P1 | 既有场景 | 基线 | `MAX_THINKING_TOKENS=4096 ccp --effort max ...`；再构造 thinking 预算大于输出上限的组合（如 max_tokens 32000、预算 100000），分别带与不带 `--betas interleaved-thinking-2025-05-14` | budget + effort 叠加；interleaved 大预算 | 成功，有 thinking；期望带 interleaved beta 时预算不截断，发往上游的 effort 保持 `max` | 两个字段同时存在时服务端取舍合理。已知现象（未修复）：预算被截成 31999，effort 从 max 降为 high。官方语义下 interleaved thinking 预算是整轮总量，可大于 max_tokens；上游本就不接收 max_tokens，截断只会让思考档位无故下降。复现时记为问题 |
-| CC-T-09 | P1 | 既有场景 | 运行配置 `thinkingTriggerMode=always`（先备份，结束恢复） | 先在默认 real_request 下跑：普通 sonnet、prompt 含 think/ultrathink、`--effort low`/`--effort max`、`--model sonnet-thinking`；再切到 always 跑普通 `ccp '17*23'` | 服务端强制 | real_request 下：普通 adaptive（含关键词和各档 effort）不输出可见 thinking；`-thinking` 模型名或 `thinking.type=enabled` 输出 `thinking_delta` 且有 thinking tokens。always 下：普通请求也出现可见 thinking，usage 非 0 | 结束后 GET 运行配置确认已恢复 `real_request` |
+| CC-T-09 | P1 | 既有场景 | 运行配置 `routeFeatures.defaults.thinkingTrigger=always`，测试路由不覆盖该字段（先备份，结束恢复） | 先在默认 real_request 下跑：普通 sonnet、prompt 含 think/ultrathink、`--effort low`/`--effort max`、`--model sonnet-thinking`；再切到 always 跑普通 `ccp '17*23'` | 服务端强制 | real_request 下：普通 adaptive（含关键词和各档 effort）不输出可见 thinking；`-thinking` 模型名或 `thinking.type=enabled` 输出 `thinking_delta` 且有 thinking tokens。always 下：普通请求也出现可见 thinking，usage 非 0 | 结束后 GET 运行配置确认已恢复 `real_request` |
 | CC-T-10 | P0 | 既有场景 | 基线 | `--model claude-sonnet-4-5-thinking`、`--model claude-haiku-4-5-thinking`、`--model sonnet-thinking`，统一用 `--output-format=stream-json --include-partial-messages --effort high`，prompt 如 `"Think briefly, then reply with exactly: OK"`；另用直连 API 测 `thinking.type=enabled` 以及 adaptive + effort=max | 模型名后缀 | 有可见 thinking，或清晰报错：出现 thinking 块和 `thinking_delta`，随后 `text_delta`；`result.usage` 与 `modelUsage` 非 0，`thinking_tokens>0`，计费不为零 | 不得静默退化为普通模型；只有真的拿到 thinking 输出才算通过，不能因为请求成功就判通过；记录 upstream model（应为基础模型，不带 `-thinking`）。对照"已知现象"中该别名无 thinking block 的历史记录给出结论 |
 | CC-T-11 | P1 | 新增（用户要求） | 基线 | 直接 curl：`thinking:{type:"enabled",budget_tokens:2048}` + `stream:false` | 非流式 | content 含 `thinking` + `text` 块 | `extractThinking` 生效；usage 含 thinking_tokens；正文中不残留 `<thinking>` 标签（旧行为：非流式下标签原样泄漏到正文） |
 
@@ -93,7 +93,7 @@
 
 | 编号 | 优先级 | 来源 | 前置 | 步骤/命令 | 参数 | 预期结果 | 判定/观察点 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| CC-T-50 | P0 | 既有场景 | 上游推理能力发现不完整、运营方 prompt steering（兼容 thinking 提示注入）总开关关闭（先备份，结束恢复） | `claude --print --effort high "..."`；`claude --print --model sonnet-thinking --effort high "..."`；同模型普通请求对照 | 显式 reasoning + prompt steering 关闭 | exit 0，最终文本正常；sonnet-thinking 有 thinking block 且 thinking tokens 非零；普通请求也正常 | 不再出现 `API Error: 400 reasoning was requested, but both native reasoning fields and compatible thinking prompt controls are unavailable`。已知现象：普通请求 200，reasoning 请求在发往上游前被本地拒绝；原因是能力状态未知时不生成原生推理字段，兼容 thinking 提示又被总开关关掉。预期客户端显式 reasoning 走专用的 thinking 兼容传输 |
+| CC-T-50 | P0 | 既有场景 | 上游推理能力发现不完整（模型没有原生 reasoning 字段）、测试路由上注入项 thinkingControls 关闭（先备份，结束恢复） | `claude --print --effort high "..."`；`claude --print --model sonnet-thinking --effort high "..."`；同模型普通请求对照；再在路由上开启 thinkingControls 重跑 | 显式 reasoning + thinkingControls 关闭 | thinkingControls 关闭时两条 reasoning 请求都在发往上游前返回 400：`reasoning was requested, but both native reasoning fields and compatible thinking prompt controls are unavailable`，CLI 显示 `API Error: 400 ...`；普通请求正常 200。开启 thinkingControls 后 exit 0，sonnet-thinking 有 thinking block 且 thinking tokens 非零 | 400 发生在上游调用前（无上游 attempt）。背景：thinking 兼容标签只由注入项 thinkingControls 控制，与其他注入项无关，没有显式 reasoning 特例；`-thinking` 模型名解析（`routeFeatures.thinkingModelName`）和 thinking 触发方式不受提示词开关影响 |
 | CC-T-51 | P0 | 既有场景 | 上游模型目录只声明基础模型、没有原生 reasoning effort 字段 | `ccp --model sonnet '...'` 普通请求 | 默认 adaptive + effort | 请求正常成功，不返回 400 | 已知问题：CLI 默认带 adaptive 和 effort，服务端因上游模型没声明原生 reasoning schema 就回 400 `does not advertise a native reasoning effort field`；预期降级处理 |
 
 ## 流式节奏、展示与跨上游
