@@ -13875,12 +13875,17 @@ fn normalized_overlay_preserves_future_fields_after_sanitize_image_and_steering_
             "round {round}"
         );
         assert!(
-            crate::anthropic::prompt_steering::apply_to_messages_request(
-                "/cc/v1/messages",
-                crate::model::config::CompatProfile::ClaudeCode,
-                &crate::model::config::PromptSteeringConfig::default(),
+            !crate::anthropic::prompt_injection::apply_to_messages_request(
+                &crate::model::config::ResolvedInjections::resolve(
+                    "/cc/v1/messages",
+                    crate::model::config::UpstreamKind::Local,
+                    crate::model::config::CompatProfile::ClaudeCode,
+                    &crate::model::config::PromptInjectionConfig::default(),
+                ),
                 &mut payload,
             )
+            .items
+            .is_empty()
         );
 
         let mut route = test_route("claude-sonnet-4-5");

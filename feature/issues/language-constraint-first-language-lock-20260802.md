@@ -26,12 +26,13 @@ Last reviewed: 2026-08-02 Asia/Shanghai
 
 ## 当前源码链
 
-2026-08-02 源码核对结果：
+源码核对结果：
 
-- `src/model/config.rs` 的默认“语言约束提示词”是静态文本，要求模型使用“用户最新消息的主要语言”；源码没有首语言变量、语言检测结果缓存或按会话保存的语言状态。
-- `src/anthropic/prompt_steering.rs::apply_to_system` 在每个请求处理时检查提示词标记；未发现标记时把同一段代理提示插入 `system` 开头。若 Claude Code 客户端把上一轮的 `system` 原样带回，则标记会阻止重复追加，但不会把语言值写入服务端状态。
-- `messages`、流式入口和 `count_tokens` 共用运行配置和提示词规则；当前代码没有“第一次语言优先”的分支。
-- 路径是否注入提示词由运行配置的 `scope/routeMode/routeRules` 决定，不能把 `/cc` 当成语言状态作用域。
+- 语言约束（注入项 A2 `languageConstraint`）的默认文本在 `src/model/prompt_injection/catalog.rs` 的 `DEFAULT_LANGUAGE_CONSTRAINT_PROMPT`，是静态文本：可见回复使用用户要求的语言，其次是客户端设置的语言，再次是用户自己消息的语言（不按工具输出、文件或 system reminder 判断）；源码没有首语言变量或按会话保存的语言状态。
+- 语言轮次提醒（注入项 A3 `languageTurnReminder`）追加在当前 user 消息末尾。语言值由 `src/anthropic/language_preference.rs` 在每个请求里从客户端语言设置或用户最近一条真实文本重新识别，不跨请求缓存。
+- `src/anthropic/prompt_injection.rs::apply_to_system` 在每个请求处理时检查提示词标记；未发现标记时把代理提示块插入 `system` 开头。若 Claude Code 客户端把上一轮的 `system` 原样带回，则标记会阻止重复追加，但不会把语言值写入服务端状态。
+- `messages`、流式入口和 `count_tokens` 按同一份 `promptInjection` 设置解析注入项；当前代码没有“第一次语言优先”的分支。
+- 某个路径是否注入 A2/A3 由 `promptInjection` 的全局默认和该路由上的设置决定，不能把 `/cc` 当成语言状态作用域。
 - 本轮未发现进程级或全局语言缓存；仍需在真实失败样本中确认 Claude Code 自身的会话系统提示、压缩恢复或上游模型行为是否造成表象锁定。
 
 ## 2026-08-02 首轮复现结果

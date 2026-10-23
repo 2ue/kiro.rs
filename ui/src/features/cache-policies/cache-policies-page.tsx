@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   Check,
   Copy,
@@ -27,21 +28,29 @@ import {
   StatGrid,
   useConfirm,
 } from '@/components/patterns'
-import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input } from '@/components/ui'
+import { Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   defaultReportedUsage,
   emptyRuntimeConfig,
   normalizeCachePolicy,
-  normalizePromptSteering,
+  normalizePromptInjection,
   normalizeReportedUsage,
+  normalizeRouteFeatures,
 } from '@/lib/runtime-config-defaults'
-import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
-import type { CachePolicyConfig, CacheRoutePolicyPatch, IdentityPromptConfig, IdentityRouteOverride, RuntimeConfig } from '@/types/api'
-import { identitySummary, RouteIdentityEditor } from './route-identity-editor'
-import { RouteWebSearchEditor } from './route-websearch-editor'
+import { usePromptInjectionCatalog, useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
+import type { CachePolicyConfig, CacheRoutePolicyPatch, RouteFeatureOverride, RuntimeConfig } from '@/types/api'
+import {
+  RouteFeaturesEditor,
+  RouteInjectionEditor,
+  routeInjectionSummary,
+} from '@/features/prompt-injection/route-injection-editor'
 import { RoutePolicyImportDialog } from './route-policy-import-dialog'
-import { buildRoutePolicyFile, downloadRoutePolicyFile } from './route-policy-transfer'
+import {
+  buildRoutePolicyFile,
+  downloadRoutePolicyFile,
+  type RouteInjectionOverrides,
+} from './route-policy-transfer'
 import {
   buildDefinedCacheRoute,
   cachePolicyForStrategyTemplate,
@@ -68,9 +77,10 @@ type PathEditorState = {
   prefix: string
   policy: CacheRoutePolicyPatch
   definedRoutes: string[]
-  identity: IdentityRouteOverride
-  /** Model-driven WebSearch override; undefined follows the runtime default. */
-  webSearch?: boolean
+  /** Explicit prompt-injection settings of this route; items left out follow the defaults. */
+  injection: RouteInjectionOverrides
+  /** Explicit feature settings of this route. */
+  features: RouteFeatureOverride
   /** Set when the editor was prefilled by copying or importing a route policy. */
   origin?: { kind: 'copy' | 'import'; route: string | null }
   /** Register the new /dfcache route as soon as a valid name is typed (copy of a reachable route). */
@@ -133,62 +143,59 @@ function hydrateRuntimeConfig(config: RuntimeConfig): RuntimeConfig {
     reportedUsage: normalizeReportedUsage(config.reportedUsage ?? defaultReportedUsage()),
     cachePolicy: normalizeCachePolicy(config.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(config.definedCacheRoutes ?? []),
-    promptSteering: normalizePromptSteering(config.promptSteering),
+    promptInjection: normalizePromptInjection(config.promptInjection),
+    routeFeatures: normalizeRouteFeatures(config.routeFeatures),
   }
 }
 
-/** Identity override stored for a route prefix, accepting both "/x" and "/x/" keys. */
-function identityOverrideForPrefix(identity: IdentityPromptConfig, prefix: string): IdentityRouteOverride {
+/** A map entry stored for a route prefix, accepting both "/x" and "/x/" keys. */
+function entryForPrefix<T>(map: Record<string, T>, prefix: string): T | undefined {
   const canonical = canonicalCachePolicyPath(prefix)
-  const entry = Object.entries(identity.pathOverrides ?? {}).find(([key]) => canonicalCachePolicyPath(key) === canonical)
-  return entry ? { ...entry[1] } : {}
+  return Object.entries(map).find(([key]) => canonicalCachePolicyPath(key) === canonical)?.[1]
 }
 
-function withIdentityOverride(
+/** Replaces the entry of `oldPrefix` (and any alias of `nextPrefix`) with `value` under `nextPrefix`. */
+function withPrefixEntry<T extends object>(
+  map: Record<string, T>,
+  oldPrefix: string | null,
+  nextPrefix: string | null,
+  value: T | null,
+): Record<string, T> {
+  const result: Record<string, T> = {}
+  for (const [key, entry] of Object.entries(map)) {
+    const canonical = canonicalCachePolicyPath(key)
+    if (canonical === oldPrefix || canonical === nextPrefix) continue
+    result[key] = entry
+  }
+  if (nextPrefix && value && Object.keys(value).length > 0) result[nextPrefix] = value
+  return result
+}
+
+function injectionForPrefix(config: RuntimeConfig, prefix: string): RouteInjectionOverrides {
+  return structuredClone(entryForPrefix(config.promptInjection.pathOverrides, prefix) ?? {})
+}
+
+function featuresForPrefix(config: RuntimeConfig, prefix: string): RouteFeatureOverride {
+  return structuredClone(entryForPrefix(config.routeFeatures.pathOverrides, prefix) ?? {})
+}
+
+function withRouteSettings(
   config: RuntimeConfig,
   oldPrefix: string | null,
   nextPrefix: string | null,
-  override: IdentityRouteOverride | null,
-): RuntimeConfig['promptSteering'] {
-  const identity = config.promptSteering.identity
-  const pathOverrides: Record<string, IdentityRouteOverride> = {}
-  for (const [key, value] of Object.entries(identity.pathOverrides ?? {})) {
-    const canonical = canonicalCachePolicyPath(key)
-    if (canonical === oldPrefix || canonical === nextPrefix) continue
-    pathOverrides[key] = value
+  injection: RouteInjectionOverrides | null,
+  features: RouteFeatureOverride | null,
+): Pick<RuntimeConfig, 'promptInjection' | 'routeFeatures'> {
+  return {
+    promptInjection: {
+      ...config.promptInjection,
+      pathOverrides: withPrefixEntry(config.promptInjection.pathOverrides, oldPrefix, nextPrefix, injection),
+    },
+    routeFeatures: {
+      ...config.routeFeatures,
+      pathOverrides: withPrefixEntry(config.routeFeatures.pathOverrides, oldPrefix, nextPrefix, features),
+    },
   }
-  if (nextPrefix && override && Object.keys(override).length > 0) pathOverrides[nextPrefix] = override
-  return { ...config.promptSteering, identity: { ...identity, pathOverrides } }
-}
-
-/** Model-driven WebSearch override stored for a route prefix. */
-function webSearchOverrideForPrefix(config: RuntimeConfig, prefix: string): boolean | undefined {
-  const canonical = canonicalCachePolicyPath(prefix)
-  const entry = Object.entries(config.bodyConversion.modelDrivenWebSearch?.pathOverrides ?? {})
-    .find(([key]) => canonicalCachePolicyPath(key) === canonical)
-  return entry?.[1]
-}
-
-function withWebSearchOverride(
-  config: RuntimeConfig,
-  oldPrefix: string | null,
-  nextPrefix: string | null,
-  value: boolean | undefined,
-): RuntimeConfig['bodyConversion'] {
-  const current = config.bodyConversion.modelDrivenWebSearch ?? { enabled: false, pathOverrides: {} }
-  const pathOverrides: Record<string, boolean> = {}
-  for (const [key, enabled] of Object.entries(current.pathOverrides ?? {})) {
-    const canonical = canonicalCachePolicyPath(key)
-    if (canonical === oldPrefix || canonical === nextPrefix) continue
-    pathOverrides[key] = enabled
-  }
-  if (nextPrefix && value !== undefined) pathOverrides[nextPrefix] = value
-  return { ...config.bodyConversion, modelDrivenWebSearch: { ...current, pathOverrides } }
-}
-
-function webSearchBadge(config: RuntimeConfig, prefix: string): string {
-  const value = webSearchOverrideForPrefix(config, prefix) ?? config.bodyConversion.modelDrivenWebSearch?.enabled ?? false
-  return value ? 'WebSearch 模型驱动' : 'WebSearch 模板'
 }
 
 function stripReadOnlyRuntimeFields(config: RuntimeConfig): RuntimeConfig {
@@ -404,7 +411,7 @@ function TemplateCard({
 function PathCard({
   prefix,
   policy,
-  identityBadges,
+  routeBadges,
   builtIn,
   registered,
   onEdit,
@@ -414,7 +421,7 @@ function PathCard({
 }: {
   prefix: string
   policy: CacheRoutePolicyPatch
-  identityBadges: string[]
+  routeBadges: string[]
   builtIn: boolean
   registered: boolean
   onEdit: () => void
@@ -443,8 +450,8 @@ function PathCard({
       <CardContent className="mt-auto pt-1">
         <div className="flex flex-wrap gap-2">
           {pathSummary(policy).map((item) => <Badge key={item} size="xs" tone="neutral">{item}</Badge>)}
-          {identityBadges.map((item) => (
-            <Badge key={item} size="xs" tone={item === '身份隐藏关' || item === 'WebSearch 模板' ? 'neutral' : 'info'}>{item}</Badge>
+          {routeBadges.map((item) => (
+            <Badge key={item} size="xs" tone="info">{item}</Badge>
           ))}
         </div>
       </CardContent>
@@ -454,6 +461,9 @@ function PathCard({
 
 export function CachePoliciesPage() {
   const runtimeConfig = useRuntimeConfig()
+  const injectionCatalog = usePromptInjectionCatalog()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [editorTab, setEditorTab] = useState('cache')
   const updateConfig = useUpdateRuntimeConfig()
   const confirm = useConfirm()
   const [workingConfig, setWorkingConfig] = useState<RuntimeConfig | null>(null)
@@ -478,7 +488,8 @@ export function CachePoliciesPage() {
       ...Object.keys(cachePolicy.pathOverrides ?? {}).map(canonicalCachePolicyPath),
       ...Object.keys(workingConfig.reportedUsage.pathOverrides ?? {}).map(canonicalCachePolicyPath),
       ...definedRoutes.map(canonicalCachePolicyPath),
-      ...Object.keys(workingConfig.promptSteering.identity.pathOverrides ?? {}).map(canonicalCachePolicyPath),
+      ...Object.keys(workingConfig.promptInjection.pathOverrides).map(canonicalCachePolicyPath),
+      ...Object.keys(workingConfig.routeFeatures.pathOverrides).map(canonicalCachePolicyPath),
     ])).sort(routeOrder)
   }, [cachePolicy.pathOverrides, definedRoutes, workingConfig])
 
@@ -535,8 +546,8 @@ export function CachePoliciesPage() {
       prefix,
       policy: mergedPathPolicy(prefix),
       definedRoutes: [...workingConfig.definedCacheRoutes],
-      identity: identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
-      webSearch: webSearchOverrideForPrefix(workingConfig, prefix),
+      injection: injectionForPrefix(workingConfig, prefix),
+      features: featuresForPrefix(workingConfig, prefix),
     })
   }
 
@@ -547,7 +558,8 @@ export function CachePoliciesPage() {
       prefix: '/dfcache/',
       policy: { cacheType: 'no_cache' },
       definedRoutes: [...definedRoutes],
-      identity: {},
+      injection: {},
+      features: {},
     })
   }
 
@@ -562,8 +574,8 @@ export function CachePoliciesPage() {
       // Deep copies so editing the copy never touches the source route's draft.
       policy: structuredClone(mergedPathPolicy(prefix)),
       definedRoutes: [...definedRoutes],
-      identity: structuredClone(identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix)),
-      webSearch: webSearchOverrideForPrefix(workingConfig, prefix),
+      injection: injectionForPrefix(workingConfig, prefix),
+      features: featuresForPrefix(workingConfig, prefix),
       origin: { kind: 'copy', route: prefix },
       // Built-in routes and registered /dfcache routes are reachable, so the copy is too.
       autoRegister: isBuiltInPrefix(prefix) || Boolean(sourceRoute && definedRoutes.includes(sourceRoute)),
@@ -575,14 +587,19 @@ export function CachePoliciesPage() {
     downloadRoutePolicyFile(buildRoutePolicyFile(
       prefix,
       sanitizeCacheRoutePolicy(mergedPathPolicy(prefix)),
-      identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
-      webSearchOverrideForPrefix(workingConfig, prefix),
+      injectionForPrefix(workingConfig, prefix),
+      featuresForPrefix(workingConfig, prefix),
     ))
     toast.success(`已导出 ${prefix} 的路由策略`)
   }
 
   /** Imported policies open the normal new-route editor, prefilled; the route is never imported. */
-  const openImportedPathEditor = (imported: { sourceRoute: string | null; cachePolicy: CacheRoutePolicyPatch; identity: IdentityRouteOverride; webSearch?: boolean }) => {
+  const openImportedPathEditor = (imported: {
+    sourceRoute: string | null
+    cachePolicy: CacheRoutePolicyPatch
+    promptInjection: RouteInjectionOverrides
+    features: RouteFeatureOverride
+  }) => {
     setImportOpen(false)
     setPathEditor({
       mode: 'new',
@@ -590,8 +607,8 @@ export function CachePoliciesPage() {
       prefix: '/dfcache/',
       policy: imported.cachePolicy,
       definedRoutes: [...definedRoutes],
-      identity: imported.identity,
-      webSearch: imported.webSearch,
+      injection: imported.promptInjection,
+      features: imported.features,
       origin: { kind: 'import', route: imported.sourceRoute },
     })
   }
@@ -634,8 +651,7 @@ export function CachePoliciesPage() {
       cachePolicy: normalizeCachePolicy(nextCachePolicy),
       reportedUsage: normalizeReportedUsage(nextReportedUsage),
       definedCacheRoutes: nextDefinedRoutes,
-      promptSteering: withIdentityOverride(workingConfig, oldPrefix, nextPrefix, pathEditor.identity),
-      bodyConversion: withWebSearchOverride(workingConfig, oldPrefix, nextPrefix, pathEditor.webSearch),
+      ...withRouteSettings(workingConfig, oldPrefix, nextPrefix, pathEditor.injection, pathEditor.features),
     })
     if (saved) setPathEditor(null)
   }
@@ -644,7 +660,7 @@ export function CachePoliciesPage() {
     if (!workingConfig) return
     const confirmed = await confirm({
       title: '删除路由策略？',
-      message: `确认删除路径 ${prefix} 的路由策略吗？对应的缓存覆盖、Usage 覆盖、身份隐藏覆盖、WebSearch 设置和 /dfcache 注册都会被清理。`,
+      message: `确认删除路径 ${prefix} 的路由策略吗？对应的缓存覆盖、Usage 覆盖、提示词注入和功能设置、/dfcache 注册都会被清理。`,
       confirmText: '确认删除',
       cancelText: '取消',
       tone: 'danger',
@@ -664,8 +680,7 @@ export function CachePoliciesPage() {
       cachePolicy: normalizeCachePolicy(nextCachePolicy),
       reportedUsage: normalizeReportedUsage(nextReportedUsage),
       definedCacheRoutes: normalizeDefinedCacheRoutes(nextDefinedRoutes),
-      promptSteering: withIdentityOverride(workingConfig, normalizedPrefix, null, null),
-      bodyConversion: withWebSearchOverride(workingConfig, normalizedPrefix, null, undefined),
+      ...withRouteSettings(workingConfig, normalizedPrefix, null, null, null),
     }, '路由策略已删除')
     if (saved && pathEditor?.originalPrefix === prefix) setPathEditor(null)
   }
@@ -674,6 +689,17 @@ export function CachePoliciesPage() {
     if (!workingConfig) return
     await persist({ ...workingConfig, highCacheThreshold: threshold }, '缓存命中阈值已保存')
   }
+
+  const linkedRoute = searchParams.get('route')
+  const linkedTab = searchParams.get('tab')
+  // Links from the prompt-injection matrix open that route's editor on the requested tab.
+  useEffect(() => {
+    if (!linkedRoute || !workingConfig) return
+    setEditorTab(linkedTab === 'injection' || linkedTab === 'features' ? linkedTab : 'cache')
+    openPathEditor(canonicalCachePolicyPath(linkedRoute))
+    setSearchParams({}, { replace: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkedRoute, workingConfig])
 
   if (runtimeConfig.isLoading || !workingConfig) return <LoadingState text="加载路由策略..." />
   if (runtimeConfig.error) return <ErrorState message={extractErrorMessage(runtimeConfig.error)} />
@@ -735,14 +761,7 @@ export function CachePoliciesPage() {
                 key={prefix}
                 prefix={prefix}
                 policy={mergedPathPolicy(prefix)}
-                identityBadges={[
-                  ...identitySummary(
-                    workingConfig.promptSteering.identity,
-                    prefix,
-                    identityOverrideForPrefix(workingConfig.promptSteering.identity, prefix),
-                  ),
-                  webSearchBadge(workingConfig, prefix),
-                ]}
+                routeBadges={routeInjectionSummary(workingConfig, injectionCatalog.data?.items ?? [], canonicalCachePolicyPath(prefix))}
                 builtIn={isBuiltInPrefix(prefix)}
                 registered={Boolean(normalizedRoute && definedRoutes.includes(normalizedRoute))}
                 onEdit={() => openPathEditor(prefix)}
@@ -817,8 +836,8 @@ export function CachePoliciesPage() {
               ? `导入路由策略${pathEditor.origin.route ? ` · 来自 ${pathEditor.origin.route}` : ''}`
               : pathEditor.mode === 'new' ? '新增路由策略' : `编辑路由策略 · ${pathEditor.originalPrefix}`}
           description={pathEditor.origin
-            ? `已填入${pathEditor.origin.kind === 'copy' ? '来源路由' : '导入'}的缓存策略和身份隐藏设置；路由不会${pathEditor.origin.kind === 'copy' ? '复制' : '导入'}，请填写新的 /dfcache 路由名后保存。`
-            : '路径、缓存策略和身份隐藏会一起保存；关闭弹窗不会提交草稿。'}
+            ? `已填入${pathEditor.origin.kind === 'copy' ? '来源路由' : '导入'}的缓存、提示词注入和功能设置；路由不会${pathEditor.origin.kind === 'copy' ? '复制' : '导入'}，请填写新的 /dfcache 路由名后保存。`
+            : '缓存、提示词注入和功能三个分区一起保存；关闭弹窗不会提交草稿。'}
           width="max-w-5xl"
           noBodyPadding
           onClose={() => { if (!updateConfig.isPending) setPathEditor(null) }}
@@ -830,55 +849,70 @@ export function CachePoliciesPage() {
           }
         >
           <div className="px-5 py-6 sm:px-7 sm:py-7">
-            <PathStrategyBindingCard
-              prefix={pathEditor.prefix}
-              policy={pathEditor.policy}
-              cachePolicy={workingConfig.cachePolicy}
-              definedRoutes={pathEditor.definedRoutes}
-              builtIn={isBuiltInPrefix(pathEditor.prefix)}
-              showDelete={false}
-              onPrefixChange={(nextPrefix) => setPathEditor((current) => {
-                if (!current) return current
-                const oldRoute = normalizeDefinedCacheRoute(current.prefix)
-                const nextRoute = normalizeDefinedCacheRoute(nextPrefix)
-                let definedRoutes = current.definedRoutes
-                if (oldRoute && nextRoute && definedRoutes.includes(oldRoute)) {
-                  definedRoutes = definedRoutes.filter((route) => route !== oldRoute)
-                  definedRoutes = normalizeDefinedCacheRoutes([...definedRoutes, nextRoute])
-                } else if (current.autoRegister && nextRoute) {
-                  // A copied reachable route stays reachable once it has a valid name.
-                  definedRoutes = normalizeDefinedCacheRoutes([...definedRoutes, nextRoute])
-                }
-                return { ...current, prefix: nextPrefix, definedRoutes }
-              })}
-              onDelete={() => undefined}
-              onChange={(policy) => setPathEditor((current) => current ? { ...current, policy } : current)}
-              onDefinedRouteChange={(enabled) => setPathEditor((current) => {
-                if (!current) return current
-                const route = normalizeDefinedCacheRoute(current.prefix)
-                if (!route) return current
-                const routes = enabled
-                  ? normalizeDefinedCacheRoutes([...current.definedRoutes, route])
-                  : current.definedRoutes.filter((item) => item !== route)
-                // An explicit choice replaces the copy's automatic registration.
-                return { ...current, definedRoutes: routes, autoRegister: enabled }
-              })}
-            />
-            <div className="mt-8 border-t pt-6">
-              <RouteIdentityEditor
-                prefix={canonicalCachePolicyPath(normalizeCachePolicyPath(pathEditor.prefix) ?? pathEditor.prefix)}
-                identity={workingConfig.promptSteering.identity}
-                value={pathEditor.identity}
-                onChange={(identity) => setPathEditor((current) => current ? { ...current, identity } : current)}
-              />
-            </div>
-            <div className="mt-8 border-t pt-6">
-              <RouteWebSearchEditor
-                defaultEnabled={workingConfig.bodyConversion.modelDrivenWebSearch?.enabled ?? false}
-                value={pathEditor.webSearch}
-                onChange={(webSearch) => setPathEditor((current) => current ? { ...current, webSearch } : current)}
-              />
-            </div>
+            <Tabs value={editorTab} onValueChange={setEditorTab}>
+              <TabsList>
+                <TabsTrigger value="cache">缓存</TabsTrigger>
+                <TabsTrigger value="injection">提示词注入</TabsTrigger>
+                <TabsTrigger value="features">功能</TabsTrigger>
+              </TabsList>
+              <TabsContent value="cache" className="pt-4">
+                <PathStrategyBindingCard
+                  prefix={pathEditor.prefix}
+                  policy={pathEditor.policy}
+                  cachePolicy={workingConfig.cachePolicy}
+                  definedRoutes={pathEditor.definedRoutes}
+                  builtIn={isBuiltInPrefix(pathEditor.prefix)}
+                  showDelete={false}
+                  onPrefixChange={(nextPrefix) => setPathEditor((current) => {
+                    if (!current) return current
+                    const oldRoute = normalizeDefinedCacheRoute(current.prefix)
+                    const nextRoute = normalizeDefinedCacheRoute(nextPrefix)
+                    let definedRoutes = current.definedRoutes
+                    if (oldRoute && nextRoute && definedRoutes.includes(oldRoute)) {
+                      definedRoutes = definedRoutes.filter((route) => route !== oldRoute)
+                      definedRoutes = normalizeDefinedCacheRoutes([...definedRoutes, nextRoute])
+                    } else if (current.autoRegister && nextRoute) {
+                      // A copied reachable route stays reachable once it has a valid name.
+                      definedRoutes = normalizeDefinedCacheRoutes([...definedRoutes, nextRoute])
+                    }
+                    return { ...current, prefix: nextPrefix, definedRoutes }
+                  })}
+                  onDelete={() => undefined}
+                  onChange={(policy) => setPathEditor((current) => current ? { ...current, policy } : current)}
+                  onDefinedRouteChange={(enabled) => setPathEditor((current) => {
+                    if (!current) return current
+                    const route = normalizeDefinedCacheRoute(current.prefix)
+                    if (!route) return current
+                    const routes = enabled
+                      ? normalizeDefinedCacheRoutes([...current.definedRoutes, route])
+                      : current.definedRoutes.filter((item) => item !== route)
+                    // An explicit choice replaces the copy's automatic registration.
+                    return { ...current, definedRoutes: routes, autoRegister: enabled }
+                  })}
+                />
+              </TabsContent>
+              <TabsContent value="injection" className="pt-4">
+                {injectionCatalog.data ? (
+                  <RouteInjectionEditor
+                    route={canonicalCachePolicyPath(normalizeCachePolicyPath(pathEditor.prefix) ?? pathEditor.prefix)}
+                    catalog={injectionCatalog.data.items}
+                    config={workingConfig}
+                    value={pathEditor.injection}
+                    onChange={(injection) => setPathEditor((current) => current ? { ...current, injection } : current)}
+                  />
+                ) : (
+                  <LoadingState text="加载注入项..." />
+                )}
+              </TabsContent>
+              <TabsContent value="features" className="pt-4">
+                <RouteFeaturesEditor
+                  route={canonicalCachePolicyPath(normalizeCachePolicyPath(pathEditor.prefix) ?? pathEditor.prefix)}
+                  config={workingConfig}
+                  value={pathEditor.features}
+                  onChange={(features) => setPathEditor((current) => current ? { ...current, features } : current)}
+                />
+              </TabsContent>
+            </Tabs>
           </div>
         </ModalShell>
       )}

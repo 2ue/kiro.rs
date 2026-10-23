@@ -30,10 +30,10 @@ use super::types::{
     CredentialUsageSummaryResponse, CredentialValidationGroup, CredentialValidationInfo,
     CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
     CredentialsStatusResponse, DiscoverExternalPoolSupportedModelsRequest, ExternalPoolTestRequest,
-    LoadBalancingModeResponse, ManualModelResponse, PromptSteeringDefaults,
-    ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse, ProxyResourceImportEntry,
-    ProxyResourceResponse, ProxyResourceTestRequest, ProxyResourceTestResponse,
-    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
+    LoadBalancingModeResponse, ManualModelResponse, ProxyResourceBatchTestItem,
+    ProxyResourceBatchTestResponse, ProxyResourceImportEntry, ProxyResourceResponse,
+    ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
+    RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
     SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
     SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
@@ -5913,8 +5913,9 @@ impl AdminService {
             whitespace_compression: config.compression.whitespace_compression,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion.clone(),
-            prompt_steering: config.prompt_steering.clone().normalized(),
-            prompt_steering_defaults: PromptSteeringDefaults::default(),
+            prompt_injection: config.prompt_injection.clone().normalized(),
+            route_features: config.route_features.clone().normalized(),
+            claude_models_only: config.claude_models_only,
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
@@ -5953,9 +5954,40 @@ impl AdminService {
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
             extract_thinking: config.extract_thinking,
-            thinking_trigger_mode: config.thinking_trigger_mode,
             expose_proxy_warnings: config.expose_proxy_warnings,
         }
+    }
+
+    pub fn prompt_injection_catalog(&self) -> super::types::PromptInjectionCatalogResponse {
+        use crate::model::prompt_injection::{MAX_TEXT_CHARS, MAX_TOTAL_TEXT_CHARS, catalog};
+        super::types::PromptInjectionCatalogResponse {
+            items: catalog::entries(),
+            fixed: catalog::fixed_injections(),
+            max_text_chars: MAX_TEXT_CHARS,
+            max_total_text_chars: MAX_TOTAL_TEXT_CHARS,
+        }
+    }
+
+    /// 用当前运行配置（或请求里的草稿）预览注入结果。草稿只用于这次调用，不会保存。
+    pub fn preview_prompt_injection(
+        &self,
+        body: super::types::PromptInjectionPreviewBody,
+    ) -> Result<crate::anthropic::PromptInjectionPreviewResponse, AdminServiceError> {
+        let mut config = self.token_manager.runtime_config();
+        if let Some(draft) = body.draft {
+            if let Some(prompt_injection) = draft.prompt_injection {
+                let prompt_injection = prompt_injection.normalized();
+                prompt_injection
+                    .validate()
+                    .map_err(AdminServiceError::InvalidCredential)?;
+                config.prompt_injection = prompt_injection;
+            }
+            if let Some(route_features) = draft.route_features {
+                config.route_features = route_features.normalized();
+            }
+        }
+        crate::anthropic::preview_prompt_injection(&config, body.request)
+            .map_err(AdminServiceError::InvalidCredential)
     }
 
     /// 更新运行时全局配置，并写入 PgSQL。
@@ -5964,6 +5996,11 @@ impl AdminService {
         req: UpdateRuntimeConfigRequest,
     ) -> Result<RuntimeConfigResponse, AdminServiceError> {
         let current_config = self.token_manager.runtime_config();
+        if req.prompt_steering.is_some() || req.thinking_trigger_mode.is_some() {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptSteering 和 thinkingTriggerMode 已停用，请改用 promptInjection 和 routeFeatures（请在新版管理后台的提示词注入页面编辑）".to_string(),
+            ));
+        }
         let request_admission = req
             .request_admission
             .unwrap_or(current_config.request_admission);
@@ -6143,11 +6180,19 @@ impl AdminService {
             .body_conversion
             .clone()
             .unwrap_or_else(|| current_config.body_conversion.clone());
-        let prompt_steering = req
-            .prompt_steering
+        let prompt_injection = req
+            .prompt_injection
             .clone()
-            .unwrap_or_else(|| current_config.prompt_steering.clone())
+            .unwrap_or_else(|| current_config.prompt_injection.clone())
             .normalized();
+        let route_features = req
+            .route_features
+            .clone()
+            .unwrap_or_else(|| current_config.route_features.clone())
+            .normalized();
+        let claude_models_only = req
+            .claude_models_only
+            .unwrap_or(current_config.claude_models_only);
         let missing_max_tokens = req
             .missing_max_tokens
             .unwrap_or(current_config.missing_max_tokens)
@@ -6271,9 +6316,6 @@ impl AdminService {
         let extract_thinking = req
             .extract_thinking
             .unwrap_or(current_config.extract_thinking);
-        let thinking_trigger_mode = req
-            .thinking_trigger_mode
-            .unwrap_or(current_config.thinking_trigger_mode);
         let expose_proxy_warnings = req
             .expose_proxy_warnings
             .unwrap_or(current_config.expose_proxy_warnings);
@@ -6450,21 +6492,9 @@ impl AdminService {
         missing_max_tokens
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
-        let prompt_steering_chars = prompt_steering.language_constraint.prompt.chars().count()
-            + prompt_steering.task_quality.prompt.chars().count()
-            + prompt_steering.custom.prompt.chars().count()
-            + prompt_steering.identity.prompt.chars().count()
-            + prompt_steering
-                .identity
-                .turn_reminder
-                .prompt
-                .chars()
-                .count();
-        if prompt_steering_chars > 20_000 {
-            return Err(AdminServiceError::InvalidCredential(
-                "promptSteering 提示词总长度不能大于 20000 字符".to_string(),
-            ));
-        }
+        prompt_injection
+            .validate()
+            .map_err(AdminServiceError::InvalidCredential)?;
         if warmup_selection_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialWarmupSelectionPercent 不能大于 100".to_string(),
@@ -6659,7 +6689,9 @@ impl AdminService {
                 config.compression = compression.clone();
                 config.image_processing = image_processing;
                 config.body_conversion = body_conversion;
-                config.prompt_steering = prompt_steering;
+                config.prompt_injection = prompt_injection;
+                config.route_features = route_features;
+                config.claude_models_only = claude_models_only;
                 config.missing_max_tokens = missing_max_tokens;
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
@@ -6694,7 +6726,6 @@ impl AdminService {
                 config.model_resolution_mode = model_resolution_mode;
                 config.model_mapping = model_mapping;
                 config.extract_thinking = extract_thinking;
-                config.thinking_trigger_mode = thinking_trigger_mode;
                 config.expose_proxy_warnings = expose_proxy_warnings;
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -10397,7 +10428,8 @@ impl AdminService {
             .path_overrides
             .keys()
             .chain(config.reported_usage.path_overrides.keys())
-            .chain(config.prompt_steering.identity.path_overrides.keys())
+            .chain(config.prompt_injection.path_overrides.keys())
+            .chain(config.route_features.path_overrides.keys())
             .chain(config.defined_cache_routes.iter())
         {
             routes.extend(

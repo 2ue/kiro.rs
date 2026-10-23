@@ -92,8 +92,8 @@ budget 到 Kiro 的映射（使用规范化之后的值）：
 ### G1：`display` 被忽略
 
 - `Thinking` 没有 `display` 字段（`types.rs:82-91`），raw 校验也不读它（`request_facts.rs:276-322`）。
-- 发给 Kiro 的 `display` 只由 `force_visible_thinking` 决定（`model.rs:251-254`），而它来自运营配置 `prompt_steering` 和
-  `thinking_trigger_mode`（`src/anthropic/handlers.rs:11377-11399`），与客户端的 `display` 无关。
+- 发给 Kiro 的 `display` 只由 `force_visible_thinking` 决定（`model.rs:251-254`），而它来自路由功能 `routeFeatures.thinkingTrigger`
+  （`real_request`/`always`/`off`，`src/anthropic/handlers.rs` 的 `should_force_visible_thinking`），与客户端的 `display` 无关。
 - 结果：`display:"omitted"` 的请求照样拿到完整 thinking 文本；`display:"bogus"` 也返回 200。
 
 ### G2：interleaved thinking 下的 budget 被截断，effort 档位随之下降

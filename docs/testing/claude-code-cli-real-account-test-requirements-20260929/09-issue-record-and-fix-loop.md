@@ -48,7 +48,7 @@ Verified-against: Claude Code CLI <版本>，kiro.rs <commit/二进制 SHA-256>�
 - 用例编号：CC-...
 - 路由：/cc/v1/messages（或其他）
 - 模型：requested=<...>，upstream=<...>
-- 相关配置：thinkingTriggerMode=...，payloadTooLongHandling=...，其他非默认项
+- 相关配置：routeFeatures.thinkingTrigger=...，该路由实际注入的项（请求日志 prompt_injections）=...，payloadTooLongHandling=...，其他非默认项
 
 ## 复现步骤
 

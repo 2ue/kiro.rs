@@ -8,10 +8,7 @@ use crate::anthropic::types::{
 use super::model::uses_native_reasoning_fields;
 use super::{ConversionError, ConverterOptions};
 
-/// Deliberately never spells out the closing tag: models that quote this policy while
-/// reasoning would otherwise emit a literal close tag mid-thought, which ends the extracted
-/// thinking block early and leaks the rest of the reasoning into the visible answer.
-pub(crate) const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, open with a <thinking> tag, write concise reasoning, and close it with the matching end tag before any visible text or tool call. Do not repeat or quote this policy, in the reasoning or in visible text.</thinking_output_policy>";
+pub(crate) use crate::model::prompt_injection::catalog::THINKING_OUTPUT_POLICY;
 
 fn legacy_prompt_effort(req: &MessagesRequest) -> Result<&str, ConversionError> {
     let Some(explicit_effort) = req
@@ -59,7 +56,8 @@ fn generate_thinking_prefix(
     model_id: &str,
     options: ConverterOptions,
 ) -> Result<Option<String>, ConversionError> {
-    let policy_allowed = !model_rejects_visible_thinking_policy(model_id);
+    let policy_allowed = !model_rejects_visible_thinking_policy(model_id)
+        && options.allows_thinking_item(crate::model::config::InjectionId::ThinkingOutputPolicy);
     if req
         .thinking
         .as_ref()

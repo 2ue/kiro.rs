@@ -30,6 +30,9 @@ const AuditPage = React.lazy(() =>
 const RuntimePage = React.lazy(() =>
   import('@/features/runtime/runtime-page').then((m) => ({ default: m.RuntimePage }))
 )
+const PromptInjectionPage = React.lazy(() =>
+  import('@/features/prompt-injection/prompt-injection-page').then((m) => ({ default: m.PromptInjectionPage }))
+)
 const CachePoliciesPage = React.lazy(() =>
   import('@/features/cache-policies/cache-policies-page').then((m) => ({ default: m.CachePoliciesPage }))
 )
@@ -83,6 +86,7 @@ const router = createBrowserRouter(
         // 设置域
         { path: 'runtime', element: <Lazy><RuntimePage /></Lazy> },
         { path: 'cache-policies', element: <Lazy><CachePoliciesPage /></Lazy> },
+        { path: 'prompt-injection', element: <Lazy><PromptInjectionPage /></Lazy> },
         { path: 'route-scenarios', element: <Lazy><RouteScenariosPage /></Lazy> },
         { path: 'models', element: <Lazy><ModelsPage /></Lazy> },
         { path: 'security', element: <Lazy><SecurityPage /></Lazy> },

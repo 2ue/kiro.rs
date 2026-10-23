@@ -40,7 +40,6 @@ Status: `structure-contract-pass / dynamic-evidence-open`；结构门禁已通�
 | `external-pool-profiles-and-sse-safety.md` | `OK`（聚焦 response state machine 有证据；handler/CLI/长历史/load 仍 pending） |
 | `payload-guard-semantics-limits-and-performance.md` | `OK`（历史/图片/raw identity 有聚焦证据；413/burst/L5 pending） |
 | `postgres-startup-migration-atomicity.md` | `OK`（原子性与升级矩阵有当前证据；最终 release binary 绑定 pending） |
-| `prompt-policy-tool-choice-and-count-tokens.md` | `OK`（后端/UI 解耦有聚焦证据；browser/CLI/count_tokens 正交矩阵仍 pending） |
 | `protocol-capability-regression-matrix.md` | `OK`（完整能力合同已写；真实 CLI/长历史/故障/load 仍 pending） |
 | `protocol-transcript-and-tool-history-leak.md` | `OK`（聚焦实现/状态机已有证据；真实 CLI、长历史、HTTP fault 与最终性能门禁未关闭） |
 | `remote-multimodal-resource-and-ssrf-bounds.md` | `OK`（连接绑定与请求预算有聚焦证据；handler/CLI/load/最终候选仍 pending） |

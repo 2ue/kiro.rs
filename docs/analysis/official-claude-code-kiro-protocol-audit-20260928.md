@@ -49,9 +49,10 @@ and compatible thinking prompt controls are unavailable
   `9c27f881abc0b5100c7d0b39166c166406f1db26`。
 - 发布成功不等于 reasoning 400 已解决；该问题跨 `v0.0.174`/`v0.0.175`
   的配置和能力发现状态仍需单独处理。
-- 本文后续修复阶段已在当前工作树实现 explicit reasoning fallback 修复：
-  `promptSteering.enabled=false` 不再阻断客户端显式 reasoning 的专用
-  thinking 兼容传输；普通运营方 prompt 注入仍受总开关控制。
+- 当前机制：thinking 兼容标签（`<thinking_mode>` 等）只由注入项
+  `thinkingControls` 控制，与其他注入项相互独立，不存在提示词总开关，也没有
+  显式 reasoning 特例。`thinkingControls` 关闭且模型没有原生 reasoning 字段时，
+  带 reasoning 的请求仍返回上面的 400。
 
 ### 本次实际做了什么
 
@@ -261,26 +262,18 @@ AND !inject_thinking_prefix()
        )
 ```
 
-修复前，`inject_thinking_prefix()` 只有下列条件全部满足才为真：
-
-- `promptSteering.enabled`
-- `thinkingPromptControls`
-- `promptSteering.thinking.enabled`
-- 当前 compat profile 允许该类注入
-
-修复后，显式客户端 reasoning 请求会设置
-`explicit_reasoning_request=true`，仅重新允许专用 thinking 兼容传输：
+`inject_thinking_prefix()` 只看注入项 `thinkingControls` 在当前路由上的解析结果：
 
 ```text
-(promptSteering.enabled OR explicit_reasoning_request)
-AND thinkingPromptControls
-AND promptSteering.thinking.enabled
-AND 当前 compat profile 允许该类注入
+promptInjection 中 thinkingControls 对当前路由（最长前缀匹配，未设置时用 defaults）为开启
+AND (当前 compat profile 不是 anthropic-strict OR 强制可见 thinking)
 ```
 
-这不会恢复 language/task/custom prompt、tool-choice prompt、chunked-write prompt
-或自动 thinking trigger；也不会在 capability `Unknown` 时伪造 Kiro 原生
-`additionalModelRequestFields`。
+它与 taskQuality、语言、自定义、tool-choice、chunked-write 等其他注入项无关，
+也不区分请求是否由客户端显式携带 reasoning。`-thinking` 模型名解析
+（`routeFeatures.thinkingModelName`）和 thinking 触发方式
+（`routeFeatures.thinkingTrigger`）不受任何提示词注入项影响。该条件也不会在
+capability `Unknown` 时伪造 Kiro 原生 `additionalModelRequestFields`。
 
 ### 远端配置和能力状态
 
@@ -671,10 +664,10 @@ id、endpoint 和 extra metadata。即使 local body pipeline 已解析
 ### P0：必须修复或先建立明确策略
 
 1. **Reasoning capability discovery 的 `Unknown` 策略**
-   - 修复前会让真实 Claude Code 默认 reasoning 直接 400。
-   - 当前修复已使显式客户端 reasoning 在已启用
-     `thinkingPromptControls` 且 `promptSteering.thinking.enabled=true` 时走
-     专用兼容传输，不再被 `promptSteering.enabled=false` 阻断。
+   - 能力发现不完整且没有兼容传输时，真实 Claude Code 默认 reasoning 会直接 400。
+   - 当前机制：路由上注入项 `thinkingControls` 开启时，reasoning 请求走 thinking
+     兼容标签传输；该项关闭且模型没有原生 reasoning 字段时返回 400，由运营方
+     在路由上开启 `thinkingControls` 解决。
    - `Supported`：生成原生 Kiro fields。
    - `AuthoritativeAbsent/Invalid`：明确说明该上游模型不支持。
    - `Unknown`：不能永久等价于“不支持”。后续仍应把 capability discovery
@@ -778,12 +771,11 @@ parse Anthropic request
 
 ### 关键源码
 
-- `src/anthropic/converter.rs`：`explicit_reasoning_request`、thinking prompt
-  fallback 条件、reasoning 两条路径均不可用时的拒绝。
+- `src/anthropic/converter.rs`：`inject_thinking_prefix()` 按注入项
+  `thinkingControls` 判断 thinking 兼容标签，reasoning 两条路径均不可用时的拒绝。
 - `src/anthropic/handlers/local_body_pipeline.rs`：handler 构造
   `ConverterOptions` 的真实路径。
-- `src/model/config.rs`：`promptSteering.enabled` 与显式客户端 reasoning 的
-  语义注释。
+- `src/model/prompt_injection/`：注入项目录、按路由最长前缀解析和旧配置迁移。
 - `src/anthropic/converter/model.rs:217-264`：能力状态到 Kiro native fields。
 - `src/anthropic/model_capabilities.rs:591-610`：cohort 不匹配返回 `Unknown`。
 - `src/anthropic/model_capabilities.rs:687-850`：不完整 discovery 的状态更新。

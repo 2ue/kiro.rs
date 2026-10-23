@@ -30,7 +30,7 @@ Messages 兼容层、Kiro 上游转换和错误/流式/usage/工具/thinking 行
 - 工具定义、`tool_use`/`tool_result` 配对及多轮历史。
 - 流式 SSE 事件顺序、终态、usage 和错误 envelope。
 - Claude Code CLI 的非交互和可行的交互式行为。
-- Kiro 请求/事件转换，包括 native reasoning、prompt steering、模型 alias、
+- Kiro 请求/事件转换，包括 native reasoning、提示词注入、模型 alias、
   EventStream/JSON content-type、EOF 和上游错误。
 - 入口拒绝记录的完整性：`model=requested/upper` 为什么出现
   `unknown`、`content`/诊断为何可能为空，以及这些字段是否在错误发生前

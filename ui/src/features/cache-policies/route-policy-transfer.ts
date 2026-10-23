@@ -1,8 +1,15 @@
-import type { CacheRoutePolicyPatch, IdentityRouteOverride, PromptCacheStrategyType } from '@/types/api'
+import type {
+  CacheRoutePolicyPatch,
+  InjectionId,
+  InjectionItemOverride,
+  PromptCacheStrategyType,
+  RouteFeatureOverride,
+  ThinkingTriggerMode,
+} from '@/types/api'
 
 /** Marker of a route policy file, so unrelated JSON is rejected with a clear message. */
 export const ROUTE_POLICY_FORMAT = 'kiro-rs-route-policy'
-export const ROUTE_POLICY_VERSION = 1
+export const ROUTE_POLICY_VERSION = 2
 /** Route policy files are a few KB; anything far larger is not a route policy. */
 export const ROUTE_POLICY_MAX_BYTES = 1024 * 1024
 
@@ -13,13 +20,22 @@ export type RoutePolicyFile = {
   /** Informational only; the route itself is never imported. */
   sourceRoute: string
   cachePolicy: CacheRoutePolicyPatch
-  identity: IdentityRouteOverride
-  /** Model-driven WebSearch for the route; absent means "follow the default". */
-  webSearch?: boolean
+  /** The route's explicit prompt-injection settings; items left out follow the defaults. */
+  promptInjection: RouteInjectionOverrides
+  /** The route's explicit feature settings. */
+  features: RouteFeatureOverride
 }
 
+export type RouteInjectionOverrides = Partial<Record<InjectionId, InjectionItemOverride>>
+
 export type RoutePolicyImport =
-  | { ok: true; sourceRoute: string | null; cachePolicy: CacheRoutePolicyPatch; identity: IdentityRouteOverride; webSearch?: boolean }
+  | {
+      ok: true
+      sourceRoute: string | null
+      cachePolicy: CacheRoutePolicyPatch
+      promptInjection: RouteInjectionOverrides
+      features: RouteFeatureOverride
+    }
   | { ok: false; error: string }
 
 const CACHE_TYPES: PromptCacheStrategyType[] = [
@@ -45,14 +61,67 @@ const CACHE_OBJECT_KEYS: Array<keyof CacheRoutePolicyPatch> = [
   'coldRequestGuard',
 ]
 
-const IDENTITY_KEYS: Array<keyof IdentityRouteOverride> = [
+const INJECTION_IDS: InjectionId[] = [
+  'taskQuality',
+  'languageConstraint',
+  'languageTurnReminder',
+  'custom',
+  'identityPrompt',
+  'identityTurnReminder',
+  'chunkedWritePolicy',
+  'chunkedWriteToolSuffix',
+  'thinkingControls',
+  'thinkingOutputPolicy',
+  'toolChoicePrefix',
+  'toolChoiceTurnReminder',
+  'webSearchGuidance',
+  'emptyTurnNudge',
+]
+
+const FEATURE_BOOL_KEYS = ['thinkingModelName', 'channelLeakGuard', 'channelLeakGuardStream', 'modelDrivenWebSearch'] as const
+const THINKING_TRIGGERS: ThinkingTriggerMode[] = ['real_request', 'always', 'off']
+
+/** Version 1 files carried identity masking and WebSearch in their own shapes. */
+const LEGACY_IDENTITY_KEYS = [
   'enabled',
   'promptEnabled',
   'turnReminderEnabled',
   'outputGuardEnabled',
   'outputGuardStreamEnabled',
   'applyToExternalPool',
-]
+] as const
+
+function convertLegacyIdentity(
+  identity: Record<string, unknown>,
+): { promptInjection: RouteInjectionOverrides; features: RouteFeatureOverride } | string {
+  const values: Partial<Record<(typeof LEGACY_IDENTITY_KEYS)[number], boolean>> = {}
+  for (const [key, value] of Object.entries(identity)) {
+    if (!LEGACY_IDENTITY_KEYS.includes(key as (typeof LEGACY_IDENTITY_KEYS)[number])) {
+      return `identity 中有未知字段：${key}`
+    }
+    if (value === null || value === undefined) continue
+    if (typeof value !== 'boolean') return `identity.${key} 必须是 true 或 false`
+    values[key as (typeof LEGACY_IDENTITY_KEYS)[number]] = value
+  }
+  // The old switch gated every identity sub-feature; an explicit "off" turns them all off.
+  const gate = values.enabled
+  const combine = (sub: boolean | undefined) => (gate === false ? false : gate === true ? (sub ?? true) : sub)
+  const promptInjection: RouteInjectionOverrides = {}
+  const features: RouteFeatureOverride = {}
+  const prompt = combine(values.promptEnabled)
+  if (prompt !== undefined || values.applyToExternalPool !== undefined) {
+    promptInjection.identityPrompt = {
+      ...(prompt === undefined ? {} : { enabled: prompt }),
+      ...(values.applyToExternalPool === undefined ? {} : { externalPool: values.applyToExternalPool }),
+    }
+  }
+  const reminder = combine(values.turnReminderEnabled)
+  if (reminder !== undefined) promptInjection.identityTurnReminder = { enabled: reminder }
+  const guard = combine(values.outputGuardEnabled)
+  if (guard !== undefined) features.channelLeakGuard = guard
+  if (values.outputGuardStreamEnabled !== undefined) features.channelLeakGuardStream = values.outputGuardStreamEnabled
+  return { promptInjection, features }
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -61,8 +130,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 export function buildRoutePolicyFile(
   sourceRoute: string,
   cachePolicy: CacheRoutePolicyPatch,
-  identity: IdentityRouteOverride,
-  webSearch?: boolean,
+  promptInjection: RouteInjectionOverrides,
+  features: RouteFeatureOverride,
   now: Date = new Date(),
 ): RoutePolicyFile {
   return {
@@ -71,9 +140,47 @@ export function buildRoutePolicyFile(
     exportedAt: now.toISOString(),
     sourceRoute,
     cachePolicy: structuredClone(cachePolicy),
-    identity: structuredClone(identity),
-    ...(webSearch === undefined ? {} : { webSearch }),
+    promptInjection: structuredClone(promptInjection),
+    features: structuredClone(features),
   }
+}
+
+function parseInjection(input: unknown): RouteInjectionOverrides | string {
+  if (input === undefined || input === null) return {}
+  if (!isPlainObject(input)) return 'promptInjection 必须是对象'
+  const result: RouteInjectionOverrides = {}
+  for (const [id, item] of Object.entries(input)) {
+    if (!INJECTION_IDS.includes(id as InjectionId)) return `promptInjection 中有未知注入项：${id}`
+    if (!isPlainObject(item)) return `promptInjection.${id} 必须是对象`
+    const parsed: InjectionItemOverride = {}
+    for (const [key, value] of Object.entries(item)) {
+      if (key !== 'enabled' && key !== 'externalPool') return `promptInjection.${id} 中有未知字段：${key}`
+      if (value === null || value === undefined) continue
+      if (typeof value !== 'boolean') return `promptInjection.${id}.${key} 必须是 true 或 false`
+      parsed[key] = value
+    }
+    if (parsed.enabled !== undefined || parsed.externalPool !== undefined) result[id as InjectionId] = parsed
+  }
+  return result
+}
+
+function parseFeatures(input: unknown): RouteFeatureOverride | string {
+  if (input === undefined || input === null) return {}
+  if (!isPlainObject(input)) return 'features 必须是对象'
+  const result: RouteFeatureOverride = {}
+  for (const [key, value] of Object.entries(input)) {
+    if (value === null || value === undefined) continue
+    if (key === 'thinkingTrigger') {
+      if (!THINKING_TRIGGERS.includes(value as ThinkingTriggerMode)) return `features.thinkingTrigger 取值无效：${String(value)}`
+      result.thinkingTrigger = value as ThinkingTriggerMode
+    } else if ((FEATURE_BOOL_KEYS as readonly string[]).includes(key)) {
+      if (typeof value !== 'boolean') return `features.${key} 必须是 true 或 false`
+      result[key as (typeof FEATURE_BOOL_KEYS)[number]] = value
+    } else {
+      return `features 中有未知字段：${key}`
+    }
+  }
+  return result
 }
 
 /** File name for an exported route, e.g. `/dfcache/team-a` -> `route-policy-dfcache-team-a.json`. */
@@ -114,22 +221,29 @@ export function parseRoutePolicyImport(text: string): RoutePolicyImport {
     return { ok: false, error: `不支持的缓存策略类型：${String(cacheType)}` }
   }
 
-  const identityInput = data.identity ?? {}
-  if (!isPlainObject(identityInput)) return { ok: false, error: 'identity 必须是对象' }
-  const identity: IdentityRouteOverride = {}
-  for (const [key, value] of Object.entries(identityInput)) {
-    if (!IDENTITY_KEYS.includes(key as keyof IdentityRouteOverride)) {
-      return { ok: false, error: `identity 中有未知字段：${key}` }
+  let promptInjection: RouteInjectionOverrides
+  let features: RouteFeatureOverride
+  if (data.version < 2) {
+    const identityInput = data.identity ?? {}
+    if (!isPlainObject(identityInput)) return { ok: false, error: 'identity 必须是对象' }
+    const converted = convertLegacyIdentity(identityInput)
+    if (typeof converted === 'string') return { ok: false, error: converted }
+    if (data.webSearch !== undefined && data.webSearch !== null && typeof data.webSearch !== 'boolean') {
+      return { ok: false, error: 'webSearch 必须是 true 或 false' }
     }
-    if (value === null || value === undefined) continue
-    if (typeof value !== 'boolean') return { ok: false, error: `identity.${key} 必须是 true 或 false` }
-    identity[key as keyof IdentityRouteOverride] = value
+    promptInjection = converted.promptInjection
+    features = {
+      ...converted.features,
+      ...(typeof data.webSearch === 'boolean' ? { modelDrivenWebSearch: data.webSearch } : {}),
+    }
+  } else {
+    const parsedInjection = parseInjection(data.promptInjection)
+    if (typeof parsedInjection === 'string') return { ok: false, error: parsedInjection }
+    const parsedFeatures = parseFeatures(data.features)
+    if (typeof parsedFeatures === 'string') return { ok: false, error: parsedFeatures }
+    promptInjection = parsedInjection
+    features = parsedFeatures
   }
-
-  if (data.webSearch !== undefined && data.webSearch !== null && typeof data.webSearch !== 'boolean') {
-    return { ok: false, error: 'webSearch 必须是 true 或 false' }
-  }
-  const webSearch = typeof data.webSearch === 'boolean' ? data.webSearch : undefined
 
   // Wrong-typed nested values would break the editor, so check each known field's shape here.
   const policy: Record<string, unknown> = { cacheType }
@@ -150,8 +264,8 @@ export function parseRoutePolicyImport(text: string): RoutePolicyImport {
     ok: true,
     sourceRoute: typeof data.sourceRoute === 'string' && data.sourceRoute.trim() ? data.sourceRoute.trim() : null,
     cachePolicy: structuredClone(policy) as CacheRoutePolicyPatch,
-    identity,
-    ...(webSearch === undefined ? {} : { webSearch }),
+    promptInjection,
+    features,
   }
 }
 

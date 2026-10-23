@@ -43,7 +43,7 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [下游标准 usage 单字段超过 1m](downstream-usage-standard-field-over-1m-20260731.md) - 2026-07-31 三台生产部署只读证据显示 `input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens` 可单字段超过 1m；标准字段 focused fix 已实现并测试：reported-usage cache creation 使用 `finalCacheCreationMaxTokens=400000` 与 `20000..45000` deterministic jitter，无 full `reportedUsage` 的本地 prompt-cache/`kiro_rs_tool` 路径也会 cap 标准 cache read/write，local credential 与 external pool failure 记录保留诊断估算并将标准字段归零；仍需 frozen/isolated usage-shape smoke、dashboard/API rollup 区分和生产复发观察。
 - [Pro Max 账号卡片套餐显示](subscription-pro-max-card-label-20260801.md) - 根因确认不是截图：UI 套餐 helper 与后端 `subscription_key`/`subscription_rank` 缺少 `Pro Max` 分支，已补齐 `Pro Max` 标签、`pro_max` 筛选键和等级排序，并补充 Power/Pro Max 筛选项；focused Rust/UI/admin-ui 验证通过，最终候选浏览器门禁仍随 release gate 进行。
 - [2026-08-01 生产外部池两类错误根因补充](20260801-production-external-errors-root-cause.md) - 外部池“输入上限预检”发送前硬拒绝绕过“请求大小保护”，以及外部池 route 缺少本地 Kiro 发送链路的兼容模型处理导致部分“模型处理”模式无法按配置生效；当前修复是取消内容长度发送前拒绝、保留调度/安全预检，并让直接外部池和本地失败 fallback 路径携带“模型（本地解析）”。
-- [内置路由策略必须完全由配置决定](route-policy-config-authority-20260802.md) - 2026-08-02 P0 配置权威问题已完成后端与两套 UI focused 修复：`/cc`、`/v1`、`/ha`、`/na` 仍是内置入口，但缓存、usage、提示词、外部池等运行策略均由运行配置解析；`/cc` 可配置成无缓存，`/na` 可配置成高缓存，提示词引导按路径规则命中任意内置或自定义入口；全量 Rust、UI/admin-ui build、文档合同和提示词配置独立性测试通过，真实服务热加载/浏览器交互/生产复发观察仍作为后续门禁。
+- [内置路由策略必须完全由配置决定](route-policy-config-authority-20260802.md) - 2026-08-02 P0 配置权威问题已完成后端与两套 UI focused 修复：`/cc`、`/v1`、`/ha`、`/na` 仍是内置入口，但缓存、usage、提示词、外部池等运行策略均由运行配置解析；`/cc` 可配置成无缓存，`/na` 可配置成高缓存，提示词注入项不带路由规则，由任意内置或自定义入口上的路由设置显式开关；全量 Rust、UI/admin-ui build 和文档合同通过，真实服务热加载/浏览器交互/生产复发观察仍作为后续门禁。
 - [语言约束提示词首语言锁定](language-constraint-first-language-lock-20260802.md) - 2026-08-02 新登记；短/长历史、真实 Claude Code CLI 基础会话、模拟压缩摘要和相反首语言并发矩阵均未复现首语言锁定，真实自动 compact 阈值和异常样本仍待证据。
 - [usage 清理安全与 Redis 隔离](usage-cleanup-safety-and-redis-isolation.md) - 2026-08-02/03 用户体验问题；后端安全合同、新旧 UI 语义、真实浏览器交互、Admin cache 写入竞态修复、`每批数量` 上限 5,000、PostgreSQL 约束迁移和迁移关闭时 schema compatibility guard 已有 focused pass，但动态多实例一致性、生产规模性能和 Redis chaos 仍未关闭，不能把已有 focused 证据当成完整修复。
 - [159/170 现网 usage 错误审计与体验改进](production-usage-error-audit-159-170-20260802.md) - 2026-08-02 新登记；按用户澄清排在语言约束和 usage 清理之后。2026-08-03 已完成只读 evidence pass，两台均为 `v0.0.123`，形成 P001-P004 问题簇；超长预检和 usage 标准字段属于旧版本已记录类，外部 5xx 已跨池重试，外部 400 不自动重试而保留为 Admin 诊断增强候选。
@@ -65,7 +65,6 @@ Usage cleanup 的最终产品合同是 soft cleanup 同步删除范围内明细�
 - [重试预算、准入与 RPM 放大](retry-budget-admission-and-rpm-amplification.md)
 - [Token refresh 失败波、自动恢复与集群 RPM](token-refresh-failure-wave-and-cluster-rpm.md)
 - [请求 API Key admission](request-api-key-admission.md)
-- [prompt policy、tool choice 与 count tokens](prompt-policy-tool-choice-and-count-tokens.md)
 - [Redis scheduler degraded 与 fallback](redis-scheduler-degraded-and-fallback.md)
 - [业务 Redis 与观测 Redis 故障域隔离](business-observability-redis-fault-domain.md)
 - [高并发低 RPM、排队与凭据运行态假禁用](high-concurrency-low-rpm-runtime-quarantine.md)

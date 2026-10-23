@@ -21,7 +21,6 @@ const SNIPPET_MAX_CHARS: usize = 2000;
 const CITED_TEXT_MAX_CHARS: usize = 150;
 const SEARCH_TOOL_NAME: &str = "web_search";
 const SEARCH_TOOL_DESCRIPTION: &str = "Search the web for current or external information. Use a concise query. Results are numbered so they can be cited.";
-const GUIDANCE: &str = "<web_search_guidance>You can search the web with the `web_search` tool. Call it with a concise query when the answer needs current or external information; you may search again with a refined query. Before a search call, write one short sentence saying what you are going to search for. After the results arrive, answer the user from them; if the user only asked for a search, summarize the most relevant results instead of just confirming that the search ran. When a sentence uses information from a search result, put that result's number in square brackets right after the sentence, for example [1] or [1][3]. Only cite numbers that appear in the results.</web_search_guidance>";
 /// Part of every result list header: a reminder next to where the answer is generated is
 /// followed more reliably than the system prompt alone. Phrased as a description of the data,
 /// not an instruction, so the model does not open its answer by acknowledging it.
@@ -205,7 +204,17 @@ pub(super) async fn run(ctx: ModelDrivenWebSearchContext) -> websearch::WebSearc
             .saturating_add(1),
     );
 
-    let mut request = internal_request(&ctx.payload);
+    let injections = ctx
+        .runtime_config
+        .injections_for(&ctx.endpoint, crate::model::config::UpstreamKind::Local);
+    let guidance = injections
+        .allows(crate::model::config::InjectionId::WebSearchGuidance)
+        .then(|| {
+            injections
+                .text(crate::model::prompt_injection::TextKey::WebSearchGuidance)
+                .to_string()
+        });
+    let mut request = internal_request(&ctx.payload, guidance.as_deref());
     if websearch::is_claude_code_search_request(&ctx.payload) {
         // The Claude Code WebSearch sub-request always expects a search.
         request.tool_choice = Some(json!({"type": "tool", "name": SEARCH_TOOL_NAME}));
@@ -647,8 +656,12 @@ fn clean_text_blocks(ctx: &ModelDrivenWebSearchContext, blocks: &mut Vec<Value>)
 }
 
 /// The request sent to the model: the native tool becomes an ordinary `web_search` tool, the
-/// citation guidance is appended to the system prompt, and thinking is off for the inner calls.
-fn internal_request(payload: &MessagesRequest) -> MessagesRequest {
+/// citation guidance (injection item `webSearchGuidance`, when on) is appended to the system
+/// prompt, and thinking is off for the inner calls.
+pub(super) fn internal_request(
+    payload: &MessagesRequest,
+    guidance: Option<&str>,
+) -> MessagesRequest {
     let mut request = payload.clone();
     request.stream = false;
     request.thinking = None;
@@ -677,13 +690,15 @@ fn internal_request(payload: &MessagesRequest) -> MessagesRequest {
         cache_control: None,
     });
     request.tools = Some(tools);
-    request
-        .system
-        .get_or_insert_with(Vec::new)
-        .push(SystemMessage {
-            text: GUIDANCE.to_string(),
-            cache_control: None,
-        });
+    if let Some(guidance) = guidance.map(str::trim).filter(|text| !text.is_empty()) {
+        request
+            .system
+            .get_or_insert_with(Vec::new)
+            .push(SystemMessage {
+                text: guidance.to_string(),
+                cache_control: None,
+            });
+    }
     request
 }
 
@@ -1349,7 +1364,10 @@ mod tests {
             "messages": [{"role": "user", "content": "Search the web: latest Rust"}]
         }))
         .unwrap();
-        let request = internal_request(&payload);
+        let request = internal_request(
+            &payload,
+            Some(crate::model::prompt_injection::catalog::DEFAULT_WEB_SEARCH_GUIDANCE),
+        );
         assert!(!request.stream);
         assert!(request.thinking.is_none());
         let tools = request.tools.unwrap();
@@ -1365,6 +1383,7 @@ mod tests {
                 .text
                 .contains("web_search_guidance")
         );
+        assert!(internal_request(&payload, None).system.is_none());
     }
 
     #[test]

@@ -27,9 +27,9 @@ pub(super) async fn prepare(
 
     let mut report = ParsedAnthropicBodyReport::default();
 
-    let prompt_additions_enabled = runtime_config.prompt_steering.enabled;
+    let features = runtime_config.route_features_for(endpoint);
 
-    if prompt_additions_enabled && plan.thinking.model_name_override.is_enabled() {
+    if features.thinking_model_name && plan.thinking.model_name_override.is_enabled() {
         if let Err(message) = override_thinking_from_model_name(payload) {
             let request_id = envelope::request_id();
             return Err(envelope::error_response_with_id(
@@ -41,8 +41,8 @@ pub(super) async fn prepare(
         }
         report.thinking_model_name_override = true;
     }
-    if prompt_additions_enabled && plan.thinking.trigger_mode.is_enabled() {
-        apply_thinking_trigger_mode(payload, runtime_config);
+    if plan.thinking.trigger_mode.is_enabled() {
+        apply_thinking_trigger_mode(payload, features.thinking_trigger);
         report.thinking_trigger_mode = true;
     }
     if plan.thinking.trace.is_enabled() {

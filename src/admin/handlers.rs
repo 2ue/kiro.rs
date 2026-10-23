@@ -17,9 +17,9 @@ use super::{
         BatchDeleteCredentialsRequest, BatchProxyResourceImportRequest,
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
         CreateRequestApiKeyRequest, DiscoverExternalPoolSupportedModelsRequest,
-        ExportCredentialsQuery, ExternalPoolTestRequest, ProxyResourceTestRequest,
-        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialFastRequest,
-        SetCredentialOverageRequest, SetCredentialProxyRequest,
+        ExportCredentialsQuery, ExternalPoolTestRequest, PromptInjectionPreviewBody,
+        ProxyResourceTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
+        SetCredentialFastRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
         SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
         SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
@@ -1316,6 +1316,24 @@ pub async fn update_runtime_config(
     Json(payload): Json<UpdateRuntimeConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.update_runtime_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/prompt-injection/catalog
+/// 全部注入项的说明、内置文本、建议和关闭后的影响
+pub async fn get_prompt_injection_catalog(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.prompt_injection_catalog())
+}
+
+/// POST /api/admin/prompt-injection/preview
+/// 按路由和请求条件预览实际注入的内容；可以带未保存的配置草稿，不会保存。
+pub async fn preview_prompt_injection(
+    State(state): State<AdminState>,
+    Json(payload): Json<PromptInjectionPreviewBody>,
+) -> impl IntoResponse {
+    match state.service.preview_prompt_injection(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

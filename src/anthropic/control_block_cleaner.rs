@@ -524,7 +524,7 @@ mod tests {
     fn echoed_identity_reminder_is_removed_in_both_paths() {
         let text = format!(
             "before{}after",
-            crate::model::config::DEFAULT_IDENTITY_TURN_REMINDER
+            crate::model::prompt_injection::catalog::DEFAULT_IDENTITY_TURN_REMINDER
         );
         assert_eq!(strip_control_blocks(&text), "beforeafter");
 

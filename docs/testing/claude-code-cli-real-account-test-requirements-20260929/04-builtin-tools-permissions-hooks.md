@@ -7,7 +7,7 @@
 说明：
 - 「来源」列取值：既有场景（旧测试记录中已有的场景，已并入本分册）/ 新增（用户要求）/ 新增（补充）。
 - 「前置」列写“默认”表示使用本文开头的通用前置；「参数」列写“默认”表示使用 `ccp`（见 01-environment-and-observability.md）的默认参数。
-- 路由说明：代理有 `/cc` 入口（面向 Claude Code，默认开启部分工具提示词引导）和 `/v1` 等非 `/cc` 入口。涉及路由差异的用例在「前置」中写明。
+- 路由说明：代理有 `/cc` 入口（面向 Claude Code）和 `/v1` 等非 `/cc` 入口。提示词注入按注入项逐项开关，由路由策略按最长前缀覆盖默认值；新装默认分块写入、tool_choice 等工具相关注入项全局开启，任务质量只在 `/cc` 开启。涉及路由差异的用例在「前置」中写明。
 - 部分场景真实模型难以稳定复现，需配合模拟上游或直连请求（curl/SDK）覆盖，已在「前置」中标明。
 - U 组 35–59、H 组 10 为本次并入旧场景时新增的编号，未新开分组。
 
@@ -18,7 +18,7 @@
 | CC-U-01 | P0 | 既有场景 | 默认 | `ccp --allowedTools Bash '用 Bash 执行 printf kiro-tool-ok，然后回复结果'`；等价变体：`claude -p --dangerously-skip-permissions --allowedTools Bash --model sonnet "Use Bash to print cli tool ok, then finish."`，以及 `claude --print --allowedTools Bash ...` 输出固定文本（如 tool-ok） | `--allowedTools Bash`；`--model sonnet`；`--output-format stream-json --verbose` | 输出含 `kiro-tool-ok`（或对应固定文本）；exit 0 | 第一轮返回 tool_use（name=Bash，`input_json_delta` 拼出对应命令），CLI 执行后回传 tool_result，第二轮基于工具结果完成；tool_use 与 tool_result 各 1 个且 ID 配对；`num_turns>=2`（典型为 2）；resultSubtype=success；stop_reason 先 `tool_use` 后 `end_turn`；usage 非 0。背景：最基础的 tool_use → tool_result 两回合链路，修改 reasoning/thinking 转换后也要回归 |
 | CC-U-02 | P0 | 新增（用户要求） | 默认 | `Read` 读取 README，回答其中的 marker | 默认 | 回答正确 | tool_result 内容完整 |
 | CC-U-03 | P0 | 新增（用户要求） | 默认 | `Edit` 修改一个函数名，再 `git diff` 确认 | 默认 | 文件被正确修改 | Edit 的 `old_string/new_string` 含多行、引号、制表符时参数不被破坏 |
-| CC-U-04 | P0 | 既有场景 | 默认；分别指向 `/cc` 与 `/v1` 入口 | `Write` 新建 `hello.py` 并用 Bash 运行；再让它“创建一个 300 行的 demo.py”，统计 Write 与 Edit 次数和每次内容行数 | 默认 | 文件内容正确，运行成功；`/v1` 等非 `/cc` 入口 1 次 Write 写完整文件，与官方 API 行为一致 | 大文件写入（>20KB 或 >150 行）时是否被 `chunkedToolPolicy`/提示注入改成分块写，记录行为。已知现象：代理默认对非 strict 路由改写 Write/Edit 工具描述，要求超 150 行时先写 50 行、再每块最多 50 行用 Edit 续写，300 行文件变成约 6 次调用，token 和延迟成倍增加；预期：非 `/cc` 入口不做分块改写 |
+| CC-U-04 | P0 | 既有场景 | 默认；分别指向 `/cc` 与 `/v1` 入口 | `Write` 新建 `hello.py` 并用 Bash 运行；再让它“创建一个 300 行的 demo.py”，统计 Write 与 Edit 次数和每次内容行数 | 默认 | 文件内容正确，运行成功；`/v1` 等非 `/cc` 入口 1 次 Write 写完整文件，与官方 API 行为一致 | 大文件写入（>20KB 或 >150 行）时是否被注入项 chunkedWritePolicy/chunkedWriteToolSuffix 改成分块写，记录行为。已知现象：代理默认对非 strict 路由改写 Write/Edit 工具描述，要求超 150 行时先写 50 行、再每块最多 50 行用 Edit 续写，300 行文件变成约 6 次调用，token 和延迟成倍增加；预期：非 `/cc` 入口不做分块改写 |
 | CC-U-05 | P1 | 既有场景 | 默认 | `Glob` 查找 `**/*.py`、`Grep` 搜索某字符串；另跑：`claude -p --model sonnet --output-format stream-json --verbose --allowedTools "Read,Grep,LS" "请搜索某目录中某逻辑，列出三个关键文件和原因。不要改文件。"` | `--allowedTools "Read,Grep,LS"` | 结果正确；多次调用 Grep/Read 后继续回答 | 空结果时模型正常说明；没有 `TOOL_USE_RESULT_MISMATCH` 或 `Expected toolResult`；没有重复的 tool_result、重复工具调用或重复最终段落；正文中没有 `<tool_use>`、`<invoke>` 这类 XML 泄漏。背景：工具调用历史配对被破坏时，上游会返回 400 Improperly formed request |
 | CC-U-06 | P1 | 新增（用户要求） | 默认 | `TodoWrite`：要求"列出 4 步计划并逐步完成" | 默认 | todo 状态依次更新 | 多次 TodoWrite 的复杂嵌套数组参数正确 |
 | CC-U-07 | P1 | 新增（用户要求） | 默认 | `NotebookEdit` 修改 `.ipynb` 某个 cell | 默认 | notebook 结构有效 | 参数中的 cell_id / edit_mode 正确 |
@@ -75,7 +75,7 @@
 | 编号 | 优先级 | 来源 | 前置 | 步骤/命令 | 参数 | 预期结果 | 判定/观察点 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | CC-U-50 | P1 | 既有场景 | 历史中已有 Bash 调用；直连请求（curl/SDK）或 CLI 内部辅助请求 | 之后某请求带 `tool_choice: none` 并要求“再跑一次上次的命令” | `tool_choice: {"type":"none"}` | 不出现 tool_use，stop_reason 为 `end_turn`，只输出文本 | 已知现象：none 模式下代理为满足上游约束把历史用过的工具以空 schema 占位加回，模型仍可调用，CLI 会执行参数为空的工具并报错 |
-| CC-U-51 | P1 | 既有场景 | 直连请求（curl/SDK）；分别在默认、关闭提示词开关、strict profile 下各跑一组 | 用 `tool_choice any` 或指定工具名发送“你好”，重复 20 次，统计纯文本加 `end_turn` 的次数；再用一个不存在的工具名指定一次 | `tool_choice: {"type":"any"}` / `{"type":"tool","name":"..."}`；流式与非流式 | 每次都调用工具（指定模式必须是指定工具）；非流式违规时重试一次，流式违规至少记录 `tool_choice_violation` | 背景：这两种模式只靠过滤工具和一句提示引导；关闭提示词开关或 strict profile 时 any 完全无引导；指定工具名不存在时退化为发送全部工具，需记录该行为 |
+| CC-U-51 | P1 | 既有场景 | 直连请求（curl/SDK）；分别在默认、在路由上关闭 toolChoicePrefix/toolChoiceTurnReminder 注入项、strict profile 下各跑一组 | 用 `tool_choice any` 或指定工具名发送“你好”，重复 20 次，统计纯文本加 `end_turn` 的次数；再用一个不存在的工具名指定一次 | `tool_choice: {"type":"any"}` / `{"type":"tool","name":"..."}`；流式与非流式 | 每次都调用工具（指定模式必须是指定工具）；非流式违规时重试一次，流式违规至少记录 `tool_choice_violation` | 背景：这两种模式只靠过滤工具和一句提示引导；关闭这两个注入项或 strict profile 时 any 完全无提示引导（结构化过滤仍由 `bodyConversion.toolChoiceSteering` 控制）；指定工具名不存在时退化为发送全部工具，需记录该行为 |
 
 ## 工具结果形态
 
@@ -91,7 +91,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | CC-U-55 | P1 | 既有场景 | CLI 指向 `/cc` 入口 | 让它写 300 行文件；另一轮明确要求“一次写完”或“用 Bash heredoc 写入” | 默认 | 仍可分块，但模型能说明原因；用户明确要求时不被静默压制 | 已知现象：注入文本要求“always comply silently”、不许询问或建议绕过，模型因此不解释分块也不按用户要求换方式 |
 | CC-U-56 | P1 | 既有场景 | CLI 指向 `/cc` 入口（交互式） | 分块写大文件过程中按 Esc/Ctrl+C 中止，或触发压缩、网络错误，检查目标文件；另跑一次完整写入 | 默认 | 不留下半截且带占位符的文件；最后一块完成后占位符已删除 | 背景：分块依赖“唯一占位符 + 多次 Edit”，中途打断会留下残缺文件，忘删占位符会进入交付物 |
-| CC-U-57 | P1 | 既有场景 | 关闭 promptSteering 总开关，或切到 strict profile | 在 `/cc` 与 `/v1` 路由各重复“写 300 行文件” | 服务端配置：promptSteering 关闭 / strict profile | 只有 1 次 Write | 所有路由都不注入分块、语言、任务质量提示；结构化 tool_choice 过滤不受影响。背景：这些提示词默认开启，只能整体关闭 |
+| CC-U-57 | P1 | 既有场景 | 分三组：只关闭 chunkedWritePolicy；只关闭 chunkedWriteToolSuffix；两项都关闭或切到 strict profile（在 `/cc` 与 `/v1` 路由上设置，先备份，结束恢复） | 在 `/cc` 与 `/v1` 路由各重复“写 300 行文件”；另发一条不声明 Write/Edit 工具的直连请求 | 服务端配置：按组关闭对应注入项 / strict profile | 两项都关闭或 strict 时只有 1 次 Write；只关一项时另一项仍按设置注入，其他注入项不受影响 | 用 `POST /api/admin/prompt-injection/preview` 对照每组实际注入内容：chunkedWritePolicy 只在请求声明了 Write/Edit 时注入，不声明时不出现；chunkedWriteToolSuffix 只改 Write/Edit 工具描述；结构化 tool_choice 过滤不受影响 |
 | CC-U-58 | P2 | 既有场景 | 开启分块写入策略；让 Write/Edit 工具描述超过 10000 字符（如通过自定义 system/工具描述构造） | 让 CLI 写大文件 | 请求体诊断 | 截断后描述末尾仍完整保留代理注入的分块策略，模型按策略执行 | 已知现象：描述会被静默截到 10000 字符，以前在追加策略后才截，策略被截掉而悄悄失效；截断没有省略标记和告警，需记录是否已补告警 |
 
 ## 缓存

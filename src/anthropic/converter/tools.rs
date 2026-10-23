@@ -12,12 +12,12 @@ use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolSpecification};
 
 use super::schema::normalize_json_schema;
 use super::{ConversionError, ConverterOptions};
-
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
-
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+use crate::model::config::InjectionId;
+use crate::model::prompt_injection::TextKey;
+use crate::model::prompt_injection::catalog::{
+    TOOL_CHOICE_ANY_PREFIX, TOOL_CHOICE_ANY_REMINDER, TOOL_CHOICE_NONE_PREFIX,
+    TOOL_CHOICE_PARALLEL_DISABLED_PREFIX, TOOL_CHOICE_TOOL_PREFIX, TOOL_CHOICE_TOOL_REMINDER,
+};
 
 const EMPTY_TOOL_DESCRIPTION_PLACEHOLDER: &str = "Tool available to the assistant.";
 
@@ -25,17 +25,6 @@ const PLACEHOLDER_TOOL_DESCRIPTION: &str = "Tool used in conversation history";
 
 const UNAVAILABLE_PLACEHOLDER_TOOL_DESCRIPTION: &str =
     "Tool used earlier in this conversation. It is NOT available in this turn: do not call it.";
-
-const TOOL_CHOICE_PARALLEL_DISABLED_PREFIX: &str = "<tool_choice_parallel>disabled</tool_choice_parallel><tool_choice_policy>Call at most one tool in this turn. Do not issue several tool calls in the same response.</tool_choice_policy>";
-
-const TOOL_CHOICE_NONE_PREFIX: &str = "<tool_choice>none</tool_choice><tool_choice_policy>Do not call any tool in this turn, including tools used earlier in this conversation. Respond with text only.</tool_choice_policy>";
-
-/// 追加到系统提示词的分块写入策略
-pub(super) const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolChoiceDirective {
@@ -517,7 +506,7 @@ pub(super) fn generate_tool_choice_prefix(
     tool_name_map: &HashMap<String, String>,
     options: ConverterOptions,
 ) -> Option<String> {
-    if !options.inject_tool_choice_prefix() {
+    if !options.inject_tool_choice_item(InjectionId::ToolChoicePrefix) {
         return None;
     }
 
@@ -542,17 +531,16 @@ pub(super) fn generate_tool_choice_turn_reminder(
     tool_name_map: &HashMap<String, String>,
     options: ConverterOptions,
 ) -> Option<String> {
-    if !options.inject_tool_choice_prefix() || !request_declares_tools(req) {
+    if !options.inject_tool_choice_item(InjectionId::ToolChoiceTurnReminder)
+        || !request_declares_tools(req)
+    {
         return None;
     }
     match parse_tool_choice(&req.tool_choice) {
-        ToolChoiceDirective::Any => Some(
-            "<tool_choice_reminder>Respond by calling one of the available tools.</tool_choice_reminder>"
-                .to_string(),
-        ),
-        ToolChoiceDirective::Tool(name) => Some(format!(
-            "<tool_choice_reminder>Respond by calling the tool `{}`.</tool_choice_reminder>",
-            kiro_facing_tool_choice_name(req, &name, tool_name_map)
+        ToolChoiceDirective::Any => Some(TOOL_CHOICE_ANY_REMINDER.to_string()),
+        ToolChoiceDirective::Tool(name) => Some(TOOL_CHOICE_TOOL_REMINDER.replace(
+            "{name}",
+            &kiro_facing_tool_choice_name(req, &name, tool_name_map),
         )),
         _ => None,
     }
@@ -579,18 +567,14 @@ fn tool_choice_directive_prefix(
     tool_name_map: &HashMap<String, String>,
 ) -> Option<String> {
     match directive {
-        ToolChoiceDirective::Any => Some(
-            "<tool_choice>any</tool_choice><tool_choice_policy>You MUST call at least one of the available tools in this turn. A response without a tool call is invalid.</tool_choice_policy>"
-                .to_string(),
-        ),
+        ToolChoiceDirective::Any => Some(TOOL_CHOICE_ANY_PREFIX.to_string()),
         ToolChoiceDirective::Tool(name) => {
             let kiro_name = kiro_facing_tool_choice_name(req, &name, tool_name_map);
-            Some(format!(
-                "<tool_choice>tool</tool_choice><tool_choice_name>{}</tool_choice_name><tool_choice_policy>You MUST call the tool `{}` in this turn. A response without that tool call is invalid.</tool_choice_policy>",
-                kiro_name, kiro_name
-            ))
+            Some(TOOL_CHOICE_TOOL_PREFIX.replace("{name}", &kiro_name))
         }
-        ToolChoiceDirective::None if request_declares_tools(req) || request_history_has_tool_use(req) => {
+        ToolChoiceDirective::None
+            if request_declares_tools(req) || request_history_has_tool_use(req) =>
+        {
             Some(TOOL_CHOICE_NONE_PREFIX.to_string())
         }
         // 未声明 tools 时客户端同样不允许调用工具；只有历史里出现过工具调用（会生成占位定义）时才需要提示。
@@ -627,6 +611,14 @@ fn request_declares_tools(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
 }
 
+/// 请求是否声明了 Claude Code 的 Write 或 Edit 工具（分块写入策略的作用对象）。
+pub(super) fn request_declares_write_or_edit(req: &MessagesRequest) -> bool {
+    req.tools
+        .iter()
+        .flatten()
+        .any(|tool| matches!(tool.name.as_str(), "Write" | "Edit"))
+}
+
 fn request_history_has_tool_use(req: &MessagesRequest) -> bool {
     req.messages.iter().any(|message| {
         message.content.as_array().is_some_and(|blocks| {
@@ -653,6 +645,8 @@ pub(super) struct ConvertedTools {
     pub(super) tools: Vec<Tool>,
     pub(super) tool_cache_point_insert_after: Vec<usize>,
     pub(super) tool_schema_key_map: ToolSchemaKeyMap,
+    /// Write/Edit 描述后缀至少加到了一个工具上。
+    pub(super) chunked_suffix_applied: bool,
 }
 
 pub(super) fn convert_tools(
@@ -674,6 +668,7 @@ pub(super) fn convert_tools(
         allocate_selected_tool_names(tools, &selected_indices, tool_name_map, &options)?;
 
     let mut converted = Vec::new();
+    let mut chunked_suffix_applied = false;
     let mut cache_point_insert_after = Vec::new();
     let mut tool_schema_key_map = ToolSchemaKeyMap::default();
     let schema_key_mapper = match SchemaKeyMapper::new(
@@ -695,15 +690,24 @@ pub(super) fn convert_tools(
         let description = normalize_tool_description(&t.name, &t.description);
 
         // 对 Write/Edit 工具追加自定义描述后缀
-        let suffix = if options.inject_chunked_tool_descriptions() {
+        let suffix = if options.allows(InjectionId::ChunkedWriteToolSuffix) {
             match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                "Write" => options
+                    .injections
+                    .text(TextKey::ChunkedWriteToolSuffixWrite)
+                    .trim(),
+                "Edit" => options
+                    .injections
+                    .text(TextKey::ChunkedWriteToolSuffixEdit)
+                    .trim(),
                 _ => "",
             }
         } else {
             ""
         };
+        if !suffix.is_empty() {
+            chunked_suffix_applied = true;
+        }
         // 限制客户端描述长度为 10000 字符（安全截断 UTF-8，单次遍历）。先截断客户端描述再追加
         // 代理自己的策略后缀，避免长描述把后缀截掉。
         let mut description = match description.char_indices().nth(10000) {
@@ -748,5 +752,6 @@ pub(super) fn convert_tools(
         tools: converted,
         tool_cache_point_insert_after: cache_point_insert_after,
         tool_schema_key_map,
+        chunked_suffix_applied,
     })
 }

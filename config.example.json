@@ -57,12 +57,46 @@
     "toolSchemaKeyMapping": "sanitize",
     "toolSchemaKeyValidationRegex": "^[a-zA-Z0-9_.-]{1,64}$",
     "toolChoiceSteering": true,
-    "chunkedToolPolicy": true,
-    "thinkingPromptControls": true,
     "nativeReasoningFields": true,
     "toolPairingRepair": true,
     "historyPlaceholderTools": true
   },
+  "promptInjection": {
+    "applyToCountTokens": true,
+    "defaults": {
+      "taskQuality": { "enabled": false, "externalPool": false },
+      "languageConstraint": { "enabled": false, "externalPool": false },
+      "languageTurnReminder": { "enabled": false },
+      "custom": { "enabled": false, "externalPool": false },
+      "identityPrompt": { "enabled": false, "externalPool": false },
+      "identityTurnReminder": { "enabled": false },
+      "chunkedWritePolicy": { "enabled": true },
+      "chunkedWriteToolSuffix": { "enabled": true },
+      "thinkingControls": { "enabled": true },
+      "thinkingOutputPolicy": { "enabled": true },
+      "toolChoicePrefix": { "enabled": true },
+      "toolChoiceTurnReminder": { "enabled": true },
+      "webSearchGuidance": { "enabled": true },
+      "emptyTurnNudge": { "enabled": true }
+    },
+    "texts": {},
+    "pathOverrides": {
+      "/cc": {
+        "taskQuality": { "enabled": true }
+      }
+    }
+  },
+  "routeFeatures": {
+    "defaults": {
+      "thinkingModelName": true,
+      "thinkingTrigger": "real_request",
+      "channelLeakGuard": false,
+      "channelLeakGuardStream": true,
+      "modelDrivenWebSearch": false
+    },
+    "pathOverrides": {}
+  },
+  "claudeModelsOnly": false,
   "payloadShaping": {
     "enabled": true,
     "truncateHistoricalToolResults": true,

@@ -28,7 +28,6 @@ import {
   SelectValue,
   Spinner,
   Switch,
-  Textarea,
 } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -36,7 +35,6 @@ import {
   defaultBodyConversion,
   defaultExternalPoolsConfig,
   defaultMissingMaxTokens,
-  defaultPromptSteering,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
   defaultWeightedCapacity,
@@ -47,7 +45,8 @@ import {
   normalizeMissingMaxTokens,
   normalizeModelMapping,
   normalizePayloadShaping,
-  normalizePromptSteering,
+  normalizePromptInjection,
+  normalizeRouteFeatures,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   normalizeWeightedCapacity,
@@ -124,10 +123,6 @@ function normalizeRuleList(value?: string[] | null): string[] {
   return (value ?? []).map((rule) => rule.trim()).filter(Boolean)
 }
 
-function parseRuleText(value: string): string[] {
-  return value.split(/[\r\n,]+/).map((rule) => rule.trim()).filter(Boolean)
-}
-
 function parseStatusCodeList(value: string): number[] {
   const seen = new Set<number>()
   const codes: number[] = []
@@ -144,10 +139,6 @@ function joinStatusCodeList(value: number[] = []): string {
   return value
     .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
     .join(', ')
-}
-
-function ruleText(value?: string[] | null): string {
-  return normalizeRuleList(value).join('\n')
 }
 
 function NumField({
@@ -371,7 +362,8 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     imageProcessing: normalizeImageProcessing(draft.imageProcessing),
     bodyConversion: normalizeBodyConversion(draft.bodyConversion),
-    promptSteering: normalizePromptSteering(draft.promptSteering),
+    promptInjection: normalizePromptInjection(draft.promptInjection),
+    routeFeatures: normalizeRouteFeatures(draft.routeFeatures),
     missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
@@ -473,22 +465,10 @@ export function RuntimePage() {
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
   const [savedDraft, setSavedDraft] = useState<RuntimeConfig | null>(null)
   const [activeSection, setActiveSection] = useState<RuntimeSectionKey>('loadBalancing')
-  const [promptSteeringRouteRulesText, setPromptSteeringRouteRulesText] = useState('')
-  const [identityRouteRulesText, setIdentityRouteRulesText] = useState('')
 
   useEffect(() => {
     if (config.data) {
       const bodyConversion = normalizeBodyConversion(config.data.bodyConversion ?? defaultBodyConversion())
-      const rawPromptSteering = (config.data as Partial<RuntimeConfig>).promptSteering
-      const promptSteering = normalizePromptSteering(rawPromptSteering ?? {
-        ...defaultPromptSteering(),
-        toolChoice: { enabled: bodyConversion.toolChoiceSteering },
-        chunkedWrite: {
-          ...defaultPromptSteering().chunkedWrite,
-          enabled: bodyConversion.chunkedToolPolicy,
-        },
-        thinking: { enabled: bodyConversion.thinkingPromptControls },
-      })
       const hydratedDraft: RuntimeConfig = {
         ...emptyRuntimeConfig,
         ...config.data,
@@ -506,7 +486,8 @@ export function RuntimePage() {
         },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
         bodyConversion,
-        promptSteering,
+        promptInjection: normalizePromptInjection(config.data.promptInjection),
+        routeFeatures: normalizeRouteFeatures(config.data.routeFeatures),
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens ?? defaultMissingMaxTokens()),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         externalPools: {
@@ -526,8 +507,6 @@ export function RuntimePage() {
       }
       setDraft(hydratedDraft)
       setSavedDraft(hydratedDraft)
-      setPromptSteeringRouteRulesText(ruleText(promptSteering.routeRules))
-      setIdentityRouteRulesText(ruleText(promptSteering.identity.routeRules))
     }
   }, [config.data])
 
@@ -570,112 +549,12 @@ export function RuntimePage() {
       },
     }))
 
-  const setPromptSteering = <K extends keyof RuntimeConfig['promptSteering']>(k: K) => (v: RuntimeConfig['promptSteering'][K]) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        [k]: v,
-      },
-    }))
-
-  const setPromptSteeringText =
-    (block: 'languageConstraint' | 'taskQuality' | 'custom', key: 'enabled' | 'prompt') =>
-    (v: boolean | string) =>
+  const setRouteFeatureDefault =
+    <K extends keyof RuntimeConfig['routeFeatures']['defaults']>(k: K) =>
+    (v: RuntimeConfig['routeFeatures']['defaults'][K]) =>
       setDraft((prev) => ({
         ...prev,
-        promptSteering: {
-          ...defaultPromptSteering(),
-          ...prev.promptSteering,
-          [block]: {
-            ...defaultPromptSteering()[block],
-            ...prev.promptSteering?.[block],
-            [key]: v,
-          },
-        },
-      }))
-
-  const setIdentity =
-    <K extends keyof RuntimeConfig['promptSteering']['identity']>(k: K) =>
-    (v: RuntimeConfig['promptSteering']['identity'][K]) =>
-      setDraft((prev) => ({
-        ...prev,
-        promptSteering: {
-          ...defaultPromptSteering(),
-          ...prev.promptSteering,
-          identity: {
-            ...defaultPromptSteering().identity,
-            ...prev.promptSteering?.identity,
-            [k]: v,
-          },
-        },
-      }))
-
-  const setIdentityOutputGuard =
-    <K extends keyof RuntimeConfig['promptSteering']['identity']['outputGuard']>(k: K) =>
-    (v: RuntimeConfig['promptSteering']['identity']['outputGuard'][K]) =>
-      setDraft((prev) => ({
-        ...prev,
-        promptSteering: {
-          ...defaultPromptSteering(),
-          ...prev.promptSteering,
-          identity: {
-            ...defaultPromptSteering().identity,
-            ...prev.promptSteering?.identity,
-            outputGuard: {
-              ...defaultPromptSteering().identity.outputGuard,
-              ...prev.promptSteering?.identity?.outputGuard,
-              [k]: v,
-            },
-          },
-        },
-      }))
-
-  const setIdentityTurnReminder =
-    <K extends keyof RuntimeConfig['promptSteering']['identity']['turnReminder']>(k: K) =>
-    (v: RuntimeConfig['promptSteering']['identity']['turnReminder'][K]) =>
-      setDraft((prev) => ({
-        ...prev,
-        promptSteering: {
-          ...defaultPromptSteering(),
-          ...prev.promptSteering,
-          identity: {
-            ...defaultPromptSteering().identity,
-            ...prev.promptSteering?.identity,
-            turnReminder: {
-              ...defaultPromptSteering().identity.turnReminder,
-              ...prev.promptSteering?.identity?.turnReminder,
-              [k]: v,
-            },
-          },
-        },
-      }))
-
-  const setPromptSteeringToggle = (key: 'toolChoice' | 'thinking') => (enabled: boolean) =>
-    setDraft((prev) => ({
-      ...prev,
-      promptSteering: {
-        ...defaultPromptSteering(),
-        ...prev.promptSteering,
-        [key]: { enabled },
-      },
-    }))
-
-  const setChunkedWriteSteering =
-    (key: keyof RuntimeConfig['promptSteering']['chunkedWrite']) =>
-    (value: boolean) =>
-      setDraft((prev) => ({
-        ...prev,
-        promptSteering: {
-          ...defaultPromptSteering(),
-          ...prev.promptSteering,
-          chunkedWrite: {
-            ...defaultPromptSteering().chunkedWrite,
-            ...prev.promptSteering?.chunkedWrite,
-            [key]: value,
-          },
-        },
+        routeFeatures: { ...prev.routeFeatures, defaults: { ...prev.routeFeatures.defaults, [k]: v } },
       }))
 
   const setMissingMaxTokens = <K extends keyof RuntimeConfig['missingMaxTokens']>(k: K) => (v: RuntimeConfig['missingMaxTokens'][K]) =>
@@ -1501,291 +1380,14 @@ export function RuntimePage() {
                 </div>
                 <div className="space-y-3">
                   <div>
-                    <div className="text-sm font-semibold">提示词引导</div>
+                    <div className="text-sm font-semibold">提示词注入</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      管理代理新增的语言、任务质量、tool_choice、thinking 与分块兼容提示；关闭总开关后不新增任何这类提示，客户端原始结构化字段仍保留。
+                      代理写进上游请求的提示词（任务质量、语言、身份、分块写入、thinking 与 tool_choice 兼容标签等）每一项单独设置，统一在提示词注入页编辑；和路由的关联在路由策略里设置。
                     </div>
                   </div>
-                  <TwoCol>
-                    <TogField
-                      label="启用提示词引导"
-                      desc="总开关。关闭后不会注入语言约束、任务质量、tool_choice、thinking 或分块写入提示；客户端已提供的结构化字段仍按原语义处理。"
-                      checked={draft.promptSteering.enabled}
-                      onChange={setPromptSteering('enabled')}
-                    />
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">生效范围</div>
-                      <Select value={draft.promptSteering.scope} onValueChange={(v) => setPromptSteering('scope')(v as RuntimeConfig['promptSteering']['scope'])}>
-                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="route_rules">按路径规则</SelectItem>
-                          <SelectItem value="claude_code_profile">Claude Code / Debug profile</SelectItem>
-                          <SelectItem value="all_routes">全部 messages 路由</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <div className="text-xs leading-5 text-muted-foreground">anthropic-strict profile 始终不注入 synthetic prompt。</div>
-                    </div>
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">提示词路径模式</div>
-                      <Select
-                        value={draft.promptSteering.routeMode}
-                        disabled={draft.promptSteering.scope !== 'route_rules'}
-                        onValueChange={(v) => setPromptSteering('routeMode')(v as RuntimeConfig['promptSteering']['routeMode'])}
-                      >
-                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="allow_list">只对规则命中的入口生效</SelectItem>
-                          <SelectItem value="deny_list">对规则外的入口生效</SelectItem>
-                          <SelectItem value="allow_all">全部入口生效</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <div className="text-xs leading-5 text-muted-foreground">仅在“按路径规则”范围下参与判断。</div>
-                    </div>
-                    <div className="space-y-1.5 md:col-span-2">
-                      <div className="text-sm font-semibold">提示词路径规则</div>
-                      <Textarea
-                        className="min-h-28 font-mono text-xs"
-                        value={promptSteeringRouteRulesText}
-                        disabled={draft.promptSteering.scope !== 'route_rules' || draft.promptSteering.routeMode === 'allow_all'}
-                        placeholder={'/cc\n/v1\n/ha\n/na\n/dfcache/team'}
-                        onChange={(e) => {
-                          setPromptSteeringRouteRulesText(e.target.value)
-                          setPromptSteering('routeRules')(parseRuleText(e.target.value))
-                        }}
-                      />
-                      <div className="text-xs leading-5 text-muted-foreground">
-                        每行一条，可填入口前缀或完整 messages / count_tokens 路径；默认规则是 /cc，但可以改成任意内置或自定义路由。
-                      </div>
-                    </div>
-                    <TogField
-                      label="应用到外部池"
-                      desc="开启后，请求进入外部池 raw passthrough 时也按同一提示词路径规则处理增强后的 system。"
-                      checked={draft.promptSteering.applyToExternalPool}
-                      onChange={setPromptSteering('applyToExternalPool')}
-                    />
-                    <TogField
-                      label="count_tokens 同步计入"
-                      desc="count_tokens 使用同一提示词路径规则，避免估算低于真实请求。"
-                      checked={draft.promptSteering.applyToCountTokens}
-                      onChange={setPromptSteering('applyToCountTokens')}
-                    />
-                    <TogField
-                      label="语言约束"
-                      desc="默认关闭。开启后在 system 顶部注入一次：优先用户明确要求的语言，其次客户端声明的语言（如 Claude Code 的 language 设置），否则跟随用户自己的消息。关闭时不注入任何语言提示词。"
-                      checked={draft.promptSteering.languageConstraint.enabled}
-                      onChange={setPromptSteeringText('languageConstraint', 'enabled')}
-                    />
-                    <TogField
-                      label="任务质量"
-                      desc="强调最新用户消息、仅分析/真实执行/发布等任务边界，以及已验证必须有证据。"
-                      checked={draft.promptSteering.taskQuality.enabled}
-                      onChange={setPromptSteeringText('taskQuality', 'enabled')}
-                    />
-                    <TogField
-                      label="tool_choice 引导"
-                      desc="控制本地 Kiro 的 tool_choice 兼容提示；总开关关闭时不注入提示，但结构化 0/N/1 工具过滤仍按请求执行。"
-                      checked={draft.promptSteering.toolChoice.enabled}
-                      onChange={setPromptSteeringToggle('toolChoice')}
-                    />
-                    <TogField
-                      label="thinking 提示控制"
-                      desc="控制 synthetic thinking 兼容提示；总开关关闭时不注入提示，客户端显式 thinking 仍保留。"
-                      checked={draft.promptSteering.thinking.enabled}
-                      onChange={setPromptSteeringToggle('thinking')}
-                    />
-                    <TogField
-                      label="分块写入提示"
-                      desc="控制 Write/Edit 分块兼容提示及其两个提示位置；总开关关闭时不注入这些提示。"
-                      checked={draft.promptSteering.chunkedWrite.enabled}
-                      onChange={setChunkedWriteSteering('enabled')}
-                    />
-                    <TogField
-                      label="分块 system 提示"
-                      desc="在 system 中要求模型遵守 Write/Edit 分块限制。"
-                      checked={draft.promptSteering.chunkedWrite.systemPromptEnabled}
-                      disabled={!draft.promptSteering.chunkedWrite.enabled}
-                      onChange={setChunkedWriteSteering('systemPromptEnabled')}
-                    />
-                    <TogField
-                      label="分块工具描述"
-                      desc="给 Write/Edit 工具 description 追加分块限制说明。"
-                      checked={draft.promptSteering.chunkedWrite.toolDescriptionEnabled}
-                      disabled={!draft.promptSteering.chunkedWrite.enabled}
-                      onChange={setChunkedWriteSteering('toolDescriptionEnabled')}
-                    />
-                    <TogField
-                      label="自定义追加提示词"
-                      desc="追加 operator 自定义 system prompt；默认关闭。"
-                      checked={draft.promptSteering.custom.enabled}
-                      onChange={setPromptSteeringText('custom', 'enabled')}
-                    />
-                  </TwoCol>
-                  <div className="grid gap-3">
-                    <div className="rounded-md border bg-background p-4">
-                      <div className="mb-3 flex items-center justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-medium">语言约束提示词</div>
-                          <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在“语言约束”开启时注入；留空保存时使用内置默认。</div>
-                        </div>
-                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('languageConstraint', 'prompt')(config.data?.promptSteeringDefaults?.languageConstraintPrompt ?? '')}>
-                          恢复默认
-                        </Button>
-                      </div>
-                      <Textarea
-                        className="min-h-48 font-mono text-xs"
-                        value={draft.promptSteering.languageConstraint.prompt}
-                        onChange={(event) => setPromptSteeringText('languageConstraint', 'prompt')(event.target.value)}
-                      />
-                    </div>
-                    <div className="rounded-md border bg-background p-4">
-                      <div className="mb-3 flex items-center justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-medium">任务质量提示词</div>
-                          <div className="mt-1 text-xs leading-5 text-muted-foreground">用于减少追问被忽视、任务边界错误、没有真实证据却声称完成等问题。</div>
-                        </div>
-                        <Button type="button" variant="outline" size="sm" onClick={() => setPromptSteeringText('taskQuality', 'prompt')(config.data?.promptSteeringDefaults?.taskQualityPrompt ?? '')}>
-                          恢复默认
-                        </Button>
-                      </div>
-                      <Textarea
-                        className="min-h-48 font-mono text-xs"
-                        value={draft.promptSteering.taskQuality.prompt}
-                        onChange={(event) => setPromptSteeringText('taskQuality', 'prompt')(event.target.value)}
-                      />
-                    </div>
-                    <div className="rounded-md border bg-background p-4">
-                      <div className="mb-3">
-                        <div className="text-sm font-medium">自定义追加提示词</div>
-                        <div className="mt-1 text-xs leading-5 text-muted-foreground">仅在上方“自定义追加提示词”开启时注入；不要写动态 request id、时间或账号信息。</div>
-                      </div>
-                      <Textarea
-                        className="min-h-32 font-mono text-xs"
-                        value={draft.promptSteering.custom.prompt}
-                        onChange={(event) => setPromptSteeringText('custom', 'prompt')(event.target.value)}
-                      />
-                    </div>
-                  </div>
-                </div>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">身份与渠道隐藏</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      统一以 Claude 身份回答，不暴露 Kiro / AWS 等上游渠道。这里是默认值：没有单独设置的路由按这里的开关和路由规则生效；单个路由可以在“路由策略”页面独立开关。不受上方提示词引导的总开关和 strict 模式影响。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <TogField
-                      label="启用身份隐藏"
-                      desc="总开关，默认关闭。关闭后下方提示词、每轮提醒和输出过滤都不生效。"
-                      checked={draft.promptSteering.identity.enabled}
-                      onChange={setIdentity('enabled')}
-                    />
-                    <div className="space-y-1.5">
-                      <div className="text-sm font-semibold">生效路由</div>
-                      <Select
-                        value={draft.promptSteering.identity.routeMode}
-                        disabled={!draft.promptSteering.identity.enabled}
-                        onValueChange={(v) => setIdentity('routeMode')(v as RuntimeConfig['promptSteering']['identity']['routeMode'])}
-                      >
-                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="allow_all">全部路由</SelectItem>
-                          <SelectItem value="allow_list">只在以下路由生效</SelectItem>
-                          <SelectItem value="deny_list">以下路由不生效</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="space-y-1.5 md:col-span-2">
-                      <div className="text-sm font-semibold">路由规则</div>
-                      <Textarea
-                        className="min-h-20 font-mono text-xs"
-                        value={identityRouteRulesText}
-                        disabled={!draft.promptSteering.identity.enabled || draft.promptSteering.identity.routeMode === 'allow_all'}
-                        placeholder={'/cc\n/v1'}
-                        onChange={(e) => {
-                          setIdentityRouteRulesText(e.target.value)
-                          setIdentity('routeRules')(parseRuleText(e.target.value))
-                        }}
-                      />
-                      <div className="text-xs leading-5 text-muted-foreground">
-                        每行一条，填入口前缀（如 /cc）或完整 messages / count_tokens 路径。
-                      </div>
-                    </div>
-                    <TogField
-                      label="注入身份声明"
-                      desc="在 system 最前面加一段简短的身份声明。"
-                      checked={draft.promptSteering.identity.promptEnabled}
-                      disabled={!draft.promptSteering.identity.enabled}
-                      onChange={setIdentity('promptEnabled')}
-                    />
-                    <TogField
-                      label="每轮身份提醒"
-                      desc="在当前用户消息末尾追加一句提醒，对抗上游自带的身份设定；只作用于本地 Kiro 链路。"
-                      checked={draft.promptSteering.identity.turnReminder.enabled}
-                      disabled={!draft.promptSteering.identity.enabled}
-                      onChange={setIdentityTurnReminder('enabled')}
-                    />
-                    <TogField
-                      label="输出过滤"
-                      desc="返回前删除“我是 Kiro / 我不是 Kiro / 指令冲突”这类暴露渠道的句子，只看自我描述，不拦普通提到的词。"
-                      checked={draft.promptSteering.identity.outputGuard.enabled}
-                      disabled={!draft.promptSteering.identity.enabled}
-                      onChange={setIdentityOutputGuard('enabled')}
-                    />
-                    <TogField
-                      label="流式也过滤"
-                      desc="流式回复按整句检查后再下发，每句要等说完才发出，首字会稍晚；关闭后流式只靠提示词。"
-                      checked={draft.promptSteering.identity.outputGuard.streamEnabled}
-                      disabled={!draft.promptSteering.identity.enabled || !draft.promptSteering.identity.outputGuard.enabled}
-                      onChange={setIdentityOutputGuard('streamEnabled')}
-                    />
-                    <TogField
-                      label="应用到外部池"
-                      desc="外部池通常直连真实 Claude 上游，默认不注入提示词；某个外部池也需要时再开启。"
-                      checked={draft.promptSteering.identity.applyToExternalPool}
-                      disabled={!draft.promptSteering.identity.enabled}
-                      onChange={setIdentity('applyToExternalPool')}
-                    />
-                    <TogField
-                      label="模型列表只显示 Claude"
-                      desc="/v1/models 隐藏 DeepSeek、GLM、MiniMax、Qwen 等非 Claude 模型；直接用模型名调用不受影响。独立开关，不跟随上面的总开关和路由。"
-                      checked={draft.promptSteering.identity.claudeModelsOnly}
-                      onChange={setIdentity('claudeModelsOnly')}
-                    />
-                  </TwoCol>
-                  <div className="grid gap-3">
-                    <div className="rounded-md border bg-background p-4">
-                      <div className="mb-3 flex items-center justify-between gap-3">
-                        <div className="text-sm font-medium">身份声明提示词</div>
-                        <Button type="button" variant="outline" size="sm" onClick={() => setIdentity('prompt')(config.data?.promptSteeringDefaults?.identityPrompt ?? '')}>
-                          恢复默认
-                        </Button>
-                      </div>
-                      <Textarea
-                        className="min-h-48 font-mono text-xs"
-                        value={draft.promptSteering.identity.prompt}
-                        onChange={(event) => setIdentity('prompt')(event.target.value)}
-                      />
-                      <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                        留空保存时使用内置默认。只约束模型如何介绍自己，不要禁止讨论 Kiro / AWS 这些词，否则用户代码里出现这些词时模型会回避。
-                      </div>
-                    </div>
-                    <div className="rounded-md border bg-background p-4">
-                      <div className="mb-3 flex items-center justify-between gap-3">
-                        <div className="text-sm font-medium">每轮身份提醒</div>
-                        <Button type="button" variant="outline" size="sm" onClick={() => setIdentityTurnReminder('prompt')(config.data?.promptSteeringDefaults?.identityTurnReminderPrompt ?? '')}>
-                          恢复默认
-                        </Button>
-                      </div>
-                      <Textarea
-                        className="min-h-20 font-mono text-xs"
-                        value={draft.promptSteering.identity.turnReminder.prompt}
-                        onChange={(event) => setIdentityTurnReminder('prompt')(event.target.value)}
-                      />
-                      <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                        保持简短，并用 &lt;identity_reminder&gt; 标签包裹：模型若原样复述该标签块，代理会在输出中删掉它。
-                      </div>
-                    </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button asChild variant="outline" size="sm"><Link to="/prompt-injection">打开提示词注入</Link></Button>
+                    <Button asChild variant="outline" size="sm"><Link to="/cache-policies">打开路由策略</Link></Button>
                   </div>
                 </div>
                 <div className="space-y-3">
@@ -1824,17 +1426,9 @@ export function RuntimePage() {
                       />
                     </div>
                     <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
-                    <TogField label="结构化 tool_choice" desc="按请求语义执行 none=0、any=N、named=1 工具过滤；提示词总开关只控制额外提示，不删除结构化语义。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
-                    <TogField label="thinking 转换能力" desc="允许本地 Kiro 生成原生 thinking 字段；客户端显式字段仍按能力合同映射，额外兼容提示受上方总开关控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
-                    <TogField label="分块工具策略" desc="定义 Write/Edit 分块协议能力；额外 system/工具描述提示受上方总开关控制。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
+                    <TogField label="结构化 tool_choice" desc="按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用（含 disable_parallel_tool_use）。对应的提示词在提示词注入页单独控制。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
                     <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
-                    <TogField
-                      label="WebSearch 模型驱动（默认值）"
-                      desc="开启后由模型生成搜索词、根据结果写带引用的回答；每次搜索多调用 1 次模型，token 计入本次 usage。关闭时沿用模板回答。路由策略里可以按路由单独设置。"
-                      checked={draft.bodyConversion.modelDrivenWebSearch.enabled}
-                      onChange={(enabled) => setBodyConversion('modelDrivenWebSearch')({ ...draft.bodyConversion.modelDrivenWebSearch, enabled })}
-                    />
                   </TwoCol>
                 </div>
                 <div className="space-y-3">
@@ -1937,19 +1531,34 @@ export function RuntimePage() {
                     </p>
                   </div>
                   <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">思考触发</div>
-                    <Select value={draft.thinkingTriggerMode} onValueChange={(v) => set('thinkingTriggerMode')(v as RuntimeConfig['thinkingTriggerMode'])}>
+                    <div className="text-sm font-semibold">思考触发（默认值）</div>
+                    <Select
+                      value={draft.routeFeatures.defaults.thinkingTrigger}
+                      onValueChange={(v) => setRouteFeatureDefault('thinkingTrigger')(v as RuntimeConfig['routeFeatures']['defaults']['thinkingTrigger'])}
+                    >
                       <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="real_request">按请求触发</SelectItem>
                         <SelectItem value="always">总是触发</SelectItem>
+                        <SelectItem value="off">不自动开启</SelectItem>
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-muted-foreground">
-                      {draft.thinkingTriggerMode === 'always'
+                      {draft.routeFeatures.defaults.thinkingTrigger === 'always'
                         ? '除非请求明确关闭，否则每次调用都会输出思考内容。'
-                        : '按 Claude Code CLI 的习惯触发：模型或请求明确需要深度思考时，才会输出思考内容。'}
+                        : draft.routeFeatures.defaults.thinkingTrigger === 'off'
+                          ? '只看客户端自己的 thinking 参数，代理不自动开启，也不强制可见输出。'
+                          : '按 Claude Code CLI 的习惯触发：请求明确需要深度思考时，才会输出思考内容。'}
+                      {' '}路由策略里可以按路由单独设置。
                     </p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <TogField
+                      label="模型列表只显示 Claude"
+                      desc="/v1/models 只列出 Claude 模型，避免非 Claude 的上游模型目录暴露渠道。直接请求未列出的模型不受影响。"
+                      checked={draft.claudeModelsOnly}
+                      onChange={set('claudeModelsOnly')}
+                    />
                   </div>
                   <div className="space-y-1.5">
                     <div className="text-sm font-semibold">缺失 max_tokens</div>

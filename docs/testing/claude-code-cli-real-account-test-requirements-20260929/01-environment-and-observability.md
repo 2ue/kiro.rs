@@ -66,11 +66,11 @@ nohup "$candidate_root/kiro-rs" -c "$KIRO_CONFIG" \
 | 余额 | `GET /api/admin/credentials/{id}/balance` | 开始/每组结束/结束时的剩余额度 |
 | 单账号冒烟 | `POST /api/admin/credentials/{id}/test` | sonnet-4.5、haiku-4.5 各一次，确认账号可用 |
 | 模型目录 | `GET /api/admin/model-capabilities` | 上游实际可用模型、是否带原生 reasoning 能力（决定 thinking 走原生字段还是 XML 提示） |
-| 运行配置 | `GET /api/admin/config/runtime` | `thinkingTriggerMode`、`payloadTooLongHandling`、`payloadGuard*`、`payloadShaping.*`、`bodyConversion.*`、`reportedUsage`、外部池开关、`requestAdmission`、`kiroUpstreamStreamIdleTimeoutSecs`、`expose_proxy_warnings`、后台 token 刷新开关 |
+| 运行配置 | `GET /api/admin/config/runtime` | `routeFeatures`（`thinkingTrigger`、`thinkingModelName` 等）、`promptInjection`（各注入项默认值和路由覆盖）、`payloadTooLongHandling`、`payloadGuard*`、`payloadShaping.*`、`bodyConversion.*`、`reportedUsage`、外部池开关、`requestAdmission`、`kiroUpstreamStreamIdleTimeoutSecs`、`expose_proxy_warnings`、后台 token 刷新开关 |
 
 基线要求（除非用例明确要求修改）：
 
-- `thinkingTriggerMode=real_request`
+- `routeFeatures.defaults.thinkingTrigger=real_request`，且测试路由没有覆盖该字段
 - `payloadTooLongHandling=client_compaction`（当前默认值：上游报 too-long 时把错误交给 Claude Code 自己压缩，不在服务端静默裁剪）
 - 外部池关闭或无可用外部池
 - 修改运行配置的用例必须先备份当前配置 JSON，用例结束后恢复并再次 GET 确认。
@@ -232,7 +232,7 @@ cccurl() {
 | CC-ENV-08 | P0 | 既有场景 | 无 | 测试前后各执行第 1 节预检脚本：`lsof` 找 PID，`ps -p <pid> -o command=` 确认是本仓库 kiro-rs，配置为 `$KIRO_CONFIG`，数据库与 Redis namespace 归属正确；替换二进制时按第 1 节决策表处理，替换后先查 `/healthz`、`/readyz` 再跑 CLI | 19023 | 只停止经核验的那一个进程；健康检查成功；所有用例复用同一实例；结束后恢复原二进制并通过 `/readyz` | 记录 PID、命令行、二进制 SHA-256、"复用/本轮启动/替换"。背景：常规测试不允许为每个用例另起代理实例；破坏性用例需要临时实例时，记录其端口、配置、存储和清理结果 |
 | CC-ENV-09 | P0 | 新增（补充） | CC-ENV-08 通过 | 按第 2 节调用 credentials-paged、balance、credentials/{id}/test（sonnet-4.5、haiku-4.5 各一次）、model-capabilities | Admin API | 至少一个免费 plan 账号可用；两个模型冒烟均成功；记录每个模型是否带原生 reasoning 能力 | 余额写入 `$EVID/balance-start.json`；原生 reasoning 状态决定 03 分册签名类用例是否适用（无原生能力时 thinking 走 XML 提示路径，不会有 `signature_delta`，属预期） |
 | CC-ENV-10 | P0 | 新增（补充） | CC-ENV-08 通过 | 1. `GET /api/admin/config/runtime` 备份到 `$EVID/runtime-config.base.json`；2. 核对第 2 节基线；3. 每个修改配置的用例结束后 PUT 回备份并再次 GET 比对 | Admin API | 基线满足；每次恢复后配置与备份逐字段一致 | 不一致时后续用例暂停，先恢复。备份文件含内部配置，不入库 |
-| CC-ENV-11 | P1 | 既有场景 | CC-ENV-10 已备份配置 | 1. 不重启服务，在管理端修改路由策略（缓存、usage 上报、prompt steering 任选其一，每次只改一项）；2. `CASE=CC-ENV-11-<项> ccp 'Reply with exactly: pong'`；3. 恢复配置后再跑一次 | 运行时配置热更新 | CLI 请求按新配置生效（如 usage 上报口径、steering 是否注入可在 usage 记录/warnings 头/日志中看到变化），而不是按写死的路径规则走；恢复后回到基线行为 | 对比修改前、修改后、恢复后三次请求的 usage 记录和日志。背景：路由策略已改为由配置决定，但真实 CLI 下动态配置生效尚未验证 |
+| CC-ENV-11 | P1 | 既有场景 | CC-ENV-10 已备份配置 | 1. 不重启服务，在管理端修改路由策略（缓存、usage 上报、某个提示词注入项任选其一，每次只改一项）；2. `CASE=CC-ENV-11-<项> ccp 'Reply with exactly: pong'`；3. 恢复配置后再跑一次 | 运行时配置热更新 | CLI 请求按新配置生效（如 usage 上报口径、注入项是否注入可在 usage 记录/warnings 头/日志中看到变化），而不是按写死的路径规则走；恢复后回到基线行为 | 对比修改前、修改后、恢复后三次请求的 usage 记录和日志。背景：路由策略已改为由配置决定，但真实 CLI 下动态配置生效尚未验证 |
 | CC-ENV-12 | P2 | 既有场景 | 运行配置中可开启闲置账号后台 token 刷新；CC-ENV-10 已备份 | 1. 开启后台刷新；2. 等待至少一个扫描周期（看服务日志确认刷新已执行）；3. `CASE=CC-ENV-12 ccp --bare 'Reply with exactly: pong'`；4. 期间记录服务进程 RSS 与 FD 数；5. 恢复配置 | 后台 token 刷新 | 文本正确；最终 usage 非 0；输出无内部调度术语；RSS/FD 不持续增长 | `ps -o rss= -p <pid>`、`lsof -p <pid>` 行数前后对比。背景：后台 worker 刷新账号不能影响请求热路径 |
 | CC-ENV-13 | P0 | 既有场景 | 每组或每轮结束时 | 1. 停止本轮启动的 fake 上游、MCP server、抓包代理、tmux 会话、`claude --bg` 会话；2. 按需停止本轮启动的 19023 实例（只 kill 已核验 PID）；3. 检查端口监听、临时进程、临时 CLI HOME、临时 Cargo target、测试数据库/Redis 前缀；4. 用过 ccman 的切回原 profile | 清理 | 无残留端口监听、进程和临时目录；原 profile 已恢复并核对 | 清理结果写入本轮报告。临时服务、Cargo target、Redis 前缀任一没清理干净，也算门禁失败 |
 
@@ -255,7 +255,7 @@ cccurl() {
 | CC-ENV-21 | P0 | 既有场景 | CC-ENV-09 确认模型有原生 reasoning 能力（否则本用例不适用，记录"不适用"及原因） | 执行 03 分册中的 thinking 多轮签名回放用例，检查每个回放请求的 attempts | 签名回放 | 真正的通过是一次上游请求就成功，而不是靠去掉 reasoning 的重试才成功 | attempts 中出现"签名无效后同账号去掉 reasoning 重试"或"格式错误后同账号去掉 reasoning 重试"即判未通过；日志中出现"多块 reasoning 冲突，先丢历史 thinking"也判未通过。背景：上游报签名无效或 Improperly formed request 时代理会剥离 reasoning 重试，本地转换遇到多块 reasoning 冲突时也会先丢历史 thinking，这些都会让回放失败看起来像成功 |
 | CC-ENV-22 | P1 | 既有场景 | `CC_NONESSENTIAL_OFF=0`（放开后台 haiku 请求） | `CASE=CC-ENV-22 ccp '在工作目录新建 a.txt 写入 hello，再读出来确认'`（一次 `--print` 会触发工具循环多次请求和后台 haiku 请求） | 非 bare；sonnet 主模型 + haiku 后台 | `modelUsage` 等于本次所有 messages 请求原始 usage 按模型之和；`result.usage` 只对应最后一条主响应；服务端每条请求各有一条 usage 记录 | 逐条列出服务端记录并与 `modelUsage` 对账。背景：一次 `--print` 可能触发多条上游请求，只看最终 result 会低估成本。原场景用 Opus 验证，免费 plan 不可用，改用 sonnet + haiku |
 | CC-ENV-23 | P1 | 既有场景 | 能构造一个进入上游前就被本地拒绝的请求（例如当前模型 reasoning 通道不可用时强制 reasoning，或 reasoning 转换失败） | 1. `CASE=CC-ENV-23 ccp <构造参数> 'hi'`；2. 查 usage 记录和后台拒绝记录 | 本地/入口拒绝 | 拒绝记录里有请求模型、解析后/上游模型、具体诊断类别（转换失败类型），而不是 `model=unknown`、`content=unknown` 或诊断为空；CLI 收到可读错误 | 采样记录不当作精确计数。若字段缺失，区分是请求还没解析完、转换失败后记录丢了字段，还是查询层采样或脱敏导致显示缺失。已知现象：本地拒绝的采样记录固定写成 `model=unknown`、诊断内容看不到，排查者误以为模型没传或模型不可用 |
-| CC-ENV-24 | P1 | 既有场景 | CC-ENV-10 已备份；开启 `expose_proxy_warnings` | 1. 经 `/cc` 和 `/v1`（`CC_BASE=http://127.0.0.1:19023`）各发一轮普通对话，同时抓包记录 CLI 实际发送、但代理会忽略的字段（如 `temperature`）；2. 用 debug log 或抓包查看响应头 `x-kiro-rs-warnings`；3. 关闭配置重复 | `expose_proxy_warnings` 开/关 | 开启时头中列出 converter 改写、被忽略的请求字段（如 `ignored-field=temperature`）、提示词注入（`prompt_steering_applied=...`），内容与实际一致；关闭时不出现该头 | 与服务日志中的改写记录逐项对照。已知现象：该头只统计 converter 内部改写，不含被丢弃的字段和提示词注入，且默认关闭，客户端看不到代理做了哪些改动，排障时无法和官方行为对照 |
+| CC-ENV-24 | P1 | 既有场景 | CC-ENV-10 已备份；开启 `expose_proxy_warnings` | 1. 经 `/cc` 和 `/v1`（`CC_BASE=http://127.0.0.1:19023`）各发一轮普通对话，同时抓包记录 CLI 实际发送、但代理会忽略的字段（如 `temperature`）；2. 用 debug log 或抓包查看响应头 `x-kiro-rs-warnings`；3. 关闭配置重复 | `expose_proxy_warnings` 开/关 | 开启时头中列出 converter 改写、被忽略的请求字段（如 `ignored-field=temperature`）、提示词注入（实际注入了哪些注入项），内容与实际一致；关闭时不出现该头 | 与服务日志中的改写记录逐项对照。已知现象：该头只统计 converter 内部改写，不含被丢弃的字段和提示词注入，且默认关闭，客户端看不到代理做了哪些改动，排障时无法和官方行为对照 |
 
 ### 7.5 输出安全与证据
 

@@ -484,20 +484,13 @@ function serviceConfig({ pgUrl, redisUrl, redisPrefix, proxyPort, fakePort, apiK
       toolSchemaKeyMapping: "sanitize",
       toolSchemaKeyValidationRegex: "^[a-zA-Z0-9_.-]{1,64}$",
       toolChoiceSteering: true,
-      chunkedToolPolicy: true,
-      thinkingPromptControls: true,
       nativeReasoningFields: true,
       toolPairingRepair: true,
       historyPlaceholderTools: true,
     },
-    promptSteering: {
-      enabled: true,
-      languageEnabled: true,
-      taskQualityEnabled: true,
-      customEnabled: false,
-      toolChoiceEnabled: true,
-      thinkingEnabled: true,
-      chunkedToolPolicyEnabled: true,
+    // Fresh-install prompt injection defaults; omitted items take their built-in default.
+    promptInjection: {
+      pathOverrides: { "/cc": { taskQuality: { enabled: true } } },
     },
     payloadGuardEnabled: true,
     payloadGuardMode: "on_too_long",

@@ -23,7 +23,9 @@ import {
   getLoadBalancingMode,
   getProxyResources,
   importProxyResources,
+  getPromptInjectionCatalog,
   getRuntimeConfig,
+  previewPromptInjection,
   getSystemVersion,
   resetCredentialFailure,
   setCredentialDisabled,
@@ -463,6 +465,18 @@ export function useRuntimeConfig() {
     queryKey: ['runtime-config'],
     queryFn: getRuntimeConfig,
   })
+}
+
+export function usePromptInjectionCatalog() {
+  return useQuery({
+    queryKey: ['prompt-injection-catalog'],
+    queryFn: getPromptInjectionCatalog,
+    staleTime: Infinity,
+  })
+}
+
+export function usePromptInjectionPreview() {
+  return useMutation({ mutationFn: previewPromptInjection })
 }
 
 export function useSystemVersion() {

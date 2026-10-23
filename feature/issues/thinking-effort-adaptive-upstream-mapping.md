@@ -38,7 +38,7 @@ Related cases: A05, A09, C01, D01, D07, F05
 审计必须从原始字节到实际 wire body 逐层建立字段所有权：
 
 1. Claude Code CLI 生成的 `/cc/v1/messages` 原始 body，包括 unknown-field、stream/non-stream 和 count_tokens 差异。
-2. Anthropic request types、request entry/raw prefilter、body processing、prompt steering、payload guard 和 local/external profile。
+2. Anthropic request types、request entry/raw prefilter、body processing、提示词注入、payload guard 和 local/external profile。
 3. model alias 与 thinking-capability 解析、`BodyConversionConfig`、thinking/prompt 相关 runtime 配置及两套 UI save-refresh。
 4. Anthropic-to-Kiro converter、CLI/IDE endpoint rewrite、Kiro request structs 和 JSON whitespace/single-pass helper。
 5. reqwest 发往 fake/官方 Kiro endpoint 的最终 headers、Content-Length、SHA-256 和 redacted JSON body。
@@ -70,7 +70,7 @@ Related cases: A05, A09, C01, D01, D07, F05
 - effort：absent、`low`、`medium`、`high`、`max`、大小写/空白/未知值；每格 5 轮。
 - thinking：absent、disabled、enabled + budget、`adaptive`、畸形组合；每格 5 轮。
 - 触发：显式字段、CLI 配置/参数、thinking alias、普通 prompt、`think hard`/高难任务、tool-use 前决策、长会话续问；主动与被动证据分开。
-- 配置：prompt master ON/OFF，thinking compatibility prompt 子开关 ON/OFF，body conversion thinking controls ON/OFF，local/external profile；总开关关闭时禁止代理新增 thinking 提示，但客户端显式 thinking/output_config 仍按能力合同映射。
+- 配置：注入项 `thinkingControls`（B1）和 `thinkingOutputPolicy`（B2）在路由上 ON/OFF，路由功能 `thinkingTrigger`（real_request/always/off）和 `thinkingModelName`，local/external profile；B1/B2 关闭时代理不新增 thinking 提示，但客户端显式 thinking/output_config 仍按能力合同映射。
 - 故障：不支持的模型/字段、400、429、500、partial stream 和恢复；错误不得换号放大或静默降级。
 
 ## 官方与开源交叉验证
@@ -93,7 +93,7 @@ Related cases: A05, A09, C01, D01, D07, F05
 
 不能预先选定“总是透传 Anthropic 字段”或“总是注入 adaptive”。选定原则是：客户端结构化意图优先；只有 Kiro 协议有明确等价语义时映射；不支持的取值要规范拒绝或以显式、可观测、经验证的兼容策略处理，不能静默 clamp/drop；operator prompt 开关不得改变结构化能力。
 
-若 Kiro 仅支持有限 effort 集合，兼容表必须是具名、可测试的映射，并在 usage/diagnostics 中记录请求值、映射值和原因，不记录用户 prompt。若 Kiro 支持 adaptive，则保留/生成它的条件必须由结构化协议能力控制，而不是文本 prompt 或语言增强总开关。
+若 Kiro 仅支持有限 effort 集合，兼容表必须是具名、可测试的映射，并在 usage/diagnostics 中记录请求值、映射值和原因，不记录用户 prompt。若 Kiro 支持 adaptive，则保留/生成它的条件必须由结构化协议能力控制，而不是文本 prompt 或某个提示词注入项的开关。
 
 ## 验收与性能
 
@@ -153,7 +153,7 @@ Claude Code CLI `2.1.220`，通过 caller-owned 隔离 PostgreSQL/Redis 运行
 
 未来 Claude CLI 或 Kiro 上游可能增加 effort/thinking 取值、改变默认或改名。实现必须保留 unknown-field 观测与明确 fail-closed/compatibility policy，不能通过硬编码当前 CLI 版本掩盖变化。
 
-回滚不得恢复“关闭提示词引导即关闭所有 thinking/tool 协议能力”的旧耦合，也不得用无日志的 clamp 保持表面成功。若新映射与真实上游不兼容，应回滚到上一记录 binary，并保留明确错误与本专题阻断，直到重新完成 wire 矩阵。
+回滚不得让提示词注入项的开关决定 thinking/tool 协议能力，也不得用无日志的 clamp 保持表面成功。若新映射与真实上游不兼容，应回滚到上一记录 binary，并保留明确错误与本专题阻断，直到重新完成 wire 矩阵。
 
 ### 2026-07-23 最终候选复核
 
@@ -193,7 +193,7 @@ v0.0.117 冻结候选执行两层证据：raw Claude CLI capture 30/30 表明 Cl
 - 显式 `max` 不降级为 `high`。
 - 这个变更只影响 native `output_config` reasoning wire，不改变模型路由、模型 alias 或下游 model 字段。
 - `thinking.type=enabled/disabled` 与 `output_config` 的不兼容组合仍由 request facts fail-closed；`output_config` 只与 adaptive 或 omitted thinking 兼容。
-- prompt 总开关不应决定结构化 `thinking/output_config` 是否能映射；它只控制文本提示增强。
+- 提示词注入项的开关不决定结构化 `thinking/output_config` 是否能映射；它们只控制代理新增的文本提示。
 
 新增 Rust 精确测试：
 
@@ -242,7 +242,7 @@ Claude Code CLI=2.1.197
 
 4. Claude Code CLI 2.1.197 的 `--effort medium/high/xhigh/max` 在本轮 ingress capture 里仍然不可直接从 visible JSON 字段区分：CLI 发送 `thinking.enabled + budget_tokens=31999`，没有 `output_config` 或 top-level effort。因此代理不能把 `budget_tokens=31999` 盲目推断成 `max`，否则会错误升级其他 effort 档。
 
-5. prompt steering 总开关不再作为结构化 thinking/output_config 能力的唯一开关。文本语言增强、任务质量、tool_choice prompt、thinking prompt、chunked tool prompt 应由子开关控制；客户端显式结构化字段仍按能力合同解析/映射。
+5. 没有提示词总开关。语言约束、任务质量、tool_choice 提示、thinking 提示、分块写入提示都是 `promptInjection` 里的独立注入项，各自有全局默认并可按路由设置；`-thinking` 模型名解析（`routeFeatures.thinkingModelName`）和 thinking 触发方式（`routeFeatures.thinkingTrigger`）是路由功能，不受任何提示词开关影响。客户端显式结构化字段仍按能力合同解析/映射；`thinkingControls`（B1）关闭且模型没有原生 reasoning 字段时，带 reasoning 的请求返回 400。
 
 最终验证：
 

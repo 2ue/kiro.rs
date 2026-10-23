@@ -54,7 +54,7 @@ pub(crate) mod payload_guard_runtime;
 pub(crate) mod pricing;
 pub(crate) mod prompt_cache;
 pub(crate) mod prompt_cache_creation_control;
-pub(crate) mod prompt_steering;
+pub(crate) mod prompt_injection;
 pub(crate) mod request_admission;
 pub(crate) mod request_body;
 pub(crate) mod request_facts;
@@ -72,4 +72,7 @@ pub mod types;
 pub(crate) mod usage;
 mod websearch;
 
+pub(crate) use handlers::{
+    PromptInjectionPreviewRequest, PromptInjectionPreviewResponse, preview_prompt_injection,
+};
 pub use router::{AnthropicRouterConfig, AnthropicRouterDependencies, create_router_with_provider};

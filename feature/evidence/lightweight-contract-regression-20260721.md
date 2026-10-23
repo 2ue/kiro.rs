@@ -6,7 +6,7 @@ Status: `contract-pass / release-gate-still-no-go`
 
 ## 目的
 
-本轮在推进 E05 non-Docker runner 后，追加执行一组低产物合同，确认文档、UI 字段、prompt 开关、runner 路径、安全信号和构建 wrapper 清理没有回归。该批不替代动态服务、真实 Claude Code CLI/native upstream、UI browser/build、旧版本升级或 final release gate。
+本轮在推进 E05 non-Docker runner 后，追加执行一组低产物合同，确认文档、UI 字段、runner 路径、安全信号和构建 wrapper 清理没有回归。该批不替代动态服务、真实 Claude Code CLI/native upstream、UI browser/build、旧版本升级或 final release gate。
 
 ## 执行约束
 
@@ -19,7 +19,7 @@ Status: `contract-pass / release-gate-still-no-go`
 
 ## 结果
 
-### 1. 文档、UI 和 prompt 合同
+### 1. 文档和 UI 合同
 
 命令：
 
@@ -28,8 +28,6 @@ node feature/tests/check-feature-docs.mjs
 node feature/tests/cost-format-contract.mjs
 node feature/tests/mcp-attempt-channel-contract.mjs
 node feature/tests/request-api-key-id-contract.mjs
-node feature/tests/prompt-control-independence.mjs
-node feature/tests/prompt-default-parity.mjs
 ```
 
 结果：
@@ -38,8 +36,6 @@ node feature/tests/prompt-default-parity.mjs
 - cost format：`ui + admin-ui` PASS。
 - MCP attempt channel：两套 UI PASS。
 - request API key ID：`ui + admin-ui` PASS。
-- prompt control independence：2 UI surfaces PASS。
-- prompt default parity：Rust、UI、Admin UI PASS，且未发现 internal transcript fingerprints。
 
 ### 2. Runner input/signal safety contracts
 
@@ -173,9 +169,7 @@ node feature/tests/inventory-build-artifacts.mjs --gate
 ```bash
 node feature/tests/cost-format-contract.mjs \
   && node feature/tests/mcp-attempt-channel-contract.mjs \
-  && node feature/tests/request-api-key-id-contract.mjs \
-  && node feature/tests/prompt-control-independence.mjs \
-  && node feature/tests/prompt-default-parity.mjs
+  && node feature/tests/request-api-key-id-contract.mjs
 
 node --test feature/tests/protocol-contamination-source-contract.test.mjs
 
@@ -210,7 +204,7 @@ node --test \
 
 结果：
 
-- UI/prompt 字段合同：cost format、MCP attempt channel、request API key ID、prompt control independence、prompt default parity 均 PASS。
+- UI 字段合同：cost format、MCP attempt channel、request API key ID 均 PASS。
 - Protocol contamination source contract：10 tests total；10 pass、0 skipped、0 failed。该合同锁定不信任任意 `Hashxxxxxxxx`、raw marker-free body 不 DOM parse/serialize、assistant 清理不改 user/tool data、signed/redacted thinking 原子 fail closed、strict request 不 raw-external bypass，以及 stream/non-stream/external 污染后不发送 success terminal。
 - Protocol marker inventory source contract：4 tests total；4 pass、0 skipped、0 failed。该合同锁定生产源码中内部 transcript marker 的允许位置、inert dot placeholder、无 bare `<invoke>` 生产字面量、无旧 output placeholder 生产生成点，以及 invalid tool_result repair 不 textify rejected content。
 - Protocol contamination + Redis fault-domain 合批：56 tests total；47 pass、9 explicit live-signal skips、0 failed。9 个 skip 继承自 Redis fault-domain live signal fixture，不是 protocol-contamination skip。
@@ -296,7 +290,7 @@ find . -maxdepth 3 -type d -name target -print
 本证据支持以下结论：
 
 - E05 runner 改造后，相邻低产物合同未回归。
-- 文档、UI cost/request-key/MCP 字段、prompt 控制独立性仍满足合同。
+- 文档、UI cost/request-key/MCP 字段仍满足合同。
 - 多个 runtime runner 的输入拒绝、no protected-9022 probe、signal cleanup 和 temp cleanup 合同仍成立。
 - scoped wrapper 的清理协议仍成立。
 
