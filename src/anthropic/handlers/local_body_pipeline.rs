@@ -70,6 +70,8 @@ fn conversion_error_category(error: &ConversionError) -> &'static str {
                 "invalid_image_data"
             } else if message.starts_with("Image data cannot be empty.") {
                 "empty_image_data"
+            } else if message.starts_with("remote image URL sources are not supported") {
+                "remote_image_url"
             } else if message.contains("image") {
                 "image_content"
             } else {

@@ -13,8 +13,8 @@ use crate::model::prompt_injection::TextKey;
 use crate::model::prompt_injection::catalog::THINKING_OUTPUT_POLICY;
 
 use super::content::{
-    normalize_tool_use_input, process_message_content, render_server_tool_block,
-    sanitize_tool_use_id,
+    UserImageMode, normalize_tool_use_input, process_message_content_with_mode,
+    render_server_tool_block, sanitize_tool_use_id,
 };
 use super::thinking::{generate_thinking_prefix_for_model, has_thinking_tags};
 use super::tools::{generate_tool_choice_prefix, map_tool_name, request_declares_write_or_edit};
@@ -236,7 +236,8 @@ pub(super) fn merge_user_messages(
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) =
+            process_message_content_with_mode(&msg.content, UserImageMode::History)?;
         if !text.is_empty() {
             content_parts.push(text);
         }

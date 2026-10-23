@@ -60,6 +60,7 @@ const DEFAULT_AUTO_RETRY_ATTEMPTS: usize = 3;
 
 /// Kiro 上游模型容量不足时返回的 `reason`。
 const MODEL_TEMPORARILY_UNAVAILABLE_REASON: &str = "MODEL_TEMPORARILY_UNAVAILABLE";
+const INSUFFICIENT_MODEL_CAPACITY_REASON: &str = "INSUFFICIENT_MODEL_CAPACITY";
 
 /// Global model discovery is an auxiliary operation, not an inference request. Keep its
 /// credential fan-out independent from the size of the configured account pool.
@@ -1178,6 +1179,7 @@ mod tests {
         RiskControl,
         ServerError,
         ModelTemporarilyUnavailable,
+        InsufficientModelCapacity,
         BadRequest,
         Forbidden,
         Success,
@@ -1342,6 +1344,14 @@ mod tests {
                 })),
             )
                 .into_response(),
+            RotationReply::InsufficientModelCapacity => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "message": "I am experiencing high traffic, please try again shortly.",
+                    "reason": "INSUFFICIENT_MODEL_CAPACITY"
+                })),
+            )
+                .into_response(),
             RotationReply::BadRequest => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"message": "malformed"})),
@@ -1467,6 +1477,16 @@ mod tests {
         pool_size: usize,
         budget: Arc<InferenceAttemptBudget>,
     ) -> Result<(), anyhow::Error> {
+        call_prod_like_rotation_provider_with_manager(server, pool_size, budget)
+            .await
+            .0
+    }
+
+    async fn call_prod_like_rotation_provider_with_manager(
+        server: &RotationServer,
+        pool_size: usize,
+        budget: Arc<InferenceAttemptBudget>,
+    ) -> (Result<(), anyhow::Error>, Arc<MultiTokenManager>) {
         let mut config = Config::default();
         config.kiro_upstream_base_url = Some(server.base_url.clone());
         config.kiro_upstream_response_timeout_secs = 5;
@@ -1483,7 +1503,8 @@ mod tests {
         );
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
         endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let provider =
+            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
         let request_body = serde_json::json!({
             "conversationState": {
                 "conversationId": "conv-model-unavailable",
@@ -1493,7 +1514,7 @@ mod tests {
             }
         })
         .to_string();
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             provider.call_api_with_context_with_request_id_and_attempt_budget(
                 &request_body,
@@ -1507,7 +1528,8 @@ mod tests {
         )
         .await
         .expect("prod-like rotation provider call timed out")
-        .map(|_| ())
+        .map(|_| ());
+        (result, manager)
     }
 
     fn distinct_accounts(attempts: &[RotationAttempt]) -> usize {
@@ -1569,6 +1591,67 @@ mod tests {
         let attempts = server.state.attempts();
         assert_eq!(attempts.len(), 2, "{attempts:?}");
         assert_eq!(distinct_accounts(&attempts), 2);
+    }
+
+    /// F2：容量类 429（`INSUFFICIENT_MODEL_CAPACITY`）与账号无关：像模型不可用一样按预算换号，
+    /// 但不给任何账号写冷却，否则一次上游容量抖动会把可用账号全部踢出调度。
+    #[tokio::test]
+    async fn insufficient_model_capacity_429_fails_over_without_account_cooldown() {
+        let rule: RotationRule = Arc::new(|attempt: &RotationAttempt| {
+            if attempt.account <= 4 {
+                RotationReply::InsufficientModelCapacity
+            } else {
+                RotationReply::Success
+            }
+        });
+        let server = RotationServer::start(rule).await;
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        let (result, manager) =
+            call_prod_like_rotation_provider_with_manager(&server, 5, budget.clone()).await;
+        let attempts = server.state.attempts();
+        assert!(result.is_ok(), "fifth account should succeed: {attempts:?}");
+        assert_eq!(attempts.len(), 5, "{attempts:?}");
+        assert_eq!(distinct_accounts(&attempts), 5);
+        let snapshot = manager.snapshot();
+        for entry in &snapshot.entries {
+            assert!(
+                !entry.cooled_down && entry.cooldowns.is_empty(),
+                "capacity 429 must not cool account {} down: {:?}",
+                entry.id,
+                entry.cooldowns
+            );
+        }
+
+        // Account-level 429 keeps the existing behaviour: the failing account is cooled down.
+        let server = RotationServer::start(rule_always(RotationReply::TooManyRequests)).await;
+        let budget = Arc::new(InferenceAttemptBudget::new(5));
+        let (result, manager) =
+            call_prod_like_rotation_provider_with_manager(&server, 2, budget).await;
+        assert!(result.is_err());
+        assert!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .any(|entry| entry.cooled_down || !entry.cooldowns.is_empty()),
+            "account 429 still cools the account down"
+        );
+    }
+
+    #[test]
+    fn model_capacity_rate_limit_detection_uses_structured_reason() {
+        assert!(KiroProvider::is_model_capacity_rate_limit(
+            r#"{"message":"high traffic","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
+        ));
+        assert!(KiroProvider::is_model_capacity_rate_limit(
+            r#"{"error":{"reason":"MODEL_TEMPORARILY_UNAVAILABLE"}}"#
+        ));
+        assert!(!KiroProvider::is_model_capacity_rate_limit(
+            r#"{"message":"INSUFFICIENT_MODEL_CAPACITY"}"#
+        ));
+        assert!(!KiroProvider::is_model_capacity_rate_limit(
+            r#"{"message":"Too many requests","reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+        ));
     }
 
     /// 普通 5xx 不受影响：仍是默认 3 次。
@@ -4973,6 +5056,18 @@ mod tests {
             (
                 r#"{"message":"Image data cannot be empty.","reason":"REQUEST_BODY_INVALID"}"#,
                 "image_invalid_bad_request",
+            ),
+            (
+                r#"{"message":"messages.6.content.1.image.source.base64: image exceeds 5 MB maximum: 5298668 bytes > 5242880 bytes","reason":"IMAGE_SIZE_EXCEEDED"}"#,
+                "image_too_large_bad_request",
+            ),
+            (
+                r#"{"message":"Tool use and tool result do not match","reason":"TOOL_USE_RESULT_MISMATCH"}"#,
+                "tool_use_format_bad_request",
+            ),
+            (
+                r#"{"message":"Expected toolResult blocks at messages.3.content for the following Ids: tooluse_abc"}"#,
+                "tool_use_format_bad_request",
             ),
             (
                 r#"{"message":"Bedrock could not process image","reason":"IMAGE_FORMAT_UNSUPPORTED"}"#,
@@ -14061,7 +14156,14 @@ impl KiroProvider {
                     max_retries,
                     "Kiro API returned a retryable upstream status"
                 );
-                if status.is_server_error() && Self::is_model_temporarily_unavailable(&body) {
+                // Capacity 429s (`INSUFFICIENT_MODEL_CAPACITY`, or a 429 carrying
+                // `MODEL_TEMPORARILY_UNAVAILABLE`) describe the upstream model, not this account:
+                // fail over like a 5xx model-unavailable, but never cool the account down.
+                let model_capacity_limited =
+                    status.as_u16() == 429 && Self::is_model_capacity_rate_limit(&body);
+                if model_capacity_limited
+                    || (status.is_server_error() && Self::is_model_temporarily_unavailable(&body))
+                {
                     max_retries = Self::model_unavailable_retry_limit(
                         max_retries,
                         attempt,
@@ -14106,7 +14208,13 @@ impl KiroProvider {
                     && failure_kind == ApiUpstreamFailureKind::RateLimit
                     && retry_after.is_none();
                 let berserk_skips_cooldown = berserk_applies;
-                if !berserk_skips_cooldown {
+                if model_capacity_limited {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        "上游模型容量不足（429），换号重试且不写账号冷却"
+                    );
+                } else if !berserk_skips_cooldown {
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
                         ctx.id,
                         model.as_deref(),
@@ -14378,6 +14486,17 @@ impl KiroProvider {
             .any(|code| code.eq_ignore_ascii_case(MODEL_TEMPORARILY_UNAVAILABLE_REASON))
     }
 
+    /// 429 caused by upstream model capacity rather than the account's own quota. Only the
+    /// structured reason counts; free-text matches could misclassify account throttling.
+    fn is_model_capacity_rate_limit(body: &str) -> bool {
+        Self::structured_upstream_error_codes(body)
+            .iter()
+            .any(|code| {
+                code.eq_ignore_ascii_case(INSUFFICIENT_MODEL_CAPACITY_REASON)
+                    || code.eq_ignore_ascii_case(MODEL_TEMPORARILY_UNAVAILABLE_REASON)
+            })
+    }
+
     /// `MODEL_TEMPORARILY_UNAVAILABLE` 时的换号次数上限（循环计数）。
     ///
     /// 普通瞬态错误沿用 `credentialRetryMaxAttempts` / 默认 3 次；模型容量不足时
@@ -14595,6 +14714,9 @@ impl KiroProvider {
         if Self::bad_request_body_indicates_invalid_model(&lower) {
             return "model_invalid_bad_request";
         }
+        if Self::bad_request_body_indicates_image_too_large(&lower) {
+            return "image_too_large_bad_request";
+        }
         // Image failures can mention tool-result images, so classify them before tool protocol
         // failures. Neither image failures nor a generic REQUEST_BODY_INVALID is account-specific.
         if Self::bad_request_body_indicates_invalid_image(&lower) {
@@ -14696,6 +14818,12 @@ impl KiroProvider {
         .any(|needle| lower_body.contains(needle))
     }
 
+    /// Upstream `IMAGE_SIZE_EXCEEDED`, e.g.
+    /// `messages.6.content.1.image.source.base64: image exceeds 5 MB maximum: ...`.
+    fn bad_request_body_indicates_image_too_large(lower_body: &str) -> bool {
+        lower_body.contains("image_size_exceeded") || lower_body.contains("image exceeds")
+    }
+
     fn bad_request_body_indicates_invalid_image(lower_body: &str) -> bool {
         [
             "image_format_unsupported",
@@ -14733,6 +14861,9 @@ impl KiroProvider {
             "invalid tool-use sequence",
             "invalid tool use sequence",
             "tool_use_invalid",
+            // Bedrock/Kiro tool pairing validation (reason code and plain-text message).
+            "tool_use_result_mismatch",
+            "expected toolresult blocks",
         ]
         .iter()
         .any(|needle| lower_body.contains(needle))
@@ -14805,6 +14936,7 @@ impl KiroProvider {
             | "profile_arn_bad_request"
             | "tool_use_format_bad_request"
             | "image_invalid_bad_request"
+            | "image_too_large_bad_request"
             | "request_body_invalid_bad_request"
             | "content_length_exceeds_threshold"
             | "context_window_full_bad_request"

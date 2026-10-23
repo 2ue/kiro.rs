@@ -84,6 +84,9 @@ const ASSISTANT_TEXT_TAIL_LIMIT_CHARS: usize = 4096;
 const TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS: usize = 128;
 const MAX_BUFFERED_ATOMIC_THINKING_BYTES: usize = 1024 * 1024;
 /// 上游只返回 usage/metadata 侧信道事件就 EOF，没有任何 assistant/reasoning/tool 输出。
+/// Anthropic stop reason for an upstream content-filter refusal
+/// (`metadataEvent.stopReason = CONTENT_FILTERED`).
+pub(crate) const REFUSAL_STOP_REASON: &str = "refusal";
 pub(crate) const UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL: &str = "upstream eventstream ended with only usage/metadata events and no assistant, reasoning, or tool output";
 
 /// 合并一段 Kiro 原生 reasoning 文本。上游有两种形态：每个事件带截至目前的完整内容
@@ -1348,9 +1351,17 @@ impl SseStateManager {
         self.has_tool_use
     }
 
-    /// 设置 stop_reason
+    /// 设置 stop_reason。`refusal` 是终态：拦截之后同一条流里再到的 contextUsage 或
+    /// 输出上限异常不能把它改成 max_tokens 之类可续写的原因。
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
+        if self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON) {
+            return;
+        }
         self.stop_reason = Some(reason.into());
+    }
+
+    fn is_refusal(&self) -> bool {
+        self.stop_reason.as_deref() == Some(REFUSAL_STOP_REASON)
     }
 
     fn explicit_stop_reason(&self) -> Option<&str> {
@@ -1416,6 +1427,9 @@ impl SseStateManager {
 
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
+        if self.is_refusal() {
+            return REFUSAL_STOP_REASON.to_string();
+        }
         if let Some(ref reason) = self.stop_reason {
             // A completed turn that already emitted tool calls must stay `tool_use`, otherwise the
             // client never executes them. contextUsage reaching 100% only reports window usage.
@@ -1704,6 +1718,8 @@ pub struct StreamContext {
     saw_upstream_completed_tool_use: bool,
     /// 是否见过上游 metadataEvent。
     saw_upstream_metadata: bool,
+    /// 上游内容过滤拒答说明（`metadataEvent.stopReason = CONTENT_FILTERED`）。
+    upstream_content_filter_refusal: Option<String>,
     /// 是否见过上游 contextUsageEvent。
     saw_upstream_context_usage: bool,
     /// 是否见过上游 meteringEvent。
@@ -1909,6 +1925,7 @@ impl StreamContext {
             saw_upstream_tool_use: false,
             saw_upstream_completed_tool_use: false,
             saw_upstream_metadata: false,
+            upstream_content_filter_refusal: None,
             saw_upstream_context_usage: false,
             saw_upstream_metering: false,
             saw_upstream_output_limit: false,
@@ -2035,7 +2052,10 @@ impl StreamContext {
     }
 
     pub fn upstream_terminal_failure_detail(&self) -> Option<&'static str> {
-        if self.has_stream_error() || self.saw_upstream_completed {
+        if self.has_stream_error()
+            || self.saw_upstream_completed
+            || self.upstream_content_filter_refusal.is_some()
+        {
             return None;
         }
         if !self.has_meaningful_upstream_response() {
@@ -2071,8 +2091,11 @@ impl StreamContext {
             || self.saw_upstream_output_limit
     }
 
+    /// A content-filter refusal is an authoritative upstream answer, not an empty turn: it must
+    /// not trigger the usage-only retry (the same history would be filtered again).
     fn has_meaningful_upstream_response(&self) -> bool {
-        self.saw_upstream_assistant_content
+        self.upstream_content_filter_refusal.is_some()
+            || self.saw_upstream_assistant_content
             || self.saw_upstream_reasoning_content
             || self.saw_upstream_tool_use
     }
@@ -2111,6 +2134,11 @@ impl StreamContext {
 
     pub fn saw_upstream_metadata(&self) -> bool {
         self.saw_upstream_metadata
+    }
+
+    #[cfg(test)]
+    pub fn upstream_content_filter_refusal(&self) -> Option<&str> {
+        self.upstream_content_filter_refusal.as_deref()
     }
 
     pub fn last_assistant_content_chars(&self) -> u32 {
@@ -2178,6 +2206,7 @@ impl StreamContext {
 
         if let Some(reason) = self.state_manager.explicit_stop_reason() {
             return match reason {
+                REFUSAL_STOP_REASON => "upstream_content_filtered",
                 "max_tokens" => "local_inferred_max_tokens",
                 "model_context_window_exceeded" => "local_context_window_exceeded",
                 _ => "local_explicit_stop_reason",
@@ -2583,6 +2612,11 @@ impl StreamContext {
             }
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::Metadata(metadata) => {
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!(refusal = %refusal, "上游内容过滤拒答，按 stop_reason=refusal 结束");
+                    self.state_manager.set_stop_reason(REFUSAL_STOP_REASON);
+                    self.upstream_content_filter_refusal.get_or_insert(refusal);
+                }
                 if let Some(token_usage) = &metadata.token_usage {
                     let merged_usage = self.metadata_usage.get_or_insert_with(Default::default);
                     merged_usage.merge_positive_from(token_usage);
@@ -3989,7 +4023,11 @@ impl StreamContext {
         let mut events = Vec::new();
 
         events.extend(self.flush_pending_trivial_text());
-        if self.stream_error.is_none() {
+        if self.upstream_content_filter_refusal.is_some() && self.stream_error.is_none() {
+            // A refusal can cut a tool call off mid-input. Never complete or report those calls.
+            self.tool_input_buffers.clear();
+            self.pending_tool_starts.clear();
+        } else if self.stream_error.is_none() {
             events.extend(self.flush_incomplete_tool_input_buffers());
             events.extend(self.flush_pending_tool_starts());
         } else {
@@ -4468,7 +4506,7 @@ mod tests {
                 "legacy complete",
                 None,
             )));
-            metadata.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+            metadata.process_kiro_event(&Event::Metadata(MetadataEvent::with_token_usage(None)));
             assert_eq!(
                 metadata.upstream_terminal_failure_detail(),
                 None,
@@ -5009,7 +5047,7 @@ mod tests {
             "abc",
             Some("IN_PROGRESS"),
         )));
-        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent { token_usage: None }));
+        let _ = ctx.process_kiro_event(&Event::Metadata(MetadataEvent::with_token_usage(None)));
         let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
             name: "Read".to_string(),
             tool_use_id: "toolu_read".to_string(),
@@ -5767,15 +5805,15 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("hello"));
-        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
+        all_events.extend(ctx.process_kiro_event(&Event::Metadata(
+            MetadataEvent::with_token_usage(Some(MetadataTokenUsage {
                 uncached_input_tokens: 100,
                 output_tokens: 9,
                 total_tokens: 116,
                 cache_read_input_tokens: 7,
                 cache_write_input_tokens: 3,
-            }),
-        })));
+            })),
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5800,9 +5838,9 @@ mod tests {
                 context_usage_percentage: 0.0,
             })),
         );
-        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage::default()),
-        })));
+        all_events.extend(ctx.process_kiro_event(&Event::Metadata(
+            MetadataEvent::with_token_usage(Some(MetadataTokenUsage::default())),
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -5830,15 +5868,17 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
         let mut events = ctx.process_assistant_response("hello");
-        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
-                uncached_input_tokens: 21,
-                output_tokens: 13,
-                total_tokens: 377,
-                cache_read_input_tokens: 300,
-                cache_write_input_tokens: 43,
-            }),
-        })));
+        events.extend(
+            ctx.process_kiro_event(&Event::Metadata(MetadataEvent::with_token_usage(Some(
+                MetadataTokenUsage {
+                    uncached_input_tokens: 21,
+                    output_tokens: 13,
+                    total_tokens: 377,
+                    cache_read_input_tokens: 300,
+                    cache_write_input_tokens: 43,
+                },
+            )))),
+        );
         events.extend(
             ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
                 conversation_id: Some("conv-1".to_string()),
@@ -5866,12 +5906,14 @@ mod tests {
         let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
         let mut events = ctx.process_assistant_response("hello");
-        events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
-                output_tokens: 13,
-                ..MetadataTokenUsage::default()
-            }),
-        })));
+        events.extend(
+            ctx.process_kiro_event(&Event::Metadata(MetadataEvent::with_token_usage(Some(
+                MetadataTokenUsage {
+                    output_tokens: 13,
+                    ..MetadataTokenUsage::default()
+                },
+            )))),
+        );
         events.extend(
             ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
                 conversation_id: Some("conv-1".to_string()),
@@ -6590,15 +6632,15 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("hello"));
-        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
-            token_usage: Some(MetadataTokenUsage {
+        all_events.extend(ctx.process_kiro_event(&Event::Metadata(
+            MetadataEvent::with_token_usage(Some(MetadataTokenUsage {
                 uncached_input_tokens: 1200,
                 output_tokens: 900,
                 total_tokens: 206100,
                 cache_read_input_tokens: 180000,
                 cache_write_input_tokens: 24000,
-            }),
-        })));
+            })),
+        )));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -8689,6 +8731,129 @@ mod tests {
             .find(|event| event.event == "message_delta")
             .and_then(|event| event.data["delta"]["stop_reason"].as_str())
             .map(str::to_string)
+    }
+
+    fn content_filtered_metadata(details: bool) -> Event {
+        let mut payload = serde_json::json!({"stopReason": "CONTENT_FILTERED"});
+        if details {
+            payload["stopDetails"] = serde_json::json!({
+                "refusal": {
+                    "category": "CYBER",
+                    "explanation": "The selected model cannot continue this conversation."
+                }
+            });
+        }
+        Event::Metadata(serde_json::from_value(payload).expect("metadata event"))
+    }
+
+    /// Upstream frame order seen in production (ZyphrZero capture): a little reasoning, then
+    /// `metadataEvent.stopReason=CONTENT_FILTERED`, then `contextUsage` 100%. The turn must end
+    /// with `refusal`, not be reported as empty/usage-only or as a context-window overflow.
+    #[test]
+    fn content_filtered_metadata_ends_stream_with_refusal_for_five_rounds() {
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 8, true, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: "The".to_string(),
+                    ..Default::default()
+                },
+            )));
+            events.extend(ctx.process_kiro_event(&content_filtered_metadata(round % 2 == 0)));
+            events.extend(ctx.process_kiro_event(&Event::ContextUsage(
+                crate::kiro::model::events::ContextUsageEvent {
+                    context_usage_percentage: 100.0,
+                },
+            )));
+            assert_eq!(
+                ctx.upstream_terminal_failure_detail(),
+                None,
+                "round {round}"
+            );
+            events.extend(ctx.generate_final_events());
+
+            assert_eq!(
+                final_stop_reason(&events).as_deref(),
+                Some(REFUSAL_STOP_REASON),
+                "round {round}"
+            );
+            assert_eq!(ctx.downstream_stop_reason(), REFUSAL_STOP_REASON);
+            assert_eq!(ctx.stop_reason_source(), "upstream_content_filtered");
+            assert!(ctx.upstream_content_filter_refusal().is_some());
+            assert!(events.iter().all(|event| event.event != "error"));
+        }
+    }
+
+    #[test]
+    fn bare_content_filtered_metadata_is_not_a_usage_only_turn_for_five_rounds() {
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&content_filtered_metadata(false)));
+            assert_eq!(
+                ctx.upstream_terminal_failure_detail(),
+                None,
+                "round {round}: refusal must not trigger the usage-only retry"
+            );
+            assert_eq!(
+                ctx.upstream_content_filter_refusal(),
+                Some("CONTENT_FILTERED")
+            );
+            events.extend(ctx.generate_final_events());
+            assert_eq!(
+                final_stop_reason(&events).as_deref(),
+                Some(REFUSAL_STOP_REASON)
+            );
+        }
+    }
+
+    #[test]
+    fn content_filtered_refusal_drops_cut_off_tool_calls_for_five_rounds() {
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 8, false, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            events.extend(
+                ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                    name: "Bash".to_string(),
+                    tool_use_id: format!("tooluse_refused_{round}"),
+                    input: r#"{"command": "rm -"#.to_string(),
+                    stop: false,
+                }),
+            );
+            events.extend(ctx.process_kiro_event(&content_filtered_metadata(true)));
+            events.extend(ctx.generate_final_events());
+
+            assert_eq!(
+                final_stop_reason(&events).as_deref(),
+                Some(REFUSAL_STOP_REASON)
+            );
+            assert!(
+                events.iter().all(|event| event.event != "error"),
+                "round {round}: a cut-off tool call must not surface as a JSON error"
+            );
+            // The partial delta already streamed before the refusal stays as is; nothing is
+            // appended or repaired into a "complete" call after the refusal.
+            let input_deltas = events
+                .iter()
+                .filter(|event| event.data["delta"]["type"] == "input_json_delta")
+                .count();
+            assert_eq!(input_deltas, 1, "round {round}");
+        }
+    }
+
+    #[test]
+    fn metadata_without_content_filter_is_not_a_refusal() {
+        let event: crate::kiro::model::events::MetadataEvent =
+            serde_json::from_value(serde_json::json!({"stopReason": "END_TURN"})).unwrap();
+        assert_eq!(event.content_filter_refusal(), None);
+        let event: crate::kiro::model::events::MetadataEvent =
+            serde_json::from_value(serde_json::json!({
+                "stopReason": "CONTENT_FILTERED",
+                "stopDetails": {"refusal": {"category": "CYBER", "explanation": "no"}}
+            }))
+            .unwrap();
+        assert_eq!(event.content_filter_refusal().as_deref(), Some("CYBER: no"));
     }
 
     #[test]

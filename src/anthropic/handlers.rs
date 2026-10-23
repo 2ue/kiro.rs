@@ -6591,6 +6591,18 @@ fn map_provider_error(
         );
     }
 
+    if is_upstream_image_too_large_error(&err_str) {
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：图片超过上游 5 MB 限制", error_id);
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
+            request_id,
+            error_id,
+            [("x-should-retry", "false".to_string())],
+        );
+    }
+
     if is_upstream_invalid_model_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
@@ -6747,6 +6759,15 @@ fn is_upstream_payload_too_long_error(value: &str) -> bool {
 fn is_upstream_context_window_full_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("context window is full") && lower.contains("reduce conversation history")
+}
+
+/// Upstream `IMAGE_SIZE_EXCEEDED`. The provider error carries the classified reason; the raw
+/// upstream text (which names internal message indexes) is never forwarded to the client.
+fn is_upstream_image_too_large_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("image_too_large_bad_request")
+        || lower.contains("image_size_exceeded")
+        || lower.contains("image exceeds 5 mb")
 }
 
 fn is_upstream_improperly_formed_error(value: &str) -> bool {
@@ -7211,7 +7232,7 @@ fn payload_guard_error_response(err: PayloadGuardError) -> Response {
         PayloadGuardError::OversizedImage { .. } => envelope::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.",
+            envelope::PUBLIC_IMAGE_TOO_LARGE_MESSAGE,
         ),
         PayloadGuardError::ToolPairingInvariant { .. } => envelope::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10586,6 +10607,11 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
             | Event::InvalidState(_)
             | Event::Error { .. }
             | Event::Exception { .. } => return false,
+            // A content-filter refusal is an authoritative answer; retrying the same history
+            // would only be filtered again.
+            Event::Metadata(metadata) if metadata.content_filter_refusal().is_some() => {
+                return false;
+            }
             Event::Metadata(_)
             | Event::MessageMetadata(_)
             | Event::Metering(_)
@@ -12957,6 +12983,7 @@ async fn handle_non_stream_request(
         super::transcript_sanitizer::ToolTranscriptSanitizer::new(known_tool_names.iter().cloned());
     let mut upstream_message_status: Option<String> = None;
     let mut saw_meaningful_upstream_response = false;
+    let mut content_filter_refusal: Option<String> = None;
     let mut saw_upstream_metadata = false;
     let mut saw_upstream_context_usage = false;
     let mut saw_upstream_metering = false;
@@ -13114,7 +13141,8 @@ async fn handle_non_stream_request(
                     context_input_tokens = Some(actual_input_tokens);
                 }
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if percentage.is_finite() && percentage >= 100.0 {
+                if percentage.is_finite() && percentage >= 100.0 && content_filter_refusal.is_none()
+                {
                     stop_reason = "model_context_window_exceeded".to_string();
                 }
                 tracing::debug!(
@@ -13125,6 +13153,12 @@ async fn handle_non_stream_request(
             }
             Event::Metadata(metadata) => {
                 saw_upstream_metadata = true;
+                if let Some(refusal) = metadata.content_filter_refusal() {
+                    tracing::warn!(refusal = %refusal, "非流式响应上游内容过滤拒答，按 stop_reason=refusal 结束");
+                    stop_reason = super::stream::REFUSAL_STOP_REASON.to_string();
+                    saw_meaningful_upstream_response = true;
+                    content_filter_refusal.get_or_insert(refusal);
+                }
                 if let Some(token_usage) = metadata.token_usage {
                     tracing::debug!(
                         input_tokens = token_usage.input_tokens(),
@@ -13224,7 +13258,9 @@ async fn handle_non_stream_request(
                 message,
             } => {
                 if exception_type == "ContentLengthExceededException" {
-                    stop_reason = "max_tokens".to_string();
+                    if content_filter_refusal.is_none() {
+                        stop_reason = "max_tokens".to_string();
+                    }
                 } else {
                     let detail =
                         format!("upstream exception event {}: {}", exception_type, message);
@@ -13264,6 +13300,10 @@ async fn handle_non_stream_request(
             envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
             &credential_usage.request.request_id,
         );
+    }
+    if content_filter_refusal.is_some() {
+        // A refusal can cut a tool call off mid-input. Never complete or report those calls.
+        tool_json_buffers.clear();
     }
     if !tool_json_buffers.is_empty() {
         for (tool_use_id, buffer) in std::mem::take(&mut tool_json_buffers) {
