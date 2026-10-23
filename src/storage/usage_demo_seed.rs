@@ -93,6 +93,35 @@ fn demo_external_route(
     }
 }
 
+/// Cache behaviour that makes the hit-rate views tell a story: sticky local
+/// traffic and direct-policy pools reuse the prompt cache well, while requests
+/// that overflowed from the local pool lose stickiness and mostly miss. A
+/// nightly redeploy window (03:00-04:59) resets local caches.
+fn demo_cache_split(
+    rng: &mut fastrand::Rng,
+    input_tokens: i32,
+    is_external: bool,
+    fallback_reason: Option<&str>,
+    hour: u32,
+) -> (i32, i32) {
+    let (hit_probability, read_share) = match (is_external, fallback_reason) {
+        (false, _) if (3..=4).contains(&hour) => (35, 0.70),
+        (false, _) => (92, 0.90),
+        (true, None) => (88, 0.86),
+        (true, Some("local_capacity_full" | "local_capacity_exhausted")) => (45, 0.75),
+        (true, Some(_)) => (30, 0.70),
+    };
+    if rng.usize(0..100) < hit_probability {
+        let jitter = 0.9 + rng.f64() * 0.1;
+        let read = (f64::from(input_tokens) * read_share * jitter) as i32;
+        let creation = (f64::from(input_tokens - read) * 0.25) as i32;
+        (read, creation)
+    } else {
+        // Cold request: the prompt is written to the cache instead.
+        (0, (f64::from(input_tokens) * 0.8) as i32)
+    }
+}
+
 pub async fn seed_usage_demo(
     store: &PostgresStore,
     days: u32,
@@ -160,18 +189,21 @@ pub async fn seed_usage_demo(
             };
             let is_external = rng.f64() < external_ratio;
             let model = choose_model(&mut rng);
+            let capacity_crunch = day == 2 && (11..=15).contains(&hour);
+            let (route_subtype, fallback_reason, direct_policy_reason) = if is_external {
+                demo_external_route(&mut rng, capacity_crunch)
+            } else {
+                (None, None, None)
+            };
             let input_tokens = 24_000 + rng.i32(0..96_000);
             let output_tokens = 600 + rng.i32(0..3_000);
-            let cache_read = if rng.usize(0..100) < 18 {
-                input_tokens / 3
-            } else {
-                0
-            };
-            let cache_creation = if cache_read == 0 && rng.usize(0..100) < 9 {
-                input_tokens / 10
-            } else {
-                0
-            };
+            let (cache_read, cache_creation) = demo_cache_split(
+                &mut rng,
+                input_tokens,
+                is_external,
+                fallback_reason.as_deref(),
+                hour,
+            );
             let total_input_tokens = input_tokens;
             let billable_input_tokens = (input_tokens - cache_read - cache_creation).max(0);
             let base_cost = estimate_cost(
@@ -182,12 +214,6 @@ pub async fn seed_usage_demo(
                 cache_creation,
             ) * weekend_factor;
             let error_spike = day == 4 && (14..=15).contains(&hour) && !is_external;
-            let capacity_crunch = day == 2 && (11..=15).contains(&hour);
-            let (route_subtype, fallback_reason, direct_policy_reason) = if is_external {
-                demo_external_route(&mut rng, capacity_crunch)
-            } else {
-                (None, None, None)
-            };
             let status = choose_status(&mut rng, error_spike);
             let pricing_available = rng.usize(0..100) >= 3;
             let (
