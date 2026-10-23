@@ -87,6 +87,9 @@ const USAGE_CLEANUP_COMMIT_LOCK_ID: i64 = 4_950_531_234_003;
 const USAGE_OFFLINE_MAINTENANCE_LOCK_ID: i64 = 4_950_531_234_004;
 const USAGE_RECORD_COMMIT_LOCK_DOMAIN: i64 = 0x0055_5341_4745_4944;
 const USAGE_INDEX_STARTUP_MAX_BYTES: i64 = 64 * 1024 * 1024;
+const ADMIN_AUDIT_CLEANUP_MAX_BATCH: usize = 5_000;
+const ADMIN_AUDIT_CLEANUP_LOCK_TIMEOUT_MS: u64 = 250;
+const ADMIN_AUDIT_CLEANUP_STATEMENT_TIMEOUT_MS: u64 = 5_000;
 const USAGE_SOFT_DELETE_WATERMARK_SCOPE: &str = "soft_delete_created_at";
 const USAGE_CLEANUP_LOCK_TIMEOUT_MS: u64 = 250;
 const USAGE_CLEANUP_STATEMENT_TIMEOUT_MS: u64 = 10_000;
@@ -464,6 +467,18 @@ const USAGE_INDEX_DEFINITIONS: &[UsageIndexDefinition] = &[
         table: "usage_credential_cost_summary",
         name: "idx_usage_credential_cost_summary_cost",
         sql: "CREATE INDEX IF NOT EXISTS idx_usage_credential_cost_summary_cost ON usage_credential_cost_summary (estimated_cost_usd DESC, requests DESC)",
+    },
+    // Account change view on the audit page: filter by account and by event kind. Built like the
+    // usage indexes so a large audit table never stalls startup.
+    UsageIndexDefinition {
+        table: "admin_audit_logs",
+        name: "idx_admin_audit_logs_object_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_object_created ON admin_audit_logs (object_type, object_id, created_at DESC)",
+    },
+    UsageIndexDefinition {
+        table: "admin_audit_logs",
+        name: "idx_admin_audit_logs_account_event_created",
+        sql: "CREATE INDEX IF NOT EXISTS idx_admin_audit_logs_account_event_created ON admin_audit_logs ((detail->>'accountEvent'), created_at DESC) WHERE detail ? 'accountEvent'",
     },
 ];
 
@@ -3323,11 +3338,29 @@ impl PostgresStore {
         credential_id: u64,
         info: &CredentialAccountInfoRow,
     ) -> anyhow::Result<()> {
+        self.save_credential_account_info_returning_previous(credential_id, info)
+            .await
+            .map(drop)
+    }
+
+    /// Saves the snapshot and returns the usage figures it replaced (read in the same statement).
+    /// `None` when this is the first snapshot for the account.
+    pub async fn save_credential_account_info_returning_previous(
+        &self,
+        credential_id: u64,
+        info: &CredentialAccountInfoRow,
+    ) -> anyhow::Result<Option<AccountQuotaFigures>> {
         let checked_at = DateTime::parse_from_rfc3339(&info.checked_at)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
-        sqlx::query(
+        let previous = sqlx::query(
             r#"
+            WITH previous AS (
+                SELECT current_usage, usage_limit, current_overages
+                FROM credential_account_info
+                WHERE credential_id = $1
+            ),
+            saved AS (
             INSERT INTO credential_account_info (
                 credential_id, subscription_title, current_usage, usage_limit,
                 remaining, usage_percentage, credit_limit, credit_remaining,
@@ -3353,6 +3386,11 @@ impl PostgresStore {
                 next_reset_at = EXCLUDED.next_reset_at,
                 checked_at = EXCLUDED.checked_at,
                 updated_at = now()
+            RETURNING credential_id
+            )
+            SELECT previous.current_usage, previous.usage_limit, previous.current_overages
+            FROM saved
+            LEFT JOIN previous ON TRUE
             "#,
         )
         .bind(credential_id as i64)
@@ -3372,9 +3410,17 @@ impl PostgresStore {
         .bind(info.current_overages)
         .bind(info.next_reset_at)
         .bind(checked_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        let usage: Option<f64> = previous.try_get("current_usage")?;
+        Ok(match usage {
+            Some(current_usage) => Some(AccountQuotaFigures {
+                current_usage,
+                usage_limit: previous.try_get("usage_limit")?,
+                current_overages: previous.try_get("current_overages")?,
+            }),
+            None => None,
+        })
     }
 
     #[allow(dead_code)]
@@ -5009,28 +5055,25 @@ impl PostgresStore {
         Ok(())
     }
 
-    pub async fn query_admin_audit_logs(
+    /// Audit page query. Every filter is optional and applied in SQL so paging stays exact.
+    pub async fn query_admin_audit_logs_filtered(
         &self,
         page: usize,
         limit: usize,
+        filter: &AdminAuditLogFilter,
     ) -> anyhow::Result<AdminAuditLogPage> {
         let page = page.max(1);
         let limit = if limit == 0 { 20 } else { limit.min(200) };
         let offset = page.saturating_sub(1).saturating_mul(limit);
-        let rows = sqlx::query(
-            r#"
-            SELECT id, created_at, actor, action, object_type, object_id,
-                   success, error_message, detail
-            FROM admin_audit_logs
-            ORDER BY created_at DESC, id DESC
-            OFFSET $1
-            LIMIT $2
-            "#,
-        )
-        .bind(usize_to_i64(offset))
-        .bind(usize_to_i64(limit.saturating_add(1)))
-        .fetch_all(&self.pool)
-        .await?;
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "SELECT id, created_at, actor, action, object_type, object_id, success, error_message, detail FROM admin_audit_logs WHERE TRUE",
+        );
+        push_admin_audit_log_filter(&mut builder, filter);
+        builder.push(" ORDER BY created_at DESC, id DESC OFFSET ");
+        builder.push_bind(usize_to_i64(offset));
+        builder.push(" LIMIT ");
+        builder.push_bind(usize_to_i64(limit.saturating_add(1)));
+        let rows = builder.build().fetch_all(&self.pool).await?;
         let has_next = rows.len() > limit;
         let records = rows
             .into_iter()
@@ -5056,6 +5099,87 @@ impl PostgresStore {
             has_next,
             records,
         })
+    }
+
+    /// Account change counts per event kind since `since`, plus how many distinct accounts.
+    pub async fn summarize_account_events(
+        &self,
+        since: DateTime<Utc>,
+        source: Option<&str>,
+    ) -> anyhow::Result<Vec<AccountEventSummaryRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT detail->>'accountEvent' AS event,
+                   COUNT(*) AS events,
+                   COUNT(DISTINCT (object_type, object_id)) AS accounts
+            FROM admin_audit_logs
+            WHERE detail ? 'accountEvent'
+              AND created_at >= $1
+              AND ($2::text IS NULL OR detail->>'accountSource' = $2)
+            GROUP BY detail->>'accountEvent'
+            "#,
+        )
+        .bind(since)
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AccountEventSummaryRow {
+                    event: row.try_get("event")?,
+                    events: row.try_get::<i64, _>("events")?.max(0) as u64,
+                    accounts: row.try_get::<i64, _>("accounts")?.max(0) as u64,
+                })
+            })
+            .collect()
+    }
+
+    /// Deletes up to `limit` audit rows older than `retention`, oldest first. Small batches with
+    /// short lock and statement timeouts keep it from holding locks the request path needs;
+    /// rows another session is touching are skipped and picked up next time.
+    pub async fn delete_expired_admin_audit_logs(
+        &self,
+        retention: std::time::Duration,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        let limit = limit.clamp(1, ADMIN_AUDIT_CLEANUP_MAX_BATCH);
+        let retention_secs = i64::try_from(retention.as_secs())
+            .map_err(|_| anyhow::anyhow!("审计日志保留时长超出 PgSQL 范围"))?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!(
+            "SET LOCAL lock_timeout = '{}ms'",
+            ADMIN_AUDIT_CLEANUP_LOCK_TIMEOUT_MS
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{}ms'",
+            ADMIN_AUDIT_CLEANUP_STATEMENT_TIMEOUT_MS
+        ))
+        .execute(&mut *tx)
+        .await?;
+        let removed = sqlx::query(
+            r#"
+            WITH expired AS (
+                SELECT id
+                FROM admin_audit_logs
+                WHERE created_at < now() - ($1::bigint * interval '1 second')
+                ORDER BY created_at ASC, id ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM admin_audit_logs logs
+            USING expired
+            WHERE logs.id = expired.id
+            "#,
+        )
+        .bind(retention_secs)
+        .bind(usize_to_i64(limit))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(removed)
     }
 
     pub async fn record_credential_event(
@@ -5496,6 +5620,14 @@ pub struct CredentialAccountInfoRow {
     pub checked_at: String,
 }
 
+/// Usage figures of an account-info snapshot, used to detect quota transitions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AccountQuotaFigures {
+    pub current_usage: f64,
+    pub usage_limit: f64,
+    pub current_overages: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminAuditLogRow {
@@ -5508,6 +5640,113 @@ pub struct AdminAuditLogRow {
     pub success: bool,
     pub error_message: Option<String>,
     pub detail: serde_json::Value,
+}
+
+/// Optional filters for the audit page. Empty strings are treated as absent.
+#[derive(Debug, Clone, Default)]
+pub struct AdminAuditLogFilter {
+    /// Only account change events (`detail.accountEvent` present).
+    pub account_events_only: bool,
+    /// One of the account event kinds, e.g. `quota_exhausted`.
+    pub account_event: Option<String>,
+    /// `local` or `external`.
+    pub account_source: Option<String>,
+    /// `credential` / `external_pool` / ...
+    pub object_type: Option<String>,
+    /// Exact object id.
+    pub object_id: Option<String>,
+    /// Substring of the account label (email, pool name, ...), case-insensitive.
+    pub account_query: Option<String>,
+    pub action: Option<String>,
+    /// `admin-api`, `system-scheduler`, ...
+    pub actor: Option<String>,
+    pub success: Option<bool>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+fn push_admin_audit_log_filter(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    filter: &AdminAuditLogFilter,
+) {
+    fn present(value: &Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+    if filter.account_events_only {
+        builder.push(" AND detail ? 'accountEvent'");
+    }
+    if let Some(event) = present(&filter.account_event) {
+        builder
+            .push(" AND detail->>'accountEvent' = ")
+            .push_bind(event);
+    }
+    if let Some(source) = present(&filter.account_source) {
+        builder
+            .push(" AND detail->>'accountSource' = ")
+            .push_bind(source);
+    }
+    if let Some(object_type) = present(&filter.object_type) {
+        builder.push(" AND object_type = ").push_bind(object_type);
+    }
+    if let Some(object_id) = present(&filter.object_id) {
+        builder.push(" AND object_id = ").push_bind(object_id);
+    }
+    if let Some(query) = present(&filter.account_query) {
+        let pattern = format!("%{}%", escape_like_pattern(&query));
+        builder
+            .push(" AND (COALESCE(detail->>'accountLabel', detail->>'credentialLabel', '') ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR object_id = ")
+            .push_bind(query.trim_start_matches('#').to_string())
+            .push(")");
+    }
+    if let Some(action) = present(&filter.action) {
+        builder.push(" AND action = ").push_bind(action);
+    }
+    if let Some(actor) = present(&filter.actor) {
+        builder.push(" AND actor = ").push_bind(actor);
+    }
+    if let Some(success) = filter.success {
+        builder.push(" AND success = ").push_bind(success);
+    }
+    if let Some(since) = filter.since {
+        builder.push(" AND created_at >= ").push_bind(since);
+    }
+    if let Some(until) = filter.until {
+        builder.push(" AND created_at < ").push_bind(until);
+    }
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountEventSummaryRow {
+    pub event: String,
+    pub events: u64,
+    pub accounts: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountEventSummaryResponse {
+    pub hours: u32,
+    pub since: String,
+    pub account_source: Option<String>,
+    pub items: Vec<AccountEventSummaryRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -13669,6 +13908,7 @@ mod tests {
         UsageRouteSubtype, UsageSource,
     };
     use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
+    use serde_json::json;
 
     fn test_config() -> Option<Config> {
         let url = crate::storage::integration_test_url("KIRO_RS_TEST_POSTGRES_URL")?;
@@ -13724,6 +13964,251 @@ mod tests {
 
         let missing = required_postgres_schema_missing_columns(&present);
         assert_eq!(missing, vec!["external_upstream_pools.revision"]);
+    }
+
+    #[tokio::test]
+    async fn account_change_log_filters_summarizes_and_expires() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let event = |kind: &str, source: &str, label: &str| json!({ "accountEvent": kind, "accountSource": source, "accountLabel": label });
+        for (actor, action, object_type, object_id, detail) in [
+            (
+                "system-scheduler",
+                "auto_disable_credential",
+                "credential",
+                "1",
+                event("quota_exhausted", "local", "a@example.com"),
+            ),
+            (
+                "system-scheduler",
+                "auto_disable_credential",
+                "credential",
+                "2",
+                event("quota_exhausted", "local", "b@example.com"),
+            ),
+            (
+                "system-scheduler",
+                "auto_disable_credential",
+                "credential",
+                "2",
+                event("auto_disabled", "local", "b@example.com"),
+            ),
+            (
+                "system-external-pool",
+                "external_pool_account_event",
+                "external_pool",
+                "9",
+                event("quota_exhausted", "external", "pool-nine"),
+            ),
+            (
+                "admin-api",
+                "update_runtime_config",
+                "runtime_config",
+                "",
+                json!({}),
+            ),
+        ] {
+            store
+                .record_admin_audit_log(
+                    actor,
+                    action,
+                    object_type,
+                    Some(object_id).filter(|id| !id.is_empty()),
+                    true,
+                    None,
+                    detail,
+                )
+                .await
+                .unwrap();
+        }
+        // One old account event that retention should remove.
+        sqlx::query(
+            "INSERT INTO admin_audit_logs (actor, action, object_type, object_id, success, detail, created_at) VALUES ('system-scheduler', 'auto_disable_credential', 'credential', '3', true, $1, now() - interval '20 days')",
+        )
+        .bind(event("auto_disabled", "local", "old@example.com"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let page = |filter: AdminAuditLogFilter| {
+            let store = &store;
+            async move {
+                store
+                    .query_admin_audit_logs_filtered(1, 50, &filter)
+                    .await
+                    .unwrap()
+            }
+        };
+        let all = page(AdminAuditLogFilter::default()).await;
+        assert_eq!(all.records.len(), 6);
+        let events = page(AdminAuditLogFilter {
+            account_events_only: true,
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(events.records.len(), 5);
+        let quota = page(AdminAuditLogFilter {
+            account_event: Some("quota_exhausted".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(quota.records.len(), 3);
+        let local_quota = page(AdminAuditLogFilter {
+            account_event: Some("quota_exhausted".into()),
+            account_source: Some("local".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(local_quota.records.len(), 2);
+        let by_label = page(AdminAuditLogFilter {
+            account_query: Some("B@EXAMPLE".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(by_label.records.len(), 2);
+        let by_id = page(AdminAuditLogFilter {
+            account_query: Some("#9".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(by_id.records.len(), 1);
+        // LIKE wildcards in the search are literal.
+        let wildcard = page(AdminAuditLogFilter {
+            account_query: Some("%".into()),
+            ..Default::default()
+        })
+        .await;
+        assert!(wildcard.records.is_empty());
+        let recent = page(AdminAuditLogFilter {
+            account_events_only: true,
+            since: Some(Utc::now() - chrono::Duration::days(1)),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(recent.records.len(), 4);
+        // Paging stays exact under a filter.
+        let first = store
+            .query_admin_audit_logs_filtered(
+                1,
+                2,
+                &AdminAuditLogFilter {
+                    account_events_only: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.records.len(), 2);
+        assert!(first.has_next);
+
+        let mut summary = store
+            .summarize_account_events(Utc::now() - chrono::Duration::days(1), None)
+            .await
+            .unwrap();
+        summary.sort_by(|a, b| a.event.cmp(&b.event));
+        let summary: Vec<_> = summary
+            .iter()
+            .map(|row| (row.event.as_str(), row.events, row.accounts))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("auto_disabled", 1, 1), ("quota_exhausted", 3, 3)]
+        );
+        let local = store
+            .summarize_account_events(Utc::now() - chrono::Duration::days(1), Some("local"))
+            .await
+            .unwrap();
+        assert_eq!(
+            local
+                .iter()
+                .find(|row| row.event == "quota_exhausted")
+                .unwrap()
+                .events,
+            2
+        );
+
+        let retention = std::time::Duration::from_secs(15 * 24 * 60 * 60);
+        assert_eq!(
+            store
+                .delete_expired_admin_audit_logs(retention, 100)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .delete_expired_admin_audit_logs(retention, 100)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(page(AdminAuditLogFilter::default()).await.records.len(), 5);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_info_save_returns_the_snapshot_it_replaced() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        let saved = store
+            .insert_credential(&KiroCredentials {
+                email: Some("quota@example.com".to_string()),
+                kiro_api_key: Some("ksk_quota_transition".to_string()),
+                auth_method: Some("api_key".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = saved.id.unwrap();
+        let info = |current_usage: f64, current_overages: f64| CredentialAccountInfoRow {
+            subscription_title: Some("KIRO PRO".to_string()),
+            current_usage,
+            usage_limit: 1000.0,
+            remaining: (1000.0 - current_usage).max(0.0),
+            usage_percentage: current_usage / 10.0,
+            credit_limit: 1000.0,
+            credit_remaining: (1000.0 - current_usage).max(0.0),
+            credit_base: 1000.0,
+            credit_bonus: 0.0,
+            overage_status: Some("ENABLED".to_string()),
+            overage_capability: Some("OVERAGE_CAPABLE".to_string()),
+            overage_cap: 10000.0,
+            overage_rate: 0.04,
+            current_overages,
+            next_reset_at: None,
+            checked_at: Utc::now().to_rfc3339(),
+        };
+        let first = store
+            .save_credential_account_info_returning_previous(id, &info(900.0, 0.0))
+            .await
+            .unwrap();
+        assert_eq!(first, None);
+        let second = store
+            .save_credential_account_info_returning_previous(id, &info(1000.0, 12.5))
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            Some(AccountQuotaFigures {
+                current_usage: 900.0,
+                usage_limit: 1000.0,
+                current_overages: 0.0
+            })
+        );
+        let third = store
+            .save_credential_account_info_returning_previous(id, &info(10.0, 0.0))
+            .await
+            .unwrap();
+        assert_eq!(third.map(|figures| figures.current_overages), Some(12.5));
+
+        store.drop_test_schema().await.unwrap();
     }
 
     async fn clean(store: &PostgresStore) {
@@ -17549,7 +18034,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let audit_page = store.query_admin_audit_logs(1, 20).await.unwrap();
+        let audit_page = store
+            .query_admin_audit_logs_filtered(1, 20, &AdminAuditLogFilter::default())
+            .await
+            .unwrap();
         assert_eq!(audit_page.records.len(), 1);
         assert_eq!(audit_page.records[0].action, "set_credential_priority");
         assert_eq!(audit_page.records[0].object_id.as_deref(), Some("7"));

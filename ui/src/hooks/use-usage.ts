@@ -4,6 +4,7 @@ import {
   clearUsageRecords,
   cancelUsageCleanup,
   deleteManualModel,
+  getAccountEventSummary,
   getAuditLogsPage,
   getUsageCleanupStatus,
   getModelCapabilities,
@@ -376,6 +377,15 @@ export function useAuditLogsPage(query: AdminAuditLogPageQuery) {
     queryKey: ['audit-logs-page', query],
     queryFn: () => getAuditLogsPage(query),
     refetchInterval: 15000,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useAccountEventSummary(hours: number, accountSource?: string) {
+  return useQuery({
+    queryKey: ['account-event-summary', hours, accountSource ?? ''],
+    queryFn: () => getAccountEventSummary(hours, accountSource),
+    refetchInterval: 30000,
     placeholderData: (previousData) => previousData,
   })
 }

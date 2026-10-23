@@ -1929,6 +1929,8 @@ pub struct RuntimeConfigResponse {
     pub extract_thinking: bool,
     pub thinking_trigger_mode: ThinkingTriggerMode,
     pub expose_proxy_warnings: bool,
+    pub audit_log_retention_enabled: bool,
+    pub audit_log_retention_days: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2127,6 +2129,10 @@ pub struct UpdateRuntimeConfigRequest {
     pub thinking_trigger_mode: Option<ThinkingTriggerMode>,
     #[serde(default)]
     pub expose_proxy_warnings: Option<bool>,
+    #[serde(default)]
+    pub audit_log_retention_enabled: Option<bool>,
+    #[serde(default)]
+    pub audit_log_retention_days: Option<u32>,
 }
 
 impl UpdateRuntimeConfigRequest {

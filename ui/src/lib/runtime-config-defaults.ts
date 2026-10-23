@@ -572,6 +572,8 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   extractThinking: true,
   thinkingTriggerMode: 'real_request',
   exposeProxyWarnings: false,
+  auditLogRetentionEnabled: false,
+  auditLogRetentionDays: 15,
   definedCacheRoutes: [],
 }
 

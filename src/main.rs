@@ -601,6 +601,15 @@ async fn async_main() {
             );
         }
     }
+    let audit_retention_task = {
+        let token_manager = token_manager.clone();
+        storage::account_events::spawn_audit_retention_worker(postgres_store.clone(), move || {
+            let config = token_manager.runtime_config();
+            config
+                .audit_log_retention_enabled
+                .then_some(config.audit_log_retention_days)
+        })
+    };
     let model_capability_recovery_task = spawn_model_capability_recovery_worker(
         kiro_provider.clone(),
         model_capabilities.clone(),
@@ -777,6 +786,7 @@ async fn async_main() {
     tokio::join!(
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
         abort_task_with_timeout("model capability recovery", model_capability_recovery_task),
+        abort_task_with_timeout("audit log retention", audit_retention_task),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 

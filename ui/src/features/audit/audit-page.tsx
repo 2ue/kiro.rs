@@ -1,10 +1,13 @@
 import { useMemo, useState } from 'react'
-import { CheckCircle2, Eye, FileClock, Filter, RefreshCw, X, XCircle } from 'lucide-react'
+import { Activity, CheckCircle2, Eye, FileClock, Filter, RefreshCw, Settings2, X, XCircle } from 'lucide-react'
+import { toast } from 'sonner'
 import { formatDate } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
-import { useAuditLogsPage } from '@/hooks/use-usage'
-import type { AdminAuditLogRow } from '@/types/api'
+import { useAccountEventSummary, useAuditLogsPage } from '@/hooks/use-usage'
+import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
+import type { AdminAuditLogPageQuery, AdminAuditLogRow } from '@/types/api'
 import {
+  Callout,
   PageContainer,
   PageHeader,
   SectionCard,
@@ -12,25 +15,42 @@ import {
   ErrorState,
   LoadingState,
   ModalShell,
+  StatCard,
+  StatGrid,
   Toolbar,
   ToolbarSearch,
   ToolbarActions,
+  useConfirm,
 } from '@/components/patterns'
 import {
   Badge,
   Button,
+  Input,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Switch,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
+  Tabs,
+  TabsList,
+  TabsTrigger,
 } from '@/components/ui'
+import {
+  ACCOUNT_EVENT_ORDER,
+  TIME_RANGES,
+  accountEventMeta,
+  accountEventQuery,
+  accountEventView,
+  summaryTiles,
+  type AccountFilterState,
+} from './account-events'
 
 // ─── 标签映射 ─────────────────────────────────────────────────────────────────
 
@@ -51,6 +71,9 @@ const ACTION_LABELS: Record<string, string> = {
   clear_credential_in_flight: '清理并发占用',
   auto_disable_credential: '自动禁用账号',
   auto_enable_credential: '自动恢复账号',
+  credential_account_event: '账号异动',
+  external_pool_account_event: '外部池异动',
+  clear_external_pool_cooldown: '清除账号池冷却',
   batch_import_credentials: '批量导入账号',
   batch_update_credentials: '批量修改账号',
   delete_disabled_credentials: '删除已禁用账号',
@@ -93,6 +116,7 @@ const OBJECT_LABELS: Record<string, string> = {
   proxy_resource: '代理资源',
   external_pool: '外部账号池',
   load_balancing: '负载均衡',
+  route_scenario: '路由场景',
 }
 
 const ACTION_CATEGORIES = [
@@ -149,6 +173,9 @@ const ACTION_TO_CATEGORY: Record<string, string> = {
   delete_external_pool: 'external_pool',
   set_external_pool_enabled: 'external_pool',
   clear_external_pool_auto_disabled: 'external_pool',
+  clear_external_pool_cooldown: 'external_pool',
+  credential_account_event: 'credential',
+  external_pool_account_event: 'external_pool',
 }
 
 function actionLabel(action: string): string { return ACTION_LABELS[action] ?? action }
@@ -159,19 +186,28 @@ function detailText(value: unknown): string {
   return JSON.stringify(value, null, 2)
 }
 
+const PAGE_LIMIT = 20
+
 // ─── 详情弹窗 ─────────────────────────────────────────────────────────────────
 
 function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow | null; open: boolean; onClose: () => void }) {
   if (!record) return null
+  const event = accountEventView(record)
   return (
-    <ModalShell open={open} onClose={onClose} title="审计详情" width="max-w-2xl">
+    <ModalShell open={open} onClose={onClose} title={event ? '账号异动详情' : '审计详情'} width="max-w-2xl">
       <div className="space-y-4 text-sm">
         <div className="grid gap-3 sm:grid-cols-2">
           {[
             { label: '时间', value: formatDate(record.createdAt) },
-            { label: '执行者', value: record.actor },
-            { label: '动作', value: actionLabel(record.action) },
-            { label: '对象', value: `${objectLabel(record.objectType)}${record.objectId ? ` #${record.objectId}` : ''}` },
+            { label: '执行者', value: event?.actor ?? record.actor },
+            { label: event ? '变动' : '动作', value: event ? event.label : actionLabel(record.action) },
+            {
+              label: event ? '账号' : '对象',
+              value: event
+                ? `${event.source === 'external' ? '外部池' : '本地'} #${event.accountId} · ${event.accountLabel}`
+                : `${objectLabel(record.objectType)}${record.objectId ? ` #${record.objectId}` : ''}`,
+            },
+            ...(event?.reason ? [{ label: '原因', value: event.reason }] : []),
           ].map(({ label, value }) => (
             <div key={label}>
               <div className="text-xs text-muted-foreground">{label}</div>
@@ -179,13 +215,15 @@ function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow 
             </div>
           ))}
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">结果</span>
-          <Badge tone={record.success ? 'success' : 'error'}>
-            {record.success ? <CheckCircle2 className="size-3" /> : <XCircle className="size-3" />}
-            {record.success ? '成功' : '失败'}
-          </Badge>
-        </div>
+        {!event && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">结果</span>
+            <Badge tone={record.success ? 'success' : 'error'}>
+              {record.success ? <CheckCircle2 className="size-3" /> : <XCircle className="size-3" />}
+              {record.success ? '成功' : '失败'}
+            </Badge>
+          </div>
+        )}
         {record.errorMessage && (
           <div>
             <div className="mb-1 text-xs font-semibold text-destructive">错误信息</div>
@@ -205,26 +243,264 @@ function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow 
   )
 }
 
-// ─── 主页 ──────────────────────────────────────────────────────────────────────
+// ─── 保留时长设置 ─────────────────────────────────────────────────────────────
 
-export function AuditPage() {
+function RetentionDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const runtimeConfig = useRuntimeConfig()
+  const update = useUpdateRuntimeConfig()
+  const confirm = useConfirm()
+  const currentEnabled = runtimeConfig.data?.auditLogRetentionEnabled ?? false
+  const currentDays = runtimeConfig.data?.auditLogRetentionDays ?? 15
+  const [draftEnabled, setDraftEnabled] = useState<boolean | null>(null)
+  const [draftDays, setDraftDays] = useState<string | null>(null)
+  const enabled = draftEnabled ?? currentEnabled
+  const value = draftDays ?? String(currentDays)
+  const days = Number(value)
+  const valid = Number.isInteger(days) && days >= 1 && days <= 3650
+
+  const close = () => { setDraftEnabled(null); setDraftDays(null); onClose() }
+  const save = async () => {
+    if (!runtimeConfig.data || !valid) return
+    // Turning cleanup on, or shortening an active retention, deletes history; ask first.
+    const deletes = enabled && (!currentEnabled || days < currentDays)
+    if (deletes) {
+      const ok = await confirm({
+        title: '开启自动清理？',
+        message: `保存后，后台会在 1 小时内开始删除 ${days} 天以前的全部审计日志（含账号异动和后台操作记录），删除后无法恢复。需要留存的话请先备份。`,
+        confirmText: '确认开启',
+        tone: 'danger',
+      })
+      if (!ok) return
+    }
+    update.mutate({ ...runtimeConfig.data, auditLogRetentionEnabled: enabled, auditLogRetentionDays: days }, {
+      onSuccess: () => { toast.success(enabled ? `已开启自动清理，保留 ${days} 天` : '已关闭自动清理，不会删除任何日志'); close() },
+      onError: (error) => toast.error(`保存失败：${extractErrorMessage(error)}`),
+    })
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      onClose={close}
+      title="日志自动清理"
+      description="默认关闭，不删除任何日志。开启后，后台每小时清理一次超过保留天数的审计日志（含账号异动），分小批执行，失败只记日志，不影响调度。"
+      footer={
+        <>
+          <Button variant="outline" onClick={close} disabled={update.isPending}>取消</Button>
+          <Button onClick={() => void save()} disabled={!valid || !runtimeConfig.data || update.isPending}>{update.isPending ? '保存中...' : '保存'}</Button>
+        </>
+      }
+    >
+      {runtimeConfig.isLoading ? (
+        <LoadingState text="读取配置..." />
+      ) : runtimeConfig.error ? (
+        <ErrorState title="读取配置失败" message={extractErrorMessage(runtimeConfig.error)} />
+      ) : (
+        <div className="space-y-4">
+          <label className="flex items-center justify-between gap-3 rounded-lg border p-3">
+            <span>
+              <span className="block text-sm font-medium">自动清理过期日志</span>
+              <span className="block text-xs text-muted-foreground">{enabled ? '已开启：超过保留天数的日志会被删除' : '已关闭：所有日志都会保留'}</span>
+            </span>
+            <Switch checked={enabled} onCheckedChange={setDraftEnabled} aria-label="自动清理过期日志" />
+          </label>
+          <div className="space-y-2">
+            <label className="text-sm font-medium" htmlFor="audit-retention-days">保留天数</label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="audit-retention-days"
+                className="w-32"
+                type="number"
+                min={1}
+                max={3650}
+                value={value}
+                disabled={!enabled}
+                onChange={(event) => setDraftDays(event.target.value)}
+              />
+              <span className="text-sm text-muted-foreground">天（1 ~ 3650，默认 15）</span>
+            </div>
+            {!valid && <p className="text-xs text-destructive">请输入 1 到 3650 之间的整数</p>}
+          </div>
+          {enabled && !currentEnabled && (
+            <Callout tone="warning">开启后会删除 {valid ? days : '-'} 天以前的全部审计日志，删除后无法恢复。</Callout>
+          )}
+        </div>
+      )}
+    </ModalShell>
+  )
+}
+
+// ─── 账号异动 ─────────────────────────────────────────────────────────────────
+
+const DEFAULT_ACCOUNT_FILTER: AccountFilterState = { range: '24', kind: '__all__', source: '__all__', account: '' }
+
+function AccountEventsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => void }) {
+  const [filter, setFilter] = useState<AccountFilterState>(DEFAULT_ACCOUNT_FILTER)
   const [page, setPage] = useState(1)
-  const [selected, setSelected] = useState<AdminAuditLogRow | null>(null)
+  // Recomputed only when the filter or page changes, so the time window doesn't move on every render.
+  const query = useMemo(() => accountEventQuery(filter, page, PAGE_LIMIT), [filter, page])
+  const logs = useAuditLogsPage(query)
+  const summaryHours = filter.range === 'all' ? 720 : Number(filter.range)
+  const summary = useAccountEventSummary(summaryHours, filter.source === '__all__' ? undefined : filter.source)
+  const records = logs.data?.records ?? []
+  const pending = logs.isPlaceholderData || logs.isFetching
+  const tiles = summaryTiles(summary.data?.items ?? [])
+  const changed = filter.kind !== '__all__' || filter.source !== '__all__' || !!filter.account.trim() || filter.range !== DEFAULT_ACCOUNT_FILTER.range
+  const rangeLabel = filter.range === 'all' ? '最近 30 天' : TIME_RANGES.find((item) => item.value === filter.range)?.label ?? ''
+
+  const update = (patch: Partial<AccountFilterState>) => { setFilter((prev) => ({ ...prev, ...patch })); setPage(1) }
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="mb-2 text-xs text-muted-foreground">{rangeLabel}的异动统计，点击可筛选</div>
+        {summary.isLoading ? (
+          <LoadingState text="统计中..." className="py-4" />
+        ) : tiles.length === 0 ? (
+          <div className="rounded-lg bg-muted/30 px-4 py-3 text-sm text-muted-foreground">这段时间没有账号异动</div>
+        ) : (
+          <StatGrid min="9.5rem">
+            {tiles.map((tile) => (
+              <button
+                key={tile.kind}
+                type="button"
+                className={`rounded-xl text-left outline-none ring-primary focus-visible:ring-2 ${filter.kind === tile.kind ? 'ring-2' : ''}`}
+                onClick={() => update({ kind: filter.kind === tile.kind ? '__all__' : tile.kind })}
+                aria-pressed={filter.kind === tile.kind}
+                aria-label={`筛选${tile.label}`}
+              >
+                <StatCard
+                  title={tile.label}
+                  value={tile.events}
+                  desc={`涉及 ${tile.accounts} 个账号`}
+                  tone={tile.tone === 'neutral' ? 'default' : tile.tone}
+                />
+              </button>
+            ))}
+          </StatGrid>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Select value={filter.range} onValueChange={(range) => update({ range })}>
+          <SelectTrigger size="sm" className="w-36" aria-label="时间范围"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {TIME_RANGES.map((item) => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={filter.kind} onValueChange={(kind) => update({ kind })}>
+          <SelectTrigger size="sm" className="w-36" aria-label="变动类型"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">全部变动</SelectItem>
+            {ACCOUNT_EVENT_ORDER.map((kind) => <SelectItem key={kind} value={kind}>{accountEventMeta(kind).label}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <Select value={filter.source} onValueChange={(source) => update({ source })}>
+          <SelectTrigger size="sm" className="w-32" aria-label="账号来源"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">全部来源</SelectItem>
+            <SelectItem value="local">本地账号</SelectItem>
+            <SelectItem value="external">外部池</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="min-w-48 flex-1">
+          <ToolbarSearch value={filter.account} onChange={(account) => update({ account })} placeholder="账号邮箱、名称或 #ID" />
+        </div>
+        {changed && (
+          <Button variant="ghost" size="sm" onClick={() => { setFilter(DEFAULT_ACCOUNT_FILTER); setPage(1) }}>
+            <X className="h-3.5 w-3.5" />重置
+          </Button>
+        )}
+        <Button variant="outline" size="sm" onClick={() => { logs.refetch(); summary.refetch() }} disabled={pending}>
+          <RefreshCw className={`h-3.5 w-3.5 ${pending ? 'animate-spin' : ''}`} />刷新
+        </Button>
+      </div>
+
+      {logs.isLoading ? (
+        <LoadingState text="加载账号异动..." className="py-8" />
+      ) : logs.error ? (
+        <ErrorState title="账号异动加载失败" message={extractErrorMessage(logs.error)} />
+      ) : records.length === 0 ? (
+        <EmptyState
+          icon={<Activity />}
+          title="没有账号异动"
+          description={changed ? '没有匹配当前筛选条件的记录' : '额度耗尽、自动禁用、风控和恢复会记录在这里'}
+          action={changed ? <Button variant="outline" size="sm" onClick={() => { setFilter(DEFAULT_ACCOUNT_FILTER); setPage(1) }}>重置筛选</Button> : undefined}
+        />
+      ) : (
+        <>
+          <div className="scrollbar-thin overflow-x-auto rounded-lg border">
+            <Table className="min-w-[760px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>时间</TableHead>
+                  <TableHead>账号</TableHead>
+                  <TableHead>变动</TableHead>
+                  <TableHead>原因</TableHead>
+                  <TableHead>触发</TableHead>
+                  <TableHead className="w-12 text-right">详情</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {records.map((record) => {
+                  const event = accountEventView(record)
+                  if (!event) return null
+                  return (
+                    <TableRow key={record.id} className="cursor-pointer hover:bg-muted/40" onClick={() => onSelect(record)}>
+                      <TableCell className="whitespace-nowrap text-xs tabular-nums text-muted-foreground">{formatDate(record.createdAt)}</TableCell>
+                      <TableCell className="max-w-64">
+                        <button
+                          type="button"
+                          className="block max-w-full truncate text-left text-xs font-medium hover:text-primary hover:underline"
+                          title={`只看这个账号：${event.accountLabel}`}
+                          onClick={(e) => { e.stopPropagation(); update({ account: `#${event.accountId}`, source: event.source }) }}
+                        >
+                          {event.accountLabel}
+                        </button>
+                        <div className="text-[0.62rem] text-muted-foreground/70">{event.source === 'external' ? '外部池' : '本地'} #{event.accountId}</div>
+                      </TableCell>
+                      <TableCell><Badge tone={event.tone}>{event.label}</Badge></TableCell>
+                      <TableCell className="max-w-72 truncate text-xs" title={event.reason}>{event.reason || '—'}</TableCell>
+                      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{event.actor}</TableCell>
+                      <TableCell className="text-right">
+                        <Button variant="ghost" size="icon-xs" onClick={(e) => { e.stopPropagation(); onSelect(record) }} title="查看详情" aria-label="查看详情">
+                          <Eye className="size-3.5" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          </div>
+          <PageNav page={page} hasNext={Boolean(logs.data?.hasNext)} pending={pending} onChange={setPage} />
+        </>
+      )}
+    </div>
+  )
+}
+
+// ─── 全部操作 ─────────────────────────────────────────────────────────────────
+
+function AllLogsView({ onSelect }: { onSelect: (record: AdminAuditLogRow) => void }) {
+  const [page, setPage] = useState(1)
   const [q, setQ] = useState('')
   const [successFilter, setSuccessFilter] = useState<'__all__' | 'success' | 'failed'>('__all__')
   const [categoryFilter, setCategoryFilter] = useState('__all__')
   const [showFilters, setShowFilters] = useState(false)
 
-  const limit = 20
-  const query = useMemo(() => ({ page, limit }), [page])
+  const query = useMemo<AdminAuditLogPageQuery>(() => ({
+    page,
+    limit: PAGE_LIMIT,
+    success: successFilter === '__all__' ? undefined : successFilter === 'success',
+    objectType: categoryFilter === 'credential' || categoryFilter === 'external_pool' ? categoryFilter : undefined,
+  }), [page, successFilter, categoryFilter])
   const logs = useAuditLogsPage(query)
-  const allRecords = logs.data?.records ?? []
-  const hasNext = Boolean(logs.data?.hasNext)
   const pending = logs.isPlaceholderData || logs.isFetching
 
-  // Client-side filtering (server doesn't support filters yet)
+  // Free-text and categories without their own object type still filter the loaded page.
   const records = useMemo(() => {
-    let filtered = allRecords
+    let filtered = logs.data?.records ?? []
     if (q.trim()) {
       const lower = q.toLowerCase()
       filtered = filtered.filter(
@@ -238,134 +514,116 @@ export function AuditPage() {
           (r.errorMessage && r.errorMessage.toLowerCase().includes(lower))
       )
     }
-    if (successFilter !== '__all__') {
-      const wantSuccess = successFilter === 'success'
-      filtered = filtered.filter((r) => r.success === wantSuccess)
-    }
-    if (categoryFilter !== '__all__') {
+    if (categoryFilter !== '__all__' && categoryFilter !== 'credential' && categoryFilter !== 'external_pool') {
       filtered = filtered.filter((r) => ACTION_TO_CATEGORY[r.action] === categoryFilter)
     }
     return filtered
-  }, [allRecords, q, successFilter, categoryFilter])
+  }, [logs.data?.records, q, categoryFilter])
 
   const hasFilters = successFilter !== '__all__' || categoryFilter !== '__all__' || !!q.trim()
   const filterCount = [successFilter !== '__all__', categoryFilter !== '__all__', !!q.trim()].filter(Boolean).length
-
-  const clearFilters = () => { setQ(''); setSuccessFilter('__all__'); setCategoryFilter('__all__') }
+  const clearFilters = () => { setQ(''); setSuccessFilter('__all__'); setCategoryFilter('__all__'); setPage(1) }
 
   return (
-    <PageContainer>
-      <PageHeader title="审计" subtitle="后台关键操作记录，便于排查配置与数据变化来源" />
+    <div className="space-y-2">
+      <Toolbar>
+        <ToolbarSearch value={q} onChange={(v) => { setQ(v); setPage(1) }} placeholder="搜索动作、执行者、对象..." />
+        <ToolbarActions>
+          <Button variant="outline" size="sm" onClick={() => logs.refetch()} disabled={pending}>
+            <RefreshCw className={`h-3.5 w-3.5 ${pending ? 'animate-spin' : ''}`} />
+            刷新
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className={hasFilters ? 'border-primary text-primary' : ''}
+            onClick={() => setShowFilters((v) => !v)}
+          >
+            <Filter className="h-3.5 w-3.5" />
+            筛选
+            {filterCount > 0 && <Badge tone="primary">{filterCount}</Badge>}
+          </Button>
+        </ToolbarActions>
+      </Toolbar>
 
-      <SectionCard
-        icon={<FileClock />}
-        title="操作日志"
-        description="记录账号、配置、价格、用量的关键写操作"
-        noPadding
-      >
-        <div className="px-4 pt-4 pb-2">
-          <Toolbar>
-            <ToolbarSearch value={q} onChange={(v) => { setQ(v); setPage(1) }} placeholder="搜索动作、执行者、对象..." />
-            <ToolbarActions>
-              <Button variant="outline" size="sm" onClick={() => logs.refetch()} disabled={pending}>
-                <RefreshCw className={`h-3.5 w-3.5 ${pending ? 'animate-spin' : ''}`} />
-                刷新
+      {showFilters && (
+        <div className="rounded-lg bg-muted/30 p-3">
+          <div className="grid gap-2 sm:grid-cols-3">
+            <Select value={categoryFilter} onValueChange={(v) => { setCategoryFilter(v); setPage(1) }}>
+              <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {ACTION_CATEGORIES.map((c) => (
+                  <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={successFilter} onValueChange={(v) => { setSuccessFilter(v as typeof successFilter); setPage(1) }}>
+              <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all__">全部结果</SelectItem>
+                <SelectItem value="success">成功</SelectItem>
+                <SelectItem value="failed">失败</SelectItem>
+              </SelectContent>
+            </Select>
+            {hasFilters && (
+              <Button variant="ghost" size="sm" onClick={clearFilters}>
+                <X className="h-3.5 w-3.5" />清除筛选
               </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                className={hasFilters ? 'border-primary text-primary' : ''}
-                onClick={() => setShowFilters((v) => !v)}
-              >
-                <Filter className="h-3.5 w-3.5" />
-                筛选
-                {filterCount > 0 && <Badge tone="primary">{filterCount}</Badge>}
-              </Button>
-              {pending && <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />}
-            </ToolbarActions>
-          </Toolbar>
-
-          {showFilters && (
-            <div className="mt-2 rounded-lg bg-muted/30 p-3">
-              <div className="grid gap-2 sm:grid-cols-3">
-                <Select value={categoryFilter} onValueChange={(v) => { setCategoryFilter(v); setPage(1) }}>
-                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {ACTION_CATEGORIES.map((c) => (
-                      <SelectItem key={c.value} value={c.value}>{c.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Select value={successFilter} onValueChange={(v) => { setSuccessFilter(v as typeof successFilter); setPage(1) }}>
-                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__all__">全部结果</SelectItem>
-                    <SelectItem value="success">成功</SelectItem>
-                    <SelectItem value="failed">失败</SelectItem>
-                  </SelectContent>
-                </Select>
-                {hasFilters && (
-                  <Button variant="ghost" size="sm" onClick={clearFilters}>
-                    <X className="h-3.5 w-3.5" />清除筛选
-                  </Button>
-                )}
-              </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
+      )}
 
-        {logs.isLoading ? (
-          <LoadingState text="加载日志..." className="py-8" />
-        ) : logs.error ? (
-          <div className="px-4 pb-4">
-            <ErrorState title="审计日志加载失败" message={extractErrorMessage(logs.error)} />
-          </div>
-        ) : records.length === 0 ? (
-          <div className="px-4 pb-4">
-            <EmptyState
-              icon={<FileClock />}
-              title="暂无审计记录"
-              description={hasFilters ? '没有匹配当前筛选条件的记录' : '后台关键操作记录会在这里展示'}
-              action={hasFilters ? <Button variant="outline" size="sm" onClick={clearFilters}>清除筛选</Button> : undefined}
-            />
-          </div>
-        ) : (
-          <>
-            <div className="scrollbar-thin overflow-x-auto">
-              <Table className="min-w-[720px]">
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>时间</TableHead>
-                    <TableHead>动作</TableHead>
-                    <TableHead>对象</TableHead>
-                    <TableHead>执行者</TableHead>
-                    <TableHead>结果</TableHead>
-                    <TableHead className="text-right w-16">详情</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {records.map((record) => (
-                    <TableRow key={record.id} className="cursor-pointer hover:bg-muted/40" onClick={() => setSelected(record)}>
-                      <TableCell className="tabular-nums text-muted-foreground text-xs whitespace-nowrap">
+      {logs.isLoading ? (
+        <LoadingState text="加载日志..." className="py-8" />
+      ) : logs.error ? (
+        <ErrorState title="审计日志加载失败" message={extractErrorMessage(logs.error)} />
+      ) : records.length === 0 ? (
+        <EmptyState
+          icon={<FileClock />}
+          title="暂无审计记录"
+          description={hasFilters ? '没有匹配当前筛选条件的记录' : '后台关键操作记录会在这里展示'}
+          action={hasFilters ? <Button variant="outline" size="sm" onClick={clearFilters}>清除筛选</Button> : undefined}
+        />
+      ) : (
+        <>
+          <div className="scrollbar-thin overflow-x-auto rounded-lg border">
+            <Table className="min-w-[720px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>时间</TableHead>
+                  <TableHead>动作</TableHead>
+                  <TableHead>对象</TableHead>
+                  <TableHead>执行者</TableHead>
+                  <TableHead>结果</TableHead>
+                  <TableHead className="w-16 text-right">详情</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {records.map((record) => {
+                  const event = accountEventView(record)
+                  return (
+                    <TableRow key={record.id} className="cursor-pointer hover:bg-muted/40" onClick={() => onSelect(record)}>
+                      <TableCell className="whitespace-nowrap text-xs tabular-nums text-muted-foreground">
                         {formatDate(record.createdAt)}
                       </TableCell>
                       <TableCell>
-                        <div className="text-xs font-medium text-foreground">{actionLabel(record.action)}</div>
-                        <div className="text-[0.62rem] text-muted-foreground/60 font-mono">{record.action}</div>
+                        <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+                          {actionLabel(record.action)}
+                          {event && <Badge tone={event.tone}>{event.label}</Badge>}
+                        </div>
+                        <div className="font-mono text-[0.62rem] text-muted-foreground/60">{record.action}</div>
                       </TableCell>
                       <TableCell>
-                        <div className="text-xs">{objectLabel(record.objectType)}</div>
+                        <div className="text-xs">{event ? event.accountLabel : objectLabel(record.objectType)}</div>
                         <div className="text-[0.62rem] text-muted-foreground/60">
-                          {record.objectId ? `#${record.objectId}` : '—'}
+                          {event ? `${objectLabel(record.objectType)} #${record.objectId}` : record.objectId ? `#${record.objectId}` : '—'}
                         </div>
                       </TableCell>
                       <TableCell className="text-xs">{record.actor}</TableCell>
                       <TableCell>
                         <Badge tone={record.success ? 'success' : 'error'}>
-                          {record.success
-                            ? <CheckCircle2 className="size-3" />
-                            : <XCircle className="size-3" />
-                          }
+                          {record.success ? <CheckCircle2 className="size-3" /> : <XCircle className="size-3" />}
                           {record.success ? '成功' : '失败'}
                         </Badge>
                       </TableCell>
@@ -373,34 +631,75 @@ export function AuditPage() {
                         <Button
                           variant="ghost"
                           size="icon-xs"
-                          onClick={(e) => { e.stopPropagation(); setSelected(record) }}
+                          onClick={(e) => { e.stopPropagation(); onSelect(record) }}
                           title="查看详情"
+                          aria-label="查看详情"
                         >
                           <Eye className="size-3.5" />
                         </Button>
                       </TableCell>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          </div>
+          <PageNav page={page} hasNext={Boolean(logs.data?.hasNext)} pending={pending} onChange={setPage} />
+        </>
+      )}
+    </div>
+  )
+}
 
-            <div className="px-4 py-3">
-              <div className="flex items-center justify-center gap-3">
-                <Button variant="outline" size="sm" disabled={page === 1 || pending} onClick={() => setPage((v) => Math.max(1, v - 1))}>
-                  上一页
-                </Button>
-                <span className="text-xs text-muted-foreground">第 {page} 页，每页 {limit} 条</span>
-                <Button variant="outline" size="sm" disabled={!hasNext || pending} onClick={() => setPage((v) => v + 1)}>
-                  下一页
-                </Button>
-              </div>
-            </div>
-          </>
-        )}
+function PageNav({ page, hasNext, pending, onChange }: { page: number; hasNext: boolean; pending: boolean; onChange: (page: number) => void }) {
+  return (
+    <div className="flex items-center justify-center gap-3 py-1">
+      <Button variant="outline" size="sm" disabled={page === 1 || pending} onClick={() => onChange(Math.max(1, page - 1))}>
+        上一页
+      </Button>
+      <span className="text-xs text-muted-foreground">第 {page} 页，每页 {PAGE_LIMIT} 条</span>
+      <Button variant="outline" size="sm" disabled={!hasNext || pending} onClick={() => onChange(page + 1)}>
+        下一页
+      </Button>
+    </div>
+  )
+}
+
+// ─── 主页 ──────────────────────────────────────────────────────────────────────
+
+export function AuditPage() {
+  const [view, setView] = useState<'accounts' | 'all'>('accounts')
+  const [selected, setSelected] = useState<AdminAuditLogRow | null>(null)
+  const [retentionOpen, setRetentionOpen] = useState(false)
+  const runtimeConfig = useRuntimeConfig()
+  const retentionDays = runtimeConfig.data?.auditLogRetentionDays
+  const retentionEnabled = runtimeConfig.data?.auditLogRetentionEnabled ?? false
+
+  return (
+    <PageContainer>
+      <PageHeader
+        title="审计"
+        subtitle="账号异动和后台关键操作记录，便于排查账号状态与配置变化来源"
+        actions={
+          <Button variant="outline" size="sm" onClick={() => setRetentionOpen(true)}>
+            <Settings2 className="h-3.5 w-3.5" />
+            {retentionEnabled ? `自动清理：保留 ${retentionDays ?? '-'} 天` : '自动清理：已关闭'}
+          </Button>
+        }
+      />
+
+      <SectionCard>
+        <Tabs value={view} onValueChange={(value) => setView(value as typeof view)}>
+          <TabsList className="mb-4">
+            <TabsTrigger value="accounts"><Activity className="size-3.5" />账号异动</TabsTrigger>
+            <TabsTrigger value="all"><FileClock className="size-3.5" />全部操作</TabsTrigger>
+          </TabsList>
+        </Tabs>
+        {view === 'accounts' ? <AccountEventsView onSelect={setSelected} /> : <AllLogsView onSelect={setSelected} />}
       </SectionCard>
 
       <AuditDetailModal record={selected} open={Boolean(selected)} onClose={() => setSelected(null)} />
+      <RetentionDialog open={retentionOpen} onClose={() => setRetentionOpen(false)} />
     </PageContainer>
   )
 }
