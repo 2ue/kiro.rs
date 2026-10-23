@@ -2142,6 +2142,15 @@ export interface AccessKeysResponse {
   maskedAdminApiKey: string
 }
 
+export type KeyLimitMetric = 'cost_usd' | 'credits' | 'tokens'
+export type KeyLimitPeriod = 'daily' | 'monthly' | 'total'
+
+export interface KeyUsageLimit {
+  metric: KeyLimitMetric
+  period: KeyLimitPeriod
+  limit: number
+}
+
 export interface RequestApiKeyItem {
   id: string
   apiKey: string
@@ -2150,6 +2159,7 @@ export interface RequestApiKeyItem {
   name: string
   enabled: boolean
   requestAdmission?: RequestAdmissionConfig
+  usageLimits: KeyUsageLimit[]
 }
 
 export interface CreateRequestApiKeyRequest {
@@ -2157,6 +2167,7 @@ export interface CreateRequestApiKeyRequest {
   name?: string
   enabled?: boolean
   requestAdmission?: RequestAdmissionConfig
+  usageLimits?: KeyUsageLimit[]
 }
 
 export interface UpdateRequestApiKeyRequest {
@@ -2164,6 +2175,7 @@ export interface UpdateRequestApiKeyRequest {
   name?: string
   enabled?: boolean
   requestAdmission?: RequestAdmissionConfig
+  usageLimits?: KeyUsageLimit[]
 }
 
 export interface UpdateAdminApiKeyRequest {

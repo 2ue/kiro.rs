@@ -33,7 +33,8 @@ use super::types::{
     LoadBalancingModeResponse, ManualModelResponse, PromptSteeringDefaults,
     ProxyResourceBatchTestItem, ProxyResourceBatchTestResponse, ProxyResourceImportEntry,
     ProxyResourceResponse, ProxyResourceTestRequest, ProxyResourceTestResponse,
-    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
+    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem,
+    RequestKeyUsageLimitItem, RequestKeyUsageLimitsResponse, RuntimeConfigResponse,
     SetCredentialConcurrencyRequest, SetCredentialOverageRequest, SetCredentialProxyRequest,
     SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest,
     SetCredentialRoutePolicyRequest, SetCredentialRpmRequest, SetLoadBalancingModeRequest,
@@ -44,6 +45,9 @@ use super::types::{
     UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupResumeRequest,
     UsageCleanupStatusResponse, UsageDashboardAccountItem, UsageDashboardAccountsResponse,
     ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+};
+use crate::anthropic::request_key_limits::{
+    KeyLimitPeriod, limited_periods, spawn_seed_from_history, validate_key_limits,
 };
 use crate::anthropic::{
     inference_attempt_budget::{
@@ -668,6 +672,9 @@ fn request_api_key_items(
                     .unwrap_or_else(|| format!("请求 Key {}", index + 1)),
                 enabled: policy.map(|policy| policy.enabled).unwrap_or(true),
                 request_admission: policy.and_then(|policy| policy.request_admission),
+                usage_limits: policy
+                    .map(|policy| policy.usage_limits.clone())
+                    .unwrap_or_default(),
             }
         })
         .collect()
@@ -1058,6 +1065,7 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         let config = self.token_manager.runtime_config();
         self.refresh_request_api_key_runtime(&config);
+        self.seed_request_key_usage_counters(&config);
         self.audit(
             action,
             "security_keys",
@@ -1065,6 +1073,78 @@ impl AdminService {
             true,
             None,
             detail,
+        );
+        Ok(())
+    }
+
+    /// Adds usage already recorded in the period to each limited window, once per window, so a
+    /// new limit counts what was spent before it was set. Runs in the background.
+    fn seed_request_key_usage_counters(&self, config: &Config) {
+        spawn_seed_from_history(
+            self.request_admission.usage_limits().clone(),
+            self.postgres_store.clone(),
+            limited_periods(&config.request_api_key_policies()),
+        );
+    }
+
+    /// Current usage against each limit of every request key that has limits.
+    pub async fn get_request_key_usage_limits(
+        &self,
+    ) -> Result<RequestKeyUsageLimitsResponse, AdminServiceError> {
+        let config = self.token_manager.runtime_config();
+        let limiter = self.request_admission.usage_limits().clone();
+        let now = chrono::Utc::now();
+        let mut items = Vec::new();
+        for policy in config.request_api_key_policies() {
+            if policy.usage_limits.is_empty() {
+                continue;
+            }
+            let key_id = stable_request_api_key_id(&policy.api_key);
+            let (statuses, error) = match limiter.statuses(&key_id, now).await {
+                Ok(statuses) => (statuses.unwrap_or_default(), None),
+                Err(err) => (Vec::new(), Some(err.to_string())),
+            };
+            items.push(RequestKeyUsageLimitItem {
+                key_id,
+                enabled: policy.enabled,
+                statuses,
+                error,
+            });
+        }
+        Ok(RequestKeyUsageLimitsResponse {
+            timezone: "Asia/Shanghai".to_string(),
+            items,
+        })
+    }
+
+    /// Clears the current window of one limit period for a key, so it starts from zero.
+    pub async fn reset_request_key_usage(
+        &self,
+        key_id: &str,
+        period: KeyLimitPeriod,
+    ) -> Result<(), AdminServiceError> {
+        let config = self.token_manager.runtime_config();
+        if !config
+            .request_api_keys()
+            .iter()
+            .any(|key| stable_request_api_key_id(key) == key_id)
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "调用 API Key 不存在".to_string(),
+            ));
+        }
+        self.request_admission
+            .usage_limits()
+            .reset(key_id, period)
+            .await
+            .map_err(|err| AdminServiceError::InternalError(format!("重置 Key 用量失败: {err}")))?;
+        self.audit(
+            "reset_request_key_usage",
+            "security_keys",
+            Some(key_id.to_string()),
+            true,
+            None,
+            json!({ "period": period.as_str() }),
         );
         Ok(())
     }
@@ -1088,6 +1168,17 @@ impl AdminService {
             .collect::<Vec<_>>();
         self.request_admission
             .update_policies(config.request_admission, overrides);
+        self.request_admission.usage_limits().update_limits(
+            policies
+                .iter()
+                .filter(|policy| policy.enabled)
+                .map(|policy| {
+                    (
+                        stable_request_api_key_id(&policy.api_key),
+                        policy.usage_limits.clone(),
+                    )
+                }),
+        );
     }
 
     pub fn create_request_api_key(
@@ -1122,12 +1213,15 @@ impl AdminService {
         admission
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
+        let usage_limits = req.usage_limits.unwrap_or_default();
+        validate_key_limits(&usage_limits).map_err(AdminServiceError::InvalidCredential)?;
         keys.push(next_key.clone());
         policies.push(RequestApiKeyPolicy {
             api_key: next_key.clone(),
             name: req.name.unwrap_or_default(),
             enabled: req.enabled.unwrap_or(true),
             request_admission: Some(admission),
+            usage_limits,
         });
         self.persist_request_api_keys(
             keys,
@@ -1175,6 +1269,9 @@ impl AdminService {
                 .validate()
                 .map_err(AdminServiceError::InvalidCredential)?;
         }
+        if let Some(usage_limits) = req.usage_limits.as_ref() {
+            validate_key_limits(usage_limits).map_err(AdminServiceError::InvalidCredential)?;
+        }
         if keys
             .iter()
             .enumerate()
@@ -1200,12 +1297,20 @@ impl AdminService {
             if let Some(admission) = req.request_admission {
                 policy.request_admission = Some(admission);
             }
-        } else if req.name.is_some() || req.enabled.is_some() || req.request_admission.is_some() {
+            if let Some(usage_limits) = req.usage_limits.clone() {
+                policy.usage_limits = usage_limits;
+            }
+        } else if req.name.is_some()
+            || req.enabled.is_some()
+            || req.request_admission.is_some()
+            || req.usage_limits.is_some()
+        {
             policies.push(RequestApiKeyPolicy {
                 api_key: next_key.clone(),
                 name: req.name.unwrap_or_default(),
                 enabled: req.enabled.unwrap_or(true),
                 request_admission: req.request_admission,
+                usage_limits: req.usage_limits.clone().unwrap_or_default(),
             });
         }
         self.persist_request_api_keys(
@@ -7620,6 +7725,7 @@ fn validate_request_api_key_policies(
         if let Some(admission) = policy.request_admission {
             admission.validate()?;
         }
+        validate_key_limits(&policy.usage_limits)?;
         if !keys.iter().any(|configured| configured == key) {
             return Err("managed request API Key 必须同时存在于 apiKey/apiKeys 列表".to_string());
         }

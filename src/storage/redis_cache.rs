@@ -2146,6 +2146,138 @@ impl RedisStore {
         Ok(stats)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn ttl_secs_for_test(&self, key: impl AsRef<str>) -> anyhow::Result<i64> {
+        let mut manager = self.manager.clone();
+        Ok(redis::cmd("TTL")
+            .arg(self.key(key))
+            .query_async(&mut manager)
+            .await?)
+    }
+
+    /// Reads one float field of a hash; `None` when the hash or field is absent.
+    pub async fn hash_get_f64(
+        &self,
+        key: impl AsRef<str>,
+        field: &str,
+    ) -> anyhow::Result<Option<f64>> {
+        let mut manager = self.manager.clone();
+        let value: Option<String> = redis::cmd("HGET")
+            .arg(self.key(key))
+            .arg(field)
+            .query_async(&mut manager)
+            .await?;
+        Ok(value.and_then(|value| value.parse::<f64>().ok()))
+    }
+
+    /// Adds to float fields of a hash and marks it with `marker`, atomically; sets the expiry on
+    /// first write.
+    pub async fn hash_incr_by_float(
+        &self,
+        key: impl AsRef<str>,
+        marker: &str,
+        fields: &[(&str, f64)],
+        ttl_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let script = r#"
+            for i = 1, #ARGV - 1, 2 do
+                redis.call('HINCRBYFLOAT', KEYS[1], ARGV[i], ARGV[i + 1])
+            end
+            redis.call('HSETNX', KEYS[1], KEYS[2], 1)
+            local ttl = tonumber(KEYS[3])
+            if ttl > 0 and redis.call('TTL', KEYS[1]) < 0 then
+                redis.call('EXPIRE', KEYS[1], ttl)
+            end
+            return 1
+        "#;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(script)
+            .arg(3)
+            .arg(self.key(key))
+            .arg(marker)
+            .arg(ttl_secs.unwrap_or(0));
+        for (field, value) in fields {
+            command.arg(*field).arg(value.to_string());
+        }
+        let mut manager = self.manager.clone();
+        let _: i64 = command.query_async(&mut manager).await?;
+        Ok(())
+    }
+
+    /// Writes `fields` and `marker` into a hash only if the hash does not exist yet; an existing
+    /// hash is left untouched. Returns whether it wrote.
+    pub async fn hash_init_if_absent(
+        &self,
+        key: impl AsRef<str>,
+        marker: &str,
+        fields: &[(&str, f64)],
+        ttl_secs: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let script = r#"
+            if redis.call('EXISTS', KEYS[1]) == 1 then
+                return 0
+            end
+            for i = 1, #ARGV - 1, 2 do
+                redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
+            end
+            redis.call('HSET', KEYS[1], KEYS[2], 1)
+            local ttl = tonumber(KEYS[3])
+            if ttl > 0 then
+                redis.call('EXPIRE', KEYS[1], ttl)
+            end
+            return 1
+        "#;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(script)
+            .arg(3)
+            .arg(self.key(key))
+            .arg(marker)
+            .arg(ttl_secs.unwrap_or(0));
+        for (field, value) in fields {
+            command.arg(*field).arg(value.to_string());
+        }
+        let mut manager = self.manager.clone();
+        let written: i64 = command.query_async(&mut manager).await?;
+        Ok(written == 1)
+    }
+
+    /// Replaces a hash with `fields` plus `marker` and sets its expiry.
+    pub async fn hash_replace(
+        &self,
+        key: impl AsRef<str>,
+        marker: &str,
+        fields: &[(&str, f64)],
+        ttl_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let script = r#"
+            redis.call('DEL', KEYS[1])
+            for i = 1, #ARGV - 1, 2 do
+                redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
+            end
+            redis.call('HSET', KEYS[1], KEYS[2], 1)
+            local ttl = tonumber(KEYS[3])
+            if ttl > 0 then
+                redis.call('EXPIRE', KEYS[1], ttl)
+            end
+            return 1
+        "#;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(script)
+            .arg(3)
+            .arg(self.key(key))
+            .arg(marker)
+            .arg(ttl_secs.unwrap_or(0));
+        for (field, value) in fields {
+            command.arg(*field).arg(value.to_string());
+        }
+        let mut manager = self.manager.clone();
+        let _: i64 = command.query_async(&mut manager).await?;
+        Ok(())
+    }
+
     pub async fn incr_with_ttl(
         &self,
         key: impl AsRef<str>,

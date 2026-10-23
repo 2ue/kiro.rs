@@ -13,6 +13,7 @@ use tokio::runtime::{Runtime, RuntimeFlavor};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::anthropic::request_key_limits::{KeyUsageDelta, RequestKeyLimiter};
 use crate::common::upstream_error::RawUpstreamError;
 use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
 use crate::storage::postgres::PostgresUsageStore;
@@ -2153,6 +2154,8 @@ pub struct UsageRecorder {
     backpressured_redis_records: AtomicU64,
     dropped_persist_records: Arc<AtomicU64>,
     dropped_redis_records: Arc<AtomicU64>,
+    /// Per-key usage limits; set once at startup. Every accepted record adds to its key's counters.
+    key_limits: OnceLock<Arc<RequestKeyLimiter>>,
 }
 
 fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
@@ -2418,6 +2421,7 @@ impl UsageRecorder {
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
             dropped_redis_records: Arc::new(AtomicU64::new(0)),
+            key_limits: OnceLock::new(),
         }
     }
 
@@ -2515,6 +2519,7 @@ impl UsageRecorder {
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records,
             dropped_redis_records,
+            key_limits: OnceLock::new(),
         }
     }
 
@@ -2543,6 +2548,36 @@ impl UsageRecorder {
             "UsageRecorder observability materialization must not use business Redis"
         );
         Self::with_postgres_internal(limit, postgres_store, observability_redis_store)
+    }
+
+    /// Counts usage against per-key limits from now on. Later calls are ignored.
+    pub fn set_key_limits(&self, limiter: Arc<RequestKeyLimiter>) {
+        let _ = self.key_limits.set(limiter);
+    }
+
+    fn add_key_usage(&self, record: &UsageRecord) {
+        let (Some(limiter), Some(key_id)) =
+            (self.key_limits.get(), record.request_api_key_id.as_deref())
+        else {
+            return;
+        };
+        let tokens = [
+            record.compat_input_tokens,
+            record.output_tokens,
+            record.cache_read_input_tokens,
+            record.cache_creation_input_tokens,
+        ]
+        .iter()
+        .map(|value| i64::from((*value).max(0)))
+        .sum::<i64>();
+        limiter.spawn_record(
+            key_id.to_string(),
+            KeyUsageDelta {
+                cost_usd: record.estimated_cost_usd,
+                credits: record.kiro_metering_usage,
+                tokens: tokens as f64,
+            },
+        );
     }
 
     pub fn record(&self, record: UsageRecord) -> UsageRecordOutcome {
@@ -2580,6 +2615,7 @@ impl UsageRecorder {
             return UsageRecordOutcome::RejectedCleanupWatermark;
         }
 
+        self.add_key_usage(&record);
         self.record_usage_postgres(record.clone());
 
         {
@@ -4723,6 +4759,7 @@ mod tests {
             backpressured_redis_records: AtomicU64::new(0),
             dropped_persist_records: Arc::new(AtomicU64::new(0)),
             dropped_redis_records: Arc::new(AtomicU64::new(0)),
+            key_limits: OnceLock::new(),
         });
         (recorder, persisted, started, gate)
     }
@@ -4859,6 +4896,7 @@ mod tests {
                 backpressured_redis_records: AtomicU64::new(0),
                 dropped_persist_records: Arc::new(AtomicU64::new(0)),
                 dropped_redis_records: Arc::new(AtomicU64::new(0)),
+                key_limits: OnceLock::new(),
             };
 
             let windows = recorder.dashboard_windows(Some("UTC"), 500).unwrap();

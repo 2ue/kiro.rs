@@ -6,6 +6,7 @@ import {
   EyeOff,
   KeyRound,
   Plus,
+  RotateCcw,
   Save,
   Trash2,
   Wand2,
@@ -31,6 +32,11 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Spinner,
   Switch,
   Tooltip,
@@ -41,14 +47,41 @@ import {
   createRequestApiKey,
   deleteRequestApiKey,
   getAccessKeys,
+  getRequestKeyUsageLimits,
+  resetRequestKeyUsage,
   updateAdminApiKey,
   updateRequestApiKey,
 } from '@/api/credentials'
 import type {
   AccessKeysResponse,
+  KeyLimitMetric,
+  KeyLimitPeriod,
+  KeyUsageLimit,
   RequestAdmissionConfig,
   RequestApiKeyItem,
+  RequestKeyUsageLimitItem,
 } from '@/types/api'
+import {
+  METRIC_OPTIONS,
+  PERIOD_OPTIONS,
+  formatLimitValue,
+  metricLabel,
+  nextDraft,
+  parseDrafts,
+  periodLabel,
+  toDrafts,
+  usageView,
+  type LimitDraft,
+} from './key-limits'
+import { formatDate } from '@/lib/format'
+
+interface RequestKeyPolicyDraft {
+  apiKey: string
+  name: string
+  enabled: boolean
+  requestAdmission: RequestAdmissionConfig
+  usageLimits: KeyUsageLimit[]
+}
 
 const DEFAULT_REQUEST_ADMISSION: RequestAdmissionConfig = {
   rpm: 300,
@@ -85,6 +118,7 @@ function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[
       ...item,
       name: item.name ?? `请求 Key ${index + 1}`,
       enabled: item.enabled ?? true,
+      usageLimits: item.usageLimits ?? [],
     }))
   }
   if (!response.requestApiKey) return []
@@ -95,6 +129,7 @@ function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[
     primary: true,
     name: '兼容旧主 Key',
     enabled: true,
+    usageLimits: [],
   }]
 }
 
@@ -123,12 +158,7 @@ function RequestApiKeyDialog({
   initialApiKey?: string
   saving: boolean
   onOpenChange: (open: boolean) => void
-  onSave: (policy: {
-    apiKey: string
-    name: string
-    enabled: boolean
-    requestAdmission: RequestAdmissionConfig
-  }) => void
+  onSave: (policy: RequestKeyPolicyDraft) => void
 }) {
   const isEdit = Boolean(item)
   const admission = item?.requestAdmission ?? defaultAdmission
@@ -139,6 +169,19 @@ function RequestApiKeyDialog({
   const [concurrent, setConcurrent] = useState(admission.maxConcurrentRequests)
   const [queued, setQueued] = useState(admission.maxQueuedRequests)
   const [timeout, setTimeout] = useState(admission.queueTimeoutMs)
+  const [limitDrafts, setLimitDrafts] = useState<LimitDraft[]>(() => toDrafts(item?.usageLimits))
+
+  useEffect(() => {
+    setLimitDrafts(toDrafts(item?.usageLimits))
+  }, [open, item?.id, item?.usageLimits])
+
+  const parsedLimits = parseDrafts(limitDrafts)
+  const updateLimit = (index: number, patch: Partial<LimitDraft>) =>
+    setLimitDrafts((prev) => prev.map((draft, i) => (i === index ? { ...draft, ...patch } : draft)))
+  const addLimit = () => {
+    const next = nextDraft(limitDrafts)
+    if (next) setLimitDrafts((prev) => [...prev, next])
+  }
 
   useEffect(() => {
     setApiKey(initialApiKey ?? item?.apiKey ?? '')
@@ -201,12 +244,68 @@ function RequestApiKeyDialog({
           <p className="mt-4 text-xs leading-5 text-muted-foreground">
             此上限按实例、按 Key 生效；排队请求不会自动切换到外部池。
           </p>
+
+          <div className="mt-5 space-y-3 border-t pt-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold">用量限额</div>
+                <div className="text-xs text-muted-foreground">按计费金额、积分或 Token 限制，达到后返回 429，到期后自动恢复。</div>
+              </div>
+              <Button type="button" variant="outline" size="xs" disabled={saving || !nextDraft(limitDrafts)} onClick={addLimit}>
+                <Plus className="h-3.5 w-3.5" />添加限额
+              </Button>
+            </div>
+            {limitDrafts.length === 0 ? (
+              <p className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">未设置，不限用量。</p>
+            ) : (
+              <div className="space-y-2">
+                {limitDrafts.map((draft, index) => (
+                  <div key={index} className="grid grid-cols-[7rem_8rem_1fr_auto] items-center gap-2">
+                    <Select value={draft.period} disabled={saving} onValueChange={(period) => updateLimit(index, { period: period as KeyLimitPeriod })}>
+                      <SelectTrigger size="sm" aria-label="周期"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {PERIOD_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                    <Select value={draft.metric} disabled={saving} onValueChange={(metric) => updateLimit(index, { metric: metric as KeyLimitMetric })}>
+                      <SelectTrigger size="sm" aria-label="限制项"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {METRIC_OPTIONS.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                    <div className="flex items-center gap-1.5">
+                      <Input
+                        type="number"
+                        min={0}
+                        step={draft.metric === 'tokens' ? 1 : 'any'}
+                        className="h-8"
+                        aria-label="上限"
+                        value={draft.value}
+                        disabled={saving}
+                        placeholder="上限"
+                        onChange={(event) => updateLimit(index, { value: event.target.value })}
+                      />
+                      <span className="shrink-0 text-xs text-muted-foreground">{METRIC_OPTIONS.find((option) => option.value === draft.metric)?.unit}</span>
+                    </div>
+                    <Button type="button" variant="ghost" size="icon-xs" aria-label="删除这条限额" disabled={saving} onClick={() => setLimitDrafts((prev) => prev.filter((_, i) => i !== index))}>
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {parsedLimits.error && <p className="text-xs text-destructive">{parsedLimits.error}</p>}
+            <p className="text-xs leading-5 text-muted-foreground">
+              计费金额取用量记录里的计费金额，积分取本地账号消耗的积分，Token 为输入、输出和缓存读写之和。每天、每月按北京时间零点重置。
+              用量在请求结束后计入，并发请求可能让用量略超上限；计数服务不可用时，设置了限额的 Key 会被拒绝。
+            </p>
+          </div>
         </DialogBody>
         <DialogFooter>
           <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)}>取消</Button>
           <Button
             type="button"
-            disabled={saving || apiKey.trim().length < 8}
+            disabled={saving || apiKey.trim().length < 8 || Boolean(parsedLimits.error)}
             onClick={() => onSave({
               apiKey: apiKey.trim(),
               name: name.trim(),
@@ -217,6 +316,7 @@ function RequestApiKeyDialog({
                 maxQueuedRequests: queued,
                 queueTimeoutMs: timeout,
               },
+              usageLimits: parsedLimits.limits,
             })}
           >
             {saving ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}保存
@@ -224,6 +324,66 @@ function RequestApiKeyDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// ─── KeyUsageLimitsView ───────────────────────────────────────────────────────
+
+const USAGE_TONE_CLASS = { success: 'bg-success', warning: 'bg-warning', error: 'bg-destructive' } as const
+
+/** Used / limit bars for one key; reset clears the current window of that period. */
+function KeyUsageLimitsView({
+  item,
+  usage,
+  onReset,
+}: {
+  item: RequestApiKeyItem
+  usage?: RequestKeyUsageLimitItem
+  onReset: (item: RequestApiKeyItem, period: KeyLimitPeriod) => void
+}) {
+  if (item.usageLimits.length === 0) return null
+  if (usage?.error) {
+    return (
+      <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        用量计数读取失败，此 Key 的请求会被拒绝：{usage.error}
+      </div>
+    )
+  }
+  return (
+    <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+      {item.usageLimits.map((limit) => {
+        const status = usage?.statuses.find((entry) => entry.metric === limit.metric && entry.period === limit.period)
+        const view = status ? usageView(status) : null
+        return (
+          <div key={`${limit.period}:${limit.metric}`} className="rounded-md border px-3 py-2">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="font-medium">{periodLabel(limit.period)} {metricLabel(limit.metric)}</span>
+              <span className={`tabular-nums ${status?.exceeded ? 'font-semibold text-destructive' : 'text-muted-foreground'}`}>
+                {status ? formatLimitValue(limit.metric, status.used) : '…'} / {formatLimitValue(limit.metric, limit.limit)}
+              </span>
+            </div>
+            <div
+              role="progressbar"
+              aria-label={`${periodLabel(limit.period)}${metricLabel(limit.metric)}用量`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(view?.percent ?? 0)}
+              className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted"
+            >
+              <div className={`h-full rounded-full ${USAGE_TONE_CLASS[view?.tone ?? 'success']}`} style={{ width: `${view?.percent ?? 0}%` }} />
+            </div>
+            <div className="mt-1 flex items-center justify-between gap-2 text-[0.68rem] text-muted-foreground">
+              <span>
+                {status?.exceeded ? '已达上限，请求被拒绝' : status?.resetsAt ? `${formatDate(status.resetsAt)} 重置` : '累计不重置'}
+              </span>
+              <Button type="button" variant="ghost" size="xs" className="h-5 px-1.5 text-[0.68rem]" onClick={() => onReset(item, limit.period)}>
+                <RotateCcw className="h-3 w-3" />清零
+              </Button>
+            </div>
+          </div>
+        )
+      })}
+    </div>
   )
 }
 
@@ -240,6 +400,8 @@ interface RequestKeysSectionProps {
   onToggleVisible: (id: string) => void
   onDelete: (item: RequestApiKeyItem) => void
   defaultAdmission: RequestAdmissionConfig
+  usageByKey: Map<string, RequestKeyUsageLimitItem>
+  onResetUsage: (item: RequestApiKeyItem, period: KeyLimitPeriod) => void
 }
 
 function RequestKeysSection({
@@ -253,6 +415,8 @@ function RequestKeysSection({
   onToggleVisible,
   onDelete,
   defaultAdmission,
+  usageByKey,
+  onResetUsage,
 }: RequestKeysSectionProps) {
   const requestKeys = accessKeyItems(keys)
 
@@ -311,6 +475,9 @@ function RequestKeysSection({
                   <span className="rounded border bg-muted/50 px-2 py-1">RPM {admission.rpm || '不限'}</span>
                   <span className="rounded border bg-muted/50 px-2 py-1">并发 {admission.maxConcurrentRequests || '不限'}</span>
                   <span className="rounded border bg-muted/50 px-2 py-1">队列 {admission.maxQueuedRequests || 0}</span>
+                  {item.usageLimits.length > 0 && (
+                    <span className="rounded border border-primary/30 bg-primary/5 px-2 py-1 text-primary">限额 {item.usageLimits.length} 项</span>
+                  )}
                 </div>
                 <div className="flex flex-wrap justify-start gap-1.5 md:justify-end">
                   <Button variant="outline" size="xs" disabled={busy} onClick={() => onToggleVisible(item.id)} title={visible ? '隐藏 Key' : '显示 Key'}>
@@ -328,6 +495,7 @@ function RequestKeysSection({
                   </Button>
                 </div>
               </div>
+              <KeyUsageLimitsView item={item} usage={usageByKey.get(item.id)} onReset={onResetUsage} />
             </div>
           )
         })}
@@ -352,6 +520,37 @@ export function SecurityPage() {
   const [nextAdminKey, setNextAdminKey] = useState('')
   const [newKeyPlaintext, setNewKeyPlaintext] = useState<string | null>(null)
   const confirm = useConfirm()
+  const [usageByKey, setUsageByKey] = useState<Map<string, RequestKeyUsageLimitItem>>(new Map())
+
+  const loadUsage = async () => {
+    try {
+      const response = await getRequestKeyUsageLimits()
+      setUsageByKey(new Map(response.items.map((entry) => [entry.keyId, entry])))
+    } catch {
+      // Usage bars just stay on the last value; the key list itself is unaffected.
+    }
+  }
+
+  useEffect(() => {
+    void loadUsage()
+    const timer = window.setInterval(() => { void loadUsage() }, 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const handleResetUsage = async (item: RequestApiKeyItem, period: KeyLimitPeriod) => {
+    const ok = await confirm({
+      title: '清零用量',
+      message: `把「${item.name}」${periodLabel(period)}的用量计数清零？清零后该周期从 0 重新计算，历史用量记录不受影响。`,
+      confirmText: '清零',
+      tone: 'danger',
+    })
+    if (!ok) return
+    try {
+      await resetRequestKeyUsage(item.id, period)
+      toast.success('用量已清零')
+      void loadUsage()
+    } catch (e) { toast.error(`清零失败: ${extractErrorMessage(e)}`) }
+  }
 
   const loadKeys = async () => {
     setLoading(true)
@@ -382,12 +581,7 @@ export function SecurityPage() {
     setKeyDialogOpen(true)
   }
 
-  const handleSaveKeyDialog = async (policy: {
-    apiKey: string
-    name: string
-    enabled: boolean
-    requestAdmission: RequestAdmissionConfig
-  }) => {
+  const handleSaveKeyDialog = async (policy: RequestKeyPolicyDraft) => {
     setCreating(true)
     try {
       const response = keyDialogItem
@@ -395,6 +589,8 @@ export function SecurityPage() {
         : await createRequestApiKey(policy)
       setKeysAndReset(response)
       setKeyDialogOpen(false)
+      // New limits start from usage already recorded in the period; give that a moment.
+      window.setTimeout(() => { void loadUsage() }, 1_500)
       if (!keyDialogItem) {
         const created = accessKeyItems(response).find((item) => item.apiKey === policy.apiKey)
         if (created) {
@@ -491,6 +687,8 @@ export function SecurityPage() {
         onToggleVisible={(id) => setVisibleIds((prev) => { const next = new Set(prev); next.has(id) ? next.delete(id) : next.add(id); return next })}
         onDelete={handleDelete}
         defaultAdmission={keys?.defaultRequestAdmission ?? DEFAULT_REQUEST_ADMISSION}
+        usageByKey={usageByKey}
+        onResetUsage={handleResetUsage}
       />
 
       <RequestApiKeyDialog

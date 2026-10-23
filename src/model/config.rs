@@ -5059,6 +5059,9 @@ pub struct RequestApiKeyPolicy {
     pub enabled: bool,
     #[serde(default)]
     pub request_admission: Option<RequestAdmissionConfig>,
+    /// Usage caps (billed amount, credits, tokens) per period; empty means unlimited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_limits: Vec<crate::anthropic::request_key_limits::KeyUsageLimit>,
 }
 
 impl RequestApiKeyPolicy {
@@ -8406,6 +8409,7 @@ mod tests {
         let mut file = Config::default();
         file.set_request_api_keys(["sk-file", "sk-extra"]);
         file.set_request_api_key_policies([RequestApiKeyPolicy {
+            usage_limits: Vec::new(),
             api_key: "sk-extra".to_string(),
             name: "file-managed".to_string(),
             enabled: true,
@@ -8435,6 +8439,7 @@ mod tests {
         let mut file = Config::default();
         file.set_request_api_keys(["sk-legacy", "sk-removed"]);
         file.set_request_api_key_policies([RequestApiKeyPolicy {
+            usage_limits: Vec::new(),
             api_key: "sk-removed".to_string(),
             name: "stale-file-entry".to_string(),
             enabled: true,

@@ -73,6 +73,8 @@ import type {
   ExternalPoolTestRequest,
   ExternalPoolTestResponse,
   UpdateExternalPoolRequest,
+  KeyLimitPeriod,
+  RequestKeyUsageLimitsResponse,
 } from '@/types/api'
 
 const CREDENTIALS_LIST_PAGE_LIMIT = 500
@@ -414,6 +416,15 @@ export async function createRequestApiKey(req: CreateRequestApiKeyRequest = {}):
 export async function updateRequestApiKey(id: string, req: UpdateRequestApiKeyRequest): Promise<AccessKeysResponse> {
   const { data } = await api.put<AccessKeysResponse>(`/security/request-keys/${id}`, req)
   return data
+}
+
+export async function getRequestKeyUsageLimits(): Promise<RequestKeyUsageLimitsResponse> {
+  const { data } = await api.get<RequestKeyUsageLimitsResponse>('/security/request-keys/usage-limits')
+  return data
+}
+
+export async function resetRequestKeyUsage(id: string, period: KeyLimitPeriod): Promise<void> {
+  await api.post(`/security/request-keys/${id}/usage-limits/reset`, { period })
 }
 
 export async function deleteRequestApiKey(id: string): Promise<AccessKeysResponse> {
