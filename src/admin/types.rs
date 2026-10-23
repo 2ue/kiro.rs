@@ -6,13 +6,11 @@ use crate::anthropic::pricing::ModelPricing;
 use crate::anthropic::usage::UsageRecord;
 use crate::kiro::token_manager::CredentialIdentitySnapshot;
 use crate::model::config::{
-    BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig,
-    DEFAULT_IDENTITY_PROMPT, DEFAULT_IDENTITY_TURN_REMINDER, DEFAULT_LANGUAGE_CONSTRAINT_PROMPT,
-    DEFAULT_TASK_QUALITY_PROMPT, ExternalPoolsConfig, ImageProcessingConfig, KiroAgentModeStrategy,
-    MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PayloadShapingConfigPatch, PromptCacheCreationControlConfig,
-    PromptSteeringConfig, ReportedUsageConfig, RequestAdmissionConfig, ThinkingTriggerMode,
-    WeightedCapacityConfig,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
+    ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
+    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
+    PromptCacheCreationControlConfig, PromptInjectionConfig, ReportedUsageConfig,
+    RequestAdmissionConfig, RouteFeaturesConfig, WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -1838,26 +1836,6 @@ pub struct TokenRefreshAdmissionRuntimeResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PromptSteeringDefaults {
-    pub language_constraint_prompt: &'static str,
-    pub task_quality_prompt: &'static str,
-    pub identity_prompt: &'static str,
-    pub identity_turn_reminder_prompt: &'static str,
-}
-
-impl Default for PromptSteeringDefaults {
-    fn default() -> Self {
-        Self {
-            language_constraint_prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim(),
-            task_quality_prompt: DEFAULT_TASK_QUALITY_PROMPT.trim(),
-            identity_prompt: DEFAULT_IDENTITY_PROMPT.trim(),
-            identity_turn_reminder_prompt: DEFAULT_IDENTITY_TURN_REMINDER.trim(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RuntimeConfigResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
@@ -1933,9 +1911,9 @@ pub struct RuntimeConfigResponse {
     pub whitespace_compression: bool,
     pub image_processing: ImageProcessingConfig,
     pub body_conversion: BodyConversionConfig,
-    pub prompt_steering: PromptSteeringConfig,
-    /// Built-in prompt texts, so admin consoles restore defaults without keeping their own copy.
-    pub prompt_steering_defaults: PromptSteeringDefaults,
+    pub prompt_injection: PromptInjectionConfig,
+    pub route_features: RouteFeaturesConfig,
+    pub claude_models_only: bool,
     pub missing_max_tokens: MissingMaxTokensConfig,
     pub payload_guard_enabled: bool,
     pub payload_guard_mode: PayloadGuardMode,
@@ -1969,10 +1947,38 @@ pub struct RuntimeConfigResponse {
     pub model_resolution_mode: ModelResolutionMode,
     pub model_mapping: ModelMappingConfig,
     pub extract_thinking: bool,
-    pub thinking_trigger_mode: ThinkingTriggerMode,
     pub expose_proxy_warnings: bool,
     pub audit_log_retention_enabled: bool,
     pub audit_log_retention_days: u32,
+}
+
+/// 预览请求：请求条件，加上可选的未保存草稿（只用于这次预览）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptInjectionPreviewBody {
+    #[serde(flatten)]
+    pub request: crate::anthropic::PromptInjectionPreviewRequest,
+    #[serde(default)]
+    pub draft: Option<PromptInjectionDraft>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PromptInjectionDraft {
+    #[serde(default)]
+    pub prompt_injection: Option<PromptInjectionConfig>,
+    #[serde(default)]
+    pub route_features: Option<RouteFeaturesConfig>,
+}
+
+/// 管理端目录接口的返回。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptInjectionCatalogResponse {
+    pub items: Vec<crate::model::prompt_injection::catalog::CatalogEntry>,
+    pub fixed: Vec<crate::model::prompt_injection::catalog::FixedInjection>,
+    pub max_text_chars: usize,
+    pub max_total_text_chars: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2103,7 +2109,14 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub body_conversion: Option<BodyConversionConfig>,
     #[serde(default)]
-    pub prompt_steering: Option<PromptSteeringConfig>,
+    pub prompt_injection: Option<PromptInjectionConfig>,
+    #[serde(default)]
+    pub route_features: Option<RouteFeaturesConfig>,
+    #[serde(default)]
+    pub claude_models_only: Option<bool>,
+    /// 已停用的旧字段。收到时返回 400，避免旧版页面把旧结构写回去。
+    #[serde(default)]
+    pub prompt_steering: Option<serde_json::Value>,
     #[serde(default)]
     pub missing_max_tokens: Option<MissingMaxTokensConfig>,
     #[serde(default)]
@@ -2170,8 +2183,9 @@ pub struct UpdateRuntimeConfigRequest {
     pub model_mapping: Option<ModelMappingConfig>,
     #[serde(default)]
     pub extract_thinking: Option<bool>,
+    /// 已停用的旧字段，现在是 `routeFeatures.defaults.thinkingTrigger`。收到时返回 400。
     #[serde(default)]
-    pub thinking_trigger_mode: Option<ThinkingTriggerMode>,
+    pub thinking_trigger_mode: Option<serde_json::Value>,
     #[serde(default)]
     pub expose_proxy_warnings: Option<bool>,
     #[serde(default)]

@@ -1259,6 +1259,8 @@ impl PostgresStore {
         let value: serde_json::Value = row.try_get("config")?;
         let mut config: Config = serde_json::from_value(value)?;
         config.set_config_path_for_runtime(None);
+        // 升级过程中旧版本实例可能写回旧的提示词字段；每次加载都转换，热加载也能拿到新结构。
+        config.migrate_legacy_prompt_fields();
         Ok(Some(config))
     }
 

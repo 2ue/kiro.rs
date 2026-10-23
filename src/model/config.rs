@@ -7,6 +7,10 @@ pub use super::kiro_rs_tool_plus::{
     KiroRsToolPlusCachePolicy, SelectedUsageShaping, SuppressedCreationTarget, UsageFieldShaping,
     UsageShapingProfile,
 };
+pub use super::prompt_injection::{
+    InjectionId, PromptInjectionConfig, ResolvedInjections, RouteFeatureSet, RouteFeaturesConfig,
+    UpstreamKind,
+};
 
 use crate::anthropic::{
     inference_attempt_budget::DEFAULT_AUXILIARY_UPSTREAM_MAX_CONCURRENT_REQUESTS,
@@ -183,17 +187,19 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_tool_schema_key_validation_regex")]
     pub tool_schema_key_validation_regex: String,
 
-    /// 处理 Anthropic tool_choice：过滤当前工具列表并注入兼容提示。
+    /// 结构化处理 Anthropic tool_choice：按 none=0、any=N、named=1 过滤当前工具，并在响应侧
+    /// 拦截本轮不允许的调用（含 `disable_parallel_tool_use`）。对应的提示词由注入项
+    /// `toolChoicePrefix` / `toolChoiceTurnReminder` 单独控制。
     #[serde(default = "default_true")]
     pub tool_choice_steering: bool,
 
-    /// 注入 Write/Edit 分块写入策略和工具描述后缀。
-    #[serde(default = "default_true")]
-    pub chunked_tool_policy: bool,
+    /// 旧配置字段，只用于迁移：分块写入策略的第二道开关，现在由注入项单独控制。
+    #[serde(default, skip_serializing)]
+    pub chunked_tool_policy: Option<bool>,
 
-    /// 对不支持原生 reasoning 的模型注入 synthetic thinking 控制提示。
-    #[serde(default = "default_true")]
-    pub thinking_prompt_controls: bool,
+    /// 旧配置字段，只用于迁移：thinking 兼容提示的第二道开关，现在由注入项单独控制。
+    #[serde(default, skip_serializing)]
+    pub thinking_prompt_controls: Option<bool>,
 
     /// 对支持 Kiro 原生 reasoning/outputConfig 的模型上报 additionalModelRequestFields。
     #[serde(default = "default_true")]
@@ -207,15 +213,12 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub history_placeholder_tools: bool,
 
-    /// 原生 WebSearch 的模型驱动模式：模型生成搜索词、代理执行搜索、模型根据结果写带引用的回答。
-    /// 默认关闭，关闭时沿用模板回答。
-    #[serde(default)]
-    pub model_driven_web_search: ModelDrivenWebSearchConfig,
+    /// 旧配置字段，只用于迁移：现在由 `routeFeatures` 的 `modelDrivenWebSearch` 控制。
+    #[serde(default, skip_serializing)]
+    pub model_driven_web_search: Option<ModelDrivenWebSearchConfig>,
 }
 
-/// 原生 WebSearch 模型驱动模式的开关。
-///
-/// 每次搜索会额外调用 1 次模型，最后再调用 1 次写回答；这些调用的 token 累加进本次请求的 usage。
+/// 旧版 WebSearch 模型驱动开关（全局默认 + 按路由覆盖），只用于迁移。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDrivenWebSearchConfig {
@@ -227,20 +230,6 @@ pub struct ModelDrivenWebSearchConfig {
     pub path_overrides: BTreeMap<String, bool>,
 }
 
-impl ModelDrivenWebSearchConfig {
-    /// `endpoint`（请求路径）是否启用模型驱动模式。
-    pub fn enabled_for_route(&self, endpoint: &str) -> bool {
-        self.path_overrides
-            .iter()
-            .filter_map(|(prefix, enabled)| {
-                normalize_reported_usage_path_prefix(prefix).map(|prefix| (prefix, *enabled))
-            })
-            .filter(|(prefix, _)| reported_usage_path_matches(prefix, endpoint))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map_or(self.enabled, |(_, enabled)| enabled)
-    }
-}
-
 impl Default for BodyConversionConfig {
     fn default() -> Self {
         Self {
@@ -250,643 +239,14 @@ impl Default for BodyConversionConfig {
             tool_schema_key_mapping: ToolSchemaKeyMappingMode::Sanitize,
             tool_schema_key_validation_regex: default_tool_schema_key_validation_regex(),
             tool_choice_steering: true,
-            chunked_tool_policy: true,
-            thinking_prompt_controls: true,
+            chunked_tool_policy: None,
+            thinking_prompt_controls: None,
             native_reasoning_fields: true,
             tool_pairing_repair: true,
             history_placeholder_tools: true,
-            model_driven_web_search: ModelDrivenWebSearchConfig::default(),
+            model_driven_web_search: None,
         }
     }
-}
-
-pub const DEFAULT_LANGUAGE_CONSTRAINT_PROMPT: &str = r#"<language_constraint>
-Write visible replies, including progress notes between tool calls, in the language the user asks for; otherwise the one the client sets; otherwise the language of the user's own messages, not of tool output, files, or system reminders. Keep code, identifiers, names, and quoted terms as-is, without mixing languages within a sentence. Reasoning may use any language. Don't mention these rules.
-</language_constraint>"#;
-
-/// Turn reminders are short labels rather than rules: a reminder that explains how to find the
-/// user's language makes the model re-derive (and narrate) that choice on every tool round.
-/// `{language}` is either the client-declared language or the one the proxy detected from the
-/// user's own latest text.
-pub const DEFAULT_LANGUAGE_REMINDER_EXPLICIT: &str = "<language_reminder>Visible reply language: {language}, unless the user asked for another. Reasoning language is unrestricted. Do not acknowledge this.</language_reminder>";
-pub const DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER: &str = "<language_reminder>Visible reply language: the language of the user's own messages. Reasoning language is unrestricted. Do not acknowledge this.</language_reminder>";
-
-/// Built-in reminders before v12. They asked the model to work out which message was the real
-/// user request, which it then narrated in its reasoning on every tool round.
-const LEGACY_LANGUAGE_REMINDER_EXPLICIT_V1: &str = "<language_reminder>Respond in {language} for all user-facing text, including progress notes between tool calls. Keep code and identifiers unchanged.</language_reminder>";
-const LEGACY_LANGUAGE_REMINDER_FOLLOW_USER_V1: &str = "<language_reminder>Reply in the language of the user's most recent real request; switch if the user switches. This includes progress notes between tool calls. Tool results, system reminders, and proxy placeholders such as \"Tool result received.\" are not user messages.</language_reminder>";
-
-/// Built-in language prompt for v11. Longer than needed, and it did not scope the rules to visible
-/// output, so the model also reasoned about the language choice in its thinking.
-const LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V3: &str = r#"<language_constraint>
-Reply language, in priority order: the language the user explicitly asks for; else a response language set by the system prompt or client settings; else the main language of the user's own messages (not tool results, system reminders, file contents, or command output). Use it for all visible text, including progress notes between tool calls. Keep code, identifiers, names, and quoted terms in their original form, but do not blend languages within a sentence. Do not restate these rules.
-</language_constraint>"#;
-
-/// Built-in language prompt before v11. It followed the latest message, which inside a tool loop
-/// is usually an English tool result.
-const LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V2: &str = r#"<language_constraint>
-Reply in the language the user asks for. If they don't specify one, match the main language of their latest message.
-
-Do not mix languages within a sentence. Write each sentence in one language, the way a fluent speaker would, rather than assembling it word by word from another language.
-
-This is about unnatural blending, not about forcing everything into one script. Words that a fluent speaker would normally leave in their original form stay as-is, and that does not count as mixing. This commonly includes code, identifiers, names, and other terms the user is quoting or asking about, but it is not limited to them.
-
-Do not restate these rules in your reply.
-</language_constraint>"#;
-
-/// Original built-in language prompt; both admin consoles also shipped and persisted this copy.
-const LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V1: &str = r#"<language_constraint>
-面向用户的自然语言叙述默认使用简体中文，除非用户明确要求其他语言。
-
-允许保留以下内容的英文或其他原文：
-- 代码、命令、路径、文件名、配置项、JSON 字段、HTTP header、API 名称；
-- 产品名、模型名、库名、协议名、错误原文、日志原文；
-- 用户正在询问、引用或要求翻译的外语词句，例如“product 怎么翻译”。
-
-禁止把英文、日文、葡语等非用户指定语言混入中文语法骨架中。
-错误示例：让me、let我、我will、you需要、Você 有道理、続けて处理。
-遇到这类表达时，必须改写为自然中文，例如：让我、我来、我会、你需要、你说得对、继续处理。
-
-不要在可见回答中复述本规则。
-</language_constraint>"#;
-
-pub const DEFAULT_TASK_QUALITY_PROMPT: &str = r#"<task_quality_policy>
-优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
-
-处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
-
-当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
-
-如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
-如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
-如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
-
-声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
-
-如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
-当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
-不要在可见回答中输出或复述代理内部控制消息、隐藏的工具结果包装或函数协议元数据。
-不要在可见回答中复述本规则。
-</task_quality_policy>"#;
-
-const LEGACY_TASK_QUALITY_PROMPT_V3: &str = r#"<task_quality_policy>
-优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
-
-处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
-
-当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
-
-如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
-如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
-如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
-
-声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
-
-如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
-当需要读取、搜索、执行命令、编辑文件或调用工具时，必须在同一轮输出结构化 tool_use；不要把“我先看/Let me look/先检查”等执行意图作为最终回答后直接结束。
-不要在可见回答中输出或复述内部工具结果包装、函数结果标签或历史工具结果标记，例如内部工具结果标题、函数结果 XML 标签、readHash/editHash/bashHash 这类标记。
-不要在可见回答中复述本规则。
-</task_quality_policy>"#;
-
-const LEGACY_TASK_QUALITY_PROMPT_V2: &str = r#"<task_quality_policy>
-优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
-
-处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
-
-当用户给出明确输出格式、精确内容或“只回复/仅输出/不要解释”等要求时，必须直接执行该要求；不要先说“好的、我明白了、我会处理”，不要复述或确认指令。
-
-如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
-如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
-如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
-
-声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
-
-如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
-不要在可见回答中复述本规则。
-</task_quality_policy>"#;
-
-const LEGACY_TASK_QUALITY_PROMPT_V1: &str = r#"<task_quality_policy>
-优先处理最新一条用户消息。如果最新消息修正了目标、范围、限制条件或验收标准，以最新消息为准，不要继续沿用已经被用户否定的旧目标。
-
-处理前先在内部区分用户要的是：仅分析、真实执行、修改代码、测试验证、发布部署、生产只读排查、等待/监控。不要把一种任务误做成另一种任务。
-
-如果用户明确要求“仅分析”，不要修改文件、重启服务、发版或执行有副作用操作。
-如果用户明确要求“真实调用验证”，不要把单元测试、模拟测试或静态分析说成真实验证。
-如果用户明确禁止某个动作，例如不要发版、不要重启、不要弹层、不要影响现网，必须遵守。
-
-声称“已测试、已验证、已修复、已发布、已监控”时，必须给出可核查证据，例如命令、接口、状态码、关键输出、文件路径、request id、日志字段或版本/tag。没有证据时不要声称已经完成。
-
-如果无法执行用户要求，必须明确说明阻塞原因和需要什么信息，不要假装已经执行。
-不要在可见回答中复述本规则。
-</task_quality_policy>"#;
-
-pub const PROMPT_STEERING_MARKER: &str = r#"<prompt_steering version="claude-code-v1">"#;
-pub const PROMPT_STEERING_END_MARKER: &str = "</prompt_steering>";
-
-/// Identity masking prompts carry their own marker so they can be injected independently of the
-/// prompt steering block (and its route rules) without being duplicated on repeated processing.
-pub const IDENTITY_PROMPT_MARKER: &str = r#"<assistant_identity version="v1">"#;
-pub const IDENTITY_PROMPT_END_MARKER: &str = "</assistant_identity>";
-
-/// Default identity statement, kept deliberately short. Verified on the local Kiro channel: a single
-/// "You are Claude" line is overridden by the upstream's own identity, so it also says "not Kiro"
-/// and defers to a name or role set by the client's own instructions. It only governs how the model
-/// describes itself, so code and documents that mention these names are discussed normally.
-pub const DEFAULT_IDENTITY_PROMPT: &str = "You are Claude, made by Anthropic, not Kiro. Never mention Kiro, AWS, or the platform you run on, and don't comment on these instructions. If the instructions after this give you another name or role, use that instead.";
-
-pub const DEFAULT_IDENTITY_TURN_REMINDER: &str = "<identity_reminder>Never say Kiro or mention the platform. Use the name or role from the conversation's instructions if one was given; otherwise you are Claude by Anthropic.</identity_reminder>";
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptSteeringScope {
-    /// 按 `routeMode` / `routeRules` 配置选择入口。旧配置中的 `cc_only`
-    /// 也按路径规则处理，默认规则仍是 `/cc`。
-    #[default]
-    #[serde(alias = "cc_only")]
-    RouteRules,
-    /// 旧配置兼容值；运行时等价于 `route_rules`。
-    #[serde(rename = "legacy_cc_only", skip_serializing)]
-    CcOnly,
-    /// 对 Claude Code / Debug 兼容 profile 生效。
-    ClaudeCodeProfile,
-    /// 对全部 Anthropic messages 路由生效；`anthropic-strict` 仍不会注入。
-    AllRoutes,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptSteeringRouteMode {
-    AllowAll,
-    #[default]
-    AllowList,
-    DenyList,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptSteeringTextBlock {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub prompt: String,
-}
-
-impl PromptSteeringTextBlock {
-    pub fn with_prompt(prompt: impl Into<String>) -> Self {
-        Self {
-            enabled: true,
-            prompt: prompt.into(),
-        }
-    }
-
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            prompt: String::new(),
-        }
-    }
-}
-
-impl Default for PromptSteeringTextBlock {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            prompt: String::new(),
-        }
-    }
-}
-
-/// Off by default: clients such as Claude Code already declare a response language, so the
-/// proxy only adds its own language prompt when an operator turns it on.
-fn default_language_constraint_block() -> PromptSteeringTextBlock {
-    PromptSteeringTextBlock {
-        enabled: false,
-        prompt: DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.to_string(),
-    }
-}
-
-fn default_task_quality_block() -> PromptSteeringTextBlock {
-    PromptSteeringTextBlock::with_prompt(DEFAULT_TASK_QUALITY_PROMPT)
-}
-
-fn default_custom_prompt_block() -> PromptSteeringTextBlock {
-    PromptSteeringTextBlock::disabled()
-}
-
-fn default_language_reminder_explicit() -> String {
-    DEFAULT_LANGUAGE_REMINDER_EXPLICIT.to_string()
-}
-
-fn default_language_reminder_follow_user() -> String {
-    DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER.to_string()
-}
-
-fn default_language_turn_reminder() -> LanguageTurnReminderConfig {
-    LanguageTurnReminderConfig::default()
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptSteeringToggle {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-impl Default for PromptSteeringToggle {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ChunkedWritePromptSteeringConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub system_prompt_enabled: bool,
-    #[serde(default = "default_true")]
-    pub tool_description_enabled: bool,
-}
-
-impl Default for ChunkedWritePromptSteeringConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            system_prompt_enabled: true,
-            tool_description_enabled: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LanguageTurnReminderConfig {
-    /// 是否在当前轮追加语言提醒；默认 true，但只有 language_constraint.enabled 为 true 时才生效。
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// 客户端设置了语言时使用，`{language}` 会被替换成清洗后的语言名。
-    #[serde(default = "default_language_reminder_explicit")]
-    pub explicit_prompt: String,
-    /// 未设置或已清除时使用。
-    #[serde(default = "default_language_reminder_follow_user")]
-    pub follow_user_prompt: String,
-}
-
-impl Default for LanguageTurnReminderConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            explicit_prompt: default_language_reminder_explicit(),
-            follow_user_prompt: default_language_reminder_follow_user(),
-        }
-    }
-}
-
-fn default_identity_prompt() -> String {
-    DEFAULT_IDENTITY_PROMPT.to_string()
-}
-
-fn default_identity_turn_reminder_prompt() -> String {
-    DEFAULT_IDENTITY_TURN_REMINDER.to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityTurnReminderConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_identity_turn_reminder_prompt")]
-    pub prompt: String,
-}
-
-impl Default for IdentityTurnReminderConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            prompt: default_identity_turn_reminder_prompt(),
-        }
-    }
-}
-
-/// Output-side guard that removes channel-revealing self-descriptions ("I'm Kiro", "I'm not
-/// Kiro", remarks about conflicting instructions) from assistant text.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityOutputGuardConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Also guard streaming responses. Streamed text is then released sentence by sentence
-    /// after each sentence is checked, which delays every chunk until its sentence completes.
-    #[serde(default = "default_true")]
-    pub stream_enabled: bool,
-}
-
-impl Default for IdentityOutputGuardConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            stream_enabled: true,
-        }
-    }
-}
-
-/// Assistant identity masking.
-///
-/// Independent of the prompt steering master switch, its route rules, and the strict profile; it
-/// has its own route binding (`routeMode` / `routeRules`, all routes by default). The system block
-/// is placed first; the optional turn reminder is appended to the current user turn on the local
-/// Kiro path, where the upstream injects its own identity; the output guard removes the leaks the
-/// prompt cannot prevent.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityPromptConfig {
-    /// Master switch for every identity feature below except `claudeModelsOnly`. Off by default.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Which messages routes identity masking applies to; all routes by default.
-    #[serde(default = "default_identity_route_mode")]
-    pub route_mode: PromptSteeringRouteMode,
-    #[serde(default)]
-    pub route_rules: Vec<String>,
-    /// Inject the identity statement at the top of the system prompt.
-    #[serde(default = "default_true")]
-    pub prompt_enabled: bool,
-    #[serde(default = "default_identity_prompt")]
-    pub prompt: String,
-    #[serde(default)]
-    pub turn_reminder: IdentityTurnReminderConfig,
-    #[serde(default)]
-    pub output_guard: IdentityOutputGuardConfig,
-    /// External pools usually forward to a real Anthropic-compatible upstream that already
-    /// answers as Claude; enable only if a pool needs the same masking.
-    #[serde(default)]
-    pub apply_to_external_pool: bool,
-    /// List only Claude models in `/v1/models`. The non-Claude upstream catalog (for example
-    /// DeepSeek / GLM / MiniMax / Qwen ids) fingerprints the serving channel. Independent of
-    /// `enabled`; requests that name an unlisted model directly still resolve as before.
-    #[serde(default)]
-    pub claude_models_only: bool,
-    /// Per-route overrides keyed by path prefix (`/v1`, `/cc`, `/dfcache/x`, ...), matched by the
-    /// longest prefix like cache policy path overrides. Unset fields fall back to the defaults
-    /// above; a route with an override is not subject to `routeMode` / `routeRules`.
-    #[serde(default)]
-    pub path_overrides: BTreeMap<String, IdentityRouteOverride>,
-}
-
-/// Identity settings for one route; every field is optional and falls back to the defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityRouteOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_reminder_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_guard_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_guard_stream_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub apply_to_external_pool: Option<bool>,
-}
-
-impl IdentityRouteOverride {
-    pub fn is_empty(&self) -> bool {
-        self == &Self::default()
-    }
-}
-
-impl Default for IdentityPromptConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            route_mode: default_identity_route_mode(),
-            route_rules: Vec::new(),
-            prompt_enabled: true,
-            prompt: default_identity_prompt(),
-            turn_reminder: IdentityTurnReminderConfig::default(),
-            output_guard: IdentityOutputGuardConfig::default(),
-            apply_to_external_pool: false,
-            claude_models_only: false,
-            path_overrides: BTreeMap::new(),
-        }
-    }
-}
-
-fn default_identity_route_mode() -> PromptSteeringRouteMode {
-    PromptSteeringRouteMode::AllowAll
-}
-
-impl IdentityPromptConfig {
-    pub fn normalized(mut self) -> Self {
-        self.route_rules = normalize_route_rules(&self.route_rules);
-        self.path_overrides = std::mem::take(&mut self.path_overrides)
-            .into_iter()
-            .filter(|(_, route)| !route.is_empty())
-            .filter_map(|(prefix, route)| {
-                normalize_reported_usage_path_prefix(&prefix).map(|prefix| (prefix, route))
-            })
-            .collect();
-        self.prompt = self.prompt.trim().to_string();
-        if self.prompt.is_empty() {
-            self.prompt = default_identity_prompt();
-        }
-        self.turn_reminder.prompt = self.turn_reminder.prompt.trim().to_string();
-        if self.turn_reminder.prompt.is_empty() {
-            self.turn_reminder.prompt = default_identity_turn_reminder_prompt();
-        }
-        self
-    }
-
-    /// The per-route override that governs `endpoint`, using the longest matching prefix.
-    pub fn route_override(&self, endpoint: &str) -> Option<(&String, &IdentityRouteOverride)> {
-        self.path_overrides
-            .iter()
-            .filter(|(prefix, _)| reported_usage_path_matches(prefix, endpoint))
-            .max_by_key(|(prefix, _)| prefix.len())
-    }
-
-    /// Whether identity masking is on for `endpoint` (the request path). A route override with an
-    /// explicit `enabled` decides on its own; otherwise the global switch and route rules apply.
-    pub fn applies_to_route(&self, endpoint: &str) -> bool {
-        if let Some(enabled) = self
-            .route_override(endpoint)
-            .and_then(|(_, route)| route.enabled)
-        {
-            return enabled;
-        }
-        self.enabled
-            && match self.route_mode {
-                PromptSteeringRouteMode::AllowAll => true,
-                PromptSteeringRouteMode::AllowList => self
-                    .route_rules
-                    .iter()
-                    .any(|rule| route_rule_matches(rule, endpoint)),
-                PromptSteeringRouteMode::DenyList => !self
-                    .route_rules
-                    .iter()
-                    .any(|rule| route_rule_matches(rule, endpoint)),
-            }
-    }
-
-    /// Resolves the identity settings for one request: everything is off when the route does not
-    /// match, so later stages only check their own switch.
-    pub fn for_route(&self, endpoint: &str) -> Self {
-        let mut resolved = self.clone();
-        resolved.enabled = self.applies_to_route(endpoint);
-        if let Some((_, route)) = self.route_override(endpoint) {
-            if let Some(value) = route.prompt_enabled {
-                resolved.prompt_enabled = value;
-            }
-            if let Some(value) = route.turn_reminder_enabled {
-                resolved.turn_reminder.enabled = value;
-            }
-            if let Some(value) = route.output_guard_enabled {
-                resolved.output_guard.enabled = value;
-            }
-            if let Some(value) = route.output_guard_stream_enabled {
-                resolved.output_guard.stream_enabled = value;
-            }
-            if let Some(value) = route.apply_to_external_pool {
-                resolved.apply_to_external_pool = value;
-            }
-        }
-        resolved
-    }
-
-    pub fn system_prompt_applies(&self) -> bool {
-        self.enabled && self.prompt_enabled
-    }
-
-    /// Turn reminder text for the current user turn, when enabled.
-    pub fn turn_reminder_text(&self) -> Option<&str> {
-        (self.enabled && self.turn_reminder.enabled)
-            .then_some(self.turn_reminder.prompt.trim())
-            .filter(|prompt| !prompt.is_empty())
-    }
-
-    pub fn output_guard_applies(&self, stream: bool) -> bool {
-        self.enabled && self.output_guard.enabled && (!stream || self.output_guard.stream_enabled)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptSteeringConfig {
-    /// 总提示词引导开关。关闭后不注入 language/task/custom、tool_choice、thinking 或
-    /// Write/Edit 分块兼容提示；客户端已经提供的结构化字段仍按原始请求语义保留。
-    /// 当上游缺少原生 reasoning schema 时，显式客户端 reasoning 请求仍可使用专用
-    /// thinking 兼容传输，避免把协议能力请求误判为运营方主动提示词注入。
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub scope: PromptSteeringScope,
-    #[serde(default)]
-    pub route_mode: PromptSteeringRouteMode,
-    #[serde(default = "default_prompt_steering_route_rules")]
-    pub route_rules: Vec<String>,
-    #[serde(default)]
-    pub apply_to_external_pool: bool,
-    #[serde(default = "default_true")]
-    pub apply_to_count_tokens: bool,
-    #[serde(default = "default_language_constraint_block")]
-    pub language_constraint: PromptSteeringTextBlock,
-    #[serde(default = "default_language_turn_reminder")]
-    pub language_turn_reminder: LanguageTurnReminderConfig,
-    #[serde(default = "default_task_quality_block")]
-    pub task_quality: PromptSteeringTextBlock,
-    #[serde(default)]
-    pub tool_choice: PromptSteeringToggle,
-    #[serde(default)]
-    pub chunked_write: ChunkedWritePromptSteeringConfig,
-    #[serde(default)]
-    pub thinking: PromptSteeringToggle,
-    #[serde(default = "default_custom_prompt_block")]
-    pub custom: PromptSteeringTextBlock,
-    /// Assistant identity masking; not gated by `enabled`, scope, or route rules.
-    #[serde(default)]
-    pub identity: IdentityPromptConfig,
-}
-
-impl Default for PromptSteeringConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            scope: PromptSteeringScope::RouteRules,
-            route_mode: PromptSteeringRouteMode::AllowList,
-            route_rules: default_prompt_steering_route_rules(),
-            apply_to_external_pool: false,
-            apply_to_count_tokens: true,
-            language_constraint: default_language_constraint_block(),
-            language_turn_reminder: LanguageTurnReminderConfig::default(),
-            task_quality: default_task_quality_block(),
-            tool_choice: PromptSteeringToggle::default(),
-            chunked_write: ChunkedWritePromptSteeringConfig::default(),
-            thinking: PromptSteeringToggle::default(),
-            custom: default_custom_prompt_block(),
-            identity: IdentityPromptConfig::default(),
-        }
-    }
-}
-
-impl PromptSteeringConfig {
-    pub fn normalized(mut self) -> Self {
-        if self.scope == PromptSteeringScope::CcOnly {
-            self.scope = PromptSteeringScope::RouteRules;
-        }
-        self.route_rules = normalize_route_rules(&self.route_rules);
-        if self.route_mode == PromptSteeringRouteMode::AllowList && self.route_rules.is_empty() {
-            self.route_rules = default_prompt_steering_route_rules();
-        }
-        if self.language_constraint.prompt.trim().is_empty() {
-            self.language_constraint.prompt = DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.to_string();
-        } else {
-            self.language_constraint.prompt = self.language_constraint.prompt.trim().to_string();
-        }
-        if self
-            .language_turn_reminder
-            .explicit_prompt
-            .trim()
-            .is_empty()
-        {
-            self.language_turn_reminder.explicit_prompt = default_language_reminder_explicit();
-        } else {
-            self.language_turn_reminder.explicit_prompt = self
-                .language_turn_reminder
-                .explicit_prompt
-                .trim()
-                .to_string();
-        }
-        if self
-            .language_turn_reminder
-            .follow_user_prompt
-            .trim()
-            .is_empty()
-        {
-            self.language_turn_reminder.follow_user_prompt =
-                default_language_reminder_follow_user();
-        } else {
-            self.language_turn_reminder.follow_user_prompt = self
-                .language_turn_reminder
-                .follow_user_prompt
-                .trim()
-                .to_string();
-        }
-        if self.task_quality.prompt.trim().is_empty() {
-            self.task_quality.prompt = DEFAULT_TASK_QUALITY_PROMPT.to_string();
-        } else {
-            self.task_quality.prompt = self.task_quality.prompt.trim().to_string();
-        }
-        self.custom.prompt = self.custom.prompt.trim().to_string();
-        self.identity = self.identity.normalized();
-        self
-    }
-}
-
-fn default_prompt_steering_route_rules() -> Vec<String> {
-    vec!["/cc".to_string()]
 }
 
 pub const DEFAULT_MISSING_MAX_TOKENS_VALUE: i32 = 20_480;
@@ -4174,13 +3534,15 @@ impl CompatProfile {
 
 /// Thinking 触发策略。
 ///
-/// `real_request` 保持客户端请求的真实语义；`always` 在请求未显式关闭
-/// thinking 时强制进入可见 thinking 输出。
+/// `real_request`：客户端请求带 Claude Code 可见 thinking 信号（如 `ultrathink`）时开启
+/// thinking 并强制可见输出；`always`：请求未显式关闭 thinking 时一律开启；`off`：只按客户端
+/// 显式的 `thinking` 字段处理，代理不自动开启，也不强制可见输出。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingTriggerMode {
     RealRequest,
     Always,
+    Off,
 }
 
 impl Default for ThinkingTriggerMode {
@@ -5461,7 +4823,7 @@ pub struct Config {
     /// 单个下游请求允许发出的辅助上游 HTTP 请求硬上限。
     ///
     /// Token refresh 与 enterprise profile discovery 共享该 request-scoped 预算；
-    /// 不计入 inferenceUpstreamMaxAttempts，也不受 prompt steering 开关控制。
+    /// 不计入 inferenceUpstreamMaxAttempts，也不受提示词注入开关控制。
     #[serde(default = "default_auxiliary_upstream_max_attempts")]
     pub auxiliary_upstream_max_attempts: u32,
 
@@ -5619,10 +4981,21 @@ pub struct Config {
     #[serde(default)]
     pub body_conversion: BodyConversionConfig,
 
-    /// 提示词引导配置。默认路径规则仍只命中 `/cc`，但实际生效范围由配置决定。
-    /// `enabled` 是所有代理新增提示内容的总开关；子开关只在总开关开启时进一步细分。
+    /// 代理写进上游请求的提示词：每一项的全局默认、可编辑文本和按路由的显式设置。
     #[serde(default)]
-    pub prompt_steering: PromptSteeringConfig,
+    pub prompt_injection: PromptInjectionConfig,
+
+    /// 按路由控制的功能（`-thinking` 模型名、thinking 触发、渠道信息过滤、WebSearch 模型驱动）。
+    #[serde(default)]
+    pub route_features: RouteFeaturesConfig,
+
+    /// `/v1/models` 只列出 Claude 模型，避免非 Claude 上游目录暴露渠道。
+    #[serde(default)]
+    pub claude_models_only: bool,
+
+    /// 旧配置字段，只用于迁移，加载后转换成上面三个字段。
+    #[serde(default, skip_serializing)]
+    pub prompt_steering: Option<serde_json::Value>,
 
     /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略。
     #[serde(default)]
@@ -5776,9 +5149,9 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// thinking 触发策略（默认按真实请求触发）。
-    #[serde(default = "default_thinking_trigger_mode")]
-    pub thinking_trigger_mode: ThinkingTriggerMode,
+    /// 旧配置字段，只用于迁移：现在是 `routeFeatures` 的 `thinkingTrigger`。
+    #[serde(default, skip_serializing)]
+    pub thinking_trigger_mode: Option<ThinkingTriggerMode>,
 
     /// 本地 prompt-cache 模拟的目标 cache read 中心比例。
     ///
@@ -5915,7 +5288,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 12;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 13;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -6307,10 +5680,6 @@ fn default_model_resolution_mode() -> ModelResolutionMode {
 
 fn default_extract_thinking() -> bool {
     true
-}
-
-fn default_thinking_trigger_mode() -> ThinkingTriggerMode {
-    ThinkingTriggerMode::RealRequest
 }
 
 fn default_true() -> bool {
@@ -6835,7 +6204,7 @@ fn normalize_reported_usage_normal_max_multiplier(value: f64) -> f64 {
     }
 }
 
-fn normalize_reported_usage_path_prefix(prefix: &str) -> Option<String> {
+pub(crate) fn normalize_reported_usage_path_prefix(prefix: &str) -> Option<String> {
     let trimmed = prefix.trim();
     if trimmed.is_empty() {
         return None;
@@ -6853,7 +6222,7 @@ fn normalize_reported_usage_path_prefix(prefix: &str) -> Option<String> {
     })
 }
 
-fn reported_usage_path_matches(prefix: &str, path: &str) -> bool {
+pub(crate) fn reported_usage_path_matches(prefix: &str, path: &str) -> bool {
     if prefix == "/" {
         return true;
     }
@@ -7045,7 +6414,10 @@ impl Default for Config {
             compression: CompressionConfig::default(),
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
-            prompt_steering: PromptSteeringConfig::default(),
+            prompt_injection: PromptInjectionConfig::default(),
+            route_features: RouteFeaturesConfig::default(),
+            claude_models_only: false,
+            prompt_steering: None,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
@@ -7076,7 +6448,7 @@ impl Default for Config {
             model_resolution_mode: default_model_resolution_mode(),
             model_mapping: ModelMappingConfig::default(),
             extract_thinking: default_extract_thinking(),
-            thinking_trigger_mode: default_thinking_trigger_mode(),
+            thinking_trigger_mode: None,
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
             prompt_cache_token_scale: default_prompt_cache_token_scale(),
             prompt_cache_max_simulated_input_tokens:
@@ -7296,7 +6668,9 @@ impl Config {
     /// Apply one-way runtime config migrations that keep old PgSQL configs aligned
     /// with current built-in route semantics.
     pub fn apply_runtime_config_migrations(&mut self) -> bool {
-        let mut changed = self.cache_policy.migrate_builtin_no_cache_routes();
+        // 旧的提示词字段要按迁移前的版本号先做 v2–v12 的文本替换，所以在版本号推进前转换。
+        let mut changed = self.migrate_legacy_prompt_fields();
+        changed |= self.cache_policy.migrate_builtin_no_cache_routes();
         if self.runtime_config_migration_version < 1 {
             if self.payload_guard_mode == PayloadGuardMode::Preemptive {
                 self.payload_guard_mode = PayloadGuardMode::OnTooLong;
@@ -7305,26 +6679,17 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 2 {
-            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V1 {
-                self.prompt_steering.task_quality.prompt =
-                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
-            }
+            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
             self.runtime_config_migration_version = 2;
             changed = true;
         }
         if self.runtime_config_migration_version < 3 {
-            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V2 {
-                self.prompt_steering.task_quality.prompt =
-                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
-            }
+            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
             self.runtime_config_migration_version = 3;
             changed = true;
         }
         if self.runtime_config_migration_version < 4 {
-            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V3 {
-                self.prompt_steering.task_quality.prompt =
-                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
-            }
+            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
             self.runtime_config_migration_version = 4;
             changed = true;
         }
@@ -7354,13 +6719,7 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 6 {
-            // Both frontend defaults could persist the v3 built-in fingerprint prompt after
-            // the original v4 migration had already completed. Replace only the exact built-in
-            // bytes so user-edited prompts remain authoritative.
-            if self.prompt_steering.task_quality.prompt == LEGACY_TASK_QUALITY_PROMPT_V3 {
-                self.prompt_steering.task_quality.prompt =
-                    DEFAULT_TASK_QUALITY_PROMPT.trim().to_string();
-            }
+            // 提示词文本替换已并入 migrate_legacy_prompt_fields。
             self.runtime_config_migration_version = 6;
             changed = true;
         }
@@ -7381,10 +6740,7 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 9 {
-            // External pools should behave like the configured upstream service by default. The
-            // older default injected operator prompt steering into fallback pool requests, which
-            // changes prompt content, token accounting, and third-party protocol compliance tests.
-            self.prompt_steering.apply_to_external_pool = false;
+            // 提示词相关的改动已并入 migrate_legacy_prompt_fields。
             self.runtime_config_migration_version = 9;
             changed = true;
         }
@@ -7405,45 +6761,68 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 11 {
-            // The language prompt now resolves the reply language from the client (explicit user
-            // request, then a client-declared language such as Claude Code's `language` setting,
-            // then the user's own messages). Replace only the exact built-in bytes; operator-edited
-            // prompt text stays authoritative.
-            let prompt = self.prompt_steering.language_constraint.prompt.trim();
-            if prompt == LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V1.trim()
-                || prompt == LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V2.trim()
-            {
-                self.prompt_steering.language_constraint.prompt =
-                    DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim().to_string();
-            }
-            // The proxy language prompt is now opt-in. Older configs materialized the former
-            // default `enabled: true`, so turn it off once; operators can enable it again.
-            self.prompt_steering.language_constraint.enabled = false;
+            // 提示词相关的改动已并入 migrate_legacy_prompt_fields。
             self.runtime_config_migration_version = 11;
             changed = true;
         }
         if self.runtime_config_migration_version < 12 {
-            // Language prompts now scope to visible output and the turn reminders are short labels.
-            // Replace only the exact built-in bytes; operator-edited text stays authoritative and
-            // the enabled switches are left untouched.
-            let steering = &mut self.prompt_steering;
-            if steering.language_constraint.prompt.trim()
-                == LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V3.trim()
-            {
-                steering.language_constraint.prompt =
-                    DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim().to_string();
-            }
-            let reminder = &mut steering.language_turn_reminder;
-            if reminder.explicit_prompt.trim() == LEGACY_LANGUAGE_REMINDER_EXPLICIT_V1 {
-                reminder.explicit_prompt = default_language_reminder_explicit();
-            }
-            if reminder.follow_user_prompt.trim() == LEGACY_LANGUAGE_REMINDER_FOLLOW_USER_V1 {
-                reminder.follow_user_prompt = default_language_reminder_follow_user();
-            }
+            // 提示词相关的改动已并入 migrate_legacy_prompt_fields。
             self.runtime_config_migration_version = 12;
             changed = true;
         }
+        if self.runtime_config_migration_version < 13 {
+            // v13：提示词配置改为 promptInjection / routeFeatures（见 migrate_legacy_prompt_fields）。
+            self.runtime_config_migration_version = 13;
+            changed = true;
+        }
         changed
+    }
+
+    /// 旧字段（`promptSteering`、`thinkingTriggerMode`、`bodyConversion` 里的两个提示词开关和
+    /// `modelDrivenWebSearch`）存在时，转换成等价的 `promptInjection` / `routeFeatures` /
+    /// `claudeModelsOnly`，然后清掉旧字段。返回是否有改动。
+    ///
+    /// 只看旧字段是否存在、不看版本号：配置文件加载时版本号会直接设成最新，旧实例写回 PgSQL
+    /// 的配置也可能带着最新版本号，两种情况都要转换。旧字段无法解析时保留新字段的现值并记录错误。
+    pub fn migrate_legacy_prompt_fields(&mut self) -> bool {
+        use super::prompt_injection::{legacy, migrate};
+        let raw_steering = self.prompt_steering.take();
+        let thinking_trigger_mode = self.thinking_trigger_mode.take();
+        let chunked_tool_policy = self.body_conversion.chunked_tool_policy.take();
+        let thinking_prompt_controls = self.body_conversion.thinking_prompt_controls.take();
+        let model_driven_web_search = self.body_conversion.model_driven_web_search.take();
+        let prompt_steering = match raw_steering {
+            Some(value) => match serde_json::from_value::<legacy::PromptSteeringConfig>(value) {
+                Ok(mut steering) => {
+                    legacy::apply_legacy_versioned_migrations(
+                        &mut steering,
+                        self.runtime_config_migration_version,
+                    );
+                    Some(steering)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "旧 promptSteering 配置无法解析，提示词注入保持当前配置");
+                    return true;
+                }
+            },
+            None => None,
+        };
+        let legacy_fields = migrate::LegacyPromptFields {
+            prompt_steering,
+            thinking_trigger_mode,
+            chunked_tool_policy,
+            thinking_prompt_controls,
+            model_driven_web_search,
+        };
+        if legacy_fields.is_empty() {
+            return false;
+        }
+        let migrated = migrate::migrate(legacy_fields, self.compat_profile);
+        self.prompt_injection = migrated.prompt_injection;
+        self.route_features = migrated.route_features;
+        self.claude_models_only = migrated.claude_models_only;
+        tracing::info!("旧提示词配置已转换为 promptInjection / routeFeatures");
+        true
     }
 
     /// 从文件加载配置
@@ -7463,6 +6842,7 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
+        config.migrate_legacy_prompt_fields();
         config.apply_env_overrides();
         config
             .validate_redis_fault_domains()
@@ -7542,59 +6922,6 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn model_driven_web_search_is_off_by_default_and_follows_the_longest_route_override() {
-        let mut config = super::ModelDrivenWebSearchConfig::default();
-        assert!(!config.enabled_for_route("/v1/messages"));
-        config.path_overrides.insert("/cc".to_string(), true);
-        config.path_overrides.insert("/cc/off".to_string(), false);
-        assert!(config.enabled_for_route("/cc/v1/messages"));
-        assert!(!config.enabled_for_route("/cc/off/v1/messages"));
-        assert!(!config.enabled_for_route("/ccx/v1/messages"));
-        config.enabled = true;
-        assert!(config.enabled_for_route("/v1/messages"));
-        assert!(!config.enabled_for_route("/cc/off/v1/messages"));
-
-        let parsed: super::BodyConversionConfig =
-            serde_json::from_value(serde_json::json!({})).expect("body conversion");
-        assert!(!parsed.model_driven_web_search.enabled);
-    }
-
-    #[test]
-    fn prompt_steering_language_turn_reminder_defaults_and_normalizes() {
-        let mut config: PromptSteeringConfig = serde_json::from_value(serde_json::json!({}))
-            .expect("legacy prompt steering config should deserialize");
-        assert_eq!(
-            config.language_turn_reminder,
-            LanguageTurnReminderConfig::default()
-        );
-
-        config.language_turn_reminder.explicit_prompt = "  ".to_string();
-        config.language_turn_reminder.follow_user_prompt = "  custom follow  ".to_string();
-        let normalized = config.normalized();
-        assert_eq!(
-            normalized.language_turn_reminder.explicit_prompt,
-            DEFAULT_LANGUAGE_REMINDER_EXPLICIT
-        );
-        assert_eq!(
-            normalized.language_turn_reminder.follow_user_prompt,
-            "custom follow"
-        );
-
-        let serialized = serde_json::to_value(normalized).expect("serialize prompt steering");
-        assert!(serialized.get("languageTurnReminder").is_some());
-        assert!(
-            serialized["languageTurnReminder"]
-                .get("explicitPrompt")
-                .is_some()
-        );
-        assert!(
-            serialized["languageTurnReminder"]
-                .get("followUserPrompt")
-                .is_some()
-        );
-    }
 
     #[test]
     fn observability_redis_is_optional_and_uses_its_own_prefix() {
@@ -10351,148 +9678,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_migration_disables_legacy_external_pool_prompt_steering_once() {
-        let mut config = Config {
-            runtime_config_migration_version: 8,
-            prompt_steering: PromptSteeringConfig {
-                apply_to_external_pool: true,
-                ..PromptSteeringConfig::default()
-            },
-            ..Config::default()
-        };
-
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(
-            config.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert!(!config.prompt_steering.apply_to_external_pool);
-
-        config.prompt_steering.apply_to_external_pool = true;
-        assert!(!config.apply_runtime_config_migrations());
-        assert!(config.prompt_steering.apply_to_external_pool);
-
-        let current: Config = serde_json::from_value(serde_json::json!({
-            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
-            "promptSteering": {
-                "applyToExternalPool": true
-            }
-        }))
-        .unwrap();
-        assert!(current.prompt_steering.apply_to_external_pool);
-
-        let current_without_field: Config = serde_json::from_value(serde_json::json!({
-            "runtimeConfigMigrationVersion": CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
-            "promptSteering": {}
-        }))
-        .unwrap();
-        assert!(!current_without_field.prompt_steering.apply_to_external_pool);
-    }
-
-    #[test]
-    fn runtime_config_migration_replaces_only_built_in_language_prompts_once() {
-        for legacy in [
-            LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V1,
-            LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V2,
-        ] {
-            let mut config = Config {
-                runtime_config_migration_version: 10,
-                ..Config::default()
-            };
-            config.prompt_steering.language_constraint.enabled = true;
-            config.prompt_steering.language_constraint.prompt = legacy.to_string();
-
-            assert!(config.apply_runtime_config_migrations());
-            assert!(!config.prompt_steering.language_constraint.enabled);
-            assert_eq!(
-                config.prompt_steering.language_constraint.prompt,
-                DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim()
-            );
-            assert_eq!(
-                config.runtime_config_migration_version,
-                CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-            );
-
-            // Once migrated, an operator may re-enable it or restore the old wording on purpose.
-            config.prompt_steering.language_constraint.enabled = true;
-            config.prompt_steering.language_constraint.prompt = legacy.to_string();
-            assert!(!config.apply_runtime_config_migrations());
-            assert!(config.prompt_steering.language_constraint.enabled);
-            assert_eq!(config.prompt_steering.language_constraint.prompt, legacy);
-        }
-
-        let custom = "<language_constraint>始终使用简体中文。</language_constraint>";
-        let mut edited = Config {
-            runtime_config_migration_version: 10,
-            ..Config::default()
-        };
-        edited.prompt_steering.language_constraint.prompt = custom.to_string();
-        assert!(edited.apply_runtime_config_migrations());
-        assert_eq!(edited.prompt_steering.language_constraint.prompt, custom);
-    }
-
-    #[test]
-    fn runtime_config_migration_v12_replaces_only_built_in_language_texts() {
-        let mut config = Config {
-            runtime_config_migration_version: 11,
-            ..Config::default()
-        };
-        config.prompt_steering.language_constraint.enabled = true;
-        config.prompt_steering.language_constraint.prompt =
-            LEGACY_LANGUAGE_CONSTRAINT_PROMPT_V3.trim().to_string();
-        config
-            .prompt_steering
-            .language_turn_reminder
-            .explicit_prompt = LEGACY_LANGUAGE_REMINDER_EXPLICIT_V1.to_string();
-        config
-            .prompt_steering
-            .language_turn_reminder
-            .follow_user_prompt = LEGACY_LANGUAGE_REMINDER_FOLLOW_USER_V1.to_string();
-
-        assert!(config.apply_runtime_config_migrations());
-        let steering = &config.prompt_steering;
-        assert!(steering.language_constraint.enabled);
-        assert_eq!(
-            steering.language_constraint.prompt,
-            DEFAULT_LANGUAGE_CONSTRAINT_PROMPT.trim()
-        );
-        assert_eq!(
-            steering.language_turn_reminder.explicit_prompt,
-            DEFAULT_LANGUAGE_REMINDER_EXPLICIT
-        );
-        assert_eq!(
-            steering.language_turn_reminder.follow_user_prompt,
-            DEFAULT_LANGUAGE_REMINDER_FOLLOW_USER
-        );
-        assert!(!config.apply_runtime_config_migrations());
-
-        let mut edited = Config {
-            runtime_config_migration_version: 11,
-            ..Config::default()
-        };
-        edited.prompt_steering.language_constraint.prompt =
-            "<language_constraint>custom</language_constraint>".to_string();
-        edited
-            .prompt_steering
-            .language_turn_reminder
-            .follow_user_prompt = "<language_reminder>custom</language_reminder>".to_string();
-        edited.prompt_steering.language_turn_reminder.enabled = false;
-        assert!(edited.apply_runtime_config_migrations());
-        assert_eq!(
-            edited.prompt_steering.language_constraint.prompt,
-            "<language_constraint>custom</language_constraint>"
-        );
-        assert_eq!(
-            edited
-                .prompt_steering
-                .language_turn_reminder
-                .follow_user_prompt,
-            "<language_reminder>custom</language_reminder>"
-        );
-        assert!(!edited.prompt_steering.language_turn_reminder.enabled);
-    }
-
-    #[test]
     fn runtime_config_migration_adds_404_to_external_pool_retry_status_codes_once() {
         let mut config = Config {
             runtime_config_migration_version: 9,
@@ -10516,192 +9701,6 @@ mod tests {
         config.external_pools.external_pool_retry_status_codes =
             vec![404, 408, 425, 429, 500, 502, 503, 504, 529];
         assert!(!config.apply_runtime_config_migrations());
-    }
-
-    #[test]
-    fn runtime_config_migration_updates_legacy_default_task_quality_prompt_only() {
-        let mut legacy_default = Config {
-            runtime_config_migration_version: 1,
-            ..Default::default()
-        };
-        legacy_default.prompt_steering.task_quality.prompt =
-            LEGACY_TASK_QUALITY_PROMPT_V1.to_string();
-
-        assert!(legacy_default.apply_runtime_config_migrations());
-        assert_eq!(
-            legacy_default.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert_eq!(
-            legacy_default.prompt_steering.task_quality.prompt,
-            DEFAULT_TASK_QUALITY_PROMPT.trim()
-        );
-
-        let mut legacy_default_v2 = Config {
-            runtime_config_migration_version: 2,
-            ..Default::default()
-        };
-        legacy_default_v2.prompt_steering.task_quality.prompt =
-            LEGACY_TASK_QUALITY_PROMPT_V2.to_string();
-
-        assert!(legacy_default_v2.apply_runtime_config_migrations());
-        assert_eq!(
-            legacy_default_v2.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert_eq!(
-            legacy_default_v2.prompt_steering.task_quality.prompt,
-            DEFAULT_TASK_QUALITY_PROMPT.trim()
-        );
-
-        let mut custom = Config {
-            runtime_config_migration_version: 1,
-            ..Default::default()
-        };
-        custom.prompt_steering.task_quality.prompt = "custom task prompt".to_string();
-
-        assert!(custom.apply_runtime_config_migrations());
-        assert_eq!(
-            custom.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert_eq!(
-            custom.prompt_steering.task_quality.prompt,
-            "custom task prompt"
-        );
-
-        let mut legacy_default_v3 = Config {
-            runtime_config_migration_version: 3,
-            ..Default::default()
-        };
-        legacy_default_v3.prompt_steering.task_quality.prompt =
-            LEGACY_TASK_QUALITY_PROMPT_V3.to_string();
-
-        assert!(legacy_default_v3.apply_runtime_config_migrations());
-        assert_eq!(
-            legacy_default_v3.runtime_config_migration_version,
-            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
-        );
-        assert_eq!(
-            legacy_default_v3.prompt_steering.task_quality.prompt,
-            DEFAULT_TASK_QUALITY_PROMPT.trim()
-        );
-
-        let mut customized_v3 = Config {
-            runtime_config_migration_version: 3,
-            ..Default::default()
-        };
-        customized_v3.prompt_steering.task_quality.prompt =
-            format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix");
-
-        assert!(customized_v3.apply_runtime_config_migrations());
-        assert_eq!(
-            customized_v3.prompt_steering.task_quality.prompt,
-            format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix")
-        );
-
-        let mut whitespace_customized_v3 = Config {
-            runtime_config_migration_version: 3,
-            ..Default::default()
-        };
-        whitespace_customized_v3.prompt_steering.task_quality.prompt =
-            format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}");
-
-        assert!(whitespace_customized_v3.apply_runtime_config_migrations());
-        assert_eq!(
-            whitespace_customized_v3.prompt_steering.task_quality.prompt,
-            format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}")
-        );
-
-        let mut persisted_by_old_ui_at_v5 = Config {
-            runtime_config_migration_version: 5,
-            ..Default::default()
-        };
-        persisted_by_old_ui_at_v5
-            .prompt_steering
-            .task_quality
-            .prompt = LEGACY_TASK_QUALITY_PROMPT_V3.to_string();
-        assert!(persisted_by_old_ui_at_v5.apply_runtime_config_migrations());
-        assert_eq!(
-            persisted_by_old_ui_at_v5
-                .prompt_steering
-                .task_quality
-                .prompt,
-            DEFAULT_TASK_QUALITY_PROMPT.trim()
-        );
-
-        for custom_prompt in [
-            format!("{LEGACY_TASK_QUALITY_PROMPT_V3}\ncustom suffix"),
-            format!(" {LEGACY_TASK_QUALITY_PROMPT_V3}"),
-            "operator custom task prompt".to_string(),
-        ] {
-            let mut customized_at_v5 = Config {
-                runtime_config_migration_version: 5,
-                ..Default::default()
-            };
-            customized_at_v5.prompt_steering.task_quality.prompt = custom_prompt.clone();
-            assert!(customized_at_v5.apply_runtime_config_migrations());
-            assert_eq!(
-                customized_at_v5.prompt_steering.task_quality.prompt, custom_prompt,
-                "v6 migration must preserve user-edited prompt bytes"
-            );
-        }
-    }
-
-    #[test]
-    fn prompt_master_protocol_capabilities_and_prompt_subtoggles_round_trip_independently() {
-        for round in 0..5 {
-            for mask in 0_u8..128 {
-                let mut config = Config::default();
-                config.prompt_steering.enabled = mask & 1 != 0;
-                config.body_conversion.tool_choice_steering = mask & 2 != 0;
-                config.body_conversion.thinking_prompt_controls = mask & 4 != 0;
-                config.body_conversion.chunked_tool_policy = mask & 8 != 0;
-                config.prompt_steering.tool_choice.enabled = mask & 16 != 0;
-                config.prompt_steering.thinking.enabled = mask & 32 != 0;
-                config.prompt_steering.chunked_write.enabled = mask & 64 != 0;
-
-                let encoded = serde_json::to_string(&config)
-                    .unwrap_or_else(|error| panic!("round {round}, mask {mask}: {error}"));
-                let decoded: Config = serde_json::from_str(&encoded)
-                    .unwrap_or_else(|error| panic!("round {round}, mask {mask}: {error}"));
-
-                assert_eq!(
-                    decoded.prompt_steering.enabled, config.prompt_steering.enabled,
-                    "round {round}, mask {mask}: operator prompt master"
-                );
-                assert_eq!(
-                    decoded.body_conversion.tool_choice_steering,
-                    config.body_conversion.tool_choice_steering,
-                    "round {round}, mask {mask}: structured tool_choice capability"
-                );
-                assert_eq!(
-                    decoded.body_conversion.thinking_prompt_controls,
-                    config.body_conversion.thinking_prompt_controls,
-                    "round {round}, mask {mask}: thinking capability"
-                );
-                assert_eq!(
-                    decoded.body_conversion.chunked_tool_policy,
-                    config.body_conversion.chunked_tool_policy,
-                    "round {round}, mask {mask}: chunked capability"
-                );
-                assert_eq!(
-                    decoded.prompt_steering.tool_choice.enabled,
-                    config.prompt_steering.tool_choice.enabled,
-                    "round {round}, mask {mask}: tool_choice prompt"
-                );
-                assert_eq!(
-                    decoded.prompt_steering.thinking.enabled,
-                    config.prompt_steering.thinking.enabled,
-                    "round {round}, mask {mask}: thinking prompt"
-                );
-                assert_eq!(
-                    decoded.prompt_steering.chunked_write.enabled,
-                    config.prompt_steering.chunked_write.enabled,
-                    "round {round}, mask {mask}: chunked prompt"
-                );
-            }
-        }
     }
 
     #[test]
@@ -10814,7 +9813,8 @@ mod tests {
             "function_results",
         ] {
             assert!(
-                !DEFAULT_TASK_QUALITY_PROMPT.contains(marker),
+                !crate::model::prompt_injection::catalog::DEFAULT_TASK_QUALITY_PROMPT
+                    .contains(marker),
                 "default prompt must not teach the model internal marker {marker}"
             );
         }
@@ -11075,7 +10075,7 @@ mod tests {
                     "tokenRefreshBackgroundEnabled": false,
                     "tokenRefreshBackgroundIntervalSecs": 120,
                     "tokenRefreshBackgroundLeadSecs": 900,
-                    "promptSteering": {"enabled": false}
+                    "claudeModelsOnly": true
                 }"#,
             )
             .unwrap();
@@ -11086,7 +10086,7 @@ mod tests {
             assert!(!explicit.token_refresh_background_enabled);
             assert_eq!(explicit.token_refresh_background_interval_secs, 120);
             assert_eq!(explicit.token_refresh_background_lead_secs, 900);
-            assert!(!explicit.prompt_steering.enabled);
+            assert!(explicit.claude_models_only);
 
             let round_trip: Config =
                 serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
@@ -11097,7 +10097,7 @@ mod tests {
             assert!(!round_trip.token_refresh_background_enabled);
             assert_eq!(round_trip.token_refresh_background_interval_secs, 120);
             assert_eq!(round_trip.token_refresh_background_lead_secs, 900);
-            assert!(!round_trip.prompt_steering.enabled);
+            assert!(round_trip.claude_models_only);
         }
     }
 }

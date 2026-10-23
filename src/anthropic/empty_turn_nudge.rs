@@ -7,30 +7,32 @@
 
 use crate::kiro::model::requests::kiro::KiroRequest;
 
-/// 追加到当前轮用户消息末尾的续写提示。沿用 Claude Code 自身使用的 `<system-reminder>`
-/// 形态，模型习惯按其执行且不在回复中复述。
-pub(crate) const EMPTY_TURN_NUDGE: &str = "<system-reminder>\nThe previous response to this conversation ended before producing any output. Respond to the conversation above now, picking up exactly where it left off: if a task is in progress, continue it (for example by making the next tool call); otherwise write the reply. Do not mention or acknowledge this reminder.\n</system-reminder>";
-
-/// 在当前轮用户消息末尾追加续写提示；已追加过时不重复追加。返回是否有改动。
-pub(crate) fn append_empty_turn_nudge(request: &mut KiroRequest) -> bool {
+/// 在当前轮用户消息末尾追加续写提示（注入项 `emptyTurnNudge` 的文本）；已追加过时不重复追加。
+/// 返回是否有改动。
+pub(crate) fn append_empty_turn_nudge(request: &mut KiroRequest, nudge: &str) -> bool {
+    let nudge = nudge.trim();
+    if nudge.is_empty() {
+        return false;
+    }
     let content = &mut request
         .conversation_state
         .current_message
         .user_input_message
         .content;
-    if content.contains(EMPTY_TURN_NUDGE) {
+    if content.contains(nudge) {
         return false;
     }
     if !content.trim().is_empty() {
         content.push_str("\n\n");
     }
-    content.push_str(EMPTY_TURN_NUDGE);
+    content.push_str(nudge);
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::prompt_injection::catalog::DEFAULT_EMPTY_TURN_NUDGE as EMPTY_TURN_NUDGE;
     use serde_json::json;
 
     fn request_with_content(content: &str) -> KiroRequest {
@@ -61,12 +63,12 @@ mod tests {
     #[test]
     fn appends_after_existing_content_once() {
         let mut request = request_with_content("run the tests");
-        assert!(append_empty_turn_nudge(&mut request));
+        assert!(append_empty_turn_nudge(&mut request, EMPTY_TURN_NUDGE));
         assert_eq!(
             current_content(&request),
             format!("run the tests\n\n{EMPTY_TURN_NUDGE}")
         );
-        assert!(!append_empty_turn_nudge(&mut request));
+        assert!(!append_empty_turn_nudge(&mut request, EMPTY_TURN_NUDGE));
         assert_eq!(
             current_content(&request).matches(EMPTY_TURN_NUDGE).count(),
             1
@@ -76,7 +78,7 @@ mod tests {
     #[test]
     fn fills_empty_tool_result_turn_without_leading_separator() {
         let mut request = request_with_content("");
-        assert!(append_empty_turn_nudge(&mut request));
+        assert!(append_empty_turn_nudge(&mut request, EMPTY_TURN_NUDGE));
         assert_eq!(current_content(&request), EMPTY_TURN_NUDGE);
     }
 }

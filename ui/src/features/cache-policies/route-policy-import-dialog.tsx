@@ -79,7 +79,7 @@ export function RoutePolicyImportDialog({
         <Textarea
           id="route-policy-import-text"
           className="min-h-72 font-mono text-xs"
-          placeholder={'{\n  "format": "kiro-rs-route-policy",\n  "version": 1,\n  "cachePolicy": { "cacheType": "current_high_cache" },\n  "identity": {}\n}'}
+          placeholder={'{\n  "format": "kiro-rs-route-policy",\n  "version": 2,\n  "cachePolicy": { "cacheType": "current_high_cache" },\n  "promptInjection": {},\n  "features": {}\n}'}
           value={text}
           aria-invalid={Boolean(error)}
           aria-describedby={error ? 'route-policy-import-error' : undefined}

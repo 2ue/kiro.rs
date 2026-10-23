@@ -78,7 +78,7 @@ Out of scope:
 | 调度模式分散、无法统一解释 route/fallback/rescue | Open design | [Route planner and capacity ledger](topics/route-planner-capacity-ledger.md) |
 | thinking signature / redacted thinking / payload guard 风险 | Open blocker | [Thinking signature protocol safety](topics/thinking-signature-protocol-safety.md) |
 | 生产 `THINKING_SIGNATURE_INVALID`、stream read error、retry 后 too-long 归因 | Completed read-only audits; retry-state-machine, observability and protocol follow-ups open | [Production Thinking Signature audit](topics/production-thinking-signature-error-20260928.md) |
-| Claude Code / Kiro reasoning 400 与入口拒绝记录 `model=unknown`、内容/诊断缺失 | Audit complete; explicit reasoning fallback fixed locally and verified with real Claude Code CLI; release/deploy validation pending | [Official Claude Code / Anthropic 与 Kiro protocol audit](topics/official-claude-code-kiro-protocol-audit-20260928.md) |
+| Claude Code / Kiro reasoning 400 与入口拒绝记录 `model=unknown`、内容/诊断缺失 | Audit complete; the thinking compatibility tags are now the per-route injection item `thinkingControls`, verified with real Claude Code CLI; release/deploy validation pending | [Official Claude Code / Anthropic 与 Kiro protocol audit](topics/official-claude-code-kiro-protocol-audit-20260928.md) |
 | OpenAI 官方 Chat/Responses ↔ Kiro 协议互转入口缺失 | Planning only; current service exposes Anthropic Messages routes and has no `/v1/chat/completions` or `/v1/responses` | [OpenAI/Kiro protocol interop refactor plan](topics/openai-kiro-protocol-interop-refactor-plan.md) |
 | 真实 CLI / load chaos / release gates 未全量闭环 | Open validation | [Validation and release gates](topics/validation-and-release-gates.md) |
 | 项目文档状态漂移、旧分析未归档 | In progress | [Document disposition](indexes/document-disposition.md) |

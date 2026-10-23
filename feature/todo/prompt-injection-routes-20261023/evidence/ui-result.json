@@ -1,0 +1,125 @@
+{
+  "results": [
+    {
+      "name": "注入项页列出全部 14 个注入项",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "每项显示关闭后的影响",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "关闭\"建议开\"的项出现红色提示",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "保存后接口返回的默认值为关",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "刷新后开关保持",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "编辑文本后显示\"已修改\"",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "去掉 <language_reminder> 标签保存被拒绝",
+      "ok": true,
+      "detail": "保存失败：提示词注入文本 languageTurnReminder.followUser 必须保留 <language_reminder>"
+    },
+    {
+      "name": "恢复默认后\"已修改\"消失",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "批量全部设为关弹出确认",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "路由矩阵列出内置路由",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "不可关闭内容展示 system 确认句",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "预览 /cc + any 注入 A1/A7/A8/B3/B4",
+      "ok": true,
+      "detail": "A1,A2,A3,A4,A5,A6,A7,A8,B3,B4"
+    },
+    {
+      "name": "预览显示 tool_choice 前缀和工具描述后缀",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "从矩阵链接打开路由编辑并停在提示词注入分区",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "路由编辑弹窗有三个分区",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "保存后 /ha 显式开启任务质量",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "保存后 /ha 显式开启 WebSearch 模型驱动",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "路由卡片显示注入数量与功能徽标",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "运行配置页不再有\"启用提示词引导\"总开关",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "1440px 宽度下页面没有横向溢出",
+      "ok": true,
+      "detail": "overflow=-9"
+    },
+    {
+      "name": "1024px 宽度下页面没有横向溢出",
+      "ok": true,
+      "detail": "overflow=-9"
+    },
+    {
+      "name": "390px 宽度下页面没有横向溢出",
+      "ok": true,
+      "detail": "overflow=-9"
+    },
+    {
+      "name": "Tab 可以用方向键切换",
+      "ok": true,
+      "detail": "路由矩阵"
+    },
+    {
+      "name": "页面没有控制台错误",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "consoleErrors": []
+}

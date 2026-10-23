@@ -6,7 +6,7 @@ Status: Archived on 2026-07-28
 
 Authority: Preserves the July runtime-correctness/release-hardening workspace history; does not define current project status, current release readiness, or current scheduler/runtime direction
 
-Read when: Retrieving the old feature final report, old implementation status, or old remediation/prompt-injection plans
+Read when: Retrieving the old feature final report, old implementation status, or old remediation plans
 
 Current authority: [Rust Runtime Scheduler Stabilization](../../plantree/plans/rust-runtime-scheduler-stabilization/README.md), [feature issues](../../../feature/issues/README.md), [feature evidence](../../../feature/evidence/README.md), and current source
 
@@ -16,7 +16,7 @@ Current authority: [Rust Runtime Scheduler Stabilization](../../plantree/plans/r
 | --- | --- | --- |
 | `feature/final-report.md` | [final-report.md](final-report.md) | historical final-report draft/checkpoint |
 | `feature/implementation-status.md` | [implementation-status.md](implementation-status.md) | historical implementation handoff |
-| `feature/plans/**` | [plans/](plans/README.md) | historical remediation/prompt-injection plans |
+| `feature/plans/**` | [plans/](plans/README.md) | historical remediation plans |
 
 ## Current Interpretation
 

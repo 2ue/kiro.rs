@@ -158,8 +158,8 @@ fn document_content_source_is_converted_and_title_kept() {
 }
 ```
 
-Write 后缀被截断的复现需要开启 `promptSteering.chunkedWrite.toolDescriptionEnabled`（`src/anthropic/converter.rs:160-167`），
-构造 `Write` 工具描述 10,000 字符，断言结果仍包含 `WRITE_TOOL_DESCRIPTION_SUFFIX` 的前 30 个字符。
+Write 后缀被截断的复现需要开启注入项 `chunkedWriteToolSuffix`（A8，`src/anthropic/converter/tools.rs` 的 `convert_tools`），
+构造 `Write` 工具描述 10,000 字符，断言结果仍包含 `DEFAULT_WRITE_TOOL_SUFFIX`（`src/model/prompt_injection/catalog.rs`）的前 30 个字符。
 
 ### 端到端复现
 

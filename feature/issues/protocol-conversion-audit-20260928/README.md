@@ -62,7 +62,7 @@ usage 与缓存模拟（token 放大、cache 命中统计）属于产品策略�
 | `f965f1d` | P26 缓解（400 invalid model 换一个账号重试一次） |
 | 本次提交 | P27：上游超长时返回 `prompt is too long` 触发客户端压缩，所有路由一致，压缩请求保留裁剪重试 |
 
-各文档的 `Status:` 与"修复结果与验证（2026-09-29）"一节记录具体改动、单测和真实上游结果。仍然开放：P10、P12、P13、P14、P15、P16、P19、P25 的缺口；P03、P17、P18、P20、P21 的剩余子项；P26 的根治方案（按账号目录派发）。
+各文档的 `Status:` 与"修复结果与验证（2026-09-29）"一节记录具体改动、单测和真实上游结果。仍然开放：P10、P12、P13、P15、P16、P19、P25 的缺口；P03、P17、P18、P20、P21 的剩余子项；P26 的根治方案（按账号目录派发）。
 
 ## 问题列表
 
@@ -81,8 +81,7 @@ usage 与缓存模拟（token 放大、cache 命中统计）属于产品策略�
 | [P11](11-models-endpoint-openai-shape.md) | `/v1/models` 返回 OpenAI 风格结构 | Medium | aux |
 | [P12](12-count-tokens-estimate-inconsistent.md) | count_tokens 为估算值，与 messages 口径不一致 | Medium | aux |
 | [P13](13-websearch-emulation-incomplete.md) | web_search 模拟不完整（query 来源、citations、encrypted_content） | Medium | aux |
-| [P14](14-prompt-steering-alters-tool-behavior.md) | 提示注入与 chunked_write 改变 Claude Code 工具行为 | Medium | request |
-| [P15](15-tool-choice-prompt-only-enforcement.md) | tool_choice `any` 只靠提示词约束，`disable_parallel_tool_use` 被忽略 | Medium | request |
+| [P15](15-tool-choice-prompt-only-enforcement.md) | tool_choice `none` 与 `disable_parallel_tool_use` 已在响应侧执行；`any`/`tool` 未调用工具时只记录 `tool_choice_violation`，不重试 | Low | request |
 | [P16](16-xml-thinking-block-missing-signature.md) | XML 提取出的 thinking block 没有 signature | Low | stream |
 | [P17](17-error-status-and-envelope-deviations.md) | 错误状态码和错误信封与协议有偏差（404/529/空 body 等） | Low | aux |
 | [P18](18-stream-event-ordering-details.md) | 流式 block 关闭顺序、tool_use 块并行打开、空 text 块 | Low | stream |

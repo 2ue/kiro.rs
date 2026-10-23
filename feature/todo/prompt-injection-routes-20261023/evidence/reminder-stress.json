@@ -1,0 +1,188 @@
+{
+  "results": [
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 0,
+      "tool_choice": "auto",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "tool_use"
+      ],
+      "text": "",
+      "elapsed_s": 3.6
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 1,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "tool_use"
+      ],
+      "text": "",
+      "elapsed_s": 4.2
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 2,
+      "tool_choice": "auto",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "tool_use"
+      ],
+      "text": "",
+      "elapsed_s": 2.3
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 3,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "tool_use"
+      ],
+      "text": "",
+      "elapsed_s": 2.2
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 4,
+      "tool_choice": "auto",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "tool_use"
+      ],
+      "text": "",
+      "elapsed_s": 4.0
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 5,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "tool_use"
+      ],
+      "text": "",
+      "elapsed_s": 2.7
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 6,
+      "tool_choice": "auto",
+      "stop_reason": "end_turn",
+      "blocks": [
+        "text"
+      ],
+      "text": "这个目录里有一个 `notes.md` 文件。\n\n**notes.md 总结：**\n\n这是关于 Rust 所有权系统的三条核心规则：\n\n1. 每个值都有一个所有者\n2. 赋值时所有权会转移\n3. 借用不会转移所有权\n\n这些是 Rust 内存管理的基础概念。",
+      "elapsed_s": 5.5
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "index": 7,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "tool_use"
+      ],
+      "text": "",
+      "elapsed_s": 2.0
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 0,
+      "tool_choice": "auto",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "text",
+        "tool_use"
+      ],
+      "text": "让我读取 notes.md 文件：",
+      "elapsed_s": 1.6
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 1,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "text",
+        "tool_use"
+      ],
+      "text": "让我先查看目录结构：",
+      "elapsed_s": 5.5
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 2,
+      "tool_choice": "auto",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "text",
+        "tool_use"
+      ],
+      "text": "目录里有：\n\n- **README.md** - 项目演示文件\n- **notes.md** - 笔记文件\n\n但我读取 notes.md 时没有看到内容。让我重新查看一下：",
+      "elapsed_s": 2.0
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 3,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "text",
+        "tool_use"
+      ],
+      "text": "我需要先查看目录内容和文件。",
+      "elapsed_s": 1.2
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 4,
+      "tool_choice": "auto",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "text",
+        "tool_use"
+      ],
+      "text": "我需要先查看目录内容。",
+      "elapsed_s": 1.4
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 5,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "text",
+        "tool_use"
+      ],
+      "text": "我需要读取 notes.md 文件的内容。",
+      "elapsed_s": 1.9
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 6,
+      "tool_choice": "auto",
+      "stop_reason": "end_turn",
+      "blocks": [
+        "text"
+      ],
+      "text": "这个目录包含 `notes.md` 和 `README.md` 两个文件。\n\n**notes.md 的内容总结：**\n\n这是关于所有权（Ownership）概念的三条核心原则：\n\n1. **每个值都有唯一的所有者** - 任何数据都属于某个变量或结构\n2. **赋值时所有权会转移** - 将值分配给另一个变量时，原变量失去所有权\n3. **借用不转移所有权** - 通过引用使用值不会改变其所有权\n\n这些看起来像是 Rust 编程语言中内存管理的基础概念。",
+      "elapsed_s": 2.6
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "index": 7,
+      "tool_choice": "any",
+      "stop_reason": "tool_use",
+      "blocks": [
+        "text",
+        "tool_use"
+      ],
+      "text": "我尝试读取目录内容，但 notes.md 文件似乎不存在。让我重新查看一下目录结构：",
+      "elapsed_s": 1.6
+    }
+  ],
+  "hits": []
+}

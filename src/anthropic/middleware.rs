@@ -26,7 +26,7 @@ use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
     ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptSteeringConfig, ReportedUsageConfig, ThinkingTriggerMode,
+    PromptCacheSimulationMode, PromptInjectionConfig, ReportedUsageConfig, RouteFeaturesConfig,
     normalize_defined_cache_routes,
 };
 
@@ -267,8 +267,6 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
-    /// thinking 触发策略
-    pub thinking_trigger_mode: ThinkingTriggerMode,
     /// 请求级 usage 记录器
     pub usage_recorder: Arc<UsageRecorder>,
     /// tool-use 格式错误内部诊断写盘器。关闭时为 no-op。
@@ -341,8 +339,12 @@ pub struct AppState {
     pub image_processing: ImageProcessingConfig,
     /// 本地 Anthropic -> Kiro 转换能力配置
     pub body_conversion: BodyConversionConfig,
-    /// 统一提示词引导配置
-    pub prompt_steering: PromptSteeringConfig,
+    /// 提示词注入配置
+    pub prompt_injection: PromptInjectionConfig,
+    /// 按路由控制的功能
+    pub route_features: RouteFeaturesConfig,
+    /// `/v1/models` 只列出 Claude 模型
+    pub claude_models_only: bool,
     /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略
     pub missing_max_tokens: MissingMaxTokensConfig,
     /// payload shaping 配置
@@ -370,7 +372,6 @@ impl AppState {
             request_api_keys,
             kiro_provider: None,
             extract_thinking,
-            thinking_trigger_mode: ThinkingTriggerMode::RealRequest,
             usage_recorder,
             tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -407,7 +408,9 @@ impl AppState {
             kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
-            prompt_steering: PromptSteeringConfig::default(),
+            prompt_injection: PromptInjectionConfig::default(),
+            route_features: RouteFeaturesConfig::default(),
+            claude_models_only: false,
             missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: ExternalPoolsConfig::default(),
@@ -423,8 +426,15 @@ impl AppState {
         self
     }
 
-    pub fn with_thinking_trigger_mode(mut self, mode: ThinkingTriggerMode) -> Self {
-        self.thinking_trigger_mode = mode;
+    pub fn with_prompt_injection(
+        mut self,
+        prompt_injection: PromptInjectionConfig,
+        route_features: RouteFeaturesConfig,
+        claude_models_only: bool,
+    ) -> Self {
+        self.prompt_injection = prompt_injection.normalized();
+        self.route_features = route_features.normalized();
+        self.claude_models_only = claude_models_only;
         self
     }
 
@@ -510,7 +520,6 @@ impl AppState {
         kiro_upstream_stream_idle_timeout_secs: u64,
         image_processing: ImageProcessingConfig,
         body_conversion: BodyConversionConfig,
-        prompt_steering: PromptSteeringConfig,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
@@ -526,7 +535,6 @@ impl AppState {
         self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
         self.image_processing = image_processing.normalized();
         self.body_conversion = body_conversion;
-        self.prompt_steering = prompt_steering.normalized();
         self.payload_shaping = payload_shaping;
         self
     }

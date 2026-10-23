@@ -74,6 +74,9 @@ import type {
   ExternalPoolTestResponse,
   UpdateExternalPoolRequest,
   KeyLimitPeriod,
+  PromptInjectionCatalog,
+  PromptInjectionPreviewRequest,
+  PromptInjectionPreviewResponse,
   RequestKeyUsageLimitsResponse,
 } from '@/types/api'
 
@@ -390,6 +393,18 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
 
 export async function getSystemVersion(): Promise<SystemVersionResponse> {
   const { data } = await api.get<SystemVersionResponse>('/system/version')
+  return data
+}
+
+export async function getPromptInjectionCatalog(): Promise<PromptInjectionCatalog> {
+  const { data } = await api.get<PromptInjectionCatalog>('/prompt-injection/catalog')
+  return data
+}
+
+export async function previewPromptInjection(
+  req: PromptInjectionPreviewRequest,
+): Promise<PromptInjectionPreviewResponse> {
+  const { data } = await api.post<PromptInjectionPreviewResponse>('/prompt-injection/preview', req)
   return data
 }
 

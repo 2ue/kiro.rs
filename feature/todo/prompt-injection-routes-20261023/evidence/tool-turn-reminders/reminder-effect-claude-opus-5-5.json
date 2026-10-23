@@ -1,0 +1,671 @@
+{
+  "model": "claude-opus-5-5",
+  "language_a2off_old": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8893572181243414,
+      "text": "README 里的内容翻来覆去就是同一段话，实际讲到的配置方式有这几种：\n\n- **环境变量**：加载时最先读取，优先级最高。\n- **`settings.toml` 文件**：环境变量里没有对应配置时，再从这个文件读。\n- **默认值**：上面两处都没有时用默认值，同时打印一条警告。\n- **`CONFLOAD_PATH` 环境变量**：写在 “Environment” 一节，说明是“Set CONFLOAD_PATH to override”。README 没讲清楚它覆盖的是什么，按字面理解应该是配置文件路径，也就是替换默认的 `settings.toml`。\n\n合并规则是：嵌套表只做浅合"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7577319587628866,
+      "text": "`src/` 下一共有 24 处用到 `request_timeout_secs`，分布在 `src/handlers/` 的 6 个文件里，每个文件 4 处。每处都是同样的写法：\n\n```rust\nlet timeout = Duration::from_secs(config.request_timeout_secs);\n```\n\n| 文件 | 行号 |\n|---|---|\n| `auth.rs` | 40, 46, 52, 58 |\n| `billing.rs` | 41, 47, 53, 59 |\n| `proxy.rs` | 42, 48, 54, 60 |\n| `stream.rs"
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9182692307692307,
+      "text": "README 内容不多，同一段话重复了很多遍。实际讲到的配置方式有这几点：\n\n- 环境变量：优先级最高，加载时先读它。\n- `settings.toml`：环境变量里没有的配置项，从这个文件里取。\n- 默认值：前两处都没有时使用默认值，同时打印一条警告。\n- `CONFLOAD_PATH`：在 Environment 一节提到，用来覆盖配置路径。README 没说清它覆盖的是什么，推测是 `settings.toml` 的位置。\n- 合并规则：嵌套表做浅合并，数组直接整体替换，不逐项合并。\n\nREADME 里没有具体的变量命名规则（比如前缀、嵌套键怎么映射到环境变量），也没有示例。要弄清这些得"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.7735849056603774,
+      "text": "`request_timeout_secs` 在 `src/handlers/` 下的 6 个文件里共出现 24 次，每个文件 4 次，写法都是：\n\n```rust\nlet timeout = Duration::from_secs(config.request_timeout_secs);\n```\n\n| 文件 | 行号 |\n|---|---|\n| `auth.rs` | 40, 46, 52, 58 |\n| `billing.rs` | 41, 47, 53, 59 |\n| `proxy.rs` | 42, 48, 54, 60 |\n| `stream.rs` | 43, 49, 55, 6"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    }
+  ],
+  "language_a2on_old": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8316831683168316,
+      "text": "最近 10 个提交的信息都一样，都只改了 `src/pipeline.rs`。我看一下具体 diff。"
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9028871391076115,
+      "text": "README 内容不多，同一段话重复了很多遍。去掉重复后，讲的配置方式就这几点：\n\n- 优先级：先读环境变量，读不到再用 `settings.toml`。\n- 默认值：环境变量和 `settings.toml` 里都没有时，用默认值，同时打印一条警告。\n- 合并规则：嵌套表只做浅合并，数组直接整个替换，不会合并元素。\n- 路径覆盖：`## Environment` 一节写了可以设 `CONFLOAD_PATH` 来覆盖。但没说覆盖的是什么，从上下文看应该是 `settings.toml` 的路径。\n\nREADME 没写具体有哪些环境变量、变量怎么命名、默认值是什么。这些要看 `src/` 里的"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7228915662650602,
+      "text": "`src` 下共有 24 处用到 `request_timeout_secs`，都在 `src/handlers/` 里。6 个 handler 文件各 4 处，写法完全一样：\n\n```rust\nlet timeout = Duration::from_secs(config.request_timeout_secs);\n```\n\n| 文件 | 行号 |\n|---|---|\n| `src/handlers/auth.rs` | 40, 46, 52, 58 |\n| `src/handlers/billing.rs` | 41, 47, 53, 59 |\n| `src/handlers/prox"
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8495575221238938,
+      "text": "最近 10 个提交的信息完全一样，改的也都是 `src/pipeline.rs`，接下来看看具体 diff。"
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9090909090909091,
+      "text": "README 里的配置内容不多，主要是同一段话重复了很多遍，归纳下来有这几点：\n\n- 加载优先级：先读环境变量，读不到再用 `settings.toml`。\n- 默认值：环境变量和 `settings.toml` 里都没有某项配置时，用默认值并打印一条警告。\n- 合并规则：嵌套表只做浅合并，数组直接整体替换，不会合并。\n- 路径覆盖：`## Environment` 小节写了可以用环境变量 `CONFLOAD_PATH` 覆盖路径。它应该是指定配置文件的位置，但 README 没说清楚。\n\nREADME 没有写具体有哪些配置项，没写默认值是多少，也没写环境变量的命名规则（比如有没有 `CONF"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.6168831168831169,
+      "text": "`src` 下一共 24 处用到，全部在 `src/handlers/` 里。6 个 handler 文件各出现 4 次，写法都一样：\n\n```rust\nlet timeout = Duration::from_secs(config.request_timeout_secs);\n```\n\n| 文件 | 行号 |\n|---|---|\n| `src/handlers/auth.rs` | 40, 46, 52, 58 |\n| `src/handlers/billing.rs` | 41, 47, 53, 59 |\n| `src/handlers/proxy.rs` | 42, 48, 54, 6"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    }
+  ],
+  "tool_choice_old": [
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    }
+  ],
+  "language_a2off_new": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7241379310344828,
+      "text": "只有一个测试挂了：`cache::tests::evicts_oldest`，在 src/cache.rs:212 断言失败，期望 2 实际 3。看下代码。"
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.909310761789601,
+      "text": "README 里讲的配置方式不多，同一段话被重复了很多遍，实际内容只有这些：\n\n- **配置来源和优先级**：先读环境变量，没有就读 `settings.toml`。\n- **默认值**：两处都没配时用默认值，并打印一条警告。\n- **合并规则**：嵌套表只做浅合并，数组直接整体替换，不会逐项合并。\n- **`CONFLOAD_PATH`**：在 Environment 一节里，说明可以用它来覆盖配置。README 没写它覆盖的是什么，从名字看应该是配置文件路径，具体要看 `src` 里的代码才能确定。\n\nREADME 没列出有哪些环境变量名（除了 `CONFLOAD_PATH`），也没说变量"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7532467532467533,
+      "text": "`src/` 下一共 24 处引用，全部在 `src/handlers/` 里。6 个 handler 文件各有 4 处，写法都一样：\n\n```rust\nlet timeout = Duration::from_secs(config.request_timeout_secs);\n```\n\n| 文件 | 行号 |\n|---|---|\n| `auth.rs` | 40, 46, 52, 58 |\n| `billing.rs` | 41, 47, 53, 59 |\n| `proxy.rs` | 42, 48, 54, 60 |\n| `stream.rs` | 43, 49, 55, 61 |\n| "
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": 0.6923076923076923,
+      "text": "1 个测试失败：`cache::tests::evicts_oldest`，src/cache.rs:212 断言期望 2，实际是 3。我去看下代码。"
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8547008547008547,
+      "text": "最近 10 个提交的信息完全一样，都只改了 `src/pipeline.rs`。我看一下实际的 diff 内容。"
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9033816425120773,
+      "text": "README 只讲了三种配置来源，按优先级从高到低：\n\n1. 环境变量：最先读取。\n2. `settings.toml`：环境变量里没有时才读这个文件。\n3. 默认值：前两者都没有时使用，同时打印一条警告。\n\n另外还有两点：\n\n- 可以设置环境变量 `CONFLOAD_PATH` 来覆盖路径（\"Environment\" 一节）。README 没说清楚覆盖的是什么，从上下文推断应该是 `settings.toml` 的位置。\n- 合并规则：嵌套表只做浅合并，数组会被整体替换，不会拼接。\n\nREADME 正文基本是同一段话重复了很多遍，没有更多信息。要了解具体有哪些配置项，或者确认 `CONFLO"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.6449612403100775,
+      "text": "`src/` 下一共 24 处用到 `request_timeout_secs`，都在 `src/handlers/` 的 6 个文件里，每个文件 4 处。写法都一样：`Duration::from_secs(config.request_timeout_secs)`。\n\n| 文件 | 行号 |\n|---|---|\n| `src/handlers/auth.rs` | 40, 46, 52, 58 |\n| `src/handlers/billing.rs` | 41, 47, 53, 59 |\n| `src/handlers/proxy.rs` | 42, 48, 54, 60 |\n| `sr"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": 0.928,
+      "text": "最近 60 条日志里没有明显的慢请求。最慢的是 request 1059（worker-3），79 ms，所有请求都返回 status=200。\n\n有个趋势要留意：耗时从 request 1000 的 20 ms 开始，每个请求固定多 1 ms，一路涨到 79 ms。4 个 worker 都这样，3 分钟里翻了差不多 4 倍。这么规律的线性增长，多半是系统性的原因，比如连接池或缓存不断累积、内存泄漏、队列积压。照这个速度，大约 15 分钟后会超过 1 秒。\n\n这次只看了 `/var/log/app.log` 的最后 60 行，更早的日志还没查。需要的话，我可以扫一遍整个文件，找出超过某个阈值（"
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    }
+  ],
+  "language_a2on_new": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7333333333333333,
+      "text": "挂了 1 个：`cache::tests::evicts_oldest`，在 `src/cache.rs:212` 断言失败，期望 2 实际 3。接下来看代码定位原因。"
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": 0.864,
+      "text": "最近 10 个提交的提交信息完全一样，都只改了 `src/pipeline.rs`。我看一下具体的 diff 内容。"
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.883177570093458,
+      "text": "README 里讲的配置方式不多，同一段话重复了很多遍，实际内容就下面这几点：\n\n- 加载优先级：先读环境变量，读不到再用 `settings.toml`。\n- 默认值：环境变量和 `settings.toml` 里都没有某个配置时，用默认值，并打印一条警告。\n- 合并规则：嵌套表只做浅合并，数组整体替换，不合并。\n- `CONFLOAD_PATH`：在 \"Environment\" 一节里提到，设置它可以 \"override\"。README 没写清楚它覆盖的是什么，推测是 `settings.toml` 的路径。\n\nREADME 没有列出具体有哪些配置项，也没说明环境变量怎么命名（比如前缀规则"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7360350492880613,
+      "text": "`src/handlers/` 下有 6 个文件用到了 `request_timeout_secs`，一共 24 处。每个文件 4 处，写法都一样：\n\n```rust\nlet timeout = Duration::from_secs(config.request_timeout_secs);\n```\n\n| 文件 | 行号 |\n|---|---|\n| `src/handlers/auth.rs` | 40, 46, 52, 58 |\n| `src/handlers/billing.rs` | 41, 47, 53, 59 |\n| `src/handlers/proxy.rs` | 42, 48"
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9523809523809523,
+      "text": "按常见标准看，最近没有慢请求。不过耗时在稳定上涨，值得留意。\n\n我看的是 `/var/log/app.log` 最后 60 行，请求 1000 到 1059，覆盖约 177 秒：\n\n- 耗时从 20 ms 涨到 79 ms，最高 79 ms，没有超过 100 ms 的。\n- 全部返回 `status=200`，没有报错。\n- worker-0 到 worker-3 轮流处理请求，没有哪个 worker 单独变慢。\n- 每个请求比上一个慢 1 ms，涨势很均匀，3 分钟内耗时翻到接近 4 倍。\n\n这么均匀地一直变慢，不像偶发抖动，更像有东西在不断累积，比如内存、连接池、队列或缓存只增不减。照这个"
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": 1.0,
+      "text": "依赖装好了，有 3 个高危漏洞，我看一下具体是哪些。"
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": 0.6206896551724138,
+      "text": "只有 `cache::tests::evicts_oldest` 挂了，我看下代码。"
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9036144578313253,
+      "text": "README 里讲的配置方式就这几条，同一段话重复了很多遍，实际内容不多：\n\n- 优先级：先读环境变量，没有再读 `settings.toml`。\n- 默认值：两边都没有时用默认值，并打印一条 warning。\n- 合并规则：嵌套表只做浅合并，数组直接整个替换。\n- 路径覆盖：设置 `CONFLOAD_PATH` 可以覆盖配置路径。README 没说清楚覆盖的是不是 `settings.toml` 的位置。\n\nREADME 没写环境变量的命名规则（比如前缀、嵌套键怎么映射），默认值从哪来也没提。需要的话我可以去 `src` 里查实际实现。"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8,
+      "text": "`src/` 下一共有 24 处用到了 `request_timeout_secs`，全部在 `src/handlers/` 的 6 个文件里，每个文件 4 处，写法都一样：\n\n```rust\nlet timeout = Duration::from_secs(config.request_timeout_secs);\n```\n\n| 文件 | 行号 |\n|---|---|\n| `auth.rs` | 40, 46, 52, 58 |\n| `billing.rs` | 41, 47, 53, 59 |\n| `proxy.rs` | 42, 48, 54, 60 |\n| `stream.rs` |"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9333333333333333,
+      "text": "从 `/var/log/app.log` 最后 60 行看，没有明显的慢请求。不过延迟一直在稳定上涨，这一点要留意。\n\n- 请求 1000–1059 全部返回 `status=200`，耗时 20–79 ms，最大的是 worker-3 的 request 1059（79 ms）。\n- 每个请求比上一个慢 1 ms，60 个请求从 20 ms 涨到 79 ms。4 个 worker 都是这样，所以不像是单个 worker 的问题，更像是整体负载或资源在慢慢累积，比如连接池、内存或队列。\n- 请求间隔固定 3 秒左右，流量很小，延迟却还在涨，所以不太可能是压力导致的。\n\n我只看了最后 60 行，"
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": null,
+      "text": ""
+    }
+  ],
+  "tool_choice_new": [
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    }
+  ]
+}

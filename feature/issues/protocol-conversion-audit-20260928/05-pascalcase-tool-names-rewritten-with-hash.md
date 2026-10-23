@@ -29,8 +29,8 @@ Verified-against: a4227c1 (2026-09-29)
 
 影响：
 
-1. **提示词和工具名对不上。** Claude Code 的 system prompt 和工具描述里大量写着 "Use the Read tool"、"use `Edit` tool"。代理自己追加的 Write/Edit 分块后缀也直接写 `` `Edit` tool ``（`src/anthropic/converter/tools.rs:16-19`）。模型实际能调用的却是 `readHash9b9a8d05` / `editHash464c4ffd`，只能靠模型自己把 `Edit` 和 `editHash464c4ffd` 联系起来。
-2. **泄漏指纹和防御成本。** `xxxHash<8hex>` 是最显眼的泄漏指纹。项目为此加了多层兜底：默认 task prompt 里禁止输出 readHash/editHash/bashHash 的规则（`src/model/config.rs:262`，后来通过迁移从默认值里删掉，见 [prompt-policy 专题](../prompt-policy-tool-choice-and-count-tokens.md)），以及 `ToolTranscriptSanitizer` 对映射名的识别（`src/anthropic/transcript_sanitizer.rs:690-705`）。每个 Claude Code 请求都会走这条映射路径，所以这些兜底也在每个请求上生效。
+1. **提示词和工具名对不上。** Claude Code 的 system prompt 和工具描述里大量写着 "Use the Read tool"、"use `Edit` tool"。代理自己追加的 Write/Edit 分块后缀（注入项 A8 `chunkedWriteToolSuffix`）也直接写 `` `Edit` tool ``（`src/model/prompt_injection/catalog.rs:64-66`）。模型实际能调用的却是 `readHash9b9a8d05` / `editHash464c4ffd`，只能靠模型自己把 `Edit` 和 `editHash464c4ffd` 联系起来。
+2. **泄漏指纹和防御成本。** `xxxHash<8hex>` 是最显眼的泄漏指纹。项目的兜底是 `ToolTranscriptSanitizer` 对映射名的识别（`src/anthropic/transcript_sanitizer.rs:690-705`）；默认任务质量提示词（A1，`src/model/prompt_injection/catalog.rs` 的 `DEFAULT_TASK_QUALITY_PROMPT`）只泛化要求不在可见回答中输出代理内部控制消息、隐藏的工具结果包装或函数协议元数据，不再点名具体的 hash 工具名。每个 Claude Code 请求都会走这条映射路径，所以这层兜底也在每个请求上生效。
 3. **可观测性。** "工具名称已规范化/映射" 这条日志（`src/anthropic/converter.rs:584-592`）在 Claude Code 流量上几乎每个请求都会打出来，真正非法或超长的名字反而被埋在里面。
 
 观察记录：2026-09-28 本次审计会话本身就经过代理转发，模型侧看到的工具名是 `readHash9b9a8d05`、`bashHashd1e9567d`、`editHash464c4ffd`、`writeHash3f00927a`、`agentHash11b39c93`、`skillHash6df1bb18`、`toolSearchHash3161b03b`，和上面算出的 sha256 前 8 位完全一致，而 system prompt 里用的仍然是 `Read`/`Bash`/`Edit`。这只是一次观察，不作为生产频率证据。
@@ -89,7 +89,7 @@ bad_request: {"error":{"type":"<nil>","message":"上游 API 400: {\"message\":\"
 对审计原述的修正：
 
 - 审计说 "长度 ≤64"。当前常量和 sub2api 都是 63，建议保留 63，不要放宽到 64。
-- 审计把 `src/model/config.rs:~262` 当作 "现有缓解"。这段是旧版 `task_quality_policy` 常量里的文本（`src/model/config.rs:255-264`），当前默认值已经通过配置迁移去掉了具体的 hash 字样（见 [prompt-policy 专题](../prompt-policy-tool-choice-and-count-tokens.md) 的 migration v6 记录）。它是遗留防御，不是现行机制。
+- 审计把 `src/model/config.rs:~262` 当作 "现有缓解"。当前默认任务质量提示词（`DEFAULT_TASK_QUALITY_PROMPT`）里没有具体的 hash 字样，这条不是现行机制。
 
 ## 复现
 

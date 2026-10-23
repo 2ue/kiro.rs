@@ -26,7 +26,10 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
 #[cfg(test)]
 use crate::kiro::model::requests::tool::ToolResult;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode, PromptSteeringConfig};
+use crate::model::config::{
+    CompatProfile, InjectionId, PromptCacheSimulationMode, ResolvedInjections,
+};
+use crate::model::prompt_injection::TextKey;
 
 #[cfg(test)]
 use super::types::ContentBlock;
@@ -47,6 +50,8 @@ mod tool_pairing;
 #[path = "converter/tools.rs"]
 mod tools;
 
+#[cfg(test)]
+use crate::model::prompt_injection::catalog::DEFAULT_CHUNKED_WRITE_POLICY as SYSTEM_CHUNKED_POLICY;
 use content::process_message_content;
 #[cfg(test)]
 use content::sanitize_tool_use_id;
@@ -64,9 +69,7 @@ use tool_pairing::{
     remove_orphaned_tool_uses, sanitize_history_tool_results, validate_tool_pairing,
 };
 #[cfg(test)]
-use tools::{
-    SYSTEM_CHUNKED_POLICY, TOOL_HASH_MARKER, TOOL_NAME_MAX_LEN, map_tool_name, shorten_tool_name,
-};
+use tools::{TOOL_HASH_MARKER, TOOL_NAME_MAX_LEN, map_tool_name, shorten_tool_name};
 use tools::{
     collect_history_tool_names, convert_tools, create_placeholder_tool,
     create_unavailable_placeholder_tool, generate_tool_choice_turn_reminder,
@@ -115,6 +118,8 @@ pub struct ConversionResult {
     pub response_tool_policy: ResponseToolPolicy,
     /// Kiro 原生模型扩展字段，例如 reasoning effort。
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+    /// 本次转换实际注入的项（不是"允许注入"的项），按注入顺序，用于请求日志和预览。
+    pub applied_injections: Vec<InjectionId>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,13 +131,9 @@ pub struct ConverterOptions {
     pub kiro_cache_point_tools_only: bool,
     pub kiro_cache_point_record_plan: bool,
     pub force_visible_thinking: bool,
-    /// Explicit client reasoning is a protocol capability request, not an operator prompt
-    /// addition. It is populated from the request before history conversion so a disabled
-    /// operator prompt master cannot turn a valid Claude Code reasoning request into a local 400
-    /// when the configured compatibility thinking transport is available.
-    pub(crate) explicit_reasoning_request: bool,
     pub(crate) native_reasoning_capability: KiroReasoningCapabilityState,
-    pub prompt_steering: PromptSteeringConfig,
+    /// 这个请求允许注入的项（已按路由、上游和 compat profile 解析）。
+    pub injections: ResolvedInjections,
     pub(crate) language_turn_reminder: Option<ClientLanguagePreference>,
 }
 
@@ -146,9 +147,8 @@ impl Default for ConverterOptions {
             kiro_cache_point_tools_only: true,
             kiro_cache_point_record_plan: true,
             force_visible_thinking: false,
-            explicit_reasoning_request: false,
             native_reasoning_capability: KiroReasoningCapabilityState::LegacyFallback,
-            prompt_steering: PromptSteeringConfig::default(),
+            injections: ResolvedInjections::default(),
             language_turn_reminder: None,
         }
     }
@@ -159,64 +159,48 @@ impl ConverterOptions {
         self.compat_profile.is_strict()
     }
 
-    fn inject_chunked_policy(&self) -> bool {
-        let prompt_steering = self.prompt_steering.clone().normalized();
-        !self.is_strict()
-            && prompt_steering.enabled
-            && prompt_steering.chunked_write.enabled
-            && prompt_steering.chunked_write.system_prompt_enabled
-            && self.conversion.chunked_tool_policy.is_enabled()
+    pub(super) fn allows(&self, id: InjectionId) -> bool {
+        self.injections.allows(id)
     }
 
-    fn inject_chunked_tool_descriptions(&self) -> bool {
-        let prompt_steering = self.prompt_steering.clone().normalized();
-        !self.is_strict()
-            && prompt_steering.enabled
-            && prompt_steering.chunked_write.enabled
-            && prompt_steering.chunked_write.tool_description_enabled
-            && self.conversion.chunked_tool_policy.is_enabled()
+    /// thinking 控制标签和可见输出策略。strict 下默认不注入，强制可见 thinking 时例外（保持
+    /// 现有行为）。
+    pub(super) fn allows_thinking_item(&self, id: InjectionId) -> bool {
+        let item = self.injections.item(id);
+        item.allowed
+            || (self.force_visible_thinking
+                && item.blocked == Some(crate::model::prompt_injection::BlockReason::Strict))
     }
 
     fn inject_thinking_prefix(&self) -> bool {
-        let prompt_steering = self.prompt_steering.clone().normalized();
-        (prompt_steering.enabled || self.explicit_reasoning_request)
-            && self.conversion.thinking_prompt_controls.is_enabled()
-            && prompt_steering.thinking.enabled
-            && (self.force_visible_thinking || !self.is_strict())
-    }
-
-    fn inject_tool_choice_prefix(&self) -> bool {
-        let prompt_steering = self.prompt_steering.clone().normalized();
-        !self.is_strict()
-            && prompt_steering.enabled
-            && prompt_steering.tool_choice.enabled
-            && self.conversion.tool_choice_steering.is_enabled()
+        self.allows_thinking_item(InjectionId::ThinkingControls)
     }
 
     fn tool_choice_steering_enabled(&self) -> bool {
         self.conversion.tool_choice_steering.is_enabled()
     }
 
+    /// tool_choice 提示词依附在结构化 tool_choice 处理上：处理关闭时工具不会被过滤，
+    /// 提示"必须调用"或"不能调用"就和实际发出的工具列表矛盾。
+    fn inject_tool_choice_item(&self, id: InjectionId) -> bool {
+        self.tool_choice_steering_enabled() && self.allows(id)
+    }
+
     fn language_turn_reminder_text(&self) -> Option<String> {
-        let prompt_steering = self.prompt_steering.clone().normalized();
-        if self.is_strict()
-            || !prompt_steering.enabled
-            || !prompt_steering.language_constraint.enabled
-            || !prompt_steering.language_turn_reminder.enabled
-        {
+        if !self.allows(InjectionId::LanguageTurnReminder) {
             return None;
         }
-
         let preference = self.language_turn_reminder.as_ref()?;
         let prompt = match preference {
             ClientLanguagePreference::Explicit(language)
-            | ClientLanguagePreference::Detected(language) => prompt_steering
-                .language_turn_reminder
-                .explicit_prompt
+            | ClientLanguagePreference::Detected(language) => self
+                .injections
+                .text(TextKey::LanguageTurnReminderExplicit)
                 .replace("{language}", language),
-            ClientLanguagePreference::FollowUser => {
-                prompt_steering.language_turn_reminder.follow_user_prompt
-            }
+            ClientLanguagePreference::FollowUser => self
+                .injections
+                .text(TextKey::LanguageTurnReminderFollowUser)
+                .to_string(),
         };
         (!prompt.trim().is_empty()).then_some(prompt)
     }
@@ -451,13 +435,9 @@ pub fn convert_request_with_resolved_model(
 
 fn convert_request_with_model_id(
     req: &MessagesRequest,
-    mut options: ConverterOptions,
+    options: ConverterOptions,
     model_id: String,
 ) -> Result<ConversionResult, ConversionError> {
-    // An explicit Anthropic reasoning request must not be blocked by the operator prompt master.
-    // The flag only re-enables the dedicated thinking compatibility control; all other prompt
-    // additions continue to use promptSteering.enabled.
-    options.explicit_reasoning_request = requested_native_reasoning(req);
     let mut warnings = ProxyWarnings::default();
 
     // 2. 检查消息列表
@@ -496,12 +476,16 @@ fn convert_request_with_model_id(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
+    let mut applied_injections = Vec::new();
     let converted_tools = convert_tools(
         &req.tools,
         &req.tool_choice,
         &mut tool_name_map,
         options.clone(),
     )?;
+    if converted_tools.chunked_suffix_applied {
+        applied_injections.push(InjectionId::ChunkedWriteToolSuffix);
+    }
     let mut tools = converted_tools.tools;
     let mut known_tool_names: std::collections::HashSet<String> = tools
         .iter()
@@ -518,6 +502,7 @@ fn convert_request_with_model_id(
         &model_id,
         &mut tool_name_map,
         &mut warnings,
+        &mut applied_injections,
         options.clone(),
     )?;
 
@@ -609,9 +594,12 @@ fn convert_request_with_model_id(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // A turn that only carries tool results has no user-authored text. Turn reminders appended
-    // to it read as text injected into a tool result, and models reply that they will ignore
-    // "the instruction inside the tool output" (seen on 2026-10-21 in Claude Code sessions).
+    // A turn that only carries tool results has no user-authored text. Any turn reminder appended
+    // to it sits right after the tool output, and Claude Code's own system prompt tells the model
+    // to report instructions found in tool results: in 2026-10-21 sessions it wrote "the tool
+    // result ends with reminders that you did not send, I will ignore them" in visible replies.
+    // So every turn reminder (tool_choice, language, identity) is only added when the user wrote
+    // text in this turn; the system-level prompts still apply on tool-result-only turns.
     let turn_has_user_text = !text_content.trim().is_empty();
     let mut content = text_content;
     if content.trim().is_empty() {
@@ -624,22 +612,30 @@ fn convert_request_with_model_id(
         }
     }
     if let Some(reminder) = generate_tool_choice_turn_reminder(req, &tool_name_map, options.clone())
-    {
-        content.push_str("\n\n");
-        content.push_str(&reminder);
-    }
-    if let Some(reminder) = options.language_turn_reminder_text() {
-        content.push_str("\n\n");
-        content.push_str(&reminder);
-    }
-    if let Some(reminder) = options
-        .prompt_steering
-        .identity
-        .turn_reminder_text()
         .filter(|_| turn_has_user_text)
     {
         content.push_str("\n\n");
-        content.push_str(reminder);
+        content.push_str(&reminder);
+        applied_injections.push(InjectionId::ToolChoiceTurnReminder);
+    }
+    if let Some(reminder) = options
+        .language_turn_reminder_text()
+        .filter(|_| turn_has_user_text)
+    {
+        content.push_str("\n\n");
+        content.push_str(&reminder);
+        applied_injections.push(InjectionId::LanguageTurnReminder);
+    }
+    if turn_has_user_text && options.allows(InjectionId::IdentityTurnReminder) {
+        let reminder = options
+            .injections
+            .text(TextKey::IdentityTurnReminder)
+            .trim();
+        if !reminder.is_empty() {
+            content.push_str("\n\n");
+            content.push_str(reminder);
+            applied_injections.push(InjectionId::IdentityTurnReminder);
+        }
     }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
@@ -713,6 +709,7 @@ fn convert_request_with_model_id(
         warnings,
         response_tool_policy,
         additional_model_request_fields,
+        applied_injections,
     })
 }
 
@@ -1772,33 +1769,29 @@ mod tests {
     }
 
     #[test]
-    fn operator_prompt_master_disables_all_proxy_prompt_additions() {
-        let mut options = ConverterOptions::default();
-        options.prompt_steering.enabled = false;
-
-        assert!(!options.inject_chunked_policy());
-        assert!(!options.inject_chunked_tool_descriptions());
+    fn injection_items_switch_independently_of_structured_tool_choice() {
+        let options = ConverterOptions {
+            injections: ResolvedInjections::all_off(),
+            ..ConverterOptions::default()
+        };
+        assert!(!options.allows(InjectionId::ChunkedWritePolicy));
+        assert!(!options.allows(InjectionId::ChunkedWriteToolSuffix));
         assert!(!options.inject_thinking_prefix());
-        assert!(!options.inject_tool_choice_prefix());
-        assert!(options.tool_choice_steering_enabled());
-
-        options.prompt_steering.enabled = true;
-        options.prompt_steering.chunked_write.enabled = false;
-        options.prompt_steering.thinking.enabled = false;
-        options.prompt_steering.tool_choice.enabled = false;
-
-        assert!(!options.inject_chunked_policy());
-        assert!(!options.inject_chunked_tool_descriptions());
-        assert!(!options.inject_thinking_prefix());
-        assert!(!options.inject_tool_choice_prefix());
+        assert!(!options.inject_tool_choice_item(InjectionId::ToolChoicePrefix));
         assert!(
             options.tool_choice_steering_enabled(),
-            "prompt-only toggles must not disable structured tool filtering"
+            "prompt items must not disable structured tool filtering"
         );
+
+        let options = ConverterOptions::default();
+        assert!(options.allows(InjectionId::ChunkedWritePolicy));
+        assert!(options.allows(InjectionId::ChunkedWriteToolSuffix));
+        assert!(options.inject_thinking_prefix());
+        assert!(options.inject_tool_choice_item(InjectionId::ToolChoicePrefix));
     }
 
     #[test]
-    fn explicit_reasoning_keeps_compatibility_transport_when_operator_prompt_master_is_off() {
+    fn explicit_reasoning_uses_thinking_controls_even_when_other_items_are_off() {
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
         let cases = [
@@ -1841,11 +1834,16 @@ mod tests {
                 metadata: None,
                 stop_sequences: None,
             };
-            let mut options = ConverterOptions {
+            let options = ConverterOptions {
                 native_reasoning_capability: KiroReasoningCapabilityState::Unknown,
+                injections: ResolvedInjections::with_items(
+                    &InjectionId::ALL
+                        .iter()
+                        .map(|id| (*id, matches!(id, InjectionId::ThinkingControls)))
+                        .collect::<Vec<_>>(),
+                ),
                 ..ConverterOptions::default()
             };
-            options.prompt_steering.enabled = false;
 
             let result = convert_request_with_options(&req, options)
                 .expect("explicit reasoning should use the compatibility transport");
@@ -1870,13 +1868,15 @@ mod tests {
     }
 
     #[test]
-    fn operator_prompt_master_off_preserves_structured_tool_filtering() {
+    fn all_items_off_preserves_structured_tool_filtering() {
         let req = base_tool_choice_request(serde_json::json!({
             "type": "tool",
             "name": "read_file"
         }));
-        let mut options = ConverterOptions::default();
-        options.prompt_steering.enabled = false;
+        let options = ConverterOptions {
+            injections: ResolvedInjections::all_off(),
+            ..ConverterOptions::default()
+        };
 
         let result = convert_request_with_options(&req, options).unwrap();
         let context = &result
@@ -3328,8 +3328,6 @@ mod tests {
 
     #[test]
     fn explicit_reasoning_effort_falls_back_to_compat_prompt_without_native_schema_five_rounds() {
-        use crate::anthropic::body_capabilities::{BodyStageState, KiroConverterPlan};
-
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
         let req = MessagesRequest {
@@ -3395,12 +3393,13 @@ mod tests {
                 );
             }
 
-            let mut conversion = KiroConverterPlan::default();
-            conversion.thinking_prompt_controls = BodyStageState::Disabled;
             let error = convert_request_with_options(
                 &req,
                 ConverterOptions {
-                    conversion,
+                    injections: ResolvedInjections::with_items(&[(
+                        InjectionId::ThinkingControls,
+                        false,
+                    )]),
                     native_reasoning_capability: KiroReasoningCapabilityState::AuthoritativeAbsent,
                     ..ConverterOptions::default()
                 },
@@ -4276,9 +4275,11 @@ mod tests {
             metadata: None,
             stop_sequences: None,
         };
-        let mut options = ConverterOptions::default();
+        let mut options = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[(InjectionId::ThinkingControls, false)]),
+            ..ConverterOptions::default()
+        };
         options.conversion.native_reasoning_fields = BodyStageState::Disabled;
-        options.conversion.thinking_prompt_controls = BodyStageState::Disabled;
 
         for round in 0..5 {
             let error = convert_request_with_options(&req, options.clone())
@@ -4490,10 +4491,25 @@ mod tests {
     }
 
     fn language_reminder_options(preference: ClientLanguagePreference) -> ConverterOptions {
-        let mut options = ConverterOptions::default();
-        options.prompt_steering.language_constraint.enabled = true;
-        options.language_turn_reminder = Some(preference);
-        options
+        ConverterOptions {
+            injections: ResolvedInjections::with_items(&[(
+                InjectionId::LanguageTurnReminder,
+                true,
+            )]),
+            language_turn_reminder: Some(preference),
+            ..ConverterOptions::default()
+        }
+    }
+
+    /// tool_choice 前缀和每轮提醒一起开或一起关。
+    fn tool_choice_items(enabled: bool, profile: CompatProfile) -> ResolvedInjections {
+        ResolvedInjections::with_items_and_profile(
+            &[
+                (InjectionId::ToolChoicePrefix, enabled),
+                (InjectionId::ToolChoiceTurnReminder, enabled),
+            ],
+            profile,
+        )
     }
 
     fn current_message_content(result: &ConversionResult) -> &str {
@@ -4546,11 +4562,13 @@ mod tests {
 
         let mut repeated_prompt_options =
             language_reminder_options(ClientLanguagePreference::Explicit("简体中文".to_string()));
-        repeated_prompt_options
-            .prompt_steering
-            .language_turn_reminder
-            .explicit_prompt =
-            "<language_reminder>{language}/{language}</language_reminder>".to_string();
+        repeated_prompt_options.injections = ResolvedInjections::with_items_and_text(
+            &[(InjectionId::LanguageTurnReminder, true)],
+            &[(
+                TextKey::LanguageTurnReminderExplicit,
+                "<language_reminder>{language}/{language}</language_reminder>",
+            )],
+        );
         let repeated_prompt_result =
             convert_request_with_options(&req, repeated_prompt_options).unwrap();
         assert!(
@@ -4560,39 +4578,56 @@ mod tests {
     }
 
     #[test]
-    fn identity_turn_reminder_is_appended_last_even_when_steering_is_off() {
+    fn identity_turn_reminder_is_appended_last_and_switches_on_its_own() {
+        use crate::model::prompt_injection::catalog::DEFAULT_IDENTITY_TURN_REMINDER;
         let req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
         let baseline = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
 
-        let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
-        options.prompt_steering.identity.enabled = true;
-        let result = convert_request_with_options(&req, options.clone()).unwrap();
+        let options = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[
+                (InjectionId::LanguageTurnReminder, true),
+                (InjectionId::IdentityTurnReminder, true),
+            ]),
+            language_turn_reminder: Some(ClientLanguagePreference::FollowUser),
+            ..ConverterOptions::default()
+        };
+        let result = convert_request_with_options(&req, options).unwrap();
         let content = current_message_content(&result);
         assert!(
-            content.ends_with(crate::model::config::DEFAULT_IDENTITY_TURN_REMINDER),
+            content.ends_with(DEFAULT_IDENTITY_TURN_REMINDER),
             "identity reminder must be the last instruction in the turn: {content}"
         );
         assert!(content.contains("<language_reminder>"));
         assert!(content.find("<language_reminder>") < content.find("<identity_reminder>"));
+        assert_eq!(
+            result.applied_injections,
+            vec![
+                InjectionId::LanguageTurnReminder,
+                InjectionId::IdentityTurnReminder
+            ]
+        );
 
-        // The steering master switch only gates operator steering, not identity masking.
-        let mut steering_off = ConverterOptions::default();
-        steering_off.prompt_steering.enabled = false;
-        steering_off.prompt_steering.identity.enabled = true;
-        let result = convert_request_with_options(&req, steering_off).unwrap();
+        // 其他注入项全部关闭时，身份提醒照样注入。
+        let only_identity = ConverterOptions {
+            injections: ResolvedInjections::with_items(
+                &InjectionId::ALL
+                    .iter()
+                    .map(|id| (*id, *id == InjectionId::IdentityTurnReminder))
+                    .collect::<Vec<_>>(),
+            ),
+            ..ConverterOptions::default()
+        };
+        let result = convert_request_with_options(&req, only_identity).unwrap();
         assert_eq!(
             current_message_content(&result),
             format!(
                 "{}\n\n{}",
                 current_message_content(&baseline),
-                crate::model::config::DEFAULT_IDENTITY_TURN_REMINDER
+                DEFAULT_IDENTITY_TURN_REMINDER
             )
         );
 
-        let mut reminder_off = ConverterOptions::default();
-        reminder_off.prompt_steering.identity.enabled = true;
-        reminder_off.prompt_steering.identity.turn_reminder.enabled = false;
-        let result = convert_request_with_options(&req, reminder_off).unwrap();
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
         assert_eq!(
             current_message_content(&result),
             current_message_content(&baseline)
@@ -4603,8 +4638,13 @@ mod tests {
     fn identity_turn_reminder_is_not_appended_to_tool_result_only_turns() {
         use super::super::types::Message as AnthropicMessage;
 
-        let mut options = ConverterOptions::default();
-        options.prompt_steering.identity.enabled = true;
+        let options = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[(
+                InjectionId::IdentityTurnReminder,
+                true,
+            )]),
+            ..ConverterOptions::default()
+        };
         let tool_turn = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
@@ -4654,11 +4694,13 @@ mod tests {
     fn language_turn_reminder_follow_user_uses_configured_prompt() {
         let req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
         let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
-        options
-            .prompt_steering
-            .language_turn_reminder
-            .follow_user_prompt =
-            "<language_reminder>Use the user's latest language.</language_reminder>".to_string();
+        options.injections = ResolvedInjections::with_items_and_text(
+            &[(InjectionId::LanguageTurnReminder, true)],
+            &[(
+                TextKey::LanguageTurnReminderFollowUser,
+                "<language_reminder>Use the user's latest language.</language_reminder>",
+            )],
+        );
         let result = convert_request_with_options(&req, options).unwrap();
 
         assert!(
@@ -4669,10 +4711,10 @@ mod tests {
     }
 
     #[test]
-    fn language_turn_reminder_follows_tool_result_placeholder() {
+    fn no_turn_reminder_is_appended_to_a_tool_result_only_turn() {
         use super::super::types::Message as AnthropicMessage;
 
-        let req = MessagesRequest {
+        let request = |tool_choice: serde_json::Value| MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![
@@ -4696,26 +4738,69 @@ mod tests {
             stream: false,
             system: None,
             tools: Some(vec![test_tool("read_file")]),
-            tool_choice: None,
+            tool_choice: Some(tool_choice),
             thinking: None,
             output_config: None,
             output_format: None,
             metadata: None,
             stop_sequences: None,
         };
-        let result = convert_request_with_options(
-            &req,
-            language_reminder_options(ClientLanguagePreference::FollowUser),
-        )
-        .unwrap();
-        let content = current_message_content(&result);
+        let all_reminders = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[
+                (InjectionId::LanguageTurnReminder, true),
+                (InjectionId::IdentityTurnReminder, true),
+                (InjectionId::ToolChoiceTurnReminder, true),
+            ]),
+            language_turn_reminder: Some(ClientLanguagePreference::Explicit("中文".to_string())),
+            ..ConverterOptions::default()
+        };
+        for tool_choice in [
+            serde_json::json!({"type": "auto"}),
+            serde_json::json!({"type": "any"}),
+            serde_json::json!({"type": "tool", "name": "read_file"}),
+        ] {
+            let result =
+                convert_request_with_options(&request(tool_choice.clone()), all_reminders.clone())
+                    .unwrap();
+            let content = current_message_content(&result);
+            for tag in [
+                "<language_reminder>",
+                "<identity_reminder>",
+                "<tool_choice_reminder>",
+            ] {
+                assert!(!content.contains(tag), "{tool_choice}: {tag} in {content}");
+            }
+            for id in [
+                InjectionId::LanguageTurnReminder,
+                InjectionId::IdentityTurnReminder,
+                InjectionId::ToolChoiceTurnReminder,
+            ] {
+                assert!(
+                    !result.applied_injections.contains(&id),
+                    "{tool_choice}: {id:?}"
+                );
+            }
+            // The structured tool_choice handling still applies on this turn.
+            if tool_choice["type"] == "any" {
+                assert!(result.response_tool_policy.required().is_some());
+            }
+        }
 
-        assert!(content.starts_with(TOOL_RESULTS_PROVIDED_PLACEHOLDER));
-        assert!(content.contains("<language_reminder>"));
-        assert!(
-            content.find(TOOL_RESULTS_PROVIDED_PLACEHOLDER).unwrap()
-                < content.find("<language_reminder>").unwrap()
-        );
+        // The same reminders still go on a turn where the user wrote text.
+        let mut with_text = request(serde_json::json!({"type": "any"}));
+        with_text.messages[2].content = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"},
+            {"type": "text", "text": "now summarize it"}
+        ]);
+        let result = convert_request_with_options(&with_text, all_reminders).unwrap();
+        let content = current_message_content(&result);
+        for tag in [
+            "<language_reminder>",
+            "<identity_reminder>",
+            "<tool_choice_reminder>",
+        ] {
+            assert!(content.contains(tag), "{tag} missing in {content}");
+        }
     }
 
     #[test]
@@ -4734,7 +4819,7 @@ mod tests {
     }
 
     #[test]
-    fn language_turn_reminder_requires_all_injection_gates() {
+    fn language_turn_reminder_needs_its_item_and_a_detected_preference() {
         let req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
         assert!(ConverterOptions::default().language_turn_reminder.is_none());
         let cases = [
@@ -4744,22 +4829,17 @@ mod tests {
             },
             {
                 let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
-                options.prompt_steering.language_constraint.enabled = false;
-                options
-            },
-            {
-                let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
-                options.prompt_steering.enabled = false;
-                options
-            },
-            {
-                let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
-                options.prompt_steering.language_turn_reminder.enabled = false;
+                options.injections =
+                    ResolvedInjections::with_items(&[(InjectionId::LanguageTurnReminder, false)]);
                 options
             },
             {
                 let mut options = language_reminder_options(ClientLanguagePreference::FollowUser);
                 options.compat_profile = CompatProfile::AnthropicStrict;
+                options.injections = ResolvedInjections::with_items_and_profile(
+                    &[(InjectionId::LanguageTurnReminder, true)],
+                    CompatProfile::AnthropicStrict,
+                );
                 options
             },
         ];
@@ -5031,10 +5111,15 @@ mod tests {
             );
         }
 
-        // Prompt steering disabled keeps the current user text untouched.
+        // 每轮提醒关闭时当前轮的用户文字保持原样。
         let req = base_tool_choice_request(serde_json::json!({"type": "any"}));
-        let mut options = ConverterOptions::default();
-        options.prompt_steering.tool_choice.enabled = false;
+        let options = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[(
+                InjectionId::ToolChoiceTurnReminder,
+                false,
+            )]),
+            ..ConverterOptions::default()
+        };
         let result = convert_request_with_options(&req, options).unwrap();
         assert_eq!(
             result
@@ -5084,7 +5169,7 @@ mod tests {
     }
 
     #[test]
-    fn named_tool_choice_prefers_exact_name_across_profiles_and_prompt_master_states() {
+    fn named_tool_choice_prefers_exact_name_across_profiles_and_prompt_item_states() {
         for compat_profile in [CompatProfile::ClaudeCode, CompatProfile::AnthropicStrict] {
             for prompt_master_enabled in [false, true] {
                 for requested in ["foo-bar", "foo_bar"] {
@@ -5097,7 +5182,7 @@ mod tests {
                         compat_profile,
                         ..ConverterOptions::default()
                     };
-                    options.prompt_steering.enabled = prompt_master_enabled;
+                    options.injections = tool_choice_items(prompt_master_enabled, compat_profile);
 
                     let result = convert_request_with_options(&req, options)
                         .expect("an exact named choice must remain unambiguous");
@@ -5131,7 +5216,7 @@ mod tests {
                     compat_profile,
                     ..ConverterOptions::default()
                 };
-                options.prompt_steering.enabled = prompt_master_enabled;
+                options.injections = tool_choice_items(prompt_master_enabled, compat_profile);
 
                 let error = convert_request_with_options(&req, options)
                     .expect_err("ambiguous normalized tool choice must fail locally");
@@ -5165,8 +5250,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_operator_prompt_master_disables_prompt_but_preserves_structured_tool_choice_semantics()
-     {
+    fn all_items_off_disables_prompts_but_preserves_structured_tool_choice_semantics() {
         let cases = [
             (serde_json::json!({"type": "none"}), 0usize),
             (serde_json::json!({"type": "any"}), 2usize),
@@ -5178,8 +5262,10 @@ mod tests {
 
         for (tool_choice, expected_tool_count) in cases {
             let req = base_tool_choice_request(tool_choice);
-            let mut options = ConverterOptions::default();
-            options.prompt_steering.enabled = false;
+            let options = ConverterOptions {
+                injections: ResolvedInjections::all_off(),
+                ..ConverterOptions::default()
+            };
 
             let result = convert_request_with_options(&req, options).unwrap();
             assert_eq!(
@@ -5208,9 +5294,13 @@ mod tests {
             "type": "tool",
             "name": "read_file"
         }));
-        let mut options = ConverterOptions::default();
-        options.prompt_steering.enabled = false;
-        options.prompt_steering.tool_choice.enabled = false;
+        let options = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[
+                (InjectionId::ToolChoicePrefix, false),
+                (InjectionId::ToolChoiceTurnReminder, false),
+            ]),
+            ..ConverterOptions::default()
+        };
 
         let result = convert_request_with_options(&req, options).unwrap();
         assert_eq!(
@@ -5233,16 +5323,21 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_strict_filters_tool_choice_without_prompt_steering() {
+    fn test_anthropic_strict_filters_tool_choice_without_prompt_injection() {
         let req = base_tool_choice_request(serde_json::json!({
             "type": "tool",
             "name": "read_file"
         }));
 
+        // 运行时注入项和 compat profile 来自同一份运行配置，这里同样按 strict 解析。
         let result = convert_request_with_options(
             &req,
             ConverterOptions {
                 compat_profile: CompatProfile::AnthropicStrict,
+                injections: ResolvedInjections::with_items_and_profile(
+                    &[],
+                    CompatProfile::AnthropicStrict,
+                ),
                 ..ConverterOptions::default()
             },
         )
@@ -5256,7 +5351,7 @@ mod tests {
         assert_eq!(context.tools.len(), 1);
         assert!(
             result.conversation_state.history.is_empty(),
-            "strict profile should avoid synthetic prompt steering"
+            "strict profile should avoid synthetic prompt injection"
         );
     }
 
@@ -6037,9 +6132,10 @@ mod tests {
 
     #[test]
     fn format_only_request_converts_with_thinking_controls_disabled() {
-        let mut options = ConverterOptions::default();
-        options.conversion.thinking_prompt_controls =
-            crate::anthropic::body_capabilities::BodyStageState::Disabled;
+        let options = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[(InjectionId::ThinkingControls, false)]),
+            ..ConverterOptions::default()
+        };
         convert_request_with_options(&format_only_request(), options)
             .expect("structured output alone must not require reasoning controls");
     }

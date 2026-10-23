@@ -1,0 +1,53 @@
+{
+  "label": "default",
+  "route": "/cc",
+  "turns": [
+    {
+      "index": 0,
+      "task": "在当前目录创建 notes.md，写三条关于 Rust 所有权的要点，然后读出来确认内容。",
+      "is_error": false,
+      "num_turns": 3,
+      "elapsed_s": 25.8
+    },
+    {
+      "index": 1,
+      "task": "用 Bash 列出当前目录的文件，再用 Grep 找出包含“所有权”的文件，告诉我结果。",
+      "is_error": false,
+      "num_turns": 3,
+      "elapsed_s": 14.2
+    },
+    {
+      "index": 2,
+      "task": "写一个 300 行的 Python 文件 big.py：定义 100 个函数 f0..f99，每个函数返回自己的编号。写完后用 Bash 运行 python3 -c \"import big; print(big.f99())\" 验证。",
+      "is_error": false,
+      "num_turns": 9,
+      "elapsed_s": 49.0
+    },
+    {
+      "index": 3,
+      "task": "把 big.py 里 f50 的返回值改成 5000，然后用 Bash 验证 f50() 的结果。",
+      "is_error": false,
+      "num_turns": 3,
+      "elapsed_s": 10.1
+    },
+    {
+      "index": 4,
+      "task": "Explain in two sentences what the files in this directory do. Use tools to check them first.",
+      "is_error": false,
+      "num_turns": 4,
+      "elapsed_s": 16.1
+    },
+    {
+      "index": 5,
+      "task": "检查一下 notes.md 有没有错别字，如果有就修正，没有就直接告诉我没有。",
+      "is_error": false,
+      "num_turns": 1,
+      "elapsed_s": 10.7
+    }
+  ],
+  "session_id": "18a56292-293b-40b4-adca-2db39e09af26",
+  "assistant_text_blocks": 13,
+  "tool_uses": 17,
+  "leak_hits": [],
+  "big_py_f99": "99 5000"
+}
