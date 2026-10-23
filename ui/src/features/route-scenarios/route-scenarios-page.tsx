@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Copy, Download, Pencil, Play, Plus, RotateCcw, Route, Save, Trash2, Upload, X } from 'lucide-react'
+import { Copy, Download, Eraser, Pencil, Play, Plus, RotateCcw, Route, Save, Trash2, Upload, X } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   Badge,
@@ -50,6 +50,16 @@ import type {
 } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import { RouteSelector } from './route-selector'
+import {
+  accountRuleGroups,
+  assignPolicy,
+  buildAccountRows,
+  filterRows,
+  initialBatchPolicy,
+  policySummary,
+  selectByClick,
+  type AccountRow,
+} from './account-rules'
 
 const MODE_LABELS: Record<ExternalPoolRouteMode, string> = {
   allow_all: '不限制',
@@ -59,6 +69,9 @@ const MODE_LABELS: Record<ExternalPoolRouteMode, string> = {
 
 const SCENARIO_FILE_FORMAT = 'kiro-rs-route-scenario'
 
+/** Account rows rendered per step; selection and batch actions always cover the whole list. */
+const RENDER_STEP = 200
+
 function emptyContent(): RouteScenarioContent {
   return {
     local: { routeMode: 'allow_all', routeRules: [] },
@@ -66,12 +79,6 @@ function emptyContent(): RouteScenarioContent {
     localAccounts: [],
     externalAccounts: [],
   }
-}
-
-export function policySummary(policy: RoutePolicy): string {
-  if (policy.routeMode === 'allow_all') return '不限制'
-  const routes = policy.routeRules.join('、') || '（未选路由）'
-  return policy.routeMode === 'allow_list' ? `仅允许 ${routes}` : `禁止 ${routes}`
 }
 
 /** Route policy editor: mode plus a route picker (routes are selected, never typed). */
@@ -115,8 +122,13 @@ function PolicyEditor({
   )
 }
 
-/** Accounts with their own rule; every unlisted account is reset to "unrestricted". */
+/**
+ * Every account of one pool with its rule in the scenario. Select any number of accounts, then
+ * set one rule for all of them; setting again overwrites. Unlisted accounts are reset to
+ * "unrestricted" on apply.
+ */
 function AccountRulesEditor({
+  idPrefix,
   title,
   description,
   accounts,
@@ -124,6 +136,7 @@ function AccountRulesEditor({
   routes,
   onChange,
 }: {
+  idPrefix: string
   title: string
   description: string
   accounts: RouteScenarioAccountOption[]
@@ -131,170 +144,218 @@ function AccountRulesEditor({
   routes: string[]
   onChange: (next: AccountRoutePolicy[]) => void
 }) {
-  const [picking, setPicking] = React.useState(false)
+  const [search, setSearch] = React.useState('')
+  const [filter, setFilter] = React.useState('all')
   const [selected, setSelected] = React.useState<Set<number>>(new Set())
-  const [batchPolicy, setBatchPolicy] = React.useState<RoutePolicy>({ routeMode: 'deny_list', routeRules: [] })
-  const byId = React.useMemo(() => new Map(accounts.map((account) => [account.id, account])), [accounts])
-  const listed = new Set(value.map((entry) => entry.id))
+  const [editing, setEditing] = React.useState<{ ids: number[]; batch: boolean } | null>(null)
+  const lastClicked = React.useRef<number | null>(null)
 
-  const update = (id: number, policy: RoutePolicy) =>
-    onChange(value.map((entry) => (entry.id === id ? { id, ...policy } : entry)))
-  const remove = (ids: Set<number>) => {
-    onChange(value.filter((entry) => !ids.has(entry.id)))
-    setSelected(new Set())
-  }
-  const applyBatch = () => {
-    onChange(value.map((entry) => (selected.has(entry.id) ? { id: entry.id, ...batchPolicy } : entry)))
-    setSelected(new Set())
-  }
-  const toggle = (id: number, checked: boolean) =>
+  const [renderLimit, setRenderLimit] = React.useState(RENDER_STEP)
+
+  const rows = React.useMemo(() => buildAccountRows(accounts, value), [accounts, value])
+  const groups = React.useMemo(() => accountRuleGroups(value), [value])
+  const keyword = search.trim()
+
+  // A rule filter disappears once its last account changes; fall back to all accounts.
+  const activeFilter = filter.startsWith('rule:') && !groups.some((group) => `rule:${group.key}` === filter) ? 'all' : filter
+  const visible = React.useMemo(() => filterRows(rows, activeFilter, search), [rows, activeFilter, search])
+  // Ids that left the list (account deleted, stale rule cleared) drop out of the selection.
+  const selectedRows = rows.filter((row) => selected.has(row.id))
+  const selectedIds = selectedRows.map((row) => row.id)
+  const visibleSelected = visible.filter((row) => selected.has(row.id)).length
+  const headerState: boolean | 'indeterminate' =
+    visibleSelected === 0 ? false : visibleSelected === visible.length ? true : 'indeterminate'
+  const selectedWithRule = selectedRows.filter((row) => row.rule).length
+  const rendered = visible.slice(0, renderLimit)
+
+  const updateSelected = (update: (next: Set<number>) => void) =>
     setSelected((prev) => {
       const next = new Set(prev)
-      if (checked) next.add(id)
-      else next.delete(id)
+      update(next)
       return next
     })
+  const toggleAllVisible = () =>
+    updateSelected((next) => {
+      for (const row of visible) {
+        if (headerState === true) next.delete(row.id)
+        else next.add(row.id)
+      }
+    })
+  const invertVisible = () =>
+    updateSelected((next) => {
+      for (const row of visible) {
+        if (next.has(row.id)) next.delete(row.id)
+        else next.add(row.id)
+      }
+    })
+  // Shift-click selects or clears the whole range since the previous click.
+  const clickRow = (index: number, shift: boolean) => {
+    setSelected((prev) => selectByClick(prev, visible, index, lastClicked.current, shift))
+    lastClicked.current = visible[index]?.id ?? null
+  }
+  // Batch operations end the selection; a single-row edit leaves an in-progress selection alone.
+  const assign = (ids: number[], policy: RoutePolicy, batch: boolean) => {
+    onChange(assignPolicy(value, ids, policy))
+    if (batch) setSelected(new Set())
+    setEditing(null)
+  }
 
   return (
-    <SectionCard
-      title={title}
-      description={description}
-      actions={<Button size="sm" variant="outline" onClick={() => setPicking(true)}><Plus />添加账号</Button>}
-    >
-      {value.length === 0 ? (
-        <p className="text-sm text-muted-foreground">没有单独规则的账号，全部按“不限制”处理。</p>
-      ) : (
-        <div className="space-y-3">
-          {selected.size > 0 && (
-            <div className="space-y-3 rounded-md border bg-muted/40 p-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-sm font-medium">已选 {selected.size} 个账号，批量设置为：</span>
-                <div className="flex gap-2">
-                  <Button size="sm" onClick={applyBatch} disabled={batchPolicy.routeMode === 'allow_list' && batchPolicy.routeRules.length === 0}>应用到所选</Button>
-                  <Button size="sm" variant="outline" onClick={() => remove(selected)}><Trash2 />移除所选</Button>
+    <SectionCard title={title} description={description}>
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            className="h-8 w-56"
+            placeholder="搜索名称、ID 或规则"
+            value={search}
+            onChange={(event) => { setSearch(event.target.value); setRenderLimit(RENDER_STEP) }}
+            aria-label={`搜索${title}`}
+          />
+          <Select value={activeFilter} onValueChange={(next) => { setFilter(next); setRenderLimit(RENDER_STEP) }}>
+            <SelectTrigger size="sm" className="w-56" aria-label={`按规则筛选${title}`}><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部账号（{rows.length}）</SelectItem>
+              <SelectItem value="unset">未设置（{rows.length - value.length}）</SelectItem>
+              <SelectItem value="set">已设置（{value.length}）</SelectItem>
+              {groups.map((group) => (
+                <SelectItem key={group.key} value={`rule:${group.key}`}>{group.summary}（{group.count}）</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="ml-auto text-xs text-muted-foreground">已设置 {value.length} / {rows.length}，其余应用时不限制</span>
+        </div>
+
+        <div className="flex min-h-9 flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-1.5">
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={headerState} onCheckedChange={toggleAllVisible} disabled={visible.length === 0} aria-label={`全选当前列表的${title}`} />
+            全选{keyword || activeFilter !== 'all' ? '筛选结果' : ''}（{visible.length}）
+          </label>
+          <Button size="xs" variant="ghost" onClick={invertVisible} disabled={visible.length === 0}>反选</Button>
+          {selectedIds.length > 0 ? (
+            <div className="ml-auto flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium">
+                已选 {selectedIds.length} 个
+                {selectedIds.length > visibleSelected && <span className="font-normal text-muted-foreground">（{selectedIds.length - visibleSelected} 个不在当前列表）</span>}
+              </span>
+              <Button size="sm" onClick={() => setEditing({ ids: selectedIds, batch: true })}><Route />设置路由规则</Button>
+              <Button size="sm" variant="outline" onClick={() => assign(selectedIds, { routeMode: 'allow_all', routeRules: [] }, true)} disabled={selectedWithRule === 0}>
+                <Eraser />清除设置
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>取消选择</Button>
+            </div>
+          ) : (
+            <span className="ml-auto text-xs text-muted-foreground">勾选账号后统一设置；Shift 点击可连续选择</span>
+          )}
+        </div>
+
+        {visible.length === 0 ? (
+          <p className="py-6 text-center text-sm text-muted-foreground">{rows.length === 0 ? '这里还没有账号' : '没有匹配的账号'}</p>
+        ) : (
+          <div className="max-h-[32rem] divide-y overflow-y-auto rounded-md border">
+            {rendered.map((row, index) => (
+              <div key={row.id} className="flex items-center gap-3 px-3 py-2 hover:bg-muted/30">
+                <Checkbox
+                  id={`${idPrefix}-account-${row.id}`}
+                  checked={selected.has(row.id)}
+                  onClick={(event) => {
+                    event.preventDefault()
+                    clickRow(index, event.shiftKey)
+                  }}
+                  aria-label={`选择账号 #${row.id}`}
+                />
+                <label htmlFor={`${idPrefix}-account-${row.id}`} className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+                  <span className="shrink-0 font-mono text-xs text-muted-foreground">#{row.id}</span>
+                  <span className="min-w-0 truncate text-sm">{row.label}</span>
+                  {row.missing && <Badge tone="error" className="shrink-0 whitespace-nowrap">已删除，应用时跳过</Badge>}
+                </label>
+                <span className={row.rule ? 'max-w-[45%] shrink-0 truncate text-sm' : 'shrink-0 text-xs text-muted-foreground'} title={row.rule ? policySummary(row.rule) : undefined}>
+                  {row.rule ? policySummary(row.rule) : '未设置'}
+                </span>
+                <div className="flex shrink-0 gap-0.5">
+                  <Button size="icon-xs" variant="ghost" title="设置规则" aria-label={`设置账号 #${row.id} 的规则`} onClick={() => setEditing({ ids: [row.id], batch: false })}><Pencil /></Button>
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    title="清除设置"
+                    aria-label={`清除账号 #${row.id} 的设置`}
+                    className={row.rule ? undefined : 'invisible'}
+                    onClick={() => assign([row.id], { routeMode: 'allow_all', routeRules: [] }, false)}
+                  >
+                    <X />
+                  </Button>
                 </div>
               </div>
-              <PolicyEditor value={batchPolicy} routes={routes} onChange={setBatchPolicy} idPrefix={`${title}-batch`} />
-            </div>
-          )}
-          <div className="divide-y rounded-md border">
-            {value.map((entry) => {
-              const account = byId.get(entry.id)
-              return (
-                <div key={entry.id} className="space-y-3 p-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Checkbox
-                      checked={selected.has(entry.id)}
-                      onCheckedChange={(checked) => toggle(entry.id, Boolean(checked))}
-                      aria-label={`选择账号 #${entry.id}`}
-                    />
-                    <span className="font-mono text-xs text-muted-foreground">#{entry.id}</span>
-                    <span className="min-w-0 truncate text-sm font-medium">{account?.label ?? '账号已不存在'}</span>
-                    {!account && <Badge tone="error">已删除，应用时跳过</Badge>}
-                    <Button className="ml-auto" size="icon-xs" variant="ghost" aria-label={`移除账号 #${entry.id}`} onClick={() => remove(new Set([entry.id]))}><X /></Button>
-                  </div>
-                  <PolicyEditor value={entry} routes={routes} onChange={(policy) => update(entry.id, policy)} idPrefix={`${title}-${entry.id}`} />
-                </div>
-              )
-            })}
+            ))}
+            {visible.length > rendered.length && (
+              <div className="flex items-center justify-center gap-2 p-2 text-xs text-muted-foreground">
+                已显示 {rendered.length} / {visible.length}，全选和批量操作对全部 {visible.length} 个生效
+                <Button size="xs" variant="ghost" onClick={() => setRenderLimit((limit) => limit + RENDER_STEP)}>再显示 {Math.min(RENDER_STEP, visible.length - rendered.length)} 个</Button>
+              </div>
+            )}
           </div>
-        </div>
+        )}
+      </div>
+      {editing && (
+        <AssignPolicyDialog
+          idPrefix={idPrefix}
+          ids={editing.ids}
+          rows={rows}
+          routes={routes}
+          onClose={() => setEditing(null)}
+          onApply={(policy) => assign(editing.ids, policy, editing.batch)}
+        />
       )}
-      <AccountPicker
-        open={picking}
-        title={`添加${title}`}
-        accounts={accounts.filter((account) => !listed.has(account.id))}
-        onClose={() => setPicking(false)}
-        onAdd={(ids) => {
-          onChange([...value, ...ids.map((id) => ({ id, routeMode: 'deny_list' as const, routeRules: [] }))])
-          setPicking(false)
-        }}
-      />
     </SectionCard>
   )
 }
 
-function AccountPicker({
-  open,
-  title,
-  accounts,
+/** One rule for a set of accounts. Mounted per use, so it always starts from the accounts' rule. */
+function AssignPolicyDialog({
+  idPrefix,
+  ids,
+  rows,
+  routes,
   onClose,
-  onAdd,
+  onApply,
 }: {
-  open: boolean
-  title: string
-  accounts: RouteScenarioAccountOption[]
+  idPrefix: string
+  ids: number[]
+  rows: AccountRow[]
+  routes: string[]
   onClose: () => void
-  onAdd: (ids: number[]) => void
+  onApply: (policy: RoutePolicy) => void
 }) {
-  const [search, setSearch] = React.useState('')
-  const [picked, setPicked] = React.useState<Set<number>>(new Set())
-  React.useEffect(() => {
-    if (!open) {
-      setSearch('')
-      setPicked(new Set())
-    }
-  }, [open])
-  const keyword = search.trim().toLowerCase()
-  const visible = accounts.filter((account) =>
-    !keyword || account.label.toLowerCase().includes(keyword) || String(account.id).includes(keyword),
-  )
-  const allVisiblePicked = visible.length > 0 && visible.every((account) => picked.has(account.id))
-  const toggleAll = () =>
-    setPicked((prev) => {
-      const next = new Set(prev)
-      for (const account of visible) {
-        if (allVisiblePicked) next.delete(account.id)
-        else next.add(account.id)
-      }
-      return next
-    })
+  const targetIds = new Set(ids)
+  const targets = rows.filter((row) => targetIds.has(row.id))
+  const existing = targets.filter((row) => row.rule)
+  const [policy, setPolicy] = React.useState<RoutePolicy>(() => initialBatchPolicy(targets))
+  const needsRoutes = policy.routeMode !== 'allow_all' && policy.routeRules.length === 0
+  const single = targets.length === 1 ? targets[0] : null
 
   return (
     <ModalShell
-      open={open}
+      open
       onClose={onClose}
-      title={title}
-      description="选中的账号会加入场景，默认规则为“禁止所选路由”，加入后再设置路由。"
+      title={single ? `设置账号 #${single.id} 的规则` : `设置 ${ids.length} 个账号的规则`}
+      description={single ? single.label : '所选账号统一使用下面的规则，原来的规则会被替换。'}
       footer={
         <>
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button onClick={() => onAdd(Array.from(picked))} disabled={picked.size === 0}>添加 {picked.size || ''}</Button>
+          <Button onClick={() => onApply(policy)} disabled={needsRoutes}>
+            {policy.routeMode === 'allow_all' ? '清除设置' : single ? '确定' : `应用到 ${ids.length} 个账号`}
+          </Button>
         </>
       }
     >
       <div className="space-y-3">
-        <Input placeholder="按名称、email 或 ID 搜索" value={search} onChange={(event) => setSearch(event.target.value)} aria-label="搜索账号" />
-        {visible.length === 0 ? (
-          <p className="py-6 text-center text-sm text-muted-foreground">没有可添加的账号</p>
-        ) : (
-          <>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox checked={allVisiblePicked} onCheckedChange={toggleAll} aria-label="全选当前列表" />
-              全选当前列表（{visible.length}）
-            </label>
-            <div className="max-h-96 divide-y overflow-y-auto rounded-md border">
-              {visible.map((account) => (
-                <label key={account.id} className="flex cursor-pointer items-center gap-3 p-2.5 hover:bg-muted/50">
-                  <Checkbox
-                    checked={picked.has(account.id)}
-                    onCheckedChange={(checked) =>
-                      setPicked((prev) => {
-                        const next = new Set(prev)
-                        if (checked) next.add(account.id)
-                        else next.delete(account.id)
-                        return next
-                      })
-                    }
-                    aria-label={`选择 ${account.label}`}
-                  />
-                  <span className="font-mono text-xs text-muted-foreground">#{account.id}</span>
-                  <span className="min-w-0 flex-1 truncate text-sm">{account.label}</span>
-                  <span className="shrink-0 text-xs text-muted-foreground">当前：{policySummary(account)}</span>
-                </label>
-              ))}
-            </div>
-          </>
+        <PolicyEditor value={policy} routes={routes} onChange={setPolicy} idPrefix={`${idPrefix}-assign`} />
+        {policy.routeMode === 'allow_all' && <p className="text-xs text-muted-foreground">不限制等于不设置，这些账号会从场景里移除，应用时恢复为不限制。</p>}
+        {needsRoutes && <p className="text-xs text-muted-foreground">请选择路由。在路由列表里点“全选”可一次选中现有全部路由。</p>}
+        {policy.routeMode === 'deny_list' && routes.length > 0 && routes.every((route) => policy.routeRules.includes(route)) && (
+          <p className="text-xs text-muted-foreground">已禁止现有全部路由；之后新增的路由不在这条规则里，仍会进入这些账号。</p>
+        )}
+        {!single && existing.length > 0 && (
+          <Callout tone="warning">其中 {existing.length} 个账号已有规则，会被替换为这条规则。</Callout>
         )}
       </div>
     </ModalShell>
@@ -364,8 +425,9 @@ function ScenarioEditor({
         <PolicyEditor value={state.content.local} routes={routes} onChange={(local) => setContent({ local })} idPrefix="local-pool" />
       </SectionCard>
       <AccountRulesEditor
+        idPrefix="local"
         title="本地账号"
-        description="只对需要单独限制的账号添加规则；没列出的本地账号应用时恢复为“不限制”。"
+        description="勾选账号后统一设置路由规则，再次设置会替换原规则。未设置的账号应用时恢复为“不限制”。"
         accounts={localAccounts}
         value={state.content.localAccounts}
         routes={routes}
@@ -375,8 +437,9 @@ function ScenarioEditor({
         <PolicyEditor value={state.content.external} routes={routes} onChange={(external) => setContent({ external })} idPrefix="external-pool" />
       </SectionCard>
       <AccountRulesEditor
+        idPrefix="external"
         title="外部账号"
-        description="只对需要单独限制的外部账号添加规则；没列出的外部账号应用时恢复为“不限制”。"
+        description="勾选账号后统一设置路由规则，再次设置会替换原规则。未设置的账号应用时恢复为“不限制”。"
         accounts={externalAccounts}
         value={state.content.externalAccounts}
         routes={routes}
