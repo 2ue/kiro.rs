@@ -58,7 +58,7 @@ pub struct CredentialAccountInfo {
     /// Overage 单价（美元）。
     #[serde(default)]
     pub overage_rate: f64,
-    /// 已产生 Overage 费用（美元）。
+    /// 已产生的 Overage 用量（积分）。
     #[serde(default)]
     pub current_overages: f64,
     /// 下次重置时间（Unix 时间戳）

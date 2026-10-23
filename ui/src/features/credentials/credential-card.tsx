@@ -37,6 +37,7 @@ import {
   formatLastUsed,
   formatMeteringUsage,
   formatNumber,
+  formatPercent,
   formatQuotaFixed,
   formatUsd,
   formatUsdFixed2,
@@ -314,9 +315,9 @@ export function CredentialCard({
     : '未查询'
   const overageDetail = accountInfo
     ? [
-        accountInfo.overageCap > 0 ? `上限 ${formatUsd(accountInfo.overageCap)}` : null,
+        accountInfo.overageCap > 0 ? `上限 ${formatQuotaFixed(accountInfo.overageCap)}` : null,
         accountInfo.overageRate > 0 ? `单价 ${formatUsd(accountInfo.overageRate)}` : null,
-        accountInfo.currentOverages > 0 ? `已用 ${formatUsd(accountInfo.currentOverages)}` : null,
+        accountInfo.currentOverages > 0 ? `已用 ${formatQuotaFixed(accountInfo.currentOverages)}` : null,
       ].filter(Boolean).join(' · ') || undefined
     : '查询额度后同步状态'
   const displayCredentialLabel = credentialLabel(credential, showEmailSuffix)
@@ -628,7 +629,14 @@ export function CredentialCard({
 
       <div className="mx-3 mb-2 px-3 py-2">
         <div className="flex items-center justify-between gap-3">
-          <span className="text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">额度</span>
+          <span className="flex items-baseline gap-1.5 text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">
+            额度
+            {accountInfo && accountInfo.usageLimit > 0 && !loadingBalance && (
+              <span className={`tabular normal-case ${quotaBar.inOverage ? 'font-semibold text-violet-600 dark:text-violet-400' : ''}`}>
+                {formatPercent(quotaBar.usagePercent / 100)}
+              </span>
+            )}
+          </span>
           <span className="truncate text-xs font-semibold tabular text-foreground">
             {loadingBalance
               ? '…'
@@ -638,7 +646,7 @@ export function CredentialCard({
                       {`${formatQuotaFixed(Math.min(accountInfo.currentUsage, accountInfo.usageLimit))} / ${formatQuotaFixed(accountInfo.usageLimit)}`}
                       {quotaBar.inOverage && (
                         <span className="ml-1.5 text-violet-600 dark:text-violet-400">
-                          超额 {quotaBar.overageUsage > 0 ? `+${formatQuotaFixed(quotaBar.overageUsage)}` : formatUsd(accountInfo.currentOverages)}
+                          超额 +{formatQuotaFixed(quotaBar.overage)}
                         </span>
                       )}
                     </>

@@ -66,9 +66,14 @@ export function formatQuota(value: number | undefined | null): string {
   }).format(num)
 }
 
+/** Quota credits with at most 6 decimals and no trailing zeros, e.g. 1,000 / 12.5 / 0.000123. */
 export function formatQuotaFixed(value: number | undefined | null): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '-'
-  return (value as number).toFixed(6)
+  return new Intl.NumberFormat('zh-CN', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 6,
+    useGrouping: true,
+  }).format(value as number)
 }
 
 export function formatCredits(value: number | undefined | null): string {
