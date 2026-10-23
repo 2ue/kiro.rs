@@ -1,4 +1,4 @@
-import { useId, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Area,
   Bar,
@@ -31,9 +31,6 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-  Tabs,
-  TabsList,
-  TabsTrigger,
 } from '@/components/ui'
 import type {
   UsageOverviewSeriesBreakdown,
@@ -44,6 +41,7 @@ import type {
 } from '@/types/api'
 
 // 分类色按位分配、不循环；超过 5 个成员折叠为“其他”。见 globals.css 的 --trend-*。
+// 槽位语义：0 蓝=主体，1 琥珀=需关注，2 青=恢复，3 玫红=失败，4 紫=其他。
 const SLOT_COLORS = ['var(--trend-1)', 'var(--trend-2)', 'var(--trend-3)', 'var(--trend-4)', 'var(--trend-5)'] as const
 const OTHER_COLOR = 'var(--trend-other)'
 const INK_COLOR = 'var(--trend-line)'
@@ -53,15 +51,17 @@ const MAX_STACK_MEMBERS = 5
 // 颜色跟随实体而不是排名：已知成员固定槽位，切换范围不会互换颜色。
 const LOCAL_ROUTE_COLORS: Record<string, string> = {
   local_success: SLOT_COLORS[0],
-  local_error_no_fallback: SLOT_COLORS[1],
   local_rescue_after_external: SLOT_COLORS[2],
+  local_error_no_fallback: SLOT_COLORS[3],
 }
+// 策略直连是主动选择用蓝；容量不足琥珀；账号不可用紫；模型不支持玫红；系统降级青。
+// 这个顺序与相邻关系已单独做过色盲校验，改动前先重跑校验。
 const EXTERNAL_REASON_COLORS: Record<string, string> = {
   policy_direct: SLOT_COLORS[0],
   local_capacity: SLOT_COLORS[1],
-  local_unavailable: SLOT_COLORS[2],
+  local_unavailable: SLOT_COLORS[4],
   model_unsupported: SLOT_COLORS[3],
-  system_degraded: SLOT_COLORS[4],
+  system_degraded: SLOT_COLORS[2],
 }
 
 type ValueFormat = 'count' | 'usd' | 'credits' | 'usdPerCredit' | 'percent'
@@ -81,6 +81,8 @@ type TrendLine = {
   value: (point: UsageOverviewSeriesPoint) => number | null
   /** 整个范围的汇总值；比例类折线必须先汇总分子分母再相除，不能对每个时段的比例求和 */
   aggregate?: (points: UsageOverviewSeriesPoint[]) => number | null
+  /** 合计/参照类折线用虚线中性色，靠线型而不是颜色和分类系列区分 */
+  reference?: boolean
 }
 
 type TrendExtraRow = {
@@ -239,7 +241,7 @@ export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[
       ratioAxis: true,
       reference: HIT_RATE_REFERENCE,
       lines: [
-        { key: 'hit:all', name: '整体', color: SLOT_COLORS[2], value: (point) => cacheHitRate(point.all), aggregate: (points) => aggregateHitRate(points, (point) => point.all) },
+        { key: 'hit:all', name: '整体', color: INK_COLOR, reference: true, value: (point) => cacheHitRate(point.all), aggregate: (points) => aggregateHitRate(points, (point) => point.all) },
         { key: 'hit:local', name: '本地账号池', color: SLOT_COLORS[0], value: (point) => cacheHitRate(point.local), aggregate: (points) => aggregateHitRate(points, (point) => point.local) },
         { key: 'hit:external', name: '外部池', color: SLOT_COLORS[1], value: (point) => cacheHitRate(point.external), aggregate: (points) => aggregateHitRate(points, (point) => point.external) },
       ],
@@ -262,6 +264,7 @@ export function summaryTrendViews(creditUnitPriceUsd: number | null): TrendView[
         key: 'revenue',
         name: '对外计费',
         color: INK_COLOR,
+        reference: true,
         value: (point) => point.all.estimatedCostUsd,
         aggregate: (points) => sumOver(points, (point) => point.all.estimatedCostUsd),
       }],
@@ -353,6 +356,7 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
         key: 'billable',
         name: '可计费',
         color: INK_COLOR,
+        reference: true,
         value: (point) => point.external.billableCostUsd,
         aggregate: (points) => sumOver(points, (point) => point.external.billableCostUsd),
       }],
@@ -363,7 +367,7 @@ export function externalTrendViews(groups: UsageOverviewSeriesGroups): TrendView
       key: 'profit',
       label: '毛利',
       format: 'usd',
-      bars: [{ key: 'profit', name: '毛利', color: SLOT_COLORS[0], value: (point) => point.external.profitUsd }],
+      bars: [{ key: 'profit', name: '毛利', color: SLOT_COLORS[2], value: (point) => point.external.profitUsd }],
       footnote: '补偿后计费 - 上游原始成本；低于 0 的时段在亏钱。',
     },
     {
@@ -561,6 +565,76 @@ function TrendTable({
   )
 }
 
+/** 跟随系统“减少动态效果”设置；开启时图表不做过渡动画。 */
+function usePrefersReducedMotion(): boolean {
+  const [reduced, setReduced] = useState(() =>
+    typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+  )
+  useEffect(() => {
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const onChange = () => setReduced(query.matches)
+    query.addEventListener('change', onChange)
+    return () => query.removeEventListener('change', onChange)
+  }, [])
+  return reduced
+}
+
+/** 分段切换器：选中底块在选项之间滑动，而不是瞬间跳过去。 */
+function SegmentedViews({
+  views,
+  value,
+  onChange,
+}: {
+  views: Array<{ key: string; label: string }>
+  value: string
+  onChange: (key: string) => void
+}) {
+  const listRef = useRef<HTMLDivElement>(null)
+  const [indicator, setIndicator] = useState<{ left: number; width: number } | null>(null)
+  useLayoutEffect(() => {
+    const list = listRef.current
+    const active = list?.querySelector<HTMLButtonElement>(`[data-view="${CSS.escape(value)}"]`)
+    if (!list || !active) return
+    setIndicator({ left: active.offsetLeft, width: active.offsetWidth })
+  }, [value, views])
+  return (
+    <div
+      ref={listRef}
+      role="tablist"
+      aria-label="切换视图"
+      className="relative inline-flex h-8 max-w-full items-center overflow-x-auto rounded-lg bg-muted p-1 text-muted-foreground"
+    >
+      {indicator && (
+        <span
+          aria-hidden
+          className="absolute top-1 bottom-1 rounded-md bg-card shadow-sm ring-1 ring-border/40 transition-[left,width] duration-300 ease-out motion-reduce:transition-none"
+          style={{ left: indicator.left, width: indicator.width }}
+        />
+      )}
+      {views.map((item) => {
+        const selected = item.key === value
+        return (
+          <button
+            key={item.key}
+            type="button"
+            role="tab"
+            data-view={item.key}
+            aria-selected={selected}
+            className={cn(
+              'relative z-10 inline-flex h-6 items-center whitespace-nowrap rounded-md px-2.5 text-xs font-medium transition-colors duration-200',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              selected ? 'text-foreground' : 'hover:text-foreground',
+            )}
+            onClick={() => onChange(item.key)}
+          >
+            {item.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 /** ChartConfig 的 key 会变成 CSS 变量名，这里统一转成合法标识符。 */
 function chartKey(key: string): string {
   return `s-${key.replace(/[^a-zA-Z0-9_-]/g, '_')}`
@@ -607,6 +681,10 @@ export function OverviewTrendCard({
   onDrillDown?: (point: UsageOverviewSeriesPoint) => void
 }) {
   const gradientId = useId().replace(/:/g, '')
+  const reducedMotion = usePrefersReducedMotion()
+  const animate = !reducedMotion
+  // 切换视图时整张图重新挂载，柱子从基线长出、折线从左往右画出。
+  const animation = { isAnimationActive: animate, animationDuration: 600, animationEasing: 'ease-out' as const }
   const [viewKey, setViewKey] = useState(views[0]?.key ?? '')
   const [hidden, setHidden] = useState<Set<string>>(() => new Set())
   const [showTable, setShowTable] = useState(false)
@@ -655,6 +733,7 @@ export function OverviewTrendCard({
       name: series.name,
       color: series.color,
       shape: 'dot' as const,
+      dashed: false,
       total: sumOver(points, series.value),
     })),
     ...(view.lines ?? []).map((line) => ({
@@ -662,6 +741,7 @@ export function OverviewTrendCard({
       name: line.name,
       color: line.color,
       shape: 'line' as const,
+      dashed: Boolean(line.reference),
       total: line.aggregate ? line.aggregate(points) : null,
     })),
   ]
@@ -677,10 +757,8 @@ export function OverviewTrendCard({
     (min) => Math.max(0, Math.floor((min - 0.05) * 20) / 20),
     (max) => Math.min(1, Math.ceil((max + 0.05) * 20) / 20),
   ]
-  const gradientItems = [
-    ...visibleBars.map((series) => ({ key: series.key })),
-    ...visibleLines.map((line) => ({ key: line.key, area: true })),
-  ]
+  // 柱子用实色 + 卡片色描边分段，避免堆叠时渐变在接缝处断层；渐变只给折线下的面积用。
+  const gradientItems = visibleLines.map((line) => ({ key: line.key, area: true }))
   const chartConfig: ChartConfig = Object.fromEntries([
     ...view.bars.map((series) => [chartKey(series.key), { label: series.name, color: series.color }]),
     ...(view.lines ?? []).map((line) => [chartKey(line.key), { label: line.name, color: line.color }]),
@@ -714,23 +792,14 @@ export function OverviewTrendCard({
         <div className="min-w-0">
           <div className="text-xs text-muted-foreground">{headlineLabel}</div>
           <div
-            className="mt-0.5 text-2xl font-semibold tracking-tight text-foreground"
+            key={view.key}
+            className="mt-0.5 text-2xl font-semibold tracking-tight text-foreground animate-in fade-in-0 slide-in-from-bottom-1 duration-300 motion-reduce:animate-none"
             title={headlineValue == null ? undefined : formatValue(headlineValue, view.format)}
           >
             {formatSummaryValue(headlineValue, view.format)}
           </div>
         </div>
-        {views.length > 1 && (
-          <Tabs value={view.key} onValueChange={switchView}>
-            <TabsList className="h-8 max-w-full overflow-x-auto">
-              {views.map((item) => (
-                <TabsTrigger key={item.key} value={item.key} className="h-6 px-2.5 text-xs">
-                  {item.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-        )}
+        {views.length > 1 && <SegmentedViews views={views} value={view.key} onChange={switchView} />}
       </div>
       <div className={cn('transition-opacity', loading && 'opacity-60')}>
         {loading && points.length === 0 ? (
@@ -741,8 +810,9 @@ export function OverviewTrendCard({
           <TrendTable points={points} view={view} bars={visibleBars} lines={visibleLines} partialFrom={partialFrom} />
         ) : (
           <ChartContainer
+            key={view.key}
             config={chartConfig}
-            className="aspect-auto h-[280px] w-full"
+            className="aspect-auto h-[280px] w-full animate-in fade-in-0 duration-300 motion-reduce:animate-none"
             role="img"
             aria-label={`${title}：${view.label}，共 ${points.length} 个时段，可切换为数据表查看具体数值`}
           >
@@ -779,7 +849,8 @@ export function OverviewTrendCard({
                   width={52}
                 />
                 <ChartTooltip
-                  cursor={lineOnly ? { strokeDasharray: '3 3' } : { radius: 6 }}
+                  cursor={lineOnly ? { strokeDasharray: '3 3' } : { radius: 6, fillOpacity: 0.6 }}
+                  animationDuration={150}
                   content={(props) => (
                     <TrendTooltip
                       active={props.active}
@@ -796,14 +867,14 @@ export function OverviewTrendCard({
                 {view.reference && (
                   <ReferenceLine
                     y={view.reference.value}
-                    stroke="hsl(var(--warning))"
-                    strokeOpacity={0.7}
-                    strokeDasharray="4 4"
+                    stroke="hsl(var(--muted-foreground))"
+                    strokeOpacity={0.45}
+                    strokeDasharray="2 4"
                     ifOverflow="extendDomain"
                     label={{
                       value: `${view.reference.label} ${formatValue(view.reference.value, view.format)}`,
                       position: 'insideTopRight',
-                      fill: 'hsl(var(--warning))',
+                      fill: 'hsl(var(--muted-foreground))',
                       fontSize: 11,
                     }}
                   />
@@ -814,10 +885,14 @@ export function OverviewTrendCard({
                     dataKey={series.key}
                     name={series.name}
                     stackId="trend"
-                    fill={gradientRef(series.key)}
+                    fill={chartVar(series.key)}
+                    fillOpacity={0.9}
+                    stroke={SURFACE}
+                    strokeWidth={visibleBars.length > 1 ? 1 : 0}
                     maxBarSize={points.length > 48 ? 10 : 28}
-                    radius={series.key === topBarKey ? [6, 6, 0, 0] : 0}
-                    isAnimationActive={false}
+                    radius={series.key === topBarKey ? [5, 5, 0, 0] : 0}
+                    activeBar={{ fillOpacity: 1 }}
+                    {...animation}
                   />
                 ))}
                 {visibleBars.map((series) => (
@@ -827,10 +902,12 @@ export function OverviewTrendCard({
                     name={`${series.name}（进行中）`}
                     stackId="trend"
                     fill={chartVar(series.key)}
-                    fillOpacity={0.3}
+                    fillOpacity={0.25}
+                    stroke={SURFACE}
+                    strokeWidth={visibleBars.length > 1 ? 1 : 0}
                     maxBarSize={points.length > 48 ? 10 : 28}
                     radius={series.key === topBarKey ? [6, 6, 0, 0] : 0}
-                    isAnimationActive={false}
+                    {...animation}
                     legendType="none"
                   />
                 ))}
@@ -842,7 +919,7 @@ export function OverviewTrendCard({
                     stroke="none"
                     fill={gradientRef(line.key)}
                     connectNulls={false}
-                    isAnimationActive={false}
+                    {...animation}
                     activeDot={false}
                     legendType="none"
                     tooltipType="none"
@@ -855,13 +932,14 @@ export function OverviewTrendCard({
                     name={line.name}
                     type={points.length > 72 ? 'linear' : 'monotone'}
                     stroke={chartVar(line.key)}
-                    strokeWidth={points.length > 72 ? 1.5 : 2}
+                    strokeWidth={line.reference ? 1.75 : points.length > 72 ? 1.5 : 2}
+                    strokeDasharray={line.reference ? '5 4' : undefined}
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     dot={false}
                     activeDot={{ r: 4, fill: chartVar(line.key), stroke: SURFACE, strokeWidth: 2 }}
                     connectNulls={false}
-                    isAnimationActive={false}
+                    {...animation}
                   />
                 ))}
               </ComposedChart>
@@ -869,7 +947,10 @@ export function OverviewTrendCard({
         )}
       </div>
       {hasData && legendItems.length > 1 && (
-        <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-border/50 pt-3">
+        <div
+          key={view.key}
+          className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-border/50 pt-3 animate-in fade-in-0 duration-300 motion-reduce:animate-none"
+        >
           {legendItems.map((item) => {
             const off = hidden.has(item.key)
             return (
@@ -877,7 +958,7 @@ export function OverviewTrendCard({
                 key={item.key}
                 type="button"
                 className={cn(
-                  'group inline-flex items-center gap-2 rounded-md text-left text-xs transition-opacity',
+                  'group inline-flex items-center gap-2 rounded-md text-left text-xs transition-opacity duration-200',
                   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
                   off && 'opacity-40',
                 )}
@@ -885,10 +966,14 @@ export function OverviewTrendCard({
                 title={off ? `显示 ${item.name}` : `隐藏 ${item.name}`}
                 onClick={() => toggle(item.key)}
               >
-                <span
-                  className={cn('shrink-0', item.shape === 'line' ? 'h-0.5 w-3.5 rounded-full' : 'size-2.5 rounded-full')}
-                  style={{ background: item.color }}
-                />
+                {item.dashed ? (
+                  <span className="w-3.5 shrink-0 border-t-2 border-dashed" style={{ borderColor: item.color }} />
+                ) : (
+                  <span
+                    className={cn('shrink-0', item.shape === 'line' ? 'h-0.5 w-3.5 rounded-full' : 'size-2.5 rounded-full')}
+                    style={{ background: item.color }}
+                  />
+                )}
                 <span className="text-muted-foreground group-hover:text-foreground">{item.name}</span>
                 {item.total != null && (
                   <span className="font-medium tabular-nums text-foreground">{formatSummaryValue(item.total, view.format)}</span>
