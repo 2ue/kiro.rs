@@ -1,0 +1,657 @@
+{
+  "model": "claude-haiku-4-5",
+  "language_a2off_old": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8857142857142857,
+      "text": "测试挂了，问题在 `src/cache.rs:212` 的 `cache::tests::evicts_oldest`。\n\n断言失败：期望值是 2，但实际得到 3。这看起来是缓存驱逐逻辑的问题——可能没有正确移除最旧的条目。\n\n让我看一下这个测试和相关代码："
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8984615384615384,
+      "text": "最近 10 次提交都是对 `src/pipeline.rs` 文件的重构，主题都是\"将请求管道拆分为 parse、convert 和 dispatch 三个阶段\"。每次提交都修改了 40-49 行代码。\n\n看起来是同一个重构任务被多次提交了。想看某一个具体提交的详细改动吗？"
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9121338912133892,
+      "text": "README 讲了两种配置方式：\n\n1. **环境变量** - 优先级最高，通过设置环境变量来配置\n2. **settings.toml 文件** - 优先级次之，从配置文件读取设置\n3. **默认值** - 两者都缺失时使用，并打印警告\n\n加载顺序是：环境变量 → settings.toml → 默认值\n\n另外还提到了 **CONFLOAD_PATH** 环境变量，用来覆盖配置文件路径。\n\n合并策略：嵌套表浅合并，数组则直接替换。"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.48632218844984804,
+      "text": "`request_timeout_secs` 在以下 6 个处理器中使用：\n\n- **src/handlers/auth.rs** - 第 40, 46, 52, 58 行\n- **src/handlers/billing.rs** - 第 41, 47, 53, 59 行\n- **src/handlers/proxy.rs** - 第 42, 48, 54, 60 行\n- **src/handlers/stream.rs** - 第 43, 49, 55, 61 行\n- **src/handlers/retry.rs** - 第 44, 50, 56, 62 行\n- **src/handle"
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9868421052631579,
+      "text": "没有明显的慢请求。根据日志，最近的请求响应时间在 20-79ms 之间，呈线性递增趋势，都在正常范围内。所有请求状态码都是 200（成功）。\n\n如果你想定义\"慢请求\"的阈值（比如超过 100ms），我可以进一步筛查日志。"
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9354838709677419,
+      "text": "装好了，但有问题：\n\n1. **3 个高危漏洞** — 需要修复\n2. **inflight 包已弃用** — 会泄漏内存\n\n运行修复："
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8571428571428571,
+      "text": "测试结果：**1 个失败**\n\n失败位置：`src/cache.rs:212:9` 在 `cache::tests::evicts_oldest` 测试中\n\n问题：断言失败\n- 期望值：2\n- 实际值：3\n\n这看起来是缓存驱逐逻辑的问题。让我看一下代码："
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9643835616438357,
+      "text": "最近的提交都是针对 `src/pipeline.rs` 的重构，主题是\"将请求管道分解为解析、转换和分派三个阶段\"。每次提交都修改了大约 40-49 行代码。\n\n看起来是同一个重构任务的多次迭代提交。想看具体的改动内容吗？可以查看最新提交的详细差异。"
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9113924050632911,
+      "text": "根据 README，这个库讲了 2 种配置方式：\n\n1. **环境变量** - 优先级最高，首先读取环境变量\n2. **settings.toml 文件** - 作为备选方案，在环境变量缺失时使用\n\n配置的加载逻辑是：\n- 环境变量 → settings.toml 文件 → 默认值（缺失时使用默认值并打印警告）\n- 嵌套表会浅合并，数组则直接替换\n- 可以通过设置 `CONFLOAD_PATH` 环境变量来覆盖配置路径"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.425,
+      "text": "`request_timeout_secs` 在以下 6 个 handler 文件中使用：\n\n- **src/handlers/auth.rs** - 行 40, 46, 52, 58\n- **src/handlers/billing.rs** - 行 41, 47, 53, 59\n- **src/handlers/proxy.rs** - 行 42, 48, 54, 60\n- **src/handlers/stream.rs** - 行 43, 49, 55, 61\n- **src/handlers/retry.rs** - 行 44, 50, 56, 62\n- **src/handlers"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9782608695652174,
+      "text": "没有明显的慢请求。日志显示最近的请求都在 20-79 ms 之间完成，响应时间呈线性递增趋势，所有请求都返回 200 状态码。\n\n这个模式看起来很规律（每个 worker 轮流处理请求，间隔 3 秒），是否需要我查看更长的历史日志或检查特定时间段的数据？"
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9025641025641026,
+      "text": "装好了，但有问题：\n\n- **3个高危漏洞**，建议修复\n- **inflight 模块已弃用**，会泄漏内存，被多个依赖间接引用\n\n要我运行 `npm audit fix` 自动修复吗？"
+    }
+  ],
+  "language_a2on_old": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7777777777777778,
+      "text": "测试挂在 `cache::tests::evicts_oldest`，在 `src/cache.rs:212` 处断言失败。预期值是 2，但实际得到 3。\n\n让我看一下相关代码："
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": 0.831275720164609,
+      "text": "最近的提交都是对 `src/pipeline.rs` 的重构，主题是\"split the request pipeline into parse, convert and dispatch stages\"（将请求管道分解为解析、转换和分发三个阶段）。\n\n这 10 个提交看起来是逐步迭代的，每次都修改了 `src/pipeline.rs` 中的 40-49 行。可以看出这是在逐步调整代码结构。\n\n想看具体改了什么吗？我可以查看最新提交或对比某两个版本之间的差异。"
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9366197183098591,
+      "text": "根据 README，这个库支持 **3 种配置方式**：\n\n1. **环境变量** — 优先级最高，首先读取\n2. **settings.toml 文件** — 环境变量未设置时作为备选\n3. **默认值** — 两者都缺失时使用，并打印警告\n\n配置的合并规则是：嵌套表进行浅合并，数组则直接替换。\n\n另外还提到可以通过设置 `CONFLOAD_PATH` 环境变量来覆盖配置文件的路径。\n\n不过 README 内容重复较多，信息不够详细。如果需要了解具体用法，建议查看源码。"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.6502835538752363,
+      "text": "`request_timeout_secs` 用在以下地方：\n\n**handlers 目录下的 6 个模块中**：\n- `src/handlers/auth.rs` - 第 40, 46, 52, 58 行\n- `src/handlers/billing.rs` - 第 41, 47, 53, 59 行\n- `src/handlers/proxy.rs` - 第 42, 48, 54, 60 行\n- `src/handlers/stream.rs` - 第 43, 49, 55, 61 行\n- `src/handlers/retry.rs` - 第 44, 50, 56, 62 行\n- `sr"
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9551282051282052,
+      "text": "从日志来看，最近的请求响应时间呈现逐步增长的趋势。最新的请求（request 1059）响应时间已经达到 79ms，而最早的请求（request 1000）只需 20ms。\n\n**关键观察：**\n- 响应时间从 20ms 线性递增到 79ms\n- 所有请求状态都是 200（正常）\n- 没有明显的异常峰值或错误\n\n这种渐进式增长可能表明：\n1. 系统负载在逐步加重\n2. 可能存在内存泄漏或资源积累\n3. 数据库查询或缓存效率下降\n\n建议检查：\n- Worker 的内存占用趋势\n- 数据库连接池状态\n- 缓存命中率"
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9086161879895561,
+      "text": "依赖装好了，但有 3 个高风险漏洞。运行 `npm audit fix` 可以修复它们。\n\n另外还有个问题：`inflight` 这个包已弃用且会泄漏内存，它是被其他依赖间接引入的。要彻底解决，需要更新那些依赖，或者用 `npm audit fix --force` 强制修复（可能升级到不兼容的版本）。\n\n要修复吗？"
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8260869565217391,
+      "text": "找到了。`cache::tests::evicts_oldest` 测试失败。\n\n问题在 `src/cache.rs:212`，断言失败：期望值是 2，但实际得到 3。\n\n让我查看一下这个测试和相关代码："
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8020565552699229,
+      "text": "最近 10 次提交都是同一个改动：**refactor: split the request pipeline into parse, convert and dispatch stages**\n\n都修改了 `src/pipeline.rs` 文件，每次改动行数略有不同（从 40 到 49 行的改动）。看起来是同一个重构，可能是多次迭代或重复提交。\n\n要看具体改了什么内容，我查一下最新提交的详细变化："
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8888888888888888,
+      "text": "README 讲了两种配置方式：\n\n1. **环境变量** - 优先级最高，通过 `CONFLOAD_PATH` 可以覆盖配置路径\n2. **settings.toml 文件** - 当环境变量未设置时的备选方案\n\n加载逻辑是：先读环境变量 → 再读 settings.toml → 都没有则使用默认值并打印警告。嵌套表浅层合并，数组则直接替换。"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.5263157894736842,
+      "text": "`request_timeout_secs` 被用在以下 6 个 handler 文件中：\n\n- **src/handlers/auth.rs** - 第 40, 46, 52, 58 行\n- **src/handlers/billing.rs** - 第 41, 47, 53, 59 行\n- **src/handlers/proxy.rs** - 第 42, 48, 54, 60 行\n- **src/handlers/stream.rs** - 第 43, 49, 55, 61 行\n- **src/handlers/retry.rs** - 第 44, 50, 56, 62 行\n- **sr"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9676425269645609,
+      "text": "从日志看，worker 的请求响应时间在逐步增长，从 20ms 缓慢上升到 79ms。这说明有性能衰减的趋势，但没有明显的\"慢请求\"峰值。\n\n所有请求都返回 200 状态码，说明没有错误。不过这种线性的性能下降可能表示：\n\n- 内存泄漏或资源逐步消耗\n- 队列堆积\n- GC 压力增加\n\n建议检查：\n1. worker 进程的内存和 CPU 使用情况\n2. 更早的日志，看什么时候开始出现衰减\n3. 是否有周期性的慢请求或只是这个持续增长的趋势\n\n要我看更多的历史日志吗？"
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8754716981132076,
+      "text": "依赖装好了，但有以下问题：\n\n1. **deprecated 警告**：`inflight@1.0.6` 这个模块不再维护，会有内存泄漏的风险\n\n2. **3 个高危漏洞**：检出了安全问题\n\n要修复这些漏洞，运行：\n```bash\nnpm audit fix\n```\n\n要我继续修复吗？"
+    }
+  ],
+  "tool_choice_old": [
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": false,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Grep"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    }
+  ],
+  "language_a2off_new": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7419354838709677,
+      "text": "找到了，`cache::tests::evicts_oldest` 测试失败。\n\n问题在 `src/cache.rs:212` 行，断言失败：期望值是 2，实际值是 3。"
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8141592920353983,
+      "text": "最近 10 次提交都是对 `src/pipeline.rs` 进行重构，内容相同：**\"refactor: split the request pipeline into parse, convert and dispatch stages\"**（将请求管道拆分为解析、转换和分发三个阶段）。\n\n每次提交都修改了 40+ 行代码。看起来可能是重复提交或者版本控制有问题。\n\n要看具体改了什么内容吗？可以用 `git show` 查看最新一次提交的详细差异。"
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9128630705394191,
+      "text": "这个库的 README 讲了两种配置方式：\n\n1. **环境变量** — 优先级最高，通过设置环境变量来配置\n2. **settings.toml 文件** — 作为备选方案，当环境变量不存在时读取\n\n加载逻辑是：环境变量 → settings.toml → 默认值（缺失时打印警告）\n\n对于嵌套配置，浅层合并；数组则直接替换。\n\n另外还提到可以通过 `CONFLOAD_PATH` 环境变量来覆盖配置文件的位置。"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.5785536159600998,
+      "text": "`request_timeout_secs` 在以下地方使用：\n\n| 文件 | 行号 | 用途 |\n|------|------|------|\n| `src/handlers/auth.rs` | 40, 46, 52, 58 | 4 处用到 |\n| `src/handlers/billing.rs` | 41, 47, 53, 59 | 4 处用到 |\n| `src/handlers/proxy.rs` | 42, 48, 54, 60 | 4 处用到 |\n| `src/handlers/stream.rs` | 43, 49, 55, 61 | 4 处用到 |\n| `src/handle"
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9642857142857143,
+      "text": "没有明显的慢请求。最近的日志显示：\n\n- 请求耗时从 20ms 逐渐增长到 79ms，整体在正常范围内\n- 所有请求都返回 200 状态码，没有错误\n- 四个 worker 分布均匀，负载平衡\n\n如果要定义\"慢请求\"的阈值（比如超过 100ms），当前日志中没有发现。"
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8735632183908046,
+      "text": "依赖已装好，有 3 个高危漏洞。运行 `npm audit fix` 可以自动修复："
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8048780487804879,
+      "text": "测试挂了。`cache::tests::evicts_oldest` 失败，断言错误在 `src/cache.rs:212:9`，预期值是 2 但得到了 3。\n\n让我看一下这个测试和相关代码："
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8,
+      "text": "最近10次提交都是同一个改动：\n\n**提交信息**: `refactor: split the request pipeline into parse, convert and dispatch stages`\n\n**修改文件**: 仅 `src/pipeline.rs`\n\n**改动量**: 每次提交都是40-49行的修改（增删混合）\n\n看起来这个文件被反复提交了多次，可能是同一个重构被多次修改或者是测试/迭代过程。如果需要看具体改了什么内容，可以查看最新提交的详细差异：\n\n```bash\ngit show HEAD\n```\n\n或对比最新和最早的版本：\n\n```bash\ngit diff HE"
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8852459016393442,
+      "text": "README 讲了两种配置方式：\n\n1. **环境变量** - 优先级最高\n2. **settings.toml 文件** - 作为备选方案\n\n加载优先级是：环境变量 → settings.toml → 默认值（缺失时打印警告）\n\n还提到了一个环境变量 `CONFLOAD_PATH` 可以用来覆盖配置文件路径。\n\n嵌套表会浅层合并，数组会被替换。"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.4883720930232558,
+      "text": "`request_timeout_secs` 在以下 6 个 handler 文件中使用：\n\n1. **src/handlers/auth.rs** - 第 40, 46, 52, 58 行\n2. **src/handlers/billing.rs** - 第 41, 47, 53, 59 行\n3. **src/handlers/proxy.rs** - 第 42, 48, 54, 60 行\n4. **src/handlers/stream.rs** - 第 43, 49, 55, 61 行\n5. **src/handlers/retry.rs** - 第 44, 50, 56, 62 行\n6"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9642857142857143,
+      "text": "没有发现慢请求。最近的日志显示所有请求都在 20-79ms 之间完成，响应时间呈现稳定的线性增长趋势，所有请求状态码都是 200。worker 运行状态正常。"
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8961748633879781,
+      "text": "依赖已装好。发现问题：\n\n- **3 个高危漏洞**，建议运行 `npm audit fix` 修复\n- **inflight 包已弃用**，会有内存泄漏风险\n\n要我修复这些漏洞吗？"
+    }
+  ],
+  "language_a2on_new": [
+    {
+      "case": 0,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8297872340425532,
+      "text": "测试挂了。`cache::tests::evicts_oldest` 失败了。\n\n问题在 `src/cache.rs:212`，断言失败：期望值是 2，实际值是 3。这说明缓存驱逐最旧元素的逻辑有问题。"
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9151670951156813,
+      "text": "最近10条提交都是同一个改动：重构请求管道，将其拆分为 parse、convert 和 dispatch 三个阶段。\n\n所有提交都只改了 `src/pipeline.rs` 这一个文件，每次提交的改动量在 40-49 行之间。\n\n看起来这些提交很相似（可能是多次迭代或意外的重复提交）。要看具体改了什么细节吗？"
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9004739336492891,
+      "text": "根据 README，这个库支持以下配置方式：\n\n1. **环境变量** - 优先级最高，首先读取\n2. **settings.toml 文件** - 作为备选方案\n3. **默认值** - 当以上两者都缺失时使用，并打印警告\n\n加载规则：\n- 环境变量优先\n- 嵌套表浅合并（shallow merge）\n- 数组会被替换（不合并）\n- 可通过设置 `CONFLOAD_PATH` 环境变量覆盖配置文件路径"
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "status": 200,
+      "share": 0.7695749440715883,
+      "text": "根据搜索结果，`request_timeout_secs` 被用到了以下 6 个处理器模块中：\n\n1. **auth.rs** - 认证处理器（行号：40, 46, 52, 58）\n2. **billing.rs** - 账单处理器（行号：41, 47, 53, 59）\n3. **proxy.rs** - 代理处理器（行号：42, 48, 54, 60）\n4. **stream.rs** - 流处理器（行号：43, 49, 55, 61）\n5. **retry.rs** - 重试处理器（行号：44, 50, 56, 62）\n6. **health.rs** - 健康检查处理器（行号：45, 5"
+    },
+    {
+      "case": 4,
+      "rep": 0,
+      "status": 200,
+      "share": 0.9357798165137615,
+      "text": "从日志来看，最近没有明显的慢请求。所有请求的响应时间都在 20-79 ms 之间，呈线性递增趋势，没有异常尖峰。\n\n- 最快的请求：20 ms（request 1000）\n- 最慢的请求：79 ms（request 1059）\n- 所有请求状态码都是 200（正常）\n- 各 worker 分布均衡\n\n如果想查看更长的历史记录或设置特定的慢请求阈值（比如超过 100 ms），可以继续深入查看。"
+    },
+    {
+      "case": 5,
+      "rep": 0,
+      "status": 200,
+      "share": 0.8484848484848485,
+      "text": "依赖装完了。有以下问题：\n\n1. **deprecation 警告**：`inflight@1.0.6` 包已弃用，存在内存泄漏\n2. **3 个高危漏洞**：建议运行 `npm audit fix` 修复\n\n要我修复这些漏洞吗？"
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8333333333333334,
+      "text": "有一个测试失败了。在 `src/cache.rs` 第 212 行，`cache::tests::evicts_oldest` 测试中断言失败：\n\n期望值是 2，实际值是 3。\n\n让我看一下这个测试和相关代码："
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9230769230769231,
+      "text": "最近10次提交都是对 `src/pipeline.rs` 的重构，改动内容都是\"将请求管道分解为 parse、convert 和 dispatch 三个阶段\"。\n\n每次提交改动行数略有不同（40-49行），但提交信息完全相同。看起来可能是迭代开发或多次调整同一个功能。\n\n要查看具体改了什么代码，我可以看一下最新提交的详细差异吗？"
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "status": 200,
+      "share": 0.9004739336492891,
+      "text": "根据 README，这个库支持两种配置方式：\n\n1. **环境变量** — 优先级最高，通过设置 `CONFLOAD_PATH` 可以覆盖默认路径\n2. **settings.toml 文件** — 作为环保备选方案\n\n加载顺序是：先读环境变量，再回退到 settings.toml，如果两者都缺失则使用默认值并打印警告。\n\n合并逻辑：嵌套表会浅合并，数组则直接替换。"
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "status": 200,
+      "share": 0.4878048780487805,
+      "text": "`request_timeout_secs` 用在以下 6 个 handler 文件中：\n\n- **src/handlers/auth.rs** — 第 40, 46, 52, 58 行\n- **src/handlers/billing.rs** — 第 41, 47, 53, 59 行\n- **src/handlers/proxy.rs** — 第 42, 48, 54, 60 行\n- **src/handlers/stream.rs** — 第 43, 49, 55, 61 行\n- **src/handlers/retry.rs** — 第 44, 50, 56, 62 行\n- **src"
+    },
+    {
+      "case": 4,
+      "rep": 1,
+      "status": 200,
+      "share": 0.967741935483871,
+      "text": "根据日志来看，没有明显的慢请求。最近的请求响应时间在 20-79ms 之间，呈现稳定的线性增长趋势。所有请求都返回 200 状态码，worker 负载分布均匀。\n\n如果你要定义\"慢请求\"的阈值（比如超过 100ms 或 500ms），我可以进一步检查是否存在超过该阈值的请求。"
+    },
+    {
+      "case": 5,
+      "rep": 1,
+      "status": 200,
+      "share": 0.8963210702341137,
+      "text": "依赖安装完了，有以下几个问题：\n\n1. **内存泄漏警告**：`inflight` 模块已过时且会泄漏内存，在依赖树中被多个包引用\n2. **3个高危漏洞**：npm audit 检测到安全问题\n\n要修复这些，运行：\n```bash\nnpm audit fix\n```\n\n要我现在修复吗？"
+    }
+  ],
+  "tool_choice_new": [
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": false,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 0,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Read"
+      ]
+    },
+    {
+      "case": 0,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 1,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": false,
+      "tools": [
+        "Bash"
+      ]
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 2,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "any",
+      "status": 200,
+      "complied": false,
+      "tools": []
+    },
+    {
+      "case": 3,
+      "rep": 1,
+      "choice": "tool",
+      "status": 200,
+      "complied": true,
+      "tools": [
+        "TodoWrite"
+      ]
+    }
+  ]
+}

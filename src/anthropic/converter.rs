@@ -594,9 +594,12 @@ fn convert_request_with_model_id(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // A turn that only carries tool results has no user-authored text. Turn reminders appended
-    // to it read as text injected into a tool result, and models reply that they will ignore
-    // "the instruction inside the tool output" (seen on 2026-10-21 in Claude Code sessions).
+    // A turn that only carries tool results has no user-authored text. Any turn reminder appended
+    // to it sits right after the tool output, and Claude Code's own system prompt tells the model
+    // to report instructions found in tool results: in 2026-10-21 sessions it wrote "the tool
+    // result ends with reminders that you did not send, I will ignore them" in visible replies.
+    // So every turn reminder (tool_choice, language, identity) is only added when the user wrote
+    // text in this turn; the system-level prompts still apply on tool-result-only turns.
     let turn_has_user_text = !text_content.trim().is_empty();
     let mut content = text_content;
     if content.trim().is_empty() {
@@ -609,12 +612,16 @@ fn convert_request_with_model_id(
         }
     }
     if let Some(reminder) = generate_tool_choice_turn_reminder(req, &tool_name_map, options.clone())
+        .filter(|_| turn_has_user_text)
     {
         content.push_str("\n\n");
         content.push_str(&reminder);
         applied_injections.push(InjectionId::ToolChoiceTurnReminder);
     }
-    if let Some(reminder) = options.language_turn_reminder_text() {
+    if let Some(reminder) = options
+        .language_turn_reminder_text()
+        .filter(|_| turn_has_user_text)
+    {
         content.push_str("\n\n");
         content.push_str(&reminder);
         applied_injections.push(InjectionId::LanguageTurnReminder);
@@ -4704,10 +4711,10 @@ mod tests {
     }
 
     #[test]
-    fn language_turn_reminder_follows_tool_result_placeholder() {
+    fn no_turn_reminder_is_appended_to_a_tool_result_only_turn() {
         use super::super::types::Message as AnthropicMessage;
 
-        let req = MessagesRequest {
+        let request = |tool_choice: serde_json::Value| MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![
@@ -4731,26 +4738,69 @@ mod tests {
             stream: false,
             system: None,
             tools: Some(vec![test_tool("read_file")]),
-            tool_choice: None,
+            tool_choice: Some(tool_choice),
             thinking: None,
             output_config: None,
             output_format: None,
             metadata: None,
             stop_sequences: None,
         };
-        let result = convert_request_with_options(
-            &req,
-            language_reminder_options(ClientLanguagePreference::FollowUser),
-        )
-        .unwrap();
-        let content = current_message_content(&result);
+        let all_reminders = ConverterOptions {
+            injections: ResolvedInjections::with_items(&[
+                (InjectionId::LanguageTurnReminder, true),
+                (InjectionId::IdentityTurnReminder, true),
+                (InjectionId::ToolChoiceTurnReminder, true),
+            ]),
+            language_turn_reminder: Some(ClientLanguagePreference::Explicit("中文".to_string())),
+            ..ConverterOptions::default()
+        };
+        for tool_choice in [
+            serde_json::json!({"type": "auto"}),
+            serde_json::json!({"type": "any"}),
+            serde_json::json!({"type": "tool", "name": "read_file"}),
+        ] {
+            let result =
+                convert_request_with_options(&request(tool_choice.clone()), all_reminders.clone())
+                    .unwrap();
+            let content = current_message_content(&result);
+            for tag in [
+                "<language_reminder>",
+                "<identity_reminder>",
+                "<tool_choice_reminder>",
+            ] {
+                assert!(!content.contains(tag), "{tool_choice}: {tag} in {content}");
+            }
+            for id in [
+                InjectionId::LanguageTurnReminder,
+                InjectionId::IdentityTurnReminder,
+                InjectionId::ToolChoiceTurnReminder,
+            ] {
+                assert!(
+                    !result.applied_injections.contains(&id),
+                    "{tool_choice}: {id:?}"
+                );
+            }
+            // The structured tool_choice handling still applies on this turn.
+            if tool_choice["type"] == "any" {
+                assert!(result.response_tool_policy.required().is_some());
+            }
+        }
 
-        assert!(content.starts_with(TOOL_RESULTS_PROVIDED_PLACEHOLDER));
-        assert!(content.contains("<language_reminder>"));
-        assert!(
-            content.find(TOOL_RESULTS_PROVIDED_PLACEHOLDER).unwrap()
-                < content.find("<language_reminder>").unwrap()
-        );
+        // The same reminders still go on a turn where the user wrote text.
+        let mut with_text = request(serde_json::json!({"type": "any"}));
+        with_text.messages[2].content = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"},
+            {"type": "text", "text": "now summarize it"}
+        ]);
+        let result = convert_request_with_options(&with_text, all_reminders).unwrap();
+        let content = current_message_content(&result);
+        for tag in [
+            "<language_reminder>",
+            "<identity_reminder>",
+            "<tool_choice_reminder>",
+        ] {
+            assert!(content.contains(tag), "{tag} missing in {content}");
+        }
     }
 
     #[test]

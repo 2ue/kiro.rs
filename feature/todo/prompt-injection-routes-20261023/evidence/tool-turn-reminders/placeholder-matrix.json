@@ -1,0 +1,47 @@
+{
+  "tool_result_received": {
+    "cases": 12,
+    "http_error": 0,
+    "empty": 0,
+    "correct": 12,
+    "tool_call": 0,
+    "leaks": [],
+    "errors": []
+  },
+  "space": {
+    "cases": 12,
+    "http_error": 0,
+    "empty": 0,
+    "correct": 12,
+    "tool_call": 0,
+    "leaks": [],
+    "errors": []
+  },
+  "dot": {
+    "cases": 12,
+    "http_error": 0,
+    "empty": 0,
+    "correct": 12,
+    "tool_call": 0,
+    "leaks": [],
+    "errors": []
+  },
+  "continue_zh": {
+    "cases": 12,
+    "http_error": 0,
+    "empty": 0,
+    "correct": 12,
+    "tool_call": 0,
+    "leaks": [],
+    "errors": []
+  },
+  "results_above": {
+    "cases": 12,
+    "http_error": 0,
+    "empty": 0,
+    "correct": 11,
+    "tool_call": 1,
+    "leaks": [],
+    "errors": []
+  }
+}

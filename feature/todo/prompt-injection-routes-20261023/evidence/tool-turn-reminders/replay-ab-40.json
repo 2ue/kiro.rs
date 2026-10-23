@@ -1,0 +1,30 @@
+{
+  "old": {
+    "ok": 39,
+    "errors": 1,
+    "replies_text": 18,
+    "replies_thinking": 26,
+    "hits": [
+      {
+        "case": "b252e4a8#914",
+        "kind": "thinking",
+        "match": "占位",
+        "context": "复：  1. **`effort: \"none\"` 兼容** - 改动最小，证据确定（18 个错误，采集确认是 Claude Code 发的） 2. **超长报错例外分支** - 改动小，逻辑清晰（thinking 签名重试后再遇到超长变 502） 3. **图片转换失败时用文字占位** - 改动小，参考 TsinHzl 的做法（12 个错误） 4. **`invalid tool use format` 的无效重放** - 改动小，先加条件判断（11 个错误，但还没样本）  现在需要找到相关代码位置： - effort 验证在 `src/anthropic"
+      }
+    ]
+  },
+  "new": {
+    "ok": 40,
+    "errors": 0,
+    "replies_text": 9,
+    "replies_thinking": 15,
+    "hits": [
+      {
+        "case": "15cfed4d#14",
+        "kind": "thinking",
+        "match": "代理（agent-add",
+        "context": "用户要求分析会话 7f53e926 的任务、前因后果和上下文，整理成详细文档，包括原始需求、证据、分析结果方案、产物等。  从刚才提取的内容看： 1. 会话主要任务是修复 cctest 检测失败 2. 有一个调研子代理（agent-add630d6d05b8bfc1）深入研究了官方协议和开源检测器 3. 任务识别了 4 个失败项：结构化输出、工具调用ID格式、WebSearch、签名校验 4. 会话在 08:39 停在\"开始实施\"之前，还没产出代码 5. 之前几个任务（identity-masking、route"
+      }
+    ]
+  }
+}
