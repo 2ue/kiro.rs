@@ -11475,9 +11475,11 @@ fn create_sse_stream(
                                 None
                             };
                             // An upstream turn that only reports usage/metadata is retried once
-                            // before output with a continue nudge (and without reasoning shaping);
-                            // if it is still empty it is served as a normal empty end_turn, as
-                            // before, so a Claude Code task is never interrupted by an error.
+                            // before output with a continue nudge (and without reasoning shaping).
+                            // If the retry is still usage-only, fail closed. Returning a 200
+                            // empty end_turn poisons Claude Code history and prevents the client
+                            // from distinguishing an upstream refusal/short-circuit from a real
+                            // completed turn.
                             let terminal_protocol_failure = match terminal_protocol_failure {
                                 Some(detail)
                                     if detail
@@ -11507,9 +11509,13 @@ fn create_sse_stream(
                                     }
                                     tracing::warn!(
                                         attempt = state.attempt_number,
-                                        "上游只返回 usage/metadata，按空 end_turn 结束本轮"
+                                        "重试后上游仍只返回 usage/metadata，按失败终态返回"
                                     );
-                                    None
+                                    // Do not let the generic protocol-error retry path send a
+                                    // third request: this is already the terminal result of the
+                                    // dedicated usage-only retry policy.
+                                    state.retry_plan = None;
+                                    Some(detail)
                                 }
                                 other => other,
                             };
@@ -12838,7 +12844,7 @@ async fn handle_non_stream_request(
             }
         }
 
-        // 与流式一致：上游只返回 usage/metadata 时，带续写提示重试一次；仍为空则按空 end_turn 返回。
+        // 与流式一致：上游只返回 usage/metadata 时，带续写提示重试一次；仍为空则失败。
         if !usage_only_retried
             && stream_retry_config.active()
             && stream_retry_config.allows(StreamRetryReason::UsageOnly)
@@ -12890,12 +12896,12 @@ async fn handle_non_stream_request(
                         non_stream_status_retry_attempt = next_attempt;
                         continue;
                     }
-                    // 重试没能发出时，这一轮本身已是可交付的空 end_turn，按原结果返回。
+                    // 重试没能发出时，继续走下面的 usage-only fail-closed 分支。
                     Err(retry_error) => {
                         tracing::warn!(
                             request_id = %request_id,
                             error = %retry_error,
-                            "非流式空轮次的续写重试未能发出，按空 end_turn 返回"
+                            "非流式空轮次的续写重试未能发出"
                         );
                     }
                 }
@@ -13298,12 +13304,16 @@ async fn handle_non_stream_request(
     if missing_explicit_status {
         let has_trusted_upstream_completion_signal =
             saw_upstream_metadata || saw_upstream_context_usage || saw_upstream_metering;
-        // 与流式一致：仅有 usage/metadata 侧信道事件而无任何输出时按空 end_turn 返回，
-        // 不报错中断 Claude Code 的任务。
+        // 与流式一致：仅有 usage/metadata 侧信道事件而无任何输出时必须失败，
+        // 不能伪装成已完成的空 end_turn。
         let terminal_failure = if !saw_meaningful_upstream_response {
-            (!has_trusted_upstream_completion_signal).then_some(
-                "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
-            )
+            if has_trusted_upstream_completion_signal {
+                Some(super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL)
+            } else {
+                Some(
+                    "upstream eventstream ended without a meaningful assistant, reasoning, or tool event",
+                )
+            }
         } else if !saw_completed_tool_use && !has_trusted_upstream_completion_signal {
             Some("upstream eventstream ended without a trusted completion signal")
         } else {

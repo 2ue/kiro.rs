@@ -5842,7 +5842,7 @@ async fn run_handler_usage_only_eof_matrix() {
             Some(&["usage_only:sends=1".to_string()][..])
         );
 
-        // 重试仍为空：只重试一次，按空 end_turn 结束，不报错。
+        // 重试仍为空：只重试一次，随后以 SSE error 结束，不能伪装成空 end_turn。
         let upstream =
             HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
                 .await;
@@ -5850,11 +5850,11 @@ async fn run_handler_usage_only_eof_matrix() {
         let (status, _request_id, body) = call_handler_eventstream_fault(app, true).await;
         assert_eq!(status, StatusCode::OK, "usage-only twice round={round}");
         assert!(
-            body.contains(r#""stop_reason":"end_turn""#),
+            body.contains("event: error"),
             "usage-only twice round={round} body={body}"
         );
         assert!(
-            !body.contains("event: error"),
+            !body.contains(r#""stop_reason":"end_turn""#),
             "usage-only twice round={round}"
         );
         assert_eq!(upstream.hits(), 2, "usage-only twice round={round}");
@@ -5870,9 +5870,8 @@ fn handler_usage_only_eof_retries_before_empty_success_for_five_rounds() {
 }
 
 /// A non-streaming turn that only reports usage/metadata is retried once with the continue
-/// nudge; if the retry is still empty it is served as an empty end_turn (as before) instead of
-/// an error that interrupts the Claude Code task. An EOF without any trusted completion signal
-/// still fails with a retryable 502.
+/// nudge; if the retry is still empty it fails with a retryable 502 instead of an empty success.
+/// An EOF without any trusted completion signal also fails with a retryable 502.
 async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
     let nudge = serde_json::to_string(crate::anthropic::empty_turn_nudge::EMPTY_TURN_NUDGE)
         .expect("nudge json");
@@ -5913,9 +5912,9 @@ async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
                 .await;
         let (app, _usage_recorder) = handler_eventstream_fault_router(&upstream.base_url);
         let (status, _request_id, body) = call_handler_eventstream_fault(app, false).await;
-        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "round={round} body={body}");
         assert!(
-            body.contains(r#""stop_reason":"end_turn""#),
+            body.contains("request could not be completed"),
             "round={round} body={body}"
         );
         assert_eq!(upstream.hits(), 2, "round={round}");
