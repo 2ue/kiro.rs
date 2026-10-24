@@ -143,6 +143,24 @@ export function proxySummary(c: Pick<CredentialStatusItem, 'effectiveProxySource
   return label
 }
 
+/** Chinese labels for the scheduler's disable reasons; unknown values are shown as they are. */
+const DISABLED_REASON_LABEL: Record<string, string> = {
+  Manual: '手动禁用',
+  TooManyFailures: '连续失败禁用',
+  TooManyRefreshFailures: '刷新失败禁用',
+  QuotaExceeded: '额度用尽',
+  InvalidRefreshToken: 'Token 失效',
+  InvalidConfig: '配置无效',
+  TemporarilySuspended: '账号暂停',
+  AccountSuspended: '账号封禁',
+  AccountLocked: '账号锁定',
+}
+
+export function disabledReasonLabel(reason?: string | null): string {
+  if (!reason) return '禁用'
+  return DISABLED_REASON_LABEL[reason] ?? reason
+}
+
 export function dispatchStatusLabel(
   c: Pick<
     CredentialStatusItem,
@@ -201,7 +219,7 @@ export function credentialCreditStatus(
   credential: Pick<CredentialStatusItem, 'disabled' | 'disabledReason' | 'lastErrorKind' | 'lastErrorReason'>
 ): { available: boolean; reason?: string } {
   if (credential.disabled) {
-    return { available: false, reason: credential.disabledReason || '账号已禁用' }
+    return { available: false, reason: credential.disabledReason ? disabledReasonLabel(credential.disabledReason) : '账号已禁用' }
   }
   const errorText = [credential.lastErrorKind, credential.lastErrorReason]
     .filter((value): value is string => Boolean(value?.trim()))

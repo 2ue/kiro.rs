@@ -10548,8 +10548,31 @@ fn filter_export_credentials_by_ids(
     Ok(())
 }
 
+/// Disable reasons that mean the account itself is unusable (rejected token, invalid config,
+/// suspended or locked), whatever its quota snapshot says.
+const ACCOUNT_ERROR_DISABLE_REASONS: &[&str] = &[
+    "InvalidRefreshToken",
+    "InvalidConfig",
+    "TemporarilySuspended",
+    "AccountSuspended",
+    "AccountLocked",
+];
+
+fn has_account_error_disable_reason(credential: &CredentialStatusItem) -> bool {
+    credential
+        .disabled_reason
+        .as_deref()
+        .is_some_and(|reason| ACCOUNT_ERROR_DISABLE_REASONS.contains(&reason))
+}
+
 /// 额度用尽：被 QuotaExceeded 自动禁用，或最近一次账号额度快照显示已用尽。
+///
+/// An explicit account-error disable reason wins over the quota snapshot: a free account that
+/// ran past its limit and was later suspended upstream is an account error, not quota exhausted.
 fn is_quota_exhausted(credential: &CredentialStatusItem) -> bool {
+    if has_account_error_disable_reason(credential) {
+        return false;
+    }
     if credential.disabled_reason.as_deref() == Some("QuotaExceeded") {
         return true;
     }
@@ -10566,20 +10589,11 @@ fn is_quota_exhausted(credential: &CredentialStatusItem) -> bool {
 /// 只使用结构化信号：`last_error_reason` 是自由文本（可能包含上游响应体），
 /// 子串匹配会把 `token_refresh_rate_limited`、`max tokens` 之类误判为账号异常。
 fn is_account_error(credential: &CredentialStatusItem) -> bool {
+    if has_account_error_disable_reason(credential) {
+        return true;
+    }
     if is_quota_exhausted(credential) {
         return false;
-    }
-    if matches!(
-        credential.disabled_reason.as_deref(),
-        Some(
-            "InvalidRefreshToken"
-                | "InvalidConfig"
-                | "TemporarilySuspended"
-                | "AccountSuspended"
-                | "AccountLocked"
-        )
-    ) {
-        return true;
     }
 
     // last_error_* 在调用成功后不会清空，失败连击需仍未归零才视为当前异常。
