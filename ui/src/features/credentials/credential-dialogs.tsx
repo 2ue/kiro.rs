@@ -49,6 +49,7 @@ import { useAddCredential, useBatchUpdateCredentials, useCredentials, useProxyRe
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
   AddCredentialRequest,
+  BatchCredentialImportDefaults,
   BatchUpdateCredentialsRequest,
   CredentialExportFormat,
   CredentialStatusItem,
@@ -161,7 +162,7 @@ export interface VerifyResult {
 // Helpers
 // ============================================================================
 
-interface CredentialParameterDefaults {
+export interface CredentialParameterDefaults {
   disabled: string
   priority: string
   maxConcurrentRequests: string
@@ -181,7 +182,7 @@ interface CredentialParameterDefaults {
   tags: string[]
 }
 
-function initialParameterDefaults(): CredentialParameterDefaults {
+export function initialParameterDefaults(): CredentialParameterDefaults {
   return {
     disabled: 'false',
     priority: '',
@@ -306,7 +307,32 @@ function mergeCredentialDefaults(
   }
 }
 
-function validateProxyAssignment(defaults: CredentialParameterDefaults): string | undefined {
+/** The parameter panel as the server-side import defaults (used when pushing inventory accounts). */
+export function parameterDefaultsToImportDefaults(defaults: CredentialParameterDefaults): BatchCredentialImportDefaults {
+  const proxyResourceId = parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID')
+  const maxConcurrentRequests = parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发')
+  const rpm = parseOptionalNonNegativeInteger(defaults.rpm, '默认账号 RPM')
+  return {
+    disabled: defaults.disabled === 'true',
+    priority: parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
+    maxConcurrentRequests,
+    rpm,
+    authRegion: optionalTrimmed(defaults.authRegion) || optionalTrimmed(defaults.region),
+    apiRegion: optionalTrimmed(defaults.apiRegion),
+    endpoint: optionalTrimmed(defaults.endpoint),
+    enableOverageAfterImport: defaults.enableOverageAfterImport,
+    tags: defaults.tags,
+    ...(defaults.proxyMode === 'round_robin'
+      ? { proxyResourceIds: defaults.proxyResourceIds.map(Number).filter(Number.isFinite) }
+      : defaults.proxyMode === 'single'
+        ? proxyResourceId !== undefined
+          ? { proxyResourceId }
+          : { proxyUrl: optionalTrimmed(defaults.proxyUrl), proxyUsername: optionalTrimmed(defaults.proxyUsername), proxyPassword: optionalTrimmed(defaults.proxyPassword) }
+        : {}),
+  }
+}
+
+export function validateProxyAssignment(defaults: CredentialParameterDefaults): string | undefined {
   if (defaults.proxyMode === 'round_robin' && defaults.proxyResourceIds.length === 0) {
     return '已选择多个代理轮换，请至少选择一个代理资源'
   }
@@ -352,9 +378,11 @@ function downloadBlob(blob: Blob, filename: string) {
 // CredentialParameterDefaultsPanel
 // ============================================================================
 
-function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, tagOptions = [], disabled }: {
+export function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, tagOptions = [], disabled, hideProxy }: {
   defaults: CredentialParameterDefaults; onChange: (d: CredentialParameterDefaults) => void
   proxyResources: ProxyResource[]; tagOptions?: string[]; disabled?: boolean
+  /** Hide the proxy fields when every account already brings a usable proxy. */
+  hideProxy?: boolean
 }) {
   const [showPu, setShowPu] = useState(false)
   const [showPp, setShowPp] = useState(false)
@@ -463,6 +491,7 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
         <Field label="API Region"><Input className="font-mono" value={defaults.apiRegion} disabled={disabled} onChange={(e) => update('apiRegion', e.target.value)} placeholder="us-east-1" /></Field>
         <Field label="Machine ID"><Input value={defaults.machineId} disabled={disabled} onChange={(e) => update('machineId', e.target.value)} /></Field>
         <Field label="端点"><Input value={defaults.endpoint} disabled={disabled} onChange={(e) => update('endpoint', e.target.value)} placeholder="ide / cli" /></Field>
+        {!hideProxy && (<>
         <Field label="代理分配方式" description="轮换按导入顺序循环分配；账号自身代理配置优先。">
           <Select value={defaults.proxyMode} onValueChange={(v) => setProxyMode(v as ProxyAssignmentMode)} disabled={disabled}>
             <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
@@ -514,6 +543,7 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
             <Field label="代理密码"><SecretInput value={defaults.proxyPassword} onChange={(v) => update('proxyPassword', v)} visible={showPp} onToggle={() => setShowPp((v) => !v)} disabled={disabled || proxyLocked} placeholder="可选" /></Field>
           </>
         )}
+        </>)}
       </FieldGrid>
     </div>
   )

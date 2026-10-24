@@ -2082,7 +2082,7 @@ impl AdminService {
         self.audit(action, object_type, Some(object_id), true, None, detail);
     }
 
-    fn audit(
+    pub(super) fn audit(
         &self,
         action: &'static str,
         object_type: &'static str,
@@ -7192,6 +7192,12 @@ impl AdminService {
 
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+        if let Some(retry_after) = local_rate_limit_retry_after(&e) {
+            return AdminServiceError::LocalRateLimited {
+                source: Box::new(AdminServiceError::InternalError(e.to_string())),
+                retry_after,
+            };
+        }
         let msg = e.to_string();
 
         if msg.contains("凭据已存在")
@@ -10818,4 +10824,67 @@ fn block_on_admin_store<T>(
             .build()?
             .block_on(future)
     }
+}
+
+// Seams for the account inventory (`inventory.rs`). The inventory keeps its own table and worker;
+// it only borrows the shared pool, runtime config, proxy snapshot and the pool import below.
+impl AdminService {
+    pub(super) fn inventory_pool(&self) -> sqlx::PgPool {
+        self.postgres_store.pool().clone()
+    }
+
+    pub(super) fn inventory_postgres(&self) -> Arc<PostgresStore> {
+        self.postgres_store.clone()
+    }
+
+    pub(super) fn inventory_token_manager(&self) -> Arc<MultiTokenManager> {
+        self.token_manager.clone()
+    }
+
+    pub(super) fn inventory_runtime_config(&self) -> crate::model::config::Config {
+        self.token_manager.runtime_config()
+    }
+
+    /// Same parsing and normalisation as the pool import.
+    pub(super) fn inventory_credential_from_request(
+        &self,
+        req: AddCredentialRequest,
+    ) -> Result<KiroCredentials, AdminServiceError> {
+        self.credential_from_request(req, false)
+    }
+
+    /// The pool import used when an inventory account is pushed.
+    pub(super) async fn add_credential_for_inventory(
+        &self,
+        req: AddCredentialRequest,
+        auto_discover_supported_models: bool,
+    ) -> Result<u64, AdminServiceError> {
+        // Hitting the local refresh admission limit consumes nothing upstream; wait and retry
+        // with the same rules the credential info refresh uses.
+        let deadline = tokio::time::Instant::now() + CREDENTIAL_INFO_REFRESH_TOTAL_BUDGET;
+        let (result, _) = retry_local_rate_limited(deadline, || {
+            let req = req.clone();
+            async move {
+                self.add_credential_with_model_discovery(req, auto_discover_supported_models)
+                    .await
+            }
+        })
+        .await;
+        result.map(|response| response.credential_id)
+    }
+}
+
+pub(super) fn balance_response_from_usage_public(
+    id: u64,
+    usage: UsageLimitsResponse,
+) -> BalanceResponse {
+    balance_response_from_usage(id, usage)
+}
+
+pub(super) fn apply_batch_import_defaults_public(
+    credential: AddCredentialRequest,
+    defaults: &BatchCredentialImportDefaults,
+    round_robin_proxy_resource_id: Option<u64>,
+) -> AddCredentialRequest {
+    apply_batch_import_defaults(credential, defaults, round_robin_proxy_resource_id)
 }

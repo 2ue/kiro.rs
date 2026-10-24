@@ -106,6 +106,10 @@ struct RequiredPostgresColumn {
 
 const REQUIRED_POSTGRES_SCHEMA_COLUMNS: &[RequiredPostgresColumn] = &[
     RequiredPostgresColumn {
+        table_name: "credential_inventory",
+        column_name: "pushed_credential_id",
+    },
+    RequiredPostgresColumn {
         table_name: "usage_rollup_totals",
         column_name: "total_compat_input_tokens",
     },
@@ -14110,6 +14114,38 @@ CREATE TABLE IF NOT EXISTS route_scenarios (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS credential_inventory (
+    id BIGSERIAL PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'stored',
+    auth_kind TEXT NOT NULL,
+    refresh_token_hash TEXT,
+    api_key_hash TEXT,
+    identity_key TEXT,
+    email TEXT,
+    data JSONB,
+    source TEXT,
+    note TEXT,
+    account_info JSONB,
+    last_check_at TIMESTAMPTZ,
+    last_check_error TEXT,
+    last_refresh_at TIMESTAMPTZ,
+    last_refresh_error TEXT,
+    refresh_failure_count INTEGER NOT NULL DEFAULT 0,
+    pushed_credential_id BIGINT,
+    pushed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_inventory_refresh_hash
+    ON credential_inventory (refresh_token_hash) WHERE refresh_token_hash IS NOT NULL AND deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_inventory_api_key_hash
+    ON credential_inventory (api_key_hash) WHERE api_key_hash IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_credential_inventory_identity
+    ON credential_inventory (identity_key) WHERE identity_key IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_credential_inventory_status
+    ON credential_inventory (status, id DESC) WHERE deleted_at IS NULL;
 "#;
 
 // Explicit maintenance-only backfill. Do not call this from the default startup

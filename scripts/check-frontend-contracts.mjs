@@ -63,6 +63,22 @@ const intentionallyUiOnly = new Set([
   'RouteScenarioOptions',
   'RouteScenarioPreview',
   'SaveRouteScenarioRequest',
+  // Account inventory: only the new console has the inventory page.
+  'BatchCredentialImportDefaults',
+  'InventoryActionItem',
+  'InventoryActionResponse',
+  'InventoryCounts',
+  'InventoryImportDefaults',
+  'InventoryImportItem',
+  'InventoryImportRequest',
+  'InventoryImportResponse',
+  'InventoryItem',
+  'InventoryListQuery',
+  'InventoryListResponse',
+  'InventoryPoolLink',
+  'InventoryPushRequest',
+  'InventoryStatus',
+  'InventoryUpdateRequest',
 ])
 const intentionallyAdminOnly = new Set(['AdminErrorResponse', 'BulkCredentialActionError'])
 

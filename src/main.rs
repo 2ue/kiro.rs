@@ -618,6 +618,12 @@ async fn async_main() {
                 .then_some(config.audit_log_retention_days)
         })
     };
+    // The account inventory renews its own tokens with the pool's refresh settings. It never
+    // touches the scheduler; it only shares the database pool and the refresh helpers.
+    let inventory_renewal_task = admin::spawn_inventory_renewal_worker(
+        token_manager.clone(),
+        storage::credential_inventory::InventoryStore::new(postgres_store.pool().clone()),
+    );
     let model_capability_recovery_task = spawn_model_capability_recovery_worker(
         kiro_provider.clone(),
         model_capabilities.clone(),
@@ -710,6 +716,11 @@ async fn async_main() {
                 request_admission: request_admission.clone(),
                 external_pool_manager: external_pool_manager.clone(),
             });
+            match admin_service.reconcile_inventory_pushes().await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, "已处理上次中断的库存推送"),
+                Err(err) => tracing::warn!(error = %err, "处理中断的库存推送失败"),
+            }
             let admin_state =
                 admin::AdminState::with_key_store(admin_api_key_store.clone(), admin_service);
             let admin_app = admin::create_admin_router(admin_state);
@@ -795,6 +806,7 @@ async fn async_main() {
         abort_task_with_timeout("Redis runtime event listener", runtime_event_listener),
         abort_task_with_timeout("model capability recovery", model_capability_recovery_task),
         abort_task_with_timeout("audit log retention", audit_retention_task),
+        abort_task_with_timeout("inventory renewal", inventory_renewal_task),
         abort_task_with_timeout("startup pricing sync", startup_pricing_sync_task),
     );
 

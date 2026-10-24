@@ -98,7 +98,7 @@ function credentialRouteSummary(mode?: ExternalPoolRouteMode, rules: string[] = 
 const QUOTA_TONE_CLASS = { success: 'bg-success', warning: 'bg-warning', error: 'bg-destructive' } as const
 
 /** Plan usage, followed on the same track by overage in a separate colour once past the limit. */
-function QuotaBar({ model }: { model: ReturnType<typeof quotaBarModel> }) {
+export function QuotaBar({ model }: { model: ReturnType<typeof quotaBarModel> }) {
   return (
     <div
       role="progressbar"
