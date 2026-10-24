@@ -5922,9 +5922,10 @@ async fn run_stream_precommit_retry_falls_back_to_external_when_local_exhausted(
         return;
     };
     for round in 1..=5 {
-        let upstream =
-            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::EmptyStreamEveryAttempt)
-                .await;
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::EmptyStreamEveryAttempt,
+        )
+        .await;
         let (app, usage_recorder) = handler_eventstream_fault_router_with_external(
             &upstream.base_url,
             2,
@@ -6014,9 +6015,10 @@ fn stream_precommit_retry_falls_back_to_external_when_local_exhausted_for_five_r
 /// every local account has failed.
 async fn run_stream_precommit_retry_without_external_pool_reports_error() {
     for round in 1..=5 {
-        let upstream =
-            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::EmptyStreamEveryAttempt)
-                .await;
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::EmptyStreamEveryAttempt,
+        )
+        .await;
         let (app, usage_recorder) =
             handler_eventstream_fault_router_with_config(&upstream.base_url, 2, 1, |config| {
                 config.kiro_upstream_stream_retry_max_attempts = 10;
@@ -6031,7 +6033,11 @@ async fn run_stream_precommit_retry_without_external_pool_reports_error() {
         );
         assert_eq!(upstream.hits(), 2, "round={round}");
         let record = usage_record_for_request(&usage_recorder, &request_id);
-        assert_eq!(record.status, UsageRecordStatus::StreamError, "round={round}");
+        assert_eq!(
+            record.status,
+            UsageRecordStatus::StreamError,
+            "round={round}"
+        );
     }
 }
 
