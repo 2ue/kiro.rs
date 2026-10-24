@@ -22,7 +22,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import type { InventoryItem, InventoryStatus } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 import { QuotaBar } from '@/features/credentials/credential-card'
-import { authLabel, credentialSubscriptionLabel, quotaBarModel } from '@/features/credentials/credential-utils'
+import { authLabel, credentialSubscriptionLabel, disabledReasonLabel, quotaBarModel } from '@/features/credentials/credential-utils'
 import { InventoryEditModal, InventoryImportModal, InventoryPushModal } from './inventory-dialogs'
 
 const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100]
@@ -86,7 +86,7 @@ function InventoryCard({ item, selected, onToggle, onEdit }: {
             </div>
             <div className="mt-1 text-muted-foreground">
               {item.pool.exists
-                ? `${item.pool.subscriptionTitle ? credentialSubscriptionLabel(item.pool.subscriptionTitle) + ' · ' : ''}${item.pool.disabledReason ? `禁用原因 ${item.pool.disabledReason} · ` : ''}由账号池续期`
+                ? `${item.pool.subscriptionTitle ? credentialSubscriptionLabel(item.pool.subscriptionTitle) + ' · ' : ''}${item.pool.disabledReason ? `${disabledReasonLabel(item.pool.disabledReason)} · ` : ''}由账号池续期`
                 : '账号池中已删除'}
             </div>
             {item.pool.exists && (

@@ -71,6 +71,7 @@ import {
   accountInfoValue,
   authLabel,
   credentialLabel,
+  disabledReasonLabel,
   endpointLabel,
   numberOrZero,
   proxySummary,
@@ -525,7 +526,7 @@ export function CredentialCard({
   // Render
   // --------------------------------------------------------------------------
   const statusTone = credential.disabled ? 'error' : credential.cooledDown ? 'warning' : credential.rateLimited ? 'info' : 'success'
-  const statusLabel = credential.disabled ? (credential.disabledReason || '禁用') : credential.cooledDown ? `冷却` : credential.rateLimited ? '限流' : '正常'
+  const statusLabel = credential.disabled ? disabledReasonLabel(credential.disabledReason) : credential.cooledDown ? `冷却` : credential.rateLimited ? '限流' : '正常'
 
   const fast = credential.fast ?? 0
   const routeSummary = credentialRouteSummary(credential.routeMode, credential.routeRules)
@@ -564,7 +565,7 @@ export function CredentialCard({
             )}
           </div>
           <div className="mt-1.5 flex flex-wrap items-center gap-1">
-            <Badge tone={statusTone}>{statusLabel}</Badge>
+            <Badge tone={statusTone} title={credential.disabled ? credential.disabledReason || undefined : undefined}>{statusLabel}</Badge>
             <Badge>{authLabel(credential.authMethod)}</Badge>
             <Badge tone={subMeta.tone} title={subMeta.title}>
               {loadingBalance ? '…' : subMeta.label}

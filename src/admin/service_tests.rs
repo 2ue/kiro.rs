@@ -1156,6 +1156,30 @@ fn credential_status_filters_keep_quota_and_account_errors_separate() {
 }
 
 #[test]
+fn suspended_account_with_an_exhausted_quota_snapshot_is_an_account_error() {
+    // Seen on 2026-10-24: free accounts used past their limit, then got suspended upstream.
+    // Their quota snapshot still says exhausted; they belong to "账号异常", once.
+    for reason in [
+        "TemporarilySuspended",
+        "AccountSuspended",
+        "AccountLocked",
+        "InvalidRefreshToken",
+        "InvalidConfig",
+    ] {
+        let mut suspended = credential_item(1, true, None, 0, 0.0, Some(100.0));
+        suspended.disabled_reason = Some(reason.to_string());
+        assert!(is_account_error(&suspended), "{reason}");
+        assert!(!is_quota_exhausted(&suspended), "{reason}");
+    }
+
+    // A quota disable stays quota exhausted even when a snapshot is missing.
+    let mut quota = credential_item(2, true, None, 0, 0.0, None);
+    quota.disabled_reason = Some("QuotaExceeded".to_string());
+    assert!(is_quota_exhausted(&quota));
+    assert!(!is_account_error(&quota));
+}
+
+#[test]
 fn credential_custom_sort_runs_before_pagination_order() {
     let mut credentials = vec![
         credential_item(1, false, Some("2026-01-01T00:00:00Z"), 10, 0.2, Some(20.0)),
