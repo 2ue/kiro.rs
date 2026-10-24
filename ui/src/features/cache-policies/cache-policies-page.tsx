@@ -62,8 +62,7 @@ import {
 import { usePromptInjectionCatalog, useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
 import type { CachePolicyConfig, CacheRoutePolicyPatch, RouteFeatureOverride, RuntimeConfig } from '@/types/api'
 import {
-  RouteFeaturesEditor,
-  RouteInjectionEditor,
+  RouteBehaviorEditor,
   routeInjectionSummary,
 } from '@/features/prompt-injection/route-injection-editor'
 import { RoutePolicyImportDialog } from './route-policy-import-dialog'
@@ -766,7 +765,8 @@ export function CachePoliciesPage() {
   // Links from the prompt-injection matrix open that route's editor on the requested tab.
   useEffect(() => {
     if (!linkedRoute || !workingConfig) return
-    setEditorTab(linkedTab === 'injection' || linkedTab === 'features' ? linkedTab : 'cache')
+    // Older links name the two tabs that are now one.
+    setEditorTab(linkedTab === 'behavior' || linkedTab === 'injection' || linkedTab === 'features' ? 'behavior' : 'cache')
     openPathEditor(canonicalCachePolicyPath(linkedRoute))
     setSearchParams({}, { replace: true })
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -908,7 +908,7 @@ export function CachePoliciesPage() {
               : pathEditor.mode === 'new' ? '新增路由策略' : `编辑路由策略 · ${pathEditor.originalPrefix}`}
           description={pathEditor.origin
             ? `已填入${pathEditor.origin.kind === 'copy' ? '来源路由' : '导入'}的缓存、提示词注入和功能设置；路由不会${pathEditor.origin.kind === 'copy' ? '复制' : '导入'}，请填写新的 /dfcache 路由名后保存。`
-            : '缓存、提示词注入和功能三个分区一起保存；关闭弹窗不会提交草稿。'}
+            : '缓存、提示词与功能两个分区一起保存；关闭弹窗不会提交草稿。'}
           width="max-w-5xl"
           noBodyPadding
           onClose={() => { if (!updateConfig.isPending) setPathEditor(null) }}
@@ -923,8 +923,7 @@ export function CachePoliciesPage() {
             <Tabs value={editorTab} onValueChange={setEditorTab}>
               <TabsList>
                 <TabsTrigger value="cache">缓存</TabsTrigger>
-                <TabsTrigger value="injection">提示词注入</TabsTrigger>
-                <TabsTrigger value="features">功能</TabsTrigger>
+                <TabsTrigger value="behavior">提示词与功能</TabsTrigger>
               </TabsList>
               <TabsContent value="cache" className="pt-4">
                 <PathStrategyBindingCard
@@ -962,26 +961,20 @@ export function CachePoliciesPage() {
                   })}
                 />
               </TabsContent>
-              <TabsContent value="injection" className="pt-4">
+              <TabsContent value="behavior" className="pt-4">
                 {injectionCatalog.data ? (
-                  <RouteInjectionEditor
+                  <RouteBehaviorEditor
                     route={canonicalCachePolicyPath(normalizeCachePolicyPath(pathEditor.prefix) ?? pathEditor.prefix)}
                     catalog={injectionCatalog.data.items}
                     config={workingConfig}
-                    value={pathEditor.injection}
-                    onChange={(injection) => setPathEditor((current) => current ? { ...current, injection } : current)}
+                    injection={pathEditor.injection}
+                    features={pathEditor.features}
+                    onInjectionChange={(injection) => setPathEditor((current) => current ? { ...current, injection } : current)}
+                    onFeaturesChange={(features) => setPathEditor((current) => current ? { ...current, features } : current)}
                   />
                 ) : (
                   <LoadingState text="加载注入项..." />
                 )}
-              </TabsContent>
-              <TabsContent value="features" className="pt-4">
-                <RouteFeaturesEditor
-                  route={canonicalCachePolicyPath(normalizeCachePolicyPath(pathEditor.prefix) ?? pathEditor.prefix)}
-                  config={workingConfig}
-                  value={pathEditor.features}
-                  onChange={(features) => setPathEditor((current) => current ? { ...current, features } : current)}
-                />
               </TabsContent>
             </Tabs>
           </div>

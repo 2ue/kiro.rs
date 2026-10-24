@@ -1,5 +1,6 @@
 import {
   Activity,
+  ChevronDown,
   MoreHorizontal,
   RefreshCw,
   RotateCcw,
@@ -219,11 +220,12 @@ export interface CredentialCardProps {
   balance?: BalanceResponse
   loadingBalance: boolean
   expanded: boolean
+  onToggleExpanded: () => void
   showEmailSuffix: boolean
 }
 
 export function CredentialCard({
-  credential, selected, onToggleSelect, onQueryBalance, onTest, balance, loadingBalance, expanded, showEmailSuffix,
+  credential, selected, onToggleSelect, onQueryBalance, onTest, balance, loadingBalance, expanded, onToggleExpanded, showEmailSuffix,
 }: CredentialCardProps) {
   const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
@@ -533,7 +535,7 @@ export function CredentialCard({
     <div
       data-fast-tier={fastTier}
       className={[
-        'relative overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
+        '@container relative overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
         fast > 0 ? 'fast-card' : '',
         credential.disabled ? 'opacity-75' : '',
       ].join(' ')}>
@@ -606,7 +608,7 @@ export function CredentialCard({
       </div>
 
       {/* ── Summary Row ── */}
-      <div className="grid grid-cols-2 gap-2 px-3 pb-2 pt-1 sm:grid-cols-5">
+      <div className="grid grid-cols-3 gap-2 px-3 pb-2 pt-1 @md:grid-cols-5">
         <SummaryCell label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} />
         <ConcurrencySummaryCell
           value={concurrencySummaryValue}
@@ -744,6 +746,18 @@ export function CredentialCard({
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          className="ml-auto"
+          onClick={onToggleExpanded}
+          aria-expanded={expanded}
+          title={expanded ? '收起详情' : '展开详情'}
+        >
+          <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} aria-hidden="true" />
+          {expanded ? '收起' : '详情'}
+        </Button>
       </div>
 
       {/* ── Expanded Detail ── */}
@@ -753,7 +767,7 @@ export function CredentialCard({
           {/* 调度运行态 */}
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">基础信息</div>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
               <MetaItem label="创建时间" value={credential.createdAt ? formatFullDate(credential.createdAt) : '-'} />
               <MetaItem label="更新时间" value={credential.updatedAt ? formatFullDate(credential.updatedAt) : '-'} />
               {credential.email && credential.maskedApiKey && (
@@ -764,7 +778,7 @@ export function CredentialCard({
 
           {/* 调度运行态 */}
           <div>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
               <MetaItem
                 label="429自动禁用"
                 value={
@@ -833,7 +847,7 @@ export function CredentialCard({
 
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">计费与积分</div>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
               <MetaItem
                 label="估算计费/原始计费"
                 value={`${formatUsdFixed2(credential.estimatedCostUsd)} / ${formatUsdFixed2(credential.originalCostUsd)}`}
@@ -864,7 +878,7 @@ export function CredentialCard({
           {/* 网络 */}
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">网络配置</div>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
               <MetaItem
                 label="Auth Region"
                 value={
@@ -916,7 +930,7 @@ export function CredentialCard({
             控制哪些入口路由可以调度到这个账号。被排除的路由不会用这个账号，先于 Fast 和优先级生效。
             如果某个路由所有本地账号都被排除，按外部池的路由规则决定是否转外部池。要整套切换多个账号的规则，用路由场景。
           </div>
-          <div className="grid gap-3 md:grid-cols-[200px_1fr]">
+          <div className="grid gap-3 @lg:grid-cols-[200px_1fr]">
             <SelectBox
               label="路由模式"
               value={routeModeDraft}

@@ -36,7 +36,7 @@ function RouteMatrix({ config, catalog }: { config: RuntimeConfig; catalog: Inje
           {routes.map((route) => (
             <tr key={route} className="border-t">
               <th scope="row" className="sticky left-0 bg-card p-2 text-left font-mono font-medium">
-                <Link className="text-primary underline-offset-2 hover:underline" to={`/cache-policies?route=${encodeURIComponent(route)}&tab=injection`}>
+                <Link className="text-primary underline-offset-2 hover:underline" to={`/cache-policies?route=${encodeURIComponent(route)}&tab=behavior`}>
                   {route}
                 </Link>
               </th>
