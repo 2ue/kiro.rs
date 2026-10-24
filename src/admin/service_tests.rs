@@ -1053,14 +1053,15 @@ fn credential_default_sort_puts_fast_accounts_first() {
         credential_item(5, false, Some("2026-01-04T00:00:00Z"), 0, 0.0, None),
     ];
     credentials[1].fast = 2; // #2
-    credentials[2].fast = 5; // #3, disabled but still Fast
+    credentials[2].fast = 5; // #3, disabled: Fast is ignored
     credentials[3].fast = 2; // #4
 
     sort_credentials_for_admin_display(&mut credentials);
 
     let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
-    // Highest Fast first; equal Fast keeps enabled-then-newest; non-Fast accounts follow.
-    assert_eq!(ids, vec![3, 4, 2, 5, 1]);
+    // Normal Fast accounts first (equal Fast keeps newest first); everything else, including
+    // the disabled Fast account, keeps the usual enabled-then-newest order.
+    assert_eq!(ids, vec![4, 2, 5, 1, 3]);
 
     // An explicit sort is untouched by Fast.
     let query = CredentialListQuery {
@@ -1071,6 +1072,45 @@ fn credential_default_sort_puts_fast_accounts_first() {
     sort_credentials_for_admin_display_with_query(&mut credentials, &query);
     let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
     assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn credential_default_sort_ignores_fast_on_accounts_that_are_not_normal() {
+    let mut credentials = vec![
+        credential_item(1, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None),
+        credential_item(2, false, Some("2026-01-02T00:00:00Z"), 0, 0.0, Some(100.0)),
+        credential_item(3, false, Some("2026-01-03T00:00:00Z"), 0, 0.0, None),
+        credential_item(4, false, Some("2026-01-04T00:00:00Z"), 0, 0.0, None),
+        credential_item(5, false, Some("2026-01-05T00:00:00Z"), 0, 0.0, None),
+    ];
+    credentials[0].fast = 1; // #1 normal
+    credentials[1].fast = 9; // #2 quota exhausted
+    credentials[2].fast = 9; // #3 account error
+    credentials[2].last_error_kind = Some("auth".to_string());
+    credentials[2].transient_failure_streak = 1;
+    credentials[3].fast = 3; // #4 cooling
+    credentials[3].cooled_down = true;
+
+    sort_credentials_for_admin_display(&mut credentials);
+
+    let ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
+    // Only the normal Fast account moves up; the others keep the newest-first order.
+    assert_eq!(ids, vec![1, 5, 4, 3, 2]);
+}
+
+#[test]
+fn usage_cleanup_row_limit_is_a_per_run_budget() {
+    // A paused job that already used its row budget gets a fresh one when resumed.
+    assert_eq!(usage_cleanup_run_rows_remaining(10_000, 0, 10_000), 0);
+    assert_eq!(
+        usage_cleanup_run_rows_remaining(10_000, 10_000, 10_000),
+        10_000
+    );
+    assert_eq!(
+        usage_cleanup_run_rows_remaining(14_000, 10_000, 10_000),
+        6_000
+    );
+    assert_eq!(usage_cleanup_run_rows_remaining(25_000, 10_000, 10_000), 0);
 }
 
 #[test]

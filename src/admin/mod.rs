@@ -19,12 +19,14 @@
 mod capture_handlers;
 mod error;
 mod handlers;
+mod inventory;
 mod middleware;
 mod route_scenarios;
 mod router;
 mod service;
 pub mod types;
 
+pub use inventory::spawn_inventory_renewal_worker;
 pub use middleware::{AdminApiKeyStore, AdminState};
 pub use router::create_admin_router;
 pub use service::{AdminService, AdminServiceDependencies};

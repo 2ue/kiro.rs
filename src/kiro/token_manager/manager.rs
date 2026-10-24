@@ -13393,6 +13393,45 @@ impl MultiTokenManager {
         .await
     }
 
+    /// Refreshes a credential that is not in the pool (the account inventory) and returns the
+    /// refreshed credential, so the caller can store a rotated refresh token. Uses the same refresh
+    /// path and proxy handling as pool accounts; nothing is added to the pool or the scheduler.
+    pub async fn refresh_detached_credential(
+        &self,
+        credentials: KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
+        Ok(self
+            .acquire_context_for_external_credentials(credentials)
+            .await?
+            .credentials)
+    }
+
+    /// Queries quota and subscription for a credential that is not in the pool, using an access
+    /// token that is still valid. Does not refresh.
+    pub async fn usage_limits_for_detached_credential(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<UsageLimitsResponse> {
+        let resolved = self.resolve_proxy_for_credential(credentials.clone())?;
+        let token = if resolved.is_api_key_credential() {
+            resolved.kiro_api_key.clone()
+        } else {
+            resolved.access_token.clone()
+        }
+        .ok_or_else(|| anyhow::anyhow!("凭据缺少可用 token"))?;
+        let effective_proxy = resolved.effective_proxy(self.proxy.as_ref());
+        let config = self.runtime_config();
+        get_usage_limits(&resolved, &config, &token, effective_proxy.as_ref()).await
+    }
+
+    /// Whether a proxy resource exists and is enabled in the runtime snapshot.
+    pub fn proxy_resource_enabled(&self, id: u64) -> bool {
+        self.proxy_resources
+            .lock()
+            .get(&id)
+            .is_some_and(|resource| resource.enabled)
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程

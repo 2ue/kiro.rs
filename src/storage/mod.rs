@@ -1,4 +1,5 @@
 pub mod account_events;
+pub mod credential_inventory;
 pub mod postgres;
 pub mod redis_cache;
 pub mod usage_demo_seed;

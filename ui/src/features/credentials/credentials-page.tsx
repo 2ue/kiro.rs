@@ -115,7 +115,7 @@ import {
 // Constants
 // ============================================================================
 
-const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200, 500]
+const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100]
 const CREDIT_INFO_DETAIL_BATCH_SIZE = 500
 const EMAIL_SUFFIX_VISIBILITY_STORAGE_KEY = 'kiro-console:credentials:show-email-suffix'
 
@@ -198,7 +198,7 @@ const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
 export function CredentialsPage() {
   const modelCapabilities = useModelCapabilities()
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(PAGE_SIZE_OPTIONS[0])
+  const [pageSize, setPageSize] = useState(20)
   const [showEmailSuffix, setShowEmailSuffix] = useState(() => {
     try {
       return window.localStorage.getItem(EMAIL_SUFFIX_VISIBILITY_STORAGE_KEY) !== 'false'
@@ -206,7 +206,20 @@ export function CredentialsPage() {
       return true
     }
   })
-  const [allExpanded, setAllExpanded] = useState(true)
+  // Cards start collapsed. "展开全部 / 收起全部" sets every card; each card can also be opened alone.
+  const cardScrollRef = useRef<HTMLDivElement | null>(null)
+  const [allExpanded, setAllExpanded] = useState(false)
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
+  const toggleCardExpanded = (id: number) => setExpandedIds((current) => {
+    const next = new Set(current)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+  const toggleAllExpanded = () => {
+    setAllExpanded((value) => !value)
+    setExpandedIds(new Set())
+  }
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [quickQuery, setQuickQuery] = useState('')
   const [modelQuery, setModelQuery] = useState('')
@@ -279,6 +292,11 @@ export function CredentialsPage() {
     sortBy,
     sortOrder,
   ])
+  // A new page, page size or filter starts at the top of the card area.
+  useEffect(() => {
+    const list = cardScrollRef.current
+    if (list && list.getBoundingClientRect().top < 0) list.scrollIntoView({ block: 'start' })
+  }, [listQuery])
 
   const credentials = useCredentialList(listQuery)
   const pageTransitionPending = Boolean(
@@ -1000,6 +1018,7 @@ export function CredentialsPage() {
 
       {/* Main section */}
       <SectionCard
+        className="overflow-visible"
         title="账号列表"
         description={
           hasAnyFilters
@@ -1007,26 +1026,41 @@ export function CredentialsPage() {
             : `共 ${credentialSummary.data?.total ?? grandTotal} 个账号`
         }
       >
-        <div className="mb-3 flex flex-wrap gap-2" role="tablist" aria-label="账号快捷状态筛选">
-          {[
-            ['normal', '正常', credentialSummary.data?.normal ?? 0, 'success'],
-            ['cooling', '冷却', credentialSummary.data?.cooling ?? credentialSummary.data?.coolingDown ?? 0, 'warning'],
-            ['quota_exhausted', '额度用尽', credentialSummary.data?.quotaExhausted ?? 0, 'error'],
-            ['account_error', '账号异常', credentialSummary.data?.accountError ?? 0, 'error'],
-          ].map(([value, label, count, tone]) => (
-            <Button
-              key={value}
-              type="button"
-              size="sm"
-              variant={statusFilter === value ? 'default' : 'outline'}
-              onClick={() => applyStatusFilter(value as string)}
-              role="tab"
-              aria-selected={statusFilter === value}
-            >
-              <span>{label}</span>
-              <Badge tone={statusFilter === value ? 'neutral' : tone as 'success' | 'warning' | 'error'} className="ml-1">{count as number}</Badge>
-            </Button>
-          ))}
+        {/* Filters stay under the top bar while the cards scroll (desktop only: on a phone they fill the screen). */}
+        <div className="z-20 -mx-5 -mt-1 border-b bg-card px-5 pb-1 pt-1 lg:sticky lg:top-[var(--header-h)]">
+        <div
+          className="mb-3 inline-flex max-w-full flex-wrap gap-0.5 self-start rounded-lg bg-muted p-0.5"
+          role="radiogroup"
+          aria-label="按状态快速筛选"
+        >
+          {([
+            ['__all__', '全部', credentialSummary.data?.total ?? grandTotal, 'bg-muted-foreground/60'],
+            ['normal', '正常', credentialSummary.data?.normal ?? 0, 'bg-success'],
+            ['cooling', '冷却', credentialSummary.data?.cooling ?? credentialSummary.data?.coolingDown ?? 0, 'bg-warning'],
+            ['quota_exhausted', '额度用尽', credentialSummary.data?.quotaExhausted ?? 0, 'bg-destructive'],
+            ['account_error', '账号异常', credentialSummary.data?.accountError ?? 0, 'bg-destructive'],
+            ['disabled', '已禁用', credentialSummary.data?.disabled ?? 0, 'bg-muted-foreground/40'],
+          ] as const).map(([value, label, count, dot]) => {
+            const selected = statusFilter === value
+            return (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                // Clicking the selected status again goes back to all accounts.
+                onClick={() => applyStatusFilter(selected ? '__all__' : value)}
+                className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 ${selected
+                  ? 'bg-card text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {value !== '__all__' && <span className={`size-1.5 rounded-full ${dot}`} aria-hidden="true" />}
+                {label}
+                <span className={`tabular-nums ${selected ? 'text-foreground' : 'text-muted-foreground/80'}`}>{count}</span>
+              </button>
+            )
+          })}
         </div>
         {/* Toolbar */}
         <Toolbar className="mb-3">
@@ -1229,7 +1263,7 @@ export function CredentialsPage() {
             {credentials.isFetching && !credentials.isLoading && <Spinner size="sm" />}
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" size="xs" onClick={() => setAllExpanded((v) => !v)}>
+            <Button variant="ghost" size="xs" onClick={toggleAllExpanded}>
               {allExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
               {allExpanded ? '收起全部' : '展开全部'}
             </Button>
@@ -1244,7 +1278,10 @@ export function CredentialsPage() {
           </div>
         </div>
 
+        </div>
+
         {/* Credential list */}
+        <div ref={cardScrollRef} className="scroll-mt-[calc(var(--header-h)+15rem)]" aria-label="账号卡片">
         {currentCredentials.length === 0 ? (
           <EmptyState
             icon={<Server className="h-12 w-12" />}
@@ -1261,7 +1298,7 @@ export function CredentialsPage() {
             }
           />
         ) : (
-          <div className="grid gap-3 lg:grid-cols-2">
+          <div className="grid items-start gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
             {currentCredentials.map((credential) => (
               <CredentialCard
                 key={credential.id}
@@ -1272,16 +1309,18 @@ export function CredentialsPage() {
                 onTest={setTestingCredential}
                 balance={balanceMap.get(credential.id)}
                 loadingBalance={loadingBalanceIds.has(credential.id)}
-                expanded={allExpanded}
+                expanded={allExpanded !== expandedIds.has(credential.id)}
+                onToggleExpanded={() => toggleCardExpanded(credential.id)}
                 showEmailSuffix={showEmailSuffix}
               />
             ))}
           </div>
         )}
+        </div>
 
         {/* Pagination */}
         {filteredTotal > 0 && (
-          <div className="mt-4">
+          <div className="z-10 -mx-5 mt-3 border-t bg-card px-5 py-3 lg:sticky lg:bottom-0">
             <Pagination
               page={page}
               pageCount={totalPages}

@@ -2817,3 +2817,156 @@ export interface RouteScenarioAccountOption extends RoutePolicy {
   id: number
   label: string
 }
+
+// ============================================================================
+// Account inventory
+// ============================================================================
+
+/** Scheduling defaults applied server-side when accounts are imported into the pool. */
+export interface BatchCredentialImportDefaults {
+  disabled?: boolean
+  priority?: number
+  maxConcurrentRequests?: number | null
+  rpm?: number | null
+  rateLimitAutoDisableEnabled?: boolean
+  provider?: string
+  authRegion?: string
+  apiRegion?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  proxyResourceId?: number | null
+  proxyResourceIds?: number[]
+  endpoint?: string
+  warmupRemaining?: number
+  enableOverageAfterImport?: boolean
+  supportedModels?: string[]
+  tags?: string[]
+}
+
+export type InventoryStatus = 'stored' | 'invalid' | 'pushing' | 'pushed'
+
+export interface InventoryImportDefaults {
+  authRegion?: string
+  apiRegion?: string
+  proxyResourceId?: number
+  proxyResourceIds?: number[]
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+}
+
+export interface InventoryImportRequest {
+  credentials: AddCredentialRequest[]
+  defaults?: InventoryImportDefaults
+  check?: boolean
+  source?: string
+}
+
+export interface InventoryImportItem {
+  index: number
+  ok: boolean
+  skipped: boolean
+  inventoryId?: number
+  email?: string
+  message?: string
+}
+
+export interface InventoryImportResponse {
+  total: number
+  imported: number
+  skipped: number
+  failed: number
+  items: InventoryImportItem[]
+}
+
+export interface InventoryPoolLink {
+  credentialId: number
+  exists: boolean
+  disabled: boolean
+  disabledReason?: string
+  subscriptionTitle?: string
+}
+
+export interface InventoryItem {
+  id: number
+  status: InventoryStatus
+  authMethod: string
+  email?: string
+  provider?: string
+  authRegion?: string
+  apiRegion?: string
+  machineId?: string
+  hasProxy: boolean
+  proxyResourceId?: number
+  proxyResourceName?: string
+  proxyUsable?: boolean
+  proxyUrl?: string
+  expiresAt?: string
+  accountInfo?: BalanceResponse
+  lastCheckAt?: string
+  lastCheckError?: string
+  lastRefreshAt?: string
+  lastRefreshError?: string
+  refreshFailureCount: number
+  source?: string
+  note?: string
+  pool?: InventoryPoolLink
+  pushedAt?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface InventoryCounts {
+  total: number
+  stored: number
+  invalid: number
+  pushing: number
+  pushed: number
+}
+
+export interface InventoryListResponse {
+  page: number
+  limit: number
+  total: number
+  totalPages: number
+  counts: InventoryCounts
+  items: InventoryItem[]
+}
+
+export interface InventoryListQuery {
+  page?: number
+  limit?: number
+  status?: string
+  q?: string
+}
+
+export interface InventoryUpdateRequest {
+  authRegion?: string
+  apiRegion?: string
+  proxyResourceId?: number | null
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  note?: string
+}
+
+export interface InventoryPushRequest {
+  ids: number[]
+  defaults?: BatchCredentialImportDefaults
+  autoDiscoverSupportedModels?: boolean
+}
+
+export interface InventoryActionItem {
+  id: number
+  ok: boolean
+  credentialId?: number
+  message?: string
+}
+
+export interface InventoryActionResponse {
+  total: number
+  succeeded: number
+  failed: number
+  items: InventoryActionItem[]
+}

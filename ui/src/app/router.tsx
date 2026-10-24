@@ -45,8 +45,8 @@ const ModelsPage = React.lazy(() =>
 const SecurityPage = React.lazy(() =>
   import('@/features/security/security-page').then((m) => ({ default: m.SecurityPage }))
 )
-const ValidationPage = React.lazy(() =>
-  import('@/features/validation/validation-page').then((m) => ({ default: m.ValidationPage }))
+const InventoryPage = React.lazy(() =>
+  import('@/features/inventory/inventory-page').then((m) => ({ default: m.InventoryPage }))
 )
 
 function ShellWithAuth() {
@@ -76,7 +76,8 @@ const router = createBrowserRouter(
         { path: 'overview', element: <Lazy><OverviewPage /></Lazy> },
         // 资源域
         { path: 'credentials', element: <Lazy><CredentialsPage /></Lazy> },
-        { path: 'validation', element: <Lazy><ValidationPage /></Lazy> },
+        { path: 'inventory', element: <Lazy><InventoryPage /></Lazy> },
+        { path: 'validation', element: <Navigate to="/inventory" replace /> },
         { path: 'external-pools', element: <Lazy><ExternalPoolsPage /></Lazy> },
         { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },
         // 分析域

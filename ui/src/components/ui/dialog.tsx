@@ -30,20 +30,71 @@ interface DialogContentProps
   hideClose?: boolean
 }
 
+/** Whether a pointer event landed inside the dialog box, judged by position. */
+function pointInside(element: HTMLElement | null, event: Event): boolean {
+  if (!element || !('clientX' in event)) return false
+  const { clientX, clientY } = event as PointerEvent
+  const rect = element.getBoundingClientRect()
+  return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom
+}
+
+/**
+ * While a Select, Popover or menu inside the dialog is open, Radix makes the rest of the page
+ * ignore the pointer, so a click on another field of the dialog lands on the overlay and reads
+ * as "outside". On touch the dialog only decides at the following click, after the dropdown has
+ * closed, and then closes itself. A click is only treated as outside when it is outside the
+ * dialog box and no nested layer was open when it started.
+ */
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   DialogContentProps
->(({ className, children, width = 'max-w-2xl', hideClose, ...props }, ref) => (
+>(({ className, children, width = 'max-w-2xl', hideClose, onPointerDownOutside, onInteractOutside, ...props }, ref) => {
+  const contentRef = React.useRef<HTMLDivElement | null>(null)
+  const nestedLayerOpenAtPointerDown = React.useRef(false)
+  const setRefs = React.useCallback(
+    (node: HTMLDivElement | null) => {
+      contentRef.current = node
+      if (typeof ref === 'function') ref(node)
+      else if (ref) ref.current = node
+    },
+    [ref]
+  )
+
+  React.useEffect(() => {
+    const record = () => {
+      nestedLayerOpenAtPointerDown.current = Boolean(
+        document.querySelector('[data-radix-popper-content-wrapper]')
+      )
+    }
+    document.addEventListener('pointerdown', record, true)
+    return () => document.removeEventListener('pointerdown', record, true)
+  }, [])
+
+  const keepOpenWhenInside = (event: { preventDefault: () => void; detail: { originalEvent: Event } }) => {
+    if (nestedLayerOpenAtPointerDown.current || pointInside(contentRef.current, event.detail.originalEvent)) {
+      event.preventDefault()
+    }
+  }
+
+  return (
   <DialogPortal>
     <DialogOverlay />
     <DialogPrimitive.Content
-      ref={ref}
+      ref={setRefs}
       className={cn(
         'fixed left-1/2 top-1/2 z-50 flex max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl bg-background shadow-2xl',
         'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95',
         width,
         className
       )}
+      onPointerDownOutside={(event) => {
+        keepOpenWhenInside(event)
+        onPointerDownOutside?.(event)
+      }}
+      onInteractOutside={(event) => {
+        keepOpenWhenInside(event)
+        onInteractOutside?.(event)
+      }}
       {...props}
     >
       {children}
@@ -55,7 +106,8 @@ const DialogContent = React.forwardRef<
       )}
     </DialogPrimitive.Content>
   </DialogPortal>
-))
+  )
+})
 DialogContent.displayName = DialogPrimitive.Content.displayName
 
 function DialogHeader({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {

@@ -45,6 +45,7 @@ use super::{
         update_external_pool, update_proxy_resource, update_request_api_key, update_runtime_config,
         upsert_manual_model, validate_existing_credentials, validate_external_credentials,
     },
+    inventory::http as inventory_http,
     middleware::{AdminState, admin_auth_middleware},
     route_scenarios::http as route_scenario_http,
 };
@@ -78,6 +79,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/import", post(batch_import_credentials))
+        .route("/inventory", get(inventory_http::list))
+        .route("/inventory/import", post(inventory_http::import))
+        .route("/inventory/check", post(inventory_http::check))
+        .route("/inventory/push", post(inventory_http::push))
+        .route("/inventory/delete", post(inventory_http::delete))
+        .route("/inventory/{id}", put(inventory_http::update))
         .route(
             "/route-scenarios",
             get(route_scenario_http::list).post(route_scenario_http::create),
