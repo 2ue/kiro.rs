@@ -44,7 +44,7 @@ export function StatCard({ title, value, valueTitle, desc, icon, tone = 'default
   return (
     <div
       className={cn(
-        'relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition hover:shadow-md',
+        'relative flex min-h-[5.75rem] flex-col justify-between overflow-hidden rounded-xl bg-card px-4 py-3 shadow-sm transition hover:shadow-md',
         className
       )}
     >

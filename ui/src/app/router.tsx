@@ -48,6 +48,12 @@ const SecurityPage = React.lazy(() =>
 const InventoryPage = React.lazy(() =>
   import('@/features/inventory/inventory-page').then((m) => ({ default: m.InventoryPage }))
 )
+// Development-only gallery of every credential card state; absent from production builds.
+const CredentialCardPreview = import.meta.env.DEV
+  ? React.lazy(() =>
+      import('@/features/credentials/credential-card-preview').then((m) => ({ default: m.CredentialCardPreview }))
+    )
+  : null
 
 function ShellWithAuth() {
   const { logout } = useAuth()
@@ -91,6 +97,9 @@ const router = createBrowserRouter(
         { path: 'route-scenarios', element: <Lazy><RouteScenariosPage /></Lazy> },
         { path: 'models', element: <Lazy><ModelsPage /></Lazy> },
         { path: 'security', element: <Lazy><SecurityPage /></Lazy> },
+        ...(CredentialCardPreview
+          ? [{ path: 'credentials/preview', element: <Lazy><CredentialCardPreview /></Lazy> }]
+          : []),
 
         { path: '*', element: <Navigate to="overview" replace /> },
       ],

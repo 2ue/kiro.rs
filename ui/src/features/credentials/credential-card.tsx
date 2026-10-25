@@ -1,14 +1,22 @@
 import {
   Activity,
-  ChevronDown,
-  MoreHorizontal,
+  Boxes,
+  ChevronRight,
+  Coins,
+  Ellipsis,
+  Eraser,
+  Flame,
+  FlaskConical,
+  KeyRound,
+  Pencil,
   RefreshCw,
   RotateCcw,
+  Route,
   Router,
+  ShieldOff,
   Trash2,
   Wallet,
-  Route,
-  Wand2,
+  Globe,
   Zap,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -20,22 +28,31 @@ import {
   Checkbox,
   SelectItem,
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
   Input,
+  Sheet,
+  SheetBody,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  Skeleton,
   Spinner,
   Switch,
+  Tooltip,
 } from '@/components/ui'
-import { EmptyState, Field, FieldGrid, LoadingState, ModalShell, useConfirm } from '@/components/patterns'
-import { ProgressRing } from '@/components/charts'
+import { EmptyState, Field, FieldGrid, LoadingState, MiddleTruncate, ModalShell, useConfirm } from '@/components/patterns'
 import {
-  formatApproxElapsedMs,
   formatCompact,
   formatFullDate,
-  formatLastUsed,
+  formatDateTime,
   formatMeteringUsage,
   formatNumber,
   formatPercent,
@@ -43,7 +60,7 @@ import {
   formatUsd,
   formatUsdFixed2,
 } from '@/lib/format'
-import { extractErrorMessage } from '@/lib/utils'
+import { cn, extractErrorMessage } from '@/lib/utils'
 import {
   useClearInFlight,
   useCredentialDiagnostics,
@@ -70,13 +87,20 @@ import type { BalanceResponse, CredentialStatusItem, ExternalPoolRouteMode, Usag
 import {
   accountInfoValue,
   authLabel,
+  credentialFlags,
   credentialLabel,
-  disabledReasonLabel,
+  credentialRouteSummary,
+  credentialStatusMeta,
   endpointLabel,
+  loadTone,
   numberOrZero,
   proxySummary,
   quotaBarModel,
+  quotaReading,
   subscriptionBadgeMeta,
+  successRate,
+  type CredentialFlag,
+  type CredentialSubscriptionKey,
 } from './credential-utils'
 import { SecretInput } from './credential-inputs'
 import { SelectBox } from '@/features/external-pools/external-pool-components'
@@ -87,14 +111,6 @@ import { getRouteScenarioOptions } from '@/api/credentials'
 // ============================================================================
 // Sub-components
 // ============================================================================
-
-/** Short label for a credential's route policy; undefined when it accepts every route. */
-function credentialRouteSummary(mode?: ExternalPoolRouteMode, rules: string[] = []): string | undefined {
-  if (!mode || mode === 'allow_all') return undefined
-  const list = rules.length <= 2 ? rules.join(', ') : `${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
-  if (mode === 'allow_list') return rules.length ? `仅 ${list}` : '不承接任何入口'
-  return rules.length ? `排除 ${list}` : undefined
-}
 
 const QUOTA_TONE_CLASS = { success: 'bg-success', warning: 'bg-warning', error: 'bg-destructive' } as const
 
@@ -125,67 +141,97 @@ export function QuotaBar({ model }: { model: ReturnType<typeof quotaBarModel> })
   )
 }
 
-function SummaryCell({ label, value, error, onClick }: { label: string; value: React.ReactNode; error?: boolean; onClick?: () => void }) {
-  const content = (
+/** A stat cell: label above, value below; the value turns amber or red when it nears its limit. */
+function Meter({
+  label,
+  value,
+  tone,
+  onClick,
+  title,
+  wrap,
+}: {
+  label: string
+  value: React.ReactNode
+  tone?: 'warning' | 'error'
+  onClick?: () => void
+  title?: string
+  /** Let a long value break onto a second line instead of being cut off. */
+  wrap?: boolean
+}) {
+  const body = (
     <>
-      <span className="text-[0.68rem] font-medium text-muted-foreground uppercase tracking-wide truncate">{label}</span>
-      <span className={`text-xs font-semibold tabular truncate ${error ? 'text-destructive' : onClick ? 'text-primary' : 'text-foreground'}`}>
+      <span className="block text-[0.7rem] leading-4 text-muted-foreground">{label}</span>
+      <span className={cn('tabular mt-0.5 block text-xs font-semibold leading-4', wrap ? 'break-words' : 'truncate', tone === 'error' ? 'text-destructive' : tone === 'warning' ? 'text-warning' : 'text-foreground')}>
         {value}
       </span>
     </>
   )
-  if (onClick) {
-    return (
-      <button type="button" onClick={onClick} title={`修改${label}`}
-        className="flex flex-col gap-0.5 min-w-0 items-start rounded px-1 -mx-1 text-left transition-colors hover:bg-muted/60">
-        {content}
-      </button>
-    )
-  }
-  return <div className="flex flex-col gap-0.5 min-w-0">{content}</div>
-}
-
-function ConcurrencySummaryCell({
-  value,
-  detail,
-  ringValue,
-  ringColor,
-  ringLabel,
-  error,
-  onClick,
-}: {
-  value: string
-  detail: React.ReactNode
-  ringValue: number
-  ringColor: string
-  ringLabel: React.ReactNode
-  error?: boolean
-  onClick: () => void
-}) {
+  if (!onClick) return <div className="min-w-0" title={title}>{body}</div>
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      title="修改并发"
-      className="flex min-w-0 items-center gap-2 rounded px-1 py-0.5 -mx-1 text-left transition-colors hover:bg-muted/60"
-    >
-      <ProgressRing
-        value={ringValue}
-        size={34}
-        strokeWidth={4}
-        color={ringColor}
-        label={<span className="text-[0.55rem] tabular">{ringLabel}</span>}
-        className="shrink-0"
-      />
-      <span className="flex min-w-0 flex-col gap-0.5">
-        <span className="text-[0.68rem] font-medium text-muted-foreground uppercase tracking-wide truncate">并发</span>
-        <span className={`text-xs font-semibold tabular truncate ${error ? 'text-destructive' : 'text-primary'}`}>
-          {value}
-        </span>
-        <span className="truncate text-[0.65rem] text-muted-foreground">{detail}</span>
-      </span>
+    <button type="button" onClick={onClick} title={title} aria-label={title}
+      className="-m-1.5 block min-w-0 rounded-md p-1.5 text-left transition-colors hover:bg-muted/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      {body}
     </button>
   )
+}
+
+/** One row in the detail sheet; editable rows show a pencil and open the matching dialog. */
+function DetailRow({ label, children, onEdit, editLabel, tone }: {
+  label: string
+  children: React.ReactNode
+  onEdit?: () => void
+  editLabel?: string
+  tone?: 'error' | 'warning'
+}) {
+  return (
+    <div className="flex min-h-9 items-center justify-between gap-4 py-1.5">
+      <dt className="shrink-0 text-xs text-muted-foreground">{label}</dt>
+      <dd className={cn('flex min-w-0 items-center justify-end gap-1 text-right text-sm font-medium', tone === 'error' ? 'text-destructive' : tone === 'warning' ? 'text-warning' : 'text-foreground')}>
+        <span className="min-w-0 break-words">{children}</span>
+        {onEdit && (
+          <Button variant="ghost" size="icon-xs" onClick={onEdit} aria-label={editLabel ?? `修改${label}`} title={editLabel ?? `修改${label}`} className="-mr-1.5 text-muted-foreground">
+            <Pencil />
+          </Button>
+        )}
+      </dd>
+    </div>
+  )
+}
+
+function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="py-3 first:pt-0">
+      <h3 className="mb-1 text-[0.7rem] font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>
+      <dl className="divide-y divide-border/60">{children}</dl>
+    </section>
+  )
+}
+
+/** Each plan gets its own colour so a page of cards can be read by tier at a glance. */
+const SUBSCRIPTION_CLASS: Record<CredentialSubscriptionKey, string> = {
+  free: 'bg-muted text-muted-foreground',
+  students: 'bg-sky-500/10 text-sky-700 dark:text-sky-300',
+  pro: 'bg-primary/10 text-primary',
+  pro_plus: 'bg-violet-500/10 text-violet-700 dark:text-violet-300',
+  pro_max: 'bg-fuchsia-500/10 text-fuchsia-700 dark:text-fuchsia-300',
+  power: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  unknown: 'bg-muted text-muted-foreground',
+}
+
+const AUTH_CLASS: Record<string, string> = {
+  social: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  idc: 'bg-blue-500/10 text-blue-700 dark:text-blue-300',
+  external_idp: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+  api_key: 'bg-orange-500/10 text-orange-700 dark:text-orange-300',
+}
+
+/** Icon and a one-word label for standing settings; the tooltip carries the full sentence. */
+const CONFIG_FLAG: Partial<Record<CredentialFlag['key'], { icon: React.ComponentType<{ className?: string }>; short: string }>> = {
+  route: { icon: Route, short: '路由' },
+  proxy: { icon: Router, short: '代理' },
+  models: { icon: Boxes, short: '模型' },
+  'rate-limit': { icon: ShieldOff, short: '429仅冷却' },
+  'profile-arn': { icon: KeyRound, short: 'ARN' },
 }
 
 function MetaItem({ label, value, detail, error }: {
@@ -211,6 +257,9 @@ const EMPTY_SUPPORTED_MODELS: string[] = []
 // ============================================================================
 // CredentialCard exports
 // ============================================================================
+
+/** The responsive grid credential cards sit in; shared by the account page and the preview. */
+export const CREDENTIAL_CARD_GRID = 'grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4'
 
 export interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -290,14 +339,12 @@ export function CredentialCard({
 
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
   const accountInfo = accountInfoValue(credential, balance)
-  const transientFailureStreak = numberOrZero(credential.transientFailureStreak)
   const probationRemainingSecs = numberOrZero(credential.probationRemainingSecs)
   const recentErrorRate = numberOrZero(credential.recentErrorRate)
   const schedulerScore = numberOrZero(credential.schedulerScore)
   const schedulerSelectionCount = numberOrZero(credential.schedulerSelectionCount)
   const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
-  const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
   const subMeta = subscriptionBadgeMeta(credential, balance)
   const epLabel = endpointLabel(credential.endpoint)
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
@@ -318,32 +365,11 @@ export function CredentialCard({
     : '未查询'
   const overageDetail = accountInfo
     ? [
-        accountInfo.overageCap > 0 ? `上限 ${formatQuotaFixed(accountInfo.overageCap)}` : null,
         accountInfo.overageRate > 0 ? `单价 ${formatUsd(accountInfo.overageRate)}` : null,
         accountInfo.currentOverages > 0 ? `已用 ${formatQuotaFixed(accountInfo.currentOverages)}` : null,
       ].filter(Boolean).join(' · ') || undefined
     : '查询额度后同步状态'
   const displayCredentialLabel = credentialLabel(credential, showEmailSuffix)
-
-  const concurrencyPct =
-    credential.maxConcurrentRequests > 0
-      ? Math.round((credential.inFlightRequests / credential.maxConcurrentRequests) * 100)
-      : 0
-  const concurrencySummaryValue =
-    credential.maxConcurrentRequests > 0
-      ? `${credential.inFlightRequests}/${credential.maxConcurrentRequests}`
-      : `${credential.inFlightRequests}/∞`
-  const concurrencySummaryDetail =
-    credential.inFlightRequests > 0
-      ? `最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`
-      : undefined
-  const concurrencyError = credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests
-  const ringColor =
-    concurrencyPct >= 90
-      ? 'hsl(var(--destructive))'
-      : concurrencyPct >= 70
-        ? 'hsl(var(--warning))'
-        : 'hsl(var(--success))'
 
   const resetProxyDraft = () => {
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
@@ -525,403 +551,442 @@ export function CredentialCard({
   // --------------------------------------------------------------------------
   // Render
   // --------------------------------------------------------------------------
-  const statusTone = credential.disabled ? 'error' : credential.cooledDown ? 'warning' : credential.rateLimited ? 'info' : 'success'
-  const statusLabel = credential.disabled ? disabledReasonLabel(credential.disabledReason) : credential.cooledDown ? `冷却` : credential.rateLimited ? '限流' : '正常'
-
   const fast = credential.fast ?? 0
-  const routeSummary = credentialRouteSummary(credential.routeMode, credential.routeRules)
   const fastTier = fast > 0 ? String(Math.min(fast, 3)) : undefined
+  const status = credentialStatusMeta(credential)
+  const flags = credentialFlags(credential)
+  const attentionFlags = flags.filter((flag) => flag.kind === 'attention')
+  const configFlags = flags.filter((flag) => flag.kind === 'config')
+  const routeSummary = credentialRouteSummary(credential.routeMode, credential.routeRules)
+  // A disabled account's numbers are history; fade them but keep the switch and actions at full strength.
+  const dim = credential.disabled ? 'opacity-60' : undefined
+
+  const concurrencyLimit = credential.maxConcurrentRequests
+  const concurrencyText = `${credential.inFlightRequests}/${concurrencyLimit > 0 ? concurrencyLimit : '∞'}`
+  const rpmLimit = credential.rpm
+  const rpmText = `${formatCompact(recentSelection60s)}/${rpmLimit > 0 ? formatCompact(rpmLimit) : '∞'}`
+  const quota = quotaReading(accountInfo, quotaBar)
+  const success = successRate(credential.successCount, schedulerSelectionCount)
+  const quotaToneClass = quotaBar.inOverage
+    ? 'text-violet-600 dark:text-violet-400'
+    : quotaBar.baseTone === 'error'
+      ? 'text-destructive'
+      : quotaBar.baseTone === 'warning'
+        ? 'text-warning'
+        : 'text-foreground'
+
+  const toggleDisabled = () => setDisabled.mutate(
+    { id: credential.id, disabled: !credential.disabled },
+    {
+      onSuccess: (res) => toast.success(res.message),
+      onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
+    }
+  )
+  const runForceRefresh = () => forceRefresh.mutate(credential.id, {
+    onSuccess: (res) => toast.success(res.message),
+    onError: (e) => toast.error(`刷新失败: ${extractErrorMessage(e)}`),
+  })
+  const runResetFailure = () => resetFailure.mutate(credential.id, {
+    onSuccess: (res) => toast.success(res.message),
+    onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
+  })
+  const toggleWarmup = () => setWarmup.mutate(
+    { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
+    {
+      onSuccess: () => toast.success(credential.warmupRemaining > 0 ? '已关闭预热' : '已开启预热'),
+      onError: (e) => toast.error(`预热设置失败: ${extractErrorMessage(e)}`),
+    }
+  )
+  const runClearInFlight = async () => {
+    if (!canClearInFlight) return
+    const ok = await confirmDialog({ title: '清理并发', message: `清理账号 #${credential.id} 当前并发占用？`, confirmText: '清理', tone: 'danger' })
+    if (!ok) return
+    clearInFlight.mutate({ id: credential.id }, {
+      onSuccess: (res) => toast.success(res.message),
+      onError: (e) => toast.error(`清理失败: ${extractErrorMessage(e)}`),
+    })
+  }
+  const openDiagnostics = () => { setDiagnosticsPage(1); setDiagnosticRecords([]); setShowDiagnostics(true) }
+  const openFlag = (key: CredentialFlag['key']) => {
+    if (key === 'route') { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }
+    else if (key === 'proxy') { resetProxyDraft(); setEditingProxy(true) }
+    else if (key === 'models') setEditingSupportedModels(true)
+    else if (key === 'errors') openDiagnostics()
+    else onToggleExpanded()
+  }
 
   return (
-    <div
+    <article
       data-fast-tier={fastTier}
-      className={[
-        '@container relative overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
-        fast > 0 ? 'fast-card' : '',
-        credential.disabled ? 'opacity-75' : '',
-      ].join(' ')}>
-      {credential.isCurrent && <span className="absolute inset-y-3 left-0 w-1 rounded-r-full bg-primary" />}
+      aria-label={`账号 ${displayCredentialLabel}`}
+      data-selected={selected || undefined}
+      className={cn(
+        'group/card relative flex h-full flex-col overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
+        // Exactly one edge: Fast cards draw a gradient rim, the rest a plain border.
+        fast > 0 ? 'fast-card' : cn('border', selected ? 'border-primary ring-1 ring-primary' : 'border-border/70'),
+      )}>
+      {/* ── Header: selection, state and the one switch that matters ── */}
+      <div className="flex items-center gap-2 px-4 pt-4">
+        <Checkbox checked={selected} onCheckedChange={onToggleSelect} aria-label={`选择 ${displayCredentialLabel}`} />
+        <Badge tone={status.tone} dot title={status.title}>{status.label}</Badge>
+        {fast > 0 && (
+          <button type="button" className="fast-badge" onClick={() => setEditingFast(true)}
+            title={`Fast ${fast}：优先打满这个账号；点击修改`} aria-label={`Fast ${fast}，点击修改`}>
+            <Zap className="size-3" aria-hidden="true" fill="currentColor" />FAST {fast}
+          </button>
+        )}
+        <span className="tabular ml-auto font-mono text-xs text-muted-foreground">#{credential.id}</span>
+        <Switch checked={!credential.disabled} disabled={setDisabled.isPending} onCheckedChange={toggleDisabled}
+          aria-label={credential.disabled ? '启用账号' : '禁用账号'} title={credential.disabled ? '启用账号' : '禁用账号'} />
+      </div>
 
-      {/* ── Header ── */}
-      <div className="flex items-start gap-2.5 px-3 pt-3 pb-2">
-        <Checkbox checked={selected} onCheckedChange={onToggleSelect} className="mt-0.5 shrink-0" />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="max-w-[220px] truncate text-sm font-semibold" title={displayCredentialLabel}>
-              {displayCredentialLabel}
+      {/* ── Identity: one line, the middle elided with *** when it does not fit; plan and login as coloured chips ── */}
+      <div className={cn('px-4 pt-2', dim)}>
+        <button type="button" onClick={onToggleExpanded} title={`${displayCredentialLabel}：查看详情`}
+          className="-mx-1.5 block w-[calc(100%+0.75rem)] rounded-md px-1.5 py-0.5 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          <MiddleTruncate text={displayCredentialLabel} className="text-[0.95rem] font-semibold leading-6 text-foreground" />
+        </button>
+        <div className="mt-1.5 flex flex-wrap items-center gap-1">
+          <span className={cn('inline-flex h-5 items-center rounded-full px-2 text-[0.68rem] font-semibold', SUBSCRIPTION_CLASS[subMeta.key])} title={subMeta.title}>
+            {loadingBalance ? '…' : subMeta.label}
+          </span>
+          <span className={cn('inline-flex h-5 items-center rounded-full px-2 text-[0.68rem] font-semibold', AUTH_CLASS[credential.authMethod ?? ''] ?? 'bg-muted text-muted-foreground')}>
+            {authLabel(credential.authMethod)}
+          </span>
+          {epLabel && (
+            <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-[0.68rem] font-medium text-muted-foreground" title={credential.endpoint}>
+              {epLabel}
             </span>
-            <span className="tabular text-xs text-muted-foreground font-mono">#{credential.id}</span>
-            {credential.isCurrent && <Badge tone="primary">当前</Badge>}
-            {fast > 0 && (
-              <button
-                type="button"
-                className="fast-badge"
-                onClick={() => setEditingFast(true)}
-                title={`Fast ${fast}：优先打满这个账号；点击修改`}
-                aria-label={`Fast ${fast}，点击修改`}>
-                <Zap className="size-3" aria-hidden="true" fill="currentColor" />
-                FAST {fast}
-              </button>
-            )}
-          </div>
-          <div className="mt-1.5 flex flex-wrap items-center gap-1">
-            <Badge tone={statusTone} title={credential.disabled ? credential.disabledReason || undefined : undefined}>{statusLabel}</Badge>
-            <Badge>{authLabel(credential.authMethod)}</Badge>
-            <Badge tone={subMeta.tone} title={subMeta.title}>
-              {loadingBalance ? '…' : subMeta.label}
-            </Badge>
-            {epLabel && <Badge title={credential.endpoint}>{epLabel}</Badge>}
-            {credential.hasProxy && <Badge tone="info">代理</Badge>}
-            {routeSummary && (
-              <button type="button" onClick={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }}
-                title={`${routeSummary}；点击修改`} aria-label={`${routeSummary}，点击修改`}>
-                <Badge tone="secondary" className="cursor-pointer">
-                  <Route className="mr-0.5 size-3" aria-hidden="true" />{routeSummary}
-                </Badge>
-              </button>
-            )}
-            {credential.rateLimitAutoDisableEnabled === false && <Badge tone="warning">429仅冷却</Badge>}
-            {supportedModels.length > 0 && <Badge tone="secondary" title={supportedModels.join('\n')}>模型 {supportedModels.length}</Badge>}
-            {credential.hasProfileArn && <Badge tone="secondary">Profile ARN</Badge>}
-            {!credential.disabled && credential.cooledDown && credential.cooldownRemainingSecs > 0 && (
-              <Badge tone="error" className="animate-pulse" title={credential.cooldownReason || undefined}>冷却 {credential.cooldownRemainingSecs}s</Badge>
-            )}
-            {!credential.disabled && credential.rateLimited && (
-              <Badge tone="warning" className="animate-pulse">限流 {credential.rateLimitRemainingSecs}s</Badge>
-            )}
-            {transientFailureStreak > 0 && <Badge tone="error">错误 {transientFailureStreak}</Badge>}
-            {credential.warmupRemaining > 0 && <Badge tone="warning">预热 {credential.warmupRemaining}</Badge>}
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-1 pt-0.5">
-          <Switch
-            checked={!credential.disabled}
-            disabled={setDisabled.isPending}
-            onCheckedChange={() => setDisabled.mutate(
-              { id: credential.id, disabled: !credential.disabled },
-              {
-                onSuccess: (res) => toast.success(res.message),
-                onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
-              }
-            )}
-          />
+          )}
         </div>
       </div>
 
-      {/* ── Summary Row ── */}
-      <div className="grid grid-cols-3 gap-2 px-3 pb-2 pt-1 @md:grid-cols-5">
-        <SummaryCell label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} />
-        <ConcurrencySummaryCell
-          value={concurrencySummaryValue}
-          detail={concurrencySummaryDetail}
-          ringValue={concurrencyPct}
-          ringColor={ringColor}
-          ringLabel={credential.inFlightRequests}
-          error={concurrencyError}
-          onClick={() => setEditingConcurrency(true)}
-        />
-        <SummaryCell
-          label="RPM"
-          value={`${formatCompact(recentSelection60s)}/${credential.rpm === 0 ? '∞' : formatCompact(credential.rpm)}`}
-          error={credential.rpm > 0 && recentSelection60s >= credential.rpm}
-          onClick={() => setEditingRpm(true)}
-        />
-        <SummaryCell label="成功" value={<span title={formatNumber(credential.successCount)}>{formatCompact(credential.successCount)}</span>} />
-        <SummaryCell label="最近" value={formatLastUsed(credential.lastUsedAt)} />
-      </div>
-
-      <div className="mx-3 mb-2 px-3 py-2">
-        <div className="flex items-center justify-between gap-3">
-          <span className="flex items-baseline gap-1.5 text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">
-            额度
-            {accountInfo && accountInfo.usageLimit > 0 && !loadingBalance && (
-              <span className={`tabular normal-case ${quotaBar.inOverage ? 'font-semibold text-violet-600 dark:text-violet-400' : ''}`}>
-                {formatPercent(quotaBar.usagePercent / 100)}
-              </span>
-            )}
-          </span>
-          <span className="truncate text-xs font-semibold tabular text-foreground">
-            {loadingBalance
-              ? '…'
-              : accountInfo
-                ? (
-                    <>
-                      {`${formatQuotaFixed(Math.min(accountInfo.currentUsage, accountInfo.usageLimit))} / ${formatQuotaFixed(accountInfo.usageLimit)}`}
-                      {quotaBar.inOverage && (
-                        <span className="ml-1.5 text-violet-600 dark:text-violet-400">
-                          超额 +{formatQuotaFixed(quotaBar.overage)}
-                        </span>
-                      )}
-                    </>
-                  )
-                : '- / -'}
-          </span>
+      {/* ── Quota: used / limit with the share beside it; overage spelled out when it happens ── */}
+      <div className={cn('px-4 pt-3', dim)}>
+        <div className="flex flex-wrap items-baseline gap-x-1.5 text-xs leading-5">
+          <span className="mr-auto shrink-0 text-muted-foreground">额度</span>
+          {loadingBalance ? (
+            <Skeleton className="h-4 w-28" />
+          ) : accountInfo && accountInfo.usageLimit > 0 && quota ? (
+            // Percent and amount wrap as separate pieces, so a long overage reading never spills out of the card.
+            <span className="tabular ml-auto flex flex-wrap items-baseline justify-end gap-x-1.5 text-right">
+              <span className={cn('whitespace-nowrap font-semibold', quotaToneClass)}>{quota.percent}</span>
+              <span className="whitespace-nowrap font-medium text-foreground">{quota.amount}</span>
+            </span>
+          ) : (
+            <button type="button" onClick={() => onQueryBalance(credential.id)} className="font-medium text-primary hover:underline">
+              未查询，点击查询
+            </button>
+          )}
         </div>
         <QuotaBar model={quotaBar} />
       </div>
 
-      {/* ── Action Strip ── */}
-      <div className="flex flex-wrap gap-0.5 px-2 pb-2 pt-0.5">
-        {/* 高频操作：直接展示 */}
-        <Button type="button" variant="ghost" size="xs" onClick={() => onTest(credential)}>
-          <Wand2 className="h-3.5 w-3.5" /> 测试
+      {/* ── Billing: credits used, estimated and original cost, always visible ── */}
+      <dl className={cn('grid grid-cols-3 gap-3 px-4 pt-3', dim)}>
+        <div className="min-w-0">
+          <dt className="text-[0.7rem] leading-4 text-muted-foreground">使用积分</dt>
+          <dd className="tabular mt-0.5 truncate text-xs font-semibold leading-4 text-foreground" title={formatMeteringUsage(credential.kiroMeteringUsage)}>
+            {formatMeteringUsage(credential.kiroMeteringUsage)}
+          </dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-[0.7rem] leading-4 text-muted-foreground">估算费用</dt>
+          <dd className="tabular mt-0.5 truncate text-xs font-semibold leading-4 text-foreground">{formatUsdFixed2(credential.estimatedCostUsd)}</dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-[0.7rem] leading-4 text-muted-foreground">原始费用</dt>
+          <dd className="tabular mt-0.5 truncate text-xs font-semibold leading-4 text-foreground">{formatUsdFixed2(credential.originalCostUsd)}</dd>
+        </div>
+      </dl>
+
+      {/* ── Load: what the scheduler is doing with it right now ── */}
+      {/* Priority is a short number; success/dispatch needs the room for two counts. */}
+      <div className={cn('grid grid-cols-[1fr_1fr_0.7fr_1.6fr] gap-x-2 px-4 pt-3.5', dim)}>
+        <Meter label="并发" value={concurrencyText}
+          tone={loadTone(credential.inFlightRequests, concurrencyLimit)}
+          onClick={() => setEditingConcurrency(true)} title="修改并发限制" />
+        <Meter label="RPM" value={rpmText}
+          tone={loadTone(recentSelection60s, rpmLimit)}
+          onClick={() => setEditingRpm(true)} title="修改 RPM 限制" />
+        <Meter label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} title="修改优先级" />
+        <Meter label="成功/调度"
+          wrap
+          value={<>{formatCompact(credential.successCount)}/<wbr />{formatCompact(success.dispatched)}</>}
+          // Only a low rate is worth colouring; a healthy one stays neutral like the other values.
+          tone={success.tone === 'success' ? undefined : success.tone}
+          title={`成功 ${formatNumber(credential.successCount)} / 调度 ${formatNumber(success.dispatched)}${success.percent !== undefined ? `，成功率 ${formatPercent(success.percent / 100)}` : ''}`} />
+      </div>
+
+      {/* ── Flags: attention first in words, standing settings as icons; absent when there are none ── */}
+      {(attentionFlags.length > 0 || configFlags.length > 0 || overageEnabled) && (
+      <div className="flex flex-wrap items-center gap-1.5 px-4 pt-3">
+        {attentionFlags.map((flag) => (
+          <button key={flag.key} type="button" onClick={() => openFlag(flag.key)} title={flag.title}>
+            <Badge tone={flag.tone} className="cursor-pointer">{flag.label}</Badge>
+          </button>
+        ))}
+        {overageEnabled && (
+          <Tooltip label={overageDetail ? `超额调用已开启：${overageDetail}` : '超额调用已开启'}>
+            <span tabIndex={0} className="inline-flex h-5 items-center gap-1 rounded-full bg-violet-500/10 px-2 text-[0.68rem] font-medium text-violet-700 dark:text-violet-300">
+              <Coins className="size-3" aria-hidden="true" />超额
+            </span>
+          </Tooltip>
+        )}
+        {configFlags.map((flag) => {
+          const meta = CONFIG_FLAG[flag.key]
+          const Icon = meta?.icon
+          return (
+            <Tooltip key={flag.key} label={flag.title ?? flag.label}>
+              <button type="button" onClick={() => openFlag(flag.key)} aria-label={flag.title ?? flag.label}
+                className={cn(
+                  'inline-flex h-5 items-center gap-1 rounded-full px-2 text-[0.68rem] font-medium transition-colors hover:brightness-95',
+                  flag.tone === 'warning' ? 'bg-warning/10 text-warning' : flag.tone === 'info' ? 'bg-info/10 text-info' : 'bg-muted text-muted-foreground',
+                )}>
+                {Icon && <Icon className="size-3" aria-hidden="true" />}
+                <span>{meta?.short ?? flag.label}</span>
+                {flag.count !== undefined && <span className="tabular">{flag.count}</span>}
+              </button>
+            </Tooltip>
+          )
+        })}
+      </div>
+      )}
+
+      {/* ── Times: when the account was added and when it last served a request successfully ── */}
+      {/* Pinned with the action bar, so the times of cards in a row line up whether or not they have flags. */}
+      <div className="tabular mt-auto grid grid-cols-2 gap-x-2 px-4 pb-3 pt-2.5 text-[0.7rem] leading-4 text-muted-foreground">
+        {/* Label above value keeps both on fixed lines, so a date with a year never pushes the row taller. */}
+        <span className="min-w-0" title={credential.createdAt ? `创建时间：${formatFullDate(credential.createdAt)}` : undefined}>
+          <span className="block">创建</span>
+          <span className="block truncate text-foreground/80">{formatDateTime(credential.createdAt)}</span>
+        </span>
+        <span className="min-w-0 text-right"
+          // `lastUsedAt` moves only when a request on this account succeeds.
+          title={credential.lastUsedAt ? `最近一次成功请求：${formatFullDate(credential.lastUsedAt)}` : '还没有成功请求'}>
+          <span className="block">最近成功</span>
+          <span className="block truncate text-foreground/80">{credential.lastUsedAt ? formatDateTime(credential.lastUsedAt) : '未成功过'}</span>
+        </span>
+      </div>
+
+      {/* ── Actions: pinned to the bottom so every card in a row lines up ── */}
+      <div className="flex items-center gap-0.5 border-t border-border/60 px-2 py-1.5">
+        <Button variant="ghost" size="xs" onClick={() => onTest(credential)}>
+          <FlaskConical />测试
         </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="xs"
-          onClick={() => { setDiagnosticsPage(1); setDiagnosticRecords([]); setShowDiagnostics(true) }}
-          title="查看账号调度与错误诊断"
-        >
-          <Activity className="h-3.5 w-3.5" /> 诊断
+        <Button variant="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance}>
+          {loadingBalance ? <Spinner size="sm" /> : <Wallet />}额度
         </Button>
-        <Button type="button" variant="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance}>
-          {loadingBalance ? <Spinner size="sm" /> : <Wallet className="h-3.5 w-3.5" />} 查询
+        <Button variant="ghost" size="xs" onClick={openDiagnostics} title="查看账号调度与错误诊断">
+          <Activity />诊断
         </Button>
-        <Button type="button" variant="ghost" size="xs"
-          disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}
-          title={credential.authMethod === 'api_key' ? 'API Key 无需刷新' : '强制刷新 Token'}
-          onClick={() => forceRefresh.mutate(credential.id, {
-            onSuccess: (res) => toast.success(res.message),
-            onError: (e) => toast.error(`刷新失败: ${extractErrorMessage(e)}`),
-          })}>
-          <RefreshCw className={`h-3.5 w-3.5 ${forceRefresh.isPending ? 'animate-spin' : ''}`} /> 刷新Token
-        </Button>
-        <Button type="button" variant="ghost" size="xs"
-          disabled={resetFailure.isPending || !hasFailures}
-          onClick={() => resetFailure.mutate(credential.id, {
-            onSuccess: (res) => toast.success(res.message),
-            onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
-          })}>
-          <RotateCcw className="h-3.5 w-3.5" /> 恢复异常
-        </Button>
-        {/* 低频/危险操作：收入 ... 菜单 */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button type="button" variant="ghost" size="xs" title="更多操作">
-              <MoreHorizontal className="h-3.5 w-3.5" />
+            <Button variant="ghost" size="icon-xs" title="更多操作" aria-label="更多操作">
+              <Ellipsis />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuLabel>更多操作</DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }}>
-              <Route className="h-3.5 w-3.5" aria-hidden="true" /> 路由限制{routeSummary ? `（${routeSummary}）` : ''}
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => setEditingFast(true)}>
-              <Zap className="h-3.5 w-3.5" aria-hidden="true" /> {fast > 0 ? `修改 Fast（当前 ${fast}）` : '开启 Fast'}
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={setWarmup.isPending}
-              onSelect={() => setWarmup.mutate(
-                { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
-                {
-                  onSuccess: () => toast.success(credential.warmupRemaining > 0 ? '已关闭预热' : '已开启预热'),
-                  onError: (e) => toast.error(`预热设置失败: ${extractErrorMessage(e)}`),
-                }
+          {/* Only what the card has no direct entry for: concurrency, RPM and priority are the stat cells,
+              test / quota / diagnostics the buttons, and Fast, route, models and proxy their chips once set. */}
+          <DropdownMenuContent align="start" className="w-60">
+            <DropdownMenuGroup>
+              <DropdownMenuLabel className="text-xs text-muted-foreground">调度</DropdownMenuLabel>
+              {fast === 0 && (
+                <DropdownMenuItem onSelect={() => setEditingFast(true)}>
+                  <Zap /> 开启 Fast
+                </DropdownMenuItem>
               )}
-            >
-              {credential.warmupRemaining > 0 ? '关闭预热' : '开启预热'}
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              disabled={clearInFlight.isPending || !canClearInFlight}
-              onSelect={async () => {
-                if (!canClearInFlight) return
-                const ok = await confirmDialog({ title: '清理并发', message: `清理账号 #${credential.id} 当前并发占用？`, confirmText: '清理', tone: 'danger' })
-                if (!ok) return
-                clearInFlight.mutate({ id: credential.id }, {
-                  onSuccess: (res) => toast.success(res.message),
-                  onError: (e) => toast.error(`清理失败: ${extractErrorMessage(e)}`),
-                })
-              }}
-            >
-              清理并发
-            </DropdownMenuItem>
+              {!routeSummary && (
+                <DropdownMenuItem onSelect={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }}>
+                  <Route /> 路由限制<span className="ml-auto text-xs text-muted-foreground">全部入口</span>
+                </DropdownMenuItem>
+              )}
+              {supportedModels.length === 0 && (
+                <DropdownMenuItem onSelect={() => setEditingSupportedModels(true)}>
+                  <Boxes /> 支持模型<span className="ml-auto text-xs text-muted-foreground">不限制</span>
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuItem disabled={setWarmup.isPending} onSelect={toggleWarmup}>
+                <Flame /> {credential.warmupRemaining > 0 ? '关闭预热' : '开启预热'}
+              </DropdownMenuItem>
+              <DropdownMenuCheckboxItem
+                checked={credential.rateLimitAutoDisableEnabled !== false}
+                disabled={setCredentialRateLimitAutoDisable.isPending}
+                onCheckedChange={(checked) => toggleRateLimitAutoDisable(checked === true)}>
+                429 自动禁用
+              </DropdownMenuCheckboxItem>
+              <DropdownMenuCheckboxItem
+                checked={overageEnabled}
+                disabled={!accountInfo || !overageCapable || setCredentialOverage.isPending}
+                onCheckedChange={(checked) => toggleOverage(checked === true)}>
+                超额调用<span className="ml-auto pl-2 text-xs text-muted-foreground">{overageLabel}</span>
+              </DropdownMenuCheckboxItem>
+            </DropdownMenuGroup>
             <DropdownMenuSeparator />
-            <DropdownMenuItem
-              destructive
-              disabled={!credential.disabled}
-              onSelect={() => { if (credential.disabled) setShowDeleteConfirm(true) }}
-            >
-              <Trash2 className="h-3.5 w-3.5" /> 删除
+            <DropdownMenuGroup>
+              <DropdownMenuLabel className="text-xs text-muted-foreground">网络</DropdownMenuLabel>
+              {!credential.hasProxy && (
+                <DropdownMenuItem onSelect={() => { resetProxyDraft(); setEditingProxy(true) }}>
+                  <Router /> 代理<span className="ml-auto max-w-24 truncate text-xs text-muted-foreground">{proxySummary(credential)}</span>
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuItem onSelect={() => setEditingRegions(true)}>
+                <Globe /> Region<span className="ml-auto font-mono text-xs text-muted-foreground">{credential.effectiveApiRegion || '-'}</span>
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              <DropdownMenuLabel className="text-xs text-muted-foreground">维护</DropdownMenuLabel>
+              <DropdownMenuItem disabled={forceRefresh.isPending || credential.authMethod === 'api_key'} onSelect={runForceRefresh}>
+                <RefreshCw /> {credential.authMethod === 'api_key' ? '刷新 Token（API Key 无需）' : '刷新 Token'}
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={resetFailure.isPending || !hasFailures} onSelect={runResetFailure}>
+                <RotateCcw /> 恢复异常
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={clearInFlight.isPending || !canClearInFlight} onSelect={runClearInFlight}>
+                <Eraser /> 清理并发
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem destructive disabled={!credential.disabled} onSelect={() => { if (credential.disabled) setShowDeleteConfirm(true) }}>
+              <Trash2 /> {credential.disabled ? '删除' : '删除（需先禁用）'}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
-        <Button
-          type="button"
-          variant="ghost"
-          size="xs"
-          className="ml-auto"
-          onClick={onToggleExpanded}
-          aria-expanded={expanded}
-          title={expanded ? '收起详情' : '展开详情'}
-        >
-          <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} aria-hidden="true" />
-          {expanded ? '收起' : '详情'}
+        <Button variant="ghost" size="xs" className="ml-auto text-muted-foreground" onClick={onToggleExpanded} aria-haspopup="dialog" title="查看全部信息">
+          详情<ChevronRight />
         </Button>
       </div>
 
-      {/* ── Expanded Detail ── */}
-      {expanded && (
-        <div className="space-y-4 px-3 pb-3 pt-2 animate-in fade-in-0 slide-in-from-top-2 duration-200">
-
-          {/* 调度运行态 */}
-          <div>
-            <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">基础信息</div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
-              <MetaItem label="创建时间" value={credential.createdAt ? formatFullDate(credential.createdAt) : '-'} />
-              <MetaItem label="更新时间" value={credential.updatedAt ? formatFullDate(credential.updatedAt) : '-'} />
-              {credential.email && credential.maskedApiKey && (
-                <MetaItem label="API Key" value={<span className="font-mono truncate block" title={credential.maskedApiKey}>{credential.maskedApiKey}</span>} />
-              )}
+      {/* ── Detail sheet: everything else, grouped, with edit entry points ── */}
+      <Sheet open={expanded} onOpenChange={(open) => { if (open !== expanded) onToggleExpanded() }}>
+        <SheetContent width="sm:max-w-md">
+          <SheetHeader>
+            <div className="flex items-center gap-2">
+              <Badge tone={status.tone} dot title={status.title}>{status.label}</Badge>
+              <span className="tabular font-mono text-xs text-muted-foreground">#{credential.id}</span>
             </div>
-          </div>
-
-          {/* 调度运行态 */}
-          <div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
-              <MetaItem
-                label="429自动禁用"
-                value={
-                  <span className="inline-flex items-center gap-2">
-                    <Switch
-                      checked={credential.rateLimitAutoDisableEnabled !== false}
-                      disabled={setCredentialRateLimitAutoDisable.isPending}
-                      onCheckedChange={toggleRateLimitAutoDisable}
-                    />
-                    <span>{credential.rateLimitAutoDisableEnabled === false ? '关闭' : '开启'}</span>
-                  </span>
-                }
-              />
-              <MetaItem label="近期错误率" value={`${(recentErrorRate * 100).toFixed(1)}%`} error={recentErrorRate > 0} />
-              <MetaItem
-                label="调度评分(压力)"
-                value={`${schedulerScore.toFixed(2)} (${schedulerSelectionPressure.toFixed(2)})`}
-                error={schedulerSelectionPressure > 1}
-              />
-              <MetaItem label="总调度" value={<span title={formatNumber(schedulerSelectionCount)}>{formatCompact(schedulerSelectionCount)}</span>} />
-              <MetaItem
-                label="支持模型"
-                value={
-                  <button
-                    type="button"
-                    className="max-w-full truncate text-left text-sm text-primary hover:underline"
-                    title={supportedModels.length > 0 ? supportedModels.join('\n') : undefined}
-                    onClick={() => setEditingSupportedModels(true)}
-                  >
-                    {supportedModelsSummary(supportedModels)}
-                  </button>
-                }
-              />
-              <MetaItem label="失败/刷新失败" value={`${credential.failureCount} / ${credential.refreshFailureCount}`} error={hasFailures} />
-              {credential.warmupRemaining > 0 && (
-                <MetaItem label="预热剩余" value={credential.warmupRemaining} />
-              )}
-              {credential.inProbation && (
-                <MetaItem label="观察期" value={`${probationRemainingSecs}s`} />
-              )}
-              {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
-                <MetaItem
-                  label="计价请求覆盖"
-                  value={<span title={`${formatNumber(credential.pricedRequests)}/${formatNumber(credential.pricedRequests + credential.unpricedRequests)}`}>{formatCompact(credential.pricedRequests)}/{formatCompact(credential.pricedRequests + credential.unpricedRequests)}</span>}
-                  error={credential.unpricedRequests > 0}
-                />
-              )}
-              {credential.cooldownReason && (
-                <MetaItem label="冷却原因" value={<span className="truncate text-destructive text-xs">{credential.cooldownReason}</span>} />
-              )}
-            </div>
-            {credential.cooldowns && credential.cooldowns.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-1.5 text-xs text-muted-foreground">
-                {credential.cooldowns.map((cd) => (
-                  <span
-                    key={`${cd.global ? 'global' : cd.model}-${cd.remainingSecs}`}
-                    className="rounded bg-muted/40 px-2 py-0.5"
-                    title={cd.reason || undefined}
-                  >
-                    {cd.global ? '全部模型' : cd.model || '-'} · 冷却 {cd.remainingSecs}s
-                  </span>
-                ))}
+            <SheetTitle className="break-all">{displayCredentialLabel}</SheetTitle>
+            <SheetDescription className="flex flex-wrap items-center gap-1">
+              <span className={cn('inline-flex h-5 items-center rounded-full px-2 text-[0.68rem] font-semibold', SUBSCRIPTION_CLASS[subMeta.key])}>{subMeta.label}</span>
+              <span className={cn('inline-flex h-5 items-center rounded-full px-2 text-[0.68rem] font-semibold', AUTH_CLASS[credential.authMethod ?? ''] ?? 'bg-muted text-muted-foreground')}>{authLabel(credential.authMethod)}</span>
+              {epLabel && <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-[0.68rem] font-medium">{epLabel}</span>}
+            </SheetDescription>
+          </SheetHeader>
+          <SheetBody className="divide-y divide-border/70">
+            {credential.lastErrorReason && (
+              <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
+                <div className="font-semibold text-destructive">最近错误{credential.lastErrorAtMs ? `（${formatDateTime(credential.lastErrorAtMs)}）` : ''}</div>
+                <div className="mt-1 break-words text-muted-foreground">{credential.lastErrorKind}: {credential.lastErrorReason}</div>
               </div>
             )}
-          </div>
 
-          <div>
-            <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">计费与积分</div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
-              <MetaItem
-                label="估算计费/原始计费"
-                value={`${formatUsdFixed2(credential.estimatedCostUsd)} / ${formatUsdFixed2(credential.originalCostUsd)}`}
-              />
-              <MetaItem label="使用积分" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
-              <MetaItem
-                label="超额调用"
-                value={
-                  <span className="inline-flex items-center gap-2">
-                    {setCredentialOverage.isPending ? (
-                      <Spinner size="sm" />
-                    ) : (
-                      <Switch
-                        checked={overageEnabled}
-                        disabled={!accountInfo || !overageCapable}
-                        onCheckedChange={toggleOverage}
-                        aria-label="切换超额调用"
-                      />
-                    )}
-                    <span className={overageEnabled ? 'text-warning' : !overageCapable ? 'text-muted-foreground' : ''}>{overageLabel}</span>
-                  </span>
-                }
-                detail={overageDetail}
-              />
-            </div>
-          </div>
+            <DetailSection title="调度">
+              <DetailRow label="优先级" onEdit={() => setEditingPriority(true)}>{credential.priority}</DetailRow>
+              <DetailRow label="Fast" onEdit={() => setEditingFast(true)}>{fast > 0 ? fast : '未开启'}</DetailRow>
+              <DetailRow label="并发" onEdit={() => setEditingConcurrency(true)} tone={loadTone(credential.inFlightRequests, concurrencyLimit)}>
+                {concurrencyText}
+                {credential.inFlightRequests > 0 && (
+                  <span className="ml-1 text-xs font-normal text-muted-foreground">最老 {credential.oldestInFlightAgeSecs}s · 闲置 {credential.newestInFlightIdleSecs}s</span>
+                )}
+              </DetailRow>
+              <DetailRow label="RPM（近 60 秒）" onEdit={() => setEditingRpm(true)} tone={loadTone(recentSelection60s, rpmLimit)}>{rpmText}</DetailRow>
+              <DetailRow label="路由限制" onEdit={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }} editLabel="修改路由限制">
+                {routeSummary ?? '全部入口'}
+              </DetailRow>
+              <DetailRow label="支持模型" onEdit={() => setEditingSupportedModels(true)}>
+                <span title={supportedModels.join('\n') || undefined}>{supportedModelsSummary(supportedModels)}</span>
+              </DetailRow>
+              <DetailRow label="429 自动禁用">
+                <span className="inline-flex items-center gap-2">
+                  <span className="text-xs font-normal text-muted-foreground">{credential.rateLimitAutoDisableEnabled === false ? '仅冷却' : '开启'}</span>
+                  <Switch checked={credential.rateLimitAutoDisableEnabled !== false} disabled={setCredentialRateLimitAutoDisable.isPending}
+                    onCheckedChange={toggleRateLimitAutoDisable} aria-label="429 自动禁用" />
+                </span>
+              </DetailRow>
+              {credential.warmupRemaining > 0 && <DetailRow label="预热剩余" tone="warning">{credential.warmupRemaining} 次</DetailRow>}
+              {credential.inProbation && <DetailRow label="观察期">{probationRemainingSecs}s</DetailRow>}
+            </DetailSection>
 
-          {/* 网络 */}
-          <div>
-            <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">网络配置</div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
-              <MetaItem
-                label="Auth Region"
-                value={
-                  <button type="button" className="font-mono text-primary hover:underline text-sm"
-                    onClick={() => setEditingRegions(true)}>
-                    {credential.effectiveAuthRegion || '-'}
-                  </button>
-                }
-              />
-              <MetaItem
-                label="API Region"
-                value={
-                  <button type="button" className="font-mono text-primary hover:underline text-sm"
-                    onClick={() => setEditingRegions(true)}>
-                    {credential.effectiveApiRegion || '-'}
-                  </button>
-                }
-              />
-              <MetaItem
-                label="代理"
-                value={
-                  <button type="button" className="flex items-center gap-1 text-primary hover:underline text-sm"
-                    onClick={() => { resetProxyDraft(); setEditingProxy(true) }}>
-                    <Router className="h-3 w-3 shrink-0" />
-                    <span className="truncate">{proxySummary(credential)}</span>
-                  </button>
-                }
-              />
-            </div>
-          </div>
+            <DetailSection title="运行">
+              <DetailRow label="成功 / 调度" tone={success.tone === 'success' ? undefined : success.tone}>
+                {formatNumber(credential.successCount)} / {formatNumber(success.dispatched)}
+                {success.percent !== undefined && <span className="ml-1 text-xs font-normal text-muted-foreground">（{formatPercent(success.percent / 100)}）</span>}
+              </DetailRow>
+              <DetailRow label="连续失败 / 刷新失败" tone={hasFailures ? 'error' : undefined}>
+                {credential.failureCount} / {credential.refreshFailureCount}
+              </DetailRow>
+              <DetailRow label="近期错误率" tone={recentErrorRate > 0 ? 'error' : undefined}>{formatPercent(recentErrorRate)}</DetailRow>
+              <DetailRow label="调度评分（压力）" tone={schedulerSelectionPressure > 1 ? 'error' : undefined}>
+                {schedulerScore.toFixed(2)}（{schedulerSelectionPressure.toFixed(2)}）
+              </DetailRow>
+              <DetailRow label="最近成功">{credential.lastUsedAt ? formatDateTime(credential.lastUsedAt) : '未成功过'}</DetailRow>
+              {credential.cooldownReason && <DetailRow label="冷却原因" tone="warning">{credential.cooldownReason}</DetailRow>}
+              {credential.cooldowns && credential.cooldowns.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 py-2">
+                  {credential.cooldowns.map((cd) => (
+                    <Badge key={`${cd.global ? 'global' : cd.model}-${cd.remainingSecs}`} tone="warning" title={cd.reason || undefined}>
+                      {cd.global ? '全部模型' : cd.model || '-'} · {cd.remainingSecs}s
+                    </Badge>
+                  ))}
+                </div>
+              )}
+            </DetailSection>
 
-          {/* 最近错误 */}
-          {credential.lastErrorReason && (
-            <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs">
-              <span className="font-semibold text-destructive">
-                最近错误{lastTransientErrorAgo ? ` (${lastTransientErrorAgo})` : ''}：
-              </span>
-              <span className="text-muted-foreground">{credential.lastErrorKind}: {credential.lastErrorReason}</span>
-            </div>
-          )}
-        </div>
-      )}
+            <DetailSection title="额度与计费">
+              <DetailRow label="已用 / 上限" tone={quotaBar.inOverage ? 'error' : undefined}>
+                {quota ? `${quota.percent}  ${quota.amount}` : '未查询'}
+              </DetailRow>
+              <DetailRow label="超额调用">
+                <span className="inline-flex items-center gap-2">
+                  <span className={cn('text-xs font-normal', overageEnabled ? 'text-warning' : 'text-muted-foreground')}>{overageLabel}</span>
+                  {setCredentialOverage.isPending ? <Spinner size="sm" /> : (
+                    <Switch checked={overageEnabled} disabled={!accountInfo || !overageCapable} onCheckedChange={toggleOverage} aria-label="切换超额调用" />
+                  )}
+                </span>
+              </DetailRow>
+              {overageDetail && <DetailRow label="超额说明">{overageDetail}</DetailRow>}
+              <DetailRow label="估算 / 原始计费">{formatUsdFixed2(credential.estimatedCostUsd)} / {formatUsdFixed2(credential.originalCostUsd)}</DetailRow>
+              <DetailRow label="使用积分">{formatMeteringUsage(credential.kiroMeteringUsage)}</DetailRow>
+              {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
+                <DetailRow label="计价请求覆盖" tone={credential.unpricedRequests > 0 ? 'warning' : undefined}>
+                  {formatNumber(credential.pricedRequests)} / {formatNumber(credential.pricedRequests + credential.unpricedRequests)}
+                </DetailRow>
+              )}
+            </DetailSection>
+
+            <DetailSection title="网络">
+              <DetailRow label="Auth Region" onEdit={() => setEditingRegions(true)} editLabel="修改 Region">
+                <span className="font-mono">{credential.effectiveAuthRegion || '-'}</span>
+              </DetailRow>
+              <DetailRow label="API Region" onEdit={() => setEditingRegions(true)} editLabel="修改 Region">
+                <span className="font-mono">{credential.effectiveApiRegion || '-'}</span>
+              </DetailRow>
+              <DetailRow label="代理" onEdit={() => { resetProxyDraft(); setEditingProxy(true) }} editLabel="修改代理">{proxySummary(credential)}</DetailRow>
+            </DetailSection>
+
+            <DetailSection title="账号">
+              {credential.email && credential.maskedApiKey && (
+                <DetailRow label="API Key"><span className="font-mono">{credential.maskedApiKey}</span></DetailRow>
+              )}
+              {credential.hasProfileArn && <DetailRow label="Profile ARN">已配置</DetailRow>}
+              <DetailRow label="创建时间">{formatDateTime(credential.createdAt)}</DetailRow>
+              <DetailRow label="更新时间">{formatDateTime(credential.updatedAt)}</DetailRow>
+            </DetailSection>
+          </SheetBody>
+          <SheetFooter>
+            <Button variant="outline" size="sm" onClick={() => onTest(credential)}><FlaskConical />测试</Button>
+            <Button variant="outline" size="sm" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance}>
+              {loadingBalance ? <Spinner size="sm" /> : <Wallet />}查询额度
+            </Button>
+            <Button variant="outline" size="sm" onClick={openDiagnostics}><Activity />诊断</Button>
+            <Button variant="outline" size="sm" className="ml-auto" onClick={runForceRefresh}
+              disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}>
+              <RefreshCw className={forceRefresh.isPending ? 'animate-spin' : undefined} />刷新 Token
+            </Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
 
       {/* ── Route Policy Modal ── */}
       <ModalShell open={editingRoutePolicy} title={`路由限制：${displayCredentialLabel}`} width="max-w-lg"
@@ -1348,6 +1413,6 @@ export function CredentialCard({
           </div>
         </div>
       </ModalShell>
-    </div>
+    </article>
   )
 }

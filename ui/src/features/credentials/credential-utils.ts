@@ -5,6 +5,7 @@ import type {
   CredentialRuntimeItem,
   CredentialStatusItem,
   CredentialUsageSummaryItem,
+  ExternalPoolRouteMode,
 } from '@/types/api'
 
 // ============================================================================
@@ -32,7 +33,112 @@ export function authLabel(authMethod: string | null | undefined) {
   return authMethod || 'Unknown'
 }
 
-type BadgeTone = 'neutral' | 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info'
+export type BadgeTone = 'neutral' | 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info'
+
+/** Short label for a credential's route policy; undefined when it accepts every route. */
+export function credentialRouteSummary(mode?: ExternalPoolRouteMode, rules: string[] = []): string | undefined {
+  if (!mode || mode === 'allow_all') return undefined
+  const list = rules.length <= 2 ? rules.join(', ') : `${rules[0]}, ${rules[1]} 等 ${rules.length} 条`
+  if (mode === 'allow_list') return rules.length ? `仅 ${list}` : '不承接任何入口'
+  return rules.length ? `排除 ${list}` : undefined
+}
+
+/** The one state a card leads with; the most blocking condition wins. */
+export function credentialStatusMeta(
+  c: Pick<
+    CredentialStatusItem,
+    | 'disabled'
+    | 'disabledReason'
+    | 'cooledDown'
+    | 'cooldownRemainingSecs'
+    | 'cooldownReason'
+    | 'rateLimited'
+    | 'rateLimitRemainingSecs'
+    | 'inFlightRequests'
+    | 'maxConcurrentRequests'
+    | 'inProbation'
+    | 'probationRemainingSecs'
+  >,
+): { label: string; tone: BadgeTone; title?: string } {
+  if (c.disabled) {
+    const manual = !c.disabledReason || c.disabledReason === 'Manual'
+    return { label: disabledReasonLabel(c.disabledReason), tone: manual ? 'neutral' : 'error', title: c.disabledReason || undefined }
+  }
+  if (c.cooledDown) {
+    return { label: c.cooldownRemainingSecs > 0 ? `冷却 ${c.cooldownRemainingSecs}s` : '冷却', tone: 'warning', title: c.cooldownReason || undefined }
+  }
+  if (c.rateLimited) {
+    return { label: c.rateLimitRemainingSecs > 0 ? `限流 ${c.rateLimitRemainingSecs}s` : '限流', tone: 'info' }
+  }
+  if (c.maxConcurrentRequests > 0 && c.inFlightRequests >= c.maxConcurrentRequests) {
+    return { label: '并发已满', tone: 'warning', title: `${c.inFlightRequests}/${c.maxConcurrentRequests}` }
+  }
+  if (c.inProbation) {
+    const secs = numberOrZero(c.probationRemainingSecs)
+    return { label: '观察期', tone: 'info', title: secs > 0 ? `剩余 ${secs}s` : undefined }
+  }
+  return { label: '正常', tone: 'success' }
+}
+
+export interface CredentialFlag {
+  key: 'current' | 'errors' | 'warmup' | 'route' | 'proxy' | 'models' | 'rate-limit' | 'profile-arn'
+  /** `attention` needs a look and is spelled out; `config` is a standing setting shown as an icon. */
+  kind: 'attention' | 'config'
+  label: string
+  tone: BadgeTone
+  title?: string
+  /** A number worth showing next to an icon, e.g. how many models the account is limited to. */
+  count?: number
+}
+
+/** Secondary markers in the order a card shows them. */
+export function credentialFlags(
+  c: Pick<
+    CredentialStatusItem,
+    | 'isCurrent'
+    | 'disabled'
+    | 'transientFailureStreak'
+    | 'lastErrorReason'
+    | 'warmupRemaining'
+    | 'routeMode'
+    | 'routeRules'
+    | 'hasProxy'
+    | 'effectiveProxySource'
+    | 'proxyResourceName'
+    | 'supportedModels'
+    | 'rateLimitAutoDisableEnabled'
+    | 'hasProfileArn'
+  >,
+): CredentialFlag[] {
+  const flags: CredentialFlag[] = []
+  if (c.isCurrent) flags.push({ key: 'current', kind: 'attention', label: '当前', tone: 'primary', title: '调度器当前选中的账号' })
+  const streak = numberOrZero(c.transientFailureStreak)
+  if (!c.disabled && streak > 0) {
+    flags.push({ key: 'errors', kind: 'attention', label: `连续错误 ${streak}`, tone: 'error', title: c.lastErrorReason || undefined })
+  }
+  if (c.warmupRemaining > 0) {
+    flags.push({ key: 'warmup', kind: 'attention', label: `预热 ${c.warmupRemaining}`, tone: 'warning', title: `还需成功 ${c.warmupRemaining} 次才完全参与调度` })
+  }
+  const route = credentialRouteSummary(c.routeMode, c.routeRules)
+  if (route) flags.push({ key: 'route', kind: 'config', label: route, tone: 'secondary', title: `路由限制：${route}` })
+  if (c.hasProxy) flags.push({ key: 'proxy', kind: 'config', label: '代理', tone: 'info', title: `代理：${proxySummary(c)}` })
+  const models = c.supportedModels ?? []
+  if (models.length > 0) flags.push({ key: 'models', kind: 'config', label: `模型 ${models.length}`, tone: 'secondary', count: models.length, title: `只调度 ${models.length} 个模型：${models.join('、')}` })
+  if (c.rateLimitAutoDisableEnabled === false) {
+    flags.push({ key: 'rate-limit', kind: 'config', label: '429仅冷却', tone: 'warning', title: '遇到 429 只冷却，不自动禁用' })
+  }
+  if (c.hasProfileArn) flags.push({ key: 'profile-arn', kind: 'config', label: 'Profile ARN', tone: 'neutral', title: '已配置 Profile ARN' })
+  return flags
+}
+
+/** Colour for a used/limit ratio; a limit of 0 means unlimited and never warns. */
+export function loadTone(used: number, limit: number): 'warning' | 'error' | undefined {
+  if (!(limit > 0)) return undefined
+  const ratio = used / limit
+  if (ratio >= 1) return 'error'
+  if (ratio >= 0.7) return 'warning'
+  return undefined
+}
 
 export type CredentialSubscriptionKey =
   | 'free'
@@ -47,21 +153,21 @@ export const CREDENTIAL_SUBSCRIPTION_OPTIONS: Array<{
   value: Exclude<CredentialSubscriptionKey, 'unknown'>
   label: string
 }> = [
-  { value: 'free', label: 'Kiro Free' },
-  { value: 'students', label: 'Kiro Students' },
-  { value: 'pro', label: 'Kiro Pro' },
-  { value: 'pro_plus', label: 'Kiro Pro+' },
-  { value: 'pro_max', label: 'Kiro Pro Max' },
-  { value: 'power', label: 'Kiro Power' },
+  { value: 'free', label: 'Free' },
+  { value: 'students', label: 'Students' },
+  { value: 'pro', label: 'Pro' },
+  { value: 'pro_plus', label: 'Pro+' },
+  { value: 'pro_max', label: 'Pro Max' },
+  { value: 'power', label: 'Power' },
 ]
 
 const CREDENTIAL_SUBSCRIPTION_LABELS: Record<CredentialSubscriptionKey, string> = {
-  free: 'Kiro Free',
-  students: 'Kiro Students',
-  pro: 'Kiro Pro',
-  pro_plus: 'Kiro Pro+',
-  pro_max: 'Kiro Pro Max',
-  power: 'Kiro Power',
+  free: 'Free',
+  students: 'Students',
+  pro: 'Pro',
+  pro_plus: 'Pro+',
+  pro_max: 'Pro Max',
+  power: 'Power',
   unknown: '未知订阅',
 }
 
@@ -88,16 +194,17 @@ export function credentialSubscriptionLabel(title?: string | null): string {
 export function subscriptionBadgeMeta(
   cred: Pick<CredentialStatusItem, 'subscriptionTitle' | 'accountInfo'>,
   balance?: BalanceResponse
-): { label: string; tone: BadgeTone; title?: string } {
+): { key: CredentialSubscriptionKey; label: string; tone: BadgeTone; title?: string } {
   const raw = balance?.subscriptionTitle || cred.accountInfo?.subscriptionTitle || cred.subscriptionTitle || ''
   const key = credentialSubscriptionKey(raw)
   const label = credentialSubscriptionLabel(raw)
   if (key === 'power' || key === 'pro_max' || key === 'pro_plus' || key === 'pro') {
-    return { label, tone: 'primary', title: raw || undefined }
+    return { key, label, tone: 'primary', title: raw || undefined }
   }
-  if (key === 'students') return { label, tone: 'info', title: raw || undefined }
-  if (key === 'free') return { label, tone: 'secondary', title: raw || undefined }
+  if (key === 'students') return { key, label, tone: 'info', title: raw || undefined }
+  if (key === 'free') return { key, label, tone: 'secondary', title: raw || undefined }
   return {
+    key,
     label: label.length > 12 ? label.slice(0, 12) + '…' : label,
     tone: 'neutral',
     title: raw || undefined,
@@ -347,4 +454,51 @@ export function quotaBarModel(
 
 function finiteNonNegative(value: number | null | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/**
+ * Quota as one reading: `32.8%  16.4/50` within the plan, `100%（+34.5%）  1,000(+345)/1,000` once
+ * past it, so the overage sits next to the number it adds to instead of on a line of its own.
+ * Brackets only appear when there is overage. Overage has no known cap, so none is shown.
+ */
+export function quotaReading(
+  info: Pick<CredentialAccountInfo, 'currentUsage' | 'usageLimit'> | undefined,
+  bar: QuotaBarModel,
+): { percent: string; amount: string } | undefined {
+  if (!info || !(info.usageLimit > 0)) return undefined
+  const pct = (value: number) => `${(Math.round(value * 10) / 10).toString()}%`
+  const limit = formatQuota1(info.usageLimit)
+  if (!bar.inOverage) {
+    return { percent: pct(bar.basePercent), amount: `${formatQuota1(info.currentUsage)}/${limit}` }
+  }
+  return {
+    percent: `100%（+${pct((bar.overage / info.usageLimit) * 100)}）`,
+    amount: `${limit}(+${formatQuota1(bar.overage)})/${limit}`,
+  }
+}
+
+/** Credits with grouping and at most 6 decimals, matching `formatQuotaFixed` without importing the UI formatter. */
+function formatQuota1(value: number): string {
+  return new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 6, useGrouping: true }).format(value)
+}
+
+/** Below this many dispatches the ratio is too noisy to colour. */
+const SUCCESS_RATE_MIN_SAMPLE = 20
+
+/**
+ * Successes against dispatches. Dispatches also count requests still in flight, cancelled by the
+ * client or retried on another account, so the gap is "did not succeed here", not "failed". Older
+ * stats can have fewer dispatches than successes; those read as fully successful.
+ */
+export function successRate(successCount: number, selectionCount: number): {
+  dispatched: number
+  percent?: number
+  tone?: 'success' | 'warning' | 'error'
+} {
+  const success = Math.max(0, successCount || 0)
+  const dispatched = Math.max(success, selectionCount || 0)
+  if (dispatched === 0) return { dispatched }
+  const percent = (success / dispatched) * 100
+  if (dispatched < SUCCESS_RATE_MIN_SAMPLE) return { dispatched, percent }
+  return { dispatched, percent, tone: percent >= 95 ? 'success' : percent >= 80 ? 'warning' : 'error' }
 }

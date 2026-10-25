@@ -297,9 +297,8 @@
   --fast-c: 320 85% 62%;
   position: relative;
   isolation: isolate;
-  box-shadow:
-    0 0 0 1px hsl(var(--fast-b) / 0.35),
-    0 8px 28px -10px hsl(var(--fast-b) / 0.55);
+  /* The gradient rim below is the only edge; a ring here would draw a second border. */
+  box-shadow: 0 8px 28px -10px hsl(var(--fast-b) / 0.55);
 }
 .fast-card[data-fast-tier='2'] {
   --fast-a: 262 90% 66%;
@@ -330,6 +329,10 @@
   mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
   animation: fast-rim-spin 4s linear infinite;
   pointer-events: none;
+}
+/* A selected Fast card thickens its own rim instead of adding a border of its own. */
+.fast-card[data-selected='true']::before {
+  padding: 2.5px;
 }
 .fast-card::after {
   content: '';
