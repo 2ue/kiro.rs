@@ -20,7 +20,7 @@ const CardHeader = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDiv
     <div
       ref={ref}
       className={cn(
-        'flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between',
+        'flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between',
         className
       )}
       {...props}
@@ -49,7 +49,7 @@ const CardDescription = React.forwardRef<
 CardDescription.displayName = 'CardDescription'
 
 const CardContent = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => <div ref={ref} className={cn('p-5', className)} {...props} />
+  ({ className, ...props }, ref) => <div ref={ref} className={cn('p-4', className)} {...props} />
 )
 CardContent.displayName = 'CardContent'
 
@@ -57,7 +57,7 @@ const CardFooter = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDiv
   ({ className, ...props }, ref) => (
     <div
       ref={ref}
-      className={cn('flex items-center gap-2 px-5 py-4', className)}
+      className={cn('flex items-center gap-2 px-4 py-3', className)}
       {...props}
     />
   )

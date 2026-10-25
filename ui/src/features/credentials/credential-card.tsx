@@ -536,18 +536,19 @@ export function CredentialCard({
     <div
       data-fast-tier={fastTier}
       className={[
-        '@container relative overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
+        '@container relative flex h-full flex-col overflow-hidden rounded-xl bg-card shadow-sm transition-shadow hover:shadow-md',
+        expanded ? 'col-span-full' : '',
         fast > 0 ? 'fast-card' : '',
         credential.disabled ? 'opacity-75' : '',
       ].join(' ')}>
       {credential.isCurrent && <span className="absolute inset-y-3 left-0 w-1 rounded-r-full bg-primary" />}
 
       {/* ── Header ── */}
-      <div className="flex items-start gap-2.5 px-3 pt-3 pb-2">
+      <div className="flex items-start gap-2.5 px-3 pb-1.5 pt-2.5">
         <Checkbox checked={selected} onCheckedChange={onToggleSelect} className="mt-0.5 shrink-0" />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="max-w-[220px] truncate text-sm font-semibold" title={displayCredentialLabel}>
+            <span className="min-w-0 break-all text-sm font-semibold leading-5" title={displayCredentialLabel}>
               {displayCredentialLabel}
             </span>
             <span className="tabular text-xs text-muted-foreground font-mono">#{credential.id}</span>
@@ -564,7 +565,7 @@ export function CredentialCard({
               </button>
             )}
           </div>
-          <div className="mt-1.5 flex flex-wrap items-center gap-1">
+          <div className="mt-1 flex flex-wrap items-center gap-1">
             <Badge tone={statusTone} title={credential.disabled ? credential.disabledReason || undefined : undefined}>{statusLabel}</Badge>
             <Badge>{authLabel(credential.authMethod)}</Badge>
             <Badge tone={subMeta.tone} title={subMeta.title}>
@@ -609,7 +610,7 @@ export function CredentialCard({
       </div>
 
       {/* ── Summary Row ── */}
-      <div className="grid grid-cols-3 gap-2 px-3 pb-2 pt-1 @md:grid-cols-5">
+      <div className="grid grid-cols-3 gap-x-2 gap-y-1.5 px-3 pb-1.5 pt-0.5 @md:grid-cols-5">
         <SummaryCell label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} />
         <ConcurrencySummaryCell
           value={concurrencySummaryValue}
@@ -630,7 +631,7 @@ export function CredentialCard({
         <SummaryCell label="最近" value={formatLastUsed(credential.lastUsedAt)} />
       </div>
 
-      <div className="mx-3 mb-2 px-3 py-2">
+      <div className="mx-3 mb-1.5 mt-auto px-3 py-1.5">
         <div className="flex items-center justify-between gap-3">
           <span className="flex items-baseline gap-1.5 text-[0.68rem] font-medium uppercase tracking-wide text-muted-foreground">
             额度
@@ -661,7 +662,7 @@ export function CredentialCard({
       </div>
 
       {/* ── Action Strip ── */}
-      <div className="flex flex-wrap gap-0.5 px-2 pb-2 pt-0.5">
+      <div className="flex flex-wrap gap-0.5 px-2 pb-1.5">
         {/* 高频操作：直接展示 */}
         <Button type="button" variant="ghost" size="xs" onClick={() => onTest(credential)}>
           <Wand2 className="h-3.5 w-3.5" /> 测试
@@ -768,7 +769,7 @@ export function CredentialCard({
           {/* 调度运行态 */}
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">基础信息</div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3 @4xl:grid-cols-6">
               <MetaItem label="创建时间" value={credential.createdAt ? formatFullDate(credential.createdAt) : '-'} />
               <MetaItem label="更新时间" value={credential.updatedAt ? formatFullDate(credential.updatedAt) : '-'} />
               {credential.email && credential.maskedApiKey && (
@@ -779,7 +780,7 @@ export function CredentialCard({
 
           {/* 调度运行态 */}
           <div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3 @4xl:grid-cols-6">
               <MetaItem
                 label="429自动禁用"
                 value={
@@ -848,7 +849,7 @@ export function CredentialCard({
 
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">计费与积分</div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3 @4xl:grid-cols-6">
               <MetaItem
                 label="估算计费/原始计费"
                 value={`${formatUsdFixed2(credential.estimatedCostUsd)} / ${formatUsdFixed2(credential.originalCostUsd)}`}
@@ -879,7 +880,7 @@ export function CredentialCard({
           {/* 网络 */}
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">网络配置</div>
-            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3">
+            <div className="grid grid-cols-2 gap-3 @md:grid-cols-3 @4xl:grid-cols-6">
               <MetaItem
                 label="Auth Region"
                 value={

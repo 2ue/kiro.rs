@@ -222,7 +222,7 @@ export function InventoryPage() {
         title="库存账号"
         description={`共 ${inventory.data?.total ?? 0} 个`}
       >
-        <div className="z-20 -mx-5 -mt-1 border-b bg-card px-5 pb-3 pt-1 lg:sticky lg:top-[var(--header-h)]">
+        <div className="z-20 -mx-4 -mt-1 border-b bg-card px-4 pb-3 pt-1 lg:sticky lg:top-[var(--header-h)]">
           <div className="flex flex-wrap items-center gap-2">
             <div className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5" role="radiogroup" aria-label="按状态筛选">
               {([['__all__', '全部', counts?.total ?? 0, ''] as const, ...(['stored', 'pushed', 'invalid', 'pushing'] as const).map((key) => [key, STATUS_META[key].label, counts?.[key] ?? 0, STATUS_META[key].dot] as const)]).map(([value, label, count, dot]) => {
@@ -297,7 +297,7 @@ export function InventoryPage() {
         </div>
 
         {(inventory.data?.total ?? 0) > 0 && (
-          <div className="z-10 -mx-5 mt-3 border-t bg-card px-5 py-3 lg:sticky lg:bottom-0">
+          <div className="z-10 -mx-4 mt-3 border-t bg-card px-4 py-3 lg:sticky lg:bottom-0">
             <Pagination
               page={page}
               pageCount={inventory.data?.totalPages ?? 1}
