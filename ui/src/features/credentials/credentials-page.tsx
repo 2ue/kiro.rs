@@ -1,8 +1,6 @@
 import {
   CheckCircle2,
-  ChevronDown,
   ChevronRight,
-  ChevronUp,
   Download,
   FileUp,
   Filter,
@@ -88,7 +86,7 @@ import type {
   LoadBalancingMode,
 } from '@/types/api'
 import { pageMeta } from '@/types/ui'
-import { CredentialCard } from './credential-card'
+import { CREDENTIAL_CARD_GRID, CredentialCard } from './credential-card'
 import {
   AddCredentialModal,
   BatchEditCredentialsModal,
@@ -206,20 +204,10 @@ export function CredentialsPage() {
       return true
     }
   })
-  // Cards start collapsed. "展开全部 / 收起全部" sets every card; each card can also be opened alone.
   const cardScrollRef = useRef<HTMLDivElement | null>(null)
-  const [allExpanded, setAllExpanded] = useState(false)
-  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
-  const toggleCardExpanded = (id: number) => setExpandedIds((current) => {
-    const next = new Set(current)
-    if (next.has(id)) next.delete(id)
-    else next.add(id)
-    return next
-  })
-  const toggleAllExpanded = () => {
-    setAllExpanded((value) => !value)
-    setExpandedIds(new Set())
-  }
+  // One card's details are open at a time, in a side sheet.
+  const [detailId, setDetailId] = useState<number | null>(null)
+  const toggleDetail = (id: number) => setDetailId((current) => (current === id ? null : id))
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [quickQuery, setQuickQuery] = useState('')
   const [modelQuery, setModelQuery] = useState('')
@@ -1263,10 +1251,6 @@ export function CredentialsPage() {
             {credentials.isFetching && !credentials.isLoading && <Spinner size="sm" />}
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" size="xs" onClick={toggleAllExpanded}>
-              {allExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-              {allExpanded ? '收起全部' : '展开全部'}
-            </Button>
             {disabledCount > 0 && (
               <Button
                 variant="destructive" size="xs"
@@ -1281,7 +1265,7 @@ export function CredentialsPage() {
         </div>
 
         {/* Credential list */}
-        <div ref={cardScrollRef} className="scroll-mt-[calc(var(--header-h)+15rem)]" aria-label="账号卡片">
+        <div ref={cardScrollRef} className="scroll-mt-[calc(var(--header-h)+15rem)] pt-3" aria-label="账号卡片">
         {currentCredentials.length === 0 ? (
           <EmptyState
             icon={<Server className="h-12 w-12" />}
@@ -1298,7 +1282,7 @@ export function CredentialsPage() {
             }
           />
         ) : (
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+          <div className={CREDENTIAL_CARD_GRID}>
             {currentCredentials.map((credential) => (
               <CredentialCard
                 key={credential.id}
@@ -1309,8 +1293,8 @@ export function CredentialsPage() {
                 onTest={setTestingCredential}
                 balance={balanceMap.get(credential.id)}
                 loadingBalance={loadingBalanceIds.has(credential.id)}
-                expanded={allExpanded !== expandedIds.has(credential.id)}
-                onToggleExpanded={() => toggleCardExpanded(credential.id)}
+                expanded={detailId === credential.id}
+                onToggleExpanded={() => toggleDetail(credential.id)}
                 showEmailSuffix={showEmailSuffix}
               />
             ))}

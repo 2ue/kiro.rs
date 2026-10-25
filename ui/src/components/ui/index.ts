@@ -59,6 +59,17 @@ export {
 } from './dropdown-menu'
 export { Popover, PopoverTrigger, PopoverAnchor, PopoverContent } from './popover'
 export {
+  Sheet,
+  SheetTrigger,
+  SheetClose,
+  SheetContent,
+  SheetHeader,
+  SheetBody,
+  SheetFooter,
+  SheetTitle,
+  SheetDescription,
+} from './sheet'
+export {
   Table,
   TableHeader,
   TableBody,

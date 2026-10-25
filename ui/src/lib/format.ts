@@ -133,6 +133,23 @@ export function formatFullDate(value?: string | null): string {
   })
 }
 
+/** Exact local time: `MM/DD HH:mm:ss` within this year, with the year in front otherwise. */
+export function formatDateTime(value?: string | number | null): string {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '-'
+  const sameYear = date.getFullYear() === new Date().getFullYear()
+  return date.toLocaleString('zh-CN', {
+    hour12: false,
+    ...(sameYear ? {} : { year: 'numeric' as const }),
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
 export function formatLastUsed(lastUsedAt: string | null): string {
   if (!lastUsedAt) return '从未使用'
   const date = new Date(lastUsedAt)
