@@ -190,6 +190,7 @@ const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
   nativeReasoningFields: true,
   toolPairingRepair: true,
   historyPlaceholderTools: true,
+  codeExecution: { enabled: false, pathOverrides: {}, timeoutMs: 5000, maxOutputBytes: 16384, maxCodeBytes: 65536 },
 })
 
 const normalizeBodyConversion = (
@@ -205,6 +206,13 @@ const normalizeBodyConversion = (
     nativeReasoningFields: input?.nativeReasoningFields ?? base.nativeReasoningFields,
     toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
     historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
+    codeExecution: {
+      enabled: input?.codeExecution?.enabled ?? base.codeExecution.enabled,
+      pathOverrides: { ...(input?.codeExecution?.pathOverrides ?? base.codeExecution.pathOverrides) },
+      timeoutMs: input?.codeExecution?.timeoutMs ?? base.codeExecution.timeoutMs,
+      maxOutputBytes: input?.codeExecution?.maxOutputBytes ?? base.codeExecution.maxOutputBytes,
+      maxCodeBytes: input?.codeExecution?.maxCodeBytes ?? base.codeExecution.maxCodeBytes,
+    },
   }
 }
 
@@ -4506,6 +4514,7 @@ export function RuntimeConfigPanel() {
               ['nativeReasoningFields', '原生 reasoning 字段', '对支持的 Kiro 模型上报 additionalModelRequestFields。'],
               ['toolPairingRepair', '工具配对修复', '清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
+              ['codeExecution', '代码执行（默认关闭）', '仅在路由开启时执行 Anthropic code_execution 的 Python 代码，并返回 bash_code_execution 服务端工具结果。'],
             ].map(([key, title, description]) => (
               <ToggleField
                 key={key}

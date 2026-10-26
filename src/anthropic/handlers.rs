@@ -15,13 +15,13 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     BodyConversionConfig, CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
-    CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
-    KiroRsToolCachePolicy, MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, PromptCacheStrategyType, PromptInjectionConfig, ReportedUsageConfig,
-    ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, RouteFeatureSet, RouteFeaturesConfig,
-    StableSegmentCachePolicy, ThinkingTriggerMode, normalize_defined_cache_route,
-    normalize_defined_cache_routes, resolve_cache_policy_for_path,
+    CacheSimulationPolicy, CodeExecutionConfig, CompatProfile, Config, ExternalPoolsConfig,
+    ImageProcessingConfig, KiroRsToolCachePolicy, MissingMaxTokensConfig, MissingMaxTokensPolicy,
+    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PromptCacheCreationControlConfig, PromptCacheSimulationMode, PromptCacheStrategyType,
+    PromptInjectionConfig, ReportedUsageConfig, ReportedUsagePathPolicy, ResolvedCacheRoutePolicy,
+    RouteFeatureSet, RouteFeaturesConfig, StableSegmentCachePolicy, ThinkingTriggerMode,
+    normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
 use crate::token;
 use anyhow::Error;
@@ -8358,6 +8358,11 @@ async fn post_messages_inner(
     }
     let capacity_weight_units =
         capacity_weight_units_for_local_request(provider.as_ref(), input_tokens);
+    let code_execution = super::code_execution::request_config(
+        &payload,
+        &endpoint,
+        &runtime_config.body_conversion.code_execution,
+    );
     usage_context.set_capacity_weight_units(capacity_weight_units);
     crate::diagnostics::capture::record("client_request", Some(&usage_context.request_id), || {
         serde_json::json!({
@@ -8401,6 +8406,7 @@ async fn post_messages_inner(
             tool_schema_key_map,
             known_tool_names,
             response_tool_policy,
+            code_execution.clone(),
             usage_context,
             attribution,
             warnings_header,
@@ -8435,6 +8441,7 @@ async fn post_messages_inner(
             tool_schema_key_map,
             known_tool_names,
             response_tool_policy,
+            code_execution,
             usage_context,
             attribution,
             warnings_header,
@@ -8994,6 +9001,7 @@ struct StreamContextTemplate {
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
     response_tool_policy: ResponseToolPolicy,
+    code_execution: Option<CodeExecutionConfig>,
 }
 
 impl StreamContextTemplate {
@@ -9011,6 +9019,7 @@ impl StreamContextTemplate {
             credential_usage.request.simulation_mode,
         );
         ctx.set_response_tool_policy(&self.response_tool_policy);
+        ctx.set_code_execution(self.code_execution.clone());
         ctx.set_stop_sequences(credential_usage.request.stop_sequences.clone());
         ctx.set_omit_thinking_display(credential_usage.request.omit_thinking_display);
         ctx.set_strip_injected_control_blocks(
@@ -9234,6 +9243,7 @@ async fn handle_stream_request(
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
     response_tool_policy: ResponseToolPolicy,
+    code_execution: Option<CodeExecutionConfig>,
     usage_context: RequestUsageContext,
     admission_attribution: Option<RequestRejectionAttribution>,
     warnings_header: Option<String>,
@@ -9858,6 +9868,7 @@ async fn handle_stream_request(
         tool_schema_key_map,
         known_tool_names,
         response_tool_policy,
+        code_execution,
     };
     let (ctx, initial_events) = context_template.build(&credential_usage);
     let retry_plan = if stream_retry_config.active() {
@@ -12227,6 +12238,7 @@ async fn handle_non_stream_request(
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
     response_tool_policy: ResponseToolPolicy,
+    code_execution: Option<CodeExecutionConfig>,
     usage_context: RequestUsageContext,
     admission_attribution: Option<RequestRejectionAttribution>,
     warnings_header: Option<String>,
@@ -13647,6 +13659,13 @@ async fn handle_non_stream_request(
     }
 
     content.extend(tool_uses);
+    let code_execution_handled = code_execution
+        .as_ref()
+        .map(|config| super::code_execution::rewrite_blocks(&mut content, config))
+        .unwrap_or(0);
+    if code_execution_handled > 0 {
+        stop_reason = "end_turn".to_string();
+    }
     // Kiro 无法表达 tool_choice=none 等约束，这里丢弃不允许的调用；被丢弃的调用不会下发，
     // 因而也不会产生需要配对的 tool_result。
     let mut response_tool_gate = response_tool_policy.gate();

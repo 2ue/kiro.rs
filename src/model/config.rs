@@ -213,6 +213,13 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub history_placeholder_tools: bool,
 
+    /// Anthropic `code_execution_*` 服务端工具的本地受限执行配置。
+    ///
+    /// 默认关闭。关闭时保持普通 `tool_use` 透传，避免在未配置执行环境时
+    /// 改变既有 Kiro 调度行为。
+    #[serde(default)]
+    pub code_execution: CodeExecutionConfig,
+
     /// 旧配置字段，只用于迁移：现在由 `routeFeatures` 的 `modelDrivenWebSearch` 控制。
     #[serde(default, skip_serializing)]
     pub model_driven_web_search: Option<ModelDrivenWebSearchConfig>,
@@ -244,9 +251,68 @@ impl Default for BodyConversionConfig {
             native_reasoning_fields: true,
             tool_pairing_repair: true,
             history_placeholder_tools: true,
+            code_execution: CodeExecutionConfig::default(),
             model_driven_web_search: None,
         }
     }
+}
+
+/// Claude Code 服务端代码执行的受限本地执行器配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeExecutionConfig {
+    /// 是否启用代码执行转换。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 按请求路径前缀覆盖全局值，使用最长前缀匹配。
+    #[serde(default)]
+    pub path_overrides: BTreeMap<String, bool>,
+    /// 单次执行超时时间，范围会在执行器内收口。
+    #[serde(default = "default_code_execution_timeout_ms")]
+    pub timeout_ms: u64,
+    /// stdout/stderr 各自最多返回的字节数。
+    #[serde(default = "default_code_execution_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// 允许提交给解释器的最大代码字节数。
+    #[serde(default = "default_code_execution_max_code_bytes")]
+    pub max_code_bytes: usize,
+}
+
+impl Default for CodeExecutionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_overrides: BTreeMap::new(),
+            timeout_ms: default_code_execution_timeout_ms(),
+            max_output_bytes: default_code_execution_max_output_bytes(),
+            max_code_bytes: default_code_execution_max_code_bytes(),
+        }
+    }
+}
+
+impl CodeExecutionConfig {
+    pub fn enabled_for_route(&self, endpoint: &str) -> bool {
+        self.path_overrides
+            .iter()
+            .filter_map(|(prefix, enabled)| {
+                normalize_reported_usage_path_prefix(prefix).map(|prefix| (prefix, *enabled))
+            })
+            .filter(|(prefix, _)| reported_usage_path_matches(prefix, endpoint))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map_or(self.enabled, |(_, enabled)| enabled)
+    }
+}
+
+fn default_code_execution_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_code_execution_max_output_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_code_execution_max_code_bytes() -> usize {
+    64 * 1024
 }
 
 pub const DEFAULT_MISSING_MAX_TOKENS_VALUE: i32 = 20_480;
@@ -6922,6 +6988,20 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_execution_defaults_to_disabled_and_supports_longest_route_override() {
+        let parsed: super::BodyConversionConfig =
+            serde_json::from_value(serde_json::json!({})).expect("body conversion");
+        assert!(!parsed.code_execution.enabled);
+        assert_eq!(parsed.code_execution.timeout_ms, 5_000);
+        let mut config = super::CodeExecutionConfig::default();
+        config.path_overrides.insert("/dfcache".to_string(), true);
+        config.path_overrides.insert("/dfcache/mine-hak".to_string(), false);
+        assert!(config.enabled_for_route("/dfcache/other/v1/messages"));
+        assert!(!config.enabled_for_route("/dfcache/mine-hak/v1/messages"));
+        assert!(!config.enabled_for_route("/dfcachex/v1/messages"));
+    }
 
     #[test]
     fn observability_redis_is_optional_and_uses_its_own_prefix() {

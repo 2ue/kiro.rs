@@ -1434,6 +1434,7 @@ export function RuntimePage() {
                     <TogField label="结构化 tool_choice" desc="按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用（含 disable_parallel_tool_use）。对应的提示词在提示词注入页单独控制。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
                     <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
+                    <TogField label="代码执行（默认关闭）" desc="仅在路由开启时执行 Anthropic code_execution 的 Python 代码，并返回 bash_code_execution 服务端工具结果。" checked={draft.bodyConversion.codeExecution.enabled} onChange={(enabled) => setBodyConversion('codeExecution')({ ...draft.bodyConversion.codeExecution, enabled })} />
                   </TwoCol>
                 </div>
                 <div className="space-y-3">

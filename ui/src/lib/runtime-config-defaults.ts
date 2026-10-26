@@ -144,6 +144,7 @@ export function defaultBodyConversion(): BodyConversionConfig {
     nativeReasoningFields: true,
     toolPairingRepair: true,
     historyPlaceholderTools: true,
+    codeExecution: { enabled: false, pathOverrides: {}, timeoutMs: 5000, maxOutputBytes: 16384, maxCodeBytes: 65536 },
   }
 }
 
@@ -158,6 +159,13 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
     nativeReasoningFields: input?.nativeReasoningFields ?? base.nativeReasoningFields,
     toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
     historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
+    codeExecution: {
+      enabled: input?.codeExecution?.enabled ?? base.codeExecution.enabled,
+      pathOverrides: { ...(input?.codeExecution?.pathOverrides ?? base.codeExecution.pathOverrides) },
+      timeoutMs: input?.codeExecution?.timeoutMs ?? base.codeExecution.timeoutMs,
+      maxOutputBytes: input?.codeExecution?.maxOutputBytes ?? base.codeExecution.maxOutputBytes,
+      maxCodeBytes: input?.codeExecution?.maxCodeBytes ?? base.codeExecution.maxCodeBytes,
+    },
   }
 }
 

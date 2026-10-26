@@ -1612,6 +1612,15 @@ export interface BodyConversionConfig {
   nativeReasoningFields: boolean
   toolPairingRepair: boolean
   historyPlaceholderTools: boolean
+  codeExecution: CodeExecutionConfig
+}
+
+export interface CodeExecutionConfig {
+  enabled: boolean
+  pathOverrides: Record<string, boolean>
+  timeoutMs: number
+  maxOutputBytes: number
+  maxCodeBytes: number
 }
 
 export type InjectionId =

@@ -60,6 +60,13 @@
     "nativeReasoningFields": true,
     "toolPairingRepair": true,
     "historyPlaceholderTools": true,
+    "codeExecution": {
+      "enabled": false,
+      "pathOverrides": {},
+      "timeoutMs": 5000,
+      "maxOutputBytes": 16384,
+      "maxCodeBytes": 65536
+    },
     "modelDrivenWebSearch": {
       "enabled": false,
       "pathOverrides": {}

@@ -1463,8 +1463,8 @@ impl SseStateManager {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 如果是 tool_use 块，先关闭之前的文本块
-        if block_type == "tool_use" {
+        // 工具块和服务端工具块都先关闭之前的文本块。
+        if matches!(block_type, "tool_use" | "server_tool_use") {
             self.has_tool_use = true;
             for (block_index, block) in self.active_blocks.iter_mut() {
                 if block.block_type == "text" && block.started && !block.stopped {
@@ -1761,6 +1761,10 @@ pub struct StreamContext {
     identity_guard: Option<super::identity_guard::IdentityGuard>,
     /// Turns the internal structured-output tool call back into JSON text.
     structured_output: Option<super::structured_output::StructuredOutputStreamRewriter>,
+    /// Optional local Anthropic code execution compatibility.
+    code_execution: Option<crate::model::config::CodeExecutionConfig>,
+    /// Whether at least one code execution server-tool result was emitted.
+    code_execution_handled: bool,
 }
 
 impl StreamContext {
@@ -1947,6 +1951,8 @@ impl StreamContext {
             control_block_cleaner: None,
             identity_guard: None,
             structured_output: None,
+            code_execution: None,
+            code_execution_handled: false,
         }
     }
 
@@ -1956,6 +1962,13 @@ impl StreamContext {
             .structured_output()
             .cloned()
             .map(super::structured_output::StructuredOutputStreamRewriter::new);
+    }
+
+    pub fn set_code_execution(
+        &mut self,
+        config: Option<crate::model::config::CodeExecutionConfig>,
+    ) {
+        self.code_execution = config;
     }
 
     pub fn response_tool_gate(&self) -> &ResponseToolGate {
@@ -2021,6 +2034,9 @@ impl StreamContext {
     }
 
     pub fn downstream_stop_reason(&self) -> String {
+        if self.code_execution_handled {
+            return "end_turn".to_string();
+        }
         if self.stop_sequence_matched() {
             return super::stop_sequence::STOP_SEQUENCE_STOP_REASON.to_string();
         }
@@ -3800,6 +3816,43 @@ impl StreamContext {
         let upstream_name = resolved.upstream;
         let original_name = resolved.original;
 
+        // Anthropic code execution is a server-side tool. When enabled, buffer the model's
+        // ordinary Kiro tool chunks and emit the server-tool pair only after the JSON input is
+        // complete, so Claude Code never sees an executable client-side tool_use.
+        if self
+            .code_execution
+            .as_ref()
+            .is_some_and(|_| super::code_execution::is_code_execution_name(&original_name))
+        {
+            if !tool_use.input.is_empty() {
+                self.tool_input_buffers
+                    .entry(tool_use.tool_use_id.clone())
+                    .or_default()
+                    .push_str(&tool_use.input);
+            }
+            self.tool_input_names
+                .insert(tool_use.tool_use_id.clone(), upstream_name);
+            if !tool_use.stop {
+                return events;
+            }
+            let full_input = self
+                .tool_input_buffers
+                .remove(&tool_use.tool_use_id)
+                .unwrap_or_else(|| tool_use.input.clone());
+            self.tool_input_names.remove(&tool_use.tool_use_id);
+            let input = if full_input.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&full_input).unwrap_or_else(|_| serde_json::json!({}))
+            };
+            let config = self
+                .code_execution
+                .clone()
+                .expect("code execution config checked above");
+            events.extend(self.emit_code_execution_result(input, &config));
+            return events;
+        }
+
         if !tool_use.input.is_empty() {
             self.tool_input_buffers
                 .entry(tool_use.tool_use_id.clone())
@@ -3895,6 +3948,64 @@ impl StreamContext {
             }
         }
 
+        events
+    }
+
+    fn emit_code_execution_result(
+        &mut self,
+        input: serde_json::Value,
+        config: &crate::model::config::CodeExecutionConfig,
+    ) -> Vec<SseEvent> {
+        let server_id = envelope::server_tool_use_id();
+        let result = super::code_execution::execute(&input, config);
+        self.code_execution_handled = true;
+        self.state_manager.set_stop_reason("end_turn");
+        let server_index = self.state_manager.next_block_index();
+        let mut events = self.state_manager.handle_content_block_start(
+            server_index,
+            "server_tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": server_index,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": server_id,
+                    "name": "bash_code_execution",
+                    "input": {}
+                }
+            }),
+        );
+        let input_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+        if let Some(input_delta) = self.state_manager.handle_content_block_delta(
+            server_index,
+            json!({
+                "type": "content_block_delta",
+                "index": server_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": input_json
+                }
+            }),
+        ) {
+            self.output_token_estimate.record(&input_json);
+            events.push(input_delta);
+        }
+        if let Some(stop) = self.state_manager.handle_content_block_stop(server_index) {
+            events.push(stop);
+        }
+        let result_index = self.state_manager.next_block_index();
+        events.extend(self.state_manager.handle_content_block_start(
+            result_index,
+            "bash_code_execution_tool_result",
+            json!({
+                "type": "content_block_start",
+                "index": result_index,
+                "content_block": super::code_execution::result_block(&server_id, &result)
+            }),
+        ));
+        if let Some(stop) = self.state_manager.handle_content_block_stop(result_index) {
+            events.push(stop);
+        }
         events
     }
 
@@ -5138,6 +5249,55 @@ mod tests {
             start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
+    }
+
+    #[test]
+    fn code_execution_stream_emits_server_tool_pair_with_json_delta() {
+        use crate::kiro::model::events::ToolUseEvent;
+        use crate::model::config::CodeExecutionConfig;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.set_code_execution(Some(CodeExecutionConfig::default()));
+        let _ = ctx.generate_initial_events();
+
+        let mut events = ctx.process_tool_use(&ToolUseEvent {
+            name: "code_execution".to_string(),
+            tool_use_id: "toolu_code".to_string(),
+            input: r#"{"code":"print('HELLO"#.to_string(),
+            stop: false,
+        });
+        events.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "code_execution".to_string(),
+            tool_use_id: "toolu_code".to_string(),
+            input: r#"_STREAM')","language":"python"}"#.to_string(),
+            stop: true,
+        }));
+        events.extend(ctx.generate_final_events());
+
+        let server_start = events
+            .iter()
+            .find(|event| event.data["content_block"]["type"] == "server_tool_use")
+            .expect("server_tool_use start");
+        assert_eq!(server_start.data["content_block"]["input"], json!({}));
+        assert!(events.iter().any(|event| {
+            event.data["delta"]["type"] == "input_json_delta"
+                && event.data["delta"]["partial_json"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("HELLO_STREAM"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.data["content_block"]["type"] == "bash_code_execution_tool_result"
+        }));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.data["content_block"]["type"] != "tool_use")
+        );
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
     }
 
     fn typed_kiro_event(event_type: &str, payload: Value) -> Event {
