@@ -142,6 +142,7 @@ export function defaultBodyConversion(): BodyConversionConfig {
     toolSchemaKeyValidationRegex: '^[a-zA-Z0-9_.-]{1,64}$',
     toolChoiceSteering: true,
     nativeReasoningFields: true,
+    syntheticThinkingSignatures: true,
     toolPairingRepair: true,
     historyPlaceholderTools: true,
     codeExecution: { enabled: false, pathOverrides: {}, timeoutMs: 5000, maxOutputBytes: 16384, maxCodeBytes: 65536 },
@@ -157,6 +158,7 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
     toolSchemaKeyValidationRegex: input?.toolSchemaKeyValidationRegex ?? base.toolSchemaKeyValidationRegex,
     toolChoiceSteering: input?.toolChoiceSteering ?? base.toolChoiceSteering,
     nativeReasoningFields: input?.nativeReasoningFields ?? base.nativeReasoningFields,
+    syntheticThinkingSignatures: input?.syntheticThinkingSignatures ?? base.syntheticThinkingSignatures,
     toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
     historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
     codeExecution: {

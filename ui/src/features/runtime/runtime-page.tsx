@@ -1431,6 +1431,7 @@ export function RuntimePage() {
                       />
                     </div>
                     <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
+                    <TogField label="Thinking 兼容签名" desc="Kiro 没有原生签名时，为 Claude Code 输出确定性的兼容签名；历史回放到 Kiro 前会自动剥离。" checked={draft.bodyConversion.syntheticThinkingSignatures} onChange={setBodyConversion('syntheticThinkingSignatures')} />
                     <TogField label="结构化 tool_choice" desc="按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用（含 disable_parallel_tool_use）。对应的提示词在提示词注入页单独控制。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
                     <TogField label="工具配对修复" desc="清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
                     <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
