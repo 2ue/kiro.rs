@@ -1,11 +1,12 @@
 import * as React from 'react'
-import { Activity, ArrowRightLeft, CheckCircle2, Edit3, Eye, EyeOff, Network, Plus, RefreshCw, Trash2, Unlink } from 'lucide-react'
+import { Activity, ArrowRightLeft, CheckCircle2, Edit3, Eye, EyeOff, Network, Plus, RefreshCw, Trash2, Unlink, UserX } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   useBatchUpdateCredentials,
   useCredentials,
   useDeleteProxyResource,
   useProxyResources,
+  useTestAllProxyResources,
   useTestProxyResource,
 } from '@/hooks/use-credentials'
 import { formatDate } from '@/lib/format'
@@ -35,7 +36,8 @@ import {
 } from '@/components/ui'
 import { ProxyEditorModal, ProxyImportModal } from './proxy-components'
 
-const PAGE_SIZE_OPTIONS = [10, 25, 50, 100]
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
+const DEFAULT_PAGE_SIZE = 20
 const DIRECT_PROXY_VALUE = '__direct__'
 type ReplaceProxyMode = 'single' | 'individual'
 
@@ -56,6 +58,19 @@ function latencyTone(result: ProxyResourceTestResponse): 'success' | 'info' | 'w
   return 'error'
 }
 
+/** The last test the server recorded, shown until this page runs a test of its own. */
+function storedResult(resource: ProxyResource): ProxyResourceTestResponse | undefined {
+  if (resource.lastTestSuccess === null || resource.lastTestSuccess === undefined) return undefined
+  return {
+    success: resource.lastTestSuccess,
+    message: resource.lastTestMessage ?? '',
+    proxyUrl: resource.proxyUrl,
+    testUrl: resource.lastTestUrl ?? '',
+    status: resource.lastTestStatus ?? null,
+    durationMs: resource.lastTestDurationMs ?? 0,
+  }
+}
+
 function latencyLabel(result: ProxyResourceTestResponse): string {
   if (!result.success) return result.status ? `失败 · HTTP ${result.status}` : '失败'
   return `${result.durationMs}ms`
@@ -66,12 +81,17 @@ export function ProxiesPage() {
   const allCredentials = useCredentials({ enabled: false, refetchInterval: false })
   const removeProxy = useDeleteProxyResource()
   const testProxy = useTestProxyResource()
+  const testAll = useTestAllProxyResources()
   const batchUpdateCredentials = useBatchUpdateCredentials()
   const confirm = useConfirm()
 
   const [page, setPage] = React.useState(1)
-  const [pageSize, setPageSize] = React.useState(PAGE_SIZE_OPTIONS[0])
+  const [pageSize, setPageSize] = React.useState(DEFAULT_PAGE_SIZE)
   const [selectedIds, setSelectedIds] = React.useState<Set<number>>(new Set())
+  const [batchDeleteOpen, setBatchDeleteOpen] = React.useState(false)
+  const [batchDeleteBound, setBatchDeleteBound] = React.useState<CredentialStatusItem[]>([])
+  const [batchReplacement, setBatchReplacement] = React.useState(DIRECT_PROXY_VALUE)
+  const [batchDeleting, setBatchDeleting] = React.useState(false)
   const [showSecrets, setShowSecrets] = React.useState(false)
   const [editorOpen, setEditorOpen] = React.useState(false)
   const [editing, setEditing] = React.useState<ProxyResource | null>(null)
@@ -94,11 +114,12 @@ export function ProxiesPage() {
     () => list.slice((page - 1) * pageSize, page * pageSize),
     [list, page, pageSize],
   )
-  const selectedResources = React.useMemo(
-    () => list.filter((resource) => selectedIds.has(resource.id)),
-    [list, selectedIds],
-  )
+  const liveCount = list.filter((resource) => (testResults.get(resource.id) ?? storedResult(resource))?.success).length
+  const selectedResources = React.useMemo(() => list.filter((resource) => selectedIds.has(resource.id)), [list, selectedIds])
   const allPageSelected = pagedList.length > 0 && pagedList.every((resource) => selectedIds.has(resource.id))
+  const somePageSelected = pagedList.some((resource) => selectedIds.has(resource.id))
+  const batchEnabledBound = batchDeleteBound.filter((credential) => !credential.disabled)
+  const batchReplacementOptions = list.filter((resource) => resource.enabled && !selectedIds.has(resource.id))
   const deleteCandidateEnabledCredentials = deleteBoundCredentials.filter((credential) => !credential.disabled)
   const replacementOptions = list.filter((resource) => resource.id !== deleteCandidate?.id && resource.enabled)
   const replaceOptions = list.filter((resource) => resource.id !== replaceCandidate?.id && resource.enabled)
@@ -112,10 +133,101 @@ export function ProxiesPage() {
     if (page > pageCount) setPage(pageCount)
   }, [page, pageCount])
 
+  // Drop selections for proxies that no longer exist.
   React.useEffect(() => {
     const validIds = new Set(list.map((resource) => resource.id))
-    setSelectedIds((prev) => new Set([...prev].filter((id) => validIds.has(id))))
+    setSelectedIds((prev) => {
+      const next = new Set([...prev].filter((id) => validIds.has(id)))
+      return next.size === prev.size ? prev : next
+    })
   }, [list])
+
+  const toggleSelected = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const togglePageSelected = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (allPageSelected) pagedList.forEach((resource) => next.delete(resource.id))
+      else pagedList.forEach((resource) => next.add(resource.id))
+      return next
+    })
+  }
+
+  /** Selects every proxy the last test found unreachable, across all pages. */
+  const selectFailed = () => {
+    const failed = list.filter((resource) => (testResults.get(resource.id) ?? storedResult(resource))?.success === false)
+    if (failed.length === 0) { toast.info('没有测活失败的代理'); return }
+    setSelectedIds(new Set(failed.map((resource) => resource.id)))
+    toast.success(`已选中 ${failed.length} 个测活失败的代理`)
+  }
+
+  const requestBatchDelete = async () => {
+    if (selectedResources.length === 0) return
+    let credentials: CredentialStatusItem[]
+    try {
+      credentials = (await allCredentials.refetch()).data?.credentials || []
+    } catch (error) {
+      toast.error(`加载账号绑定失败: ${extractErrorMessage(error)}`)
+      return
+    }
+    const ids = new Set(selectedResources.map((resource) => resource.id))
+    const bound = credentials.filter((credential) => typeof credential.proxyResourceId === 'number' && ids.has(credential.proxyResourceId))
+    const alternatives = list.filter((resource) => resource.enabled && !ids.has(resource.id))
+    setBatchDeleteBound(bound)
+    setBatchReplacement(alternatives.length > 0 ? String(alternatives[0].id) : DIRECT_PROXY_VALUE)
+    setBatchDeleteOpen(true)
+  }
+
+  /**
+   * Moves enabled accounts off the selected proxies first (the server refuses to delete a proxy that
+   * still serves an enabled account), then deletes them one by one. Disabled accounts' bindings are
+   * cleared by the delete itself.
+   */
+  const confirmBatchDelete = async () => {
+    setBatchDeleting(true)
+    try {
+      if (batchEnabledBound.length > 0) {
+        const replacementId = batchReplacement === DIRECT_PROXY_VALUE ? null : Number(batchReplacement)
+        const enabledIds = batchEnabledBound.map((credential) => credential.id)
+        for (let start = 0; start < enabledIds.length; start += 500) {
+          const result = await batchUpdateCredentials.mutateAsync({
+            ids: enabledIds.slice(start, start + 500),
+            proxy: { proxyResourceId: replacementId },
+          })
+          if (result.failed > 0) {
+            toast.warning(`改绑未全部成功：成功 ${result.success}，失败 ${result.failed}，已取消删除`)
+            return
+          }
+        }
+      }
+      let deleted = 0
+      const failures: string[] = []
+      for (const resource of selectedResources) {
+        try {
+          await removeProxy.mutateAsync(resource.id)
+          deleted += 1
+        } catch (error) {
+          failures.push(`${resource.name}: ${extractErrorMessage(error)}`)
+        }
+      }
+      setSelectedIds(new Set())
+      setBatchDeleteOpen(false)
+      setBatchDeleteBound([])
+      if (failures.length > 0) toast.warning(`已删除 ${deleted} 个，失败 ${failures.length} 个：${failures.slice(0, 2).join('；')}`)
+      else toast.success(`已删除 ${deleted} 个代理${batchEnabledBound.length > 0 ? `，${batchEnabledBound.length} 个启用账号已改绑` : ''}`)
+    } catch (error) {
+      toast.error(`批量删除失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setBatchDeleting(false)
+    }
+  }
 
   const openCreate = () => {
     setEditing(null)
@@ -133,27 +245,6 @@ export function ProxiesPage() {
   const handlePageSizeChange = (nextPageSize: number) => {
     setPageSize(nextPageSize)
     setPage(1)
-  }
-
-  const toggleSelected = (id: number) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
-
-  const togglePageSelected = () => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev)
-      if (allPageSelected) {
-        pagedList.forEach((resource) => next.delete(resource.id))
-      } else {
-        pagedList.forEach((resource) => next.add(resource.id))
-      }
-      return next
-    })
   }
 
   const loadCredentialSnapshot = async () => {
@@ -187,41 +278,67 @@ export function ProxiesPage() {
     }
   }
 
-  const batchTestSelected = async () => {
-    if (!selectedResources.length) return toast.error('请先选择要测活的代理')
-    const pendingIds = new Set(selectedResources.map((resource) => resource.id))
-    setTestingIds(pendingIds)
-    let passed = 0
-    let cursor = 0
-    const workerCount = Math.min(6, selectedResources.length)
-    await Promise.all(Array.from({ length: workerCount }, async () => {
-      while (cursor < selectedResources.length) {
-        const resource = selectedResources[cursor]
-        cursor += 1
-        try {
-          const result = await testProxy.mutateAsync({ id: resource.id, request: {} })
-          setTestResults((prev) => new Map(prev).set(resource.id, result))
-          if (result.success) passed += 1
-        } catch (error) {
-          setTestResults((prev) => new Map(prev).set(resource.id, {
-            success: false,
-            message: `测活请求失败: ${extractErrorMessage(error)}`,
-            proxyUrl: resource.proxyUrl,
-            testUrl: '',
-            status: null,
-            durationMs: 0,
-          }))
-          toast.error(`代理「${resource.name}」测试失败: ${extractErrorMessage(error)}`)
-        } finally {
-          setTestingIds((prev) => {
-            const next = new Set(prev)
-            next.delete(resource.id)
-            return next
-          })
-        }
+  /** Tests every proxy at once on the server; nothing needs to be selected first. */
+  const testAllProxies = async () => {
+    if (!list.length) return toast.error('还没有代理资源')
+    setTestingIds(new Set(list.map((resource) => resource.id)))
+    try {
+      const result = await testAll.mutateAsync({})
+      setTestResults((prev) => {
+        const next = new Map(prev)
+        for (const item of result.items) next.set(item.resourceId, item)
+        return next
+      })
+      if (result.failed > 0) toast.warning(`全部测活完成：通过 ${result.success}/${result.total}，${result.failed} 个不可用`)
+      else toast.success(`全部测活完成：${result.total} 个代理全部可用`)
+    } catch (error) {
+      toast.error(`全部测活失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setTestingIds(new Set())
+    }
+  }
+
+  /** Disabled accounts keep their proxy binding by default; this frees those proxies for live accounts. */
+  const unbindDisabledAccounts = async () => {
+    let credentials: CredentialStatusItem[]
+    try {
+      credentials = (await allCredentials.refetch()).data?.credentials || []
+    } catch (error) {
+      toast.error(`加载账号失败: ${extractErrorMessage(error)}`)
+      return
+    }
+    const bound = credentials.filter((credential) => credential.disabled && typeof credential.proxyResourceId === 'number')
+    if (bound.length === 0) {
+      toast.info('没有绑定代理资源的禁用账号')
+      return
+    }
+    const proxyCount = new Set(bound.map((credential) => credential.proxyResourceId)).size
+    const confirmed = await confirm({
+      title: '解除禁用账号的代理',
+      message: `将解除 ${bound.length} 个禁用账号与 ${proxyCount} 个代理资源的绑定。只清除绑定关系，不删除账号和代理；这些账号以后重新启用时会走全局代理或直连。`,
+      confirmText: '解除绑定',
+      tone: 'danger',
+    })
+    if (!confirmed) return
+    // The batch endpoint takes a page of accounts at a time.
+    const chunkSize = 500
+    let success = 0
+    let failed = 0
+    try {
+      for (let start = 0; start < bound.length; start += chunkSize) {
+        const result = await batchUpdateCredentials.mutateAsync({
+          ids: bound.slice(start, start + chunkSize).map((credential) => credential.id),
+          proxy: { proxyResourceId: null },
+        })
+        success += result.success
+        failed += result.failed
       }
-    }))
-    toast.success(`批量测活完成：通过 ${passed}/${selectedResources.length}`)
+    } catch (error) {
+      toast.error(`解除绑定失败（已处理 ${success} 个）: ${extractErrorMessage(error)}`)
+      return
+    }
+    if (failed > 0) toast.warning(`解除绑定未全部成功：成功 ${success}，失败 ${failed}`)
+    else toast.success(`已解除 ${success} 个禁用账号的代理绑定`)
   }
 
   const handleImported = (items: Array<{ resourceId: number; result: ProxyResourceTestResponse }>) => {
@@ -264,11 +381,6 @@ export function ProxiesPage() {
     if (!confirmed) return
     try {
       await removeProxy.mutateAsync(resource.id)
-      setSelectedIds((prev) => {
-        const next = new Set(prev)
-        next.delete(resource.id)
-        return next
-      })
       toast.success(disabledBound > 0 ? `代理已删除，已清除 ${disabledBound} 个已禁用账号关联` : '代理资源已删除')
     } catch (error) {
       toast.error(`删除失败: ${extractErrorMessage(error)}`)
@@ -437,11 +549,6 @@ export function ProxiesPage() {
         }
       }
       await removeProxy.mutateAsync(deleteCandidate.id)
-      setSelectedIds((prev) => {
-        const next = new Set(prev)
-        next.delete(deleteCandidate.id)
-        return next
-      })
       toast.success(`已更换 ${enabledIds.length} 个启用账号的代理，并删除代理「${deleteCandidate.name}」`)
       setDeleteBoundCredentials([])
       setDeleteCandidate(null)
@@ -464,9 +571,13 @@ export function ProxiesPage() {
               {showSecrets ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
               <span className="hidden sm:inline">{showSecrets ? '隐藏密钥' : '显示密钥'}</span>
             </Button>
-            <Button variant="outline" size="sm" onClick={batchTestSelected} disabled={selectedResources.length === 0 || testingIds.size > 0}>
-              {testingIds.size > 0 ? <Spinner size="sm" /> : <CheckCircle2 className="h-4 w-4" />}
-              批量测活
+            <Button variant="outline" size="sm" onClick={() => void testAllProxies()} disabled={list.length === 0 || testingIds.size > 0} title="测试全部代理资源">
+              {testAll.isPending ? <Spinner size="sm" /> : <CheckCircle2 className="h-4 w-4" />}
+              全部测活
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => void unbindDisabledAccounts()} disabled={batchUpdateCredentials.isPending || allCredentials.isFetching} title="解除所有禁用账号与代理资源的绑定">
+              {allCredentials.isFetching || batchUpdateCredentials.isPending ? <Spinner size="sm" /> : <UserX className="h-4 w-4" />}
+              解除禁用账号代理
             </Button>
             <Button size="sm" onClick={openCreate}>
               <Plus className="h-4 w-4" />新增代理
@@ -497,13 +608,30 @@ export function ProxiesPage() {
         ) : (
           <div className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/30 px-3 py-2">
-              <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                <Checkbox checked={allPageSelected} onCheckedChange={togglePageSelected} />
-                全选当前页
-              </label>
+              <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                <label className="flex items-center gap-2">
+                  <Checkbox
+                    checked={allPageSelected ? true : somePageSelected ? 'indeterminate' : false}
+                    onCheckedChange={togglePageSelected}
+                    aria-label="全选当前页"
+                  />
+                  全选当前页
+                </label>
+                <span>共 {list.length} 个代理 · 最近测活可用 {liveCount} 个</span>
+                <Button type="button" variant="ghost" size="xs" onClick={selectFailed}>选中测活失败的</Button>
+              </div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                {selectedIds.size > 0 && <Badge tone="primary">已选 {selectedIds.size}</Badge>}
                 {resources.isFetching && <Spinner size="sm" />}
+                {selectedIds.size > 0 && (
+                  <>
+                    <Badge tone="primary">已选 {selectedIds.size}</Badge>
+                    <Button type="button" variant="ghost" size="xs" onClick={() => setSelectedIds(new Set())}>取消选择</Button>
+                    <Button type="button" variant="destructive" size="xs" onClick={() => void requestBatchDelete()}
+                      disabled={allCredentials.isFetching || batchDeleting}>
+                      {allCredentials.isFetching ? <Spinner size="sm" /> : <Trash2 className="h-3.5 w-3.5" />}批量删除
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
 
@@ -522,12 +650,12 @@ export function ProxiesPage() {
                 </thead>
                 <tbody className="divide-y divide-border/60">
                   {pagedList.map((resource) => {
-                    const result = testResults.get(resource.id)
+                    const result = testResults.get(resource.id) ?? storedResult(resource)
                     const testing = testingIds.has(resource.id)
                     return (
-                      <tr key={resource.id} className="bg-card align-top">
+                      <tr key={resource.id} className={cn('align-top', selectedIds.has(resource.id) ? 'bg-primary/5' : 'bg-card')}>
                         <td className="px-3 py-3">
-                          <Checkbox checked={selectedIds.has(resource.id)} onCheckedChange={() => toggleSelected(resource.id)} />
+                          <Checkbox checked={selectedIds.has(resource.id)} onCheckedChange={() => toggleSelected(resource.id)} aria-label={`选择代理 ${resource.name}`} />
                         </td>
                         <td className="min-w-0 px-3 py-3">
                           <div className="flex flex-wrap items-center gap-1.5">
@@ -629,6 +757,55 @@ export function ProxiesPage() {
           </div>
         )}
       </div>
+
+      <ModalShell
+        open={batchDeleteOpen}
+        onClose={() => { if (!batchDeleting) { setBatchDeleteOpen(false); setBatchDeleteBound([]) } }}
+        title={`删除 ${selectedResources.length} 个代理`}
+        description="删除后不可恢复。已禁用账号与这些代理的绑定会一起清除。"
+        width="max-w-xl"
+        footer={(
+          <>
+            <Button variant="outline" size="sm" onClick={() => setBatchDeleteOpen(false)} disabled={batchDeleting}>取消</Button>
+            <Button variant="destructive" size="sm" onClick={() => void confirmBatchDelete()} disabled={batchDeleting || selectedResources.length === 0}>
+              {batchDeleting && <Spinner size="sm" />}
+              {batchEnabledBound.length > 0 ? '改绑后删除' : '确认删除'}
+            </Button>
+          </>
+        )}
+      >
+        <div className="space-y-4 text-sm">
+          <div className="max-h-40 overflow-y-auto rounded-lg border border-border/60 text-xs">
+            {selectedResources.map((resource) => {
+              const count = batchDeleteBound.filter((credential) => credential.proxyResourceId === resource.id)
+              const enabled = count.filter((credential) => !credential.disabled).length
+              return (
+                <div key={resource.id} className="flex items-center justify-between gap-3 border-b border-border/60 px-3 py-1.5 last:border-b-0">
+                  <span className="min-w-0 truncate">{resource.name} <span className="text-muted-foreground">#{resource.id}</span></span>
+                  <span className={enabled > 0 ? 'text-warning' : 'text-muted-foreground'}>
+                    {count.length === 0 ? '未绑定账号' : `绑定 ${count.length} 个（启用 ${enabled}）`}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+          {batchEnabledBound.length > 0 ? (
+            <div className="space-y-2 rounded-lg border border-warning/40 bg-warning/5 p-3">
+              <div className="font-medium">有 {batchEnabledBound.length} 个启用账号还在用这些代理，删除前先改绑到：</div>
+              <Select value={batchReplacement} onValueChange={setBatchReplacement} disabled={batchDeleting}>
+                <SelectTrigger size="sm" className="sm:w-80"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={DIRECT_PROXY_VALUE}>不绑定代理（走全局代理或直连）</SelectItem>
+                  {batchReplacementOptions.map((resource) => <SelectItem key={resource.id} value={String(resource.id)}>{resource.name}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">要把这些账号分散到多个代理，可以先在账号页用批量修改轮换代理，再回来删除。</p>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">这些代理没有绑定启用账号，可以直接删除。</p>
+          )}
+        </div>
+      </ModalShell>
 
       <ModalShell
         open={Boolean(deleteCandidate)}

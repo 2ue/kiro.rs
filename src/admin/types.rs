@@ -1403,6 +1403,9 @@ pub struct BatchUpdateCredentialsRequest {
     pub rate_limit_auto_disable: Option<SetCredentialRateLimitAutoDisableRequest>,
     #[serde(default)]
     pub proxy: Option<SetCredentialProxyRequest>,
+    /// Proxy resources assigned round-robin in the order of `ids`; replaces `proxy` when non-empty.
+    #[serde(default, alias = "proxy_resource_ids")]
+    pub proxy_resource_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2576,6 +2579,19 @@ mod tests {
         assert_eq!(req.concurrency.unwrap().max_concurrent_requests, None);
         assert_eq!(req.rpm.unwrap().rpm, None);
         assert!(req.regions.is_none());
+        assert!(req.proxy.is_none());
+        assert!(req.proxy_resource_ids.is_empty());
+    }
+
+    #[test]
+    fn batch_update_credentials_request_accepts_round_robin_proxy_resource_ids() {
+        let req: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
+            "ids": [4, 5, 6],
+            "proxyResourceIds": [9, 3]
+        }))
+        .unwrap();
+
+        assert_eq!(req.proxy_resource_ids, vec![9, 3]);
         assert!(req.proxy.is_none());
     }
 

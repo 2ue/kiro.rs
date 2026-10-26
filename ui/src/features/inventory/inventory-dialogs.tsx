@@ -10,13 +10,18 @@ import { extractErrorMessage } from '@/lib/utils'
 import type { AddCredentialRequest, InventoryActionResponse, InventoryImportResponse, InventoryItem } from '@/types/api'
 import {
   CredentialParameterDefaultsPanel,
+  FormSection,
   initialParameterDefaults,
   parameterDefaultsToImportDefaults,
   validateProxyAssignment,
 } from '@/features/credentials/credential-dialogs'
-import { SecretInput } from '@/features/credentials/credential-inputs'
+import {
+  ProxyAssignmentField,
+  initialProxyAssignment,
+  validateProxyAssignmentValue,
+  type ProxyAssignmentValue,
+} from '@/features/proxies/proxy-assignment-field'
 
-type ProxyMode = 'single' | 'round_robin' | 'direct_url' | 'none'
 
 // ============================================================================
 // Import into the inventory: region and proxy only, no scheduling parameters.
@@ -26,13 +31,7 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
   const [text, setText] = useState('')
   const [authRegion, setAuthRegion] = useState('us-east-1')
   const [apiRegion, setApiRegion] = useState('us-east-1')
-  const [proxyMode, setProxyMode] = useState<ProxyMode>('single')
-  const [proxyResourceId, setProxyResourceId] = useState('')
-  const [proxyResourceIds, setProxyResourceIds] = useState<string[]>([])
-  const [proxyUrl, setProxyUrl] = useState('')
-  const [proxyUsername, setProxyUsername] = useState('')
-  const [proxyPassword, setProxyPassword] = useState('')
-  const [showSecret, setShowSecret] = useState(false)
+  const [proxy, setProxy] = useState<ProxyAssignmentValue>(() => initialProxyAssignment('single'))
   const [check, setCheck] = useState(true)
   const [source, setSource] = useState('')
   const [result, setResult] = useState<InventoryImportResponse | null>(null)
@@ -44,8 +43,7 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
   useEffect(() => {
     if (!open) {
       setText(''); setResult(null); setError(''); setSource('')
-      setProxyMode('single'); setProxyResourceId(''); setProxyResourceIds([])
-      setProxyUrl(''); setProxyUsername(''); setProxyPassword(''); setCheck(true)
+      setProxy(initialProxyAssignment('single')); setCheck(true)
     }
   }, [open])
 
@@ -72,9 +70,8 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
     if (!Array.isArray(parsed)) { setError(parsed); return }
     if (!parsed.length) { setError('未找到有效账号，请检查格式'); return }
     if (!authRegion.trim()) { setError('请填写 Auth Region：刷新 token 和查询额度都依赖它'); return }
-    if (proxyMode === 'single' && !proxyResourceId) { setError('请选择代理资源，或改为"不使用代理"'); return }
-    if (proxyMode === 'round_robin' && proxyResourceIds.length === 0) { setError('请至少选择一个轮换代理'); return }
-    if (proxyMode === 'direct_url' && !proxyUrl.trim()) { setError('请填写代理 URL'); return }
+    const proxyError = validateProxyAssignmentValue(proxy, { requireSingle: true })
+    if (proxyError) { setError(proxyError); return }
     try {
       const response = await importInventory.mutateAsync({
         credentials: parsed,
@@ -83,9 +80,9 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
         defaults: {
           authRegion: authRegion.trim(),
           apiRegion: apiRegion.trim() || undefined,
-          ...(proxyMode === 'single' ? { proxyResourceId: Number(proxyResourceId) } : {}),
-          ...(proxyMode === 'round_robin' ? { proxyResourceIds: proxyResourceIds.map(Number) } : {}),
-          ...(proxyMode === 'direct_url' ? { proxyUrl: proxyUrl.trim(), proxyUsername: proxyUsername || undefined, proxyPassword: proxyPassword || undefined } : {}),
+          ...(proxy.mode === 'single' ? { proxyResourceId: Number(proxy.resourceId) } : {}),
+          ...(proxy.mode === 'round_robin' ? { proxyResourceIds: proxy.resourceIds.map(Number) } : {}),
+          ...(proxy.mode === 'direct_url' ? { proxyUrl: proxy.url.trim(), proxyUsername: proxy.username || undefined, proxyPassword: proxy.password || undefined } : {}),
         },
       })
       setResult(response)
@@ -101,7 +98,7 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
       onClose={onClose}
       title="导入到库存"
       description="库存账号不参与调度，只做保管和自动续期。优先级、并发等调度参数在推送到账号池时再选。"
-      width="max-w-3xl"
+      width="max-w-5xl"
       footer={result ? (
         <>
           <Button variant="outline" onClick={() => setResult(null)}>继续导入</Button>
@@ -135,28 +132,28 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
           </div>
         </div>
       ) : (
-        <div className="space-y-5 text-sm">
-          <section className="space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-[13px] font-medium">账号数据</h3>
+        <div className="space-y-4 text-sm">
+          <FormSection
+            title="账号数据"
+            actions={(
               <label className="cursor-pointer">
                 <input type="file" className="sr-only" accept=".json,.jsonl,.txt" multiple onChange={(e) => void handleFile(e)} />
                 <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
               </label>
-            </div>
+            )}
+          >
             <Textarea
-              className="min-h-[120px] font-mono text-xs"
+              className="min-h-[160px] font-mono text-xs"
               placeholder={'[{"refreshToken":"eyJ..."}]\n// 或每行一个 JSON 对象；支持账号页导出的文件'}
               value={text}
               onChange={(e) => { setText(e.target.value); setResult(null) }}
             />
-            <p className="text-xs text-muted-foreground">
+            <p className="mt-2 text-xs text-muted-foreground">
               {typeof parsed === 'string' ? <span className="text-destructive">{parsed}</span> : `识别到 ${parsedCount} 个账号。已在账号池使用的账号会被跳过。`}
             </p>
-          </section>
+          </FormSection>
 
-          <section className="space-y-2">
-            <h3 className="text-[13px] font-medium">区域</h3>
+          <FormSection title="区域">
             <FieldGrid>
               <Field label="Auth Region" description="刷新 token 用；账号自带的值优先" required>
                 <Input className="font-mono" value={authRegion} onChange={(e) => setAuthRegion(e.target.value)} placeholder="us-east-1" />
@@ -165,56 +162,20 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
                 <Input className="font-mono" value={apiRegion} onChange={(e) => setApiRegion(e.target.value)} placeholder="us-east-1" />
               </Field>
             </FieldGrid>
-          </section>
+          </FormSection>
 
-          <section className="space-y-2">
-            <h3 className="text-[13px] font-medium">代理</h3>
-            <p className="text-xs leading-5 text-muted-foreground">
-              建议绑定代理：续期、查询和推送到账号池后的调用都走同一个出口，账号环境保持一致。账号自带代理时优先使用账号的。
-            </p>
-            <Select value={proxyMode} onValueChange={(value) => setProxyMode(value as ProxyMode)}>
-              <SelectTrigger size="sm" className="sm:w-60"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="single">绑定一个代理资源</SelectItem>
-                <SelectItem value="round_robin">多个代理资源轮换</SelectItem>
-                <SelectItem value="direct_url">直接填写代理 URL</SelectItem>
-                <SelectItem value="none">不使用代理</SelectItem>
-              </SelectContent>
-            </Select>
-            {proxyMode === 'single' && (
-              <Select value={proxyResourceId || '__none__'} onValueChange={(value) => setProxyResourceId(value === '__none__' ? '' : value)}>
-                <SelectTrigger size="sm" className="sm:w-80"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__none__">选择代理资源</SelectItem>
-                  {proxies.map((resource) => <SelectItem key={resource.id} value={String(resource.id)}>{resource.name}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            )}
-            {proxyMode === 'round_robin' && (
-              <div className="grid max-h-40 gap-1 overflow-y-auto rounded-md border p-2 sm:grid-cols-2">
-                {proxies.map((resource) => (
-                  <label key={resource.id} className="flex min-w-0 items-center gap-2 rounded px-2 py-1 hover:bg-muted/60">
-                    <Checkbox
-                      checked={proxyResourceIds.includes(String(resource.id))}
-                      onCheckedChange={(checked) => setProxyResourceIds((current) => checked === true ? [...current, String(resource.id)] : current.filter((id) => id !== String(resource.id)))}
-                    />
-                    <span className="truncate">{resource.name}</span>
-                  </label>
-                ))}
-                {proxies.length === 0 && <span className="text-xs text-muted-foreground">没有可用的代理资源</span>}
-              </div>
-            )}
-            {proxyMode === 'direct_url' && (
-              <FieldGrid>
-                <Field label="代理 URL"><Input value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} placeholder="socks5h://host:port" /></Field>
-                <Field label="用户名"><SecretInput value={proxyUsername} onChange={setProxyUsername} visible={showSecret} onToggle={() => setShowSecret((v) => !v)} placeholder="可选" /></Field>
-                <Field label="密码"><SecretInput value={proxyPassword} onChange={setProxyPassword} visible={showSecret} onToggle={() => setShowSecret((v) => !v)} placeholder="可选" /></Field>
-              </FieldGrid>
-            )}
-            {proxyMode === 'none' && <Callout tone="warning">不使用代理时，续期和查询走本机出口，和推送后的调用出口可能不一致。</Callout>}
-          </section>
+          <FormSection title="代理" description="建议绑定代理：续期、查询和推送到账号池后的调用都走同一个出口，账号环境保持一致。账号自带代理时优先使用账号的。">
+            <ProxyAssignmentField
+              value={proxy}
+              onChange={setProxy}
+              proxyResources={proxies}
+              modes={['single', 'round_robin', 'direct_url', 'none']}
+            />
+            {proxy.mode === 'none' && <Callout tone="warning" className="mt-3">不使用代理时，续期和查询走本机出口，和推送后的调用出口可能不一致。</Callout>}
+          </FormSection>
 
-          <section className="space-y-2">
+          <FormSection title="导入选项">
+            <div className="grid gap-4 sm:grid-cols-2">
             <label className="flex items-start gap-2 rounded-lg border px-3 py-2.5">
               <Checkbox checked={check} onCheckedChange={(value) => setCheck(value === true)} className="mt-0.5" />
               <span>
@@ -225,7 +186,8 @@ export function InventoryImportModal({ open, onClose }: { open: boolean; onClose
             <Field label="来源备注" description="可选，例如批次号、渠道">
               <Input value={source} onChange={(e) => setSource(e.target.value)} placeholder="例如 2026-10 批次" />
             </Field>
-          </section>
+            </div>
+          </FormSection>
           {error && <Callout tone="error">{error}</Callout>}
         </div>
       )}
@@ -282,7 +244,7 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
       onClose={onClose}
       title={`推送 ${items.length} 个账号到账号池`}
       description="推送后账号由账号池接管：账号池负责续期和调度，库存只保留记录并显示账号池里的状态。"
-      width="max-w-3xl"
+      width="max-w-5xl"
       footer={result ? <Button onClick={onClose}>完成</Button> : (
         <>
           <Button variant="outline" onClick={onClose} disabled={push.isPending}>取消</Button>
@@ -315,10 +277,12 @@ export function InventoryPushModal({ open, items, onClose, onDone }: {
             proxyResources={proxies}
             hideProxy={needsProxy === 0}
           />
-          <label className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2.5">
-            <Checkbox checked={autoDiscover} onCheckedChange={(value) => setAutoDiscover(value === true)} />
-            <span>自动发现模型限制（API Key 账号）</span>
-          </label>
+          <FormSection title="推送选项">
+            <label className="flex items-center gap-2">
+              <Checkbox checked={autoDiscover} onCheckedChange={(value) => setAutoDiscover(value === true)} />
+              <span>自动发现模型限制（API Key 账号）</span>
+            </label>
+          </FormSection>
           {error && <Callout tone="error">{error}</Callout>}
         </div>
       )}
