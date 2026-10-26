@@ -60,6 +60,12 @@ import type {
 import { SecretInput } from './credential-inputs'
 import { CredentialTagsField } from '@/components/credential-tags-field'
 import { credentialSubscriptionLabel } from './credential-utils'
+import {
+  ProxyAssignmentField,
+  initialProxyAssignment,
+  validateProxyAssignmentValue,
+  type ProxyAssignmentValue,
+} from '@/features/proxies/proxy-assignment-field'
 
 // ============================================================================
 // ImportProgressList — 共用进度列表（BatchImportModal + KamImportModal 共用）
@@ -145,7 +151,7 @@ function ImportResultFooter({
 
 type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
 type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
-type ProxyAssignmentMode = 'single' | 'round_robin' | 'none'
+type ProxyAssignmentMode = 'single' | 'round_robin' | 'direct_url' | 'none'
 
 // ============================================================================
 // Verify result type (used by BatchVerifyModal)
@@ -283,7 +289,8 @@ function mergeCredentialDefaults(
     : undefined
   const defaultProxyResourceId = roundRobinProxyResourceId !== undefined
     ? roundRobinProxyResourceId
-    : parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID')
+    : defaults.proxyMode === 'single' ? parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID') : undefined
+  const defaultDirect = defaults.proxyMode === 'direct_url'
   const hasDirectProxy = Boolean(optionalTrimmed(cred.proxyUrl) || optionalTrimmed(cred.proxyUsername) || optionalTrimmed(cred.proxyPassword))
   const proxyResourceId = typeof cred.proxyResourceId !== 'undefined' ? cred.proxyResourceId : hasDirectProxy ? undefined : defaultProxyResourceId
   const useProxyResource = typeof proxyResourceId === 'number'
@@ -300,9 +307,9 @@ function mergeCredentialDefaults(
     endpoint: optionalTrimmed(cred.endpoint) || optionalTrimmed(defaults.endpoint),
     enableOverageAfterImport: typeof cred.enableOverageAfterImport === 'undefined' || cred.enableOverageAfterImport === null ? defaults.enableOverageAfterImport : cred.enableOverageAfterImport,
     proxyResourceId,
-    proxyUrl: optionalTrimmed(cred.proxyUrl) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUrl)),
-    proxyUsername: optionalTrimmed(cred.proxyUsername) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUsername)),
-    proxyPassword: optionalTrimmed(cred.proxyPassword) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyPassword)),
+    proxyUrl: optionalTrimmed(cred.proxyUrl) || (useProxyResource || !defaultDirect ? undefined : optionalTrimmed(defaults.proxyUrl)),
+    proxyUsername: optionalTrimmed(cred.proxyUsername) || (useProxyResource || !defaultDirect ? undefined : optionalTrimmed(defaults.proxyUsername)),
+    proxyPassword: optionalTrimmed(cred.proxyPassword) || (useProxyResource || !defaultDirect ? undefined : optionalTrimmed(defaults.proxyPassword)),
     tags: cred.tags?.length ? cred.tags : defaults.tags,
   }
 }
@@ -325,18 +332,40 @@ export function parameterDefaultsToImportDefaults(defaults: CredentialParameterD
     ...(defaults.proxyMode === 'round_robin'
       ? { proxyResourceIds: defaults.proxyResourceIds.map(Number).filter(Number.isFinite) }
       : defaults.proxyMode === 'single'
-        ? proxyResourceId !== undefined
-          ? { proxyResourceId }
-          : { proxyUrl: optionalTrimmed(defaults.proxyUrl), proxyUsername: optionalTrimmed(defaults.proxyUsername), proxyPassword: optionalTrimmed(defaults.proxyPassword) }
-        : {}),
+        ? proxyResourceId !== undefined ? { proxyResourceId } : {}
+        : defaults.proxyMode === 'direct_url'
+          ? { proxyUrl: optionalTrimmed(defaults.proxyUrl), proxyUsername: optionalTrimmed(defaults.proxyUsername), proxyPassword: optionalTrimmed(defaults.proxyPassword) }
+          : {}),
   }
 }
 
 export function validateProxyAssignment(defaults: CredentialParameterDefaults): string | undefined {
-  if (defaults.proxyMode === 'round_robin' && defaults.proxyResourceIds.length === 0) {
-    return '已选择多个代理轮换，请至少选择一个代理资源'
+  return validateProxyAssignmentValue(defaultsToProxyAssignment(defaults))
+}
+
+/** The parameter panel's proxy fields as the shared proxy-assignment value, and back. */
+function defaultsToProxyAssignment(defaults: CredentialParameterDefaults): ProxyAssignmentValue {
+  return {
+    mode: defaults.proxyMode,
+    resourceId: defaults.proxyResourceId,
+    resourceIds: defaults.proxyResourceIds,
+    url: defaults.proxyUrl,
+    username: defaults.proxyUsername,
+    password: defaults.proxyPassword,
   }
-  return undefined
+}
+
+function proxyAssignmentToDefaults(defaults: CredentialParameterDefaults, value: ProxyAssignmentValue): CredentialParameterDefaults {
+  const mode = value.mode === 'clear' ? 'none' : value.mode
+  return {
+    ...defaults,
+    proxyMode: mode,
+    proxyResourceId: mode === 'single' ? value.resourceId : '',
+    proxyResourceIds: mode === 'round_robin' ? value.resourceIds : [],
+    proxyUrl: mode === 'direct_url' ? value.url : '',
+    proxyUsername: mode === 'direct_url' ? value.username : '',
+    proxyPassword: mode === 'direct_url' ? value.password : '',
+  }
 }
 
 async function verifyImportedCredential(
@@ -375,6 +404,31 @@ function downloadBlob(blob: Blob, filename: string) {
 }
 
 // ============================================================================
+// FormSection — one titled block of a large dialog
+// ============================================================================
+
+export function FormSection({ title, description, actions, children, className }: {
+  title: React.ReactNode
+  description?: React.ReactNode
+  actions?: React.ReactNode
+  children: React.ReactNode
+  className?: string
+}) {
+  return (
+    <section className={`rounded-lg border border-border/70 bg-card p-4 ${className ?? ''}`}>
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">{title}</h3>
+          {description && <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{description}</p>}
+        </div>
+        {actions && <div className="flex shrink-0 items-center gap-1">{actions}</div>}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+// ============================================================================
 // CredentialParameterDefaultsPanel
 // ============================================================================
 
@@ -384,167 +438,65 @@ export function CredentialParameterDefaultsPanel({ defaults, onChange, proxyReso
   /** Hide the proxy fields when every account already brings a usable proxy. */
   hideProxy?: boolean
 }) {
-  const [showPu, setShowPu] = useState(false)
-  const [showPp, setShowPp] = useState(false)
   type StringDefaultKey = Exclude<keyof CredentialParameterDefaults, 'enableOverageAfterImport' | 'proxyMode' | 'proxyResourceIds' | 'tags'>
-  const update = (key: StringDefaultKey, value: string) => {
-    const text = value
-    if (key === 'proxyResourceId' && value && value !== '__none__') {
-      onChange({
-        ...defaults,
-        proxyMode: 'single',
-        proxyResourceId: value,
-        proxyResourceIds: [],
-        proxyUrl: '',
-        proxyUsername: '',
-        proxyPassword: '',
-      })
-      return
-    }
-    if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && text.trim()) {
-      onChange({ ...defaults, proxyMode: 'single', [key]: text, proxyResourceId: '', proxyResourceIds: [] })
-      return
-    }
-    onChange({ ...defaults, [key]: value })
-  }
-  const setProxyMode = (proxyMode: ProxyAssignmentMode) => {
-    if (proxyMode === 'none') {
-      onChange({
-        ...defaults,
-        proxyMode,
-        proxyResourceId: '',
-        proxyResourceIds: [],
-        proxyUrl: '',
-        proxyUsername: '',
-        proxyPassword: '',
-      })
-      return
-    }
-    if (proxyMode === 'round_robin') {
-      onChange({
-        ...defaults,
-        proxyMode,
-        proxyResourceId: '',
-        proxyUrl: '',
-        proxyUsername: '',
-        proxyPassword: '',
-      })
-      return
-    }
-    onChange({ ...defaults, proxyMode, proxyResourceIds: [] })
-  }
-  const toggleProxyResource = (id: number, checked: boolean | 'indeterminate') => {
-    const idValue = String(id)
-    const selected = new Set(defaults.proxyResourceIds)
-    if (checked === true) selected.add(idValue)
-    else selected.delete(idValue)
-    onChange({ ...defaults, proxyMode: 'round_robin', proxyResourceId: '', proxyResourceIds: Array.from(selected) })
-  }
-  const proxyLocked = Boolean(defaults.proxyResourceId)
+  const update = (key: StringDefaultKey, value: string) => onChange({ ...defaults, [key]: value })
   return (
-    <div className="rounded-lg bg-muted/30 p-3">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <div className="text-sm font-semibold">默认参数</div>
-          <div className="mt-0.5 text-xs text-muted-foreground">只填充每条账号中缺失的字段。</div>
-        </div>
-        <Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => onChange(initialParameterDefaults())}>清空</Button>
-      </div>
-      <FieldGrid>
-        <Field label="导入后状态" description="账号自身 disabled 字段优先">
-          <Select value={defaults.disabled} onValueChange={(v) => update('disabled', v)} disabled={disabled}>
-            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="false">启用</SelectItem>
-              <SelectItem value="true">禁用</SelectItem>
-            </SelectContent>
-          </Select>
-        </Field>
-        <div className="flex items-center gap-2 rounded-md bg-background/60 px-3 py-2">
-          <Checkbox
-            id="default-enable-overage"
-            checked={defaults.enableOverageAfterImport}
-            disabled={disabled}
-            onCheckedChange={(v) => onChange({ ...defaults, enableOverageAfterImport: Boolean(v) })}
-          />
-          <label htmlFor="default-enable-overage" className="text-sm cursor-pointer">
+    <div className="space-y-4">
+      <FormSection
+        title="默认参数"
+        description="只填充每条账号里缺失的字段；账号自身带的值优先。"
+        actions={<Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => onChange(initialParameterDefaults())}>清空</Button>}
+      >
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <Field label="导入后状态">
+            <Select value={defaults.disabled} onValueChange={(v) => update('disabled', v)} disabled={disabled}>
+              <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="false">启用</SelectItem>
+                <SelectItem value="true">禁用</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="默认优先级" description="数字越小越优先"><Input type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(e) => update('priority', e.target.value)} /></Field>
+          <Field label="端点"><Input value={defaults.endpoint} disabled={disabled} onChange={(e) => update('endpoint', e.target.value)} placeholder="ide / cli" /></Field>
+          <Field label="默认账号并发" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
+          <Field label="默认账号 RPM" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(e) => update('rpm', e.target.value)} /></Field>
+          <Field label="Machine ID"><Input value={defaults.machineId} disabled={disabled} onChange={(e) => update('machineId', e.target.value)} /></Field>
+          <Field label="Auth Region"><Input className="font-mono" value={defaults.authRegion} disabled={disabled} onChange={(e) => update('authRegion', e.target.value)} placeholder="us-east-1" /></Field>
+          <Field label="API Region"><Input className="font-mono" value={defaults.apiRegion} disabled={disabled} onChange={(e) => update('apiRegion', e.target.value)} placeholder="us-east-1" /></Field>
+          <Field label="Region 兼容" description="未设置 Auth Region 时的回退"><Input className="font-mono" value={defaults.region} disabled={disabled} onChange={(e) => update('region', e.target.value)} placeholder="us-east-1" /></Field>
+          <div className="space-y-1.5 sm:col-span-2 lg:col-span-3">
+            <div className="text-sm font-medium">账号标签</div>
+            <CredentialTagsField
+              value={defaults.tags}
+              options={tagOptions}
+              onChange={(tags) => onChange({ ...defaults, tags })}
+              disabled={disabled}
+            />
+            <p className="text-[0.7rem] leading-4 text-muted-foreground">文件中已有标签优先；没有标签的账号使用这里的默认标签。</p>
+          </div>
+          <label className="flex items-center gap-2 text-sm sm:col-span-2 lg:col-span-3">
+            <Checkbox
+              id="default-enable-overage"
+              checked={defaults.enableOverageAfterImport}
+              disabled={disabled}
+              onCheckedChange={(v) => onChange({ ...defaults, enableOverageAfterImport: Boolean(v) })}
+            />
             导入后尝试开启超额
           </label>
         </div>
-        <div className="sm:col-span-2 space-y-1.5">
-          <div className="text-sm font-medium">账号标签</div>
-          <div className="text-xs leading-5 text-muted-foreground">
-            文件中已有标签优先；没有标签的账号使用这里的默认标签。
-          </div>
-          <CredentialTagsField
-            value={defaults.tags}
-            options={tagOptions}
-            onChange={(tags) => onChange({ ...defaults, tags })}
+      </FormSection>
+      {!hideProxy && (
+        <FormSection title="代理" description="轮换按导入顺序循环分配；账号自身带的代理优先。">
+          <ProxyAssignmentField
+            value={defaultsToProxyAssignment(defaults)}
+            onChange={(value) => onChange(proxyAssignmentToDefaults(defaults, value))}
+            proxyResources={proxyResources.filter((resource) => resource.enabled)}
+            modes={['single', 'round_robin', 'direct_url', 'none']}
             disabled={disabled}
           />
-        </div>
-        <Field label="默认优先级"><Input type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(e) => update('priority', e.target.value)} /></Field>
-        <Field label="默认账号并发" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
-        <Field label="默认账号 RPM" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(e) => update('rpm', e.target.value)} /></Field>
-        <Field label="Region 兼容"><Input className="font-mono" value={defaults.region} disabled={disabled} onChange={(e) => update('region', e.target.value)} placeholder="us-east-1" /></Field>
-        <Field label="Auth Region"><Input className="font-mono" value={defaults.authRegion} disabled={disabled} onChange={(e) => update('authRegion', e.target.value)} placeholder="us-east-1" /></Field>
-        <Field label="API Region"><Input className="font-mono" value={defaults.apiRegion} disabled={disabled} onChange={(e) => update('apiRegion', e.target.value)} placeholder="us-east-1" /></Field>
-        <Field label="Machine ID"><Input value={defaults.machineId} disabled={disabled} onChange={(e) => update('machineId', e.target.value)} /></Field>
-        <Field label="端点"><Input value={defaults.endpoint} disabled={disabled} onChange={(e) => update('endpoint', e.target.value)} placeholder="ide / cli" /></Field>
-        {!hideProxy && (<>
-        <Field label="代理分配方式" description="轮换按导入顺序循环分配；账号自身代理配置优先。">
-          <Select value={defaults.proxyMode} onValueChange={(v) => setProxyMode(v as ProxyAssignmentMode)} disabled={disabled}>
-            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="single">统一代理</SelectItem>
-              <SelectItem value="round_robin">多个代理轮换</SelectItem>
-              <SelectItem value="none">不设置代理</SelectItem>
-            </SelectContent>
-          </Select>
-        </Field>
-        {defaults.proxyMode === 'round_robin' && (
-          <div className="sm:col-span-2 space-y-1.5">
-            <div className="text-sm font-medium">轮换代理资源</div>
-            {proxyResources.length > 0 ? (
-              <div className="grid max-h-40 gap-2 overflow-y-auto rounded-md border bg-background/60 p-2 sm:grid-cols-2">
-                {proxyResources.map((resource) => (
-                  <label key={resource.id} className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted/60">
-                    <Checkbox
-                      checked={defaults.proxyResourceIds.includes(String(resource.id))}
-                      onCheckedChange={(checked) => toggleProxyResource(resource.id, checked)}
-                      disabled={disabled}
-                    />
-                    <span className="min-w-0 flex-1 truncate text-sm">{resource.name}</span>
-                    {!resource.enabled && <span className="shrink-0 text-[0.7rem] text-muted-foreground">已禁用</span>}
-                  </label>
-                ))}
-              </div>
-            ) : (
-              <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">暂无可用代理资源</div>
-            )}
-            <p className="text-[0.7rem] leading-4 text-muted-foreground">
-              已选 {defaults.proxyResourceIds.length} 个，按选择顺序循环分配给账号 1、2、3…。
-            </p>
-          </div>
-        )}
-        {defaults.proxyMode === 'single' && (
-          <>
-            <Field label="代理资源">
-              <Select value={defaults.proxyResourceId || '__none__'} onValueChange={(v) => update('proxyResourceId', v === '__none__' ? '' : v)} disabled={disabled}>
-                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__none__">不绑定</SelectItem>
-                  {proxyResources.map((r) => <SelectItem key={r.id} value={String(r.id)}>{r.name}{r.enabled ? '' : '（已禁用）'}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field label="直连代理 URL"><Input value={defaults.proxyUrl} disabled={disabled || proxyLocked} onChange={(e) => update('proxyUrl', e.target.value)} placeholder="socks5h://..." /></Field>
-            <Field label="代理用户名"><SecretInput value={defaults.proxyUsername} onChange={(v) => update('proxyUsername', v)} visible={showPu} onToggle={() => setShowPu((v) => !v)} disabled={disabled || proxyLocked} placeholder="可选" /></Field>
-            <Field label="代理密码"><SecretInput value={defaults.proxyPassword} onChange={(v) => update('proxyPassword', v)} visible={showPp} onToggle={() => setShowPp((v) => !v)} disabled={disabled || proxyLocked} placeholder="可选" /></Field>
-          </>
-        )}
-        </>)}
-      </FieldGrid>
+        </FormSection>
+      )}
     </div>
   )
 }
@@ -921,57 +873,70 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const retryFailed = () => { if (failedItems.length) runItems(failedItems, true) }
 
   return (
-    <ModalShell open={open} title="批量导入账号" width="max-w-3xl" onClose={onClose}>
+    <ModalShell
+      open={open}
+      title="批量导入账号"
+      description="粘贴或选择文件后先解析预览，确认无误再开始导入。"
+      width="max-w-5xl"
+      onClose={onClose}
+      footer={!results.length ? (
+        <>
+          <Button variant="outline" size="sm" onClick={onClose}>取消</Button>
+          <Button size="sm" onClick={handleParse} disabled={!text.trim()}>解析预览</Button>
+        </>
+      ) : undefined}
+    >
       <div className="space-y-4">
         {!results.length ? (
           <>
-            <div className="flex items-center gap-2">
-              <label className="cursor-pointer">
-                <input type="file" className="sr-only" accept=".json,.jsonl,.txt" multiple onChange={handleFile} />
-                <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
-              </label>
-              <span className="text-xs text-muted-foreground">或粘贴 JSON/JSONL 到下方</span>
-            </div>
-            <Textarea
-              className="min-h-[140px] font-mono text-xs"
-              placeholder={'[{"refreshToken":"eyJ..."},{"refreshToken":"eyJ..."}]\n// 或每行一个 JSON 对象'}
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-            />
-            {parseError && <div className="text-xs text-destructive">{parseError}</div>}
+            <FormSection
+              title="账号数据"
+              description="支持 JSON 数组、每行一个 JSON 对象（JSONL），以及账号页导出的文件。"
+              actions={(
+                <label className="cursor-pointer">
+                  <input type="file" className="sr-only" accept=".json,.jsonl,.txt" multiple onChange={handleFile} />
+                  <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
+                </label>
+              )}
+            >
+              <Textarea
+                className="min-h-[160px] font-mono text-xs"
+                placeholder={'[{"refreshToken":"eyJ..."},{"refreshToken":"eyJ..."}]\n// 或每行一个 JSON 对象'}
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+              />
+              {parseError && <div className="mt-2 text-xs text-destructive">{parseError}</div>}
+            </FormSection>
             <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} tagOptions={tagOptions} />
-            <div className="flex items-center gap-3 rounded-lg bg-muted/30 p-3">
-              <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="batch-auto-discover-models" />
-              <label htmlFor="batch-auto-discover-models" className="text-sm cursor-pointer">自动发现模型限制</label>
-            </div>
-            <div className="rounded-lg bg-muted/30 p-3 space-y-2">
-              <div className="text-sm font-semibold">验活方式</div>
-              <div className="flex items-center gap-3">
-                <Checkbox checked={skipVerify} onCheckedChange={(v) => setSkipVerify(Boolean(v))} id="skip-verify" />
-                <label htmlFor="skip-verify" className="text-sm cursor-pointer">跳过验活</label>
-              </div>
-              {!skipVerify && (
-                <div className="space-y-2">
-                  <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)}>
+            <FormSection title="导入选项">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="验活方式" description={skipVerify ? '导入后不做任何检查' : verifyMode === 'subscription_only' ? '刷新 token 并查询订阅和积分，不消耗模型额度' : '发一次模型请求确认账号可用'}>
+                  <Select
+                    value={skipVerify ? 'skip' : verifyMode}
+                    onValueChange={(v) => { if (v === 'skip') setSkipVerify(true); else { setSkipVerify(false); setVerifyMode(v as ImportVerificationMode) } }}
+                  >
                     <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="subscription_only">查询订阅/积分（不请求模型）</SelectItem>
                       <SelectItem value="model_and_subscription">只测试模型</SelectItem>
+                      <SelectItem value="skip">跳过验活</SelectItem>
                     </SelectContent>
                   </Select>
-                  {verifyMode === 'model_and_subscription' && (
-                    <div className="flex items-center gap-3">
+                </Field>
+                <div className="flex flex-col justify-center gap-2.5 text-sm">
+                  <label className="flex items-center gap-2">
+                    <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="batch-auto-discover-models" />
+                    自动发现模型限制
+                  </label>
+                  {!skipVerify && verifyMode === 'model_and_subscription' && (
+                    <label className="flex items-center gap-2">
                       <Checkbox checked={refreshInfoAfterModelTest} onCheckedChange={(v) => setRefreshInfoAfterModelTest(Boolean(v))} id="batch-refresh-info-after-model-test" />
-                      <label htmlFor="batch-refresh-info-after-model-test" className="text-sm cursor-pointer">同步查询订阅/积分</label>
-                    </div>
+                      同时查询订阅/积分
+                    </label>
                   )}
                 </div>
-              )}
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" size="sm" onClick={onClose}>取消</Button>
-              <Button size="sm" onClick={handleParse} disabled={!text.trim()}>解析预览</Button>
-            </div>
+              </div>
+            </FormSection>
           </>
         ) : (
           <>
@@ -1169,26 +1134,40 @@ export function KamImportModal({ open, onClose, existingCredentials, onDone }: {
   }
 
   return (
-    <ModalShell open={open} title="KAM 导入账号" width="max-w-2xl" onClose={onClose}>
+    <ModalShell
+      open={open}
+      title="KAM 导入账号"
+      description="粘贴 KAM 导出的 JSON 或选择文件，解析后可以选择验活方式再导入。"
+      width="max-w-5xl"
+      onClose={onClose}
+      footer={!accounts.length ? (
+        <>
+          <Button variant="outline" size="sm" onClick={onClose}>取消</Button>
+          <Button size="sm" onClick={handleParse} disabled={!text.trim()}>解析预览</Button>
+        </>
+      ) : undefined}
+    >
       <div className="space-y-4">
         {!accounts.length ? (
           <>
-            <div className="flex gap-2">
-              <label className="cursor-pointer">
-                <input type="file" className="sr-only" accept=".json,.txt" multiple onChange={handleFile} />
-                <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
-              </label>
-            </div>
-            <Textarea className="min-h-[120px] font-mono text-xs" placeholder='粘贴 KAM JSON...' value={text} onChange={(e) => setText(e.target.value)} />
+            <FormSection
+              title="KAM 数据"
+              actions={(
+                <label className="cursor-pointer">
+                  <input type="file" className="sr-only" accept=".json,.txt" multiple onChange={handleFile} />
+                  <Button type="button" variant="outline" size="sm" asChild><span><FileUp className="h-3.5 w-3.5" />从文件导入</span></Button>
+                </label>
+              )}
+            >
+              <Textarea className="min-h-[160px] font-mono text-xs" placeholder='粘贴 KAM JSON...' value={text} onChange={(e) => setText(e.target.value)} />
+            </FormSection>
             <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} tagOptions={tagOptions} />
-            <div className="flex items-center gap-3 rounded-lg bg-muted/30 p-3">
-              <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="kam-auto-discover-models" />
-              <label htmlFor="kam-auto-discover-models" className="text-sm cursor-pointer">自动发现模型限制</label>
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" size="sm" onClick={onClose}>取消</Button>
-              <Button size="sm" onClick={handleParse} disabled={!text.trim()}>解析预览</Button>
-            </div>
+            <FormSection title="导入选项">
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox checked={autoDiscoverSupportedModels} onCheckedChange={(v) => setAutoDiscoverSupportedModels(Boolean(v))} id="kam-auto-discover-models" />
+                自动发现模型限制
+              </label>
+            </FormSection>
           </>
         ) : (
           <>
@@ -1282,17 +1261,12 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
     fast: '',
     concurrency: '',
     rpm: '',
-    proxyResourceId: '',
-    proxyUrl: '',
-    proxyUsername: '',
-    proxyPassword: '',
     region: '',
     authRegion: '',
     apiRegion: '',
   })
+  const [proxyAssignment, setProxyAssignment] = useState<ProxyAssignmentValue>(() => initialProxyAssignment('round_robin'))
   const [rateLimitAutoDisableEnabled, setRateLimitAutoDisableEnabled] = useState(true)
-  const [showProxyUsername, setShowProxyUsername] = useState(false)
-  const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [enableFields, setEnableFields] = useState({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
   const [routeModeDraft, setRouteModeDraft] = useState<ExternalPoolRouteMode>('allow_all')
   const [routeRulesDraft, setRouteRulesDraft] = useState<string[]>([])
@@ -1302,25 +1276,14 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
 
-  const proxyLocked = Boolean(fields.proxyResourceId)
-
-  const setProxyResourceDraft = (v: string) => {
-    setFields((p) => ({ ...p, proxyResourceId: v, proxyUrl: v ? '' : p.proxyUrl, proxyUsername: v ? '' : p.proxyUsername, proxyPassword: v ? '' : p.proxyPassword }))
-  }
-
-  const setDirectProxyDraft = (key: 'proxyUrl' | 'proxyUsername' | 'proxyPassword', v: string) => {
-    setFields((p) => ({ ...p, [key]: v, proxyResourceId: v.trim() ? '' : p.proxyResourceId }))
-  }
-
   useEffect(() => {
     if (!open) {
-      setFields({ priority: '', fast: '', concurrency: '', rpm: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
+      setFields({ priority: '', fast: '', concurrency: '', rpm: '', region: '', authRegion: '', apiRegion: '' })
+      setProxyAssignment(initialProxyAssignment('round_robin'))
       setRateLimitAutoDisableEnabled(true)
       setEnableFields({ priority: false, fast: false, routePolicy: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
       setRouteModeDraft('allow_all')
       setRouteRulesDraft([])
-      setShowProxyUsername(false)
-      setShowProxyPassword(false)
     }
   }, [open])
 
@@ -1357,12 +1320,22 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       req.routePolicy = { routeMode: routeModeDraft, routeRules }
     }
     if (enableFields.proxy) {
-      const resourceId = fields.proxyResourceId ? Number(fields.proxyResourceId) : null
-      req.proxy = {
-        proxyResourceId: resourceId,
-        proxyUrl: resourceId ? undefined : fields.proxyUrl.trim() || undefined,
-        proxyUsername: resourceId ? undefined : fields.proxyUsername.trim() || undefined,
-        proxyPassword: resourceId ? undefined : fields.proxyPassword.trim() || undefined,
+      const proxyError = validateProxyAssignmentValue(proxyAssignment, { requireSingle: true })
+      if (proxyError) { toast.error(proxyError); return }
+      if (proxyAssignment.mode === 'round_robin') {
+        // The server assigns these in turn in the order of `ids`.
+        req.proxyResourceIds = proxyAssignment.resourceIds.map(Number)
+      } else if (proxyAssignment.mode === 'single') {
+        req.proxy = { proxyResourceId: Number(proxyAssignment.resourceId) }
+      } else if (proxyAssignment.mode === 'direct_url') {
+        req.proxy = {
+          proxyResourceId: null,
+          proxyUrl: proxyAssignment.url.trim(),
+          proxyUsername: proxyAssignment.username.trim() || undefined,
+          proxyPassword: proxyAssignment.password.trim() || undefined,
+        }
+      } else {
+        req.proxy = { proxyResourceId: null }
       }
     }
     if (enableFields.regions) {
@@ -1405,182 +1378,154 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   }
 
   return (
-    <ModalShell open={open} title={`批量修改（${ids.length} 个账号）`} width="max-w-lg" onClose={onClose}>
-      <div className="space-y-4">
-        <div className="space-y-3">
-          <div className="rounded-lg bg-muted/30 p-3 space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="text-sm font-semibold">调度覆盖</div>
-              <Button type="button" variant="ghost" size="xs" onClick={clearSchedulingDraft} disabled={batchUpdate.isPending}>
-                清理优先级/并发/RPM
-              </Button>
-        </div>
-        <FieldGrid>
-              <Field label="优先级" description="数字越小越优先；留空重置为默认 0">
-                <div className="flex items-center gap-2">
-                  <Checkbox checked={enableFields.priority} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, priority: Boolean(v) }))} id="batch-priority" />
-                  <Input
-                    type="number"
-                    min={0}
-                    value={fields.priority}
-                    disabled={!enableFields.priority || batchUpdate.isPending}
-                    onChange={(e) => setFields((p) => ({ ...p, priority: e.target.value }))}
-                    placeholder="留空重置"
-                  />
-                </div>
-              </Field>
-              <Field label="Fast" description="数字越大越先打满；0 或留空表示关闭">
-                <div className="flex items-center gap-2">
-                  <Checkbox checked={enableFields.fast} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, fast: Boolean(v) }))} id="batch-fast" aria-label="批量修改 Fast" />
-                  <Input
-                    type="number"
-                    min={0}
-                    value={fields.fast}
-                    disabled={!enableFields.fast || batchUpdate.isPending}
-                    onChange={(e) => setFields((p) => ({ ...p, fast: e.target.value }))}
-                    placeholder="留空关闭"
-                  />
-                </div>
-              </Field>
-              <Field label="路由限制" description="从路由策略里已有的路由中选择">
-                <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    <Checkbox checked={enableFields.routePolicy} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, routePolicy: Boolean(v) }))} id="batch-route-policy" aria-label="批量修改路由限制" />
-                    <Select value={routeModeDraft} onValueChange={(v) => setRouteModeDraft(v as ExternalPoolRouteMode)} disabled={!enableFields.routePolicy || batchUpdate.isPending}>
-                      <SelectTrigger size="sm" className="w-full" aria-label="路由模式"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="allow_all">全部入口允许</SelectItem>
-                        <SelectItem value="allow_list">只允许下列入口</SelectItem>
-                        <SelectItem value="deny_list">禁止下列入口</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <RouteSelector
-                    routes={routeOptions}
-                    value={routeRulesDraft}
-                    disabled={!enableFields.routePolicy || routeModeDraft === 'allow_all' || batchUpdate.isPending}
-                    onChange={setRouteRulesDraft}
-                  />
-                </div>
-              </Field>
-              <Field label="最大并发" description="留空清除覆盖，0 表示不限">
-                <div className="flex items-center gap-2">
-                  <Checkbox checked={enableFields.concurrency} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, concurrency: Boolean(v) }))} id="batch-concurrency" />
-                  <Input
-                    type="number"
-                    min={0}
-                    value={fields.concurrency}
-                    disabled={!enableFields.concurrency || batchUpdate.isPending}
-                    onChange={(e) => setFields((p) => ({ ...p, concurrency: e.target.value }))}
-                    placeholder="留空继承全局"
-                  />
-                </div>
-              </Field>
-              <Field label="RPM" description="留空清除覆盖，0 表示不限">
-                <div className="flex items-center gap-2">
-                  <Checkbox checked={enableFields.rpm} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, rpm: Boolean(v) }))} id="batch-rpm" />
-                  <Input
-                    type="number"
-                    min={0}
-                    value={fields.rpm}
-                    disabled={!enableFields.rpm || batchUpdate.isPending}
-                    onChange={(e) => setFields((p) => ({ ...p, rpm: e.target.value }))}
-                    placeholder="留空继承全局"
-                  />
-                </div>
-              </Field>
-              <Field label="429自动禁用" description="关闭后，429 临时风控只进入冷却，不自动禁用">
-                <div className="flex items-center gap-2">
-                  <Checkbox checked={enableFields.rateLimitAutoDisable} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, rateLimitAutoDisable: Boolean(v) }))} id="batch-rate-limit-auto-disable" />
-                  <label htmlFor="batch-rate-limit-auto-disable" className="sr-only">修改 429 自动禁用</label>
-                  <Checkbox
-                    checked={rateLimitAutoDisableEnabled}
-                    disabled={!enableFields.rateLimitAutoDisable || batchUpdate.isPending}
-                    onCheckedChange={(v) => setRateLimitAutoDisableEnabled(Boolean(v))}
-                    id="batch-rate-limit-auto-disable-enabled"
-                  />
-                  <label htmlFor="batch-rate-limit-auto-disable-enabled" className="text-sm">
-                    {rateLimitAutoDisableEnabled ? '开启' : '关闭'}
-                  </label>
-                </div>
-              </Field>
-            </FieldGrid>
-          </div>
-          <div className="rounded-lg bg-muted/30 p-3 space-y-3">
-            <div className="flex items-center gap-2">
-              <Checkbox checked={enableFields.proxy} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, proxy: Boolean(v) }))} id="batch-proxy" />
-              <label htmlFor="batch-proxy" className="text-sm font-semibold cursor-pointer">代理设置</label>
-            </div>
-            {enableFields.proxy && (
-              <div className="space-y-3">
-                <Field label="代理资源" description="选择资源会清空直连代理字段；不选且 URL 为空则清除账号级代理">
-                  <Select value={fields.proxyResourceId || '__none__'} onValueChange={(v) => setProxyResourceDraft(v === '__none__' ? '' : v)}>
-                    <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="__none__">不绑定（清除代理资源）</SelectItem>
-                      {proxyOptions.map((r) => <SelectItem key={r.id} value={String(r.id)}>{r.name}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <div className={`rounded-lg p-3 space-y-2 ${proxyLocked ? 'opacity-50 bg-muted/20' : 'bg-card shadow-sm'}`}>
-                  <div className="text-xs font-semibold text-muted-foreground">
-                    直连代理{proxyLocked ? '（已选代理资源，保存时会清空）' : ''}
-                  </div>
-                  <FieldGrid>
-                    <Field label="代理 URL">
-                      <Input
-                        value={fields.proxyUrl}
-                        placeholder="socks5h://127.0.0.1:1080"
-                        disabled={proxyLocked}
-                        onChange={(e) => setDirectProxyDraft('proxyUrl', e.target.value)}
-                      />
-                    </Field>
-                    <Field label="用户名">
-                      <SecretInput
-                        value={fields.proxyUsername}
-                        onChange={(v) => setDirectProxyDraft('proxyUsername', v)}
-                        visible={showProxyUsername}
-                        onToggle={() => setShowProxyUsername((v) => !v)}
-                        disabled={proxyLocked}
-                        placeholder="可选"
-                      />
-                    </Field>
-                    <Field label="密码">
-                      <SecretInput
-                        value={fields.proxyPassword}
-                        onChange={(v) => setDirectProxyDraft('proxyPassword', v)}
-                        visible={showProxyPassword}
-                        onToggle={() => setShowProxyPassword((v) => !v)}
-                        disabled={proxyLocked}
-                        placeholder="可选"
-                      />
-                    </Field>
-                  </FieldGrid>
-                </div>
-              </div>
-            )}
-          </div>
-          <div className="rounded-lg bg-muted/30 p-3 space-y-3">
-            <div className="flex items-center gap-2">
-              <Checkbox checked={enableFields.regions} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, regions: Boolean(v) }))} id="batch-regions" />
-              <label htmlFor="batch-regions" className="text-sm font-semibold cursor-pointer">Region 设置</label>
-            </div>
-            {enableFields.regions && (
-              <FieldGrid>
-                <Field label="Auth Region"><Input className="font-mono" value={fields.authRegion} onChange={(e) => setFields((p) => ({ ...p, authRegion: e.target.value }))} placeholder="留空清除" /></Field>
-                <Field label="API Region"><Input className="font-mono" value={fields.apiRegion} onChange={(e) => setFields((p) => ({ ...p, apiRegion: e.target.value }))} placeholder="留空清除" /></Field>
-              </FieldGrid>
-            )}
-          </div>
-        </div>
-        <div className="flex justify-end gap-2">
-          <Button variant="ghost" size="sm" onClick={onClose} disabled={batchUpdate.isPending}>取消</Button>
+    <ModalShell
+      open={open}
+      title={`批量修改（${ids.length} 个账号）`}
+      description="只修改勾选的项，没勾选的保持原样。"
+      width="max-w-4xl"
+      onClose={onClose}
+      footer={(
+        <>
+          <span className="mr-auto self-center text-xs text-muted-foreground">
+            {Object.values(enableFields).some(Boolean) ? `将修改 ${Object.values(enableFields).filter(Boolean).length} 项` : '勾选要修改的项'}
+          </span>
+          <Button variant="outline" size="sm" onClick={onClose} disabled={batchUpdate.isPending}>取消</Button>
           <Button size="sm" onClick={submit} disabled={batchUpdate.isPending || !Object.values(enableFields).some(Boolean)}>
             {batchUpdate.isPending && <Spinner size="sm" />}应用修改
           </Button>
-        </div>
+        </>
+      )}
+    >
+      <div className="space-y-4">
+        <FormSection
+          title="调度"
+          description="勾选左侧的框才会修改该项。"
+          actions={(
+            <Button type="button" variant="ghost" size="xs" onClick={clearSchedulingDraft} disabled={batchUpdate.isPending}>
+              清理优先级/并发/RPM
+            </Button>
+          )}
+        >
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <BatchField id="batch-priority" label="优先级" description="数字越小越优先；留空重置为 0"
+              enabled={enableFields.priority} onEnabledChange={(v) => setEnableFields((p) => ({ ...p, priority: v }))}>
+              <Input type="number" min={0} value={fields.priority} disabled={!enableFields.priority || batchUpdate.isPending}
+                onChange={(e) => setFields((p) => ({ ...p, priority: e.target.value }))} placeholder="留空重置" />
+            </BatchField>
+            <BatchField id="batch-fast" label="Fast" description="数字越大越先打满；0 或留空关闭"
+              enabled={enableFields.fast} onEnabledChange={(v) => setEnableFields((p) => ({ ...p, fast: v }))}>
+              <Input type="number" min={0} value={fields.fast} disabled={!enableFields.fast || batchUpdate.isPending}
+                onChange={(e) => setFields((p) => ({ ...p, fast: e.target.value }))} placeholder="留空关闭" />
+            </BatchField>
+            <BatchField id="batch-rate-limit-auto-disable" label="429 自动禁用" description="关闭后 429 只进入冷却，不自动禁用"
+              enabled={enableFields.rateLimitAutoDisable} onEnabledChange={(v) => setEnableFields((p) => ({ ...p, rateLimitAutoDisable: v }))}>
+              <Select value={rateLimitAutoDisableEnabled ? 'on' : 'off'} onValueChange={(v) => setRateLimitAutoDisableEnabled(v === 'on')}
+                disabled={!enableFields.rateLimitAutoDisable || batchUpdate.isPending}>
+                <SelectTrigger size="sm" aria-label="429 自动禁用"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="on">开启</SelectItem>
+                  <SelectItem value="off">关闭（只冷却）</SelectItem>
+                </SelectContent>
+              </Select>
+            </BatchField>
+            <BatchField id="batch-concurrency" label="最大并发" description="留空清除覆盖，0 表示不限"
+              enabled={enableFields.concurrency} onEnabledChange={(v) => setEnableFields((p) => ({ ...p, concurrency: v }))}>
+              <Input type="number" min={0} value={fields.concurrency} disabled={!enableFields.concurrency || batchUpdate.isPending}
+                onChange={(e) => setFields((p) => ({ ...p, concurrency: e.target.value }))} placeholder="留空继承全局" />
+            </BatchField>
+            <BatchField id="batch-rpm" label="RPM" description="留空清除覆盖，0 表示不限"
+              enabled={enableFields.rpm} onEnabledChange={(v) => setEnableFields((p) => ({ ...p, rpm: v }))}>
+              <Input type="number" min={0} value={fields.rpm} disabled={!enableFields.rpm || batchUpdate.isPending}
+                onChange={(e) => setFields((p) => ({ ...p, rpm: e.target.value }))} placeholder="留空继承全局" />
+            </BatchField>
+          </div>
+        </FormSection>
+
+        <FormSection
+          title={<SectionToggle id="batch-route-policy" checked={enableFields.routePolicy} onChange={(v) => setEnableFields((p) => ({ ...p, routePolicy: v }))}>路由限制</SectionToggle>}
+          description="从路由策略里已有的路由中选择。"
+        >
+          {enableFields.routePolicy ? (
+            <div className="grid gap-4 sm:grid-cols-[14rem_1fr]">
+              <Field label="路由模式">
+                <Select value={routeModeDraft} onValueChange={(v) => setRouteModeDraft(v as ExternalPoolRouteMode)} disabled={batchUpdate.isPending}>
+                  <SelectTrigger size="sm" aria-label="路由模式"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="allow_all">全部入口允许</SelectItem>
+                    <SelectItem value="allow_list">只允许下列入口</SelectItem>
+                    <SelectItem value="deny_list">禁止下列入口</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label="路由">
+                <RouteSelector
+                  routes={routeOptions}
+                  value={routeRulesDraft}
+                  disabled={routeModeDraft === 'allow_all' || batchUpdate.isPending}
+                  onChange={setRouteRulesDraft}
+                />
+              </Field>
+            </div>
+          ) : <p className="text-xs text-muted-foreground">不修改</p>}
+        </FormSection>
+
+        <FormSection
+          title={<SectionToggle id="batch-proxy" checked={enableFields.proxy} onChange={(v) => setEnableFields((p) => ({ ...p, proxy: v }))}>代理</SectionToggle>}
+          description={`轮换时按账号顺序循环分配给这 ${ids.length} 个账号；清除会去掉账号自己的代理，改走全局代理或直连。`}
+        >
+          {enableFields.proxy ? (
+            <ProxyAssignmentField
+              value={proxyAssignment}
+              onChange={setProxyAssignment}
+              proxyResources={proxyOptions.filter((resource) => resource.enabled)}
+              modes={['round_robin', 'single', 'direct_url', 'clear']}
+              disabled={batchUpdate.isPending}
+            />
+          ) : <p className="text-xs text-muted-foreground">不修改</p>}
+        </FormSection>
+
+        <FormSection
+          title={<SectionToggle id="batch-regions" checked={enableFields.regions} onChange={(v) => setEnableFields((p) => ({ ...p, regions: v }))}>Region</SectionToggle>}
+        >
+          {enableFields.regions ? (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Auth Region"><Input className="font-mono" value={fields.authRegion} onChange={(e) => setFields((p) => ({ ...p, authRegion: e.target.value }))} placeholder="留空清除" /></Field>
+              <Field label="API Region"><Input className="font-mono" value={fields.apiRegion} onChange={(e) => setFields((p) => ({ ...p, apiRegion: e.target.value }))} placeholder="留空清除" /></Field>
+            </div>
+          ) : <p className="text-xs text-muted-foreground">不修改</p>}
+        </FormSection>
       </div>
     </ModalShell>
+  )
+}
+
+/** A batch-edit field that only applies when its box is ticked. */
+function BatchField({ id, label, description, enabled, onEnabledChange, children }: {
+  id: string
+  label: string
+  description?: string
+  enabled: boolean
+  onEnabledChange: (enabled: boolean) => void
+  children: React.ReactNode
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <label htmlFor={id} className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+        <Checkbox id={id} checked={enabled} onCheckedChange={(v) => onEnabledChange(Boolean(v))} aria-label={`修改${label}`} />
+        {label}
+      </label>
+      {children}
+      {description && <p className="text-[0.7rem] leading-4 text-muted-foreground">{description}</p>}
+    </div>
+  )
+}
+
+function SectionToggle({ id, checked, onChange, children }: { id: string; checked: boolean; onChange: (checked: boolean) => void; children: React.ReactNode }) {
+  return (
+    <label htmlFor={id} className="flex cursor-pointer items-center gap-2">
+      <Checkbox id={id} checked={checked} onCheckedChange={(v) => onChange(Boolean(v))} />
+      {children}
+    </label>
   )
 }
 
