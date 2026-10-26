@@ -59,7 +59,11 @@
     "toolChoiceSteering": true,
     "nativeReasoningFields": true,
     "toolPairingRepair": true,
-    "historyPlaceholderTools": true
+    "historyPlaceholderTools": true,
+    "modelDrivenWebSearch": {
+      "enabled": false,
+      "pathOverrides": {}
+    }
   },
   "promptInjection": {
     "applyToCountTokens": true,
