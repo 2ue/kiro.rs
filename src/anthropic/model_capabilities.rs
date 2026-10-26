@@ -1756,6 +1756,12 @@ fn standard_listing_id(model: &str) -> Option<String> {
     if MODEL_LISTING_ALIASES.contains(&model.as_str()) {
         return None;
     }
+    // Claude Code 2.1.x validates this explicit thinking alias against `/v1/models`
+    // before sending a request. Keep it discoverable while retaining the older
+    // request-side alias behavior for the other shorthand names.
+    if model == "sonnet-thinking" {
+        return Some(model);
+    }
     let (base, thinking) = strip_model_compat_suffixes(&model);
     if thinking || base != model {
         return None;
@@ -1807,6 +1813,12 @@ pub fn static_anthropic_models() -> Vec<Model> {
             64_000,
         ),
         ("sonnet", "Claude Code Alias: Sonnet", 1_771_286_400, 64_000),
+        (
+            "sonnet-thinking",
+            "Claude Code Alias: Sonnet (Thinking)",
+            1_771_286_400,
+            64_000,
+        ),
         ("haiku", "Claude Code Alias: Haiku", 1_760_486_400, 64_000),
         ("claude-opus-4.8", "Claude Opus 4.8", 1_779_926_400, 128_000),
         (
@@ -3437,7 +3449,10 @@ mod tests {
                 !(id.starts_with("claude-") && id.contains('.')),
                 "Kiro dotted id listed: {id}"
             );
-            assert!(!id.ends_with("-thinking"), "thinking variant listed: {id}");
+            assert!(
+                id == "sonnet-thinking" || !id.ends_with("-thinking"),
+                "unexpected thinking variant listed: {id}"
+            );
             assert!(!id.contains("[1m]"), "1m variant listed: {id}");
             assert!(
                 !MODEL_LISTING_ALIASES.contains(&id.as_str()),

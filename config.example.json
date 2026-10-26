@@ -58,6 +58,7 @@
     "toolSchemaKeyValidationRegex": "^[a-zA-Z0-9_.-]{1,64}$",
     "toolChoiceSteering": true,
     "nativeReasoningFields": true,
+    "syntheticThinkingSignatures": true,
     "toolPairingRepair": true,
     "historyPlaceholderTools": true,
     "codeExecution": {

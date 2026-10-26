@@ -1457,6 +1457,33 @@ pub(crate) fn is_claude_code_search_request(req: &MessagesRequest) -> bool {
     }
 }
 
+/// Claude Code's built-in `WebSearch` is a client-side tool in current CLI releases:
+/// the CLI sends a dedicated search sub-request with an empty `tools` array instead
+/// of Anthropic's `web_search_20250305` declaration.  Model-driven mode needs the
+/// server-side declaration to enter the existing MCP agent loop, so add it only for
+/// that exact protocol-shaped sub-request. Returns whether a tool was inserted.
+pub(crate) fn ensure_claude_code_web_search_tool(req: &mut MessagesRequest) -> bool {
+    if !is_claude_code_search_request(req) || has_native_web_search_tool(req) {
+        return false;
+    }
+
+    let tools = req.tools.get_or_insert_with(Vec::new);
+    if tools.iter().any(is_native_web_search_tool) {
+        return false;
+    }
+    tools.push(crate::anthropic::types::Tool {
+        tool_type: Some("web_search_20250305".to_string()),
+        name: "web_search".to_string(),
+        description: String::new(),
+        input_schema: std::collections::HashMap::new(),
+        max_uses: None,
+        allowed_domains: None,
+        blocked_domains: None,
+        cache_control: None,
+    });
+    true
+}
+
 /// `max_uses` of the request's native web_search tool, if set.
 pub(crate) fn native_web_search_max_uses(req: &MessagesRequest) -> Option<i32> {
     req.tools
@@ -1678,6 +1705,35 @@ mod tests {
 
         assert!(has_web_search_tool(&req));
         assert!(has_native_web_search_tool(&req));
+    }
+
+    #[test]
+    fn claude_code_search_subrequest_gets_native_tool_bridge() {
+        let mut req = MessagesRequest {
+            model: "sonnet".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!(
+                    "Perform a web search for the query: latest Rust release"
+                ),
+            }],
+            stream: true,
+            system: None,
+            tools: Some(Vec::new()),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            output_format: None,
+            metadata: None,
+            stop_sequences: None,
+        };
+
+        assert!(ensure_claude_code_web_search_tool(&mut req));
+        assert!(has_native_web_search_tool(&req));
+        assert_eq!(req.tools.as_ref().map(Vec::len), Some(1));
+        assert_eq!(req.tools.as_ref().unwrap()[0].name, "web_search");
+        assert!(!ensure_claude_code_web_search_tool(&mut req));
     }
 
     fn domain_request(allowed: Option<&[&str]>, blocked: Option<&[&str]>) -> MessagesRequest {

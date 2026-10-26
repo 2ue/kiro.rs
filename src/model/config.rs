@@ -205,6 +205,11 @@ pub struct BodyConversionConfig {
     #[serde(default = "default_true")]
     pub native_reasoning_fields: bool,
 
+    /// 为没有 Kiro 原生 reasoning 签名的 Claude Code thinking 块生成确定性的
+    /// 兼容签名标记。该标记只在回传给客户端时出现，历史回放会在发往 Kiro 前剥离。
+    #[serde(default = "default_true")]
+    pub synthetic_thinking_signatures: bool,
+
     /// 修复或文本化不严格配对的 tool_use/tool_result，减少 Kiro 400。
     #[serde(default = "default_true")]
     pub tool_pairing_repair: bool,
@@ -249,6 +254,7 @@ impl Default for BodyConversionConfig {
             chunked_tool_policy: None,
             thinking_prompt_controls: None,
             native_reasoning_fields: true,
+            synthetic_thinking_signatures: true,
             tool_pairing_repair: true,
             history_placeholder_tools: true,
             code_execution: CodeExecutionConfig::default(),
@@ -6997,7 +7003,9 @@ mod tests {
         assert_eq!(parsed.code_execution.timeout_ms, 5_000);
         let mut config = super::CodeExecutionConfig::default();
         config.path_overrides.insert("/dfcache".to_string(), true);
-        config.path_overrides.insert("/dfcache/mine-hak".to_string(), false);
+        config
+            .path_overrides
+            .insert("/dfcache/mine-hak".to_string(), false);
         assert!(config.enabled_for_route("/dfcache/other/v1/messages"));
         assert!(!config.enabled_for_route("/dfcache/mine-hak/v1/messages"));
         assert!(!config.enabled_for_route("/dfcachex/v1/messages"));

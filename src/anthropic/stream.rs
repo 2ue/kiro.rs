@@ -10,6 +10,7 @@ use crate::kiro::model::events::{Event, MetadataTokenUsage};
 use crate::model::config::{PromptCacheSimulationMode, ReportedUsagePathPolicy};
 
 use super::envelope;
+use super::signature::synthetic_thinking_signature;
 use super::tool_schema_keys::ToolSchemaKeyMap;
 use super::tool_use_policy::{ResponseToolGate, ResponseToolPolicy};
 use super::transcript_sanitizer::{
@@ -1647,8 +1648,12 @@ pub struct StreamContext {
     pub thinking_enabled: bool,
     /// 是否把 XML `<thinking>` 文本提取为 unsigned thinking block
     pub extract_xml_thinking: bool,
+    /// 没有 Kiro 原生签名时，是否向 Claude Code 输出兼容签名标记。
+    synthetic_thinking_signatures: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
+    /// 当前 XML thinking 块的原始文本，用于生成稳定兼容签名。
+    xml_thinking_content: String,
     /// 字面 `<invoke>` 跨 chunk 嗅探缓冲区。
     invoke_sniff_buffer: String,
     /// 是否在 thinking 块内
@@ -1895,7 +1900,9 @@ impl StreamContext {
             fence_scan_partial: String::new(),
             thinking_enabled,
             extract_xml_thinking,
+            synthetic_thinking_signatures: false,
             thinking_buffer: String::new(),
+            xml_thinking_content: String::new(),
             invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
@@ -1969,6 +1976,11 @@ impl StreamContext {
         config: Option<crate::model::config::CodeExecutionConfig>,
     ) {
         self.code_execution = config;
+    }
+
+    /// 为 prompt-steered thinking 输出可回放的 Claude Code 兼容签名标记。
+    pub fn set_synthetic_thinking_signatures(&mut self, enabled: bool) {
+        self.synthetic_thinking_signatures = enabled;
     }
 
     pub fn response_tool_gate(&self) -> &ResponseToolGate {
@@ -3484,15 +3496,6 @@ impl StreamContext {
         events
     }
 
-    /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
-        if thinking.is_empty() {
-            return self.create_sanitized_thinking_delta_event(index, "");
-        }
-        let safe = self.thinking_transcript_sanitizer.push(thinking);
-        self.create_sanitized_thinking_delta_event(index, &safe)
-    }
-
     fn create_sanitized_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
         self.record_thinking_output_tokens(thinking);
         SseEvent::new(
@@ -3508,11 +3511,6 @@ impl StreamContext {
         )
     }
 
-    fn flush_thinking_transcript(&mut self, index: i32) -> Option<SseEvent> {
-        let pending = self.thinking_transcript_sanitizer.finish();
-        (!pending.is_empty()).then(|| self.create_sanitized_thinking_delta_event(index, &pending))
-    }
-
     /// 在 XML thinking 块内追加内容。
     ///
     /// 如果当前 thinking 块已在 tool_use 边界被提前关闭（thinking 尚未收到结束标签），
@@ -3525,6 +3523,7 @@ impl StreamContext {
             .thinking_block_index
             .is_some_and(|index| self.state_manager.is_block_open_of_type(index, "thinking"));
         if !block_open {
+            self.xml_thinking_content.clear();
             let thinking_index = self.state_manager.next_block_index();
             self.thinking_block_index = Some(thinking_index);
             events.extend(self.state_manager.handle_content_block_start(
@@ -3541,8 +3540,12 @@ impl StreamContext {
                 }),
             ));
         }
+        // 兼容签名必须覆盖实际下发的 thinking 文本。清洗器可能暂存或删除
+        // 内部 transcript；把原始上游文本拿去签名会让标记与客户端看到的内容不一致。
+        let safe = self.thinking_transcript_sanitizer.push(thinking);
+        self.xml_thinking_content.push_str(&safe);
         if let Some(thinking_index) = self.thinking_block_index {
-            events.push(self.create_thinking_delta_event(thinking_index, thinking));
+            events.push(self.create_sanitized_thinking_delta_event(thinking_index, &safe));
         }
     }
 
@@ -3558,13 +3561,20 @@ impl StreamContext {
         {
             return;
         }
-        if let Some(pending) = self.flush_thinking_transcript(thinking_index) {
-            events.push(pending);
+        let pending = self.thinking_transcript_sanitizer.finish();
+        if !pending.is_empty() {
+            self.xml_thinking_content.push_str(&pending);
+            events.push(self.create_sanitized_thinking_delta_event(thinking_index, &pending));
         }
-        events.push(self.create_thinking_delta_event(thinking_index, ""));
+        events.push(self.create_sanitized_thinking_delta_event(thinking_index, ""));
+        if self.synthetic_thinking_signatures {
+            let signature = synthetic_thinking_signature(&self.xml_thinking_content);
+            events.push(self.create_signature_delta_event(thinking_index, &signature));
+        }
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
             events.push(stop_event);
         }
+        self.xml_thinking_content.clear();
     }
 
     pub fn claude_code_noop_delta_keepalive_event(&self) -> Option<SseEvent> {
@@ -3599,7 +3609,7 @@ impl StreamContext {
         ))
     }
 
-    /// 创建官方 Anthropic extended-thinking 签名 delta。
+    /// 创建 extended-thinking 兼容签名 delta；原生签名与本地兼容标记共用此协议位置。
     fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
         SseEvent::new(
             "content_block_delta",
@@ -3682,6 +3692,9 @@ impl StreamContext {
         events.push(self.create_sanitized_thinking_delta_event(thinking_index, &output));
         if let Some(signature_event) = self.take_native_signature_delta_event(thinking_index) {
             events.push(signature_event);
+        } else if self.synthetic_thinking_signatures {
+            let signature = synthetic_thinking_signature(&output);
+            events.push(self.create_signature_delta_event(thinking_index, &signature));
         }
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
             events.push(stop_event);
@@ -8882,6 +8895,53 @@ mod tests {
         }
         events.extend(ctx.generate_final_events());
         (events, ctx)
+    }
+
+    #[test]
+    fn synthetic_xml_thinking_signature_is_non_empty_and_precedes_stop() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4.5", 1, true, HashMap::new());
+        ctx.set_synthetic_thinking_signatures(true);
+        let mut events = ctx.generate_initial_events();
+        events.extend(
+            ctx.process_assistant_response("<thinking>\nprivate thought</thinking>\n\nanswer"),
+        );
+        events.extend(ctx.generate_final_events());
+
+        let thinking_start = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "thinking"
+            })
+            .expect("thinking start");
+        let thinking_index = thinking_start.data["index"].as_i64().unwrap();
+        let signature = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_delta"
+                    && event.data["index"].as_i64() == Some(thinking_index)
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .and_then(|event| event.data["delta"]["signature"].as_str())
+            .expect("synthetic signature");
+        assert!(!signature.is_empty());
+        let signature_pos = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_delta"
+                    && event.data["index"].as_i64() == Some(thinking_index)
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .unwrap();
+        let stop_pos = events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_stop"
+                    && event.data["index"].as_i64() == Some(thinking_index)
+            })
+            .unwrap();
+        assert!(signature_pos < stop_pos);
     }
 
     fn final_stop_reason(events: &[SseEvent]) -> Option<String> {

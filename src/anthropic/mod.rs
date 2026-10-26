@@ -61,6 +61,7 @@ pub(crate) mod request_body;
 pub(crate) mod request_facts;
 pub mod request_key_limits;
 mod router;
+pub(crate) mod signature;
 mod stop_sequence;
 mod stream;
 mod structured_output;

@@ -6872,6 +6872,78 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_thinking_signature_is_replayed_as_unsigned_xml() {
+        let thinking = "compatibility thought";
+        let signature = crate::anthropic::signature::synthetic_thinking_signature(thinking);
+        let message = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": thinking, "signature": signature},
+                {"type": "text", "text": "visible answer"}
+            ]),
+        };
+
+        let converted =
+            convert_assistant_message(&message, &mut HashMap::new(), ConverterOptions::default())
+                .expect("synthetic signature should be accepted as compatibility history");
+        let assistant = converted.assistant_response_message;
+        assert_eq!(
+            assistant.content,
+            "<thinking>compatibility thought</thinking>\n\nvisible answer"
+        );
+        assert!(assistant.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn tampered_synthetic_thinking_signature_is_rejected() {
+        let message = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "thinking",
+                    "thinking": "changed thought",
+                    "signature": crate::anthropic::signature::synthetic_thinking_signature(
+                        "original thought"
+                    )
+                }
+            ]),
+        };
+
+        let error =
+            convert_assistant_message(&message, &mut HashMap::new(), ConverterOptions::default())
+                .expect_err("tampered compatibility signature must fail closed");
+        assert!(error.to_string().contains("compatibility signature"));
+    }
+
+    #[test]
+    fn opaque_thinking_signature_still_replays_as_native_reasoning() {
+        let message = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "native thought", "signature": "opaque-upstream-signature"},
+                {"type": "text", "text": "visible answer"}
+            ]),
+        };
+
+        let converted =
+            convert_assistant_message(&message, &mut HashMap::new(), ConverterOptions::default())
+                .expect("opaque signature should remain native reasoning");
+        assert_eq!(
+            converted.assistant_response_message.reasoning_content,
+            Some(
+                crate::kiro::model::requests::conversation::ReasoningContent::reasoning_text(
+                    "native thought",
+                    "opaque-upstream-signature"
+                )
+            )
+        );
+        assert_eq!(
+            converted.assistant_response_message.content,
+            "visible answer"
+        );
+    }
+
+    #[test]
     fn redacted_thinking_uses_native_union_without_content_loss_for_five_rounds() {
         for round in 0..5 {
             let data = BASE64_STANDARD.encode(format!("opaque-{round}"));

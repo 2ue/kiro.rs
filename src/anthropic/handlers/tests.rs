@@ -6599,6 +6599,57 @@ fn non_stream_unsigned_thinking_blocks_carry_empty_signature_for_five_rounds() {
 }
 
 #[test]
+fn non_stream_synthetic_thinking_signature_is_non_empty_and_native_is_preserved() {
+    let mut synthetic = Vec::new();
+    let mut sanitizer = super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(
+        std::iter::empty::<String>(),
+    );
+    append_non_stream_reasoning_and_text_with_options(
+        &mut synthetic,
+        false,
+        true,
+        true,
+        None,
+        "",
+        None,
+        "<thinking>compat thought</thinking>\n\nanswer",
+        &HashSet::new(),
+        &HashMap::new(),
+        &ToolSchemaKeyMap::default(),
+        &mut HashSet::new(),
+        &mut sanitizer,
+    )
+    .expect("synthetic thinking");
+    assert_eq!(synthetic[0]["type"], "thinking");
+    assert_eq!(synthetic[0]["thinking"], "compat thought");
+    let signature = synthetic[0]["signature"].as_str().unwrap_or_default();
+    assert!(!signature.is_empty());
+    assert!(crate::anthropic::signature::is_synthetic_thinking_signature(signature));
+
+    let mut native = Vec::new();
+    let mut native_sanitizer = super::super::transcript_sanitizer::ToolTranscriptSanitizer::new(
+        std::iter::empty::<String>(),
+    );
+    append_non_stream_reasoning_and_text_with_options(
+        &mut native,
+        true,
+        false,
+        true,
+        None,
+        "native thought",
+        Some("opaque-upstream-signature"),
+        "answer",
+        &HashSet::new(),
+        &HashMap::new(),
+        &ToolSchemaKeyMap::default(),
+        &mut HashSet::new(),
+        &mut native_sanitizer,
+    )
+    .expect("native thinking");
+    assert_eq!(native[0]["signature"], "opaque-upstream-signature");
+}
+
+#[test]
 fn non_stream_thinking_policy_sanitizes_unsigned_and_drops_atomic_blocks() {
     let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
     for _round in 0..5 {

@@ -188,6 +188,7 @@ const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
   toolSchemaKeyValidationRegex: '^[a-zA-Z0-9_.-]{1,64}$',
   toolChoiceSteering: true,
   nativeReasoningFields: true,
+  syntheticThinkingSignatures: true,
   toolPairingRepair: true,
   historyPlaceholderTools: true,
   codeExecution: { enabled: false, pathOverrides: {}, timeoutMs: 5000, maxOutputBytes: 16384, maxCodeBytes: 65536 },
@@ -204,6 +205,7 @@ const normalizeBodyConversion = (
     toolSchemaKeyValidationRegex: input?.toolSchemaKeyValidationRegex ?? base.toolSchemaKeyValidationRegex,
     toolChoiceSteering: input?.toolChoiceSteering ?? base.toolChoiceSteering,
     nativeReasoningFields: input?.nativeReasoningFields ?? base.nativeReasoningFields,
+    syntheticThinkingSignatures: input?.syntheticThinkingSignatures ?? base.syntheticThinkingSignatures,
     toolPairingRepair: input?.toolPairingRepair ?? base.toolPairingRepair,
     historyPlaceholderTools: input?.historyPlaceholderTools ?? base.historyPlaceholderTools,
     codeExecution: {
@@ -4512,6 +4514,7 @@ export function RuntimeConfigPanel() {
               ['toolNameMapping', '工具名映射', '清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。'],
               ['toolChoiceSteering', '结构化 tool_choice', '按请求语义过滤工具（none=0、any=N、named=1），并在响应侧拦截本轮不允许的调用。对应的提示词在新版管理后台的提示词注入页单独控制。'],
               ['nativeReasoningFields', '原生 reasoning 字段', '对支持的 Kiro 模型上报 additionalModelRequestFields。'],
+              ['syntheticThinkingSignatures', 'Thinking 兼容签名', 'Kiro 没有原生签名时，为 Claude Code 输出确定性的兼容签名；回放到 Kiro 前会自动剥离。'],
               ['toolPairingRepair', '工具配对修复', '清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
               ['codeExecution', '代码执行（默认关闭）', '仅在路由开启时执行 Anthropic code_execution 的 Python 代码，并返回 bash_code_execution 服务端工具结果。'],

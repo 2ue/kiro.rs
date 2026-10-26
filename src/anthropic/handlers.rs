@@ -7486,7 +7486,11 @@ fn claude_models_only(state: &AppState) -> bool {
 /// Claude ids plus the Claude Code aliases (`opus`, `sonnet`, `haiku`, ...) that the listing keeps.
 fn is_listed_claude_model(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
-    id.starts_with("claude-") || matches!(id.as_str(), "opus" | "sonnet" | "haiku" | "opusplan")
+    id.starts_with("claude-")
+        || matches!(
+            id.as_str(),
+            "opus" | "sonnet" | "sonnet-thinking" | "haiku" | "opusplan"
+        )
 }
 
 fn model_retrieve_response(state: &AppState, model_id: &str) -> Response {
@@ -7987,6 +7991,16 @@ async fn post_messages_inner(
     }
     // 检查是否声明了 Anthropic 原生 WebSearch 工具。
     websearch::strip_native_web_search_tools_without_query(&mut payload);
+    let model_driven_websearch_enabled = runtime_config
+        .route_features_for(&endpoint)
+        .model_driven_web_search;
+    if model_driven_websearch_enabled && websearch::ensure_claude_code_web_search_tool(&mut payload)
+    {
+        tracing::info!(
+            endpoint,
+            "bridged Claude Code client-side WebSearch request to native server-side tool"
+        );
+    }
     if websearch::has_native_web_search_tool(&payload) {
         if !websearch_supported_for_profile(runtime_config.compat_profile) {
             let response = envelope::error_response(
@@ -8077,9 +8091,7 @@ async fn post_messages_inner(
                         .canonical_reported_usage_for_success(raw, UsageSource::RequestEstimate)
                 }) as websearch::SharedWebSearchUsageMapper
             });
-        let model_driven = runtime_config
-            .route_features_for(&endpoint)
-            .model_driven_web_search;
+        let model_driven = model_driven_websearch_enabled;
         usage_context.set_websearch_mode(if model_driven {
             "model_driven"
         } else {
@@ -8402,6 +8414,8 @@ async fn post_messages_inner(
             usage_context.context_window_tokens,
             thinking_enabled,
             extract_xml_thinking,
+            runtime_config.body_conversion.synthetic_thinking_signatures
+                && runtime_config.compat_profile.allows_unsigned_thinking(),
             tool_name_map,
             tool_schema_key_map,
             known_tool_names,
@@ -8437,6 +8451,8 @@ async fn post_messages_inner(
             input_tokens,
             thinking_enabled,
             extract_thinking,
+            runtime_config.body_conversion.synthetic_thinking_signatures
+                && runtime_config.compat_profile.allows_unsigned_thinking(),
             tool_name_map,
             tool_schema_key_map,
             known_tool_names,
@@ -8997,6 +9013,7 @@ struct StreamContextTemplate {
     context_window_tokens: i32,
     thinking_enabled: bool,
     extract_xml_thinking: bool,
+    synthetic_thinking_signatures: bool,
     tool_name_map: HashMap<String, String>,
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
@@ -9020,6 +9037,7 @@ impl StreamContextTemplate {
         );
         ctx.set_response_tool_policy(&self.response_tool_policy);
         ctx.set_code_execution(self.code_execution.clone());
+        ctx.set_synthetic_thinking_signatures(self.synthetic_thinking_signatures);
         ctx.set_stop_sequences(credential_usage.request.stop_sequences.clone());
         ctx.set_omit_thinking_display(credential_usage.request.omit_thinking_display);
         ctx.set_strip_injected_control_blocks(
@@ -9239,6 +9257,7 @@ async fn handle_stream_request(
     context_window_tokens: i32,
     thinking_enabled: bool,
     extract_xml_thinking: bool,
+    synthetic_thinking_signatures: bool,
     tool_name_map: HashMap<String, String>,
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
@@ -9864,6 +9883,7 @@ async fn handle_stream_request(
         context_window_tokens,
         thinking_enabled,
         extract_xml_thinking,
+        synthetic_thinking_signatures,
         tool_name_map,
         tool_schema_key_map,
         known_tool_names,
@@ -12100,10 +12120,44 @@ fn append_recovered_non_stream_blocks(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn append_non_stream_reasoning_and_text(
     content: &mut Vec<Value>,
     native_reasoning_enabled: bool,
     extract_xml_thinking: bool,
+    redacted_thinking: Option<&str>,
+    native_thinking_content: &str,
+    native_thinking_signature: Option<&str>,
+    text_content: &str,
+    known_tool_names: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+    tool_schema_key_map: &ToolSchemaKeyMap,
+    seen_tool_sigs: &mut HashSet<String>,
+    thinking_transcript_sanitizer: &mut super::transcript_sanitizer::ToolTranscriptSanitizer,
+) -> Result<(), &'static str> {
+    append_non_stream_reasoning_and_text_with_options(
+        content,
+        native_reasoning_enabled,
+        extract_xml_thinking,
+        false,
+        redacted_thinking,
+        native_thinking_content,
+        native_thinking_signature,
+        text_content,
+        known_tool_names,
+        tool_name_map,
+        tool_schema_key_map,
+        seen_tool_sigs,
+        thinking_transcript_sanitizer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_non_stream_reasoning_and_text_with_options(
+    content: &mut Vec<Value>,
+    native_reasoning_enabled: bool,
+    extract_xml_thinking: bool,
+    synthetic_thinking_signatures: bool,
     redacted_thinking: Option<&str>,
     native_thinking_content: &str,
     native_thinking_signature: Option<&str>,
@@ -12151,6 +12205,10 @@ fn append_non_stream_reasoning_and_text(
                 if !output.is_empty() {
                     // thinking 块总带 signature 字段；无上游签名时为空字符串，
                     // 回传时 converter 按无签名 thinking 处理。
+                    let signature = signature.map(str::to_string).or_else(|| {
+                        synthetic_thinking_signatures
+                            .then(|| super::signature::synthetic_thinking_signature(output))
+                    });
                     content.push(json!({
                         "type": "thinking",
                         "thinking": output,
@@ -12180,10 +12238,12 @@ fn append_non_stream_reasoning_and_text(
                 std::iter::empty(),
             );
             if !safe_thinking.is_empty() {
+                let signature = synthetic_thinking_signatures
+                    .then(|| super::signature::synthetic_thinking_signature(&safe_thinking));
                 content.push(json!({
                     "type": "thinking",
                     "thinking": safe_thinking,
-                    "signature": ""
+                    "signature": signature.unwrap_or_default()
                 }));
             }
         }
@@ -12234,6 +12294,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     native_reasoning_enabled: bool,
     extract_xml_thinking: bool,
+    synthetic_thinking_signatures: bool,
     tool_name_map: HashMap<String, String>,
     tool_schema_key_map: ToolSchemaKeyMap,
     known_tool_names: HashSet<String>,
@@ -13588,10 +13649,11 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
-    if let Err(detail) = append_non_stream_reasoning_and_text(
+    if let Err(detail) = append_non_stream_reasoning_and_text_with_options(
         &mut content,
         native_reasoning_enabled,
         extract_xml_thinking,
+        synthetic_thinking_signatures,
         redacted_thinking.as_deref(),
         &native_thinking_content,
         native_thinking_signature.as_deref(),

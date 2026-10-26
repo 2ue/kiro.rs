@@ -22,6 +22,9 @@ use super::{
     ConversionError, ConverterOptions, EMPTY_USER_CONTENT_PLACEHOLDER, ProxyWarnings,
     TOOL_RESULTS_PROVIDED_PLACEHOLDER,
 };
+use crate::anthropic::signature::{
+    is_synthetic_thinking_signature, synthetic_thinking_signature_matches,
+};
 use crate::anthropic::transcript_sanitizer::ToolTranscriptSanitizer;
 
 /// 构建历史消息
@@ -354,10 +357,21 @@ fn convert_assistant_message_with_known_tools(
                             if let Some(signature) =
                                 block.signature.filter(|signature| !signature.is_empty())
                             {
-                                native_candidates.push((
-                                    ReasoningContent::reasoning_text(thinking, signature),
-                                    tool_uses.len(),
-                                ));
+                                if is_synthetic_thinking_signature(&signature) {
+                                    if !synthetic_thinking_signature_matches(&thinking, &signature)
+                                    {
+                                        return Err(ConversionError::UnsupportedContent(
+                                            "assistant thinking compatibility signature does not match thinking text"
+                                                .to_string(),
+                                        ));
+                                    }
+                                    thinking_content.push_str(&thinking);
+                                } else {
+                                    native_candidates.push((
+                                        ReasoningContent::reasoning_text(thinking, signature),
+                                        tool_uses.len(),
+                                    ));
+                                }
                             } else {
                                 thinking_content.push_str(&thinking);
                             }

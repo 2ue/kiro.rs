@@ -1612,6 +1612,7 @@ export interface BodyConversionConfig {
   /** Structured tool_choice handling: tool filtering and response-side enforcement only. */
   toolChoiceSteering: boolean
   nativeReasoningFields: boolean
+  syntheticThinkingSignatures: boolean
   toolPairingRepair: boolean
   historyPlaceholderTools: boolean
   codeExecution: CodeExecutionConfig
