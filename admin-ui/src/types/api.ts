@@ -588,6 +588,8 @@ export interface BatchUpdateCredentialsRequest {
   rpm?: SetCredentialRpmRequest
   rateLimitAutoDisable?: SetCredentialRateLimitAutoDisableRequest
   proxy?: SetCredentialProxyRequest
+  /** Proxy resources assigned in turn in the order of `ids`; replaces `proxy` when non-empty. */
+  proxyResourceIds?: number[]
 }
 
 export interface BatchUpdateCredentialItem {

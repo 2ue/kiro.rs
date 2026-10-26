@@ -4511,6 +4511,7 @@ impl AdminService {
             && req.rpm.is_none()
             && req.rate_limit_auto_disable.is_none()
             && req.proxy.is_none()
+            && req.proxy_resource_ids.is_empty()
         {
             return Err(AdminServiceError::InvalidCredential(
                 "没有选择任何要修改的账号字段".to_string(),
@@ -4544,6 +4545,17 @@ impl AdminService {
             )),
             None => None,
         };
+        let rotation = normalized_batch_proxy_resource_ids(&req.proxy_resource_ids);
+        if !rotation.is_empty() {
+            let missing = self.token_manager.missing_proxy_resource_ids(&rotation);
+            if !missing.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "代理资源不存在或已删除: {:?}",
+                    missing
+                )));
+            }
+        }
+        let proxy_assignments = batch_proxy_assignments(&ids, &rotation);
 
         let mut items = Vec::with_capacity(ids.len());
         let mut success = 0usize;
@@ -4633,7 +4645,17 @@ impl AdminService {
                 }
             }
 
-            if error.is_none() {
+            if error.is_none()
+                && let Some(proxy_resource_id) = proxy_assignments.get(&id).copied()
+                && let Err(err) = self
+                    .token_manager
+                    .set_credential_proxy(id, Some(proxy_resource_id), None, None, None)
+                    .map_err(|e| self.classify_error(e, id))
+            {
+                error = Some(err.to_string());
+            }
+
+            if error.is_none() && proxy_assignments.is_empty() {
                 if let Some((proxy_resource_id, proxy_url, proxy_username, proxy_password)) = &proxy
                 {
                     if let Err(err) = self
@@ -4679,7 +4701,8 @@ impl AdminService {
                 "concurrency": concurrency.is_some(),
                 "rpm": rpm.is_some(),
                 "rateLimitAutoDisable": rate_limit_auto_disable.is_some(),
-                "proxy": proxy.is_some(),
+                "proxy": proxy.is_some() || !rotation.is_empty(),
+                "proxyRotation": rotation,
             }),
         );
         Ok(BatchUpdateCredentialsResponse {
@@ -8186,6 +8209,18 @@ fn credential_has_direct_proxy(credential: &AddCredentialRequest) -> bool {
 fn normalized_batch_proxy_resource_ids(ids: &[u64]) -> Vec<u64> {
     let mut seen = HashSet::new();
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
+}
+
+/// Which proxy resource each account gets when a batch rotates over `rotation`: the n-th account
+/// in `ids` takes `rotation[n % len]`. Empty when there is nothing to rotate over.
+fn batch_proxy_assignments(ids: &[u64], rotation: &[u64]) -> HashMap<u64, u64> {
+    if rotation.is_empty() {
+        return HashMap::new();
+    }
+    ids.iter()
+        .enumerate()
+        .map(|(index, id)| (*id, rotation[index % rotation.len()]))
+        .collect()
 }
 
 fn resolve_add_credential_auth_method(req: &AddCredentialRequest) -> String {

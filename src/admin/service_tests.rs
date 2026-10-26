@@ -1811,6 +1811,21 @@ fn credential_route_policy_validation_normalizes_and_rejects_empty_allow_list() 
 }
 
 #[test]
+fn batch_proxy_assignments_rotate_in_account_order() {
+    let assignments = batch_proxy_assignments(&[10, 11, 12, 13, 14], &[7, 3]);
+    assert_eq!(assignments.get(&10), Some(&7));
+    assert_eq!(assignments.get(&11), Some(&3));
+    assert_eq!(assignments.get(&12), Some(&7));
+    assert_eq!(assignments.get(&13), Some(&3));
+    assert_eq!(assignments.get(&14), Some(&7));
+    // More proxies than accounts: each account still gets exactly one, the rest stay unused.
+    let fewer = batch_proxy_assignments(&[1, 2], &[5, 6, 7]);
+    assert_eq!(fewer.len(), 2);
+    assert_eq!((fewer[&1], fewer[&2]), (5, 6));
+    assert!(batch_proxy_assignments(&[1, 2], &[]).is_empty());
+}
+
+#[test]
 fn batch_update_accepts_route_policy_alone() {
     let req: BatchUpdateCredentialsRequest = serde_json::from_value(serde_json::json!({
         "ids": [1, 2],
