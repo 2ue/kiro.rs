@@ -521,7 +521,7 @@ pub(super) fn prepare_with_plan(
         known_tool_names: conversion_result.known_tool_names,
         response_tool_policy: {
             let mut policy = conversion_result.response_tool_policy;
-            if let Some((_, target)) = structured_output {
+            if let Some((_, Some(target))) = structured_output {
                 policy.set_structured_output(target);
             }
             policy

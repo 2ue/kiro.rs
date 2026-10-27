@@ -358,12 +358,16 @@ fn convert_assistant_message_with_known_tools(
                                 block.signature.filter(|signature| !signature.is_empty())
                             {
                                 if is_synthetic_thinking_signature(&signature) {
+                                    // A synthetic signature is a proxy transport marker, not an
+                                    // upstream credential. `thinking.display=omitted` signs the
+                                    // full text but replays an empty string, so a mismatch is
+                                    // expected; degrade to unsigned thinking instead of failing.
                                     if !synthetic_thinking_signature_matches(&thinking, &signature)
                                     {
-                                        return Err(ConversionError::UnsupportedContent(
-                                            "assistant thinking compatibility signature does not match thinking text"
-                                                .to_string(),
-                                        ));
+                                        tracing::debug!(
+                                            thinking_chars = thinking.chars().count(),
+                                            "synthetic thinking signature does not match replayed text; treating block as unsigned"
+                                        );
                                     }
                                     thinking_content.push_str(&thinking);
                                 } else {
@@ -690,11 +694,12 @@ fn generated_thinking_prefix_len(msg: &AnthropicMessage, content: &str) -> Optio
         .iter()
         .filter_map(|item| serde_json::from_value::<ContentBlock>(item.clone()).ok())
         .filter(|block| block.block_type == "thinking")
+        // Must mirror the conversion path: empty and synthetic signatures both become the
+        // generated `<thinking>` prefix; only opaque signatures go native.
         .filter(|block| {
-            !block
-                .signature
-                .as_deref()
-                .is_some_and(|signature| !signature.is_empty())
+            block.signature.as_deref().is_none_or(|signature| {
+                signature.is_empty() || is_synthetic_thinking_signature(signature)
+            })
         })
         .filter_map(|block| block.thinking)
         .collect::<String>();

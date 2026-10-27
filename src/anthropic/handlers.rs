@@ -11457,7 +11457,26 @@ fn create_sse_stream(
                                                 let suppressed_before = state
                                                     .ctx
                                                     .suppressed_tool_context_leak_blocks();
-                                                let sse_events = state.ctx.process_kiro_event(&event);
+                                                let mut sse_events =
+                                                    state.ctx.process_kiro_event(&event);
+                                                // Code execution runs on the blocking pool, never
+                                                // on this async worker.
+                                                for pending in
+                                                    state.ctx.take_pending_code_executions()
+                                                {
+                                                    let input = pending.input.clone();
+                                                    let result =
+                                                        super::code_execution::execute_blocking(
+                                                            pending.input,
+                                                            pending.config,
+                                                        )
+                                                        .await;
+                                                    sse_events.extend(
+                                                        state
+                                                            .ctx
+                                                            .complete_code_execution(input, result),
+                                                    );
+                                                }
                                                 if state.ctx.suppressed_tool_context_leak_blocks()
                                                     > suppressed_before
                                                 {
@@ -13721,15 +13740,8 @@ async fn handle_non_stream_request(
     }
 
     content.extend(tool_uses);
-    let code_execution_handled = code_execution
-        .as_ref()
-        .map(|config| super::code_execution::rewrite_blocks(&mut content, config))
-        .unwrap_or(0);
-    if code_execution_handled > 0 {
-        stop_reason = "end_turn".to_string();
-    }
     // Kiro 无法表达 tool_choice=none 等约束，这里丢弃不允许的调用；被丢弃的调用不会下发，
-    // 因而也不会产生需要配对的 tool_result。
+    // 因而也不会产生需要配对的 tool_result。必须先于代码执行，与流式一致：被拦截的调用不执行。
     let mut response_tool_gate = response_tool_policy.gate();
     if response_tool_gate.retain_admitted_tool_use_blocks(&mut content) > 0 {
         has_tool_use = content
@@ -13742,6 +13754,13 @@ async fn handle_non_stream_request(
     credential_usage
         .request
         .mark_response_tool_gate(&response_tool_gate);
+    let code_execution_handled = match code_execution.as_ref() {
+        Some(config) => super::code_execution::rewrite_blocks(&mut content, config).await,
+        None => 0,
+    };
+    if code_execution_handled > 0 {
+        stop_reason = "end_turn".to_string();
+    }
     if let Some(target) = response_tool_policy.structured_output()
         && let Some(reason) = super::structured_output::rewrite_content(&mut content, target)
     {

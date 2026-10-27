@@ -8,7 +8,8 @@
 use std::{
     fs,
     io::Read,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -37,7 +38,7 @@ pub(crate) fn request_config(
     endpoint: &str,
     config: &CodeExecutionConfig,
 ) -> Option<CodeExecutionConfig> {
-    if !config.enabled_for_route(endpoint) {
+    if !config.enabled_for_route(endpoint) || tool_choice_is_none(request) {
         return None;
     }
     request
@@ -46,6 +47,14 @@ pub(crate) fn request_config(
         .iter()
         .any(is_code_execution_tool)
         .then(|| config.clone())
+}
+
+/// `tool_choice: none` forbids every tool call this turn, so nothing may be executed.
+fn tool_choice_is_none(request: &MessagesRequest) -> bool {
+    request.tool_choice.as_ref().is_some_and(|choice| {
+        choice.as_str() == Some("none")
+            || choice.get("type").and_then(Value::as_str) == Some("none")
+    })
 }
 
 fn is_code_execution_tool(tool: &super::types::Tool) -> bool {
@@ -59,6 +68,21 @@ fn is_code_execution_tool(tool: &super::types::Tool) -> bool {
 
 pub(crate) fn is_code_execution_name(name: &str) -> bool {
     CODE_EXECUTION_TOOL_NAMES.contains(&name)
+}
+
+/// A completed code execution tool call waiting to be run off the async runtime.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingCodeExecution {
+    pub(crate) input: Value,
+    pub(crate) config: CodeExecutionConfig,
+}
+
+/// Runs [`execute`] on the blocking thread pool so a slow snippet never stalls an async worker.
+pub(crate) async fn execute_blocking(input: Value, config: CodeExecutionConfig) -> ExecutionResult {
+    match tokio::task::spawn_blocking(move || execute(&input, &config)).await {
+        Ok(result) => result,
+        Err(error) => failure(&format!("code execution task failed: {error}")),
+    }
 }
 
 pub(crate) fn execute(input: &Value, config: &CodeExecutionConfig) -> ExecutionResult {
@@ -133,6 +157,9 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Own process group, so background children can be killed together with the leader.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -141,31 +168,36 @@ where
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let max_output = config.max_output_bytes.clamp(1, 1024 * 1024);
-    let stdout_reader = thread::spawn(move || read_limited(stdout, max_output));
-    let stderr_reader = thread::spawn(move || read_limited(stderr, max_output));
+    let stdout_reader = spawn_reader(stdout, max_output);
+    let stderr_reader = spawn_reader(stderr, max_output);
 
     let timeout = Duration::from_millis(config.timeout_ms.clamp(100, 120_000));
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => {
+    loop {
+        match child_exited(&mut child) {
+            Ok(true) => break,
+            Ok(false) if Instant::now() >= deadline => {
                 timed_out = true;
-                let _ = child.kill();
-                break child.wait().ok();
+                break;
             }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(false) => thread::sleep(Duration::from_millis(10)),
             Err(error) => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 let _ = child.wait();
                 return failure(&format!("failed to wait for Python: {error}"));
             }
         }
-    };
+    }
+    // Kill the whole group whether the leader exited or timed out: a background child would
+    // otherwise keep the pipes open and block the readers. The leader is still unreaped here, so
+    // its pid (the group id) cannot have been reused.
+    kill_process_tree(&mut child);
+    let status = child.wait().ok();
 
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    // A process that left the group (setsid) can still hold the pipes; never wait on it.
+    let stdout = stdout_reader.recv_timeout(READER_GRACE).unwrap_or_default();
+    let stderr = stderr_reader.recv_timeout(READER_GRACE).unwrap_or_default();
     let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
     if timed_out {
         if !stderr.is_empty() {
@@ -173,15 +205,80 @@ where
         }
         stderr.push_str("execution timed out");
     }
-    let return_code = status
-        .and_then(|status| status.code())
-        .unwrap_or(if timed_out { 124 } else { 1 });
+    let return_code = if timed_out {
+        124
+    } else {
+        status.and_then(|status| status.code()).unwrap_or(1)
+    };
     ExecutionResult {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr,
         return_code,
     }
 }
+
+/// How long to wait for the pipe readers after the process group has been killed.
+const READER_GRACE: Duration = Duration::from_secs(1);
+
+fn spawn_reader<R: Read + Send + 'static>(reader: R, max_output: usize) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(read_limited(reader, max_output));
+    });
+    receiver
+}
+
+/// Whether the child has exited, without reaping it.
+#[cfg(unix)]
+fn child_exited(child: &mut Child) -> std::io::Result<bool> {
+    // SAFETY: siginfo_t is a plain C struct; all-zero is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid out pointer. WNOWAIT leaves the child waitable for `Child::wait`.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == -1 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: waitid filled `info` (or left it zeroed when nothing has exited yet).
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(not(unix))]
+fn child_exited(child: &mut Child) -> std::io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+/// Kills the child's whole process group (unix) and the child itself.
+fn kill_process_tree(child: &mut Child) {
+    kill_process_group(child);
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn kill_process_group(child: &Child) {
+    // The child was spawned with `process_group(0)`, so its pid is the group id.
+    let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: killpg only sends a signal; ESRCH (group already gone) is ignored.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &Child) {}
 
 fn read_limited<R: Read>(mut reader: R, max_output: usize) -> Vec<u8> {
     let mut output = Vec::new();
@@ -205,7 +302,7 @@ fn python_command() -> Option<&'static str> {
     })
 }
 
-fn failure(message: &str) -> ExecutionResult {
+pub(crate) fn failure(message: &str) -> ExecutionResult {
     ExecutionResult {
         stdout: String::new(),
         stderr: message.to_string(),
@@ -214,8 +311,12 @@ fn failure(message: &str) -> ExecutionResult {
 }
 
 /// Replaces ordinary `tool_use(name=code_execution)` blocks with the Anthropic server-tool
-/// pair expected by Claude Code. Returns the number of handled blocks.
-pub(crate) fn rewrite_blocks(content: &mut Vec<Value>, config: &CodeExecutionConfig) -> usize {
+/// pair expected by Claude Code. Returns the number of handled blocks. Callers must apply the
+/// response tool gate first so disallowed calls are never executed.
+pub(crate) async fn rewrite_blocks(
+    content: &mut Vec<Value>,
+    config: &CodeExecutionConfig,
+) -> usize {
     let mut rewritten = Vec::with_capacity(content.len());
     let mut count = 0;
     for block in std::mem::take(content) {
@@ -230,7 +331,7 @@ pub(crate) fn rewrite_blocks(content: &mut Vec<Value>, config: &CodeExecutionCon
         }
         let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
         let server_id = envelope::server_tool_use_id();
-        let result = execute(&input, config);
+        let result = execute_blocking(input.clone(), config.clone()).await;
         rewritten.push(json!({
             "type": "server_tool_use",
             "id": server_id,
@@ -282,20 +383,118 @@ mod tests {
         assert_eq!(result.stdout, "HELLO_BASH");
     }
 
-    #[test]
-    fn response_uses_server_tool_blocks() {
+    #[tokio::test]
+    async fn response_uses_server_tool_blocks() {
         let mut content = vec![json!({
             "type": "tool_use",
             "id": "toolu_01abc",
             "name": "code_execution",
             "input": {"code": "print('ok')"}
         })];
-        let count = rewrite_blocks(&mut content, &CodeExecutionConfig::default());
+        let count = rewrite_blocks(&mut content, &CodeExecutionConfig::default()).await;
         assert_eq!(count, 1);
         assert_eq!(content[0]["type"], "server_tool_use");
         assert_eq!(content[0]["name"], "bash_code_execution");
         assert_eq!(content[1]["type"], "bash_code_execution_tool_result");
         assert_eq!(content[1]["content"]["return_code"], 0);
+    }
+
+    fn timeout_config(timeout_ms: u64) -> CodeExecutionConfig {
+        CodeExecutionConfig {
+            timeout_ms,
+            ..CodeExecutionConfig::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks whether the process exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_background_children_that_hold_the_pipes() {
+        let started = Instant::now();
+        let result = execute(
+            &json!({"command": "sleep 30 & echo $!; sleep 30"}),
+            &timeout_config(300),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "background child kept the pipes open for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.return_code, 124);
+        assert!(result.stderr.contains("execution timed out"));
+        let pid: libc::pid_t = result.stdout.trim().parse().expect("background pid");
+        // The orphan is reaped by init shortly after SIGKILL.
+        let gone_by = Instant::now() + Duration::from_secs(3);
+        while process_alive(pid) && Instant::now() < gone_by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_alive(pid),
+            "background child {pid} survived the timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finished_leader_does_not_wait_for_background_children() {
+        let started = Instant::now();
+        let result = execute(
+            &json!({"command": "sleep 30 & printf LEADER_DONE"}),
+            &timeout_config(10_000),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "background child kept the pipes open for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(result.return_code, 0);
+        assert_eq!(result.stdout, "LEADER_DONE");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_execution_does_not_stall_the_async_runtime() {
+        let execution = tokio::spawn(execute_blocking(
+            json!({"command": "sleep 1; printf SLOW_DONE"}),
+            timeout_config(5_000),
+        ));
+        // On a current-thread runtime this timer only fires if execution left the worker.
+        let ticked = tokio::time::timeout(Duration::from_millis(500), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await;
+        assert!(ticked.is_ok(), "the async worker was blocked by execution");
+        let result = execution.await.expect("execution task");
+        assert_eq!(result.stdout, "SLOW_DONE");
+    }
+
+    #[test]
+    fn tool_choice_none_disables_execution_for_the_turn() {
+        let request = |tool_choice: Value| -> MessagesRequest {
+            serde_json::from_value(json!({
+                "model": "claude-sonnet-4",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "run"}],
+                "tools": [{"type": "code_execution_20250825", "name": "code_execution"}],
+                "tool_choice": tool_choice
+            }))
+            .expect("request")
+        };
+        let config = CodeExecutionConfig {
+            enabled: true,
+            ..CodeExecutionConfig::default()
+        };
+        assert!(
+            request_config(&request(json!({"type": "auto"})), "/v1/messages", &config).is_some()
+        );
+        assert!(
+            request_config(&request(json!({"type": "none"})), "/v1/messages", &config).is_none()
+        );
+        assert!(request_config(&request(json!("none")), "/v1/messages", &config).is_none());
     }
 
     #[test]

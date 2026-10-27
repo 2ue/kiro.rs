@@ -555,6 +555,13 @@ fn convert_request_with_model_id(
         .collect();
     let tools_unavailable = tools_unavailable_this_turn(req, &options);
     let mut response_tool_policy = ResponseToolPolicy::default();
+    if tools_unavailable {
+        // tool_choice=none sends no tools upstream, so any call to a declared tool (including
+        // server tools such as code_execution) is dropped instead of reaching the client.
+        for tool in req.tools.iter().flatten() {
+            response_tool_policy.block_tool(&tool.name);
+        }
+    }
     if let Some(max) = max_response_tool_uses(req, &options) {
         response_tool_policy.limit_tool_uses(max);
     }
@@ -5015,6 +5022,21 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_none_blocks_calls_to_declared_tools() {
+        let req = history_bash_request(
+            Some(vec![test_tool("Read"), test_tool("code_execution")]),
+            Some(serde_json::json!({"type": "none"})),
+        );
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+        assert!(result.response_tool_policy.is_unavailable("Read"));
+        assert!(result.response_tool_policy.is_unavailable("code_execution"));
+
+        let auto = history_bash_request(Some(vec![test_tool("Read")]), None);
+        let result = convert_request_with_options(&auto, ConverterOptions::default()).unwrap();
+        assert!(!result.response_tool_policy.is_unavailable("Read"));
+    }
+
+    #[test]
     fn auto_tool_choice_keeps_regular_history_placeholder_without_blocking() {
         let req = history_bash_request(Some(vec![test_tool("Read")]), None);
 
@@ -6769,6 +6791,55 @@ mod tests {
     }
 
     #[test]
+    fn reconstructed_scan_preserves_synthetic_signed_thinking_prefix() {
+        // The scaffold starts a line inside the thinking text, so an untrusted scan would cut
+        // from it through `</thinking>`.
+        let fixture =
+            "safe reasoning\nuser Continue\n\nbashHashd1e9567d: discussed inside thinking";
+        for signature in [
+            // Matching synthetic signature.
+            crate::anthropic::signature::synthetic_thinking_signature(fixture),
+            // Mismatched synthetic signature degrades to unsigned and must be trusted too.
+            crate::anthropic::signature::synthetic_thinking_signature("other text"),
+        ] {
+            let first = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": fixture, "signature": signature},
+                    {"type": "text", "text": "visible answer"}
+                ]),
+            };
+            let second = super::super::types::Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "thinking", "thinking": fixture, "signature": signature}
+                ]),
+            };
+
+            let mut tool_name_map =
+                HashMap::from([(deterministic_mapped_tool_name("Bash"), "Bash".to_string())]);
+            let merged = merge_assistant_messages(
+                &[&first, &second],
+                &mut tool_name_map,
+                ConverterOptions::default(),
+            )
+            .expect("merge");
+            assert_eq!(
+                merged.assistant_response_message.content,
+                format!(
+                    "<thinking>{fixture}</thinking>\n\nvisible answer\n\n<thinking>{fixture}</thinking>"
+                )
+            );
+            assert!(
+                merged
+                    .assistant_response_message
+                    .reasoning_content
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn visible_literal_thinking_close_cannot_hide_reconstructed_transcript() {
         let message = super::super::types::Message {
             role: "assistant".to_string(),
@@ -6895,7 +6966,7 @@ mod tests {
     }
 
     #[test]
-    fn tampered_synthetic_thinking_signature_is_rejected() {
+    fn mismatched_synthetic_thinking_signature_degrades_to_unsigned_thinking() {
         let message = super::super::types::Message {
             role: "assistant".to_string(),
             content: serde_json::json!([
@@ -6905,14 +6976,77 @@ mod tests {
                     "signature": crate::anthropic::signature::synthetic_thinking_signature(
                         "original thought"
                     )
-                }
+                },
+                {"type": "text", "text": "visible answer"}
             ]),
         };
 
-        let error =
+        let converted =
             convert_assistant_message(&message, &mut HashMap::new(), ConverterOptions::default())
-                .expect_err("tampered compatibility signature must fail closed");
-        assert!(error.to_string().contains("compatibility signature"));
+                .expect("mismatched compatibility signature must degrade, not fail");
+        let assistant = converted.assistant_response_message;
+        assert_eq!(
+            assistant.content,
+            "<thinking>changed thought</thinking>\n\nvisible answer"
+        );
+        assert!(assistant.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn omitted_display_thinking_replay_continues_tool_turn() {
+        // `thinking.display=omitted` signs the full text but sends the client an empty
+        // thinking string; Claude Code replays that pair on the tool-continuation turn.
+        let signature =
+            crate::anthropic::signature::synthetic_thinking_signature("full private reasoning");
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 128,
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "", "signature": signature},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"}
+                ]}
+            ],
+            "tools": [{
+                "name": "Bash",
+                "description": "run a command",
+                "input_schema": {"type": "object"}
+            }]
+        }))
+        .unwrap();
+
+        let converted = convert_request(&req).expect("omitted thinking replay must convert");
+        let assistant = converted
+            .conversation_state
+            .history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::Assistant(assistant) => Some(&assistant.assistant_response_message),
+                _ => None,
+            })
+            .expect("assistant history");
+        assert!(assistant.reasoning_content.is_none());
+        assert!(!assistant.content.contains("<thinking>"));
+        assert_eq!(
+            assistant.tool_uses.as_ref().expect("tool use")[0].tool_use_id,
+            "toolu_1"
+        );
+        assert_eq!(
+            converted
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len(),
+            1
+        );
     }
 
     #[test]

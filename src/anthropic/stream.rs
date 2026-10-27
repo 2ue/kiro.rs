@@ -1770,6 +1770,8 @@ pub struct StreamContext {
     code_execution: Option<crate::model::config::CodeExecutionConfig>,
     /// Whether at least one code execution server-tool result was emitted.
     code_execution_handled: bool,
+    /// Completed code execution calls waiting for the caller to run them off the async worker.
+    pending_code_executions: Vec<super::code_execution::PendingCodeExecution>,
 }
 
 impl StreamContext {
@@ -1960,6 +1962,7 @@ impl StreamContext {
             structured_output: None,
             code_execution: None,
             code_execution_handled: false,
+            pending_code_executions: Vec::new(),
         }
     }
 
@@ -3862,7 +3865,10 @@ impl StreamContext {
                 .code_execution
                 .clone()
                 .expect("code execution config checked above");
-            events.extend(self.emit_code_execution_result(input, &config));
+            // Running a process here would block the async worker; the caller runs it through
+            // `take_pending_code_executions` / `complete_code_execution` before the next event.
+            self.pending_code_executions
+                .push(super::code_execution::PendingCodeExecution { input, config });
             return events;
         }
 
@@ -3964,13 +3970,29 @@ impl StreamContext {
         events
     }
 
+    /// Code execution calls completed by the last processed event, in order.
+    pub fn take_pending_code_executions(
+        &mut self,
+    ) -> Vec<super::code_execution::PendingCodeExecution> {
+        std::mem::take(&mut self.pending_code_executions)
+    }
+
+    /// Emits the server-tool pair for a call returned by [`Self::take_pending_code_executions`].
+    pub fn complete_code_execution(
+        &mut self,
+        input: serde_json::Value,
+        result: super::code_execution::ExecutionResult,
+    ) -> Vec<SseEvent> {
+        let events = self.emit_code_execution_result(input, &result);
+        self.apply_output_filters(events)
+    }
+
     fn emit_code_execution_result(
         &mut self,
         input: serde_json::Value,
-        config: &crate::model::config::CodeExecutionConfig,
+        result: &super::code_execution::ExecutionResult,
     ) -> Vec<SseEvent> {
         let server_id = envelope::server_tool_use_id();
-        let result = super::code_execution::execute(&input, config);
         self.code_execution_handled = true;
         self.state_manager.set_stop_reason("end_turn");
         let server_index = self.state_manager.next_block_index();
@@ -4013,7 +4035,7 @@ impl StreamContext {
             json!({
                 "type": "content_block_start",
                 "index": result_index,
-                "content_block": super::code_execution::result_block(&server_id, &result)
+                "content_block": super::code_execution::result_block(&server_id, result)
             }),
         ));
         if let Some(stop) = self.state_manager.handle_content_block_stop(result_index) {
@@ -4154,6 +4176,13 @@ impl StreamContext {
         } else if self.stream_error.is_none() {
             events.extend(self.flush_incomplete_tool_input_buffers());
             events.extend(self.flush_pending_tool_starts());
+            // The streaming caller drains after every event, so only a call flushed here at EOF
+            // can still be pending; its input never arrived. Never spawn a process on this path.
+            for pending in std::mem::take(&mut self.pending_code_executions) {
+                let result =
+                    super::code_execution::failure("code execution input was not received");
+                events.extend(self.emit_code_execution_result(pending.input, &result));
+            }
         } else {
             // errmm-12：流以错误结束时，input 不完整的工具调用不能被当成完整调用补全。
             // 未开块的直接丢弃；已开块的在下面保持打开，下游只会看到 error 事件。
@@ -5285,6 +5314,13 @@ mod tests {
             input: r#"_STREAM')","language":"python"}"#.to_string(),
             stop: true,
         }));
+        // The context only records the call; the caller runs it off the async worker.
+        let pending = ctx.take_pending_code_executions();
+        assert_eq!(pending.len(), 1);
+        for pending in pending {
+            let result = super::super::code_execution::execute(&pending.input, &pending.config);
+            events.extend(ctx.complete_code_execution(pending.input, result));
+        }
         events.extend(ctx.generate_final_events());
 
         let server_start = events

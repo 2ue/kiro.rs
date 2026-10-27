@@ -10016,6 +10016,35 @@ mod tests {
     }
 
     #[test]
+    fn config_example_load_keeps_prompt_injection_and_route_features() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let example_path = std::path::Path::new(manifest_dir).join("config.example.json");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&example_path).unwrap()).unwrap();
+        let expected_injection: super::super::prompt_injection::PromptInjectionConfig =
+            serde_json::from_value(raw["promptInjection"].clone()).unwrap();
+        let expected_route_features: super::super::prompt_injection::RouteFeaturesConfig =
+            serde_json::from_value(raw["routeFeatures"].clone()).unwrap();
+
+        // Real load path, including legacy prompt field migration.
+        let config = Config::load(&example_path).unwrap();
+        assert_eq!(config.prompt_injection, expected_injection);
+        assert_eq!(config.route_features, expected_route_features);
+        assert_eq!(
+            config.claude_models_only,
+            raw["claudeModelsOnly"].as_bool().unwrap()
+        );
+
+        // Migration-only fields would make the loader rebuild both sections from legacy
+        // defaults and silently discard what the example file says.
+        let mut parsed: Config = serde_json::from_value(raw).unwrap();
+        assert!(
+            !parsed.migrate_legacy_prompt_fields(),
+            "config.example.json must not carry migration-only legacy fields"
+        );
+    }
+
+    #[test]
     fn config_example_bootstraps_desired_reported_usage_defaults() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let example_path = std::path::Path::new(manifest_dir).join("config.example.json");

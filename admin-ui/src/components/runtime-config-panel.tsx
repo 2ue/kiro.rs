@@ -4517,7 +4517,6 @@ export function RuntimeConfigPanel() {
               ['syntheticThinkingSignatures', 'Thinking 兼容签名', 'Kiro 没有原生签名时，为 Claude Code 输出确定性的兼容签名；回放到 Kiro 前会自动剥离。'],
               ['toolPairingRepair', '工具配对修复', '清理不严格配对、重复或孤立的 tool_use/tool_result；不会把被拒绝的结果原文转成普通文本。'],
               ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
-              ['codeExecution', '代码执行（默认关闭）', '仅在路由开启时执行 Anthropic code_execution 的 Python 代码，并返回 bash_code_execution 服务端工具结果。'],
             ].map(([key, title, description]) => (
               <ToggleField
                 key={key}
@@ -4536,6 +4535,24 @@ export function RuntimeConfigPanel() {
                 }
               />
             ))}
+            {/* codeExecution is an object; only the global switch is edited here, route overrides are kept. */}
+            <ToggleField
+              title="代码执行（默认关闭）"
+              description="全局开关：执行 Anthropic code_execution 的 Python 代码，并返回 bash_code_execution 服务端工具结果。按路由的覆盖保持不变。"
+              checked={draft.bodyConversion?.codeExecution?.enabled ?? false}
+              onCheckedChange={(value) =>
+                setDraft((prev) => {
+                  const bodyConversion = normalizeBodyConversion(prev.bodyConversion)
+                  return {
+                    ...prev,
+                    bodyConversion: {
+                      ...bodyConversion,
+                      codeExecution: { ...bodyConversion.codeExecution, enabled: value },
+                    },
+                  }
+                })
+              }
+            />
             <label className="block rounded-md border bg-background p-4">
               <div className="mb-3">
                 <div className="text-sm font-medium">schema key 映射</div>

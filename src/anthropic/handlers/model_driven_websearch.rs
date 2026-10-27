@@ -1,4 +1,4 @@
-//! Model-driven native WebSearch (route switch `bodyConversion.modelDrivenWebSearch`).
+//! Model-driven native WebSearch (route switch `routeFeatures.modelDrivenWebSearch`).
 //!
 //! The official server tool loop is run by the proxy: the model receives `web_search` as an
 //! ordinary tool and decides whether and what to search; each call is executed through Kiro MCP

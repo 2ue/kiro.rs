@@ -3678,6 +3678,10 @@ enum HandlerEventStreamFault {
     /// 200 with an empty EventStream body on every attempt ("ended without any frames").
     EmptyStreamEveryAttempt,
     CompleteToolWithoutStatus,
+    /// Completed call to the Claude Code `StructuredOutput` client tool.
+    StructuredOutputToolUse,
+    /// Completed call to the proxy-internal tool serving an explicit `output_config.format`.
+    InternalStructuredOutputToolUse,
     TwoIdenticalToolsWithoutStatus,
     IncompleteToolWithoutStatus,
     TextThenReadError,
@@ -4063,6 +4067,28 @@ async fn handler_eventstream_fault_upstream(
                     "name":"Bash",
                     "toolUseId":"toolu_legacy_terminal",
                     "input":"{\"command\":\"printf legacy-tool-ok\"}",
+                    "stop":true
+                }),
+            ))
+        }
+        HandlerEventStreamFault::StructuredOutputToolUse => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"StructuredOutput",
+                    "toolUseId":"toolu_structured_cli",
+                    "input":"{\"answer\":\"cli-structured-ok\"}",
+                    "stop":true
+                }),
+            ))
+        }
+        HandlerEventStreamFault::InternalStructuredOutputToolUse => {
+            handler_eventstream_bytes_response(eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"structured_output",
+                    "toolUseId":"toolu_structured_internal",
+                    "input":"{\"answer\":\"format-structured-ok\"}",
                     "stop":true
                 }),
             ))
@@ -6349,6 +6375,192 @@ fn handler_legacy_metadata_metering_and_complete_tool_are_trusted_terminals_for_
     run_handler_fixture_on_large_stack_thread(
         "legacy-terminal-positive-fixture",
         run_handler_legacy_metadata_and_complete_tool_matrix,
+    );
+}
+
+fn structured_output_handler_request(
+    stream: bool,
+    tool_choice: Option<serde_json::Value>,
+    output_format: bool,
+) -> Request<Body> {
+    let mut body = json!({
+        "model":"claude-sonnet-4-20250514",
+        "max_tokens":512,
+        "stream":stream,
+        "messages":[{"role":"user","content":"answer as JSON"}],
+        "output_config":{"effort":"high"},
+        "tools":[{
+            "name":"StructuredOutput",
+            "description":"return the final response as structured JSON",
+            "input_schema":{
+                "type":"object",
+                "properties":{"answer":{"type":"string"}},
+                "required":["answer"]
+            }
+        }]
+    });
+    if let Some(tool_choice) = tool_choice {
+        body["tool_choice"] = tool_choice;
+    }
+    if output_format {
+        body["output_config"]["format"] = json!({
+            "type":"json_schema",
+            "schema":{
+                "type":"object",
+                "properties":{"answer":{"type":"string"}},
+                "required":["answer"]
+            }
+        });
+    }
+    multimodal_handler_request("/cc/v1/messages", body.to_string())
+}
+
+async fn call_structured_output_handler(
+    app: Router,
+    request: Request<Body>,
+) -> (StatusCode, String) {
+    let response = tokio::time::timeout(Duration::from_secs(5), app.oneshot(request))
+        .await
+        .expect("structured output handler response timed out")
+        .expect("structured output handler response");
+    let status = response.status();
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await
+    .expect("structured output body timed out")
+    .expect("read structured output body");
+    (
+        status,
+        String::from_utf8(body.to_vec()).expect("UTF-8 body"),
+    )
+}
+
+fn upstream_tool_names(upstream: &HandlerEventStreamFaultUpstream) -> Vec<String> {
+    upstream
+        .bodies_snapshot()
+        .iter()
+        .flat_map(|body| {
+            body.pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools",
+            )
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool.pointer("/toolSpecification/name"))
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+async fn run_structured_output_client_tool_matrix() {
+    for stream in [false, true] {
+        // Claude Code shape: the StructuredOutput tool_use reaches the client unchanged.
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::StructuredOutputToolUse,
+        )
+        .await;
+        let (app, _) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, body) = call_structured_output_handler(
+            app,
+            structured_output_handler_request(stream, None, false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "stream={stream} body={body}");
+        assert!(
+            body.contains(r#""type":"tool_use""#),
+            "stream={stream} body={body}"
+        );
+        assert!(
+            body.contains(r#""name":"StructuredOutput""#),
+            "stream={stream} body={body}"
+        );
+        assert!(
+            body.contains(r#""stop_reason":"tool_use""#),
+            "stream={stream} body={body}"
+        );
+        assert!(
+            body.contains("cli-structured-ok"),
+            "stream={stream} body={body}"
+        );
+        assert!(
+            !body.contains(r#""type":"text""#),
+            "the client tool call must not become a text block: stream={stream} body={body}"
+        );
+        assert_eq!(
+            upstream_tool_names(&upstream),
+            ["StructuredOutput"],
+            "no internal duplicate tool is sent upstream"
+        );
+
+        // An explicit client tool_choice none is kept: no tool is offered upstream and the
+        // plain answer comes back as text.
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody)
+                .await;
+        let (app, _) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, body) = call_structured_output_handler(
+            app,
+            structured_output_handler_request(stream, Some(json!({"type":"none"})), false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "none stream={stream} body={body}");
+        assert!(
+            upstream_tool_names(&upstream).is_empty(),
+            "none must not be forced to a tool"
+        );
+        assert!(
+            !body.contains(r#""type":"tool_use""#),
+            "none stream={stream} body={body}"
+        );
+        assert!(
+            body.contains("recovered-ok"),
+            "none stream={stream} body={body}"
+        );
+        assert!(
+            body.contains(r#""stop_reason":"end_turn""#),
+            "none stream={stream} body={body}"
+        );
+
+        // Explicit output_config.format keeps the internal-tool rewrite into JSON text.
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::InternalStructuredOutputToolUse,
+        )
+        .await;
+        let (app, _) = handler_eventstream_fault_router(&upstream.base_url);
+        let (status, body) = call_structured_output_handler(
+            app,
+            structured_output_handler_request(stream, None, true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "format stream={stream} body={body}");
+        assert!(
+            !body.contains(r#""type":"tool_use""#),
+            "format stream={stream} body={body}"
+        );
+        assert!(
+            body.contains("format-structured-ok"),
+            "format stream={stream} body={body}"
+        );
+        assert!(
+            body.contains(r#""stop_reason":"end_turn""#),
+            "format stream={stream} body={body}"
+        );
+        assert_eq!(
+            upstream_tool_names(&upstream),
+            ["StructuredOutput", "structured_output"]
+        );
+    }
+}
+
+#[test]
+fn structured_output_client_tool_passes_through_and_format_still_rewrites() {
+    run_handler_fixture_on_large_stack_thread(
+        "structured-output-client-tool-fixture",
+        run_structured_output_client_tool_matrix,
     );
 }
 
