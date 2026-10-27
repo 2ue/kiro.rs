@@ -1,8 +1,12 @@
-//! Anthropic structured outputs (`output_config.format`) on the local Kiro path.
+//! Anthropic structured outputs on the local Kiro path.
 //!
 //! Kiro has no JSON-schema output mode, so the schema is offered to the model as an internal tool
 //! whose input is the final answer. The response side turns that tool call back into one plain
 //! `text` block holding the JSON, with `stop_reason: end_turn`, the shape the official API returns.
+//!
+//! Claude Code currently advertises structured output as a `StructuredOutput` tool whose
+//! `input_schema` is the requested schema. Anthropic's direct API uses `output_config.format`;
+//! both forms are normalized to the same internal response rewrite.
 //!
 //! - Without callable client tools the internal tool is forced (`tool_choice: tool`).
 //! - With client tools the model must either call one of them or give the structured answer
@@ -31,28 +35,56 @@ pub(crate) struct StructuredOutputTarget {
 }
 
 /// Returns the request to convert and the response target when the request asks for structured
-/// output. `None` keeps the request unchanged (no `format`, or a format this path cannot serve).
+/// output. `None` keeps the request unchanged.
 pub(crate) fn plan(payload: &MessagesRequest) -> Option<(MessagesRequest, StructuredOutputTarget)> {
     // `output_config.format` wins; the deprecated top-level `output_format` is the fallback.
     let format = payload
         .output_config
         .as_ref()
         .and_then(|config| config.format.as_ref())
-        .or(payload.output_format.as_ref())?;
-    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
-        tracing::debug!("output_config.format without json_schema type is ignored");
+        .or(payload.output_format.as_ref());
+    let schema = format
+        .filter(|format| format.get("type").and_then(Value::as_str) == Some("json_schema"))
+        .and_then(|format| format.get("schema").and_then(Value::as_object))
+        .cloned();
+    if format.is_some() && schema.is_none() {
+        tracing::debug!("output_config.format is not a usable json_schema; ignored");
         return None;
     }
-    let Some(schema) = format.get("schema").and_then(Value::as_object) else {
-        tracing::debug!("output_config.format.schema is not an object; ignored");
-        return None;
-    };
 
+    // Claude Code 2.1.x sends `output_config.effort` plus a `StructuredOutput` tool. In this
+    // shape the tool itself is the schema carrier; reuse it instead of appending a duplicate.
+    let cli_structured_tool = (schema.is_none())
+        .then(|| {
+            payload
+                .tools
+                .iter()
+                .flatten()
+                .find(|tool| is_structured_output_tool_name(&tool.name))
+        })
+        .flatten();
+    let schema = schema.or_else(|| {
+        cli_structured_tool.map(|tool| {
+            tool.input_schema
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+    })?;
+    if cli_structured_tool.is_some() && schema.is_empty() {
+        tracing::debug!("structured output schema is empty; ignored");
+        return None;
+    }
+
+    let existing_tool_name = cli_structured_tool.map(|tool| tool.name.clone());
     let client_tools: Vec<&Tool> = payload
         .tools
         .iter()
         .flatten()
-        .filter(|tool| tool.tool_type.is_none() || tool.input_schema.contains_key("type"))
+        .filter(|tool| {
+            Some(tool.name.as_str()) != existing_tool_name.as_deref()
+                && (tool.tool_type.is_none() || tool.input_schema.contains_key("type"))
+        })
         .collect();
     let client_choice = payload
         .tool_choice
@@ -60,22 +92,23 @@ pub(crate) fn plan(payload: &MessagesRequest) -> Option<(MessagesRequest, Struct
         .and_then(|choice| choice.get("type"))
         .and_then(Value::as_str);
     let forced = client_tools.is_empty() || client_choice == Some("none");
-    let tool_name = unused_tool_name(payload);
+    let tool_name = existing_tool_name
+        .clone()
+        .unwrap_or_else(|| unused_tool_name(payload));
 
     let mut request = payload.clone();
-    request.tools.get_or_insert_with(Vec::new).push(Tool {
-        tool_type: None,
-        name: tool_name.clone(),
-        description: TOOL_DESCRIPTION.to_string(),
-        input_schema: schema
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<HashMap<_, _>>(),
-        max_uses: None,
-        allowed_domains: None,
-        blocked_domains: None,
-        cache_control: None,
-    });
+    if existing_tool_name.is_none() {
+        request.tools.get_or_insert_with(Vec::new).push(Tool {
+            tool_type: None,
+            name: tool_name.clone(),
+            description: TOOL_DESCRIPTION.to_string(),
+            input_schema: schema.into_iter().collect::<HashMap<_, _>>(),
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None,
+            cache_control: None,
+        });
+    }
     if forced {
         request.tool_choice = Some(json!({"type": "tool", "name": tool_name}));
     } else if client_choice != Some("tool") {
@@ -90,6 +123,10 @@ pub(crate) fn plan(payload: &MessagesRequest) -> Option<(MessagesRequest, Struct
         request.tool_choice = Some(choice);
     }
     Some((request, StructuredOutputTarget { tool_name, forced }))
+}
+
+fn is_structured_output_tool_name(name: &str) -> bool {
+    name == "StructuredOutput" || name == "structured_output"
 }
 
 fn unused_tool_name(payload: &MessagesRequest) -> String {
@@ -384,12 +421,87 @@ mod tests {
     }
 
     #[test]
+    fn plan_accepts_claude_code_structured_output_tool_without_format() {
+        let req = request(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Return JSON."}],
+            "output_config": {"effort": "high"},
+            "tools": [{
+                "name": "Bash",
+                "description": "Run a command",
+                "input_schema": {"type": "object", "properties": {}}
+            }, {
+                "name": "StructuredOutput",
+                "description": "return the final response as structured JSON",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"]
+                }
+            }]
+        }));
+        let (converted, target) = plan(&req).expect("structured plan");
+        assert_eq!(target.tool_name, "StructuredOutput");
+        assert!(
+            !target.forced,
+            "Bash remains callable alongside the schema tool"
+        );
+        assert_eq!(converted.tools.as_ref().expect("tools").len(), 2);
+        assert_eq!(
+            converted.tools.as_ref().unwrap()[1].name,
+            "StructuredOutput"
+        );
+        assert_eq!(
+            converted.tools.as_ref().unwrap()[1].input_schema["type"],
+            "object"
+        );
+        assert_eq!(converted.tool_choice, Some(json!({"type": "any"})));
+    }
+
+    #[test]
+    fn plan_accepts_lowercase_cli_structured_output_tool_without_duplicate() {
+        let req = request(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Return JSON."}],
+            "tools": [{
+                "name": "structured_output",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}}
+                }
+            }]
+        }));
+        let (converted, target) = plan(&req).expect("structured plan");
+        assert_eq!(target.tool_name, "structured_output");
+        assert!(target.forced);
+        assert_eq!(converted.tools.as_ref().expect("tools").len(), 1);
+        assert_eq!(
+            converted.tool_choice,
+            Some(json!({"type": "tool", "name": "structured_output"}))
+        );
+    }
+
+    #[test]
     fn plan_ignores_requests_without_json_schema_format() {
         let mut req = schema_request(None);
         req.output_config.as_mut().unwrap().format = Some(json!({"type": "text"}));
         assert!(plan(&req).is_none());
         req.output_config.as_mut().unwrap().format = None;
         assert!(plan(&req).is_none());
+    }
+
+    #[test]
+    fn plan_keeps_an_empty_json_schema_as_a_valid_direct_format() {
+        let mut req = schema_request(None);
+        req.output_config.as_mut().unwrap().format = Some(json!({
+            "type": "json_schema",
+            "schema": {}
+        }));
+        let (converted, target) = plan(&req).expect("empty JSON schema is still an object schema");
+        assert!(target.forced);
+        assert_eq!(converted.tools.expect("tools")[0].input_schema.len(), 0);
     }
 
     #[test]
