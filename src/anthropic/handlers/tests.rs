@@ -40,7 +40,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Mutex as StdMutex, atomic::AtomicUsize};
@@ -6153,6 +6153,93 @@ async fn run_handler_non_stream_usage_only_eof_should_not_retry_matrix() {
             "round={round}"
         );
     }
+}
+
+/// Usage-only turns are retried up to kiroUpstreamStreamRetryMaxAttempts (first call included),
+/// on another account each time, for both streaming and non-streaming; once the cap is used the
+/// request still fails closed instead of returning an empty success.
+async fn run_usage_only_retries_up_to_shared_attempt_cap() {
+    for (stream, label) in [(true, "stream"), (false, "non-stream")] {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
+                .await;
+        let (app, usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 8, 8, |config| {
+                config.kiro_upstream_stream_retry_max_attempts = 6;
+                config.inference_upstream_max_attempts = 10;
+            });
+        let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+        assert_eq!(
+            upstream.hits(),
+            6,
+            "{label}: six attempts in total, first call included"
+        );
+        if stream {
+            assert_eq!(status, StatusCode::OK, "{label} body={body}");
+            assert_eq!(
+                body.matches("event: error").count(),
+                1,
+                "{label} body={body}"
+            );
+            assert!(!body.contains(r#""stop_reason":"end_turn""#), "{label}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} body={body}");
+        }
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        let accounts: HashSet<_> = record
+            .credential_attempts
+            .iter()
+            .map(|attempt| attempt.credential_id)
+            .collect();
+        assert_eq!(
+            accounts.len(),
+            6,
+            "{label}: every retry moves to another account"
+        );
+
+        // The request budget still bounds the retries when it is lower than the retry cap.
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
+                .await;
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 8, 8, |config| {
+                config.kiro_upstream_stream_retry_max_attempts = 6;
+                config.inference_upstream_max_attempts = 3;
+            });
+        let _ = call_handler_eventstream_fault(app, stream).await;
+        assert_eq!(
+            upstream.hits(),
+            3,
+            "{label}: capped by inferenceUpstreamMaxAttempts"
+        );
+
+        // A later attempt that answers ends the retries and succeeds.
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::UsageOnlyMeteringNoStatus,
+        )
+        .await;
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 8, 8, |config| {
+                config.kiro_upstream_stream_retry_max_attempts = 6;
+            });
+        let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
+        assert_eq!(status, StatusCode::OK, "{label} body={body}");
+        assert!(body.contains("recovered-ok"), "{label} body={body}");
+        assert_eq!(upstream.hits(), 2, "{label}");
+    }
+}
+
+#[test]
+fn usage_only_retries_up_to_shared_attempt_cap() {
+    run_handler_fixture_on_large_stack_thread(
+        "usage-only-shared-attempt-cap",
+        run_usage_only_retries_up_to_shared_attempt_cap,
+    );
+}
+
+#[test]
+fn default_pre_output_retry_cap_is_six() {
+    assert_eq!(Config::default().kiro_upstream_stream_retry_max_attempts, 6);
 }
 
 #[test]

@@ -4879,9 +4879,11 @@ pub struct Config {
     #[serde(default = "default_kiro_upstream_stream_retry_enabled")]
     pub kiro_upstream_stream_retry_enabled: bool,
 
-    /// 单个流式请求在“未向下游提交”窗口内最多尝试多少次上游流。
+    /// 单个请求在“未向下游提交”窗口内最多尝试多少次上游（包含首次调用；默认 6）。
     ///
-    /// 包含首次调用；默认 2 表示最多补一次重试。0/1 都等价于不额外重试。
+    /// 流式和非流式共用，覆盖所有首输出前重试：流读取错误、流静默/首输出超时、2xx 错误事件、
+    /// EventStream 不完整，以及只有 usage/metadata 的空轮次。实际发送次数同时受
+    /// `inferenceUpstreamMaxAttempts` 约束。0/1 都等价于不额外重试。
     #[serde(default = "default_kiro_upstream_stream_retry_max_attempts")]
     pub kiro_upstream_stream_retry_max_attempts: u32,
 
@@ -5490,8 +5492,13 @@ fn default_kiro_upstream_stream_retry_enabled() -> bool {
     true
 }
 
+/// Default cap on pre-output upstream attempts, first call included. Shared by every pre-output
+/// retry: stream read errors, idle and first-output timeouts, 2xx error events, incomplete
+/// EventStreams and usage-only (empty) turns, streaming and non-streaming alike.
+pub(crate) const DEFAULT_KIRO_UPSTREAM_STREAM_RETRY_MAX_ATTEMPTS: u32 = 6;
+
 fn default_kiro_upstream_stream_retry_max_attempts() -> u32 {
-    2
+    DEFAULT_KIRO_UPSTREAM_STREAM_RETRY_MAX_ATTEMPTS
 }
 
 /// 狂暴模式轮数上限。
@@ -7331,7 +7338,7 @@ mod tests {
         assert_eq!(config.stream_pre_output_hold_secs, 15);
         assert_eq!(config.stream_first_output_timeout_secs, 0);
         assert!(config.kiro_upstream_stream_retry_enabled);
-        assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 2);
+        assert_eq!(config.kiro_upstream_stream_retry_max_attempts, 6);
         assert!(config.kiro_upstream_stream_retry_on_idle_timeout);
         assert!(config.kiro_upstream_stream_retry_on_read_error);
         assert!(config.kiro_upstream_stream_retry_on_status_error);

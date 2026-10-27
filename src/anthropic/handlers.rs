@@ -1057,7 +1057,8 @@ impl RequestRuntimeConfig {
             stream_pre_output_hold_secs: DEFAULT_STREAM_PRE_OUTPUT_HOLD_SECS,
             stream_first_output_timeout_secs: DEFAULT_STREAM_FIRST_OUTPUT_TIMEOUT_SECS,
             kiro_upstream_stream_retry_enabled: true,
-            kiro_upstream_stream_retry_max_attempts: 2,
+            kiro_upstream_stream_retry_max_attempts:
+                crate::model::config::DEFAULT_KIRO_UPSTREAM_STREAM_RETRY_MAX_ATTEMPTS,
             inference_upstream_max_attempts: DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
             auxiliary_upstream_max_attempts: DEFAULT_AUXILIARY_UPSTREAM_MAX_ATTEMPTS,
             kiro_upstream_stream_retry_on_idle_timeout: true,
@@ -11754,10 +11755,15 @@ fn create_sse_stream(
                                     if detail
                                         == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL =>
                                 {
-                                    if !state.downstream_committed && !state.usage_only_retried {
-                                        state.usage_only_retried = true;
-                                        if let Some(plan) = state.retry_plan.as_mut() {
-                                            prepare_usage_only_stream_retry_plan(plan);
+                                    // Usage-only turns are retried before any output, each time on another
+                                    // account with the continue nudge, until the shared
+                                    // kiroUpstreamStreamRetryMaxAttempts cap (and the request budget) runs out.
+                                    if !state.downstream_committed {
+                                        if !state.usage_only_retried {
+                                            state.usage_only_retried = true;
+                                            if let Some(plan) = state.retry_plan.as_mut() {
+                                                prepare_usage_only_stream_retry_plan(plan);
+                                            }
                                         }
                                         match retry_stream_before_downstream_commit(
                                             state,
@@ -11780,9 +11786,9 @@ fn create_sse_stream(
                                         attempt = state.attempt_number,
                                         "重试后上游仍只返回 usage/metadata，按失败终态返回"
                                     );
-                                    // Do not let the generic protocol-error retry path send a
-                                    // third request: this is already the terminal result of the
-                                    // dedicated usage-only retry policy.
+                                    // Do not let the generic protocol-error retry path send yet
+                                    // another request: the usage-only retries above have already
+                                    // used the shared attempt cap.
                                     state.retry_plan = None;
                                     Some(detail)
                                 }
@@ -12896,7 +12902,6 @@ async fn handle_non_stream_request(
         }
     };
     let mut non_stream_status_retry_attempt = 1_u32;
-    let mut usage_only_retried = false;
     let (credential_usage, completion, upstream_events) = loop {
         usage_context.mark_upstream_header();
         let credential_attempts = merge_credential_attempts(
@@ -13155,14 +13160,13 @@ async fn handle_non_stream_request(
             }
         }
 
-        // 与流式一致：上游只返回 usage/metadata 时，带续写提示重试一次；仍为空则失败。
-        if !usage_only_retried
-            && stream_retry_config.active()
+        // 与流式一致：上游只返回 usage/metadata 时换号并带续写提示重试，次数与其他首输出前重试
+        // 共用 kiroUpstreamStreamRetryMaxAttempts（同时受单请求推理发送上限约束）；用完仍为空则失败。
+        if stream_retry_config.active()
             && stream_retry_config.allows(StreamRetryReason::UsageOnly)
             && non_stream_status_retry_attempt < stream_retry_config.max_attempts
             && non_stream_events_are_usage_only(&upstream_events)
         {
-            usage_only_retried = true;
             if let Some((retry_body, retry_request)) = usage_only_retry_request(
                 request_body,
                 Some(kiro_request),
@@ -13173,7 +13177,8 @@ async fn handle_non_stream_request(
                     request_id = %request_id,
                     attempt = non_stream_status_retry_attempt,
                     next_attempt,
-                    "本地 Kiro 非流式响应只返回 usage/metadata，带续写提示重试一次"
+                    max_attempts = stream_retry_config.max_attempts,
+                    "本地 Kiro 非流式响应只返回 usage/metadata，带续写提示换号重试"
                 );
                 retry_attempt_prefix =
                     merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());

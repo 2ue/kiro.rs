@@ -471,7 +471,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   streamPreOutputHoldSecs: 15,
   streamFirstOutputTimeoutSecs: 0,
   kiroUpstreamStreamRetryEnabled: true,
-  kiroUpstreamStreamRetryMaxAttempts: 2,
+  kiroUpstreamStreamRetryMaxAttempts: 6,
   inferenceUpstreamMaxAttempts: 4,
   auxiliaryUpstreamMaxAttempts: 2,
   auxiliaryUpstreamMaxConcurrentRequests: 16,

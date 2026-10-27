@@ -506,7 +506,7 @@ const emptyConfig: RuntimeConfig = {
   streamPreOutputHoldSecs: 15,
   streamFirstOutputTimeoutSecs: 0,
   kiroUpstreamStreamRetryEnabled: true,
-  kiroUpstreamStreamRetryMaxAttempts: 2,
+  kiroUpstreamStreamRetryMaxAttempts: 6,
   inferenceUpstreamMaxAttempts: 4,
   auxiliaryUpstreamMaxAttempts: 2,
   auxiliaryUpstreamMaxConcurrentRequests: 16,
@@ -4045,7 +4045,7 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="首输出前最多尝试"
-              description="包含第一次调用；默认 2。只用于流读取错误、流静默超时或 2xx JSON 错误体等首输出前失败。"
+              description="包含第一次调用；默认 6。流式和非流式共用，覆盖首输出前的流读取错误、静默或首输出超时、2xx 错误事件、EventStream 不完整和空回（只有用量统计）。实际次数还受下方推理发送硬上限约束。"
               value={draft.kiroUpstreamStreamRetryMaxAttempts}
               min={1}
               max={100}
