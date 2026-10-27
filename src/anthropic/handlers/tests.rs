@@ -4288,6 +4288,23 @@ fn handler_eventstream_fault_router_with_external(
     configure: impl FnOnce(&mut Config),
     external_pool_manager: Option<Arc<ExternalPoolManager>>,
 ) -> (Router, Arc<UsageRecorder>) {
+    let (router, usage_recorder, _manager) = handler_eventstream_fault_router_with_manager(
+        base_url,
+        credential_count,
+        credential_retry_max_attempts,
+        configure,
+        external_pool_manager,
+    );
+    (router, usage_recorder)
+}
+
+fn handler_eventstream_fault_router_with_manager(
+    base_url: &str,
+    credential_count: u64,
+    credential_retry_max_attempts: u32,
+    configure: impl FnOnce(&mut Config),
+    external_pool_manager: Option<Arc<ExternalPoolManager>>,
+) -> (Router, Arc<UsageRecorder>, Arc<MultiTokenManager>) {
     assert!(credential_count > 0);
     let mut config = Config::default();
     config.kiro_upstream_base_url = Some(base_url.to_string());
@@ -4327,7 +4344,7 @@ fn handler_eventstream_fault_router_with_external(
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
     let provider = Arc::new(KiroProvider::with_proxy(
-        manager,
+        manager.clone(),
         None,
         endpoints,
         "ide".to_string(),
@@ -4349,7 +4366,7 @@ fn handler_eventstream_fault_router_with_external(
         },
         AnthropicRouterConfig::from_runtime_config(&config),
     );
-    (router, usage_recorder)
+    (router, usage_recorder, manager)
 }
 
 fn handler_eventstream_fault_router(base_url: &str) -> (Router, Arc<UsageRecorder>) {
@@ -6163,11 +6180,16 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
         let upstream =
             HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
                 .await;
-        let (app, usage_recorder) =
-            handler_eventstream_fault_router_with_config(&upstream.base_url, 8, 8, |config| {
+        let (app, usage_recorder, token_manager) = handler_eventstream_fault_router_with_manager(
+            &upstream.base_url,
+            8,
+            8,
+            |config| {
                 config.kiro_upstream_stream_retry_max_attempts = 6;
                 config.inference_upstream_max_attempts = 10;
-            });
+            },
+            None,
+        );
         let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
         assert_eq!(
             upstream.hits(),
@@ -6195,6 +6217,18 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
             accounts.len(),
             6,
             "{label}: every retry moves to another account"
+        );
+        let cooled: Vec<_> = token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.cooled_down || entry.last_error_reason.is_some())
+            .map(|entry| (entry.id, entry.cooldown_reason, entry.last_error_reason))
+            .collect();
+        assert!(
+            cooled.is_empty(),
+            "{label}: an empty turn depends on the request, so no account is cooled down or \
+             charged an error: {cooled:?}"
         );
 
         // The request budget still bounds the retries when it is lower than the retry cap.
@@ -6234,6 +6268,150 @@ fn usage_only_retries_up_to_shared_attempt_cap() {
     run_handler_fixture_on_large_stack_thread(
         "usage-only-shared-attempt-cap",
         run_usage_only_retries_up_to_shared_attempt_cap,
+    );
+}
+
+fn request_capture_test_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "kiro-handler-request-capture-{}",
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+async fn read_capture_records(dir: &std::path::Path, count: usize) -> Vec<Value> {
+    for _ in 0..300 {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut files: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+            if files.len() >= count {
+                files.sort();
+                return files
+                    .iter()
+                    .map(|file| serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap())
+                    .collect();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected {count} capture records in {}", dir.display());
+}
+
+/// A request that stays usage-only until the retries run out is written to the capture dir with
+/// both bodies, so it can be replayed; capture is off by default.
+async fn run_usage_only_failure_is_captured_for_replay() {
+    for stream in [true, false] {
+        let dir = request_capture_test_dir();
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
+                .await;
+        let capture_dir = dir.display().to_string();
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 4, 4, |config| {
+                config.kiro_upstream_stream_retry_max_attempts = 3;
+                config.request_capture.enabled = true;
+                config.request_capture.dir = capture_dir;
+            });
+        let (_status, request_id, _body) = call_handler_eventstream_fault(app, stream).await;
+        assert_eq!(upstream.hits(), 3, "stream={stream}");
+        let records = read_capture_records(&dir.join("usage-only"), 1).await;
+        let record = &records[0];
+        assert_eq!(record["kind"], "usage_only");
+        assert_eq!(record["requestId"], request_id);
+        assert_eq!(record["stream"], stream);
+        assert_eq!(record["attempts"], 3, "stream={stream}");
+        assert_eq!(
+            record["clientBody"]["messages"][0]["content"], "exercise the EventStream fixture",
+            "stream={stream}"
+        );
+        assert!(
+            record["kiroBody"]["conversationState"].is_object(),
+            "stream={stream} record={record}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Off by default: nothing is written.
+    let dir = request_capture_test_dir();
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::UsageOnlyEveryAttempt)
+            .await;
+    let capture_dir = dir.display().to_string();
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 4, 4, |config| {
+            config.request_capture.dir = capture_dir;
+        });
+    let _ = call_handler_eventstream_fault(app, true).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!dir.exists(), "capture is disabled by default");
+}
+
+#[test]
+fn usage_only_failure_is_captured_for_replay() {
+    run_handler_fixture_on_large_stack_thread(
+        "usage-only-request-capture",
+        run_usage_only_failure_is_captured_for_replay,
+    );
+}
+
+/// A tool_choice request records the reply the client got; `display: "updates"` (sent by Claude
+/// Code) hides reasoning text the same way `omitted` does.
+async fn run_tool_choice_reply_capture_and_updates_display() {
+    for stream in [true, false] {
+        let dir = request_capture_test_dir();
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::ReasoningOnlyNoStatus)
+                .await;
+        let capture_dir = dir.display().to_string();
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 2, 2, |config| {
+                config.request_capture.enabled = true;
+                config.request_capture.dir = capture_dir;
+            });
+        let request = multimodal_handler_request(
+            "/cc/v1/messages",
+            json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 2048,
+                "stream": stream,
+                "thinking": {"type": "adaptive", "display": "updates"},
+                "tool_choice": {"type": "none"},
+                "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "say hi"}]
+            })
+            .to_string(),
+        );
+        let response = tokio::time::timeout(Duration::from_secs(5), app.oneshot(request))
+            .await
+            .expect("response timed out")
+            .expect("response");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("partial upstream reasoning"),
+            "stream={stream}: updates display must hide reasoning text: {body}"
+        );
+        let records = read_capture_records(&dir.join("tool-choice"), 1).await;
+        let record = &records[0];
+        assert_eq!(record["kind"], "tool_choice");
+        assert_eq!(record["toolChoice"], json!({"type": "none"}));
+        assert_eq!(record["stream"], stream);
+        assert!(
+            record["injections"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "toolChoicePrefix")),
+            "stream={stream} record={record}"
+        );
+        assert_eq!(record["leakMarkers"], json!([]), "stream={stream}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn tool_choice_reply_capture_and_updates_display() {
+    run_handler_fixture_on_large_stack_thread(
+        "tool-choice-request-capture",
+        run_tool_choice_reply_capture_and_updates_display,
     );
 }
 
@@ -7659,6 +7837,7 @@ fn runtime_config_for_payload_guard(
         missing_max_tokens: MissingMaxTokensConfig::default(),
         payload_shaping: PayloadShapingConfig::default(),
         external_pools: ExternalPoolsConfig::default(),
+        request_capture: crate::model::config::RequestCaptureConfig::default(),
     }
 }
 
@@ -9132,6 +9311,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache,
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -9249,6 +9429,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
     let usage_context = RequestUsageContext {
         recorder: Arc::new(UsageRecorder::new(10)),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -9344,6 +9525,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
     let usage_context = RequestUsageContext {
         recorder: Arc::new(UsageRecorder::new(10)),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -9444,6 +9626,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -9579,6 +9762,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -9664,6 +9848,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
     let usage_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -9813,6 +9998,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
     let mut usage_context = RequestUsageContext {
         recorder: Arc::new(UsageRecorder::new(10)),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -10152,6 +10338,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
     let v1_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: prompt_cache.clone(),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -10328,6 +10515,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder,
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -10439,6 +10627,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache,
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -10530,6 +10719,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder.clone(),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -11348,6 +11538,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder,
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: prompt_cache.clone(),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -11452,6 +11643,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
     let usage_context = RequestUsageContext {
         recorder: usage_recorder,
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: prompt_cache.clone(),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -15292,6 +15484,7 @@ fn stable_segment_usage_context(policy: StableSegmentCachePolicy) -> RequestUsag
     RequestUsageContext {
         recorder: Arc::new(UsageRecorder::new(10)),
         tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+        request_capture: None,
         prompt_cache: Arc::new(PromptCacheTracker::default()),
         prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
         pricing_catalog: Arc::new(PricingCatalog::new()),

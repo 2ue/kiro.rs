@@ -1918,6 +1918,7 @@ pub struct RuntimeConfigResponse {
     pub route_features: RouteFeaturesConfig,
     pub claude_models_only: bool,
     pub missing_max_tokens: MissingMaxTokensConfig,
+    pub request_capture: crate::model::config::RequestCaptureConfig,
     pub payload_guard_enabled: bool,
     pub payload_guard_mode: PayloadGuardMode,
     pub payload_guard_max_bytes: u64,
@@ -2122,6 +2123,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub prompt_steering: Option<serde_json::Value>,
     #[serde(default)]
     pub missing_max_tokens: Option<MissingMaxTokensConfig>,
+    #[serde(default)]
+    pub request_capture: Option<crate::model::config::RequestCaptureConfig>,
     #[serde(default)]
     pub payload_guard_enabled: Option<bool>,
     #[serde(default)]

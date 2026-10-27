@@ -2071,6 +2071,16 @@ export interface MissingMaxTokensConfig {
   defaultValue: number
 }
 
+/** Targeted request capture for offline replay (files under `dir`, off by default). */
+export interface RequestCaptureConfig {
+  enabled: boolean
+  dir: string
+  usageOnly: boolean
+  toolChoice: boolean
+  maxFiles: number
+  maxBodyBytes: number
+}
+
 export interface RequestAdmissionConfig {
   rpm: number
   maxConcurrentRequests: number
@@ -2177,6 +2187,7 @@ export interface RuntimeConfig {
   routeFeatures: RouteFeaturesConfig
   claudeModelsOnly: boolean
   missingMaxTokens: MissingMaxTokensConfig
+  requestCapture: RequestCaptureConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number

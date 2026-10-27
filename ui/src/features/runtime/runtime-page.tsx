@@ -35,6 +35,7 @@ import {
   defaultBodyConversion,
   defaultExternalPoolsConfig,
   defaultMissingMaxTokens,
+  defaultRequestCapture,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
   defaultWeightedCapacity,
@@ -43,6 +44,7 @@ import {
   normalizeBodyConversion,
   normalizeImageProcessing,
   normalizeMissingMaxTokens,
+  normalizeRequestCapture,
   normalizeModelMapping,
   normalizePayloadShaping,
   normalizePromptInjection,
@@ -369,6 +371,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     promptInjection: normalizePromptInjection(draft.promptInjection),
     routeFeatures: normalizeRouteFeatures(draft.routeFeatures),
     missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
+    requestCapture: normalizeRequestCapture(draft.requestCapture),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
@@ -493,6 +496,7 @@ export function RuntimePage() {
         promptInjection: normalizePromptInjection(config.data.promptInjection),
         routeFeatures: normalizeRouteFeatures(config.data.routeFeatures),
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens ?? defaultMissingMaxTokens()),
+        requestCapture: normalizeRequestCapture(config.data.requestCapture),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         externalPools: {
           ...defaultExternalPoolsConfig(),
@@ -569,6 +573,12 @@ export function RuntimePage() {
         ...prev.missingMaxTokens,
         [k]: v,
       },
+    }))
+
+  const setRequestCapture = <K extends keyof RuntimeConfig['requestCapture']>(k: K) => (v: RuntimeConfig['requestCapture'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      requestCapture: { ...defaultRequestCapture(), ...prev.requestCapture, [k]: v },
     }))
 
   const hasDraftChanges = savedDraft !== null && runtimeConfigDraftFingerprint(draft) !== runtimeConfigDraftFingerprint(savedDraft)
@@ -1619,6 +1629,62 @@ export function RuntimePage() {
                   <TogField label="整理思考内容" desc="把响应里的思考内容单独整理出来，方便客户端按固定格式展示。" checked={draft.extractThinking} onChange={set('extractThinking')} />
                   <TogField label="显示处理告警" desc="把代理处理中的提醒返回给客户端，方便排查问题。" checked={draft.exposeProxyWarnings} onChange={set('exposeProxyWarnings')} />
                 </TwoCol>
+                <div className="space-y-4 border-t border-border/70 pt-4">
+                  <TogField
+                    label="请求诊断抓取"
+                    desc="把需要排查的请求写成文件，用于本地回放。文件里有完整请求体，只在排查时打开，用完关闭。"
+                    checked={draft.requestCapture.enabled}
+                    onChange={setRequestCapture('enabled')}
+                  />
+                  <TwoCol>
+                    <TogField
+                      label="抓取空回请求"
+                      desc="首输出前重试用完仍只返回用量统计的本地请求：保存客户端请求体和发给 Kiro 的请求体。"
+                      checked={draft.requestCapture.usageOnly}
+                      disabled={!draft.requestCapture.enabled}
+                      onChange={setRequestCapture('usageOnly')}
+                    />
+                    <TogField
+                      label="抓取 tool_choice 回复"
+                      desc="注入了 tool_choice 指令的请求：保存客户端收到的回复，并标出提到策略或注入的回复。"
+                      checked={draft.requestCapture.toolChoice}
+                      disabled={!draft.requestCapture.enabled}
+                      onChange={setRequestCapture('toolChoice')}
+                    />
+                    <NumField
+                      label="每类最多保留"
+                      desc="空回和 tool_choice 各自的文件数上限，超出后删除最旧的。"
+                      value={draft.requestCapture.maxFiles}
+                      min={1}
+                      max={2000}
+                      suffix="个文件"
+                      disabled={!draft.requestCapture.enabled}
+                      onChange={setRequestCapture('maxFiles')}
+                    />
+                    <NumField
+                      label="单个请求体上限"
+                      desc="每个请求体或回复正文最多保留的字节数，超出部分截断并在文件里标记。"
+                      value={draft.requestCapture.maxBodyBytes}
+                      min={1024}
+                      max={8388608}
+                      suffix="字节"
+                      disabled={!draft.requestCapture.enabled}
+                      onChange={setRequestCapture('maxBodyBytes')}
+                    />
+                  </TwoCol>
+                  <div className="space-y-1.5">
+                    <div className="text-sm font-semibold text-foreground">抓取目录</div>
+                    <div className="text-xs leading-relaxed text-muted-foreground">
+                      工作目录内的相对路径（Docker 中是 /app 下）。空回写到 usage-only/，tool_choice 写到 tool-choice/。
+                    </div>
+                    <Input
+                      className="font-mono text-xs"
+                      value={draft.requestCapture.dir}
+                      disabled={!draft.requestCapture.enabled}
+                      onChange={(e) => setRequestCapture('dir')(e.target.value)}
+                    />
+                  </div>
+                </div>
               </div>
             )}
           </div>

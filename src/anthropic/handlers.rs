@@ -90,8 +90,7 @@ use super::transcript_sanitizer::RESPONSE_PROTOCOL_CONTAMINATION_DETAIL;
 #[cfg(test)]
 use super::types::OutputConfig;
 use super::types::{
-    CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsQuery, ModelsResponse,
-    Thinking, ThinkingDisplay,
+    CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsQuery, ModelsResponse, Thinking,
 };
 use super::usage::{
     ExternalPoolAttempt, ExternalPoolUsageSnapshot, RequestRejectionUsageContext,
@@ -344,6 +343,8 @@ impl CacheHitShapingContext {
 struct RequestUsageContext {
     recorder: Arc<super::usage::UsageRecorder>,
     tool_format_debug_recorder: Arc<ToolFormatDebugRecorder>,
+    /// Targeted request capture for this request; `None` when capture is off.
+    request_capture: Option<Arc<super::request_capture::RequestCaptureSeed>>,
     prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
     prompt_cache_creation_controller:
         Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
@@ -994,6 +995,7 @@ struct RequestRuntimeConfig {
     missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
+    request_capture: crate::model::config::RequestCaptureConfig,
 }
 
 impl RequestRuntimeConfig {
@@ -1072,6 +1074,7 @@ impl RequestRuntimeConfig {
             missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
             external_pools: state.external_pools.clone(),
+            request_capture: crate::model::config::RequestCaptureConfig::default(),
         }
     }
 
@@ -1174,6 +1177,7 @@ impl RequestRuntimeConfig {
             missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
+            request_capture: config.request_capture.normalized(),
         }
     }
 
@@ -3392,6 +3396,34 @@ impl RequestUsageContext {
         }
     }
 
+    fn capture_meta(&self) -> super::request_capture::CaptureRequestMeta<'_> {
+        super::request_capture::CaptureRequestMeta {
+            request_id: &self.request_id,
+            conversation_id: self.conversation_id.as_deref(),
+            endpoint: &self.endpoint,
+            stream: self.stream,
+            model: &self.model,
+            upstream_model: self.upstream_model.as_deref(),
+        }
+    }
+
+    /// Writes the tool_choice capture record for a completed reply (no-op when capture is off).
+    fn capture_tool_choice_reply(
+        &self,
+        reply: &super::request_capture::CapturedReply,
+        stop_reason: Option<&str>,
+        gate: &ResponseToolGate,
+    ) {
+        if let Some(capture) = self.request_capture.as_ref() {
+            capture.record_tool_choice(
+                &self.capture_meta(),
+                reply,
+                stop_reason,
+                gate.tool_choice_violation(),
+            );
+        }
+    }
+
     /// 记录响应侧工具约束结果：tool_choice 违规与被丢弃的 tool_use（同时写日志）。
     fn mark_response_tool_gate(&self, gate: &ResponseToolGate) {
         gate.log_completion(&self.request_id);
@@ -4829,6 +4861,14 @@ impl CredentialUsageContext {
             });
         self.request
             .mark_response_tool_gate(ctx.response_tool_gate());
+        if let Some(captured) = ctx.downstream_text_capture() {
+            let stop_reason = ctx.downstream_stop_reason();
+            self.request.capture_tool_choice_reply(
+                captured.reply(),
+                Some(&stop_reason),
+                ctx.response_tool_gate(),
+            );
+        }
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage
             .is_none_or(|usage| !super::cache::metadata_usage_has_signal(usage))
@@ -5923,6 +5963,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
     RequestUsageContext {
         recorder: state.usage_recorder.clone(),
         tool_format_debug_recorder: state.tool_format_debug_recorder.clone(),
+        request_capture: None,
         prompt_cache: state.prompt_cache.clone(),
         prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
@@ -5947,7 +5988,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         omit_thinking_display: payload
             .thinking
             .as_ref()
-            .is_some_and(|thinking| thinking.display_mode() == ThinkingDisplay::Omitted),
+            .is_some_and(|thinking| thinking.display_mode().hides_reasoning()),
         strip_injected_control_blocks: !super::control_block_cleaner::request_mentions_control_tags(
             payload,
         ),
@@ -7827,6 +7868,10 @@ async fn post_messages_inner(
     // Bytes 克隆仅增加引用计数；只在采集开启时保留，避免延长请求体生命周期。
     let capture_bodies = crate::diagnostics::capture::is_active()
         .then(|| (raw_body.clone(), effective_raw_body.clone()));
+    let request_capture_client_body = runtime_config
+        .request_capture
+        .enabled
+        .then(|| raw_body.clone());
     let mut external_fallback = build_external_fallback_context(
         &state,
         &runtime_config,
@@ -8347,8 +8392,20 @@ async fn post_messages_inner(
         extract_xml_thinking,
         too_long_retry,
         cache_point_retry,
-        applied_injections: _,
+        applied_injections,
     } = prepared_local;
+    let request_capture = request_capture_client_body
+        .as_ref()
+        .and_then(|client_body| {
+            super::request_capture::RequestCaptureSeed::new(
+                &runtime_config.request_capture,
+                client_body,
+                &request_body,
+                payload.tool_choice.as_ref(),
+                applied_injections.contains(&crate::model::config::InjectionId::ToolChoicePrefix),
+                applied_injections.iter().map(|id| id.as_str()).collect(),
+            )
+        });
 
     let mut usage_context = prepare_usage_context_with_inference_attempt_budget(
         &state,
@@ -8363,6 +8420,7 @@ async fn post_messages_inner(
         inference_attempt_budget.clone(),
         request_api_key_id,
     );
+    usage_context.request_capture = request_capture;
     if let Some(report) = payload_guard_report.clone() {
         usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
     }
@@ -9055,6 +9113,14 @@ impl StreamContextTemplate {
             credential_usage.request.uses_local_prompt_cache_strategy(),
         );
         ctx.set_stream_error_id(credential_usage.request.error_id.clone());
+        if let Some(capture) = credential_usage
+            .request
+            .request_capture
+            .as_ref()
+            .filter(|capture| capture.wants_tool_choice())
+        {
+            ctx.enable_downstream_text_capture(capture.max_reply_bytes());
+        }
 
         let initial_events =
             ctx.generate_initial_events_with_reported_usage_mapper(|reported_usage| {
@@ -10932,6 +10998,14 @@ fn usage_only_retry_request(
 }
 
 /// 流式空轮次：把重试计划替换为 [`usage_only_retry_request`]。返回是否替换成功。
+/// Captures a request whose upstream stayed usage-only until the pre-output retries ran out.
+fn record_usage_only_capture(credential_usage: &CredentialUsageContext, attempts: u32) {
+    let request = &credential_usage.request;
+    if let Some(capture) = request.request_capture.as_ref() {
+        capture.record_usage_only(&request.capture_meta(), attempts);
+    }
+}
+
 fn prepare_usage_only_stream_retry_plan(plan: &mut StreamRetryPlan) -> bool {
     let Some((body, request)) = usage_only_retry_request(
         &plan.request_body,
@@ -10972,18 +11046,25 @@ async fn retry_stream_before_downstream_commit(
         "本地 Kiro 流式响应在首个下游事件前失败，准备换号重试"
     );
 
-    state
-        .completion
-        .report_upstream_stream_failure(detail.clone());
-    let previous_attempts = state.completion.attempts().to_vec();
-    state.prior_attempts =
-        merge_credential_attempts(std::mem::take(&mut state.prior_attempts), previous_attempts);
-    state.usage_guard.complete();
     let attempt_budget = plan
         .base_usage_context
         .latency
         .inference_attempt_budget
         .clone();
+    if reason == StreamRetryReason::UsageOnly {
+        // An empty turn depends on the request, not the account: skip the account for the rest
+        // of this request instead of cooling it down for everyone.
+        attempt_budget.exclude_usage_only_credential(state.completion.credential_id());
+        state.completion.report_usage_only_turn();
+    } else {
+        state
+            .completion
+            .report_upstream_stream_failure(detail.clone());
+    }
+    let previous_attempts = state.completion.attempts().to_vec();
+    state.prior_attempts =
+        merge_credential_attempts(std::mem::take(&mut state.prior_attempts), previous_attempts);
+    state.usage_guard.complete();
     let consumed_before = attempt_budget.snapshot().consumed;
     let retry_dispatch = call_api_stream_maybe_fail_fast(
         &plan.provider,
@@ -11819,9 +11900,17 @@ fn create_sse_stream(
                                         }
                                     }
                                 }
-                                state
-                                    .completion
-                                    .report_upstream_stream_failure(detail.clone());
+                                if detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL {
+                                    state.completion.report_usage_only_turn();
+                                    record_usage_only_capture(
+                                        state.usage_guard.context(),
+                                        state.attempt_number,
+                                    );
+                                } else {
+                                    state
+                                        .completion
+                                        .report_upstream_stream_failure(detail.clone());
+                                }
                                 state.ctx.record_stream_error("api_error", detail);
                                 let bytes = finish_stream_with_recorded_error(
                                     &mut state.ctx,
@@ -13182,10 +13271,11 @@ async fn handle_non_stream_request(
                 );
                 retry_attempt_prefix =
                     merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
-                completion.report_upstream_body_status_failure(
-                    super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL,
-                );
                 let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
+                // The empty turn depends on the request, not the account: skip the account for
+                // the rest of this request instead of cooling it down.
+                attempt_budget.exclude_usage_only_credential(completion.credential_id());
+                completion.report_usage_only_turn();
                 let consumed_before = attempt_budget.snapshot().consumed;
                 let retry_dispatch = call_api_maybe_fail_fast(
                     &provider,
@@ -13653,6 +13743,9 @@ async fn handle_non_stream_request(
         };
         if let Some(detail) = terminal_failure {
             tracing::warn!(error = detail, "非流式响应缺少可信完成信号");
+            if detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL {
+                record_usage_only_capture(&credential_usage, non_stream_status_retry_attempt);
+            }
             credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
             completion.release();
             return envelope::error_response_with_id(
@@ -13815,6 +13908,19 @@ async fn handle_non_stream_request(
     credential_usage
         .request
         .set_downstream_stop_reason(stop_reason.clone());
+    if let Some(capture) = credential_usage
+        .request
+        .request_capture
+        .as_ref()
+        .filter(|capture| capture.wants_tool_choice())
+    {
+        let reply = super::request_capture::reply_from_content(&content, capture.max_reply_bytes());
+        credential_usage.request.capture_tool_choice_reply(
+            &reply,
+            Some(&stop_reason),
+            &response_tool_gate,
+        );
+    }
 
     // Metadata fields are resolved independently below. Keep the local/context
     // estimate as the fallback for missing upstream input fields.

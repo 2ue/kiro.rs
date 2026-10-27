@@ -162,7 +162,7 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
-    /// `thinking.display`（`summarized` / `omitted`）。保留原始 JSON 值，
+    /// `thinking.display`（`summarized` / `omitted` / `updates`）。保留原始 JSON 值，
     /// 非法值不报错，按默认处理（见 [`Thinking::display_mode`]）。
     #[serde(default)]
     pub display: Option<serde_json::Value>,
@@ -176,6 +176,10 @@ pub enum ThinkingDisplay {
     Summarized,
     /// thinking 块只下发空文本和 signature。
     Omitted,
+    /// Beta `thinking-display-updates-2026-08-18`（Claude Code 交互请求会发送）：推理块与
+    /// `omitted` 一样只有空文本和 signature，只有工具调用之间的进度说明带文字。Kiro 不区分
+    /// 进度说明和推理，所以本地上游按 `omitted` 下发；外部池原样转发该值。
+    Updates,
 }
 
 impl ThinkingDisplay {
@@ -183,7 +187,13 @@ impl ThinkingDisplay {
         match self {
             Self::Summarized => "summarized",
             Self::Omitted => "omitted",
+            Self::Updates => "updates",
         }
+    }
+
+    /// Whether reasoning text is withheld from the client (signatures are still sent).
+    pub fn hides_reasoning(self) -> bool {
+        matches!(self, Self::Omitted | Self::Updates)
     }
 }
 
@@ -198,6 +208,7 @@ impl Thinking {
         match self.display.as_ref()?.as_str()? {
             "summarized" => Some(ThinkingDisplay::Summarized),
             "omitted" => Some(ThinkingDisplay::Omitted),
+            "updates" => Some(ThinkingDisplay::Updates),
             _ => None,
         }
     }
@@ -426,10 +437,20 @@ mod tests {
         assert_eq!(bogus.display_mode(), ThinkingDisplay::Summarized);
         let wrong_type = parse(serde_json::json!({"type": "adaptive", "display": 3}));
         assert_eq!(wrong_type.display_mode(), ThinkingDisplay::Summarized);
+        // Claude Code 2.1.287+ sends the `updates` beta value on interactive requests.
+        let updates = parse(serde_json::json!({"type": "adaptive", "display": "updates"}));
+        assert_eq!(updates.display_mode(), ThinkingDisplay::Updates);
+        assert!(updates.display_mode().hides_reasoning());
+        assert!(omitted.display_mode().hides_reasoning());
+        assert!(!summarized.display_mode().hides_reasoning());
 
         assert_eq!(
             serde_json::to_value(&omitted).unwrap(),
             serde_json::json!({"type": "adaptive", "display": "omitted"})
+        );
+        assert_eq!(
+            serde_json::to_value(&updates).unwrap(),
+            serde_json::json!({"type": "adaptive", "display": "updates"})
         );
         assert_eq!(
             serde_json::to_value(&bogus).unwrap(),

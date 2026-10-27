@@ -655,6 +655,79 @@ impl ToolFormatDebugConfig {
     }
 }
 
+/// 定向请求抓取（见 `anthropic::request_capture`）。每条记录一个 JSON 文件，含完整请求体，
+/// 只用于内部排查和本地回放，不写入 usage 数据库。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RequestCaptureConfig {
+    /// 总开关，默认关闭。
+    pub enabled: bool,
+    /// 抓取目录；空回和 tool_choice 分别写入 `usage-only/`、`tool-choice/` 子目录。
+    pub dir: String,
+    /// 首输出前重试用完仍空回的本地请求：记录客户端请求体和发给 Kiro 的请求体。
+    pub usage_only: bool,
+    /// 注入了 tool_choice 指令的请求：记录客户端收到的回复，并标出提到策略的回复。
+    pub tool_choice: bool,
+    /// 每个子目录最多保留的文件数，超出后删除最旧的。
+    pub max_files: u32,
+    /// 每个请求体或回复正文最多保留的字节数。
+    pub max_body_bytes: usize,
+}
+
+pub const REQUEST_CAPTURE_MAX_FILES_LIMIT: u32 = 2_000;
+pub const REQUEST_CAPTURE_MAX_BODY_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+
+impl Default for RequestCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: "logs/request-capture".to_string(),
+            usage_only: true,
+            tool_choice: true,
+            max_files: 200,
+            max_body_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl RequestCaptureConfig {
+    pub fn normalized(&self) -> Self {
+        let dir = self.dir.trim();
+        Self {
+            enabled: self.enabled,
+            dir: if dir.is_empty() {
+                Self::default().dir
+            } else {
+                dir.to_string()
+            },
+            usage_only: self.usage_only,
+            tool_choice: self.tool_choice,
+            max_files: self.max_files.clamp(1, REQUEST_CAPTURE_MAX_FILES_LIMIT),
+            max_body_bytes: self
+                .max_body_bytes
+                .clamp(1024, REQUEST_CAPTURE_MAX_BODY_BYTES_LIMIT),
+        }
+    }
+
+    /// The directory is editable from the admin page and receives full request bodies, so it
+    /// must stay inside the working directory (Docker: `/app`, next to the other diagnostics).
+    pub fn validate(&self) -> Result<(), String> {
+        let path = std::path::Path::new(self.dir.trim());
+        let escapes = path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        });
+        if escapes {
+            return Err(
+                "requestCapture.dir 必须是工作目录内的相对路径（例如 logs/request-capture），不能以 / 开头或包含 ..".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadShapingConfigPatch {
@@ -5316,6 +5389,10 @@ pub struct Config {
     #[serde(default)]
     pub tool_format_debug: ToolFormatDebugConfig,
 
+    /// 定向请求抓取：空回失败的请求体、tool_choice 请求的回复，用于本地回放。默认关闭。
+    #[serde(default)]
+    pub request_capture: RequestCaptureConfig,
+
     /// Admin 高缓存请求阈值。
     #[serde(default = "default_high_cache_threshold")]
     pub high_cache_threshold: i32,
@@ -6546,6 +6623,7 @@ impl Default for Config {
             active_route_scenario_id: None,
             usage_record_limit: default_usage_record_limit(),
             tool_format_debug: ToolFormatDebugConfig::default(),
+            request_capture: RequestCaptureConfig::default(),
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
             expose_proxy_warnings: default_expose_proxy_warnings(),

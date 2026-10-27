@@ -231,6 +231,29 @@ const normalizeMissingMaxTokens = (
   defaultValue: toWhole(input?.defaultValue ?? 20480, 1, 200000),
 })
 
+const defaultRequestCapture = (): RuntimeConfig['requestCapture'] => ({
+  enabled: false,
+  dir: 'logs/request-capture',
+  usageOnly: true,
+  toolChoice: true,
+  maxFiles: 200,
+  maxBodyBytes: 2 * 1024 * 1024,
+})
+
+const normalizeRequestCapture = (
+  input?: Partial<RuntimeConfig['requestCapture']> | null,
+): RuntimeConfig['requestCapture'] => {
+  const base = defaultRequestCapture()
+  return {
+    enabled: input?.enabled ?? base.enabled,
+    dir: input?.dir?.trim() || base.dir,
+    usageOnly: input?.usageOnly ?? base.usageOnly,
+    toolChoice: input?.toolChoice ?? base.toolChoice,
+    maxFiles: toWhole(input?.maxFiles ?? base.maxFiles, 1, 2000),
+    maxBodyBytes: toWhole(input?.maxBodyBytes ?? base.maxBodyBytes, 1024, 8 * 1024 * 1024),
+  }
+}
+
 const normalizeImageProcessing = (input?: Partial<ImageProcessingConfig> | null): ImageProcessingConfig => {
   const next: ImageProcessingConfig = {
     ...defaultImageProcessing(),
@@ -585,6 +608,7 @@ const emptyConfig: RuntimeConfig = {
   },
   claudeModelsOnly: false,
   missingMaxTokens: defaultMissingMaxTokens(),
+  requestCapture: defaultRequestCapture(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
@@ -3630,6 +3654,7 @@ export function RuntimeConfigPanel() {
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
         bodyConversion,
         missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens),
+        requestCapture: normalizeRequestCapture(config.data.requestCapture),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity),
         externalPools: {
           ...defaultExternalPoolsConfig(),
@@ -3728,6 +3753,7 @@ export function RuntimeConfigPanel() {
       routeFeatures: draft.routeFeatures,
       claudeModelsOnly: draft.claudeModelsOnly,
       missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
+      requestCapture: normalizeRequestCapture(draft.requestCapture),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -5044,6 +5070,73 @@ export function RuntimeConfigPanel() {
                 setDraft((prev) => ({ ...prev, exposeProxyWarnings }))
               }
             />
+            <ToggleField
+              title="请求诊断抓取"
+              description="把需要排查的请求写成文件，用于本地回放。文件里有完整请求体，只在排查时打开，用完关闭。"
+              checked={draft.requestCapture.enabled}
+              onCheckedChange={(enabled) =>
+                setDraft((prev) => ({ ...prev, requestCapture: { ...prev.requestCapture, enabled } }))
+              }
+            />
+            <ToggleField
+              title="抓取空回请求"
+              description="首输出前重试用完仍只返回用量统计的本地请求：保存客户端请求体和发给 Kiro 的请求体。"
+              checked={draft.requestCapture.usageOnly}
+              disabled={!draft.requestCapture.enabled}
+              onCheckedChange={(usageOnly) =>
+                setDraft((prev) => ({ ...prev, requestCapture: { ...prev.requestCapture, usageOnly } }))
+              }
+            />
+            <ToggleField
+              title="抓取 tool_choice 回复"
+              description="注入了 tool_choice 指令的请求：保存客户端收到的回复，并标出提到策略或注入的回复。"
+              checked={draft.requestCapture.toolChoice}
+              disabled={!draft.requestCapture.enabled}
+              onCheckedChange={(toolChoice) =>
+                setDraft((prev) => ({ ...prev, requestCapture: { ...prev.requestCapture, toolChoice } }))
+              }
+            />
+            <NumberField
+              title="抓取每类最多保留"
+              description="空回和 tool_choice 各自的文件数上限，超出后删除最旧的。"
+              value={draft.requestCapture.maxFiles}
+              min={1}
+              max={2000}
+              suffix="个文件"
+              disabled={!draft.requestCapture.enabled}
+              onChange={(maxFiles) =>
+                setDraft((prev) => ({ ...prev, requestCapture: { ...prev.requestCapture, maxFiles } }))
+              }
+            />
+            <NumberField
+              title="抓取单个请求体上限"
+              description="每个请求体或回复正文最多保留的字节数，超出部分截断并在文件里标记。"
+              value={draft.requestCapture.maxBodyBytes}
+              min={1024}
+              max={8388608}
+              suffix="字节"
+              disabled={!draft.requestCapture.enabled}
+              onChange={(maxBodyBytes) =>
+                setDraft((prev) => ({ ...prev, requestCapture: { ...prev.requestCapture, maxBodyBytes } }))
+              }
+            />
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">抓取目录</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  工作目录内的相对路径（Docker 中是 /app 下）。空回写到 usage-only/，tool_choice 写到 tool-choice/。
+                </div>
+              </div>
+              <Input
+                className="font-mono text-xs"
+                value={draft.requestCapture.dir}
+                disabled={!draft.requestCapture.enabled}
+                onChange={(event) => {
+                  const dir = event.target.value
+                  setDraft((prev) => ({ ...prev, requestCapture: { ...prev.requestCapture, dir } }))
+                }}
+              />
+            </label>
           </ConfigSection>
 
           <div className="rounded-lg border bg-muted/20 p-4">

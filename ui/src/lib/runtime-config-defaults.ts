@@ -5,6 +5,7 @@ import type {
   BodyConversionConfig,
   ImageProcessingConfig,
   MissingMaxTokensConfig,
+  RequestCaptureConfig,
   ModelMappingConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
@@ -241,6 +242,29 @@ export function normalizeMissingMaxTokens(input?: Partial<MissingMaxTokensConfig
   return {
     policy,
     defaultValue: toWhole(input?.defaultValue ?? base.defaultValue, 1, 200000),
+  }
+}
+
+export function defaultRequestCapture(): RequestCaptureConfig {
+  return {
+    enabled: false,
+    dir: 'logs/request-capture',
+    usageOnly: true,
+    toolChoice: true,
+    maxFiles: 200,
+    maxBodyBytes: 2 * 1024 * 1024,
+  }
+}
+
+export function normalizeRequestCapture(input?: Partial<RequestCaptureConfig> | null): RequestCaptureConfig {
+  const base = defaultRequestCapture()
+  return {
+    enabled: input?.enabled ?? base.enabled,
+    dir: input?.dir?.trim() || base.dir,
+    usageOnly: input?.usageOnly ?? base.usageOnly,
+    toolChoice: input?.toolChoice ?? base.toolChoice,
+    maxFiles: toWhole(input?.maxFiles ?? base.maxFiles, 1, 2000),
+    maxBodyBytes: toWhole(input?.maxBodyBytes ?? base.maxBodyBytes, 1024, 8 * 1024 * 1024),
   }
 }
 
@@ -539,6 +563,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   routeFeatures: defaultRouteFeatures(),
   claudeModelsOnly: false,
   missingMaxTokens: defaultMissingMaxTokens(),
+  requestCapture: defaultRequestCapture(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,

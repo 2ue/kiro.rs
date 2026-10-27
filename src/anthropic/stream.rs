@@ -10,6 +10,7 @@ use crate::kiro::model::events::{Event, MetadataTokenUsage};
 use crate::model::config::{PromptCacheSimulationMode, ReportedUsagePathPolicy};
 
 use super::envelope;
+use super::request_capture::DownstreamTextCapture;
 use super::signature::synthetic_thinking_signature;
 use super::tool_schema_keys::ToolSchemaKeyMap;
 use super::tool_use_policy::{ResponseToolGate, ResponseToolPolicy};
@@ -1735,6 +1736,8 @@ pub struct StreamContext {
     last_assistant_content_chars: u32,
     /// 最近 assistant/code 可见文本尾部窗口，仅用于低成本异常特征检测，不落库。
     assistant_text_tail: String,
+    /// 请求诊断抓取开启时，记录客户端最终收到的文本和工具调用名（有上限）。
+    downstream_text_capture: Option<DownstreamTextCapture>,
     /// 已命中的工具上下文泄漏标记名，仅保存 marker 名，不保存正文。
     tool_context_leak_markers: Vec<&'static str>,
     /// 是否见过像“我先检查/我会执行/I will inspect”的执行前说明。
@@ -1944,6 +1947,7 @@ impl StreamContext {
             saw_upstream_output_limit: false,
             last_assistant_content_chars: 0,
             assistant_text_tail: String::new(),
+            downstream_text_capture: None,
             tool_context_leak_markers: Vec::new(),
             assistant_intent_preamble_hint: false,
             pending_trivial_text: String::new(),
@@ -2042,10 +2046,23 @@ impl StreamContext {
         } else {
             events
         };
-        match self.stop_sequence_filter.as_mut() {
+        let events = match self.stop_sequence_filter.as_mut() {
             Some(filter) => filter.apply(events),
             None => events,
+        };
+        if let Some(capture) = self.downstream_text_capture.as_mut() {
+            capture.observe(&events);
         }
+        events
+    }
+
+    /// Keeps the text the client receives (after every output filter) for the request capture.
+    pub fn enable_downstream_text_capture(&mut self, max_bytes: usize) {
+        self.downstream_text_capture = Some(DownstreamTextCapture::new(max_bytes));
+    }
+
+    pub fn downstream_text_capture(&self) -> Option<&DownstreamTextCapture> {
+        self.downstream_text_capture.as_ref()
     }
 
     pub fn downstream_stop_reason(&self) -> String {

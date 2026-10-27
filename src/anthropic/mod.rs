@@ -58,6 +58,7 @@ pub(crate) mod prompt_cache_creation_control;
 pub(crate) mod prompt_injection;
 pub(crate) mod request_admission;
 pub(crate) mod request_body;
+pub(crate) mod request_capture;
 pub(crate) mod request_facts;
 pub mod request_key_limits;
 mod router;

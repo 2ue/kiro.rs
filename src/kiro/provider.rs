@@ -875,6 +875,14 @@ impl KiroApiCompletion {
         self.in_flight_lease.lock().take();
     }
 
+    /// The upstream answered with only usage/metadata events. Whether that happens depends on the
+    /// request content (other accounts usually answer the same request the same way), so the
+    /// account is neither cooled down nor charged a sticky-session soft failure; the caller
+    /// excludes it for the rest of this request instead.
+    pub fn report_usage_only_turn(&self) {
+        self.release();
+    }
+
     /// Upstream returned successful headers, but the complete EventStream body
     /// contained a retryable Kiro status event before any downstream response
     /// was committed.
@@ -1021,6 +1029,15 @@ impl KiroStreamCompletion {
             self.token_manager
                 .record_session_soft_failure_deferred(session_id, self.credential_id);
         }
+    }
+
+    /// 上游只返回 usage/metadata（空回）。是否空回取决于请求内容，同一个请求换账号通常结果相同，
+    /// 所以不冷却、不记会话软失败，只释放占用；调用方在本请求内排除该账号。
+    pub fn report_usage_only_turn(&self) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.in_flight_lease.lock().take();
     }
 
     /// 上游流读取错误、idle timeout 或上游错误事件时调用，并让调度器短暂避开该凭据。
@@ -8647,20 +8664,20 @@ impl KiroProvider {
         self.token_manager.route_rejected_by_all_credentials(route)
     }
 
-    /// Initial per-request exclusions: credentials whose route rules reject the request route.
+    /// Initial per-request exclusions: credentials whose route rules reject the request route,
+    /// plus credentials that already answered this request with a usage-only turn.
     fn route_excluded_credential_ids(
         &self,
         inference_attempt_budget: Option<&InferenceAttemptBudget>,
     ) -> HashSet<u64> {
-        inference_attempt_budget
-            .and_then(InferenceAttemptBudget::dispatch_route)
-            .map(|route| {
-                self.token_manager
-                    .credential_ids_rejecting_route(route)
-                    .into_iter()
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(budget) = inference_attempt_budget else {
+            return HashSet::new();
+        };
+        let mut excluded = budget.usage_only_credential_ids();
+        if let Some(route) = budget.dispatch_route() {
+            excluded.extend(self.token_manager.credential_ids_rejecting_route(route));
+        }
+        excluded
     }
 
     fn credential_log_label(&self, id: u64) -> String {
