@@ -105,6 +105,7 @@ pub fn usage_external_reason_category(
         | "local_proxy_blocked"
         | "local_all_cooling_down"
         | "local_transient_exhausted"
+        | "local_request_excluded_all"
         | "no_available_credentials" => "local_unavailable",
         "unsupported_model" | "local_no_model_compatible" => "model_unsupported",
         "local_scheduler_redis_degraded" | "local_pool_risk_circuit_open" => "system_degraded",

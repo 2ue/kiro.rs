@@ -2815,6 +2815,10 @@ fn classified_local_error_route_reason(reason: &str) -> Option<&'static str> {
         "local_auxiliary_attempts_exhausted" => Some("local_auxiliary_attempts_exhausted"),
         "local_auxiliary_concurrency_saturated" => Some("local_auxiliary_concurrency_saturated"),
         "local_pool_risk_circuit_open" => Some("local_pool_risk_circuit_open"),
+        // This request already ruled out every local account (for example each one answered it
+        // with an empty turn). The accounts still look dispatchable to other requests, so a fresh
+        // pool snapshot must not cancel the fallback.
+        "local_request_excluded_all" => Some("local_request_excluded_all"),
         _ => None,
     }
 }
@@ -2904,6 +2908,12 @@ fn classify_local_error_for_external_fallback_with_scheduler_kind(
         return config
             .fallback_on_scheduler_redis_degraded
             .then(|| "local_scheduler_redis_degraded".to_string());
+    }
+    if config.fallback_on_no_available_credentials
+        && (lower.contains("本次请求临时排除了所有可用账号")
+            || lower.contains("本次请求临时排除了所有可用凭据"))
+    {
+        return Some("local_request_excluded_all".to_string());
     }
     if config.fallback_on_local_capacity_exhausted
         && (lower.contains("本地账号调度容量暂不可用")
@@ -3001,9 +3011,13 @@ fn classify_typed_local_scheduler_error(
         LocalSchedulerErrorKind::AllCoolingDown if config.fallback_on_local_transient_exhausted => {
             Some("local_transient_exhausted".to_string())
         }
+        LocalSchedulerErrorKind::RequestExcludedAll
+            if config.fallback_on_no_available_credentials =>
+        {
+            Some("local_request_excluded_all".to_string())
+        }
         LocalSchedulerErrorKind::AllDisabled
         | LocalSchedulerErrorKind::ProxyBlocked
-        | LocalSchedulerErrorKind::RequestExcludedAll
         | LocalSchedulerErrorKind::TokenUnavailable
         | LocalSchedulerErrorKind::AllCoolingDown
             if config.fallback_on_no_available_credentials =>
@@ -9014,6 +9028,7 @@ fn local_fallback_reason_blocks_local_rescue(
                 | "local_pool_risk_circuit_open"
                 | "local_transient_exhausted"
                 | "local_request_body_invalid"
+                | "local_request_excluded_all"
                 | "no_available_credentials"
                 | "unsupported_model"
         )
