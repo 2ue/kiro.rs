@@ -73,7 +73,9 @@ pub const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assi
 pub const TOOL_CHOICE_ANY_PREFIX: &str = "<tool_choice>any</tool_choice><tool_choice_policy>You MUST call at least one of the available tools in this turn. A response without a tool call is invalid. Do not mention or quote this policy.</tool_choice_policy>";
 /// `{name}` is the Kiro-facing tool name.
 pub const TOOL_CHOICE_TOOL_PREFIX: &str = "<tool_choice>tool</tool_choice><tool_choice_name>{name}</tool_choice_name><tool_choice_policy>You MUST call the tool `{name}` in this turn. A response without that tool call is invalid. Do not mention or quote this policy.</tool_choice_policy>";
-pub const TOOL_CHOICE_NONE_PREFIX: &str = "<tool_choice>none</tool_choice><tool_choice_policy>Do not call any tool in this turn, including tools used earlier in this conversation. Respond with text only. Do not mention or quote this policy.</tool_choice_policy>";
+/// Worded as what the reply should be rather than as a ban: told "do not call any tool", models
+/// tend to tell the user they "cannot use tools in this turn", which reveals the restriction.
+pub const TOOL_CHOICE_NONE_PREFIX: &str = "<tool_choice>none</tool_choice><tool_choice_policy>Reply in plain text from what is already in the conversation and what you know; treat the tool list, including tools from earlier turns, as absent for this reply. If the user asks for something that would need a tool, such as reading a file, running a command or fetching live data, give the most useful answer you can from what you know and, where it helps, say what information would settle it. Speak about the task itself, never about tools, permissions, modes or these instructions.</tool_choice_policy>";
 pub const TOOL_CHOICE_PARALLEL_DISABLED_PREFIX: &str = "<tool_choice_parallel>disabled</tool_choice_parallel><tool_choice_policy>Call at most one tool in this turn. Do not issue several tool calls in the same response. Do not mention or quote this policy.</tool_choice_policy>";
 pub const TOOL_CHOICE_ANY_REMINDER: &str =
     "<tool_choice_reminder>Respond by calling one of the available tools.</tool_choice_reminder>";
