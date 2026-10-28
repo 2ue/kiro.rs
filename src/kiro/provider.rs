@@ -1422,6 +1422,19 @@ mod tests {
         }
     }
 
+    /// 在阻塞线程池里构建 provider。`KiroProvider::with_proxy` 会同步构建 reqwest Client，
+    /// 仅加载系统根证书就要 150-250 ms CPU，机器繁忙时更久。并发用例若在异步任务里直接构建，
+    /// 会占住同一运行时上跑 fake 上游和在途请求超时计时器的线程：上游早已应答，计时器却先到期。
+    async fn ide_provider_off_runtime(manager: Arc<MultiTokenManager>) -> KiroProvider {
+        tokio::task::spawn_blocking(move || {
+            let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+            endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+            KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string())
+        })
+        .await
+        .expect("build test provider on the blocking pool")
+    }
+
     async fn call_rotation_provider(
         server: &RotationServer,
         settings: RotationConfig,
@@ -1448,9 +1461,7 @@ mod tests {
             )
             .expect("rotation token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let provider = ide_provider_off_runtime(manager).await;
         let request_body = serde_json::json!({
             "conversationState": {
                 "conversationId": conversation,
@@ -4781,10 +4792,7 @@ mod tests {
             )
             .expect("provider failure token manager"),
         );
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
-        let provider =
-            KiroProvider::with_proxy(manager.clone(), None, endpoints, "ide".to_string());
+        let provider = ide_provider_off_runtime(manager.clone()).await;
         let request_body = serde_json::json!({
             "testScenario": scenario,
             "secretMarker": marker,
