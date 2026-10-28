@@ -3816,6 +3816,9 @@ enum HandlerEventStreamFault {
     IncompleteToolWithoutStatus,
     TextThenReadError,
     NoContentHeartbeats,
+    /// Signed reasoning snapshots arrive first; the answer follows only after a long pause, the
+    /// shape of a long native reasoning turn.
+    ReasoningThenLongPauseThenText,
     ThinkingThenReadError,
     ToolThenReadError,
     EmptyToolThenReadError,
@@ -4280,6 +4283,33 @@ async fn handler_eventstream_fault_upstream(
                 )),
             ),
         ]),
+        HandlerEventStreamFault::ReasoningThenLongPauseThenText => {
+            let mut answer = eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"answer after reasoning"}),
+            );
+            answer.extend(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"COMPLETED"}),
+            ));
+            handler_eventstream_chunked_response(vec![
+                (
+                    Duration::ZERO,
+                    Ok(Bytes::from(eventstream_test_frame(
+                        "reasoningContentEvent",
+                        json!({"text":"Planning the"}),
+                    ))),
+                ),
+                (
+                    Duration::from_millis(20),
+                    Ok(Bytes::from(eventstream_test_frame(
+                        "reasoningContentEvent",
+                        json!({"text":"Planning the answer.","signature":"fixture-signature"}),
+                    ))),
+                ),
+                (Duration::from_secs(3), Ok(Bytes::from(answer))),
+            ])
+        }
         HandlerEventStreamFault::ThinkingThenReadError => {
             handler_eventstream_chunked_response(vec![
                 (
@@ -5979,6 +6009,98 @@ async fn run_handler_reasoning_only_eof_matrix() {
             "reasoning-only round {round}"
         );
     }
+}
+
+/// Native reasoning reaches the client as it arrives. Before, the whole segment was held until
+/// the answer started, so the first token waited for the full reasoning time.
+async fn run_native_reasoning_reaches_client_before_reasoning_ends() {
+    for round in 1..=3 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::ReasoningThenLongPauseThenText,
+        )
+        .await;
+        let (app, usage_recorder) = first_output_router(&upstream.base_url, 1, 15, 0);
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(handler_eventstream_fault_request_for_path(
+                "/cc/v1/messages",
+                true,
+            )),
+        )
+        .await
+        .expect("reasoning response timed out")
+        .expect("reasoning response");
+        assert_eq!(response.status(), StatusCode::OK, "round={round}");
+        let request_id = response_request_id(&response);
+        let mut data_stream = response.into_body().into_data_stream();
+
+        // The second upstream event is a cumulative snapshot, so only its new suffix is sent.
+        let mut early = String::new();
+        while !early.contains(r#""thinking":" answer.""#) {
+            let chunk = tokio::time::timeout(Duration::from_millis(1500), data_stream.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("round={round}: thinking was held until reasoning ended: {early}")
+                })
+                .expect("stream continues")
+                .expect("stream chunk");
+            early.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "round={round}: first thinking took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            early.contains(r#""type":"thinking_delta""#),
+            "round={round}"
+        );
+        assert!(
+            early.contains(r#""thinking":"Planning the""#),
+            "round={round}"
+        );
+        assert!(!early.contains("signature_delta"), "round={round}: {early}");
+        assert!(!early.contains("answer after reasoning"), "round={round}");
+
+        let mut body = early;
+        while let Some(chunk) = data_stream.next().await {
+            body.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+        }
+        assert!(body.contains("fixture-signature"), "round={round}: {body}");
+        assert!(body.contains("answer after reasoning"), "round={round}");
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert!(!body.contains(r#""type":"error""#), "round={round}: {body}");
+        assert!(
+            body.find("fixture-signature") < body.find("answer after reasoning"),
+            "round={round}: signature closes the thinking block before the answer"
+        );
+        assert_eq!(upstream.hits(), 1, "round={round}");
+
+        let record = usage_record_for_request(&usage_recorder, &request_id);
+        assert_eq!(record.status, UsageRecordStatus::Success, "round={round}");
+        let trace = record.latency_trace.as_ref().expect("latency trace");
+        let first_output = trace.first_output_delta_ms.expect("first output recorded");
+        assert!(
+            first_output < 1500,
+            "round={round}: first output {first_output}ms"
+        );
+        assert_eq!(trace.first_thinking_delta_ms, Some(first_output));
+        assert!(
+            trace
+                .first_visible_text_delta_ms
+                .is_some_and(|text| text >= 3000),
+            "round={round}: visible text follows the pause: {trace:?}"
+        );
+    }
+}
+
+#[test]
+fn handler_native_reasoning_reaches_client_before_reasoning_ends() {
+    run_handler_fixture_on_large_stack_thread(
+        "native-reasoning-early-output-fixture",
+        run_native_reasoning_reaches_client_before_reasoning_ends,
+    );
 }
 
 #[test]

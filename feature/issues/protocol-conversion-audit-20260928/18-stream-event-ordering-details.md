@@ -66,10 +66,9 @@ AWS EventStream 编码（公开规范）：prelude = `total_length(4) + headers_
 
 原生 reasoning：
 
-- `src/anthropic/stream.rs:2661-2737` `process_reasoning_content`：第 2737-2738 行（2026-09-29 核对时由 2735-2736 更正）`native_reasoning_content.clear(); push_str(text)`，每个事件用最新的累计快照覆盖，不下发任何事件。
-- `src/anthropic/stream.rs:3373-3433` `close_native_reasoning_block`：拿到完整内容后，先整体经过 sanitizer，签名块如果被污染就整体丢弃；然后一次性发出 start、单个 `thinking_delta`、`signature_delta`、stop。
-- 缓冲上限：`src/anthropic/stream.rs:85` `MAX_BUFFERED_ATOMIC_THINKING_BYTES = 1 MiB`。
-- **这是有意的设计**：[Thinking 与签名内容安全](../thinking-and-signed-content-safety.md) 规定"signed/redacted：完整原子缓冲后才决定是否下发；绝不局部改写或把净化后的正文与原 signature 重新组合"，并把"首 thinking 延迟"列为必要成本。本文不推翻这个决策。
+- `src/anthropic/stream.rs` `process_reasoning_content`：每个事件经 `merge_native_reasoning_text` 算出新增部分（累计快照只取后缀），过增量 sanitizer 后立即作为 `thinking_delta` 下发；第一段安全文本到达时开 thinking 块。
+- `close_native_reasoning_block`：在正文、工具调用、redacted 块或流结束时放出 sanitizer 暂存的安全文本，发送 `signature_delta` 和 stop。本段被拦截过内容时不发 signature，整轮以协议污染错误结束。
+- 规则见 [Thinking 与签名内容安全](../thinking-and-signed-content-safety.md)。
 
 帧解析：
 
@@ -202,7 +201,7 @@ C. 在输出层重排：先缓存整条流，最后按 index 排序输出。这�
    - `flush_incomplete_tool_input_buffers` 按 block index 升序处理（先收集，再排序）。
    - `emit_text_delta_raw` 新开 text 块时，同样先关闭已打开的 tool_use 块。
 2. **延迟开 text 块**：去掉 `generate_initial_events` 中预先打开的 text 块，让 `emit_text_delta_raw` 在第一个真实文本出现时再开块（它已经具备按需开块的能力）。需要同时检查依赖 `text_block_index == Some(0)` 的逻辑，以及 keepalive（`active_open_block_for_keepalive`，第 1286-1292 行）在"还没有任何块"时的行为，保证 `ping` 仍然正常发送。
-3. **reasoning**：保持原子缓冲这一既定决策。可以增加一个可选的观测字段，记录"首个 thinking 事件的延迟"；如果将来要支持增量 thinking，只对**未签名**且 sanitizer 能确认前缀安全的内容做增量下发，单独立项。
+3. **reasoning**：已改为边收边发（签名与未签名都适用），首个 thinking 延迟由 usage 的 `firstThinkingDeltaMs` 观测。
 4. **帧解析**：`parse_frame` 读完 12 字节 prelude 后立刻校验 prelude CRC，再判断长度和等待完整帧。message CRC 的校验时机保持不变。
 
 ## 测试与验收

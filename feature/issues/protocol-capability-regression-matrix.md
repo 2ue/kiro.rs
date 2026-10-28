@@ -120,7 +120,7 @@ upstream 或故障恢复通过。
 
 ## 性能与兼容性风险
 
-- signed/redacted thinking 原子缓冲会增加首 thinking 延迟与最多 1 MiB/active block 内存；必须测 p95/p99 和超限 fail-closed。
+- local native thinking 边收边发，首 thinking 延迟应接近上游首个 reasoning 事件；external SSE thinking 单事件缓冲最多 1 MiB，必须测 p95/p99 和超限 fail-closed。
 - raw marker prefilter 若过宽会增加 DOM parse；若过窄会漏掉转义变体。必须同时测 marker-free 1 KiB-5 MiB 和 Unicode 转义污染。
 - payload trim、schema sizing 和未知字段保留可能增加序列化；要求 clean raw 0 次 guard serialize，并验证 CPU/RSS 近线性。
 - 真实 CLI 版本可能不暴露 native WebSearch/agents/image；此类环境限制不能降低其他适用门禁，也不能写成能力通过。

@@ -21,7 +21,7 @@ Severity: P0
 ## 根因
 
 1. 旧策略的字段所有权不完整，只覆盖 text，没有把 thinking、signature、redacted data 和 request history 纳入同一 request-scoped 协议边界。
-2. native/external streaming 的 signature 可能晚于 thinking delta 到达。如果先下发 thinking 正文，后来才发现该块有签名或污染，服务端已经无法回滚客户端看到的字节。
+2. native/external streaming 的 signature 可能晚于 thinking delta 到达。已经下发的 thinking 字节无法从客户端撤回，所以污染必须在下发前被清洗器扣住，并且一旦确认污染，整轮要以错误结束，不能让客户端把这段 thinking 写进历史。
 3. signed thinking 的正文与 signature 是不可分割的完整性单元，redacted thinking 也是不透明单元。局部删除正文再保留原 signature 会制造内容/签名不一致；修改 signature 更不允许。
 4. 早期调用方把“sanitizer 删除了内容”仍当作成功，可合成空白 text、正常 usage/message_stop 或部分 HTTP 200。marker 消失因此不等于协议正确。
 5. SSE 的 CRLF、多 `data:` 行、start 内嵌内容、逐字节 transport chunk、orphan delta 和 EOF 提供了多种分块绕过路径，不能用单行字符串替换处理。
@@ -47,7 +47,7 @@ Bash: hidden internal result
 - 将 JSON SSE 拆为多 `data:` 行、CRLF，并把整个 transport 拆成单字节；
 - 把候选拆在 text -> thinking、thinking -> text、thinking -> tool_use 或 EOF 边界；
 - 在可见 text 之前和之后分别触发，检查 retry/terminal 差异；
-- 对 1 MiB 与 `1 MiB + 1` 原子 thinking buffer 做边界测试。
+- local native reasoning 超过 1 MiB 时仍逐段下发、不报错；external SSE 对 1 MiB 与 `1 MiB + 1` 单事件缓冲做边界测试。
 
 ### 多轮与长会话复现
 
@@ -57,17 +57,18 @@ Bash: hidden internal result
 
 - request assistant history：unsigned thinking 可按完整可信 transcript 状态机净化；污染的 signed/redacted block 整块删除，clean block value-identical。用户/tool-owned 数据不动。
 - response local/external、stream/non-stream：任何已确认 transcript contamination 都 fail closed。首输出前仅可在共享 attempt budget 内重试；提交后零重试并发送规范 stream error；不再合成空白成功、partial 200 或 success terminal。
-- signed/redacted：完整原子缓冲后才决定是否下发；绝不局部改写或把净化后的正文与原 signature 重新组合。
+- local native signed thinking：边收边发。每个 reasoning 事件的新增部分经过增量 sanitizer 后立即作为 `thinking_delta` 下发，可疑片段由 sanitizer 扣住，确认是普通文本后原样放出。没有拦截时，下发文本与上游原文逐字一致，原生 signature 在块结束时下发。一旦确认污染：私有 transcript 不下发，signature 不下发，整轮以协议污染错误结束。绝不把净化后的正文与原 signature 重新组合。
+- redacted thinking：不透明块，原样整块下发。
 - XML/unsigned：使用独立增量 sanitizer，结构化 block 边界显式 flush；pending candidate 不能跨进 tool block。
 - 错误与 usage：公开错误只含通用处理失败文案及 request/error ID；内部 marker 不进入 error。污染后不向客户端发送上游 success usage 或 thinking token 终止字段，usage 状态记录为 error/stream_error。
-- 资源：普通候选缓冲最多 4 KiB；需要原子判断的 thinking block 最多 1 MiB，超限同样 fail closed。
+- 资源：普通候选缓冲最多 4 KiB；local native reasoning 只保留当前段的累计文本用于快照去重，不设整段缓冲上限。external SSE 单事件缓冲最多 1 MiB，超限 fail closed。
 
 ## 方案取舍
 
 - 仅删除 hash 指纹成本低，但会漏掉 unhashed、legacy、roleless、signature 和未来工具名，且容易误删正常讨论，已否决。
 - 对 signed thinking 只清洗正文会破坏完整性，已否决。
 - 对污染 response 返回安全前缀加空白占位仍会造成语义截断和假成功，已由 P0 fail-closed 合同替代。
-- 原子缓冲会增加最多 1 MiB/active thinking block 的内存和首 thinking 延迟；这是保证 signature 晚到时仍可回滚的必要成本，超限必须显式失败而不是无界增长。
+- local native reasoning 整段原子缓冲已否决：现网 59137 上它把首字推迟到推理结束（opus-5.5 首字 p90 约 100s），而 81952 条本地流式记录里签名推理污染为 0 次。改为边收边发后，污染由增量 sanitizer 扣住、整轮报错兜底，安全性不变，首字回到上游首个 reasoning 事件的时间。分析见 [59137 本地账号首字慢根因](../../docs/analysis/prod-59137-local-first-token-reasoning-buffer-20261028.md)。
 
 ## 验收合同
 
@@ -83,9 +84,8 @@ native/XML/signed/redacted、local/external、stream/non-stream、逐字符、�
   - 用户正文、tool input、tool result、代码围栏和不完整/无工具名匹配的讨论仍原样保留。
 - `src/anthropic/stream.rs`
   - XML unsigned thinking 使用独立增量 sanitizer，候选不会跨入 text/tool block。
-  - native reasoning 在结构边界前缓冲完整累计快照；签名晚到也不会发生“先发正文、后发现必须整块删除”的回滚问题。
-  - native signed/redacted 污染整块抑制；只按实际下发的安全 thinking 计算 `thinking_tokens`。
-  - 原子 thinking 缓冲硬上限为 1 MiB；超限 fail closed 并生成规范流错误，不继续积累内存。
+  - native reasoning 边收边发：累计快照只下发新增后缀，增量片段直接下发；第一段安全文本到达时开 thinking 块，正文、工具调用、redacted 块或流结束时关块并发送 signature。
+  - native signed 污染时扣住私有 transcript、不发 signature，并以协议污染错误结束本轮；只按实际下发的安全 thinking 计算 `thinking_tokens`。
 - `src/anthropic/handlers.rs`
   - local non-stream 对 native/XML/signed/redacted 使用相同策略。
   - text 与 thinking suppression 合并写入既有 usage observability；没有伪造 thinking token 数。
@@ -117,7 +117,7 @@ native/XML/signed/redacted、local/external、stream/non-stream、逐字符、�
 | external SSE redacted、clean signed content 事件原样、块内 ping 即时透传 | 每格 5 | pass |
 | external SSE 多 data 行 + CRLF + JSON 跨行 + 逐字节 transport | signed/unsigned 各 5 | pass |
 | raw JSON `\\u000a`/混合 CRLF 转义与 marker 讨论误报边界 | 每格 5 | pass |
-| external/local 1 MiB 异常边界 | 各 1 个确定性边界测试 | pass |
+| external 1 MiB 异常边界；local native reasoning 超过 1 MiB 逐段下发 | 各 1 个确定性边界测试 | pass |
 
 已执行并通过：
 

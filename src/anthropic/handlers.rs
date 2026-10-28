@@ -13501,7 +13501,7 @@ async fn handle_non_stream_request(
                     redacted_thinking = Some(redacted);
                 }
                 if !reasoning.text.is_empty() {
-                    super::stream::merge_native_reasoning_text(
+                    let _ = super::stream::merge_native_reasoning_text(
                         &mut native_thinking_content,
                         &reasoning.text,
                     );

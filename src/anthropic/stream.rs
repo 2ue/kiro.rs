@@ -84,7 +84,6 @@ fn is_trivial_tool_preamble_text(content: &str) -> bool {
 
 const ASSISTANT_TEXT_TAIL_LIMIT_CHARS: usize = 4096;
 const TOOL_CONTEXT_LEAK_SPLIT_SCAN_LIMIT_CHARS: usize = 128;
-const MAX_BUFFERED_ATOMIC_THINKING_BYTES: usize = 1024 * 1024;
 /// 上游只返回 usage/metadata 侧信道事件就 EOF，没有任何 assistant/reasoning/tool 输出。
 /// Anthropic stop reason for an upstream content-filter refusal
 /// (`metadataEvent.stopReason = CONTENT_FILTERED`).
@@ -94,11 +93,15 @@ pub(crate) const UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL: &str = "upstream eventst
 /// 合并一段 Kiro 原生 reasoning 文本。上游有两种形态：每个事件带截至目前的完整内容
 /// （新文本以已有内容开头），或只带新增片段。前者替换，后者追加；只按"替换"处理会让
 /// 增量形态只剩最后一个片段。
-pub(crate) fn merge_native_reasoning_text(accumulated: &mut String, text: &str) {
+///
+/// 返回本次新增内容在 `accumulated` 中的起始字节位置，流式下发只发送 `accumulated[start..]`。
+pub(crate) fn merge_native_reasoning_text(accumulated: &mut String, text: &str) -> usize {
+    let start = accumulated.len();
     if text.starts_with(accumulated.as_str()) {
         accumulated.clear();
     }
     accumulated.push_str(text);
+    start
 }
 
 const TOOL_CONTEXT_LEAK_MARKERS: &[(&str, &str)] = &[
@@ -1675,16 +1678,21 @@ pub struct StreamContext {
     current_thinking_tag: Option<ThinkingXmlTag>,
     /// 是否已收到原生 reasoningContentEvent
     native_reasoning_seen: bool,
-    /// 原生 reasoning 累计内容，用于从快照计算 delta
+    /// 当前原生 reasoning 段从上游收到的累计内容，用于从快照计算 delta
     native_reasoning_content: String,
+    /// 当前原生 reasoning 段已经作为 thinking_delta 下发的内容（兼容签名按它计算）
+    native_reasoning_emitted: String,
+    /// 当前原生 reasoning 段的下游 thinking 块索引；首段安全文本下发时才开块
+    native_reasoning_block_index: Option<i32>,
+    /// 当前段开始时清洗器已拦截的块数，用于判断本段是否被污染
+    native_reasoning_suppressed_before: u32,
     /// 原生 reasoning 签名，按 Anthropic SSE 规范在 thinking block stop 前发送 signature_delta。
     native_reasoning_signature: Option<String>,
     /// 原生 reasoning 签名是否已通过 signature_delta 发送。
     native_reasoning_signature_sent: bool,
-    /// 原生 reasoning 在结构边界处完成原子判定后不重复下发。
-    native_reasoning_finalized: bool,
-    /// 原生 signed thinking 超过有界缓冲后 fail closed。
-    native_reasoning_buffer_overflow: bool,
+    /// 是否有未关闭的原生 reasoning 段；段在正文、工具调用或流结束等结构边界处关闭，
+    /// 之后的 reasoning 事件开启新段。
+    native_reasoning_segment_open: bool,
     /// 上游流内错误，最终以 SSE error 事件暴露。
     ///
     /// 这里保存原始错误用于 usage/日志定位；生产 SSE 输出会通过
@@ -1918,10 +1926,12 @@ impl StreamContext {
             current_thinking_tag: None,
             native_reasoning_seen: false,
             native_reasoning_content: String::new(),
+            native_reasoning_emitted: String::new(),
+            native_reasoning_block_index: None,
+            native_reasoning_suppressed_before: 0,
             native_reasoning_signature: None,
             native_reasoning_signature_sent: false,
-            native_reasoning_finalized: false,
-            native_reasoning_buffer_overflow: false,
+            native_reasoning_segment_open: false,
             stream_error: None,
             last_stream_error: None,
             stream_error_id: None,
@@ -2930,23 +2940,12 @@ impl StreamContext {
         }
 
         self.native_reasoning_seen = true;
-        if self.native_reasoning_finalized {
-            // A previous reasoning segment was already closed, so this event starts a new block.
-            // Each Claude Code thinking block must carry its own Kiro-native signature_delta.
-            self.native_reasoning_content.clear();
-            self.native_reasoning_signature = None;
-            self.native_reasoning_signature_sent = false;
-            self.native_reasoning_buffer_overflow = false;
-        }
-        self.native_reasoning_finalized = false;
         let mut events = Vec::new();
 
         if let Some(redacted) = reasoning.redacted_content.as_deref() {
-            self.native_reasoning_content.clear();
-            self.native_reasoning_signature = None;
-            self.native_reasoning_signature_sent = false;
-            self.native_reasoning_buffer_overflow = false;
-            self.native_reasoning_finalized = true;
+            // A redacted block is opaque and complete on its own; close any open plain segment
+            // first so blocks never overlap.
+            events.extend(self.close_native_reasoning_block());
             tracing::debug!(
                 redacted_thinking_encoded_bytes = redacted.len(),
                 "preserving opaque redacted reasoning block"
@@ -2971,19 +2970,25 @@ impl StreamContext {
             return events;
         }
 
-        if let Some(signature) = reasoning.signature.as_deref() {
-            if !signature.is_empty() {
-                if signature.len() > MAX_BUFFERED_ATOMIC_THINKING_BYTES {
-                    self.native_reasoning_signature = None;
-                    self.native_reasoning_buffer_overflow = true;
-                    self.record_stream_error(
-                        "api_error",
-                        "native reasoning signature exceeded bounded atomic thinking buffer",
-                    );
-                } else {
-                    self.native_reasoning_signature = Some(signature.to_string());
-                }
-            }
+        if !self.native_reasoning_segment_open {
+            // A new segment starts a new thinking block; each Claude Code thinking block must
+            // carry its own Kiro-native signature_delta.
+            self.native_reasoning_segment_open = true;
+            self.native_reasoning_content.clear();
+            self.native_reasoning_emitted.clear();
+            self.native_reasoning_block_index = None;
+            self.native_reasoning_signature = None;
+            self.native_reasoning_signature_sent = false;
+            self.native_reasoning_suppressed_before =
+                self.thinking_transcript_sanitizer.suppressed_blocks();
+        }
+
+        if let Some(signature) = reasoning
+            .signature
+            .as_deref()
+            .filter(|signature| !signature.is_empty())
+        {
+            self.native_reasoning_signature = Some(signature.to_string());
         }
 
         let text = reasoning.text.as_str();
@@ -2991,28 +2996,13 @@ impl StreamContext {
             return events;
         }
 
-        let merged_len = if text.starts_with(self.native_reasoning_content.as_str()) {
-            text.len()
-        } else {
-            self.native_reasoning_content
-                .len()
-                .saturating_add(text.len())
-        };
-        if merged_len.saturating_add(
-            self.native_reasoning_signature
-                .as_ref()
-                .map_or(0, String::len),
-        ) > MAX_BUFFERED_ATOMIC_THINKING_BYTES
-        {
-            self.native_reasoning_content.clear();
-            self.native_reasoning_buffer_overflow = true;
-            self.record_stream_error(
-                "api_error",
-                "native reasoning exceeded bounded atomic thinking buffer",
-            );
-            return events;
-        }
-        merge_native_reasoning_text(&mut self.native_reasoning_content, text);
+        // Stream reasoning as it arrives instead of holding the whole segment until a structural
+        // boundary: holding it delayed the first token until reasoning finished. The sanitizer
+        // still withholds any internal tool transcript, and the signature is sent at block close.
+        let start = merge_native_reasoning_text(&mut self.native_reasoning_content, text);
+        let delta = self.native_reasoning_content[start..].to_string();
+        let safe = self.thinking_transcript_sanitizer.push(&delta);
+        self.push_native_reasoning_delta(&mut events, &safe);
         events
     }
 
@@ -3658,68 +3648,71 @@ impl StreamContext {
         Some(self.create_signature_delta_event(index, &signature))
     }
 
+    /// 下发一段已通过清洗器的原生 reasoning 文本；本段第一次有非空文本时才开 thinking 块。
+    fn push_native_reasoning_delta(&mut self, events: &mut Vec<SseEvent>, thinking: &str) {
+        if thinking.is_empty() {
+            return;
+        }
+        let index = match self.native_reasoning_block_index {
+            Some(index) => index,
+            None => {
+                let index = self.state_manager.next_block_index();
+                self.native_reasoning_block_index = Some(index);
+                events.extend(self.state_manager.handle_content_block_start(
+                    index,
+                    "thinking",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                    }),
+                ));
+                index
+            }
+        };
+        self.native_reasoning_emitted.push_str(thinking);
+        events.push(self.create_sanitized_thinking_delta_event(index, thinking));
+    }
+
+    /// 在结构边界（正文、工具调用、redacted 块或流结束）关闭当前原生 reasoning 段：
+    /// 放出清洗器暂存的安全文本，再发送签名和 content_block_stop。
+    ///
+    /// 清洗器没有拦截任何内容时，下发文本与上游原文逐字一致，原生签名照常有效。本段被拦截过
+    /// 内容（包括签名里带内部协议文本）时不再下发签名；拦截计数会让本轮以协议污染错误结束，
+    /// 客户端不会把这段 thinking 写进历史。
     fn close_native_reasoning_block(&mut self) -> Vec<SseEvent> {
-        if self.native_reasoning_finalized {
+        if !self.native_reasoning_segment_open {
             return Vec::new();
         }
-        self.native_reasoning_finalized = true;
-        if self.native_reasoning_buffer_overflow || self.native_reasoning_content.is_empty() {
-            return Vec::new();
-        }
+        self.native_reasoning_segment_open = false;
 
         let mut events = Vec::new();
-        let suppressed_before = self.thinking_transcript_sanitizer.suppressed_blocks();
-        let mut safe = self
-            .thinking_transcript_sanitizer
-            .push(&self.native_reasoning_content);
-        safe.push_str(&self.thinking_transcript_sanitizer.finish());
-        let signed = self
-            .native_reasoning_signature
-            .as_deref()
-            .is_some_and(|signature| !signature.is_empty());
+        let pending = self.thinking_transcript_sanitizer.finish();
+        self.push_native_reasoning_delta(&mut events, &pending);
         if let Some(signature) = self.native_reasoning_signature.as_deref() {
             let _ = self.thinking_transcript_sanitizer.push(signature);
             let _ = self.thinking_transcript_sanitizer.finish();
         }
-        let polluted = self.thinking_transcript_sanitizer.suppressed_blocks() > suppressed_before;
-        if signed && polluted {
+        let polluted = self.thinking_transcript_sanitizer.suppressed_blocks()
+            > self.native_reasoning_suppressed_before;
+        let Some(index) = self.native_reasoning_block_index.take() else {
+            // Nothing safe was emitted for this segment, so there is no block to close.
+            return events;
+        };
+        if polluted {
             tracing::warn!(
                 native_thinking_bytes = self.native_reasoning_content.len(),
-                "suppressed polluted signed thinking block atomically"
+                "withheld signature of polluted native thinking block"
             );
-            return events;
-        }
-
-        let output = if signed {
-            self.native_reasoning_content.clone()
-        } else {
-            safe
-        };
-        if output.is_empty() {
-            return events;
-        }
-        let thinking_index = self.state_manager.next_block_index();
-        self.thinking_block_index = Some(thinking_index);
-        events.extend(self.state_manager.handle_content_block_start(
-            thinking_index,
-            "thinking",
-            json!({
-                "type": "content_block_start",
-                "index": thinking_index,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-            }),
-        ));
-        events.push(self.create_sanitized_thinking_delta_event(thinking_index, &output));
-        if let Some(signature_event) = self.take_native_signature_delta_event(thinking_index) {
+        } else if let Some(signature_event) = self.take_native_signature_delta_event(index) {
             events.push(signature_event);
         } else if self.synthetic_thinking_signatures {
-            let signature = synthetic_thinking_signature(&output);
-            events.push(self.create_signature_delta_event(thinking_index, &signature));
+            let signature = synthetic_thinking_signature(&self.native_reasoning_emitted);
+            events.push(self.create_signature_delta_event(index, &signature));
         }
-        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(index) {
             events.push(stop_event);
         }
-        self.thinking_block_index = None;
         events
     }
 
@@ -4185,6 +4178,15 @@ impl StreamContext {
     {
         let mut events = Vec::new();
 
+        // A streamed native reasoning block may still be open; close it before any pending text
+        // or tool block starts so content blocks never overlap.
+        if self.native_reasoning_seen {
+            events.extend(self.close_native_reasoning_block());
+            self.thinking_buffer.clear();
+            self.in_thinking_block = false;
+            self.thinking_extracted = true;
+        }
+
         events.extend(self.flush_pending_trivial_text());
         if self.upstream_content_filter_refusal.is_some() && self.stream_error.is_none() {
             // A refusal can cut a tool call off mid-input. Never complete or report those calls.
@@ -4204,13 +4206,6 @@ impl StreamContext {
             // errmm-12：流以错误结束时，input 不完整的工具调用不能被当成完整调用补全。
             // 未开块的直接丢弃；已开块的在下面保持打开，下游只会看到 error 事件。
             self.pending_tool_starts.clear();
-        }
-
-        if self.native_reasoning_seen {
-            events.extend(self.close_native_reasoning_block());
-            self.thinking_buffer.clear();
-            self.in_thinking_block = false;
-            self.thinking_extracted = true;
         }
 
         // Flush thinking_buffer 中的剩余内容
@@ -5692,7 +5687,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_native_reasoning_leak_is_suppressed_atomically_across_snapshots() {
+    fn signed_native_reasoning_leak_withholds_transcript_and_signature_across_snapshots() {
         use crate::kiro::model::events::ReasoningContentEvent;
 
         let polluted = "safe prefix\nuser Continue\n\nBash: hidden";
@@ -5721,8 +5716,16 @@ mod tests {
             events.extend(ctx.process_assistant_response("visible answer"));
             events.extend(ctx.generate_final_events());
 
-            assert_eq!(collect_thinking_content(&events), "");
-            assert_eq!(collect_text_content(&events), "visible answer");
+            // The safe prefix streams out; the internal transcript never does, the signature is
+            // withheld, and the turn ends with a protocol error so the client keeps no history.
+            assert_eq!(collect_thinking_content(&events), "safe prefix\n");
+            assert!(!events.iter().any(|event| {
+                event
+                    .data
+                    .pointer("/delta/thinking")
+                    .and_then(Value::as_str)
+                    .is_some_and(|thinking| thinking.contains("Continue"))
+            }));
             assert!(!events.iter().any(|event| {
                 event
                     .data
@@ -5730,18 +5733,13 @@ mod tests {
                     .and_then(Value::as_str)
                     == Some("opaque-signature")
             }));
-            assert!(!events.iter().any(|event| {
-                event.data["usage"]["output_tokens_details"]["thinking_tokens"]
-                    .as_i64()
-                    .is_some_and(|tokens| tokens > 0)
-            }));
             assert_eq!(ctx.suppressed_tool_context_leak_blocks(), 1);
             assert_protocol_contamination_error(&events, &ctx);
         }
     }
 
     #[test]
-    fn polluted_native_signature_drops_clean_signed_reasoning() {
+    fn polluted_native_signature_is_withheld_and_fails_closed() {
         use crate::kiro::model::events::ReasoningContentEvent;
 
         for _round in 0..5 {
@@ -5762,8 +5760,7 @@ mod tests {
             )));
             events.extend(ctx.process_assistant_response("visible"));
             events.extend(ctx.generate_final_events());
-            assert_eq!(collect_thinking_content(&events), "");
-            assert_eq!(collect_text_content(&events), "visible");
+            assert_eq!(collect_thinking_content(&events), "ordinary reasoning");
             assert!(
                 !events
                     .iter()
@@ -5774,9 +5771,12 @@ mod tests {
     }
 
     #[test]
-    fn native_atomic_thinking_buffer_overflow_fails_closed() {
+    fn large_native_reasoning_streams_without_a_buffer_limit() {
         use crate::kiro::model::events::ReasoningContentEvent;
 
+        // 17 x 64 KiB is larger than the 1 MiB atomic buffer that used to fail the turn closed.
+        // Each fragment has a distinct prefix so it is read as incremental, not as a snapshot.
+        let fragment = |index: usize| format!("[{index:02}]{}", "x".repeat(64 * 1024));
         let mut ctx = StreamContext::new_with_thinking_with_known_tools(
             "test-model",
             1,
@@ -5785,22 +5785,170 @@ mod tests {
             HashSet::from(["Bash".to_string()]),
         );
         let mut events = ctx.generate_initial_events();
-        events.extend(
-            ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
-                text: "x".repeat(MAX_BUFFERED_ATOMIC_THINKING_BYTES + 1),
-                signature: Some("opaque-signature".to_string()),
+        let mut expected = String::new();
+        for index in 0..17 {
+            let text = fragment(index);
+            expected.push_str(&text);
+            let emitted = ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                text: text.clone(),
+                signature: (index == 16).then(|| "opaque-signature".to_string()),
                 redacted_content: None,
-            })),
-        );
-        assert!(ctx.has_stream_error());
+            }));
+            assert_eq!(
+                collect_thinking_content(&emitted),
+                text,
+                "fragment {index} must stream immediately"
+            );
+            events.extend(emitted);
+        }
+        events.extend(ctx.process_assistant_response("visible"));
         events.extend(ctx.generate_final_events());
-        assert_eq!(collect_thinking_content(&events), "");
-        assert!(events.iter().any(|event| event.event == "error"));
-        assert!(
-            !events
+
+        assert!(!ctx.has_stream_error());
+        assert_eq!(collect_thinking_content(&events), expected);
+        assert_eq!(native_signatures(&events), vec!["opaque-signature"]);
+        assert_eq!(collect_text_content(&events), "visible");
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn native_reasoning_streams_each_delta_before_the_segment_closes_for_five_rounds() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+            let mut events = ctx.generate_initial_events();
+            // Cumulative snapshots (round 0-2) and incremental fragments (round 3-4).
+            let cumulative = round < 3;
+            let parts = ["Let me ", "check the ", "request."];
+            let mut sent = String::new();
+            for (step, part) in parts.iter().enumerate() {
+                sent.push_str(part);
+                let text = if cumulative {
+                    sent.clone()
+                } else {
+                    part.to_string()
+                };
+                let emitted =
+                    ctx.process_kiro_event(&Event::ReasoningContent(ReasoningContentEvent {
+                        text,
+                        signature: (step == parts.len() - 1).then(|| format!("sig-{round}")),
+                        redacted_content: None,
+                    }));
+                // Each event is forwarded right away: only the new part, never a repeat.
+                assert_eq!(collect_thinking_content(&emitted), *part, "round {round}");
+                assert!(native_signatures(&emitted).is_empty(), "round {round}");
+                assert_eq!(
+                    emitted
+                        .iter()
+                        .filter(|event| event.event == "content_block_start")
+                        .count(),
+                    usize::from(step == 0),
+                    "round {round}: one thinking block per segment"
+                );
+                assert!(
+                    emitted
+                        .iter()
+                        .all(|event| event.event != "content_block_stop"),
+                    "round {round}: the block stays open while reasoning continues"
+                );
+                if step == 0 {
+                    // Keepalive while reasoning is open targets the open thinking block.
+                    let keepalive = ctx
+                        .claude_code_noop_delta_keepalive_event()
+                        .expect("open thinking block keepalive");
+                    assert_eq!(keepalive.data["delta"]["type"], "thinking_delta");
+                    assert_eq!(keepalive.data["delta"]["thinking"], "");
+                }
+                events.extend(emitted);
+            }
+            events.extend(ctx.process_assistant_response("answer"));
+            events.extend(ctx.generate_final_events());
+
+            assert_eq!(
+                collect_thinking_content(&events),
+                "Let me check the request."
+            );
+            assert_eq!(native_signatures(&events), vec![format!("sig-{round}")]);
+            assert_eq!(collect_text_content(&events), "answer");
+            let thinking_stop = events
                 .iter()
-                .any(|event| { event.data.pointer("/delta/signature").is_some() })
-        );
+                .position(|event| event.event == "content_block_stop")
+                .expect("thinking block stops");
+            let signature = events
+                .iter()
+                .position(|event| event.data["delta"]["type"] == "signature_delta")
+                .expect("signature delta");
+            assert!(signature < thinking_stop, "round {round}");
+        }
+    }
+
+    #[test]
+    fn clean_signed_native_reasoning_streams_byte_identical_text_for_five_rounds() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        // Lines that look like transcript scaffolding at first are held only until they are
+        // proven ordinary, then released unchanged, so the native signature stays valid.
+        let reasoning = "Plan:\nuser Continue reading the config\nTool results:\nnone yet\n\
+                         user Tool results provided by the build are cached\n```\nuser Continue\n```\n\
+                         Bash: is only a word here\r\n最后检查。";
+        for round in 0..5 {
+            let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+                "test-model",
+                1,
+                true,
+                HashMap::new(),
+                HashSet::from(["Bash".to_string()]),
+            );
+            let mut events = ctx.generate_initial_events();
+            let step = round + 1;
+            let chars = reasoning.chars().collect::<Vec<_>>();
+            for piece in chars.chunks(step) {
+                events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                    ReasoningContentEvent {
+                        text: piece.iter().collect(),
+                        signature: Some("opaque-signature".to_string()),
+                        redacted_content: None,
+                    },
+                )));
+            }
+            events.extend(ctx.process_kiro_event(&tool_use_fragment(
+                "tool_1",
+                "Bash",
+                r#"{"command":"pwd"}"#,
+                true,
+            )));
+            events.extend(ctx.generate_final_events());
+
+            assert_eq!(
+                collect_thinking_content(&events),
+                reasoning,
+                "round {round}"
+            );
+            assert_eq!(native_signatures(&events), vec!["opaque-signature"]);
+            assert_eq!(
+                ctx.suppressed_tool_context_leak_blocks(),
+                0,
+                "round {round}"
+            );
+            assert!(!ctx.has_stream_error(), "round {round}");
+        }
+    }
+
+    fn native_signatures(events: &[SseEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|event| {
+                event.data["delta"]["signature"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
     }
 
     #[test]
