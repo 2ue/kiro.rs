@@ -195,10 +195,9 @@ pub(crate) struct InferenceAttemptBudget {
     /// Request entry route (e.g. `/cc/v1/messages`) used to apply per-credential route
     /// rules on every local dispatch of this request, including stream retries and MCP calls.
     dispatch_route: OnceLock<String>,
-    /// Local credentials that answered this request with a usage-only (empty) turn. Later
-    /// dispatches of the same request skip them instead of putting them on cooldown: an empty
-    /// turn depends on the request content, so it says nothing about the account itself.
-    usage_only_credential_ids: Mutex<HashSet<u64>>,
+    /// 本请求内已经空回（只有 usage/metadata、零帧或空响应体）的本地账号。同一请求后续派发
+    /// 跳过它们；是否另外冷却由全局开关 `credentialEmptyTurnCooldownEnabled` 决定。
+    empty_turn_credential_ids: Mutex<HashSet<u64>>,
     credential_dispatch_elapsed_ms: AtomicU64,
     upstream_header_wait_ms: AtomicU64,
 }
@@ -230,7 +229,7 @@ impl InferenceAttemptBudget {
             started_at: Instant::now(),
             dispatch_deadline: OnceLock::new(),
             dispatch_route: OnceLock::new(),
-            usage_only_credential_ids: Mutex::new(HashSet::new()),
+            empty_turn_credential_ids: Mutex::new(HashSet::new()),
             credential_dispatch_elapsed_ms: AtomicU64::new(0),
             upstream_header_wait_ms: AtomicU64::new(0),
         }
@@ -300,14 +299,14 @@ impl InferenceAttemptBudget {
         self.dispatch_route.get().map(String::as_str)
     }
 
-    /// Records a local credential that returned a usage-only turn for this request.
-    pub(crate) fn exclude_usage_only_credential(&self, credential_id: u64) {
-        self.usage_only_credential_ids.lock().insert(credential_id);
+    /// 记录在本请求内空回的本地账号。
+    pub(crate) fn exclude_empty_turn_credential(&self, credential_id: u64) {
+        self.empty_turn_credential_ids.lock().insert(credential_id);
     }
 
     /// Local credentials later dispatches of this request should skip.
-    pub(crate) fn usage_only_credential_ids(&self) -> HashSet<u64> {
-        self.usage_only_credential_ids.lock().clone()
+    pub(crate) fn empty_turn_credential_ids(&self) -> HashSet<u64> {
+        self.empty_turn_credential_ids.lock().clone()
     }
 
     pub(crate) fn dispatch_deadline(&self) -> Option<Instant> {

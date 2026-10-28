@@ -482,6 +482,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   credentialServerErrorCooldownSecs: 5,
   credentialNetworkErrorCooldownSecs: 5,
   credentialStreamErrorCooldownSecs: 5,
+  credentialEmptyTurnCooldownEnabled: false,
   credentialProtocolErrorCooldownSecs: 10,
   credentialAuthErrorCooldownSecs: 10,
   credentialCooldownBackoffMultiplier: 2,

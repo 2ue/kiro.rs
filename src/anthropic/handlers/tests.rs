@@ -3807,6 +3807,8 @@ enum HandlerEventStreamFault {
     UsageOnlyEveryAttempt,
     /// 200 with an empty EventStream body on every attempt ("ended without any frames").
     EmptyStreamEveryAttempt,
+    /// 每次都返回 200、content-type 为 JSON 且响应体为空（生产上的 json_stream_incomplete_body）。
+    EmptyJsonBodyEveryAttempt,
     CompleteToolWithoutStatus,
     /// Completed call to the Claude Code `StructuredOutput` client tool.
     StructuredOutputToolUse,
@@ -4027,6 +4029,9 @@ async fn handler_eventstream_fault_upstream(
             HandlerEventStreamFault::EmptyStreamEveryAttempt => {
                 handler_eventstream_bytes_response(Vec::new())
             }
+            HandlerEventStreamFault::EmptyJsonBodyEveryAttempt => {
+                handler_eventstream_json_labeled_bytes_response(Vec::new())
+            }
             _ => handler_eventstream_bytes_response(handler_eventstream_normal_body()),
         };
     }
@@ -4127,6 +4132,9 @@ async fn handler_eventstream_fault_upstream(
         }
         HandlerEventStreamFault::EmptyStreamEveryAttempt => {
             handler_eventstream_bytes_response(Vec::new())
+        }
+        HandlerEventStreamFault::EmptyJsonBodyEveryAttempt => {
+            handler_eventstream_json_labeled_bytes_response(Vec::new())
         }
         HandlerEventStreamFault::UnknownEventOnly => {
             handler_eventstream_bytes_response(eventstream_test_frame(
@@ -4386,7 +4394,11 @@ async fn handler_eventstream_fault_upstream(
                 header::CONTENT_LENGTH,
                 (LOCAL_NON_STREAM_RESPONSE_MAX_BYTES + 1).to_string(),
             )
-            .body(Body::empty())
+            // Body::empty() 的长度是确定的 0，服务端会把 content-length 改成 0，变成空响应体；
+            // 用长度未知的空流才能让客户端真正看到超限的 content-length。
+            .body(Body::from_stream(stream::empty::<
+                Result<Bytes, std::io::Error>,
+            >()))
             .expect("build declared over-limit response"),
         HandlerEventStreamFault::NonStreamChunkedOverLimit => {
             handler_eventstream_chunked_response(vec![
@@ -6520,6 +6532,84 @@ fn usage_only_retries_up_to_shared_attempt_cap() {
     run_handler_fixture_on_large_stack_thread(
         "usage-only-shared-attempt-cap",
         run_usage_only_retries_up_to_shared_attempt_cap,
+    );
+}
+
+fn cooled_down_credentials(token_manager: &MultiTokenManager) -> Vec<(u64, Option<String>)> {
+    token_manager
+        .snapshot()
+        .entries
+        .into_iter()
+        .filter(|entry| entry.cooled_down)
+        .map(|entry| (entry.id, entry.cooldown_reason))
+        .collect()
+}
+
+/// 三种空回（只有用量统计、零帧、JSON 空响应体）在流式和非流式下：
+/// 全局开关关闭（默认）时不冷却任何账号，每次重试都换到新账号；
+/// 打开后每个空回过的账号都进入冷却。
+async fn run_empty_turn_cooldown_follows_global_switch() {
+    for fault in [
+        HandlerEventStreamFault::UsageOnlyEveryAttempt,
+        HandlerEventStreamFault::EmptyStreamEveryAttempt,
+        HandlerEventStreamFault::EmptyJsonBodyEveryAttempt,
+    ] {
+        for stream in [true, false] {
+            for cooldown_enabled in [false, true] {
+                let label = format!("{fault:?} stream={stream} cooldown={cooldown_enabled}");
+                let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+                let (app, usage_recorder, token_manager) =
+                    handler_eventstream_fault_router_with_manager(
+                        &upstream.base_url,
+                        4,
+                        4,
+                        |config| {
+                            config.kiro_upstream_stream_retry_max_attempts = 3;
+                            config.inference_upstream_max_attempts = 10;
+                            config.credential_empty_turn_cooldown_enabled = cooldown_enabled;
+                        },
+                        None,
+                    );
+                let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+                if stream {
+                    assert_eq!(status, StatusCode::OK, "{label} body={body}");
+                    assert_eq!(
+                        body.matches("event: error").count(),
+                        1,
+                        "{label} body={body}"
+                    );
+                } else {
+                    assert_eq!(status, StatusCode::BAD_GATEWAY, "{label} body={body}");
+                }
+                assert_eq!(upstream.hits(), 3, "{label}: 首次调用加两次重试");
+                let record = usage_record_for_request(&usage_recorder, &request_id);
+                let accounts: HashSet<_> = record
+                    .credential_attempts
+                    .iter()
+                    .map(|attempt| attempt.credential_id)
+                    .collect();
+                assert_eq!(accounts.len(), 3, "{label}: 每次重试都换到新账号");
+
+                let cooled = cooled_down_credentials(&token_manager);
+                if cooldown_enabled {
+                    assert_eq!(
+                        cooled.len(),
+                        3,
+                        "{label}: 空回过的账号都进入冷却 {cooled:?}"
+                    );
+                } else {
+                    assert!(cooled.is_empty(), "{label}: 默认空回不冷却账号 {cooled:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_turn_cooldown_follows_global_switch() {
+    run_handler_fixture_on_large_stack_thread(
+        "empty-turn-cooldown-switch",
+        run_empty_turn_cooldown_follows_global_switch,
     );
 }
 

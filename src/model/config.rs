@@ -4999,6 +4999,14 @@ pub struct Config {
     #[serde(default = "default_credential_stream_error_cooldown_secs")]
     pub credential_stream_error_cooldown_secs: u64,
 
+    /// 空回是否让账号进入冷却（默认关闭）。
+    ///
+    /// 空回指上游返回 200 但没有任何正文、思考或工具输出：只有用量统计事件、流里一帧都没有、
+    /// 或非流式响应体为空。关闭时账号不冷却、不记会话失败，只在当次请求内排除并换号；
+    /// 开启时按 `credential_stream_error_cooldown_secs` 冷却，并记会话失败。
+    #[serde(default)]
+    pub credential_empty_turn_cooldown_enabled: bool,
+
     /// 可重试协议异常或无法分类错误的基础冷却秒数。
     #[serde(default = "default_credential_protocol_error_cooldown_secs")]
     pub credential_protocol_error_cooldown_secs: u64,
@@ -6641,6 +6649,7 @@ impl Default for Config {
             credential_network_error_cooldown_secs: default_credential_network_error_cooldown_secs(
             ),
             credential_stream_error_cooldown_secs: default_credential_stream_error_cooldown_secs(),
+            credential_empty_turn_cooldown_enabled: false,
             credential_protocol_error_cooldown_secs:
                 default_credential_protocol_error_cooldown_secs(),
             credential_auth_error_cooldown_secs: default_credential_auth_error_cooldown_secs(),
@@ -7531,6 +7540,10 @@ mod tests {
         assert_eq!(config.credential_auth_error_cooldown_secs, 10);
         assert_eq!(config.credential_cooldown_backoff_multiplier, 2.0);
         assert_eq!(config.credential_probation_secs, 30);
+        assert!(
+            !config.credential_empty_turn_cooldown_enabled,
+            "空回默认不让账号冷却"
+        );
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 5);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);

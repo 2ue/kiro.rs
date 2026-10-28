@@ -10372,6 +10372,11 @@ enum JsonStreamSniffResult {
     Error(JsonStreamError),
 }
 
+/// 标成 JSON 的上游响应体只有空白（流式路径）。
+const JSON_STREAM_EMPTY_BODY_DETAIL: &str = "json_stream_empty_body";
+/// 标成 JSON 的上游响应体为空（非流式路径一次读完时）。
+const JSON_STREAM_INCOMPLETE_BODY_DETAIL: &str = "json_stream_incomplete_body";
+
 struct JsonStreamErrorSniffer {
     enabled: bool,
     decided: bool,
@@ -10477,7 +10482,7 @@ impl JsonStreamErrorSniffer {
         if trimmed.is_empty() {
             return Some(JsonStreamError {
                 error_type: "api_error",
-                internal_detail: "json_stream_empty_body".to_string(),
+                internal_detail: JSON_STREAM_EMPTY_BODY_DETAIL.to_string(),
                 body_bytes: 0,
                 diagnostics: Some(upstream_body_diagnostics(
                     "json_stream_sniffer",
@@ -10745,7 +10750,7 @@ fn inspect_complete_upstream_body(
         JsonStreamSniffResult::Pending => {
             Err(sniffer.finish().unwrap_or_else(|| JsonStreamError {
                 error_type: "api_error",
-                internal_detail: "json_stream_incomplete_body".to_string(),
+                internal_detail: JSON_STREAM_INCOMPLETE_BODY_DETAIL.to_string(),
                 body_bytes: 0,
                 diagnostics: Some(upstream_body_diagnostics(
                     "json_stream_sniffer",
@@ -10818,10 +10823,22 @@ fn decode_complete_eventstream(body: &[u8]) -> Result<Vec<Event>, String> {
         ));
     }
     if decoder.frames_decoded() == 0 {
-        return Err("upstream eventstream ended without any frames".to_string());
+        return Err(UPSTREAM_NO_FRAMES_DETAIL.to_string());
     }
 
     Ok(events)
+}
+
+const UPSTREAM_NO_FRAMES_DETAIL: &str = "upstream eventstream ended without any frames";
+
+/// 上游返回 200 但没有任何输出的空回：只有 usage/metadata 侧信道事件、EventStream 一帧都没有、
+/// 或标成 JSON 的响应体为空。这些都在本请求内排除该账号换号；是否冷却账号由全局开关
+/// `credentialEmptyTurnCooldownEnabled` 决定（默认不冷却）。
+fn is_empty_turn_detail(detail: &str) -> bool {
+    detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
+        || detail == UPSTREAM_NO_FRAMES_DETAIL
+        || detail == JSON_STREAM_EMPTY_BODY_DETAIL
+        || detail == JSON_STREAM_INCOMPLETE_BODY_DETAIL
 }
 
 /// 非流式完整响应是否为空轮次：没有任何文本、reasoning 或工具输出，也没有错误类事件，
@@ -11108,6 +11125,85 @@ fn usage_only_retry_request(
     Some((body, request))
 }
 
+struct NonStreamEmptyTurnRetry<'a> {
+    provider: &'a Arc<KiroProvider>,
+    request_body: &'a str,
+    kiro_request: &'a KiroRequest,
+    request_id: &'a str,
+    external_fallback: Option<&'a ExternalFallbackContext>,
+    capacity_weight_units: u32,
+    model: &'a str,
+    stream_retry_config: &'a LocalStreamRetryConfig,
+    attempt: u32,
+    usage_context: &'a RequestUsageContext,
+}
+
+/// 非流式零帧或空响应体：在首输出前重试次数内排除该账号并换号重发原请求。
+///
+/// 返回 `Some` 表示已拿到新账号的响应，调用方继续读取；`None` 表示没有拿到新响应（首输出前重试
+/// 关闭、次数用完，或换号请求没能发出），调用方上报空回后按失败终态返回。换号请求发出前，这里
+/// 已经替当前账号上报过空回；空回上报只生效一次，调用方再报不会重复计。
+async fn retry_non_stream_empty_turn(
+    retry: NonStreamEmptyTurnRetry<'_>,
+    completion: &crate::kiro::provider::KiroApiCompletion,
+    detail: &str,
+) -> Option<crate::kiro::provider::KiroApiResponse> {
+    let config = retry.stream_retry_config;
+    if !config.active()
+        || !config.allows(StreamRetryReason::ProtocolError)
+        || retry.attempt >= config.max_attempts
+    {
+        return None;
+    }
+    tracing::warn!(
+        request_id = %retry.request_id,
+        attempt = retry.attempt,
+        next_attempt = retry.attempt.saturating_add(1),
+        max_attempts = config.max_attempts,
+        detail = %detail,
+        "本地 Kiro 非流式响应为空，换号重试"
+    );
+    let attempt_budget = retry.usage_context.latency.inference_attempt_budget.clone();
+    attempt_budget.exclude_empty_turn_credential(completion.credential_id());
+    completion.report_empty_turn(detail);
+    let consumed_before = attempt_budget.snapshot().consumed;
+    let retry_dispatch = call_api_maybe_fail_fast(
+        retry.provider,
+        retry.request_body,
+        Some(retry.kiro_request),
+        Some(retry.request_id),
+        retry.external_fallback,
+        retry.capacity_weight_units,
+        Some(retry.model),
+        attempt_budget.clone(),
+    )
+    .await;
+    let retry_sends = attempt_budget
+        .snapshot()
+        .consumed
+        .saturating_sub(consumed_before);
+    if retry_sends > 0 {
+        retry
+            .usage_context
+            .mark_stream_retry_sends(retry_sends, StreamRetryReason::ProtocolError);
+    } else if retry_dispatch.is_err() {
+        retry
+            .usage_context
+            .mark_stream_retry_dispatch_failure(StreamRetryReason::ProtocolError);
+    }
+    match retry_dispatch {
+        Ok(response) => Some(response),
+        Err(error) => {
+            tracing::warn!(
+                request_id = %retry.request_id,
+                error = %error,
+                "非流式空响应的换号重试未能发出"
+            );
+            None
+        }
+    }
+}
+
 /// 流式空轮次：把重试计划替换为 [`usage_only_retry_request`]。返回是否替换成功。
 /// Captures a request whose upstream stayed usage-only until the pre-output retries ran out.
 fn record_usage_only_capture(credential_usage: &CredentialUsageContext, attempts: u32) {
@@ -11162,11 +11258,10 @@ async fn retry_stream_before_downstream_commit(
         .latency
         .inference_attempt_budget
         .clone();
-    if reason == StreamRetryReason::UsageOnly {
-        // An empty turn depends on the request, not the account: skip the account for the rest
-        // of this request instead of cooling it down for everyone.
-        attempt_budget.exclude_usage_only_credential(state.completion.credential_id());
-        state.completion.report_usage_only_turn();
+    if reason == StreamRetryReason::UsageOnly || is_empty_turn_detail(&detail) {
+        // 空回：本请求内排除该账号换号；是否冷却由全局开关决定（默认不冷却）。
+        attempt_budget.exclude_empty_turn_credential(state.completion.credential_id());
+        state.completion.report_empty_turn(detail.clone());
     } else {
         state
             .completion
@@ -11894,9 +11989,15 @@ fn create_sse_stream(
                                         }
                                     }
                                 }
-                                state
-                                    .completion
-                                    .report_upstream_stream_failure(error.internal_detail.clone());
+                                if is_empty_turn_detail(&error.internal_detail) {
+                                    state
+                                        .completion
+                                        .report_empty_turn(error.internal_detail.clone());
+                                } else {
+                                    state.completion.report_upstream_stream_failure(
+                                        error.internal_detail.clone(),
+                                    );
+                                }
                                 state.usage_guard.context().request.merge_error_metadata(
                                     error.diagnostics.clone().map(|diagnostics| {
                                         json!({ "upstreamBodyDiagnostics": diagnostics })
@@ -11923,7 +12024,7 @@ fn create_sse_stream(
                                     state.decoder.pending_bytes()
                                 ))
                             } else if state.decoder.frames_decoded() == 0 {
-                                Some("upstream eventstream ended without any frames".to_string())
+                                Some(UPSTREAM_NO_FRAMES_DETAIL.to_string())
                             } else if state.ctx.upstream_status_indicates_incomplete() {
                                 Some(format!(
                                     "upstream eventstream ended with incomplete messageStatus={}",
@@ -12011,12 +12112,15 @@ fn create_sse_stream(
                                         }
                                     }
                                 }
-                                if detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL {
-                                    state.completion.report_usage_only_turn();
-                                    record_usage_only_capture(
-                                        state.usage_guard.context(),
-                                        state.attempt_number,
-                                    );
+                                if is_empty_turn_detail(&detail) {
+                                    state.completion.report_empty_turn(detail.clone());
+                                    if detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL
+                                    {
+                                        record_usage_only_capture(
+                                            state.usage_guard.context(),
+                                            state.attempt_number,
+                                        );
+                                    }
                                 } else {
                                     state
                                         .completion
@@ -13199,6 +13303,40 @@ async fn handle_non_stream_request(
                             .clone()
                             .map(|diagnostics| json!({ "upstreamBodyDiagnostics": diagnostics })),
                     );
+                    if is_empty_turn_detail(&error.internal_detail) {
+                        match retry_non_stream_empty_turn(
+                            NonStreamEmptyTurnRetry {
+                                provider: &provider,
+                                request_body,
+                                kiro_request,
+                                request_id: &request_id,
+                                external_fallback: external_fallback.as_ref(),
+                                capacity_weight_units,
+                                model,
+                                stream_retry_config: &stream_retry_config,
+                                attempt: non_stream_status_retry_attempt,
+                                usage_context: &usage_context,
+                            },
+                            &completion,
+                            &error.internal_detail,
+                        )
+                        .await
+                        {
+                            Some(response) => {
+                                retry_attempt_prefix = merge_credential_attempts(
+                                    retry_attempt_prefix,
+                                    completion.attempts().to_vec(),
+                                );
+                                api_response = response;
+                                non_stream_status_retry_attempt =
+                                    non_stream_status_retry_attempt.saturating_add(1);
+                                continue;
+                            }
+                            None => completion.report_empty_turn(error.internal_detail.clone()),
+                        }
+                    } else {
+                        completion.release();
+                    }
                     credential_usage.record_failure_with_public_error(
                         UsageRecordStatus::Error,
                         error.error_type,
@@ -13210,7 +13348,6 @@ async fn handle_non_stream_request(
                             Some(&credential_usage.request.error_id),
                         )),
                     );
-                    completion.release();
                     return envelope::error_response_with_id(
                         status,
                         error.error_type,
@@ -13227,8 +13364,41 @@ async fn handle_non_stream_request(
                 Ok(events) => events,
                 Err(detail) => {
                     tracing::warn!(error = %detail, "非流式 EventStream 响应不完整");
+                    if is_empty_turn_detail(&detail) {
+                        match retry_non_stream_empty_turn(
+                            NonStreamEmptyTurnRetry {
+                                provider: &provider,
+                                request_body,
+                                kiro_request,
+                                request_id: &request_id,
+                                external_fallback: external_fallback.as_ref(),
+                                capacity_weight_units,
+                                model,
+                                stream_retry_config: &stream_retry_config,
+                                attempt: non_stream_status_retry_attempt,
+                                usage_context: &usage_context,
+                            },
+                            &completion,
+                            &detail,
+                        )
+                        .await
+                        {
+                            Some(response) => {
+                                retry_attempt_prefix = merge_credential_attempts(
+                                    retry_attempt_prefix,
+                                    completion.attempts().to_vec(),
+                                );
+                                api_response = response;
+                                non_stream_status_retry_attempt =
+                                    non_stream_status_retry_attempt.saturating_add(1);
+                                continue;
+                            }
+                            None => completion.report_empty_turn(detail.clone()),
+                        }
+                    } else {
+                        completion.release();
+                    }
                     credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-                    completion.release();
                     return envelope::error_response_with_id(
                         StatusCode::BAD_GATEWAY,
                         "api_error",
@@ -13383,10 +13553,9 @@ async fn handle_non_stream_request(
                 retry_attempt_prefix =
                     merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
                 let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
-                // The empty turn depends on the request, not the account: skip the account for
-                // the rest of this request instead of cooling it down.
-                attempt_budget.exclude_usage_only_credential(completion.credential_id());
-                completion.report_usage_only_turn();
+                // 空回：本请求内排除该账号换号；是否冷却由全局开关决定（默认不冷却）。
+                attempt_budget.exclude_empty_turn_credential(completion.credential_id());
+                completion.report_empty_turn(super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL);
                 let consumed_before = attempt_budget.snapshot().consumed;
                 let retry_dispatch = call_api_maybe_fail_fast(
                     &provider,
@@ -13856,9 +14025,11 @@ async fn handle_non_stream_request(
             tracing::warn!(error = detail, "非流式响应缺少可信完成信号");
             if detail == super::stream::UPSTREAM_SIDE_CHANNEL_ONLY_EOF_DETAIL {
                 record_usage_only_capture(&credential_usage, non_stream_status_retry_attempt);
+                completion.report_empty_turn(detail);
+            } else {
+                completion.release();
             }
             credential_usage.record_failure(UsageRecordStatus::Error, "api_error", detail);
-            completion.release();
             return envelope::error_response_with_id(
                 StatusCode::BAD_GATEWAY,
                 "api_error",

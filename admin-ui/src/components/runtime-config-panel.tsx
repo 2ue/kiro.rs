@@ -518,6 +518,7 @@ const emptyConfig: RuntimeConfig = {
   credentialServerErrorCooldownSecs: 5,
   credentialNetworkErrorCooldownSecs: 5,
   credentialStreamErrorCooldownSecs: 5,
+  credentialEmptyTurnCooldownEnabled: false,
   credentialProtocolErrorCooldownSecs: 10,
   credentialAuthErrorCooldownSecs: 10,
   credentialCooldownBackoffMultiplier: 2,
@@ -3795,6 +3796,7 @@ export function RuntimeConfigPanel() {
       credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
       credentialNetworkErrorCooldownSecs: toWhole(draft.credentialNetworkErrorCooldownSecs, 1),
       credentialStreamErrorCooldownSecs: toWhole(draft.credentialStreamErrorCooldownSecs, 1),
+      credentialEmptyTurnCooldownEnabled: Boolean(draft.credentialEmptyTurnCooldownEnabled),
       credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
       credentialAuthErrorCooldownSecs: toWhole(draft.credentialAuthErrorCooldownSecs, 1),
       credentialCooldownBackoffMultiplier: Math.max(1, Number(draft.credentialCooldownBackoffMultiplier.toFixed(2))),
@@ -4079,6 +4081,7 @@ export function RuntimeConfigPanel() {
             <NumberField title="5xx / 408 基础冷却" description="上游过载或超时响应首次触发的冷却时长。" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialServerErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialServerErrorCooldownSecs }))} />
             <NumberField title="网络错误基础冷却" description="发送失败、连接中断等网络错误首次触发的冷却时长。" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialNetworkErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialNetworkErrorCooldownSecs }))} />
             <NumberField title="流读取错误基础冷却" description="流读取错误或上游 idle timeout 首次触发的冷却时长。" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialStreamErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialStreamErrorCooldownSecs }))} />
+            <ToggleField title="空回也让账号冷却" description="空回指上游返回成功但没有任何内容：只有用量统计、一帧数据都没有、或响应体为空。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求。打开后按流读取错误基础冷却该账号。" checked={draft.credentialEmptyTurnCooldownEnabled} onCheckedChange={(credentialEmptyTurnCooldownEnabled) => setDraft((prev) => ({ ...prev, credentialEmptyTurnCooldownEnabled }))} />
             <NumberField title="协议异常基础冷却" description="可重试协议不匹配和未分类瞬态错误首次触发的冷却时长。" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialProtocolErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialProtocolErrorCooldownSecs }))} />
             <NumberField title="认证判定基础冷却" description="401/403 触发刷新或失败判定期间暂停继续调度该账号的时长。" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialAuthErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialAuthErrorCooldownSecs }))} />
             <NumberField title="连续失败退避倍率" description="同一凭据连续发生瞬态错误时冷却倍增倍率。" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={(credentialCooldownBackoffMultiplier) => setDraft((prev) => ({ ...prev, credentialCooldownBackoffMultiplier }))} />
