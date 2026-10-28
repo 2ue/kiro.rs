@@ -33,6 +33,7 @@ import {
 } from '@/hooks/use-usage'
 import { getUsageRecords } from '@/api/usage'
 import { getCredentialList, getExternalPools } from '@/api/credentials'
+import { cacheWriteTtlMarker, cacheWriteTtlTitle } from './cache-ttl-label'
 import { formatDate, formatCompact, formatNumber, formatPercent, formatUsdCsv, formatUsdFixed2, ratio } from '@/lib/format'
 import { normalizeRequestApiKeyId } from '@/lib/request-api-key-id'
 import { cn, extractErrorMessage } from '@/lib/utils'
@@ -1072,7 +1073,10 @@ function RecordsView({
                         {/* 缓存 */}
                         <TableCell className="font-mono text-xs tabular-nums">
                           <div className="text-success" title={formatNumber(record.cacheReadInputTokens)}>读 {formatCompact(record.cacheReadInputTokens)}</div>
-                          <div className="text-primary" title={formatNumber(record.cacheCreationInputTokens)}>写 {formatCompact(record.cacheCreationInputTokens)}</div>
+                          <div className="text-primary" title={cacheWriteTtlTitle(record) ?? formatNumber(record.cacheCreationInputTokens)}>
+                            写 {formatCompact(record.cacheCreationInputTokens)}
+                            {cacheWriteTtlMarker(record) && <span className="ml-1 font-semibold">（{cacheWriteTtlMarker(record)}）</span>}
+                          </div>
                           <div className="text-muted-foreground/60">{formatPercent(rowReadRatio)} / {formatPercent(rowCachedRatio)}</div>
                         </TableCell>
                         {/* 费用 */}
