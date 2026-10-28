@@ -1858,6 +1858,7 @@ pub struct RuntimeConfigResponse {
     pub credential_server_error_cooldown_secs: u64,
     pub credential_network_error_cooldown_secs: u64,
     pub credential_stream_error_cooldown_secs: u64,
+    pub credential_empty_turn_cooldown_enabled: bool,
     pub credential_protocol_error_cooldown_secs: u64,
     pub credential_auth_error_cooldown_secs: u64,
     pub credential_cooldown_backoff_multiplier: f64,
@@ -2007,6 +2008,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_network_error_cooldown_secs: Option<u64>,
     #[serde(default)]
     pub credential_stream_error_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_empty_turn_cooldown_enabled: Option<bool>,
     #[serde(default)]
     pub credential_protocol_error_cooldown_secs: Option<u64>,
     #[serde(default)]

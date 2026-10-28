@@ -301,6 +301,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
     credentialNetworkErrorCooldownSecs: toWhole(draft.credentialNetworkErrorCooldownSecs, 1),
     credentialStreamErrorCooldownSecs: toWhole(draft.credentialStreamErrorCooldownSecs, 1),
+    credentialEmptyTurnCooldownEnabled: Boolean(draft.credentialEmptyTurnCooldownEnabled),
     credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
     credentialAuthErrorCooldownSecs: toWhole(draft.credentialAuthErrorCooldownSecs, 1),
     credentialCooldownBackoffMultiplier: Math.max(1, Number(draft.credentialCooldownBackoffMultiplier.toFixed(2))),
@@ -1272,6 +1273,7 @@ export function RuntimePage() {
                 <NumField label="服务繁忙后暂停" desc="收到 5xx 服务端错误后的初始冷却" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialServerErrorCooldownSecs')} />
                 <NumField label="网络错误基础冷却" desc="连接超时、DNS 失败等网络层错误后的冷却" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialNetworkErrorCooldownSecs')} />
                 <NumField label="流式中断后暂停" desc="流式响应中途中断后的冷却" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
+                <TogField label="空回也让账号冷却" desc="空回指上游返回成功但没有任何内容：只有用量统计、一帧数据都没有、或响应体为空。默认关闭：只在当次请求里换号，不冷却账号、不影响其他请求。打开后按「流式中断后暂停」冷却该账号。" checked={draft.credentialEmptyTurnCooldownEnabled} onChange={set('credentialEmptyTurnCooldownEnabled')} />
                 <NumField label="格式异常后暂停" desc="响应格式/协议异常后的冷却" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />
                 <NumField label="授权异常后暂停" desc="收到 401/403 授权失败后的冷却" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialAuthErrorCooldownSecs')} />
                 <NumField label="最大冷却时长" desc="连续出错时最多暂停多久" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={set('credentialMaxCooldownSecs')} />

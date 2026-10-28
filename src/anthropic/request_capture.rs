@@ -415,7 +415,14 @@ fn writer_loop(rx: Receiver<CaptureJob>) {
 fn write_job(job: &CaptureJob) -> std::io::Result<()> {
     create_private_dir(&job.dir)?;
     let bytes = serde_json::to_vec_pretty(&job.record).map_err(std::io::Error::other)?;
-    write_private_file(&job.dir.join(&job.file_name), &bytes)?;
+    // 先写临时文件再改名，读取方（含回放脚本）不会看到写了一半的记录；临时名不带
+    // FILE_PREFIX，清理时也不会被计入。
+    let temp_path = job.dir.join(format!(".tmp-{}", job.file_name));
+    write_private_file(&temp_path, &bytes)?;
+    if let Err(err) = std::fs::rename(&temp_path, job.dir.join(&job.file_name)) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
     prune_oldest(&job.dir, job.max_files as usize)
 }
 
@@ -514,7 +521,15 @@ mod tests {
     ) -> Vec<PathBuf> {
         for _ in 0..500 {
             if let Ok(entries) = std::fs::read_dir(dir) {
-                let mut files: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+                // 只认正式记录；写入中的 `.tmp-` 临时文件改名前不算数。
+                let mut files: Vec<_> = entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with(FILE_PREFIX))
+                    })
+                    .collect();
                 files.sort();
                 let names: Vec<String> = files
                     .iter()

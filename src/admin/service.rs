@@ -6098,6 +6098,7 @@ impl AdminService {
             credential_server_error_cooldown_secs: config.credential_server_error_cooldown_secs,
             credential_network_error_cooldown_secs: config.credential_network_error_cooldown_secs,
             credential_stream_error_cooldown_secs: config.credential_stream_error_cooldown_secs,
+            credential_empty_turn_cooldown_enabled: config.credential_empty_turn_cooldown_enabled,
             credential_protocol_error_cooldown_secs: config.credential_protocol_error_cooldown_secs,
             credential_auth_error_cooldown_secs: config.credential_auth_error_cooldown_secs,
             credential_cooldown_backoff_multiplier: config.credential_cooldown_backoff_multiplier,
@@ -6377,6 +6378,9 @@ impl AdminService {
         let credential_stream_error_cooldown_secs = req
             .credential_stream_error_cooldown_secs
             .unwrap_or(current_config.credential_stream_error_cooldown_secs);
+        let credential_empty_turn_cooldown_enabled = req
+            .credential_empty_turn_cooldown_enabled
+            .unwrap_or(current_config.credential_empty_turn_cooldown_enabled);
         let credential_protocol_error_cooldown_secs = req
             .credential_protocol_error_cooldown_secs
             .unwrap_or(current_config.credential_protocol_error_cooldown_secs);
@@ -6924,6 +6928,8 @@ impl AdminService {
                     credential_network_error_cooldown_secs;
                 config.credential_stream_error_cooldown_secs =
                     credential_stream_error_cooldown_secs;
+                config.credential_empty_turn_cooldown_enabled =
+                    credential_empty_turn_cooldown_enabled;
                 config.credential_protocol_error_cooldown_secs =
                     credential_protocol_error_cooldown_secs;
                 config.credential_auth_error_cooldown_secs = credential_auth_error_cooldown_secs;

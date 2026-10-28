@@ -875,12 +875,15 @@ impl KiroApiCompletion {
         self.in_flight_lease.lock().take();
     }
 
-    /// The upstream answered with only usage/metadata events. Whether that happens depends on the
-    /// request content (other accounts usually answer the same request the same way), so the
-    /// account is neither cooled down nor charged a sticky-session soft failure; the caller
-    /// excludes it for the rest of this request instead.
-    pub fn report_usage_only_turn(&self) {
-        self.release();
+    /// 上游空回（只有 usage/metadata、零帧或空响应体）。默认只释放占用、不冷却、不记会话软失败，
+    /// 由调用方在本请求内排除该账号；全局开关 `credentialEmptyTurnCooldownEnabled` 打开时
+    /// 按流式错误冷却。
+    pub fn report_empty_turn(&self, reason: impl Into<String>) {
+        if self.token_manager.empty_turn_cooldown_enabled() {
+            self.report_upstream_body_status_failure(reason);
+        } else {
+            self.release();
+        }
     }
 
     /// Upstream returned successful headers, but the complete EventStream body
@@ -1031,9 +1034,14 @@ impl KiroStreamCompletion {
         }
     }
 
-    /// 上游只返回 usage/metadata（空回）。是否空回取决于请求内容，同一个请求换账号通常结果相同，
-    /// 所以不冷却、不记会话软失败，只释放占用；调用方在本请求内排除该账号。
-    pub fn report_usage_only_turn(&self) {
+    /// 上游空回（只有 usage/metadata、零帧或空响应体）。默认只释放占用、不冷却、不记会话软失败，
+    /// 由调用方在本请求内排除该账号；全局开关 `credentialEmptyTurnCooldownEnabled` 打开时
+    /// 按流式错误冷却。
+    pub fn report_empty_turn(&self, reason: impl Into<String>) {
+        if self.token_manager.empty_turn_cooldown_enabled() {
+            self.report_upstream_stream_failure(reason);
+            return;
+        }
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -8665,7 +8673,7 @@ impl KiroProvider {
     }
 
     /// Initial per-request exclusions: credentials whose route rules reject the request route,
-    /// plus credentials that already answered this request with a usage-only turn.
+    /// plus credentials that already answered this request with an empty turn.
     fn route_excluded_credential_ids(
         &self,
         inference_attempt_budget: Option<&InferenceAttemptBudget>,
@@ -8673,7 +8681,7 @@ impl KiroProvider {
         let Some(budget) = inference_attempt_budget else {
             return HashSet::new();
         };
-        let mut excluded = budget.usage_only_credential_ids();
+        let mut excluded = budget.empty_turn_credential_ids();
         if let Some(route) = budget.dispatch_route() {
             excluded.extend(self.token_manager.credential_ids_rejecting_route(route));
         }

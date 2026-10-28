@@ -2517,6 +2517,8 @@ export interface RuntimeConfig {
   credentialServerErrorCooldownSecs: number
   credentialNetworkErrorCooldownSecs: number
   credentialStreamErrorCooldownSecs: number
+  /** 空回（只有用量统计、零帧或空响应体）是否让账号冷却，默认关闭。 */
+  credentialEmptyTurnCooldownEnabled: boolean
   credentialProtocolErrorCooldownSecs: number
   credentialAuthErrorCooldownSecs: number
   credentialCooldownBackoffMultiplier: number

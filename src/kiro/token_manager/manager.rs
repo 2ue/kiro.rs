@@ -2501,6 +2501,11 @@ impl MultiTokenManager {
         self.config.lock().clone()
     }
 
+    /// 空回是否让账号冷却（全局开关，默认关闭）。
+    pub fn empty_turn_cooldown_enabled(&self) -> bool {
+        self.config.lock().credential_empty_turn_cooldown_enabled
+    }
+
     fn runtime_capacity_change_should_reset_warmup(previous: &Config, current: &Config) -> bool {
         previous.credential_rpm != current.credential_rpm
             || previous.credential_max_concurrent_requests
