@@ -141,7 +141,13 @@ export function QuotaBar({ model }: { model: ReturnType<typeof quotaBarModel> })
   )
 }
 
-/** A stat cell: label above, value below; the value turns amber or red when it nears its limit. */
+const METER_FILL_CLASS = { warning: 'bg-warning', error: 'bg-destructive' } as const
+
+/**
+ * A stat cell: label above, value below; the value turns amber or red when it nears its limit.
+ * Cells given `percent` also draw a thin bar of how full they are. `percent: null` means the value
+ * has no limit: the bar's room is kept so cells in a row stay aligned, but nothing is drawn.
+ */
 function Meter({
   label,
   value,
@@ -149,6 +155,7 @@ function Meter({
   onClick,
   title,
   wrap,
+  percent,
 }: {
   label: string
   value: React.ReactNode
@@ -157,6 +164,7 @@ function Meter({
   title?: string
   /** Let a long value break onto a second line instead of being cut off. */
   wrap?: boolean
+  percent?: number | null
 }) {
   const body = (
     <>
@@ -164,6 +172,21 @@ function Meter({
       <span className={cn('tabular mt-0.5 block text-xs font-semibold leading-4', wrap ? 'break-words' : 'truncate', tone === 'error' ? 'text-destructive' : tone === 'warning' ? 'text-warning' : 'text-foreground')}>
         {value}
       </span>
+      {percent !== undefined && (
+        <span
+          className={cn('mt-1.5 block h-1 overflow-hidden rounded-full', percent === null ? 'invisible' : 'bg-muted')}
+          role={percent === null ? undefined : 'progressbar'}
+          aria-label={percent === null ? undefined : `${label}占用`}
+          aria-valuemin={percent === null ? undefined : 0}
+          aria-valuemax={percent === null ? undefined : 100}
+          aria-valuenow={percent === null ? undefined : Math.round(Math.min(100, Math.max(0, percent)))}
+        >
+          <span
+            className={cn('block h-full rounded-full transition-[width] duration-300', tone ? METER_FILL_CLASS[tone] : 'bg-primary/60')}
+            style={{ width: `${Math.min(100, Math.max(0, percent ?? 0))}%` }}
+          />
+        </span>
+      )}
     </>
   )
   if (!onClick) return <div className="min-w-0" title={title}>{body}</div>
@@ -702,16 +725,19 @@ export function CredentialCard({
 
       {/* ── Load: what the scheduler is doing with it right now ── */}
       {/* Priority is a short number; success/dispatch needs the room for two counts. */}
-      <div className={cn('grid grid-cols-[1fr_1fr_0.7fr_1.6fr] gap-x-2 px-4 pt-3.5', dim)}>
+      <div className={cn('grid grid-cols-[1fr_1fr_0.7fr_1.6fr] items-start gap-x-2 px-4 pt-3.5', dim)}>
         <Meter label="并发" value={concurrencyText}
+          percent={concurrencyLimit > 0 ? (credential.inFlightRequests / concurrencyLimit) * 100 : null}
           tone={loadTone(credential.inFlightRequests, concurrencyLimit)}
           onClick={() => setEditingConcurrency(true)} title="修改并发限制" />
         <Meter label="RPM" value={rpmText}
+          percent={rpmLimit > 0 ? (recentSelection60s / rpmLimit) * 100 : null}
           tone={loadTone(recentSelection60s, rpmLimit)}
           onClick={() => setEditingRpm(true)} title="修改 RPM 限制" />
-        <Meter label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} title="修改优先级" />
+        <Meter label="优先级" value={credential.priority} percent={null} onClick={() => setEditingPriority(true)} title="修改优先级" />
         <Meter label="成功/调度"
           wrap
+          percent={null}
           value={<>{formatCompact(credential.successCount)}/<wbr />{formatCompact(success.dispatched)}</>}
           // Only a low rate is worth colouring; a healthy one stays neutral like the other values.
           tone={success.tone === 'success' ? undefined : success.tone}
