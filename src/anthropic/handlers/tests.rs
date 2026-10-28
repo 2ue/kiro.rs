@@ -6620,21 +6620,37 @@ fn request_capture_test_dir() -> std::path::PathBuf {
     ))
 }
 
+/// Reads the finished capture records in `dir`. The capture is written by one process-wide thread
+/// after the response is sent, so the test first waits for that thread to drain its queue instead
+/// of polling the directory against a wall clock, and skips the writer's `.tmp-` files.
 async fn read_capture_records(dir: &std::path::Path, count: usize) -> Vec<Value> {
-    for _ in 0..300 {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut files: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
-            if files.len() >= count {
-                files.sort();
-                return files
-                    .iter()
-                    .map(|file| serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap())
-                    .collect();
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("expected {count} capture records in {}", dir.display());
+    tokio::task::spawn_blocking(crate::anthropic::request_capture::flush_for_tests)
+        .await
+        .expect("flush request capture writer");
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("capture-") && name.ends_with(".json"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    assert_eq!(
+        files.len(),
+        count,
+        "expected {count} capture records in {}: {files:?}",
+        dir.display()
+    );
+    files
+        .iter()
+        .map(|file| serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap())
+        .collect()
 }
 
 /// A request that stays usage-only until the retries run out is written to the capture dir with

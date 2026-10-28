@@ -369,17 +369,37 @@ struct CaptureJob {
     record: Value,
 }
 
+enum WriterMessage {
+    Write(CaptureJob),
+    /// Answered once every job queued before it has been written.
+    #[cfg(test)]
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
 struct CaptureWriter {
-    tx: SyncSender<CaptureJob>,
+    tx: SyncSender<WriterMessage>,
     dropped: AtomicU64,
 }
 
 impl CaptureWriter {
     fn submit(&self, job: CaptureJob) {
-        if self.tx.try_send(job).is_err() {
+        if self.tx.try_send(WriterMessage::Write(job)).is_err() {
             let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::warn!(dropped, "请求诊断抓取队列已满，丢弃本条记录");
         }
+    }
+}
+
+/// Blocks until every capture submitted so far is on disk. Tests call this instead of polling the
+/// directory, which raced the single writer thread on a busy machine.
+#[cfg(test)]
+pub(crate) fn flush_for_tests() {
+    let Some(writer) = writer() else {
+        return;
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if writer.tx.send(WriterMessage::Flush(done_tx)).is_ok() {
+        let _ = done_rx.recv();
     }
 }
 
@@ -408,10 +428,18 @@ fn writer() -> Option<&'static CaptureWriter> {
         .as_ref()
 }
 
-fn writer_loop(rx: Receiver<CaptureJob>) {
-    while let Ok(job) = rx.recv() {
-        if let Err(err) = write_job(&job) {
-            tracing::warn!(dir = %job.dir.display(), "写入请求诊断抓取失败: {}", err);
+fn writer_loop(rx: Receiver<WriterMessage>) {
+    while let Ok(message) = rx.recv() {
+        match message {
+            WriterMessage::Write(job) => {
+                if let Err(err) = write_job(&job) {
+                    tracing::warn!(dir = %job.dir.display(), "写入请求诊断抓取失败: {}", err);
+                }
+            }
+            #[cfg(test)]
+            WriterMessage::Flush(done) => {
+                let _ = done.send(());
+            }
         }
     }
 }
