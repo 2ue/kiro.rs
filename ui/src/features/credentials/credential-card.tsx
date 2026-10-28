@@ -2,11 +2,13 @@ import {
   Activity,
   Boxes,
   ChevronRight,
+  CircleAlert,
   Coins,
   Ellipsis,
   Eraser,
   Flame,
   FlaskConical,
+  Gauge,
   KeyRound,
   Pencil,
   RefreshCw,
@@ -14,10 +16,13 @@ import {
   Route,
   Router,
   ShieldOff,
+  Snowflake,
+  Timer,
   Trash2,
   Wallet,
   Globe,
   Zap,
+  type LucideIcon,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
@@ -48,7 +53,7 @@ import {
   Switch,
   Tooltip,
 } from '@/components/ui'
-import { EmptyState, Field, FieldGrid, LoadingState, MiddleTruncate, ModalShell, useConfirm } from '@/components/patterns'
+import { EmptyState, Field, LoadingState, MiddleTruncate, ModalShell, useConfirm } from '@/components/patterns'
 import {
   formatCompact,
   formatFullDate,
@@ -66,12 +71,10 @@ import {
   useCredentialDiagnostics,
   useDeleteCredential,
   useForceRefreshToken,
-  useProxyResources,
   useResetFailure,
   useRuntimeConfig,
   useSetCredentialConcurrency,
   useSetCredentialOverage,
-  useSetCredentialProxy,
   useSetCredentialRegions,
   useSetCredentialRpm,
   useSetCredentialRateLimitAutoDisable,
@@ -91,6 +94,7 @@ import {
   credentialLabel,
   credentialRouteSummary,
   credentialStatusMeta,
+  formatRemaining,
   endpointLabel,
   loadTone,
   numberOrZero,
@@ -100,9 +104,11 @@ import {
   subscriptionBadgeMeta,
   successRate,
   type CredentialFlag,
+  type CredentialStateKind,
+  type CredentialStatusMeta,
   type CredentialSubscriptionKey,
 } from './credential-utils'
-import { SecretInput } from './credential-inputs'
+import { CredentialProxyDialog } from './credential-proxy-dialog'
 import { SelectBox } from '@/features/external-pools/external-pool-components'
 import { SupportedModelTagsEditor, mergeSupportedModels } from '@/features/shared/supported-model-tags'
 import { RouteSelector } from '@/features/route-scenarios/route-selector'
@@ -141,12 +147,17 @@ export function QuotaBar({ model }: { model: ReturnType<typeof quotaBarModel> })
   )
 }
 
-const METER_FILL_CLASS = { warning: 'bg-warning', error: 'bg-destructive' } as const
+type MeterTone = 'warning' | 'full' | 'error'
+
+// A full account is busy, not broken: it keeps the amber of "nearly full" instead of turning red.
+const METER_TEXT_CLASS: Record<MeterTone, string> = { warning: 'text-warning', full: 'text-warning', error: 'text-destructive' }
+const METER_FILL_CLASS: Record<MeterTone, string> = { warning: 'bg-warning', full: 'bg-warning', error: 'bg-destructive' }
 
 /**
- * A stat cell: label above, value below; the value turns amber or red when it nears its limit.
- * Cells given `percent` also draw a thin bar of how full they are. `percent: null` means the value
- * has no limit: the bar's room is kept so cells in a row stay aligned, but nothing is drawn.
+ * A stat cell: label above, value below; the value turns amber when it nears or reaches its limit
+ * and red for a low success rate. Cells given `percent` also draw a thin bar of how full they are.
+ * `percent: null` means the value has no limit: the bar's room is kept so cells in a row stay
+ * aligned, but nothing is drawn.
  */
 function Meter({
   label,
@@ -159,7 +170,7 @@ function Meter({
 }: {
   label: string
   value: React.ReactNode
-  tone?: 'warning' | 'error'
+  tone?: MeterTone
   onClick?: () => void
   title?: string
   /** Let a long value break onto a second line instead of being cut off. */
@@ -169,7 +180,7 @@ function Meter({
   const body = (
     <>
       <span className="block text-[0.7rem] leading-4 text-muted-foreground">{label}</span>
-      <span className={cn('tabular mt-0.5 block text-xs font-semibold leading-4', wrap ? 'break-words' : 'truncate', tone === 'error' ? 'text-destructive' : tone === 'warning' ? 'text-warning' : 'text-foreground')}>
+      <span className={cn('tabular mt-0.5 block text-xs font-semibold leading-4', wrap ? 'break-words' : 'truncate', tone ? METER_TEXT_CLASS[tone] : 'text-foreground')}>
         {value}
       </span>
       {percent !== undefined && (
@@ -197,6 +208,9 @@ function Meter({
     </button>
   )
 }
+
+/** Detail rows colour a full account like a nearly full one. */
+const rowTone = (tone: ReturnType<typeof loadTone>) => (tone ? 'warning' : undefined)
 
 /** One row in the detail sheet; editable rows show a pencil and open the matching dialog. */
 function DetailRow({ label, children, onEdit, editLabel, tone }: {
@@ -227,6 +241,59 @@ function DetailSection({ title, children }: { title: string; children: React.Rea
       <h3 className="mb-1 text-[0.7rem] font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>
       <dl className="divide-y divide-border/60">{children}</dl>
     </section>
+  )
+}
+
+/**
+ * How each leading state is drawn. Errors are red with an alert icon; a cooldown is sky blue with a
+ * snowflake; a full account (concurrency or RPM) is amber. Each of them also colours the card's top
+ * edge, so a page of cards shows at a glance which accounts are broken and which are only waiting.
+ */
+const STATE_STYLE: Record<CredentialStateKind, {
+  tone: 'neutral' | 'success' | 'warning' | 'error' | 'info'
+  badgeClass?: string
+  icon?: LucideIcon
+  edgeClass?: string
+}> = {
+  normal: { tone: 'success' },
+  probation: { tone: 'info' },
+  disabled: { tone: 'neutral' },
+  error: { tone: 'error', icon: CircleAlert, edgeClass: 'bg-destructive' },
+  cooldown: {
+    tone: 'info',
+    badgeClass: 'bg-sky-500/15 text-sky-700 dark:text-sky-300',
+    icon: Snowflake,
+    edgeClass: 'bg-sky-500',
+  },
+  rate_limited: { tone: 'warning', badgeClass: 'bg-warning/15', icon: Timer, edgeClass: 'bg-warning' },
+  concurrency_full: { tone: 'warning', badgeClass: 'bg-warning/15', icon: Gauge, edgeClass: 'bg-warning' },
+}
+
+/** Counts a snapshot's remaining seconds down every second until the next refresh replaces it. */
+function useCountdown(secs: number | undefined): number | undefined {
+  const [anchor, setAnchor] = useState(() => ({ secs, at: Date.now() }))
+  const [, setTick] = useState(0)
+  if (anchor.secs !== secs) setAnchor({ secs, at: Date.now() })
+  const remaining = secs === undefined ? undefined : Math.max(0, secs - Math.floor((Date.now() - anchor.at) / 1000))
+  const ticking = remaining !== undefined && remaining > 0
+  useEffect(() => {
+    if (!ticking) return
+    const timer = window.setInterval(() => setTick((n) => n + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [ticking])
+  return remaining
+}
+
+function StatusBadge({ status, remaining }: { status: CredentialStatusMeta; remaining?: number }) {
+  const style = STATE_STYLE[status.kind]
+  const Icon = style.icon
+  const suffix = status.usage ?? (remaining !== undefined ? (remaining > 0 ? formatRemaining(remaining) : undefined) : undefined)
+  return (
+    <Badge tone={style.tone} dot={!Icon} className={style.badgeClass} title={status.title}>
+      {Icon && <Icon className="size-3" aria-hidden="true" />}
+      {status.label}
+      {suffix && <span className="tabular">{suffix}</span>}
+    </Badge>
   )
 }
 
@@ -329,19 +396,12 @@ export function CredentialCard({
   const [regionValue, setRegionValue] = useState(credential.region || '')
   const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
   const [apiRegionValue, setApiRegionValue] = useState(credential.apiRegion || '')
-  const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-  const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
-  const [proxyUsername, setProxyUsername] = useState(credential.proxyUsername || '')
-  const [proxyPassword, setProxyPassword] = useState(credential.proxyPassword || '')
   const [supportedModelsDraft, setSupportedModelsDraft] = useState<string[]>(supportedModels)
-  const [showProxyUsername, setShowProxyUsername] = useState(false)
-  const [showProxyPassword, setShowProxyPassword] = useState(false)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setFast = useSetCredentialFast()
   const setRoutePolicy = useSetCredentialRoutePolicy()
-  const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
@@ -349,8 +409,6 @@ export function CredentialCard({
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
   const discoverCredentialSupportedModels = useDiscoverCredentialSupportedModels()
-  const proxyResources = useProxyResources()
-  const proxyResourceOptions = proxyResources.data?.resources || []
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const setWarmup = useSetWarmup()
@@ -394,15 +452,6 @@ export function CredentialCard({
     : '查询额度后同步状态'
   const displayCredentialLabel = credentialLabel(credential, showEmailSuffix)
 
-  const resetProxyDraft = () => {
-    setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-    setProxyUrl(credential.proxyUrl || '')
-    setProxyUsername(credential.proxyUsername || '')
-    setProxyPassword(credential.proxyPassword || '')
-    setShowProxyUsername(false)
-    setShowProxyPassword(false)
-  }
-
   useEffect(() => { setPriorityValue(String(credential.priority)) }, [credential.priority])
   useEffect(() => { setFastValue(String(credential.fast ?? 0)) }, [credential.fast])
   useEffect(() => {
@@ -419,7 +468,6 @@ export function CredentialCard({
   useEffect(() => {
     setSupportedModelsDraft(supportedModels)
   }, [credential.id, supportedModels])
-  useEffect(() => { resetProxyDraft() }, [credential.id, credential.proxyResourceId, credential.proxyUrl, credential.proxyUsername, credential.proxyPassword])
   useEffect(() => {
     if (!showDiagnostics || !diagnostics.data) return
     setDiagnosticRecords((current) => diagnosticsPage === 1
@@ -466,26 +514,6 @@ export function CredentialCard({
     setFast.mutate({ id: credential.id, fast: n }, {
       onSuccess: (res) => { toast.success(res.message); setEditingFast(false) },
       onError: (e) => toast.error(`操作失败: ${extractErrorMessage(e)}`),
-    })
-  }
-
-  const saveProxy = () => {
-    const url = proxyUrl.trim()
-    if (!proxyResourceId && !url && (proxyUsername.trim() || proxyPassword.trim())) {
-      toast.error('直接代理 URL 为空时不能单独设置用户名/密码')
-      return
-    }
-    setCredentialProxy.mutate({
-      id: credential.id,
-      request: {
-        proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
-        proxyUrl: proxyResourceId ? undefined : url || undefined,
-        proxyUsername: proxyResourceId ? undefined : proxyUsername.trim() || undefined,
-        proxyPassword: proxyResourceId ? undefined : proxyPassword.trim() || undefined,
-      },
-    }, {
-      onSuccess: (res) => { toast.success(res.message); setEditingProxy(false) },
-      onError: (e) => toast.error(`代理设置失败: ${extractErrorMessage(e)}`),
     })
   }
 
@@ -577,6 +605,8 @@ export function CredentialCard({
   const fast = credential.fast ?? 0
   const fastTier = fast > 0 ? String(Math.min(fast, 3)) : undefined
   const status = credentialStatusMeta(credential)
+  const stateStyle = STATE_STYLE[status.kind]
+  const remaining = useCountdown(status.remainingSecs)
   const flags = credentialFlags(credential)
   const attentionFlags = flags.filter((flag) => flag.kind === 'attention')
   const configFlags = flags.filter((flag) => flag.kind === 'config')
@@ -632,7 +662,7 @@ export function CredentialCard({
   const openDiagnostics = () => { setDiagnosticsPage(1); setDiagnosticRecords([]); setShowDiagnostics(true) }
   const openFlag = (key: CredentialFlag['key']) => {
     if (key === 'route') { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }
-    else if (key === 'proxy') { resetProxyDraft(); setEditingProxy(true) }
+    else if (key === 'proxy') { setEditingProxy(true) }
     else if (key === 'models') setEditingSupportedModels(true)
     else if (key === 'errors') openDiagnostics()
     else onToggleExpanded()
@@ -648,10 +678,11 @@ export function CredentialCard({
         // Exactly one edge: Fast cards draw a gradient rim, the rest a plain border.
         fast > 0 ? 'fast-card' : cn('border', selected ? 'border-primary ring-1 ring-primary' : 'border-border/70'),
       )}>
+      {stateStyle.edgeClass && <span aria-hidden="true" className={cn('pointer-events-none absolute inset-x-0 top-0 h-1', stateStyle.edgeClass)} />}
       {/* ── Header: selection, state and the one switch that matters ── */}
       <div className="flex items-center gap-2 px-4 pt-4">
         <Checkbox checked={selected} onCheckedChange={onToggleSelect} aria-label={`选择 ${displayCredentialLabel}`} />
-        <Badge tone={status.tone} dot title={status.title}>{status.label}</Badge>
+        <StatusBadge status={status} remaining={remaining} />
         {fast > 0 && (
           <button type="button" className="fast-badge" onClick={() => setEditingFast(true)}
             title={`Fast ${fast}：优先打满这个账号；点击修改`} aria-label={`Fast ${fast}，点击修改`}>
@@ -852,7 +883,7 @@ export function CredentialCard({
             <DropdownMenuGroup>
               <DropdownMenuLabel className="text-xs text-muted-foreground">网络</DropdownMenuLabel>
               {!credential.hasProxy && (
-                <DropdownMenuItem onSelect={() => { resetProxyDraft(); setEditingProxy(true) }}>
+                <DropdownMenuItem onSelect={() => { setEditingProxy(true) }}>
                   <Router /> 代理<span className="ml-auto max-w-24 truncate text-xs text-muted-foreground">{proxySummary(credential)}</span>
                 </DropdownMenuItem>
               )}
@@ -889,7 +920,7 @@ export function CredentialCard({
         <SheetContent width="sm:max-w-md">
           <SheetHeader>
             <div className="flex items-center gap-2">
-              <Badge tone={status.tone} dot title={status.title}>{status.label}</Badge>
+              <StatusBadge status={status} remaining={remaining} />
               <span className="tabular font-mono text-xs text-muted-foreground">#{credential.id}</span>
             </div>
             <SheetTitle className="break-all">{displayCredentialLabel}</SheetTitle>
@@ -910,13 +941,13 @@ export function CredentialCard({
             <DetailSection title="调度">
               <DetailRow label="优先级" onEdit={() => setEditingPriority(true)}>{credential.priority}</DetailRow>
               <DetailRow label="Fast" onEdit={() => setEditingFast(true)}>{fast > 0 ? fast : '未开启'}</DetailRow>
-              <DetailRow label="并发" onEdit={() => setEditingConcurrency(true)} tone={loadTone(credential.inFlightRequests, concurrencyLimit)}>
+              <DetailRow label="并发" onEdit={() => setEditingConcurrency(true)} tone={rowTone(loadTone(credential.inFlightRequests, concurrencyLimit))}>
                 {concurrencyText}
                 {credential.inFlightRequests > 0 && (
                   <span className="ml-1 text-xs font-normal text-muted-foreground">最老 {credential.oldestInFlightAgeSecs}s · 闲置 {credential.newestInFlightIdleSecs}s</span>
                 )}
               </DetailRow>
-              <DetailRow label="RPM（近 60 秒）" onEdit={() => setEditingRpm(true)} tone={loadTone(recentSelection60s, rpmLimit)}>{rpmText}</DetailRow>
+              <DetailRow label="RPM（近 60 秒）" onEdit={() => setEditingRpm(true)} tone={rowTone(loadTone(recentSelection60s, rpmLimit))}>{rpmText}</DetailRow>
               <DetailRow label="路由限制" onEdit={() => { resetRoutePolicyDraft(); setEditingRoutePolicy(true) }} editLabel="修改路由限制">
                 {routeSummary ?? '全部入口'}
               </DetailRow>
@@ -947,12 +978,13 @@ export function CredentialCard({
                 {schedulerScore.toFixed(2)}（{schedulerSelectionPressure.toFixed(2)}）
               </DetailRow>
               <DetailRow label="最近成功">{credential.lastUsedAt ? formatDateTime(credential.lastUsedAt) : '未成功过'}</DetailRow>
-              {credential.cooldownReason && <DetailRow label="冷却原因" tone="warning">{credential.cooldownReason}</DetailRow>}
+              {credential.cooldownReason && <DetailRow label="冷却原因">{credential.cooldownReason}</DetailRow>}
               {credential.cooldowns && credential.cooldowns.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 py-2">
                   {credential.cooldowns.map((cd) => (
-                    <Badge key={`${cd.global ? 'global' : cd.model}-${cd.remainingSecs}`} tone="warning" title={cd.reason || undefined}>
-                      {cd.global ? '全部模型' : cd.model || '-'} · {cd.remainingSecs}s
+                    <Badge key={`${cd.global ? 'global' : cd.model}-${cd.remainingSecs}`} className={STATE_STYLE.cooldown.badgeClass} title={cd.reason || undefined}>
+                      <Snowflake className="size-3" aria-hidden="true" />
+                      {cd.global ? '全部模型' : cd.model || '-'} · {formatRemaining(cd.remainingSecs)}
                     </Badge>
                   ))}
                 </div>
@@ -988,7 +1020,7 @@ export function CredentialCard({
               <DetailRow label="API Region" onEdit={() => setEditingRegions(true)} editLabel="修改 Region">
                 <span className="font-mono">{credential.effectiveApiRegion || '-'}</span>
               </DetailRow>
-              <DetailRow label="代理" onEdit={() => { resetProxyDraft(); setEditingProxy(true) }} editLabel="修改代理">{proxySummary(credential)}</DetailRow>
+              <DetailRow label="代理" onEdit={() => { setEditingProxy(true) }} editLabel="修改代理">{proxySummary(credential)}</DetailRow>
             </DetailSection>
 
             <DetailSection title="账号">
@@ -1264,70 +1296,8 @@ export function CredentialCard({
       </ModalShell>
 
       {/* ── Proxy Modal ── */}
-      <ModalShell open={editingProxy} title={`绑定代理：${displayCredentialLabel}`} width="max-w-xl"
-        onClose={() => { if (setCredentialProxy.isPending) return; resetProxyDraft(); setEditingProxy(false) }}>
-        <div className="space-y-3">
-          <button type="button"
-            className={`w-full rounded-lg border p-3 text-left text-sm transition-colors ${!proxyResourceId ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted'}`}
-            onClick={() => setProxyResourceId('')}>
-            <div className="flex items-center justify-between">
-              <span className="font-semibold">不绑定代理资源</span>
-              {!proxyResourceId && <Badge tone="primary">已选</Badge>}
-            </div>
-            <div className="mt-1 text-xs text-muted-foreground">可使用下方直连代理或全局代理。</div>
-          </button>
-          <div className={`rounded-lg border p-3 ${proxyResourceId ? 'opacity-60' : 'border-border bg-card'}`}>
-            <div className="mb-3 text-sm font-semibold">账号直连代理</div>
-            <FieldGrid>
-              <Field label="代理 URL">
-                <Input value={proxyUrl} placeholder="socks5h://127.0.0.1:1080"
-                  disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)}
-                  onChange={(e) => { if (e.target.value.trim()) setProxyResourceId(''); setProxyUrl(e.target.value) }} />
-              </Field>
-              <Field label="用户名">
-                <SecretInput value={proxyUsername} onChange={(v) => { if (v.trim()) setProxyResourceId(''); setProxyUsername(v) }}
-                  visible={showProxyUsername} onToggle={() => setShowProxyUsername((v) => !v)}
-                  disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)} placeholder="可选" />
-              </Field>
-              <Field label="密码">
-                <SecretInput value={proxyPassword} onChange={(v) => { if (v.trim()) setProxyResourceId(''); setProxyPassword(v) }}
-                  visible={showProxyPassword} onToggle={() => setShowProxyPassword((v) => !v)}
-                  disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)} placeholder="可选" />
-              </Field>
-            </FieldGrid>
-          </div>
-          {proxyResources.isLoading ? (
-            <LoadingState text="加载代理资源..." />
-          ) : proxyResourceOptions.length === 0 ? (
-            <EmptyState title="暂无代理资源" description="请先在代理页添加" />
-          ) : (
-            <div className="max-h-56 overflow-y-auto scrollbar-thin space-y-1.5">
-              {proxyResourceOptions.map((r) => {
-                const sel = proxyResourceId === String(r.id)
-                return (
-                  <button key={r.id} type="button"
-                    className={`w-full rounded-lg border p-2.5 text-left text-sm transition-colors ${sel ? 'border-primary bg-primary/5' : r.enabled ? 'border-border hover:bg-muted' : 'border-destructive/25 bg-destructive/5 opacity-60'}`}
-                    onClick={() => { setProxyResourceId(String(r.id)); setProxyUrl(''); setProxyUsername(''); setProxyPassword('') }}>
-                    <div className="flex items-center gap-1.5">
-                      <span className="font-semibold">{r.name}</span>
-                      <span className="text-xs text-muted-foreground font-mono">#{r.id}</span>
-                      <Badge tone={r.enabled ? 'success' : 'error'}>{r.enabled ? '启用' : '禁用'}</Badge>
-                      {sel && <Badge tone="primary">已选</Badge>}
-                    </div>
-                    <div className="mt-0.5 truncate text-xs text-muted-foreground">{r.proxyUrl}</div>
-                  </button>
-                )
-              })}
-            </div>
-          )}
-          <div className="flex justify-end gap-2">
-            <Button variant="ghost" size="sm" onClick={() => { resetProxyDraft(); setEditingProxy(false) }} disabled={setCredentialProxy.isPending}>取消</Button>
-            <Button size="sm" onClick={saveProxy} disabled={setCredentialProxy.isPending}>
-              {setCredentialProxy.isPending && <Spinner size="sm" />}保存
-            </Button>
-          </div>
-        </div>
-      </ModalShell>
+      <CredentialProxyDialog open={editingProxy} onClose={() => setEditingProxy(false)}
+        credential={credential} title={`绑定代理：${displayCredentialLabel}`} />
 
       {/* ── Diagnostics ── */}
       <ModalShell
@@ -1348,8 +1318,7 @@ export function CredentialCard({
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 <MetaItem
                   label="冷却"
-                  value={diagnostics.data?.runtime?.cooledDown ? `${diagnostics.data.runtime.cooldownRemainingSecs}s` : '无'}
-                  error={Boolean(diagnostics.data?.runtime?.cooledDown)}
+                  value={diagnostics.data?.runtime?.cooledDown ? formatRemaining(diagnostics.data.runtime.cooldownRemainingSecs) : '无'}
                 />
                 <MetaItem
                   label="并发"

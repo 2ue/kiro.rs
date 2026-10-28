@@ -5,7 +5,10 @@ import {
   credentialFlags,
   credentialRouteSummary,
   credentialStatusMeta,
+  displayProxyUrl,
+  formatRemaining,
   loadTone,
+  proxyChoice,
   quotaBarModel,
   quotaReading,
   subscriptionBadgeMeta,
@@ -19,6 +22,7 @@ const healthy = {
   cooledDown: false,
   cooldownRemainingSecs: 0,
   cooldownReason: undefined,
+  cooldowns: [],
   rateLimited: false,
   rateLimitRemainingSecs: 0,
   inFlightRequests: 0,
@@ -44,18 +48,59 @@ const plain = {
 }
 
 test('the leading status is the most blocking condition', () => {
-  assert.deepEqual(credentialStatusMeta(healthy), { label: '正常', tone: 'success' })
-  assert.deepEqual(credentialStatusMeta({ ...healthy, disabled: true }), { label: '禁用', tone: 'neutral', title: undefined })
+  assert.deepEqual(credentialStatusMeta(healthy), { kind: 'normal', label: '正常' })
+  assert.deepEqual(credentialStatusMeta({ ...healthy, disabled: true }), { kind: 'disabled', label: '禁用', title: undefined })
   assert.equal(credentialStatusMeta({ ...healthy, disabled: true, disabledReason: 'Manual' }).label, '手动禁用')
-  assert.equal(credentialStatusMeta({ ...healthy, disabled: true, disabledReason: 'Manual' }).tone, 'neutral')
+  assert.equal(credentialStatusMeta({ ...healthy, disabled: true, disabledReason: 'Manual' }).kind, 'disabled')
   const suspended = credentialStatusMeta({ ...healthy, disabled: true, disabledReason: 'TemporarilySuspended', cooledDown: true })
-  assert.deepEqual(suspended, { label: '账号暂停', tone: 'error', title: 'TemporarilySuspended' })
-  assert.equal(credentialStatusMeta({ ...healthy, cooledDown: true, cooldownRemainingSecs: 42, rateLimited: true }).label, '冷却 42s')
-  assert.equal(credentialStatusMeta({ ...healthy, rateLimited: true, rateLimitRemainingSecs: 9 }).label, '限流 9s')
-  assert.equal(credentialStatusMeta({ ...healthy, inFlightRequests: 30 }).label, '并发已满')
+  assert.deepEqual(suspended, { kind: 'error', label: '账号暂停', title: 'TemporarilySuspended' })
+  const cooling = credentialStatusMeta({ ...healthy, cooledDown: true, cooldownRemainingSecs: 42, rateLimited: true })
+  assert.equal(cooling.kind, 'cooldown')
+  assert.equal(cooling.label, '冷却')
+  assert.equal(cooling.remainingSecs, 42)
+  const limited = credentialStatusMeta({ ...healthy, rateLimited: true, rateLimitRemainingSecs: 9 })
+  assert.equal(limited.kind, 'rate_limited')
+  assert.equal(limited.remainingSecs, 9)
+  const full = credentialStatusMeta({ ...healthy, inFlightRequests: 30 })
+  assert.equal(full.kind, 'concurrency_full')
+  assert.equal(full.usage, '30/30')
   // A limit of 0 means unlimited, so it is never full.
-  assert.equal(credentialStatusMeta({ ...healthy, inFlightRequests: 99, maxConcurrentRequests: 0 }).label, '正常')
+  assert.equal(credentialStatusMeta({ ...healthy, inFlightRequests: 99, maxConcurrentRequests: 0 }).kind, 'normal')
   assert.equal(credentialStatusMeta({ ...healthy, inProbation: true, probationRemainingSecs: 30 }).title, '剩余 30s')
+})
+
+test('cooldown, rate limit and full concurrency are waiting states, never errors', () => {
+  for (const state of [
+    { ...healthy, cooledDown: true, cooldownRemainingSecs: 5 },
+    { ...healthy, rateLimited: true, rateLimitRemainingSecs: 5 },
+    { ...healthy, inFlightRequests: 30 },
+  ]) {
+    assert.notEqual(credentialStatusMeta(state).kind, 'error')
+  }
+})
+
+test('a cooldown scoped to some models says so; a global one does not', () => {
+  const scoped = credentialStatusMeta({
+    ...healthy,
+    cooledDown: true,
+    cooldownRemainingSecs: 12,
+    cooldowns: [{ model: 'claude-sonnet-4.5', global: false, remainingSecs: 12 }],
+  })
+  assert.equal(scoped.label, '模型冷却')
+  assert.match(scoped.title ?? '', /claude-sonnet-4\.5/)
+  const global = credentialStatusMeta({
+    ...healthy,
+    cooledDown: true,
+    cooldownRemainingSecs: 12,
+    cooldowns: [{ global: true, remainingSecs: 12 }, { model: 'claude-sonnet-4.5', global: false, remainingSecs: 3 }],
+  })
+  assert.equal(global.label, '冷却')
+})
+
+test('remaining time reads as seconds, then minutes and seconds', () => {
+  assert.equal(formatRemaining(0), '0s')
+  assert.equal(formatRemaining(42), '42s')
+  assert.equal(formatRemaining(245), '4m05s')
 })
 
 test('flags put things that need a look first and standing settings after', () => {
@@ -100,11 +145,11 @@ test('route summary only appears when the route policy restricts something', () 
   assert.equal(credentialRouteSummary('deny_list', ['/a', '/b', '/c']), '排除 /a, /b 等 3 条')
 })
 
-test('load tone warns from 70% and turns red at the limit; an unlimited limit never warns', () => {
+test('load tone warns from 70% and marks the limit as full, not as an error; an unlimited limit never warns', () => {
   assert.equal(loadTone(0, 30), undefined)
   assert.equal(loadTone(20, 30), undefined)
   assert.equal(loadTone(21, 30), 'warning')
-  assert.equal(loadTone(30, 30), 'error')
+  assert.equal(loadTone(30, 30), 'full')
   assert.equal(loadTone(500, 0), undefined)
 })
 
@@ -146,4 +191,39 @@ test('success rate compares successes with dispatches and only colours a meaning
   assert.equal(successRate(3, 5).tone, undefined)
   // Older stats with fewer dispatches than successes read as fully successful.
   assert.deepEqual(successRate(83, 80), { dispatched: 83, percent: 100, tone: 'success' })
+})
+
+const resource = (id: number, extra: Record<string, unknown> = {}) => ({
+  id,
+  name: `proxy-${id}`,
+  proxyUrl: `socks5h://user:secret@10.0.0.${id}:1080`,
+  hasPassword: true,
+  enabled: true,
+  createdAt: '2026-10-01T00:00:00Z',
+  updatedAt: '2026-10-01T00:00:00Z',
+  credentialCount: 1,
+  ...extra,
+})
+
+test('proxy urls are shown without credentials', () => {
+  assert.equal(displayProxyUrl('socks5h://user:secret@10.0.0.1:1080'), 'socks5h://10.0.0.1:1080')
+  assert.equal(displayProxyUrl('http://10.0.0.1:8080'), 'http://10.0.0.1:8080')
+  assert.equal(displayProxyUrl(undefined), '')
+})
+
+test('proxy choice resolves in the backend order and flags resources that block scheduling', () => {
+  const resources = [resource(1), resource(2, { enabled: false })]
+  const bound = proxyChoice({ resourceId: 1 }, resources)
+  assert.equal(bound.title, 'proxy-1')
+  assert.equal(bound.detail, 'socks5h://10.0.0.1:1080')
+  assert.equal(bound.blocked, undefined)
+  assert.match(proxyChoice({ resourceId: 2 }, resources).blocked ?? '', /已禁用/)
+  assert.match(proxyChoice({ resourceId: 9 }, resources).blocked ?? '', /不存在/)
+  // Before the list loads, an unknown resource is not reported as missing.
+  assert.equal(proxyChoice({ resourceId: 9 }, undefined, { resourceName: 'hk-1' }).blocked, undefined)
+  assert.equal(proxyChoice({ resourceId: 9 }, undefined, { resourceName: 'hk-1' }).title, 'hk-1')
+  assert.equal(proxyChoice({ url: 'http://u:p@1.2.3.4:8080' }, resources).detail, 'http://1.2.3.4:8080')
+  assert.equal(proxyChoice({ url: 'direct' }, resources, { globalProxyUrl: 'http://g:1' }).title, '直连')
+  assert.equal(proxyChoice({}, resources, { globalProxyUrl: 'http://g:1' }).title, '全局代理')
+  assert.equal(proxyChoice({}, resources).title, '直连')
 })

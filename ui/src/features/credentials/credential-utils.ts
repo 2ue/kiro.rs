@@ -6,6 +6,7 @@ import type {
   CredentialStatusItem,
   CredentialUsageSummaryItem,
   ExternalPoolRouteMode,
+  ProxyResource,
 } from '@/types/api'
 
 // ============================================================================
@@ -43,6 +44,38 @@ export function credentialRouteSummary(mode?: ExternalPoolRouteMode, rules: stri
   return rules.length ? `排除 ${list}` : undefined
 }
 
+/**
+ * What a card leads with. `error` is an account problem that keeps it out of the scheduler;
+ * `cooldown`, `rate_limited` and `concurrency_full` are an enabled account that skips new
+ * requests for now and clears on its own, so they are kept apart from errors.
+ */
+export type CredentialStateKind =
+  | 'normal'
+  | 'probation'
+  | 'disabled'
+  | 'error'
+  | 'cooldown'
+  | 'rate_limited'
+  | 'concurrency_full'
+
+export interface CredentialStatusMeta {
+  kind: CredentialStateKind
+  label: string
+  title?: string
+  /** Seconds until a cooldown or rate limit lifts, as of the snapshot; the card counts it down. */
+  remainingSecs?: number
+  /** `used/limit` for a full account. */
+  usage?: string
+}
+
+/** Compact time left: `42s`, `4m05s`. */
+export function formatRemaining(secs: number): string {
+  const total = Math.max(0, Math.ceil(secs))
+  if (total < 60) return `${total}s`
+  const minutes = Math.floor(total / 60)
+  return `${minutes}m${String(total % 60).padStart(2, '0')}s`
+}
+
 /** The one state a card leads with; the most blocking condition wins. */
 export function credentialStatusMeta(
   c: Pick<
@@ -52,6 +85,7 @@ export function credentialStatusMeta(
     | 'cooledDown'
     | 'cooldownRemainingSecs'
     | 'cooldownReason'
+    | 'cooldowns'
     | 'rateLimited'
     | 'rateLimitRemainingSecs'
     | 'inFlightRequests'
@@ -59,25 +93,46 @@ export function credentialStatusMeta(
     | 'inProbation'
     | 'probationRemainingSecs'
   >,
-): { label: string; tone: BadgeTone; title?: string } {
+): CredentialStatusMeta {
   if (c.disabled) {
     const manual = !c.disabledReason || c.disabledReason === 'Manual'
-    return { label: disabledReasonLabel(c.disabledReason), tone: manual ? 'neutral' : 'error', title: c.disabledReason || undefined }
+    return { kind: manual ? 'disabled' : 'error', label: disabledReasonLabel(c.disabledReason), title: c.disabledReason || undefined }
   }
   if (c.cooledDown) {
-    return { label: c.cooldownRemainingSecs > 0 ? `冷却 ${c.cooldownRemainingSecs}s` : '冷却', tone: 'warning', title: c.cooldownReason || undefined }
+    const cooldowns = c.cooldowns ?? []
+    // A cooldown scoped to some models leaves the account serving every other model.
+    const models = cooldowns.some((cd) => cd.global) ? [] : cooldowns.flatMap((cd) => (cd.model ? [cd.model] : []))
+    const reason = c.cooldownReason ? `；原因：${c.cooldownReason}` : ''
+    return {
+      kind: 'cooldown',
+      label: models.length > 0 ? '模型冷却' : '冷却',
+      title: models.length > 0
+        ? `${models.join('、')} 暂停调度，其他模型照常，到时自动恢复${reason}`
+        : `暂停调度，到时自动恢复${reason}`,
+      remainingSecs: Math.max(0, c.cooldownRemainingSecs),
+    }
   }
   if (c.rateLimited) {
-    return { label: c.rateLimitRemainingSecs > 0 ? `限流 ${c.rateLimitRemainingSecs}s` : '限流', tone: 'info' }
+    return {
+      kind: 'rate_limited',
+      label: '限流',
+      title: '近 60 秒的请求数到了 RPM 上限，新请求先分给其他账号，到时自动恢复',
+      remainingSecs: Math.max(0, c.rateLimitRemainingSecs),
+    }
   }
   if (c.maxConcurrentRequests > 0 && c.inFlightRequests >= c.maxConcurrentRequests) {
-    return { label: '并发已满', tone: 'warning', title: `${c.inFlightRequests}/${c.maxConcurrentRequests}` }
+    return {
+      kind: 'concurrency_full',
+      label: '并发已满',
+      title: `并发 ${c.inFlightRequests}/${c.maxConcurrentRequests}，新请求先分给其他账号，有请求结束后恢复`,
+      usage: `${c.inFlightRequests}/${c.maxConcurrentRequests}`,
+    }
   }
   if (c.inProbation) {
     const secs = numberOrZero(c.probationRemainingSecs)
-    return { label: '观察期', tone: 'info', title: secs > 0 ? `剩余 ${secs}s` : undefined }
+    return { kind: 'probation', label: '观察期', title: secs > 0 ? `剩余 ${secs}s` : undefined }
   }
-  return { label: '正常', tone: 'success' }
+  return { kind: 'normal', label: '正常' }
 }
 
 export interface CredentialFlag {
@@ -131,11 +186,14 @@ export function credentialFlags(
   return flags
 }
 
-/** Colour for a used/limit ratio; a limit of 0 means unlimited and never warns. */
-export function loadTone(used: number, limit: number): 'warning' | 'error' | undefined {
+/**
+ * Colour for a used/limit ratio; a limit of 0 means unlimited and never warns. A full account is
+ * busy, not broken, so it gets `full` rather than an error colour.
+ */
+export function loadTone(used: number, limit: number): 'warning' | 'full' | undefined {
   if (!(limit > 0)) return undefined
   const ratio = used / limit
-  if (ratio >= 1) return 'error'
+  if (ratio >= 1) return 'full'
   if (ratio >= 0.7) return 'warning'
   return undefined
 }
@@ -235,6 +293,60 @@ export function sourceLabel(src?: CredentialStatusItem['effectiveProxySource']):
     none: '无代理',
   }
   return labels[src || ''] || '未配置'
+}
+
+/** A proxy URL for display, with any `user:password@` part left out. */
+export function displayProxyUrl(url?: string | null): string {
+  const value = url?.trim() ?? ''
+  return value.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, '$1')
+}
+
+/** Matches the backend's `proxyUrl: "direct"`: no proxy at all, not even the global one. */
+const PROXY_DIRECT = 'direct'
+
+export interface ProxyChoice {
+  title: string
+  detail?: string
+  /** Set when the choice is a proxy resource. */
+  resourceId?: number
+  /** Why the account cannot be scheduled with this choice. */
+  blocked?: string
+}
+
+/**
+ * What a credential's proxy binding resolves to, in the backend's order: a proxy resource, then the
+ * account's own proxy URL, then the global proxy, then a direct connection. A missing or disabled
+ * resource never falls back; the scheduler skips the account instead.
+ */
+export function proxyChoice(
+  binding: { resourceId?: number | null; url?: string | null },
+  resources: ProxyResource[] | undefined,
+  fallback: { resourceName?: string; globalProxyUrl?: string | null } = {},
+): ProxyChoice {
+  const url = binding.url?.trim() ?? ''
+  if (binding.resourceId) {
+    const id = binding.resourceId
+    const resource = resources?.find((r) => r.id === id)
+    if (resource) {
+      return {
+        title: resource.name,
+        detail: displayProxyUrl(resource.proxyUrl),
+        resourceId: id,
+        blocked: resource.enabled ? undefined : '代理资源已禁用，这个账号不会被调度',
+      }
+    }
+    return {
+      title: fallback.resourceName || `代理资源 #${id}`,
+      resourceId: id,
+      // Until the list has loaded, a resource that is not in it yet is not known to be missing.
+      blocked: resources ? '代理资源不存在，这个账号不会被调度' : undefined,
+    }
+  }
+  if (url.toLowerCase() === PROXY_DIRECT) return { title: '直连', detail: '不走任何代理，包括全局代理' }
+  if (url) return { title: '账号直连代理', detail: displayProxyUrl(url) }
+  const global = fallback.globalProxyUrl?.trim()
+  if (global) return { title: '全局代理', detail: displayProxyUrl(global) }
+  return { title: '直连', detail: '未配置全局代理' }
 }
 
 export function proxySummary(c: Pick<CredentialStatusItem, 'effectiveProxySource' | 'proxyResourceName'>): string {
