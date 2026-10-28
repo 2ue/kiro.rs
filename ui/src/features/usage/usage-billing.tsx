@@ -49,7 +49,7 @@ export function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): strin
     `输入 ${formatNumber(snapshot.inputTokens)}`,
     `输出 ${formatNumber(snapshot.outputTokens)}`,
     `读 ${formatNumber(snapshot.cacheReadInputTokens)}`,
-    `写 ${formatNumber(snapshot.cacheCreationInputTokens)}`,
+    `写 ${formatNumber(snapshot.cacheCreationInputTokens)}${snapshot.cacheCreation1hInputTokens > 0 ? `（1h ${formatNumber(snapshot.cacheCreation1hInputTokens)}）` : ''}`,
   ].join(' / ')
 }
 

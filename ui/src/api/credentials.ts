@@ -144,6 +144,22 @@ export async function getCredentialsPage(query: CredentialsPageQuery): Promise<C
   return data
 }
 
+/**
+ * Every account matching a server-side filter, page by page. Pages that only need some accounts
+ * (those bound to one proxy, the disabled ones) use this instead of downloading the whole pool.
+ */
+export async function getCredentialsMatching(
+  filter: Omit<CredentialsPageQuery, 'page' | 'limit'>,
+): Promise<CredentialStatusItem[]> {
+  const items: CredentialListItem[] = []
+  for (let page = 1; ; page += 1) {
+    const result = await getCredentialList({ ...filter, page, limit: CREDENTIALS_LIST_PAGE_LIMIT })
+    items.push(...result.items)
+    if (page >= result.totalPages) break
+  }
+  return items.map(credentialListItemToStatus)
+}
+
 export async function getCredentialList(query: CredentialsPageQuery): Promise<CredentialListResponse> {
   const { data } = await api.get<CredentialListResponse>('/credentials/list', { params: query })
   return data

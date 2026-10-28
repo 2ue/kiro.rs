@@ -347,7 +347,7 @@ export function poolRouteSummary(pool: ExternalPool): string {
 
 export function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined): string {
   if (mode === 'current_path_policy') {
-    return '返回给下游的 usage 按当前入口路径的缓存策略整理；该路径是 no-cache、开了非流式 Usage 透传，或非流式请求按官方规则不会有缓存时，保持上游原始 usage。'
+    return '返回给下游的 usage 按当前入口路径的缓存策略整理；该路径是 no-cache、非流式缓存选了强制不缓存，或非流式请求按官方规则不会有缓存时，保持上游原始 usage。'
   }
   return '返回给下游的 usage 保持外部账号上游原始值；不按当前入口路径整理。'
 }

@@ -1,9 +1,9 @@
 import * as React from 'react'
 import { Activity, ArrowRightLeft, CheckCircle2, Edit3, Eye, EyeOff, Network, Plus, RefreshCw, Trash2, Unlink, UserX } from 'lucide-react'
 import { toast } from 'sonner'
+import { getCredentialsMatching } from '@/api/credentials'
 import {
   useBatchUpdateCredentials,
-  useCredentials,
   useDeleteProxyResource,
   useProxyResources,
   useTestAllProxyResources,
@@ -40,6 +40,10 @@ const PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 const DEFAULT_PAGE_SIZE = 20
 const DIRECT_PROXY_VALUE = '__direct__'
 type ReplaceProxyMode = 'single' | 'individual'
+/** The row button whose account lookup is running. */
+type RowAction = 'replace' | 'clear' | 'delete'
+
+const rowKey = (id: number, action: RowAction) => `proxy-${id}-${action}`
 
 function maskSecret(value?: string | null): string {
   if (!value) return '-'
@@ -78,7 +82,6 @@ function latencyLabel(result: ProxyResourceTestResponse): string {
 
 export function ProxiesPage() {
   const resources = useProxyResources()
-  const allCredentials = useCredentials({ enabled: false, refetchInterval: false })
   const removeProxy = useDeleteProxyResource()
   const testProxy = useTestProxyResource()
   const testAll = useTestAllProxyResources()
@@ -107,6 +110,11 @@ export function ProxiesPage() {
   const [replaceTargetProxy, setReplaceTargetProxy] = React.useState('')
   const [replaceMode, setReplaceMode] = React.useState<ReplaceProxyMode>('single')
   const [replaceTargetsByCredential, setReplaceTargetsByCredential] = React.useState<Map<number, string>>(new Map())
+  // What is loading which accounts right now: a proxy row's action, the batch delete, or the
+  // disabled-account unbind. Each shows its own spinner instead of sharing one.
+  const [loadingBindings, setLoadingBindings] = React.useState<Set<string>>(new Set())
+  const [deletingId, setDeletingId] = React.useState<number | null>(null)
+  const [unbindingDisabled, setUnbindingDisabled] = React.useState(false)
 
   const list = resources.data?.resources || []
   const pageCount = Math.max(1, Math.ceil(list.length / pageSize))
@@ -170,15 +178,18 @@ export function ProxiesPage() {
 
   const requestBatchDelete = async () => {
     if (selectedResources.length === 0) return
-    let credentials: CredentialStatusItem[]
-    try {
-      credentials = (await allCredentials.refetch()).data?.credentials || []
-    } catch (error) {
-      toast.error(`加载账号绑定失败: ${extractErrorMessage(error)}`)
-      return
-    }
     const ids = new Set(selectedResources.map((resource) => resource.id))
-    const bound = credentials.filter((credential) => typeof credential.proxyResourceId === 'number' && ids.has(credential.proxyResourceId))
+    // Only proxies that still have accounts need their bindings looked up.
+    const withBindings = selectedResources.filter((resource) => resource.credentialCount > 0)
+    let bound: CredentialStatusItem[] = []
+    if (withBindings.length > 0) {
+      const loaded = await withBindingsLoading('batch-delete', async () => {
+        const lists = await Promise.all(withBindings.map((resource) => getCredentialsMatching({ proxyResourceId: resource.id })))
+        return lists.flat()
+      })
+      if (!loaded) return
+      bound = loaded
+    }
     const alternatives = list.filter((resource) => resource.enabled && !ids.has(resource.id))
     setBatchDeleteBound(bound)
     setBatchReplacement(alternatives.length > 0 ? String(alternatives[0].id) : DIRECT_PROXY_VALUE)
@@ -247,9 +258,30 @@ export function ProxiesPage() {
     setPage(1)
   }
 
-  const loadCredentialSnapshot = async () => {
-    const snapshot = allCredentials.data ?? (await allCredentials.refetch()).data
-    return snapshot?.credentials || []
+  /**
+   * Runs one account lookup under its own spinner key; on failure shows the error and returns
+   * undefined. Lookups go through the server-side filter, so the page never downloads every account.
+   */
+  const withBindingsLoading = async <T,>(key: string, load: () => Promise<T>): Promise<T | undefined> => {
+    setLoadingBindings((prev) => new Set(prev).add(key))
+    try {
+      return await load()
+    } catch (error) {
+      toast.error(`加载账号绑定失败: ${extractErrorMessage(error)}`)
+      return undefined
+    } finally {
+      setLoadingBindings((prev) => {
+        const next = new Set(prev)
+        next.delete(key)
+        return next
+      })
+    }
+  }
+
+  /** Accounts bound to one proxy; a proxy whose count is 0 has none, so nothing is fetched. */
+  const loadBoundCredentials = (resource: ProxyResource, action: RowAction) => {
+    if (resource.credentialCount === 0) return Promise.resolve<CredentialStatusItem[]>([])
+    return withBindingsLoading(rowKey(resource.id, action), () => getCredentialsMatching({ proxyResourceId: resource.id }))
   }
 
   const testOne = async (resource: ProxyResource) => {
@@ -300,14 +332,9 @@ export function ProxiesPage() {
 
   /** Disabled accounts keep their proxy binding by default; this frees those proxies for live accounts. */
   const unbindDisabledAccounts = async () => {
-    let credentials: CredentialStatusItem[]
-    try {
-      credentials = (await allCredentials.refetch()).data?.credentials || []
-    } catch (error) {
-      toast.error(`加载账号失败: ${extractErrorMessage(error)}`)
-      return
-    }
-    const bound = credentials.filter((credential) => credential.disabled && typeof credential.proxyResourceId === 'number')
+    const disabled = await withBindingsLoading('unbind-disabled', () => getCredentialsMatching({ status: 'disabled' }))
+    if (!disabled) return
+    const bound = disabled.filter((credential) => typeof credential.proxyResourceId === 'number')
     if (bound.length === 0) {
       toast.info('没有绑定代理资源的禁用账号')
       return
@@ -324,6 +351,7 @@ export function ProxiesPage() {
     const chunkSize = 500
     let success = 0
     let failed = 0
+    setUnbindingDisabled(true)
     try {
       for (let start = 0; start < bound.length; start += chunkSize) {
         const result = await batchUpdateCredentials.mutateAsync({
@@ -336,6 +364,8 @@ export function ProxiesPage() {
     } catch (error) {
       toast.error(`解除绑定失败（已处理 ${success} 个）: ${extractErrorMessage(error)}`)
       return
+    } finally {
+      setUnbindingDisabled(false)
     }
     if (failed > 0) toast.warning(`解除绑定未全部成功：成功 ${success}，失败 ${failed}`)
     else toast.success(`已解除 ${success} 个禁用账号的代理绑定`)
@@ -351,14 +381,8 @@ export function ProxiesPage() {
   }
 
   const requestDelete = async (resource: ProxyResource) => {
-    let credentials: CredentialStatusItem[]
-    try {
-      credentials = await loadCredentialSnapshot()
-    } catch (error) {
-      toast.error(`加载账号绑定失败: ${extractErrorMessage(error)}`)
-      return
-    }
-    const bound = credentials.filter((credential) => credential.proxyResourceId === resource.id)
+    const bound = await loadBoundCredentials(resource, 'delete')
+    if (!bound) return
     const enabledBound = bound.filter((credential) => !credential.disabled)
     const disabledBound = bound.length - enabledBound.length
     if (enabledBound.length > 0) {
@@ -379,23 +403,22 @@ export function ProxiesPage() {
       tone: 'danger',
     })
     if (!confirmed) return
+    setDeletingId(resource.id)
     try {
       await removeProxy.mutateAsync(resource.id)
       toast.success(disabledBound > 0 ? `代理已删除，已清除 ${disabledBound} 个已禁用账号关联` : '代理资源已删除')
     } catch (error) {
+      // The count on the page can lag behind: the server refuses when an enabled account was bound meanwhile.
       toast.error(`删除失败: ${extractErrorMessage(error)}`)
+      void resources.refetch()
+    } finally {
+      setDeletingId(null)
     }
   }
 
   const requestReplaceBindings = async (resource: ProxyResource) => {
-    let credentials: CredentialStatusItem[]
-    try {
-      credentials = await loadCredentialSnapshot()
-    } catch (error) {
-      toast.error(`加载账号绑定失败: ${extractErrorMessage(error)}`)
-      return
-    }
-    const bound = credentials.filter((credential) => credential.proxyResourceId === resource.id)
+    const bound = await loadBoundCredentials(resource, 'replace')
+    if (!bound) return
     if (bound.length === 0) {
       toast.info('当前代理没有绑定账号')
       return
@@ -499,14 +522,8 @@ export function ProxiesPage() {
   }
 
   const clearBindings = async (resource: ProxyResource) => {
-    let credentials: CredentialStatusItem[]
-    try {
-      credentials = await loadCredentialSnapshot()
-    } catch (error) {
-      toast.error(`加载账号绑定失败: ${extractErrorMessage(error)}`)
-      return
-    }
-    const bound = credentials.filter((credential) => credential.proxyResourceId === resource.id)
+    const bound = await loadBoundCredentials(resource, 'clear')
+    if (!bound) return
     if (bound.length === 0) {
       toast.info('当前代理没有绑定账号')
       return
@@ -575,8 +592,8 @@ export function ProxiesPage() {
               {testAll.isPending ? <Spinner size="sm" /> : <CheckCircle2 className="h-4 w-4" />}
               全部测活
             </Button>
-            <Button variant="outline" size="sm" onClick={() => void unbindDisabledAccounts()} disabled={batchUpdateCredentials.isPending || allCredentials.isFetching} title="解除所有禁用账号与代理资源的绑定">
-              {allCredentials.isFetching || batchUpdateCredentials.isPending ? <Spinner size="sm" /> : <UserX className="h-4 w-4" />}
+            <Button variant="outline" size="sm" onClick={() => void unbindDisabledAccounts()} disabled={unbindingDisabled || loadingBindings.has('unbind-disabled')} title="解除所有禁用账号与代理资源的绑定">
+              {unbindingDisabled || loadingBindings.has('unbind-disabled') ? <Spinner size="sm" /> : <UserX className="h-4 w-4" />}
               解除禁用账号代理
             </Button>
             <Button size="sm" onClick={openCreate}>
@@ -627,8 +644,8 @@ export function ProxiesPage() {
                     <Badge tone="primary">已选 {selectedIds.size}</Badge>
                     <Button type="button" variant="ghost" size="xs" onClick={() => setSelectedIds(new Set())}>取消选择</Button>
                     <Button type="button" variant="destructive" size="xs" onClick={() => void requestBatchDelete()}
-                      disabled={allCredentials.isFetching || batchDeleting}>
-                      {allCredentials.isFetching ? <Spinner size="sm" /> : <Trash2 className="h-3.5 w-3.5" />}批量删除
+                      disabled={loadingBindings.has('batch-delete') || batchDeleting}>
+                      {loadingBindings.has('batch-delete') ? <Spinner size="sm" /> : <Trash2 className="h-3.5 w-3.5" />}批量删除
                     </Button>
                   </>
                 )}
@@ -652,6 +669,8 @@ export function ProxiesPage() {
                   {pagedList.map((resource) => {
                     const result = testResults.get(resource.id) ?? storedResult(resource)
                     const testing = testingIds.has(resource.id)
+                    const rowAction = (['replace', 'clear', 'delete'] as const).find((action) => loadingBindings.has(rowKey(resource.id, action)))
+                    const rowLoading = rowAction !== undefined
                     return (
                       <tr key={resource.id} className={cn('align-top', selectedIds.has(resource.id) ? 'bg-primary/5' : 'bg-card')}>
                         <td className="px-3 py-3">
@@ -709,18 +728,18 @@ export function ProxiesPage() {
                               size="icon-sm"
                               title="更换代理绑定"
                               onClick={() => requestReplaceBindings(resource)}
-                              disabled={resource.credentialCount === 0 || batchUpdateCredentials.isPending}
+                              disabled={resource.credentialCount === 0 || batchUpdateCredentials.isPending || rowLoading}
                             >
-                              <ArrowRightLeft className="size-4" />
+                              {rowLoading && rowAction === 'replace' ? <Spinner size="sm" /> : <ArrowRightLeft className="size-4" />}
                             </Button>
                             <Button
                               variant="ghost"
                               size="icon-sm"
                               title="清除代理绑定"
                               onClick={() => clearBindings(resource)}
-                              disabled={resource.credentialCount === 0 || batchUpdateCredentials.isPending}
+                              disabled={resource.credentialCount === 0 || batchUpdateCredentials.isPending || rowLoading}
                             >
-                              <Unlink className="size-4" />
+                              {rowLoading && rowAction === 'clear' ? <Spinner size="sm" /> : <Unlink className="size-4" />}
                             </Button>
                             <Button variant="ghost" size="icon-sm" title="编辑代理" onClick={() => openEdit(resource)}>
                               <Edit3 className="size-4" />
@@ -731,9 +750,9 @@ export function ProxiesPage() {
                               className="text-destructive hover:bg-destructive/10 hover:text-destructive"
                               title="删除代理"
                               onClick={() => requestDelete(resource)}
-                              disabled={removeProxy.isPending || batchUpdateCredentials.isPending}
+                              disabled={deletingId === resource.id || rowLoading}
                             >
-                              <Trash2 className="size-4" />
+                              {deletingId === resource.id || (rowLoading && rowAction === 'delete') ? <Spinner size="sm" /> : <Trash2 className="size-4" />}
                             </Button>
                           </div>
                         </td>
