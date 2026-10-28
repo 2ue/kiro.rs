@@ -4,6 +4,10 @@ use axum::{
     Router, middleware,
     routing::{delete, get, patch, post, put},
 };
+use tower_http::compression::{
+    CompressionLayer,
+    predicate::{And, DefaultPredicate, NotForContentType, Predicate},
+};
 
 use super::{
     capture_handlers::{download_capture, get_capture_overview, start_capture, stop_capture},
@@ -347,5 +351,103 @@ pub fn create_admin_router(state: AdminState) -> Router {
             state.clone(),
             admin_auth_middleware,
         ))
+        .layer(admin_compression_layer())
         .with_state(state)
+}
+
+/// Account, proxy and usage lists are large, repetitive JSON; gzip cuts what a slow link has to
+/// carry by most of it. Applied only when the client sends `Accept-Encoding: gzip`; capture
+/// downloads are already zip archives and pass through as they are.
+fn admin_compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentType>> {
+    CompressionLayer::new()
+        .gzip(true)
+        .no_br()
+        .no_deflate()
+        .no_zstd()
+        .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("application/zip")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::admin_compression_layer;
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, header},
+        response::IntoResponse,
+        routing::get,
+    };
+    use std::io::Read;
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        let json = "{\"id\":1,\"email\":\"user@example.com\"}".repeat(200);
+        Router::new()
+            .route(
+                "/json",
+                get(move || async move {
+                    ([(header::CONTENT_TYPE, "application/json")], json).into_response()
+                }),
+            )
+            .route(
+                "/zip",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "application/zip")],
+                        vec![b'z'; 4096],
+                    )
+                        .into_response()
+                }),
+            )
+            .layer(admin_compression_layer())
+    }
+
+    async fn get_with(path: &str, accept: Option<&str>) -> axum::response::Response {
+        let mut request = Request::builder().uri(path);
+        if let Some(accept) = accept {
+            request = request.header(header::ACCEPT_ENCODING, accept);
+        }
+        app()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn json_is_gzipped_when_the_client_accepts_it() {
+        let response = get_with("/json", Some("gzip, deflate, br")).await;
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        let compressed = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let mut plain = String::new();
+        flate2::read::GzDecoder::new(&compressed[..])
+            .read_to_string(&mut plain)
+            .unwrap();
+        assert!(plain.starts_with("{\"id\":1"));
+        assert!(
+            compressed.len() * 5 < plain.len(),
+            "repetitive JSON should shrink well"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stay_plain_without_accept_encoding() {
+        let response = get_with("/json", None).await;
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn zip_downloads_are_not_compressed_again() {
+        let response = get_with("/zip", Some("gzip")).await;
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            4096
+        );
+    }
 }
