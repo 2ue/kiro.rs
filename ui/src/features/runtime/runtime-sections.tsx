@@ -1615,6 +1615,46 @@ function StableSegmentPolicyForm({
   )
 }
 
+type NonStreamCacheMode = 'by_request' | 'force_off'
+
+/** Stored as `skipNonStreamUsageProjection`: `force_off` is `true`, `by_request` is `false`. */
+const NON_STREAM_CACHE_OPTIONS: Array<{ value: NonStreamCacheMode; label: string; desc: string }> = [
+  {
+    value: 'by_request',
+    label: '按场景',
+    desc: '按官方规则判断：请求带 cache_control，且断点前内容达到模型最小缓存长度，就按本路径缓存策略整理 usage；其余非流式请求不整理，直接透传上游 usage。',
+  },
+  {
+    value: 'force_off',
+    label: '强制不缓存',
+    desc: '所有非流式请求都不整理 usage、不推进本地缓存：外部池保持上游 usage 原样，本地账号用上游原始 metadata。',
+  },
+]
+
+function NonStreamCacheSelect({
+  checked,
+  onChange,
+}: {
+  checked: boolean | undefined
+  onChange: (skipNonStreamUsageProjection: boolean) => void
+}) {
+  const selected = NON_STREAM_CACHE_OPTIONS[checked ? 1 : 0]
+  return (
+    <div className="space-y-1.5">
+      <div className="text-sm font-semibold text-foreground">非流式缓存</div>
+      <Select value={selected.value} onValueChange={(next) => onChange(next === 'force_off')}>
+        <SelectTrigger size="sm" className="w-full max-w-xs" aria-label="非流式缓存"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          {NON_STREAM_CACHE_OPTIONS.map((option) => (
+            <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <div className="text-xs leading-relaxed text-muted-foreground">{selected.desc}</div>
+    </div>
+  )
+}
+
 function NonStreamCacheToggle({
   value,
   fallbackPrefix,
@@ -1626,13 +1666,9 @@ function NonStreamCacheToggle({
 }) {
   const policy = value ?? defaultUsagePatch(fallbackPrefix)
   return (
-    <TogField
-      label="非流式 Usage 透传"
-      desc="仅影响非流式请求。开启：所有非流式请求都不整理 usage、不推进本地缓存，外部池保持上游 usage 原样，本地凭证用上游原始 metadata。关闭：带 cache_control 且断点前内容达到模型最小缓存长度的请求按本路径缓存策略整理，其余同开启时透传。"
-      checked={Boolean(policy.skipNonStreamUsageProjection)}
-      onChange={(skipNonStreamUsageProjection) =>
-        onChange({ ...policy, skipNonStreamUsageProjection })
-      }
+    <NonStreamCacheSelect
+      checked={policy.skipNonStreamUsageProjection}
+      onChange={(skipNonStreamUsageProjection) => onChange({ ...policy, skipNonStreamUsageProjection })}
     />
   )
 }
@@ -2072,7 +2108,7 @@ export function PathStrategyBindingCard({
                   onChange={(routeNamespace) => patch({ routeNamespace })}
                 />
               </ParameterGroup>
-              <ParameterGroup title="非流式请求" desc="决定非流式响应是否直接使用上游 usage。">
+              <ParameterGroup title="非流式请求" desc="决定非流式请求按场景整理缓存 usage，还是一律不缓存。">
                 <NonStreamCacheToggle
                   value={effectivePolicy.reportedUsage}
                   fallbackPrefix={prefix}
@@ -2096,7 +2132,7 @@ export function PathStrategyBindingCard({
             </div>
           ) : (
             <div className="space-y-7">
-              <ParameterGroup title="非流式请求" desc="决定非流式响应是否直接使用上游 usage。">
+              <ParameterGroup title="非流式请求" desc="决定非流式请求按场景整理缓存 usage，还是一律不缓存。">
                 <NonStreamCacheToggle
                   value={effectivePolicy.reportedUsage}
                   fallbackPrefix={prefix}
@@ -2866,7 +2902,7 @@ function PathPolicyEditor({
     onChange({ ...policy, [key]: v })
   return (
     <div className="space-y-8">
-      <ParameterGroup title="Usage 总开关" desc="先决定这条路径是否参与展示用量整理，以及非流式请求是否直接透传上游结果。">
+      <ParameterGroup title="Usage 总开关" desc="先决定这条路径是否参与展示用量整理，以及非流式请求按什么规则处理缓存。">
         <div className="grid gap-x-8 gap-y-5 lg:grid-cols-2">
           <TogField
             label="启用本规则"
@@ -2874,10 +2910,8 @@ function PathPolicyEditor({
             checked={policy.enabled}
             onChange={set('enabled')}
           />
-          <TogField
-            label="非流式 Usage 透传"
-            desc="开启：所有非流式请求透传上游 usage，不推进本地缓存。关闭：只有按官方规则会有缓存的非流式请求（带 cache_control 且达到模型最小缓存长度）才整理，其余照样透传。"
-            checked={Boolean(policy.skipNonStreamUsageProjection)}
+          <NonStreamCacheSelect
+            checked={policy.skipNonStreamUsageProjection}
             onChange={set('skipNonStreamUsageProjection')}
           />
         </div>

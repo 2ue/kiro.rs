@@ -1739,14 +1739,26 @@ function ReportedUsagePathEditor({
       )}
       {value.enabled && (
         <>
-          <ToggleField
-            title="禁用非流式整形"
-            description="开启后，命中此路径的非流式请求一律不改写返回 usage；关闭时，只有带 cache_control 且断点前内容达到模型最小缓存长度的非流式请求才按路径策略整形，其余同样透传。流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
-            checked={Boolean(value.skipNonStreamUsageProjection)}
-            onCheckedChange={(skipNonStreamUsageProjection) =>
-              onChange({ ...value, skipNonStreamUsageProjection })
-            }
-          />
+          <label className="block rounded-md border bg-background p-4">
+            <div className="mb-3">
+              <div className="text-sm font-medium">非流式缓存</div>
+              <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                {value.skipNonStreamUsageProjection
+                  ? '强制不缓存：命中此路径的非流式请求一律不改写返回 usage。这是上层拦截，后续外部池等配置不能重新开启本次整形。流式请求不受影响。'
+                  : '按场景：带 cache_control 且断点前内容达到模型最小缓存长度的非流式请求按路径策略整形，其余透传上游 usage。流式请求不受影响。'}
+              </div>
+            </div>
+            <select
+              className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              value={value.skipNonStreamUsageProjection ? 'force_off' : 'by_request'}
+              onChange={(event) =>
+                onChange({ ...value, skipNonStreamUsageProjection: event.target.value === 'force_off' })
+              }
+            >
+              <option value="by_request">按场景</option>
+              <option value="force_off">强制不缓存</option>
+            </select>
+          </label>
           <div className="grid gap-4 lg:grid-cols-2">
             <ReportedUsageFieldEditor
               title="输入字段改写（input_tokens）"
