@@ -392,6 +392,9 @@ struct RequestUsageContext {
     cache_hit_shaping: CacheHitShapingContext,
     /// 冷请求下游 usage 约束开关（路由 `coldRequestGuard.enabled`，默认关闭）。
     cold_request_guard: bool,
+    /// 本地账号缓存写入时长（路由 `cacheTtl.local`），在最终下游 usage 上统一应用。
+    /// no_cache 路由（含非流式透传）为 `None`，保留上游原始拆分。
+    cache_write_ttl: Option<super::cache::CacheWriteTtl>,
     /// Kiro-RS Tool Plus 策略：下游 usage 由该策略独立整形。
     kiro_rs_tool_plus: Option<KiroRsToolPlusRequest>,
     simulated_usage: Option<super::cache::CacheSimulation>,
@@ -888,6 +891,7 @@ struct ExternalFallbackContext {
     prompt_cache_strategy_type: PromptCacheStrategyType,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_route_namespace: Option<String>,
+    cache_ttl_mode: crate::model::config::CacheTtlMode,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -1275,6 +1279,7 @@ impl RequestRuntimeConfig {
             hit_shaping: crate::model::config::CacheHitShapingPolicy::default(),
             cold_request_guard: crate::model::config::ColdRequestGuardPolicy::default(),
             kiro_rs_tool_plus: crate::model::config::KiroRsToolPlusCachePolicy::default(),
+            cache_ttl: crate::model::config::CacheTtlPolicy::default(),
         }
         .normalized()
     }
@@ -1925,6 +1930,7 @@ fn raw_external_route_request_with_hints(
         prompt_cache_strategy_type: policy.cache_type,
         prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
         prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
+        cache_ttl_mode: policy.cache_ttl.external_pool,
         prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
         prompt_cache_token_scale: policy.simulation.token_scale,
         prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
@@ -1999,6 +2005,7 @@ fn build_external_fallback_context(
         prompt_cache_strategy_type: policy.cache_type,
         prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
         prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
+        cache_ttl_mode: policy.cache_ttl.external_pool,
         prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
         prompt_cache_token_scale: policy.simulation.token_scale,
         prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
@@ -2549,6 +2556,7 @@ impl ExternalFallbackContext {
             prompt_cache_strategy_type: self.prompt_cache_strategy_type,
             prompt_cache_simulation_mode: self.prompt_cache_simulation_mode,
             prompt_cache_route_namespace: self.prompt_cache_route_namespace.clone(),
+            cache_ttl_mode: self.cache_ttl_mode,
             prompt_cache_target_read_ratio: self.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: self.prompt_cache_token_scale,
             prompt_cache_max_simulated_input_tokens: self.prompt_cache_max_simulated_input_tokens,
@@ -3424,6 +3432,14 @@ impl RequestUsageContext {
         if observability.filtered_trivial_text_chars > 0 {
             *self.latency.filtered_trivial_text_chars.lock() =
                 Some(observability.filtered_trivial_text_chars);
+        }
+    }
+
+    /// Applies the route's cache TTL mode to a final downstream usage (no-op on no-cache routes).
+    fn apply_cache_write_ttl(&self, usage: super::cache::CacheUsage) -> super::cache::CacheUsage {
+        match self.cache_write_ttl {
+            Some(ttl) => usage.with_cache_creation_ttl(ttl),
+            None => usage,
         }
     }
 
@@ -4417,6 +4433,16 @@ impl CredentialUsageContext {
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
+        self.request.apply_cache_write_ttl(
+            self.canonical_reported_usage_for_success_untimed(usage, usage_source),
+        )
+    }
+
+    fn canonical_reported_usage_for_success_untimed(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
         let raw = super::cache::RawUsage::uncached(self.request.input_tokens, usage.output_tokens)
             .to_cache_usage();
         if self.request.kiro_rs_tool_plus.is_some() {
@@ -4433,7 +4459,24 @@ impl CredentialUsageContext {
         self.shape_final_cache_hit(reported_usage, controlled, raw)
     }
 
+    /// Final downstream usage of a successful local request. The route's cache TTL mode is
+    /// applied last, so every earlier shaping step can ignore the 5m/1h split.
     fn canonical_reported_usage_for_success_with_raw(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        raw_usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        self.request.apply_cache_write_ttl(
+            self.canonical_reported_usage_for_success_with_raw_untimed(
+                usage,
+                usage_source,
+                raw_usage,
+            ),
+        )
+    }
+
+    fn canonical_reported_usage_for_success_with_raw_untimed(
         &self,
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
@@ -5852,6 +5895,7 @@ fn prepare_usage_context(
             DEFAULT_INFERENCE_UPSTREAM_MAX_ATTEMPTS,
         )),
         None,
+        None,
     )
 }
 
@@ -5867,10 +5911,19 @@ fn prepare_usage_context_with_inference_attempt_budget(
     input_tokens: i32,
     inference_attempt_budget: Arc<InferenceAttemptBudget>,
     request_api_key_id: Option<String>,
+    top_level_cache_ttl: Option<super::cache::CacheWriteTtl>,
 ) -> RequestUsageContext {
     let policy = cache_route.policy;
     let simulation_mode = prompt_cache_simulation_mode_for_policy(&policy);
     let strategy_type = policy.cache_type;
+    let cache_write_ttl = (strategy_type != PromptCacheStrategyType::NoCache).then(|| {
+        super::cache::resolve_cache_write_ttl(
+            policy.cache_ttl.local.for_local(),
+            super::cache::RequestCacheTtl::from_request(payload)
+                .with_top_level(top_level_cache_ttl),
+            false,
+        )
+    });
     let prompt_cache_model = model_resolution
         .as_ref()
         .and_then(|resolution| resolution.upstream_model.as_deref())
@@ -6053,7 +6106,10 @@ fn prepare_usage_context_with_inference_attempt_budget(
         prompt_cache_cap_jitter_max_tokens: policy.simulation.cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
         prompt_cache_creation_control: policy.creation_control,
-        prompt_cache_bounds: prompt_cache_bounds_for_policy(&policy),
+        prompt_cache_bounds: match cache_write_ttl {
+            Some(ttl) => prompt_cache_bounds_for_policy(&policy).with_write_ttl(ttl),
+            None => prompt_cache_bounds_for_policy(&policy),
+        },
         stable_segment_cache_policy: policy.stable_segment,
         reported_cache_usage_policy,
         cache_hit_shaping: CacheHitShapingContext {
@@ -6070,6 +6126,7 @@ fn prepare_usage_context_with_inference_attempt_budget(
         cold_request_guard: strategy_type != PromptCacheStrategyType::NoCache
             && strategy_type != PromptCacheStrategyType::KiroRsToolPlus
             && policy.cold_request_guard.enabled,
+        cache_write_ttl,
         kiro_rs_tool_plus: (strategy_type == PromptCacheStrategyType::KiroRsToolPlus).then(|| {
             KiroRsToolPlusRequest {
                 policy: policy.kiro_rs_tool_plus,
@@ -7897,6 +7954,7 @@ async fn post_messages_inner(
     );
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let top_level_cache_control = effective_raw_probe.top_level_cache_control;
+    let top_level_cache_ttl = effective_raw_probe.top_level_cache_ttl;
     // Bytes 克隆仅增加引用计数；只在采集开启时保留，避免延长请求体生命周期。
     let capture_bodies = crate::diagnostics::capture::is_active()
         .then(|| (raw_body.clone(), effective_raw_body.clone()));
@@ -8157,6 +8215,7 @@ async fn post_messages_inner(
             input_tokens,
             inference_attempt_budget.clone(),
             request_api_key_id.clone(),
+            top_level_cache_ttl,
         );
         let request_id = usage_context.request_id.clone();
         let error_id = usage_context.error_id.clone();
@@ -8466,6 +8525,7 @@ async fn post_messages_inner(
         input_tokens,
         inference_attempt_budget.clone(),
         request_api_key_id,
+        top_level_cache_ttl,
     );
     usage_context.request_capture = request_capture;
     if let Some(report) = payload_guard_report.clone() {
@@ -9171,47 +9231,51 @@ impl StreamContextTemplate {
 
         let initial_events =
             ctx.generate_initial_events_with_reported_usage_mapper(|reported_usage| {
-                if credential_usage.request.kiro_rs_tool_plus.is_some() {
-                    let raw =
-                        super::cache::RawUsage::uncached(credential_usage.request.input_tokens, 0)
-                            .to_cache_usage();
-                    return credential_usage.kiro_rs_tool_plus_reported_usage(
-                        reported_usage,
-                        UsageSource::LocalPromptCache,
-                        raw,
-                        false,
-                    );
-                }
-                let preview = credential_usage.preview_creation_frequency_control(
-                    reported_usage,
-                    UsageSource::LocalPromptCache,
-                );
-                let raw =
-                    super::cache::RawUsage::uncached(credential_usage.request.input_tokens, 0)
-                        .to_cache_usage();
-                if credential_usage.uses_bounded_high_cache() {
-                    return credential_usage
-                        .shape_bounded_final_usage(preview, preview, raw, false);
-                }
-                let reported_policy = credential_usage.request.hit_shaping_reported_policy();
-                let shaped = credential_usage.request.cache_hit_shaping.apply(
-                    preview,
-                    CacheHitShapingRequest {
-                        raw,
-                        creation_allowed: credential_usage.creation_allowed_after_control(preview),
-                        pricing: credential_usage
-                            .request
-                            .pricing_catalog
-                            .model_pricing(credential_usage.creation_control_model()),
-                        reported_policy: reported_policy.as_ref(),
-                    },
-                );
-                let constrained = credential_usage.constrain_cold_reported_usage(shaped, raw);
-                credential_usage
-                    .request
-                    .apply_stable_segment_final_caps(constrained)
+                credential_usage.request.apply_cache_write_ttl(
+                    credential_usage.initial_reported_usage_untimed(reported_usage),
+                )
             });
         (ctx, initial_events)
+    }
+}
+
+impl CredentialUsageContext {
+    /// message_start usage before the route's cache TTL mode is applied.
+    fn initial_reported_usage_untimed(
+        &self,
+        reported_usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        if self.request.kiro_rs_tool_plus.is_some() {
+            let raw =
+                super::cache::RawUsage::uncached(self.request.input_tokens, 0).to_cache_usage();
+            return self.kiro_rs_tool_plus_reported_usage(
+                reported_usage,
+                UsageSource::LocalPromptCache,
+                raw,
+                false,
+            );
+        }
+        let preview =
+            self.preview_creation_frequency_control(reported_usage, UsageSource::LocalPromptCache);
+        let raw = super::cache::RawUsage::uncached(self.request.input_tokens, 0).to_cache_usage();
+        if self.uses_bounded_high_cache() {
+            return self.shape_bounded_final_usage(preview, preview, raw, false);
+        }
+        let reported_policy = self.request.hit_shaping_reported_policy();
+        let shaped = self.request.cache_hit_shaping.apply(
+            preview,
+            CacheHitShapingRequest {
+                raw,
+                creation_allowed: self.creation_allowed_after_control(preview),
+                pricing: self
+                    .request
+                    .pricing_catalog
+                    .model_pricing(self.creation_control_model()),
+                reported_policy: reported_policy.as_ref(),
+            },
+        );
+        let constrained = self.constrain_cold_reported_usage(shaped, raw);
+        self.request.apply_stable_segment_final_caps(constrained)
     }
 }
 

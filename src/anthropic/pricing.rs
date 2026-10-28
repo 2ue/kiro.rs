@@ -18,17 +18,42 @@ pub const MANUAL_PRICING_SOURCE: &str = "manual";
 pub struct ModelPricing {
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
+    /// 5-minute cache write (the standard `cache_creation_input_tokens` rate).
     pub cache_creation_input_token_cost: f64,
+    /// 1-hour cache write. 0 means "not set": derived as 2x input (Anthropic's 1h write rate).
+    #[serde(default)]
+    pub cache_creation_1h_input_token_cost: f64,
     pub cache_read_input_token_cost: f64,
 }
 
+/// Anthropic prices a 1-hour cache write at 2x the base input rate (5-minute writes: 1.25x).
+const ONE_HOUR_CACHE_WRITE_INPUT_MULTIPLIER: f64 = 2.0;
+
 impl ModelPricing {
     pub fn estimate(self, usage: CacheUsage) -> f64 {
+        let creation = usage.cache_creation_input_tokens.max(0);
+        let creation_1h = usage.cache_creation_1h_input_tokens.max(0).min(creation);
         (usage.input_tokens.max(0) as f64 * self.input_cost_per_token)
             + (usage.output_tokens.max(0) as f64 * self.output_cost_per_token)
-            + (usage.cache_creation_input_tokens.max(0) as f64
-                * self.cache_creation_input_token_cost)
+            + ((creation - creation_1h) as f64 * self.cache_creation_input_token_cost)
+            + (creation_1h as f64 * self.effective_cache_creation_1h_input_token_cost())
             + (usage.cache_read_input_tokens.max(0) as f64 * self.cache_read_input_token_cost)
+    }
+
+    /// The 1-hour cache write rate, falling back to 2x input when the source did not set it.
+    pub fn effective_cache_creation_1h_input_token_cost(self) -> f64 {
+        if self.cache_creation_1h_input_token_cost > 0.0 {
+            self.cache_creation_1h_input_token_cost
+        } else {
+            self.input_cost_per_token * ONE_HOUR_CACHE_WRITE_INPUT_MULTIPLIER
+        }
+    }
+
+    /// Fills the 1-hour write rate when it is missing, so stored and displayed prices show it.
+    pub fn with_derived_cache_creation_1h_cost(mut self) -> Self {
+        self.cache_creation_1h_input_token_cost =
+            self.effective_cache_creation_1h_input_token_cost();
+        self
     }
 
     fn is_usable(self) -> bool {
@@ -572,9 +597,15 @@ fn pricing_from_entry(value: &serde_json::Value) -> Option<ModelPricing> {
         output_cost_per_token: number_field(value, "output_cost_per_token")?,
         cache_creation_input_token_cost: number_field(value, "cache_creation_input_token_cost")
             .unwrap_or_else(|| number_field(value, "input_cost_per_token").unwrap_or(0.0) * 1.25),
+        cache_creation_1h_input_token_cost: number_field(
+            value,
+            "cache_creation_input_token_cost_above_1hr",
+        )
+        .unwrap_or(0.0),
         cache_read_input_token_cost: number_field(value, "cache_read_input_token_cost")
             .unwrap_or_else(|| number_field(value, "input_cost_per_token").unwrap_or(0.0) * 0.1),
-    };
+    }
+    .with_derived_cache_creation_1h_cost();
     pricing.is_usable().then_some(pricing)
 }
 
@@ -604,6 +635,7 @@ fn fallback_prices() -> HashMap<String, ModelPricing> {
                 input_cost_per_token: 0.000001,
                 output_cost_per_token: 0.000005,
                 cache_creation_input_token_cost: 0.00000125,
+                cache_creation_1h_input_token_cost: 0.000002,
                 cache_read_input_token_cost: 0.0000001,
             },
         ),
@@ -613,6 +645,7 @@ fn fallback_prices() -> HashMap<String, ModelPricing> {
                 input_cost_per_token: 0.000003,
                 output_cost_per_token: 0.000015,
                 cache_creation_input_token_cost: 0.00000375,
+                cache_creation_1h_input_token_cost: 0.000006,
                 cache_read_input_token_cost: 0.0000003,
             },
         ),
@@ -622,6 +655,7 @@ fn fallback_prices() -> HashMap<String, ModelPricing> {
                 input_cost_per_token: 0.000003,
                 output_cost_per_token: 0.000015,
                 cache_creation_input_token_cost: 0.00000375,
+                cache_creation_1h_input_token_cost: 0.000006,
                 cache_read_input_token_cost: 0.0000003,
             },
         ),
@@ -631,6 +665,7 @@ fn fallback_prices() -> HashMap<String, ModelPricing> {
                 input_cost_per_token: 0.000005,
                 output_cost_per_token: 0.000025,
                 cache_creation_input_token_cost: 0.00000625,
+                cache_creation_1h_input_token_cost: 0.00001,
                 cache_read_input_token_cost: 0.0000005,
             },
         ),
@@ -640,6 +675,7 @@ fn fallback_prices() -> HashMap<String, ModelPricing> {
                 input_cost_per_token: 0.000005,
                 output_cost_per_token: 0.000025,
                 cache_creation_input_token_cost: 0.00000625,
+                cache_creation_1h_input_token_cost: 0.00001,
                 cache_read_input_token_cost: 0.0000005,
             },
         ),
@@ -649,6 +685,7 @@ fn fallback_prices() -> HashMap<String, ModelPricing> {
                 input_cost_per_token: 0.000005,
                 output_cost_per_token: 0.000025,
                 cache_creation_input_token_cost: 0.00000625,
+                cache_creation_1h_input_token_cost: 0.00001,
                 cache_read_input_token_cost: 0.0000005,
             },
         ),
@@ -715,6 +752,7 @@ mod tests {
                     input_cost_per_token: 0.000003,
                     output_cost_per_token: 0.000015,
                     cache_creation_input_token_cost: 0.00000375,
+                    cache_creation_1h_input_token_cost: 0.0,
                     cache_read_input_token_cost: 0.0000003,
                 },
                 source: Some(LITELLM_SOURCE.to_string()),
@@ -746,6 +784,7 @@ mod tests {
                 input_cost_per_token: 0.00001,
                 output_cost_per_token: 0.00002,
                 cache_creation_input_token_cost: 0.0000125,
+                cache_creation_1h_input_token_cost: 0.0,
                 cache_read_input_token_cost: 0.000001,
             },
         );
@@ -775,6 +814,7 @@ mod tests {
                 input_cost_per_token: 0.000005,
                 output_cost_per_token: 0.000025,
                 cache_creation_input_token_cost: 0.00000625,
+                cache_creation_1h_input_token_cost: 0.0,
                 cache_read_input_token_cost: 0.0000005,
             },
         );
@@ -804,6 +844,7 @@ mod tests {
                 input_cost_per_token: 0.000007,
                 output_cost_per_token: 0.000031,
                 cache_creation_input_token_cost: 0.000008,
+                cache_creation_1h_input_token_cost: 0.0,
                 cache_read_input_token_cost: 0.0000007,
             },
         );
@@ -833,6 +874,7 @@ mod tests {
                 input_cost_per_token: 0.000007,
                 output_cost_per_token: 0.000031,
                 cache_creation_input_token_cost: 0.000008,
+                cache_creation_1h_input_token_cost: 0.0,
                 cache_read_input_token_cost: 0.0000007,
             },
         );
@@ -898,9 +940,71 @@ mod tests {
                 input_cost_per_token: 0.000005,
                 output_cost_per_token: 0.000025,
                 cache_creation_input_token_cost: 0.00000625,
+                // The source has no 1-hour rate, so it is derived as 2x input.
+                cache_creation_1h_input_token_cost: 0.00001,
                 cache_read_input_token_cost: 0.0000005,
             })
         );
         assert!(!prices.contains_key("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn litellm_one_hour_cache_write_rate_is_read_and_billed() {
+        let value = serde_json::json!({
+            "claude-opus-5-5": {
+                "input_cost_per_token": 0.000004,
+                "output_cost_per_token": 0.00002,
+                "cache_creation_input_token_cost": 0.000005,
+                "cache_creation_input_token_cost_above_1hr": 0.000008,
+                "cache_read_input_token_cost": 0.0000002
+            }
+        });
+        let candidates = pricing_sync_candidates(["claude-opus-5-5".to_string()]);
+        let pricing = parse_litellm_prices(&value, &candidates).unwrap()["claude-opus-5-5"];
+        assert_eq!(pricing.cache_creation_1h_input_token_cost, 0.000008);
+
+        let write = |five_minutes: i32, one_hour: i32| CacheUsage {
+            total_input_tokens: five_minutes + one_hour,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: five_minutes + one_hour,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: five_minutes,
+            cache_creation_1h_input_tokens: one_hour,
+        };
+        let five_minute_cost = pricing.estimate(write(1_000_000, 0));
+        let one_hour_cost = pricing.estimate(write(0, 1_000_000));
+        assert!((five_minute_cost - 5.0).abs() < 1e-9, "{five_minute_cost}");
+        assert!((one_hour_cost - 8.0).abs() < 1e-9, "{one_hour_cost}");
+        // Mixed writes bill each part at its own rate.
+        assert!((pricing.estimate(write(500_000, 500_000)) - 6.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_one_hour_rate_bills_two_times_input() {
+        let pricing = ModelPricing {
+            input_cost_per_token: 0.000003,
+            output_cost_per_token: 0.000015,
+            cache_creation_input_token_cost: 0.00000375,
+            cache_creation_1h_input_token_cost: 0.0,
+            cache_read_input_token_cost: 0.0000003,
+        };
+        assert_eq!(
+            pricing.effective_cache_creation_1h_input_token_cost(),
+            0.000006
+        );
+        let usage = CacheUsage {
+            total_input_tokens: 1_000_000,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 1_000_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 1_000_000,
+        };
+        assert!((pricing.estimate(usage) - 6.0).abs() < 1e-9);
+        // Built-in prices carry the 1-hour rate explicitly.
+        let builtin = fallback_prices()["claude-sonnet-4-5"];
+        assert_eq!(builtin.cache_creation_1h_input_token_cost, 0.000006);
     }
 }

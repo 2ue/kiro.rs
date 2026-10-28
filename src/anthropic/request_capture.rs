@@ -501,11 +501,26 @@ mod tests {
     }
 
     async fn wait_for_files(dir: &Path, count: usize) -> Vec<PathBuf> {
-        for _ in 0..200 {
+        wait_for_files_where(dir, count, |_| true).await
+    }
+
+    /// Waits until `dir` holds exactly `count` files and `done` accepts their sorted names. The
+    /// writer thread writes and prunes one record at a time, so a bare file count can be met
+    /// while the last record is still queued.
+    async fn wait_for_files_where(
+        dir: &Path,
+        count: usize,
+        done: impl Fn(&[String]) -> bool,
+    ) -> Vec<PathBuf> {
+        for _ in 0..500 {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 let mut files: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
-                if files.len() == count {
-                    files.sort();
+                files.sort();
+                let names: Vec<String> = files
+                    .iter()
+                    .map(|file| file.to_string_lossy().into_owned())
+                    .collect();
+                if files.len() == count && done(&names) {
                     return files;
                 }
             }
@@ -550,7 +565,12 @@ mod tests {
             seed.record_usage_only(&meta(id), 10);
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let files = wait_for_files(&dir.join("usage-only"), 2).await;
+        // Wait for the last record and the prune that follows it, not just for two files.
+        let files = wait_for_files_where(&dir.join("usage-only"), 2, |names| {
+            names.iter().any(|name| name.contains("req_c"))
+                && !names.iter().any(|name| name.contains("req_a"))
+        })
+        .await;
         let newest: Value = serde_json::from_slice(&std::fs::read(&files[1]).unwrap()).unwrap();
         assert_eq!(newest["kind"], "usage_only");
         assert_eq!(newest["requestId"], "req_c");

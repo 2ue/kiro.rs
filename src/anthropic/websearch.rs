@@ -218,6 +218,9 @@ pub(crate) fn usage_json(
         "cache_creation_input_tokens": usage.cache_creation_input_tokens.max(0),
         "cache_read_input_tokens": usage.cache_read_input_tokens.max(0)
     });
+    if let Some(breakdown) = usage.cache_creation_breakdown_json() {
+        value["cache_creation"] = breakdown;
+    }
     if let Some(requests) = web_search_requests {
         value["server_tool_use"] = json!({"web_search_requests": requests});
     }

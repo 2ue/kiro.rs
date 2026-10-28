@@ -99,6 +99,8 @@ pub(crate) struct RawMessagesBodyProbe {
     pub(crate) stream: Option<bool>,
     /// A non-null top-level `cache_control` (automatic prompt caching).
     pub(crate) top_level_cache_control: bool,
+    /// `ttl` of the top-level `cache_control`, when it set one.
+    pub(crate) top_level_cache_ttl: Option<crate::anthropic::cache::CacheWriteTtl>,
     pub(crate) max_tokens_present: bool,
     pub(crate) max_tokens: Option<i64>,
     pub(crate) complete_top_level_object: bool,
@@ -1110,7 +1112,13 @@ fn scan_top_level_object(
             i = value_end;
         } else if key == ProbedTopLevelKey::CacheControl {
             let value_end = skip_json_value(bytes, value_start, 1, budget)?;
-            probe.top_level_cache_control = &bytes[value_start..value_end] != b"null";
+            let value = &bytes[value_start..value_end];
+            probe.top_level_cache_control = value != b"null";
+            probe.top_level_cache_ttl = serde_json::from_slice::<serde_json::Value>(value)
+                .ok()
+                .and_then(|cache_control| {
+                    crate::anthropic::cache::RequestCacheTtl::from_cache_control(&cache_control)
+                });
             i = value_end;
         } else {
             i = skip_json_value(bytes, value_start, 1, budget)?;

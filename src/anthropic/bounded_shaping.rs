@@ -388,6 +388,7 @@ mod tests {
             input_cost_per_token: 0.000004,
             output_cost_per_token: 0.00002,
             cache_creation_input_token_cost: 0.000005,
+            cache_creation_1h_input_token_cost: 0.0,
             cache_read_input_token_cost: 0.0000002,
         }
     }

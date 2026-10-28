@@ -486,6 +486,7 @@ mod tests {
             input_cost_per_token: 3.0,
             output_cost_per_token: 15.0,
             cache_creation_input_token_cost: 3.75,
+            cache_creation_1h_input_token_cost: 0.0,
             cache_read_input_token_cost: 0.3,
         };
         let mut policy = KiroRsToolPlusCachePolicy::default();

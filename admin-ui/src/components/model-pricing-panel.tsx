@@ -41,6 +41,7 @@ type ManualModelForm = {
   inputCostPerMillion: string
   outputCostPerMillion: string
   cacheCreationInputCostPerMillion: string
+  cacheCreation1hInputCostPerMillion: string
   cacheReadInputCostPerMillion: string
 }
 
@@ -59,6 +60,7 @@ const emptyManualForm: ManualModelForm = {
   inputCostPerMillion: '',
   outputCostPerMillion: '',
   cacheCreationInputCostPerMillion: '',
+  cacheCreation1hInputCostPerMillion: '',
   cacheReadInputCostPerMillion: '',
 }
 
@@ -132,6 +134,7 @@ function formFromModel(item: ModelCapabilityItem, price?: ModelPricing): ManualM
     inputCostPerMillion: dollarsPerMillion(price?.inputCostPerToken),
     outputCostPerMillion: dollarsPerMillion(price?.outputCostPerToken),
     cacheCreationInputCostPerMillion: dollarsPerMillion(price?.cacheCreationInputTokenCost),
+    cacheCreation1hInputCostPerMillion: dollarsPerMillion(price?.cacheCreation1hInputTokenCost),
     cacheReadInputCostPerMillion: dollarsPerMillion(price?.cacheReadInputTokenCost),
   }
 }
@@ -171,6 +174,7 @@ function buildManualPayload(form: ManualModelForm): UpsertManualModelRequest {
     const input = optionalNumber(form.inputCostPerMillion)
     const output = optionalNumber(form.outputCostPerMillion)
     const cacheCreation = optionalNumber(form.cacheCreationInputCostPerMillion)
+    const cacheCreation1h = optionalNumber(form.cacheCreation1hInputCostPerMillion)
     const cacheRead = optionalNumber(form.cacheReadInputCostPerMillion)
     if (
       !Number.isFinite(input) ||
@@ -178,6 +182,7 @@ function buildManualPayload(form: ManualModelForm): UpsertManualModelRequest {
       (input as number) < 0 ||
       (output as number) < 0 ||
       (cacheCreation !== undefined && (!Number.isFinite(cacheCreation) || cacheCreation < 0)) ||
+      (cacheCreation1h !== undefined && (!Number.isFinite(cacheCreation1h) || cacheCreation1h < 0)) ||
       (cacheRead !== undefined && (!Number.isFinite(cacheRead) || cacheRead < 0))
     ) {
       throw new Error('价格必须是有效数字')
@@ -186,6 +191,7 @@ function buildManualPayload(form: ManualModelForm): UpsertManualModelRequest {
       inputCostPerMillion: input as number,
       outputCostPerMillion: output as number,
       cacheCreationInputCostPerMillion: cacheCreation,
+      cacheCreation1hInputCostPerMillion: cacheCreation1h,
       cacheReadInputCostPerMillion: cacheRead,
     }
   }
@@ -292,8 +298,11 @@ function ManualModelDialog({
                 <Field title="输出 $/M">
                   <Input type="number" min={0} step="0.000001" value={form.outputCostPerMillion} disabled={upsert.isPending} onChange={(event) => set('outputCostPerMillion', event.target.value)} />
                 </Field>
-                <Field title="缓存写入 $/M">
-                  <Input type="number" min={0} step="0.000001" value={form.cacheCreationInputCostPerMillion} disabled={upsert.isPending} onChange={(event) => set('cacheCreationInputCostPerMillion', event.target.value)} />
+                <Field title="缓存写入 5 分钟 $/M">
+                  <Input type="number" min={0} step="0.000001" value={form.cacheCreationInputCostPerMillion} disabled={upsert.isPending} placeholder="留空按输入 × 1.25" onChange={(event) => set('cacheCreationInputCostPerMillion', event.target.value)} />
+                </Field>
+                <Field title="缓存写入 1 小时 $/M">
+                  <Input type="number" min={0} step="0.000001" value={form.cacheCreation1hInputCostPerMillion} disabled={upsert.isPending} placeholder="留空按输入 × 2" onChange={(event) => set('cacheCreation1hInputCostPerMillion', event.target.value)} />
                 </Field>
                 <Field title="缓存读取 $/M">
                   <Input type="number" min={0} step="0.000001" value={form.cacheReadInputCostPerMillion} disabled={upsert.isPending} onChange={(event) => set('cacheReadInputCostPerMillion', event.target.value)} />
@@ -657,7 +666,8 @@ export function ModelPricingPanel() {
                     <th className="px-3 py-2 font-medium">来源</th>
                     <th className="px-3 py-2 font-medium text-right">输入</th>
                     <th className="px-3 py-2 font-medium text-right">输出</th>
-                    <th className="px-3 py-2 font-medium text-right">缓存写入</th>
+                    <th className="px-3 py-2 font-medium text-right">缓存写入 5 分钟</th>
+                    <th className="px-3 py-2 font-medium text-right">缓存写入 1 小时</th>
                     <th className="px-3 py-2 font-medium text-right">缓存读取</th>
                   </tr>
                 </thead>
@@ -669,6 +679,7 @@ export function ModelPricingPanel() {
                       <td className="px-3 py-2 text-right font-mono">{formatPrice(item.pricing.inputCostPerToken)}</td>
                       <td className="px-3 py-2 text-right font-mono">{formatPrice(item.pricing.outputCostPerToken)}</td>
                       <td className="px-3 py-2 text-right font-mono">{formatPrice(item.pricing.cacheCreationInputTokenCost)}</td>
+                      <td className="px-3 py-2 text-right font-mono">{formatPrice(item.pricing.cacheCreation1hInputTokenCost)}</td>
                       <td className="px-3 py-2 text-right font-mono">{formatPrice(item.pricing.cacheReadInputTokenCost)}</td>
                     </tr>
                   ))}

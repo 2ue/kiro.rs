@@ -11633,6 +11633,7 @@ async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
         prompt_cache_route_namespace: None,
+        cache_ttl_mode: crate::model::config::CacheTtlMode::default(),
         prompt_cache_target_read_ratio: 0.98,
         prompt_cache_token_scale: 1.6,
         prompt_cache_max_simulated_input_tokens: 300_000,
@@ -12906,6 +12907,7 @@ fn test_route(model: &str) -> ExternalRouteRequest {
         prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
         prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
         prompt_cache_route_namespace: None,
+        cache_ttl_mode: crate::model::config::CacheTtlMode::default(),
         prompt_cache_target_read_ratio: 0.98,
         prompt_cache_token_scale: 1.6,
         prompt_cache_max_simulated_input_tokens: 300_000,
@@ -15006,6 +15008,7 @@ fn external_pool_billing_matches_dashed_opus_request_to_dotted_pricing_model() {
             input_cost_per_token: 0.000007,
             output_cost_per_token: 0.000031,
             cache_creation_input_token_cost: 0.000008,
+            cache_creation_1h_input_token_cost: 0.0,
             cache_read_input_token_cost: 0.0000007,
         },
     );
@@ -17723,6 +17726,82 @@ data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cac
     assert_eq!(raw.cache_creation_input_tokens, 1_998_336);
     assert_eq!(raw.cache_creation_5m_input_tokens, 0);
     assert_eq!(raw.cache_creation_1h_input_tokens, 1_998_336);
+}
+
+/// External pools resolve the write TTL from the route mode; "channel first" follows a channel
+/// that reported a 1-hour write and otherwise falls back to the request marker.
+#[test]
+fn external_pool_cache_ttl_modes_follow_route_and_channel() {
+    use crate::model::config::CacheTtlMode;
+    let channel_1h = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1998336,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1998336}}}
+
+"#;
+    let channel_5m = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1998336,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":1998336,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+    let split = |mode: CacheTtlMode, request_ttl: Option<&str>, event: &[u8]| {
+        let mut route = test_route("claude-opus-4-8");
+        payload_mut(&mut route).stream = true;
+        if let Some(ttl) = request_ttl {
+            payload_mut(&mut route).system.as_mut().unwrap()[0].cache_control =
+                Some(serde_json::json!({"type": "ephemeral", "ttl": ttl}));
+        }
+        route.cache_ttl_mode = mode;
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        let projected = rewrite_sse_event_usage(event, Some(&projection), None);
+        let value = event_data_value(&projected);
+        let usage = value["usage"].clone();
+        assert_projected_cache_creation_consistent(&usage);
+        let total = usage["cache_creation_input_tokens"].as_i64().unwrap();
+        assert!(total > 0, "{usage}");
+        let hour = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_i64()
+            .unwrap();
+        if hour == total {
+            "1h"
+        } else {
+            assert_eq!(hour, 0, "{usage}");
+            "5m"
+        }
+    };
+
+    // Channel-first: the channel's 1h wins even over an explicit 5m request.
+    assert_eq!(
+        split(
+            CacheTtlMode::UpstreamThenRequestDefault5m,
+            Some("5m"),
+            channel_1h
+        ),
+        "1h"
+    );
+    // A channel that reported only 5m counts as unmarked: follow the request, else 5m.
+    assert_eq!(
+        split(
+            CacheTtlMode::UpstreamThenRequestDefault5m,
+            Some("1h"),
+            channel_5m
+        ),
+        "1h"
+    );
+    assert_eq!(
+        split(CacheTtlMode::UpstreamThenRequestDefault5m, None, channel_5m),
+        "5m"
+    );
+    // The other modes ignore the channel.
+    assert_eq!(
+        split(CacheTtlMode::FollowRequestDefault5m, None, channel_1h),
+        "5m"
+    );
+    assert_eq!(
+        split(CacheTtlMode::FollowRequestDefault1h, None, channel_5m),
+        "1h"
+    );
+    assert_eq!(split(CacheTtlMode::Force5m, Some("1h"), channel_1h), "5m");
+    assert_eq!(split(CacheTtlMode::Force1h, Some("5m"), channel_5m), "1h");
 }
 
 #[test]

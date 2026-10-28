@@ -2220,8 +2220,12 @@ fn default_true() -> bool {
 pub struct ManualModelPricingRequest {
     pub input_cost_per_million: f64,
     pub output_cost_per_million: f64,
+    /// 5-minute cache write.
     #[serde(default)]
     pub cache_creation_input_cost_per_million: Option<f64>,
+    /// 1-hour cache write; defaults to 2x input.
+    #[serde(default)]
+    pub cache_creation_1h_input_cost_per_million: Option<f64>,
     #[serde(default)]
     pub cache_read_input_cost_per_million: Option<f64>,
 }
@@ -2238,12 +2242,20 @@ impl ManualModelPricingRequest {
             .cache_read_input_cost_per_million
             .and_then(cost_per_token)
             .unwrap_or(input * 0.1);
-        Some(ModelPricing {
-            input_cost_per_token: input,
-            output_cost_per_token: output,
-            cache_creation_input_token_cost: cache_creation,
-            cache_read_input_token_cost: cache_read,
-        })
+        let cache_creation_1h = self
+            .cache_creation_1h_input_cost_per_million
+            .and_then(cost_per_token)
+            .unwrap_or(0.0);
+        Some(
+            ModelPricing {
+                input_cost_per_token: input,
+                output_cost_per_token: output,
+                cache_creation_input_token_cost: cache_creation,
+                cache_creation_1h_input_token_cost: cache_creation_1h,
+                cache_read_input_token_cost: cache_read,
+            }
+            .with_derived_cache_creation_1h_cost(),
+        )
     }
 }
 

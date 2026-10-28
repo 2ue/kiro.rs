@@ -29,6 +29,8 @@ import type {
   AccessKeysResponse,
   CachePolicyConfig,
   CacheRoutePolicyPatch,
+  CacheTtlMode,
+  CacheTtlPolicyPatch,
   CompatProfile,
   ImageProcessingConfig,
   KiroAgentModeStrategy,
@@ -2021,7 +2023,7 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.kiroRsToolPlus && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard
+  return !policy.cacheType && policy.routeNamespace === undefined && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool && !policy.kiroRsToolPlus && !policy.stableSegment && !policy.hitShaping && !policy.coldRequestGuard && !policy.cacheTtl
 }
 
 function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -2425,6 +2427,92 @@ function SimulationOverrideForm({
       <NumberField title="放大生效门槛" description="输入达到多少 Token 后才进行放大模拟。" value={merged.scaleMinInputTokens ?? 20000} min={0} suffix="Token" onChange={set('scaleMinInputTokens')} />
       <NumberField title="上限扣减下限" description="触顶后随机扣减的最小 Token 数。" value={merged.capJitterMinTokens ?? 12000} min={0} suffix="Token" onChange={set('capJitterMinTokens')} />
       <NumberField title="上限扣减上限" description="触顶后随机扣减的最大 Token 数。" value={merged.capJitterMaxTokens ?? 24000} min={0} suffix="Token" onChange={set('capJitterMaxTokens')} />
+    </div>
+  )
+}
+
+const CACHE_TTL_MODE_OPTIONS: Array<{ value: CacheTtlMode; label: string; desc: string }> = [
+  {
+    value: 'follow_request_default_5m',
+    label: '跟随请求，未指定按 5 分钟',
+    desc: '请求的 cache_control 写了 ttl 就按它；没写（或只写 cache_control）按 5 分钟。与官方 API 一致。',
+  },
+  { value: 'follow_request_default_1h', label: '跟随请求，未指定按 1 小时', desc: '请求写了 ttl 就按它；没写按 1 小时。' },
+  { value: 'force_5m', label: '固定 5 分钟', desc: '忽略请求的 ttl，一律按 5 分钟（普通缓存）。' },
+  { value: 'force_1h', label: '固定 1 小时', desc: '忽略请求的 ttl，一律按 1 小时。' },
+  {
+    value: 'upstream_then_request_default_5m',
+    label: '渠道 1 小时优先，其次跟随请求，未指定按 5 分钟',
+    desc: '渠道返回了 1 小时写入就按 1 小时；渠道只返回 5 分钟或没有拆分时，按请求的 ttl，请求也没写按 5 分钟。',
+  },
+]
+
+function CacheTtlModeField({
+  title,
+  description,
+  value,
+  external,
+  onChange,
+}: {
+  title: string
+  description: string
+  value: CacheTtlMode | undefined
+  external: boolean
+  onChange: (next: CacheTtlMode) => void
+}) {
+  const options = CACHE_TTL_MODE_OPTIONS.filter((option) => external || option.value !== 'upstream_then_request_default_5m')
+  const selected = options.find((option) => option.value === (value ?? 'follow_request_default_5m')) ?? options[0]
+  return (
+    <label className="block rounded-md border bg-background p-4">
+      <div className="mb-3">
+        <div className="text-sm font-medium">{title}</div>
+        <div className="mt-1 text-xs leading-5 text-muted-foreground">{description}</div>
+      </div>
+      <select
+        className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        value={selected.value}
+        onChange={(event) => onChange(event.target.value as CacheTtlMode)}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
+      <div className="mt-2 text-xs leading-5 text-muted-foreground">{selected.desc}</div>
+    </label>
+  )
+}
+
+function CacheTtlPolicyForm({
+  value,
+  onChange,
+}: {
+  value: CacheTtlPolicyPatch | undefined
+  onChange: (next: CacheTtlPolicyPatch) => void
+}) {
+  return (
+    <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
+      <div>
+        <h4 className="text-sm font-semibold">缓存写入时长</h4>
+        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+          最终 usage 的缓存写入全部记为 5 分钟（cache_creation.ephemeral_5m_input_tokens，普通缓存）或 1 小时（ephemeral_1h_input_tokens），成本按对应单价计算。
+        </p>
+      </div>
+      <div className="grid gap-4 md:grid-cols-2">
+        <CacheTtlModeField
+          title="本地账号"
+          description="本地 Kiro 账号返回的缓存写入时长。"
+          value={value?.local}
+          external={false}
+          onChange={(local) => onChange({ ...value, local })}
+        />
+        <CacheTtlModeField
+          title="外部池账号"
+          description="外部池按本路径策略整形 usage 时的缓存写入时长；外部账号透传 usage 时不改。"
+          value={value?.externalPool}
+          external
+          onChange={(externalPool) => onChange({ ...value, externalPool })}
+        />
+      </div>
     </div>
   )
 }
@@ -2895,6 +2983,9 @@ function StrategyTemplateCard({
           {hitShapingSection}
         </>
       )}
+      {cacheType !== 'no_cache' && (
+        <CacheTtlPolicyForm value={template.cacheTtl} onChange={(cacheTtl) => onChange({ ...template, cacheTtl })} />
+      )}
     </div>
   )
 }
@@ -2904,14 +2995,15 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
   const hitShaping = policy.hitShaping ?? defaultCacheHitShaping()
   // 只透传已配置的值，不补默认：未配置的模板保持关闭且不新增字段。
   const coldRequestGuard = policy.coldRequestGuard ? { coldRequestGuard: policy.coldRequestGuard } : {}
+  const cacheTtl = policy.cacheTtl ? { cacheTtl: policy.cacheTtl } : {}
   if (cacheType === 'kiro_rs_tool') {
-    return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(), hitShaping, ...coldRequestGuard }
+    return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(), hitShaping, ...coldRequestGuard, ...cacheTtl }
   }
   if (cacheType === 'stable_segment_cache') {
-    return { cacheType: 'stable_segment_cache', stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(), hitShaping, ...coldRequestGuard }
+    return { cacheType: 'stable_segment_cache', stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(), hitShaping, ...coldRequestGuard, ...cacheTtl }
   }
   if (cacheType === 'kiro_rs_tool_plus') {
-    return { cacheType: 'kiro_rs_tool_plus', kiroRsToolPlus: policy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch() }
+    return { cacheType: 'kiro_rs_tool_plus', kiroRsToolPlus: policy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch(), ...cacheTtl }
   }
   return {
     cacheType: cacheType === 'bounded_high_cache' ? 'bounded_high_cache' : 'current_high_cache',
@@ -2920,6 +3012,7 @@ function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType
     reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
     hitShaping,
     ...coldRequestGuard,
+    ...cacheTtl,
   }
 }
 
@@ -3226,6 +3319,9 @@ function PathCachePolicyCard({
             onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
           />
         </div>
+      )}
+      {effectiveCacheType !== 'no_cache' && (
+        <CacheTtlPolicyForm value={effectivePolicy.cacheTtl} onChange={(cacheTtl) => patch({ cacheTtl })} />
       )}
       <RouteSettingsNotice />
     </div>

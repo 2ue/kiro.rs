@@ -1068,6 +1068,8 @@ pub struct ExternalRouteRequest {
     pub prompt_cache_strategy_type: PromptCacheStrategyType,
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
     pub prompt_cache_route_namespace: Option<String>,
+    /// Route cache TTL mode for external pools (`cacheTtl.externalPool`).
+    pub cache_ttl_mode: crate::model::config::CacheTtlMode,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
     pub prompt_cache_max_simulated_input_tokens: i32,
@@ -15617,6 +15619,9 @@ fn project_usage_value(
     );
     let projected = apply_external_pool_usage_cost_floor(projected, raw_for_floor, projection);
     let projected = apply_external_pool_bounded_final_caps(projected, controlled, projection);
+    // The route's cache TTL mode decides the final 5m/1h split, after every shaping step.
+    let write_ttl = projection.resolve_write_ttl(upstream_raw_usage.as_ref(), commit_cache_state);
+    let projected = projected.with_cache_creation_ttl(write_ttl);
     let projected_json = projected.to_anthropic_usage_json();
     let obj = usage.as_object_mut()?;
     let projected_obj = projected_json.as_object()?;
@@ -16035,31 +16040,14 @@ fn apply_projected_cache_creation_breakdown(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     usage: CacheUsage,
 ) {
-    let cache_creation_input_tokens = usage.cache_creation_input_tokens.max(0);
-    if cache_creation_input_tokens == 0 {
-        obj.remove("cache_creation");
-        return;
+    match usage.cache_creation_breakdown_json() {
+        Some(breakdown) => {
+            obj.insert("cache_creation".to_string(), breakdown);
+        }
+        None => {
+            obj.remove("cache_creation");
+        }
     }
-
-    let cache_creation_1h_input_tokens = usage
-        .cache_creation_1h_input_tokens
-        .max(0)
-        .min(cache_creation_input_tokens);
-    let cache_creation_5m_input_tokens = usage
-        .cache_creation_5m_input_tokens
-        .max(0)
-        .min(cache_creation_input_tokens.saturating_sub(cache_creation_1h_input_tokens));
-    let remainder = cache_creation_input_tokens
-        .saturating_sub(cache_creation_5m_input_tokens)
-        .saturating_sub(cache_creation_1h_input_tokens);
-
-    obj.insert(
-        "cache_creation".to_string(),
-        json!({
-            "ephemeral_5m_input_tokens": cache_creation_5m_input_tokens.saturating_add(remainder),
-            "ephemeral_1h_input_tokens": cache_creation_1h_input_tokens,
-        }),
-    );
 }
 
 trait ExternalPoolUsageUplift {

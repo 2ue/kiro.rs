@@ -3243,6 +3243,130 @@ fn usage_field(value: &Value, field: &str) -> i64 {
         .unwrap_or_else(|| panic!("missing usage.{field}: {value}"))
 }
 
+/// A local route's cache TTL mode decides the downstream `cache_creation` split, the usage
+/// record and the cost; "follow request" honours `cache_control.ttl`.
+#[test]
+fn local_route_cache_ttl_mode_sets_downstream_breakdown_and_cost() {
+    use crate::model::config::{CacheTtlMode, CacheTtlPolicyPatch};
+    run_handler_fixture_on_large_stack_thread("local-cache-ttl-mode", || async {
+        let upstream = MultimodalHandlerUpstream::start().await;
+        let mut config = route_policy_matrix_config(&upstream.base_url);
+        for (route, mode) in [
+            ("/dfcache/ttl-default", CacheTtlMode::FollowRequestDefault5m),
+            (
+                "/dfcache/ttl-default1h",
+                CacheTtlMode::FollowRequestDefault1h,
+            ),
+            ("/dfcache/ttl-force1h", CacheTtlMode::Force1h),
+            ("/dfcache/ttl-force5m", CacheTtlMode::Force5m),
+        ] {
+            config.defined_cache_routes.push(route.to_string());
+            config.cache_policy.path_overrides.insert(
+                route.to_string(),
+                CacheRoutePolicyPatch {
+                    cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                    route_namespace: Some(true),
+                    cache_ttl: Some(CacheTtlPolicyPatch {
+                        local: Some(mode),
+                        external_pool: None,
+                    }),
+                    ..CacheRoutePolicyPatch::default()
+                },
+            );
+        }
+        let (app, usage_recorder) = multimodal_handler_test_router_from_config(config);
+
+        let send = |path: &'static str, ttl: Option<&'static str>| {
+            let app = app.clone();
+            let usage_recorder = usage_recorder.clone();
+            async move {
+                let mut cache_control = json!({"type": "ephemeral"});
+                if let Some(ttl) = ttl {
+                    cache_control["ttl"] = json!(ttl);
+                }
+                let body = json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 32,
+                    "stream": false,
+                    "system": [{
+                        "type": "text",
+                        "text": "stable route policy cache system prompt ".repeat(700),
+                        "cache_control": cache_control
+                    }],
+                    "metadata": {"user_id": format!(r#"{{"session_id":"{}"}}"#, uuid::Uuid::new_v4())},
+                    "messages": [{"role": "user", "content": "route policy matrix ttl"}]
+                })
+                .to_string();
+                let response = app
+                    .oneshot(multimodal_handler_request(
+                        &format!("{path}/v1/messages"),
+                        body,
+                    ))
+                    .await
+                    .expect("ttl response");
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let request_id = response_request_id(&response);
+                let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+                    .await
+                    .expect("ttl body");
+                let value: Value = serde_json::from_slice(&bytes).expect("ttl json");
+                (
+                    value,
+                    usage_record_for_request(&usage_recorder, &request_id),
+                )
+            }
+        };
+
+        let split = |value: &Value| {
+            let usage = &value["usage"];
+            (
+                usage["cache_creation_input_tokens"].as_i64().unwrap(),
+                usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                    .as_i64()
+                    .unwrap(),
+                usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                    .as_i64()
+                    .unwrap(),
+            )
+        };
+
+        // Default mode, no ttl: a normal (5-minute) cache write.
+        let (value, record) = send("/dfcache/ttl-default", None).await;
+        let (creation, five, hour) = split(&value);
+        assert!(creation > 0, "{value}");
+        assert_eq!((five, hour), (creation, 0));
+        assert_eq!(record.cache_creation_1h_input_tokens, 0);
+        let five_minute_cost = record.estimated_cost_usd;
+
+        // Default mode follows an explicit 1h ttl.
+        let (value, record) = send("/dfcache/ttl-default", Some("1h")).await;
+        let (creation, five, hour) = split(&value);
+        assert_eq!((five, hour), (0, creation), "{value}");
+        assert_eq!(record.cache_creation_1h_input_tokens, creation as i32);
+        assert!(
+            record.estimated_cost_usd > five_minute_cost,
+            "1h writes cost more: {} vs {five_minute_cost}",
+            record.estimated_cost_usd
+        );
+
+        // Default-1h mode: unset ttl becomes 1h, an explicit 5m is kept.
+        let (value, _) = send("/dfcache/ttl-default1h", None).await;
+        let (creation, _, hour) = split(&value);
+        assert_eq!(hour, creation, "{value}");
+        let (value, _) = send("/dfcache/ttl-default1h", Some("5m")).await;
+        let (creation, five, _) = split(&value);
+        assert_eq!(five, creation, "{value}");
+
+        // Forced modes ignore the request.
+        let (value, _) = send("/dfcache/ttl-force1h", Some("5m")).await;
+        let (creation, _, hour) = split(&value);
+        assert_eq!(hour, creation, "{value}");
+        let (value, _) = send("/dfcache/ttl-force5m", Some("1h")).await;
+        let (creation, five, hour) = split(&value);
+        assert_eq!((five, hour), (creation, 0), "{value}");
+    });
+}
+
 async fn route_policy_matrix_message_request(
     app: &Router,
     usage_recorder: &UsageRecorder,
@@ -9453,6 +9577,7 @@ fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
@@ -9571,6 +9696,7 @@ fn unreported_kiro_rs_tool_usage_caps_standard_cache_fields_only_for_local_cache
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
@@ -9667,6 +9793,7 @@ fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
@@ -9768,6 +9895,7 @@ fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/cc/v1/messages",
@@ -9904,6 +10032,7 @@ fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
@@ -9990,6 +10119,7 @@ fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_u
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::KiroRsTool,
@@ -10140,6 +10270,7 @@ fn local_latency_trace_records_markers_without_changing_first_output_semantics()
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
@@ -10480,6 +10611,7 @@ fn path_overrides_independently_control_reported_usage_fields() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy_for_path(
             "/v1/messages",
@@ -10660,6 +10792,7 @@ fn creation_control_preserves_reported_usage_input_policy() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: reported_cache_usage_policy(
             PromptCacheStrategyType::CurrentHighCache,
@@ -10769,6 +10902,7 @@ fn provider_error_hint_extracts_credential_for_failure_records() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
@@ -10861,6 +10995,7 @@ fn failure_usage_record_keeps_large_request_estimate_out_of_standard_fields() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
@@ -11680,6 +11815,7 @@ fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,
@@ -11785,6 +11921,7 @@ fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         stable_segment_cache_policy: StableSegmentCachePolicy::default(),
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: Some(cache::CacheSimulation {
@@ -14870,6 +15007,7 @@ fn bounded_high_cache_keeps_minerst_usage_within_bounds_and_leaves_current_untou
                 input_cost_per_token: 0.000004,
                 output_cost_per_token: 0.00002,
                 cache_creation_input_token_cost: 0.000005,
+                cache_creation_1h_input_token_cost: 0.0,
                 cache_read_input_token_cost: 0.0000002,
             },
         );
@@ -15626,6 +15764,7 @@ fn stable_segment_usage_context(policy: StableSegmentCachePolicy) -> RequestUsag
         stable_segment_cache_policy: policy,
         cache_hit_shaping: CacheHitShapingContext::default(),
         cold_request_guard: false,
+        cache_write_ttl: None,
         kiro_rs_tool_plus: None,
         reported_cache_usage_policy: None,
         simulated_usage: None,

@@ -8,6 +8,113 @@ use crate::model::config::{
     ReportedUsagePathPolicy,
 };
 
+/// Duration a cache write is reported under (`ephemeral_5m` / `ephemeral_1h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheWriteTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+/// The TTL the client asked for: the longest `cache_control.ttl` it set anywhere in the request.
+/// `None` when no breakpoint carried a `ttl` (a bare `cache_control` counts as unspecified).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestCacheTtl(pub Option<CacheWriteTtl>);
+
+impl RequestCacheTtl {
+    /// TTL set by one `cache_control` object (`{"type":"ephemeral","ttl":"1h"}`).
+    pub fn from_cache_control(cache_control: &serde_json::Value) -> Option<CacheWriteTtl> {
+        Self::ttl_of_holder(&json!({ "cache_control": cache_control }))
+    }
+
+    fn ttl_of_holder(value: &serde_json::Value) -> Option<CacheWriteTtl> {
+        let ttl = value.get("cache_control")?.get("ttl")?;
+        let seconds = match ttl {
+            serde_json::Value::Number(n) => n.as_u64()?,
+            serde_json::Value::String(text) => {
+                let text = text.trim().to_ascii_lowercase();
+                if let Some(hours) = text.strip_suffix('h') {
+                    hours.trim().parse::<u64>().ok()? * 3600
+                } else if let Some(minutes) = text.strip_suffix('m') {
+                    minutes.trim().parse::<u64>().ok()? * 60
+                } else if let Some(secs) = text.strip_suffix('s') {
+                    secs.trim().parse::<u64>().ok()?
+                } else {
+                    text.parse::<u64>().ok()?
+                }
+            }
+            _ => return None,
+        };
+        Some(if seconds > 300 {
+            CacheWriteTtl::OneHour
+        } else {
+            CacheWriteTtl::FiveMinutes
+        })
+    }
+
+    pub fn from_request(req: &crate::anthropic::types::MessagesRequest) -> Self {
+        fn scan(value: &serde_json::Value, found: &mut RequestCacheTtl) {
+            match value {
+                serde_json::Value::Array(items) => items.iter().for_each(|item| scan(item, found)),
+                serde_json::Value::Object(_) => {
+                    *found = found.with_top_level(RequestCacheTtl::ttl_of_holder(value));
+                }
+                _ => {}
+            }
+        }
+
+        let mut found = Self(None);
+        let marked = req
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|tool| tool.cache_control.as_ref())
+            .chain(
+                req.system
+                    .iter()
+                    .flatten()
+                    .filter_map(|block| block.cache_control.as_ref()),
+            );
+        for cache_control in marked {
+            found = found.with_top_level(Self::from_cache_control(cache_control));
+        }
+        for message in &req.messages {
+            scan(&message.content, &mut found);
+        }
+        found
+    }
+
+    /// Merges another marker; the longest TTL wins (top-level automatic caching included).
+    pub fn with_top_level(self, other: Option<CacheWriteTtl>) -> Self {
+        match (self.0, other) {
+            (Some(CacheWriteTtl::OneHour), _) | (_, Some(CacheWriteTtl::OneHour)) => {
+                Self(Some(CacheWriteTtl::OneHour))
+            }
+            (Some(ttl), _) | (None, Some(ttl)) => Self(Some(ttl)),
+            (None, None) => Self(None),
+        }
+    }
+}
+
+/// Resolves the reported TTL for a cache write from the route's mode. `upstream_has_1h` is true
+/// only when an external channel reported a non-zero `ephemeral_1h_input_tokens`.
+pub fn resolve_cache_write_ttl(
+    mode: crate::model::config::CacheTtlMode,
+    request: RequestCacheTtl,
+    upstream_has_1h: bool,
+) -> CacheWriteTtl {
+    use crate::model::config::CacheTtlMode;
+    match mode {
+        CacheTtlMode::FollowRequestDefault5m => request.0.unwrap_or(CacheWriteTtl::FiveMinutes),
+        CacheTtlMode::FollowRequestDefault1h => request.0.unwrap_or(CacheWriteTtl::OneHour),
+        CacheTtlMode::Force5m => CacheWriteTtl::FiveMinutes,
+        CacheTtlMode::Force1h => CacheWriteTtl::OneHour,
+        CacheTtlMode::UpstreamThenRequestDefault5m if upstream_has_1h => CacheWriteTtl::OneHour,
+        CacheTtlMode::UpstreamThenRequestDefault5m => {
+            request.0.unwrap_or(CacheWriteTtl::FiveMinutes)
+        }
+    }
+}
+
 /// Usage split used for Anthropic prompt-cache compatible responses.
 ///
 /// `input_tokens` here means the billable uncached portion reported in Anthropic
@@ -39,6 +146,9 @@ impl CacheUsage {
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "cache_read_input_tokens": self.cache_read_input_tokens
         });
+        if let Some(breakdown) = self.cache_creation_breakdown_json() {
+            usage["cache_creation"] = breakdown;
+        }
 
         if let Some(thinking_tokens) = thinking_tokens.filter(|tokens| *tokens > 0) {
             usage["output_tokens_details"] = json!({
@@ -47,6 +157,35 @@ impl CacheUsage {
         }
 
         usage
+    }
+
+    /// The standard `cache_creation` object (`ephemeral_5m_input_tokens` /
+    /// `ephemeral_1h_input_tokens`), present only when there is a cache write. The two fields
+    /// always add up to `cache_creation_input_tokens`; any unassigned remainder counts as 5m.
+    pub fn cache_creation_breakdown_json(self) -> Option<serde_json::Value> {
+        let creation = self.cache_creation_input_tokens.max(0);
+        if creation == 0 {
+            return None;
+        }
+        let one_hour = self.cache_creation_1h_input_tokens.max(0).min(creation);
+        Some(json!({
+            "ephemeral_5m_input_tokens": creation - one_hour,
+            "ephemeral_1h_input_tokens": one_hour,
+        }))
+    }
+
+    /// Puts the whole cache write into one TTL bucket. This is the only place the final 5m/1h
+    /// split is set: every shaping step before it may move the split around, so the route's
+    /// cache TTL mode is applied last.
+    pub fn with_cache_creation_ttl(mut self, ttl: CacheWriteTtl) -> Self {
+        let creation = self.cache_creation_input_tokens.max(0);
+        let (five_minutes, one_hour) = match ttl {
+            CacheWriteTtl::FiveMinutes => (creation, 0),
+            CacheWriteTtl::OneHour => (0, creation),
+        };
+        self.cache_creation_5m_input_tokens = five_minutes;
+        self.cache_creation_1h_input_tokens = one_hour;
+        self
     }
 
     #[cfg(test)]
@@ -2017,6 +2156,162 @@ pub fn usage_has_cache(usage: &CacheUsage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_ttl_request(
+        markers: &[serde_json::Value],
+    ) -> crate::anthropic::types::MessagesRequest {
+        let content: Vec<serde_json::Value> = markers
+            .iter()
+            .map(|marker| json!({"type": "text", "text": "x", "cache_control": marker}))
+            .collect();
+        serde_json::from_value(json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_ttl_request_marker_reads_explicit_ttl_only() {
+        use CacheWriteTtl::*;
+        let read = |markers: &[serde_json::Value]| {
+            RequestCacheTtl::from_request(&cache_ttl_request(markers)).0
+        };
+        // A bare cache_control does not specify a duration.
+        assert_eq!(read(&[json!({"type": "ephemeral"})]), None);
+        assert_eq!(
+            read(&[json!({"type": "ephemeral", "ttl": "5m"})]),
+            Some(FiveMinutes)
+        );
+        assert_eq!(
+            read(&[json!({"type": "ephemeral", "ttl": "1h"})]),
+            Some(OneHour)
+        );
+        // Any 1h breakpoint wins, even when a later breakpoint is 5m.
+        assert_eq!(
+            read(&[
+                json!({"type": "ephemeral", "ttl": "1h"}),
+                json!({"type": "ephemeral", "ttl": "5m"})
+            ]),
+            Some(OneHour)
+        );
+        assert_eq!(
+            read(&[json!({"type": "ephemeral", "ttl": 3600})]),
+            Some(OneHour)
+        );
+        // Top-level automatic caching merges in.
+        assert_eq!(
+            RequestCacheTtl(None).with_top_level(Some(OneHour)),
+            RequestCacheTtl(Some(OneHour))
+        );
+    }
+
+    #[test]
+    fn cache_ttl_modes_resolve_as_documented() {
+        use crate::model::config::CacheTtlMode::*;
+        use CacheWriteTtl::*;
+        let unset = RequestCacheTtl(None);
+        let asked_5m = RequestCacheTtl(Some(FiveMinutes));
+        let asked_1h = RequestCacheTtl(Some(OneHour));
+        let cases = [
+            (FollowRequestDefault5m, unset, false, FiveMinutes),
+            (FollowRequestDefault5m, asked_1h, false, OneHour),
+            (FollowRequestDefault1h, unset, false, OneHour),
+            (FollowRequestDefault1h, asked_5m, false, FiveMinutes),
+            (Force5m, asked_1h, true, FiveMinutes),
+            (Force1h, asked_5m, false, OneHour),
+            // Channel-first: a channel 1h write wins over the request.
+            (UpstreamThenRequestDefault5m, asked_5m, true, OneHour),
+            // A channel that reported only 5m (or nothing) falls back to the request.
+            (UpstreamThenRequestDefault5m, asked_1h, false, OneHour),
+            (UpstreamThenRequestDefault5m, unset, false, FiveMinutes),
+        ];
+        for (mode, request, upstream_1h, expected) in cases {
+            assert_eq!(
+                resolve_cache_write_ttl(mode, request, upstream_1h),
+                expected,
+                "{mode:?} {request:?} upstream_1h={upstream_1h}"
+            );
+        }
+        // Local accounts have no channel marker.
+        assert_eq!(
+            UpstreamThenRequestDefault5m.for_local(),
+            FollowRequestDefault5m
+        );
+    }
+
+    #[test]
+    fn cache_ttl_modes_use_the_wire_names_the_admin_ui_sends() {
+        use crate::model::config::{CacheTtlMode, CacheTtlPolicy};
+        for (wire, mode) in [
+            (
+                "follow_request_default_5m",
+                CacheTtlMode::FollowRequestDefault5m,
+            ),
+            (
+                "follow_request_default_1h",
+                CacheTtlMode::FollowRequestDefault1h,
+            ),
+            ("force_5m", CacheTtlMode::Force5m),
+            ("force_1h", CacheTtlMode::Force1h),
+            (
+                "upstream_then_request_default_5m",
+                CacheTtlMode::UpstreamThenRequestDefault5m,
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<CacheTtlMode>(json!(wire)).unwrap(),
+                mode
+            );
+        }
+        let policy: CacheTtlPolicy = serde_json::from_value(
+            json!({"local": "force_1h", "externalPool": "upstream_then_request_default_5m"}),
+        )
+        .unwrap();
+        assert_eq!(policy.local, CacheTtlMode::Force1h);
+        assert_eq!(
+            policy.external_pool,
+            CacheTtlMode::UpstreamThenRequestDefault5m
+        );
+    }
+
+    #[test]
+    fn cache_ttl_output_uses_standard_ephemeral_fields() {
+        let usage = CacheUsage {
+            total_input_tokens: 10_000,
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_creation_input_tokens: 9_000,
+            cache_read_input_tokens: 900,
+            // Split left by earlier shaping steps; the TTL mode replaces it.
+            cache_creation_5m_input_tokens: 4_000,
+            cache_creation_1h_input_tokens: 5_000,
+        };
+        let five = usage
+            .with_cache_creation_ttl(CacheWriteTtl::FiveMinutes)
+            .to_anthropic_usage_json();
+        assert_eq!(five["cache_creation_input_tokens"], 9_000);
+        assert_eq!(five["cache_creation"]["ephemeral_5m_input_tokens"], 9_000);
+        assert_eq!(five["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+
+        let hour = usage
+            .with_cache_creation_ttl(CacheWriteTtl::OneHour)
+            .to_anthropic_usage_json();
+        assert_eq!(hour["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+        assert_eq!(hour["cache_creation"]["ephemeral_1h_input_tokens"], 9_000);
+
+        // No write: no cache_creation object, as in Anthropic responses without writes.
+        let no_write = CacheUsage {
+            cache_creation_input_tokens: 0,
+            ..usage
+        }
+        .with_cache_creation_ttl(CacheWriteTtl::OneHour)
+        .to_anthropic_usage_json();
+        assert!(no_write.get("cache_creation").is_none());
+    }
+
     #[test]
     fn metadata_usage_takes_precedence_over_simulated_cache() {
         let metadata = MetadataTokenUsage {
@@ -3645,6 +3940,7 @@ mod tests {
             input_cost_per_token: 0.000003,
             output_cost_per_token: 0.000015,
             cache_creation_input_token_cost: 0.00000375,
+            cache_creation_1h_input_token_cost: 0.0,
             cache_read_input_token_cost: 0.0000003,
         }
     }
@@ -3923,6 +4219,7 @@ mod tests {
             input_cost_per_token: 0.000005,
             output_cost_per_token: 0.000025,
             cache_creation_input_token_cost: 0.00000625,
+            cache_creation_1h_input_token_cost: 0.0,
             cache_read_input_token_cost: 0.0000005,
         };
         let raw = raw_input(968_653, 1);

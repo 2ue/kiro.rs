@@ -4578,14 +4578,16 @@ impl PostgresStore {
                 INSERT INTO model_pricing (
                     model, input_cost_per_token, output_cost_per_token,
                     cache_creation_input_token_cost, cache_read_input_token_cost,
-                    source, source_url, last_synced_at, last_error, updated_at
+                    source, source_url, last_synced_at, last_error, updated_at,
+                    cache_creation_1h_input_token_cost
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), $10)
                 ON CONFLICT (model) DO UPDATE
                 SET input_cost_per_token = EXCLUDED.input_cost_per_token,
                     output_cost_per_token = EXCLUDED.output_cost_per_token,
                     cache_creation_input_token_cost = EXCLUDED.cache_creation_input_token_cost,
                     cache_read_input_token_cost = EXCLUDED.cache_read_input_token_cost,
+                    cache_creation_1h_input_token_cost = EXCLUDED.cache_creation_1h_input_token_cost,
                     source = EXCLUDED.source,
                     source_url = EXCLUDED.source_url,
                     last_synced_at = EXCLUDED.last_synced_at,
@@ -4602,6 +4604,7 @@ impl PostgresStore {
             .bind(item_source_url)
             .bind(&status.last_synced_at)
             .bind(&status.last_error)
+            .bind(item.pricing.cache_creation_1h_input_token_cost)
             .execute(&mut *tx)
             .await?;
         }
@@ -4650,7 +4653,8 @@ impl PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT model, input_cost_per_token, output_cost_per_token,
-                   cache_creation_input_token_cost, cache_read_input_token_cost
+                   cache_creation_input_token_cost, cache_read_input_token_cost,
+                   cache_creation_1h_input_token_cost
             FROM model_pricing
             "#,
         )
@@ -4665,8 +4669,11 @@ impl PostgresStore {
                     output_cost_per_token: row.try_get("output_cost_per_token")?,
                     cache_creation_input_token_cost: row
                         .try_get("cache_creation_input_token_cost")?,
+                    cache_creation_1h_input_token_cost: row
+                        .try_get("cache_creation_1h_input_token_cost")?,
                     cache_read_input_token_cost: row.try_get("cache_read_input_token_cost")?,
-                },
+                }
+                .with_derived_cache_creation_1h_cost(),
             );
         }
         Ok(prices)
@@ -4677,6 +4684,7 @@ impl PostgresStore {
             r#"
             SELECT model, input_cost_per_token, output_cost_per_token,
                    cache_creation_input_token_cost, cache_read_input_token_cost,
+                   cache_creation_1h_input_token_cost,
                    source, source_url, last_synced_at, last_error
             FROM model_pricing
             ORDER BY model ASC
@@ -4726,8 +4734,11 @@ impl PostgresStore {
                     output_cost_per_token: row.try_get("output_cost_per_token")?,
                     cache_creation_input_token_cost: row
                         .try_get("cache_creation_input_token_cost")?,
+                    cache_creation_1h_input_token_cost: row
+                        .try_get("cache_creation_1h_input_token_cost")?,
                     cache_read_input_token_cost: row.try_get("cache_read_input_token_cost")?,
-                },
+                }
+                .with_derived_cache_creation_1h_cost(),
                 source: Some(row.try_get("source")?),
             });
         }
@@ -4991,14 +5002,16 @@ impl PostgresStore {
                 INSERT INTO model_pricing (
                     model, input_cost_per_token, output_cost_per_token,
                     cache_creation_input_token_cost, cache_read_input_token_cost,
-                    source, source_url, last_synced_at, last_error, updated_at
+                    source, source_url, last_synced_at, last_error, updated_at,
+                    cache_creation_1h_input_token_cost
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, 'manual', NULL, NULL, now())
+                VALUES ($1, $2, $3, $4, $5, $6, 'manual', NULL, NULL, now(), $7)
                 ON CONFLICT (model) DO UPDATE
                 SET input_cost_per_token = EXCLUDED.input_cost_per_token,
                     output_cost_per_token = EXCLUDED.output_cost_per_token,
                     cache_creation_input_token_cost = EXCLUDED.cache_creation_input_token_cost,
                     cache_read_input_token_cost = EXCLUDED.cache_read_input_token_cost,
+                    cache_creation_1h_input_token_cost = EXCLUDED.cache_creation_1h_input_token_cost,
                     source = EXCLUDED.source,
                     source_url = EXCLUDED.source_url,
                     last_error = NULL,
@@ -5011,6 +5024,7 @@ impl PostgresStore {
             .bind(pricing.cache_creation_input_token_cost)
             .bind(pricing.cache_read_input_token_cost)
             .bind(MANUAL_PRICING_SOURCE)
+            .bind(pricing.cache_creation_1h_input_token_cost)
             .execute(&mut *tx)
             .await?;
         } else if clear_pricing {
@@ -14025,6 +14039,9 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE model_pricing
+    ADD COLUMN IF NOT EXISTS cache_creation_1h_input_token_cost DOUBLE PRECISION NOT NULL DEFAULT 0;
+
 CREATE TABLE IF NOT EXISTS model_pricing_sync_status (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -18926,6 +18943,7 @@ mod tests {
                     input_cost_per_token: 0.000003,
                     output_cost_per_token: 0.000015,
                     cache_creation_input_token_cost: 0.00000375,
+                    cache_creation_1h_input_token_cost: 0.0,
                     cache_read_input_token_cost: 0.0000003,
                 },
                 source: None,
@@ -19036,6 +19054,7 @@ mod tests {
                     input_cost_per_token: 0.00001,
                     output_cost_per_token: 0.00002,
                     cache_creation_input_token_cost: 0.0000125,
+                    cache_creation_1h_input_token_cost: 0.0,
                     cache_read_input_token_cost: 0.000001,
                 }),
                 false,

@@ -6,6 +6,8 @@ import type {
   ModelCapabilitiesStatus,
   CachePolicyConfig,
   CacheRoutePolicyPatch,
+  CacheTtlMode,
+  CacheTtlPolicyPatch,
   ModelMappingConfig,
   ModelMappingRule,
   PayloadShapingConfig,
@@ -332,7 +334,7 @@ export function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyTy
   }
 }
 
-const SHARED_ROUTE_POLICY_FIELDS = ['cachePoint', 'bounds'] as const
+const SHARED_ROUTE_POLICY_FIELDS = ['cachePoint', 'bounds', 'cacheTtl'] as const
 
 function pickDefinedRoutePolicyFields(
   policy: CacheRoutePolicyPatch,
@@ -605,6 +607,95 @@ function SimulationOverrideForm({
         />
       </FieldGrid>
     </div>
+  )
+}
+
+const CACHE_TTL_MODE_OPTIONS: Array<{ value: CacheTtlMode; label: string; desc: string }> = [
+  {
+    value: 'follow_request_default_5m',
+    label: '跟随请求，未指定按 5 分钟',
+    desc: '请求的 cache_control 写了 ttl 就按它；没写（或只写 cache_control）按 5 分钟。与官方 API 一致。',
+  },
+  {
+    value: 'follow_request_default_1h',
+    label: '跟随请求，未指定按 1 小时',
+    desc: '请求写了 ttl 就按它；没写按 1 小时。',
+  },
+  { value: 'force_5m', label: '固定 5 分钟', desc: '忽略请求的 ttl，一律按 5 分钟（普通缓存）。' },
+  { value: 'force_1h', label: '固定 1 小时', desc: '忽略请求的 ttl，一律按 1 小时。' },
+  {
+    value: 'upstream_then_request_default_5m',
+    label: '渠道 1 小时优先，其次跟随请求，未指定按 5 分钟',
+    desc: '渠道返回了 1 小时写入就按 1 小时；渠道只返回 5 分钟或没有拆分时，按请求的 ttl，请求也没写按 5 分钟。',
+  },
+]
+
+const DEFAULT_CACHE_TTL_MODE: CacheTtlMode = 'follow_request_default_5m'
+
+function CacheTtlModeSelect({
+  label,
+  desc,
+  value,
+  external,
+  onChange,
+}: {
+  label: string
+  desc: string
+  value: CacheTtlMode | undefined
+  external: boolean
+  onChange: (next: CacheTtlMode) => void
+}) {
+  const options = CACHE_TTL_MODE_OPTIONS.filter(
+    (option) => external || option.value !== 'upstream_then_request_default_5m',
+  )
+  const current = value ?? DEFAULT_CACHE_TTL_MODE
+  const selected = options.find((option) => option.value === current) ?? options[0]
+  return (
+    <div className="space-y-1.5">
+      <div className="text-sm font-semibold text-foreground">{label}</div>
+      <div className="text-xs leading-relaxed text-muted-foreground">{desc}</div>
+      <Select value={selected.value} onValueChange={(next) => onChange(next as CacheTtlMode)}>
+        <SelectTrigger size="sm" className="w-full max-w-md"><SelectValue /></SelectTrigger>
+        <SelectContent>
+          {options.map((option) => (
+            <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <div className="text-xs leading-relaxed text-muted-foreground">{selected.desc}</div>
+    </div>
+  )
+}
+
+function CacheTtlPolicyForm({
+  value,
+  onChange,
+}: {
+  value: CacheTtlPolicyPatch | undefined
+  onChange: (next: CacheTtlPolicyPatch) => void
+}) {
+  return (
+    <ParameterGroup
+      title="缓存写入时长"
+      desc="最终 usage 的缓存写入全部记为 5 分钟（cache_creation.ephemeral_5m_input_tokens，普通缓存）或 1 小时（ephemeral_1h_input_tokens），成本按对应单价计算。"
+    >
+      <FieldGrid>
+        <CacheTtlModeSelect
+          label="本地账号"
+          desc="本地 Kiro 账号返回的缓存写入时长。"
+          value={value?.local}
+          external={false}
+          onChange={(local) => onChange({ ...value, local })}
+        />
+        <CacheTtlModeSelect
+          label="外部池账号"
+          desc="外部池按本路径策略整形 usage 时的缓存写入时长；外部账号透传 usage 时不改。"
+          value={value?.externalPool}
+          external
+          onChange={(externalPool) => onChange({ ...value, externalPool })}
+        />
+      </FieldGrid>
+    </ParameterGroup>
   )
 }
 
@@ -1550,6 +1641,7 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
   // 只透传已配置的值，不补默认：未配置的模板保持关闭且不新增字段。
   const coldRequestGuard = policy.coldRequestGuard ? { coldRequestGuard: policy.coldRequestGuard } : {}
+  const cacheTtl = policy.cacheTtl ? { cacheTtl: policy.cacheTtl } : {}
   if (cacheType === 'kiro_rs_tool') {
     return {
       cacheType: 'kiro_rs_tool',
@@ -1557,12 +1649,14 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
       kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
       hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
       ...coldRequestGuard,
+      ...cacheTtl,
     }
   }
   if (cacheType === 'kiro_rs_tool_plus') {
     return {
       cacheType: 'kiro_rs_tool_plus',
       kiroRsToolPlus: policy.kiroRsToolPlus ?? defaultKiroRsToolPlusPatch(),
+      ...cacheTtl,
     }
   }
   if (cacheType === 'stable_segment_cache') {
@@ -1572,6 +1666,7 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
       stableSegment: policy.stableSegment ?? defaultStableSegmentPatch(),
       hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
       ...coldRequestGuard,
+      ...cacheTtl,
     }
   }
   return {
@@ -1581,6 +1676,7 @@ export function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, ca
     reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
     hitShaping: policy.hitShaping ?? defaultCacheHitShaping(),
     ...coldRequestGuard,
+    ...cacheTtl,
   }
 }
 
@@ -1694,6 +1790,12 @@ export function StrategyTemplateEditor({
             />
           </ParameterGroup>
         </>
+      )}
+      {cacheType !== 'no_cache' && (
+        <CacheTtlPolicyForm
+          value={template.cacheTtl}
+          onChange={(cacheTtl) => onChange({ ...template, cacheTtl })}
+        />
       )}
     </div>
   )
@@ -2017,6 +2119,14 @@ export function PathStrategyBindingCard({
                   onChange={(coldRequestGuard) => patch({ coldRequestGuard })}
                 />
               </ParameterGroup>
+            </div>
+          )}
+          {effectiveCacheType !== 'no_cache' && (
+            <div className="mt-7">
+              <CacheTtlPolicyForm
+                value={effectivePolicy.cacheTtl}
+                onChange={(cacheTtl) => patch({ cacheTtl })}
+              />
             </div>
           )}
         </EditorSection>

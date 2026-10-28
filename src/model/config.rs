@@ -1905,6 +1905,97 @@ impl CacheHitShapingPolicy {
     }
 }
 
+/// 缓存写入时长（5 分钟 / 1 小时）。整次请求的写入只归一种时长：最终下游 usage 的
+/// `cache_creation_input_tokens` 全部记入 `cache_creation.ephemeral_5m_input_tokens` 或
+/// `ephemeral_1h_input_tokens`。"请求标记"指客户端任一 `cache_control.ttl` 写了 `"1h"`（或大于
+/// 5 分钟）或 `"5m"`；只写 `cache_control` 不写 `ttl` 视为未指定。
+/// Wire names are spelled out: `rename_all = "snake_case"` would produce `force5m`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CacheTtlMode {
+    /// 跟随请求标记，未指定按 5 分钟（与官方 API 一致）。
+    #[default]
+    #[serde(rename = "follow_request_default_5m")]
+    FollowRequestDefault5m,
+    /// 跟随请求标记，未指定按 1 小时。
+    #[serde(rename = "follow_request_default_1h")]
+    FollowRequestDefault1h,
+    /// 忽略请求标记，一律 5 分钟。
+    #[serde(rename = "force_5m")]
+    Force5m,
+    /// 忽略请求标记，一律 1 小时。
+    #[serde(rename = "force_1h")]
+    Force1h,
+    /// 仅外部池：渠道返回了 1 小时写入就按 1 小时；渠道只有 5 分钟写入或没有拆分时视为未标记，
+    /// 改为跟随请求标记，请求也未指定按 5 分钟。
+    #[serde(rename = "upstream_then_request_default_5m")]
+    UpstreamThenRequestDefault5m,
+}
+
+impl CacheTtlMode {
+    /// 本地账号没有渠道标记，渠道优先模式退化为"跟随请求，未指定按 5 分钟"。
+    pub fn for_local(self) -> Self {
+        match self {
+            Self::UpstreamThenRequestDefault5m => Self::FollowRequestDefault5m,
+            other => other,
+        }
+    }
+}
+
+/// 路由缓存策略的写入时长设置：本地账号和外部池分开配置。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheTtlPolicy {
+    #[serde(default)]
+    pub local: CacheTtlMode,
+    #[serde(default)]
+    pub external_pool: CacheTtlMode,
+}
+
+impl CacheTtlPolicy {
+    pub fn validate(self, label: &str) -> Result<(), String> {
+        if self.local == CacheTtlMode::UpstreamThenRequestDefault5m {
+            return Err(format!(
+                "{label}.local 不支持 upstream_then_request_default_5m（本地账号没有渠道标记）"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheTtlPolicyPatch {
+    #[serde(default)]
+    pub local: Option<CacheTtlMode>,
+    #[serde(default)]
+    pub external_pool: Option<CacheTtlMode>,
+}
+
+impl CacheTtlPolicyPatch {
+    fn apply_to(self, mut policy: CacheTtlPolicy) -> CacheTtlPolicy {
+        if let Some(value) = self.local {
+            policy.local = value;
+        }
+        if let Some(value) = self.external_pool {
+            policy.external_pool = value;
+        }
+        policy
+    }
+
+    fn is_empty(&self) -> bool {
+        self.local.is_none() && self.external_pool.is_none()
+    }
+
+    fn validate_raw(&self, label: &str) -> Result<(), String> {
+        if self.local == Some(CacheTtlMode::UpstreamThenRequestDefault5m) {
+            return Err(format!(
+                "{label}.local 不支持 upstream_then_request_default_5m（本地账号没有渠道标记）"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 冷请求下游 usage 约束（默认关闭）。
 ///
 /// 开启后，本地前缀追踪本次未命中的请求（新会话首轮、fork / resume 后、服务重启后的首个
@@ -3002,6 +3093,9 @@ pub struct CacheRoutePolicyPatch {
     pub hit_shaping: Option<CacheHitShapingPolicyPatch>,
     #[serde(default)]
     pub cold_request_guard: Option<ColdRequestGuardPolicyPatch>,
+    /// 缓存写入时长；所有缓存策略都生效（no_cache 无写入，不受影响）。
+    #[serde(default)]
+    pub cache_ttl: Option<CacheTtlPolicyPatch>,
 }
 
 impl CacheRoutePolicyPatch {
@@ -3041,6 +3135,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.cold_request_guard {
             policy.cold_request_guard = patch.apply_to(policy.cold_request_guard);
         }
+        if let Some(patch) = self.cache_ttl {
+            policy.cache_ttl = patch.apply_to(policy.cache_ttl);
+        }
         policy.normalized()
     }
 
@@ -3073,6 +3170,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = &self.hit_shaping {
             patch.validate_raw(&format!("{label}.hitShaping"))?;
+        }
+        if let Some(patch) = &self.cache_ttl {
+            patch.validate_raw(&format!("{label}.cacheTtl"))?;
         }
         let policy = self.apply_route_to(base);
         policy.validate(label)
@@ -3120,6 +3220,9 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.cold_request_guard {
             policy.cold_request_guard = patch.apply_to(policy.cold_request_guard);
         }
+        if let Some(patch) = self.cache_ttl {
+            policy.cache_ttl = patch.apply_to(policy.cache_ttl);
+        }
         policy.normalized()
     }
 
@@ -3136,6 +3239,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(plus) = self.kiro_rs_tool_plus {
             policy.kiro_rs_tool_plus = plus.normalized();
+        }
+        if let Some(patch) = self.cache_ttl {
+            policy.cache_ttl = patch.apply_to(policy.cache_ttl);
         }
         policy.normalized()
     }
@@ -3161,6 +3267,9 @@ impl CacheRoutePolicyPatch {
         }
         if let Some(patch) = self.cold_request_guard {
             policy.cold_request_guard = patch.apply_to(policy.cold_request_guard);
+        }
+        if let Some(patch) = self.cache_ttl {
+            policy.cache_ttl = patch.apply_to(policy.cache_ttl);
         }
         policy.normalized()
     }
@@ -3212,6 +3321,10 @@ impl CacheRoutePolicyPatch {
                 .cold_request_guard
                 .as_ref()
                 .is_none_or(ColdRequestGuardPolicyPatch::is_empty)
+            && self
+                .cache_ttl
+                .as_ref()
+                .is_none_or(CacheTtlPolicyPatch::is_empty)
     }
 }
 
@@ -3374,6 +3487,7 @@ impl CachePolicyConfig {
             hit_shaping: base.hit_shaping,
             cold_request_guard: base.cold_request_guard,
             kiro_rs_tool_plus: base.kiro_rs_tool_plus,
+            cache_ttl: base.cache_ttl,
         };
         self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
     }
@@ -3404,6 +3518,7 @@ impl CachePolicyConfig {
             hit_shaping: base.hit_shaping,
             cold_request_guard: base.cold_request_guard,
             kiro_rs_tool_plus: base.kiro_rs_tool_plus,
+            cache_ttl: base.cache_ttl,
         };
         self.stable_segment_cache
             .apply_stable_segment_fields_to(neutral)
@@ -3435,6 +3550,7 @@ impl CachePolicyConfig {
             hit_shaping: CacheHitShapingPolicy::disabled(),
             cold_request_guard: ColdRequestGuardPolicy::disabled(),
             kiro_rs_tool_plus: KiroRsToolPlusCachePolicy::default(),
+            cache_ttl: base.cache_ttl,
         };
         self.kiro_rs_tool_plus
             .apply_kiro_rs_tool_plus_fields_to(neutral)
@@ -3464,6 +3580,7 @@ impl CachePolicyConfig {
             hit_shaping: CacheHitShapingPolicy::disabled(),
             cold_request_guard: ColdRequestGuardPolicy::disabled(),
             kiro_rs_tool_plus: base.kiro_rs_tool_plus,
+            cache_ttl: base.cache_ttl,
         }
         .normalized()
     }
@@ -3513,6 +3630,8 @@ pub struct CacheRoutePolicy {
     pub hit_shaping: CacheHitShapingPolicy,
     pub cold_request_guard: ColdRequestGuardPolicy,
     pub kiro_rs_tool_plus: KiroRsToolPlusCachePolicy,
+    /// 缓存写入时长（5 分钟 / 1 小时），本地账号与外部池分开设置；所有缓存策略共用。
+    pub cache_ttl: CacheTtlPolicy,
 }
 
 impl CacheRoutePolicy {
@@ -3541,6 +3660,7 @@ impl CacheRoutePolicy {
             .validate(&format!("{label}.stableSegment"))?;
         self.kiro_rs_tool_plus
             .validate(&format!("{label}.kiroRsToolPlus"))?;
+        self.cache_ttl.validate(&format!("{label}.cacheTtl"))?;
         Ok(())
     }
 }
@@ -6686,6 +6806,7 @@ impl Config {
             hit_shaping: CacheHitShapingPolicy::default(),
             cold_request_guard: ColdRequestGuardPolicy::default(),
             kiro_rs_tool_plus: KiroRsToolPlusCachePolicy::default(),
+            cache_ttl: CacheTtlPolicy::default(),
         }
         .normalized()
     }

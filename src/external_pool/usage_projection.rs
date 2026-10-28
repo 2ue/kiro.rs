@@ -4,6 +4,10 @@ use super::*;
 struct ExternalUsageProjectionState {
     committed_controlled_usage: Option<CacheUsage>,
     observed_cache_read_evidence: bool,
+    /// The channel reported a 1-hour cache write in any usage event of this response.
+    observed_upstream_1h_write: bool,
+    /// Write TTL resolved for the committed usage; sets the lifetime of the entries it writes.
+    committed_write_ttl: Option<crate::anthropic::cache::CacheWriteTtl>,
 }
 
 /// Kiro-RS Tool Plus 策略在外部池上的整形参数。
@@ -57,6 +61,10 @@ pub(super) struct ExternalUsageProjectionContext {
     pub(super) bounded_seed: u64,
     /// 路由 hitShaping 参数：收口时提供读取倍数上限和读写最小值。
     pub(super) cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy,
+    /// 外部池缓存写入时长（路由 `cacheTtl.externalPool`）与请求里的 `cache_control.ttl`，
+    /// 在投影输出时结合渠道返回的拆分统一决定。
+    pub(super) cache_ttl_mode: crate::model::config::CacheTtlMode,
+    pub(super) request_cache_ttl: crate::anthropic::cache::RequestCacheTtl,
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
@@ -86,6 +94,8 @@ pub(super) struct ExternalUsageProjectionTemplate {
     kiro_rs_tool_plus: Option<ExternalKiroRsToolPlusProjection>,
     bounded_final_caps: bool,
     cache_hit_shaping_policy: crate::model::config::CacheHitShapingPolicy,
+    cache_ttl_mode: crate::model::config::CacheTtlMode,
+    request_cache_ttl: crate::anthropic::cache::RequestCacheTtl,
 }
 
 impl ExternalUsageProjectionTemplate {
@@ -161,6 +171,8 @@ impl ExternalUsageProjectionTemplate {
             bounded_final_caps: self.bounded_final_caps,
             bounded_seed: fastrand::u64(..),
             cache_hit_shaping_policy: self.cache_hit_shaping_policy,
+            cache_ttl_mode: self.cache_ttl_mode,
+            request_cache_ttl: self.request_cache_ttl,
             state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
         }
     }
@@ -433,6 +445,14 @@ fn build_template(
         bounded_final_caps: route.prompt_cache_strategy_type
             == PromptCacheStrategyType::BoundedHighCache,
         cache_hit_shaping_policy: route.cache_hit_shaping_policy,
+        cache_ttl_mode: route.cache_ttl_mode,
+        request_cache_ttl: crate::anthropic::cache::RequestCacheTtl::from_request(payload)
+            .with_top_level(
+                route
+                    .effective_raw_probe
+                    .as_deref()
+                    .and_then(|probe| probe.top_level_cache_ttl),
+            ),
     })
 }
 
@@ -469,6 +489,35 @@ impl ExternalUsageProjectionContext {
         state.committed_controlled_usage = Some(usage);
     }
 
+    /// Resolves the reported cache write TTL for this response. `upstream_usage` is the
+    /// channel's own usage of the current event; once any event reports a 1-hour write the
+    /// channel counts as having marked 1h for the rest of the response.
+    pub(super) fn resolve_write_ttl(
+        &self,
+        upstream_usage: Option<&CacheUsage>,
+        commit: bool,
+    ) -> crate::anthropic::cache::CacheWriteTtl {
+        let mut state = self.state.lock();
+        state.observed_upstream_1h_write |=
+            upstream_usage.is_some_and(|usage| usage.cache_creation_1h_input_tokens > 0);
+        let ttl = crate::anthropic::cache::resolve_cache_write_ttl(
+            self.cache_ttl_mode,
+            self.request_cache_ttl,
+            state.observed_upstream_1h_write,
+        );
+        if commit {
+            state.committed_write_ttl = Some(ttl);
+        }
+        ttl
+    }
+
+    fn committed_bounds(&self) -> PromptCacheBounds {
+        match self.state.lock().committed_write_ttl {
+            Some(ttl) => self.prompt_cache_bounds.with_write_ttl(ttl),
+            None => self.prompt_cache_bounds,
+        }
+    }
+
     pub(super) fn record_success(&self) {
         let Some(usage) = self.state.lock().committed_controlled_usage else {
             return;
@@ -476,6 +525,7 @@ impl ExternalUsageProjectionContext {
         if !self.cache_state_enabled {
             return;
         }
+        let bounds = self.committed_bounds();
         if let Some(plus) = self.kiro_rs_tool_plus {
             if let Some(config) = plus.shaper().frequency_control() {
                 let _ = self
@@ -504,13 +554,13 @@ impl ExternalUsageProjectionContext {
             self.prompt_cache.commit_kiro_rs_tool_success_with_bounds(
                 self.scope.clone(),
                 plan,
-                self.prompt_cache_bounds,
+                bounds,
             );
         } else if let Some(plan) = self.stable_segment_prompt_cache_plan.as_ref() {
             self.prompt_cache.commit_stable_segment_success_with_bounds(
                 self.scope.clone(),
                 plan,
-                self.prompt_cache_bounds,
+                bounds,
                 self.stable_segment_cache_policy.unwrap_or_default(),
             );
         } else {
@@ -518,7 +568,7 @@ impl ExternalUsageProjectionContext {
                 self.scope.clone(),
                 self.prompt_cache_profile.as_ref(),
                 self.prompt_cache_target_read_ratio,
-                self.prompt_cache_bounds,
+                bounds,
             );
         }
     }

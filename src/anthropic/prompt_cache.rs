@@ -135,6 +135,9 @@ pub struct PromptCacheBounds {
     pub max_entries_global: usize,
     pub entry_ttl: Duration,
     pub estimated_bytes_limit: u64,
+    /// Lifetime of entries written by this request, from the route's cache TTL mode. `None`
+    /// keeps the TTL of the request's last breakpoint. Always capped at `entry_ttl`.
+    pub write_ttl: Option<Duration>,
 }
 
 impl Default for PromptCacheBounds {
@@ -144,6 +147,7 @@ impl Default for PromptCacheBounds {
             max_entries_global: DEFAULT_MAX_ENTRIES_GLOBAL,
             entry_ttl: DEFAULT_MAX_ENTRY_TTL,
             estimated_bytes_limit: DEFAULT_ESTIMATED_BYTES_LIMIT,
+            write_ttl: None,
         }
     }
 }
@@ -160,11 +164,26 @@ impl PromptCacheBounds {
             max_entries_global,
             entry_ttl: Duration::from_secs(entry_ttl_secs.max(1)),
             estimated_bytes_limit,
+            write_ttl: None,
         }
+    }
+
+    /// Sets the lifetime of entries this request writes (the route's resolved cache TTL).
+    pub fn with_write_ttl(mut self, ttl: crate::anthropic::cache::CacheWriteTtl) -> Self {
+        self.write_ttl = Some(match ttl {
+            crate::anthropic::cache::CacheWriteTtl::FiveMinutes => DEFAULT_PROMPT_CACHE_TTL,
+            crate::anthropic::cache::CacheWriteTtl::OneHour => HOUR_PROMPT_CACHE_TTL,
+        });
+        self
     }
 
     fn effective_ttl(self, ttl: Duration) -> Duration {
         ttl.min(self.entry_ttl)
+    }
+
+    /// Lifetime for a new entry: the route's write TTL when set, else the breakpoint's TTL.
+    fn write_entry_ttl(self, breakpoint_ttl: Duration) -> Duration {
+        self.effective_ttl(self.write_ttl.unwrap_or(breakpoint_ttl))
     }
 
     fn max_entries_by_bytes(self) -> usize {
@@ -649,7 +668,7 @@ impl PromptCacheTracker {
             return;
         }
 
-        let ttl = bounds.effective_ttl(
+        let ttl = bounds.write_entry_ttl(
             profile
                 .breakpoints
                 .last()
@@ -854,7 +873,7 @@ impl PromptCacheTracker {
             return;
         }
 
-        let ttl = bounds.effective_ttl(
+        let ttl = bounds.write_entry_ttl(
             profile
                 .breakpoints
                 .last()
@@ -905,7 +924,7 @@ impl PromptCacheTracker {
             return;
         }
 
-        let ttl = bounds.effective_ttl(
+        let ttl = bounds.write_entry_ttl(
             profile
                 .breakpoints
                 .last()
@@ -2161,6 +2180,7 @@ mod tests {
             max_entries_global: 10,
             entry_ttl: std::time::Duration::from_secs(1),
             estimated_bytes_limit: 0,
+            write_ttl: None,
         };
 
         tracker.update_with_bounds(Some(scope.clone()), Some(&profile), 0.85, bounds);
@@ -3228,6 +3248,7 @@ mod tests {
             max_entries_global: 12,
             entry_ttl: std::time::Duration::from_secs(3_600),
             estimated_bytes_limit: 0,
+            write_ttl: None,
         };
         let byte_limited = PromptCacheBounds {
             estimated_bytes_limit: 5 * ESTIMATED_ENTRY_BYTES,
@@ -3415,6 +3436,7 @@ mod tests {
             max_entries_global: 100,
             entry_ttl: std::time::Duration::from_secs(3_600),
             estimated_bytes_limit: 0,
+            write_ttl: None,
         };
 
         let scope = test_scope("bounded-session");
@@ -3445,6 +3467,7 @@ mod tests {
             max_entries_global: 10,
             entry_ttl: std::time::Duration::from_secs(3_600),
             estimated_bytes_limit: 3 * ESTIMATED_ENTRY_BYTES,
+            write_ttl: None,
         };
 
         for credential_id in 1..=6 {

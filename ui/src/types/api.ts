@@ -1926,6 +1926,24 @@ export interface CacheRoutePolicyPatch {
   stableSegment?: StableSegmentCachePolicyPatch
   hitShaping?: CacheHitShapingPolicyPatch
   coldRequestGuard?: ColdRequestGuardPolicyPatch
+  cacheTtl?: CacheTtlPolicyPatch
+}
+
+/**
+ * 缓存写入时长：最终 usage 的写入全部记为 5 分钟（ephemeral_5m，普通缓存）或 1 小时（ephemeral_1h）。
+ * "请求标记"指 cache_control.ttl；只写 cache_control 不写 ttl 视为未指定。
+ * upstream_then_request_default_5m 只用于外部池。
+ */
+export type CacheTtlMode =
+  | 'follow_request_default_5m'
+  | 'follow_request_default_1h'
+  | 'force_5m'
+  | 'force_1h'
+  | 'upstream_then_request_default_5m'
+
+export interface CacheTtlPolicyPatch {
+  local?: CacheTtlMode
+  externalPool?: CacheTtlMode
 }
 
 /** 冷请求 usage 约束：默认关闭，关闭时与未引入该约束的行为一致。 */
@@ -2676,7 +2694,10 @@ export type LoadBalancingMode = 'priority' | 'balanced' | 'health_balanced' | 'w
 export interface ModelPricing {
   inputCostPerToken: number
   outputCostPerToken: number
+  /** 5 分钟缓存写入单价 */
   cacheCreationInputTokenCost: number
+  /** 1 小时缓存写入单价；来源没有时按 input 的 2 倍 */
+  cacheCreation1hInputTokenCost: number
   cacheReadInputTokenCost: number
 }
 
@@ -2729,6 +2750,7 @@ export interface ManualModelPricingRequest {
   inputCostPerMillion: number
   outputCostPerMillion: number
   cacheCreationInputCostPerMillion?: number
+  cacheCreation1hInputCostPerMillion?: number
   cacheReadInputCostPerMillion?: number
 }
 
