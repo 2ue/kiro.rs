@@ -980,11 +980,13 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// 命中该路径的非流式请求是否透传上游 usage。
+    /// 命中该路径的非流式请求是否全部透传上游 usage（强制关）。
     ///
     /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求不进入
     /// 本系统 usage 整形、input 采样和补偿，也不会读取或写入本地 prompt-cache 状态；
     /// 外部池非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
+    /// 关闭时按常规：只有 Anthropic 会返回缓存的非流式请求（带 cache_control，且断点前内容
+    /// 达到模型最小缓存长度）按路径策略整形，其余非流式请求同开启时一样透传。
     /// 流式请求不受影响。
     /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
     #[serde(default)]

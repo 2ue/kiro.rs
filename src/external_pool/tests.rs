@@ -11468,6 +11468,11 @@ fn external_pool_retry_boundary_cross_pool_separates_route_errors_from_protocol_
 fn external_payload_guard_retry_route_trims_and_disables_second_retry() {
     for round in 1..=5 {
         let mut route = test_route("claude-sonnet-4-6");
+        // Trimming is measured against an 8 KB body: keep the system prompt at its short size.
+        if let Some(payload) = route.payload.as_mut() {
+            payload.system.as_mut().unwrap()[0].text =
+                "You are a careful coding assistant. ".repeat(180);
+        }
         let mut messages = Vec::new();
         for idx in 0..32 {
             messages.push(Message {
@@ -12967,9 +12972,10 @@ fn test_payload(model: &str) -> MessagesRequest {
             content: serde_json::json!("hello"),
         }],
         stream: false,
+        // Marked like Claude Code's system prompt, so non-streaming shaping applies.
         system: Some(vec![SystemMessage {
-            text: "You are a careful coding assistant. ".repeat(180),
-            cache_control: None,
+            text: "You are a careful coding assistant. ".repeat(500),
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
         }]),
         tools: None,
         tool_choice: None,
@@ -13811,18 +13817,25 @@ fn normalized_failover_builds_and_serializes_the_full_body_once_per_request() {
 
 #[test]
 fn raw_failover_shares_tool_and_usage_projection_parsing_across_pools() {
-    let raw = br#"{
-        "model":"claude-sonnet-4-5",
-        "max_tokens":128,
-        "messages":[
-            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]},
-            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+    // Long enough, with a cache breakpoint, for non-streaming usage projection to apply.
+    let raw = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 128,
+        "system": [{
+            "type": "text",
+            "text": "You are a careful coding assistant. ".repeat(200),
+            "cache_control": {"type": "ephemeral"}
+        }],
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]}
         ],
-        "tools":[{"name":"Bash","description":"run","input_schema":{"type":"object"}}],
-        "stream":false,
-        "metadata":{"user_id":"raw-cache-session"}
-    }"#;
-    let route = raw_test_route(raw);
+        "tools": [{"name": "Bash", "description": "run", "input_schema": {"type": "object"}}],
+        "stream": false,
+        "metadata": {"user_id": "raw-cache-session"}
+    })
+    .to_string();
+    let route = raw_test_route(raw.as_bytes());
 
     for pool_id in 1..=8 {
         let mut pool = test_pool("https://example.com/v1", true);
@@ -15314,7 +15327,18 @@ fn usage_projection_applies_current_path_policy_to_json_body() {
 
 #[test]
 fn raw_passthrough_keeps_body_but_still_applies_usage_projection() {
-    let raw = br#"{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"system":[{"type":"text","text":"You are a careful coding assistant. You are a careful coding assistant. You are a careful coding assistant. "}],"stream":false,"metadata":{"user_id":"raw-projection-session"}}"#;
+    // Top-level cache_control (automatic caching) over a prefix above the minimum.
+    let raw = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hello"}],
+        "system": [{"type": "text", "text": "You are a careful coding assistant. ".repeat(200)}],
+        "cache_control": {"type": "ephemeral"},
+        "stream": false,
+        "metadata": {"user_id": "raw-projection-session"}
+    })
+    .to_string();
+    let raw = raw.as_bytes();
     let route = raw_test_route(raw);
     assert!(route.payload.is_none());
     assert_eq!(route.request_input_tokens, 0);
@@ -15326,7 +15350,7 @@ fn raw_passthrough_keeps_body_but_still_applies_usage_projection() {
     pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
     let prepared = external_pool_prepare_request(&route, &pool).unwrap();
-    assert_eq!(prepared.body, Bytes::from_static(raw));
+    assert_eq!(prepared.body, Bytes::copy_from_slice(raw));
 
     let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":5,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
@@ -15448,6 +15472,53 @@ fn usage_projection_final_output_guard_caps_after_external_output_uplift() {
     assert_eq!(usage["output_tokens"].as_i64().unwrap(), 70);
     let reported = projected.usage_capture.reported.expect("reported usage");
     assert_eq!(reported.output_tokens, 70);
+}
+
+/// A non-streaming request without any cache breakpoint, or whose marked prefix is below the
+/// model minimum, keeps the external upstream usage exactly as `skipNonStreamUsageProjection`
+/// would; streaming requests are still shaped.
+#[test]
+fn usage_projection_passes_through_non_stream_requests_anthropic_would_not_cache() {
+    let mut pool = test_pool("http://pool.example.com", false);
+    pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+    let mut unmarked = test_route("claude-sonnet-4-5");
+    if let Some(payload) = unmarked.payload.as_mut() {
+        payload.system.as_mut().unwrap()[0].cache_control = None;
+    }
+    assert!(projection_context(&unmarked, &pool, 0).is_none());
+
+    // The 42-token haiku shape seen in production: marked, but far below Haiku 4.5's minimum.
+    let mut short = test_route("claude-haiku-4-5-20251001");
+    if let Some(payload) = short.payload.as_mut() {
+        payload.system.as_mut().unwrap()[0].text = "Reply with one word.".to_string();
+    }
+    short.request_input_tokens = 42;
+    assert!(projection_context(&short, &pool, 0).is_none());
+
+    // Streaming keeps the path policy whatever the request looks like (fresh route: the
+    // projection template is cached per route).
+    let mut unmarked_stream = test_route("claude-sonnet-4-5");
+    if let Some(payload) = unmarked_stream.payload.as_mut() {
+        payload.system.as_mut().unwrap()[0].cache_control = None;
+        payload.stream = true;
+    }
+    assert!(projection_context(&unmarked_stream, &pool, 0).is_some());
+
+    // A raw body that only sets top-level cache_control (automatic caching) is shaped.
+    let raw = serde_json::json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 8,
+        "system": [{"type": "text", "text": "You are a careful coding assistant. ".repeat(200)}],
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": false
+    });
+    let unmarked_raw = raw_test_route(raw.to_string().as_bytes());
+    assert!(projection_context(&unmarked_raw, &pool, 0).is_none());
+    let mut automatic = raw.clone();
+    automatic["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    let automatic_raw = raw_test_route(automatic.to_string().as_bytes());
+    assert!(projection_context(&automatic_raw, &pool, 0).is_some());
 }
 
 #[test]

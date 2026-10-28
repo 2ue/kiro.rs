@@ -254,6 +254,21 @@ fn build_template(
         .upstream_model
         .clone()
         .unwrap_or_else(|| payload.model.clone());
+    // Same rule as local requests: a non-streaming request the Anthropic API could not return
+    // cache usage for keeps the upstream usage, as if `skipNonStreamUsageProjection` were on.
+    if !stream
+        && route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
+        && !crate::anthropic::prompt_cache::request_qualifies_for_prompt_cache(
+            payload,
+            route
+                .effective_raw_probe
+                .as_deref()
+                .is_some_and(|probe| probe.top_level_cache_control),
+            &model,
+        )
+    {
+        return None;
+    }
     let prompt_cache_supported = route
         .model_capabilities
         .supports_prompt_caching_for(&model)

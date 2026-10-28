@@ -1739,7 +1739,7 @@ function ReportedUsagePathEditor({
         <>
           <ToggleField
             title="禁用非流式整形"
-            description="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
+            description="开启后，命中此路径的非流式请求一律不改写返回 usage；关闭时，只有带 cache_control 且断点前内容达到模型最小缓存长度的非流式请求才按路径策略整形，其余同样透传。流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
             checked={Boolean(value.skipNonStreamUsageProjection)}
             onCheckedChange={(skipNonStreamUsageProjection) =>
               onChange({ ...value, skipNonStreamUsageProjection })

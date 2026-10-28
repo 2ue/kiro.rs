@@ -1316,6 +1316,37 @@ fn cache_route_for_request_stream(
     cache_route
 }
 
+/// Non-streaming requests follow the route's cache strategy only when the Anthropic API itself
+/// could return cache usage for them (see `request_qualifies_for_prompt_cache`). Any other
+/// non-streaming request is handled as if `skipNonStreamUsageProjection` were on: upstream usage
+/// passes through and the local cache state is neither read nor written. Streaming requests and
+/// no-cache routes are unchanged.
+fn cache_route_for_local_request(
+    mut cache_route: ResolvedCacheRoutePolicy,
+    payload: &MessagesRequest,
+    top_level_cache_control: bool,
+    cache_model: &str,
+) -> ResolvedCacheRoutePolicy {
+    if !payload.stream
+        && cache_route.policy.cache_type != PromptCacheStrategyType::NoCache
+        && !cache_route
+            .policy
+            .reported_usage
+            .skip_non_stream_usage_projection
+        && !super::prompt_cache::request_qualifies_for_prompt_cache(
+            payload,
+            top_level_cache_control,
+            cache_model,
+        )
+    {
+        cache_route
+            .policy
+            .reported_usage
+            .skip_non_stream_usage_projection = true;
+    }
+    cache_route_for_request_stream(cache_route, payload.stream)
+}
+
 fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
     match policy.cache_type {
         PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::BoundedHighCache
@@ -7865,6 +7896,7 @@ async fn post_messages_inner(
         request_api_key_id.as_deref(),
     );
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
+    let top_level_cache_control = effective_raw_probe.top_level_cache_control;
     // Bytes 克隆仅增加引用计数；只在采集开启时保留，避免延长请求体生命周期。
     let capture_bodies = crate::diagnostics::capture::is_active()
         .then(|| (raw_body.clone(), effective_raw_body.clone()));
@@ -8104,8 +8136,15 @@ async fn post_messages_inner(
             payload.tools.as_deref(),
         ) as i32;
 
-        let websearch_cache_route =
-            cache_route_for_request_stream(cache_route.clone(), payload.stream);
+        let websearch_cache_route = cache_route_for_local_request(
+            cache_route.clone(),
+            &payload,
+            top_level_cache_control,
+            model_resolution
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&payload.model),
+        );
         let usage_context = prepare_usage_context_with_inference_attempt_budget(
             &state,
             websearch_cache_route,
@@ -8331,7 +8370,15 @@ async fn post_messages_inner(
         };
     }
 
-    let local_cache_route = cache_route_for_request_stream(cache_route, payload.stream);
+    let local_cache_route = cache_route_for_local_request(
+        cache_route,
+        &payload,
+        top_level_cache_control,
+        model_resolution
+            .upstream_model
+            .as_deref()
+            .unwrap_or(&payload.model),
+    );
     let request_simulation_mode =
         prompt_cache_simulation_mode_for_policy(&local_cache_route.policy);
     let cache_type = local_cache_route.policy.cache_type;

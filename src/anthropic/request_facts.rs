@@ -97,6 +97,8 @@ impl fmt::Debug for RawRequestBodySnapshot {
 pub(crate) struct RawMessagesBodyProbe {
     pub(crate) model: Option<String>,
     pub(crate) stream: Option<bool>,
+    /// A non-null top-level `cache_control` (automatic prompt caching).
+    pub(crate) top_level_cache_control: bool,
     pub(crate) max_tokens_present: bool,
     pub(crate) max_tokens: Option<i64>,
     pub(crate) complete_top_level_object: bool,
@@ -1013,6 +1015,7 @@ enum ProbedTopLevelKey {
     MaxTokens,
     Thinking,
     OutputConfig,
+    CacheControl,
     Other,
 }
 
@@ -1105,6 +1108,10 @@ fn scan_top_level_object(
                 probe.output_config_value_span = Some(span);
             }
             i = value_end;
+        } else if key == ProbedTopLevelKey::CacheControl {
+            let value_end = skip_json_value(bytes, value_start, 1, budget)?;
+            probe.top_level_cache_control = &bytes[value_start..value_end] != b"null";
+            i = value_end;
         } else {
             i = skip_json_value(bytes, value_start, 1, budget)?;
         }
@@ -1151,6 +1158,7 @@ fn parse_probed_top_level_key_at(
         "max_tokens" => ProbedTopLevelKey::MaxTokens,
         "thinking" => ProbedTopLevelKey::Thinking,
         "output_config" => ProbedTopLevelKey::OutputConfig,
+        "cache_control" => ProbedTopLevelKey::CacheControl,
         _ => ProbedTopLevelKey::Other,
     };
     Ok((key, end))

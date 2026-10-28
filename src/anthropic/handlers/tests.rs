@@ -1635,7 +1635,9 @@ fn websearch_messages_body(
 
 fn single_query_websearch_body(query: &str, stream: bool) -> String {
     websearch_messages_body(
-        vec![json!({"role": "user", "content": query})],
+        vec![json!({"role": "user", "content": [
+            {"type": "text", "text": query, "cache_control": {"type": "ephemeral"}}
+        ]})],
         stream,
         Some("web_search_20250305"),
         false,
@@ -3135,7 +3137,11 @@ fn route_policy_matrix_messages_body(label: &str) -> String {
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 32,
         "stream": false,
-        "system": "stable route policy cache system prompt ".repeat(700),
+        "system": [{
+            "type": "text",
+            "text": "stable route policy cache system prompt ".repeat(700),
+            "cache_control": {"type": "ephemeral"}
+        }],
         "metadata": {
             "user_id": r#"{"session_id":"11111111-2222-4333-8444-555555555555"}"#
         },
@@ -9263,6 +9269,102 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
             .reported_usage
             .skip_non_stream_usage_projection
     );
+}
+
+/// Non-streaming requests follow the route's cache strategy only when Anthropic could return
+/// cache usage for them; the others pass upstream usage through. Streaming is unchanged.
+#[test]
+fn non_stream_cache_route_follows_the_request_not_only_the_route() {
+    let state = AppState::new(
+        Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+        true,
+        Arc::new(UsageRecorder::new(10)),
+        Arc::new(PromptCacheTracker::default()),
+        Arc::new(PromptCacheCreationController::default()),
+        PromptCacheSimulationMode::HighCache,
+        0.95,
+        CompatProfile::ClaudeCode,
+        false,
+    );
+    // `/cc` defaults to current_high_cache.
+    let route =
+        RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/cc/v1/messages");
+    assert_eq!(
+        route.policy.cache_type,
+        PromptCacheStrategyType::CurrentHighCache
+    );
+    let long = "You are a helpful coding assistant with deep knowledge of Go, Rust and Python. "
+        .repeat(80);
+    let request = |stream: bool, marked: bool, system_text: &str| MessagesRequest {
+        model: "claude-sonnet-4-5".to_string(),
+        max_tokens: 64,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: json!("check this transcript"),
+        }],
+        stream,
+        system: Some(vec![SystemMessage {
+            text: system_text.to_string(),
+            cache_control: marked.then(|| json!({"type": "ephemeral"})),
+        }]),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        output_format: None,
+        metadata: None,
+        stop_sequences: None,
+    };
+    let shaped = |route: &ResolvedCacheRoutePolicy| {
+        route.policy.cache_type == PromptCacheStrategyType::CurrentHighCache
+            && route.policy.reported_usage.enabled
+    };
+    let model = "claude-sonnet-4-5";
+
+    // Marked prefix above the minimum: shaped by the route strategy, like streaming.
+    let qualified =
+        cache_route_for_local_request(route.clone(), &request(false, true, &long), false, model);
+    assert!(shaped(&qualified));
+    // Top-level cache_control (automatic caching) qualifies an unmarked body.
+    let automatic =
+        cache_route_for_local_request(route.clone(), &request(false, false, &long), true, model);
+    assert!(shaped(&automatic));
+
+    // No cache_control, or a marked prefix below the minimum: upstream usage passes through.
+    for (label, req) in [
+        ("unmarked", request(false, false, &long)),
+        ("too short", request(false, true, "You are a classifier.")),
+    ] {
+        let passthrough = cache_route_for_local_request(route.clone(), &req, false, model);
+        assert_eq!(
+            passthrough.policy.cache_type,
+            PromptCacheStrategyType::NoCache,
+            "{label}"
+        );
+        assert!(!passthrough.policy.reported_usage.enabled, "{label}");
+        assert!(
+            passthrough
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection,
+            "{label}"
+        );
+        assert!(passthrough.namespace.is_none(), "{label}");
+    }
+
+    // Streaming keeps the route strategy whatever the request looks like.
+    let stream =
+        cache_route_for_local_request(route.clone(), &request(true, false, "short"), false, model);
+    assert!(shaped(&stream));
+
+    // The route-level switch still forces passthrough for every non-streaming request.
+    let mut forced = route.clone();
+    forced
+        .policy
+        .reported_usage
+        .skip_non_stream_usage_projection = true;
+    let forced = cache_route_for_local_request(forced, &request(false, true, &long), false, model);
+    assert_eq!(forced.policy.cache_type, PromptCacheStrategyType::NoCache);
 }
 
 #[test]

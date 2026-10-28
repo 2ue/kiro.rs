@@ -1889,6 +1889,33 @@ fn prune_expired_locked(entries_by_scope: &mut ScopeEntries, now: DateTime<Utc>)
     });
 }
 
+/// Whether the Anthropic API itself could return cache usage for this request: the client marked
+/// a cache breakpoint (on a block, or at the top level for automatic caching) and the prefix up to
+/// the last breakpoint reaches the model's minimum cacheable length. Requests that fail this would
+/// come back with zero cache fields from Anthropic, so non-streaming shaping skips them.
+pub(crate) fn request_qualifies_for_prompt_cache(
+    req: &MessagesRequest,
+    top_level_cache_control: bool,
+    cache_model: &str,
+) -> bool {
+    let blocks = flatten_cache_blocks(req);
+    let total_tokens: i32 = blocks.iter().map(|block| block.tokens).sum();
+    // Automatic caching puts the breakpoint on the last cacheable block, so the whole request
+    // counts as the cached prefix.
+    let cached_prefix_tokens = if top_level_cache_control {
+        total_tokens
+    } else {
+        let Some(last_breakpoint) = blocks.iter().rposition(|block| block.ttl.is_some()) else {
+            return false;
+        };
+        blocks[..=last_breakpoint]
+            .iter()
+            .map(|block| block.tokens)
+            .sum()
+    };
+    cached_prefix_tokens >= min_cacheable_tokens_for_model(cache_model)
+}
+
 fn min_cacheable_tokens_for_model(model: &str) -> i32 {
     let model = model.to_lowercase().replace('_', "-");
     if model.contains("haiku") {
@@ -2195,6 +2222,56 @@ mod tests {
         let repeated_first = tracker.compute(Some(scope), Some(&profile), 0.95);
         assert_eq!(repeated_first.cache_read_input_tokens, 0);
         assert!(repeated_first.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn only_marked_prefixes_above_the_model_minimum_qualify_for_cache() {
+        // No cache_control anywhere: Anthropic returns zero cache fields, however long.
+        let unmarked = request(long_text());
+        assert!(!request_qualifies_for_prompt_cache(
+            &unmarked,
+            false,
+            "claude-sonnet-4-5"
+        ));
+        // Top-level cache_control (automatic caching) caches the whole request.
+        assert!(request_qualifies_for_prompt_cache(
+            &unmarked,
+            true,
+            "claude-sonnet-4-5"
+        ));
+
+        let mut marked = request(long_text());
+        marked.system.as_mut().unwrap()[0].cache_control = Some(json!({"type": "ephemeral"}));
+        assert!(request_qualifies_for_prompt_cache(
+            &marked,
+            false,
+            "claude-sonnet-4-5"
+        ));
+        // The same ~1.8k-token prefix is below Haiku 4.5's 4096-token minimum.
+        assert!(!request_qualifies_for_prompt_cache(
+            &marked,
+            false,
+            "claude-haiku-4-5-20251001"
+        ));
+
+        // A breakpoint on a short block counts only the prefix up to it, not the text after.
+        let mut short_marked = request("You are a classifier.".to_string());
+        short_marked.system.as_mut().unwrap()[0].cache_control = Some(json!({"type": "ephemeral"}));
+        short_marked.messages[0].content = json!(long_text());
+        assert!(!request_qualifies_for_prompt_cache(
+            &short_marked,
+            false,
+            "claude-sonnet-4-5"
+        ));
+        // A breakpoint at the end of the long user turn covers it.
+        short_marked.messages[0].content = json!([
+            {"type": "text", "text": long_text(), "cache_control": {"type": "ephemeral"}}
+        ]);
+        assert!(request_qualifies_for_prompt_cache(
+            &short_marked,
+            false,
+            "claude-sonnet-4-5"
+        ));
     }
 
     #[test]
