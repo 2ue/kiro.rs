@@ -131,8 +131,8 @@ const GROUPS: ScenarioGroup[] = [
         credential: card({ email: 'fast.tier.two@gmail.com', fast: 2, authMethod: 'idc', ...paid('KIRO PRO', 310, 1000), inFlightRequests: 22, recentSchedulerSelectionCount60s: 74 }),
       },
       {
-        title: '并发已满 · RPM 打满',
-        credential: card({ email: 'saturated@gmail.com', ...paid('KIRO PRO+', 880, 2000), inFlightRequests: 30, oldestInFlightAgeSecs: 182, recentSchedulerSelectionCount60s: 100 }),
+        title: '并发已满',
+        credential: card({ email: 'saturated@gmail.com', ...paid('KIRO PRO+', 880, 2000), inFlightRequests: 30, oldestInFlightAgeSecs: 182, recentSchedulerSelectionCount60s: 64 }),
       },
       {
         title: '冷却中（按模型）',
@@ -147,7 +147,23 @@ const GROUPS: ScenarioGroup[] = [
         }),
       },
       {
-        title: '限流中',
+        title: '冷却中（全部模型）',
+        credential: card({
+          email: 'cooling.all.models@gmail.com',
+          ...paid('KIRO PRO', 520, 1000),
+          cooledDown: true,
+          cooldownRemainingSecs: 245,
+          cooldownReason: 'stream_error upstream eventstream ended without any frames',
+          cooldowns: [{ global: true, remainingSecs: 245, reason: 'stream_error upstream eventstream ended without any frames' }],
+          inFlightRequests: 0,
+          transientFailureStreak: 2,
+          lastErrorKind: 'stream',
+          lastErrorReason: 'upstream eventstream ended without any frames',
+          lastErrorAtMs: Date.now() - 20_000,
+        }),
+      },
+      {
+        title: '限流中（RPM 打满）',
         credential: card({ email: 'rate.limited@gmail.com', ...paid('KIRO PRO', 380, 1000), rateLimited: true, rateLimitRemainingSecs: 9, recentSchedulerSelectionCount60s: 100 }),
       },
       {

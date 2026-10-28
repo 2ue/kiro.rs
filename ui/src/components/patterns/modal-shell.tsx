@@ -20,6 +20,8 @@ interface ModalShellProps {
   width?: string
   /** body 不要默认内边距 */
   noBodyPadding?: boolean
+  /** 固定在标题下方、不随 body 滚动的内容 */
+  pinned?: React.ReactNode
 }
 
 export function ModalShell({
@@ -31,6 +33,7 @@ export function ModalShell({
   footer,
   width = 'max-w-2xl',
   noBodyPadding,
+  pinned,
 }: ModalShellProps) {
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
@@ -39,6 +42,7 @@ export function ModalShell({
           <DialogTitle>{title}</DialogTitle>
           {description && <DialogDescription>{description}</DialogDescription>}
         </DialogHeader>
+        {pinned && <div className="shrink-0 border-b border-border/70 bg-card px-5 py-3">{pinned}</div>}
         <DialogBody className={noBodyPadding ? 'p-0' : undefined}>{children}</DialogBody>
         {footer && <DialogFooter>{footer}</DialogFooter>}
       </DialogContent>
