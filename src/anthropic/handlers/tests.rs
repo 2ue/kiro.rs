@@ -16720,11 +16720,11 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
             ),
             (
                 InjectionId::ToolChoicePrefix,
-                "<tool_choice>any</tool_choice>",
+                crate::model::prompt_injection::catalog::TOOL_CHOICE_ANY_PREFIX,
             ),
             (
                 InjectionId::ToolChoiceTurnReminder,
-                "<tool_choice_reminder>",
+                crate::model::prompt_injection::catalog::TOOL_CHOICE_ANY_REMINDER,
             ),
         ];
         for (_, marker) in markers {

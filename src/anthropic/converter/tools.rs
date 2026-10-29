@@ -519,7 +519,7 @@ pub(super) fn generate_tool_choice_prefix(
         return prefix;
     }
     Some(match prefix {
-        Some(prefix) => format!("{prefix}{TOOL_CHOICE_PARALLEL_DISABLED_PREFIX}"),
+        Some(prefix) => format!("{prefix} {TOOL_CHOICE_PARALLEL_DISABLED_PREFIX}"),
         None => TOOL_CHOICE_PARALLEL_DISABLED_PREFIX.to_string(),
     })
 }

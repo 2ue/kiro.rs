@@ -771,6 +771,26 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::prompt_injection::catalog::{
+        TOOL_CHOICE_ANY_PREFIX, TOOL_CHOICE_NONE_PREFIX, TOOL_CHOICE_PARALLEL_DISABLED_PREFIX,
+        TOOL_CHOICE_TOOL_PREFIX,
+    };
+
+    /// Whether `content` carries any of the proxy's tool_choice prefixes.
+    fn contains_tool_choice_prefix(content: &str) -> bool {
+        let tool_prefix_head = TOOL_CHOICE_TOOL_PREFIX
+            .split("{name}")
+            .next()
+            .unwrap_or_default();
+        [
+            TOOL_CHOICE_ANY_PREFIX,
+            TOOL_CHOICE_NONE_PREFIX,
+            TOOL_CHOICE_PARALLEL_DISABLED_PREFIX,
+            tool_prefix_head,
+        ]
+        .iter()
+        .any(|prefix| content.contains(prefix))
+    }
 
     const VALID_PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
     const VALID_GIF_BASE64: &str = "R0lGODlhCgAKAIMAAExpccrKyt3d3djY2MzMzNXV1dbW1tfX19TU1MjIyMXFxcnJydra2gAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQFAAAAACwAAAAACgAKAAAEFlDISau9uI60zggEIjFKUBigmK3sGgEAOw==";
@@ -1812,7 +1832,7 @@ mod tests {
                 .all(|message| !matches!(
                     message,
                     Message::User(user)
-                        if user.user_input_message.content.contains("<tool_choice>")
+                        if contains_tool_choice_prefix(&user.user_input_message.content)
                 ))
         );
     }
@@ -1939,7 +1959,7 @@ mod tests {
             !matches!(
                 message,
                 Message::User(user)
-                    if user.user_input_message.content.contains("<tool_choice>")
+                    if contains_tool_choice_prefix(&user.user_input_message.content)
                         || user.user_input_message.content.contains("<thinking_mode>")
                         || user.user_input_message.content.contains(SYSTEM_CHUNKED_POLICY)
             )
@@ -2094,10 +2114,7 @@ mod tests {
         );
         assert!(
             body.contains(&format!(r#""toolChoiceName":"{}""#, mapped_name))
-                || body.contains(&format!(
-                    "<tool_choice_name>{}</tool_choice_name>",
-                    mapped_name
-                )),
+                || body.contains(&format!("the tool `{mapped_name}`")),
             "Kiro-facing tool choice steering should use the mapped Kiro name"
         );
     }
@@ -4815,7 +4832,7 @@ mod tests {
             for tag in [
                 "<language_reminder>",
                 "<identity_reminder>",
-                "<tool_choice_reminder>",
+                "Respond by calling",
             ] {
                 assert!(!content.contains(tag), "{tool_choice}: {tag} in {content}");
             }
@@ -4846,7 +4863,7 @@ mod tests {
         for tag in [
             "<language_reminder>",
             "<identity_reminder>",
-            "<tool_choice_reminder>",
+            "Respond by calling",
         ] {
             assert!(content.contains(tag), "{tag} missing in {content}");
         }
@@ -4861,7 +4878,7 @@ mod tests {
         )
         .unwrap();
         let content = current_message_content(&result);
-        let tool_choice = content.find("<tool_choice_reminder>").unwrap();
+        let tool_choice = content.find("Respond by calling").unwrap();
         let language = content.find("<language_reminder>").unwrap();
 
         assert!(tool_choice < language);
@@ -4919,7 +4936,7 @@ mod tests {
                 .any(|message| matches!(
                     message,
                     Message::User(user)
-                        if user.user_input_message.content.contains("<tool_choice>none</tool_choice>")
+                        if user.user_input_message.content.contains(TOOL_CHOICE_NONE_PREFIX)
                 )),
             "compat mode should steer Kiro away from tool calls when tool_choice is none"
         );
@@ -4973,7 +4990,7 @@ mod tests {
             matches!(
                 message,
                 Message::User(user)
-                    if user.user_input_message.content.contains("<tool_choice>none</tool_choice>")
+                    if user.user_input_message.content.contains(TOOL_CHOICE_NONE_PREFIX)
             )
         })
     }
@@ -5086,7 +5103,7 @@ mod tests {
                             if user
                                 .user_input_message
                                 .content
-                                .contains("<tool_choice_parallel>disabled</tool_choice_parallel>")
+                                .contains(TOOL_CHOICE_PARALLEL_DISABLED_PREFIX)
                     )),
                 "{tool_choice}"
             );
@@ -5134,9 +5151,7 @@ mod tests {
 
             assert!(current.starts_with("use the appropriate tool"), "{current}");
             assert!(
-                current.ends_with(&format!(
-                    "<tool_choice_reminder>Respond by calling {reminder}.</tool_choice_reminder>"
-                )),
+                current.ends_with(&format!("Respond by calling {reminder}.")),
                 "{tool_choice}: {current}"
             );
             assert_eq!(
@@ -5147,7 +5162,7 @@ mod tests {
             assert!(
                 result.conversation_state.history.iter().any(|message| matches!(
                     message,
-                    Message::User(user) if user.user_input_message.content.contains("You MUST call")
+                    Message::User(user) if contains_tool_choice_prefix(&user.user_input_message.content)
                 )),
                 "{tool_choice}"
             );
@@ -5165,7 +5180,7 @@ mod tests {
                     .current_message
                     .user_input_message
                     .content
-                    .contains("<tool_choice_reminder>"),
+                    .contains("Respond by calling"),
                 "{tool_choice}"
             );
             assert_eq!(
@@ -5224,8 +5239,7 @@ mod tests {
                     message,
                     Message::User(user)
                         if user.user_input_message.content.contains(&format!(
-                            "<tool_choice_name>{}</tool_choice_name>",
-                            kiro_tool_name
+                            "the tool `{kiro_tool_name}`"
                         ))
                 )),
             "compat mode should add a Kiro-facing forced-tool steering prefix"
@@ -5346,7 +5360,7 @@ mod tests {
                 !matches!(
                     message,
                     Message::User(user)
-                        if user.user_input_message.content.contains("<tool_choice>")
+                        if contains_tool_choice_prefix(&user.user_input_message.content)
                 )
             }));
         }
@@ -5381,7 +5395,7 @@ mod tests {
             !matches!(
                 message,
                 Message::User(user)
-                    if user.user_input_message.content.contains("<tool_choice>")
+                    if contains_tool_choice_prefix(&user.user_input_message.content)
             )
         }));
     }
