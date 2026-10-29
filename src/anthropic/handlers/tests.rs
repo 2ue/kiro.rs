@@ -11677,6 +11677,48 @@ async fn official_kiro_bad_request_message_is_exposed_when_safe() {
     assert!(!message.contains("凭据"));
 }
 
+/// `IMAGE_COUNT_EXCEEDED` used to reach the client as the generic "request is invalid" 400, so
+/// Claude Code kept resending the same history (one session failed 132 times in production).
+#[tokio::test]
+async fn image_count_exceeded_maps_to_a_clear_non_retryable_400() {
+    for raw in [
+        r#"非流式 API 请求失败（账号 #12 hidden）: 400 Bad Request upstream_failure class=invalid_request upstream_status=400 public_status=400 body_bytes=99 retry_after_secs=unknown content_type=json reason=image_count_exceeded_bad_request"#,
+        r#"流式 API 请求失败: 400 Bad Request {"message":"too many inline media segments: 123 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}"#,
+    ] {
+        let response = map_provider_error(
+            anyhow::anyhow!("{raw}"),
+            Some("req_test_image_count"),
+            Some("req_01image_count"),
+            None,
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{raw}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            Some("false"),
+            "{raw}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            value.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("invalid_request_error")
+        );
+        let message = value
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .expect("error message");
+        assert!(message.contains("more than 100 images"), "{message}");
+        assert!(!message.contains("账号"), "{message}");
+        assert!(!message.contains("hidden"), "{message}");
+    }
+}
+
 #[tokio::test]
 async fn official_kiro_high_load_message_is_exposed_when_safe() {
     let response = map_provider_error(

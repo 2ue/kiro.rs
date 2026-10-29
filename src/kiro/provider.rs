@@ -2576,8 +2576,37 @@ mod tests {
             }),
             _ => serde_json::json!({"message": "Bad request"}),
         };
+        let response = match scenario.as_str() {
+            "tool_mismatch_500" => serde_json::json!({
+                "message": "Tool use and tool result do not match",
+                "reason": "TOOL_USE_RESULT_MISMATCH"
+            }),
+            "tool_schema_invalid_nested_500" => serde_json::json!({
+                "error": {
+                    "message": "tools.3.custom.input_schema is invalid",
+                    "reason": "TOOL_SCHEMA_INVALID"
+                }
+            }),
+            "expected_tool_result_text_500" => serde_json::json!({
+                "message": "Expected toolResult blocks at messages.3.content for the following Ids: tooluse_abc"
+            }),
+            // Mentions the reason only inside free text: must stay a retryable 5xx.
+            "tool_reason_in_free_text_500" => serde_json::json!({
+                "message": "internal error while checking TOOL_USE_RESULT_MISMATCH rules"
+            }),
+            "image_count_exceeded" => serde_json::json!({
+                "message": "too many inline media segments: 123 exceeds limit 100",
+                "reason": "IMAGE_COUNT_EXCEEDED"
+            }),
+            _ => response,
+        };
         let status = match scenario.as_str() {
-            "rescue_server_error" | "provider_status_500" => StatusCode::INTERNAL_SERVER_ERROR,
+            "rescue_server_error"
+            | "provider_status_500"
+            | "tool_mismatch_500"
+            | "tool_schema_invalid_nested_500"
+            | "expected_tool_result_text_500"
+            | "tool_reason_in_free_text_500" => StatusCode::INTERNAL_SERVER_ERROR,
             "provider_status_503" => StatusCode::SERVICE_UNAVAILABLE,
             "invalid_model_404" | "model_unavailable_404" => StatusCode::NOT_FOUND,
             "provider_status_401" => StatusCode::UNAUTHORIZED,
@@ -6096,6 +6125,119 @@ mod tests {
             server.state.total_hits.load(Ordering::Relaxed),
             expected_total_hits,
             "the full retry matrix should issue exactly the sum of each case's expected inference requests"
+        );
+    }
+
+    /// A 5xx whose body is a request-shape validation failure fails like the matching 400: one
+    /// send, no account cooldown, a 400-class diagnostic. A 5xx that only mentions the reason in
+    /// free text stays a retryable server error that switches accounts.
+    #[tokio::test]
+    async fn server_error_with_client_validation_body_fails_fast_for_five_rounds() {
+        let server = FakeBadRequestServer::start().await;
+        for is_stream in [false, true] {
+            for scenario in [
+                "tool_mismatch_500",
+                "tool_schema_invalid_nested_500",
+                "expected_tool_result_text_500",
+            ] {
+                for round in 1..=5 {
+                    let outcome =
+                        call_fake_provider_failure(&server, scenario, 20, round, is_stream, 0)
+                            .await;
+                    let label = format!("{scenario} stream={is_stream} round={round}");
+                    assert_eq!(outcome.consumed_sends, 1, "{label}: no retry");
+                    assert_eq!(outcome.attempts.len(), 1, "{label}");
+                    assert_eq!(
+                        outcome.attempts[0].error_type.as_deref(),
+                        Some("tool_use_format_bad_request"),
+                        "{label}"
+                    );
+                    assert_eq!(outcome.attempts[0].action, "fail", "{label}");
+                    assert!(
+                        outcome.error_text.contains("class=invalid_request"),
+                        "{label}: {}",
+                        outcome.error_text
+                    );
+                    assert!(
+                        outcome.error_text.contains("public_status=400"),
+                        "{label}: {}",
+                        outcome.error_text
+                    );
+                    assert!(
+                        outcome.cooled_down.iter().all(|cooled| !*cooled),
+                        "{label}: a malformed request must not cool the account"
+                    );
+                }
+            }
+            for round in 1..=5 {
+                let outcome = call_fake_provider_failure(
+                    &server,
+                    "tool_reason_in_free_text_500",
+                    20,
+                    round,
+                    is_stream,
+                    0,
+                )
+                .await;
+                let label = format!("free-text stream={is_stream} round={round}");
+                assert_eq!(outcome.consumed_sends, 4, "{label}: still a retryable 5xx");
+                assert!(
+                    outcome.error_text.contains("class=server_error"),
+                    "{label}: {}",
+                    outcome.error_text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn server_error_client_validation_detection_needs_an_exact_reason() {
+        for body in [
+            r#"{"message":"x","reason":"TOOL_USE_RESULT_MISMATCH"}"#,
+            r#"{"error":{"reason":"TOOL_SCHEMA_INVALID"}}"#,
+            "Expected toolResult blocks at messages.3.content",
+        ] {
+            assert!(
+                KiroProvider::is_server_error_client_validation(body),
+                "{body}"
+            );
+        }
+        for body in [
+            r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+            r#"{"message":"checking TOOL_USE_RESULT_MISMATCH","reason":"INTERNAL"}"#,
+            r#"{"__type":"ValidationException","message":"tool"}"#,
+            "upstream timed out",
+        ] {
+            assert!(
+                !KiroProvider::is_server_error_client_validation(body),
+                "{body}"
+            );
+        }
+    }
+
+    /// Production 2026-10-28: `IMAGE_COUNT_EXCEEDED` was classified as a generic `bad_request`.
+    /// It is now its own reason and still fails fast (the request itself is the problem).
+    #[tokio::test]
+    async fn image_count_exceeded_400_is_classified_and_not_retried() {
+        let server = FakeBadRequestServer::start().await;
+        for round in 0..3 {
+            let (hits, attempts) =
+                call_fake_bad_request_provider(&server, "image_count_exceeded", 20, round, true)
+                    .await;
+            assert_eq!(hits, 1, "round {round}");
+            assert_eq!(
+                attempts
+                    .last()
+                    .and_then(|attempt| attempt.error_type.as_deref()),
+                Some("image_count_exceeded_bad_request"),
+                "round {round}"
+            );
+        }
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"too many inline media segments: 123 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}"#
+            ),
+            "image_count_exceeded_bad_request"
         );
     }
 
@@ -13525,6 +13667,43 @@ impl KiroProvider {
                     ));
                 }
 
+                // 与主循环相同：5xx 但实为请求体协议校验失败，换号也一样，直接按 400 失败。
+                if retry_status.is_server_error()
+                    && Self::is_server_error_client_validation(&retry_upstream_body.text)
+                {
+                    let message = Self::api_failure_diagnostic(
+                        ApiUpstreamFailureKind::InvalidRequest,
+                        retry_status,
+                        Some(retry_upstream_body.bytes),
+                        retry_after,
+                        Some(retry_content_kind),
+                        Some(Self::bad_request_diagnostic_reason(
+                            "tool_use_format_bad_request",
+                        )),
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt.saturating_add(1),
+                        ctx.id,
+                        &credential_label,
+                        Some(retry_status),
+                        "fail",
+                        Some("tool_use_format_bad_request"),
+                        Some(message.clone()),
+                        retry_started_at,
+                        model.as_deref(),
+                    );
+                    Self::attach_raw_upstream_error(
+                        &mut attempts,
+                        retry_status,
+                        retry_content_kind,
+                        &retry_upstream_body.text,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(message, &attempts));
+                }
+
                 if matches!(retry_status.as_u16(), 408 | 429) || retry_status.is_server_error() {
                     let failure_kind = match retry_status.as_u16() {
                         408 => ApiUpstreamFailureKind::Timeout,
@@ -14163,6 +14342,45 @@ impl KiroProvider {
                 continue;
             }
 
+            // 5xx 但报文是消息数组本身的协议校验失败（工具调用与结果配对不上、工具定义不合法）：
+            // 根因在请求体，换号重发结果相同，只会把一个坏请求放大成多次上游调用。按 400 工具格式
+            // 错误处理：不重试、不换号、不冷却账号，对外返回 400。
+            if status.is_server_error() && Self::is_server_error_client_validation(&body) {
+                let message = Self::api_failure_diagnostic(
+                    ApiUpstreamFailureKind::InvalidRequest,
+                    status,
+                    Some(body_bytes),
+                    retry_after,
+                    Some(content_kind),
+                    Some(Self::bad_request_diagnostic_reason(
+                        "tool_use_format_bad_request",
+                    )),
+                );
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    upstream_status = status.as_u16(),
+                    body_bytes,
+                    "Kiro API 以 5xx 返回请求格式错误，不重试"
+                );
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "fail",
+                    Some("tool_use_format_bad_request"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                    model.as_deref(),
+                );
+                Self::attach_raw_upstream_error(&mut attempts, status, content_kind, &body);
+                Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                self.finish_attempt(&mut ctx);
+                return Err(Self::traced_error(message, &attempts));
+            }
+
             // 429/408/5xx - 瞬态上游错误：不禁用凭据；若本机内存态存在备选，
             // 仅在当前请求内临时排除失败账号，避免重试链反复命中同一账号。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
@@ -14750,6 +14968,9 @@ impl KiroProvider {
         if Self::bad_request_body_indicates_image_too_large(&lower) {
             return "image_too_large_bad_request";
         }
+        if Self::bad_request_body_indicates_image_count_exceeded(&lower) {
+            return "image_count_exceeded_bad_request";
+        }
         // Image failures can mention tool-result images, so classify them before tool protocol
         // failures. Neither image failures nor a generic REQUEST_BODY_INVALID is account-specific.
         if Self::bad_request_body_indicates_invalid_image(&lower) {
@@ -14855,6 +15076,31 @@ impl KiroProvider {
     /// `messages.6.content.1.image.source.base64: image exceeds 5 MB maximum: ...`.
     fn bad_request_body_indicates_image_too_large(lower_body: &str) -> bool {
         lower_body.contains("image_size_exceeded") || lower_body.contains("image exceeds")
+    }
+
+    /// 上游以 5xx 返回、但实为请求体协议校验失败的报文。只认精确特征：JSON 顶层 `reason` 或
+    /// `error.reason` 为 `TOOL_USE_RESULT_MISMATCH` / `TOOL_SCHEMA_INVALID`，或纯文本里出现
+    /// `Expected toolResult blocks`。不按 `ValidationException` 之类的宽泛类型匹配，以免把真正
+    /// 可重试的上游故障误判为不可重试。
+    fn is_server_error_client_validation(body: &str) -> bool {
+        const REASONS: &[&str] = &["TOOL_USE_RESULT_MISMATCH", "TOOL_SCHEMA_INVALID"];
+        let structured_reason = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .is_some_and(|value| {
+                ["/reason", "/error/reason"].into_iter().any(|pointer| {
+                    value
+                        .pointer(pointer)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|reason| REASONS.contains(&reason))
+                })
+            });
+        structured_reason || body.contains("Expected toolResult blocks")
+    }
+
+    /// `{"message":"too many inline media segments: 123 exceeds limit 100","reason":"IMAGE_COUNT_EXCEEDED"}`
+    fn bad_request_body_indicates_image_count_exceeded(lower_body: &str) -> bool {
+        lower_body.contains("image_count_exceeded")
+            || lower_body.contains("too many inline media segments")
     }
 
     fn bad_request_body_indicates_invalid_image(lower_body: &str) -> bool {
@@ -14970,6 +15216,7 @@ impl KiroProvider {
             | "tool_use_format_bad_request"
             | "image_invalid_bad_request"
             | "image_too_large_bad_request"
+            | "image_count_exceeded_bad_request"
             | "request_body_invalid_bad_request"
             | "content_length_exceeds_threshold"
             | "context_window_full_bad_request"

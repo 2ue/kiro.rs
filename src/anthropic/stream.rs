@@ -3940,6 +3940,18 @@ impl StreamContext {
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_else(|| tool_use.input.clone());
             self.tool_input_names.remove(&tool_use.tool_use_id);
+            // 只观测、不改行为：参数已经逐段下发给客户端，这里拿不回来。先统计正常结束的工具调用里
+            // 参数不是合法 JSON 的频率，再决定要不要改成缓冲到结束、校验后再下发。
+            if !full_input.trim().is_empty()
+                && serde_json::from_str::<serde::de::IgnoredAny>(&full_input).is_err()
+            {
+                tracing::warn!(
+                    tool_name = %original_name,
+                    input_bytes = full_input.len(),
+                    deferred = defer_input_until_stop,
+                    "上游工具调用已结束但参数不是合法 JSON，已原样转发"
+                );
+            }
             let output_input = if has_schema_key_map {
                 self.tool_schema_key_map
                     .reverse_tool_input_json(&upstream_name, &full_input)
@@ -7602,6 +7614,71 @@ mod tests {
             input: input.to_string(),
             stop,
         })
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedStreamLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedStreamLogs {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedStreamLogs {
+        type Writer = CapturedStreamLogs;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A completed tool call whose arguments are not valid JSON is still forwarded unchanged (the
+    /// fragments already reached the client), but it is logged so the rate can be measured. The
+    /// log names the tool and size only, never the arguments.
+    #[test]
+    fn completed_tool_call_with_invalid_json_is_logged_without_its_arguments() {
+        let captured = CapturedStreamLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for (input, expect_warning) in [
+                (r#"{"command":"ls PRIVATE_ARG_MARKER"#, true),
+                (r#"{"command":"ls"}"#, false),
+                ("", false),
+            ] {
+                let before = captured.0.lock().unwrap().len();
+                let mut ctx =
+                    StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+                let mut events = ctx.generate_initial_events();
+                events.extend(ctx.process_kiro_event(&tool_event("toolu_json", input, true)));
+                let logs =
+                    String::from_utf8_lossy(&captured.0.lock().unwrap()[before..]).to_string();
+                assert_eq!(
+                    logs.contains("参数不是合法 JSON"),
+                    expect_warning,
+                    "input={input:?} logs={logs}"
+                );
+                assert!(!logs.contains("PRIVATE_ARG_MARKER"), "{logs}");
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event.event == "content_block_stop"),
+                    "input={input:?}: the tool block is still closed as before"
+                );
+            }
+        });
     }
 
     #[test]

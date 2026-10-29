@@ -6764,6 +6764,22 @@ fn map_provider_error(
         );
     }
 
+    if is_upstream_image_count_exceeded_error(&err_str) {
+        log_provider_warning_with_hint(
+            &err_str,
+            "请求被拒绝：图片数量超过上游单请求 100 张上限",
+            error_id,
+        );
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::PUBLIC_IMAGE_COUNT_EXCEEDED_MESSAGE,
+            request_id,
+            error_id,
+            [("x-should-retry", "false".to_string())],
+        );
+    }
+
     if is_upstream_image_too_large_error(&err_str) {
         log_provider_warning_with_hint(&err_str, "请求被拒绝：图片超过上游 5 MB 限制", error_id);
         return public_error_response(
@@ -6936,6 +6952,14 @@ fn is_upstream_context_window_full_error(value: &str) -> bool {
 
 /// Upstream `IMAGE_SIZE_EXCEEDED`. The provider error carries the classified reason; the raw
 /// upstream text (which names internal message indexes) is never forwarded to the client.
+/// Upstream `IMAGE_COUNT_EXCEEDED` (more than 100 inline images in one request). The local
+/// payload guard trims old history images below the limit, so this only remains when the current
+/// turn alone carries too many images; resending the same request can never succeed.
+fn is_upstream_image_count_exceeded_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("image_count_exceeded") || lower.contains("too many inline media segments")
+}
+
 fn is_upstream_image_too_large_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("image_too_large_bad_request")

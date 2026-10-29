@@ -30,6 +30,9 @@ const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
 const CURRENT_FIT_OVERHEAD_BYTES: usize = 512;
 const PAYLOAD_GUARD_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 const UPSTREAM_IMAGE_SOURCE_MAX_BYTES: usize = 5 * 1024 * 1024;
+/// 上游单个请求允许的内联图片总数（历史加当前轮）。超过时返回 400 `IMAGE_COUNT_EXCEEDED`
+/// （"too many inline media segments: N exceeds limit 100"）。
+pub(crate) const UPSTREAM_MAX_INLINE_IMAGES: usize = 100;
 pub const KIRO_DEFAULT_MAX_PAYLOAD_WEIGHT: usize = 1_300_000;
 pub const KIRO_NON_ASCII_PAYLOAD_WEIGHT: usize = 8;
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
@@ -565,6 +568,9 @@ pub fn guard_kiro_request(
         let safety_shaping = apply_payload_safety_shaping(request, config.shaping);
         let should_reserialize = safety_shaping.was_modified();
         add_shaping_stats_to_report(&mut report, safety_shaping);
+        let image_count_shaping = apply_history_image_count_limit(request);
+        let should_reserialize = should_reserialize || image_count_shaping.was_modified();
+        add_shaping_stats_to_report(&mut report, image_count_shaping);
         let current_safety_shaping = apply_current_payload_safety_shaping(request, config.shaping);
         let should_reserialize = should_reserialize || current_safety_shaping.was_modified();
         add_current_shaping_stats_to_report(&mut report, &current_safety_shaping);
@@ -2043,6 +2049,83 @@ fn apply_payload_safety_shaping(
     stats.dropped_historical_images += result.0;
     stats.dropped_historical_image_bytes += result.1;
     stats
+}
+
+/// 图片总数超过上游上限时移除最早的历史图片。与单图 5MB 的 `oversizedImageHandling` 无关：
+/// 超出数量的请求上游一定拒绝，原样发送没有意义，所以只要请求体整形开启就执行。
+fn apply_history_image_count_limit(request: &mut KiroRequest) -> ShapingStats {
+    let current_images = request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .images
+        .len();
+    let result = drop_oldest_history_images_over_count(
+        &mut request.conversation_state.history,
+        UPSTREAM_MAX_INLINE_IMAGES.saturating_sub(current_images),
+    );
+    ShapingStats {
+        dropped_historical_images: result.0,
+        dropped_historical_image_bytes: result.1,
+        ..ShapingStats::default()
+    }
+}
+
+/// 历史图片超过 `max_history_images` 时，从最早的历史消息开始移除图片，直到不超过上限。
+///
+/// 长会话里截图会一轮轮累积，超过上游 100 张的总数上限后每一轮都会被 400 拒绝，客户端用同样的
+/// 历史重发也一直失败。较早的截图对当前轮的帮助最小，所以先移除它们；当前轮的图片不动。
+fn drop_oldest_history_images_over_count(
+    history: &mut [Message],
+    max_history_images: usize,
+) -> (usize, usize) {
+    let total: usize = history
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => user.user_input_message.images.len(),
+            Message::Assistant(_) => 0,
+        })
+        .sum();
+    let mut excess = total.saturating_sub(max_history_images);
+    if excess == 0 {
+        return (0, 0);
+    }
+
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    for message in history.iter_mut() {
+        if excess == 0 {
+            break;
+        }
+        let Message::User(user) = message else {
+            continue;
+        };
+        let images = &mut user.user_input_message.images;
+        let remove = excess.min(images.len());
+        if remove == 0 {
+            continue;
+        }
+        for image in images.drain(..remove) {
+            dropped_bytes += kiro_image_source_bytes(&image);
+        }
+        dropped += remove;
+        excess -= remove;
+        let note = if remove == 1 {
+            "[Earlier image was omitted because the conversation exceeded the upstream limit of 100 images per request.]"
+        } else {
+            "[Earlier images were omitted because the conversation exceeded the upstream limit of 100 images per request.]"
+        };
+        append_text(&mut user.user_input_message.content, note);
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            history_images_before = total,
+            history_images_dropped = dropped,
+            max_history_images,
+            "历史图片超过上游单请求图片数量上限，已从最早的历史消息开始移除"
+        );
+    }
+    (dropped, dropped_bytes)
 }
 
 fn apply_anthropic_payload_safety_shaping(
@@ -9487,5 +9570,162 @@ mod tests {
                 .content
                 .contains("omitted")
         );
+    }
+
+    fn history_with_images(image_counts: &[usize]) -> Vec<Message> {
+        let mut history = Vec::new();
+        for (turn, &count) in image_counts.iter().enumerate() {
+            let mut user = HistoryUserMessage::new(format!("turn {turn}"), TEST_MODEL);
+            user.user_input_message.images = (0..count)
+                .map(|index| KiroImage::from_base64("png", format!("img-{turn}-{index}AAAA")))
+                .collect();
+            history.push(Message::User(user));
+            history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
+                "answer {turn}"
+            ))));
+        }
+        history
+    }
+
+    fn history_image_counts(request: &KiroRequest) -> Vec<usize> {
+        request
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user.user_input_message.images.len()),
+                Message::Assistant(_) => None,
+            })
+            .collect()
+    }
+
+    fn image_count_guard_config(shaping: PayloadShapingConfig) -> PayloadGuardConfig {
+        PayloadGuardConfig {
+            enabled: true,
+            max_bytes: usize::MAX,
+            max_kiro_weight: usize::MAX,
+            trim_history: false,
+            shaping,
+        }
+    }
+
+    /// Production 2026-10-28: 486 requests in 16 long sessions failed with
+    /// `IMAGE_COUNT_EXCEEDED` (101..210 inline images). The guard removes the oldest history
+    /// images until the request fits under the upstream limit, and keeps the current turn intact.
+    #[test]
+    fn history_images_over_the_upstream_count_limit_are_dropped_oldest_first() {
+        for (counts, current, expected) in [
+            // 3 * 40 = 120 history images, no current images: drop 20 from the oldest turn.
+            (vec![40, 40, 40], 0, vec![20, 40, 40]),
+            // 95 history + 10 current = 105: drop 5, spanning two turns.
+            (vec![3, 2, 90], 10, vec![0, 0, 90]),
+            // Exactly at the limit: nothing changes.
+            (vec![50, 50], 0, vec![50, 50]),
+            (vec![60, 30], 10, vec![60, 30]),
+        ] {
+            let mut request = request_with_history(history_with_images(&counts));
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images = (0..current)
+                .map(|index| KiroImage::from_base64("png", format!("current-{index}AAAA")))
+                .collect();
+            let before_total: usize = counts.iter().sum::<usize>() + current;
+
+            let (body, report) = guard_kiro_request(
+                &mut request,
+                image_count_guard_config(PayloadShapingConfig::default()),
+            )
+            .expect("guard");
+
+            let label = format!("counts={counts:?} current={current}");
+            assert_eq!(history_image_counts(&request), expected, "{label}");
+            assert_eq!(
+                request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .images
+                    .len(),
+                current,
+                "{label}: current images are never dropped"
+            );
+            let dropped = before_total.saturating_sub(UPSTREAM_MAX_INLINE_IMAGES);
+            assert_eq!(report.dropped_historical_images, dropped, "{label}");
+            if dropped > 0 {
+                assert!(report.dropped_historical_image_bytes > 0, "{label}");
+                assert!(
+                    body.contains("exceeded the upstream limit of 100 images per request"),
+                    "{label}"
+                );
+                assert_eq!(
+                    body.matches("\"format\":\"png\"").count(),
+                    UPSTREAM_MAX_INLINE_IMAGES,
+                    "{label}"
+                );
+            } else {
+                assert!(!body.contains("upstream limit of 100 images"), "{label}");
+            }
+        }
+    }
+
+    /// The note only goes on the turns that actually lost images, and the newest images stay.
+    #[test]
+    fn image_count_limit_marks_only_trimmed_turns_and_keeps_newest_images() {
+        let mut request = request_with_history(history_with_images(&[60, 60]));
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            image_count_guard_config(PayloadShapingConfig::default()),
+        )
+        .expect("guard");
+        assert_eq!(report.dropped_historical_images, 20);
+        let users: Vec<_> = request
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(&user.user_input_message),
+                Message::Assistant(_) => None,
+            })
+            .collect();
+        assert_eq!(users[0].images.len(), 40);
+        assert!(users[0].content.contains("Earlier images were omitted"));
+        assert_eq!(
+            users[0].images[0].source.bytes.as_deref(),
+            Some("img-0-20AAAA"),
+            "the oldest images of a turn go first"
+        );
+        assert_eq!(users[1].images.len(), 60);
+        assert!(!users[1].content.contains("omitted"));
+    }
+
+    /// The count limit does not depend on the 5 MB per-image option (production runs `reject`),
+    /// and it is off together with payload shaping.
+    #[test]
+    fn image_count_limit_follows_payload_shaping_not_oversized_image_handling() {
+        let mut request = request_with_history(history_with_images(&[70, 70]));
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            image_count_guard_config(PayloadShapingConfig {
+                oversized_image_handling: OversizedImageHandling::Reject,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+        assert_eq!(report.dropped_historical_images, 40);
+        assert_eq!(history_image_counts(&request), vec![30, 70]);
+
+        let mut request = request_with_history(history_with_images(&[70, 70]));
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            image_count_guard_config(PayloadShapingConfig {
+                enabled: false,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+        assert_eq!(report.dropped_historical_images, 0);
+        assert_eq!(history_image_counts(&request), vec![70, 70]);
     }
 }
