@@ -13,7 +13,7 @@ use crate::model::prompt_injection::TextKey;
 use crate::model::prompt_injection::catalog::THINKING_OUTPUT_POLICY;
 
 use super::content::{
-    UserImageMode, normalize_tool_use_input, process_message_content_with_mode,
+    SeenHistoryImages, UserImageMode, normalize_tool_use_input, process_message_content_with_dedup,
     render_server_tool_block, sanitize_tool_use_id,
 };
 use super::thinking::{generate_thinking_prefix_for_model, has_thinking_tags};
@@ -45,6 +45,12 @@ pub(super) fn build_history(
     options: ConverterOptions,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
+    // 打开历史图片去重时，整段历史共用一个集合：同一张图片只发第一次。
+    let mut seen_images = options
+        .conversion
+        .history_image_dedup
+        .is_enabled()
+        .then(SeenHistoryImages::new);
     let mut known_tool_names = req
         .tools
         .iter()
@@ -185,7 +191,8 @@ pub(super) fn build_history(
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user =
+                    merge_user_messages_with_dedup(&user_buffer, model_id, seen_images.as_mut())?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             } else if assistant_buffer.is_empty()
@@ -218,7 +225,8 @@ pub(super) fn build_history(
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user =
+            merge_user_messages_with_dedup(&user_buffer, model_id, seen_images.as_mut())?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -229,18 +237,22 @@ pub(super) fn build_history(
     Ok(history)
 }
 
-/// 合并多个 user 消息
-pub(super) fn merge_user_messages(
+/// 合并多个 user 消息；`seen_images` 为 `Some` 时对历史图片去重。
+fn merge_user_messages_with_dedup(
     messages: &[&AnthropicMessage],
     model_id: &str,
+    mut seen_images: Option<&mut SeenHistoryImages>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) =
-            process_message_content_with_mode(&msg.content, UserImageMode::History)?;
+        let (text, images, tool_results) = process_message_content_with_dedup(
+            &msg.content,
+            UserImageMode::History,
+            seen_images.as_deref_mut(),
+        )?;
         if !text.is_empty() {
             content_parts.push(text);
         }

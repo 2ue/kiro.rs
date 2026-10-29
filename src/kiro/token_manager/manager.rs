@@ -606,6 +606,8 @@ impl RefreshAttemptIdentity {
         effective_proxy: Option<&ProxyConfig>,
     ) -> Self {
         let base = Self::from_credentials(credentials);
+        // 与刷新请求头里实际发出的版本一致（自动同步打开后会变）。
+        let kiro_version = config.effective_kiro_version();
         let mut hasher = Sha256::new();
         hasher.update(base.0);
         hasher.update([match config.tls_backend {
@@ -614,7 +616,7 @@ impl RefreshAttemptIdentity {
         }]);
         for value in [
             Some(credentials.effective_auth_region(config)),
-            Some(config.kiro_version.as_str()),
+            Some(kiro_version.as_str()),
             config.machine_id.as_deref(),
             Some(config.system_version.as_str()),
             Some(config.node_version.as_str()),
@@ -1065,6 +1067,12 @@ const STICKY_BOUND_RELEASE_PROPAGATION_GRACE: StdDuration = StdDuration::from_mi
 /// the Fast tier immediately.
 const FAST_STICKY_MIGRATION_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+
+#[derive(Debug, Clone, Copy)]
+struct AutoHealLimits {
+    min_interval: StdDuration,
+    max_consecutive_rounds: u32,
+}
 const CREDENTIAL_RUNTIME_MUTATION_CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 const CREDENTIAL_RUNTIME_MUTATION_RETENTION: StdDuration =
     StdDuration::from_secs(30 * 24 * 60 * 60);
@@ -2299,6 +2307,8 @@ impl MultiTokenManager {
                     health: SchedulerHealthState::default(),
                     model_health: HashMap::new(),
                     selection_events: VecDeque::new(),
+                    last_auto_heal_at: None,
+                    auto_heal_consecutive_rounds: 0,
                 }
             })
             .collect();
@@ -2504,6 +2514,13 @@ impl MultiTokenManager {
     /// 空回是否让账号冷却（全局开关，默认关闭）。
     pub fn empty_turn_cooldown_enabled(&self) -> bool {
         self.config.lock().credential_empty_turn_cooldown_enabled
+    }
+
+    /// 上游故障（5xx、异常/错误事件、解码/读取/发送失败）是否冷却账号，默认否。
+    pub fn upstream_failure_cooldown_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .credential_upstream_failure_cooldown_enabled
     }
 
     fn runtime_capacity_change_should_reset_warmup(previous: &Config, current: &Config) -> bool {
@@ -3631,39 +3648,70 @@ impl MultiTokenManager {
         self.finish_auto_heal(healed_ids)
     }
 
+    fn auto_heal_limits(&self) -> AutoHealLimits {
+        let config = self.config.lock();
+        AutoHealLimits {
+            min_interval: StdDuration::from_secs(config.credential_auto_heal_min_interval_secs),
+            max_consecutive_rounds: config.credential_auto_heal_max_consecutive_rounds,
+        }
+    }
+
+    /// 能否对这个账号自愈：必须是连续失败禁用，距上次自愈够久，且连续轮数没到上限。
+    fn is_auto_heal_candidate(
+        entry: &CredentialEntry,
+        limits: AutoHealLimits,
+        now: Instant,
+    ) -> bool {
+        entry.disabled
+            && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+            && !entry.runtime_persistence_degraded
+            && (limits.max_consecutive_rounds == 0
+                || entry.auto_heal_consecutive_rounds < limits.max_consecutive_rounds)
+            && (limits.min_interval.is_zero()
+                || entry
+                    .last_auto_heal_at
+                    .is_none_or(|last| now.saturating_duration_since(last) >= limits.min_interval))
+    }
+
     fn has_auto_heal_candidates(&self) -> bool {
-        self.entries.lock().iter().any(|entry| {
-            entry.disabled
-                && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                && !entry.runtime_persistence_degraded
-        })
+        let limits = self.auto_heal_limits();
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .any(|entry| Self::is_auto_heal_candidate(entry, limits, now))
     }
 
     fn auto_heal_candidate_ids(&self) -> Option<Vec<u64>> {
+        let limits = self.auto_heal_limits();
+        let now = Instant::now();
         let entries = self.entries.lock();
-        if !entries.iter().any(|entry| {
+        let candidates: Vec<u64> = entries
+            .iter()
+            .filter(|entry| Self::is_auto_heal_candidate(entry, limits, now))
+            .map(|entry| entry.id)
+            .collect();
+        for entry in entries.iter().filter(|entry| {
             entry.disabled
                 && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                && !entry.runtime_persistence_degraded
+                && limits.max_consecutive_rounds > 0
+                && entry.auto_heal_consecutive_rounds >= limits.max_consecutive_rounds
         }) {
+            tracing::error!(
+                credential_id = entry.id,
+                rounds = entry.auto_heal_consecutive_rounds,
+                "账号已连续自愈多轮仍然失败，不再自动恢复，请人工检查"
+            );
+        }
+        if candidates.is_empty() {
             return None;
         }
 
         tracing::warn!(
+            candidates = candidates.len(),
             "所有可调度凭据均不可用且存在连续失败自动禁用凭据，执行自愈：重置失败计数并重新启用"
         );
-
-        Some(
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry.disabled
-                        && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        && !entry.runtime_persistence_degraded
-                })
-                .map(|entry| entry.id)
-                .collect(),
-        )
+        Some(candidates)
     }
 
     /// 把自愈结果写回本地 entry，返回该凭据是否已恢复为可用。
@@ -3690,6 +3738,11 @@ impl MultiTokenManager {
             entry.credentials.disabled = false;
             entry.disabled = false;
             entry.disabled_reason = None;
+        }
+        if !entry.disabled {
+            entry.last_auto_heal_at = Some(Instant::now());
+            entry.auto_heal_consecutive_rounds =
+                entry.auto_heal_consecutive_rounds.saturating_add(1);
         }
         !entry.disabled
     }
@@ -9231,6 +9284,8 @@ impl MultiTokenManager {
                 health: SchedulerHealthState::default(),
                 model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
+                last_auto_heal_at: None,
+                auto_heal_consecutive_rounds: 0,
             };
             if let Some(state) = runtime_states.get(&id) {
                 Self::apply_runtime_state_if_newer(&mut entry, state);
@@ -11131,6 +11186,7 @@ impl MultiTokenManager {
             || entry.disabled;
         entry.failure_count = 0;
         entry.refresh_failure_count = 0;
+        entry.auto_heal_consecutive_rounds = 0;
         let expected_generation = entry.runtime_generation;
         if entry.warmup_remaining > 0 {
             entry.warmup_remaining -= 1;
@@ -12821,6 +12877,10 @@ impl MultiTokenManager {
                     entry.refresh_failure_count = 0;
                 }
             }
+            if !disabled {
+                entry.auto_heal_consecutive_rounds = 0;
+                entry.last_auto_heal_at = None;
+            }
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
             entry.model_cooldowns.clear();
@@ -13204,6 +13264,8 @@ impl MultiTokenManager {
                 entry.disabled = false;
                 entry.disabled_reason = None;
             }
+            entry.auto_heal_consecutive_rounds = 0;
+            entry.last_auto_heal_at = None;
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
             entry.model_cooldowns.clear();
@@ -13684,6 +13746,8 @@ impl MultiTokenManager {
                 health: SchedulerHealthState::default(),
                 model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
+                last_auto_heal_at: None,
+                auto_heal_consecutive_rounds: 0,
             });
         }
 

@@ -1993,6 +1993,11 @@ export interface ImageProcessingConfig {
   safeMaterializeFileSources: boolean
   safeDownloadRemoteSources: boolean
   safeNormalizeBase64MediaTypes: boolean
+  /** 发往上游前压缩过大的图片（默认关闭）。 */
+  resizeEnabled: boolean
+  resizeMaxLongSide: number
+  resizeMaxBytes: number
+  resizeJpegQuality: number
 }
 
 export interface BodyConversionConfig {
@@ -2006,6 +2011,7 @@ export interface BodyConversionConfig {
   syntheticThinkingSignatures: boolean
   toolPairingRepair: boolean
   historyPlaceholderTools: boolean
+  historyImageDedup: boolean
   codeExecution: CodeExecutionConfig
 }
 
@@ -2519,6 +2525,15 @@ export interface RuntimeConfig {
   credentialStreamErrorCooldownSecs: number
   /** 空回（只有用量统计、零帧或空响应体）是否让账号冷却，默认关闭。 */
   credentialEmptyTurnCooldownEnabled: boolean
+  credentialUpstreamFailureCooldownEnabled: boolean
+  credentialAutoHealMinIntervalSecs: number
+  credentialAutoHealMaxConsecutiveRounds: number
+  /** 自动同步 Kiro 客户端版本号（默认关闭）。 */
+  kiroVersionAutoSyncEnabled: boolean
+  /** 最近一次自动同步读到的官方版本。 */
+  kiroVersionLatest?: string
+  /** IDE 端点的对话和联网搜索改走 runtime.{region}.kiro.dev（默认关闭）。 */
+  kiroRuntimeDomainEnabled: boolean
   credentialProtocolErrorCooldownSecs: number
   credentialAuthErrorCooldownSecs: number
   credentialCooldownBackoffMultiplier: number

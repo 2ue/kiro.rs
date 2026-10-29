@@ -1299,7 +1299,7 @@ impl RequestRuntimeConfig {
 }
 
 fn cache_route_for_request_stream(
-    mut cache_route: ResolvedCacheRoutePolicy,
+    cache_route: ResolvedCacheRoutePolicy,
     stream: bool,
 ) -> ResolvedCacheRoutePolicy {
     if stream
@@ -1311,6 +1311,35 @@ fn cache_route_for_request_stream(
         return cache_route;
     }
 
+    disable_cache_route(cache_route)
+}
+
+/// A request follows the route's cache strategy only when the Anthropic API itself could return
+/// cache usage for it (see `request_qualifies_for_prompt_cache`): the client marked a cache
+/// breakpoint and the prefix up to it reaches the model's minimum cacheable length. Any other
+/// request, streaming or not, keeps the upstream usage and neither reads nor writes the local
+/// cache state, so an unmarked request is never reported with cache writes. Non-streaming
+/// requests additionally honour `skipNonStreamUsageProjection` (force no cache). No-cache routes
+/// are unchanged.
+fn cache_route_for_local_request(
+    cache_route: ResolvedCacheRoutePolicy,
+    payload: &MessagesRequest,
+    top_level_cache_control: bool,
+    cache_model: &str,
+) -> ResolvedCacheRoutePolicy {
+    if cache_route.policy.cache_type != PromptCacheStrategyType::NoCache
+        && !super::prompt_cache::request_qualifies_for_prompt_cache(
+            payload,
+            top_level_cache_control,
+            cache_model,
+        )
+    {
+        return disable_cache_route(cache_route);
+    }
+    cache_route_for_request_stream(cache_route, payload.stream)
+}
+
+fn disable_cache_route(mut cache_route: ResolvedCacheRoutePolicy) -> ResolvedCacheRoutePolicy {
     cache_route.policy.cache_type = PromptCacheStrategyType::NoCache;
     cache_route.policy.simulation.enabled = false;
     cache_route.policy.creation_control.enabled = false;
@@ -1319,37 +1348,6 @@ fn cache_route_for_request_stream(
     cache_route.policy = cache_route.policy.normalized();
     cache_route.namespace = None;
     cache_route
-}
-
-/// Non-streaming requests follow the route's cache strategy only when the Anthropic API itself
-/// could return cache usage for them (see `request_qualifies_for_prompt_cache`). Any other
-/// non-streaming request is handled as if `skipNonStreamUsageProjection` were on: upstream usage
-/// passes through and the local cache state is neither read nor written. Streaming requests and
-/// no-cache routes are unchanged.
-fn cache_route_for_local_request(
-    mut cache_route: ResolvedCacheRoutePolicy,
-    payload: &MessagesRequest,
-    top_level_cache_control: bool,
-    cache_model: &str,
-) -> ResolvedCacheRoutePolicy {
-    if !payload.stream
-        && cache_route.policy.cache_type != PromptCacheStrategyType::NoCache
-        && !cache_route
-            .policy
-            .reported_usage
-            .skip_non_stream_usage_projection
-        && !super::prompt_cache::request_qualifies_for_prompt_cache(
-            payload,
-            top_level_cache_control,
-            cache_model,
-        )
-    {
-        cache_route
-            .policy
-            .reported_usage
-            .skip_non_stream_usage_projection = true;
-    }
-    cache_route_for_request_stream(cache_route, payload.stream)
 }
 
 fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
@@ -6386,6 +6384,16 @@ fn provider_public_error_for_message(
         );
     }
 
+    // 524 网关超时已在 provider 里直接失败（不重试、不冷却），对外是 504，客户端按超时重发。
+    if err_str.contains("reason=api_gateway_timeout") {
+        return usage_public_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            error_id,
+        );
+    }
+
     if is_upstream_invalid_model_error(err_str) {
         return usage_public_error(
             StatusCode::NOT_FOUND,
@@ -7629,6 +7637,16 @@ fn models_list_response(state: &AppState, query: &ModelsQuery) -> Response {
     Json(ModelsResponse::paginate(models, query)).into_response()
 }
 
+/// `max_tokens` filled in for clients whose protocol makes it optional (OpenAI Chat
+/// Completions). Uses the configured missing-`max_tokens` default whatever the policy, because
+/// rejecting would fail every request from such clients.
+pub(crate) fn missing_max_tokens_default_value(state: &AppState) -> i32 {
+    live_runtime_config(state)
+        .missing_max_tokens
+        .normalized()
+        .default_value
+}
+
 /// Live runtime config so admin changes apply without a restart.
 fn live_runtime_config(state: &AppState) -> RequestRuntimeConfig {
     match state.kiro_provider.as_ref() {
@@ -7676,7 +7694,10 @@ fn model_retrieve_response(state: &AppState, model_id: &str) -> Response {
     }
 }
 
-fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, Response> {
+pub(crate) fn resolve_defined_cache_route(
+    state: &AppState,
+    route: &str,
+) -> Result<String, Response> {
     let candidate = format!("/dfcache/{route}");
     let Some(prefix) = normalize_defined_cache_route(&candidate) else {
         return Err(envelope::error_response(
@@ -7702,7 +7723,7 @@ fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, 
     Ok(prefix)
 }
 
-fn record_pre_usage_rejection(
+pub(crate) fn record_pre_usage_rejection(
     attribution: Option<&RequestRejectionAttribution>,
     reason: RequestRejectionReason,
     endpoint: &str,
@@ -7914,7 +7935,9 @@ pub async fn post_messages_dfcache(
     .await
 }
 
-async fn post_messages_for_endpoint(
+/// Shared messages entry. Protocol adapters (`/v1/chat/completions`) call it with a body they
+/// already translated into the Anthropic Messages shape.
+pub(crate) async fn post_messages_for_endpoint(
     state: AppState,
     headers: HeaderMap,
     raw_body: Bytes,
@@ -8021,8 +8044,10 @@ async fn post_messages_inner(
     let local_injections =
         runtime_config.injections_for(&endpoint, crate::model::config::UpstreamKind::Local);
     // 当前轮超大图片对所有路由一致地返回 400（历史超大图片仍由 payload guard 占位处理）。
-    if let Some(response) =
-        reject_oversized_current_image(&payload, attribution.as_ref(), &endpoint)
+    // 打开图片压缩时先压缩再检查：多模态预处理之后还有同样的检查，压不下来的仍然 400。
+    if !runtime_config.image_processing.resize_enabled
+        && let Some(response) =
+            reject_oversized_current_image(&payload, attribution.as_ref(), &endpoint)
     {
         return response;
     }
@@ -10255,25 +10280,20 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// Reads a non-streaming EventStream body like `response_bytes_with_limit_and_body_timeout`,
-/// and additionally gives up when no content event arrives within `first_output_timeout_secs`
-/// (`0` disables it), so a silent upstream does not hold the connection and credential slot
-/// for the whole body timeout.
+/// Reads a non-streaming EventStream body up to `max_bytes`.
+///
+/// The body is bounded by silence, not by total time: the read fails when no new bytes arrive
+/// for `idle_timeout_secs` (the same limit streaming uses, `kiroUpstreamStreamIdleTimeoutSecs`),
+/// and every chunk resets that clock. A wall-clock cap would cut a long answer that is still
+/// being written and throw away every token already generated. In addition, it gives up when no
+/// content event arrives within `first_output_timeout_secs` (`0` disables it), so a silent
+/// upstream does not hold the connection and credential slot.
 async fn read_non_stream_body_with_first_output_deadline(
     response: reqwest::Response,
-    body_timeout_secs: u64,
+    idle_timeout_secs: u64,
     max_bytes: usize,
     first_output_timeout_secs: u64,
 ) -> Result<Bytes, NonStreamBodyError> {
-    if first_output_timeout_secs == 0 {
-        return crate::http_client::response_bytes_with_limit_and_body_timeout(
-            response,
-            body_timeout_secs,
-            max_bytes,
-        )
-        .await
-        .map_err(NonStreamBodyError::Http);
-    }
     if response
         .content_length()
         .is_some_and(|content_length| content_length > max_bytes as u64)
@@ -10282,34 +10302,34 @@ async fn read_non_stream_body_with_first_output_deadline(
             crate::http_client::HttpSendError::ResponseBodyTooLarge { max_bytes },
         ));
     }
+    let idle_timeout_secs = normalize_stream_idle_timeout_secs(idle_timeout_secs);
+    let idle_timeout = Duration::from_secs(idle_timeout_secs);
     let started = Instant::now();
-    let body_deadline =
-        (body_timeout_secs > 0).then(|| started + Duration::from_secs(body_timeout_secs));
-    let first_output_deadline = started + Duration::from_secs(first_output_timeout_secs);
+    let first_output_deadline = (first_output_timeout_secs > 0)
+        .then(|| started + Duration::from_secs(first_output_timeout_secs));
+    let mut idle_deadline = started + idle_timeout;
     let mut stream = response.bytes_stream();
     let mut body = bytes::BytesMut::with_capacity(max_bytes.min(16 * 1024));
     let mut saw_content = false;
     loop {
-        let deadline = match (saw_content, body_deadline) {
-            (false, Some(body)) => body.min(first_output_deadline),
-            (false, None) => first_output_deadline,
-            (true, Some(body)) => body,
-            (true, None) => started + Duration::from_secs(u32::MAX as u64),
-        };
+        let first_output_pending = first_output_deadline.filter(|_| !saw_content);
+        let deadline = first_output_pending
+            .map(|first| first.min(idle_deadline))
+            .unwrap_or(idle_deadline);
         let next = tokio::select! {
             chunk = stream.next() => chunk,
             _ = sleep_until(deadline) => {
-                return Err(if saw_content || body_deadline.is_some_and(|body| body <= first_output_deadline) {
-                    NonStreamBodyError::Http(crate::http_client::HttpSendError::ResponseBodyTimeout {
-                        timeout_secs: body_timeout_secs,
-                    })
-                } else {
-                    NonStreamBodyError::FirstOutputTimeout {
+                return Err(match first_output_pending {
+                    Some(first) if first <= idle_deadline => NonStreamBodyError::FirstOutputTimeout {
                         timeout_secs: first_output_timeout_secs,
-                    }
+                    },
+                    _ => NonStreamBodyError::Http(crate::http_client::HttpSendError::ResponseBodyTimeout {
+                        timeout_secs: idle_timeout_secs,
+                    }),
                 });
             }
         };
+        idle_deadline = Instant::now() + idle_timeout;
         let Some(chunk) = next else {
             return Ok(body.freeze());
         };
@@ -10927,6 +10947,24 @@ fn non_stream_events_are_usage_only(events: &[Event]) -> bool {
 /// output: the client has received nothing. Production 2026-10-21: four non-stream requests on
 /// Fast account #1948 got partial text followed by "Encountered an unexpected error" and were
 /// returned as 502 without trying another account.
+/// 解析非流式工具参数。末尾多余的右括号、逗号或同一份参数的重复会先去掉（与流式一致，结果与模型
+/// 本意相同）；真正截断或格式错误的参数返回原始解析错误。
+fn parse_non_stream_tool_input(buffer: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match super::stream::classify_tool_input_json(buffer) {
+        super::stream::ToolInputJson::Cleaned(cleaned) => {
+            tracing::info!(
+                input_bytes = buffer.len(),
+                cleaned_bytes = cleaned.len(),
+                "上游工具参数末尾有多余内容，已去掉后按合法参数处理"
+            );
+            serde_json::from_str(&cleaned)
+        }
+        super::stream::ToolInputJson::Valid | super::stream::ToolInputJson::Invalid => {
+            serde_json::from_str(buffer)
+        }
+    }
+}
+
 fn non_stream_status_error_event(events: &[Event]) -> Option<String> {
     events.iter().find_map(|event| match event {
         Event::Error {
@@ -11301,7 +11339,16 @@ async fn retry_stream_before_downstream_commit(
         // 空回：本请求内排除该账号换号；是否冷却由全局开关决定（默认不冷却）。
         attempt_budget.exclude_empty_turn_credential(state.completion.credential_id());
         state.completion.report_empty_turn(detail.clone());
+    } else if super::stream::is_tool_input_failure_detail(&detail) {
+        // 工具参数问题出在本轮输出，与账号无关：不冷却账号、不记会话失败；只在本请求内
+        // 排除该账号，换号重试时不再选回它。
+        attempt_budget.exclude_empty_turn_credential(state.completion.credential_id());
+        state.completion.report_content_failure();
     } else {
+        // 上游故障默认不冷却账号，所以要在本请求内排除它，换号时不再选回同一个账号。
+        if !plan.provider.upstream_failure_cooldown_enabled() {
+            attempt_budget.exclude_empty_turn_credential(state.completion.credential_id());
+        }
         state
             .completion
             .report_upstream_stream_failure(detail.clone());
@@ -12160,6 +12207,8 @@ fn create_sse_stream(
                                             state.attempt_number,
                                         );
                                     }
+                                } else if super::stream::is_tool_input_failure_detail(&detail) {
+                                    state.completion.report_content_failure();
                                 } else {
                                     state
                                         .completion
@@ -13270,7 +13319,7 @@ async fn handle_non_stream_request(
         let runtime = provider.runtime_config();
         let body_read = read_non_stream_body_with_first_output_deadline(
             response,
-            runtime.kiro_upstream_response_timeout_secs,
+            runtime.kiro_upstream_stream_idle_timeout_secs,
             LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
             runtime
                 .stream_first_output_timeout_secs
@@ -13469,8 +13518,12 @@ async fn handle_non_stream_request(
                 );
                 retry_attempt_prefix =
                     merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
-                completion.report_upstream_body_status_failure(detail.clone());
                 let attempt_budget = usage_context.latency.inference_attempt_budget.clone();
+                // 上游故障默认不冷却账号，所以要在本请求内排除它，换号时不再选回同一个账号。
+                if !provider.upstream_failure_cooldown_enabled() {
+                    attempt_budget.exclude_empty_turn_credential(completion.credential_id());
+                }
+                completion.report_upstream_body_status_failure(detail.clone());
                 let consumed_before = attempt_budget.snapshot().consumed;
                 let retry_dispatch = call_api_maybe_fail_fast(
                     &provider,
@@ -13744,7 +13797,7 @@ async fn handle_non_stream_request(
                     let input: serde_json::Value = if buffer.is_empty() {
                         serde_json::json!({})
                     } else {
-                        match serde_json::from_str(&buffer) {
+                        match parse_non_stream_tool_input(&buffer) {
                             Ok(input) => input,
                             Err(error) => {
                                 tracing::warn!(
@@ -13996,7 +14049,7 @@ async fn handle_non_stream_request(
             let input: serde_json::Value = if buffer.is_empty() {
                 serde_json::json!({})
             } else {
-                match serde_json::from_str(&buffer) {
+                match parse_non_stream_tool_input(&buffer) {
                     Ok(input) => input,
                     Err(error) => {
                         tracing::warn!(
@@ -14349,25 +14402,28 @@ fn model_version_uses_adaptive_thinking(model: &str, family: &str) -> bool {
     })
 }
 
+/// Opus/Sonnet/Haiku/Fable 4.6+ and the opus/sonnet/fable aliases take `thinking: adaptive`;
+/// older models need `enabled` with `budget_tokens`.
+fn base_model_uses_adaptive_thinking(model_base: &str) -> bool {
+    matches!(
+        model_base,
+        "opus" | "opusplan" | "best" | "default" | "sonnet" | "fable"
+    ) || ["opus", "sonnet", "haiku", "fable"]
+        .iter()
+        .any(|family| model_version_uses_adaptive_thinking(model_base, family))
+}
+
+pub(crate) fn model_uses_adaptive_thinking(model: &str) -> bool {
+    base_model_uses_adaptive_thinking(&strip_model_compat_suffixes(model).0)
+}
+
 fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
     let (model_base, requested_thinking) = strip_model_compat_suffixes(model);
     if !requested_thinking {
         return None;
     }
 
-    let is_opus_alias = matches!(
-        model_base.as_str(),
-        "opus" | "opusplan" | "best" | "default"
-    );
-    let is_sonnet_alias = model_base == "sonnet";
-    let is_fable_alias = model_base == "fable";
-    let adaptive = is_opus_alias
-        || is_sonnet_alias
-        || is_fable_alias
-        || model_version_uses_adaptive_thinking(&model_base, "opus")
-        || model_version_uses_adaptive_thinking(&model_base, "sonnet")
-        || model_version_uses_adaptive_thinking(&model_base, "haiku")
-        || model_version_uses_adaptive_thinking(&model_base, "fable");
+    let adaptive = base_model_uses_adaptive_thinking(&model_base);
     Some(ThinkingModelDefaults {
         thinking_type: if adaptive { "adaptive" } else { "enabled" },
         budget_tokens: if adaptive { 0 } else { 20000 },

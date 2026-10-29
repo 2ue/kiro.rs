@@ -1,6 +1,7 @@
 //! Anthropic content block conversion, including images, documents, and tool results.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::{Condvar, Mutex, Once, OnceLock};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -43,6 +44,29 @@ pub(super) fn process_message_content(
 pub(super) fn process_message_content_with_mode(
     content: &serde_json::Value,
     image_mode: UserImageMode,
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    process_message_content_with_dedup(content, image_mode, None)
+}
+
+/// 历史里已经发过的图片（按 base64 数据的哈希）。同一张图片第二次出现时换成文字说明，
+/// 只用于历史；当前这一轮的图片总是原样发送。
+pub(super) type SeenHistoryImages = HashSet<[u8; 32]>;
+
+pub(super) const HISTORY_DUPLICATE_IMAGE_PLACEHOLDER: &str =
+    "[image omitted: identical to an earlier image in this conversation]";
+
+/// 第一次见到这张图片时返回 true（并记下）；已经见过返回 false。
+fn first_sighting(seen: &mut Option<&mut SeenHistoryImages>, image: &KiroImage) -> bool {
+    let (Some(seen), Some(bytes)) = (seen.as_deref_mut(), image.source.bytes.as_deref()) else {
+        return true;
+    };
+    seen.insert(Sha256::digest(bytes.as_bytes()).into())
+}
+
+pub(super) fn process_message_content_with_dedup(
+    content: &serde_json::Value,
+    image_mode: UserImageMode,
+    mut seen_images: Option<&mut SeenHistoryImages>,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -93,15 +117,27 @@ pub(super) fn process_message_content_with_mode(
                                 text_parts.push(HISTORY_REMOTE_IMAGE_PLACEHOLDER.to_string());
                                 continue;
                             }
-                            images.push(convert_image_source(source)?);
+                            let image = convert_image_source(source)?;
+                            if first_sighting(&mut seen_images, &image) {
+                                images.push(image);
+                            } else {
+                                text_parts.push(HISTORY_DUPLICATE_IMAGE_PLACEHOLDER.to_string());
+                            }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) =
                                 block.tool_use_id.as_deref().and_then(sanitize_tool_use_id)
                             {
-                                let (result_images, omitted_images) =
+                                let (result_images, mut omitted_images) =
                                     extract_tool_result_images(&block.content);
-                                images.extend(result_images);
+                                for image in result_images {
+                                    if first_sighting(&mut seen_images, &image) {
+                                        images.push(image);
+                                    } else {
+                                        omitted_images
+                                            .push(HISTORY_DUPLICATE_IMAGE_PLACEHOLDER.to_string());
+                                    }
+                                }
                                 let mut result_text = extract_tool_result_content(&block.content);
                                 for note in omitted_images {
                                     if !result_text.is_empty() {

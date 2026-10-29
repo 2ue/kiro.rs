@@ -92,6 +92,10 @@ pub(super) struct CredentialEntry {
     pub(super) model_health: HashMap<String, SchedulerHealthState>,
     /// 本进程内的近期调度选中事件；无 Redis 时用于计算短窗口调度压力。
     pub(super) selection_events: VecDeque<Instant>,
+    /// 最近一次自愈的时间，用于自愈最小间隔。
+    pub(super) last_auto_heal_at: Option<Instant>,
+    /// 自愈后还没成功过就又被禁用的连续轮数；成功一次或管理员启用/重置后清零。
+    pub(super) auto_heal_consecutive_rounds: u32,
 }
 
 #[derive(Debug, Clone)]

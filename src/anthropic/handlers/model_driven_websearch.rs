@@ -792,7 +792,7 @@ async fn call_model(
     };
     let body = match read_non_stream_body_with_first_output_deadline(
         response,
-        runtime.kiro_upstream_response_timeout_secs,
+        runtime.kiro_upstream_stream_idle_timeout_secs,
         LOCAL_NON_STREAM_RESPONSE_MAX_BYTES,
         runtime
             .stream_first_output_timeout_secs

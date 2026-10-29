@@ -560,6 +560,7 @@ async fn async_main() {
     let token_manager = Arc::new(token_manager);
     let background_token_refresh_worker = token_manager.spawn_background_token_refresh_worker();
     let stats_flush_worker = token_manager.spawn_stats_flush_worker();
+    let _kiro_version_sync_task = kiro::kiro_version::spawn_auto_sync(token_manager.clone());
     let external_pool_manager = Arc::new(ExternalPoolManager::new(
         postgres_store.clone(),
         redis_store.clone(),

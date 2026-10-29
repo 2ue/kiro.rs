@@ -3809,6 +3809,14 @@ enum HandlerEventStreamFault {
     EmptyStreamEveryAttempt,
     /// 每次都返回 200、content-type 为 JSON 且响应体为空（生产上的 json_stream_incomplete_body）。
     EmptyJsonBodyEveryAttempt,
+    /// 非流式长回答：每 400 毫秒一段正文，持续约 2.4 秒，总时长超过 1 秒的静默超时。
+    SlowSteadyTextBody,
+    /// 先回一段正文，然后静默 3 秒才继续。
+    TextThenLongSilence,
+    /// 每次都返回：工具调用 stop=true 但参数是截断的 JSON，随后上游报完成。
+    InvalidToolInputThenRecover,
+    /// 工具调用 stop=true，参数是合法 JSON 但末尾多了一个右括号。
+    RedundantToolInputTail,
     CompleteToolWithoutStatus,
     /// Completed call to the Claude Code `StructuredOutput` client tool.
     StructuredOutputToolUse,
@@ -4136,6 +4144,49 @@ async fn handler_eventstream_fault_upstream(
         HandlerEventStreamFault::EmptyJsonBodyEveryAttempt => {
             handler_eventstream_json_labeled_bytes_response(Vec::new())
         }
+        HandlerEventStreamFault::SlowSteadyTextBody => {
+            let mut chunks = Vec::new();
+            for index in 0..6 {
+                chunks.push((
+                    Duration::from_millis(400),
+                    Ok(Bytes::from(eventstream_test_frame(
+                        "assistantResponseEvent",
+                        json!({"content": format!("slow-part-{index} ")}),
+                    ))),
+                ));
+            }
+            chunks.push((
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "assistantResponseEvent",
+                    json!({"content": "slow-done", "messageStatus": "COMPLETED"}),
+                ))),
+            ));
+            chunks.push((
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "contextUsageEvent",
+                    json!({"contextUsagePercentage": 0.01}),
+                ))),
+            ));
+            handler_eventstream_chunked_response(chunks)
+        }
+        HandlerEventStreamFault::TextThenLongSilence => handler_eventstream_chunked_response(vec![
+            (
+                Duration::ZERO,
+                Ok(Bytes::from(eventstream_test_frame(
+                    "assistantResponseEvent",
+                    json!({"content": "before-silence "}),
+                ))),
+            ),
+            (
+                Duration::from_secs(3),
+                Ok(Bytes::from(eventstream_test_frame(
+                    "assistantResponseEvent",
+                    json!({"content": "after-silence", "messageStatus": "COMPLETED"}),
+                ))),
+            ),
+        ]),
         HandlerEventStreamFault::UnknownEventOnly => {
             handler_eventstream_bytes_response(eventstream_test_frame(
                 "futureUnknownEvent",
@@ -4247,6 +4298,47 @@ async fn handler_eventstream_fault_upstream(
                     }),
                 ));
             }
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::InvalidToolInputThenRecover => {
+            let mut body = eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_invalid_input",
+                    "input":"{\"command\":\"printf broken",
+                    "stop":true
+                }),
+            );
+            body.extend(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"COMPLETED"}),
+            ));
+            handler_eventstream_bytes_response(body)
+        }
+        HandlerEventStreamFault::RedundantToolInputTail => {
+            let mut body = eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_redundant_tail",
+                    "input":"{\"command\":\"printf tail-ok\"}",
+                    "stop":false
+                }),
+            );
+            body.extend(eventstream_test_frame(
+                "toolUseEvent",
+                json!({
+                    "name":"Bash",
+                    "toolUseId":"toolu_redundant_tail",
+                    "input":"}",
+                    "stop":true
+                }),
+            ));
+            body.extend(eventstream_test_frame(
+                "assistantResponseEvent",
+                json!({"content":"","messageStatus":"COMPLETED"}),
+            ));
             handler_eventstream_bytes_response(body)
         }
         HandlerEventStreamFault::IncompleteToolWithoutStatus => {
@@ -6525,6 +6617,136 @@ async fn run_usage_only_retries_up_to_shared_attempt_cap() {
         assert!(body.contains("recovered-ok"), "{label} body={body}");
         assert_eq!(upstream.hits(), 2, "{label}");
     }
+}
+
+/// A tool call the upstream marks complete with unrepairable input is never handed to the client
+/// as a finished tool_use, and it does not cool the account (the account answered fine). A tool
+/// call whose input only has a redundant tail is cleaned and completes normally.
+async fn run_completed_tool_input_is_cleaned_or_fails_without_cooldown() {
+    for round in 1..=3 {
+        let upstream = HandlerEventStreamFaultUpstream::start(
+            HandlerEventStreamFault::InvalidToolInputThenRecover,
+        )
+        .await;
+        let (app, _usage_recorder, token_manager) =
+            handler_eventstream_fault_router_with_manager(&upstream.base_url, 2, 1, |_| {}, None);
+        let (status, _request_id, body) = call_handler_eventstream_fault(app, true).await;
+        assert_eq!(status, StatusCode::OK, "round={round} body={body}");
+        assert_eq!(
+            body.matches("event: error").count(),
+            1,
+            "round={round} body={body}"
+        );
+        assert!(
+            !body.contains(r#""stop_reason":"tool_use""#),
+            "round={round}: a broken tool call is never reported as a finished tool_use: {body}"
+        );
+        assert!(
+            cooled_down_credentials(&token_manager).is_empty(),
+            "round={round}: broken tool input is not an account failure"
+        );
+        // The tool block was already streamed, so the turn ends with an error instead of a retry.
+        assert_eq!(upstream.hits(), 1, "round={round}");
+
+        for stream in [true, false] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::RedundantToolInputTail,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, _request_id, body) = call_handler_eventstream_fault(app, stream).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} body={body}"
+            );
+            assert!(
+                body.contains("printf tail-ok"),
+                "round={round} stream={stream} body={body}"
+            );
+            assert!(
+                body.contains("tool_use"),
+                "round={round} stream={stream} body={body}"
+            );
+            assert!(
+                !body.contains("event: error"),
+                "round={round} stream={stream} body={body}"
+            );
+            assert_eq!(upstream.hits(), 1, "round={round} stream={stream}");
+        }
+    }
+}
+
+#[test]
+fn completed_tool_input_is_cleaned_or_fails_without_cooldown() {
+    run_handler_fixture_on_large_stack_thread(
+        "completed-tool-input-cleaning",
+        run_completed_tool_input_is_cleaned_or_fails_without_cooldown,
+    );
+}
+
+/// A non-streaming answer that keeps producing output is never cut by a total-time limit: only
+/// silence ends the read. The old code capped the whole body at `kiroUpstreamResponseTimeoutSecs`
+/// (600 s in production), which threw away long answers that were still being written.
+async fn run_non_stream_body_timeout_counts_silence_not_total_time() {
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::SlowSteadyTextBody).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+            config.kiro_upstream_response_timeout_secs = 1;
+            config.kiro_upstream_stream_idle_timeout_secs = 1;
+        });
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.oneshot(handler_eventstream_fault_request_for_path(
+            "/v1/messages",
+            false,
+        )),
+    )
+    .await
+    .expect("slow answer response")
+    .expect("slow answer");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("slow answer body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("slow-part-5"), "{body}");
+    assert!(body.contains("slow-done"), "{body}");
+
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TextThenLongSilence).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+            config.kiro_upstream_response_timeout_secs = 30;
+            config.kiro_upstream_stream_idle_timeout_secs = 1;
+        });
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        app.oneshot(handler_eventstream_fault_request_for_path(
+            "/v1/messages",
+            false,
+        )),
+    )
+    .await
+    .expect("silent answer response")
+    .expect("silent answer");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        started.elapsed() < Duration::from_millis(2_800),
+        "a silent upstream is cut by the idle limit, not the 30 s header limit: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn non_stream_body_timeout_counts_silence_not_total_time() {
+    run_handler_fixture_on_large_stack_thread(
+        "non-stream-idle-body-timeout",
+        run_non_stream_body_timeout_counts_silence_not_total_time,
+    );
 }
 
 #[test]
@@ -9623,8 +9845,8 @@ fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_s
     );
 }
 
-/// Non-streaming requests follow the route's cache strategy only when Anthropic could return
-/// cache usage for them; the others pass upstream usage through. Streaming is unchanged.
+/// Requests follow the route's cache strategy only when Anthropic could return cache usage for
+/// them; the others pass upstream usage through, streaming or not.
 #[test]
 fn non_stream_cache_route_follows_the_request_not_only_the_route() {
     let state = AppState::new(
@@ -9694,20 +9916,22 @@ fn non_stream_cache_route_follows_the_request_not_only_the_route() {
             "{label}"
         );
         assert!(!passthrough.policy.reported_usage.enabled, "{label}");
-        assert!(
-            passthrough
-                .policy
-                .reported_usage
-                .skip_non_stream_usage_projection,
-            "{label}"
-        );
+        assert!(!passthrough.policy.simulation.enabled, "{label}");
         assert!(passthrough.namespace.is_none(), "{label}");
     }
 
-    // Streaming keeps the route strategy whatever the request looks like.
+    // Streaming follows the same rule: an unmarked stream keeps the upstream usage (it used to be
+    // reported with cache writes), a marked one above the minimum is shaped.
     let stream =
         cache_route_for_local_request(route.clone(), &request(true, false, "short"), false, model);
-    assert!(shaped(&stream));
+    assert_eq!(stream.policy.cache_type, PromptCacheStrategyType::NoCache);
+    assert!(!stream.policy.reported_usage.enabled);
+    let stream_marked =
+        cache_route_for_local_request(route.clone(), &request(true, true, &long), false, model);
+    assert!(shaped(&stream_marked));
+    let stream_automatic =
+        cache_route_for_local_request(route.clone(), &request(true, false, &long), true, model);
+    assert!(shaped(&stream_automatic));
 
     // The route-level switch still forces passthrough for every non-streaming request.
     let mut forced = route.clone();
@@ -16754,4 +16978,680 @@ fn each_prompt_injection_item_switches_off_alone_in_the_real_request() {
             }
         }
     });
+}
+
+async fn call_chat_completions(
+    app: Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, HeaderMap, String) {
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer b07-handler-key")
+                .body(Body::from(body.to_string()))
+                .expect("build chat completions request"),
+        ),
+    )
+    .await
+    .expect("chat completions response timed out")
+    .expect("chat completions response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await
+    .expect("chat completions body timed out")
+    .expect("read chat completions body");
+    (
+        status,
+        headers,
+        String::from_utf8(body.to_vec()).expect("chat completions UTF-8"),
+    )
+}
+
+fn chat_completions_request(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "stream": stream,
+        "stream_options": {"include_usage": true},
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "exercise the EventStream fixture"}
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "Bash",
+            "description": "run one command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }}]
+    })
+}
+
+fn chat_completions_stream_payloads(body: &str) -> Vec<String> {
+    body.split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: ").map(str::to_string))
+        .collect()
+}
+
+/// The OpenAI endpoint reuses the messages entry end to end: the upstream receives the translated
+/// Anthropic request, text and tool calls come back in the OpenAI shape, and usage is recorded
+/// under the chat completions path.
+async fn run_chat_completions_translate_text_and_tool_calls() {
+    for round in 1..=3 {
+        for stream in [false, true] {
+            let upstream =
+                HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody)
+                    .await;
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, headers, body) = call_chat_completions(
+                app,
+                "/v1/chat/completions",
+                chat_completions_request(stream),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let upstream_body = upstream.bodies_snapshot();
+            assert_eq!(upstream_body.len(), 1, "round={round} stream={stream}");
+            let upstream_text = upstream_body[0].to_string();
+            assert!(upstream_text.contains("be brief"), "{upstream_text}");
+            assert!(upstream_text.contains("Bash"), "{upstream_text}");
+
+            let request_id = headers
+                .get("request-id")
+                .and_then(|value| value.to_str().ok())
+                .expect("request-id header")
+                .to_string();
+            if stream {
+                assert!(
+                    headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.starts_with("text/event-stream"))
+                );
+                let payloads = chat_completions_stream_payloads(&body);
+                assert_eq!(
+                    payloads.last().map(String::as_str),
+                    Some("[DONE]"),
+                    "{body}"
+                );
+                let chunks: Vec<serde_json::Value> = payloads[..payloads.len() - 1]
+                    .iter()
+                    .map(|data| serde_json::from_str(data).expect("chunk json"))
+                    .collect();
+                let text: String = chunks
+                    .iter()
+                    .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+                    .collect();
+                assert_eq!(text, "recovered-ok", "{body}");
+                let finish = chunks
+                    .iter()
+                    .find_map(|chunk| chunk["choices"][0]["finish_reason"].as_str())
+                    .expect("finish chunk");
+                assert_eq!(finish, "stop");
+                let usage = &chunks.last().expect("usage chunk")["usage"];
+                assert!(
+                    usage["prompt_tokens"]
+                        .as_u64()
+                        .is_some_and(|tokens| tokens > 0)
+                );
+                assert!(!body.contains("event: "), "{body}");
+            } else {
+                let completion: serde_json::Value =
+                    serde_json::from_str(&body).expect("completion json");
+                assert_eq!(completion["object"], "chat.completion");
+                assert!(
+                    completion["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("chatcmpl-"))
+                );
+                assert_eq!(
+                    completion["choices"][0]["message"]["content"],
+                    "recovered-ok"
+                );
+                assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+                assert!(
+                    completion["usage"]["completion_tokens"]
+                        .as_u64()
+                        .is_some_and(|tokens| tokens > 0)
+                );
+            }
+            let records = usage_recorder.query(UsageRecordQuery {
+                request_id: Some(request_id.clone()),
+                ..UsageRecordQuery::default()
+            });
+            assert_eq!(records.records.len(), 1, "round={round} stream={stream}");
+            assert_eq!(records.records[0].endpoint, "/v1/chat/completions");
+            assert_eq!(records.records[0].status, UsageRecordStatus::Success);
+        }
+
+        for stream in [false, true] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::CompleteToolWithoutStatus,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, _headers, body) = call_chat_completions(
+                app,
+                "/cc/v1/chat/completions",
+                chat_completions_request(stream),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let (name, arguments, finish) = if stream {
+                let chunks: Vec<serde_json::Value> = chat_completions_stream_payloads(&body)
+                    .iter()
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).expect("chunk json"))
+                    .collect();
+                let calls: Vec<&serde_json::Value> = chunks
+                    .iter()
+                    .filter_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"].get(0))
+                    .collect();
+                assert!(calls.iter().all(|call| call["index"] == 0), "{body}");
+                let name = calls
+                    .iter()
+                    .find_map(|call| call["function"]["name"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments: String = calls
+                    .iter()
+                    .filter_map(|call| call["function"]["arguments"].as_str())
+                    .collect();
+                let finish = chunks
+                    .iter()
+                    .find_map(|chunk| chunk["choices"][0]["finish_reason"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (name, arguments, finish)
+            } else {
+                let completion: serde_json::Value =
+                    serde_json::from_str(&body).expect("completion json");
+                let call = &completion["choices"][0]["message"]["tool_calls"][0];
+                (
+                    call["function"]["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    call["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    completion["choices"][0]["finish_reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            };
+            assert_eq!(name, "Bash", "round={round} stream={stream} {body}");
+            let arguments: serde_json::Value =
+                serde_json::from_str(&arguments).expect("tool arguments json");
+            assert_eq!(arguments, json!({"command": "printf legacy-tool-ok"}));
+            assert_eq!(finish, "tool_calls", "round={round} stream={stream}");
+        }
+    }
+}
+
+#[test]
+fn chat_completions_translate_text_and_tool_calls() {
+    run_handler_fixture_on_large_stack_thread(
+        "chat-completions-translation",
+        run_chat_completions_translate_text_and_tool_calls,
+    );
+}
+
+/// Errors use the OpenAI envelope: bad requests never reach the upstream and are recorded as
+/// rejections, unknown dfcache routes stay 404, and a stream that fails after output starts ends
+/// with one error chunk and no `[DONE]`. (Auth and admission layers answer before the handler with
+/// the Anthropic envelope, which carries the same `error.type` / `error.message` fields.)
+async fn run_chat_completions_errors_use_the_openai_envelope() {
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody).await;
+    let (app, usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, headers, body) = call_chat_completions(
+        app.clone(),
+        "/v1/chat/completions",
+        json!({"model": "claude-sonnet-4-20250514", "n": 2, "messages": [
+            {"role": "user", "content": "hi"}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).expect("error json");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("n:"))
+    );
+    assert!(error.get("type").is_none(), "{body}");
+    assert!(headers.get("request-id").is_some());
+    assert_eq!(upstream.hits(), 0);
+    let request_id = headers["request-id"].to_str().unwrap().to_string();
+    let records = usage_recorder.query(UsageRecordQuery {
+        request_id: Some(request_id),
+        ..UsageRecordQuery::default()
+    });
+    assert_eq!(records.records.len(), 1);
+    assert_eq!(records.records[0].endpoint, "/v1/chat/completions");
+    assert_eq!(records.records[0].status, UsageRecordStatus::Error);
+
+    let (status, _headers, body) = call_chat_completions(
+        app.clone(),
+        "/dfcache/missing/v1/chat/completions",
+        chat_completions_request(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).expect("error json");
+    assert_eq!(error["error"]["type"], "not_found_error");
+    assert_eq!(upstream.hits(), 0);
+
+    let (status, _headers, body) = call_chat_completions(
+        app,
+        "/dfcache/demo/v1/chat/completions",
+        chat_completions_request(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream.hits(), 1);
+
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TextThenReadError).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, _headers, body) =
+        call_chat_completions(app, "/v1/chat/completions", chat_completions_request(true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payloads = chat_completions_stream_payloads(&body);
+    assert!(!payloads.iter().any(|data| data == "[DONE]"), "{body}");
+    let last: serde_json::Value =
+        serde_json::from_str(payloads.last().expect("error chunk")).expect("error json");
+    assert!(last["error"]["message"].is_string(), "{body}");
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(|data| data.starts_with("{\"error\""))
+            .count(),
+        1,
+        "{body}"
+    );
+}
+
+#[test]
+fn chat_completions_errors_use_the_openai_envelope() {
+    run_handler_fixture_on_large_stack_thread(
+        "chat-completions-errors",
+        run_chat_completions_errors_use_the_openai_envelope,
+    );
+}
+
+/// Upstream faults before any output (exception/error events, broken frames, read errors) are not
+/// account faults: by default the pre-output retry moves to another account and nothing is cooled
+/// down. Switching `credentialUpstreamFailureCooldownEnabled` on restores the cooldown.
+async fn run_upstream_faults_switch_accounts_without_cooldown() {
+    for fault in [
+        HandlerEventStreamFault::ExceptionEventBeforeOutput,
+        HandlerEventStreamFault::ErrorEventBeforeOutput,
+        HandlerEventStreamFault::BadCrcBeforeOutput,
+        HandlerEventStreamFault::TruncatedFrameBeforeOutput,
+        HandlerEventStreamFault::ReadErrorBeforeOutput,
+    ] {
+        for stream in [true, false] {
+            for switch_on in [false, true] {
+                let label = format!("{fault:?} stream={stream} switch={switch_on}");
+                let upstream = HandlerEventStreamFaultUpstream::start(fault).await;
+                let (app, usage_recorder, token_manager) =
+                    handler_eventstream_fault_router_with_manager(
+                        &upstream.base_url,
+                        2,
+                        1,
+                        |config| config.credential_upstream_failure_cooldown_enabled = switch_on,
+                        None,
+                    );
+                let (status, request_id, body) = call_handler_eventstream_fault(app, stream).await;
+                let recovered = body.contains("recovered-ok");
+                if !recovered {
+                    // A non-stream body with a broken frame is answered 502 without a retry and
+                    // without touching the account (unchanged behaviour).
+                    assert!(!stream, "{label} status={status} body={body}");
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{label} body={body}");
+                    assert_eq!(upstream.hits(), 2, "{label}");
+                    let record = usage_record_for_request(&usage_recorder, &request_id);
+                    let accounts: HashSet<_> = record
+                        .credential_attempts
+                        .iter()
+                        .map(|attempt| attempt.credential_id)
+                        .collect();
+                    assert_eq!(
+                        accounts.len(),
+                        2,
+                        "{label}: the retry uses the other account"
+                    );
+                }
+                let cooled = cooled_down_credentials(&token_manager);
+                if switch_on && recovered {
+                    assert!(!cooled.is_empty(), "{label}: switch on cools the account");
+                } else if !switch_on {
+                    assert!(
+                        cooled.is_empty(),
+                        "{label}: upstream faults never cool {cooled:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn upstream_faults_switch_accounts_without_cooldown() {
+    run_handler_fixture_on_large_stack_thread(
+        "upstream-fault-no-cooldown",
+        run_upstream_faults_switch_accounts_without_cooldown,
+    );
+}
+
+#[test]
+fn gateway_timeout_is_reported_as_504() {
+    let diagnostic = "upstream_failure class=upstream_timeout upstream_status=524 public_status=524 body_bytes=21 retry_after_secs=unknown content_type=json reason=api_gateway_timeout";
+    let public = provider_public_error_for_message(diagnostic, Some("req_gateway"), None, None);
+    assert_eq!(public.status_code, 504);
+    assert_eq!(public.error_type, "api_error");
+    assert!(public.message.contains("req_gateway"), "{}", public.message);
+}
+
+fn responses_request(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "claude-sonnet-4-20250514",
+        "stream": stream,
+        "instructions": "be brief",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "exercise the EventStream fixture"}
+        ]}],
+        "tools": [{
+            "type": "function",
+            "name": "Bash",
+            "description": "run one command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }]
+    })
+}
+
+/// `(event type, data)` pairs of a Responses SSE body.
+fn responses_stream_events(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter_map(|frame| {
+            let mut lines = frame.lines();
+            let event = lines.next()?.strip_prefix("event: ")?.to_string();
+            let data = lines.next()?.strip_prefix("data: ")?;
+            Some((
+                event,
+                serde_json::from_str(data).expect("responses event json"),
+            ))
+        })
+        .collect()
+}
+
+/// The Responses endpoint reuses the messages entry end to end: text and tool calls come back as
+/// Responses output items, streaming ends with `response.completed`, and usage is recorded under
+/// the responses path.
+async fn run_responses_translate_text_and_tool_calls() {
+    for round in 1..=3 {
+        for stream in [false, true] {
+            let upstream =
+                HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody)
+                    .await;
+            let (app, usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, headers, body) =
+                call_chat_completions(app, "/v1/responses", responses_request(stream)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let upstream_text = upstream.bodies_snapshot()[0].to_string();
+            assert!(upstream_text.contains("be brief"), "{upstream_text}");
+            let response = if stream {
+                let events = responses_stream_events(&body);
+                assert_eq!(events[0].0, "response.created", "{body}");
+                let deltas: String = events
+                    .iter()
+                    .filter(|(event, _)| event == "response.output_text.delta")
+                    .filter_map(|(_, data)| data["delta"].as_str())
+                    .collect();
+                assert_eq!(deltas, "recovered-ok");
+                let (last, data) = events.last().expect("terminal event");
+                assert_eq!(last, "response.completed", "{body}");
+                data["response"].clone()
+            } else {
+                serde_json::from_str(&body).expect("response json")
+            };
+            assert_eq!(response["object"], "response");
+            assert_eq!(response["status"], "completed");
+            assert!(
+                response["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("resp_"))
+            );
+            assert_eq!(response["output"][0]["type"], "message");
+            assert_eq!(response["output"][0]["content"][0]["text"], "recovered-ok");
+            assert!(
+                response["usage"]["output_tokens"]
+                    .as_u64()
+                    .is_some_and(|tokens| tokens > 0)
+            );
+            let request_id = headers["request-id"].to_str().unwrap().to_string();
+            let records = usage_recorder.query(UsageRecordQuery {
+                request_id: Some(request_id),
+                ..UsageRecordQuery::default()
+            });
+            assert_eq!(records.records.len(), 1);
+            assert_eq!(records.records[0].endpoint, "/v1/responses");
+            assert_eq!(records.records[0].status, UsageRecordStatus::Success);
+        }
+
+        for stream in [false, true] {
+            let upstream = HandlerEventStreamFaultUpstream::start(
+                HandlerEventStreamFault::CompleteToolWithoutStatus,
+            )
+            .await;
+            let (app, _usage_recorder) =
+                handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+            let (status, _headers, body) =
+                call_chat_completions(app, "/cc/v1/responses", responses_request(stream)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round={round} stream={stream} {body}"
+            );
+            let response = if stream {
+                let events = responses_stream_events(&body);
+                let arguments = events
+                    .iter()
+                    .find(|(event, _)| event == "response.function_call_arguments.done")
+                    .map(|(_, data)| data["arguments"].clone())
+                    .expect("arguments done event");
+                let arguments: serde_json::Value =
+                    serde_json::from_str(arguments.as_str().unwrap()).unwrap();
+                assert_eq!(arguments, json!({"command": "printf legacy-tool-ok"}));
+                events.last().unwrap().1["response"].clone()
+            } else {
+                serde_json::from_str(&body).expect("response json")
+            };
+            let call = response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "function_call")
+                .expect("function_call item")
+                .clone();
+            assert_eq!(call["name"], "Bash");
+            assert!(call["call_id"].as_str().is_some_and(|id| !id.is_empty()));
+            let arguments: serde_json::Value =
+                serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments, json!({"command": "printf legacy-tool-ok"}));
+            assert_eq!(response["status"], "completed");
+        }
+    }
+}
+
+#[test]
+fn responses_translate_text_and_tool_calls() {
+    run_handler_fixture_on_large_stack_thread(
+        "responses-translation",
+        run_responses_translate_text_and_tool_calls,
+    );
+}
+
+async fn run_responses_errors_use_the_openai_envelope() {
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, _headers, body) = call_chat_completions(
+        app.clone(),
+        "/v1/responses",
+        json!({"model": "claude-sonnet-4-20250514", "input": "hi", "previous_response_id": "resp_1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(upstream.hits(), 0);
+
+    let (status, _headers, body) =
+        call_chat_completions(app, "/dfcache/demo/v1/responses", responses_request(false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let upstream =
+        HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::TextThenReadError).await;
+    let (app, _usage_recorder) =
+        handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |_| {});
+    let (status, _headers, body) =
+        call_chat_completions(app, "/v1/responses", responses_request(true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = responses_stream_events(&body);
+    assert_eq!(events.last().unwrap().0, "response.failed", "{body}");
+    assert!(
+        !events
+            .iter()
+            .any(|(event, _)| event == "response.completed")
+    );
+}
+
+#[test]
+fn responses_errors_use_the_openai_envelope() {
+    run_handler_fixture_on_large_stack_thread(
+        "responses-errors",
+        run_responses_errors_use_the_openai_envelope,
+    );
+}
+
+/// A noisy PNG over the 5 MB inline limit (noise does not compress, so the PNG stays large).
+fn oversized_noise_png_base64() -> String {
+    let (width, height) = (1600u32, 1200u32);
+    let mut state = 0x2545_f491_u32;
+    let image = image::RgbImage::from_fn(width, height, |_, _| {
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        };
+        image::Rgb([next(), next(), next()])
+    });
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode noise png");
+    let encoded = BASE64_STANDARD.encode(png);
+    assert!(encoded.len() > 5 * 1024 * 1024, "fixture must exceed 5 MB");
+    encoded
+}
+
+/// With image resizing on, a current-turn image over the 5 MB limit is shrunk and sent instead
+/// of being rejected; with it off the request is still the official 400 and never reaches the
+/// upstream.
+async fn run_oversized_current_image_is_resized_when_switched_on() {
+    let data = oversized_noise_png_base64();
+    for resize in [false, true] {
+        let upstream =
+            HandlerEventStreamFaultUpstream::start(HandlerEventStreamFault::NonStreamSmallBody)
+                .await;
+        let (app, _usage_recorder) =
+            handler_eventstream_fault_router_with_config(&upstream.base_url, 1, 1, |config| {
+                config.image_processing.resize_enabled = resize;
+            });
+        let request = multimodal_handler_request(
+            "/v1/messages",
+            json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": data
+                    }}
+                ]}]
+            })
+            .to_string(),
+        );
+        let response = tokio::time::timeout(Duration::from_secs(60), app.oneshot(request))
+            .await
+            .expect("oversized image response timed out")
+            .expect("oversized image response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&body);
+        if resize {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(upstream.hits(), 1);
+            let sent = upstream.bodies_snapshot()[0].to_string();
+            assert!(
+                sent.len() < 5 * 1024 * 1024,
+                "resized body is {} bytes",
+                sent.len()
+            );
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("image exceeds 5 MB maximum"), "{body}");
+            assert_eq!(upstream.hits(), 0);
+        }
+    }
+}
+
+#[test]
+fn oversized_current_image_is_resized_when_switched_on() {
+    run_handler_fixture_on_large_stack_thread(
+        "oversized-image-resize",
+        run_oversized_current_image_is_resized_when_switched_on,
+    );
 }
