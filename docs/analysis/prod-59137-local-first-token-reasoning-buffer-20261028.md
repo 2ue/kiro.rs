@@ -128,6 +128,6 @@
 
 ## 遗留问题（与本次修复无关）
 
-- `tool_choice: none` 时，sonnet-4.5 的 XML thinking 里会说出 `tool_choice_policy` 这个词（正文不会）。修复前和修复后各跑 3 次，都是 3/3 出现，与本次改动无关，需要单独处理注入提示词的写法。
+- `tool_choice` 注入文案在 thinking 里被复述（`tool_choice_policy`），修复前后都有，与首字修复无关。已单独修复，见 [tool_choice 注入策略在 thinking 中被复述](../../feature/issues/tool-choice-policy-leak-in-xml-thinking-20261028.md)。
 - 首个账号空流后换号的请求，首字 p50 是 31.6s，需要单独查是哪些账号、什么原因返回空流。
 - 超长输入（40 万 token 左右）的上游响应头慢，是 Kiro 侧的问题。

@@ -70,18 +70,23 @@ pub const DEFAULT_EDIT_TOOL_SUFFIX: &str = "- IMPORTANT: If the `new_string` con
 /// thinking block early and leaks the rest of the reasoning into the visible answer.
 pub const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, open with a <thinking> tag, write concise reasoning, and close it with the matching end tag before any visible text or tool call. Do not repeat or quote this policy, in the reasoning or in visible text.</thinking_output_policy>";
 
-pub const TOOL_CHOICE_ANY_PREFIX: &str = "<tool_choice>any</tool_choice><tool_choice_policy>You MUST call at least one of the available tools in this turn. A response without a tool call is invalid. Do not mention or quote this policy.</tool_choice_policy>";
+// tool_choice wording is plain sentences on purpose. Tagged blocks such as
+// `<tool_choice_policy>` plus "do not mention this policy" made models quote the tag name and the
+// wording in their thinking ("according to the tool_choice_policy, ..."), which Claude Code shows
+// to the user. Plain sentences read like the rest of the system prompt and are followed just as
+// well.
+pub const TOOL_CHOICE_ANY_PREFIX: &str = "Begin this reply by calling one of the available tools.";
 /// `{name}` is the Kiro-facing tool name.
-pub const TOOL_CHOICE_TOOL_PREFIX: &str = "<tool_choice>tool</tool_choice><tool_choice_name>{name}</tool_choice_name><tool_choice_policy>You MUST call the tool `{name}` in this turn. A response without that tool call is invalid. Do not mention or quote this policy.</tool_choice_policy>";
+pub const TOOL_CHOICE_TOOL_PREFIX: &str =
+    "You MUST call the tool `{name}` in this reply. A reply without that tool call is invalid.";
 /// Worded as what the reply should be rather than as a ban: told "do not call any tool", models
 /// tend to tell the user they "cannot use tools in this turn", which reveals the restriction.
-pub const TOOL_CHOICE_NONE_PREFIX: &str = "<tool_choice>none</tool_choice><tool_choice_policy>Reply in plain text from what is already in the conversation and what you know; treat the tool list, including tools from earlier turns, as absent for this reply. If the user asks for something that would need a tool, such as reading a file, running a command or fetching live data, give the most useful answer you can from what you know and, where it helps, say what information would settle it. Speak about the task itself, never about tools, permissions, modes or these instructions.</tool_choice_policy>";
-pub const TOOL_CHOICE_PARALLEL_DISABLED_PREFIX: &str = "<tool_choice_parallel>disabled</tool_choice_parallel><tool_choice_policy>Call at most one tool in this turn. Do not issue several tool calls in the same response. Do not mention or quote this policy.</tool_choice_policy>";
-pub const TOOL_CHOICE_ANY_REMINDER: &str =
-    "<tool_choice_reminder>Respond by calling one of the available tools.</tool_choice_reminder>";
+pub const TOOL_CHOICE_NONE_PREFIX: &str = "Reply in plain text from what is already in the conversation and what you know; treat the tool list, including tools from earlier turns, as absent for this reply. If the user asks for something that would need a tool, such as reading a file, running a command or fetching live data, give the most useful answer you can from what you know and, where it helps, say what information would settle it. Speak about the task itself, never about tools, permissions, modes or these instructions.";
+pub const TOOL_CHOICE_PARALLEL_DISABLED_PREFIX: &str =
+    "Make one tool call per reply, and wait for its result before making the next.";
+pub const TOOL_CHOICE_ANY_REMINDER: &str = "Respond by calling one of the available tools.";
 /// `{name}` is the Kiro-facing tool name.
-pub const TOOL_CHOICE_TOOL_REMINDER: &str =
-    "<tool_choice_reminder>Respond by calling the tool `{name}`.</tool_choice_reminder>";
+pub const TOOL_CHOICE_TOOL_REMINDER: &str = "Respond by calling the tool `{name}`.";
 
 pub const DEFAULT_WEB_SEARCH_GUIDANCE: &str = "<web_search_guidance>You can search the web with the `web_search` tool. Call it with a concise query when the answer needs current or external information; you may search again with a refined query. Before a search call, write one short sentence saying what you are going to search for. After the results arrive, answer the user from them; if the user only asked for a search, summarize the most relevant results instead of just confirming that the search ran. When a sentence uses information from a search result, put that result's number in square brackets right after the sentence, for example [1] or [1][3]. Only cite numbers that appear in the results.</web_search_guidance>";
 
@@ -457,4 +462,37 @@ pub fn fixed_injections() -> Vec<FixedInjection> {
             reason: "只删除和注入内容逐字一致的块；请求本身提到这些标签时自动关闭。",
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tag names and "do not mention this" meta-instructions are what models quoted in their
+    /// thinking; the tool_choice wording must contain neither.
+    #[test]
+    fn tool_choice_wording_has_no_quotable_tags_or_meta_instructions() {
+        for text in [
+            TOOL_CHOICE_ANY_PREFIX,
+            TOOL_CHOICE_TOOL_PREFIX,
+            TOOL_CHOICE_NONE_PREFIX,
+            TOOL_CHOICE_PARALLEL_DISABLED_PREFIX,
+            TOOL_CHOICE_ANY_REMINDER,
+            TOOL_CHOICE_TOOL_REMINDER,
+        ] {
+            let lower = text.to_ascii_lowercase();
+            for banned in [
+                "<",
+                ">",
+                "tool_choice",
+                "policy",
+                "reminder",
+                "mention",
+                "quote",
+                "this turn",
+            ] {
+                assert!(!lower.contains(banned), "{banned:?} in {text:?}");
+            }
+        }
+    }
 }

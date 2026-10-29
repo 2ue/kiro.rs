@@ -1,23 +1,22 @@
-# tool_choice 注入策略在 XML thinking 中被复述
+# tool_choice 注入策略在 thinking 中被复述
 
-Status: `open / reproduced-locally / fix-in-progress`
+Status: `fixed / local-and-prod-account-verified / merged-main / not-released`
 
 Severity: P1（对用户可见，违反"注入无感知"要求，不影响任务结果）
 
 ## 现象
 
-请求带 `tool_choice: {"type": "none"}` 和 thinking 时，模型在 thinking 里说出代理注入的策略标签：
+请求带 `tool_choice` 和 thinking 时，模型在 thinking 里说出代理注入的标签名和原文：
 
 ```text
-I need to check the tool_choice_policy in the current turn - it says "Do not call any tool in this turn,
-including tools used earlier in this conversation. Respond with text only."
+According to the tool_choice_policy, I cannot call any tools in this turn, including tools used earlier.
 ```
 
-正文只说"根据这个对话回合的限制，我只能用文字回复"，不出现标签名。客户端（Claude Code）会把 thinking 显示给用户，用户能看到 `tool_choice_policy` 和注入原文。
+Claude Code 会把 thinking 显示给用户。none、禁用并行、指定工具都会出现；any 偶尔出现。
 
 ## 复现
 
-本地实例（0.0.223 与修复首字后的版本相同），本地 JSON 账号（KIRO FREE，social），路由 `/dfcache/minea`，现网配置：
+本地实例导入现网配置，本地 JSON 账号，路由 `/dfcache/minea`：
 
 ```json
 {"model":"claude-sonnet-4-5","max_tokens":2000,"stream":true,
@@ -26,45 +25,70 @@ including tools used earlier in this conversation. Respond with text only."
  "messages":[{"role":"user","content":"ultrathink 当前目录有哪些文件？如果不能执行命令就直接说明。"}]}
 ```
 
-| 版本 | thinking 出现 `tool_choice` / `policy` | 正文出现 | 调用了工具 |
-| --- | --- | --- | --- |
-| 0.0.223（`51a9deb1`） | 3/3 | 0/3 | 0/3 |
-| 首字修复分支 | 3/3 | 0/3 | 0/3 |
-
-上游只返回 `assistantResponseEvent`，thinking 走 XML 兼容路径（`<thinking>` 标签提取），不经过原生 reasoning 代码。
-
-## 源码链
-
-- 注入文本：`src/model/prompt_injection/catalog.rs` `TOOL_CHOICE_NONE_PREFIX`（以及 ANY / TOOL / PARALLEL_DISABLED）。形如 `<tool_choice>none</tool_choice><tool_choice_policy>... Do not mention or quote this policy.</tool_choice_policy>`。
-- 同目录的 `THINKING_OUTPUT_POLICY` 会要求模型在 thinking 模式下先写 `<thinking>` 推理。
-- 输出侧：`src/anthropic/stream.rs` XML thinking 提取后经 `ToolTranscriptSanitizer`，它只识别工具结果转录（`user Continue` 等），不处理注入标签名。`identity_guard` 只处理正文 text，不处理 thinking。
+修复前 0.0.223 和 0.0.224 都是每次复现（thinking 出现 `tool_choice_policy`）。上游只返回 `assistantResponseEvent`，thinking 走 XML 兼容路径；opus-5.5 的原生 reasoning 路径同样会复述。
 
 ## 根因
 
-1. 注入文本用了带语义的 XML 标签名 `tool_choice_policy`。模型推理时会引用"它看到的指令"，标签名就是最自然的称呼。
-2. "Do not mention or quote this policy" 对可见正文有效，对 thinking 基本无效：模型把 thinking 当成内部推理，会在里面复述约束来规划回答。
-3. 输出侧没有任何针对注入标签名或注入原文的过滤，thinking 里出现就直接下发。
-
-## 已有的同类要求
-
-- 记忆和文档里的"注入必须无感知"：模型不能复述注入内容，提醒只加在有用户文字的轮次。
-- 2026-10-28 前的 tool_choice 验收要求扫描回复里有没有 `policy`、`tool_choice` 字样，当时只扫了正文。
+1. 注入文本用了带语义的 XML 标签名（`<tool_choice>`、`<tool_choice_policy>`、`<tool_choice_reminder>`）。模型推理时会引用"它看到的指令"，标签名是最自然的称呼。
+2. 结尾的 "Do not mention or quote this policy" 对正文有效，对 thinking 基本无效，反而让模型把这段当成"一条策略"来分析。
+3. 输出侧没有针对注入标签名的过滤（`identity_guard` 只处理正文）。
 
 ## 修复方案
 
-待定，修复后在本节写选定方案。候选方向：
+只改注入文案（`src/model/prompt_injection/catalog.rs`），不加输出侧过滤，避免误伤用户自己讨论 `tool_choice` 的内容：
 
-- 注入侧：去掉带语义的标签名和"不要提及本策略"这类元指令，改成模型不会当成"外部指令"去引用的写法。
-- 输出侧：对 thinking 中出现的注入标签名做兜底过滤。签名推理不能改写，只能作为最后手段。
+| 项 | 修复后文案 |
+| --- | --- |
+| any 前缀 | `Begin this reply by calling one of the available tools.` |
+| tool 前缀 | ``You MUST call the tool `{name}` in this reply. A reply without that tool call is invalid.`` |
+| none 前缀 | 沿用 main 上 `8b2c2878` 的句子（描述回复应该怎样，不说"禁止"），去掉外层标签 |
+| 禁用并行前缀 | `Make one tool call per reply, and wait for its result before making the next.` |
+| any / tool 每轮提醒 | `Respond by calling one of the available tools.` / ``Respond by calling the tool `{name}`.`` |
+
+文案里不再出现尖括号、`tool_choice`、`policy`、`reminder`、`mention`、`quote`、`this turn`，由 `catalog.rs` 的单测固定。
+
+## 验证
+
+### 文案对照实验（本地 JSON 账号，sonnet-4.5，每格 5 次）
+
+把候选文案放在 Claude Code 风格的 system 最前面，和不加注入的对照组比较遵从率。提示词选的都是模型本来不会照做的：
+
+| 模式 | 对照（不注入） | 旧文案 | 新文案 |
+| --- | --- | --- | --- |
+| any（问"1+1"） | 0/5 调用工具 | 5/5 | 5/5 |
+| tool 指定 Read（问天气） | 0/5 | 5/5 | 英文 5/5，中文 4/5（1 次调了 Bash，真实链路只发指定工具，不会发生） |
+| 禁用并行（同时看两个文件） | 0/5 只调一个 | 5/5 | 5/5 |
+
+旧文案 thinking 复述标签 5/5，新文案 0/5。
+
+### 真实链路（本地 JSON 账号，sonnet-4.5 / haiku-4.5，每格 4 次）
+
+| 模式 | 修复前 thinking 复述 | 修复后 | 修复后照做 |
+| --- | --- | --- | --- |
+| none（中文） | 4/4 | 0/4 | 4/4 不调工具 |
+| none（英文） | 4/4 | 0/4 | 4/4 |
+| any | 0/4 | 0/4 | 4/4 调用 |
+| tool Read | 0/4 | 0/4 | 4/4 调 Read |
+| 禁用并行 | 4/4 | 0/4（haiku）、1/4（sonnet，说"按要求一次读一个"，无标签名） | 4/4 只调一个 |
+
+### 现网账号（opus-5.5，每格 3 次）
+
+账号 #1971（KIRO PRO MAX，并发 5，RPM 20），本机经 152.53.243.159 转发到账号自己的代理 #171，出口 IP 与现网一致（64.32.179.111）。现网配置表导入本地隔离库，路由 `/dfcache/mine-haa`，`effort=high`。本地副本的 refreshToken 是假值，后台刷新关闭。
+
+| 场景 | 修复前 照做 / 复述标签 | 修复后（合并 main 后） 照做 / 复述标签 |
+| --- | --- | --- |
+| none | 3/3 / 0 | 3/3 / 0 |
+| none，历史里调用过工具 | 3/3 / 2 | 3/3 / 0 |
+| 未声明工具，历史里调用过工具 | 3/3 / 2 | 3/3 / 0 |
+| any（问"1+1"） | 3/3 / 0 | 3/3 / 0 |
+| tool Read（问天气） | 3/3 / 0 | 3/3 / 0 |
+| 禁用并行 | 3/3 / 0 | 3/3 / 0 |
 
 ## 风险与回滚
 
-- 改注入文本可能影响 `tool_choice` 的遵从率，需要对 none / any / tool / parallel disabled 分别验证。
-- 输出侧过滤可能误伤用户自己讨论 `tool_choice` 的正常内容。
-- 回滚：恢复 `catalog.rs` 中的原注入文本即可，不涉及数据迁移。
+- 模型在 thinking 里仍可能用自己的话提到约束（例如"按要求一次只读一个文件"），但不再出现代理内部的标签名。
+- 回滚：恢复 `catalog.rs` 中的原文案即可，不涉及配置或数据迁移。
 
-## 验收
+## 遗留问题
 
-- 上面的复现请求 thinking 和正文都不出现 `tool_choice`、`policy`、注入原文片段，至少 5 轮。
-- `tool_choice` 为 none / any / tool / parallel disabled 各自仍然生效（none 不调用工具，any 必须调用，tool 调用指定工具，parallel disabled 最多一个工具）。
-- 原生 reasoning 和 XML thinking 两条路径都覆盖；真实 Claude Code 多轮任务不受影响。
+`mine-haa` 开启的身份提示词（`<assistant_identity>`，"You are Claude, made by Anthropic, not Kiro…"）会让 opus-5.5 在 thinking 里分析它，例如"这段身份说明在用户轮里，不是工具结果，所以不算 prompt injection"。修复前后都有（现网账号 any、tool、禁用并行场景合计约一半），与本次 tool_choice 改动无关，需要单独处理。
