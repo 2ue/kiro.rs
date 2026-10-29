@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import {
   evaluateTestRun,
   formatTestRunReport,
+  githubFailureAnnotations,
   parseKnownFailures,
 } from "./run-tests-with-known-failures.mjs";
 
@@ -147,14 +148,13 @@ test("Quality Gate runs the full profile on main pushes through the filter", () 
   assert.match(workflow, /push:\n\s+branches:\n\s+- main/);
   assert.match(workflow, /quality-\$\{\{ github\.workflow \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/);
   assert.match(workflow, /QUALITY_PROFILE: \$\{\{ inputs\.profile \|\| 'full' \}\}/);
+  // Both feature sets run in parallel matrix jobs, each multi-threaded.
+  assert.match(workflow, /cargo_args: ''\n\s+- name: no default features\n\s+cargo_args: --no-default-features/);
   assert.match(
     workflow,
-    /node scripts\/ci\/run-tests-with-known-failures\.mjs -- --no-fail-fast --locked --all-targets --no-default-features -- --test-threads=1/,
+    /node scripts\/ci\/run-tests-with-known-failures\.mjs -- --no-fail-fast --locked --all-targets \$\{\{ matrix\.cargo_args \}\}/,
   );
-  assert.match(
-    workflow,
-    /node scripts\/ci\/run-tests-with-known-failures\.mjs -- --no-fail-fast --locked --all-targets -- --test-threads=1/,
-  );
+  assert.doesNotMatch(workflow, /run-tests-with-known-failures\.mjs[^\n]*--test-threads=1/);
 });
 
 test("manifest checks a successful same-SHA push and exposes the documented escape hatch", () => {
@@ -171,9 +171,11 @@ test("manifest checks a successful same-SHA push and exposes the documented esca
     manifestSection,
     /permissions:\n\s+actions: read\n\s+contents: read\n\s+packages: write/,
   );
-  assert.match(workflow, /workflow_id: "build\.yaml",\n\s+head_sha: context\.sha,\n\s+status: "success"/);
-  assert.match(workflow, /run\.head_sha === context\.sha && run\.conclusion === "success"/);
+  // The manifest waits for the same-SHA push run to finish, then requires it to have succeeded.
+  assert.match(workflow, /workflow_id: "build\.yaml",\n\s+head_sha: context\.sha,/);
+  assert.match(workflow, /run\.head_sha === context\.sha/);
   assert.match(workflow, /run\.event === "push"/);
+  assert.match(workflow, /run\.conclusion === "success"/);
   assert.match(workflow, /workflow_dispatch run exists[\s\S]*?Manually confirm it used profile=full/);
   assert.match(workflow, /vars\.ALLOW_RELEASE_WITHOUT_FULL_QUALITY != 'true'/);
   assert.match(workflow, /vars\.ALLOW_RELEASE_WITHOUT_FULL_QUALITY == 'true'/);
@@ -182,4 +184,35 @@ test("manifest checks a successful same-SHA push and exposes the documented esca
   // "is not a function"，所以在这里锁住。
   assert.match(workflow, /github\.rest\.actions\.listWorkflowRuns\(/);
   assert.doesNotMatch(workflow, /listWorkflowRunsForWorkflow/);
+});
+
+test("unexpected failures become GitHub error annotations with the panic location", () => {
+  const output = [
+    "test a::tests::broken ... FAILED",
+    "test b::tests::fine ... ok",
+    "failures:",
+    "",
+    "---- a::tests::broken stdout ----",
+    "",
+    "thread 'a::tests::broken' (1234) panicked at src/a/tests.rs:42:9:",
+    "assertion `left == right` failed: round=1",
+    "  left: 1",
+    " right: 2",
+    "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+    "test result: FAILED. 1 passed; 1 failed;",
+  ].join("\n");
+  const result = evaluateTestRun({ output, cargoExitCode: 101, knownFailures });
+
+  assert.deepEqual(githubFailureAnnotations(result, output, {}), []);
+  const [annotation] = githubFailureAnnotations(result, output, { GITHUB_ACTIONS: "true" });
+  assert.match(annotation, /^::error title=test failed%3A a%3A%3Atests%3A%3Abroken,file=src\/a\/tests.rs,line=42::/);
+  assert.match(annotation, /assertion `left == right` failed: round=1/);
+  assert.match(annotation, /left: 1/);
+});
+
+test("a failure without a panic block still gets an annotation naming the test", () => {
+  const output = "test a::tests::hung ... FAILED\ntest result: FAILED. 0 passed; 1 failed;";
+  const result = evaluateTestRun({ output, cargoExitCode: 101, knownFailures });
+  const [annotation] = githubFailureAnnotations(result, output, { GITHUB_ACTIONS: "true" });
+  assert.equal(annotation, "::error title=test failed%3A a%3A%3Atests%3A%3Ahung::a::tests::hung");
 });

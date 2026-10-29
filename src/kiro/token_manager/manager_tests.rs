@@ -1274,6 +1274,18 @@ async fn spawn_pending_refresh_token_endpoint() -> (
     (format!("http://{address}/token"), request_received, server)
 }
 
+/// Builds the refresh HTTP client before a test starts its refresh deadline. The first build loads
+/// the system root certificates (150-250 ms of CPU, about a second when the full suite builds
+/// several at once); left inside the refresh, that cost is charged to the tight per-step
+/// deadlines these tests set and fails them under load even though the fake endpoint answered.
+async fn prewarm_refresh_client(manager: &MultiTokenManager) {
+    let config = manager.runtime_config();
+    manager
+        .refresh_http_client(config.tls_backend, None)
+        .await
+        .expect("build refresh client before the refresh deadline starts");
+}
+
 fn force_refresh_test_credential(token_endpoint: String) -> KiroCredentials {
     KiroCredentials {
         id: Some(1),
@@ -2762,6 +2774,7 @@ async fn pending_force_refresh_respects_total_deadline_and_releases_redis_lock()
         Some(redis.clone()),
     )
     .unwrap();
+    prewarm_refresh_client(&manager).await;
 
     let started_at = Instant::now();
     let refresh = manager.force_refresh_token_for_with_budgets(
@@ -2821,6 +2834,7 @@ async fn aborting_force_refresh_submits_critical_redis_lock_cleanup() {
         )
         .unwrap(),
     );
+    prewarm_refresh_client(&manager).await;
     let mut refresh_task = {
         let manager = manager.clone();
         tokio::spawn(async move {
@@ -2883,6 +2897,7 @@ async fn aborting_ordinary_refresh_submits_critical_redis_lock_cleanup() {
         )
         .unwrap(),
     );
+    prewarm_refresh_client(&manager).await;
     let mut refresh_task = {
         let manager = manager.clone();
         tokio::spawn(async move {
@@ -2949,6 +2964,7 @@ async fn ordinary_refresh_with_redis_without_postgres_uses_local_authority_and_r
         Some(redis.clone()),
     )
     .unwrap();
+    prewarm_refresh_client(&manager).await;
 
     let context = manager
         .try_ensure_token_with_budgets(
