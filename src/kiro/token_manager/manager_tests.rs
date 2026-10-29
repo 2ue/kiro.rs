@@ -14343,3 +14343,304 @@ fn credential_route_policy_setter_normalizes_rules() {
     assert_eq!(entries[0].credentials.route_rules, vec!["/cc".to_string()]);
     assert!(entries[0].credentials.allows_route("/cc/v1/messages"));
 }
+
+// ---------------------------------------------------------------------------
+// Selection scenario matrix: pins the dispatch order of every load-balancing mode
+// across tiers, warmup, Fast, cooldown, RPM, sticky sessions and slot races, so a
+// refactor of the selection code must reproduce it exactly and behavior changes are
+// visible as explicit edits to the expected table.
+// ---------------------------------------------------------------------------
+
+const SELECTION_MATRIX_MODES: [&str; 4] = [
+    "priority",
+    "balanced",
+    "health_balanced",
+    "weighted_least_inflight",
+];
+
+#[derive(Clone, Copy)]
+struct MatrixCredential {
+    priority: u32,
+    fast: u32,
+    warmup: u32,
+}
+
+const fn matrix_credential(priority: u32, fast: u32, warmup: u32) -> MatrixCredential {
+    MatrixCredential {
+        priority,
+        fast,
+        warmup,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MatrixStep {
+    /// Acquire and keep the lease.
+    Hold(Option<&'static str>),
+    /// Acquire and release the lease immediately.
+    Pulse(Option<&'static str>),
+    ReleaseAll,
+    Cooldown(u64),
+    Rpm(u64, u32),
+}
+
+fn selection_matrix_manager(mode: &str, credentials: &[MatrixCredential]) -> MultiTokenManager {
+    let mut config = Config::default();
+    config.load_balancing_mode = mode.to_string();
+    config.credential_max_concurrent_requests = 2;
+    config.credential_warmup_requests = 0;
+    // Score-based modes pick randomly among the top K; K = 1 makes them deterministic.
+    config.scheduler_top_k = 1;
+    let list = credentials
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let mut credential = test_access_token_credential(&format!("matrix-{index}"), "Pro");
+            credential.priority = spec.priority;
+            credential.fast = spec.fast;
+            credential
+        })
+        .collect();
+    let manager = MultiTokenManager::new(config, list, None, None, false).unwrap();
+    for (index, spec) in credentials.iter().enumerate() {
+        if spec.warmup > 0 {
+            manager
+                .set_warmup_remaining(index as u64 + 1, spec.warmup)
+                .unwrap();
+        }
+    }
+    manager
+}
+
+async fn run_selection_matrix_scenario(
+    mode: &str,
+    credentials: &[MatrixCredential],
+    steps: &[MatrixStep],
+) -> String {
+    let manager = selection_matrix_manager(mode, credentials);
+    let mut held = Vec::new();
+    let mut trace = Vec::new();
+    for step in steps {
+        match *step {
+            MatrixStep::Hold(session) | MatrixStep::Pulse(session) => {
+                let result = manager
+                    .acquire_context_for_session_with_mode(
+                        None,
+                        session,
+                        &HashSet::new(),
+                        AcquireMode::FailFastOnCapacity,
+                        1,
+                    )
+                    .await;
+                match result {
+                    Ok(mut ctx) => {
+                        trace.push(ctx.id.to_string());
+                        if matches!(step, MatrixStep::Hold(_)) {
+                            held.push(ctx);
+                        } else {
+                            ctx.release_in_flight();
+                        }
+                    }
+                    Err(_) => trace.push("E".to_string()),
+                }
+            }
+            MatrixStep::ReleaseAll => {
+                for ctx in &mut held {
+                    ctx.release_in_flight();
+                }
+                held.clear();
+                trace.push("|".to_string());
+            }
+            MatrixStep::Cooldown(id) => {
+                manager
+                    .report_transient_failure_kind(
+                        id,
+                        None,
+                        TransientFailureKind::RateLimit,
+                        Some(StdDuration::from_secs(120)),
+                        "matrix cooldown",
+                    )
+                    .unwrap();
+            }
+            MatrixStep::Rpm(id, rpm) => manager.set_credential_rpm(id, Some(rpm)).unwrap(),
+        }
+    }
+    for ctx in &mut held {
+        ctx.release_in_flight();
+    }
+    trace.join(" ")
+}
+
+fn selection_matrix_scenarios() -> Vec<(&'static str, Vec<MatrixCredential>, Vec<MatrixStep>)> {
+    use MatrixStep::*;
+    let p = |priority| matrix_credential(priority, 0, 0);
+    vec![
+        (
+            "tiers_fill_in_order",
+            vec![p(0), p(0), p(10), p(10)],
+            vec![Hold(None); 9],
+        ),
+        (
+            "warmup_in_lower_tier",
+            vec![
+                p(0),
+                p(0),
+                matrix_credential(10, 0, 30),
+                matrix_credential(10, 0, 30),
+            ],
+            vec![Pulse(None); 8],
+        ),
+        (
+            "warmup_in_same_tier",
+            vec![p(0), matrix_credential(0, 0, 30), p(0)],
+            vec![Pulse(None); 8],
+        ),
+        (
+            "fast_above_priority",
+            vec![p(0), matrix_credential(10, 1, 0), p(5)],
+            vec![Hold(None); 7],
+        ),
+        (
+            "cooldown_skips_tier_member",
+            vec![p(0), p(0), p(10)],
+            vec![
+                Cooldown(1),
+                Hold(None),
+                Hold(None),
+                Hold(None),
+                Hold(None),
+                Hold(None),
+            ],
+        ),
+        (
+            "rpm_limited_member",
+            vec![p(0), p(0), p(10)],
+            vec![
+                Rpm(1, 1),
+                Pulse(None),
+                Pulse(None),
+                Pulse(None),
+                Pulse(None),
+            ],
+        ),
+        (
+            "sticky_borrows_when_bound_is_full",
+            vec![p(0), p(0), p(10)],
+            vec![
+                Hold(Some("s1")),
+                Hold(Some("s1")),
+                Hold(Some("s1")),
+                ReleaseAll,
+                Hold(Some("s1")),
+            ],
+        ),
+        (
+            "sticky_bound_in_lower_tier",
+            vec![p(0), p(10)],
+            vec![
+                Hold(None),
+                Hold(None),
+                Hold(Some("s2")),
+                ReleaseAll,
+                Pulse(Some("s2")),
+                Pulse(Some("s2")),
+            ],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn selection_scenario_matrix_matches_expected_dispatch_order() {
+    let mut actual = Vec::new();
+    for (name, credentials, steps) in selection_matrix_scenarios() {
+        for mode in SELECTION_MATRIX_MODES {
+            let trace = run_selection_matrix_scenario(mode, &credentials, &steps).await;
+            actual.push(format!("{name}/{mode}: {trace}"));
+        }
+    }
+    let actual = actual.join("\n");
+    assert_eq!(actual, SELECTION_MATRIX_EXPECTED.trim(), "\n{actual}\n");
+}
+
+#[test]
+fn selection_matrix_slot_race_alternative_scope() {
+    // The selected credential (id 1, priority 0) lost its slot; credential 2 (priority 10)
+    // and credential 3 (priority 0, Fast 1) still have capacity.
+    let mut actual = Vec::new();
+    for mode in SELECTION_MATRIX_MODES {
+        let manager = selection_matrix_manager(
+            mode,
+            &[
+                matrix_credential(0, 0, 0),
+                matrix_credential(10, 0, 0),
+                matrix_credential(0, 1, 0),
+            ],
+        );
+        let excluded_fast = HashSet::from([3]);
+        let lower_tier_only = manager.has_alternate_dispatchable_credential_for_slot_race(
+            None,
+            &excluded_fast,
+            1,
+            0,
+            0,
+            1,
+        );
+        let other_fast_tier = manager.has_alternate_dispatchable_credential_for_slot_race(
+            None,
+            &HashSet::from([2]),
+            1,
+            0,
+            0,
+            1,
+        );
+        actual.push(format!(
+            "{mode}: lower_tier={lower_tier_only} other_fast={other_fast_tier}"
+        ));
+    }
+    assert_eq!(
+        actual.join("\n"),
+        SELECTION_MATRIX_SLOT_RACE_EXPECTED.trim()
+    );
+}
+
+const SELECTION_MATRIX_EXPECTED: &str = r#"
+tiers_fill_in_order/priority: 1 2 1 2 3 4 3 4 E
+tiers_fill_in_order/balanced: 1 2 1 2 3 4 3 4 E
+tiers_fill_in_order/health_balanced: 1 2 3 4 1 2 3 4 E
+tiers_fill_in_order/weighted_least_inflight: 1 2 3 4 1 2 3 4 E
+warmup_in_lower_tier/priority: 3 1 2 1 2 1 2 1
+warmup_in_lower_tier/balanced: 3 1 2 1 2 1 2 1
+warmup_in_lower_tier/health_balanced: 3 1 2 1 2 1 2 1
+warmup_in_lower_tier/weighted_least_inflight: 3 1 2 1 2 1 2 1
+warmup_in_same_tier/priority: 2 1 3 1 3 1 3 1
+warmup_in_same_tier/balanced: 2 1 3 1 3 1 3 1
+warmup_in_same_tier/health_balanced: 2 1 3 1 3 1 3 1
+warmup_in_same_tier/weighted_least_inflight: 2 1 3 1 3 1 3 1
+fast_above_priority/priority: 2 2 1 1 3 3 E
+fast_above_priority/balanced: 2 2 1 1 3 3 E
+fast_above_priority/health_balanced: 2 2 1 3 1 3 E
+fast_above_priority/weighted_least_inflight: 2 2 1 3 1 3 E
+cooldown_skips_tier_member/priority: 2 2 3 3 E
+cooldown_skips_tier_member/balanced: 2 2 3 3 E
+cooldown_skips_tier_member/health_balanced: 2 3 2 3 E
+cooldown_skips_tier_member/weighted_least_inflight: 2 3 2 3 E
+rpm_limited_member/priority: 1 2 2 2
+rpm_limited_member/balanced: 1 2 2 2
+rpm_limited_member/health_balanced: 1 2 3 2
+rpm_limited_member/weighted_least_inflight: 1 2 3 2
+sticky_borrows_when_bound_is_full/priority: 1 1 2 | 1
+sticky_borrows_when_bound_is_full/balanced: 1 1 2 | 1
+sticky_borrows_when_bound_is_full/health_balanced: 1 1 2 | 1
+sticky_borrows_when_bound_is_full/weighted_least_inflight: 1 1 2 | 1
+sticky_bound_in_lower_tier/priority: 1 1 2 | 2 2
+sticky_bound_in_lower_tier/balanced: 1 1 2 | 2 2
+sticky_bound_in_lower_tier/health_balanced: 1 2 1 | 1 1
+sticky_bound_in_lower_tier/weighted_least_inflight: 1 2 1 | 1 1
+"#;
+
+const SELECTION_MATRIX_SLOT_RACE_EXPECTED: &str = r#"
+priority: lower_tier=false other_fast=true
+balanced: lower_tier=true other_fast=true
+health_balanced: lower_tier=true other_fast=true
+weighted_least_inflight: lower_tier=true other_fast=true
+"#;
