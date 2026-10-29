@@ -1768,8 +1768,9 @@ pub struct StreamContext {
     response_tool_gate: ResponseToolGate,
     /// 请求声明了 stop_sequences 时的输出侧截断过滤器。
     stop_sequence_filter: Option<super::stop_sequence::StopSequenceFilter>,
-    /// 请求 `thinking.display` 为 `omitted` 时不下发 thinking 文本。
-    omit_thinking_display: bool,
+    /// 请求的 thinking 显示方式隐藏推理（`omitted`/`updates`，或模型默认 `omitted`）时，
+    /// 去掉 thinking 文本、保留块结构与签名；带 token 计数 beta 时附带进度估算。
+    omitted_thinking_filter: Option<super::thinking_display::OmittedThinkingFilter>,
     /// 把正文中复述的 Hash 映射工具名还原为原名。
     tool_name_text_restorer: Option<super::tool_name_restore::ToolNameTextRestorer>,
     /// 清洗正文中复述的代理注入控制块（`<thinking_mode>` 等）。
@@ -1969,7 +1970,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             response_tool_gate: ResponseToolGate::default(),
             stop_sequence_filter: None,
-            omit_thinking_display: false,
+            omitted_thinking_filter: None,
             tool_name_text_restorer,
             control_block_cleaner: None,
             identity_guard: None,
@@ -2015,9 +2016,11 @@ impl StreamContext {
             .is_some_and(|filter| filter.matched().is_some())
     }
 
-    /// `thinking.display: "omitted"` 时只下发空 thinking 与 signature。
-    pub fn set_omit_thinking_display(&mut self, omit: bool) {
-        self.omit_thinking_display = omit;
+    /// 隐藏推理时只下发空 thinking 与 signature；`report_token_estimates` 为真时附带
+    /// token 计数 beta 要求的 `estimated_tokens` 粗略进度。
+    pub fn set_omit_thinking_display(&mut self, omit: bool, report_token_estimates: bool) {
+        self.omitted_thinking_filter = omit
+            .then(|| super::thinking_display::OmittedThinkingFilter::new(report_token_estimates));
     }
 
     /// 启用正文控制块清洗；客户端自身使用同名标签时应关闭。
@@ -2051,10 +2054,9 @@ impl StreamContext {
             Some(restorer) => restorer.apply(events),
             None => events,
         };
-        let events = if self.omit_thinking_display {
-            super::thinking_display::omit_thinking_text_in_events(events)
-        } else {
-            events
+        let events = match self.omitted_thinking_filter.as_mut() {
+            Some(filter) => filter.apply(events),
+            None => events,
         };
         let events = match self.stop_sequence_filter.as_mut() {
             Some(filter) => filter.apply(events),
@@ -4475,7 +4477,7 @@ mod tests {
     #[test]
     fn omitted_thinking_display_hides_xml_thinking_text() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 8, true, HashMap::new());
-        ctx.set_omit_thinking_display(true);
+        ctx.set_omit_thinking_display(true, false);
         let mut events = ctx.generate_initial_events();
         events.extend(
             ctx.process_kiro_event(&Event::AssistantResponse(assistant_response_event(
@@ -4490,11 +4492,13 @@ mod tests {
                 .iter()
                 .any(|event| event.data["content_block"]["type"] == "thinking")
         );
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.data["delta"]["type"] == "thinking_delta")
-        );
+        // The official omitted trace: one thinking_delta per block, with empty text.
+        let thinking_deltas: Vec<_> = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "thinking_delta")
+            .collect();
+        assert_eq!(thinking_deltas.len(), 1);
+        assert_eq!(thinking_deltas[0].data["delta"]["thinking"], "");
         let serialized = events
             .iter()
             .map(SseEvent::to_sse_string)
