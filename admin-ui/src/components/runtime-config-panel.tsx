@@ -372,7 +372,7 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolLocalRescueOnTimeout: true,
   externalPoolLocalRescueOnCapacity: true,
   externalPoolLocalRescueMaxWaitSecs: 15,
-  localPoolCircuitEnabled: true,
+  localPoolCircuitEnabled: false,
   localPoolCircuitWindowSecs: 300,
   localPoolCircuitOpenAfterFailures: 5,
   localPoolCircuitRequireDistinctCredentials: 5,

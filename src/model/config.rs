@@ -4276,9 +4276,10 @@ pub struct ExternalPoolsConfig {
     pub external_pool_local_rescue_on_capacity: bool,
     #[serde(default = "default_external_pool_local_rescue_max_wait_secs")]
     pub external_pool_local_rescue_max_wait_secs: u64,
-    /// 本地账号池风险保护（全池熔断）。只统计曾经成功过的账号被上游风控（暂停、封禁、锁定），
-    /// 同一账号在窗口内只计一次；从未成功过的账号（新导入、预热中）被风控只禁用它自己。
-    #[serde(default = "default_true")]
+    /// 本地账号池风险保护（全池熔断），默认关闭：被风控的账号只禁用它自己，其余账号照常调度。
+    /// 打开后只统计曾经成功过的账号被上游风控（暂停、封禁、锁定），同一账号在窗口内只计一次；
+    /// 从未成功过的账号（新导入、预热中）被风控只禁用它自己。
+    #[serde(default)]
     pub local_pool_circuit_enabled: bool,
     #[serde(default = "default_local_pool_circuit_window_secs")]
     pub local_pool_circuit_window_secs: u64,
@@ -4450,7 +4451,7 @@ impl Default for ExternalPoolsConfig {
             external_pool_local_rescue_on_capacity: true,
             external_pool_local_rescue_max_wait_secs:
                 default_external_pool_local_rescue_max_wait_secs(),
-            local_pool_circuit_enabled: true,
+            local_pool_circuit_enabled: false,
             local_pool_circuit_window_secs: default_local_pool_circuit_window_secs(),
             local_pool_circuit_open_after_failures: default_local_pool_circuit_open_after_failures(
             ),
@@ -5592,7 +5593,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 14;
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 13;
 
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
@@ -7053,10 +7054,9 @@ impl Config {
             changed = true;
         }
         if self.runtime_config_migration_version < 8 {
-            // Risk-control bursts must fail safe. Older persisted runtime configs materialized
-            // this field as false because the original circuit only fed external direct policy;
-            // v8 makes it a local-account safety circuit as well.
-            self.external_pools.local_pool_circuit_enabled = true;
+            // v8 used to switch the local pool circuit on. It is off by default now: a
+            // risk-controlled account disables only itself and the rest of the pool keeps
+            // serving. The persisted value is left as it is.
             self.runtime_config_migration_version = 8;
             changed = true;
         }
@@ -7094,23 +7094,6 @@ impl Config {
         if self.runtime_config_migration_version < 13 {
             // v13：提示词配置改为 promptInjection / routeFeatures（见 migrate_legacy_prompt_fields）。
             self.runtime_config_migration_version = 13;
-            changed = true;
-        }
-        if self.runtime_config_migration_version < 14 {
-            // v14：本地账号池风险保护改为按账号去重 + 比例阈值。仍是旧默认值（60 秒、3 次、2 个账号）
-            // 的配置升级到新默认值；用户改过的值保留。开关本身不动。
-            let pools = &mut self.external_pools;
-            if pools.local_pool_circuit_window_secs == 60
-                && pools.local_pool_circuit_open_after_failures == 3
-                && pools.local_pool_circuit_require_distinct_credentials == 2
-            {
-                pools.local_pool_circuit_window_secs = default_local_pool_circuit_window_secs();
-                pools.local_pool_circuit_open_after_failures =
-                    default_local_pool_circuit_open_after_failures();
-                pools.local_pool_circuit_require_distinct_credentials =
-                    default_local_pool_circuit_require_distinct_credentials();
-            }
-            self.runtime_config_migration_version = 14;
             changed = true;
         }
         changed
@@ -10036,51 +10019,37 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_migration_moves_old_default_pool_circuit_to_ratio_defaults_once() {
-        let old_default = |version| Config {
-            runtime_config_migration_version: version,
-            external_pools: ExternalPoolsConfig {
-                local_pool_circuit_window_secs: 60,
-                local_pool_circuit_open_after_failures: 3,
-                local_pool_circuit_require_distinct_credentials: 2,
-                ..ExternalPoolsConfig::default()
-            },
-            ..Config::default()
-        };
-        let mut config = old_default(13);
-        assert!(config.apply_runtime_config_migrations());
-        assert_eq!(config.external_pools.local_pool_circuit_window_secs, 300);
-        assert_eq!(
-            config.external_pools.local_pool_circuit_open_after_failures,
-            5
-        );
-        assert_eq!(
-            config
-                .external_pools
-                .local_pool_circuit_require_distinct_credentials,
-            5
-        );
-        assert!(!config.apply_runtime_config_migrations());
-
-        // Values an operator changed are kept.
-        let mut custom = old_default(13);
-        custom.external_pools.local_pool_circuit_open_after_failures = 10;
-        assert!(custom.apply_runtime_config_migrations());
-        assert_eq!(custom.external_pools.local_pool_circuit_window_secs, 60);
-        assert_eq!(
-            custom.external_pools.local_pool_circuit_open_after_failures,
-            10
-        );
+    fn runtime_config_migrations_never_change_the_pool_circuit() {
+        for enabled in [false, true] {
+            let mut config = Config {
+                runtime_config_migration_version: 0,
+                external_pools: ExternalPoolsConfig {
+                    local_pool_circuit_enabled: enabled,
+                    local_pool_circuit_window_secs: 60,
+                    local_pool_circuit_open_after_failures: 3,
+                    local_pool_circuit_require_distinct_credentials: 2,
+                    ..ExternalPoolsConfig::default()
+                },
+                ..Config::default()
+            };
+            config.apply_runtime_config_migrations();
+            let pools = &config.external_pools;
+            assert_eq!(
+                pools.local_pool_circuit_enabled, enabled,
+                "the switch is left as it is"
+            );
+            assert_eq!(pools.local_pool_circuit_window_secs, 60);
+            assert_eq!(pools.local_pool_circuit_open_after_failures, 3);
+            assert_eq!(pools.local_pool_circuit_require_distinct_credentials, 2);
+        }
     }
 
     #[test]
-    fn missing_pool_circuit_enabled_field_defaults_to_enabled() {
+    fn pool_circuit_is_off_by_default() {
         let pools: ExternalPoolsConfig = serde_json::from_str("{}").unwrap();
-        assert!(pools.local_pool_circuit_enabled);
-        assert_eq!(
-            pools.local_pool_circuit_enabled,
-            ExternalPoolsConfig::default().local_pool_circuit_enabled
-        );
+        assert!(!pools.local_pool_circuit_enabled);
+        assert!(!ExternalPoolsConfig::default().local_pool_circuit_enabled);
+        assert!(!Config::default().external_pools.local_pool_circuit_enabled);
     }
 
     #[test]
