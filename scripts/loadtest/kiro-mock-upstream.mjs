@@ -12,6 +12,24 @@ const LOG_REQUESTS = process.env.KIRO_MOCK_LOG_REQUESTS === "1";
 // `?headerDelayMs=` on the request overrides it.
 const DEFAULT_HEADER_DELAY_MS = Number.parseInt(process.env.KIRO_MOCK_HEADER_DELAY_MS || "0", 10);
 
+// Runtime fault control for scheduler tests. `POST /__control` with a JSON patch changes these
+// for every following request; `GET /__control` returns them with hit counters.
+// - errorRate: share of generateAssistantResponse calls answered with errorStatus (0..1).
+// - errorStatus: 429, 500, 502, 503, 403 (403 sends TEMPORARILY_SUSPENDED), or "reset" to drop
+//   the connection without a response.
+// - failTokens: access tokens (Authorization bearer) that always fail, to fail single accounts.
+// - headerDelayMs: delay before response headers.
+// - streamChunks / chunkDelayMs: long streams.
+const control = {
+  errorRate: 0,
+  errorStatus: 500,
+  failTokens: [],
+  headerDelayMs: DEFAULT_HEADER_DELAY_MS,
+  streamChunks: 0,
+  chunkDelayMs: 0,
+};
+const counters = { requests: 0, failed: 0, ok: 0, inFlight: 0, maxInFlight: 0, byToken: {} };
+
 const models = [
   { id: "sonnet", displayName: "Sonnet", maxInputTokens: 200000 },
   { id: "claude-sonnet-4-20250514", displayName: "Claude Sonnet 4", maxInputTokens: 200000 },
@@ -307,8 +325,36 @@ function handleListModels(req, res, url, scenario) {
   });
 }
 
+function bearerToken(req) {
+  const value = String(req.headers.authorization || "");
+  return value.toLowerCase().startsWith("bearer ") ? value.slice(7).trim() : value;
+}
+
+function writeControlledFailure(res, status) {
+  if (status === "reset") {
+    res.socket?.destroy();
+    return;
+  }
+  const code = Number(status);
+  if (code === 429) {
+    json(res, 429, { message: "rate limited", reason: "THROTTLED" }, { "retry-after": "1" });
+  } else if (code === 403) {
+    json(res, 403, { message: "Account temporarily suspended", reason: "TEMPORARILY_SUSPENDED" });
+  } else {
+    json(res, code || 500, { message: `mock upstream controlled failure ${code}`, requestId: "mock-error" });
+  }
+}
+
 async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
-  const headerDelayMs = Number.parseInt(url.searchParams.get("headerDelayMs") || `${DEFAULT_HEADER_DELAY_MS}`, 10);
+  counters.requests += 1;
+  counters.inFlight += 1;
+  counters.maxInFlight = Math.max(counters.maxInFlight, counters.inFlight);
+  res.on("close", () => {
+    counters.inFlight -= 1;
+  });
+  const token = bearerToken(req);
+  counters.byToken[token] = (counters.byToken[token] || 0) + 1;
+  const headerDelayMs = Number.parseInt(url.searchParams.get("headerDelayMs") || `${control.headerDelayMs}`, 10);
   if (headerDelayMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, headerDelayMs));
     // The request body has already been read, so only the response side tells whether the
@@ -316,6 +362,27 @@ async function handleGenerateAssistantResponse(req, res, url, scenario, body) {
     if (res.destroyed || res.writableEnded) {
       return;
     }
+  }
+  if (control.failTokens.includes(token) || (control.errorRate > 0 && Math.random() < control.errorRate)) {
+    counters.failed += 1;
+    writeControlledFailure(res, control.errorStatus);
+    return;
+  }
+  counters.ok += 1;
+  if (control.streamChunks > 0) {
+    const frames = [];
+    for (let index = 0; index < control.streamChunks; index += 1) {
+      frames.push({
+        delayMs: control.chunkDelayMs,
+        frame: event({ eventType: "assistantResponseEvent" }, { content: `chunk-${index} ` }),
+      });
+    }
+    frames.push({
+      delayMs: 0,
+      frame: event({ eventType: "metadataEvent" }, { tokenUsage: tokenUsageForScenario(scenario, control.streamChunks * 3) }),
+    });
+    writeStream(req, res, frames);
+    return;
   }
   if (scenario === "429") {
     json(res, 429, { message: "rate limited", reason: "THROTTLED" }, { "retry-after": "1" });
@@ -375,6 +442,18 @@ const server = http.createServer(async (req, res) => {
       const { raw, json: body } = await parseJsonBody(req);
       logRequest(req, url, scenario, raw, body);
       handleMcp(req, res, url, scenario, body);
+      return;
+    }
+
+    if (url.pathname === "/__control") {
+      if (req.method === "POST") {
+        const { json: patch } = await parseJsonBody(req);
+        Object.assign(control, patch || {});
+        if (patch && patch.resetCounters) {
+          Object.assign(counters, { requests: 0, failed: 0, ok: 0, maxInFlight: counters.inFlight, byToken: {} });
+        }
+      }
+      json(res, 200, { control, counters });
       return;
     }
 
