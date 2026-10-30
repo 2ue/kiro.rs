@@ -1960,6 +1960,8 @@ export interface CacheHitShapingPolicyPatch {
   minCostRatio?: number
   maxReadMultiplier?: number
   minCreationRatio?: number
+  /** Count cache reads toward the cost floor; off keeps the original shaping. */
+  readAwareCostFloor?: boolean
 }
 
 export interface CachePolicyConfig {
